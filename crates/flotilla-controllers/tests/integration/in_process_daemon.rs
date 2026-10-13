@@ -1,5 +1,7 @@
 #![allow(dead_code, unused_imports, clippy::empty_line_after_outer_attr)]
 
+use flotilla_resources::ResumeIntent;
+
 use flotilla_store_sqlite::SqliteBackend;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -8710,7 +8712,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         .expect("replicate terminal session");
 
     let outcome = authority
-        .convoy_resume_internal("flotilla", "split-convoy", "Continue", Some("work"), Some("coder"))
+        .convoy_resume_internal("flotilla", "split-convoy", "Continue", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("resume remote crew session");
     assert!(matches!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { .. }));
@@ -8765,7 +8767,7 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
         .expect("mark crew working");
 
     daemon
-        .convoy_resume_internal("flotilla", "busy-convoy", "Check the edge case", Some("work"), Some("coder"))
+        .convoy_resume_internal("flotilla", "busy-convoy", "Check the edge case", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("queue brief for busy crew");
 
@@ -8778,7 +8780,7 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
     assert_eq!(first.spec.receiver, "flotilla/busy-convoy/work/coder");
     assert_eq!(first.spec.sender, "principal:implicit");
     let outcome = daemon
-        .convoy_resume_internal("flotilla", "busy-convoy", "Use the newer instruction", Some("work"), Some("coder"))
+        .convoy_resume_internal("flotilla", "busy-convoy", "Use the newer instruction", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("replace pending brief");
     assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: Some("Check the edge case".to_string()) });
@@ -8807,7 +8809,7 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
     .await
     .expect("mark convoy terminal");
     let error = daemon
-        .convoy_resume_internal("flotilla", "busy-convoy", "too late", Some("work"), Some("coder"))
+        .convoy_resume_internal("flotilla", "busy-convoy", "too late", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect_err("terminal convoy should refuse a brief");
     assert!(error.contains("terminal phase `Landed`"), "unexpected refusal: {error}");
@@ -8981,12 +8983,12 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .expect("mark review crew session running");
 
     let queued = daemon
-        .convoy_resume_internal("flotilla", "idle-convoy", "Finish the current turn", Some("work"), Some("coder"))
+        .convoy_resume_internal("flotilla", "idle-convoy", "Finish the current turn", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("queue brief while crew is working");
     assert_eq!(queued, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: None });
     let unrelated = daemon
-        .convoy_resume_internal("flotilla", "idle-convoy", "Start the review", Some("review"), Some("qa"))
+        .convoy_resume_internal("flotilla", "idle-convoy", "Start the review", Some("review"), Some("qa"), ResumeIntent::Reopen)
         .await
         .expect("resume unrelated crew");
     assert_eq!(unrelated, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: None });
@@ -9129,7 +9131,14 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
         .await
         .expect("create crew session");
     daemon
-        .convoy_resume_internal("flotilla", "turn-boundary", "Begin the follow-up turn", Some("work"), Some("coder"))
+        .convoy_resume_internal(
+            "flotilla",
+            "turn-boundary",
+            "Begin the follow-up turn",
+            Some("work"),
+            Some("coder"),
+            ResumeIntent::Reminder,
+        )
         .await
         .expect("queue pending brief");
 
@@ -9973,4 +9982,120 @@ async fn explicit_convoy_name_survives_failed_branch_generation() {
     assert_eq!(convoy.status.as_ref().expect("status").naming, Some(flotilla_protocol::ConvoyNaming::Explicit));
     assert_eq!(convoy.spec.r#ref.as_deref(), Some("flotilla-flotilla"));
     assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
+}
+
+// #3145: an operator reminder immediately after crew complete is information,
+// preserving the accepted claim all the way through the ordinary reconciler.
+#[tokio::test]
+async fn convoy_resume_milliseconds_after_complete_still_lands() {
+    use flotilla_store::controller::Reconciler;
+    let (_temp, _repo, daemon) = daemon_for_cwd().await;
+    let backend = daemon.resource_backend();
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &InputMeta::builder().name("claimed-resume".into()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).role("claimed-resume".into()).build(),
+        )
+        .await
+        .unwrap();
+    let mut workflow = flotilla_resources::single_agent_workflow_spec();
+    // Artifact readiness is covered separately; this scenario isolates the accepted claim.
+    workflow.vessels[0].crew[0].promises.clear();
+    convoys
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                observed_workflow_ref: Some("workflow".into()),
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: workflow.exit,
+                    turn_delivery: workflow.turn_delivery,
+                    vessels: workflow.vessels,
+                }),
+                work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([(
+                        "coder".into(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                    )]),
+                )]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    backend
+        .using::<flotilla_resources::Vessel>("flotilla")
+        .create(
+            &InputMeta::builder().name("claimed-resume-vessel".into()).build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "claimed-resume".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut events = daemon.subscribe();
+    let complete_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::CrewComplete {
+                    context: flotilla_protocol::CrewCommandContext {
+                        crew_id: None,
+                        namespace: Some("flotilla".into()),
+                        convoy: Some("claimed-resume".into()),
+                        vessel_ref: Some("claimed-resume-vessel".into()),
+                        role: Some("coder".into()),
+                    },
+                    message: Some("accepted completion".into()),
+                    disposition: None,
+                    decision_ledger_ref: Some("https://example.test/pull/1#decision-ledger".into()),
+                    force: false,
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recv_command_finished(&mut events, complete_id).await, CommandValue::Ok);
+    let claimed = convoys.get("claimed-resume").await.unwrap().status.unwrap();
+    assert_eq!(claimed.phase, ConvoyPhase::Landing);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let resume_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyResume {
+                    namespace: Some("flotilla".into()),
+                    name: "claimed-resume".into(),
+                    prompt: "please complete".into(),
+                    vessel: None,
+                    role: None,
+                    reopen: false,
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recv_command_finished(&mut events, resume_id).await,
+        CommandValue::ConvoyBriefInformational { message: "crew already claimed; delivered without reopening".into() }
+    );
+    assert_eq!(convoys.get("claimed-resume").await.unwrap().status.unwrap(), claimed);
+    let reconciler = flotilla_store::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"));
+    for _ in 0..3 {
+        let current = convoys.get("claimed-resume").await.unwrap();
+        let prepared = reconciler.prepare(&current).await.unwrap();
+        if let Some(patch) = reconciler.reconcile(&current, &prepared, chrono::Utc::now()).patch {
+            apply_status_patch(&convoys, "claimed-resume", &patch).await.unwrap();
+        }
+    }
+    let settled = convoys.get("claimed-resume").await.unwrap().status.unwrap();
+    assert_eq!(settled.phase, ConvoyPhase::Landed, "{settled:?}");
 }

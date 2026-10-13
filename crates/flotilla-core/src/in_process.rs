@@ -5,6 +5,7 @@
 
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
+use flotilla_resources::ResumeIntent;
 use flotilla_store::ResolvedCascadeStoreExt;
 use flotilla_store_memory::InMemoryBackend;
 
@@ -5352,8 +5353,21 @@ impl InProcessDaemon {
         prompt: &str,
         requested_vessel: Option<&str>,
         requested_role: Option<&str>,
+        intent: ResumeIntent,
     ) -> Result<ConvoyResumeOutcome, String> {
-        self.crew_ops.resume(namespace, name, prompt, requested_vessel, requested_role).await
+        if intent == ResumeIntent::Reminder {
+            return self.crew_ops.resume(namespace, name, prompt, requested_vessel, requested_role).await;
+        }
+        self.crew_ops
+            .convoy_resume_with_sender_internal(
+                namespace,
+                name,
+                prompt,
+                (requested_vessel, requested_role),
+                crew_ops::MessageAttribution::operator(None),
+                intent,
+            )
+            .await
     }
 
     pub async fn convoy_withdraw_pending_brief_internal(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {

@@ -1312,6 +1312,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::ConvoyBriefDelivered { displaced: Some(displaced) } => {
             format!("brief delivered now; displaced pending brief:\n{displaced}")
         }
+        CommandValue::ConvoyBriefInformational { message } => message.clone(),
         CommandValue::ConvoyBriefDelivered { displaced: None } => "brief delivered now".to_string(),
         CommandValue::ConvoyBriefQueued { displaced: Some(displaced) } => {
             format!("brief queued for turn end; displaced brief:\n{displaced}")

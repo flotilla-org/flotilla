@@ -1,3 +1,5 @@
+use crate::in_process::crew_ops::MessageAttribution;
+use flotilla_resources::ResumeIntent;
 use std::sync::atomic::Ordering;
 
 use flotilla_resources::{Convoy as ResourceConvoy, CrewWorkPhase, TerminalSession as ResourceTerminalSession, TerminalSessionSource};
@@ -8,12 +10,31 @@ use crate::in_process::crew_ops::ConvoyResumeOutcome;
 #[tokio::test]
 async fn resume_restores_work_until_credentials_are_staged() {
     let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Done).await;
-    let error = crew.resume("flotilla", "crew", "continue", None, None).await.expect_err("credential failure");
+    let error = crew
+        .convoy_resume_with_sender_internal(
+            "flotilla",
+            "crew",
+            "continue",
+            (None, None),
+            MessageAttribution::operator(None),
+            ResumeIntent::Reopen,
+        )
+        .await
+        .expect_err("credential failure");
     assert_eq!(error, "staging unavailable");
     let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
     assert_eq!(convoy.status.expect("status").crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
     assert_eq!(
-        crew.resume("flotilla", "crew", "continue", None, None).await.expect("retry"),
+        crew.convoy_resume_with_sender_internal(
+            "flotilla",
+            "crew",
+            "continue",
+            (None, None),
+            MessageAttribution::operator(None),
+            ResumeIntent::Reopen
+        )
+        .await
+        .expect("retry"),
         ConvoyResumeOutcome::Queued { displaced: None }
     );
     let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");

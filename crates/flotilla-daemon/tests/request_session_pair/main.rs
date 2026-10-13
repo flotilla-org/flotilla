@@ -577,6 +577,7 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
             .execute(
                 Command::builder()
                     .action(CommandAction::ConvoyResume {
+                        reopen: false,
                         namespace: Some("flotilla".into()),
                         name: name.clone(),
                         prompt: "continue".into(),
@@ -1320,6 +1321,7 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
                 .execute(
                     Command::builder()
                         .action(CommandAction::ConvoyResume {
+                            reopen: false,
                             namespace: Some("flotilla".to_string()),
                             name: convoy_name.clone(),
                             prompt: prompt.to_string(),
@@ -1611,6 +1613,7 @@ async fn router_delivery_scenario_table_reaches_remote_convoy_authority() {
         (
             "resume",
             CommandAction::ConvoyResume {
+                reopen: false,
                 namespace: Some("flotilla".into()),
                 name: "remote-work".into(),
                 prompt: "continue".into(),
@@ -1621,6 +1624,7 @@ async fn router_delivery_scenario_table_reaches_remote_convoy_authority() {
         (
             "nudge",
             CommandAction::ConvoyResume {
+                reopen: false,
                 namespace: Some("flotilla".into()),
                 name: "remote-work".into(),
                 prompt: "check in".into(),
@@ -1968,6 +1972,7 @@ async fn in_memory_mutation_preserves_socket_caller_in_status_and_explain() {
         .execute(
             Command::builder()
                 .action(CommandAction::ConvoyResume {
+                    reopen: false,
                     namespace: Some("flotilla".into()),
                     name: role.into(),
                     prompt: String::new(),
@@ -4249,6 +4254,7 @@ async fn exited_crew_resume_scenario(remote_home: bool, interrupted: bool) {
         .execute(
             Command::builder()
                 .action(CommandAction::ConvoyResume {
+                    reopen: false,
                     namespace: Some("flotilla".into()),
                     name: "exited-work".into(),
                     prompt: "finish the review".into(),

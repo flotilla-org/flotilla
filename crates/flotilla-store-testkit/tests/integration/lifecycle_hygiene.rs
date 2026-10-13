@@ -1,3 +1,4 @@
+use flotilla_resources::ResumeIntent;
 use std::collections::BTreeMap;
 
 use chrono::Utc;
@@ -72,6 +73,7 @@ fn terminal_convoys_ignore_silent_continuations(tc: hegel::TestCase) {
     let rung = if tc.draw(gs::booleans()) { TurnDeliveryRung::WarmSession } else { TurnDeliveryRung::FreshAgent };
     for _ in 0..tc.draw(gs::integers::<usize>().min_value(1).max_value(5)) {
         ConvoyStatusPatch::ResumeCrewWork {
+            intent: ResumeIntent::Reopen,
             vessel: "work".into(),
             role: "coder".into(),
             resumed_at: at,

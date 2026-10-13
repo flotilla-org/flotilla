@@ -1,3 +1,4 @@
+use flotilla_resources::ResumeIntent;
 use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -617,7 +618,14 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
             .await
             .expect("agent exited");
         daemon
-            .convoy_resume_internal("flotilla", "resume-staging", "Recover the unfinished review", Some("work"), Some("coder"))
+            .convoy_resume_internal(
+                "flotilla",
+                "resume-staging",
+                "Recover the unfinished review",
+                Some("work"),
+                Some("coder"),
+                ResumeIntent::Reminder,
+            )
             .await
             .expect("resume exited agent");
         let session = sessions.get("resume-staging-session").await.expect("same session");

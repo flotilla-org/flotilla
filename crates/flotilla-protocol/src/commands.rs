@@ -940,6 +940,8 @@ pub enum CommandAction {
         vessel: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
+        #[serde(default)]
+        reopen: bool,
     },
     ConvoyWithdrawPendingBrief {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1391,6 +1393,9 @@ pub enum CommandValue {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         displaced: Option<String>,
     },
+    ConvoyBriefInformational {
+        message: String,
+    },
     ConvoyBriefQueued {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         displaced: Option<String>,
@@ -1678,6 +1683,7 @@ mod tests {
                 .build(),
             Command::builder()
                 .action(CommandAction::ConvoyResume {
+                    reopen: false,
                     namespace: Some("flotilla".into()),
                     name: "convoy-a".into(),
                     prompt: "Rebase onto main".into(),

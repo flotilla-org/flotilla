@@ -1,3 +1,4 @@
+use flotilla_resources::ResumeIntent;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
@@ -415,6 +416,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     ts(30),
                     "continue".into(),
                     Some("intent".into()),
+                    ResumeIntent::Reopen,
                 )
                 .apply(&mut status);
                 let patch = flotilla_resources::external_patches::restore_turn_activation(
@@ -984,6 +986,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                 status.phase = ConvoyPhase::Landing;
                 let before = crew_timestamps(&status);
                 let patch = ConvoyStatusPatch::ResumeCrewWork {
+                    intent: ResumeIntent::Reopen,
                     vessel: "implement".to_string(),
                     role: "coder".to_string(),
                     resumed_at: ts(30),
@@ -1262,6 +1265,7 @@ fn ledger_admission_digest_survives_duplicates_and_resets_for_new_turns(tc: hege
     }
     let patch = match continuation {
         0 => ConvoyStatusPatch::ResumeCrewWork {
+            intent: ResumeIntent::Reopen,
             vessel: "implement".into(),
             role: "coder".into(),
             resumed_at: ts(40),

@@ -1,5 +1,6 @@
 //! Crew outcomes, lifecycle teardown, and serialized crew message delivery.
 
+use flotilla_resources::ResumeIntent;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -393,6 +394,7 @@ impl MessageAttribution {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyResumeOutcome {
+    Informational,
     Delivered { displaced: Option<String> },
     Queued { displaced: Option<String> },
 }
@@ -1560,9 +1562,9 @@ impl CrewService {
                 namespace,
                 convoy_name,
                 message,
-                Some(vessel),
-                Some(role),
+                (Some(vessel), Some(role)),
                 MessageAttribution::operator(Some(principal)),
+                ResumeIntent::Reminder,
             )
             .await?;
             return Ok(CommandValue::Ok);
@@ -1700,9 +1702,9 @@ impl CrewService {
                     namespace,
                     convoy_name,
                     message,
-                    Some(vessel),
-                    Some(role),
+                    (Some(vessel), Some(role)),
                     MessageAttribution { sender, in_reply_to },
+                    ResumeIntent::Reminder,
                 )
                 .await?;
             }
@@ -2482,9 +2484,9 @@ impl CrewService {
             namespace,
             name,
             prompt,
-            requested_vessel,
-            requested_role,
+            (requested_vessel, requested_role),
             MessageAttribution::operator(None),
+            ResumeIntent::Reminder,
         )
         .await
     }
@@ -2494,9 +2496,9 @@ impl CrewService {
         namespace: &str,
         name: &str,
         prompt: &str,
-        requested_vessel: Option<&str>,
-        requested_role: Option<&str>,
+        target: (Option<&str>, Option<&str>),
         attribution: MessageAttribution,
+        intent: ResumeIntent,
     ) -> Result<ConvoyResumeOutcome, String> {
         if prompt.trim().is_empty() {
             return Err("convoy resume requires a non-empty prompt".to_string());
@@ -2504,7 +2506,7 @@ impl CrewService {
         self.adopt_legacy_convoy_queues_before_command(namespace, name).await?;
         let message_lock = self.convoy_message_lock(namespace, name).await;
         let _message_guard = message_lock.lock().await;
-        self.convoy_resume_with_sender_locked(namespace, name, prompt, requested_vessel, requested_role, attribution).await
+        self.convoy_resume_with_sender_locked(namespace, name, prompt, target, attribution, intent).await
     }
 
     async fn convoy_resume_with_sender_locked(
@@ -2512,11 +2514,12 @@ impl CrewService {
         namespace: &str,
         name: &str,
         prompt: &str,
-        requested_vessel: Option<&str>,
-        requested_role: Option<&str>,
+        target: (Option<&str>, Option<&str>),
         attribution: MessageAttribution,
+        intent: ResumeIntent,
     ) -> Result<ConvoyResumeOutcome, String> {
         let MessageAttribution { sender, in_reply_to } = attribution;
+        let (requested_vessel, requested_role) = target;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{name}` has no status"))?;
@@ -2557,6 +2560,21 @@ impl CrewService {
                 ));
             }
         };
+
+        if intent == ResumeIntent::Reminder && status.crew_claim_is_settled(&vessel, &role) {
+            let receiver =
+                crate::leaf_engine::crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), name, &vessel, &role);
+            let message_name = flotilla_resources::message_record_name(&receiver, &sender, &format!("resume:{}", uuid::Uuid::new_v4()));
+            let intent = flotilla_resources::MessageSpec::builder()
+                .sender(sender)
+                .receiver(receiver)
+                .relation(flotilla_resources::MessageRelation::Supervisor)
+                .body(prompt.to_string())
+                .maybe_in_reply_to(in_reply_to)
+                .build();
+            self.publish_message_intent(namespace, &message_name, &intent).await?;
+            return Ok(ConvoyResumeOutcome::Informational);
+        }
 
         self.ensure_vessel_backing_available(namespace, name, &vessel).await?;
         let crew_phase = status
@@ -2694,18 +2712,24 @@ impl CrewService {
         let reopened = apply_resource_status_patch(
             &convoys,
             name,
-            &convoy_external_patches::resume_crew_work(
-                vessel.clone(),
-                role.clone(),
-                self.clock.now(),
-                prompt.to_string(),
-                Some(message_name.clone()),
-            ),
+            &ConvoyStatusPatch::ResumeCrewWork {
+                vessel: vessel.clone(),
+                role: role.clone(),
+                resumed_at: self.clock.now(),
+                prompt: prompt.to_string(),
+                brief_id: Some(message_name.clone()),
+                intent,
+            },
         )
         .await
         .map_err(|err| err.to_string())?;
         if reopened.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             return Err(terminal_convoy_refusal(name, "became terminal"));
+        }
+        if intent == ResumeIntent::Reminder && reopened.status.as_ref().is_some_and(|status| status.crew_claim_is_settled(&vessel, &role)) {
+            // The claim guard made the patch a no-op; only the message is published.
+            self.publish_message_intent(namespace, &message_name, &resume_intent).await?;
+            return Ok(ConvoyResumeOutcome::Informational);
         }
         if matches!(session.provenance, ResourceProvenance::Replica { .. }) {
             if let Err(error) = self.publish_message_intent(namespace, &message_name, &resume_intent).await {
@@ -3084,6 +3108,7 @@ impl CrewService {
                             self.clock.now(),
                             request.brief.clone(),
                             Some(name.clone()),
+                            ResumeIntent::Reopen,
                         ),
                     )
                     .await
@@ -3424,7 +3449,15 @@ impl CrewService {
             }
             for (vessel, role, name, body, at) in continuations {
                 use flotilla_resources::StatusPatch;
-                ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at: at, prompt: body, brief_id: Some(name) }.apply(&mut next);
+                ConvoyStatusPatch::ResumeCrewWork {
+                    intent: ResumeIntent::Reopen,
+                    vessel,
+                    role,
+                    resumed_at: at,
+                    prompt: body,
+                    brief_id: Some(name),
+                }
+                .apply(&mut next);
             }
             if current.status.as_ref() != Some(&next) {
                 convoys

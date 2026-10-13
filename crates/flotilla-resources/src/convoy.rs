@@ -1919,6 +1919,7 @@ pub enum ConvoyStatusPatch {
         message: String,
     },
     ResumeCrewWork {
+        intent: ResumeIntent,
         vessel: String,
         role: String,
         resumed_at: DateTime<Utc>,
@@ -1963,6 +1964,26 @@ pub enum ConvoyStatusPatch {
         transitioned_at: DateTime<Utc>,
         message: Option<String>,
     },
+}
+
+/// Whether resume is ordinary information or an explicit request for new work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeIntent {
+    Reminder,
+    Reopen,
+}
+
+impl ConvoyStatus {
+    /// A settled crew claim needs explicit operator intent to reopen, including
+    /// the interval before the controller observes the transition to Landing.
+    /// An empty promise set counts as all terminal, including multi-crew convoys:
+    /// other crews may still be Working, but that does not revoke this Done claim.
+    /// Promises are checked convoy-wide; new work for the claimed crew requires Reopen.
+    pub fn crew_claim_is_settled(&self, vessel: &str, role: &str) -> bool {
+        self.crew_work.get(vessel).and_then(|crew| crew.get(role)).is_some_and(|state| state.phase == CrewWorkPhase::Done)
+            && (self.phase == ConvoyPhase::Landing
+                || self.promises.values().flat_map(BTreeMap::values).flatten().all(|promise| promise.state.terminal()))
+    }
 }
 
 impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
@@ -2523,7 +2544,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     clear_pending_brief_for(status, vessel, sender_role);
                 }
             }
-            Self::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id } => {
+            Self::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id, intent } => {
+                if *intent == ResumeIntent::Reminder && status.crew_claim_is_settled(vessel, role) {
+                    return;
+                }
                 let held_sources: Vec<_> = status
                     .workflow_snapshot
                     .as_ref()
@@ -2587,6 +2611,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.superseded_claims.push(claim.clone());
                 }
                 Self::ResumeCrewWork {
+                    intent: ResumeIntent::Reopen,
                     vessel: vessel.clone(),
                     role: role.clone(),
                     resumed_at: claim.claimed_at,
@@ -2988,8 +3013,9 @@ pub mod external_patches {
         resumed_at: DateTime<Utc>,
         prompt: String,
         brief_id: Option<String>,
+        intent: ResumeIntent,
     ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id }
+        ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id, intent }
     }
 
     pub fn record_turn_delivery(
@@ -3816,6 +3842,7 @@ mod hold_state_tests {
             assert_eq!(status.turn_deliveries["checks-settled"].hold.as_ref().expect("hold").raised_at, at);
         }
         ConvoyStatusPatch::ResumeCrewWork {
+            intent: ResumeIntent::Reopen,
             vessel: "work".into(),
             role: "reviewer".into(),
             resumed_at: at,
@@ -3825,6 +3852,7 @@ mod hold_state_tests {
         .apply(&mut status);
         assert!(status.turn_deliveries["checks-settled"].hold.is_some());
         ConvoyStatusPatch::ResumeCrewWork {
+            intent: ResumeIntent::Reopen,
             vessel: "work".into(),
             role: "coder".into(),
             resumed_at: at,
@@ -3834,5 +3862,116 @@ mod hold_state_tests {
         .apply(&mut status);
         assert!(!status.turn_deliveries.contains_key("checks-settled"));
         assert!(status.attention.is_none());
+    }
+}
+
+#[cfg(test)]
+mod claimed_resume_tests {
+    use super::*;
+
+    // #3145: only explicit reopen may discard a Done claim in Landing or with
+    // every promise terminal. Other phases keep their existing resume behavior.
+    #[hegel::test]
+    fn resume_respects_claim_boundary(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        use promises::{Promise, PromiseKind, PromiseSource, PromiseState};
+        // Cross Landing/Active, every crew phase, absent crew, empty promises,
+        // all promise states (including a promise belonging to another crew),
+        // explicit/default intent, and duplicate resume patches.
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let generated: Vec<_> = (0..count)
+            .map(|_| {
+                [PromiseState::Open, PromiseState::Submitted, PromiseState::Kept, PromiseState::Retracted]
+                    [tc.draw(gs::integers::<usize>().min_value(0).max_value(3))]
+            })
+            .collect();
+        for states in [
+            vec![],
+            vec![PromiseState::Open],
+            vec![PromiseState::Submitted],
+            vec![PromiseState::Kept],
+            vec![PromiseState::Retracted],
+            vec![PromiseState::Kept, PromiseState::Open],
+            generated,
+        ] {
+            for landing in [false, true] {
+                for reopen in [false, true] {
+                    for phase in [
+                        CrewWorkPhase::Pending,
+                        CrewWorkPhase::Working,
+                        CrewWorkPhase::Interrupted,
+                        CrewWorkPhase::Stalled,
+                        CrewWorkPhase::Done,
+                    ] {
+                        for absent in [false, true] {
+                            let mut status = ConvoyStatus {
+                                phase: if landing { ConvoyPhase::Landing } else { ConvoyPhase::Active },
+                                crew_work: if absent {
+                                    BTreeMap::new()
+                                } else {
+                                    BTreeMap::from([(
+                                        "work".into(),
+                                        BTreeMap::from([(
+                                            "coder".into(),
+                                            CrewWorkState::builder()
+                                                .phase(phase)
+                                                .finished_at(DateTime::<Utc>::UNIX_EPOCH)
+                                                .message("accepted".into())
+                                                .decision_ledger_digest("ledger".into())
+                                                .build(),
+                                        )]),
+                                    )])
+                                },
+                                promises: BTreeMap::from([(
+                                    "other".into(),
+                                    BTreeMap::from([(
+                                        "reviewer".into(),
+                                        states
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(index, state)| Promise {
+                                                id: index.to_string(),
+                                                vessel: "other".into(),
+                                                role: "reviewer".into(),
+                                                source: PromiseSource::Crew,
+                                                kind: PromiseKind::Pr,
+                                                state: *state,
+                                                retraction_reason: None,
+                                                submissions: vec![],
+                                            })
+                                            .collect(),
+                                    )]),
+                                )]),
+                                ..Default::default()
+                            };
+                            let protected = !reopen
+                                && !absent
+                                && phase == CrewWorkPhase::Done
+                                && (landing || states.iter().all(|state| matches!(state, PromiseState::Kept | PromiseState::Retracted)));
+                            let before = status.clone();
+                            let patch = ConvoyStatusPatch::ResumeCrewWork {
+                                vessel: "work".into(),
+                                role: "coder".into(),
+                                resumed_at: DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::milliseconds(1),
+                                prompt: "continue".into(),
+                                brief_id: None,
+                                intent: if reopen { ResumeIntent::Reopen } else { ResumeIntent::Reminder },
+                            };
+                            for _ in 0..2 {
+                                patch.apply(&mut status);
+                                if protected {
+                                    assert_eq!(status, before);
+                                } else {
+                                    assert_eq!(status.phase, ConvoyPhase::Active);
+                                    if !absent {
+                                        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -2,6 +2,7 @@
 //!
 //! Handlers use the capability-owned port below; the composition root supplies
 //! orchestration collaborators and shares their existing state.
+use flotilla_resources::ResumeIntent;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -95,8 +96,10 @@ impl CrewActions<'_> {
     ) -> Result<u64, String> {
         let caller = caller.clone();
         let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let CommandAction::ConvoyResume { namespace, name, prompt, vessel, role } = &command.action {
+        if let CommandAction::ConvoyResume { namespace, name, prompt, vessel, role, reopen } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
+            let intent = if *reopen { ResumeIntent::Reopen } else { ResumeIntent::Reminder };
+            let mutation_action = if *reopen { "reopened" } else { "convoy_resume" };
             let namespace = namespace.clone().unwrap_or(self.crew.provisioning_namespace().await);
             let result = match resolve_local_convoy_name(self.resource_backend, &namespace, name).await {
                 Ok(record_name) => {
@@ -104,21 +107,24 @@ impl CrewActions<'_> {
                         &namespace,
                         &record_name,
                         prompt,
-                        vessel.as_deref(),
-                        role.as_deref(),
+                        (vessel.as_deref(), role.as_deref()),
                         crew_ops::MessageAttribution::operator(dispatching_principal_ref.as_ref()),
+                        intent,
                     ))
                     .await
                     {
+                        Ok(ConvoyResumeOutcome::Informational) => {
+                            CommandValue::ConvoyBriefInformational { message: "crew already claimed; delivered without reopening".into() }
+                        }
                         Ok(ConvoyResumeOutcome::Delivered { displaced }) => {
                             self.crew
-                                .record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_resume", caller.as_ref(), false)
+                                .record_lifecycle_mutation_best_effort(&namespace, &record_name, mutation_action, caller.as_ref(), false)
                                 .await;
                             CommandValue::ConvoyBriefDelivered { displaced }
                         }
                         Ok(ConvoyResumeOutcome::Queued { displaced }) => {
                             self.crew
-                                .record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_resume", caller.as_ref(), false)
+                                .record_lifecycle_mutation_best_effort(&namespace, &record_name, mutation_action, caller.as_ref(), false)
                                 .await;
                             CommandValue::ConvoyBriefQueued { displaced }
                         }

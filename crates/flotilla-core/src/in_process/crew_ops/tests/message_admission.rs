@@ -1,3 +1,5 @@
+use crate::in_process::crew_ops::MessageAttribution;
+use flotilla_resources::ResumeIntent;
 use flotilla_store_memory::InMemoryBackend;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -466,7 +468,16 @@ async fn resume_and_withdraw_wait_for_follow_up_replication() {
         let error = if withdraw {
             crew.withdraw_pending_brief("flotilla", "crew").await.expect_err("withdraw awaits replication")
         } else {
-            crew.resume("flotilla", "crew", "replacement", None, None).await.expect_err("resume awaits replication")
+            crew.convoy_resume_with_sender_internal(
+                "flotilla",
+                "crew",
+                "replacement",
+                (None, None),
+                MessageAttribution::operator(None),
+                ResumeIntent::Reopen,
+            )
+            .await
+            .expect_err("resume awaits replication")
         };
         assert!(error.contains("follow-up Message awaits replication"), "{error}");
         assert_eq!(convoys.get("crew").await.expect("unchanged workflow").status, before);

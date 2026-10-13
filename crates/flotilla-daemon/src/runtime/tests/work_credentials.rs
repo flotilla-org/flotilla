@@ -1,4 +1,5 @@
 use super::*;
+use flotilla_resources::ResumeIntent;
 use flotilla_store_sqlite::SqliteBackend;
 
 #[tokio::test]
@@ -369,6 +370,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
             Utc::now(),
             "follow-up".to_string(),
             None,
+            ResumeIntent::Reopen,
         ),
     )
     .await

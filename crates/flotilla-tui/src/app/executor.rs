@@ -159,6 +159,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::Ok
         | CommandValue::ResourceReconciled { .. }
         | CommandValue::ConvoyBriefDelivered { .. }
+        | CommandValue::ConvoyBriefInformational { .. }
         | CommandValue::ConvoyBriefQueued { .. }
         | CommandValue::ConvoyBriefWithdrawn { .. } => {}
         CommandValue::CrewCompletionWaiting { reason, retry_at } => {
