@@ -107,6 +107,10 @@ struct BuildKitStandIn {
     workspace: Mutex<Option<PathBuf>>,
     config: Mutex<Option<PathBuf>>,
     hung_probe: Mutex<Option<String>>,
+    /// Whether the owned builder instance exists in the state directory.
+    builder_present: Mutex<bool>,
+    /// `buildx create` fails with this stderr.
+    create_failure: Option<String>,
 }
 
 impl BuildKitStandIn {
@@ -129,6 +133,8 @@ impl BuildKitStandIn {
             workspace: Mutex::new(None),
             config: Mutex::new(None),
             hung_probe: Mutex::new(None),
+            builder_present: Mutex::new(true),
+            create_failure: None,
         }
     }
 
@@ -267,7 +273,23 @@ impl CommandRunner for BuildKitStandIn {
         assert_eq!(config.join("config.json").exists(), self.mode == Mode::Push, "only push mode carries the credential");
         let rest = &args[2..];
         let step = match rest {
+            ["buildx", "inspect", "owned-buildkit"] => {
+                let present = *self.builder_present.lock().expect("builder");
+                Step::Exit(Some(if present { 0 } else { 1 }), if present { String::new() } else { "ERROR: no builder found\n".into() })
+            }
+            ["buildx", "create", "--name", "owned-buildkit", "--driver", "docker-container", "--bootstrap"] => {
+                assert!(!*self.builder_present.lock().expect("builder"), "an existing builder is never recreated");
+                assert!(self.state.is_dir(), "the builder state directory exists before Buildx writes to it");
+                match &self.create_failure {
+                    Some(stderr) => Step::Exit(Some(1), stderr.clone()),
+                    None => {
+                        *self.builder_present.lock().expect("builder") = true;
+                        Step::Exit(Some(0), String::new())
+                    }
+                }
+            }
             ["buildx", "build", ..] => {
+                assert!(*self.builder_present.lock().expect("builder"), "builds run only on a bootstrapped builder");
                 let workspace = self.check_build(rest);
                 *self.workspace.lock().expect("workspace") = Some(workspace.clone());
                 if matches!(self.build, Step::Exit(Some(0), _)) && self.mode == Mode::Push {
@@ -410,10 +432,14 @@ fn delivery_modes_build_probe_and_clean_up(tc: hegel::TestCase) {
         outcomes(&built.probes),
         [("base", &ImageProbeOutcome::Passed), ("rust", &ImageProbeOutcome::Passed), ("harness-codex", &ImageProbeOutcome::Passed)]
     );
-    let verbs: Vec<_> = runner.calls().iter().map(|call| call[2].clone()).collect();
+    let verbs: Vec<_> = runner
+        .calls()
+        .iter()
+        .map(|call| if matches!(call[2].as_str(), "buildx" | "image") { call[2..4].join(" ") } else { call[2].clone() })
+        .collect();
     let expected: Vec<&str> = match mode {
-        Mode::Push => vec!["buildx", "pull", "run", "run", "run"],
-        Mode::Load => vec!["buildx", "image", "run", "run", "run"],
+        Mode::Push => vec!["buildx inspect", "buildx build", "pull", "run", "run", "run"],
+        Mode::Load => vec!["buildx inspect", "buildx build", "image inspect", "run", "run", "run"],
     };
     assert_eq!(verbs, expected);
     let probes: Vec<_> = runner.calls().iter().filter(|call| call[2] == "run").map(|call| call.last().expect("probe").clone()).collect();
@@ -475,7 +501,7 @@ async fn build_failures_are_classified_and_redacted() {
         assert_eq!(failed.failure.class, class, "{stderr}");
         assert!(!failed.failure.reason.contains(SECRET) && !log.contains(SECRET), "credential material is redacted");
         assert!(failed.probes.iter().all(|probe| probe.outcome == ImageProbeOutcome::NotRun));
-        assert_eq!(runner.calls().len(), 1, "nothing runs after a failed build");
+        assert_eq!(runner.calls().len(), 2, "nothing runs after a failed build");
         assert_cleaned(&runner);
     }
 }
@@ -563,4 +589,63 @@ async fn invalid_push_metadata_is_infrastructure() {
     assert_eq!(failed.failure.class, ImageBuildFailureClass::Infrastructure);
     assert!(failed.failure.reason.contains("digest"));
     assert_cleaned(&runner);
+}
+
+// The owned builder is bootstrapped once, in the injected state directory,
+// through the same private configuration as the build: an absent instance is
+// created with the docker-container driver before the first build, an existing
+// one is reused, and a failed creation is an infrastructure failure that runs
+// no build.
+#[tokio::test]
+async fn owned_builder_is_bootstrapped_when_absent() {
+    let directory = tempfile::tempdir().expect("directory");
+    let runner = Arc::new(BuildKitStandIn::new(Mode::Load, layers(), directory.path()));
+    *runner.builder_present.lock().expect("builder") = false;
+    build(&runner, BTreeMap::new(), &mut String::new()).await.expect("first build bootstraps");
+    // A new operation has its own private configuration.
+    runner.config.lock().expect("config").take();
+    build(&runner, BTreeMap::new(), &mut String::new()).await.expect("second build reuses");
+    let buildx: Vec<_> = runner.calls().iter().filter(|call| call[2] == "buildx").map(|call| call[3].clone()).collect();
+    assert_eq!(buildx, ["inspect", "create", "build", "inspect", "build"]);
+
+    let mut failing = BuildKitStandIn::new(Mode::Load, layers(), &directory.path().join("failing"));
+    *failing.builder_present.get_mut().expect("builder") = false;
+    failing.create_failure = Some("ERROR: Cannot connect to the Docker daemon\n".into());
+    let failing = Arc::new(failing);
+    let failed = build(&failing, BTreeMap::new(), &mut String::new()).await.expect_err("bootstrap failure");
+    assert_eq!(failed.failure.class, ImageBuildFailureClass::Infrastructure);
+    assert!(failed.failure.reason.contains("owned builder `owned-buildkit`"), "{}", failed.failure.reason);
+    assert!(failing.calls().iter().all(|call| call[3] != "build"), "no build runs without a builder");
+}
+
+// A failed build step is attributed to the layer that owns its stage: the
+// generated output stage of layer i, or a fetch stage aliased with the
+// layer's name prefix. Steps outside any layer stage are unattributed.
+#[test]
+fn failing_steps_name_their_layer() {
+    use super::docker_image::failing_step_layer;
+    let layers = layers();
+    let summary =
+        |stage: &str| format!("#9 ERROR: process did not complete\n------\n > [{stage} 2/3] RUN make:\n------\nERROR: failed to solve\n");
+    assert_eq!(failing_step_layer(&summary("flotilla-layer-1"), &layers).as_deref(), Some("rust"));
+    assert_eq!(failing_step_layer(&summary("harness-codex-fetch"), &layers).as_deref(), Some("harness-codex"));
+    assert_eq!(failing_step_layer(&summary("flotilla-layer-9"), &layers), None);
+    assert_eq!(failing_step_layer(&summary("internal"), &layers), None);
+    assert_eq!(failing_step_layer("ERROR: failed to solve: no such host", &layers), None);
+}
+
+// A failed build carries its failing step's layer from the build output.
+#[tokio::test]
+async fn build_failures_report_the_failing_step_layer() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut runner = BuildKitStandIn::new(Mode::Load, layers(), directory.path());
+    runner.build = Step::Exit(
+        Some(1),
+        " > [flotilla-layer-2 2/2] RUN install:\nERROR: failed to solve: process \"/bin/sh -c install\" did not complete successfully: exit code: 1\n"
+            .into(),
+    );
+    let runner = Arc::new(runner);
+    let failed = build(&runner, BTreeMap::new(), &mut String::new()).await.expect_err("step failure");
+    assert_eq!(failed.failure.class, ImageBuildFailureClass::Recipe);
+    assert_eq!(failed.failed_step.as_deref(), Some("harness-codex"));
 }

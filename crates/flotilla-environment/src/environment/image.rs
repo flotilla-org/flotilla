@@ -33,8 +33,6 @@ pub trait LocalImageCache: Send + Sync {
     async fn pull(&self, reference: &str, auth: Option<&RegistryAuth>) -> Result<(), String>;
     async fn inventory(&self) -> Result<BTreeSet<String>, String>;
     async fn remove(&self, digest: &str) -> Result<(), String>;
-    /// Import a portable Docker image archive into this cache.
-    async fn load(&self, archive: &Path) -> Result<(), String>;
 }
 
 /// Builds one composed image identity for one architecture and verifies every
@@ -130,6 +128,8 @@ pub struct BuiltImage {
 pub struct FailedImageBuild {
     pub failure: ImageBuildFailure,
     pub probes: Vec<ImageLayerProbe>,
+    /// The layer whose build step failed, when the builder identifies it.
+    pub failed_step: Option<String>,
 }
 
 impl FailedImageBuild {

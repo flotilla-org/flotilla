@@ -286,7 +286,8 @@ fn read_layer(directory: &Path) -> ImageLayerSpec {
     parse_layer_directory_with_executables(&files, &executable, ImageLayerSource::Stdlib, None).expect("stdlib layer parses")
 }
 
-// The real stdlib layers compose into one Dockerfile per architecture: the
+// The stdlib layer fixtures (a copy inside this crate, read from nothing
+// outside it) compose into one Dockerfile per architecture: the
 // structural contract holds, `{arch}` pin URLs are emitted verbatim, the
 // architecture's checksum is selected, and declared context files (with
 // their executable bits) become one named context per layer.

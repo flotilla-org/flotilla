@@ -130,11 +130,6 @@ impl LocalImageCache for DockerEnvironmentProvider {
         validate_digest(digest)?;
         run(self.inner.runner.as_ref(), &["image", "rm", digest], None).await.map(|_| ())
     }
-    async fn load(&self, archive: &Path) -> Result<(), String> {
-        run(self.inner.runner.as_ref(), &["image", "load", "--input", archive.to_str().ok_or("archive path is not UTF-8")?], None)
-            .await
-            .map(|_| ())
-    }
 }
 
 /// The owned-BuildKit implementation of [`ImageBuildService`]: one generated
@@ -253,6 +248,7 @@ impl OwnedBuildKitService {
         &self,
         request: &ImageBuildRequest<'_>,
         probes: &mut [ImageLayerProbe],
+        failed_step: &mut Option<String>,
         log: &mut String,
     ) -> Result<String, ImageBuildFailure> {
         let ImageBuildRequest { identity, architecture, layers, delivery, secrets, probe_wrapper, probe_cpus } = request;
@@ -293,6 +289,7 @@ impl OwnedBuildKitService {
         let config = RegistryAuth::config(auth).map_err(|error| infrastructure(redact(error)))?;
         link_builder_state(config.path(), &self.settings.state_directory).map_err(infrastructure)?;
         let config_arg = path_arg(config.path())?;
+        self.ensure_builder(&config_arg, log).await?;
         let workspace = BuildWorkspace::create(&self.settings.scratch).map_err(infrastructure)?;
         workspace.materialise(&generated).map_err(infrastructure)?;
 
@@ -341,7 +338,9 @@ impl OwnedBuildKitService {
         log.push_str(&redact(output.stdout.clone()));
         log.push_str(&redact(output.stderr.clone()));
         if !output.success() {
-            let reason = failure_summary(&redact(output.stderr), output.exit_code);
+            let stderr = redact(output.stderr);
+            *failed_step = failing_step_layer(&stderr, layers);
+            let reason = failure_summary(&stderr, output.exit_code);
             return Err(failure(classify_build_failure(output.exit_code, &reason), reason));
         }
 
@@ -477,11 +476,71 @@ impl OwnedBuildKitService {
     }
 }
 
+impl OwnedBuildKitService {
+    /// Bootstrap the owned builder instance when it is absent: `buildx inspect
+    /// <name>` through the private configuration, and on failure `buildx create
+    /// --name <name> --driver docker-container --bootstrap`. The instance lives
+    /// in the injected state directory, so every later build reaches it through
+    /// the same configuration link, and other Buildx users never see it.
+    async fn ensure_builder(&self, config: &str, log: &mut String) -> Result<(), ImageBuildFailure> {
+        let builder = self.settings.builder.as_str();
+        let inspect = ["--config", config, "buildx", "inspect", builder].map(str::to_owned);
+        match self.docker(&inspect, CLI_TIMEOUT).await {
+            Ok(Ok(output)) if output.success() => return Ok(()),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Err(infrastructure(format!("inspecting the owned builder: {error}"))),
+            Err(()) => return Err(infrastructure("inspecting the owned builder exceeded its deadline")),
+        }
+        log.push_str(&format!("### create owned builder {builder}\n"));
+        let create =
+            ["--config", config, "buildx", "create", "--name", builder, "--driver", "docker-container", "--bootstrap"].map(str::to_owned);
+        match self.docker(&create, BUILDER_BOOTSTRAP_TIMEOUT).await {
+            Ok(Ok(output)) if output.success() => Ok(()),
+            Ok(Ok(output)) => {
+                log.push_str(&output.stderr);
+                Err(infrastructure(format!(
+                    "creating the owned builder `{builder}` failed: {}",
+                    failure_summary(&output.stderr, output.exit_code)
+                )))
+            }
+            Ok(Err(error)) => Err(infrastructure(format!("creating the owned builder `{builder}`: {error}"))),
+            Err(()) => Err(infrastructure(format!("creating the owned builder `{builder}` exceeded its deadline"))),
+        }
+    }
+}
+
+/// The layer whose build step failed, read from BuildKit's error summary
+/// (` > [<stage> n/m] …`). Stage names are generated (`flotilla-layer-<i>`) or
+/// declared aliases prefixed by their layer's name; anything else (the
+/// frontend, context transfer, an export) belongs to no layer.
+pub fn failing_step_layer(stderr: &str, layers: &[flotilla_resources::ImageLayerSpec]) -> Option<String> {
+    let stage = stderr.lines().rev().find_map(|line| {
+        let rest = line.trim_start().strip_prefix("> [")?;
+        let (stage, _) = rest.split_once(' ')?;
+        Some(stage.to_ascii_lowercase())
+    })?;
+    if let Some(index) = stage.strip_prefix("flotilla-layer-").and_then(|index| index.parse::<usize>().ok()) {
+        return layers.get(index).map(|layer| layer.name.clone());
+    }
+    layers
+        .iter()
+        .filter(|layer| stage.strip_prefix(&layer.name.to_ascii_lowercase()).is_some_and(|rest| rest.starts_with('-')))
+        .max_by_key(|layer| layer.name.len())
+        .map(|layer| layer.name.clone())
+}
+
 /// Make the owned builder instance visible through the private configuration
-/// (Buildx keeps instances under `<config>/buildx`).
+/// (Buildx keeps instances under `<config>/buildx`). The state directory is
+/// created private on first use.
 fn link_builder_state(config: &Path, state: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(state)
+            .map_err(|error| format!("builder state {}: {error}", state.display()))?;
         std::os::unix::fs::symlink(state, config.join("buildx")).map_err(|error| format!("builder state link: {error}"))
     }
     #[cfg(not(unix))]
@@ -496,11 +555,12 @@ impl ImageBuildService for OwnedBuildKitService {
     async fn build(&self, request: ImageBuildRequest<'_>, log: &mut String) -> Result<BuiltImage, FailedImageBuild> {
         let mut probes: Vec<_> =
             request.layers.iter().map(|layer| ImageLayerProbe { layer: layer.name.clone(), outcome: ImageProbeOutcome::NotRun }).collect();
-        match self.execute(&request, &mut probes, log).await {
+        let mut failed_step = None;
+        match self.execute(&request, &mut probes, &mut failed_step, log).await {
             Ok(digest) => Ok(BuiltImage { digest, probes }),
             Err(failure) => {
                 log.push_str(&format!("\n{}\n", failure.reason));
-                Err(FailedImageBuild { failure, probes })
+                Err(FailedImageBuild { failure, probes, failed_step })
             }
         }
     }
@@ -509,6 +569,8 @@ impl ImageBuildService for OwnedBuildKitService {
 pub const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
+/// Creating the builder pulls and starts the BuildKit container.
+const BUILDER_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_REASON_CHARS: usize = 2048;
 
 // Status holds a bounded diagnostic, while the Artifact retains the full output.

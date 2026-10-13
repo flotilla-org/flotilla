@@ -84,12 +84,6 @@ impl CommandRunner for DockerStandIn {
                     Err("image is absent".into())
                 }
             }
-            ["image", "load", "--input", path] => {
-                let id = std::fs::read_to_string(path).expect("archive");
-                assert!(is_image_digest(&id));
-                held.insert(id);
-                Ok(String::new())
-            }
             other => panic!("unexpected Docker invocation: {other:?}"),
         }
     }
@@ -167,13 +161,9 @@ async fn cache_refuses_mutable_references_and_propagates_runtime_failures() {
 // operation config; anonymous pulls still isolate ambient registry credentials.
 #[tokio::test]
 async fn local_cache_commands_do_not_allocate_registry_configuration() {
-    let directory = tempfile::tempdir().expect("directory");
-    let archive = directory.path().join("image.tar");
-    std::fs::write(&archive, digest(1)).expect("archive");
-    let runner = Arc::new(DockerStandIn::default());
+    let runner = Arc::new(DockerStandIn { held: Mutex::new(BTreeSet::from([digest(1)])), ..Default::default() });
     let provider = DockerEnvironmentProvider::new(runner.clone());
     let cache = provider.local_image_cache().expect("cache");
-    cache.load(&archive).await.expect("load");
     assert!(cache.inspect(&digest(1)).await.expect("inspect").is_some());
     cache.remove(&digest(1)).await.expect("remove");
     assert!(runner.calls.lock().expect("calls").iter().all(|args| args[0] == "image"));
