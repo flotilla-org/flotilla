@@ -40,6 +40,8 @@ pub(super) struct ControllerRuntimeState {
     pub(super) config: Arc<ConfigStore>,
     pub(super) local_registry: Arc<ProviderRegistry>,
     pub(super) local_host_ref: String,
+    /// OS probe boundary, injectable for deterministic launch tests.
+    pub(super) local_core_count: fn() -> Result<NonZeroUsize, std::io::Error>,
     pub(super) namespace: String,
     pub(super) host_direct_environment_name: String,
     pub(super) agentless_ssh: HashMap<String, AgentlessSshProfile>,
@@ -77,7 +79,7 @@ impl ControllerRuntimeState {
                 .parse::<usize>()
                 .map_err(|error| format!("read core count for host {host_ref}: {error}"))?
         } else if host_ref == self.local_host_ref {
-            std::thread::available_parallelism().map(usize::from).map_err(|error| format!("read local core count: {error}"))?
+            (self.local_core_count)().map(usize::from).map_err(|error| format!("read local core count: {error}"))?
         } else {
             return Err(format!("no core count source for host {host_ref}"));
         };
@@ -104,6 +106,7 @@ impl ControllerRuntimeState {
     ) -> Self {
         let environment_tools = EnvironmentToolProvisioner::for_local_host(&daemon, &config, daemon_socket_path.clone());
         Self {
+            local_core_count: std::thread::available_parallelism,
             daemon,
             config,
             local_registry,

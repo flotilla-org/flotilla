@@ -72,7 +72,10 @@ pub struct HostSpec {
     #[serde(default, skip_serializing_if = "HostConnection::is_daemon")]
     pub connection: HostConnection,
     /// Number of Rust crews this host is sized for; does not divide CPU
-    /// capacity or build parallelism. Retained for stored-record compatibility.
+    /// capacity or build parallelism. Currently no admission or memory budget
+    /// consumes it; retain the sizing metadata and stored shape for ADR 0047.
+    /// If retired later, accept and drop it for one fleet roll before removing
+    /// its decoder (rather than making old Host records undecodable).
     /// Previous-generation Host records omit it (ADR 0047); remove this
     /// decoder default one fleet roll after all hosts write the field.
     #[serde(default = "default_expected_concurrent_rust_crews")]
