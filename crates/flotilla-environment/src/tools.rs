@@ -19,6 +19,14 @@ pub struct ToolsSource<'a> {
 /// A provider-root filesystem lock serializes publication and pruning across
 /// daemon restarts and concurrent provisioning requests.
 pub fn publish(root: &Path, source: &ToolsSource<'_>) -> io::Result<PathBuf> {
+    publish_with(root, source, |input, output, hash, expected| copy_asset(input, output, hash, expected))
+}
+
+fn publish_with(
+    root: &Path,
+    source: &ToolsSource<'_>,
+    mut transfer: impl FnMut(&mut fs::File, &mut fs::File, &mut Sha256, u64) -> io::Result<()>,
+) -> io::Result<PathBuf> {
     let _lock = publication_lock(root)?;
     let mut files = vec![
         (PathBuf::from("bin/flotilla"), source.flotilla.to_path_buf()),
@@ -35,9 +43,7 @@ pub fn publish(root: &Path, source: &ToolsSource<'_>) -> io::Result<PathBuf> {
     // Stream each immutable staged snapshot into the framed digest. Memory is
     // bounded by one buffer rather than the size of the entire release.
     let result = (|| -> io::Result<PathBuf> {
-        use io::{Read, Write};
         let mut hash = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
         for (name, path) in &files {
             let destination = staging.join(name);
             fs::create_dir_all(destination.parent().expect("asset parent"))?;
@@ -48,19 +54,7 @@ pub fn publish(root: &Path, source: &ToolsSource<'_>) -> io::Result<PathBuf> {
             hash.update((name.len() as u64).to_le_bytes());
             hash.update(name.as_bytes());
             hash.update(metadata.len().to_le_bytes());
-            let mut copied = 0_u64;
-            loop {
-                let length = source.read(&mut buffer)?;
-                if length == 0 {
-                    break;
-                }
-                output.write_all(&buffer[..length])?;
-                hash.update(&buffer[..length]);
-                copied += length as u64;
-            }
-            if copied != metadata.len() {
-                return Err(io::Error::other("tools asset changed length during publication"));
-            }
+            transfer(&mut source, &mut output, &mut hash, metadata.len())?;
             fs::set_permissions(&destination, metadata.permissions())?;
         }
         let generation = format!("{:x}", hash.finalize());
@@ -101,6 +95,24 @@ pub fn publish(root: &Path, source: &ToolsSource<'_>) -> io::Result<PathBuf> {
         }
     }
     Ok(target)
+}
+
+fn copy_asset(mut source: impl io::Read, mut output: impl io::Write, hash: &mut Sha256, expected: u64) -> io::Result<()> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut copied = 0_u64;
+    loop {
+        let length = source.read(&mut buffer)?;
+        if length == 0 {
+            break;
+        }
+        output.write_all(&buffer[..length])?;
+        hash.update(&buffer[..length]);
+        copied += length as u64;
+    }
+    if copied != expected {
+        return Err(io::Error::other("tools asset changed length during publication"));
+    }
+    Ok(())
 }
 
 fn publication_lock(root: &Path) -> io::Result<fs::File> {
@@ -249,6 +261,53 @@ fn prune_local_for(root: &Path, processes: &Path, owner: u32) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Wrap real file readers at the transfer seam to deterministically model
+    // shrink/growth after metadata, plus an I/O failure after a staged copy.
+    // None may flip current or leave behind partial staging directories.
+    #[test]
+    fn streaming_failures_preserve_current_and_remove_staging() {
+        use io::Read;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("provider");
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("terminfo/x")).unwrap();
+        for file in ["flotilla", "cleat", "library", "terminfo/x/xterm-ghostty"] {
+            fs::write(source.join(file), b"initial").unwrap();
+        }
+        let assets = ToolsSource {
+            flotilla: &source.join("flotilla"),
+            cleat: &source.join("cleat"),
+            library: &source.join("library"),
+            terminfo: &source.join("terminfo"),
+        };
+        let current = publish(&root, &assets).unwrap();
+        for failure in ["shrink", "grow", "io"] {
+            fs::write(assets.cleat, failure).unwrap();
+            let mut count = 0;
+            let error = publish_with(&root, &assets, |input, output, hash, expected| {
+                count += 1;
+                if count != 2 {
+                    return copy_asset(input, output, hash, expected);
+                }
+                match failure {
+                    "shrink" => copy_asset(input.take(expected - 1), output, hash, expected),
+                    "grow" => copy_asset(input.chain(io::Cursor::new(b"extra")), output, hash, expected),
+                    _ => {
+                        copy_asset(input, output, hash, expected)?;
+                        Err(io::Error::other("injected transfer failure"))
+                    }
+                }
+            })
+            .unwrap_err();
+            assert_eq!(count, 2, "failure must occur after staging begins");
+            assert!(error.to_string().contains(if failure == "io" { "injected transfer failure" } else { "changed length" }));
+            assert_eq!(fs::read_link(root.join("tools/current")).unwrap(), current.strip_prefix(root.join("tools")).unwrap());
+            assert_eq!(fs::read(root.join("bin/cleat")).unwrap(), b"initial");
+            let entries: Vec<_> = fs::read_dir(root.join("tools")).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+            assert_eq!(entries.len(), 2, "only current and its complete generation may remain: {entries:?}");
+        }
+    }
+
     // An empty/failed first installation is safe to prune. Later publication
     // removes retired terminfo entries without disturbing the current database.
     #[test]
