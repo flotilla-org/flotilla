@@ -72,6 +72,15 @@ pub trait RepositoryInspector: Send + Sync {
         Err("bound charter inspection is unavailable".into())
     }
 
+    /// A project image layer directory at the source's head (ADR 0062);
+    /// `None` when the directory is absent.
+    async fn image_layer_snapshot(
+        &self,
+        _source: &flotilla_resources::CharterSource,
+    ) -> Result<Option<flotilla_charter::charter_store::LayerDirectorySnapshot>, String> {
+        Err("image layer inspection is unavailable".into())
+    }
+
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String>;
 
     /// Enumerate every local checkout that belongs to an inspected repository.
@@ -409,6 +418,18 @@ impl RepositoryInspector for GitRepositoryInspector {
             flotilla_vcs::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), self.runner.clone()))),
         );
         flotilla_charter::charter_store::read_charter_source(source, &self.charter_cache, Some(&vcs)).await
+    }
+
+    async fn image_layer_snapshot(
+        &self,
+        source: &flotilla_resources::CharterSource,
+    ) -> Result<Option<flotilla_charter::charter_store::LayerDirectorySnapshot>, String> {
+        let vcs = flotilla_vcs::vcs::FlotillaVcs::new(
+            flotilla_paths::path_context::ExecutionEnvironmentPath::new("/"),
+            self.runner.clone(),
+            flotilla_vcs::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), self.runner.clone()))),
+        );
+        flotilla_charter::charter_store::read_layer_directory(source, &self.charter_cache, Some(&vcs)).await
     }
 
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {

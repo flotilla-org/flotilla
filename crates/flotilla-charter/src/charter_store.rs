@@ -167,6 +167,110 @@ pub async fn read_charter_source(source: &CharterSource, cache: &Path, vcs: Opti
     .await
 }
 
+/// The conventional project image layer directory (ADR 0062), relative to a
+/// project's primary repository root or its named ops home.
+pub const PROJECT_IMAGE_LAYER_PATH: &str = ".flotilla/image";
+
+/// Every regular file of one layer directory at one revision, keyed by path
+/// relative to the directory. Unlike charter reads, no extension filter
+/// applies: fragments and context files are layer inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerDirectorySnapshot {
+    pub revision: String,
+    pub files: BTreeMap<String, Vec<u8>>,
+}
+
+/// The project layer directory below a source's root (its charter path, or a
+/// local directory).
+pub fn image_layer_source(source: &CharterSource) -> CharterSource {
+    match source {
+        CharterSource::Repository { repo, branch, path } => CharterSource::Repository {
+            repo: repo.clone(),
+            branch: branch.clone(),
+            path: Path::new(path).join(PROJECT_IMAGE_LAYER_PATH).to_string_lossy().into_owned(),
+        },
+        CharterSource::LocalDirectory { directory } => {
+            CharterSource::LocalDirectory { directory: Path::new(directory).join(PROJECT_IMAGE_LAYER_PATH).to_string_lossy().into_owned() }
+        }
+    }
+}
+
+/// Read a layer directory at the source's head as last fetched. `None` means
+/// the directory does not exist at that revision: the project has no layer.
+pub async fn read_layer_directory(
+    source: &CharterSource,
+    cache: &Path,
+    vcs: Option<&dyn Vcs>,
+) -> Result<Option<LayerDirectorySnapshot>, String> {
+    source.validate()?;
+    source_read(async {
+        match source {
+            CharterSource::Repository { repo, branch, path } => {
+                let vcs = vcs.ok_or("layer VCS provider unavailable")?;
+                let tree = GitRevisionedTree { vcs, cache, repo };
+                let revision = tree.resolve(branch).await?;
+                let entries = vcs.files_at_revision(cache, repo, &revision, path).await?;
+                if entries.is_empty() {
+                    return Ok(None);
+                }
+                let mut files = BTreeMap::new();
+                for (name, entry) in entries {
+                    let contents = match entry {
+                        TreeEntry::File(file) => file.read().await.map_err(|error| format!("read layer file {name}: {error}"))?,
+                        TreeEntry::Other => return Err(format!("layer path {name} is not a regular file")),
+                    };
+                    files.insert(name, contents);
+                }
+                Ok(Some(LayerDirectorySnapshot { revision, files }))
+            }
+            CharterSource::LocalDirectory { directory } => {
+                let directory = PathBuf::from(directory);
+                flotilla_provider_runtime::probe::blocking(
+                    "local image layer",
+                    flotilla_provider_runtime::probe::PROBE_TIMEOUT,
+                    move || local_layer_directory(&directory),
+                )
+                .await
+            }
+        }
+    })
+    .await
+}
+
+fn local_layer_directory(root: &Path) -> Result<Option<LayerDirectorySnapshot>, String> {
+    fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) -> Result<(), String> {
+        for entry in std::fs::read_dir(dir).map_err(|error| format!("read {}: {error}", dir.display()))? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            if kind.is_symlink() {
+                return Err(format!("layer directory contains symlink {}", path.display()));
+            }
+            if kind.is_dir() {
+                collect(root, &path, files)?;
+            } else if kind.is_file() {
+                let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+                let relative = relative.to_str().ok_or("layer path is not UTF-8")?.replace(std::path::MAIN_SEPARATOR, "/");
+                files.insert(relative, std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?);
+            }
+        }
+        Ok(())
+    }
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    let mut files = BTreeMap::new();
+    collect(root, root, &mut files)?;
+    let mut digest = Sha256::new();
+    for (path, contents) in &files {
+        digest.update((path.len() as u64).to_be_bytes());
+        digest.update(path.as_bytes());
+        digest.update((contents.len() as u64).to_be_bytes());
+        digest.update(contents);
+    }
+    Ok(Some(LayerDirectorySnapshot { revision: format!("local:{:x}", digest.finalize()), files }))
+}
+
 pub fn is_charter_file(path: &Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| {
         matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown" | "yaml" | "yml" | "json" | "toml" | "txt")
@@ -327,6 +431,42 @@ mod tests {
         );
         assert!(tree.read_files("unknown", ".").await.is_err());
         revision
+    }
+
+    // ADR 0062: a layer directory reads every regular file below the
+    // conventional path at the branch head, binary and extension-less files
+    // included; an absent directory is the opt-out (no layer), through both
+    // the Git and local adapters.
+    #[tokio::test]
+    async fn layer_directories_read_all_files_or_report_absence() {
+        let dir = tempfile::tempdir().expect("source");
+        let cache = tempfile::tempdir().expect("cache");
+        write_tree(dir.path()).await;
+        let layer = dir.path().join("ops").join(PROJECT_IMAGE_LAYER_PATH);
+        std::fs::create_dir_all(layer.join("prelude.d")).expect("layer directory");
+        std::fs::write(layer.join("layer.yaml"), "name: native\n").expect("definition");
+        std::fs::write(layer.join("Dockerfile.fragment"), "FROM ${BASE}\n").expect("fragment");
+        std::fs::write(layer.join("prelude.d/50-native.sh"), [0x23, 0x21, 0xff]).expect("context file");
+        fixture_git(dir.path(), &["add", "."]).await;
+        fixture_git(dir.path(), &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "layer"]).await;
+        let vcs = git_tree_provider(dir.path());
+        let repo = dir.path().to_str().expect("repository path").to_string();
+        let expected = BTreeMap::from([
+            ("Dockerfile.fragment".to_string(), b"FROM ${BASE}\n".to_vec()),
+            ("layer.yaml".to_string(), b"name: native\n".to_vec()),
+            ("prelude.d/50-native.sh".to_string(), vec![0x23, 0x21, 0xff]),
+        ]);
+        let git = image_layer_source(&CharterSource::Repository { repo: repo.clone(), branch: "main".into(), path: "ops".into() });
+        let snapshot = read_layer_directory(&git, cache.path(), Some(&vcs)).await.expect("git layer").expect("present");
+        assert_eq!(snapshot.files, expected);
+        let local = image_layer_source(&CharterSource::LocalDirectory { directory: dir.path().join("ops").to_string_lossy().into_owned() });
+        let snapshot = read_layer_directory(&local, cache.path(), None).await.expect("local layer").expect("present");
+        assert_eq!(snapshot.files, expected);
+        let absent = image_layer_source(&CharterSource::Repository { repo, branch: "main".into(), path: "ops-other".into() });
+        assert_eq!(read_layer_directory(&absent, cache.path(), Some(&vcs)).await.expect("absent git layer"), None);
+        let absent =
+            image_layer_source(&CharterSource::LocalDirectory { directory: dir.path().join("ignored").to_string_lossy().into_owned() });
+        assert_eq!(read_layer_directory(&absent, cache.path(), None).await.expect("absent local layer"), None);
     }
 
     #[tokio::test]

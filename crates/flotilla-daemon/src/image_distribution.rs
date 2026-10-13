@@ -129,12 +129,10 @@ mod tests {
             .build()
     }
 
-    fn inventory(delivery: &ImageDistributor<Docker>) -> impl std::future::Future<Output = serde_json::Value> + '_ {
-        async move {
-            delivery.backend.using::<Host>("test").get("builder").await.expect("host").status.expect("status").capabilities
-                [IMAGE_DIGESTS_CAPABILITY]
-                .clone()
-        }
+    async fn inventory(delivery: &ImageDistributor<Docker>) -> serde_json::Value {
+        delivery.backend.using::<Host>("test").get("builder").await.expect("host").status.expect("status").capabilities
+            [IMAGE_DIGESTS_CAPABILITY]
+            .clone()
     }
 
     // #2972: refreshing one cache preserves another instance's inventory on

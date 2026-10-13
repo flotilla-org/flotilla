@@ -6,7 +6,7 @@
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
     io::Write,
     path::{Path, PathBuf},
@@ -422,6 +422,18 @@ impl ResourceManifestReconciler {
                 return Err(error);
             }
         }
+        // Delegated project image layers are removed with their directory
+        // (ADR 0062); collect this candidate's layers before applying it.
+        let charter_layers = registered.then(|| {
+            files
+                .iter()
+                .filter_map(|(_, parsed)| parsed.as_ref().ok())
+                .flatten()
+                .filter(|document| document.get("kind").and_then(Value::as_str) == Some("ImageLayer"))
+                .filter_map(|document| document_identity(document, &self.default_namespace).ok())
+                .map(|identity| (identity.namespace, identity.name))
+                .collect::<BTreeSet<_>>()
+        });
         let mut report = ManifestPassReport::default();
         let mut status = root_resource.status.clone().unwrap_or_default();
         let previous = status.documents.clone();
@@ -493,6 +505,9 @@ impl ResourceManifestReconciler {
         }
         status.documents = documents;
         status.source_error = None;
+        if let Some(desired) = &charter_layers {
+            self.prune_charter_image_layers(desired).await?;
+        }
         if report.errors.is_empty() && status.documents.values().all(|state| state.phase == DocumentPhase::Applied) {
             status.applied_revision = Some(revision);
         }
@@ -571,6 +586,34 @@ impl ResourceManifestReconciler {
             .await
             .map_err(|error| format!("manifest file loading task failed: {error}"))??;
         Ok((revision, files))
+    }
+
+    /// Delete delegated-charter ImageLayers this root authored that the
+    /// current candidate no longer contains. Other layers are never touched.
+    async fn prune_charter_image_layers(&self, desired: &BTreeSet<(String, String)>) -> Result<(), String> {
+        let mut namespaces = desired.iter().map(|(namespace, _)| namespace.clone()).collect::<BTreeSet<_>>();
+        namespaces.insert(self.default_namespace.clone());
+        let root = self.root_name();
+        for namespace in namespaces {
+            let definitions = self.backend.definitions::<flotilla_resources::ImageLayer>(&namespace);
+            for layer in
+                self.backend.using::<flotilla_resources::ImageLayer>(&namespace).list().await.map_err(|error| error.to_string())?.items
+            {
+                let annotations = &layer.metadata.annotations;
+                let authored = annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION) == Some(&root)
+                    && annotations.contains_key(crate::charter_delegation::CHARTER_SCOPE);
+                if authored
+                    && layer.metadata.deletion_timestamp.is_none()
+                    && !desired.contains(&(namespace.clone(), layer.metadata.name.clone()))
+                {
+                    match definitions.delete(&layer.metadata.name).await {
+                        Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+                        Err(error) => return Err(format!("delete ImageLayer {}: {error}", layer.metadata.name)),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn publish_source_failure(&self, root: &flotilla_resources::ResourceObject<ManifestRoot>, error: &str) -> Result<(), String> {
@@ -2212,6 +2255,45 @@ mod registered_charter_tests {
         assert!(!legacy.metadata.annotations.contains_key(crate::charter_delegation::CHARTER_SCOPE));
         assert!(!legacy.metadata.annotations.contains_key(crate::charter_delegation::CHARTER_REVISION));
         assert_eq!(legacy.spec, refreshed.spec);
+    }
+
+    // ADR 0062: a registered charter's `.flotilla/image/` applies as its
+    // project's ImageLayer, and removing the directory removes the layer.
+    // Layers the charter did not author are left alone.
+    #[tokio::test]
+    async fn registered_charter_layer_is_removed_with_its_directory() {
+        let directory = tempfile::tempdir().expect("fleet input");
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let files = BTreeMap::from([
+            (
+                ".flotilla/image/layer.yaml".to_string(),
+                "name: app-native\nversion: 1.0.0\ntier: project\nprovides: [project:app]\nprobe: \"true\"\n".to_string(),
+            ),
+            (".flotilla/image/Dockerfile.fragment".to_string(), "FROM ${BASE}\nRUN true\n".to_string()),
+        ]);
+        let mut registration = project(CharterPointer::Inline { documents: vec![], files });
+        let path = directory.path().join("project.json");
+        std::fs::write(&path, serde_json::to_string(&registration).expect("encode")).expect("registration");
+        let other = flotilla_resources::ImageLayerSpec::builder()
+            .name("rust".into())
+            .version("1.99.0".into())
+            .tier(flotilla_resources::ImageLayerTier::Shared)
+            .source(flotilla_resources::ImageLayerSource::Installation)
+            .fragment("FROM ${BASE}\n".into())
+            .probe("true".into())
+            .build();
+        let layers = backend.definitions::<flotilla_resources::ImageLayer>("flotilla");
+        layers.apply(&InputMeta::builder().name(other.resource_name()).build(), &other.clone().into()).await.expect("other layer");
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), "flotilla", directory.path()).with_revision("first");
+        let report = reconciler.reconcile_once_for_test().await.expect("first apply");
+        assert!(report.errors.is_empty(), "{report:?}");
+        let applied = layers.get("project-app-app-native-1.0.0").await.expect("project layer");
+        assert_eq!(applied.spec.current().expect("current").project.as_deref(), Some("app"));
+        registration["spec"]["charter"]["files"] = serde_json::json!({});
+        std::fs::write(&path, serde_json::to_string(&registration).expect("encode")).expect("remove layer");
+        reconciler.reconcile_once().await.expect("opt out");
+        let names = layers.list().await.expect("layers").into_iter().map(|layer| layer.metadata.name).collect::<Vec<_>>();
+        assert_eq!(names, [other.resource_name()]);
     }
 
     // #2721: a fleet-repo policy federates to the host it targets alongside a

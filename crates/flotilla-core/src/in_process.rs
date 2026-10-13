@@ -27,6 +27,7 @@ use crew_ops::{CrewService, CrewTurnDeliveryActuator};
 
 #[path = "in_process/convoy_admission.rs"]
 pub mod convoy_admission;
+mod project_image_layers;
 mod project_ops;
 use checkout_providers::{CheckoutProvider, CheckoutProviders};
 mod repository_operations;
@@ -4279,7 +4280,12 @@ impl InProcessDaemon {
     }
 
     pub async fn reconcile_bound_project_charters(&self) -> Result<(), String> {
-        self.project_service().reconcile_bound_charters().await
+        let charters = self.project_service().reconcile_bound_charters().await;
+        // Project image layers ride the same periodic charter reconciliation.
+        if let Err(error) = self.project_service().reconcile_project_image_layers().await {
+            warn!(%error, "project image layer reconciliation failed");
+        }
+        charters
     }
 
     async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
