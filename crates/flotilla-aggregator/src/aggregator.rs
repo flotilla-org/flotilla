@@ -3658,10 +3658,22 @@ mod tests {
     }
 
     // #3045: after bootstrap the Aggregator maintains result sets from watch
-    // events alone. Creating, changing and deleting resources of every watched
-    // durable kind republishes rows without any whole-kind list, on any task.
+    // events alone. Convoy/session changes publish deltas without durable-store
+    // reads, on any task; warm subscriptions also read their resident result set.
     #[tokio::test]
-    async fn steady_state_applies_events_without_listing() {
+    async fn steady_state_emits_deltas_without_store_reads() {
+        steady_state_delta_read_contract(false).await;
+    }
+
+    // #3141 / #3120: definition watches resolve their winning source with gets.
+    // Do not hide that work behind the zero-read convoy/session guard.
+    #[tokio::test]
+    #[should_panic(expected = "zero durable-store read budget exceeded")]
+    async fn aggregator_definition_deltas_zero_reads_pending_3120() {
+        steady_state_delta_read_contract(true).await;
+    }
+
+    async fn steady_state_delta_read_contract(definitions: bool) {
         use flotilla_store_testkit::ReadCountsBackendExt;
         let durable = ResourceBackend::new(InMemoryBackend::default());
         let observed = ResourceBackend::new(InMemoryBackend::observed());
@@ -3676,7 +3688,7 @@ mod tests {
         let run_state = state.clone();
         let resolvers = namespace_resolvers(&counted_durable, &counted_observed);
         let run = tokio::spawn(async move { Aggregator::new(run_state, HostName::new("kiwi"), event_tx).run(resolvers).await });
-        async fn wait_for(receiver: &mut broadcast::Receiver<DaemonEvent>, name: &str) {
+        async fn wait_for(receiver: &mut broadcast::Receiver<DaemonEvent>, name: &str) -> DaemonEvent {
             let names = |event: &DaemonEvent| match event {
                 DaemonEvent::ResultSet(result) if result.query() == (QueryId::Convoys { scope: None }) => {
                     result.rows.as_convoys().map(|rows| rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>())
@@ -3685,10 +3697,15 @@ mod tests {
                 _ => None,
             };
             timeout(Duration::from_secs(5), async {
-                while !names(&receiver.recv().await.expect("aggregator event")).is_some_and(|names| names.iter().any(|n| n == name)) {}
+                loop {
+                    let event = receiver.recv().await.expect("aggregator event");
+                    if names(&event).is_some_and(|names| names.iter().any(|n| n == name)) {
+                        return event;
+                    }
+                }
             })
             .await
-            .unwrap_or_else(|_| panic!("aggregator publishes {name}"));
+            .unwrap_or_else(|_| panic!("aggregator publishes {name}"))
         }
         wait_for(&mut event_rx, "convoy-a").await;
         let durable_bootstrap = counted_durable.read_snapshot();
@@ -3700,12 +3717,14 @@ mod tests {
             let seed = convoy_with_vessel(&name).await;
             let created = convoys.create(&InputMeta::builder().name(name.clone()).build(), &seed.spec).await.expect("convoy");
             convoys.update_status(&name, &created.metadata.resource_version, seed.status.as_ref().expect("status")).await.expect("status");
-            durable
-                .clone()
-                .using::<Project>("flotilla")
-                .create(&InputMeta::builder().name(format!("project-{index}")).build(), &project_object("widgets").await.spec)
-                .await
-                .expect("project");
+            if definitions {
+                durable
+                    .clone()
+                    .using::<Project>("flotilla")
+                    .create(&InputMeta::builder().name(format!("project-{index}")).build(), &project_object("widgets").await.spec)
+                    .await
+                    .expect("project");
+            }
             let session = session_object(&format!("terminal-{index}")).await;
             durable
                 .clone()
@@ -3714,10 +3733,30 @@ mod tests {
                 .await
                 .expect("session");
         }
+        let emitted = wait_for(&mut event_rx, "convoy-7").await;
+        assert!(matches!(emitted, DaemonEvent::ResultDelta(_)), "steady-state changes emit deltas");
         convoys.delete("convoy-0").await.expect("delete convoy");
-        wait_for(&mut event_rx, "convoy-7").await;
-        counted_durable.read_snapshot().since(&durable_bootstrap).assert_no_lists("aggregator durable watches");
-        counted_observed.read_snapshot().since(&observed_bootstrap).assert_no_lists("aggregator observed watches");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let DaemonEvent::ResultDelta(delta) = event_rx.recv().await.expect("deletion delta") {
+                    if delta.changes.removed_resources().is_some_and(|removed| removed.iter().any(|resource| resource.name == "convoy-0")) {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("convoy removal delivered");
+        let query = QueryId::Convoys { scope: None };
+        state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: query.clone(), since: None }]);
+        let warm = state.result_set_for(&query).await.expect("warm subscription snapshot");
+        assert!(warm.rows.as_convoys().expect("convoy rows").iter().any(|row| row.name == "convoy-7"));
+        let durable_reads = counted_durable.read_snapshot().since(&durable_bootstrap);
+        // Preserve the existing no-list regression guard even while definition
+        // gets keep their separate zero-budget guard expected to fail.
+        durable_reads.assert_no_lists("aggregator durable watches");
+        durable_reads.assert_zero("aggregator durable delta emission");
+        counted_observed.read_snapshot().since(&observed_bootstrap).assert_zero("aggregator observed delta emission");
         assert!(!run.is_finished(), "the resource watches remain live");
         run.abort();
         let _ = run.await;

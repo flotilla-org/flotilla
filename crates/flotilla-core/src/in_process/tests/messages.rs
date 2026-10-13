@@ -431,16 +431,17 @@ async fn message_send_reads_ignore_unrelated_history() {
         let (routing, admission) = (routing.of(&backend), admission.of(&backend));
         // Routing resolves the receiver's convoy and holder by name and index;
         // admission checks the receiver's pending history and reads back its row.
+        // Two missing routing gets and the admission miss are still store calls.
         routing.assert_within(
             &ReadBudget::new()
                 .objects("Convoy", ReadOperation::Query, 1, 1)
                 .objects("Convoy", ReadOperation::Get, 1, 1)
-                .objects("Message", ReadOperation::Get, 1, 1)
+                .objects("Message", ReadOperation::Get, 2, 1)
                 .objects("TerminalSession", ReadOperation::Query, 1, 1),
             "message routing",
         );
         admission.assert_within(
-            &ReadBudget::new().objects("Message", ReadOperation::Query, 1, 1).objects("Message", ReadOperation::Get, 1, 1),
+            &ReadBudget::new().objects("Message", ReadOperation::Query, 1, 1).objects("Message", ReadOperation::Get, 2, 1),
             "message admission",
         );
         (routing, admission)

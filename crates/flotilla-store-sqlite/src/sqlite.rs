@@ -3168,11 +3168,13 @@ impl Store for SqliteBackend {
         namespace: &str,
         name: &str,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        let result = SqliteBackend::get_raw(self, resource_kind, namespace, name).await?;
+        let result = SqliteBackend::get_raw(self, resource_kind, namespace, name).await;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, ReadOperation::Get, 1);
+            // Missing, storage and decode errors still cost a crossing, but
+            // return zero objects to the caller.
+            observer.read(resource_kind.paths.kind, ReadOperation::Get, usize::from(result.is_ok()));
         }
-        Ok(result)
+        result
     }
     async fn current_position_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourcePosition, ResourceError> {
         SqliteBackend::current_position_raw(self, resource_kind, namespace).await

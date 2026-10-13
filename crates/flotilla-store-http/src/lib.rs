@@ -62,11 +62,13 @@ impl Store for HttpBackend {
         namespace: &str,
         name: &str,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        let result = HttpBackend::get_raw(self, resource_kind, namespace, name).await?;
+        let result = HttpBackend::get_raw(self, resource_kind, namespace, name).await;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, ReadOperation::Get, 1);
+            // Missing, transport and decode errors still cost a crossing, but
+            // return zero objects to the caller.
+            observer.read(resource_kind.paths.kind, ReadOperation::Get, usize::from(result.is_ok()));
         }
-        Ok(result)
+        result
     }
     async fn current_position_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourcePosition, ResourceError> {
         HttpBackend::current_position_raw(self, resource_kind, namespace).await
@@ -184,11 +186,13 @@ impl Store for HttpBackend {
         namespace: &str,
         name: &str,
     ) -> Result<ReadResourceObject<SerializedResource>, ResourceError> {
-        let result = HttpBackend::get_including_replicas_raw(self, resource_kind, namespace, name).await?;
+        let result = HttpBackend::get_including_replicas_raw(self, resource_kind, namespace, name).await;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, ReadOperation::Get, 1);
+            // Count error responses as crossings with zero returned objects,
+            // just like a local get (including transport and decode errors).
+            observer.read(resource_kind.paths.kind, ReadOperation::Get, usize::from(result.is_ok()));
         }
-        Ok(result)
+        result
     }
     async fn get_all_including_replicas_raw(
         &self,

@@ -739,9 +739,16 @@ impl InMemoryBackend {
         name: &str,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
         self.with_store(resource_kind, namespace, |store| {
-            let value = store.objects.get(name).cloned().ok_or_else(|| ResourceError::not_found(name))?;
-            self.count_read(resource_kind, ReadOperation::Get, 1);
-            Self::decode_object(resource_kind, value)
+            let result = store
+                .objects
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ResourceError::not_found(name))
+                .and_then(|value| Self::decode_object(resource_kind, value));
+            // Missing or undecodable records still cost a crossing, but return
+            // zero objects, matching the other adapters' get accounting.
+            self.count_read(resource_kind, ReadOperation::Get, usize::from(result.is_ok()));
+            result
         })
         .await
     }
@@ -1707,6 +1714,62 @@ impl From<StoredEventKind> for WatchAction {
             StoredEventKind::Modified => Self::Modified,
             StoredEventKind::Deleted => Self::Deleted,
         }
+    }
+}
+
+#[cfg(test)]
+mod read_accounting_tests {
+    use super::*;
+    use flotilla_resources::{Convoy, ConvoySpec};
+    use std::sync::Mutex as StdMutex;
+
+    // This adapter source is also compiled inside flotilla-store unit tests.
+    // Collect through its local ReadObserver identity rather than importing a
+    // testkit extension implemented for the production ResourceBackend type.
+    #[derive(Debug, Default)]
+    struct ReadEvents(StdMutex<Vec<(String, ReadOperation, usize)>>);
+
+    impl ReadObserver for ReadEvents {
+        fn read(&self, kind: &str, operation: ReadOperation, objects: usize) {
+            self.0.lock().expect("read events").push((kind.into(), operation, objects));
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    // A corrupt record costs one get but returns zero decoded objects, just
+    // like a missing record. A successful get contributes exactly one object.
+    #[tokio::test]
+    async fn get_counts_only_successfully_decoded_objects() {
+        let memory = InMemoryBackend::default();
+        let events = Arc::new(ReadEvents::default());
+        let counted = crate::ResourceBackend::new(memory.clone().with_read_observer(events.clone()));
+        let convoys = counted.using::<Convoy>("test");
+        convoys
+            .create(&InputMeta::builder().name("record".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+            .await
+            .expect("valid record");
+        events.0.lock().expect("read events").clear();
+        convoys.get("record").await.expect("successful get");
+        {
+            // Corrupt the private backing record rather than weakening the
+            // public API's validation, as a storage/decode boundary fixture.
+            let mut stores = memory.stores.lock().await;
+            let store = stores.get_mut(&InMemoryBackend::store_key(ResourceKind::of::<Convoy>(), "test")).expect("partition");
+            store.objects.get_mut("record").expect("stored record")["spec"] = Value::Null;
+        }
+        let error = convoys.get("record").await.expect_err("corrupt record cannot decode");
+        assert!(error.to_string().contains("decode stored object"), "{error}");
+        assert!(matches!(convoys.get("missing").await, Err(ResourceError::NotFound { .. })));
+        assert_eq!(
+            *events.0.lock().expect("read events"),
+            vec![
+                ("Convoy".into(), ReadOperation::Get, 1),
+                ("Convoy".into(), ReadOperation::Get, 0),
+                ("Convoy".into(), ReadOperation::Get, 0)
+            ]
+        );
     }
 }
 

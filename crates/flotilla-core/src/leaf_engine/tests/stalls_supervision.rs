@@ -1434,14 +1434,14 @@ async fn steady_state_stall_judgements_do_not_read_the_store() {
         wake.judge_stalls_at("flotilla", &objects, now).await.expect("steady state judgement");
     }
     let reads = backend.read_snapshot().since(&before);
-    assert!(reads.is_empty(), "judgements must use views, including nested routing helpers\n{reads}");
+    reads.assert_zero("stall judgement including nested routing helpers");
 }
 
 // #3045: the leaf engine's steady state is served by watch views. After one
 // bootstrap pass, reconcile passes that observe convoy changes delivered by
-// watches list no whole kind, on any task: views refresh from events.
+// watches read no store, on any task: views refresh from events.
 #[tokio::test]
-async fn leaf_engine_steady_state_lists_no_kind() {
+async fn leaf_engine_steady_state_reconcile_reads_no_store() {
     use flotilla_store_testkit::ReadCountsBackendExt;
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let counted = backend.clone().with_read_counts();
@@ -1465,11 +1465,14 @@ async fn leaf_engine_steady_state_lists_no_kind() {
         // A status write reaches the views as a watch event, not a relist.
         let name = format!("convoy-{}", index % 8);
         let convoy = convoys.get(&name).await.expect("convoy");
-        let status = convoy.status.clone().expect("status");
+        let mut status = convoy.status.clone().expect("status");
+        status.message = Some(format!("event-{index}"));
         convoys.update_status(&name, &convoy.metadata.resource_version, &status).await.expect("status write");
         wake.subscriptions.reconcile_stalls_once("flotilla").await.expect("steady state pass");
+        let resident = wake.local_convoys("flotilla").await.expect("resident convoys");
+        assert_eq!(resident[&name].status.as_ref().expect("resident status").message, status.message);
     }
-    counted.read_snapshot().since(&bootstrap).assert_no_lists("leaf engine reconcile passes");
+    counted.read_snapshot().since(&bootstrap).assert_zero("leaf engine reconcile passes");
 }
 
 // #3118: one declared stall episode yields one receiver-homed Message even

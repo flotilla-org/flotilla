@@ -329,3 +329,17 @@ async fn replica_burst_recovers_sqlite() {
     let backend = SqliteBackend::open(directory.path().join("queue.sqlite")).unwrap();
     assert_replica_burst_recovers(ResourceBackend::new(backend)).await;
 }
+
+// Missing objects still cross the store boundary: zero decoded objects does
+// not mean zero calls. All adapters obey the same accounting contract.
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[case("http")]
+#[tokio::test]
+async fn read_counts_include_missing_gets(#[case] adapter: &str) {
+    let (plain, _server) = backend(adapter).await;
+    let counted = plain.with_read_counts();
+    assert!(matches!(counted.using::<Convoy>("flotilla").get("absent").await, Err(ResourceError::NotFound { .. })));
+    assert_eq!(counted.read_snapshot().tally("Convoy", ReadOperation::Get), ReadTally { calls: 1, objects: 0 });
+}
