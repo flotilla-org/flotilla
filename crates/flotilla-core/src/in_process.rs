@@ -27,6 +27,7 @@ use crew_ops::{CrewService, CrewTurnDeliveryActuator};
 
 #[path = "in_process/convoy_admission.rs"]
 pub mod convoy_admission;
+mod project_image_layers;
 mod project_ops;
 use checkout_providers::{CheckoutProvider, CheckoutProviders};
 mod repository_operations;
@@ -2755,10 +2756,6 @@ impl InProcessDaemon {
         self.aggregator_projection_state.clone()
     }
 
-    pub async fn set_image_build_input_resolver(&self, resolver: Arc<dyn crate::image_build::ImageBuildInputResolver>) {
-        *self.convoy_admission.image_build_inputs.write().await = Some(resolver);
-    }
-
     pub fn resource_backend(&self) -> ResourceBackend {
         self.resource_backend.clone()
     }
@@ -4288,7 +4285,12 @@ impl InProcessDaemon {
     }
 
     pub async fn reconcile_bound_project_charters(&self) -> Result<(), String> {
-        self.project_service().reconcile_bound_charters().await
+        let charters = self.project_service().reconcile_bound_charters().await;
+        // Project image layers ride the same periodic charter reconciliation.
+        if let Err(error) = self.project_service().reconcile_project_image_layers().await {
+            warn!(%error, "project image layer reconciliation failed");
+        }
+        charters
     }
 
     async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {

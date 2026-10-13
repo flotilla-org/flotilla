@@ -2225,7 +2225,6 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
             &environment_name,
             &environment.metadata.resource_version,
             &flotilla_resources::EnvironmentStatus {
-                image_build_refs: Vec::new(),
                 configured_limits: None,
                 runtime_observation: None,
                 phase: flotilla_resources::EnvironmentPhase::Ready,

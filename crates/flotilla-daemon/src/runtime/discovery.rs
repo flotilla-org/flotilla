@@ -376,13 +376,27 @@ pub(super) async fn observe_fulfilment_facts(
     }
     for kind in kinds {
         let image = match &kind.spec.realisation {
-            FulfilmentRealisation::DockerPerVessel { image } => match image.resolve(&baselines).await {
+            FulfilmentRealisation::DockerPerVessel { image: Some(image) } => match image.resolve(&baselines).await {
                 Ok(image) => Some(image),
                 Err(error) => {
                     warn!(kind = %kind.metadata.name, %error, "cannot probe unresolved fulfilment image");
                     continue;
                 }
             },
+            // A composed kind has no image until admission resolves each
+            // vessel's layers; resolution, not a probe, covers its image needs
+            // (ADR 0062). Publish its capacity facts only.
+            FulfilmentRealisation::DockerPerVessel { image: None } => {
+                facts.insert(
+                    kind.metadata.name,
+                    FulfilmentFacts {
+                        observed_at: Utc::now(),
+                        free_vessel_slots: (!available_pools.contains(&kind.spec.pool)).then_some(0),
+                        ..Default::default()
+                    },
+                );
+                continue;
+            }
             FulfilmentRealisation::HostDirect => None,
         };
         let provider_kind = match kind.spec.realisation {

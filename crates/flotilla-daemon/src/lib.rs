@@ -20,6 +20,7 @@ pub mod runtime;
 pub mod server;
 mod sleep_inhibitor;
 mod startup;
+mod stdlib_image_layers;
 pub mod supervisor;
 
 pub(crate) const DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH: &str = "run/socket-path";

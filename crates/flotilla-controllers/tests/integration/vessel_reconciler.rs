@@ -249,6 +249,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement {
+                        needs: Default::default(),
                         name: "work".to_string(),
                         depends_on: Vec::new(),
                         repository_refs: None,
@@ -370,6 +371,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-shared", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.clone().expect("convoy status");
     status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels.push(VesselRequirement {
+        needs: Default::default(),
         name: "review".to_string(),
         depends_on: vec!["implement".to_string()],
         repository_refs: None,
@@ -658,6 +660,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement {
+                        needs: Default::default(),
                         name: "implement".to_string(),
                         depends_on: Vec::new(),
                         repository_refs: None,
@@ -868,6 +871,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement {
+                        needs: Default::default(),
                         name: "implement".to_string(),
                         depends_on: Vec::new(),
                         repository_refs: None,
@@ -1184,6 +1188,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement {
+                        needs: Default::default(),
                         name: "implement".to_string(),
                         depends_on: Vec::new(),
                         repository_refs: None,
@@ -1208,7 +1213,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
                 legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: HOST_REF.to_string(),
-                image: "ghcr.io/flotilla/dev:latest".to_string().into(),
+                image: Some("ghcr.io/flotilla/dev:latest".into()),
                 pull_policy: Default::default(),
                 agent_adapters: Default::default(),
                 default_cwd: None,
@@ -1223,7 +1228,6 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
         NAMESPACE,
         "env-workspace-multi-fresh",
         DockerEnvironmentSpec {
-            image_composition: None,
             image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: HOST_REF.to_string(),
@@ -1341,6 +1345,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement {
+                        needs: Default::default(),
                         name: "implement".to_string(),
                         depends_on: Vec::new(),
                         repository_refs: Some(vec![cleat.key()]),
@@ -1478,7 +1483,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
                 legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: HOST_REF.to_string(),
-                image: "ghcr.io/flotilla/dev:latest".to_string().into(),
+                image: Some("ghcr.io/flotilla/dev:latest".into()),
                 pull_policy: Default::default(),
                 agent_adapters: Default::default(),
                 default_cwd: None,
@@ -1494,7 +1499,6 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
         NAMESPACE,
         environment_ref,
         DockerEnvironmentSpec {
-            image_composition: None,
             image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: HOST_REF.to_string(),
@@ -1575,7 +1579,7 @@ async fn contained_docker_placement_propagates_never_pull_policy_to_environment(
                     swap_bytes: 0,
                 },
                 host_ref: HOST_REF.to_string(),
-                image: "flotilla-dev-env:latest".to_string().into(),
+                image: Some("flotilla-dev-env:latest".into()),
                 pull_policy: DockerImagePullPolicy::Never,
                 agent_adapters: Default::default(),
                 default_cwd: None,
@@ -1997,7 +2001,7 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
             legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: HOST_REF.to_string(),
-            image: "ghcr.io/flotilla/dev:latest".to_string().into(),
+            image: Some("ghcr.io/flotilla/dev:latest".into()),
             pull_policy: Default::default(),
             agent_adapters: BTreeSet::from(["codex".to_string()]),
             default_cwd: None,
@@ -2008,7 +2012,6 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
     "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree",
     "/workspace",
     Some(DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
@@ -2059,7 +2062,7 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
             legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: HOST_REF.to_string(),
-            image: "ghcr.io/flotilla/dev:latest".to_string().into(),
+            image: Some("ghcr.io/flotilla/dev:latest".into()),
             pull_policy: Default::default(),
             agent_adapters: Default::default(),
             default_cwd: Some("/app".to_string()),
@@ -2070,7 +2073,6 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
     "/workspace",
     "/app",
     Some(DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
@@ -3112,6 +3114,7 @@ async fn create_convoy_with_labeled_processes(
                     turn_delivery: Default::default(),
                     vessels: vec![
                         VesselRequirement {
+                            needs: Default::default(),
                             name: "implement".to_string(),
                             depends_on: Vec::new(),
                             repository_refs: None,
@@ -3124,6 +3127,7 @@ async fn create_convoy_with_labeled_processes(
                                 .build()],
                         },
                         VesselRequirement {
+                            needs: Default::default(),
                             name: "review".to_string(),
                             depends_on: vec!["implement".to_string()],
                             repository_refs: None,
@@ -3392,7 +3396,7 @@ async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edit
                     legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: name.to_string(),
-                    image: DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() },
+                    image: Some(DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() }),
                     pull_policy: DockerImagePullPolicy::Always,
                     agent_adapters: Default::default(),
                     default_cwd: None,
@@ -3419,7 +3423,7 @@ async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edit
         hosts[0]
             .0
             .definitions::<CrewImageBaseline>(NAMESPACE)
-            .apply(&meta("fleet-crew"), &CrewImageBaselineSpec { image: image.to_string(), layers: None })
+            .apply(&meta("fleet-crew"), &CrewImageBaselineSpec { image: image.to_string() })
             .await
             .expect("single fleet edit");
         let listed = hosts[0].0.using::<CrewImageBaseline>(NAMESPACE).list().await.expect("authored definitions");
@@ -3459,7 +3463,7 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
 
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let baselines = backend.definitions::<CrewImageBaseline>(NAMESPACE);
-    baselines.apply(&meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v1".to_string(), layers: None }).await.expect("baseline");
+    baselines.apply(&meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v1".to_string() }).await.expect("baseline");
     let mut convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy", "implement", REPO_URL, GIT_REF).await;
     convoy.spec.repositories.clear();
     let convoy = backend
@@ -3487,7 +3491,7 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
                 legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: HOST_REF.to_string(),
-                image: DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() },
+                image: Some(DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() }),
                 pull_policy: DockerImagePullPolicy::Always,
                 agent_adapters: Default::default(),
                 default_cwd: None,
@@ -3502,7 +3506,6 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
         NAMESPACE,
         "env-vessel",
         DockerEnvironmentSpec {
-            image_composition: None,
             image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: HOST_REF.to_string(),
@@ -3558,7 +3561,7 @@ async fn local_clone_provisioning_orders_host_checkout_before_container_and_surf
             .pool("cleat".into())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                 host_ref: HOST_REF.into(),
-                image: "ghcr.io/flotilla/dev:latest".into(),
+                image: Some("ghcr.io/flotilla/dev:latest".into()),
                 pull_policy: Default::default(),
                 agent_adapters: BTreeSet::from(["codex".into()]),
                 default_cwd: None,
@@ -3635,5 +3638,106 @@ async fn local_clone_provisioning_orders_host_checkout_before_container_and_surf
     assert_eq!(
         persisted.status.unwrap().degraded.get(&object.metadata.name).map(String::as_str),
         Some("objects copied across filesystems")
+    );
+}
+
+// ADR 0062: a composed placement's Environment names the per-identity
+// ImageBuild (the Environment reconciler supplies the digest) and declares the
+// harnesses its roles use; the vessel records the identity when provisioning
+// starts and the digest once its Environment is Ready.
+#[tokio::test]
+async fn composed_placement_records_identity_then_digest() {
+    use flotilla_resources::{DockerImageSource, VesselImage, VesselStatusPatch};
+    let identity = format!("sha256:{}", "c".repeat(64));
+    let image_build_ref = format!("image-{}-amd64", "c".repeat(40));
+    let digest = format!("registry.test/crew@sha256:{}", "d".repeat(64));
+    let built = DockerImageSource::Built { identity: identity.clone(), image_build_ref: image_build_ref.clone() };
+    let policy = PlacementPolicySpec::builder()
+        .pool("cleat".to_string())
+        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+            legacy_image_baseline_ref: None,
+            memory_policy: Default::default(),
+            host_ref: HOST_REF.to_string(),
+            image: Some(built),
+            pull_policy: Default::default(),
+            agent_adapters: Default::default(),
+            default_cwd: None,
+            env: Default::default(),
+            checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+        })
+        .build();
+
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-composed", "implement", REPO_URL, GIT_REF).await;
+    create_policy(&backend, NAMESPACE, "policy-composed", policy.clone()).await;
+    let vessel =
+        create_workspace(&backend, NAMESPACE, "vessel-composed", "convoy-composed", "implement", "policy-composed", REPO_URL).await;
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let deps = reconciler.prepare(&vessel).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
+    let environment = outcome
+        .actuations
+        .iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateEnvironment { spec, .. } => spec.docker.clone(),
+            _ => None,
+        })
+        .expect("composed placement creates its Environment");
+    assert_eq!(environment.image_build_ref.as_deref(), Some(image_build_ref.as_str()));
+    assert!(environment.image.is_empty(), "the Environment reconciler supplies the build's digest");
+    assert_eq!(environment.declared_agent_adapters, environment.required_agent_adapters);
+    assert!(matches!(
+        outcome.patch,
+        Some(VesselStatusPatch::MarkProvisioning { image: Some(ref image), .. })
+            if *image == VesselImage { identity: identity.clone(), digest: None }
+    ));
+
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-composed", "implement", REPO_URL, GIT_REF).await;
+    create_policy(&backend, NAMESPACE, "policy-composed", policy).await;
+    let environment_ref = "env-vessel-composed";
+    create_ready_docker_environment(
+        &backend,
+        NAMESPACE,
+        environment_ref,
+        DockerEnvironmentSpec { image: digest.clone(), image_build_ref: Some(image_build_ref), ..environment },
+    )
+    .await;
+    create_ready_checkout(
+        &backend,
+        NAMESPACE,
+        ReadyCheckoutFixture::builder()
+            .name("checkout-vessel-composed".to_string())
+            .env_ref(environment_ref.to_string())
+            .git_ref(GIT_REF.to_string())
+            .path("/workspace".to_string())
+            .maybe_fresh_clone(Some(fresh_clone_checkout_spec(environment_ref, GIT_REF, "/workspace", REPO_URL)))
+            .build(),
+    )
+    .await;
+    create_running_terminal(
+        &backend,
+        NAMESPACE,
+        "terminal-vessel-composed-coder",
+        environment_ref,
+        "coder",
+        "cargo test",
+        "/workspace",
+        "cleat",
+    )
+    .await;
+    let vessel =
+        create_workspace(&backend, NAMESPACE, "vessel-composed", "convoy-composed", "implement", "policy-composed", REPO_URL).await;
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let deps = reconciler.prepare(&vessel).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
+    assert!(
+        matches!(
+            outcome.patch,
+            Some(VesselStatusPatch::MarkReady { image: Some(ref image), .. })
+                if *image == VesselImage { identity: identity.clone(), digest: Some(digest.clone()) }
+        ),
+        "{:?}",
+        outcome.patch
     );
 }

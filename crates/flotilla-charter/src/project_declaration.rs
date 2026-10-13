@@ -31,6 +31,9 @@ pub struct ProjectDeclaration {
     pub skills: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub platform_matrix: Vec<String>,
+    /// Crew image selection (ADR 0062). Previous-generation declarations omit it.
+    #[serde(default)]
+    pub image: Option<flotilla_resources::ImageSelection>,
     pub members: Vec<ProjectDeclarationMember>,
 }
 

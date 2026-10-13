@@ -50,7 +50,6 @@ async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_ho
                 &EnvironmentSpec {
                     host_direct: None,
                     docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                        image_composition: None,
                         image_build_ref: None,
                         memory_policy: Default::default(),
                         host_ref: "host-test".to_string(),

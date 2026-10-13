@@ -89,6 +89,11 @@ pub struct ResolvedCascade {
     /// Local content, not inherited from ancestors.
     pub charter: BTreeMap<String, String>,
     pub charter_commit: Option<String>,
+    /// Installation image defaults (ADR 0062): the fleet-root CrewDefaults
+    /// selection overridden field by field by project-scoped CrewDefaults along
+    /// the project chain. Applied only when the project declares no `image:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_defaults: Option<crate::ImageSelection>,
 }
 
 impl Default for ResolvedCascade {
@@ -100,6 +105,7 @@ impl Default for ResolvedCascade {
             skill_layers: Vec::new(),
             charter: BTreeMap::new(),
             charter_commit: None,
+            image_defaults: None,
         }
     }
 }
@@ -204,12 +210,15 @@ impl ResolvedCascade {
             }
         }
         let mut layers = Vec::new();
+        let mut image_defaults = None;
         if let Some((name, defaults)) = by_project.get(&None) {
             layers.push(defaults_layer(format!("fleet:CrewDefaults/{name}"), defaults));
+            cascade_image_defaults(&mut image_defaults, defaults.image.as_ref());
         }
         for name in &chain {
             if let Some((defaults_name, defaults)) = by_project.get(&Some(name.clone())) {
                 layers.push(defaults_layer(format!("project:{name}:CrewDefaults/{defaults_name}"), defaults));
+                cascade_image_defaults(&mut image_defaults, defaults.image.as_ref());
             }
             let spec = if name == project_name {
                 project.clone()
@@ -225,8 +234,22 @@ impl ResolvedCascade {
         }
         let mut resolved = Self::resolve(&layers);
         resolved.project_chain = chain;
+        resolved.image_defaults = image_defaults;
         resolved.charter = project.charter_prose.clone();
         Ok(resolved)
+    }
+}
+
+/// Image defaults cascade like role fields: a later layer's declared base
+/// replaces the base, and its non-empty layer list replaces the layers.
+fn cascade_image_defaults(resolved: &mut Option<crate::ImageSelection>, layer: Option<&crate::ImageSelection>) {
+    let Some(layer) = layer else { return };
+    let resolved = resolved.get_or_insert_with(Default::default);
+    if layer.base.is_some() {
+        resolved.base.clone_from(&layer.base);
+    }
+    if !layer.layers.is_empty() {
+        resolved.layers.clone_from(&layer.layers);
     }
 }
 
@@ -283,4 +306,48 @@ pub fn project_charter_revision(object: &crate::ResourceObject<crate::Project>) 
         .or_else(|| object.metadata.annotations.get("flotilla.work/project-bootstrap-commit"))
         .or_else(|| object.metadata.annotations.get("flotilla.work/manifest-revision"))
         .cloned()
+}
+
+#[cfg(test)]
+mod image_default_tests {
+    use super::*;
+    use crate::ImageSelection;
+
+    fn defaults(project_ref: Option<&str>, image: Option<ImageSelection>) -> CrewDefaultsSpec {
+        CrewDefaultsSpec { project_ref: project_ref.map(str::to_owned), image, ..Default::default() }
+    }
+
+    // ADR 0062: the fleet-root CrewDefaults image is the installation default;
+    // project-scoped CrewDefaults on the chain override its base and layers
+    // field by field, and unrelated projects' defaults never apply.
+    #[test]
+    fn image_defaults_cascade_along_the_project_chain() {
+        let projects = BTreeMap::from([
+            ("fleet".to_string(), ProjectSpec::builder().display_name("fleet".into()).build()),
+            ("child".to_string(), ProjectSpec::builder().display_name("child".into()).parent("fleet".into()).build()),
+            ("other".to_string(), ProjectSpec::builder().display_name("other".into()).parent("fleet".into()).build()),
+        ]);
+        let hierarchy = ProjectHierarchy::from_declared(
+            projects.iter().map(|(name, spec)| (name.clone(), spec.parent.clone())).collect(),
+            Some("fleet".into()),
+        );
+        let selection = |base: Option<&str>, layers: &[&str]| ImageSelection {
+            base: base.map(str::to_owned),
+            layers: layers.iter().map(|layer| layer.to_string()).collect(),
+        };
+        let layers = vec![
+            ("root".to_string(), defaults(None, Some(selection(Some("base-ubuntu-24.04"), &["rust"])))),
+            ("child".to_string(), defaults(Some("child"), Some(selection(None, &["rust", "zig"])))),
+            ("other".to_string(), defaults(Some("other"), Some(selection(Some("base-other"), &[])))),
+        ];
+        let resolve = |project: &str| {
+            ResolvedCascade::from_specs(&hierarchy, &projects, &layers, project, &projects[project]).expect("cascade").image_defaults
+        };
+        assert_eq!(resolve("child"), Some(selection(Some("base-ubuntu-24.04"), &["rust", "zig"])));
+        assert_eq!(resolve("other"), Some(selection(Some("base-other"), &["rust"])));
+        assert_eq!(resolve("fleet"), Some(selection(Some("base-ubuntu-24.04"), &["rust"])));
+        let none = ResolvedCascade::from_specs(&hierarchy, &projects, &[], "child", &projects["child"]).expect("cascade");
+        assert_eq!(none.image_defaults, None);
+        assert!(serde_json::to_value(&none).expect("encode").get("image_defaults").is_none());
+    }
 }

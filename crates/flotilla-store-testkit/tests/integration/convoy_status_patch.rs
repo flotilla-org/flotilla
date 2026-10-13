@@ -22,6 +22,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
         turn_delivery: Default::default(),
         vessels: vec![
             VesselRequirement {
+                needs: Default::default(),
                 name: "implement".to_string(),
                 depends_on: Vec::new(),
                 repository_refs: None,
@@ -58,6 +59,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                 ],
             },
             VesselRequirement {
+                needs: Default::default(),
                 name: "review".to_string(),
                 depends_on: vec!["implement".to_string()],
                 repository_refs: None,

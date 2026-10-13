@@ -7,7 +7,10 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_charter::{
-    charter_store::CharterSnapshot,
+    charter_store::{
+        charter_image_layer_source, CharterSnapshot, LayerDirectorySnapshot, CHARTER_IMAGE_LAYER_PATH, PROJECT_IMAGE_LAYER_PATH,
+        PROJECT_IMAGE_MANAGER,
+    },
     ops_entry::{materialized_workflow_name, parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION},
 };
 use flotilla_resources::{
@@ -28,6 +31,10 @@ pub(crate) const CHARTER_SCOPE: &str = "flotilla.work/charter-scope";
 #[async_trait]
 pub(crate) trait CharterReader: Send + Sync {
     async fn read(&self, source: &CharterSource) -> Result<CharterSnapshot, String>;
+    /// The charter's project image layer directory (ADR 0062), if present.
+    async fn read_layer(&self, _source: &CharterSource) -> Result<Option<LayerDirectorySnapshot>, String> {
+        Ok(None)
+    }
 }
 
 pub(crate) struct BoundCharterReader<'a> {
@@ -41,6 +48,12 @@ impl CharterReader for BoundCharterReader<'_> {
         let identity = serde_json::to_vec(source).map_err(|error| error.to_string())?;
         let cache = self.cache.join(format!("charter-{:x}", Sha256::digest(identity)));
         flotilla_charter::charter_store::read_charter_source(source, &cache, self.vcs).await
+    }
+
+    async fn read_layer(&self, source: &CharterSource) -> Result<Option<LayerDirectorySnapshot>, String> {
+        let identity = serde_json::to_vec(source).map_err(|error| error.to_string())?;
+        let cache = self.cache.join(format!("charter-{:x}", Sha256::digest(identity)));
+        flotilla_charter::charter_store::read_layer_directory(source, &cache, self.vcs).await
     }
 }
 
@@ -185,11 +198,21 @@ pub(crate) async fn expand_registered_charters(
                     // Authorize before following a nested repository pointer.
                     // An out-of-scope source must not cause an external fetch.
                 }
-                let (snapshot, source, inline_documents) = match pointer {
+                let layer_prefix = format!("{CHARTER_IMAGE_LAYER_PATH}/");
+                let (snapshot, source, inline_documents, layer) = match pointer {
                     CharterPointer::Inline { documents, files } => (
                         CharterSnapshot { revision: document.revision.clone(), files: files.clone() },
                         format!("inline charter {ns}/{project} in {}", document.source),
                         documents.clone(),
+                        {
+                            let layer = files
+                                .iter()
+                                .filter_map(|(path, contents)| {
+                                    path.strip_prefix(&layer_prefix).map(|path| (path.to_string(), contents.clone().into_bytes()))
+                                })
+                                .collect::<BTreeMap<_, _>>();
+                            (!layer.is_empty()).then_some(layer)
+                        },
                     ),
                     CharterPointer::Repository { repo, branch, path } => {
                         if repository_fetches == MAX_REPOSITORY_FETCHES {
@@ -197,13 +220,14 @@ pub(crate) async fn expand_registered_charters(
                         }
                         repository_fetches += 1;
                         let source = CharterSource::Repository { repo: repo.clone(), branch: branch.clone(), path: path.clone() };
-                        (
-                            flotilla_charter::charter_store::source_read(reader.read(&source))
-                                .await
-                                .map_err(|error| format!("charter scope `{ns}/{project}`: {error}"))?,
-                            format!("{repo}@{branch}:{path}"),
-                            Vec::new(),
-                        )
+                        let snapshot = flotilla_charter::charter_store::source_read(reader.read(&source))
+                            .await
+                            .map_err(|error| format!("charter scope `{ns}/{project}`: {error}"))?;
+                        let layer = flotilla_charter::charter_store::source_read(reader.read_layer(&charter_image_layer_source(&source)))
+                            .await
+                            .map_err(|error| format!("charter scope `{ns}/{project}` image layer: {error}"))?
+                            .map(|layer| layer.files);
+                        (snapshot, format!("{repo}@{branch}:{path}"), Vec::new(), layer)
                     }
                 };
                 let scope = Some((ns.clone(), project.clone()));
@@ -220,7 +244,54 @@ pub(crate) async fn expand_registered_charters(
                             .build(),
                     );
                 }
+                // A delegated charter's `image/` (its project's named ops
+                // home) is the project's layer (ADR 0062), authored as a
+                // project-source ImageLayer.
+                if let Some(files) = layer {
+                    let layer =
+                        flotilla_resources::parse_layer_directory(&files, flotilla_resources::ImageLayerSource::Project, Some(&project))
+                            .map_err(|error| format!("{source}/{CHARTER_IMAGE_LAYER_PATH}: charter scope `{ns}/{project}`: {error}"))?;
+                    // One project, one layer source: the primary repository's
+                    // `.flotilla/image/` as well is a within-source clash.
+                    let primaries = backend
+                        .definitions::<flotilla_resources::ImageLayer>(&ns)
+                        .list_selected(flotilla_store::StoreQuery {
+                            labels: BTreeMap::from([(flotilla_resources::MANAGED_BY_LABEL.to_string(), PROJECT_IMAGE_MANAGER.to_string())]),
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    for other in primaries {
+                        let primary = other.metadata.deletion_timestamp.is_none()
+                            && other.metadata.labels.get(flotilla_resources::MANAGED_BY_LABEL).map(String::as_str)
+                                == Some(PROJECT_IMAGE_MANAGER)
+                            && other.spec.current().is_some_and(|spec| spec.project.as_deref() == Some(project.as_str()));
+                        if primary {
+                            return Err(format!(
+                                "project `{ns}/{project}` defines its image layer twice: `{PROJECT_IMAGE_LAYER_PATH}/` in its primary \
+                                 repository (ImageLayer `{}`) and `{CHARTER_IMAGE_LAYER_PATH}/` in {source}",
+                                other.metadata.name
+                            ));
+                        }
+                    }
+                    pending.push_back(
+                        Document::builder()
+                            .path(prefix.join(CHARTER_IMAGE_LAYER_PATH))
+                            .value(json!({
+                                "apiVersion": "flotilla.work/v1", "kind": "ImageLayer",
+                                "metadata": {"name": layer.resource_name(), "namespace": ns},
+                                "spec": layer,
+                            }))
+                            .maybe_scope(scope.clone())
+                            .source(source.clone())
+                            .revision(snapshot.revision.clone())
+                            .build(),
+                    );
+                }
                 for (path, contents) in snapshot.files {
+                    if path.starts_with(&layer_prefix) {
+                        continue;
+                    }
                     let values = parse_charter_file(&path, &contents, &project, &spec)
                         .map_err(|error| format!("{source}/{path}: charter scope `{ns}/{project}`: {error}"))?;
                     for (index, mut value) in values.into_iter().enumerate() {
@@ -336,6 +407,16 @@ pub(crate) async fn expand_registered_charters(
                             })
                     }
                     "Repository" => repository_in_scope(object_name, &in_scope, catalog),
+                    // Only the delegated project's own project-source layer,
+                    // under its conventional name.
+                    "ImageLayer" => serde_json::from_value::<flotilla_resources::ImageLayerResourceSpec>(document.value["spec"].clone())
+                        .ok()
+                        .and_then(flotilla_resources::ImageLayerResourceSpec::into_current)
+                        .is_some_and(|layer| {
+                            layer.source == flotilla_resources::ImageLayerSource::Project
+                                && layer.project.as_deref() == Some(project.as_str())
+                                && layer.resource_name() == object_name
+                        }),
                     _ => false,
                 };
             if !allowed {
@@ -506,8 +587,10 @@ mod tests {
     // A fake stands in for fetching immutable Git objects through the VCS seam.
     struct MemoryReader {
         files: BTreeMap<String, String>,
+        layer: Option<BTreeMap<String, Vec<u8>>>,
         revision: String,
         reads: Mutex<Vec<CharterSource>>,
+        layer_reads: Mutex<Vec<CharterSource>>,
     }
     #[async_trait]
     impl CharterReader for MemoryReader {
@@ -515,9 +598,13 @@ mod tests {
             self.reads.lock().expect("reads").push(source.clone());
             Ok(CharterSnapshot { files: self.files.clone(), revision: self.revision.clone() })
         }
+        async fn read_layer(&self, source: &CharterSource) -> Result<Option<LayerDirectorySnapshot>, String> {
+            self.layer_reads.lock().expect("layer reads").push(source.clone());
+            Ok(self.layer.clone().map(|files| LayerDirectorySnapshot { revision: self.revision.clone(), files }))
+        }
     }
     fn reader(files: BTreeMap<String, String>) -> MemoryReader {
-        MemoryReader { files, revision: "commit-b".into(), reads: Mutex::default() }
+        MemoryReader { files, layer: None, revision: "commit-b".into(), reads: Mutex::default(), layer_reads: Mutex::default() }
     }
     fn backend() -> ResourceBackend {
         ResourceBackend::new(InMemoryBackend::default())
@@ -582,6 +669,101 @@ mod tests {
         expand_registered_charters(&inputs(documents), "commit-a", "flotilla", backend, reader)
             .await
             .map(|result| result.expect("registered"))
+    }
+
+    fn layer_files(prefix: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                format!("{prefix}layer.yaml"),
+                "name: app-native\nversion: 1.0.0\ntier: project\nprovides: [project:app]\nprobe: \"true\"\n".to_string(),
+            ),
+            (format!("{prefix}Dockerfile.fragment"), "FROM ${BASE}\nRUN true\n".to_string()),
+        ])
+    }
+
+    fn layer_document(source: flotilla_resources::ImageLayerSource, project: Option<&str>) -> Value {
+        let layer = flotilla_resources::ImageLayerSpec::builder()
+            .name("native".into())
+            .version("1.0.0".into())
+            .tier(if project.is_some() { flotilla_resources::ImageLayerTier::Project } else { flotilla_resources::ImageLayerTier::Shared })
+            .source(source)
+            .maybe_project(project.map(str::to_string))
+            .fragment("FROM ${BASE}\n".into())
+            .probe("true".into())
+            .build();
+        json!({"apiVersion": "flotilla.work/v1", "kind": "ImageLayer", "metadata": {"name": layer.resource_name()}, "spec": layer})
+    }
+
+    // ADR 0062: a delegated charter's `.flotilla/image/`, inline or fetched,
+    // becomes its own project's project-source ImageLayer; a charter can
+    // author no other project's layer and no stdlib or installation layer.
+    #[tokio::test]
+    async fn delegated_charters_author_only_their_own_project_layer() {
+        let layer = |files: &[LoadedManifestFile]| {
+            files
+                .iter()
+                .flat_map(|(_, parsed)| parsed.as_ref().expect("parsed"))
+                .find(|document| document["kind"] == "ImageLayer")
+                .cloned()
+                .expect("project layer document")
+        };
+        let inline = CharterPointer::Inline { documents: vec![], files: layer_files("image/") };
+        let inline = layer(&expand(vec![project("app", None, Some(inline))], &backend(), &reader(BTreeMap::new())).await.expect("inline"));
+        assert!(inline["metadata"]["name"].as_str().expect("name").starts_with("project-app-app-native-1.0.0-"));
+        assert_eq!((inline["spec"]["source"].as_str(), inline["spec"]["project"].as_str()), (Some("project"), Some("app")));
+        assert_eq!(inline["metadata"]["annotations"][CHARTER_SCOPE], "flotilla/app");
+
+        let mut fetched = reader(BTreeMap::new());
+        fetched.layer = Some(layer_files("").into_iter().map(|(path, contents)| (path, contents.into_bytes())).collect());
+        let pointer =
+            CharterPointer::Repository { repo: "https://example.test/app-ops".into(), branch: "main".into(), path: "charter".into() };
+        let delegated = layer(&expand(vec![project("app", None, Some(pointer))], &backend(), &fetched).await.expect("delegated"));
+        assert_eq!(delegated["spec"], inline["spec"]);
+        assert_eq!(
+            fetched.layer_reads.lock().expect("layer reads").last(),
+            Some(&CharterSource::Repository {
+                repo: "https://example.test/app-ops".into(),
+                branch: "main".into(),
+                path: "charter/image".into()
+            })
+        );
+
+        for (document, kind) in [
+            (layer_document(flotilla_resources::ImageLayerSource::Project, Some("other")), "another project's layer"),
+            (layer_document(flotilla_resources::ImageLayerSource::Stdlib, None), "a stdlib layer"),
+        ] {
+            let error = expand(vec![project("app", None, Some(inline_pointer(document)))], &backend(), &reader(BTreeMap::new()))
+                .await
+                .expect_err(kind);
+            assert!(error.contains("exceeds delegated scope `flotilla/app` by authoring ImageLayer"), "{kind}: {error}");
+        }
+
+        // The primary repository's layer as well is a within-source clash.
+        let backend = backend();
+        let primary = flotilla_resources::parse_layer_directory(
+            &layer_files("").into_iter().map(|(path, contents)| (path, contents.into_bytes())).collect(),
+            flotilla_resources::ImageLayerSource::Project,
+            Some("app"),
+        )
+        .expect("primary layer");
+        backend
+            .definitions::<flotilla_resources::ImageLayer>("flotilla")
+            .apply(
+                &flotilla_resources::InputMeta::builder()
+                    .name(primary.resource_name())
+                    .labels(BTreeMap::from([(flotilla_resources::MANAGED_BY_LABEL.to_string(), PROJECT_IMAGE_MANAGER.to_string())]))
+                    .build(),
+                &primary.into(),
+            )
+            .await
+            .expect("primary-repository layer");
+        let inline = CharterPointer::Inline { documents: vec![], files: layer_files("image/") };
+        let error = expand(vec![project("app", None, Some(inline))], &backend, &reader(BTreeMap::new())).await.expect_err("clash");
+        assert!(error.contains("defines its image layer twice"), "{error}");
+    }
+
+    fn inline_pointer(document: Value) -> CharterPointer {
+        inline(vec![document])
     }
 
     // #2721 / operator ruling: absent pointers leave legacy input handling inert,

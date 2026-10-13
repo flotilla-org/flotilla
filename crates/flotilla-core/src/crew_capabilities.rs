@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use flotilla_agent::adapter::CAPABILITIES_HEADING;
 use flotilla_resources::{
     message_record_name, vessel_placement_pin, Convoy, Environment, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, ImageBuild,
-    InputMeta, Message, MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, CREDENTIAL_REFS_ANNOTATION,
+    ImageBuildPhase, InputMeta, Message, MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, CREDENTIAL_REFS_ANNOTATION,
 };
 use flotilla_store::{MessageInbox, ResourceBackend};
 use sha2::{Digest, Sha256};
@@ -186,11 +186,10 @@ pub async fn session_card(
         text.push_str(&reachable_paths(&docker.mounts));
         if let Some(build) = &docker.image_build_ref {
             let build = backend.including_replicas::<ImageBuild>(namespace).get(build).await.map_err(|error| error.to_string())?.object;
-            if let Some(status) = &build.status {
-                text.push_str(&format!(
-                    "Verified tools and runtimes: {}.\n",
-                    status.verified_provides.iter().cloned().collect::<Vec<_>>().join(", ")
-                ));
+            // A Built image passed every layer's probe, so its layers' provides are verified.
+            if let (Some(spec), Some(ImageBuildPhase::Built)) = (build.spec.current(), build.status.as_ref().map(|status| status.phase)) {
+                let provides = spec.layers.iter().flat_map(|layer| layer.provides.iter().cloned()).collect::<BTreeSet<_>>();
+                text.push_str(&format!("Verified tools and runtimes: {}.\n", provides.into_iter().collect::<Vec<_>>().join(", ")));
             }
         }
     }

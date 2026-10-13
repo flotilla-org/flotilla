@@ -2,14 +2,11 @@
 use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use flotilla_resources::{
-    is_image_digest, HostImageAction, ImageBuildFailure, ImageBuildFailureClass, ImageLayerParent, PlacedImageIdentity,
-};
-use sha2::{Digest, Sha256};
+use flotilla_resources::{is_image_digest, HostImageAction, ImageBuildFailureClass, PlacedImageIdentity};
 
 use super::{
     docker::DockerEnvironmentProvider,
-    image::{BuiltImage, ImageComposition, ImageLayerBuild},
+    image::{BuiltImage, ImageComposition},
     ImageBuilder, LocalImageCache, RegistryAuth,
 };
 use flotilla_provider_runtime::ChannelLabel;
@@ -134,25 +131,10 @@ impl LocalImageCache for DockerEnvironmentProvider {
 
 pub struct BuildxImageBuilder {
     runner: Arc<dyn CommandRunner>,
-    cache_name: Option<String>,
 }
 impl BuildxImageBuilder {
-    async fn output_with_timeout(
-        &self,
-        args: &[&str],
-        context: &Path,
-        timeout: Duration,
-    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
-        tokio::time::timeout(timeout, self.runner.run_output("docker", args, context, &ChannelLabel::Default))
-            .await
-            .map_err(|_| format!("Docker process exceeded wall-clock deadline of {} seconds", timeout.as_secs()))?
-    }
-
-    pub fn for_cache(runner: Arc<dyn CommandRunner>, name: String) -> Self {
-        Self { runner, cache_name: Some(name) }
-    }
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner, cache_name: None }
+        Self { runner }
     }
 }
 #[async_trait]
@@ -172,179 +154,6 @@ impl ImageBuilder for BuildxImageBuilder {
             .ok_or("registry push did not report a manifest digest")?;
         Ok(format!("{repository}@{digest}"))
     }
-    async fn build_layer(
-        &self,
-        request: ImageLayerBuild<'_>,
-        auth: Option<&RegistryAuth>,
-        log: &mut String,
-    ) -> Result<(PlacedImageIdentity, BTreeSet<String>), ImageBuildFailure> {
-        let ImageLayerBuild { name, spec, parent_digest, context, cache_name, probe_script } = request;
-        let deterministic = |reason| ImageBuildFailure { class: ImageBuildFailureClass::Deterministic, reason };
-        let transient = |reason| ImageBuildFailure { class: ImageBuildFailureClass::Transient, reason: RegistryAuth::redact(auth, reason) };
-        if self.cache_name.as_deref().is_some_and(|name| name != cache_name) || cache_name.is_empty() {
-            return Err(deterministic("build requires its bound named cache".into()));
-        }
-        if let Some(auth) = auth {
-            let base = match &spec.layer.spec.parent {
-                ImageLayerParent::Image(image) => image.as_str(),
-                _ => parent_digest,
-            };
-            auth.validate(base, HostImageAction::ImagePull).map_err(deterministic)?;
-        }
-        let config = RegistryAuth::config(auth).map_err(transient)?;
-        let config_arg = config.path().to_str().ok_or_else(|| deterministic("Docker config path is not UTF-8".into()))?;
-        let architecture = match spec.inputs.architecture.as_str() {
-            "x86_64" | "amd64" => "amd64",
-            "aarch64" | "arm64" => "arm64",
-            other => other,
-        };
-        let tag = format!("flotilla-build:{:x}", Sha256::digest(format!("{name}\0{}", spec.recipe_key)));
-        let mut args = vec![
-            "--config".into(),
-            config_arg.into(),
-            "buildx".into(),
-            "build".into(),
-            "--builder".into(),
-            "default".into(),
-            "--load".into(),
-            "--progress=plain".into(),
-            "--platform".into(),
-            format!("linux/{architecture}"),
-            "--tag".into(),
-            tag.clone(),
-            "--file".into(),
-            spec.layer.spec.fragment.clone(),
-        ];
-        let base = match &spec.layer.spec.parent {
-            ImageLayerParent::Image(image) => image.clone(),
-            _ => {
-                // Buildx's default Docker driver consumes images from the host
-                // store. Give the exact local ID a content-derived label for FROM;
-                // record the ID, never this label, as the parent identity.
-                let label = format!("flotilla-parent:{:x}", Sha256::digest(parent_digest));
-                self.runner
-                    .run_with_timeout(
-                        "docker",
-                        &["--config", config_arg, "image", "tag", parent_digest, &label],
-                        context,
-                        &ChannelLabel::Default,
-                        CLI_TIMEOUT,
-                    )
-                    .await
-                    .map_err(transient)?;
-                label
-            }
-        };
-        let mut build_args = spec.layer.spec.args.clone();
-        build_args.extend(spec.layer.spec.pins.iter().map(|(name, pin)| (name.clone(), pin.value.clone())));
-        build_args.insert("BASE".into(), base);
-        for (name, value) in build_args {
-            args.extend(["--build-arg".into(), format!("{name}={value}")]);
-        }
-        args.push(".".into());
-        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let cached = self
-            .output_with_timeout(&["--config", config_arg, "image", "inspect", "--format", "{{.Id}}", &tag], context, CLI_TIMEOUT)
-            .await
-            .map_err(transient)?;
-        if !cached.success() {
-            let output = self.output_with_timeout(&args, context, BUILD_TIMEOUT).await.map_err(transient)?;
-            log.push_str(&RegistryAuth::redact(auth, output.stdout.clone()));
-            log.push_str(&RegistryAuth::redact(auth, output.stderr.clone()));
-            if !output.success() {
-                let reason = failure_summary(&RegistryAuth::redact(auth, output.stderr.clone()), output.exit_code);
-                let class = classify_build_failure(output.exit_code, &reason);
-                return Err(ImageBuildFailure { class, reason });
-            }
-        }
-        let identity = self
-            .runner
-            .run_with_timeout(
-                "docker",
-                &["--config", config_arg, "image", "inspect", "--format", "{{.Id}}", &tag],
-                context,
-                &ChannelLabel::Default,
-                CLI_TIMEOUT,
-            )
-            .await
-            .map_err(transient)?;
-        let identity = PlacedImageIdentity { local_image_id: identity.trim().into(), registry_digest: None };
-        identity.validate().map_err(deterministic)?;
-        let mut verified = BTreeSet::new();
-        for provide in &spec.layer.spec.provides {
-            let command = spec
-                .layer
-                .spec
-                .probes
-                .get(provide)
-                .filter(|command| !command.is_empty())
-                .ok_or_else(|| deterministic(format!("no verification probe declared for {provide}")))?;
-            let probe_name = format!("flotilla-probe-{:x}", Sha256::digest(format!("{name}\0{provide}")));
-            let cpus = spec.reservation.cpu.to_string();
-            // Positional arguments preserve arbitrary probe argv without shell
-            // interpolation. Preludes and the probe share their export scope.
-            let script = probe_script;
-            let mut args = vec![
-                "--config",
-                config_arg,
-                "run",
-                "--rm",
-                "--name",
-                &probe_name,
-                "--cpus",
-                &cpus,
-                "--memory",
-                "512m",
-                "--pids-limit",
-                "128",
-                "--pull=never",
-                "--network=none",
-                "--entrypoint",
-                "sh",
-                &identity.local_image_id,
-                "-c",
-                &script,
-                "flotilla-provide-probe",
-            ];
-            args.extend(command.iter().map(String::as_str));
-            let output = match self.output_with_timeout(&args, context, PROBE_TIMEOUT).await {
-                Ok(output) => output,
-                Err(reason) => {
-                    // Dropping the Docker CLI alone does not stop its container.
-                    let _ = self
-                        .runner
-                        .run_with_timeout(
-                            "docker",
-                            &["--config", config_arg, "rm", "--force", &probe_name],
-                            context,
-                            &ChannelLabel::Default,
-                            CLI_TIMEOUT,
-                        )
-                        .await;
-                    return Err(transient(reason));
-                }
-            };
-            log.push_str(&RegistryAuth::redact(auth, output.stdout.clone()));
-            log.push_str(&RegistryAuth::redact(auth, output.stderr.clone()));
-            if !output.success() {
-                let reason = failure_summary(&RegistryAuth::redact(auth, output.stderr.clone()), output.exit_code);
-                // 125 is Docker's own failure, 126/127 are an unusable probe
-                // command, and other nonzero codes belong to the probe itself.
-                let class = if output.exit_code == Some(125) || output.exit_code.is_none() || output.exit_code == Some(137) {
-                    classify_build_failure(output.exit_code, &reason)
-                } else {
-                    ImageBuildFailureClass::Deterministic
-                };
-                return Err(ImageBuildFailure {
-                    class,
-                    reason: format!("provide verification failed: {provide}: {reason}").chars().take(MAX_REASON_CHARS).collect(),
-                });
-            }
-            verified.insert(provide.clone());
-        }
-        Ok((identity, verified))
-    }
-
     async fn build(&self, c: ImageComposition<'_>, archive: &Path, auth: Option<&RegistryAuth>) -> Result<BuiltImage, String> {
         if let Some(auth) = auth {
             auth.validate(c.args.get("BASE").ok_or("authenticated composition requires a BASE reference")?, HostImageAction::ImagePull)?;
@@ -414,7 +223,6 @@ impl ImageBuilder for BuildxImageBuilder {
 
 pub const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
-const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REASON_CHARS: usize = 2048;
 
 // Status holds a bounded diagnostic, while the Artifact retains the full output.
@@ -429,7 +237,7 @@ pub fn failure_summary(stderr: &str, exit_code: Option<i32>) -> String {
 pub fn classify_build_failure(exit_code: Option<i32>, reason: &str) -> ImageBuildFailureClass {
     let reason = failure_summary(reason, exit_code).to_ascii_lowercase();
     if exit_code.is_some() && exit_code != Some(137) && reason.contains("did not complete successfully") && reason.contains("exit code:") {
-        return ImageBuildFailureClass::Deterministic;
+        return ImageBuildFailureClass::Recipe;
     }
     let infrastructure = [
         "connection reset",
@@ -450,8 +258,8 @@ pub fn classify_build_failure(exit_code: Option<i32>, reason: &str) -> ImageBuil
         "429 too many requests",
     ];
     if exit_code.is_none() || exit_code == Some(137) || infrastructure.iter().any(|signal| reason.contains(signal)) {
-        ImageBuildFailureClass::Transient
+        ImageBuildFailureClass::Infrastructure
     } else {
-        ImageBuildFailureClass::Deterministic
+        ImageBuildFailureClass::Recipe
     }
 }

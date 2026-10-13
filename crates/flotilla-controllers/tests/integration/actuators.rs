@@ -90,7 +90,6 @@ async fn environment_actuator_translates_mounts_into_provider_create_opts() {
         vec![("GITHUB_TOKEN".to_string(), "secret".to_string())],
     );
     let spec = DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: flotilla_resources::EnvironmentMemoryPolicy {
             host_memory_percent: 30,

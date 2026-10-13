@@ -337,6 +337,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement {
+                        needs: Default::default(),
                         name: "implement".to_string(),
                         depends_on: Vec::new(),
                         repository_refs: None,
@@ -544,7 +545,6 @@ async fn environment_controller_marks_docker_environment_ready() {
             &EnvironmentSpec {
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
-                    image_composition: None,
                     image_build_ref: None,
                     memory_policy: Default::default(),
                     host_ref: "01HXYZ".to_string(),

@@ -50,6 +50,11 @@ pub struct CrewDefaultsSpec {
     #[serde(default)]
     #[builder(default)]
     pub skills: BTreeMap<String, Vec<String>>,
+    /// Installation image defaults (ADR 0062). The fleet-root layer is the
+    /// installation default; project-scoped layers cascade like roles. Applied
+    /// only when a project declares no `image:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<crate::ImageSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -319,6 +324,7 @@ mod tests {
                 ("coder".into(), vec!["implement".into(), "testing".into()]),
                 ("governor".into(), vec!["wayfinder".into()]),
             ]),
+            image: None,
         };
         let project = BTreeMap::from([("coder".into(), vec!["-testing".into()])]);
         let code = resolve_skills(&catalog(), &skill_layers(&defaults, &project, "coder", &["review".into()])).expect("code selection");
@@ -412,6 +418,7 @@ mod tests {
             default_workflow_ref: None,
             roles: BTreeMap::new(),
             skills: BTreeMap::from([("governor".into(), vec!["missing".into()])]),
+            image: None,
         };
         assert!(
             matches!(check_skill_declarations(&[], &defaults, &[]), Err(SkillRefusal::Missing { layer, .. }) if layer == SkillLayer::Role)

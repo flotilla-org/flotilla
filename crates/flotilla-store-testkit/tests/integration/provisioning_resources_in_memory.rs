@@ -76,6 +76,7 @@ async fn vessel_metadata_and_status_roundtrip() {
             "convoy-fix-bug-123-implement",
             &created.metadata.resource_version,
             &VesselStatus {
+                image: None,
                 degraded: Default::default(),
                 configured_limits: None,
                 runtime_observation: None,
@@ -118,7 +119,6 @@ async fn environment_and_checkout_specs_serialize_through_in_memory_backend() {
     let env_spec = EnvironmentSpec {
         host_direct: None,
         docker: Some(DockerEnvironmentSpec {
-            image_composition: None,
             image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "01HXYZ".to_string(),
@@ -200,7 +200,7 @@ fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
             legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: "01HXYZ".to_string(),
-            image: "ghcr.io/flotilla/dev:latest".to_string().into(),
+            image: Some("ghcr.io/flotilla/dev:latest".into()),
             pull_policy: DockerImagePullPolicy::Never,
             agent_adapters: Default::default(),
             default_cwd: Some("/workspace".to_string()),

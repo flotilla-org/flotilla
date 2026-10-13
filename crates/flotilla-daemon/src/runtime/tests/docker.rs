@@ -57,7 +57,6 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
         .with_environment_tools(with_fourth_tool(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))),
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
@@ -158,7 +157,6 @@ async fn docker_provisioning_fails_loudly_without_interior_cleat_assets() {
         )),
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
@@ -243,7 +241,6 @@ async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_r
         let state =
             Arc::new(if outcome == RegistryPreflightOutcome::MissingStore { state } else { state.with_credential_store(credential_store) });
         let spec = flotilla_resources::DockerEnvironmentSpec {
-            image_composition: None,
             image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
@@ -408,7 +405,6 @@ async fn docker_orphan_cleanup_without_persisted_status_reaps_backing() {
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
                     host_ref: "host-test".into(),
                     image: "image".into(),
-                    image_composition: None,
                     image_build_ref: None,
                     memory_policy: Default::default(),
                     declared_agent_adapters: Default::default(),
@@ -446,7 +442,6 @@ async fn docker_provisioning_reports_unavailable_flotilla_cli() {
         "host-direct-host-test".to_string(),
     ));
     let spec = flotilla_resources::DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
@@ -494,7 +489,6 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
         .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf())),
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
@@ -519,7 +513,6 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
     assert!(provider.create_opts.lock().await.is_none(), "reserved mount collisions should fail before invoking the provider");
 
     let cli_collision_spec = flotilla_resources::DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         mounts: vec![flotilla_resources::EnvironmentMount {
@@ -594,7 +587,6 @@ async fn provisioned_environment_discovers_and_registers_interior_agent_adapters
     assert!(registered.agent_adapters.get("claude-code").is_some());
 
     let spec = flotilla_resources::DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
@@ -609,17 +601,18 @@ async fn provisioned_environment_discovers_and_registers_interior_agent_adapters
     assert_eq!(error, "image `contained-image` declares agent adapter `missing-adapter`, but interior discovery did not find it");
 }
 
-// #2731/#2941: legacy no-layer images survive prepared snapshots and runtime
-// preparation; unbuilt layers cannot use baseline authority, and literal tags refuse.
+// #2731/#2941: legacy baseline images freeze into literals that survive
+// prepared snapshots and runtime preparation with their provenance, while
+// authored literal tags refuse.
 #[tokio::test]
-async fn fresh_contained_admission_resolves_legacy_literal_but_refuses_unbuilt_layers_and_literal_tag() {
+async fn fresh_contained_admission_resolves_legacy_literal_and_refuses_literal_tag() {
     use flotilla_environment::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider, PrepareOpts};
     use flotilla_resources::{CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource};
 
-    // Exhaust baseline sources with/without layers and an authored literal.
-    // Timing/interleavings do not affect this immutable admission chain;
-    // old live records and routed duplicate admissions have separate coverage.
-    for (baseline, layers) in [(true, false), (true, true), (false, false)] {
+    // Exhaust a baseline source and an authored literal. Timing/interleavings
+    // do not affect this immutable admission chain; old live records and
+    // routed duplicate admissions have separate coverage.
+    for baseline in [true, false] {
         let temp = TempDir::new().expect("tempdir");
         fs::write(temp.path().join("daemon.toml"), "machine_id = \"fresh-baseline-admission\"\n").expect("config");
         let config = Arc::new(ConfigStore::with_base(temp.path()));
@@ -631,29 +624,9 @@ async fn fresh_contained_admission_resolves_legacy_literal_but_refuses_unbuilt_l
         )
         .await;
         let backend = daemon.resource_backend();
-        let selection = if layers {
-            use flotilla_resources::{ImageLayer, ImageLayerParent, ImageLayerSelection, ImageLayerSpec, ImageLayerStage};
-            backend
-                .definitions::<ImageLayer>(NAMESPACE)
-                .apply(
-                    &empty_meta("base"),
-                    &ImageLayerSpec::builder()
-                        .stage(ImageLayerStage::Base)
-                        .parent(ImageLayerParent::Image(format!("debian@sha256:{}", "a".repeat(64))))
-                        .repository("https://example.test/images".into())
-                        .revision("1".repeat(40))
-                        .fragment("Dockerfile.base".into())
-                        .build(),
-                )
-                .await
-                .expect("base layer");
-            Some(ImageLayerSelection::builder().base("base".into()).build())
-        } else {
-            None
-        };
         backend
             .definitions::<CrewImageBaseline>(NAMESPACE)
-            .apply(&empty_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:baseline".into(), layers: selection })
+            .apply(&empty_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:baseline".into() })
             .await
             .expect("baseline");
         let hosts = backend.using::<Host>(NAMESPACE);
@@ -684,11 +657,11 @@ async fn fresh_contained_admission_resolves_legacy_literal_but_refuses_unbuilt_l
             )
             .await
             .expect("default branch");
-        let image = if baseline {
+        let image = Some(if baseline {
             DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() }
         } else {
             DockerImageSource::Literal("crew:baseline".into())
-        };
+        });
         backend
             .using::<PlacementPolicy>(NAMESPACE)
             .create(
@@ -742,14 +715,6 @@ async fn fresh_contained_admission_resolves_legacy_literal_but_refuses_unbuilt_l
             .await
             .expect("admit");
         let result = wait_for_command_result(&mut events, id).await;
-        if layers {
-            assert!(
-                matches!(result, CommandValue::Error { ref message } if message.contains("image build input resolver is unavailable")),
-                "unbuilt layers must demand a builder, not run the baseline: {result:?}"
-            );
-            assert!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.is_empty());
-            continue;
-        }
         assert!(matches!(result, CommandValue::ConvoyCreated { .. }), "admission: {result:?}");
         let convoys = backend.using::<Convoy>(NAMESPACE);
         let name = convoy_record_name(&backend, "baseline-convoy").await;
@@ -775,18 +740,11 @@ async fn fresh_contained_admission_resolves_legacy_literal_but_refuses_unbuilt_l
         let snapshot = backend.using::<PlacementPolicy>(NAMESPACE).get(&vessel.spec.placement_policy_ref).await.expect("snapshot");
         let docker = snapshot.spec.docker_per_vessel.expect("docker snapshot");
         assert_eq!(docker.legacy_image_baseline_ref.as_deref(), baseline.then_some("fleet-crew"));
-        if baseline {
-            let DockerImageSource::Composition { composition } = &docker.image else { panic!("legacy literal composition") };
-            assert!(composition.layers.is_empty());
-            assert_eq!(composition.literal_base.as_deref(), Some("crew:baseline"));
-            assert!(composition.baseline_image.is_none());
-        } else {
-            assert!(matches!(docker.image, DockerImageSource::Literal(_)));
-        }
+        assert_eq!(docker.image, Some(DockerImageSource::Literal("crew:baseline".into())), "baselines freeze into literals");
         // Mutating the live baseline after admission must not change the frozen image.
         backend
             .definitions::<CrewImageBaseline>(NAMESPACE)
-            .apply(&empty_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:changed".into(), layers: None })
+            .apply(&empty_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:changed".into() })
             .await
             .expect("change live baseline");
         let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
@@ -866,7 +824,7 @@ async fn legacy_baseline_admission_recovers_old_records_and_preserves_frozen_pro
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             legacy_image_baseline_ref: None,
             host_ref: "udder".into(),
-            image: flotilla_resources::DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() },
+            image: Some(flotilla_resources::DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() }),
             pull_policy: Default::default(),
             memory_policy: Default::default(),
             agent_adapters: Default::default(),
@@ -896,7 +854,6 @@ async fn legacy_baseline_admission_recovers_old_records_and_preserves_frozen_pro
     let docker = environment.spec.docker.as_mut().expect("docker");
     docker.image = "forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-10-02.d9e59d8c.dbd6e440".into();
     docker.image_build_ref = None;
-    docker.image_composition = None;
     let mut meta = InputMeta::from(&environment.metadata);
     meta.owner_references = vec![flotilla_resources::OwnerReference {
         api_version: "flotilla.work/v1".into(),
@@ -930,7 +887,7 @@ async fn legacy_baseline_admission_recovers_old_records_and_preserves_frozen_pro
         .expect("unlabeled live baseline prepares");
     assert!(!runtime.legacy_baseline_for_environment("unknown").await.expect("absent record"));
     let mut literal = policy.spec.clone();
-    literal.docker_per_vessel.as_mut().expect("docker").image = flotilla_resources::DockerImageSource::Literal("crew:tag".into());
+    literal.docker_per_vessel.as_mut().expect("docker").image = Some(flotilla_resources::DockerImageSource::Literal("crew:tag".into()));
     policies.update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &literal).await.expect("literal policy");
     assert!(!runtime.legacy_baseline_for_environment("live-environment").await.expect("literal is not baseline"));
     assert_eq!(
@@ -999,7 +956,6 @@ async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing()
         .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf())),
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: "host-test".to_string(),

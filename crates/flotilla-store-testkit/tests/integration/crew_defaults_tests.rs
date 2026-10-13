@@ -13,6 +13,7 @@ async fn registered_defaults_apply_as_a_validated_definition() {
         .apply(
             &meta,
             &CrewDefaultsSpec {
+                image: None,
                 project_ref: None,
                 default_workflow_ref: None,
                 roles: BTreeMap::new(),
@@ -25,6 +26,7 @@ async fn registered_defaults_apply_as_a_validated_definition() {
         .apply(
             &meta,
             &CrewDefaultsSpec {
+                image: None,
                 project_ref: None,
                 default_workflow_ref: None,
                 roles: BTreeMap::new(),

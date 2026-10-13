@@ -40,7 +40,6 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
                 &EnvironmentSpec {
                     host_direct: None,
                     docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                        image_composition: None,
                         image_build_ref: None,
                         memory_policy: Default::default(),
                         host_ref: "host-test".into(),

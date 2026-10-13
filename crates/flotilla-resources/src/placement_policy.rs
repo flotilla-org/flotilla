@@ -116,7 +116,10 @@ pub enum HostDirectPlacementPolicyCheckout {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DockerPerVesselPlacementPolicySpec {
     pub host_ref: String,
-    pub image: DockerImageSource,
+    /// Omitted means the vessel's composed image (ADR 0062): admission writes a
+    /// `Built` source into each prepared placement snapshot.
+    #[serde(default, deserialize_with = "decode_optional_image_source", skip_serializing_if = "Option::is_none")]
+    pub image: Option<DockerImageSource>,
     /// Admission freezes baseline provenance alongside the resolved image.
     /// Operator-authored policies normally omit this field. Explicit values are
     /// accepted as asserted provenance, like the legacy Environment label; use
@@ -147,7 +150,7 @@ impl DockerPerVesselPlacementPolicySpec {
     /// or composition. Old live policies still carry the baseline source itself.
     pub fn legacy_image_baseline_ref(&self) -> Option<&str> {
         self.legacy_image_baseline_ref.as_deref().or(match &self.image {
-            DockerImageSource::Baseline { image_baseline_ref } => Some(image_baseline_ref.as_str()),
+            Some(DockerImageSource::Baseline { image_baseline_ref }) => Some(image_baseline_ref.as_str()),
             _ => None,
         })
     }
@@ -170,16 +173,56 @@ pub enum DockerCheckoutStrategy {
     FreshCloneInContainer { clone_path: String },
 }
 
-/// Either a placement-specific image or a same-namespace fleet Definition.
+/// A placement-specific literal, a retired baseline reference, or the
+/// per-identity composed image admission froze into a prepared snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DockerImageSource {
     Literal(String),
-    // Compatibility reader only: generation-2 fleet policies use Composition.
-    // Resolve old references into no-layer literal compositions at admission.
-    // Remove with CrewImageBaseline in generation 3 after the cut-over roll.
-    Baseline { image_baseline_ref: String },
-    Composition { composition: Box<crate::ImageComposition> },
+    // Compatibility reader only: no fleet manifests author CrewImageBaseline.
+    // Remove with CrewImageBaseline after the cut-over roll.
+    Baseline {
+        image_baseline_ref: String,
+    },
+    /// The vessel's composed image: its identity and the per-identity ImageBuild
+    /// (`image-<hex>-<arch>`) that realises it on the placement architecture.
+    Built {
+        identity: String,
+        image_build_ref: String,
+    },
+}
+
+/// Decode an optional image source, dropping the ADR 0053
+/// `{composition: {selection…}}` form as omitted. ADR 0047: remove the
+/// composition shim one roll after ADR 0062 images land.
+pub(crate) fn decode_optional_image_source<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<DockerImageSource>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Object(object)) if object.contains_key("composition") => {
+            Ok(retired_composition_image(&object["composition"]))
+        }
+        Some(value) => serde_json::from_value(value).map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+/// The image an ADR 0053 composition already carried, with the previous
+/// resolution precedence: a bound identity (registry digest, else local ID),
+/// then a literal base, then a generation-1 baseline image. A selection-only
+/// composition carried none and decodes as omitted. ADR 0047: remove with the
+/// composition shim one roll after ADR 0062 images land.
+fn retired_composition_image(composition: &serde_json::Value) -> Option<DockerImageSource> {
+    fn text(value: Option<&serde_json::Value>) -> Option<&str> {
+        value.and_then(serde_json::Value::as_str).filter(|text| !text.trim().is_empty())
+    }
+    let identity = composition.get("identity");
+    text(identity.and_then(|identity| identity.get("registry_digest")))
+        .or_else(|| text(identity.and_then(|identity| identity.get("local_image_id"))))
+        .or_else(|| text(composition.get("literal_base")))
+        .or_else(|| text(composition.get("baseline_image")))
+        .map(|image| DockerImageSource::Literal(image.to_string()))
 }
 
 impl From<String> for DockerImageSource {
@@ -191,5 +234,76 @@ impl From<String> for DockerImageSource {
 impl From<&str> for DockerImageSource {
     fn from(image: &str) -> Self {
         Self::Literal(image.to_string())
+    }
+}
+
+#[cfg(test)]
+mod image_source_tests {
+    use super::*;
+
+    fn policy(image: Option<serde_json::Value>) -> serde_json::Value {
+        let mut docker = serde_json::json!({"host_ref": "feta", "checkout": {"fresh_clone_in_container": {"clone_path": "/w"}}});
+        if let Some(image) = image {
+            docker["image"] = image;
+        }
+        serde_json::json!({"pool": "lab", "docker_per_vessel": docker})
+    }
+
+    // ADR 0062: policies omit the image (the vessel's composed image); the
+    // ADR 0053 composition form decodes as omitted (ADR 0047); literals,
+    // baselines and admission's Built source round-trip.
+    #[test]
+    fn composition_is_dropped_and_built_round_trips() {
+        let composition = serde_json::json!({"composition": {"selection": {"base": "base", "utilities": null, "harness": null, "project": null}, "layers": []}});
+        for (image, expected) in [
+            (None, None),
+            (Some(serde_json::Value::Null), None),
+            (Some(composition), None),
+            (
+                Some(serde_json::json!("registry.test/crew@sha256:abc")),
+                Some(DockerImageSource::Literal("registry.test/crew@sha256:abc".into())),
+            ),
+            (
+                Some(serde_json::json!({"image_baseline_ref": "crew"})),
+                Some(DockerImageSource::Baseline { image_baseline_ref: "crew".into() }),
+            ),
+            (
+                Some(serde_json::json!({"identity": "sha256:abc", "image_build_ref": "image-abc-amd64"})),
+                Some(DockerImageSource::Built { identity: "sha256:abc".into(), image_build_ref: "image-abc-amd64".into() }),
+            ),
+        ] {
+            let spec: PlacementPolicySpec = serde_json::from_value(policy(image)).expect("policy decodes");
+            let docker = spec.docker_per_vessel.as_ref().expect("docker");
+            assert_eq!(docker.image, expected);
+            let encoded = serde_json::to_value(&spec).expect("encode");
+            assert!(encoded["docker_per_vessel"].get("image").is_none() == expected.is_none());
+            assert_eq!(serde_json::from_value::<PlacementPolicySpec>(encoded).expect("round-trip"), spec);
+        }
+        // ADR 0047: previous-generation compositions that carried an image
+        // keep it (old resolve precedence: bound registry digest, bound local
+        // ID, literal base, baseline image); selection-only ones are omitted.
+        let bound = serde_json::json!({"composition": {"selection": {"base": "base"}, "layers": [], "literal_base": "crew:literal",
+            "baseline_image": "crew:baseline", "identity": {"local_image_id": "sha256:local", "registry_digest": "registry.test/crew@sha256:d"}}});
+        for (composition, expected) in [
+            (bound.clone(), "registry.test/crew@sha256:d"),
+            (
+                serde_json::json!({"composition": {"selection": {}, "layers": [{"name": "base"}], "identity": {"local_image_id": "sha256:local"}}}),
+                "sha256:local",
+            ),
+            (
+                serde_json::json!({"composition": {"selection": {}, "literal_base": "crew:literal", "baseline_image": "crew:baseline"}}),
+                "crew:literal",
+            ),
+            (serde_json::json!({"composition": {"selection": {}, "baseline_image": "crew:baseline"}}), "crew:baseline"),
+        ] {
+            let spec: PlacementPolicySpec = serde_json::from_value(policy(Some(composition))).expect("old composition");
+            assert_eq!(spec.docker_per_vessel.expect("docker").image, Some(DockerImageSource::Literal(expected.into())));
+        }
+        let kind: crate::FulfilmentKindSpec = serde_json::from_value(serde_json::json!({
+            "host_ref": "feta", "pool": "lab", "grants": [],
+            "realisation": "docker_per_vessel", "image": {"composition": {"selection": {}}}
+        }))
+        .expect("old fulfilment kind decodes");
+        assert_eq!(kind.realisation, crate::FulfilmentRealisation::DockerPerVessel { image: None });
     }
 }

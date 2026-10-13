@@ -537,7 +537,6 @@ pub(super) async fn create_ready_docker_environment(
             &EnvironmentSpec {
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    image_composition: None,
                     image_build_ref: None,
                     memory_policy: Default::default(),
                     host_ref,

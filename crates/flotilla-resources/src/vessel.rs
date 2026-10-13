@@ -75,6 +75,9 @@ pub struct VesselStatus {
     pub local_image_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_digest: Option<String>,
+    /// The composed image this vessel runs, kept until relaunch (ADR 0062).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<VesselImage>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checkout_refs: BTreeMap<RepositoryKey, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -99,8 +102,27 @@ pub struct VesselStatus {
     pub credential_refresh_retry: Option<ControllerRetry>,
 }
 
+/// A vessel's frozen image: the composed identity, then the built digest once
+/// provisioning resolves it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VesselImage {
+    pub identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VesselStatusPatch {
+    /// Record the composed image when provisioning starts or completes. A
+    /// recorded identity is kept: a different identity needs a relaunch.
+    RecordImage {
+        image: VesselImage,
+    },
+    /// Relaunch: replace the recorded image unconditionally.
+    ReplaceImage {
+        image: VesselImage,
+    },
     ObserveDegradation {
         conditions: BTreeMap<String, String>,
     },
@@ -123,6 +145,8 @@ pub enum VesselStatusPatch {
         placement_decision: Option<PlacementDecision>,
         started_at: DateTime<Utc>,
         message: Option<String>,
+        /// The composed image provisioning started from, recorded as [`Self::RecordImage`].
+        image: Option<VesselImage>,
     },
     MarkReady {
         configured_limits: Option<ConfiguredResourceLimits>,
@@ -136,6 +160,9 @@ pub enum VesselStatusPatch {
         requested_stance: Stance,
         effective_stance: Stance,
         ready_at: DateTime<Utc>,
+        /// The composed image and digest the Ready Environment runs; replaces
+        /// any earlier record.
+        image: Option<VesselImage>,
     },
     MarkInterrupted {
         roles: BTreeSet<String>,
@@ -156,11 +183,16 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
     fn apply(&self, status: &mut VesselStatus) {
         match self {
             Self::ObserveDegradation { conditions } => status.degraded = conditions.clone(),
+            Self::RecordImage { image } => record_image(status, image),
+            Self::ReplaceImage { image } => status.image = Some(image.clone()),
             Self::ObserveRuntime { observation } => status.runtime_observation.get_or_insert_with(Default::default).merge(observation),
             Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
             Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),
             Self::RequireEnvironmentRecreation { message } => status.message = Some(message.clone()),
-            Self::MarkProvisioning { observed_policy_ref, observed_policy_version, placement_decision, started_at, message } => {
+            Self::MarkProvisioning { observed_policy_ref, observed_policy_version, placement_decision, started_at, message, image } => {
+                if let Some(image) = image {
+                    record_image(status, image);
+                }
                 status.phase = VesselPhase::Provisioning;
                 status.observed_policy_ref = Some(observed_policy_ref.clone());
                 status.observed_policy_version = Some(observed_policy_version.clone());
@@ -182,7 +214,12 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 requested_stance,
                 effective_stance,
                 ready_at,
+                image,
             } => {
+                // Ready records the image the Environment actually runs.
+                if let Some(image) = image {
+                    status.image = Some(image.clone());
+                }
                 status.configured_limits = configured_limits.clone();
                 status.phase = VesselPhase::Ready;
                 if let Some(placement_decision) = placement_decision {
@@ -221,6 +258,90 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
 }
 
 /// Name a convoy Vessel `<convoy>-<vessel>`.
+/// A recorded identity is kept until relaunch; recording the same identity
+/// fills a missing digest and never replaces a recorded one.
+fn record_image(status: &mut VesselStatus, image: &VesselImage) {
+    match &mut status.image {
+        Some(recorded) if recorded.identity == image.identity => {
+            if recorded.digest.is_none() {
+                recorded.digest.clone_from(&image.digest);
+            }
+        }
+        Some(_) => {}
+        None => status.image = Some(image.clone()),
+    }
+}
+
 pub fn vessel_resource_name(convoy_name: &str, vessel: &str) -> String {
     format!("{convoy_name}-{vessel}")
+}
+
+#[cfg(test)]
+mod image_tests {
+    use hegel::generators as gs;
+
+    use super::*;
+
+    // ADR 0062: when its Environment becomes Ready the vessel records the
+    // image it actually runs, replacing an earlier record (a recreated
+    // Environment may run a newer digest or a relaunched identity).
+    #[test]
+    fn ready_records_the_latest_image() {
+        let ready = |identity: &str, digest: &str| VesselStatusPatch::MarkReady {
+            configured_limits: None,
+            placement_decision: None,
+            environment_ref: Some("env".into()),
+            image_ref: None,
+            local_image_id: None,
+            registry_digest: None,
+            checkout_refs: BTreeMap::new(),
+            terminal_session_refs: Vec::new(),
+            requested_stance: Default::default(),
+            effective_stance: Default::default(),
+            ready_at: chrono::Utc::now(),
+            image: Some(VesselImage { identity: identity.into(), digest: Some(digest.into()) }),
+        };
+        let mut status = VesselStatus::default();
+        ready("sha256:a", "repo@sha256:1").apply(&mut status);
+        ready("sha256:a", "repo@sha256:2").apply(&mut status);
+        assert_eq!(status.image, Some(VesselImage { identity: "sha256:a".into(), digest: Some("repo@sha256:2".into()) }));
+        ready("sha256:b", "repo@sha256:3").apply(&mut status);
+        assert_eq!(status.image, Some(VesselImage { identity: "sha256:b".into(), digest: Some("repo@sha256:3".into()) }));
+    }
+
+    // ADR 0062: a running vessel keeps its image until relaunch. Recording is
+    // idempotent, fills a missing digest, never changes a recorded identity or
+    // digest, and only ReplaceImage switches identity. Generate interleavings
+    // of two identities with and without digests.
+    #[hegel::test]
+    fn recorded_image_is_kept_until_relaunch(tc: hegel::TestCase) {
+        let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(10));
+        let mut status = VesselStatus::default();
+        let mut expected: Option<VesselImage> = None;
+        for _ in 0..steps {
+            let identity = format!("sha256:{}", tc.draw(gs::integers::<u8>().min_value(0).max_value(1)));
+            let digest = tc.draw(gs::booleans()).then(|| format!("{identity}-digest"));
+            let image = VesselImage { identity, digest };
+            let replace = tc.draw(gs::booleans());
+            let patch = if replace {
+                VesselStatusPatch::ReplaceImage { image: image.clone() }
+            } else {
+                VesselStatusPatch::RecordImage { image: image.clone() }
+            };
+            patch.apply(&mut status);
+            expected = match expected {
+                _ if replace => Some(image),
+                None => Some(image),
+                Some(mut recorded) if recorded.identity == image.identity => {
+                    recorded.digest = recorded.digest.or(image.digest);
+                    Some(recorded)
+                }
+                kept => kept,
+            };
+            assert_eq!(status.image, expected);
+            let after = status.clone();
+            patch.apply(&mut status);
+            assert_eq!(status, after, "recording the same image twice is idempotent");
+        }
+    }
 }

@@ -130,6 +130,7 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
             default_branch: None,
         }],
         dispatch_policy: None,
+        image: None,
     })
 }
 
@@ -546,6 +547,7 @@ impl ProjectService<'_> {
             dispatch_policy: declaration
                 .dispatch_policy
                 .or_else(|| existing_project.as_ref().and_then(|project| project.spec.dispatch_policy.clone())),
+            image: declaration.image,
         })?;
         let mut meta = existing_project
             .as_ref()

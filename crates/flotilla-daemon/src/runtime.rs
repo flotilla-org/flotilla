@@ -28,7 +28,6 @@ use flotilla_core::{checkout_integration::LANDING_EVIDENCE_TTL, in_process::InPr
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
-use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
     host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, Environment, Forge, Host, ManifestRoot, Repository, Resource,
@@ -206,6 +205,18 @@ impl DaemonRuntime {
         .await
         .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
         phase("register_startup_resources", register_startup_resources(&daemon, &options.namespace, &profile)).await?;
+        // Stdlib image layers are this release's data (ADR 0062). A failure
+        // keeps the previous definitions and must not stop the daemon.
+        match phase(
+            "apply_stdlib_image_layers",
+            crate::stdlib_image_layers::apply_release_stdlib(&daemon.resource_backend(), &options.namespace),
+        )
+        .await
+        {
+            Ok(application) if application.applied.is_empty() && application.deleted.is_empty() => {}
+            Ok(application) => info!(applied = ?application.applied, deleted = ?application.deleted, "applied stdlib image layers"),
+            Err(error) => error!(%error, "stdlib image layers were not applied"),
+        }
         let registered_image_caches = local_registry
             .environment_providers
             .iter()
@@ -374,63 +385,34 @@ impl DaemonRuntime {
             ))
             .await;
         if options.start_controllers {
-            let image_build_runner = {
-                use flotilla_vcs::{
-                    providers::git_worktree::GitWorktreeStrategy,
-                    vcs::{FlotillaVcs, GitCheckoutStrategy},
-                };
-                let runner = daemon.local_command_runner().ok_or("image build command runner unavailable")?;
-                let directory = config.state_dir().as_path().join("image-builds");
-                let vcs = Arc::new(FlotillaVcs::new(
-                    ExecutionEnvironmentPath::new(&directory),
-                    Arc::clone(&runner),
-                    GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), Arc::clone(&runner)))),
-                ));
-                let distributor = if let Some((_, provider)) = local_registry
-                    .environment_providers
-                    .for_kind(flotilla_environment::environment::EnvironmentKind::Docker)
-                    .filter(|(_, provider)| provider.local_image_cache().is_some())
-                {
-                    Some(Arc::new(
-                        crate::image_distribution::ImageDistributor::builder()
-                            .io(Arc::new(
-                                crate::image_distribution::ProviderImageIo::builder()
-                                    .provider(Arc::clone(provider))
-                                    .maybe_publisher(provider.image_builder())
-                                    .credentials(Arc::clone(&credential_store))
-                                    .host(profile.host_id.clone())
-                                    .build(),
-                            ))
-                            .backend(daemon.resource_backend())
-                            .namespace(options.namespace.clone())
-                            .host(profile.host_id.clone())
-                            .provider_instance(
-                                local_registry
-                                    .environment_providers
-                                    .instance_name(provider)
-                                    .ok_or("image cache provider instance is not registered")?
-                                    .to_string(),
-                            )
-                            .registered_instances(registered_image_caches.clone())
-                            .build(),
-                    ))
-                } else {
-                    // Host-direct has no local image cache. An ambiguous provider
-                    // registry also cannot attest which instance owns an observation.
-                    None
-                };
-                Arc::new(crate::image_build::LocalImageBuildRunner {
-                    cache_name: distributor.as_ref().map(|d| d.provider_instance.clone()),
-                    builder: distributor.as_ref().and_then(|d| d.io.publisher.clone()),
-                    distributor,
-                    vcs,
-                    directory,
-                    backend: daemon.resource_backend(),
-                    namespace: options.namespace.clone(),
-                    blobs: Arc::clone(&blob_store),
-                })
+            // Composed images are built by the per-identity build service
+            // (PR 2 wires its reconciler beside the projection below); this
+            // host publishes its cache inventory for placement cost.
+            let image_distributor = match local_registry
+                .environment_providers
+                .for_kind(flotilla_environment::environment::EnvironmentKind::Docker)
+                .filter(|(_, provider)| provider.local_image_cache().is_some())
+            {
+                Some((_, provider)) => Some(Arc::new(
+                    crate::image_distribution::ImageDistributor::builder()
+                        .io(Arc::new(crate::image_distribution::ProviderImageIo::builder().provider(Arc::clone(provider)).build()))
+                        .backend(daemon.resource_backend())
+                        .namespace(options.namespace.clone())
+                        .host(profile.host_id.clone())
+                        .provider_instance(
+                            local_registry
+                                .environment_providers
+                                .instance_name(provider)
+                                .ok_or("image cache provider instance is not registered")?
+                                .to_string(),
+                        )
+                        .registered_instances(registered_image_caches.clone())
+                        .build(),
+                )),
+                // Host-direct has no local image cache. An ambiguous provider
+                // registry also cannot attest which instance owns an observation.
+                None => None,
             };
-            daemon.set_image_build_input_resolver(image_build_runner.clone()).await;
             let state = Arc::new(
                 ControllerRuntimeState::new(
                     Arc::clone(&daemon),
@@ -446,7 +428,7 @@ impl DaemonRuntime {
                 .with_credential_store(Arc::clone(&credential_store))
                 .with_agent_material(agent_material)
                 .with_blob_store(Arc::clone(&blob_store))
-                .with_image_build_runner(image_build_runner),
+                .with_image_distributor(image_distributor),
             );
             phase(
                 "set_operator_reconciler",
@@ -772,13 +754,10 @@ fn spawn_controller_loops(
             move |backend: ResourceBackend, namespace_string: String| {
                 let local_host_ref = state.local_host_ref.clone();
                 let additional_host_refs = state.agentless_host_refs();
-                let image_inputs =
-                    state.image_build_runner.clone().map(|runner| runner as Arc<dyn flotilla_core::image_build::ImageBuildInputResolver>);
                 let state = Arc::clone(&state);
                 (
                     vec![],
                     EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, &namespace_string)
-                        .with_image_build_inputs(image_inputs)
                         .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
                         .with_additional_host_refs(additional_host_refs),
                 )
@@ -914,7 +893,9 @@ fn spawn_controller_loops(
             }
         }));
     }
-    if let Some(runner) = &state.image_build_runner {
+    // Builders mirror replicated per-identity ImageBuild demand into their own
+    // store. PR 2 adds the build-service reconciler that executes it.
+    {
         let projection_backend = backend.clone();
         let projection_namespace = namespace_string.clone();
         let projection_host = state.local_host_ref.clone();
@@ -936,12 +917,6 @@ fn spawn_controller_loops(
                 }
             })
             .await;
-        }));
-
-        let runner = Arc::clone(runner);
-        let host = state.local_host_ref.clone();
-        controllers.push(controller!(flotilla_resources::ImageBuild, move |backend: ResourceBackend, namespace_string: String| {
-            (vec![], flotilla_controllers::reconcilers::ImageBuildReconciler::new(Arc::clone(&runner), backend, &namespace_string, &host))
         }));
     }
     controllers

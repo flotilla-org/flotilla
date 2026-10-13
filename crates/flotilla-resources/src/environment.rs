@@ -39,16 +39,16 @@ pub struct HostDirectEnvironmentSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// The retired ADR 0053 `image_composition` field is accepted and dropped by
+// this type's lenient decoding; ADR 0047: no shim to remove, but keep this
+// type lenient until one roll after ADR 0062 images land.
 pub struct DockerEnvironmentSpec {
     pub host_ref: String,
     pub image: String,
+    /// The per-identity ImageBuild that realises `image`.
     /// ADR 0047: remove decoder default one roll after build references land.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_build_ref: Option<String>,
-    /// ADR 0047: previous-generation Environments omit frozen compositions;
-    /// remove this decoder default after one roll.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_composition: Option<Box<crate::ImageComposition>>,
     /// Agent adapters the placement policy expects discovery to find in the image.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub declared_agent_adapters: BTreeSet<String>,
@@ -94,10 +94,10 @@ pub enum EnvironmentPhase {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+// The retired ADR 0053 `image_build_refs` list is accepted and dropped by
+// this type's lenient decoding (ADR 0047); `DockerEnvironmentSpec.image_build_ref`
+// names the single per-identity build.
 pub struct EnvironmentStatus {
-    /// ADR 0047: remove default one roll after staged build progress lands.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub image_build_refs: Vec<String>,
     /// Configured limits, not usage. Remove the decoder default one fleet roll
     /// after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,7 +140,6 @@ pub enum EnvironmentStatusPatch {
     },
     WaitForImageBuild {
         message: String,
-        build_refs: Vec<String>,
     },
     MarkLost {
         message: String,
@@ -172,8 +171,7 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
                 status.registry_digest = registry_digest.clone();
                 status.message = None;
             }
-            Self::WaitForImageBuild { message, build_refs } => {
-                status.image_build_refs = build_refs.clone();
+            Self::WaitForImageBuild { message } => {
                 status.phase = EnvironmentPhase::Provisioning;
                 status.ready = false;
                 status.message = Some(message.clone());
@@ -223,6 +221,31 @@ impl EnvironmentMemoryPolicy {
         }
         memory_bytes.checked_add(self.swap_bytes).ok_or("memory and swap limit overflow")?;
         Ok(flotilla_protocol::EnvironmentMemoryLimits { memory_bytes, swap_bytes: self.swap_bytes })
+    }
+}
+
+#[cfg(test)]
+mod retired_image_field_tests {
+    use super::*;
+
+    // ADR 0047: ADR 0053 Environments carried a frozen composition and a
+    // staged build list; both decode and are dropped on the next write.
+    #[test]
+    fn retired_composition_and_build_refs_are_dropped() {
+        let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
+            "docker": {
+                "host_ref": "feta", "image": "sha256:abc", "image_build_ref": "image-abc-amd64",
+                "image_composition": {"selection": {"base": "base", "utilities": null, "harness": null, "project": null}, "layers": []}
+            }
+        }))
+        .expect("old environment spec decodes");
+        let encoded = serde_json::to_value(&spec).expect("encode");
+        assert!(encoded["docker"].get("image_composition").is_none());
+        assert_eq!(encoded["docker"]["image_build_ref"], "image-abc-amd64");
+        let status: EnvironmentStatus =
+            serde_json::from_value(serde_json::json!({"phase": "Provisioning", "image_build_refs": ["a", "b"]})).expect("old status");
+        assert_eq!(status.phase, EnvironmentPhase::Provisioning);
+        assert!(serde_json::to_value(&status).expect("encode").get("image_build_refs").is_none());
     }
 }
 

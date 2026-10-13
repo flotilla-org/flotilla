@@ -8,25 +8,9 @@ pub trait DockerImageSourceStoreExt: Sized {
 impl DockerImageSourceStoreExt for DockerImageSource {
     async fn resolve(&self, baselines: &DefinitionResolver<CrewImageBaseline>) -> Result<String, String> {
         match self {
-            Self::Composition { composition } => {
-                // A literal base is a no-layer source, including when bound.
-                // Reject ambiguous authored shapes before choosing any identity.
-                if composition.literal_base.as_ref().is_some_and(|image| image.trim().is_empty() || !composition.layers.is_empty()) {
-                    return Err("literal image composition must have a nonempty base and no layers".into());
-                }
-                if let Some(identity) = &composition.identity {
-                    identity.validate()?;
-                    return Ok(identity.registry_digest.as_ref().unwrap_or(&identity.local_image_id).clone());
-                }
-                if let Some(image) = &composition.literal_base {
-                    return Ok(image.clone());
-                }
-                composition
-                    .baseline_image
-                    .clone()
-                    .filter(|image| !image.trim().is_empty())
-                    .ok_or_else(|| "image composition awaits placement-time build identity".to_string())
-            }
+            // A composed image has no reference until its ImageBuild is Built;
+            // the environment reconciler reads the build's digest.
+            Self::Built { image_build_ref, .. } => Err(format!("composed image awaits image build `{image_build_ref}`")),
             Self::Literal(image) if !image.trim().is_empty() => Ok(image.clone()),
             Self::Literal(_) => Err("placement image is empty".to_string()),
             Self::Baseline { image_baseline_ref: name } => Ok(CrewImageBaseline::resolve(name, baselines).await?.image),
