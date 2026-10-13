@@ -22,7 +22,8 @@ use std::{
 };
 
 use flotilla_agent::SharedAgentStateStore;
-use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon};
+use flotilla_config::ConfigStore;
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_discovery::DiscoveryRuntime;
 use flotilla_protocol::{
     ConfigLabel, ConnectionRole, EnvironmentId, GoodbyeReason, HostName, Message, NodeId, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION,

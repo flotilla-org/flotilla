@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_daemon_api::daemon::{DaemonHandle, QuerySubscription};
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState,

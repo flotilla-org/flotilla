@@ -3,7 +3,7 @@ use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;

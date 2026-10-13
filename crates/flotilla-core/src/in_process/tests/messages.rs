@@ -3,12 +3,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::{CommandAction, HostName, NodeId};
 use flotilla_resources::{Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, ResourceError};
 use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
-use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 use crate::in_process::crew_ops::{convoy_message_address, convoy_sender_address};
 use crate::in_process::{retry_resource_apply, InProcessDaemon};

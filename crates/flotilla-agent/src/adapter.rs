@@ -2741,7 +2741,7 @@ gpt-6.1-sol · /workspace"
             let vcs = FlotillaVcs::new(
                 cwd,
                 runner.clone(),
-                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_vcs::default_checkout_path(), runner.clone()))),
+                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_config::default_checkout_path(), runner.clone()))),
             );
             let (result, concurrent) = tokio::join!(
                 super::ensure_flotilla_git_exclude(&*runner, &vcs, repo.path(), RUNTIME_PATHS),
@@ -2787,7 +2787,7 @@ gpt-6.1-sol · /workspace"
         let vcs = FlotillaVcs::new(
             ExecutionEnvironmentPath::new(workspace.path()),
             runner.clone(),
-            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_vcs::default_checkout_path(), runner.clone()))),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_config::default_checkout_path(), runner.clone()))),
         );
         super::ensure_flotilla_git_exclude(&*runner, &vcs, workspace.path(), &[".flotilla/briefs/governor.md"])
             .await
@@ -2816,7 +2816,7 @@ gpt-6.1-sol · /workspace"
             let vcs = FlotillaVcs::new(
                 cwd.clone(),
                 runner.clone(),
-                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_vcs::default_checkout_path(), runner.clone()))),
+                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_config::default_checkout_path(), runner.clone()))),
             );
             assert!(super::ensure_flotilla_git_exclude(&*runner, &vcs, cwd.as_path(), &[".flotilla/briefs/coder.md"]).await.is_err());
             assert_eq!(runner.remaining(), 0);
@@ -2848,7 +2848,7 @@ gpt-6.1-sol · /workspace"
             let vcs = FlotillaVcs::new(
                 cwd.clone(),
                 runner.clone(),
-                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_vcs::default_checkout_path(), runner.clone()))),
+                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_config::default_checkout_path(), runner.clone()))),
             );
             let brief = flotilla_resources::TerminalBrief {
                 path: ".flotilla/briefs/coder.md".into(),

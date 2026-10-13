@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_change_request::observation::ChangeRequestObservationSource;
 use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_config::ConfigStore;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::{CrewCommandContext, HostName};
@@ -22,7 +23,6 @@ use flotilla_store::ResourceBackend;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply, RestAdmissionSelection};
 use super::support::{test_meta, BatchedObservationRunner};
-use crate::config::ConfigStore;
 use crate::in_process::forge_service_matches;
 use crate::in_process::CrewCompletionRefusalCause;
 use crate::in_process::InProcessDaemon;

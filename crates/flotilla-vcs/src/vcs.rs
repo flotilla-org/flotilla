@@ -2482,8 +2482,10 @@ mod tests {
     }
 
     fn test_fl(cwd: &Path, runner: Arc<dyn CommandRunner>, explicit: bool) -> FlotillaVcs {
-        let strategy =
-            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::default_checkout_path(), Arc::clone(&runner))));
+        let strategy = GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(
+            flotilla_config::default_checkout_path(),
+            Arc::clone(&runner),
+        )));
         let mut vcs = FlotillaVcs::new(ExecutionEnvironmentPath::new(cwd), runner, strategy);
         vcs.explicit_checkout = explicit;
         vcs

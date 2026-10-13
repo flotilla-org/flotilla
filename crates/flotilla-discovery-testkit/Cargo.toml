@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+flotilla-config = { path = "../flotilla-config" }
 flotilla-change-request = { path = "../flotilla-change-request" }
 flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
 flotilla-environment = { path = "../flotilla-environment" }

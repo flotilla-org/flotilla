@@ -10,7 +10,7 @@ use flotilla_agent::adapter::{
 use flotilla_resources::{CrewSource, ResourceError, TerminalSessionSource, VESSEL_LABEL};
 use flotilla_store::{CharterBriefInput, CharterBriefRenderer, CharterProseRenderer, ResourceBackend};
 
-use crate::config::ConfigStore;
+use flotilla_config::ConfigStore;
 
 pub(crate) struct LiveCharterBriefRenderer {
     backend: ResourceBackend,

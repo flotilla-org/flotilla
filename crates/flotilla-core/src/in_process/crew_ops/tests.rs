@@ -5,6 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_change_request::observation::ChangeRequestObservationSource;
 use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::qualified_path::HostId;
 use flotilla_protocol::{EnvironmentId, HostName};
 use flotilla_provider_runtime::ObservationError;
@@ -20,7 +21,6 @@ use tokio::sync::RwLock;
 
 use crate::change_request_observer::ChangeRequestRefreshCadence;
 use crate::change_request_observer::ChangeRequestRefresher;
-use crate::config::ConfigStore;
 use crate::environment_manager::EnvironmentManager;
 use crate::event_sink::RecordingEventSink;
 use crate::in_process::checkout_providers::CheckoutProviders;

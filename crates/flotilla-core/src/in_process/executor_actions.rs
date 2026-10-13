@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use flotilla_config::ConfigStore;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::commands::RepositoryIdentityChange;
@@ -41,7 +42,6 @@ use super::{
     empty_repo_identity, fallback_repo_identity, repository_operations, request_manifest_resolution, retry_resource_apply, AddRepoOutcome,
     OperatorReconciler,
 };
-use crate::config::ConfigStore;
 use crate::environment_manager::EnvironmentManager;
 use crate::executor;
 use crate::step::run_step_plan_with_remote_executor;

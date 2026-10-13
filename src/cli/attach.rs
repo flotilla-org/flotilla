@@ -1,7 +1,7 @@
 use flotilla_tui::terminal::client_attach_plan;
 
 use color_eyre::Result;
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction, RepoSelector};
 
 use flotilla_tui::cli::args::Cli;

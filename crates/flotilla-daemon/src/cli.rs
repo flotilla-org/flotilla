@@ -5,9 +5,9 @@ use std::{
     time::Duration,
 };
 
-use flotilla_core::{
-    config::ConfigStore,
+use flotilla_config::{
     log_file::{rotating_log_writer, DAEMON_LOG_DIRECTORY, DAEMON_LOG_FILE},
+    ConfigStore,
 };
 use flotilla_discovery::DiscoveryRuntime;
 use flotilla_paths::path_context::DaemonHostPath;
@@ -102,7 +102,7 @@ fn init_daemon_tracing(subscriber: impl Subscriber + Send + Sync) -> Result<(), 
 mod tests {
     use std::{fs, os::fd::AsRawFd};
 
-    use flotilla_core::log_file::{rotating_log_writer, DAEMON_LOG_FILE};
+    use flotilla_config::log_file::{rotating_log_writer, DAEMON_LOG_FILE};
     use tempfile::{tempdir, TempDir};
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Registry};
 

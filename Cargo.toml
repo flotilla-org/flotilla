@@ -11,6 +11,7 @@ members = [
     "crates/flotilla-ai-utility",
     "crates/flotilla-cloud-agent",
     "crates/flotilla-commands",
+    "crates/flotilla-config",
     "crates/flotilla-controllers",
     "crates/flotilla-core",
     "crates/flotilla-environment",
@@ -93,6 +94,7 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-prov
 
 # New external crates also belong in clippy.toml's absolute-paths-allowed-crates.
 [dependencies]
+flotilla-config = { path = "crates/flotilla-config" }
 flotilla-environment = { path = "crates/flotilla-environment" }
 flotilla-vcs = { path = "crates/flotilla-vcs" }
 flotilla-provider-runtime = { path = "crates/flotilla-provider-runtime" }

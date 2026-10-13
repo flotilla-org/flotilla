@@ -13,9 +13,11 @@ C_FREE_BASE = frozenset({
     "flotilla-protocol", "flotilla-transport", "flotilla-paths",
     "flotilla-daemon-api", "flotilla-relay-protocol",
     "flotilla-resources", "flotilla-client", "flotilla-store", "flotilla-store-memory",
+    "flotilla-config",
 })
 # Shrink this explicit exemption list with the ADR 0060 step 3 store split.
-# Manifest uses TLS; TUI and the executable still reach store through core.
+# Manifest uses TLS; TUI no longer reaches core or store, but still reaches TLS
+# through manifest and provider runtime; the executable still reaches store through core.
 RESOURCE_EXEMPTIONS = frozenset({
     "flotilla-manifest", "flotilla-tui", "flotilla",
 })
@@ -73,7 +75,7 @@ def violations(metadata):
     errors = []
     if "flotilla-client" in packages and "flotilla-core" in packages and reaches("flotilla-client", "flotilla-core"):
         errors.append("flotilla-client: must not depend on flotilla-core, directly or transitively")
-    for component in ("flotilla-provider-runtime", "flotilla-discovery-api", "flotilla-vcs", "flotilla-environment", "flotilla-terminal", "flotilla-cloud-agent", "flotilla-ai-utility", "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-change-request", "flotilla-issue-tracker", "flotilla-agent", "flotilla-discovery"):
+    for component in ("flotilla-config", "flotilla-provider-runtime", "flotilla-discovery-api", "flotilla-vcs", "flotilla-environment", "flotilla-terminal", "flotilla-cloud-agent", "flotilla-ai-utility", "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-change-request", "flotilla-issue-tracker", "flotilla-agent", "flotilla-discovery"):
         for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             if component in packages and target in packages and reaches(component, target):

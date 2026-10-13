@@ -3,7 +3,7 @@ use std::path::Path;
 use std::{path::PathBuf, sync::Arc};
 
 use color_eyre::Result;
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 
@@ -748,7 +748,7 @@ mod tests {
     async fn placement_policy_cli_apply_scenario(target: u8, percent: u8) {
         use std::sync::Arc;
 
-        use flotilla_core::config::ConfigStore;
+        use flotilla_config::ConfigStore;
         use flotilla_core::in_process::InProcessDaemon;
         use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
         use flotilla_discovery_testkit::fake_discovery;

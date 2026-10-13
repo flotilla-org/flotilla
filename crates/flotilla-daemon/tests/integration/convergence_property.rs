@@ -5,7 +5,7 @@ use flotilla_store_sqlite::SqliteBackend;
 use std::{collections::BTreeSet, fmt, sync::Arc, time::Duration};
 
 use chrono::{TimeZone, Utc};
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_testkit::server::{spawn_in_memory_request_mesh, spawn_in_memory_request_topology, InMemoryRequestTopology};
 use flotilla_discovery_testkit::fake_discovery;

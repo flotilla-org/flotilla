@@ -1,5 +1,6 @@
 //! In-process daemon memory scenario for #3101; isolated global allocator target.
-use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon};
+use flotilla_config::ConfigStore;
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId, QueryCursor, QueryId};

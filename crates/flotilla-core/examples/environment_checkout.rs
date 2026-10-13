@@ -11,7 +11,7 @@
 
 use std::{path::Path, sync::Arc};
 
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_discovery::detectors::default_host_detectors;
 use flotilla_discovery::run_host_detectors;
 use flotilla_discovery::FactoryRegistry;

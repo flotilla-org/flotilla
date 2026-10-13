@@ -3,10 +3,6 @@ pub mod factory;
 pub mod providers;
 pub mod vcs;
 
-pub fn default_checkout_path() -> String {
-    "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}".to_string()
-}
-
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchInfo {

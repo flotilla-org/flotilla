@@ -113,8 +113,6 @@ use crate::checkout_integration::checkout_path_from_status_and_spec;
 use crate::checkout_integration::convoy_change_request_id_for_checkout;
 use crate::checkout_integration::inspect_checkout_integration;
 use crate::checkout_integration::inspect_convoy_checkout_integration;
-use crate::config::ConfigStore;
-use crate::config::StaticEnvironmentConfig;
 pub use crate::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler, StandingConvoyBackingInspector};
 use crate::environment_manager::EnvironmentManager;
 use crate::environment_manager::ResolvedEnvironment;
@@ -158,6 +156,8 @@ use flotilla_agent::adapter::CapabilityTable;
 use flotilla_ai_utility::AiUtility;
 use flotilla_ai_utility::ConvoyNames;
 use flotilla_cloud_agent::RepoCriteria;
+use flotilla_config::ConfigStore;
+use flotilla_config::StaticEnvironmentConfig;
 use flotilla_daemon_api::daemon::{DaemonHandle, QuerySubscription};
 use flotilla_discovery::discover_checkout_with_host_scoped;
 use flotilla_discovery::registry::ProviderRegistry;
@@ -820,7 +820,7 @@ async fn register_static_ssh_direct_environment(
     multiplex: bool,
 ) -> Result<(), String> {
     let fallback_env_id = static_ssh_environment_id(config_key);
-    let destination = crate::config::ssh_destination(&environment.hostname, environment.user.as_deref());
+    let destination = flotilla_config::ssh_destination(&environment.hostname, environment.user.as_deref());
     let runner = Arc::new(SshCommandRunner::new(destination.clone(), multiplex, Arc::clone(&discovery.runner)));
     tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, runner.run("true", &[], Path::new("/"), &ChannelLabel::Default))
         .await

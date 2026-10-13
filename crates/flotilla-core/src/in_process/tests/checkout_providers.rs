@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flotilla_change_request::ChangeRequestTracker;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository,
@@ -11,7 +12,6 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
-use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::RepositoryChangeRequestProvider;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::{fake_discovery, FakeChangeRequest, FakeVcsFactory, FakeVcsState};

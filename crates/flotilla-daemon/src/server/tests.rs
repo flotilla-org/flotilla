@@ -13,7 +13,7 @@ use std::{
 };
 
 use flotilla_agent::AgentEntry;
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_api::provider_config;

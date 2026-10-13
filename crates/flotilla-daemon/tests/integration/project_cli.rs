@@ -12,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::ops_entry::materialized_workflow_name;
 use flotilla_core::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;

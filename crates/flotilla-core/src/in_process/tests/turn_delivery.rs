@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, Selector, TerminalAttention,
@@ -13,7 +14,6 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{resume_staging_fixture, test_meta, RecordingWorkCredentials};
-use crate::config::ConfigStore;
 use crate::in_process::{input_meta_from_resource, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 

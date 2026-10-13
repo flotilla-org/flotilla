@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     CapabilityNeed, Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, FulfilmentFacts, FulfilmentGrant, FulfilmentKind,
@@ -14,7 +15,6 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{create_identity_convoy, placement_policy, test_meta};
-use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::{allocate_convoy_generation, convoy_record_name, parse_role_address, RoleAddress};
 use crate::in_process::{placement_target_host, resolve_local_convoy_name, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;

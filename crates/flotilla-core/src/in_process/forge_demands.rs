@@ -107,7 +107,8 @@ mod tests {
     use flotilla_store_testkit::ReadCountsBackendExt;
 
     use super::*;
-    use crate::{config::ConfigStore, testkits::discovery::fake_discovery};
+    use crate::testkits::discovery::fake_discovery;
+    use flotilla_config::ConfigStore;
 
     // Periodic and named servicing share lease boundaries and the legacy gate.
     #[test]

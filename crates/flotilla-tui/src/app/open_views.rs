@@ -4,7 +4,7 @@
 //! active index, pinning policy, and the mapping to/from the persisted
 //! `open-views.toml` entries. It knows nothing about rendering or data.
 
-use flotilla_core::config::OpenViewEntry;
+use flotilla_config::OpenViewEntry;
 use flotilla_protocol::{QueryId, RepoIdentity, ViewAddress};
 use serde::{Deserialize, Serialize};
 

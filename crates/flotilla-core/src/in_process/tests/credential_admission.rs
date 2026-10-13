@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     ConvoyRepositorySpec, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
@@ -13,7 +14,6 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{create_docker_placement, create_host_direct_placement, set_host_credential_expiry, test_meta};
-use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::{
     resolve_workflow_credentials, validate_workflow_credentials, validate_workflow_credentials_with_capabilities,
 };

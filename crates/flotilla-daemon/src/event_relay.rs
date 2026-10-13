@@ -3,7 +3,8 @@
 use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use flotilla_core::{config::RelayConfig, in_process::InProcessDaemon};
+use flotilla_config::RelayConfig;
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_relay_protocol::{ConsumerFrame, StreamFrame, Subject};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};

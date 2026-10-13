@@ -12,7 +12,7 @@ use flotilla_protocol::{
 };
 use flotilla_resources::host_direct_environment_name;
 
-use crate::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery::run_host_detectors;
 use flotilla_discovery::run_provisioned_host_detectors;

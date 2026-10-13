@@ -49,11 +49,11 @@ use flotilla_agent::adapter::{CrewAssignment, CrewBriefTemplateResolver};
 
 use crate::{
     checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL},
-    config::ConfigStore,
     fleet::crew_attention,
     leaf_engine::{EscalationAdmission, LeafSubscriptionTable, TurnDeliveryActuator},
     resource_explain::explain_unmet_expectation,
 };
+use flotilla_config::ConfigStore;
 
 /// An authorized supervision decision; escalation carries its admitted recipient.
 enum SupervisorRuling {

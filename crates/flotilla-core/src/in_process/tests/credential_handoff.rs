@@ -2,6 +2,7 @@ use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use flotilla_config::ConfigStore;
 use flotilla_protocol::{CrewCommandContext, HostName};
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, RepositoryKey, Selector,
@@ -12,7 +13,6 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{test_meta, SessionStagingProbe};
-use crate::config::ConfigStore;
 use crate::in_process::crew_ops::terminal_meta_with_vessel_credentials;
 use crate::in_process::{InProcessDaemon, TerminalSessionIdentity, CREDENTIAL_SCOPES_ANNOTATION};
 use crate::testkits::discovery::fake_discovery;

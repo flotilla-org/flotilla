@@ -5,7 +5,7 @@ use std::{
 };
 
 use color_eyre::Result;
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -117,7 +117,7 @@ pub(crate) async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::Vie
 
     // Connect to the daemon concurrently with terminal initialization.
     let daemon_log_path =
-        resolved_state_dir.as_path().join(flotilla_core::log_file::DAEMON_LOG_DIRECTORY).join(flotilla_core::log_file::DAEMON_LOG_FILE);
+        resolved_state_dir.as_path().join(flotilla_config::log_file::DAEMON_LOG_DIRECTORY).join(flotilla_config::log_file::DAEMON_LOG_FILE);
     let daemon_panic_log_path = resolved_config_dir.join("daemon-panic.log");
     let remote = cli.remote_daemon().map_err(|error| color_eyre::eyre::eyre!(error))?;
     let initial_remote = remote.clone();

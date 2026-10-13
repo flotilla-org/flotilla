@@ -10,7 +10,7 @@ use std::{
 };
 
 use chrono::Utc;
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::CredentialStore;
 use flotilla_discovery::registry::ProviderRegistry;

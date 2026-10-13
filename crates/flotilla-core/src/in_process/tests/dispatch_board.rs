@@ -4,12 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
 use flotilla_resources::{Convoy as ResourceConvoy, ConvoySpec, Project, ProjectSpec};
 use flotilla_store::ResourceBackend;
 
 use super::support::{test_meta, SuspendedBoardProvider};
-use crate::config::ConfigStore;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::{fake_discovery_with_provider_set, FakeDiscoveryProviders};
 

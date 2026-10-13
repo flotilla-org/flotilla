@@ -162,11 +162,11 @@ mod tests {
     use flotilla_store::ResourceBackend;
 
     use super::*;
-    use crate::config::ConfigStore;
     use crate::testkits::discovery::fake_discovery;
     use crate::testkits::discovery::fake_discovery_with_runner;
     use crate::testkits::discovery::DiscoveryMockRunner;
     use crate::testkits::replay::testing::MockRunner;
+    use flotilla_config::ConfigStore;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_environment::environment::ProvisionedEnvironment;

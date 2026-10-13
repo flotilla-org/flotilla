@@ -643,7 +643,7 @@ mod tests {
     // its actual server; no external-service stand-in or recorded replay applies.
     use std::{path::Path, sync::Arc, time::Duration};
 
-    use flotilla_core::config::ConfigStore;
+    use flotilla_config::ConfigStore;
     use flotilla_daemon::server::DaemonServer;
     use flotilla_discovery_testkit::fake_discovery;
     use flotilla_protocol::NodeId;

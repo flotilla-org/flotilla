@@ -9,6 +9,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_config::ConfigStore;
 use flotilla_manifest::{
     keys::{
         KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT, KEY_CHANGE_REQUEST_READINESS,
@@ -47,7 +48,6 @@ use tracing::warn;
 use super::{project_ops, resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 use crate::{
     checkout_integration::LANDING_EVIDENCE_TTL,
-    config::ConfigStore,
     environment_manager::EnvironmentManager,
     fleet::{
         accumulate_fleet_health_counts, fleet_observation_agreement, format_resource_replication_failures, host_credential_attention,
@@ -1656,7 +1656,7 @@ impl ReadProjections<'_> {
             .map(|item| ExplainedArtifact {
                 kind: item.object.spec.kind.clone(),
                 address: format!("artifact/{}", item.object.metadata.name),
-                view_url: crate::config::artifact_view_url(&item.object.spec, &stores),
+                view_url: flotilla_config::artifact_view_url(&item.object.spec, &stores),
             })
             .collect::<Vec<_>>();
         artifacts.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.address.cmp(&b.address)));

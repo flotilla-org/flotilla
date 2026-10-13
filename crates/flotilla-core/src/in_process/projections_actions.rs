@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::commands::AttachMode;
 use flotilla_protocol::AttachBinding;
 use flotilla_protocol::CliListKind;
@@ -54,7 +55,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::{empty_repo_identity, read_projections};
-use crate::config::ConfigStore;
 use crate::event_sink::EventSink;
 use crate::in_process::attach::ResolvedAttach;
 use crate::resource_explain::resource_read_envelope;
@@ -257,9 +257,10 @@ impl ProjectionsActions<'_> {
                 let generations = self.config.load_daemon_config()?.logging.generations;
                 let state_dir = self.config.state_dir().as_path().to_path_buf();
                 let query = query.clone();
-                let read_result = tokio::task::spawn_blocking(move || crate::log_file::read_daemon_logs(&state_dir, generations, &query))
-                    .await
-                    .map_err(|error| format!("daemon log reader task failed: {error}"))?;
+                let read_result =
+                    tokio::task::spawn_blocking(move || flotilla_config::log_file::read_daemon_logs(&state_dir, generations, &query))
+                        .await
+                        .map_err(|error| format!("daemon log reader task failed: {error}"))?;
                 match read_result {
                     Ok(lines) => Ok(CommandValue::DaemonLogs { lines }),
                     Err(message) => Ok(CommandValue::Error { message }),

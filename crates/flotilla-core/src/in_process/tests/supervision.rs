@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewMessageSender, CrewWorkPhase, CrewWorkState, InputMeta, Selector,
@@ -15,7 +16,6 @@ use flotilla_store::ResourceBackend;
 use futures::{FutureExt, StreamExt};
 
 use super::support::test_meta;
-use crate::config::ConfigStore;
 use crate::in_process::crew_ops::queue_pending_crew_message;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;

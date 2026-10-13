@@ -25,7 +25,7 @@ use flotilla_client::{
     reconnect::{is_permanent_daemon_error, ReconnectBackoff},
     DaemonEndpoint, SshEndpoint,
 };
-use flotilla_core::config::{ssh_destination, ConfigStore};
+use flotilla_config::{ssh_destination, ConfigStore};
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_manifest::{
     keys::{CATALOG_TTL_MS, REASSERT_INTERVAL_MS},

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_change_request::ChangeRequestTracker;
+use flotilla_config::ConfigStore;
 use flotilla_discovery_api::provider_config;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::Factory;
@@ -27,7 +28,6 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use crate::config::ConfigStore;
 use crate::in_process::dispatch_board::tests::board;
 use crate::in_process::input_meta_from_resource;
 use crate::in_process::InProcessDaemon;

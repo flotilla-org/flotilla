@@ -1,20 +1,35 @@
-use flotilla_vcs::default_checkout_path;
+//! Host-local Flotilla configuration: `config.toml`, `daemon.toml`,
+//! `hosts.toml`, observation roots, open views and bounded log files.
+//!
+//! ADR 0060 (`docs/adr/0060-component-crates-and-composition-root.md`): a
+//! C-free base crate. Depend only on base types (protocol, paths, resources);
+//! never on provider runtime, discovery, VCS, core, storage or composition
+//! roots. The build-graph gate enforces the same upward-dependency prohibition.
+pub mod log_file;
+pub mod provider_config;
+
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     num::NonZeroUsize,
     path::PathBuf,
     sync::{Mutex, OnceLock},
 };
 
-use flotilla_discovery_api::provider_config::{
-    AiUtilityConfig, ChangeRequestConfig, CloudAgentConfig, IssueTrackerConfig, ProviderConfig, ProviderConfigView, ResolvedCheckoutConfig,
-    TerminalPoolConfig,
-};
 use flotilla_protocol::NodeId;
 use flotilla_resources::RepositoryVcsSpec;
+use provider_config::{AiUtilityConfig, ChangeRequestConfig, CloudAgentConfig, IssueTrackerConfig, TerminalPoolConfig};
 use serde::{Deserialize, Serialize};
 
 use flotilla_paths::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
+
+/// Default checkout path template for new Git worktrees.
+pub fn default_checkout_path() -> String {
+    "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}".to_string()
+}
+
+/// Blocking `config.toml` read handed to a caller-supplied offloader.
+pub type ConfigFileRead = Box<dyn FnOnce() -> Result<FlotillaConfig, String> + Send + 'static>;
 
 /// Global flotilla config from ~/.config/flotilla/config.toml
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -666,26 +681,31 @@ impl ConfigStore {
 
     /// Discovery must not synchronously read a configurable host path on a
     /// runtime worker. Populate the same cache as the synchronous UI API.
-    pub async fn load_config_for_probe(&self) -> Result<FlotillaConfig, String> {
+    /// `offload` runs the blocking file read (for example through provider
+    /// runtime's bounded probe capacity) and is skipped when the cache is warm.
+    pub async fn load_config_offloaded<F, Fut>(&self, offload: F) -> Result<FlotillaConfig, String>
+    where
+        F: FnOnce(ConfigFileRead) -> Fut,
+        Fut: Future<Output = Result<FlotillaConfig, String>>,
+    {
         if let Some(config) = self.global_config.get() {
             return Ok(config.lock().expect("config cache mutex poisoned").clone());
         }
         let path = self.base.join("config.toml");
-        let loaded =
-            flotilla_provider_runtime::probe::blocking("discovery config", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
-                match std::fs::read_to_string(path.as_path()) {
-                    Ok(contents) => Ok(toml::from_str(&contents).unwrap_or_else(|error| {
-                        tracing::warn!(%path, err = %error, "failed to parse config; using defaults");
-                        FlotillaConfig::default()
-                    })),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FlotillaConfig::default()),
-                    Err(error) => {
-                        tracing::warn!(%path, err = %error, "failed to read config; using defaults");
-                        Ok(FlotillaConfig::default())
-                    }
-                }
-            })
-            .await?;
+        let loaded = offload(Box::new(move || match std::fs::read_to_string(path.as_path()) {
+            Ok(contents) => Ok(toml::from_str(&contents).unwrap_or_else(|error| {
+                tracing::warn!(%path, err = %error, "failed to parse config; using defaults");
+                FlotillaConfig::default()
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FlotillaConfig::default()),
+            Err(error) => {
+                tracing::warn!(%path, err = %error, "failed to read config; using defaults");
+                Ok(FlotillaConfig::default())
+            }
+        }))
+        .await?;
+        // Concurrent cold-cache callers may each read the file; the first
+        // result wins and later reads are discarded, so the race is harmless.
         let cached = self.global_config.get_or_init(|| Mutex::new(loaded));
         Ok(cached.lock().expect("config cache mutex poisoned").clone())
     }
@@ -765,36 +785,11 @@ impl ConfigStore {
         self.checkout_configs.lock().expect("checkout configs mutex poisoned").remove(repo_root.as_path());
     }
 
-    pub fn resolve_checkout_config(&self, repo_root: &ExecutionEnvironmentPath) -> ResolvedCheckoutConfig {
+    pub fn resolve_checkout_path(&self, repo_root: &ExecutionEnvironmentPath) -> String {
         let global = self.load_config();
         let specs = self.checkout_configs.lock().expect("checkout configs mutex poisoned");
         let git = specs.get(repo_root.as_path()).map(|vcs| &vcs.git);
-        ResolvedCheckoutConfig {
-            path: git.and_then(|git| git.checkout_path.clone()).unwrap_or_else(|| global.vcs.git.checkout_path.clone()),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ProviderConfigView for ConfigStore {
-    fn base_path(&self) -> &DaemonHostPath {
-        self.base_path()
-    }
-    fn state_dir(&self) -> &DaemonHostPath {
-        self.state_dir()
-    }
-    fn resolve_checkout_config(&self, repo_root: &ExecutionEnvironmentPath) -> ResolvedCheckoutConfig {
-        self.resolve_checkout_config(repo_root)
-    }
-    async fn load_config_for_probe(&self) -> Result<ProviderConfig, String> {
-        let config = self.load_config_for_probe().await?;
-        Ok(ProviderConfig {
-            change_request: config.change_request,
-            issue_tracker: config.issue_tracker,
-            cloud_agent: config.cloud_agent,
-            ai_utility: config.ai_utility,
-            terminal_pool: config.terminal_pool,
-        })
+        git.and_then(|git| git.checkout_path.clone()).unwrap_or_else(|| global.vcs.git.checkout_path.clone())
     }
 }
 

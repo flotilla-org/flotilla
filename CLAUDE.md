@@ -143,9 +143,10 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-issue-tracker` | Source-addressed issue-provider trait, GitHub/Forgejo implementations, GitHub dispatch-board reader, mission-field decoding and factories |
 | `flotilla-agent` | Agent harness adapters and registry, crew brief rendering, hook parsing and installation, agent state store, process-exit receipts |
 | `flotilla-discovery` | Static factory-list assembly, default detector lists, detector runs, provider discovery, host-scoped provider cache, `ProviderRegistry` and provider status |
-| `flotilla-core` | Refresh, observed-resource projection, convoy admission and controller ports, executor, config, step plans, `InProcessDaemon` composition root |
+| `flotilla-core` | Refresh, observed-resource projection, convoy admission and controller ports, executor, step plans, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
+| `flotilla-config` | Host-local config files (`config.toml`, `daemon.toml`, `hosts.toml`, observation roots, open views), provider preference values, default checkout path and bounded log files |
 | `flotilla-daemon-api` | `DaemonHandle` interface, query subscription token, build identity and lifecycle lock file |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
@@ -192,7 +193,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-discovery/src/lib.rs` | `DiscoveryRuntime`, detector runs, checkout and host-scoped provider discovery |
 | `crates/flotilla-discovery/src/registry.rs` | `ProviderRegistry`, typed provider sets and `command_provider_registry` |
 | `crates/flotilla-discovery/src/factories.rs`, `crates/flotilla-discovery/src/detectors/` | Default factory and detector lists |
-| `crates/flotilla-core/src/config.rs` | Persistence to `~/.config/flotilla/` |
+| `crates/flotilla-config/src/lib.rs` | Persistence to `~/.config/flotilla/` |
 | `crates/flotilla-core/src/template.rs` | `.flotilla/workspace.yaml` pane templates |
 | `crates/flotilla-protocol/src/lib.rs` | `Message` envelope, `DaemonEvent` |
 | `crates/flotilla-protocol/src/commands.rs` | `Command`, `CommandAction`, and `CommandValue` |

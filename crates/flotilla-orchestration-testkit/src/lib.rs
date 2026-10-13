@@ -1,7 +1,7 @@
 //! Standing-convoy behavior scenarios driven by an injected controller.
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::{CommandAction, HostName, NodeId};
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure,

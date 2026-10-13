@@ -3,12 +3,12 @@ use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
 use flotilla_resources::{CrewSource, CrewSpec, InputMeta, PlacementPolicy, VesselRequirement, WorkflowTemplateSpec};
 use flotilla_store::ResourceBackend;
 
 use super::support::{create_docker_placement, test_meta};
-use crate::config::ConfigStore;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 

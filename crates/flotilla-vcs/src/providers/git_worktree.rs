@@ -374,7 +374,7 @@ branch refs/heads/feature
     #[test]
     fn render_worktree_path_default_template() {
         let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![]));
-        let checkout_path = crate::default_checkout_path();
+        let checkout_path = flotilla_config::default_checkout_path();
         let mgr = GitWorktreeStrategy::new(checkout_path, runner);
         let repo = ExecutionEnvironmentPath::new("/home/user/myrepo");
 
@@ -423,7 +423,7 @@ branch refs/heads/feature
         let session = replay::test_session(&fixture("git_create_remote_branch.yaml"), masks);
         let runner = replay::test_runner(&session);
 
-        let checkout_path = crate::default_checkout_path();
+        let checkout_path = flotilla_config::default_checkout_path();
         let strategy = GitWorktreeStrategy::new(checkout_path, runner.clone());
         let vcs = crate::vcs::FlotillaVcs::new(repo_path, runner.clone(), crate::vcs::GitCheckoutStrategy::Worktree(Box::new(strategy)));
 

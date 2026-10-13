@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::result_set::ConvoyChangeRequest;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId};
 use flotilla_resources::{
@@ -20,7 +21,6 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{test_meta, ForgeAwareTestChangeRequestFactory};
-use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::{KindCandidate, PlacementResolution, PlacementTieBreak};
 use crate::in_process::{
     ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot, issue_source_for_subject, prepared_snapshot_name,

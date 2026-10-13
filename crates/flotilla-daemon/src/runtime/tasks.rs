@@ -185,7 +185,7 @@ pub(super) fn spawn_blob_sync_status_task(
 pub(super) fn spawn_manifest_reconciler_task(
     daemon: Arc<InProcessDaemon>,
     namespace: String,
-    manifests: flotilla_core::config::ResourceManifestsConfig,
+    manifests: flotilla_config::ResourceManifestsConfig,
     interval: Duration,
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,

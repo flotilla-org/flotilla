@@ -49,7 +49,10 @@ impl CheckoutVcsResolver for TestVcsResolver {
         Ok(Arc::new(FlotillaVcs::new(
             ExecutionEnvironmentPath::new(path),
             Arc::clone(&self.0),
-            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_vcs::default_checkout_path(), Arc::clone(&self.0)))),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(
+                flotilla_config::default_checkout_path(),
+                Arc::clone(&self.0),
+            ))),
         )))
     }
 }
