@@ -383,7 +383,9 @@ impl CommandRunner for RealProcessRunner {
         if output.success() {
             Ok(output.stdout)
         } else {
-            Err(output.stderr)
+            // A crashing binary writes nothing to stderr; say how it exited.
+            let exit = output.exit_code.map_or_else(|| "a signal".to_string(), |code| format!("status {code}"));
+            Err(format!("{cmd} {args:?} exited with {exit}; stderr: {:?}; stdout: {:?}", output.stderr, output.stdout))
         }
     }
 
