@@ -42,6 +42,9 @@ mod digest;
 mod legacy_field_indexes;
 #[path = "sqlite/statements.rs"]
 pub(crate) mod statements;
+#[cfg(test)]
+#[path = "sqlite/watch_replay_tests.rs"]
+mod watch_replay_tests;
 
 use statements::{CachedSql, ConnectionMeter, PrepareCounters};
 
@@ -118,8 +121,10 @@ pub struct SqliteBackend {
     discovery_readers: Arc<Mutex<Vec<usize>>>,
     writer_depth: Arc<AtomicUsize>,
     read_depth: Arc<AtomicUsize>,
-    // Mutations notify and watches register from the connection thread so a
-    // committed event cannot land between replay and live delivery.
+    // Mutations notify, and watches read the stream's current version and
+    // register, on the writer thread. A watch therefore receives live exactly
+    // the events committed after the version it registered at; its replay up
+    // to that version runs on a reader (`watch_events`).
     watchers: Arc<Mutex<WatchersByStore>>,
     replica_watchers: Arc<Mutex<ReplicaWatchersByStore>>,
     pending_cleanups: Arc<Mutex<HashSet<CleanupKey>>>,
@@ -128,6 +133,8 @@ pub struct SqliteBackend {
     read_observer: Option<Arc<dyn ReadObserver>>,
     // Serialize cross-kind Project/FleetDesignation admission across clones.
     pub(crate) hierarchy_admission: Arc<tokio::sync::Mutex<()>>,
+    #[builder(default)]
+    replay_probe: ReplayProbe,
 }
 
 // The worker owns leases and depth claims, including after a caller disappears.
@@ -183,15 +190,66 @@ impl Drop for CleanupClaim {
     }
 }
 
+/// Events a reader replayed for a watch, and the stored events it could not
+/// decode. Readers are read-only, so the writer persists those failures.
+#[derive(Default)]
 struct ReplayedEvents {
     events: Vec<SerializedWatchEvent>,
-    quarantines: Vec<EventDecodeWarning>,
+    failures: Vec<ReplayFailure>,
 }
 
-struct EventDecodeWarning {
+struct ReplayFailure {
     event_version: u64,
     name: String,
+    body_json: String,
     error: String,
+}
+
+/// Which part of a read the reader deadline bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadDeadline {
+    /// Queue wait and execution: a point read or list that overruns is shed.
+    Total,
+    /// Queue wait only. Watch replay is bounded by event retention, and once it
+    /// runs its result is the cheapest way to resume; failing it after the work
+    /// is done would only send the watcher to a more expensive relist.
+    Queue,
+}
+
+/// Test pauses around watch replay, so tests can commit writes at exact points
+/// between subscriber registration and the reader's replay. Empty outside tests.
+#[derive(Clone, Default)]
+struct ReplayProbe {
+    /// Awaited after the subscriber registered on the writer and before the
+    /// replay is queued on a reader.
+    #[cfg(test)]
+    registered: Option<Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>>,
+    /// Called on the reader thread once its replay snapshot is fixed and before
+    /// it reads the events.
+    #[cfg(test)]
+    in_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ReplayProbe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReplayProbe")
+    }
+}
+
+impl ReplayProbe {
+    async fn registered(&self) {
+        #[cfg(test)]
+        if let Some(pause) = &self.registered {
+            pause().await;
+        }
+    }
+
+    fn in_snapshot(&self) {
+        #[cfg(test)]
+        if let Some(pause) = &self.in_snapshot {
+            pause();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -401,6 +459,7 @@ impl SqliteBackend {
             local_root: None,
             read_observer: None,
             hierarchy_admission: Arc::default(),
+            replay_probe: ReplayProbe::default(),
         })
     }
 
@@ -431,6 +490,7 @@ impl SqliteBackend {
             local_root: None,
             read_observer: None,
             hierarchy_admission: Arc::default(),
+            replay_probe: ReplayProbe::default(),
         })
     }
 
@@ -1125,10 +1185,16 @@ impl SqliteBackend {
         R: Send + 'static,
         F: FnOnce(&mut RusqliteConnection) -> Result<R, ResourceError> + Send + 'static,
     {
-        self.read_call_with_pool(operation_name, operation, false).await
+        self.read_call_with_pool(operation_name, operation, false, ReadDeadline::Total).await
     }
 
-    async fn read_call_with_pool<R, F>(&self, operation_name: &'static str, operation: F, discovery: bool) -> Result<R, ResourceError>
+    async fn read_call_with_pool<R, F>(
+        &self,
+        operation_name: &'static str,
+        operation: F,
+        discovery: bool,
+        deadline: ReadDeadline,
+    ) -> Result<R, ResourceError>
     where
         R: Send + 'static,
         F: FnOnce(&mut RusqliteConnection) -> Result<R, ResourceError> + Send + 'static,
@@ -1148,7 +1214,7 @@ impl SqliteBackend {
         } else {
             (&self.reader_slots, &self.available_readers)
         };
-        let result = tokio::time::timeout(READ_DEADLINE, async {
+        let read = async {
             let permit = slots.clone().acquire_owned().await.map_err(|_| ResourceError::other("sqlite reader pool closed"))?;
             let index = available
                 .lock()
@@ -1195,8 +1261,17 @@ impl SqliteBackend {
                 })
                 .await
                 .map_err(Self::map_connection_error)
-        })
-        .await;
+        };
+        tokio::pin!(read);
+        // A queue deadline lets a read that has started run to completion. A
+        // poisoned timing lock reads as "not started", which deliberately falls
+        // back to the total deadline rather than waiting without a bound.
+        let result = match tokio::time::timeout(READ_DEADLINE, &mut read).await {
+            Err(_) if deadline == ReadDeadline::Queue && execution_started.lock().ok().and_then(|timing| *timing).is_some() => {
+                Ok(read.await)
+            }
+            result => result,
+        };
         match result {
             Ok(result) => result,
             Err(_) => {
@@ -2772,32 +2847,59 @@ impl SqliteBackend {
                 return Err(ResourceError::invalid("sqlite resource watches do not use generations"));
             }
         };
+        // Register on the writer: no commit can land between reading the
+        // stream's current version and subscribing, because mutations commit
+        // and notify on the same thread. The live receiver gets exactly the
+        // events after `replay_through`. Validation runs here too, so a bad
+        // start fails before any reader work, with the same errors as before.
         let watchers = Arc::clone(&self.watchers);
-        let (replay, receiver) = self
-            .call("watch resource replay", move |connection| {
-                let replay = match replay_from {
-                    Some(version) => Self::replay_events(resource_kind, connection, &key, version, decode)?,
-                    None => ReplayedEvents { events: Vec::new(), quarantines: Vec::new() },
-                };
-                let namespace = key.3.clone();
-                let receiver = Self::lock_watchers(&watchers)?.entry(key).or_default().subscribe(resource_kind.paths.kind, &namespace);
-                Ok((replay, receiver))
+        let register_key = key.clone();
+        let (receiver, replay_through) = self
+            .call("watch resource register", move |connection| {
+                let replay_through = replay_from.map(|from| Self::replay_bounds(connection, &register_key, from)).transpose()?;
+                let namespace = register_key.3.clone();
+                let receiver =
+                    Self::lock_watchers(&watchers)?.entry(register_key).or_default().subscribe(resource_kind.paths.kind, &namespace);
+                Ok((receiver, replay_through))
             })
             .await?;
+        self.replay_probe.registered().await;
 
-        let has_gap = !replay.quarantines.is_empty();
-        for warning in replay.quarantines {
-            tracing::warn!(
-                kind = resource_kind.paths.kind,
-                namespace,
-                name = %warning.name,
-                event_version = warning.event_version,
-                error = %warning.error,
-                "quarantined undecodable stored resource event"
-            );
-        }
+        // Replay (from, through] on a reader. Its snapshot begins after the
+        // registration returned, so it holds every event up to `through`;
+        // later commits are bounded out and arrive live instead. Until the
+        // stream is polled, live events wait in the stream's shared ring, and
+        // a subscriber that falls more than a ring behind gets `WatchExpired`
+        // (see `WatchChannel::subscribe`), never a silent gap.
+        let replay = match (replay_from, replay_through) {
+            (Some(from), Some(through)) if through > from => {
+                let probe = self.replay_probe.clone();
+                let replay_key = key.clone();
+                self.read_call_with_pool(
+                    "watch resource replay",
+                    move |connection| Self::replay_events(resource_kind, connection, &replay_key, from, through, decode, &probe),
+                    false,
+                    ReadDeadline::Queue,
+                )
+                .await?
+            }
+            _ => ReplayedEvents::default(),
+        };
 
-        if has_gap {
+        if !replay.failures.is_empty() {
+            for failure in &replay.failures {
+                tracing::warn!(
+                    kind = resource_kind.paths.kind,
+                    namespace,
+                    name = %failure.name,
+                    event_version = failure.event_version,
+                    error = %failure.error,
+                    "quarantined undecodable stored resource event"
+                );
+            }
+            let failures = replay.failures;
+            self.call("quarantine watch replay events", move |connection| Self::persist_replay_failures(connection, &key, &failures))
+                .await?;
             return Err(ResourceError::WatchExpired {
                 requested_version: "quarantined event leaves a sequence gap; snapshot required".to_string(),
                 compacted_through: None,
@@ -2947,14 +3049,8 @@ impl SqliteBackend {
         Ok(deleted != 0)
     }
 
-    fn replay_events(
-        resource_kind: ResourceKind,
-        conn: &mut RusqliteConnection,
-        key: &StoreKey,
-        replay_from: u64,
-        decode: RowDecode<DecodedObject>,
-    ) -> Result<ReplayedEvents, ResourceError> {
-        let compacted_through = conn
+    fn compaction_floor(conn: &RusqliteConnection, key: &StoreKey) -> Result<u64, ResourceError> {
+        Ok(conn
             .query_row_cached(
                 r#"
                 SELECT compacted_through FROM resource_event_compaction
@@ -2965,74 +3061,107 @@ impl SqliteBackend {
             )
             .optional()
             .map_err(|err| Self::map_sqlite(err, "read sqlite resource event compaction floor"))?
-            .unwrap_or(0);
+            .unwrap_or(0))
+    }
+
+    fn compacted_beyond(replay_from: u64, compacted_through: u64) -> Result<(), ResourceError> {
         if replay_from < compacted_through {
             return Err(ResourceError::WatchExpired {
                 requested_version: replay_from.to_string(),
                 compacted_through: Some(compacted_through.to_string()),
             });
         }
+        Ok(())
+    }
+
+    /// Validate a watch start against the stream and return the version its
+    /// replay runs through: the stream's current version.
+    fn replay_bounds(conn: &RusqliteConnection, key: &StoreKey, replay_from: u64) -> Result<u64, ResourceError> {
+        Self::compacted_beyond(replay_from, Self::compaction_floor(conn, key)?)?;
         let current_version = Self::current_version(conn, key)?;
         if replay_from > current_version {
             return Err(ResourceError::invalid(format!("resourceVersion {replay_from} is ahead of current version {current_version}")));
         }
-        let mut statement = conn
+        Ok(current_version)
+    }
+
+    /// Read and decode the events in `(replay_from, replay_through]` in one
+    /// read transaction. Compaction may have advanced since registration, so
+    /// the floor is checked again in the same snapshot as the events: a range
+    /// it has started to delete is `WatchExpired`, never a silent gap.
+    fn replay_events(
+        resource_kind: ResourceKind,
+        conn: &mut RusqliteConnection,
+        key: &StoreKey,
+        replay_from: u64,
+        replay_through: u64,
+        decode: RowDecode<DecodedObject>,
+        probe: &ReplayProbe,
+    ) -> Result<ReplayedEvents, ResourceError> {
+        let tx = conn.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource event replay"))?;
+        // The first read fixes the WAL snapshot for the rest of the transaction.
+        let compacted_through = Self::compaction_floor(&tx, key)?;
+        probe.in_snapshot();
+        Self::compacted_beyond(replay_from, compacted_through)?;
+        let mut statement = tx
             .prepare_cached(
                 r#"
                 SELECT event_version, event_type, body_json FROM resource_events
-                WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND event_version > ?5
+                WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND event_version > ?5 AND event_version <= ?6
                 ORDER BY event_version
                 "#,
             )
             .map_err(|err| Self::map_sqlite(err, "prepare sqlite resource event replay"))?;
         let rows = statement
-            .query_map(params![key.0, key.1, key.2, key.3, replay_from], |row| {
+            .query_map(params![key.0, key.1, key.2, key.3, replay_from, replay_through], |row| {
                 Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
             })
             .map_err(|err| Self::map_sqlite(err, "query sqlite resource event replay"))?;
         let rows = rows.collect::<Result<Vec<_>, _>>().map_err(|err| Self::map_sqlite(err, "read sqlite resource event replay row"))?;
         drop(statement);
-        let mut events = Vec::new();
-        let mut failures = Vec::new();
+        drop(tx);
+        let mut replayed = ReplayedEvents::default();
         for (event_version, event_type, body_json) in rows {
             // Replay quarantine uses the same decode the consumer receives.
             let decoded = StoredEventKind::from_str(&event_type)
                 .and_then(|event_kind| Self::replay_event(resource_kind, event_kind, &body_json, decode));
             match decoded {
-                Ok(event) => events.push(event),
+                Ok(event) => replayed.events.push(event),
                 Err(error) => {
                     let name = serde_json::from_str::<Value>(&body_json)
                         .ok()
                         .and_then(|value| value.pointer("/metadata/name").and_then(Value::as_str).map(str::to_owned))
                         .unwrap_or_else(|| "<unknown>".to_string());
-                    failures.push((event_version, name, body_json, error.to_string()))
+                    replayed.failures.push(ReplayFailure { event_version, name, body_json, error: error.to_string() })
                 }
             }
         }
-        if !failures.is_empty() {
-            let quarantined_at = Utc::now().to_rfc3339();
-            let tx = conn.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource event decode quarantine"))?;
-            for (event_version, name, body_json, error) in &failures {
-                tx.execute_cached(
-                    r#"
-                    INSERT INTO resource_event_decode_quarantine
-                        (group_name, version, kind, namespace, event_version, name, body_json, error, quarantined_at)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                    ON CONFLICT(group_name, version, kind, namespace, event_version)
-                    DO UPDATE SET name = excluded.name,
-                                  body_json = excluded.body_json,
-                                  error = excluded.error,
-                                  quarantined_at = excluded.quarantined_at
-                    "#,
-                    params![key.0, key.1, key.2, key.3, event_version, name, body_json, error, quarantined_at],
-                )
-                .map_err(|err| Self::map_sqlite(err, "persist sqlite resource event decode quarantine"))?;
-            }
-            tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource event decode quarantine"))?;
+        Ok(replayed)
+    }
+
+    /// Record undecodable replayed events. An event compaction removed after
+    /// the reader saw it is skipped: compaction also retires its quarantine.
+    fn persist_replay_failures(conn: &mut RusqliteConnection, key: &StoreKey, failures: &[ReplayFailure]) -> Result<(), ResourceError> {
+        let quarantined_at = Utc::now().to_rfc3339();
+        let tx = conn.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource event decode quarantine"))?;
+        let compacted_through = Self::compaction_floor(&tx, key)?;
+        for failure in failures.iter().filter(|failure| failure.event_version > compacted_through) {
+            tx.execute_cached(
+                r#"
+                INSERT INTO resource_event_decode_quarantine
+                    (group_name, version, kind, namespace, event_version, name, body_json, error, quarantined_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(group_name, version, kind, namespace, event_version)
+                DO UPDATE SET name = excluded.name,
+                              body_json = excluded.body_json,
+                              error = excluded.error,
+                              quarantined_at = excluded.quarantined_at
+                "#,
+                params![key.0, key.1, key.2, key.3, failure.event_version, failure.name, failure.body_json, failure.error, quarantined_at],
+            )
+            .map_err(|err| Self::map_sqlite(err, "persist sqlite resource event decode quarantine"))?;
         }
-        let quarantines =
-            failures.into_iter().map(|(event_version, name, _, error)| EventDecodeWarning { event_version, name, error }).collect();
-        Ok(ReplayedEvents { events, quarantines })
+        tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource event decode quarantine"))
     }
 }
 
@@ -3141,7 +3270,7 @@ impl Store for SqliteBackend {
         SqliteBackend::delete_decode_quarantine_raw(self, resource_kind, namespace, name).await
     }
     async fn namespace_inventory(&self) -> Result<BTreeMap<String, Vec<String>>, ResourceError> {
-        self.read_call_with_pool("discovery namespace inventory", Self::read_namespace_inventory, true).await
+        self.read_call_with_pool("discovery namespace inventory", Self::read_namespace_inventory, true, ReadDeadline::Total).await
     }
     async fn local_namespaces_raw(&self, resource_kind: ResourceKind) -> Result<Vec<String>, ResourceError> {
         SqliteBackend::local_namespaces_raw(self, resource_kind).await
