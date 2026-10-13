@@ -366,6 +366,9 @@ pub enum RepositoryTrust {
 pub enum HostImageAction {
     ImagePull,
     ImagePush,
+    /// A named build secret mounted into an image build on this host
+    /// (ADR 0062). Only the build service receives the material.
+    ImageBuildSecret,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

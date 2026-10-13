@@ -1178,6 +1178,43 @@ impl CredentialStore {
         })
     }
 
+    /// Resolve a named image build secret for the build service on `host`
+    /// (ADR 0062, decision B7). The credential must be declared and granted to
+    /// this host by a `host_action: {action: image-build-secret}` grant; an
+    /// unknown or ungranted name is refused, naming the secret. The material is
+    /// never delivered to a crew: the caller hands it only to the build service.
+    pub fn build_secret<'a>(&'a self, host: &'a str, credential: &'a str) -> BoxFuture<'a, Result<BuildSecretMaterial, BuildSecretError>> {
+        Box::pin(async move {
+            use flotilla_resources::{CredentialGrant, HostImageAction};
+            let grants = self
+                .backend
+                .definitions::<CredentialGrant>(&self.namespace)
+                .list()
+                .await
+                .map_err(|error| BuildSecretError::Unavailable(format!("credential grants unavailable: {error}")))?;
+            if !grants.iter().any(|grant| {
+                grant.spec.credentials.contains(credential)
+                    && grant.spec.selector.matches_host_action(host, HostImageAction::ImageBuildSecret, false)
+            }) {
+                return Err(BuildSecretError::Refused(format!("build secret `{credential}` is not granted to host {host}")));
+            }
+            let spec = match self.backend.clone().definitions::<CredentialSpec>(&self.namespace).get(credential).await {
+                Ok(object) => object.spec,
+                Err(ResourceError::NotFound { .. }) => {
+                    return Err(BuildSecretError::Refused(format!("build secret `{credential}` is not a declared credential")))
+                }
+                Err(error) => {
+                    return Err(BuildSecretError::Unavailable(format!("build secret `{credential}` declaration unavailable: {error}")))
+                }
+            };
+            let material = self
+                .resolve_for_adapter(credential, &spec, None, None)
+                .await
+                .map_err(|error| BuildSecretError::Unavailable(format!("build secret `{credential}`: {error}")))?;
+            Ok(BuildSecretMaterial(material.value))
+        })
+    }
+
     /// Environment admission resolves credentials without invoking a runtime or
     /// writing secrets. The provider performs the pull, once, with this handle.
     pub fn prepare_registry_pull<'a>(
@@ -2446,6 +2483,30 @@ fn bounded_adapter_error(name: &str, adapter: &str, detail: &str) -> String {
         detail = "preflight failed".to_string();
     }
     format!("credential `{name}` adapter `{adapter}`: {detail}")
+}
+
+/// Build secret material. Its `Debug` never shows the value.
+pub struct BuildSecretMaterial(String);
+
+impl BuildSecretMaterial {
+    pub fn expose(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl std::fmt::Debug for BuildSecretMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BuildSecretMaterial([redacted])")
+    }
+}
+
+/// Why a build secret could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildSecretError {
+    /// Unknown or ungranted: identical inputs would be refused again.
+    Refused(String),
+    /// The store or the credential's host-local source could not be read.
+    Unavailable(String),
 }
 
 fn validate_scalar_material(name: &str, adapter: &str, material: &str) -> Result<(), String> {
@@ -6028,6 +6089,76 @@ interactions:
         assert!(RegistryAuth::config(Some(&first)).is_err(), "one operation per handle, including clones");
         assert!(RegistryAuth::config(Some(&first.clone())).is_err());
         assert!(!path.exists(), "lowered config is operation-owned");
+    }
+
+    // ADR 0062 B7: a build secret resolves by name only for a host holding an
+    // image-build-secret grant for it. An unknown or ungranted name is refused
+    // naming the secret; other host actions and other hosts never authorize it;
+    // a granted name whose host-local source is missing is unavailable, not
+    // refused; and the material never appears in Debug output.
+    #[tokio::test]
+    async fn build_secrets_require_a_host_grant_and_name_the_secret() {
+        use flotilla_resources::{CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, HostActionSelector, HostImageAction};
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        for (name, env) in [("npm-token", "TEST_NPM_TOKEN"), ("absent-source", "TEST_ABSENT")] {
+            backend
+                .definitions::<CredentialSpec>("flotilla")
+                .create(
+                    &InputMeta::builder().name(name.into()).build(),
+                    &CredentialSpecSpec {
+                        consumer: CredentialConsumer::Codex,
+                        source: CredentialSource::Env { name: env.into() },
+                        lifecycle: CredentialLifecycle::Static,
+                        placement: Default::default(),
+                    },
+                )
+                .await
+                .expect("credential");
+        }
+        let grant = |name: &str, action: HostImageAction, hosts: &[&str], credentials: &[&str]| {
+            (
+                InputMeta::builder().name(name.into()).build(),
+                CredentialGrantSpec::builder()
+                    .selector(
+                        CredentialGrantSelector::builder()
+                            .host_action(
+                                HostActionSelector::builder()
+                                    .action(action)
+                                    .hosts(hosts.iter().map(|host| host.to_string()).collect())
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .credentials(credentials.iter().map(|name| name.to_string()).collect())
+                    .build(),
+            )
+        };
+        let grants = backend.definitions::<CredentialGrant>("flotilla");
+        for (meta, spec) in [
+            grant("pull", HostImageAction::ImagePull, &[], &["npm-token"]),
+            grant("secrets", HostImageAction::ImageBuildSecret, &["builder"], &["npm-token", "absent-source", "undeclared"]),
+        ] {
+            grants.create(&meta, &spec).await.expect("grant");
+        }
+        let state = tempfile::tempdir().expect("state");
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([("TEST_NPM_TOKEN".into(), "npm-secret".into())]))),
+            EnvironmentBag::new(),
+            Arc::new(RecordingRunner::default()),
+            state.path().into(),
+        );
+        let material = store.build_secret("builder", "npm-token").await.expect("granted secret");
+        assert_eq!(material.expose(), b"npm-secret");
+        assert!(!format!("{material:?}").contains("npm-secret"));
+        for (host, name) in [("other", "npm-token"), ("builder", "ungranted"), ("builder", "undeclared")] {
+            match store.build_secret(host, name).await.expect_err("refused") {
+                BuildSecretError::Refused(reason) => assert!(reason.contains(&format!("`{name}`")), "{reason}"),
+                other => panic!("expected a refusal for {name} on {host}, got {other:?}"),
+            }
+        }
+        assert!(matches!(store.build_secret("builder", "absent-source").await, Err(BuildSecretError::Unavailable(_))));
     }
 
     // Subprocess boundary double: observes the real lowered files, then fails
