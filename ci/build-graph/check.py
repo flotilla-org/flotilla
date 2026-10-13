@@ -80,6 +80,11 @@ def violations(metadata):
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             if component in packages and target in packages and reaches(component, target):
                 errors.append(f"{component}: must not depend on {target}, directly or transitively")
+    # ADR 0060 step 4: credentials depends on the capability contract crate, not on core.
+    if "flotilla-credentials" in packages and "flotilla-core" in packages:
+        dev_core = any(d["kind"] == "dev" and d["name"] == "flotilla-core" for d in packages["flotilla-credentials"]["dependencies"])
+        if reaches("flotilla-credentials", "flotilla-core") or dev_core:
+            errors.append("flotilla-credentials: must not depend on flotilla-core, directly, transitively or as a dev-dependency")
     # ADR 0060: replication syncs over dyn Store; hosts supply its ports and transports.
     for target in REPLICATION_FORBIDDEN:
         if "flotilla-replication" in packages and target in packages and reaches("flotilla-replication", target):

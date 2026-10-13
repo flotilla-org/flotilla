@@ -70,7 +70,7 @@ enum SupervisorRuling {
 pub(super) struct CrewService {
     resource_backend: ResourceBackend,
     #[builder(default)]
-    pub(super) capability_source: RwLock<Option<Arc<dyn crate::crew_capabilities::SessionCapabilitySource>>>,
+    pub(super) capability_source: RwLock<Option<Arc<dyn flotilla_capability_contract::SessionCapabilitySource>>>,
     #[builder(default)]
     pub(super) capability_cards: crate::crew_capabilities::CapabilityCardTracker,
     #[builder(default)]

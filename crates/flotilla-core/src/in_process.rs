@@ -5238,7 +5238,7 @@ impl InProcessDaemon {
         self.crew_ops.pending_crew_completions().await
     }
 
-    pub async fn set_session_capability_source(&self, source: Arc<dyn crate::crew_capabilities::SessionCapabilitySource>) {
+    pub async fn set_session_capability_source(&self, source: Arc<dyn flotilla_capability_contract::SessionCapabilitySource>) {
         *self.crew_ops.capability_source.write().await = Some(source);
     }
 

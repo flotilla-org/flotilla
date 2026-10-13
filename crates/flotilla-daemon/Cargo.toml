@@ -32,6 +32,7 @@ flotilla-agent = { path = "../flotilla-agent" }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-charter = { path = "../flotilla-charter" }
 flotilla-credentials = { path = "../flotilla-credentials" }
+flotilla-capability-contract = { path = "../flotilla-capability-contract" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
 flotilla-replication = { path = "../flotilla-replication" }

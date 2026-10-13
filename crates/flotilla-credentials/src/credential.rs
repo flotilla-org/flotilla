@@ -325,7 +325,7 @@ pub struct CredentialStore {
 
 #[derive(Clone)]
 struct DeliveredCapability {
-    capability: flotilla_core::crew_capabilities::CredentialCapability,
+    capability: flotilla_capability_contract::CredentialCapability,
     expires_at: Option<DateTime<Utc>>,
 }
 
@@ -1042,7 +1042,7 @@ impl CredentialStore {
             observations.insert(
                 key.clone(),
                 Some(DeliveredCapability {
-                    capability: flotilla_core::crew_capabilities::CredentialCapability::builder()
+                    capability: flotilla_capability_contract::CredentialCapability::builder()
                         .name(key.1.clone())
                         .repositories(repositories)
                         .maybe_permissions(delivery.and_then(|delivery| delivery.effective_permissions.clone()))
@@ -1378,7 +1378,7 @@ impl CredentialStore {
         env: &'a [(String, String)],
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let endpoints = env.iter().filter_map(|(key, value)| flotilla_core::crew_capabilities::endpoint_for_env(key, value)).collect();
+            let endpoints = env.iter().filter_map(|(key, value)| flotilla_capability_contract::endpoint_for_env(key, value)).collect();
             self.capability_endpoints.lock().await.insert((environment.to_string(), session.to_string()), endpoints);
         })
     }
@@ -2767,7 +2767,7 @@ mod tests {
     // A temporary preparation-cache gap must not revoke the last delivered capability.
     #[tokio::test]
     async fn capability_observation_survives_preparation_gap() {
-        use flotilla_core::crew_capabilities::SessionCapabilitySource;
+        use flotilla_capability_contract::SessionCapabilitySource;
         let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .definitions::<CredentialSpec>("flotilla")
@@ -2806,7 +2806,7 @@ mod tests {
     // Host registry credentials are intentionally absent from sessions, not an unknown delivery.
     #[tokio::test]
     async fn host_registry_reference_has_known_absent_session_delivery() {
-        use flotilla_core::crew_capabilities::SessionCapabilitySource;
+        use flotilla_capability_contract::SessionCapabilitySource;
         let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .definitions::<CredentialSpec>("flotilla")
@@ -2845,8 +2845,8 @@ mod tests {
     }
 
     // Generated operations cover remints, daemon reconstruction gaps, reconciliation, source failures,
-    // expiry, withdrawal, redelivery and card refresh. Every step checks the delivered observation
-    // and published revision through the real CredentialStore and core observer. The minter and
+    // expiry, withdrawal, redelivery and in-flight refresh. Every step checks the delivered observation
+    // through the real CredentialStore; card observation revisions are covered by the core observer's tests. The minter and
     // RecordingRunner replace GitHub/subprocess I/O; storage and the clock are real in-memory ports.
     #[hegel::test]
     fn generated_capability_interleavings_preserve_revisions(tc: hegel::TestCase) {
@@ -2854,9 +2854,7 @@ mod tests {
         let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(18));
         let operations = (0..count).map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(8))).collect::<Vec<_>>();
         tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime").block_on(async {
-            use flotilla_core::crew_capabilities::{
-                observe_launch_card, refresh_cards, session_card, CapabilityCardTracker, SessionCapabilitySource,
-            };
+            use flotilla_capability_contract::{credential_card, SessionCapabilitySource};
             use flotilla_resources::{
                 Convoy, ConvoySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Selector, TerminalBrief, TerminalCrewContext,
                 TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
@@ -3001,24 +2999,11 @@ mod tests {
                 .expect("repository");
             let scopes = BTreeMap::from([("github".into(), BTreeSet::from([repo.key()]))]);
             store.prepare_scoped("env", &refs, &scopes, runner.clone()).await.expect("launch delivery");
-            let mut tracker = CapabilityCardTracker::default();
             let initial = store.credentials("env", &refs).await.expect("initial observation");
             let mut expected = initial.clone();
             let mut expiry = clock.now() + Duration::hours(1);
             let mut withdrawn = false;
-            let mut observed = session_card(
-                &backend,
-                "flotilla",
-                "crew",
-                &sessions.get("session").await.expect("session").spec,
-                &initial,
-                &BTreeMap::new(),
-            )
-            .await
-            .expect("launch card");
-            assert!(observed.contains("You can push `.github/workflows`"));
-            observe_launch_card(&backend, "flotilla", "session", &observed, &tracker).await.expect("launch observation");
-            let mut revision = 1;
+            assert!(credential_card(&initial).contains("You can push `.github/workflows`"));
             let mut unknown = false;
             // Pinned prefix reproduces the reported gap before generated exploration.
             for operation in [1, 3, 2, 3, 8, 5, 4, 7, 6, 7].into_iter().chain(operations) {
@@ -3034,7 +3019,6 @@ mod tests {
                     }
                     1 => {
                         store = make_store();
-                        tracker = CapabilityCardTracker::default();
                         unknown = true;
                     }
                     2 => {
@@ -3088,21 +3072,6 @@ mod tests {
                             // Card refresh and reconciliation interleave with an in-flight token mint.
                             let during = store.credentials("env", &refs).await.expect("in-flight observation");
                             assert_eq!(during, expected);
-                            let card = session_card(
-                                &backend,
-                                "flotilla",
-                                "crew",
-                                &sessions.get("session").await.expect("session").spec,
-                                &during,
-                                &BTreeMap::new(),
-                            )
-                            .await
-                            .expect("in-flight card");
-                            if card != observed {
-                                revision += 1;
-                                observed = card;
-                            }
-                            refresh_cards(&backend, "flotilla", &store, &tracker).await.expect("in-flight card refresh");
                             store
                                 .reconcile_work_delivery("env", &refs, &refs, &scopes, runner.clone())
                                 .await
@@ -3119,34 +3088,11 @@ mod tests {
                     Ok(actual) => {
                         assert!(!unknown);
                         assert_eq!(actual, expected, "operation {operation}");
-                        let card = session_card(
-                            &backend,
-                            "flotilla",
-                            "crew",
-                            &sessions.get("session").await.expect("session").spec,
-                            &actual,
-                            &BTreeMap::new(),
-                        )
-                        .await
-                        .expect("card");
-                        if card != observed {
-                            revision += 1;
-                            observed = card;
-                        }
-                        refresh_cards(&backend, "flotilla", &store, &tracker).await.expect("card refresh");
                     }
                     Err(_) => {
                         assert!(unknown);
-                        assert!(
-                            refresh_cards(&backend, "flotilla", &store, &tracker).await.is_err(),
-                            "reconstruction must never publish an empty card"
-                        );
                     }
                 }
-                assert_eq!(
-                    sessions.get("session").await.expect("observation").metadata.annotations["flotilla.work/capabilities-revision"],
-                    revision.to_string()
-                );
             }
         });
     }
@@ -3361,8 +3307,8 @@ mod tests {
 
     #[tokio::test]
     async fn project_membership_remints_live_token_without_widening_fixed_scope() {
-        use flotilla_core::crew_capabilities::credential_card;
-        use flotilla_core::crew_capabilities::SessionCapabilitySource;
+        use flotilla_capability_contract::credential_card;
+        use flotilla_capability_contract::SessionCapabilitySource;
         let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
         let clock = Arc::new(VirtualClock::new(now));
         let minter = Arc::new(FakeGithubAppTokenMinter {
@@ -3813,7 +3759,7 @@ mod tests {
     // shared environments. Relaunch replaces only that session's delivered facts.
     #[tokio::test]
     async fn capability_endpoints_isolate_sessions_in_shared_environments() {
-        use flotilla_core::crew_capabilities::SessionCapabilitySource;
+        use flotilla_capability_contract::SessionCapabilitySource;
         let store = store_with_env(BTreeMap::new());
         let first = vec![("HTTPS_PROXY".into(), "https://first:secret@127.0.0.1:7001/private".into())];
         let second = vec![("DISPLAY".into(), ":2".into())];
@@ -6304,7 +6250,7 @@ interactions:
 mod http_contract;
 
 #[async_trait]
-impl flotilla_core::crew_capabilities::SessionCapabilitySource for CredentialStore {
+impl flotilla_capability_contract::SessionCapabilitySource for CredentialStore {
     async fn endpoints(&self, environment: &str, session: &str) -> Result<BTreeMap<String, String>, String> {
         Ok(self.capability_endpoints.lock().await.get(&(environment.to_string(), session.to_string())).cloned().unwrap_or_default())
     }
@@ -6313,7 +6259,7 @@ impl flotilla_core::crew_capabilities::SessionCapabilitySource for CredentialSto
         &self,
         environment: &str,
         references: &BTreeSet<String>,
-    ) -> Result<Vec<flotilla_core::crew_capabilities::CredentialCapability>, String> {
+    ) -> Result<Vec<flotilla_capability_contract::CredentialCapability>, String> {
         let observations = self.delivered_capabilities.lock().await;
         let now = self.clock.now();
         let mut capabilities = Vec::new();

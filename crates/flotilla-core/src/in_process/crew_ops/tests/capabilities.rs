@@ -18,7 +18,7 @@ use crate::in_process::CREDENTIAL_REFS_ANNOTATION;
 async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Message, MessageReference, Vessel, VesselSpec};
 
-    use crate::crew_capabilities::{CredentialCapability, SessionCapabilitySource};
+    use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
     // In-memory port stands in for credential mint/delivery I/O.
     struct Delivery(RwLock<Vec<CredentialCapability>>, RwLock<BTreeMap<String, String>>);
     #[async_trait]
@@ -310,7 +310,8 @@ async fn previous_generation_gets_full_card_once_then_delivered_deltas() {
 // a full card without referencing the deleted predecessor, and unchanged refresh is idempotent.
 #[tokio::test]
 async fn refresh_after_reaped_message_recovers_with_full_card() {
-    use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker, CredentialCapability, SessionCapabilitySource};
+    use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker};
+    use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
     use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Message, Vessel, VesselSpec};
     // Credential/endpoint delivery is the runtime I/O boundary; resources use the real memory backend.
     struct Delivery(RwLock<BTreeMap<String, String>>);

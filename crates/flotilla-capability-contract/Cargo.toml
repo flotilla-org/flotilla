@@ -1,0 +1,21 @@
+[package]
+name = "flotilla-capability-contract"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+bon = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+hegeltest = "=0.48.1"
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }

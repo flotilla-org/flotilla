@@ -95,6 +95,7 @@ The step-4 survey found core and store code with no home in the target crates. O
   - `flotilla-projections`: principal attention, and the host and fleet read models (host registry, host summary, fleet views and fleet health). The peer-connection parts of the host registry are Plane-A peer-layer state and stay with the daemon's peer layer until it is deleted.
   - `flotilla-charter`: the project hierarchy extension.
 - **Environments.** The live environment table (per-environment runner, environment bag, provider registry, path mapping and mounts) is implemented in `flotilla-discovery` as its per-environment runtime. Capability crates consume it through a narrow `Environments` port; the daemon wires the implementation.
+- **`flotilla-capability-contract`** (new, #3200): the session capability contract (`CredentialCapability`, `SessionCapabilitySource`, `endpoint_for_env`, `credential_card`). It depends on no flotilla crate, so `flotilla-credentials` implements the source and `flotilla-core` and the daemon consume it without a cycle. Card observation and rendering stay in core until the crew stream.
 - **Host identity** (HostId and NodeId resolution) lives in `flotilla-daemon`: the composition root resolves it once at startup and injects it.
 
 ## Consequences

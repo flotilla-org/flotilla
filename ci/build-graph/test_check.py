@@ -309,6 +309,24 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-discovery-testkit", normal=("flotilla-discovery",)),
         )), [])
 
+    def test_credentials_cannot_depend_on_core(self):
+        # ADR 0060 step 4: the capability contract lives in its own crate.
+        message = "flotilla-credentials: must not depend on flotilla-core, directly, transitively or as a dev-dependency"
+        for kind in ("normal", "dev", "build"):
+            with self.subTest(kind=kind):
+                self.assertEqual(violations(graph(
+                    package("flotilla-credentials", **{kind: ("flotilla-core",)}), package("flotilla-core"),
+                )), [message])
+        self.assertEqual(violations(graph(
+            package("flotilla-credentials", normal=("adapter",)),
+            package("adapter", normal=("flotilla-core",)), package("flotilla-core"),
+        )), [message])
+        self.assertEqual(violations(graph(
+            package("flotilla-credentials", normal=("flotilla-capability-contract",)), package("flotilla-capability-contract"),
+            package("flotilla-core", normal=("flotilla-capability-contract",)),
+            package("flotilla-daemon", normal=("flotilla-core", "flotilla-credentials")),
+        )), [])
+
     def test_replication_is_native_and_independent(self):
         # ADR 0060: replication reaches stores only through dyn Store, not daemon or HTTP crates.
         self.assertEqual(layer("flotilla-replication"), "native")
