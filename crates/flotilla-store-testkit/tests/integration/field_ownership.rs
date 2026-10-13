@@ -177,6 +177,7 @@ async fn resource_apply_reports_rejected_field_and_owner() {
     let message = error.to_string();
     assert!(message.contains("spec.docker_per_vessel.host_ref"), "{message}");
     assert!(message.contains("ReconcileLoop"), "{message}");
+    assert!(message.contains("managed manifest"), "{message}");
     let stored = policies.get("policy").await.expect("stored policy").spec.docker_per_vessel.expect("docker");
     assert_eq!(stored.host_ref, "udder");
     assert_eq!(stored.image, "image:old".into(), "a rejected apply must not partially change operator fields");
@@ -188,7 +189,7 @@ async fn operator_cannot_clear_loop_owned_docker_strategy_and_violation_remains_
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let policies = backend.using::<PlacementPolicy>("flotilla");
     let created = policies
-        .create(&InputMeta::builder().name("docker-local".to_string()).build(), &docker("docker", 4, "local", "operator/image:latest"))
+        .create(&InputMeta::builder().name("docker-on-local".to_string()).build(), &docker("docker", 4, "local", "operator/image:latest"))
         .await
         .expect("create docker policy");
 
@@ -217,7 +218,10 @@ async fn loop_can_switch_from_docker_to_host_direct_without_descendant_ownership
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let policies = backend.using::<PlacementPolicy>("flotilla");
     let created = policies
-        .create(&InputMeta::builder().name("switching".to_string()).build(), &docker("docker", 44, "local", "operator/image:latest"))
+        .create(
+            &InputMeta::builder().name("docker-on-switching".to_string()).build(),
+            &docker("docker", 44, "local", "operator/image:latest"),
+        )
         .await
         .expect("create docker policy");
 
@@ -281,4 +285,59 @@ async fn enforce_mode_records_and_refuses_with_typed_error() {
     assert!(error.is_stale_view(), "callers must classify ownership refusal as a stale-view requeue");
     assert_eq!(resources.get("only").await.expect("stored resource").spec.operator_value, "stored");
     assert_eq!(backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics").field_ownership_violations.len(), 1);
+}
+
+// #3163: local and manifest authors can change checkout and Docker presence
+// outside the seed namespace; later loop writes cannot claim those fields.
+#[hegel::test]
+fn operator_docker_strategy_sequences(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    // Generate empty/present transitions, every checkout variant, repeated writes,
+    // and both authoring routes. Serial store writes need no transport interleaving.
+    let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
+    let operations: Vec<_> =
+        (0..steps).map(|_| (tc.draw(gs::integers::<usize>().min_value(0).max_value(3)), tc.draw(gs::booleans()))).collect();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let policies = backend.using::<PlacementPolicy>("flotilla");
+        let original = docker("docker", 4, "feta", "crew:latest");
+        policies.create(&InputMeta::builder().name("docker-crew-image-feta".into()).build(), &original).await.expect("operator policy");
+        for (strategy, manifest) in operations {
+            let mut requested = original.clone();
+            match strategy {
+                0 => requested.docker_per_vessel = None,
+                1 => {}
+                2 => {
+                    requested.docker_per_vessel.as_mut().expect("docker").checkout =
+                        DockerCheckoutStrategy::LocalCloneOnHostAndMount { mount_path: "/private".into() }
+                }
+                _ => {
+                    requested.docker_per_vessel.as_mut().expect("docker").checkout =
+                        DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/clone".into() }
+                }
+            }
+            let document = json!({
+                "apiVersion": "flotilla.work/v1", "kind": "PlacementPolicy",
+                "metadata": { "name": "docker-crew-image-feta" }, "spec": requested
+            });
+            if manifest {
+                flotilla_store::apply_manifest_resource_document(&backend, "flotilla", document).await.expect("manifest authoring");
+            } else {
+                apply_resource_document(&backend, "flotilla", document).await.expect("local authoring");
+            }
+            let authored = policies.get("docker-crew-image-feta").await.expect("authored policy");
+            assert_eq!(authored.spec, requested);
+            let merged = policies
+                .write_spec(
+                    &WriterIdentity::reconcile_loop(),
+                    &InputMeta::from(&authored.metadata),
+                    &authored.metadata.resource_version,
+                    &original,
+                )
+                .await
+                .expect("observe-mode loop write");
+            assert_eq!(merged.spec, requested, "loop must preserve operator checkout and presence");
+        }
+    });
 }

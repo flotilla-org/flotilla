@@ -24,8 +24,8 @@ use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::{
     host_direct_environment_name, ConditionValue, FulfilmentFacts, FulfilmentKind, FulfilmentRealisation, Host, HostCondition,
     HostConnection, HostSpec, HostStatus, InputMeta, ModelProbeState, Platform, ResourceError, AGENTLESS_CAPABILITY,
-    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
-    TRANSPORT_CAPABILITY,
+    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, DOCKER_POLICY_NAME_PREFIX, HELD_CREDENTIALS_CAPABILITY,
+    OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, TRANSPORT_CAPABILITY,
 };
 use flotilla_store::ResourceBackend;
 use serde_json::json;
@@ -284,7 +284,7 @@ impl LocalProvisioningProfile {
     }
 
     pub(super) fn docker_policy_name(&self) -> String {
-        format!("docker-on-{}", self.host_id)
+        format!("{DOCKER_POLICY_NAME_PREFIX}{}", self.host_id)
     }
 }
 

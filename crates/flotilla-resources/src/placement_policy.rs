@@ -4,8 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     field_ownership::serialized_spec_field_value, resource::define_resource, status_patch::NoStatusPatch, FieldOwnedResource,
-    FieldOwnership, OwnershipEnforcement, ReplicationClass, ResourceError, WriterRole,
+    FieldOwnership, OwnershipEnforcement, ReplicationClass, ResourceError, WriterRole, HOST_DIRECT_NAME_PREFIX,
 };
+
+/// Reserved namespace shared by Docker policy seeding and field ownership.
+pub const DOCKER_POLICY_NAME_PREFIX: &str = "docker-on-";
 
 define_resource!(
     PlacementPolicy,
@@ -20,6 +23,9 @@ define_resource!(
 ///
 /// Strategy topology discovered by registration loops is loop-derived.
 /// Scheduling priority and runtime/container configuration are operator-authored.
+/// Docker checkout and strategy presence are loop-owned only in the reserved
+/// `docker-on-*` and `host-direct-*` seed-policy namespaces; other names are
+/// operator-authored.
 /// PlacementPolicy has no status fields.
 impl FieldOwnedResource for PlacementPolicy {
     const FIELD_OWNERSHIP: &'static [FieldOwnership] = &[
@@ -37,6 +43,30 @@ impl FieldOwnedResource for PlacementPolicy {
         FieldOwnership::new("spec.docker_per_vessel.checkout", WriterRole::ReconcileLoop),
     ];
     const OWNERSHIP_ENFORCEMENT: OwnershipEnforcement = OwnershipEnforcement::Observe;
+
+    fn field_owner(ownership: &FieldOwnership, name: &str) -> WriterRole {
+        // These are the only FIELD_OWNERSHIP entries with seed-scoped owners.
+        // New Docker fields declare their default owner in that table; add them
+        // here only if their owner also differs for operator-authored policies.
+        if matches!(ownership.field, "spec.docker_per_vessel" | "spec.docker_per_vessel.checkout")
+            && !name.starts_with(DOCKER_POLICY_NAME_PREFIX)
+            && !name.starts_with(HOST_DIRECT_NAME_PREFIX)
+        {
+            WriterRole::Operator
+        } else {
+            ownership.owner
+        }
+    }
+
+    fn ownership_rule(field: &str, owner: WriterRole) -> String {
+        let route = match owner {
+            WriterRole::ReconcileLoop =>
+                "author this PlacementPolicy through its managed manifest and ManifestRoot reconciliation, or create a separate crew policy outside the reserved docker-on-* and host-direct-* seed names",
+            WriterRole::Operator => "use flotilla resource apply for a local policy, or edit its source manifest for a managed policy",
+            WriterRole::Actuator => "use the owning actuator",
+        };
+        format!("{field} is owned by {owner:?}; {route}")
+    }
 
     fn spec_field_value(spec: &Self::Spec, field: &str) -> Result<Option<serde_json::Value>, ResourceError> {
         match field {
