@@ -23,21 +23,30 @@ use rusqlite::{
 ///
 /// `sqlite.rs` and `sqlite/digest.rs` hold 56 fixed texts on cached paths
 /// (shared statements are `*_SQL` constants, so whitespace never splits them)
-/// and `MessageQuery` adds ten shapes: five variants over two tables. The
+/// and `MessageQuery` adds [`MESSAGE_QUERY_SHAPES`]. The
 /// in-memory backend serves reads on its writer, so one connection must be able
 /// to hold all 66. The remainder is headroom for new statements.
-const FIXED_STATEMENTS: usize = 80;
+const FIXED_STATEMENTS: usize = 70 + MESSAGE_QUERY_SHAPES;
 
 /// Generated `declared_sql` shapes kept warm per connection.
 ///
-/// A shape is fixed by kind, columns, the replica branch and which predicate
-/// families a query uses; bound values never change it. Each of the 36
+/// A shape is fixed by kind, columns, the replica branch, the predicate
+/// families a query uses and the declared field paths it names (each path
+/// selects its own value table); bound values never change it. Each of the 36
 /// registered kinds has a default list shape, and the kinds that are queried
 /// add a few label, field, owner or prefix shapes, some over both partitions.
-/// Four shapes per kind covers that working set. A cold shape outside it is
-/// evicted least recently used and recompiled on its next use: correct, only
-/// slower.
-const GENERATED_SHAPES: usize = 36 * 4;
+/// Four shapes per kind covers that working set. This is an estimate: a cold
+/// shape outside it is evicted least recently used and recompiled on its next
+/// use, which is correct, only slower, and shows as `compile_events` on the
+/// connection's [`ConnectionCounters`].
+const GENERATED_SHAPES: usize = REGISTERED_KINDS * 4;
+
+/// Registered kinds the generated-shape budget was sized for;
+/// `statement_cache_budget_covers_the_fixed_set` fails when the registry grows.
+const REGISTERED_KINDS: usize = 36;
+
+/// `MessageQuery` shapes: five variants over two tables.
+const MESSAGE_QUERY_SHAPES: usize = 10;
 
 /// Statement-cache capacity for every connection (224).
 ///
@@ -186,6 +195,9 @@ impl ConnectionMeter {
     /// (<https://sqlite.org/c3ref/set_authorizer.html>). Installing an
     /// authorizer expires the connection's prepared statements, so attach the
     /// meter right after opening, before anything is cached.
+    ///
+    /// SQLite allows one authorizer per connection, and the meter owns it. A
+    /// later feature that needs an authorizer must compose with this one.
     fn attach(connection: &Connection) -> Arc<Self> {
         let meter = Arc::new(Self::default());
         let observed = Arc::clone(&meter);
@@ -236,6 +248,31 @@ mod tests {
     };
 
     const NAMESPACE: &str = "flotilla";
+
+    /// Each cached call site prepares at most one fixed text, so the call-site
+    /// count bounds the fixed set from above. A new statement that outgrows
+    /// the budget fails here instead of evicting silently: raise
+    /// `FIXED_STATEMENTS`.
+    #[test]
+    fn statement_cache_budget_covers_the_fixed_set() {
+        let sources = [include_str!("../sqlite.rs"), include_str!("digest.rs")];
+        let call_sites: usize = sources
+            .iter()
+            .map(|source| {
+                ["prepare_cached(", "execute_cached(", "query_row_cached("].iter().map(|call| source.matches(call).count()).sum::<usize>()
+            })
+            .sum();
+        assert!(
+            call_sites + super::MESSAGE_QUERY_SHAPES <= super::FIXED_STATEMENTS,
+            "{call_sites} cached call sites plus {} Message shapes exceed FIXED_STATEMENTS ({})",
+            super::MESSAGE_QUERY_SHAPES,
+            super::FIXED_STATEMENTS
+        );
+        assert!(
+            crate::declared_resource_kinds().len() <= super::REGISTERED_KINDS,
+            "the registry outgrew the generated-shape budget; raise REGISTERED_KINDS"
+        );
+    }
 
     #[derive(Debug, Clone, Copy)]
     enum Backing {

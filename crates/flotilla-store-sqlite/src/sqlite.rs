@@ -934,7 +934,9 @@ impl SqliteBackend {
         for (path, prefix) in &query.field_prefixes {
             // A range plus an exact prefix check, like label prefixes. Under the
             // query planner stability guarantee a bound GLOB pattern cannot
-            // become an index range, but `value>=?` always can.
+            // become an index range, but `value>=?` always can. Value tables
+            // hold only TEXT (`j.type='text'`), so the comparison never meets a
+            // numeric value that GLOB would have coerced.
             args.push(SqlValue::Text(prefix.clone()));
             let n = args.len();
             let value = field_expression(path);

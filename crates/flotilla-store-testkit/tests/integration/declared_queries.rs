@@ -127,6 +127,12 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
     };
     assert_eq!(backend.query_declared::<Convoy>("flotilla", &query).await.unwrap().items.len(), 1);
     assert!(backend.query_declared::<Convoy>("other", &query).await.unwrap().items.is_empty());
+    // An empty prefix matches every value, and pattern metacharacters match
+    // only themselves.
+    for (prefix, expected) in [("", 3), ("sh", 1), ("a*", 0), ("?", 0), ("[a]", 0)] {
+        let query = StoreQuery { field_prefixes: BTreeMap::from([("metadata.name".into(), prefix.into())]), ..Default::default() };
+        assert_eq!(backend.query_declared::<Convoy>("flotilla", &query).await.unwrap().items.len(), expected, "prefix {prefix:?}");
+    }
     let alternatives = vec![StoreQuery {
         field_values: BTreeMap::from([("metadata.name".into(), vec!["shadow".into(), "remote".into()])]),
         ..Default::default()
