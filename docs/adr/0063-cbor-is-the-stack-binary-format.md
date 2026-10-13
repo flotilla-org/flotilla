@@ -30,21 +30,28 @@ Our consumers are written in Rust, C, Zig and Swift. Most non-Rust code reaches 
 "CBOR" alone means many formats. Ours is:
 
 - **Deterministic encoding** (RFC 8949 §4.2): shortest integer forms, definite lengths only, map keys sorted. Every value has one byte form, so messages and log entries can later be hashed, signed or content-addressed, as atproto's DAG-CBOR does.
+- **Floats** are allowed, always in their shortest (preferred) serialization. An integer value is encoded as an integer, never as a float. **NaN is not allowed.**
+- **Strict readers.** A reader rejects input that isn't in this profile: duplicate map keys (always an error), indefinite lengths, unsorted keys, non-shortest forms, NaN and tags outside the allowed list. Two byte strings never stand for the same value.
 - **Text map keys**, so the JSON rendering of the same data stays natural.
 - **A short allowed-tag list.** Byte strings are native; any other tag (for example a content-ID tag, if logs need hashing) is added to the list deliberately.
 - **Evolution:** readers ignore unknown keys and reject unknown message types. A key is never reused with a new meaning.
-- **Stream framing:** a protocol-specific magic, a u32 length, then one CBOR map carrying a `type` field. Each protocol sets its own message size limits.
+- **Hashing and signing use the original bytes.** Because readers drop unknown keys, a signed or content-addressed message is verified over the bytes as received, never over a re-encoding of the decoded value.
+- **Stream framing:** a protocol-specific magic, a u32 length, then one CBOR map carrying a `type` field. A reader checks the length against its limit **before** allocating. Each protocol sets its own message size limit; one that sets none uses a default maximum of 1 MiB.
+- **One conformance corpus.** A shared set of golden vectors (values and their exact deterministic bytes, including floats, large integers and rejected inputs) defines the profile. Every encoder and decoder in the stack must pass it; in Rust, protocols use one shared wrapper that enforces the profile rather than calling a CBOR crate directly. Both live with the first adopter until a second repo needs them.
 
 ### Where it applies, and where it doesn't
 
 - **Applies:** control and setup messages, event streams between our programs, and event logs when we have them.
 - **Shared memory stays fixed-layout.** Ring headers, frame and block descriptors and other hot-path layouts remain `repr(C)` structs and are never encoded.
 - **JSON stays** for human- and agent-facing APIs (porthole's HTTP-over-UDS API, Katzensteg's loopback HTTP) and for config files. CBOR and JSON share a data model, so a REST endpoint may also serve `application/cbor` from the same value by content negotiation.
+- **Large integers in JSON:** a u64 above 2^53 − 1, which JSON readers outside Rust cannot hold exactly, renders as an object `{"u64": "<decimal digits>"}` rather than a bare number.
 - **Encodings stay private where possible.** A protocol with a C ABI exposes typed structs, not encoded bytes, so non-Rust consumers need no parser and a later format change stays local.
 
 ### Rollout
 
-No repo converts now. Each protocol adopts this when it is next reshaped. Jackstay's setup plane (offer, selection and track notices, grants, affordances) is first, under flotilla-org/jackstay#104. ADR 0047 is unchanged: wire formats still change freely, and stored data still decodes for one generation.
+No repo converts now. Each protocol adopts this when it is next reshaped. Jackstay's setup plane (offer, selection and track notices, grants, affordances) is first, under flotilla-org/jackstay#104.
+
+**Stored data is in scope, without urgency.** Flotilla's stored records may move to CBOR when a store is next reshaped. ADR 0047 governs the move: the new generation writes CBOR and still decodes the previous generation's JSON for one roll. Wire formats still change freely.
 
 ## Alternatives considered
 
