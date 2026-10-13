@@ -251,6 +251,28 @@ pub trait CommandRunner: Send + Sync {
     /// `Err` only if the process could not be spawned at all.
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String>;
 
+    /// [`Self::run_output`] for a client that cancels its remote work only on
+    /// a catchable signal. Dropping the returned future (a caller's deadline
+    /// or cancellation) sends SIGTERM to the command's process group, and
+    /// SIGKILL once `grace` passes without the command exiting. Docker
+    /// Buildx is the motivating client: on SIGTERM it cancels its BuildKit
+    /// solve, while SIGKILL only drops its connection.
+    ///
+    /// Runners that cannot signal a command gracefully fall back to
+    /// [`Self::run_output`] and its drop behaviour; transparent wrappers
+    /// should forward this method to their inner runner.
+    async fn run_output_with_grace(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+        grace: Duration,
+    ) -> Result<CommandOutput, String> {
+        let _ = grace;
+        self.run_output(cmd, args, cwd, label).await
+    }
+
     /// Spawn a supervised command that is expected to outlive this call.
     ///
     /// Implementations should ensure dropping the returned handle terminates
@@ -449,6 +471,45 @@ impl ProcessCommandRunner {
     }
 }
 
+/// Owns a running child until it exits. Dropped while the child still runs
+/// (its caller's future was dropped), it sends SIGTERM to the child's process
+/// group and leaves a task that escalates to SIGKILL after the grace period.
+/// The child is held unreaped until then, so its process group ID cannot be
+/// reused by an unrelated group before the escalation.
+#[cfg(unix)]
+struct GracefulTermination {
+    child: Option<tokio::process::Child>,
+    grace: Duration,
+}
+
+#[cfg(unix)]
+impl Drop for GracefulTermination {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else { return };
+        let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) else { return };
+        // The child leads its own process group (spawned with process_group(0)),
+        // so the signal reaches the command and the processes it started.
+        unsafe { libc::killpg(pid, libc::SIGTERM) };
+        let grace = self.grace;
+        let escalate = async move {
+            if tokio::time::timeout(grace, child.wait()).await.is_err() {
+                // Still unreaped: the group ID still names this command's group.
+                unsafe { libc::killpg(pid, libc::SIGKILL) };
+                let _ = child.wait().await;
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(escalate);
+            }
+            // No runtime to wait out the grace period: stop the group now.
+            Err(_) => unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            },
+        }
+    }
+}
+
 struct TokioCommandProcess {
     child: tokio::process::Child,
 }
@@ -528,6 +589,44 @@ impl CommandRunner for ProcessCommandRunner {
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             exit_code: output.status.code(),
         })
+    }
+
+    #[cfg(unix)]
+    async fn run_output_with_grace(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        _label: &ChannelLabel,
+        grace: Duration,
+    ) -> Result<CommandOutput, String> {
+        use tokio::io::AsyncReadExt;
+
+        // Not kill_on_drop: the termination guard owns the child's shutdown.
+        let mut child = Self::checked_command(cmd, args, cwd)
+            .await?
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        // The pipes are drained by their own tasks, which outlive a dropped
+        // caller: a command cancelling after SIGTERM still writes its
+        // diagnostics, and a closed pipe would kill it with SIGPIPE first.
+        async fn drain(mut pipe: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).await.map(|_| bytes)
+        }
+        let stdout = tokio::spawn(drain(child.stdout.take().expect("piped stdout")));
+        let stderr = tokio::spawn(drain(child.stderr.take().expect("piped stderr")));
+        let mut guard = GracefulTermination { child: Some(child), grace };
+        let status = guard.child.as_mut().expect("guarded child").wait().await.map_err(|e| e.to_string())?;
+        // Exited and reaped: nothing is left to terminate.
+        guard.child = None;
+        let collect = |joined: Result<std::io::Result<Vec<u8>>, tokio::task::JoinError>| {
+            joined.map_err(|e| e.to_string())?.map(|bytes| String::from_utf8_lossy(&bytes).to_string()).map_err(|e| e.to_string())
+        };
+        Ok(CommandOutput { stdout: collect(stdout.await)?, stderr: collect(stderr.await)?, exit_code: status.code() })
     }
 
     async fn spawn_long_lived(
@@ -928,6 +1027,83 @@ mod tests {
             .await
             .expect("stream stdin");
         assert_eq!(tokio::fs::read(piped).await.expect("piped bytes"), bytes);
+    }
+
+    // Dropping a graceful command (a deadline or a cancelled caller) must
+    // deliver a catchable SIGTERM first: the command's TERM handler runs.
+    // `run_output` would SIGKILL it and the marker would never appear. The
+    // shell also reports its terminated `sleep` on stderr before the handler
+    // runs, so this pins that the pipes are still drained after the drop
+    // (a closed pipe would kill the command with SIGPIPE first).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_command_receives_sigterm_when_its_future_is_dropped() {
+        let directory = tempfile::tempdir().expect("directory");
+        let ready = directory.path().join("ready");
+        let terminated = directory.path().join("terminated");
+        let script = "trap 'echo term > \"$2\"; exit 0' TERM; : > \"$1\"; while :; do sleep 0.05; done";
+        let args = ["-c", script, "flotilla-test", ready.to_str().expect("utf8"), terminated.to_str().expect("utf8")];
+        let run = ProcessCommandRunner.run_output_with_grace("sh", &args, Path::new("/"), &ChannelLabel::Default, Duration::from_secs(30));
+        let wait_ready = async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            _ = run => panic!("the looping command exited on its own"),
+            () = wait_ready => {}
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !terminated.exists() {
+            assert!(tokio::time::Instant::now() < deadline, "the dropped command never received SIGTERM");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // A command that ignores SIGTERM is killed once its grace period passes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_command_ignoring_sigterm_is_killed_after_its_grace() {
+        let directory = tempfile::tempdir().expect("directory");
+        let pid_file = directory.path().join("pid");
+        let script = "trap '' TERM; echo $$ > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; while :; do sleep 0.05; done";
+        let args = ["-c", script, "flotilla-test", pid_file.to_str().expect("utf8")];
+        let grace = Duration::from_millis(300);
+        let run = ProcessCommandRunner.run_output_with_grace("sh", &args, Path::new("/"), &ChannelLabel::Default, grace);
+        let wait_ready = async {
+            while !pid_file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            _ = run => panic!("the looping command exited on its own"),
+            () = wait_ready => {}
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file).expect("pid").trim().parse().expect("pid number");
+        tokio::time::sleep(grace / 2).await;
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "SIGTERM-ignoring command must survive until its grace passes");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        // The escalation task reaps the child, so the PID disappears.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "the command outlived its grace period");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_command_returns_full_output_and_exit_status() {
+        let output = ProcessCommandRunner
+            .run_output_with_grace(
+                "sh",
+                &["-c", "echo out; echo err >&2; exit 3"],
+                Path::new("/"),
+                &ChannelLabel::Default,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("spawned");
+        assert_eq!((output.stdout.as_str(), output.stderr.as_str(), output.exit_code), ("out\n", "err\n", Some(3)));
     }
 
     #[test]
