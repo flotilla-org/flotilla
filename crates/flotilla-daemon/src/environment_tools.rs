@@ -6,7 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_environment::environment::contained_daemon_socket_path;
 use flotilla_environment::environment::EnvironmentTool;

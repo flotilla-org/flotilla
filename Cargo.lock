@@ -1055,6 +1055,7 @@ dependencies = [
  "flotilla-agent",
  "flotilla-client",
  "flotilla-commands",
+ "flotilla-config",
  "flotilla-core",
  "flotilla-daemon",
  "flotilla-daemon-api",
@@ -1097,6 +1098,7 @@ dependencies = [
  "flotilla-build-features-base",
  "flotilla-build-features-logging",
  "flotilla-build-features-types",
+ "flotilla-config",
  "flotilla-discovery-api",
  "flotilla-paths",
  "flotilla-protocol",
@@ -1532,6 +1534,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-config"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-paths",
+ "flotilla-protocol",
+ "flotilla-resources",
+ "hegeltest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "toml_edit 0.22.27",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "flotilla-controllers"
 version = "0.1.0"
 dependencies = [
@@ -1554,6 +1582,7 @@ dependencies = [
  "flotilla-build-features-types",
  "flotilla-change-request",
  "flotilla-cloud-agent",
+ "flotilla-config",
  "flotilla-core",
  "flotilla-daemon-api",
  "flotilla-discovery",
@@ -1616,6 +1645,7 @@ dependencies = [
  "flotilla-build-features-types",
  "flotilla-change-request",
  "flotilla-cloud-agent",
+ "flotilla-config",
  "flotilla-daemon-api",
  "flotilla-discovery",
  "flotilla-discovery-api",
@@ -1657,7 +1687,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "toml",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -1752,6 +1781,7 @@ dependencies = [
  "flotilla-build-features-types",
  "flotilla-change-request",
  "flotilla-client",
+ "flotilla-config",
  "flotilla-controllers",
  "flotilla-core",
  "flotilla-credentials",
@@ -1888,12 +1918,13 @@ dependencies = [
  "flotilla-build-features-logging",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-config",
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-provider-runtime",
  "flotilla-replay-testkit",
  "flotilla-resources",
- "serde",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -1905,6 +1936,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "flotilla-change-request",
+ "flotilla-config",
  "flotilla-discovery",
  "flotilla-discovery-api",
  "flotilla-environment",
@@ -1968,6 +2000,7 @@ dependencies = [
  "flotilla-build-features-os",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-config",
  "flotilla-discovery-api",
  "flotilla-paths",
  "flotilla-provider-runtime",
@@ -2029,6 +2062,7 @@ dependencies = [
  "flotilla-build-features-os",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-config",
  "flotilla-discovery-api",
  "flotilla-forge-forgejo",
  "flotilla-forge-github",
@@ -2085,6 +2119,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "flotilla-config",
  "flotilla-core",
  "flotilla-discovery",
  "flotilla-discovery-api",
@@ -2607,6 +2642,7 @@ dependencies = [
  "flotilla-build-features-types",
  "flotilla-client",
  "flotilla-commands",
+ "flotilla-config",
  "flotilla-core",
  "flotilla-daemon",
  "flotilla-daemon-api",
@@ -2650,6 +2686,7 @@ dependencies = [
  "flotilla-build-features-base",
  "flotilla-build-features-logging",
  "flotilla-build-features-types",
+ "flotilla-config",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-paths",

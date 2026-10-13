@@ -9,12 +9,12 @@ from check import (C_FREE_BASE, RESOURCE_EXEMPTIONS, c_free_violations,
                    feature_differences, is_testkit, layer, main, tree_features, violations)
 
 
-# Explicit finite generator: the seven names are fixed by the amended contract,
+# Explicit finite generator: the eight names are fixed by the amended contract,
 # independent of the implementation's policy set (which might regress).
 BASE_CRATES = (
     "flotilla-protocol", "flotilla-transport", "flotilla-paths",
     "flotilla-daemon-api", "flotilla-relay-protocol",
-    "flotilla-resources", "flotilla-client",
+    "flotilla-resources", "flotilla-client", "flotilla-config",
 )
 
 
@@ -47,6 +47,26 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-provider-runtime", normal=("flotilla-protocol", "flotilla-tls")),
             package("flotilla-core", normal=("flotilla-provider-runtime",)),
             package("flotilla-protocol"), package("flotilla-tls"),
+        )), [])
+
+    def test_config_is_base_and_independent(self):
+        # ADR 0060 step 4: host-local configuration is a C-free base crate that
+        # discovery and components may read, but it cannot reach upward.
+        self.assertEqual(layer("flotilla-config"), "base")
+        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+                       "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertEqual(violations(graph(
+                            package("flotilla-config", **{kind: (middle,)}),
+                            package("adapter", normal=(target,)), package(target),
+                        )), [f"flotilla-config: must not depend on {target}, directly or transitively"])
+        self.assertEqual(violations(graph(
+            package("flotilla-config", normal=("flotilla-protocol", "flotilla-paths", "flotilla-resources")),
+            package("flotilla-discovery-api", normal=("flotilla-config",)),
+            package("flotilla-core", normal=("flotilla-config", "flotilla-discovery-api")),
+            package("flotilla-protocol"), package("flotilla-paths"), package("flotilla-resources"),
         )), [])
 
     def test_discovery_api_is_native_and_independent(self):
@@ -503,7 +523,7 @@ class LayerContract(unittest.TestCase):
 
     def test_resources_exemptions_remain_native(self):
         self.assertTrue(RESOURCE_EXEMPTIONS.isdisjoint(C_FREE_BASE))
-        # Manifest keeps TLS and TUI/the executable still reach store through core;
+        # Manifest and TUI keep TLS and the executable still reaches store through core;
         # these production graphs retain native feature checks.
         for name in ("flotilla-manifest", "flotilla-tui", "flotilla"):
             self.assertIn(name, RESOURCE_EXEMPTIONS)

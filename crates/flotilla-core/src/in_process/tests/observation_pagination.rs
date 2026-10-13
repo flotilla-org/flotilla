@@ -13,9 +13,9 @@ use flotilla_resources::{Repository, RepositorySpec};
 use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
-use crate::config::ConfigStore;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery_with_runner;
+use flotilla_config::ConfigStore;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;

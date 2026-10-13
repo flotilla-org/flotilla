@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+flotilla-config = { path = "../flotilla-config" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
@@ -13,7 +14,6 @@ bon = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 flotilla-client = { path = "../flotilla-client" }
 flotilla-commands = { path = "../flotilla-commands" }
-flotilla-core = { path = "../flotilla-core" }
 flotilla-manifest = { path = "../flotilla-manifest" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }

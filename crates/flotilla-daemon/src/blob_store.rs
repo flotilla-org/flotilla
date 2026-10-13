@@ -9,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_core::config::BlobStoreConfig;
+use flotilla_config::BlobStoreConfig;
 use flotilla_protocol::BlobSyncStatus;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::HttpClient;

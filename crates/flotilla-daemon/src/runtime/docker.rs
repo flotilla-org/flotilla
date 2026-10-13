@@ -7,8 +7,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_config::ConfigStore;
 use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning};
-use flotilla_core::config::ConfigStore;
 use flotilla_credentials::{compose_agent_environment, AgentMaterialRegistry, CredentialStore};
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery::run_provisioned_host_detectors;

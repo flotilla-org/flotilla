@@ -27,12 +27,12 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use crate::config::ConfigStore;
 use crate::in_process::dispatch_board::tests::board;
 use crate::in_process::input_meta_from_resource;
 use crate::in_process::InProcessDaemon;
 use crate::in_process::WorkCredentialReconciler;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_config::ConfigStore;
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;

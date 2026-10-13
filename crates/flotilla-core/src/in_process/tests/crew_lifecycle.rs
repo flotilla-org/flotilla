@@ -16,9 +16,9 @@ use flotilla_store::ResourceBackend;
 use super::support::{
     claim_crew, resume_staging_fixture, stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta, wait_for_stall,
 };
-use crate::config::ConfigStore;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
 
 #[tokio::test]

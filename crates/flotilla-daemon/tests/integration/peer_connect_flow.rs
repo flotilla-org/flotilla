@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::peer::PeerManager;
 use flotilla_daemon::peer::PeerSender;

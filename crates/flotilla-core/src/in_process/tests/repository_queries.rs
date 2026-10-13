@@ -14,11 +14,11 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
-use crate::config::ConfigStore;
 use crate::in_process::{convoy_change_request_credential_refs, InProcessDaemon};
 use crate::model::RepoModel;
 use crate::repo_state::{RepoRootState, RepoState};
 use crate::testkits::discovery::fake_discovery;
+use flotilla_config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery::registry::ProviderRegistry;
 

@@ -3,7 +3,7 @@
 use std::hash::Hash;
 
 use crokey::KeyCombination;
-use flotilla_core::config::KeysConfig;
+use flotilla_config::KeysConfig;
 
 use crate::{
     binding_table::{BindingModeId, CompiledBindings, KeyBindingMode, BINDINGS},

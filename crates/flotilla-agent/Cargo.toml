@@ -25,6 +25,7 @@ toml_edit = { version = "0.22", features = ["serde"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
+flotilla-config = { path = "../flotilla-config" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }

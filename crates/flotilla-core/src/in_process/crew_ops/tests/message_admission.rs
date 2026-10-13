@@ -14,9 +14,9 @@ use flotilla_resources::{
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
 
 use super::{fixture, StagingProbe};
-use crate::config::ConfigStore;
 use crate::in_process::WorkCredentialReconciler;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_config::ConfigStore;
 
 #[tokio::test]
 async fn turn_admission_returns_the_canonical_suppressed_message() {

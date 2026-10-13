@@ -53,7 +53,8 @@ impl Factory for ForgejoIssueProviderFactory {
 mod tests {
     use std::sync::Arc;
 
-    use flotilla_discovery_api::provider_config::{ForgejoIssueTrackerConfig, IssueTrackerConfig, ProviderConfig};
+    use flotilla_config::provider_config::{ForgejoIssueTrackerConfig, IssueTrackerConfig};
+    use flotilla_discovery_api::provider_config::ProviderConfig;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
     use flotilla_discovery_api::UnmetRequirement;

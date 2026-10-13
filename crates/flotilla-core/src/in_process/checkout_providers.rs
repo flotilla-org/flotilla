@@ -21,7 +21,8 @@ use tokio::sync::{watch, OnceCell};
 use tracing::warn;
 
 use super::{checkout_path, discover_vcs_for_checkout, InProcessDaemon};
-use crate::{config::ConfigStore, environment_manager::ManagedEnvironmentKind};
+use crate::environment_manager::ManagedEnvironmentKind;
+use flotilla_config::ConfigStore;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_vcs::vcs::Vcs;

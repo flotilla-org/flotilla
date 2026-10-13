@@ -11,10 +11,10 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
-use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::RepositoryChangeRequestProvider;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::{fake_discovery, FakeChangeRequest, FakeVcsFactory, FakeVcsState};
+use flotilla_config::ConfigStore;
 
 #[tokio::test]
 async fn checkout_vcs_discovery_is_cached_per_checkout() {

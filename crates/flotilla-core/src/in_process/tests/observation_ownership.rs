@@ -14,10 +14,10 @@ use flotilla_store::ResourceBackend;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::{test_meta, SuspendedBoardProvider};
-use crate::config::ConfigStore;
 use crate::forge_observation::OWNER_LOCAL_INCREMENTAL_READ_ERROR;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::{fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders};
+use flotilla_config::ConfigStore;
 use flotilla_protocol::ChangeRequest;
 
 // #2868: three daemons sharing a Project poll its source once per pass.

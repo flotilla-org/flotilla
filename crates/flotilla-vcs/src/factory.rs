@@ -82,7 +82,7 @@ mod tests {
             &self.0
         }
         fn resolve_checkout_config(&self, _: &ExecutionEnvironmentPath) -> ResolvedCheckoutConfig {
-            ResolvedCheckoutConfig { path: crate::default_checkout_path() }
+            ResolvedCheckoutConfig { path: flotilla_config::default_checkout_path() }
         }
         async fn load_config_for_probe(&self) -> Result<ProviderConfig, String> {
             Ok(ProviderConfig::default())

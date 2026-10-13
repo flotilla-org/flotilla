@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_daemon_api::daemon::DaemonHandle;

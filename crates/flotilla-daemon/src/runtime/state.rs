@@ -12,10 +12,10 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_agent::process::ExitReceiptObserver;
+use flotilla_config::ConfigStore;
+use flotilla_config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY;
 use flotilla_controllers::reconcilers::clone::runtime::CloneFlights;
 use flotilla_controllers::reconcilers::CheckoutRemoval;
-use flotilla_core::config::ConfigStore;
-use flotilla_core::config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::StandingConvoyBackingInspector;
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};

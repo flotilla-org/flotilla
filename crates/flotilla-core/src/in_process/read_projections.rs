@@ -47,7 +47,6 @@ use tracing::warn;
 use super::{project_ops, resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 use crate::{
     checkout_integration::LANDING_EVIDENCE_TTL,
-    config::ConfigStore,
     environment_manager::EnvironmentManager,
     fleet::{
         accumulate_fleet_health_counts, fleet_observation_agreement, format_resource_replication_failures, host_credential_attention,
@@ -61,6 +60,7 @@ use crate::{
     },
     resource_explain::{explain_condition, explain_unmet_expectation, explained_provenance, observed_freshness},
 };
+use flotilla_config::ConfigStore;
 
 /// Read projections can inspect subscription evidence without changing subscriptions or delivery.
 #[async_trait]
@@ -1656,7 +1656,7 @@ impl ReadProjections<'_> {
             .map(|item| ExplainedArtifact {
                 kind: item.object.spec.kind.clone(),
                 address: format!("artifact/{}", item.object.metadata.name),
-                view_url: crate::config::artifact_view_url(&item.object.spec, &stores),
+                view_url: flotilla_config::artifact_view_url(&item.object.spec, &stores),
             })
             .collect::<Vec<_>>();
         artifacts.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.address.cmp(&b.address)));

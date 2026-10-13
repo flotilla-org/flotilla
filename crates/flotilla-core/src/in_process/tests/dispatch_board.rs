@@ -9,9 +9,9 @@ use flotilla_resources::{Convoy as ResourceConvoy, ConvoySpec, Project, ProjectS
 use flotilla_store::ResourceBackend;
 
 use super::support::{test_meta, SuspendedBoardProvider};
-use crate::config::ConfigStore;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::{fake_discovery_with_provider_set, FakeDiscoveryProviders};
+use flotilla_config::ConfigStore;
 
 // Tracker boundary: deliberately suspend native forge observations so the board
 // scenario can prove interactive reads never wait for remote work.

@@ -180,7 +180,7 @@ impl<'a> RequestDispatcher<'a> {
             store(&spec).await?;
             Ok(Response::ArtifactPut {
                 address: format!("artifact/{name}"),
-                view_url: flotilla_core::config::artifact_view_url(&spec, &settings.blob_stores),
+                view_url: flotilla_config::artifact_view_url(&spec, &settings.blob_stores),
                 digest: spec.digest,
             })
         })
@@ -209,10 +209,10 @@ impl<'a> RequestDispatcher<'a> {
             let stores = self.daemon.config_store().load_daemon_config()?.blob_stores;
             let artifact = service.artifact_for_reference(&reference).await?;
             let view_url =
-                artifact.as_ref().and_then(|artifact| flotilla_core::config::artifact_view_url(&artifact.spec, &stores)).or_else(|| {
+                artifact.as_ref().and_then(|artifact| flotilla_config::artifact_view_url(&artifact.spec, &stores)).or_else(|| {
                     crate::blob_store::BlobDigest::parse(&reference)
                         .ok()
-                        .and_then(|digest| flotilla_core::config::artifact_view_url_for_digest(digest.as_str(), &stores))
+                        .and_then(|digest| flotilla_config::artifact_view_url_for_digest(digest.as_str(), &stores))
                 });
             let (runner, destination_path) = if let Some(caller) = self.caller.crew.as_ref() {
                 let session = service.caller_session(caller).await?;
@@ -256,7 +256,7 @@ impl<'a> RequestDispatcher<'a> {
                 .into_iter()
                 .map(|item| {
                     let mut value = serde_json::to_value(item.to_k8s_object()).map_err(|error| error.to_string())?;
-                    if let Some(url) = flotilla_core::config::artifact_view_url(&item.spec, &stores) {
+                    if let Some(url) = flotilla_config::artifact_view_url(&item.spec, &stores) {
                         value["view_url"] = serde_json::Value::String(url);
                     }
                     Ok::<_, String>(value)

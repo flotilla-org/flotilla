@@ -156,7 +156,7 @@ pub(crate) async fn materialize_manifest_root(
 pub(crate) async fn materialize_bound_manifest_root(
     backend: &ResourceBackend,
     namespace: &str,
-    config: &flotilla_core::config::ResourceManifestsConfig,
+    config: &flotilla_config::ResourceManifestsConfig,
 ) -> Result<(), String> {
     if let Some(binding) = &config.binding {
         binding.validate()?;
@@ -264,7 +264,7 @@ impl ResourceManifestReconciler {
         materialize_bound_manifest_root(
             &self.backend,
             &self.default_namespace,
-            &flotilla_core::config::ResourceManifestsConfig {
+            &flotilla_config::ResourceManifestsConfig {
                 binding: self.binding.clone(),
                 dir: self.root.clone(),
                 source: self.source.clone(),
@@ -1110,7 +1110,7 @@ mod tests {
     use std::{process::Command, time::Duration};
 
     use chrono::Utc;
-    use flotilla_core::config::ConfigStore;
+    use flotilla_config::ConfigStore;
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
@@ -2103,7 +2103,7 @@ mod tests {
 
 #[cfg(test)]
 mod registered_charter_tests {
-    use flotilla_core::config::ConfigStore;
+    use flotilla_config::ConfigStore;
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_discovery_testkit::fake_discovery;
     use flotilla_protocol::HostName;

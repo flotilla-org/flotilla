@@ -13,10 +13,10 @@ use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 
 use super::support::test_meta;
-use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::RepositoryChangeRequestProvider;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_config::ConfigStore;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RestAdmissionReply {

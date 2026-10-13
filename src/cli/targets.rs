@@ -290,7 +290,7 @@ mod tests {
     async fn cli_repository_preflight_uses_durable_identity() {
         use std::sync::Arc;
 
-        use flotilla_core::config::ConfigStore;
+        use flotilla_config::ConfigStore;
         use flotilla_core::in_process::InProcessDaemon;
         use flotilla_discovery_testkit::fake_discovery_with_provider_set;
         use flotilla_discovery_testkit::FakeDiscoveryProviders;

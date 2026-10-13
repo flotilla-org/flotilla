@@ -20,6 +20,7 @@ urlencoding = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
+flotilla-config = { path = "../flotilla-config" }
 bon.workspace = true
 bytes.workspace = true
 dirs = "6"

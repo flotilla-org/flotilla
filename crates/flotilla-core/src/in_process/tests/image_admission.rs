@@ -8,9 +8,9 @@ use flotilla_resources::{CrewSource, CrewSpec, InputMeta, PlacementPolicy, Vesse
 use flotilla_store::ResourceBackend;
 
 use super::support::{create_docker_placement, test_meta};
-use crate::config::ConfigStore;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_config::ConfigStore;
 
 // ADR 0047/#2731: legacy baseline references resolve once into no-layer
 // compositions; later baseline edits cannot change admitted literal images.

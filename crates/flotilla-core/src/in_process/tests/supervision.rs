@@ -15,10 +15,10 @@ use flotilla_store::ResourceBackend;
 use futures::{FutureExt, StreamExt};
 
 use super::support::test_meta;
-use crate::config::ConfigStore;
 use crate::in_process::crew_ops::queue_pending_crew_message;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_config::ConfigStore;
 
 #[tokio::test]
 async fn operator_brief_survives_a_racing_nudge_until_delivery() {

@@ -10,6 +10,7 @@ aws-lc-provider = ["flotilla-tls/aws-lc-provider"]
 skip-no-sandbox-tests = ["flotilla-store/skip-no-sandbox-tests", "flotilla-cloud-agent/skip-no-sandbox-tests", "flotilla-ai-utility/skip-no-sandbox-tests"]
 
 [dependencies]
+flotilla-config = { path = "../flotilla-config" }
 flotilla-forge-forgejo = { path = "../flotilla-forge-forgejo" }
 flotilla-environment = { path = "../flotilla-environment" }
 flotilla-ai-utility = { path = "../flotilla-ai-utility" }
@@ -40,7 +41,6 @@ async-trait = { workspace = true }
 bon = { workspace = true }
 tracing = { workspace = true }
 indexmap = { workspace = true }
-toml = "0.8"
 reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
 http = { workspace = true }
 bytes = { workspace = true }

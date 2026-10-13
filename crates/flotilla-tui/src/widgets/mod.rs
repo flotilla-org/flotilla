@@ -17,7 +17,7 @@ pub mod tabs;
 use std::{any::Any, collections::HashMap};
 
 use crossterm::event::{KeyEvent, MouseEvent};
-use flotilla_core::config::ConfigStore;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, NodeId, ProvisioningTarget};
 use ratatui::{layout::Rect, Frame};
 

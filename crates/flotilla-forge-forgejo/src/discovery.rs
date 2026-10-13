@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use flotilla_discovery_api::provider_config::ForgejoIssueTrackerConfig;
+use flotilla_config::provider_config::ForgejoIssueTrackerConfig;
 use flotilla_discovery_api::provider_config::ProviderConfig;
 use flotilla_discovery_api::provider_config::ProviderConfigView;
 use flotilla_discovery_api::EnvironmentBag;
@@ -119,7 +119,8 @@ fn config_path(config_parent: &Path, path: &str) -> PathBuf {
 mod tests {
     use std::collections::BTreeSet;
 
-    use flotilla_discovery_api::provider_config::{ForgejoIssueTrackerConfig, IssueTrackerConfig, ProviderConfig};
+    use flotilla_config::provider_config::{ForgejoIssueTrackerConfig, IssueTrackerConfig};
+    use flotilla_discovery_api::provider_config::ProviderConfig;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_paths::path_context::DaemonHostPath;

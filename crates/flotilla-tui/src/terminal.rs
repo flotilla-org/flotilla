@@ -55,12 +55,12 @@ fn attach_argv(plan: &ResolvedAttachPlan) -> Result<(String, Vec<String>), Strin
 /// The destination comes from the viewer's hosts.toml; native OpenSSH inherits
 /// the console handles and carries terminal resize through its allocated PTY.
 pub fn remote_attach_plan(
-    hosts: &flotilla_core::config::HostsConfig,
+    hosts: &flotilla_config::HostsConfig,
     host: &flotilla_protocol::HostName,
     reference: &str,
     mode: flotilla_protocol::commands::AttachMode,
 ) -> Result<ResolvedAttachPlan, String> {
-    use flotilla_core::config::ssh_destination;
+    use flotilla_config::ssh_destination;
     use flotilla_protocol::commands::AttachMode;
 
     let mut routes = hosts.hosts.values().filter(|route| route.expected_host_name == host.as_str());
@@ -318,7 +318,7 @@ pub fn client_attach_plan(
     binding: Option<&flotilla_protocol::AttachBinding>,
     reference: &str,
     mode: flotilla_protocol::commands::AttachMode,
-    load_hosts: impl FnOnce() -> Result<flotilla_core::config::HostsConfig, String>,
+    load_hosts: impl FnOnce() -> Result<flotilla_config::HostsConfig, String>,
 ) -> Result<flotilla_protocol::ResolvedAttachPlan, String> {
     match endpoint {
         DaemonEndpoint::Local(_) => Ok(plan),
@@ -394,7 +394,7 @@ mod tests {
     // Exhaustive finite cases cover every mode and route cardinality.
     #[test]
     fn remote_attach_uses_viewer_routes_and_preserves_seat_mode() {
-        use flotilla_core::config::HostsConfig;
+        use flotilla_config::HostsConfig;
         use flotilla_protocol::{commands::AttachMode, HostName};
         let hosts: HostsConfig = serde_json::from_value(serde_json::json!({"hosts": {"kiwi": {
             "hostname": "kiwi-alias", "user": "crew", "expected_host_name": "kiwi"

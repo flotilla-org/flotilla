@@ -10,8 +10,8 @@ use std::{
 };
 
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_controllers::reconcilers::VesselReconciler;
-use flotilla_core::config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::leaf_engine::CrewTurnIntent;
 use flotilla_daemon::runtime::spawn_pending_supervisor_turn_task;

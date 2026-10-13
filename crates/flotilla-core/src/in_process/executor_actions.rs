@@ -41,11 +41,11 @@ use super::{
     empty_repo_identity, fallback_repo_identity, repository_operations, request_manifest_resolution, retry_resource_apply, AddRepoOutcome,
     OperatorReconciler,
 };
-use crate::config::ConfigStore;
 use crate::environment_manager::EnvironmentManager;
 use crate::executor;
 use crate::step::run_step_plan_with_remote_executor;
 use crate::step::RemoteStepExecutor;
+use flotilla_config::ConfigStore;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;

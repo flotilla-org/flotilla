@@ -46,7 +46,7 @@ pub(super) struct ReclaimRefusal {
 
 pub(super) struct RuntimeOperatorReconciler {
     pub(super) state: Arc<ControllerRuntimeState>,
-    pub(super) manifests: Option<flotilla_core::config::ResourceManifestsConfig>,
+    pub(super) manifests: Option<flotilla_config::ResourceManifestsConfig>,
     pub(super) local_root: String,
 }
 
