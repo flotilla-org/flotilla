@@ -4983,6 +4983,39 @@ interactions:
     }
 
     #[tokio::test]
+    async fn claude_oauth_delivery_refuses_an_environment_without_the_claude_binary() {
+        struct NoClaudeRunner(RecordingRunner);
+
+        #[async_trait]
+        impl CommandRunner for NoClaudeRunner {
+            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+                self.0.run(cmd, args, cwd, label).await
+            }
+
+            async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+                self.0.run_output(cmd, args, cwd, label).await
+            }
+
+            async fn exists(&self, cmd: &str, _args: &[&str]) -> bool {
+                cmd != "claude"
+            }
+        }
+
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string())])));
+        let recording = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, recording.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        let error = store
+            .prepare("env-a", &BTreeSet::from(["claude-max".to_string()]), Arc::new(NoClaudeRunner(RecordingRunner::default())))
+            .await
+            .expect_err("a matching harness without its binary must still refuse");
+        assert!(error.contains("consumer binary is unavailable"), "{error}");
+    }
+
+    #[tokio::test]
     async fn claude_oauth_preflight_scratch_dir_prefers_the_user_runtime_dir_over_absolute_run() {
         let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;

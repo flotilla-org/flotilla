@@ -139,6 +139,17 @@ impl CredentialConsumer {
         }
     }
 
+    /// The agent adapter id whose harness consumes this credential, for
+    /// harness-bound consumers. Delivery needs that harness's binary, so
+    /// admission grants such a credential only to vessels running the agent.
+    pub fn harness_adapter(&self) -> Option<&'static str> {
+        match self {
+            Self::Claude | Self::ClaudeOauth { .. } => Some("claude-code"),
+            Self::Codex => Some("codex"),
+            _ => None,
+        }
+    }
+
     pub fn delivery_slot(&self) -> &'static str {
         match self {
             Self::Gh | Self::GithubApp { .. } => "github",
