@@ -149,12 +149,14 @@ An identity-based artifact policy remains a candidate for future evaluation; it 
 
 ### Incremental compilation split
 
-Desk builds and crew vessel builds keep Cargo's incremental compilation enabled, because both iterate on one checkout: a crew rebuilds after every edit, rebase and review fix, and a full non-incremental rebuild of the touched crates dominated rebase turnaround. Crew target directories live on the hosts' scratch volumes and are removed with their convoy checkout at teardown; the daily sweep skips them (see above), so a long-lived convoy can be capped on demand with `scripts/prune-target.sh`. GitHub Actions and the Forgejo candidate builds set `CARGO_INCREMENTAL=0`, because each job builds once and incremental state would only inflate the target cache.
+Desk builds and crew vessel builds keep Cargo's incremental compilation enabled, because both iterate on one checkout: a crew rebuilds after every edit, rebase and review fix, and a full non-incremental rebuild of the touched crates dominated rebase turnaround. Crew vessel provisioning exports `CARGO_INCREMENTAL=1` explicitly, because Cargo disables incremental compilation by default whenever `CI` is set and agent harness shells may set it. Crew target directories live on the hosts' scratch volumes and are removed with their convoy checkout at teardown; the daily sweep skips them (see above), so a long-lived convoy can be capped on demand with `scripts/prune-target.sh`. GitHub Actions and the Forgejo candidate builds set `CARGO_INCREMENTAL=0`, because each job builds once and incremental state would only inflate the target cache.
 
-To confirm the setting in a dispatched crew vessel, check that the environment leaves Cargo's default in place:
+To confirm the setting in a dispatched crew vessel, build once and check both the environment and target:
 
 ```bash
-test -z "${CARGO_INCREMENTAL+set}"
+test "$CARGO_INCREMENTAL" = 1
+cargo check --locked
+test -n "$(find target -path '*/incremental/*' -print -quit)"
 ```
 
 ### Development debuginfo

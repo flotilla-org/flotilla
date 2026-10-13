@@ -153,14 +153,14 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         !coder_launch.env_vars.iter().any(|(key, _)| matches!(key.as_str(), "GH_TOKEN" | "GITHUB_TOKEN_FILE" | "GIT_CONFIG_GLOBAL")),
         "ungranted host-direct crew must remain credential-less"
     );
-    assert!(!coder_launch.env_vars.iter().any(|(key, _)| key == "CARGO_INCREMENTAL"), "crew builds keep Cargo's incremental default");
+    assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "CARGO_INCREMENTAL" && value == "1"));
     assert!(coder_launch
         .env_vars
         .iter()
         .any(|(key, value)| key == "CARGO_BUILD_JOBS" && value.parse::<usize>().is_ok_and(|jobs| jobs >= 2)));
     assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "RUSTC_WORKSPACE_WRAPPER" && Path::new(value).is_file()));
     let watcher_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-watcher")).expect("watcher launch");
-    assert!(!watcher_launch.env_vars.iter().any(|(key, _)| key == "CARGO_INCREMENTAL"), "crew builds keep Cargo's incremental default");
+    assert!(watcher_launch.env_vars.iter().any(|(key, value)| key == "CARGO_INCREMENTAL" && value == "1"));
     assert!(watcher_launch
         .env_vars
         .iter()

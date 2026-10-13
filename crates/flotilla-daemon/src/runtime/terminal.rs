@@ -485,6 +485,10 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 (flotilla_agent::process::monitored_command(&plan.command, &crew.id), env, Some(crew))
             }
         };
+        // Crews rebuild one checkout across edits, rebases and review fixes. Set this explicitly: Cargo turns
+        // incremental compilation off by default when `CI` is set, and harness shells may set it.
+        env.push(("CARGO_INCREMENTAL".to_string(), "1".to_string()));
+
         let is_agent_session = matches!(spec.source, TerminalSessionSource::Agent { .. });
         let host_ref = if spec.env_ref == self.state.host_direct_environment_name {
             Some(self.state.local_host_ref.as_str())
