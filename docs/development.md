@@ -149,17 +149,15 @@ An identity-based artifact policy remains a candidate for future evaluation; it 
 
 ### Incremental compilation split
 
-Interactive desk builds keep Cargo's incremental compilation enabled because it materially shortens the edit-build loop. Crew vessel provisioning exports `CARGO_INCREMENTAL=0`, so short-lived crew builds do not mint incremental generations. GitHub Actions also sets `CARGO_INCREMENTAL=0` for the same short-lived-build reason.
+Desk builds and crew vessel builds keep Cargo's incremental compilation enabled, because both iterate on one checkout: a crew rebuilds after every edit, rebase and review fix, and a full non-incremental rebuild of the touched crates dominated rebase turnaround. Crew vessel provisioning exports `CARGO_INCREMENTAL=1` explicitly, because Cargo disables incremental compilation by default whenever `CI` is set and agent harness shells may set it. Crew target directories live on the hosts' scratch volumes and are reclaimed only when teardown removes their convoy checkout: both the daily sweep and `scripts/prune-target.sh` skip `convoy-*` roots (see above), so a long-lived convoy's incremental state grows until teardown. GitHub Actions and the Forgejo candidate builds set `CARGO_INCREMENTAL=0`, because each job builds once and incremental state would only inflate the target cache.
 
 To confirm the setting in a dispatched crew vessel, build once and check both the environment and target:
 
 ```bash
-test "$CARGO_INCREMENTAL" = 0
+test "$CARGO_INCREMENTAL" = 1
 cargo check --locked
-test -z "$(find target -path '*/incremental/*' -print -quit)"
+test -n "$(find target -path '*/incremental/*' -print -quit)"
 ```
-
-Current Cargo may create the empty `target/debug/incremental/` container even when incremental compilation is disabled; the verification checks that it contains no generated state.
 
 ### Development debuginfo
 
