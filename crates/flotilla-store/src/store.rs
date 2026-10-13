@@ -1,6 +1,9 @@
 //! Untyped storage seam. Kind descriptors retain resource validation at the
 //! authoritative write boundary, including while a backend holds its transaction.
 use crate::replica::StoredReplicaEventKind;
+use crate::{
+    typed_object, typed_read, typed_read_list, typed_read_watch, DecodedList, DecodedObject, DecodedQueryResult, DecodedReadObject,
+};
 use chrono::Utc;
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
@@ -10,7 +13,7 @@ use flotilla_resources::{
     ResourceTombstone, StatusPatch, WatchEvent, WatchStart, WatchStream,
 };
 use futures::StreamExt;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -43,7 +46,9 @@ pub struct ResourceKind {
     pub queryable_fields: &'static [&'static str],
     pub queryable_numeric_fields: &'static [&'static str],
     pub validate_namespace: bool,
-    decode: fn(Value) -> Result<ResourceObject<SerializedResource>, ResourceError>,
+    validate_stored_fn: fn(&K8sResourceObject<SerializedResource>) -> Result<(), ResourceError>,
+    decode_typed_text_fn: fn(&str) -> Result<DecodedObject, ResourceError>,
+    decode_typed_value_fn: fn(&Value) -> Result<DecodedObject, ResourceError>,
     validate_spec_fn: fn(&InputMeta, &Value) -> Result<(), ResourceError>,
     validate_spec_update_fn: fn(&Value, &Value) -> Result<(), ResourceError>,
     validate_status_update_fn: fn(Option<&Value>, &Value) -> Result<(), ResourceError>,
@@ -55,6 +60,36 @@ impl std::fmt::Debug for ResourceKind {
         f.debug_struct("ResourceKind").field("paths", &self.paths).finish()
     }
 }
+fn stored_decode_error(error: impl std::fmt::Display) -> ResourceError {
+    ResourceError::decode(format!("decode stored object: {error}"))
+}
+/// The registered type's view of a serialized object: its apiVersion and kind,
+/// and a typed deserialization of its spec and status. Metadata is already
+/// typed in the serialized form. This is the same acceptance as deserializing
+/// the whole object into `K8sResourceObject<T>`, without building a `T`-shaped
+/// copy of the tree it borrows.
+fn validate_stored<T: Resource>(object: &K8sResourceObject<SerializedResource>) -> Result<(), ResourceError> {
+    let expected_api_version = api_version(T::API_PATHS);
+    if object.api_version != expected_api_version {
+        return Err(ResourceError::decode(format!("unexpected apiVersion '{}', expected '{}'", object.api_version, expected_api_version)));
+    }
+    if object.kind != T::API_PATHS.kind {
+        return Err(ResourceError::decode(format!("unexpected kind '{}', expected '{}'", object.kind, T::API_PATHS.kind)));
+    }
+    T::Spec::deserialize(&object.spec).map_err(stored_decode_error)?;
+    if let Some(status) = &object.status {
+        Option::<T::Status>::deserialize(status).map_err(stored_decode_error)?;
+    }
+    Ok(())
+}
+fn decode_typed_text<T: Resource>(text: &str) -> Result<DecodedObject, ResourceError> {
+    let object: K8sResourceObject<T> = serde_json::from_str(text).map_err(stored_decode_error)?;
+    Ok(DecodedObject::typed(ResourceObject::from_k8s_object(object)?))
+}
+fn decode_typed_value<T: Resource>(value: &Value) -> Result<DecodedObject, ResourceError> {
+    let object: K8sResourceObject<T> = serde::Deserialize::deserialize(value).map_err(stored_decode_error)?;
+    Ok(DecodedObject::typed(ResourceObject::from_k8s_object(object)?))
+}
 impl ResourceKind {
     pub fn of<T: Resource>() -> Self {
         Self {
@@ -63,18 +98,9 @@ impl ResourceKind {
             queryable_fields: T::QUERYABLE_FIELDS,
             queryable_numeric_fields: T::QUERYABLE_NUMERIC_FIELDS,
             validate_namespace: T::VALIDATE_NAMESPACE_SPEC,
-            decode: |value| {
-                // Validate the registered type before exposing a stored row as
-                // serialized data. Keep the raw body so defaults/unknown fields
-                // are not rewritten by this read. Live watches decode only once
-                // in the typed extension; SQLite uses this pass for quarantine.
-                let object: K8sResourceObject<T> =
-                    serde::Deserialize::deserialize(&value).map_err(|e| ResourceError::decode(format!("decode stored object: {e}")))?;
-                ResourceObject::from_k8s_object(object)?;
-                let object: K8sResourceObject<SerializedResource> =
-                    serde_json::from_value(value).map_err(|e| ResourceError::decode(e.to_string()))?;
-                Ok(ResourceObject { metadata: object.metadata.into(), spec: object.spec, status: object.status })
-            },
+            validate_stored_fn: validate_stored::<T>,
+            decode_typed_text_fn: decode_typed_text::<T>,
+            decode_typed_value_fn: decode_typed_value::<T>,
             validate_spec_fn: |meta, spec| T::validate_spec(meta, &transcode(spec)?),
             validate_spec_update_fn: |current, requested| T::validate_spec_update(&transcode(current)?, &transcode(requested)?),
             validate_status_update_fn: |current, requested| {
@@ -90,11 +116,29 @@ impl ResourceKind {
             digest_fn: PartitionDigest::new::<T>,
         }
     }
+    /// Validate a stored tree against the registered type and expose it as
+    /// serialized data. The spec and status trees are kept as stored, so
+    /// defaults and unknown fields are not rewritten for raw callers.
     pub fn decode_object(self, value: Value) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        (self.decode)(value)
+        self.from_k8s(serde_json::from_value(value).map_err(stored_decode_error)?)
+    }
+    /// [`Self::decode_object`] for a stored body: one parse and one typed
+    /// validation pass.
+    pub fn decode_object_text(self, text: &str) -> Result<ResourceObject<SerializedResource>, ResourceError> {
+        self.from_k8s(serde_json::from_str(text).map_err(stored_decode_error)?)
     }
     pub fn from_k8s(self, object: K8sResourceObject<SerializedResource>) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        self.decode_object(serde_json::to_value(object).map_err(|e| ResourceError::decode(e.to_string()))?)
+        (self.validate_stored_fn)(&object)?;
+        Ok(ResourceObject { metadata: object.metadata.into(), spec: object.spec, status: object.status })
+    }
+    /// Decode a stored body once, straight into the registered type. A typed
+    /// read uses this as its only decode, so it is also the quarantine check.
+    pub fn decode_typed_text(self, text: &str) -> Result<DecodedObject, ResourceError> {
+        (self.decode_typed_text_fn)(text)
+    }
+    /// Decode a stored tree once into the registered type, borrowing the tree.
+    pub fn decode_typed_value(self, value: &Value) -> Result<DecodedObject, ResourceError> {
+        (self.decode_typed_value_fn)(value)
     }
     pub fn encode_object(self, object: &ResourceObject<SerializedResource>) -> Result<Value, ResourceError> {
         serde_json::to_value(K8sResourceObject::<SerializedResource> {
@@ -105,13 +149,6 @@ impl ResourceKind {
             status: object.status.clone(),
         })
         .map_err(|e| ResourceError::decode(e.to_string()))
-    }
-    pub fn decode_watch_object<'de>(
-        self,
-        value: impl serde::Deserializer<'de, Error = serde_json::Error>,
-    ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        let value = serde::Deserialize::deserialize(value).map_err(|e| ResourceError::decode(e.to_string()))?;
-        self.decode_object(value)
     }
     pub fn validate_spec(self, meta: &InputMeta, spec: &Value) -> Result<(), ResourceError> {
         (self.validate_spec_fn)(meta, spec)
@@ -553,6 +590,72 @@ pub trait Store: std::fmt::Debug + Send + Sync {
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
         Err(self.unsupported_operation("replicas"))
     }
+
+    // Typed reads. Each returns rows decoded once by `resource_kind`'s typed
+    // decoder; [`StoreExt`] unwraps them for `T`. The defaults read the raw
+    // form, which the kind has already validated, and leave one typed
+    // deserialization of spec and status to the caller. Adapters that hold
+    // stored text override them to decode each body once, straight into `T`.
+
+    async fn get_decoded(&self, resource_kind: ResourceKind, namespace: &str, name: &str) -> Result<DecodedObject, ResourceError> {
+        Ok(DecodedObject::serialized(self.get_raw(resource_kind, namespace, name).await?))
+    }
+    async fn list_decoded(&self, resource_kind: ResourceKind, namespace: &str) -> Result<DecodedList, ResourceError> {
+        Ok(DecodedList::serialized(self.list_raw(resource_kind, namespace).await?))
+    }
+    async fn list_decoded_matching_labels(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        required: &BTreeMap<String, String>,
+    ) -> Result<DecodedList, ResourceError> {
+        Ok(DecodedList::serialized(self.list_raw_matching_labels(resource_kind, namespace, required).await?))
+    }
+    async fn list_replicas_decoded(&self, resource_kind: ResourceKind, namespace: &str) -> Result<Vec<DecodedReadObject>, ResourceError> {
+        Ok(self.list_replicas_raw(resource_kind, namespace).await?.into_iter().map(DecodedReadObject::serialized).collect())
+    }
+    async fn get_replicas_decoded(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Vec<DecodedReadObject>, ResourceError> {
+        Ok(self.get_replicas_raw(resource_kind, namespace, name).await?.into_iter().map(DecodedReadObject::serialized).collect())
+    }
+    async fn query_decoded(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        query: &crate::StoreQuery,
+    ) -> Result<DecodedQueryResult, ResourceError> {
+        Ok(DecodedQueryResult::serialized(self.query_raw(resource_kind, namespace, query).await?))
+    }
+    async fn query_messages_decoded(
+        &self,
+        namespace: &str,
+        query: &crate::MessageQuery,
+        include_replicas: bool,
+    ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
+        self.query_messages_raw(namespace, query, include_replicas).await?.into_iter().map(typed_read).collect()
+    }
+    async fn query_message_replicas_decoded(
+        &self,
+        namespace: &str,
+        query: &crate::MessageQuery,
+    ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
+        self.query_message_replicas_raw(namespace, query).await?.into_iter().map(typed_read).collect()
+    }
+    /// A watch whose replayed events may arrive as [`crate::WatchPayload::Decoded`]
+    /// rows for `resource_kind`'s registered type. Only typed consumers
+    /// ([`crate::SerializedWatchEvent::decode`]) may read it.
+    async fn watch_decoded(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        start: WatchStart,
+    ) -> Result<crate::SerializedWatchStream, ResourceError> {
+        self.watch_raw(resource_kind, namespace, start).await
+    }
 }
 
 /// Typed convenience layer over the untyped store. Backend implementations do
@@ -565,14 +668,14 @@ pub trait StoreExt: Store {
         query: &crate::MessageQuery,
         include_replicas: bool,
     ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        self.query_messages_raw(namespace, query, include_replicas).await?.into_iter().map(convert_read).collect()
+        self.query_messages_decoded(namespace, query, include_replicas).await
     }
     async fn query_message_replicas(
         &self,
         namespace: &str,
         query: &crate::MessageQuery,
     ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        self.query_message_replicas_raw(namespace, query).await?.into_iter().map(convert_read).collect()
+        self.query_message_replicas_decoded(namespace, query).await
     }
     async fn delete_decode_quarantine_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<bool, ResourceError> {
         Ok(self.delete_decode_quarantine_raw(ResourceKind::of::<T>(), namespace, name).await?)
@@ -584,10 +687,10 @@ pub trait StoreExt: Store {
         Ok(self.stored_namespaces_raw(ResourceKind::of::<T>()).await?)
     }
     async fn list_replicas_typed<T: Resource>(&self, namespace: &str) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
-        self.list_replicas_raw(ResourceKind::of::<T>(), namespace).await?.into_iter().map(convert_read).collect()
+        self.list_replicas_decoded(ResourceKind::of::<T>(), namespace).await?.into_iter().map(DecodedReadObject::into_typed).collect()
     }
     async fn get_replicas_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
-        self.get_replicas_raw(ResourceKind::of::<T>(), namespace, name).await?.into_iter().map(convert_read).collect()
+        self.get_replicas_decoded(ResourceKind::of::<T>(), namespace, name).await?.into_iter().map(DecodedReadObject::into_typed).collect()
     }
     async fn watch_replicas_typed<T: Resource>(
         &self,
@@ -655,7 +758,7 @@ pub trait StoreExt: Store {
         Ok(self.replica_cursor_raw(ResourceKind::of::<T>(), origin_root, namespace).await?)
     }
     async fn get_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ResourceObject<T>, ResourceError> {
-        transcode(self.get_raw(ResourceKind::of::<T>(), namespace, name).await?)
+        self.get_decoded(ResourceKind::of::<T>(), namespace, name).await?.into_typed()
     }
     async fn current_position_typed<T: Resource>(&self, namespace: &str) -> Result<crate::ResourcePosition, ResourceError> {
         Ok(self.current_position_raw(ResourceKind::of::<T>(), namespace).await?)
@@ -685,14 +788,14 @@ pub trait StoreExt: Store {
         Ok(self.replica_digest_raw(ResourceKind::of::<T>(), origin, namespace, generation).await?)
     }
     async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
-        transcode(self.list_raw(ResourceKind::of::<T>(), namespace).await?)
+        self.list_decoded(ResourceKind::of::<T>(), namespace).await?.into_typed()
     }
     async fn list_typed_matching_labels<T: Resource>(
         &self,
         namespace: &str,
         required: &BTreeMap<String, String>,
     ) -> Result<ResourceList<T>, ResourceError> {
-        transcode(self.list_raw_matching_labels(ResourceKind::of::<T>(), namespace, required).await?)
+        self.list_decoded_matching_labels(ResourceKind::of::<T>(), namespace, required).await?.into_typed()
     }
     async fn create_typed<T: Resource>(
         &self,
@@ -701,7 +804,7 @@ pub trait StoreExt: Store {
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
         let spec = transcode_request(self.blocking_request_encoding(), spec.clone()).await?;
-        transcode(self.create_raw(ResourceKind::of::<T>(), namespace, meta, &spec).await?)
+        typed_object(self.create_raw(ResourceKind::of::<T>(), namespace, meta, &spec).await?)
     }
     async fn create_definition_typed<T: Resource>(
         &self,
@@ -711,7 +814,7 @@ pub trait StoreExt: Store {
         merge: MergeMetadata,
     ) -> Result<ResourceObject<T>, ResourceError> {
         let spec = transcode_request(self.blocking_request_encoding(), spec.clone()).await?;
-        transcode(self.create_definition_raw(ResourceKind::of::<T>(), namespace, meta, &spec, merge).await?)
+        typed_object(self.create_definition_raw(ResourceKind::of::<T>(), namespace, meta, &spec, merge).await?)
     }
     async fn update_typed<T: Resource>(
         &self,
@@ -721,7 +824,7 @@ pub trait StoreExt: Store {
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
         let spec = transcode_request(self.blocking_request_encoding(), spec.clone()).await?;
-        transcode(self.update_raw(ResourceKind::of::<T>(), namespace, meta, resource_version, &spec).await?)
+        typed_object(self.update_raw(ResourceKind::of::<T>(), namespace, meta, resource_version, &spec).await?)
     }
     async fn update_definition_typed<T: Resource>(
         &self,
@@ -732,7 +835,7 @@ pub trait StoreExt: Store {
         merge: MergeMetadata,
     ) -> Result<ResourceObject<T>, ResourceError> {
         let spec = transcode_request(self.blocking_request_encoding(), spec.clone()).await?;
-        transcode(self.update_definition_raw(ResourceKind::of::<T>(), namespace, meta, resource_version, &spec, merge).await?)
+        typed_object(self.update_definition_raw(ResourceKind::of::<T>(), namespace, meta, resource_version, &spec, merge).await?)
     }
     async fn update_status_typed<T: Resource>(
         &self,
@@ -742,7 +845,7 @@ pub trait StoreExt: Store {
         status: &T::Status,
     ) -> Result<ResourceObject<T>, ResourceError> {
         let status = transcode_request(self.blocking_request_encoding(), status.clone()).await?;
-        transcode(self.update_status_raw(ResourceKind::of::<T>(), namespace, name, resource_version, &status).await?)
+        typed_object(self.update_status_raw(ResourceKind::of::<T>(), namespace, name, resource_version, &status).await?)
     }
     async fn delete_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<(), ResourceError> {
         Ok(self.delete_raw(ResourceKind::of::<T>(), namespace, name).await?)
@@ -756,54 +859,54 @@ pub trait StoreExt: Store {
         Ok(self.tombstone_raw(ResourceKind::of::<T>(), namespace, name, minimum_resource_version).await?)
     }
     async fn watch_typed<T: Resource>(&self, namespace: &str, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
-        let stream = self.watch_raw(ResourceKind::of::<T>(), namespace, start).await?;
+        let stream = self.watch_decoded(ResourceKind::of::<T>(), namespace, start).await?;
         let generation = stream.generation().map(str::to_owned);
         Ok(WatchStream::new(generation, stream.map(|e| e.and_then(crate::SerializedWatchEvent::decode)).boxed()))
     }
     async fn list_including_replicas_typed<T: Resource>(&self, namespace: &str) -> Result<ReadResourceList<T>, ResourceError> {
-        convert_read_list(self.list_including_replicas_raw(ResourceKind::of::<T>(), namespace).await?)
+        typed_read_list(self.list_including_replicas_raw(ResourceKind::of::<T>(), namespace).await?)
     }
     async fn list_including_replicas_typed_matching_labels<T: Resource>(
         &self,
         namespace: &str,
         required: &BTreeMap<String, String>,
     ) -> Result<ReadResourceList<T>, ResourceError> {
-        convert_read_list(self.list_including_replicas_raw_matching_labels(ResourceKind::of::<T>(), namespace, required).await?)
+        typed_read_list(self.list_including_replicas_raw_matching_labels(ResourceKind::of::<T>(), namespace, required).await?)
     }
     async fn get_including_replicas_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ReadResourceObject<T>, ResourceError> {
-        convert_read(self.get_including_replicas_raw(ResourceKind::of::<T>(), namespace, name).await?)
+        typed_read(self.get_including_replicas_raw(ResourceKind::of::<T>(), namespace, name).await?)
     }
     async fn get_all_including_replicas_typed<T: Resource>(
         &self,
         namespace: &str,
         name: &str,
     ) -> Result<ReadResourceList<T>, ResourceError> {
-        convert_read_list(self.get_all_including_replicas_raw(ResourceKind::of::<T>(), namespace, name).await?)
+        typed_read_list(self.get_all_including_replicas_raw(ResourceKind::of::<T>(), namespace, name).await?)
     }
     async fn list_replica_sources_typed<T: Resource>(&self, namespace: &str) -> Result<ReadResourceList<T>, ResourceError> {
-        convert_read_list(self.list_replica_sources_raw(ResourceKind::of::<T>(), namespace).await?)
+        typed_read_list(self.list_replica_sources_raw(ResourceKind::of::<T>(), namespace).await?)
     }
     async fn list_read_view_typed<T: Resource>(&self, namespace: &str, query_key: &str) -> Result<ReadResourceList<T>, ResourceError> {
-        convert_read_list(self.list_read_view_raw(ResourceKind::of::<T>(), namespace, query_key).await?)
+        typed_read_list(self.list_read_view_raw(ResourceKind::of::<T>(), namespace, query_key).await?)
     }
     async fn watch_including_replicas_typed<T: Resource>(
         &self,
         namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
-        Ok(self.watch_including_replicas_raw(ResourceKind::of::<T>(), namespace).await?.map(|e| e.and_then(convert_read_watch)).boxed())
+        Ok(self.watch_including_replicas_raw(ResourceKind::of::<T>(), namespace).await?.map(|e| e.and_then(typed_read_watch)).boxed())
     }
     async fn watch_replica_sources_typed<T: Resource>(
         &self,
         namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
-        Ok(self.watch_replica_sources_raw(ResourceKind::of::<T>(), namespace).await?.map(|e| e.and_then(convert_read_watch)).boxed())
+        Ok(self.watch_replica_sources_raw(ResourceKind::of::<T>(), namespace).await?.map(|e| e.and_then(typed_read_watch)).boxed())
     }
     async fn watch_read_view_typed<T: Resource>(
         &self,
         namespace: &str,
         query_key: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
-        Ok(self.watch_read_view_raw(ResourceKind::of::<T>(), namespace, query_key).await?.map(|e| e.and_then(convert_read_watch)).boxed())
+        Ok(self.watch_read_view_raw(ResourceKind::of::<T>(), namespace, query_key).await?.map(|e| e.and_then(typed_read_watch)).boxed())
     }
 }
 #[async_trait::async_trait]

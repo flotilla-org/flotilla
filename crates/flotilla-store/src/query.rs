@@ -1,5 +1,5 @@
 //! Declared equality queries shared by storage adapters and resource HTTP.
-use crate::{convert_read_list, MessageQuery, ReadResourceList, Resource, ResourceBackend, ResourceError, ResourceKind, TypedResolver};
+use crate::{MessageQuery, ReadResourceList, Resource, ResourceBackend, ResourceError, ResourceKind, TypedResolver};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -96,9 +96,15 @@ pub struct ReplicaShadowing {
 
 /// Stable order across adapters: name, then local before replicas, then origin.
 pub fn sort_query_items(items: &mut [crate::ReadResourceObject<crate::SerializedResource>]) {
+    sort_query_rows(items, |item| (item.object.metadata.name.as_str(), &item.provenance));
+}
+
+/// [`sort_query_items`] for any row shape that exposes a name and provenance.
+pub fn sort_query_rows<I>(items: &mut [I], key: impl Fn(&I) -> (&str, &crate::ResourceProvenance)) {
     use crate::ResourceProvenance;
     items.sort_by(|a, b| {
-        a.object.metadata.name.cmp(&b.object.metadata.name).then_with(|| match (&a.provenance, &b.provenance) {
+        let ((a_name, a), (b_name, b)) = (key(a), key(b));
+        a_name.cmp(b_name).then_with(|| match (a, b) {
             (ResourceProvenance::Local, ResourceProvenance::Local) => std::cmp::Ordering::Equal,
             (ResourceProvenance::Local, _) => std::cmp::Ordering::Less,
             (_, ResourceProvenance::Local) => std::cmp::Ordering::Greater,
@@ -287,12 +293,13 @@ impl StoreQuery {
 }
 impl<T: Resource> TypedResolver<T> {
     pub async fn query_declared(&self, query: &StoreQuery) -> Result<ReadResourceList<T>, ResourceError> {
-        convert_read_list(self.backend.store().query_raw(ResourceKind::of::<T>(), &self.namespace, query).await?.into_list())
+        let items = self.backend.store().query_decoded(ResourceKind::of::<T>(), &self.namespace, query).await?.into_typed()?;
+        Ok(ReadResourceList { items })
     }
 }
 impl ResourceBackend {
     pub async fn query_declared<T: Resource>(&self, namespace: &str, query: &StoreQuery) -> Result<ReadResourceList<T>, ResourceError> {
-        convert_read_list(self.store().query_raw(ResourceKind::of::<T>(), namespace, query).await?.into_list())
+        Ok(ReadResourceList { items: self.store().query_decoded(ResourceKind::of::<T>(), namespace, query).await?.into_typed()? })
     }
 }
 

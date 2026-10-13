@@ -1,5 +1,6 @@
-use crate::{convert_read, transcode, ReadObserver, ReadOperation, ResourceKind, SerializedResource};
+use crate::{convert_read, ReadObserver, ReadOperation, ResourceKind, SerializedResource};
 use crate::{watch, DigestQuery, MessageQuery, PartitionDigest, ResourcePosition};
+use crate::{DecodedList, DecodedObject, DecodedReadObject};
 use crate::{SerializedReadWatchEvent, SerializedWatchEvent, SerializedWatchStream, WatchAction, WatchObject, WatchPayload};
 use crate::{Store, StoreExt};
 use std::{
@@ -25,6 +26,73 @@ use crate::{
 };
 
 type StoreKey = (String, String, String, String);
+
+/// Decodes one stored tree for a read: the validated tree for raw callers, or
+/// one borrowed typed deserialization for typed callers.
+type ValueDecode<R> = fn(ResourceKind, &Value) -> Result<R, ResourceError>;
+fn serialized_value(kind: ResourceKind, value: &Value) -> Result<ResourceObject<SerializedResource>, ResourceError> {
+    kind.decode_object(value.clone())
+}
+fn typed_value(kind: ResourceKind, value: &Value) -> Result<DecodedObject, ResourceError> {
+    kind.decode_typed_value(value)
+}
+
+/// Declared-query rows and their provenance, before merging and sorting.
+type QueryRows<R> = Vec<(R, ResourceProvenance)>;
+
+/// The row shape of one declared query: decoding a stored tree, and the same
+/// query delegated to a composed durable replica store.
+trait QueryRowForm {
+    type Row: Send;
+    fn decode(kind: ResourceKind, value: &Value) -> Result<Self::Row, ResourceError>;
+    fn name(row: &Self::Row) -> &str;
+    fn durable<'a>(
+        store: &'a dyn Store,
+        kind: ResourceKind,
+        namespace: &'a str,
+        query: &'a crate::StoreQuery,
+    ) -> futures::future::BoxFuture<'a, Result<QueryRows<Self::Row>, ResourceError>>;
+}
+struct SerializedRows;
+impl QueryRowForm for SerializedRows {
+    type Row = ResourceObject<SerializedResource>;
+    fn decode(kind: ResourceKind, value: &Value) -> Result<Self::Row, ResourceError> {
+        serialized_value(kind, value)
+    }
+    fn name(row: &Self::Row) -> &str {
+        &row.metadata.name
+    }
+    fn durable<'a>(
+        store: &'a dyn Store,
+        kind: ResourceKind,
+        namespace: &'a str,
+        query: &'a crate::StoreQuery,
+    ) -> futures::future::BoxFuture<'a, Result<QueryRows<Self::Row>, ResourceError>> {
+        Box::pin(async move {
+            Ok(store.query_raw(kind, namespace, query).await?.items.into_iter().map(|item| (item.object, item.provenance)).collect())
+        })
+    }
+}
+struct TypedRows;
+impl QueryRowForm for TypedRows {
+    type Row = DecodedObject;
+    fn decode(kind: ResourceKind, value: &Value) -> Result<Self::Row, ResourceError> {
+        typed_value(kind, value)
+    }
+    fn name(row: &Self::Row) -> &str {
+        row.name()
+    }
+    fn durable<'a>(
+        store: &'a dyn Store,
+        kind: ResourceKind,
+        namespace: &'a str,
+        query: &'a crate::StoreQuery,
+    ) -> futures::future::BoxFuture<'a, Result<QueryRows<Self::Row>, ResourceError>> {
+        Box::pin(async move {
+            Ok(store.query_decoded(kind, namespace, query).await?.items.into_iter().map(|item| (item.object, item.provenance)).collect())
+        })
+    }
+}
 
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[builder(builder_type(vis = "pub(in crate::in_memory)"))]
@@ -164,7 +232,7 @@ impl InMemoryBackend {
             if let Some(store) = stores.get(&key) {
                 for name in store.messages.names(query) {
                     items.push(ReadResourceObject {
-                        object: transcode(Self::decode_object(resource_kind, store.objects[&name].clone())?)?,
+                        object: resource_kind.decode_typed_value(&store.objects[&name])?.into_typed()?,
                         provenance: ResourceProvenance::Local,
                     });
                 }
@@ -181,7 +249,7 @@ impl InMemoryBackend {
                     }
                     for name in partition.messages.names(query) {
                         items.push(ReadResourceObject {
-                            object: transcode(Self::decode_object(resource_kind, partition.objects[&name].clone())?)?,
+                            object: resource_kind.decode_typed_value(&partition.objects[&name])?.into_typed()?,
                             provenance: ResourceProvenance::Replica {
                                 origin_root: origin_root.clone(),
                                 last_synced_at: partition.synced_at_by_name[&name],
@@ -387,6 +455,28 @@ impl InMemoryBackend {
         if let Some(backend) = &self.durable_replicas {
             return backend.list_replicas_raw(resource_kind, namespace).await;
         }
+        let rows = self.list_replica_rows(resource_kind, namespace, serialized_value).await?;
+        Ok(rows.into_iter().map(|(object, provenance)| ReadResourceObject { object, provenance }).collect())
+    }
+
+    pub async fn list_replicas_decoded(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+    ) -> Result<Vec<DecodedReadObject>, ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.store().list_replicas_decoded(resource_kind, namespace).await;
+        }
+        let rows = self.list_replica_rows(resource_kind, namespace, typed_value).await?;
+        Ok(rows.into_iter().map(|(object, provenance)| DecodedReadObject { object, provenance }).collect())
+    }
+
+    async fn list_replica_rows<R>(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        decode: ValueDecode<R>,
+    ) -> Result<Vec<(R, ResourceProvenance)>, ResourceError> {
         let key = Self::store_key(resource_kind, namespace);
         let replicas = self.replicas.lock().await;
         let mut items = Vec::new();
@@ -400,10 +490,10 @@ impl InMemoryBackend {
                     .get(name)
                     .copied()
                     .ok_or_else(|| ResourceError::other(format!("replica row '{name}' has no sync timestamp")))?;
-                items.push(ReadResourceObject {
-                    object: Self::decode_object(resource_kind, value.clone())?,
-                    provenance: ResourceProvenance::Replica { origin_root: origin_root.clone(), last_synced_at },
-                });
+                items.push((
+                    decode(resource_kind, value)?,
+                    ResourceProvenance::Replica { origin_root: origin_root.clone(), last_synced_at },
+                ));
             }
         }
         self.count_read(resource_kind, ReadOperation::List, items.len());
@@ -419,6 +509,30 @@ impl InMemoryBackend {
         if let Some(backend) = &self.durable_replicas {
             return backend.get_replicas_raw(resource_kind, namespace, name).await;
         }
+        let rows = self.get_replica_rows(resource_kind, namespace, name, serialized_value).await?;
+        Ok(rows.into_iter().map(|(object, provenance)| ReadResourceObject { object, provenance }).collect())
+    }
+
+    pub async fn get_replicas_decoded(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Vec<DecodedReadObject>, ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.store().get_replicas_decoded(resource_kind, namespace, name).await;
+        }
+        let rows = self.get_replica_rows(resource_kind, namespace, name, typed_value).await?;
+        Ok(rows.into_iter().map(|(object, provenance)| DecodedReadObject { object, provenance }).collect())
+    }
+
+    async fn get_replica_rows<R>(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+        decode: ValueDecode<R>,
+    ) -> Result<Vec<(R, ResourceProvenance)>, ResourceError> {
         let key = Self::store_key(resource_kind, namespace);
         let replicas = self.replicas.lock().await;
         let mut items = Vec::new();
@@ -436,10 +550,7 @@ impl InMemoryBackend {
                 .ok_or_else(|| ResourceError::other(format!("replica row '{name}' has no sync timestamp")))?;
             items.push((
                 origin_root.clone(),
-                ReadResourceObject {
-                    object: Self::decode_object(resource_kind, value.clone())?,
-                    provenance: ResourceProvenance::Replica { origin_root: origin_root.clone(), last_synced_at },
-                },
+                (decode(resource_kind, value)?, ResourceProvenance::Replica { origin_root: origin_root.clone(), last_synced_at }),
             ));
         }
         self.count_read(resource_kind, ReadOperation::Get, items.len());
@@ -732,19 +843,162 @@ impl InMemoryBackend {
         })
     }
 
+    /// Declared-query rows in `F`'s form, the resolved query and the local
+    /// position, read under the store locks. Callers merge and sort.
+    async fn query_rows<F: QueryRowForm>(
+        &self,
+        kind: ResourceKind,
+        namespace: &str,
+        query: &crate::StoreQuery,
+    ) -> Result<(Vec<(F::Row, ResourceProvenance)>, crate::StoreQuery, crate::ResourcePosition), ResourceError> {
+        query.validate(kind)?;
+        let resolved = crate::resolve_semijoins(self, kind, namespace, query).await?;
+        let query = &resolved;
+        let stores = self.stores.lock().await;
+        let key = Self::store_key(kind, namespace);
+        let local = stores.get(&key);
+        let mut items = Vec::new();
+        let mut hydration_names = local.map(|store| store.queries.names(query)).unwrap_or_default();
+        if query.all_sources_for_matches {
+            if let Some(durable) = &self.durable_replicas {
+                let mut selection = query.clone();
+                selection.replicas_only = true;
+                selection.any_of = Some(vec![
+                    crate::StoreQuery { all_sources_for_matches: false, ..query.clone() },
+                    crate::StoreQuery {
+                        field_values: BTreeMap::from([("metadata.name".into(), hydration_names.iter().cloned().collect())]),
+                        ..Default::default()
+                    },
+                ]);
+                selection.labels.clear();
+                selection.fields.clear();
+                selection.field_values.clear();
+                selection.present.clear();
+                selection.missing_fields.clear();
+                selection.field_matches_query.clear();
+                selection.field_prefixes.clear();
+                selection.label_prefixes.clear();
+                selection.owner = None;
+                items = F::durable(durable.store(), kind, namespace, &selection).await?;
+                hydration_names.extend(items.iter().map(|(row, _)| F::name(row).to_string()));
+            } else {
+                let replicas = self.replicas.lock().await;
+                for ((_, partition_key), partition) in &replicas.partitions {
+                    if partition_key == &key {
+                        hydration_names.extend(partition.queries.names(query));
+                    }
+                }
+            }
+        }
+        if let Some(store) = local.filter(|_| !query.replicas_only) {
+            let mut names = if query.all_sources_for_matches {
+                hydration_names.intersection(&store.objects.keys().cloned().collect()).cloned().collect()
+            } else {
+                store.queries.names(query)
+            };
+            if let Some(message) = &query.message {
+                let message_names = store.messages.names(message).into_iter().collect();
+                names = names.intersection(&message_names).cloned().collect();
+            }
+            for name in names {
+                items.push((
+                    F::decode(
+                        kind,
+                        store.objects.get(&name).ok_or_else(|| ResourceError::other("query index references missing local object"))?,
+                    )?,
+                    ResourceProvenance::Local,
+                ));
+            }
+        }
+        if query.include_replicas && kind.replication != crate::ReplicationClass::None {
+            if let Some(durable) = &self.durable_replicas {
+                // The composing memory store defines shadowing, not the durable
+                // store's unrelated local rows. Pass names before any decoding.
+                let mut replica_query = query.clone();
+                replica_query.replicas_only = true;
+                replica_query.merged_definitions = false;
+                replica_query.replica_shadowing = Some(query.replica_shadowing.clone().unwrap_or_else(|| crate::ReplicaShadowing {
+                    origin_root: self.local_root(),
+                    local_names: local.map(|store| store.objects.keys().cloned().collect()).unwrap_or_default(),
+                }));
+                if !query.all_sources_for_matches {
+                    items.extend(F::durable(durable.store(), kind, namespace, &replica_query).await?);
+                }
+            } else {
+                let replicas = self.replicas.lock().await;
+                for ((origin, partition_key), partition) in &replicas.partitions {
+                    if partition_key != &key {
+                        continue;
+                    }
+                    let mut names = if query.all_sources_for_matches {
+                        hydration_names.intersection(&partition.objects.keys().cloned().collect()).cloned().collect()
+                    } else {
+                        partition.queries.names(query)
+                    };
+                    if let Some(message) = &query.message {
+                        let message_names = partition.messages.names(message).into_iter().collect();
+                        names = names.intersection(&message_names).cloned().collect();
+                    }
+                    for name in names {
+                        let shadowed = if let Some(scope) = &query.replica_shadowing {
+                            origin == &scope.origin_root && scope.local_names.contains(&name)
+                        } else {
+                            origin == &self.local_root() && local.is_some_and(|store| store.objects.contains_key(&name))
+                        };
+                        if query.suppress_self_origin && shadowed {
+                            continue;
+                        }
+                        items.push((
+                            F::decode(
+                                kind,
+                                partition
+                                    .objects
+                                    .get(&name)
+                                    .ok_or_else(|| ResourceError::other("query index references missing replica object"))?,
+                            )?,
+                            ResourceProvenance::Replica {
+                                origin_root: origin.clone(),
+                                last_synced_at: *partition
+                                    .synced_at_by_name
+                                    .get(&name)
+                                    .ok_or_else(|| ResourceError::other("replica query object has no sync timestamp"))?,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        self.count_read(kind, query.read_operation(), items.len());
+        let position = crate::ResourcePosition {
+            resource_version: local.map(|store| store.current_version()).unwrap_or_default().to_string(),
+            generation: self.generation.clone(),
+        };
+        Ok((items, query.clone(), position))
+    }
+
     pub async fn get_raw(
         &self,
         resource_kind: ResourceKind,
         namespace: &str,
         name: &str,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
+        self.get_row(resource_kind, namespace, name, serialized_value).await
+    }
+
+    pub async fn get_decoded(&self, resource_kind: ResourceKind, namespace: &str, name: &str) -> Result<DecodedObject, ResourceError> {
+        self.get_row(resource_kind, namespace, name, typed_value).await
+    }
+
+    async fn get_row<R>(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+        decode: ValueDecode<R>,
+    ) -> Result<R, ResourceError> {
         self.with_store(resource_kind, namespace, |store| {
-            let result = store
-                .objects
-                .get(name)
-                .cloned()
-                .ok_or_else(|| ResourceError::not_found(name))
-                .and_then(|value| Self::decode_object(resource_kind, value));
+            let result =
+                store.objects.get(name).ok_or_else(|| ResourceError::not_found(name)).and_then(|value| decode(resource_kind, value));
             // Missing or undecodable records still cost a crossing, but return
             // zero objects, matching the other adapters' get accounting.
             self.count_read(resource_kind, ReadOperation::Get, usize::from(result.is_ok()));
@@ -845,14 +1099,39 @@ impl InMemoryBackend {
     }
 
     pub async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
+        let (mut items, resource_version) = self.list_rows(resource_kind, namespace, None, serialized_value).await?;
+        items.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
+        Ok(ResourceList { items, resource_version, generation: self.generation.clone() })
+    }
+
+    pub async fn list_decoded(&self, resource_kind: ResourceKind, namespace: &str) -> Result<DecodedList, ResourceError> {
+        let (mut items, resource_version) = self.list_rows(resource_kind, namespace, None, typed_value).await?;
+        items.sort_by(|left, right| left.name().cmp(right.name()));
+        Ok(DecodedList { items, resource_version, generation: self.generation.clone() })
+    }
+
+    /// Every object, or the objects carrying `required` labels, decoded by
+    /// `decode` under the store lock with the version they were read at.
+    async fn list_rows<R>(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        required: Option<&BTreeMap<String, String>>,
+        decode: ValueDecode<R>,
+    ) -> Result<(Vec<R>, String), ResourceError> {
         self.with_store(resource_kind, namespace, |store| {
-            self.count_read(resource_kind, ReadOperation::List, store.objects.len());
-            let mut items = Vec::with_capacity(store.objects.len());
-            for value in store.objects.values().cloned() {
-                items.push(Self::decode_object(resource_kind, value)?);
-            }
-            items.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
-            Ok(ResourceList { items, resource_version: store.current_version().to_string(), generation: self.generation.clone() })
+            let items = match required {
+                None => {
+                    self.count_read(resource_kind, ReadOperation::List, store.objects.len());
+                    store.objects.values().map(|value| decode(resource_kind, value)).collect::<Result<Vec<_>, _>>()?
+                }
+                Some(required) => {
+                    let names = store.queries.names(&crate::StoreQuery::labels(required, false, true));
+                    self.count_read(resource_kind, ReadOperation::Query, names.len());
+                    names.iter().map(|name| decode(resource_kind, &store.objects[name])).collect::<Result<Vec<_>, _>>()?
+                }
+            };
+            Ok((items, store.current_version().to_string()))
         })
         .await
     }
@@ -866,15 +1145,21 @@ impl InMemoryBackend {
         if required.is_empty() {
             return self.list_raw(resource_kind, namespace).await;
         }
+        let (items, resource_version) = self.list_rows(resource_kind, namespace, Some(required), serialized_value).await?;
+        Ok(ResourceList { items, resource_version, generation: self.generation.clone() })
+    }
 
-        self.with_store(resource_kind, namespace, |store| {
-            let names = store.queries.names(&crate::StoreQuery::labels(required, false, true));
-            self.count_read(resource_kind, ReadOperation::Query, names.len());
-            let items =
-                names.iter().map(|name| Self::decode_object(resource_kind, store.objects[name].clone())).collect::<Result<Vec<_>, _>>()?;
-            Ok(ResourceList { items, resource_version: store.current_version().to_string(), generation: self.generation.clone() })
-        })
-        .await
+    pub async fn list_decoded_matching_labels(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        required: &BTreeMap<String, String>,
+    ) -> Result<DecodedList, ResourceError> {
+        if required.is_empty() {
+            return self.list_decoded(resource_kind, namespace).await;
+        }
+        let (items, resource_version) = self.list_rows(resource_kind, namespace, Some(required), typed_value).await?;
+        Ok(DecodedList { items, resource_version, generation: self.generation.clone() })
     }
 
     pub async fn create_raw(
@@ -1249,137 +1534,26 @@ impl Store for InMemoryBackend {
         Ok(())
     }
     async fn query_raw(&self, kind: ResourceKind, namespace: &str, query: &crate::StoreQuery) -> Result<crate::QueryResult, ResourceError> {
-        query.validate(kind)?;
-        let resolved = crate::resolve_semijoins(self, kind, namespace, query).await?;
-        let query = &resolved;
-        let stores = self.stores.lock().await;
-        let key = Self::store_key(kind, namespace);
-        let local = stores.get(&key);
-        let mut items = Vec::new();
-        let mut hydration_names = local.map(|store| store.queries.names(query)).unwrap_or_default();
-        if query.all_sources_for_matches {
-            if let Some(durable) = &self.durable_replicas {
-                let mut selection = query.clone();
-                selection.replicas_only = true;
-                selection.any_of = Some(vec![
-                    crate::StoreQuery { all_sources_for_matches: false, ..query.clone() },
-                    crate::StoreQuery {
-                        field_values: BTreeMap::from([("metadata.name".into(), hydration_names.iter().cloned().collect())]),
-                        ..Default::default()
-                    },
-                ]);
-                selection.labels.clear();
-                selection.fields.clear();
-                selection.field_values.clear();
-                selection.present.clear();
-                selection.missing_fields.clear();
-                selection.field_matches_query.clear();
-                selection.field_prefixes.clear();
-                selection.label_prefixes.clear();
-                selection.owner = None;
-                items = durable.store().query_raw(kind, namespace, &selection).await?.items;
-                hydration_names.extend(items.iter().map(|source| source.object.metadata.name.clone()));
-            } else {
-                let replicas = self.replicas.lock().await;
-                for ((_, partition_key), partition) in &replicas.partitions {
-                    if partition_key == &key {
-                        hydration_names.extend(partition.queries.names(query));
-                    }
-                }
-            }
-        }
-        if let Some(store) = local.filter(|_| !query.replicas_only) {
-            let mut names = if query.all_sources_for_matches {
-                hydration_names.intersection(&store.objects.keys().cloned().collect()).cloned().collect()
-            } else {
-                store.queries.names(query)
-            };
-            if let Some(message) = &query.message {
-                let message_names = store.messages.names(message).into_iter().collect();
-                names = names.intersection(&message_names).cloned().collect();
-            }
-            for name in names {
-                items.push(ReadResourceObject {
-                    object: kind.decode_object(
-                        store
-                            .objects
-                            .get(&name)
-                            .ok_or_else(|| ResourceError::other("query index references missing local object"))?
-                            .clone(),
-                    )?,
-                    provenance: ResourceProvenance::Local,
-                });
-            }
-        }
-        if query.include_replicas && kind.replication != crate::ReplicationClass::None {
-            if let Some(durable) = &self.durable_replicas {
-                // The composing memory store defines shadowing, not the durable
-                // store's unrelated local rows. Pass names before any decoding.
-                let mut replica_query = query.clone();
-                replica_query.replicas_only = true;
-                replica_query.merged_definitions = false;
-                replica_query.replica_shadowing = Some(query.replica_shadowing.clone().unwrap_or_else(|| crate::ReplicaShadowing {
-                    origin_root: self.local_root(),
-                    local_names: local.map(|store| store.objects.keys().cloned().collect()).unwrap_or_default(),
-                }));
-                if !query.all_sources_for_matches {
-                    items.extend(durable.store().query_raw(kind, namespace, &replica_query).await?.items);
-                }
-            } else {
-                let replicas = self.replicas.lock().await;
-                for ((origin, partition_key), partition) in &replicas.partitions {
-                    if partition_key != &key {
-                        continue;
-                    }
-                    let mut names = if query.all_sources_for_matches {
-                        hydration_names.intersection(&partition.objects.keys().cloned().collect()).cloned().collect()
-                    } else {
-                        partition.queries.names(query)
-                    };
-                    if let Some(message) = &query.message {
-                        let message_names = partition.messages.names(message).into_iter().collect();
-                        names = names.intersection(&message_names).cloned().collect();
-                    }
-                    for name in names {
-                        let shadowed = if let Some(scope) = &query.replica_shadowing {
-                            origin == &scope.origin_root && scope.local_names.contains(&name)
-                        } else {
-                            origin == &self.local_root() && local.is_some_and(|store| store.objects.contains_key(&name))
-                        };
-                        if query.suppress_self_origin && shadowed {
-                            continue;
-                        }
-                        items.push(ReadResourceObject {
-                            object: kind.decode_object(
-                                partition
-                                    .objects
-                                    .get(&name)
-                                    .ok_or_else(|| ResourceError::other("query index references missing replica object"))?
-                                    .clone(),
-                            )?,
-                            provenance: ResourceProvenance::Replica {
-                                origin_root: origin.clone(),
-                                last_synced_at: *partition
-                                    .synced_at_by_name
-                                    .get(&name)
-                                    .ok_or_else(|| ResourceError::other("replica query object has no sync timestamp"))?,
-                            },
-                        });
-                    }
-                }
-            }
-        }
-        self.count_read(kind, query.read_operation(), items.len());
-        let mut items = crate::merge_query_definitions(query, items, &self.local_root())?;
+        let (items, query, position) = self.query_rows::<SerializedRows>(kind, namespace, query).await?;
+        let items = items.into_iter().map(|(object, provenance)| ReadResourceObject { object, provenance }).collect();
+        let mut items = crate::merge_query_definitions(&query, items, &self.local_root())?;
         crate::sort_query_items(&mut items);
-        Ok(crate::QueryResult {
-            local_root: Some(self.local_root()),
-            items,
-            position: crate::ResourcePosition {
-                resource_version: local.map(|store| store.current_version()).unwrap_or_default().to_string(),
-                generation: self.generation.clone(),
-            },
-        })
+        Ok(crate::QueryResult { local_root: Some(self.local_root()), items, position })
+    }
+    async fn query_decoded(
+        &self,
+        kind: ResourceKind,
+        namespace: &str,
+        query: &crate::StoreQuery,
+    ) -> Result<crate::DecodedQueryResult, ResourceError> {
+        // A causal merge of definition sources works on the stored trees.
+        if query.merged_definitions {
+            return Ok(crate::DecodedQueryResult::serialized(self.query_raw(kind, namespace, query).await?));
+        }
+        let (rows, _, position) = self.query_rows::<TypedRows>(kind, namespace, query).await?;
+        let mut items: Vec<_> = rows.into_iter().map(|(object, provenance)| DecodedReadObject { object, provenance }).collect();
+        crate::sort_query_rows(&mut items, |item| (item.object.name(), &item.provenance));
+        Ok(crate::DecodedQueryResult { local_root: Some(self.local_root()), items, position })
     }
     async fn query_values_raw(
         &self,
@@ -1629,6 +1803,39 @@ impl Store for InMemoryBackend {
         required: &BTreeMap<String, String>,
     ) -> Result<ResourceList<SerializedResource>, ResourceError> {
         InMemoryBackend::list_raw_matching_labels(self, resource_kind, namespace, required).await
+    }
+    async fn get_decoded(&self, resource_kind: ResourceKind, namespace: &str, name: &str) -> Result<DecodedObject, ResourceError> {
+        InMemoryBackend::get_decoded(self, resource_kind, namespace, name).await
+    }
+    async fn list_decoded(&self, resource_kind: ResourceKind, namespace: &str) -> Result<DecodedList, ResourceError> {
+        InMemoryBackend::list_decoded(self, resource_kind, namespace).await
+    }
+    async fn list_decoded_matching_labels(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        required: &BTreeMap<String, String>,
+    ) -> Result<DecodedList, ResourceError> {
+        InMemoryBackend::list_decoded_matching_labels(self, resource_kind, namespace, required).await
+    }
+    async fn list_replicas_decoded(&self, resource_kind: ResourceKind, namespace: &str) -> Result<Vec<DecodedReadObject>, ResourceError> {
+        InMemoryBackend::list_replicas_decoded(self, resource_kind, namespace).await
+    }
+    async fn get_replicas_decoded(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Vec<DecodedReadObject>, ResourceError> {
+        InMemoryBackend::get_replicas_decoded(self, resource_kind, namespace, name).await
+    }
+    async fn query_messages_decoded(
+        &self,
+        namespace: &str,
+        query: &MessageQuery,
+        include_replicas: bool,
+    ) -> Result<Vec<ReadResourceObject<crate::Message>>, ResourceError> {
+        self.query_messages(namespace, query, include_replicas).await
     }
     async fn create_raw(
         &self,

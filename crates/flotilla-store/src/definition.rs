@@ -65,10 +65,9 @@ impl<T: Resource> DefinitionResolver<T> {
         ensure_definitions::<T>()?;
         let hydration =
             crate::StoreQuery { all_sources_for_matches: true, include_replicas: true, suppress_self_origin: false, ..query.clone() };
-        let result = self.backend.store().query_raw(crate::ResourceKind::of::<T>(), &self.namespace, &hydration).await?;
+        let result = self.backend.store().query_decoded(crate::ResourceKind::of::<T>(), &self.namespace, &hydration).await?;
         let root = result.local_root.clone().ok_or_else(|| ResourceError::invalid("definition query has no authority root"))?;
-        let items: crate::ReadResourceList<T> = crate::convert_read_list(result.into_list())?;
-        let merged = merge_cached_definitions(items.items, &root)?;
+        let merged = merge_cached_definitions(result.into_typed::<T>()?, &root)?;
         let mut index = crate::QueryIndex::default();
         for object in &merged {
             index.update(

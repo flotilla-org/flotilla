@@ -1,11 +1,11 @@
 use crate::Store;
 #[cfg(test)]
 use crate::StoreExt;
-use crate::{convert_read, transcode, ReadObserver, ReadOperation, ResourceKind, SerializedResource};
+use crate::{convert_read, ReadObserver, ReadOperation, ResourceKind, SerializedResource};
 use crate::{watch, DigestQuery, MessageQuery, PartitionDigest, ResourcePosition};
+use crate::{DecodedList, DecodedObject, DecodedReadObject};
 use crate::{SerializedReadWatchEvent, SerializedWatchEvent, SerializedWatchStream, WatchAction, WatchObject, WatchPayload};
 use std::{
-    borrow::Borrow,
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::{
@@ -52,6 +52,22 @@ enum QueryColumns {
     LocalList,
     ReadRows,
     Field(String),
+}
+
+/// Decodes one stored body for a read. It is the only pass over the body and
+/// doubles as the read's quarantine check.
+type RowDecode<R> = fn(ResourceKind, &str) -> Result<R, ResourceError>;
+
+/// The two shapes a read hands back: the validated stored tree for pass-through
+/// callers (replication, resource HTTP), or the kind's registered type.
+struct RowForm;
+impl RowForm {
+    fn serialized(kind: ResourceKind, body: &str) -> Result<ResourceObject<SerializedResource>, ResourceError> {
+        kind.decode_object_text(body)
+    }
+    fn typed(kind: ResourceKind, body: &str) -> Result<DecodedObject, ResourceError> {
+        kind.decode_typed_text(body)
+    }
 }
 
 type StoreKey = (String, String, String, String);
@@ -254,6 +270,12 @@ impl SqliteBackend {
         self.read_observer = Some(observer);
         self
     }
+    fn observe(&self, resource_kind: ResourceKind, operation: ReadOperation, objects: usize) {
+        if let Some(observer) = &self.read_observer {
+            observer.read(resource_kind.paths.kind, operation, objects);
+        }
+    }
+
     pub fn read_observer(&self) -> Option<&dyn ReadObserver> {
         self.read_observer.as_deref()
     }
@@ -1359,10 +1381,6 @@ impl SqliteBackend {
             .map_err(|err| ResourceError::decode(format!("deserialize value: {err}")))
     }
 
-    fn decode_object(resource_kind: ResourceKind, value: Value) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        resource_kind.decode_object(value)
-    }
-
     fn encode_object(resource_kind: ResourceKind, object: &ResourceObject<SerializedResource>) -> Result<Value, ResourceError> {
         resource_kind.encode_object(object)
     }
@@ -1380,21 +1398,30 @@ impl SqliteBackend {
         })
     }
 
-    fn decode_event<'de>(
+    /// Decode one replayed event with `decode`, the only pass over a stored
+    /// object body. A `Deleted` body that does not decode as an object is a
+    /// name-only tombstone when it has no `spec`; only that failure is parsed
+    /// again, and a present but malformed spec remains an error.
+    fn replay_event(
         resource_kind: ResourceKind,
         event_kind: StoredEventKind,
-        object: impl Borrow<Value> + serde::Deserializer<'de, Error = serde_json::Error>,
-    ) -> Result<WatchEvent<SerializedResource>, ResourceError> {
-        match event_kind {
-            StoredEventKind::Added => resource_kind.decode_watch_object(object).map(WatchEvent::Added),
-            StoredEventKind::Modified => resource_kind.decode_watch_object(object).map(WatchEvent::Modified),
-            // Name-only tombstones deliberately omit `spec`; a present but
-            // malformed spec is a corrupt object and must remain an error.
-            StoredEventKind::Deleted if object.borrow().get("spec").is_none() => {
-                decode_watch_tombstone(object.borrow()).map(WatchEvent::DeletedByName)
-            }
-            StoredEventKind::Deleted => resource_kind.decode_watch_object(object).map(WatchEvent::Deleted),
+        body: &str,
+        decode: RowDecode<DecodedObject>,
+    ) -> Result<SerializedWatchEvent, ResourceError> {
+        let action = event_kind.into();
+        let error = match decode(resource_kind, body) {
+            Ok(object) => return Ok(SerializedWatchEvent { action, payload: WatchPayload::Decoded(object) }),
+            Err(error) => error,
+        };
+        if !matches!(event_kind, StoredEventKind::Deleted) {
+            return Err(error);
         }
+        let value = serde_json::from_str::<Value>(body).map_err(|_| error.clone())?;
+        if value.get("spec").is_some() {
+            return Err(error);
+        }
+        decode_watch_tombstone(&value)?;
+        Ok(SerializedWatchEvent { action, payload: WatchPayload::Owned(value) })
     }
 
     fn map_sqlite(err: rusqlite::Error, action: &str) -> ResourceError {
@@ -1568,8 +1595,7 @@ impl SqliteBackend {
             let rows = statement.query_map(params![key.0, key.1, key.2, key.3, argument], |row| row.get::<_, String>(0)).map_err(|error| Self::map_sqlite(error, "query Message inbox"))?;
             rows.map(|row| {
                 let body = row.map_err(|error| Self::map_sqlite(error, "read Message query"))?;
-                let value = serde_json::from_str(&body).map_err(|error| ResourceError::decode(error.to_string()))?;
-                Ok(ReadResourceObject { object: transcode(Self::decode_object(resource_kind, value)?)?, provenance: ResourceProvenance::Local })
+                Ok(ReadResourceObject { object: resource_kind.decode_typed_text(&body)?.into_typed()?, provenance: ResourceProvenance::Local })
             }).collect::<Result<Vec<_>, ResourceError>>()
         }).await?;
         if include_replicas {
@@ -1593,9 +1619,8 @@ impl SqliteBackend {
             let rows = statement.query_map(params![key.0, key.1, key.2, key.3, argument], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).map_err(|error| Self::map_sqlite(error, "query Message replicas"))?;
             rows.map(|row| {
                 let (body, origin, synced_at) = row.map_err(|error| Self::map_sqlite(error, "read Message replica query"))?;
-                let value = serde_json::from_str(&body).map_err(|error| ResourceError::decode(error.to_string()))?;
                 let synced_at = chrono::DateTime::parse_from_rfc3339(&synced_at).map_err(|error| ResourceError::decode(error.to_string()))?.with_timezone(&Utc);
-                Ok(ReadResourceObject { object: transcode(Self::decode_object(resource_kind, value)?)?, provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin), last_synced_at: synced_at } })
+                Ok(ReadResourceObject { object: resource_kind.decode_typed_text(&body)?.into_typed()?, provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin), last_synced_at: synced_at } })
             }).collect::<Result<Vec<_>, ResourceError>>()
         }).await
     }
@@ -1605,6 +1630,25 @@ impl SqliteBackend {
         resource_kind: ResourceKind,
         namespace: &str,
     ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
+        let rows = self.list_replica_rows(resource_kind, namespace, RowForm::serialized).await?;
+        Ok(rows.into_iter().map(|(object, provenance)| ReadResourceObject { object, provenance }).collect())
+    }
+
+    pub async fn list_replicas_decoded(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+    ) -> Result<Vec<DecodedReadObject>, ResourceError> {
+        let rows = self.list_replica_rows(resource_kind, namespace, RowForm::typed).await?;
+        Ok(rows.into_iter().map(|(object, provenance)| DecodedReadObject { object, provenance }).collect())
+    }
+
+    async fn list_replica_rows<R: Send + 'static>(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        decode: RowDecode<R>,
+    ) -> Result<Vec<(R, ResourceProvenance)>, ResourceError> {
         let key = Self::store_key(resource_kind, namespace);
         let cleanup_key = key.clone();
         let (items, invalid_partitions) = self
@@ -1631,12 +1675,8 @@ impl SqliteBackend {
                 let mut invalid_partitions = BTreeMap::<String, Vec<(String, String, String)>>::new();
                 for (origin_root, name, last_synced_at, body) in rows {
                     let identity = format!("kind={} namespace={} name={} origin={}", resource_kind.paths.kind, key.3, name, origin_root);
-                    let decoded = serde_json::from_str(&body)
+                    let decoded = decode(resource_kind, &body)
                         .map_err(|err| format!("decode cached replica object {identity}: {err}"))
-                        .and_then(|value| {
-                            Self::decode_object(resource_kind, value)
-                                .map_err(|err| format!("decode cached replica object {identity}: {err}"))
-                        })
                         .and_then(|object| {
                             DateTime::parse_from_rfc3339(&last_synced_at)
                                 .map(|last_synced_at| (object, last_synced_at.with_timezone(&Utc)))
@@ -1645,10 +1685,7 @@ impl SqliteBackend {
                     match decoded {
                         Ok((object, last_synced_at)) => items.push((
                             origin_root.clone(),
-                            ReadResourceObject {
-                                object,
-                                provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at },
-                            },
+                            (object, ResourceProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at }),
                         )),
                         Err(error) => invalid_partitions.entry(origin_root).or_default().push((name, body, error)),
                     }
@@ -1708,6 +1745,27 @@ impl SqliteBackend {
         namespace: &str,
         name: &str,
     ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
+        let rows = self.get_replica_rows(resource_kind, namespace, name, RowForm::serialized).await?;
+        Ok(rows.into_iter().map(|(object, provenance)| ReadResourceObject { object, provenance }).collect())
+    }
+
+    pub async fn get_replicas_decoded(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Vec<DecodedReadObject>, ResourceError> {
+        let rows = self.get_replica_rows(resource_kind, namespace, name, RowForm::typed).await?;
+        Ok(rows.into_iter().map(|(object, provenance)| DecodedReadObject { object, provenance }).collect())
+    }
+
+    async fn get_replica_rows<R: Send + 'static>(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+        decode: RowDecode<R>,
+    ) -> Result<Vec<(R, ResourceProvenance)>, ResourceError> {
         let key = Self::store_key(resource_kind, namespace);
         let cleanup_key = key.clone();
         let requested_name = name.to_string();
@@ -1737,22 +1795,17 @@ impl SqliteBackend {
                 for (origin_root, last_synced_at, body) in rows {
                     let identity =
                         format!("kind={} namespace={} name={} origin={}", resource_kind.paths.kind, key.3, requested_name, origin_root);
-                    let decoded = serde_json::from_str(&body)
+                    let decoded = decode(resource_kind, &body)
                         .map_err(|err| format!("decode cached replica object {identity}: {err}"))
-                        .and_then(|value| {
-                            Self::decode_object(resource_kind, value)
-                                .map_err(|err| format!("decode cached replica object {identity}: {err}"))
-                        })
                         .and_then(|object| {
                             DateTime::parse_from_rfc3339(&last_synced_at)
                                 .map(|last_synced_at| (object, last_synced_at.with_timezone(&Utc)))
                                 .map_err(|err| format!("decode cached replica sync timestamp {identity}: {err}"))
                         });
                     match decoded {
-                        Ok((object, last_synced_at)) => items.push(ReadResourceObject {
-                            object,
-                            provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at },
-                        }),
+                        Ok((object, last_synced_at)) => {
+                            items.push((object, ResourceProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at }))
+                        }
                         Err(error) => {
                             invalid.push((origin_root, body, error));
                         }
@@ -2147,6 +2200,21 @@ impl SqliteBackend {
         namespace: &str,
         name: &str,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
+        self.get_row(resource_kind, namespace, name, RowForm::serialized).await
+    }
+
+    /// One local object decoded once, straight into the kind's registered type.
+    pub async fn get_decoded(&self, resource_kind: ResourceKind, namespace: &str, name: &str) -> Result<DecodedObject, ResourceError> {
+        self.get_row(resource_kind, namespace, name, RowForm::typed).await
+    }
+
+    async fn get_row<R: Send + 'static>(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+        decode: RowDecode<R>,
+    ) -> Result<R, ResourceError> {
         let key = Self::store_key(resource_kind, namespace);
         let name = name.to_string();
         self.read_call("get resource", move |connection| {
@@ -2155,8 +2223,7 @@ impl SqliteBackend {
                 .optional()
                 .map_err(|err| Self::map_sqlite(err, "read sqlite resource object"))?
                 .ok_or_else(|| ResourceError::not_found(&name))?;
-            let value = serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode stored object JSON: {err}")))?;
-            Self::decode_object(resource_kind, value)
+            decode(resource_kind, &body)
         })
         .await
     }
@@ -2174,14 +2241,27 @@ impl SqliteBackend {
     }
 
     pub async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
-        self.list_local_query(resource_kind, namespace, &crate::StoreQuery::default()).await
+        let (items, resource_version) =
+            self.list_local_query(resource_kind, namespace, &crate::StoreQuery::default(), RowForm::serialized).await?;
+        Ok(ResourceList { items, resource_version, generation: None })
     }
-    async fn list_local_query(
+
+    /// Every local object of a kind, each decoded once into its registered type.
+    pub async fn list_decoded(&self, resource_kind: ResourceKind, namespace: &str) -> Result<DecodedList, ResourceError> {
+        let (items, resource_version) =
+            self.list_local_query(resource_kind, namespace, &crate::StoreQuery::default(), RowForm::typed).await?;
+        Ok(DecodedList { items, resource_version, generation: None })
+    }
+
+    /// Rows that fail `decode` are excluded and queued for quarantine; the
+    /// decode is the only pass over each body.
+    async fn list_local_query<R: Send + 'static>(
         &self,
         resource_kind: ResourceKind,
         namespace: &str,
         query: &crate::StoreQuery,
-    ) -> Result<ResourceList<SerializedResource>, ResourceError> {
+        decode: RowDecode<R>,
+    ) -> Result<(Vec<R>, String), ResourceError> {
         query.validate(resource_kind)?;
         let (sql, args) = Self::declared_sql(resource_kind, namespace, query, false, "", QueryColumns::LocalList);
 
@@ -2203,16 +2283,13 @@ impl SqliteBackend {
                 let mut items = Vec::new();
                 let mut failures = Vec::new();
                 for (name, body) in rows {
-                    let decoded = serde_json::from_str(&body)
-                        .map_err(|err| ResourceError::decode(format!("decode stored object JSON: {err}")))
-                        .and_then(|value| resource_kind.decode_object(value));
-                    match decoded {
+                    match decode(resource_kind, &body) {
                         Ok(object) => items.push(object),
                         Err(error) => failures.push((name, body, error.to_string())),
                     }
                 }
                 let warnings: Vec<_> = failures.iter().map(|(name, _, error)| (name.clone(), error.clone())).collect();
-                Ok((ResourceList { items, resource_version, generation: None }, (failures, warnings)))
+                Ok(((items, resource_version), (failures, warnings)))
             })
             .await?;
         let (invalid, failures) = failures;
@@ -2269,11 +2346,28 @@ impl SqliteBackend {
         namespace: &str,
         required: &BTreeMap<String, String>,
     ) -> Result<ResourceList<SerializedResource>, ResourceError> {
-        if required.is_empty() {
-            return self.list_raw(resource_kind, namespace).await;
-        }
+        let (items, resource_version) =
+            self.list_local_query(resource_kind, namespace, &Self::label_query(required), RowForm::serialized).await?;
+        Ok(ResourceList { items, resource_version, generation: None })
+    }
 
-        self.list_local_query(resource_kind, namespace, &crate::StoreQuery::labels(required, false, true)).await
+    fn label_query(required: &BTreeMap<String, String>) -> crate::StoreQuery {
+        if required.is_empty() {
+            crate::StoreQuery::default()
+        } else {
+            crate::StoreQuery::labels(required, false, true)
+        }
+    }
+
+    pub async fn list_decoded_matching_labels(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        required: &BTreeMap<String, String>,
+    ) -> Result<DecodedList, ResourceError> {
+        let (items, resource_version) =
+            self.list_local_query(resource_kind, namespace, &Self::label_query(required), RowForm::typed).await?;
+        Ok(DecodedList { items, resource_version, generation: None })
     }
 
     pub async fn create_raw(
@@ -2644,6 +2738,30 @@ impl SqliteBackend {
         namespace: &str,
         start: WatchStart,
     ) -> Result<SerializedWatchStream, ResourceError> {
+        fn serialized(kind: ResourceKind, body: &str) -> Result<DecodedObject, ResourceError> {
+            kind.decode_object_text(body).map(DecodedObject::serialized)
+        }
+        self.watch_events(resource_kind, namespace, start, serialized).await
+    }
+
+    /// [`Self::watch_raw`] whose replayed objects are decoded once, straight into
+    /// the kind's registered type, for typed consumers only.
+    pub async fn watch_decoded(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        start: WatchStart,
+    ) -> Result<SerializedWatchStream, ResourceError> {
+        self.watch_events(resource_kind, namespace, start, RowForm::typed).await
+    }
+
+    async fn watch_events(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        start: WatchStart,
+        decode: RowDecode<DecodedObject>,
+    ) -> Result<SerializedWatchStream, ResourceError> {
         let key = Self::store_key(resource_kind, namespace);
         let replay_from = match &start {
             WatchStart::Now => None,
@@ -2658,7 +2776,7 @@ impl SqliteBackend {
         let (replay, receiver) = self
             .call("watch resource replay", move |connection| {
                 let replay = match replay_from {
-                    Some(version) => Self::replay_events(resource_kind, connection, &key, version)?,
+                    Some(version) => Self::replay_events(resource_kind, connection, &key, version, decode)?,
                     None => ReplayedEvents { events: Vec::new(), quarantines: Vec::new() },
                 };
                 let namespace = key.3.clone();
@@ -2695,6 +2813,67 @@ impl SqliteBackend {
         Ok(SerializedWatchStream::new(None, Box::pin(replay_stream.chain(live_stream))))
     }
 
+    /// Declared-query rows decoded by `decode` on the reader, with the local
+    /// position read in the same snapshot. Callers merge and sort.
+    async fn query_rows<R: Send + 'static>(
+        &self,
+        kind: ResourceKind,
+        namespace: &str,
+        query: &crate::StoreQuery,
+        decode: RowDecode<R>,
+    ) -> Result<(Vec<(R, ResourceProvenance)>, crate::ResourcePosition), ResourceError> {
+        query.validate(kind)?;
+        let namespace = namespace.to_owned();
+        let query = query.clone();
+        let operation = query.read_operation();
+        let root = self.local_root().to_string();
+        let (items, position) = self
+            .read_call("declared resource query", move |connection| {
+                let tx = connection.transaction().map_err(|e| Self::map_sqlite(e, "begin query snapshot"))?;
+                let mut items = Vec::new();
+                for replicas in [false, true] {
+                    if !replicas && query.replicas_only {
+                        continue;
+                    }
+                    if replicas && (!query.include_replicas || kind.replication == crate::ReplicationClass::None) {
+                        continue;
+                    }
+                    let (sql, args) = Self::declared_sql(kind, &namespace, &query, replicas, &root, QueryColumns::ReadRows);
+                    let mut statement = tx.prepare_cached(&sql).map_err(|e| Self::map_sqlite(e, "prepare declared query"))?;
+                    let rows = statement
+                        .query_map(rusqlite::params_from_iter(args), |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?))
+                        })
+                        .map_err(|e| Self::map_sqlite(e, "run declared query"))?;
+                    for row in rows {
+                        let (body, origin, synced) = row.map_err(|e| Self::map_sqlite(e, "read declared query"))?;
+                        let object = decode(kind, &body)?;
+                        let provenance = if let Some(origin) = origin {
+                            ResourceProvenance::Replica {
+                                origin_root: NodeId::new(origin),
+                                last_synced_at: DateTime::parse_from_rfc3339(&synced.unwrap_or_default())
+                                    .map_err(|e| ResourceError::decode(e.to_string()))?
+                                    .with_timezone(&Utc),
+                            }
+                        } else {
+                            ResourceProvenance::Local
+                        };
+                        items.push((object, provenance));
+                    }
+                }
+                let key = Self::store_key(kind, &namespace);
+                let position =
+                    crate::ResourcePosition { resource_version: Self::current_version(&tx, &key)?.to_string(), generation: None };
+                tx.commit().map_err(|e| Self::map_sqlite(e, "commit query snapshot"))?;
+                Ok((items, position))
+            })
+            .await?;
+        if let Some(observer) = &self.read_observer {
+            observer.read(kind.paths.kind, operation, items.len());
+        }
+        Ok((items, position))
+    }
+
     fn validate_namespace_spec(
         resource_kind: ResourceKind,
         tx: &rusqlite::Transaction<'_>,
@@ -2713,8 +2892,7 @@ impl SqliteBackend {
         let mut siblings = Vec::new();
         for row in rows {
             let body = row.map_err(|err| Self::map_sqlite(err, "read namespace sibling"))?;
-            let value = serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode namespace sibling: {err}")))?;
-            let object = Self::decode_object(resource_kind, value)?;
+            let object = resource_kind.decode_object_text(&body)?;
             if object.metadata.deletion_timestamp.is_none() {
                 siblings.push(object);
             }
@@ -2732,11 +2910,7 @@ impl SqliteBackend {
             .query_row_cached(RESOURCE_OBJECT_BODY_SQL, params![key.0, key.1, key.2, key.3, name], |row| row.get::<_, String>(0))
             .optional()
             .map_err(|err| Self::map_sqlite(err, "read sqlite resource object"))?;
-        body.map(|body| {
-            let value = serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode stored object JSON: {err}")))?;
-            Self::decode_object(resource_kind, value)
-        })
-        .transpose()
+        body.map(|body| resource_kind.decode_object_text(&body)).transpose()
     }
 
     fn upsert_object(
@@ -2778,6 +2952,7 @@ impl SqliteBackend {
         conn: &mut RusqliteConnection,
         key: &StoreKey,
         replay_from: u64,
+        decode: RowDecode<DecodedObject>,
     ) -> Result<ReplayedEvents, ResourceError> {
         let compacted_through = conn
             .query_row_cached(
@@ -2820,24 +2995,18 @@ impl SqliteBackend {
         let mut events = Vec::new();
         let mut failures = Vec::new();
         for (event_version, event_type, body_json) in rows {
-            let value =
-                serde_json::from_str::<Value>(&body_json).map_err(|err| ResourceError::decode(format!("decode stored event JSON: {err}")));
-            let name = value
-                .as_ref()
-                .ok()
-                .and_then(|value| value.pointer("/metadata/name"))
-                .and_then(Value::as_str)
-                .unwrap_or("<unknown>")
-                .to_string();
-            let decoded =
-                value.and_then(|object| Ok(StoredEvent { kind: StoredEventKind::from_str(&event_type)?, object })).and_then(|event| {
-                    // Replay quarantine still validates on the SQLite worker.
-                    Self::decode_event(resource_kind, event.kind, &event.object)?;
-                    Ok(SerializedWatchEvent { action: event.kind.into(), payload: WatchPayload::Owned(event.object) })
-                });
+            // Replay quarantine uses the same decode the consumer receives.
+            let decoded = StoredEventKind::from_str(&event_type)
+                .and_then(|event_kind| Self::replay_event(resource_kind, event_kind, &body_json, decode));
             match decoded {
                 Ok(event) => events.push(event),
-                Err(error) => failures.push((event_version, name, body_json, error.to_string())),
+                Err(error) => {
+                    let name = serde_json::from_str::<Value>(&body_json)
+                        .ok()
+                        .and_then(|value| value.pointer("/metadata/name").and_then(Value::as_str).map(str::to_owned))
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    failures.push((event_version, name, body_json, error.to_string()))
+                }
             }
         }
         if !failures.is_empty() {
@@ -2897,59 +3066,26 @@ impl Store for SqliteBackend {
         self.record_field_ownership_violation(violation).await
     }
     async fn query_raw(&self, kind: ResourceKind, namespace: &str, query: &crate::StoreQuery) -> Result<crate::QueryResult, ResourceError> {
-        query.validate(kind)?;
-        let namespace = namespace.to_owned();
-        let query = query.clone();
-        let completion_query = query.clone();
-        let root = self.local_root().to_string();
-        let (mut items, position) = self
-            .read_call("declared resource query", move |connection| {
-                let tx = connection.transaction().map_err(|e| Self::map_sqlite(e, "begin query snapshot"))?;
-                let mut items = Vec::new();
-                for replicas in [false, true] {
-                    if !replicas && query.replicas_only {
-                        continue;
-                    }
-                    if replicas && (!query.include_replicas || kind.replication == crate::ReplicationClass::None) {
-                        continue;
-                    }
-                    let (sql, args) = Self::declared_sql(kind, &namespace, &query, replicas, &root, QueryColumns::ReadRows);
-                    let mut statement = tx.prepare_cached(&sql).map_err(|e| Self::map_sqlite(e, "prepare declared query"))?;
-                    let rows = statement
-                        .query_map(rusqlite::params_from_iter(args), |r| {
-                            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?))
-                        })
-                        .map_err(|e| Self::map_sqlite(e, "run declared query"))?;
-                    for row in rows {
-                        let (body, origin, synced) = row.map_err(|e| Self::map_sqlite(e, "read declared query"))?;
-                        let value = serde_json::from_str(&body).map_err(|e| ResourceError::decode(e.to_string()))?;
-                        let object = kind.decode_object(value)?;
-                        let provenance = if let Some(origin) = origin {
-                            ResourceProvenance::Replica {
-                                origin_root: NodeId::new(origin),
-                                last_synced_at: DateTime::parse_from_rfc3339(&synced.unwrap_or_default())
-                                    .map_err(|e| ResourceError::decode(e.to_string()))?
-                                    .with_timezone(&Utc),
-                            }
-                        } else {
-                            ResourceProvenance::Local
-                        };
-                        items.push(ReadResourceObject { object, provenance });
-                    }
-                }
-                let key = Self::store_key(kind, &namespace);
-                let position =
-                    crate::ResourcePosition { resource_version: Self::current_version(&tx, &key)?.to_string(), generation: None };
-                tx.commit().map_err(|e| Self::map_sqlite(e, "commit query snapshot"))?;
-                Ok((items, position))
-            })
-            .await?;
-        if let Some(observer) = &self.read_observer {
-            observer.read(kind.paths.kind, completion_query.read_operation(), items.len());
-        }
-        items = crate::merge_query_definitions(&completion_query, items, &self.local_root())?;
+        let (items, position) = self.query_rows(kind, namespace, query, RowForm::serialized).await?;
+        let items = items.into_iter().map(|(object, provenance)| ReadResourceObject { object, provenance }).collect();
+        let mut items = crate::merge_query_definitions(query, items, &self.local_root())?;
         crate::sort_query_items(&mut items);
         Ok(crate::QueryResult { items, position, local_root: Some(self.local_root()) })
+    }
+    async fn query_decoded(
+        &self,
+        kind: ResourceKind,
+        namespace: &str,
+        query: &crate::StoreQuery,
+    ) -> Result<crate::DecodedQueryResult, ResourceError> {
+        // A causal merge of definition sources works on the stored trees.
+        if query.merged_definitions {
+            return Ok(crate::DecodedQueryResult::serialized(self.query_raw(kind, namespace, query).await?));
+        }
+        let (rows, position) = self.query_rows(kind, namespace, query, RowForm::typed).await?;
+        let mut items: Vec<_> = rows.into_iter().map(|(object, provenance)| DecodedReadObject { object, provenance }).collect();
+        crate::sort_query_rows(&mut items, |item| (item.object.name(), &item.provenance));
+        Ok(crate::DecodedQueryResult { items, position, local_root: Some(self.local_root()) })
     }
     async fn query_values_raw(
         &self,
@@ -3265,6 +3401,68 @@ impl Store for SqliteBackend {
         start: WatchStart,
     ) -> Result<SerializedWatchStream, ResourceError> {
         SqliteBackend::watch_raw(self, resource_kind, namespace, start).await
+    }
+    async fn get_decoded(&self, resource_kind: ResourceKind, namespace: &str, name: &str) -> Result<DecodedObject, ResourceError> {
+        let result = SqliteBackend::get_decoded(self, resource_kind, namespace, name).await?;
+        self.observe(resource_kind, ReadOperation::Get, 1);
+        Ok(result)
+    }
+    async fn list_decoded(&self, resource_kind: ResourceKind, namespace: &str) -> Result<DecodedList, ResourceError> {
+        let result = SqliteBackend::list_decoded(self, resource_kind, namespace).await?;
+        self.observe(resource_kind, ReadOperation::List, result.items.len());
+        Ok(result)
+    }
+    async fn list_decoded_matching_labels(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        required: &BTreeMap<String, String>,
+    ) -> Result<DecodedList, ResourceError> {
+        let result = SqliteBackend::list_decoded_matching_labels(self, resource_kind, namespace, required).await?;
+        self.observe(resource_kind, ReadOperation::Query, result.items.len());
+        Ok(result)
+    }
+    async fn list_replicas_decoded(&self, resource_kind: ResourceKind, namespace: &str) -> Result<Vec<DecodedReadObject>, ResourceError> {
+        let result = SqliteBackend::list_replicas_decoded(self, resource_kind, namespace).await?;
+        self.observe(resource_kind, ReadOperation::List, result.len());
+        Ok(result)
+    }
+    async fn get_replicas_decoded(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Vec<DecodedReadObject>, ResourceError> {
+        let result = SqliteBackend::get_replicas_decoded(self, resource_kind, namespace, name).await?;
+        self.observe(resource_kind, ReadOperation::Get, result.len());
+        Ok(result)
+    }
+    async fn query_messages_decoded(
+        &self,
+        namespace: &str,
+        query: &MessageQuery,
+        include_replicas: bool,
+    ) -> Result<Vec<ReadResourceObject<crate::Message>>, ResourceError> {
+        let result = self.query_messages(namespace, query, include_replicas).await?;
+        self.observe(ResourceKind::of::<crate::Message>(), ReadOperation::Query, result.len());
+        Ok(result)
+    }
+    async fn query_message_replicas_decoded(
+        &self,
+        namespace: &str,
+        query: &MessageQuery,
+    ) -> Result<Vec<ReadResourceObject<crate::Message>>, ResourceError> {
+        let result = self.query_message_replicas(namespace, query).await?;
+        self.observe(ResourceKind::of::<crate::Message>(), ReadOperation::Query, result.len());
+        Ok(result)
+    }
+    async fn watch_decoded(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        start: WatchStart,
+    ) -> Result<SerializedWatchStream, ResourceError> {
+        SqliteBackend::watch_decoded(self, resource_kind, namespace, start).await
     }
 }
 #[cfg(test)]

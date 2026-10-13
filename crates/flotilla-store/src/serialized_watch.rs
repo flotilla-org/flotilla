@@ -15,6 +15,10 @@ pub trait WatchObject: Send + Sync {
 pub enum WatchPayload {
     Shared(Arc<dyn WatchObject>),
     Owned(Value),
+    /// An object a storage worker already decoded and validated: a typed row
+    /// for [`crate::Store::watch_decoded`] consumers, or a serialized row for
+    /// raw watches. Name-only tombstones stay `Owned`.
+    Decoded(crate::DecodedObject),
 }
 #[derive(Clone, Copy)]
 pub enum WatchAction {
@@ -29,15 +33,17 @@ pub struct SerializedWatchEvent {
 impl SerializedWatchEvent {
     pub fn decode<T: Resource>(self) -> Result<WatchEvent<T>, ResourceError> {
         let value = match &self.payload {
-            WatchPayload::Shared(object) => object.object(),
-            WatchPayload::Owned(value) => value,
+            WatchPayload::Shared(object) => Some(object.object()),
+            WatchPayload::Owned(value) => Some(value),
+            WatchPayload::Decoded(_) => None,
         };
-        if matches!(self.action, WatchAction::Deleted) && value.get("spec").is_none() {
+        if let Some(value) = value.filter(|value| matches!(self.action, WatchAction::Deleted) && value.get("spec").is_none()) {
             return crate::watch::decode_watch_tombstone(value).map(WatchEvent::DeletedByName);
         }
         let object = match self.payload {
             WatchPayload::Shared(object) => crate::watch::decode_watch_object(object.object()),
             WatchPayload::Owned(value) => crate::watch::decode_watch_object(value),
+            WatchPayload::Decoded(object) => object.into_typed(),
         }?;
         Ok(match self.action {
             WatchAction::Added => WatchEvent::Added(object),
@@ -62,6 +68,14 @@ impl SerializedWatchEvent {
         let value = match self.payload {
             WatchPayload::Shared(object) => object.object().clone(),
             WatchPayload::Owned(value) => value,
+            WatchPayload::Decoded(object) => {
+                let object = object.into_serialized()?;
+                return Ok(match self.action {
+                    WatchAction::Added => WatchEvent::Added(object),
+                    WatchAction::Modified => WatchEvent::Modified(object),
+                    WatchAction::Deleted => WatchEvent::Deleted(object),
+                });
+            }
         };
         if matches!(self.action, WatchAction::Deleted) && value.get("spec").is_none() {
             return crate::watch::decode_watch_tombstone(&value).map(WatchEvent::DeletedByName);
