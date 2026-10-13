@@ -485,6 +485,7 @@ async fn leaf_warm_subscription_zero_reads_pending_3120() {
         .await
         .expect("subscription evaluated");
         watches.push(watching);
+        // Index 0 is the cold attach; index 1 attaches to an already warm engine.
         if index != 0 {
             guard.assert_zero("leaf subscription after warm-up");
         }
@@ -493,8 +494,8 @@ async fn leaf_warm_subscription_zero_reads_pending_3120() {
 
 async fn routing_contract(backend: ResourceBackend, changes: &[usize], zero_reads: bool) {
     use flotilla_store_testkit::{ReadCountsBackendExt, ZeroReadGuard};
-    let counted = backend.clone().with_read_counts();
     use futures::FutureExt;
+    let counted = backend.clone().with_read_counts();
     for index in 0..64 {
         create_convoy(&backend, &format!("object-{index}"), ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
     }
