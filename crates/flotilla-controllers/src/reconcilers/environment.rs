@@ -133,7 +133,24 @@ where
                         let build = match flotilla_store::read_image_build(&self.backend, &self.namespace, name).await {
                             Ok(build) => build,
                             Err(ResourceError::NotFound { .. }) => {
-                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} awaiting replicated build status")))
+                                // A previous-generation per-stage build can never
+                                // be satisfied: fail so recreation relaunches it.
+                                let retired = match self
+                                    .backend
+                                    .including_replicas::<flotilla_resources::ImageBuild>(&self.namespace)
+                                    .get(name)
+                                    .await
+                                {
+                                    Ok(record) => record.object.spec.is_retired(),
+                                    Err(ResourceError::NotFound { .. }) => false,
+                                    Err(error) => return Err(error),
+                                };
+                                if retired {
+                                    return Ok(EnvironmentPrepared::Failed(format!(
+                                        "ImageBuild {name} is a previous-generation image build; relaunch the vessel"
+                                    )));
+                                }
+                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} awaiting replicated build status")));
                             }
                             Err(error) => return Err(error),
                         };
@@ -146,11 +163,13 @@ where
                             }
                         };
                         spec.image = digest;
-                        // A local build is only on its builder; a registry
-                        // digest is pulled by the provider with its pull credential.
-                        if matches!(build.spec.current().map(|spec| &spec.delivery), Some(ImageDelivery::Local)) {
-                            spec.pull_policy = DockerImagePullPolicy::Never;
-                        }
+                        // A local build exists only on its builder. A registry
+                        // digest is pinned, so pulling it if absent is always
+                        // safe; the provider pulls with its pull credential.
+                        spec.pull_policy = match build.spec.current().map(|spec| &spec.delivery) {
+                            Some(ImageDelivery::Local) => DockerImagePullPolicy::Never,
+                            _ => DockerImagePullPolicy::IfNotPresent,
+                        };
                     }
                     match self
                         .docker

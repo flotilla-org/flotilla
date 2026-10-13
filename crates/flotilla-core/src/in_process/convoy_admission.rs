@@ -61,6 +61,9 @@ pub(super) struct ConvoyCreateAdmission<'a> {
     /// Per-vessel composed-image pins when vessels resolve to different images.
     #[builder(default)]
     vessel_placements: BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
+    /// Builds for the composed images, created with the convoy.
+    #[builder(default)]
+    image_builds: Vec<crate::image_build::PlannedImageBuild>,
 }
 
 #[derive(bon::Builder)]
@@ -637,6 +640,7 @@ impl ConvoyAdmission {
                 placement: admission.placement_policy.as_ref(),
                 placement_decision: admission.placement_decision,
                 vessel_placements: Some(&admission.vessel_placements),
+                image_builds: &admission.image_builds,
             },
             intent.auto_attach.into(),
         )
@@ -703,7 +707,7 @@ impl ConvoyAdmission {
         bundle: ConvoySnapshotBundle<'_>,
         dispatch_regard: ConvoyDispatchRegard,
     ) -> Result<(), String> {
-        let ConvoySnapshotBundle { spec, workflow, placement, placement_decision, vessel_placements, evidence } = bundle;
+        let ConvoySnapshotBundle { spec, workflow, placement, placement_decision, vessel_placements, image_builds, evidence } = bundle;
         let workflow_value = serde_json::to_value(workflow).map_err(|error| error.to_string())?;
         let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         ensure_prepared_workflow_snapshot(&self.backend, namespace, &workflow_name, workflow).await?;
@@ -720,7 +724,12 @@ impl ConvoyAdmission {
         if let Some(vessel_placements) = vessel_placements {
             annotations.extend(self.prepare_vessel_placement_annotations(namespace, vessel_placements).await?);
         }
-        self.create_convoy_with_annotations(namespace, name, spec, placement_decision, dispatch_regard, annotations).await
+        let created = crate::image_build::create_planned_builds(&self.backend, namespace, image_builds).await?;
+        let result = self.create_convoy_with_annotations(namespace, name, spec, placement_decision, dispatch_regard, annotations).await;
+        if result.is_err() {
+            crate::image_build::remove_created_builds(&self.backend, namespace, &created).await;
+        }
+        result
     }
 
     async fn prepared_brief_query(&self, namespace: &str, admission: &PreparedConvoyAdmission) -> Result<Option<StoreQuery>, String> {
@@ -1213,10 +1222,10 @@ impl ConvoyAdmission {
         workflow: &WorkflowTemplateSpec,
         placement: &mut PlacementResolution,
         decision: Option<&PlacementDecision>,
-    ) -> Result<BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>, String> {
+    ) -> Result<(BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>, Vec<crate::image_build::PlannedImageBuild>), String> {
         let joiner = PlacementBuildJoiner { backend: &self.backend };
-        let images = joiner.compose_placement_images(namespace, project_ref, workflow, placement).await?;
-        apply_vessel_images(placement, images, decision)
+        let (images, builds) = joiner.compose_placement_images(namespace, project_ref, workflow, placement).await?;
+        Ok((apply_vessel_images(placement, images, decision)?, builds))
     }
 
     pub(super) async fn resolve_convoy_placement(
@@ -1316,15 +1325,21 @@ impl ConvoyAdmission {
             annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_name);
         }
         annotations.extend(self.prepare_vessel_placement_annotations(namespace, &admission.vessel_placements).await?);
-        self.create_convoy_with_annotations(
-            namespace,
-            &admission.name,
-            &admission.spec,
-            admission.placement_decision,
-            ConvoyDispatchRegard::Suppress,
-            annotations,
-        )
-        .await?;
+        let created = crate::image_build::create_planned_builds(&self.backend, namespace, &admission.image_builds).await?;
+        let result = self
+            .create_convoy_with_annotations(
+                namespace,
+                &admission.name,
+                &admission.spec,
+                admission.placement_decision,
+                ConvoyDispatchRegard::Suppress,
+                annotations,
+            )
+            .await;
+        if result.is_err() {
+            crate::image_build::remove_created_builds(&self.backend, namespace, &created).await;
+        }
+        result?;
         self.record_admission_naming(namespace, &admission.name, admission.naming.clone()).await;
         apply_resource_status_patch(
             &self.backend.using::<ResourceConvoy>(namespace),
@@ -1361,6 +1376,7 @@ impl ConvoyAdmission {
             adopted_checkout_ref_to_cleanup,
             dispatching_principal_ref,
             vessel_placements,
+            image_builds,
         } = request;
         let address = convoy_address(role, project_ref.as_deref());
         let mut spec = ConvoySpec {
@@ -1421,6 +1437,7 @@ impl ConvoyAdmission {
                     placement: placement.selected.as_ref().map(|placement| &placement.spec),
                     placement_decision,
                     vessel_placements: (!vessel_placements.is_empty()).then_some(&vessel_placements),
+                    image_builds: &image_builds,
                 },
                 ConvoyDispatchRegard::Emit,
             )
@@ -1435,30 +1452,33 @@ impl ConvoyAdmission {
 impl PlacementBuildJoiner<'_> {
     /// Admission only. For a docker-per-vessel placement whose policy omits
     /// the image, resolve every vessel's composition against the
-    /// replica-inclusive catalogue, get-or-create its ImageBuild for the
-    /// placement host's architecture, and return the policy each vessel runs
-    /// (`Built`). Literal and baseline images return no entries.
+    /// replica-inclusive catalogue, plan its ImageBuild for the placement
+    /// host's architecture, and return the policy each vessel runs (`Built`)
+    /// with the builds to create once admission commits. Literal and baseline
+    /// images return no entries. Nothing is written here.
     async fn compose_placement_images(
         &self,
         namespace: &str,
         project_ref: Option<&str>,
         workflow: &WorkflowTemplateSpec,
         placement: &PlacementResolution,
-    ) -> Result<BTreeMap<String, PlacementPolicySpec>, String> {
-        let Some(policy) = placement.selected.as_ref() else { return Ok(BTreeMap::new()) };
+    ) -> Result<(BTreeMap<String, PlacementPolicySpec>, Vec<crate::image_build::PlannedImageBuild>), String> {
+        let Some(policy) = placement.selected.as_ref() else { return Ok(Default::default()) };
         let Some(docker) = policy.spec.docker_per_vessel.as_ref().filter(|docker| docker.image.is_none()) else {
-            return Ok(BTreeMap::new());
+            return Ok(Default::default());
         };
         let resolved = resolve_vessel_images(self.backend, namespace, project_ref, workflow).await?;
         let mut images = BTreeMap::new();
+        let mut builds = Vec::new();
         for (vessel, image) in resolved {
-            let image_build_ref = crate::image_build::ensure_image_build(self.backend, namespace, &image, &docker.host_ref).await?;
+            let planned = crate::image_build::plan_image_build(self.backend, namespace, &image, &docker.host_ref).await?;
             let mut spec = policy.spec.clone();
             spec.docker_per_vessel.as_mut().expect("docker placement").image =
-                Some(flotilla_resources::DockerImageSource::Built { identity: image.identity, image_build_ref });
+                Some(flotilla_resources::DockerImageSource::Built { identity: image.identity, image_build_ref: planned.name.clone() });
             images.insert(vessel, spec);
+            builds.push(planned);
         }
-        Ok(images)
+        Ok((images, builds))
     }
 }
 
@@ -2722,9 +2742,18 @@ impl AdmissionReadContext<'_> {
         &self,
         context: &PlacementContext<'_>,
         workflow: &mut WorkflowTemplateSpec,
-    ) -> Result<(PlacementResolution, Vec<String>, BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>), String> {
+    ) -> Result<
+        (
+            PlacementResolution,
+            Vec<String>,
+            BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
+            Vec<crate::image_build::PlannedImageBuild>,
+        ),
+        String,
+    > {
         let PlacementContext { namespace, project_ref, repositories, intent, purpose } = *context;
         let mut vessel_placements = BTreeMap::new();
+        let mut image_builds = Vec::new();
         let has_kinds = !self
             .backend
             .query_declared::<FulfilmentKind>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
@@ -2811,8 +2840,10 @@ impl AdmissionReadContext<'_> {
                     .await?;
                 }
                 if purpose == PlacementPurpose::Admission {
-                    let images = self.runtime.builds.compose_placement_images(namespace, Some(project_ref), &one, &resolution).await?;
+                    let (images, builds) =
+                        self.runtime.builds.compose_placement_images(namespace, Some(project_ref), &one, &resolution).await?;
                     apply_vessel_images(&mut resolution, images, None)?;
+                    image_builds.extend(builds);
                 }
                 workflow.vessels[index] = one.vessels.remove(0);
                 if let Some(selected) = resolution.selected.as_ref() {
@@ -2865,7 +2896,9 @@ impl AdmissionReadContext<'_> {
                 }
             }
             if purpose == PlacementPurpose::Admission {
-                let images = self.runtime.builds.compose_placement_images(namespace, Some(project_ref), workflow, &result.0).await?;
+                let (images, builds) =
+                    self.runtime.builds.compose_placement_images(namespace, Some(project_ref), workflow, &result.0).await?;
+                image_builds.extend(builds);
                 let decision = match result.0.selected.as_ref() {
                     Some(selected) => Some(PlacementDecision {
                         minimal_alternatives: result.1.clone(),
@@ -2882,7 +2915,7 @@ impl AdmissionReadContext<'_> {
             }
             result
         };
-        Ok((placement, minimal_alternatives, vessel_placements))
+        Ok((placement, minimal_alternatives, vessel_placements, image_builds))
     }
 
     async fn decide_placement(
@@ -3122,7 +3155,7 @@ impl AdmissionReadContext<'_> {
             (None, None) => required_admission_value(&generated.branch, "generated branch")?.to_string(),
         };
         validate_convoy_branch(&branch)?;
-        let (placement, minimal_alternatives, vessel_placements) = self
+        let (placement, minimal_alternatives, vessel_placements, image_builds) = self
             .decide_vessel_placements(
                 &PlacementContext {
                     namespace,
@@ -3181,6 +3214,7 @@ impl AdmissionReadContext<'_> {
             .maybe_placement_policy(placement.selected.map(|placement| placement.spec))
             .maybe_placement_decision(placement_decision)
             .vessel_placements(vessel_placements)
+            .image_builds(image_builds)
             .build())
     }
 }
@@ -3207,6 +3241,9 @@ pub struct PreparedConvoyAdmission {
     pub(super) placement_decision: Option<PlacementDecision>,
     #[builder(default)]
     pub(super) vessel_placements: BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
+    /// Builds for the composed images, created with the convoy.
+    #[builder(default)]
+    pub(super) image_builds: Vec<crate::image_build::PlannedImageBuild>,
 }
 
 #[derive(Clone, Debug)]
@@ -3877,6 +3914,9 @@ struct ConvoySnapshotBundle<'a> {
     pub(super) placement: Option<&'a PlacementPolicySpec>,
     pub(super) placement_decision: Option<PlacementDecision>,
     pub(super) vessel_placements: Option<&'a BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>>,
+    /// Composed images' builds, created only with the convoy (refusals before
+    /// this point never leave builds behind).
+    pub(super) image_builds: &'a [crate::image_build::PlannedImageBuild],
     evidence: BriefEvidence<'a>,
 }
 
@@ -5025,18 +5065,19 @@ async fn image_placement_cost(
     };
     if let Some(identities) = composed {
         let architecture = host.and_then(crate::image_build::host_architecture);
+        let image_cache = crate::image_build::fleet_image_cache(backend, namespace).await?;
         let mut cost = ImageAcquisitionCost::Held;
         for identity in identities {
-            let digest = match &architecture {
-                Some(architecture) => {
-                    let name = flotilla_resources::image_build_name(identity, architecture);
+            let digest = match (&architecture, host) {
+                (Some(architecture), Some(host)) => {
+                    let name = crate::image_build::expected_build_name(identity, architecture, image_cache.as_ref(), &host.metadata.name);
                     match flotilla_store::read_image_build(backend, namespace, &name).await {
                         Ok(build) => build.status.filter(|status| status.phase == ImageBuildPhase::Built).and_then(|status| status.digest),
                         Err(ResourceError::NotFound { .. }) => None,
                         Err(error) => return Err(error.to_string()),
                     }
                 }
-                None => None,
+                _ => None,
             };
             let vessel = match digest {
                 Some(digest) if is_held(&digest) => ImageAcquisitionCost::Held,
@@ -6068,7 +6109,7 @@ mod tests {
             .probe("true".into())
             .build()];
         let identity = flotilla_resources::image_identity(&layers);
-        let name = flotilla_resources::image_build_name(&identity, "amd64");
+        let name = flotilla_resources::image_build_name(&identity, "amd64", &ImageDelivery::Local, "host");
         let realisation = flotilla_resources::FulfilmentRealisation::DockerPerVessel { image: None };
         let cost =
             || image_placement_cost(&backend, "test", Some(&host), Some("cache"), &realisation, Some(BTreeSet::from([identity.as_str()])));

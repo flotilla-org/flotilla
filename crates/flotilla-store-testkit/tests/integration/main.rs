@@ -36,6 +36,7 @@ mod test_module_registration;
 mod workflow_template_in_memory;
 mod workflow_template_validation;
 
+mod image_builds;
 mod image_layers;
 mod project_hierarchy;
 

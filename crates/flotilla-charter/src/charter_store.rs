@@ -167,9 +167,16 @@ pub async fn read_charter_source(source: &CharterSource, cache: &Path, vcs: Opti
     .await
 }
 
-/// The conventional project image layer directory (ADR 0062), relative to a
-/// project's primary repository root or its named ops home.
+/// The conventional project image layer directory (ADR 0062), at the root of
+/// a project's primary repository.
 pub const PROJECT_IMAGE_LAYER_PATH: &str = ".flotilla/image";
+
+/// A delegated charter's (named ops home's) image layer directory, relative
+/// to the charter path.
+pub const CHARTER_IMAGE_LAYER_PATH: &str = "image";
+
+/// Marks ImageLayers the primary-repository sync authored.
+pub const PROJECT_IMAGE_MANAGER: &str = "project-image";
 
 /// Every regular file of one layer directory at one revision, keyed by path
 /// relative to the directory. Unlike charter reads, no extension filter
@@ -180,17 +187,17 @@ pub struct LayerDirectorySnapshot {
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
-/// The project layer directory below a source's root (its charter path, or a
-/// local directory).
-pub fn image_layer_source(source: &CharterSource) -> CharterSource {
+/// A charter's image layer directory below its charter path (or local
+/// directory).
+pub fn charter_image_layer_source(source: &CharterSource) -> CharterSource {
     match source {
         CharterSource::Repository { repo, branch, path } => CharterSource::Repository {
             repo: repo.clone(),
             branch: branch.clone(),
-            path: Path::new(path).join(PROJECT_IMAGE_LAYER_PATH).to_string_lossy().into_owned(),
+            path: Path::new(path).join(CHARTER_IMAGE_LAYER_PATH).to_string_lossy().into_owned(),
         },
         CharterSource::LocalDirectory { directory } => {
-            CharterSource::LocalDirectory { directory: Path::new(directory).join(PROJECT_IMAGE_LAYER_PATH).to_string_lossy().into_owned() }
+            CharterSource::LocalDirectory { directory: Path::new(directory).join(CHARTER_IMAGE_LAYER_PATH).to_string_lossy().into_owned() }
         }
     }
 }
@@ -442,7 +449,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("source");
         let cache = tempfile::tempdir().expect("cache");
         write_tree(dir.path()).await;
-        let layer = dir.path().join("ops").join(PROJECT_IMAGE_LAYER_PATH);
+        let layer = dir.path().join("ops").join(CHARTER_IMAGE_LAYER_PATH);
         std::fs::create_dir_all(layer.join("prelude.d")).expect("layer directory");
         std::fs::write(layer.join("layer.yaml"), "name: native\n").expect("definition");
         std::fs::write(layer.join("Dockerfile.fragment"), "FROM ${BASE}\n").expect("fragment");
@@ -456,16 +463,18 @@ mod tests {
             ("layer.yaml".to_string(), b"name: native\n".to_vec()),
             ("prelude.d/50-native.sh".to_string(), vec![0x23, 0x21, 0xff]),
         ]);
-        let git = image_layer_source(&CharterSource::Repository { repo: repo.clone(), branch: "main".into(), path: "ops".into() });
+        let git = charter_image_layer_source(&CharterSource::Repository { repo: repo.clone(), branch: "main".into(), path: "ops".into() });
         let snapshot = read_layer_directory(&git, cache.path(), Some(&vcs)).await.expect("git layer").expect("present");
         assert_eq!(snapshot.files, expected);
-        let local = image_layer_source(&CharterSource::LocalDirectory { directory: dir.path().join("ops").to_string_lossy().into_owned() });
+        let local =
+            charter_image_layer_source(&CharterSource::LocalDirectory { directory: dir.path().join("ops").to_string_lossy().into_owned() });
         let snapshot = read_layer_directory(&local, cache.path(), None).await.expect("local layer").expect("present");
         assert_eq!(snapshot.files, expected);
-        let absent = image_layer_source(&CharterSource::Repository { repo, branch: "main".into(), path: "ops-other".into() });
+        let absent = charter_image_layer_source(&CharterSource::Repository { repo, branch: "main".into(), path: "ops-other".into() });
         assert_eq!(read_layer_directory(&absent, cache.path(), Some(&vcs)).await.expect("absent git layer"), None);
-        let absent =
-            image_layer_source(&CharterSource::LocalDirectory { directory: dir.path().join("ignored").to_string_lossy().into_owned() });
+        let absent = charter_image_layer_source(&CharterSource::LocalDirectory {
+            directory: dir.path().join("ignored").to_string_lossy().into_owned(),
+        });
         assert_eq!(read_layer_directory(&absent, cache.path(), None).await.expect("absent local layer"), None);
     }
 

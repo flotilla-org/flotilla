@@ -137,6 +137,16 @@ fn validation_refuses_each_rule_violation() {
                 ..shared()
             },
         ),
+        (
+            "arch placeholder with one sha256",
+            ImageLayerSpec {
+                pins: BTreeMap::from([(
+                    "rustup".into(),
+                    pin(Some("https://x.test/{arch}/rustup-init"), Some(ImagePinDigest::Single("a".repeat(64)))),
+                )]),
+                ..shared()
+            },
+        ),
         ("harness without its provide", layer("harness-codex", "1.0", ImageLayerTier::AgentRuntime, &["harness:claude"], &[])),
         ("crew utilities without its provide", layer("crew-utilities", "1.0", ImageLayerTier::AgentRuntime, &["tool:gh"], &[])),
         ("absolute context path", ImageLayerSpec { context_files: context("/etc/x"), ..shared() }),
@@ -166,7 +176,14 @@ fn validation_refuses_each_rule_violation() {
                 pin(Some("https://x.test/r"), Some(ImagePinDigest::PerArchitecture(BTreeMap::from([("amd64".into(), hex.clone())])))),
             ),
             ("toolchain".into(), pin(None, None)),
-            ("tea".into(), pin(Some("https://x.test/t"), Some(ImagePinDigest::Single(hex)))),
+            ("tea".into(), pin(Some("https://x.test/t"), Some(ImagePinDigest::Single(hex.clone())))),
+            (
+                "gh".into(),
+                pin(
+                    Some("https://x.test/gh_{arch}.tar.gz"),
+                    Some(ImagePinDigest::PerArchitecture(BTreeMap::from([("amd64".into(), hex.clone()), ("arm64".into(), hex)]))),
+                ),
+            ),
         ]),
         context_files: context("prelude.d/50-display-x11.sh"),
         build_secrets: BTreeSet::from(["forgejo-token".into()]),
@@ -208,6 +225,11 @@ fn fragment_from_contract() {
     for (fragment, case) in refused {
         assert!(validate_fragment_stages("rust", fragment).is_err(), "{case}");
     }
+    // `flotilla-` is reserved for generated stage names (`flotilla-layer-N`).
+    let reserved = validate_fragment_stages("flotilla-layer", "FROM ${BASE} AS flotilla-layer-1\nFROM ${BASE}").expect_err("reserved");
+    assert!(reserved.contains("flotilla-"), "{reserved}");
+    // An alias equal to the layer name would shadow its named build context.
+    assert!(validate_fragment_stages("rust", "FROM scratch AS rust\nFROM ${BASE}").is_err());
 }
 
 // ---- stored shapes ----
@@ -408,8 +430,49 @@ fn shadowing_and_clashes() {
     assert_eq!(pinned.expect_err("shadowed versions are hidden").to_string(), "image layer `rust@1.99` is not defined");
 
     layers.push(layer("node", "24.18.0", ImageLayerTier::Shared, &["toolchain:node"], &[]));
-    let clash = resolve_image(&ImageCatalogue::new(layers), &request()).expect_err("clash");
-    assert_eq!(clash.to_string(), "image layer `node` version `24.18.0` is defined twice in the stdlib source");
+    let catalogue = ImageCatalogue::new(layers);
+    let clash = "image layer `node` version `24.18.0` is defined twice in the stdlib source";
+    // A clash refuses only resolutions that touch the clashed name.
+    resolve_image(&catalogue, &request()).expect("an unrelated resolution is unaffected");
+    let selected = ImageRequest { selection: Some(ImageSelection { base: None, layers: vec!["node".into()] }), ..request() };
+    assert_eq!(resolve_image(&catalogue, &selected).expect_err("selected by name").to_string(), clash);
+    let needed = ImageRequest { needs: BTreeSet::from(["toolchain:node".into()]), ..request() };
+    assert_eq!(resolve_image(&catalogue, &needed).expect_err("candidate provider").to_string(), clash);
+    let required = ImageRequest { needs: BTreeSet::from(["tool:formal-modelling".into()]), ..request() };
+    assert_eq!(resolve_image(&catalogue, &required).expect_err("required provider").to_string(), clash);
+    let errors = catalogue.effective("flotilla").check().expect_err("check reports the clash");
+    assert!(errors.iter().any(|error| error.to_string() == clash), "{errors:?}");
+}
+
+// Resource names are injective over (source, project, name, version): names
+// that would read alike, and versions that sanitise alike, stay distinct.
+#[test]
+fn resource_names_are_injective() {
+    let project = |project: &str, name: &str, version: &str| ImageLayerSpec {
+        project: Some(project.into()),
+        ..layer(name, version, ImageLayerTier::Project, &["project:x"], &[])
+    };
+    let names = [
+        project("app", "x-native", "1.0.0").resource_name(),
+        project("app-x", "native", "1.0.0").resource_name(),
+        layer("rust", "1.0.A", ImageLayerTier::Shared, &["toolchain:rust"], &[]).resource_name(),
+        layer("rust", "1.0.B", ImageLayerTier::Shared, &["toolchain:rust"], &[]).resource_name(),
+        ImageLayerSpec {
+            source: ImageLayerSource::Installation,
+            ..layer("rust", "1.0.A", ImageLayerTier::Shared, &["toolchain:rust"], &[])
+        }
+        .resource_name(),
+    ];
+    assert_eq!(names.iter().collect::<BTreeSet<_>>().len(), names.len(), "{names:?}");
+    assert!(names[0].starts_with("project-app-x-native-1.0.0-"), "{}", names[0]);
+    assert!(names[2].starts_with("stdlib-rust-1.0.a-"), "{}", names[2]);
+    for name in &names {
+        assert!(
+            name.len() <= 253
+                && name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.')
+        );
+    }
+    assert_eq!(names[0], project("app", "x-native", "1.0.0").resource_name(), "names are stable");
 }
 
 // Needs resolve by exact provides lookup: provided-already adds nothing, zero
@@ -438,6 +501,23 @@ fn needs_resolve_by_provides_lookup() {
     let duplicate =
         resolve_image(&ImageCatalogue::new(layers), &ImageRequest { needs: BTreeSet::from(["display:x11".into()]), ..request() });
     assert_eq!(duplicate.expect_err("duplicate").to_string(), "duplicate providers for `display:x11`: display-x11, xvfb");
+}
+
+// Needs match providers with capability semantics: unversioned, `@version`
+// and `>=minimum` needs accept any matching provide, with duplicate refusal
+// over the matching candidates; exact strings behave as before.
+#[test]
+fn needs_match_provides_by_capability() {
+    let catalogue = ImageCatalogue::new(catalogue());
+    let need = |need: &str| resolve_image(&catalogue, &ImageRequest { needs: BTreeSet::from([need.to_string()]), ..request() });
+    assert!(names(&need("toolchain:rust>=1.90").expect("minimum")).contains(&"rust@1.99.0".to_string()));
+    assert!(names(&need("toolchain:rust@1.99.0").expect("exact")).contains(&"rust@1.99.0".to_string()));
+    assert_eq!(need("toolchain:rust>=2.0").expect_err("too new").to_string(), "unresolvable image need `toolchain:rust>=2.0`");
+    let mut layers = self::catalogue();
+    layers.push(layer("rust-nightly", "1.100.0", ImageLayerTier::Shared, &["toolchain:rust@1.100.0"], &[]));
+    let duplicate =
+        resolve_image(&ImageCatalogue::new(layers), &ImageRequest { needs: BTreeSet::from(["toolchain:rust>=1.90".into()]), ..request() });
+    assert_eq!(duplicate.expect_err("two matching").to_string(), "duplicate providers for `toolchain:rust>=1.90`: rust, rust-nightly");
 }
 
 // `requires` pulls its providers in transitively and orders them first within
@@ -578,10 +658,10 @@ fn resolution_is_order_independent_and_well_formed(tc: hegel::TestCase) {
 // name; the fixture catalogue is clean.
 #[test]
 fn catalogue_check_reports_definition_errors() {
-    ImageCatalogue::new(catalogue()).effective("flotilla").expect("effective").check().expect("clean catalogue");
+    ImageCatalogue::new(catalogue()).effective("flotilla").check().expect("clean catalogue");
     let mut layers = catalogue();
     layers.push(layer("xvfb", "1.0", ImageLayerTier::Shared, &["display:x11"], &["toolchain:go"]));
-    let errors = ImageCatalogue::new(layers).effective("flotilla").expect("effective").check().expect_err("errors");
+    let errors = ImageCatalogue::new(layers).effective("flotilla").check().expect_err("errors");
     let messages = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
     assert_eq!(
         messages,
@@ -635,7 +715,7 @@ fn layer_directory_parses_and_inlines_declared_files() {
     assert!(spec.context_files["prelude.d/50-display-x11.sh"].executable);
     let plain = parse_layer_directory(&directory(DISPLAY_YAML), ImageLayerSource::Installation, None).expect("parse");
     assert!(!plain.context_files["prelude.d/50-display-x11.sh"].executable);
-    assert_eq!(plain.resource_name(), "installation-display-x11-1.0.0");
+    assert!(plain.resource_name().starts_with("installation-display-x11-1.0.0-"));
 }
 
 #[test]
@@ -662,5 +742,5 @@ fn layer_directory_errors_name_the_problem() {
         Some("wheelhouse"),
     )
     .expect("project layer");
-    assert_eq!(project.resource_name(), "project-wheelhouse-display-x11-1.0.0");
+    assert!(project.resource_name().starts_with("project-wheelhouse-display-x11-1.0.0-"));
 }

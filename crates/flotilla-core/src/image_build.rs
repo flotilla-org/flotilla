@@ -94,16 +94,31 @@ pub fn host_architecture(host: &ResourceObject<Host>) -> Option<String> {
         .map(|arch| canonical_image_architecture(arch).to_string())
 }
 
-/// The ImageBuild name a composed identity uses on `placement_host`'s architecture.
-pub async fn placement_image_build_name(
+/// The ImageBuild name a composed identity uses on a placement: the
+/// registry build when a fleet image cache is declared, otherwise the
+/// placement host's own local build.
+pub fn expected_build_name(
+    identity: &str,
+    architecture: &str,
+    image_cache: Option<&flotilla_resources::ImageCacheBinding>,
+    placement_host: &str,
+) -> String {
+    match image_cache {
+        Some(cache) => image_build_name(identity, architecture, &ImageDelivery::Registry { repository: cache.repository.clone() }, ""),
+        None => image_build_name(identity, architecture, &ImageDelivery::Local, placement_host),
+    }
+}
+
+/// The fleet image cache, if declared.
+pub async fn fleet_image_cache(
     backend: &ResourceBackend,
     namespace: &str,
-    identity: &str,
-    placement_host: &str,
-) -> Result<String, String> {
-    let hosts = hosts(backend, namespace).await?;
-    let (_, architecture) = placement_architecture(&hosts, placement_host)?;
-    Ok(image_build_name(identity, &architecture))
+) -> Result<Option<flotilla_resources::ImageCacheBinding>, String> {
+    match backend.definitions::<FleetDesignation>(namespace).get(FLEET_DESIGNATION_NAME).await {
+        Ok(fleet) => Ok(fleet.spec.image_cache),
+        Err(ResourceError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn placement_architecture<'a>(
@@ -172,28 +187,32 @@ pub fn choose_builder(
     }
 }
 
-/// Get or create the ImageBuild for `resolved` on the placement host's
-/// architecture and return its name. An existing build with that name, local
-/// or replicated, is reused whatever its builder.
-pub async fn ensure_image_build(
+/// The ImageBuild a vessel's composed image uses on its placement: its name,
+/// and the spec to create when no copy of that name exists yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedImageBuild {
+    pub name: String,
+    pub create: Option<ImageBuildSpec>,
+}
+
+/// Plan, without writing, the ImageBuild for `resolved` on the placement
+/// host's architecture. An existing build with the expected name, local or
+/// replicated, is reused whatever its copies say.
+pub async fn plan_image_build(
     backend: &ResourceBackend,
     namespace: &str,
     resolved: &ResolvedImage,
     placement_host: &str,
-) -> Result<String, String> {
+) -> Result<PlannedImageBuild, String> {
     let hosts = hosts(backend, namespace).await?;
     let (placement, architecture) = placement_architecture(&hosts, placement_host)?;
-    let name = image_build_name(&resolved.identity, &architecture);
+    let image_cache = fleet_image_cache(backend, namespace).await?;
+    let name = expected_build_name(&resolved.identity, &architecture, image_cache.as_ref(), &placement.metadata.name);
     match flotilla_store::read_image_build(backend, namespace, &name).await {
-        Ok(_) => return Ok(name),
+        Ok(_) => return Ok(PlannedImageBuild { name, create: None }),
         Err(ResourceError::NotFound { .. }) => {}
         Err(error) => return Err(error.to_string()),
     }
-    let image_cache = match backend.definitions::<FleetDesignation>(namespace).get(FLEET_DESIGNATION_NAME).await {
-        Ok(fleet) => fleet.spec.image_cache,
-        Err(ResourceError::NotFound { .. }) => None,
-        Err(error) => return Err(error.to_string()),
-    };
     let (host_ref, delivery, reservation) = choose_builder(&hosts, placement, &architecture, image_cache.as_ref())?;
     let spec = ImageBuildSpec::builder()
         .identity(resolved.identity.clone())
@@ -203,11 +222,43 @@ pub async fn ensure_image_build(
         .delivery(delivery)
         .reservation(reservation)
         .build();
-    match backend.using::<ImageBuild>(namespace).create(&InputMeta::builder().name(name.clone()).build(), &spec.into()).await {
-        // A concurrent admission created the same name first; the name fixes
-        // identity and architecture, so that build serves this vessel too.
-        Ok(_) | Err(ResourceError::Conflict { .. }) => Ok(name),
-        Err(error) => Err(format!("create ImageBuild {name}: {error}")),
+    debug_assert_eq!(spec.resource_name(), name);
+    Ok(PlannedImageBuild { name, create: Some(spec) })
+}
+
+/// Create the planned builds that do not exist yet, once admission has passed
+/// every refusal. Returns the names this call created, so a failed commit can
+/// remove them again; a concurrent creator's copy is reused.
+pub async fn create_planned_builds(
+    backend: &ResourceBackend,
+    namespace: &str,
+    planned: &[PlannedImageBuild],
+) -> Result<Vec<String>, String> {
+    let builds = backend.using::<ImageBuild>(namespace);
+    let mut created = Vec::new();
+    for build in planned {
+        let Some(spec) = &build.create else { continue };
+        if created.contains(&build.name) {
+            continue;
+        }
+        match builds.create(&InputMeta::builder().name(build.name.clone()).build(), &spec.clone().into()).await {
+            Ok(_) => created.push(build.name.clone()),
+            Err(ResourceError::Conflict { .. }) => {}
+            Err(error) => {
+                remove_created_builds(backend, namespace, &created).await;
+                return Err(format!("create ImageBuild {}: {error}", build.name));
+            }
+        }
+    }
+    Ok(created)
+}
+
+/// Best-effort removal of builds an abandoned admission created.
+pub async fn remove_created_builds(backend: &ResourceBackend, namespace: &str, created: &[String]) {
+    for name in created {
+        if let Err(error) = backend.using::<ImageBuild>(namespace).delete(name).await {
+            tracing::warn!(image_build = %name, %error, "could not remove an abandoned admission's image build");
+        }
     }
 }
 

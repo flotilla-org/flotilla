@@ -347,8 +347,10 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                     let environment = decode::<Environment>(environment)?;
                     if let Some(docker) = &environment.spec.docker {
                         let build = composed_build(inventory, ns, docker.image_build_ref.as_deref())?;
-                        if let Some((build_ref, build)) = &build {
+                        if let ComposedBuild::Current(build_ref, build) = &build {
                             report.record(Category::Images, &identity, build_ref, check_build(probes, build).await, waiver);
+                        } else if let ComposedBuild::Missing(build_ref) = &build {
+                            report.record(Category::Images, &identity, build_ref, Err("frozen image build is unavailable".into()), waiver);
                         } else if let Some(local) = &status.local_image_id {
                             report.record(
                                 Category::Images,
@@ -428,23 +430,26 @@ async fn check_identity(probes: &impl Probes, local: &str, registry: Option<&str
     }
 }
 
-/// The current per-identity ImageBuild a composed Environment names. Retired
-/// ADR 0053 stage builds are ignored: the Environment's placed identity is
-/// checked instead. A missing current build is a refusal.
-fn composed_build(
-    inventory: &[Value],
-    namespace_name: &str,
-    build_ref: Option<&str>,
-) -> Result<Option<(String, ResourceObject<ImageBuild>)>> {
-    let Some(build_ref) = build_ref else { return Ok(None) };
+enum ComposedBuild {
+    /// Not a composed Environment, or a retired ADR 0053 stage build: the
+    /// Environment's placed identity is checked instead.
+    None,
+    /// The named build is absent from the inventory: a refusal.
+    Missing(String),
+    Current(String, Box<ResourceObject<ImageBuild>>),
+}
+
+/// The per-identity ImageBuild a composed Environment names.
+fn composed_build(inventory: &[Value], namespace_name: &str, build_ref: Option<&str>) -> Result<ComposedBuild> {
+    let Some(build_ref) = build_ref else { return Ok(ComposedBuild::None) };
     let Some(document) = inventory
         .iter()
         .find(|document| document["kind"] == "ImageBuild" && namespace(document) == namespace_name && name(document) == build_ref)
     else {
-        return Ok(None);
+        return Ok(ComposedBuild::Missing(build_ref.to_string()));
     };
     let build = decode::<ImageBuild>(document)?;
-    Ok(build.spec.current().is_some().then(|| (build_ref.to_string(), build)))
+    Ok(if build.spec.current().is_some() { ComposedBuild::Current(build_ref.to_string(), Box::new(build)) } else { ComposedBuild::None })
 }
 
 /// A Built image's digest must be available; a queued or building identity is
@@ -736,7 +741,11 @@ mod tests {
         // A composed Environment is checked through its per-identity build: a
         // failed build refuses with its reason, whatever the vessel recorded.
         let (name, build) = failed_build(&backend).await;
-        inventory[environment_index]["spec"]["docker"]["image_build_ref"] = Value::String(name);
+        // A missing build refuses even though the vessel recorded a digest.
+        inventory[environment_index]["spec"]["docker"]["image_build_ref"] = Value::String(name.clone());
+        let report = check(&inventory, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: true }).await.expect("check");
+        assert_eq!(report.images.unsatisfied, 1);
+        assert!(report.failures.iter().any(|failure| failure.contains("frozen image build is unavailable")), "{:?}", report.failures);
         inventory.push(build);
         let report = check(&inventory, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: true }).await.expect("check");
         assert_eq!(report.images.unsatisfied, 1);
@@ -771,7 +780,7 @@ mod tests {
     async fn failed_build(backend: &ResourceBackend) -> (String, Value) {
         use flotilla_resources::{ImageBuildFailure, ImageBuildFailureClass, ImageBuildStatus};
         let spec = current_build_spec();
-        let name = flotilla_resources::image_build_name(&spec.identity, &spec.architecture);
+        let name = spec.resource_name();
         let builds = backend.clone().using::<ImageBuild>("fleet");
         let created = builds.create(&InputMeta::builder().name(name.clone()).build(), &spec.into()).await.expect("build");
         let failed = ImageBuildStatus {
@@ -1103,7 +1112,7 @@ mod tests {
         let (backend, mut inventory) = placed_image_inventory().await;
         inventory[0]["metadata"]["annotations"]["flotilla.work/frozen-image-layers"] = Value::String("{not json".into());
         let spec = current_build_spec();
-        let name = flotilla_resources::image_build_name(&spec.identity, &spec.architecture);
+        let name = spec.resource_name();
         let builds = backend.clone().using::<ImageBuild>("fleet");
         let queued = builds.create(&InputMeta::builder().name(name.clone()).build(), &spec.into()).await.expect("queued build");
         let environment = backend

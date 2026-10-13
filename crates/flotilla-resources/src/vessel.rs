@@ -160,7 +160,8 @@ pub enum VesselStatusPatch {
         requested_stance: Stance,
         effective_stance: Stance,
         ready_at: DateTime<Utc>,
-        /// The composed image and its digest, recorded as [`Self::RecordImage`].
+        /// The composed image and digest the Ready Environment runs; replaces
+        /// any earlier record.
         image: Option<VesselImage>,
     },
     MarkInterrupted {
@@ -215,8 +216,9 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 ready_at,
                 image,
             } => {
+                // Ready records the image the Environment actually runs.
                 if let Some(image) = image {
-                    record_image(status, image);
+                    status.image = Some(image.clone());
                 }
                 status.configured_limits = configured_limits.clone();
                 status.phase = VesselPhase::Ready;
@@ -279,6 +281,33 @@ mod image_tests {
     use hegel::generators as gs;
 
     use super::*;
+
+    // ADR 0062: when its Environment becomes Ready the vessel records the
+    // image it actually runs, replacing an earlier record (a recreated
+    // Environment may run a newer digest or a relaunched identity).
+    #[test]
+    fn ready_records_the_latest_image() {
+        let ready = |identity: &str, digest: &str| VesselStatusPatch::MarkReady {
+            configured_limits: None,
+            placement_decision: None,
+            environment_ref: Some("env".into()),
+            image_ref: None,
+            local_image_id: None,
+            registry_digest: None,
+            checkout_refs: BTreeMap::new(),
+            terminal_session_refs: Vec::new(),
+            requested_stance: Default::default(),
+            effective_stance: Default::default(),
+            ready_at: chrono::Utc::now(),
+            image: Some(VesselImage { identity: identity.into(), digest: Some(digest.into()) }),
+        };
+        let mut status = VesselStatus::default();
+        ready("sha256:a", "repo@sha256:1").apply(&mut status);
+        ready("sha256:a", "repo@sha256:2").apply(&mut status);
+        assert_eq!(status.image, Some(VesselImage { identity: "sha256:a".into(), digest: Some("repo@sha256:2".into()) }));
+        ready("sha256:b", "repo@sha256:3").apply(&mut status);
+        assert_eq!(status.image, Some(VesselImage { identity: "sha256:b".into(), digest: Some("repo@sha256:3".into()) }));
+    }
 
     // ADR 0062: a running vessel keeps its image until relaunch. Recording is
     // idempotent, fills a missing digest, never changes a recorded identity or

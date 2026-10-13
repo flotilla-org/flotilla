@@ -379,7 +379,7 @@ impl AdmissionActions<'_> {
                 self.events.finish(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);
             }
-            let vessel_placements = match self
+            let (vessel_placements, image_builds) = match self
                 .convoy_admission
                 .join_convoy_placement_builds(
                     &namespace,
@@ -415,6 +415,7 @@ impl AdmissionActions<'_> {
                         .maybe_adopted_checkout_ref_to_cleanup(adopted_checkout_ref_to_cleanup)
                         .maybe_dispatching_principal_ref(dispatching_principal_ref)
                         .vessel_placements(vessel_placements)
+                        .image_builds(image_builds)
                         .build(),
                     admission_guard,
                 )

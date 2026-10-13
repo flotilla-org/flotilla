@@ -2257,7 +2257,7 @@ mod registered_charter_tests {
         assert_eq!(legacy.spec, refreshed.spec);
     }
 
-    // ADR 0062: a registered charter's `.flotilla/image/` applies as its
+    // ADR 0062: a registered charter's `image/` applies as its
     // project's ImageLayer, and removing the directory removes the layer.
     // Layers the charter did not author are left alone.
     #[tokio::test]
@@ -2266,10 +2266,10 @@ mod registered_charter_tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let files = BTreeMap::from([
             (
-                ".flotilla/image/layer.yaml".to_string(),
+                "image/layer.yaml".to_string(),
                 "name: app-native\nversion: 1.0.0\ntier: project\nprovides: [project:app]\nprobe: \"true\"\n".to_string(),
             ),
-            (".flotilla/image/Dockerfile.fragment".to_string(), "FROM ${BASE}\nRUN true\n".to_string()),
+            ("image/Dockerfile.fragment".to_string(), "FROM ${BASE}\nRUN true\n".to_string()),
         ]);
         let mut registration = project(CharterPointer::Inline { documents: vec![], files });
         let path = directory.path().join("project.json");
@@ -2287,7 +2287,15 @@ mod registered_charter_tests {
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), "flotilla", directory.path()).with_revision("first");
         let report = reconciler.reconcile_once_for_test().await.expect("first apply");
         assert!(report.errors.is_empty(), "{report:?}");
-        let applied = layers.get("project-app-app-native-1.0.0").await.expect("project layer");
+        let name = layers
+            .list()
+            .await
+            .expect("layers")
+            .into_iter()
+            .map(|layer| layer.metadata.name)
+            .find(|name| name.starts_with("project-app-app-native-1.0.0-"))
+            .expect("project layer applied");
+        let applied = layers.get(&name).await.expect("project layer");
         assert_eq!(applied.spec.current().expect("current").project.as_deref(), Some("app"));
         registration["spec"]["charter"]["files"] = serde_json::json!({});
         std::fs::write(&path, serde_json::to_string(&registration).expect("encode")).expect("remove layer");

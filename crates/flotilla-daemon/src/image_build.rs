@@ -51,8 +51,8 @@ mod tests {
     use chrono::Utc;
     use flotilla_protocol::NodeId;
     use flotilla_resources::{
-        image_build_name, image_identity, ImageBuild, ImageBuildPhase, ImageBuildReservation, ImageBuildSpec, ImageBuildStatusPatch,
-        ImageDelivery, ImageLayerSource, ImageLayerSpec, ImageLayerTier,
+        image_identity, ImageBuild, ImageBuildPhase, ImageBuildReservation, ImageBuildSpec, ImageBuildStatusPatch, ImageDelivery,
+        ImageLayerSource, ImageLayerSpec, ImageLayerTier,
     };
     use flotilla_store::{apply_status_patch, read_image_build};
 
@@ -86,7 +86,7 @@ mod tests {
         let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("home"));
         let builder = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("builder-root"));
         let spec = spec("builder");
-        let name = image_build_name(&spec.identity, &spec.architecture);
+        let name = spec.resource_name();
         home.using::<ImageBuild>("test")
             .create(&InputMeta::builder().name(name.clone()).build(), &spec.clone().into())
             .await
@@ -134,11 +134,14 @@ mod tests {
         let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("home"));
         let builder = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("builder-root"));
         let demand = spec("builder");
-        let name = image_build_name(&demand.identity, &demand.architecture);
+        let name = demand.resource_name();
         home.using::<ImageBuild>("test").create(&InputMeta::builder().name(name.clone()).build(), &demand.into()).await.expect("demand");
         builder
             .using::<ImageBuild>("test")
-            .create(&InputMeta::builder().name(name.clone()).build(), &spec("other").into())
+            .create(
+                &InputMeta::builder().name(name.clone()).build(),
+                &ImageBuildSpec { reservation: ImageBuildReservation { cpu: 2, disk_bytes: 1 }, ..spec("builder") }.into(),
+            )
             .await
             .expect("existing");
         builder
@@ -148,6 +151,6 @@ mod tests {
             .expect("replicate demand");
         project_builds(&builder, "test", "builder").await.expect("project");
         let local = builder.using::<ImageBuild>("test").get(&name).await.expect("local");
-        assert_eq!(local.spec.current().expect("current").host_ref, "other");
+        assert_eq!(local.spec.current().expect("current").reservation.cpu, 2);
     }
 }

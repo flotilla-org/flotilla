@@ -143,11 +143,22 @@ async fn admit(
     let policy = fixture.backend.using::<PlacementPolicy>(NS).get("crew-policy").await.expect("policy");
     let mut placement =
         PlacementResolution { selected: Some(policy), refused_candidates: Vec::new(), viable_not_selected: Vec::new(), allocation: None };
-    let pins = fixture
+    let (pins, builds) = fixture
         .daemon
         .convoy_admission
         .join_convoy_placement_builds(NS, Some("flotilla"), workflow, &mut placement, Some(&decision()))
         .await?;
+    assert!(fixture
+        .backend
+        .using::<ImageBuild>(NS)
+        .list()
+        .await
+        .expect("builds")
+        .items
+        .iter()
+        .all(|build| builds.iter().all(|planned| planned.create.is_none() || planned.name != build.metadata.name)));
+    // Admission commits its planned builds with the convoy.
+    crate::image_build::create_planned_builds(&fixture.backend, NS, &builds).await?;
     let image = placement.selected.expect("selected").spec.docker_per_vessel.expect("docker").image;
     Ok((image, pins.into_iter().map(|(vessel, (spec, _))| (vessel, spec.docker_per_vessel.expect("docker").image)).collect()))
 }
@@ -164,7 +175,8 @@ async fn build_for(fixture: &Fixture, image: &Option<DockerImageSource>) -> flot
     let spec = build.spec.current().expect("current build");
     assert_eq!(&spec.identity, identity);
     assert_eq!(image_identity(&spec.layers), *identity, "the recorded identity is the layers' identity");
-    assert_eq!(*image_build_ref, image_build_name(identity, "amd64"));
+    assert_eq!(*image_build_ref, spec.resource_name());
+    assert!(image_build_ref.starts_with(&image_build_name(identity, "amd64", &ImageDelivery::Registry { repository: String::new() }, "")));
     build
 }
 
@@ -260,6 +272,11 @@ async fn registry_delivery_uses_the_deterministic_builder() {
             reservation: ImageBuildReservation { cpu: 2, disk_bytes: 1 << 30 },
         })
     };
+    let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("work", vec![agent("coder", "codex")], &[])]).build();
+    let (local, _) = admit(&fixture, &workflow).await.expect("local admission before a registry exists");
+    let local = build_for(&fixture, &local).await;
+    assert_eq!(local.spec.current().expect("current").delivery, ImageDelivery::Local);
+    assert!(local.metadata.name.ends_with("-host-a"), "local builds carry their builder: {}", local.metadata.name);
     set_architecture(&fixture.backend, "udder", "x86_64", builder(1)).await;
     set_architecture(&fixture.backend, "feta", "x86_64", builder(2)).await;
     set_architecture(&fixture.backend, "arm", "aarch64", None).await;
@@ -279,9 +296,10 @@ async fn registry_delivery_uses_the_deterministic_builder() {
         )
         .await
         .expect("fleet");
-    let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("work", vec![agent("coder", "codex")], &[])]).build();
     let (image, _) = admit(&fixture, &workflow).await.expect("admit");
     let build = build_for(&fixture, &image).await;
+    assert_ne!(build.metadata.name, local.metadata.name, "a registry configured later creates a registry build");
+    assert_eq!(fixture.backend.using::<ImageBuild>(NS).list().await.expect("builds").items.len(), 2);
     let spec = build.spec.current().expect("current");
     assert_eq!(spec.host_ref, "feta");
     assert_eq!(spec.delivery, ImageDelivery::Registry { repository: "registry.test/flotilla/crew-images".into() });

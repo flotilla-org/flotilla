@@ -1,13 +1,14 @@
-//! Project image layers (ADR 0062): a project's `.flotilla/image/` directory,
-//! read at the default-branch head as last fetched, becomes its project-source
-//! ImageLayer. The layer lives in the project's named ops home (a member's
-//! charter-store binding) when it has one, else in its primary repository.
-//! Removing the directory removes the layer. Registered charters are applied
-//! by the manifest reconciler instead (charter delegation).
+//! Project image layers (ADR 0062): the `.flotilla/image/` directory at the
+//! root of a project's primary repository, read at the default-branch head as
+//! last fetched, becomes its project-source ImageLayer. Every project's
+//! primary repository is read, charter-delegated projects included; a
+//! delegated charter may instead author the layer at `<charter path>/image/`
+//! (charter delegation), and a project defining both is refused, naming both
+//! locations. Removing the directory removes the layer.
 use std::collections::BTreeMap;
 
 use flotilla_charter::{
-    charter_store::{image_layer_source, PROJECT_IMAGE_LAYER_PATH},
+    charter_store::{CHARTER_IMAGE_LAYER_PATH, PROJECT_IMAGE_LAYER_PATH, PROJECT_IMAGE_MANAGER},
     ops_entry::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION},
 };
 use flotilla_resources::{
@@ -18,16 +19,12 @@ use tracing::warn;
 
 use super::project_ops::{repository_transport_url_with_backend, ProjectService};
 
-/// Marks ImageLayers this sync owns; it never touches other authors' layers.
-pub(super) const PROJECT_IMAGE_MANAGER: &str = "project-image";
-
 /// Where one project's layer directory lives, as seen from this host.
 #[derive(Debug, PartialEq, Eq)]
 enum LayerHome {
     /// Read the directory here.
     Source(CharterSource),
-    /// Another host reads it (a binding on that host), or nothing can be read
-    /// yet (no default branch); leave the layer as it is.
+    /// Nothing can be read yet (no default branch); leave the layer as it is.
     Elsewhere,
 }
 
@@ -48,10 +45,10 @@ impl ProjectService<'_> {
             .collect::<std::collections::BTreeSet<_>>();
         let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
         for project in projects {
-            if project.spec.charter.is_some() || project.metadata.deletion_timestamp.is_some() {
+            if project.metadata.deletion_timestamp.is_some() || !local.contains(&project.metadata.name) {
                 continue;
             }
-            let home = match self.layer_home(&namespace, &project, local.contains(&project.metadata.name)).await {
+            let home = match self.layer_home(&namespace, &project).await {
                 Ok(Some(home)) => home,
                 Ok(None) => continue,
                 Err(error) => {
@@ -68,15 +65,9 @@ impl ProjectService<'_> {
         Ok(())
     }
 
-    /// The named ops home wins; the primary (first code) repository is read
-    /// only by the project's home. `None`: this host has nothing to read.
-    async fn layer_home(&self, namespace: &str, project: &ResourceObject<Project>, home: bool) -> Result<Option<LayerHome>, String> {
-        if let Some(binding) = project.spec.repositories.iter().find_map(|member| member.charter_store.as_ref()) {
-            return Ok((binding.host == self.repository_index.host).then(|| LayerHome::Source(image_layer_source(&binding.source))));
-        }
-        if !home {
-            return Ok(None);
-        }
+    /// The primary (first code) repository, read by the project's home.
+    /// `None`: the project has no code repository.
+    async fn layer_home(&self, namespace: &str, project: &ResourceObject<Project>) -> Result<Option<LayerHome>, String> {
         let Some(primary) = project.spec.repositories.iter().find(|member| member.roles.contains(&ProjectRepositoryRole::Code)) else {
             return Ok(None);
         };
@@ -114,6 +105,23 @@ impl ProjectService<'_> {
         let definitions = self.resource_backend.definitions::<ImageLayer>(namespace);
         let desired_name = desired.as_ref().map(|layer| layer.resource_name());
         if let (Some(layer), Some(snapshot), Some(name)) = (&desired, &snapshot, &desired_name) {
+            // One project, one layer source: a charter-authored layer for this
+            // project as well is a within-source clash, refused by name.
+            for other in definitions.list().await.map_err(|error| error.to_string())? {
+                let charter_authored = other.metadata.deletion_timestamp.is_none()
+                    && other.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(PROJECT_IMAGE_MANAGER)
+                    && other
+                        .spec
+                        .current()
+                        .is_some_and(|spec| spec.source == ImageLayerSource::Project && spec.project.as_deref() == Some(project));
+                if charter_authored {
+                    return Err(format!(
+                        "project `{project}` defines its image layer twice: `{PROJECT_IMAGE_LAYER_PATH}/` in its primary repository and \
+                         `{CHARTER_IMAGE_LAYER_PATH}/` in its charter (ImageLayer `{}`)",
+                        other.metadata.name
+                    ));
+                }
+            }
             let labels = BTreeMap::from([(MANAGED_BY_LABEL.to_string(), PROJECT_IMAGE_MANAGER.to_string())]);
             let annotations = BTreeMap::from([
                 (MATERIALIZED_PROJECT_ANNOTATION.to_string(), project.to_string()),
@@ -160,7 +168,7 @@ mod tests {
     use async_trait::async_trait;
     use flotilla_charter::charter_store::LayerDirectorySnapshot;
     use flotilla_resources::{
-        CharterStoreBinding, Clock, ImageLayerTier, ProjectRepositorySpec, ProjectSpec, RepositorySpec, RepositoryStatus, SystemClock,
+        CharterPointer, Clock, ImageLayerTier, ProjectRepositorySpec, ProjectSpec, RepositorySpec, RepositoryStatus, SystemClock,
     };
     use flotilla_store::ResourceBackend;
     use flotilla_store_memory::InMemoryBackend;
@@ -229,7 +237,11 @@ mod tests {
         ])
     }
 
-    async fn seed(backend: &ResourceBackend, binding: Option<CharterStoreBinding>) {
+    fn layer_name(version: &str) -> String {
+        parse_layer_directory(&layer_files(version), ImageLayerSource::Project, Some("app")).expect("layer").resource_name()
+    }
+
+    async fn seed(backend: &ResourceBackend, charter: Option<CharterPointer>) {
         let repository = RepositorySpec::remote("https://github.com/example/app").expect("repository");
         let created = backend
             .using::<Repository>("flotilla")
@@ -245,17 +257,13 @@ mod tests {
             )
             .await
             .expect("default branch");
-        let mut spec = ProjectSpec::builder().display_name("app".into()).build();
+        let mut spec = ProjectSpec::builder().display_name("app".into()).maybe_charter(charter).build();
         spec.repositories = vec![
             ProjectRepositorySpec::builder()
                 .repo(RepositorySpec::remote("https://github.com/example/docs").expect("docs").key())
                 .roles([ProjectRepositoryRole::Knowledge].into())
                 .build(),
-            ProjectRepositorySpec::builder()
-                .repo(repository.key())
-                .roles([ProjectRepositoryRole::Code].into())
-                .maybe_charter_store(binding)
-                .build(),
+            ProjectRepositorySpec::builder().repo(repository.key()).roles([ProjectRepositoryRole::Code].into()).build(),
         ];
         backend.using::<Project>("flotilla").create(&InputMeta::builder().name("app".into()).build(), &spec).await.expect("project");
     }
@@ -303,59 +311,83 @@ mod tests {
                 path: PROJECT_IMAGE_LAYER_PATH.into()
             })
         );
-        let layer = layers.get("project-app-app-native-1.0.0").await.expect("project layer");
+        let layer = layers.get(&layer_name("1.0.0")).await.expect("project layer");
         let spec = layer.spec.current().expect("current");
         assert_eq!((spec.source, spec.project.as_deref(), spec.tier), (ImageLayerSource::Project, Some("app"), ImageLayerTier::Project));
         assert_eq!(spec.context_files["apt.txt"].content, "libx11-dev\n");
         service.reconcile_project_image_layers().await.expect("unchanged");
-        assert_eq!(
-            layers.get("project-app-app-native-1.0.0").await.expect("layer").metadata.resource_version,
-            layer.metadata.resource_version
-        );
+        assert_eq!(layers.get(&layer_name("1.0.0")).await.expect("layer").metadata.resource_version, layer.metadata.resource_version);
 
         *source.files.lock().expect("files") = Some(layer_files("1.1.0"));
         service.reconcile_project_image_layers().await.expect("bump");
-        assert_eq!(names().await, ["project-app-app-native-1.1.0"]);
+        assert_eq!(names().await, [layer_name("1.1.0")]);
 
         let mut invalid = layer_files("1.2.0");
         invalid.insert("Dockerfile.fragment".into(), b"FROM ubuntu\n".to_vec());
         *source.files.lock().expect("files") = Some(invalid);
         service.reconcile_project_image_layers().await.expect("refusal is reported per project");
-        assert_eq!(names().await, ["project-app-app-native-1.1.0"], "an invalid layer keeps the previous one");
+        assert_eq!(names().await, [layer_name("1.1.0")], "an invalid layer keeps the previous one");
 
         *source.files.lock().expect("files") = None;
         service.reconcile_project_image_layers().await.expect("opt out");
         assert!(names().await.is_empty(), "removing the directory removes the layer");
     }
 
-    // A named ops home holds the layer instead of the primary repository; it
-    // is read only on the binding's host.
+    fn service<'a>(
+        backend: &'a ResourceBackend,
+        observed: &'a ResourceBackend,
+        clock: &'a Arc<dyn Clock>,
+        namespace: &'a std::sync::RwLock<String>,
+        operations: &'a Operations,
+    ) -> ProjectService<'a> {
+        ProjectService {
+            resource_backend: backend,
+            observed_resource_backend: observed,
+            clock,
+            namespace,
+            repository_index: RepositoryIndex { backend, observed, namespace, host: "local-host" },
+            operations,
+        }
+    }
+
+    // A charter-delegated project's primary repository is still read; a
+    // layer its charter also authored (`<charter path>/image/`) is a
+    // within-source clash, refused naming both locations.
     #[tokio::test]
-    async fn named_ops_home_wins_on_its_host() {
+    async fn charter_projects_read_their_primary_repository_and_refuse_a_second_layer() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let observed = ResourceBackend::new(InMemoryBackend::observed());
-        let ops =
-            CharterSource::Repository { repo: "https://github.com/example/ops".into(), branch: "main".into(), path: "projects/app".into() };
-        seed(&backend, Some(CharterStoreBinding { host: "ops-host".into(), source: ops.clone() })).await;
+        seed(&backend, Some(CharterPointer::Inline { documents: Vec::new(), files: BTreeMap::new() })).await;
         let source = Arc::new(LayerSource::default());
         *source.files.lock().expect("files") = Some(layer_files("1.0.0"));
         let operations = Operations(Arc::clone(&source));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        for host in ["local-host", "ops-host"] {
-            ProjectService {
-                resource_backend: &backend,
-                observed_resource_backend: &observed,
-                clock: &clock,
-                namespace: &namespace,
-                repository_index: RepositoryIndex { backend: &backend, observed: &observed, namespace: &namespace, host },
-                operations: &operations,
-            }
-            .reconcile_project_image_layers()
+        let service = service(&backend, &observed, &clock, &namespace, &operations);
+        service.reconcile_project_image_layers().await.expect("sync");
+        let layers = backend.definitions::<ImageLayer>("flotilla");
+        assert!(layers.get(&layer_name("1.0.0")).await.is_ok(), "charter projects read their primary repository");
+
+        let mut charter = parse_layer_directory(&layer_files("2.0.0"), ImageLayerSource::Project, Some("app")).expect("charter layer");
+        charter.name = "app-charter".into();
+        layers
+            .apply(
+                &InputMeta::builder()
+                    .name(charter.resource_name())
+                    .labels(BTreeMap::from([(MANAGED_BY_LABEL.to_string(), "manifest".to_string())]))
+                    .build(),
+                &charter.clone().into(),
+            )
             .await
-            .expect("sync");
-        }
-        assert_eq!(*source.reads.lock().expect("reads"), [image_layer_source(&ops)]);
-        assert!(backend.using::<ImageLayer>("flotilla").get("project-app-app-native-1.0.0").await.is_ok());
+            .expect("charter-authored layer");
+        *source.files.lock().expect("files") = Some(layer_files("1.1.0"));
+        let primary = CharterSource::Repository {
+            repo: "https://github.com/example/app".into(),
+            branch: "main".into(),
+            path: PROJECT_IMAGE_LAYER_PATH.into(),
+        };
+        let error = service.sync_project_image_layer("flotilla", "app", &primary).await.expect_err("clash");
+        assert!(error.contains("defines its image layer twice") && error.contains(&charter.resource_name()), "{error}");
+        assert!(layers.get(&layer_name("1.1.0")).await.is_err(), "the clashing layer is not applied");
     }
 }

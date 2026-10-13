@@ -29,9 +29,9 @@ impl Resource for ImageBuild {
     fn validate_spec(meta: &InputMeta, spec: &Self::Spec) -> Result<(), ResourceError> {
         let ImageBuildResourceSpec::Current(spec) = spec else { return Ok(()) };
         spec.validate().map_err(ResourceError::invalid)?;
-        let expected = image_build_name(&spec.identity, &spec.architecture);
+        let expected = spec.resource_name();
         if meta.name != expected {
-            return Err(ResourceError::invalid(format!("image build for this identity and architecture is named `{expected}`")));
+            return Err(ResourceError::invalid(format!("image build for this identity, architecture and delivery is named `{expected}`")));
         }
         Ok(())
     }
@@ -63,10 +63,23 @@ impl Resource for ImageBuild {
     }
 }
 
-/// `image-<first 40 hex of identity>-<architecture>`.
-pub fn image_build_name(identity: &str, architecture: &str) -> String {
+/// `image-<first 40 hex of identity>-<architecture>` for registry delivery.
+/// A local build exists only on its builder, so its name also carries the
+/// sanitised builder host: `image-<hex>-<architecture>-<host>`.
+pub fn image_build_name(identity: &str, architecture: &str, delivery: &ImageDelivery, host_ref: &str) -> String {
     let hex = identity.strip_prefix("sha256:").unwrap_or(identity);
-    format!("image-{}-{architecture}", &hex[..hex.len().min(40)])
+    let name = format!("image-{}-{architecture}", &hex[..hex.len().min(40)]);
+    match delivery {
+        ImageDelivery::Registry { .. } => name,
+        ImageDelivery::Local => {
+            let host = host_ref
+                .chars()
+                .map(|c| c.to_ascii_lowercase())
+                .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() { c } else { '-' })
+                .collect::<String>();
+            format!("{name}-{}", host.trim_matches('-'))
+        }
+    }
 }
 
 /// The stored spec of an ImageBuild: a current per-identity build, or a
@@ -178,6 +191,11 @@ pub struct ImageBuildSpec {
 }
 
 impl ImageBuildSpec {
+    /// The one name this build may have; see [`image_build_name`].
+    pub fn resource_name(&self) -> String {
+        image_build_name(&self.identity, &self.architecture, &self.delivery, &self.host_ref)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !matches!(self.architecture.as_str(), "amd64" | "arm64") {
             return Err(format!("image build architecture `{}` must be amd64 or arm64", self.architecture));

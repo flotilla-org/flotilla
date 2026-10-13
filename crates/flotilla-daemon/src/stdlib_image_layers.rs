@@ -138,7 +138,7 @@ mod tests {
         let layers = parse_stdlib_layers(STDLIB_IMAGE_LAYERS).expect("shipped stdlib parses");
         assert_eq!(layers.len(), STDLIB_IMAGE_LAYERS.len());
         assert!(layers.iter().all(|layer| layer.source == ImageLayerSource::Stdlib && layer.project.is_none()));
-        ImageCatalogue::new(layers).effective("any-project").expect("no clashes").check().expect("clean catalogue");
+        ImageCatalogue::new(layers).effective("any-project").check().expect("clean catalogue");
     }
 
     // Fixture directories parse with their declared context files and
@@ -146,10 +146,8 @@ mod tests {
     #[test]
     fn fixture_directories_parse_as_stdlib_layers() {
         let layers = parse_stdlib_layers(FIXTURE).expect("fixture parses");
-        assert_eq!(
-            layers.iter().map(|layer| layer.resource_name()).collect::<Vec<_>>(),
-            ["stdlib-base-ubuntu-24.04.1", "stdlib-display-x11-1.0.0"]
-        );
+        assert!(layers[0].resource_name().starts_with("stdlib-base-ubuntu-24.04.1-"));
+        assert!(layers[1].resource_name().starts_with("stdlib-display-x11-1.0.0-"));
         assert_eq!(layers[0].tier, ImageLayerTier::Base);
         assert_eq!(layers[0].from.as_deref(), Some(DIGEST));
         let prelude = &layers[1].context_files["prelude.d/50-display.sh"];
@@ -166,15 +164,17 @@ mod tests {
     async fn startup_application_is_idempotent_and_prunes_unshipped_stdlib() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut layers = parse_stdlib_layers(FIXTURE).expect("fixture parses");
+        let (base_name, display_name) = (layers[0].resource_name(), layers[1].resource_name());
         let first = apply_stdlib_layers(&backend, "flotilla", &layers).await.expect("first application");
         assert_eq!(first.applied.len(), 2);
         let local = backend.using::<ImageLayer>("flotilla");
-        let version = local.get("stdlib-display-x11-1.0.0").await.expect("display").metadata.resource_version;
+        let version = local.get(&display_name).await.expect("display").metadata.resource_version;
         assert_eq!(apply_stdlib_layers(&backend, "flotilla", &layers).await.expect("unchanged"), StdlibApplication::default());
-        assert_eq!(local.get("stdlib-display-x11-1.0.0").await.expect("display").metadata.resource_version, version);
+        assert_eq!(local.get(&display_name).await.expect("display").metadata.resource_version, version);
 
         let mut installation = layers[1].clone();
         installation.source = ImageLayerSource::Installation;
+        let installation_name = installation.resource_name();
         backend
             .definitions::<ImageLayer>("flotilla")
             .apply(&InputMeta::builder().name(installation.resource_name()).build(), &installation.into())
@@ -182,15 +182,15 @@ mod tests {
             .expect("installation layer");
         layers[1].probe = "command -v Xvfb && command -v xdpyinfo".into();
         let changed = apply_stdlib_layers(&backend, "flotilla", &layers).await.expect("changed release");
-        assert_eq!(changed.applied, ["stdlib-display-x11-1.0.0"]);
-        assert_eq!(local.get("stdlib-display-x11-1.0.0").await.expect("display").spec.current(), Some(&layers[1]));
+        assert_eq!(changed.applied, std::slice::from_ref(&display_name));
+        assert_eq!(local.get(&display_name).await.expect("display").spec.current(), Some(&layers[1]));
 
         let pruned = apply_stdlib_layers(&backend, "flotilla", &layers[..1]).await.expect("smaller release");
-        assert_eq!(pruned.deleted, ["stdlib-display-x11-1.0.0"]);
+        assert_eq!(pruned.deleted, std::slice::from_ref(&display_name));
         assert_eq!(apply_stdlib_layers(&backend, "flotilla", &layers[..1]).await.expect("settled"), StdlibApplication::default());
         let restored = apply_stdlib_layers(&backend, "flotilla", &layers).await.expect("re-shipped");
-        assert_eq!(restored.applied, ["stdlib-display-x11-1.0.0"]);
-        assert_eq!(local.get("stdlib-display-x11-1.0.0").await.expect("restored").spec.current(), Some(&layers[1]));
+        assert_eq!(restored.applied, std::slice::from_ref(&display_name));
+        assert_eq!(local.get(&display_name).await.expect("restored").spec.current(), Some(&layers[1]));
         apply_stdlib_layers(&backend, "flotilla", &layers[..1]).await.expect("pruned again");
         let names = backend
             .definitions::<ImageLayer>("flotilla")
@@ -200,6 +200,6 @@ mod tests {
             .into_iter()
             .map(|layer| layer.metadata.name)
             .collect::<BTreeSet<_>>();
-        assert_eq!(names, BTreeSet::from(["installation-display-x11-1.0.0".to_string(), "stdlib-base-ubuntu-24.04.1".to_string()]));
+        assert_eq!(names, BTreeSet::from([installation_name, base_name]));
     }
 }

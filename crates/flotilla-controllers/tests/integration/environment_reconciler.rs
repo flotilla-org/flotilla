@@ -354,9 +354,7 @@ impl DockerEnvironmentRuntime for ProvisioningDockerRuntime {
 }
 
 fn composed_build(delivery: flotilla_resources::ImageDelivery) -> (String, flotilla_resources::ImageBuildSpec) {
-    use flotilla_resources::{
-        image_build_name, image_identity, ImageBuildReservation, ImageBuildSpec, ImageLayerSource, ImageLayerSpec, ImageLayerTier,
-    };
+    use flotilla_resources::{image_identity, ImageBuildReservation, ImageBuildSpec, ImageLayerSource, ImageLayerSpec, ImageLayerTier};
     let layers = vec![ImageLayerSpec::builder()
         .name("base".into())
         .version("1".into())
@@ -375,14 +373,14 @@ fn composed_build(delivery: flotilla_resources::ImageDelivery) -> (String, floti
         .delivery(delivery)
         .reservation(ImageBuildReservation { cpu: 1, disk_bytes: 1 })
         .build();
-    (image_build_name(&identity, "amd64"), spec)
+    (spec.resource_name(), spec)
 }
 
 // ADR 0062: a composed Environment waits for its per-identity ImageBuild with
 // the build's state and failure reason, never falling back to another image,
-// then provisions the Built digest: a registry digest with the authored pull
-// policy (the provider pulls it with its pull credential), a local image ID
-// with pull policy Never.
+// then provisions the Built digest: a registry digest is digest-pinned and
+// pulled IfNotPresent whatever the policy says (the provider pulls it with its
+// pull credential); a local image ID uses pull policy Never.
 #[rstest::rstest]
 #[case::registry(flotilla_resources::ImageDelivery::Registry { repository: "registry.test/crew".into() })]
 #[case::local(flotilla_resources::ImageDelivery::Local)]
@@ -406,7 +404,7 @@ async fn composed_environment_waits_for_its_build_then_provisions_the_digest(#[c
                     image: String::new(),
                     declared_agent_adapters: BTreeSet::new(),
                     required_agent_adapters: BTreeSet::new(),
-                    pull_policy: DockerImagePullPolicy::IfNotPresent,
+                    pull_policy: DockerImagePullPolicy::Never,
                     mounts: Vec::new(),
                     env: Default::default(),
                 }),
@@ -460,4 +458,50 @@ async fn composed_environment_waits_for_its_build_then_provisions_the_digest(#[c
         ImageDelivery::Local => DockerImagePullPolicy::Never,
     };
     assert_eq!(*runtime.provisioned.lock().expect("provision log"), vec![(digest, expected_policy)]);
+}
+
+// ADR 0062: an Environment naming a previous-generation per-stage build can
+// never be satisfied; it fails with an explicit reason so the vessel's
+// recreation path relaunches it, instead of waiting forever.
+#[tokio::test]
+async fn retired_build_reference_fails_the_environment() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    flotilla_store::apply_resource_document(
+        &backend,
+        "flotilla",
+        serde_json::json!({
+            "apiVersion": "flotilla.work/v1", "kind": "ImageBuild", "metadata": {"name": "image-build-old-stage"},
+            "spec": {"recipe_key": "sha256:old", "host_ref": "host-a", "attempt": 0}
+        }),
+    )
+    .await
+    .expect("previous-generation build record");
+    let environment = backend
+        .clone()
+        .using::<Environment>("flotilla")
+        .create(
+            &InputMeta::builder().name("env-old".to_string()).build(),
+            &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(DockerEnvironmentSpec {
+                    image_build_ref: Some("image-build-old-stage".into()),
+                    memory_policy: Default::default(),
+                    host_ref: "host-a".to_string(),
+                    image: String::new(),
+                    declared_agent_adapters: BTreeSet::new(),
+                    required_agent_adapters: BTreeSet::new(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: Default::default(),
+                }),
+            },
+        )
+        .await
+        .expect("create environment");
+    let reconciler = EnvironmentReconciler::new(Arc::new(ProvisioningDockerRuntime::default()), backend.clone(), "flotilla");
+    let prepared = reconciler.prepare(&environment).await.expect("prepare");
+    assert!(matches!(
+        reconciler.reconcile(&environment, &prepared, chrono::Utc::now()).patch,
+        Some(EnvironmentStatusPatch::MarkFailed { message }) if message.contains("previous-generation image build; relaunch the vessel")
+    ));
 }

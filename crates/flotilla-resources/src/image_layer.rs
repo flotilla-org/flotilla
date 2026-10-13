@@ -377,14 +377,24 @@ impl ImageLayerSpec {
         Ok(())
     }
 
-    /// Conventional resource name: `<source>-<name>-<version>` or
-    /// `project-<project>-<name>-<version>`, restricted to `[a-z0-9.-]`.
+    /// Conventional resource name: a readable `<source>-<name>-<version>` or
+    /// `project-<project>-<name>-<version>` prefix restricted to `[a-z0-9.-]`,
+    /// then the first 12 hex of a hash over (source, project, name, version),
+    /// so names that read or sanitise alike stay distinct.
     pub fn resource_name(&self) -> String {
         let raw = match (&self.source, &self.project) {
             (ImageLayerSource::Project, Some(project)) => format!("project-{project}-{}-{}", self.name, self.version),
             (source, _) => format!("{source}-{}-{}", self.name, self.version),
         };
-        raw.chars().map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' { c } else { '-' }).collect()
+        let readable = raw
+            .chars()
+            .map(|c| c.to_ascii_lowercase())
+            .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' { c } else { '-' })
+            .take(200)
+            .collect::<String>();
+        let key = serde_json::to_vec(&(self.source, &self.project, &self.name, &self.version)).expect("name key encodes");
+        let hash = format!("{:x}", Sha256::digest(key));
+        format!("{readable}-{}", &hash[..12])
     }
 }
 
@@ -460,6 +470,9 @@ fn validate_pin(name: &str, pin: &ImageLayerPin) -> Result<(), String> {
     if pin.url.as_ref().is_some_and(|url| url.trim().is_empty()) {
         return Err(format!("pin `{name}` has an empty url"));
     }
+    if pin.url.as_ref().is_some_and(|url| url.contains("{arch}")) && matches!(pin.sha256, Some(ImagePinDigest::Single(_))) {
+        return Err(format!("pin `{name}` url varies by `{{arch}}` and needs a per-architecture sha256"));
+    }
     match &pin.sha256 {
         None if pin.url.is_some() => Err(format!("pin `{name}` downloads a url without a sha256")),
         None => Ok(()),
@@ -508,6 +521,9 @@ fn validate_fragment_stages(layer: &str, fragment: &str) -> Result<(), String> {
             return Err(format!("fragment stages start FROM ${{BASE}} or scratch, not `{image}`"));
         }
         if let Some(alias) = alias {
+            if alias.starts_with("flotilla-") {
+                return Err(format!("fragment stage alias `{alias}` uses the reserved `flotilla-` prefix"));
+            }
             let suffix = alias.strip_prefix(layer).and_then(|rest| rest.strip_prefix('-'));
             if suffix.is_none_or(str::is_empty) {
                 return Err(format!("fragment stage alias `{alias}` must be `{layer}-<suffix>`"));

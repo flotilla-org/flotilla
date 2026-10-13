@@ -49,16 +49,23 @@ impl ImageCatalogue {
     /// The catalogue as seen by `project`: other projects' layers are dropped,
     /// and per logical name the highest-precedence source wins (project, then
     /// installation, then stdlib). Two definitions with one (source, name,
-    /// version) are a clash.
-    pub fn effective(&self, project: &str) -> Result<EffectiveImageCatalogue, ImageResolutionError> {
+    /// version) are a clash, reported by [`EffectiveImageCatalogue::check`]
+    /// and refused only by resolutions that touch that name.
+    pub fn effective(&self, project: &str) -> EffectiveImageCatalogue {
         let mut by_name: BTreeMap<&str, BTreeMap<ImageLayerSource, Vec<&ImageLayerSpec>>> = BTreeMap::new();
+        let mut clashes: BTreeMap<String, Vec<ImageResolutionError>> = BTreeMap::new();
         for layer in &self.layers {
             if layer.source == ImageLayerSource::Project && layer.project.as_deref() != Some(project) {
                 continue;
             }
             let versions = by_name.entry(&layer.name).or_default().entry(layer.source).or_default();
             if versions.iter().any(|existing| existing.version == layer.version) {
-                return Err(ImageResolutionError::Clash { source: layer.source, name: layer.name.clone(), version: layer.version.clone() });
+                clashes.entry(layer.name.clone()).or_default().push(ImageResolutionError::Clash {
+                    source: layer.source,
+                    name: layer.name.clone(),
+                    version: layer.version.clone(),
+                });
+                continue;
             }
             versions.push(layer);
         }
@@ -74,7 +81,7 @@ impl ImageCatalogue {
             versions.sort_by(|left, right| compare_versions(&left.version, &right.version));
             effective.insert(name.to_string(), versions.into_iter().cloned().collect());
         }
-        Ok(EffectiveImageCatalogue { by_name: effective, shadowed })
+        EffectiveImageCatalogue { by_name: effective, shadowed, clashes }
     }
 }
 
@@ -96,6 +103,14 @@ pub struct EffectiveImageCatalogue {
     /// Winning source's versions per name, ascending.
     by_name: BTreeMap<String, Vec<ImageLayerSpec>>,
     shadowed: Vec<ShadowedImageLayer>,
+    /// Duplicate (source, name, version) definitions, per name.
+    clashes: BTreeMap<String, Vec<ImageResolutionError>>,
+}
+
+/// A layer provides `need` when any of its provides satisfies it: exactly,
+/// at an `@version`, or at a `>=minimum` (ADR 0062 provides lookup).
+fn provides(layer: &ImageLayerSpec, need: &str) -> bool {
+    layer.provides.iter().any(|provided| crate::capability_satisfies(provided, need))
 }
 
 impl EffectiveImageCatalogue {
@@ -112,6 +127,7 @@ impl EffectiveImageCatalogue {
     /// to or dotted-prefixed by `0.15`.
     pub fn lookup(&self, reference: &str) -> Result<&ImageLayerSpec, ImageResolutionError> {
         let (name, prefix) = reference.split_once('@').map_or((reference, None), |(name, version)| (name, Some(version)));
+        self.touch(name)?;
         let unknown = || ImageResolutionError::UnknownLayer { reference: reference.to_string() };
         let versions = self.by_name.get(name).ok_or_else(unknown)?;
         versions
@@ -129,7 +145,7 @@ impl EffectiveImageCatalogue {
     /// providers among default versions of selectable (non-base) layers, and
     /// `requires` that no default version provides.
     pub fn check(&self) -> Result<(), Vec<ImageResolutionError>> {
-        let mut errors = Vec::new();
+        let mut errors = self.clashes.values().flatten().cloned().collect::<Vec<_>>();
         for layer in self.by_name.values().flatten() {
             if let Err(reason) = layer.validate() {
                 errors.push(ImageResolutionError::Invalid { layer: layer.name.clone(), reason });
@@ -151,7 +167,7 @@ impl EffectiveImageCatalogue {
         }
         for layer in self.default_layers() {
             for need in &layer.requires {
-                if !self.default_layers().any(|provider| provider.provides.contains(need)) {
+                if !self.default_layers().any(|provider| provides(provider, need)) {
                     errors.push(ImageResolutionError::Unresolvable { need: need.clone(), required_by: Some(layer.name.clone()) });
                 }
             }
@@ -160,6 +176,14 @@ impl EffectiveImageCatalogue {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    /// A resolution that reaches a clashed name refuses with the clash.
+    fn touch(&self, name: &str) -> Result<(), ImageResolutionError> {
+        match self.clashes.get(name).and_then(|clashes| clashes.first()) {
+            Some(clash) => Err(clash.clone()),
+            None => Ok(()),
         }
     }
 
@@ -175,14 +199,17 @@ impl EffectiveImageCatalogue {
         capability: &str,
         required_by: Option<&str>,
     ) -> Result<Option<ImageLayerSpec>, ImageResolutionError> {
-        if selected.values().any(|layer| layer.provides.contains(capability)) {
+        if selected.values().any(|layer| provides(layer, capability)) {
             return Ok(None);
         }
         let candidates = self
             .default_layers()
             .filter(|layer| layer.tier != ImageLayerTier::Base && !selected.contains_key(&layer.name))
-            .filter(|layer| layer.provides.contains(capability))
+            .filter(|layer| provides(layer, capability))
             .collect::<Vec<_>>();
+        for candidate in &candidates {
+            self.touch(&candidate.name)?;
+        }
         match candidates.as_slice() {
             [] => Err(ImageResolutionError::Unresolvable { need: capability.to_string(), required_by: required_by.map(str::to_owned) }),
             [layer] => Ok(Some((*layer).clone())),
@@ -281,7 +308,7 @@ impl std::error::Error for ImageResolutionError {}
 /// (one harness layer per adapter plus `crew:utilities`). Roles never remove
 /// layers.
 pub fn resolve_image(catalogue: &ImageCatalogue, request: &ImageRequest) -> Result<ResolvedImage, ImageResolutionError> {
-    let effective = catalogue.effective(&request.project)?;
+    let effective = catalogue.effective(&request.project);
     let mut selected = BTreeMap::new();
 
     let base_reference = match request.selection.as_ref().and_then(|selection| selection.base.clone()) {
@@ -307,6 +334,9 @@ pub fn resolve_image(catalogue: &ImageCatalogue, request: &ImageRequest) -> Resu
         .filter_map(|versions| versions.last())
         .filter(|layer| layer.tier == ImageLayerTier::Project)
         .collect::<Vec<_>>();
+    for layer in &project_layers {
+        effective.touch(&layer.name)?;
+    }
     match project_layers.as_slice() {
         [] => {}
         [layer] => select(&mut selected, (*layer).clone())?,
@@ -344,7 +374,7 @@ pub fn resolve_image(catalogue: &ImageCatalogue, request: &ImageRequest) -> Resu
         let missing = selected
             .values()
             .flat_map(|layer| layer.requires.iter().map(move |need| (need.clone(), layer.name.clone())))
-            .find(|(need, _)| !selected.values().any(|layer| layer.provides.contains(need)));
+            .find(|(need, _)| !selected.values().any(|layer| provides(layer, need)));
         let Some((need, required_by)) = missing else { break };
         add_provider(&effective, &mut selected, &need, Some(&required_by))?;
     }
@@ -360,10 +390,10 @@ pub fn resolve_image(catalogue: &ImageCatalogue, request: &ImageRequest) -> Resu
     for layer in selected.values() {
         layer.validate().map_err(|reason| ImageResolutionError::Invalid { layer: layer.name.clone(), reason })?;
         for need in &layer.requires {
-            if layer.provides.contains(need) {
+            if provides(layer, need) {
                 continue;
             }
-            for provider in selected.values().filter(|provider| provider.provides.contains(need)) {
+            for provider in selected.values().filter(|provider| provides(provider, need)) {
                 if provider.tier > layer.tier {
                     return Err(ImageResolutionError::RequiresUpward {
                         layer: layer.name.clone(),
@@ -429,7 +459,7 @@ fn topological(layers: Vec<&ImageLayerSpec>) -> Result<Vec<ImageLayerSpec>, Imag
     for layer in &layers {
         let entry = blockers.entry(&layer.name).or_default();
         for provider in &layers {
-            if provider.name != layer.name && layer.requires.iter().any(|need| provider.provides.contains(need)) {
+            if provider.name != layer.name && layer.requires.iter().any(|need| provides(provider, need)) {
                 entry.insert(&provider.name);
             }
         }

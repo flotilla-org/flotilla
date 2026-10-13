@@ -19,7 +19,23 @@ fn spec() -> ImageBuildSpec {
 }
 
 fn meta(spec: &ImageBuildSpec) -> InputMeta {
-    InputMeta::builder().name(image_build_name(&spec.identity, &spec.architecture)).build()
+    InputMeta::builder().name(spec.resource_name()).build()
+}
+
+// Registry builds are named by identity and architecture; local builds live
+// only on their builder, so their names also carry the (sanitised) host, and
+// a registry configured later creates a distinct Registry build.
+#[test]
+fn local_build_names_carry_their_builder() {
+    let registry = spec();
+    let local = ImageBuildSpec { delivery: ImageDelivery::Local, host_ref: "Feta.lab".into(), ..spec() };
+    let hex = &registry.identity["sha256:".len().."sha256:".len() + 40];
+    assert_eq!(registry.resource_name(), format!("image-{hex}-amd64"));
+    assert_eq!(local.resource_name(), format!("image-{hex}-amd64-feta-lab"));
+    assert_eq!(image_build_name(&local.identity, "amd64", &ImageDelivery::Local, "Feta.lab"), local.resource_name());
+    ImageBuild::validate_spec(&meta(&local), &local.clone().into()).expect("local name");
+    let wrong = InputMeta::builder().name(registry.resource_name()).build();
+    assert!(ImageBuild::validate_spec(&wrong, &local.into()).is_err(), "a local build cannot take the registry name");
 }
 
 // The spec names its identity × architecture, recomputes its identity from the
@@ -27,7 +43,7 @@ fn meta(spec: &ImageBuildSpec) -> InputMeta {
 #[test]
 fn spec_validation_recomputes_identity_and_name() {
     let valid = spec();
-    let name = image_build_name(&valid.identity, "amd64");
+    let name = valid.resource_name();
     assert_eq!(name.len(), "image-".len() + 40 + "-amd64".len());
     ImageBuild::validate_spec(&meta(&valid), &valid.clone().into()).expect("valid");
     let refused = |case: &str, spec: ImageBuildSpec, meta: InputMeta| {

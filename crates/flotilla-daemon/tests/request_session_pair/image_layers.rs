@@ -92,6 +92,19 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
             .await
             .expect("layer definition");
     }
+    // Two legs: the first resolves, the second needs a capability nobody
+    // provides; admission must refuse without leaving the first's build.
+    let mut two_legs = single_agent_workflow_spec();
+    let mut demo = two_legs.vessels[0].clone();
+    demo.name = "demo".into();
+    demo.crew[0].role = "demo".into();
+    demo.needs = BTreeSet::from(["display:missing".parse().expect("leg need")]);
+    two_legs.vessels.push(demo);
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("two-legs".into()).build(), &two_legs)
+        .await
+        .expect("two-leg workflow");
     let mut display_workflow = single_agent_workflow_spec();
     display_workflow.vessels[0].needs = BTreeSet::from(["display:x11".parse().expect("leg need")]);
     backend
@@ -151,7 +164,7 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     let DockerImageSource::Built { identity, image_build_ref } = frozen_image(&backend, &convoys[0]).await else {
         panic!("composed placement freezes a Built source");
     };
-    assert_eq!(image_build_ref, image_build_name(&identity, "amd64"));
+    assert_eq!(image_build_ref, image_build_name(&identity, "amd64", &ImageDelivery::Local, &host_id));
     let builds = backend.using::<ImageBuild>("flotilla").list().await.expect("builds").items;
     assert_eq!(builds.len(), 1, "admission get-or-creates the identity's build before accepting the convoy");
     let build = builds[0].spec.current().expect("current build");
@@ -198,6 +211,25 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
         .expect("created role");
     assert_eq!(frozen_image(&backend, &created).await, DockerImageSource::Built { identity, image_build_ref });
     assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared create build").items.len(), 1);
+
+    // Refusal atomicity: admission resolves every vessel before creating any
+    // build, so a refused second leg leaves no build for the first.
+    let mut two_leg_events = mesh.hosts[0].subscribe();
+    let two_legs = CommandAction::ConvoyStart {
+        intent: Box::new(
+            ConvoyStartIntent::builder()
+                .project_ref("flotilla".into())
+                .name("two-legs".into())
+                .branch("test/two-legs".into())
+                .workflow_ref("two-legs".into())
+                .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                .build(),
+        ),
+    };
+    let command_id = mesh.hosts[0].execute(Command::builder().action(two_legs).build()).await.expect("two-leg admission");
+    let result = await_command_result(&mut two_leg_events, command_id).await;
+    assert!(matches!(result, CommandValue::Error { ref message } if message.contains("display:missing")), "{result:?}");
+    assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("no orphan builds").items.len(), 1);
 
     assert!(mesh.hosts[1].resource_backend().using::<ImageBuild>("flotilla").list().await.expect("issuer builds").items.is_empty());
     assert!(mesh.hosts[1].resource_backend().using::<Convoy>("flotilla").list().await.expect("issuer authored convoys").items.is_empty());
