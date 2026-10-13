@@ -143,10 +143,17 @@ impl CredentialConsumer {
     /// harness-bound consumers. Delivery needs that harness's binary, so
     /// admission grants such a credential only to vessels running the agent.
     pub fn harness_adapter(&self) -> Option<&'static str> {
+        // The ids must name agent adapters; flotilla-agent tests that they do.
+        // Exhaustive so a new consumer must decide whether it is harness-bound.
         match self {
             Self::Claude | Self::ClaudeOauth { .. } => Some("claude-code"),
             Self::Codex => Some("codex"),
-            _ => None,
+            Self::Gh
+            | Self::GithubApp { .. }
+            | Self::Forgejo { .. }
+            | Self::GitHttpToken { .. }
+            | Self::DockerRegistry { .. }
+            | Self::ReviewBundleStore { .. } => None,
         }
     }
 

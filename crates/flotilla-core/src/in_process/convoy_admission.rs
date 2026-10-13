@@ -4617,7 +4617,8 @@ pub(super) async fn resolve_workflow_credentials(
         // A harness-bound credential (claude-max, codex) is delivered only to a
         // vessel whose agents use that harness: a grant selects whole projects
         // and roles, and its other vessels' images lack the consumer binary.
-        let vessel_adapters = flotilla_agent::adapter::required_agent_adapters(&vessel.crew)?;
+        let vessel_adapters =
+            flotilla_agent::adapter::required_agent_adapters(&vessel.crew).map_err(|error| format!("vessel `{}`: {error}", vessel.name))?;
         granted.retain(|name| {
             specs.get(name).and_then(CredentialConsumer::harness_adapter).is_none_or(|adapter| vessel_adapters.contains(adapter))
         });

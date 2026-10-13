@@ -373,6 +373,14 @@ async fn harness_bound_credential_reaches_only_vessels_running_that_harness() {
     validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
         .await
         .expect("codex vessel admits without the Claude credential");
+    // The regression scenario: the placement holds no Claude credential at all.
+    let mut codex_only = workflow.clone();
+    codex_only.vessels.remove(0);
+    create_docker_placement(&backend, "docker-codex", "host-b", BTreeSet::new()).await;
+    let bare = backend.using::<PlacementPolicy>("flotilla").get("docker-codex").await.expect("get placement");
+    validate_workflow_credentials(&backend, "flotilla", &codex_only, Some(&bare))
+        .await
+        .expect("codex vessel admits on a placement without the Claude credential");
 }
 
 #[tokio::test]
