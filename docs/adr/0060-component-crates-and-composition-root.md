@@ -2,6 +2,7 @@
 
 **Status:** Accepted (owner grill, 2026-10-09; #2749)
 **Date:** 2026-10-09
+**Amended:** 2026-10-13 (homes for modules the target crates did not place; #3152)
 **Amends:** the VCS operation boundary rule in CLAUDE.md (CLI is no longer the universal implementation); the #2222 ruling that command handlers live in `flotilla-commands`
 **Supersedes:** the two-layer providers/orchestration cut proposed on #2749
 **Relates to:** ADR 0047 (stored data stays decodable for one generation), ADR 0058 (environment providers), ADR 0059 (agent sessions, processes and channels), ADR 0029 (the leaf engine), #2747 (build graph check), #2948 (test support), #2953 (store query pushdown)
@@ -79,6 +80,22 @@ VCS operations go through the `Vcs` trait. Each provider chooses a CLI implement
 6. **#2909**, CI by crate scope.
 
 Stored shapes are unaffected by moving code. Any crate move that changes a serialized type follows ADR 0047.
+
+### Amendment, 2026-10-13: homes the target crates did not place (#3152)
+
+The step-4 survey found core and store code with no home in the target crates. Owner rulings:
+
+- **Change feed.** Domain code drifted into `flotilla-store` because the store is the only component that publishes domain changes. The change-feed interface (typed watches, indexed views and the controller runtime) is the seam domain crates depend on; persistence is one backend behind it. It stays in `flotilla-store`'s public API until the resident-state redesign lifts it into its own crate. `flotilla-store` holds only generic machinery: the store trait, queries, views and watches, the controller runtime, owner garbage collection and dynamic kinds. The build-graph check refuses domain modules in it.
+- **`flotilla-observation`** (new): the change-request, issue and forge observers and the observed-resource projection, turning provider facts into observed resources. It sits between the provider type crates, which stay storage-free, and the store. It is expected to become event-log driven.
+- **`flotilla-messaging`**: delivery (with the `MessageTransport` seam that agent-channel transports implement), inbox, retention, conditions and the message query, moved out of `flotilla-store`. Messaging resolves receivers through a narrow port that `flotilla-crew` implements. Role routing (the crew address book and supervision path) belongs to crew.
+- **Reconcilers live with the capability that owns their kind,** and `flotilla-controllers` retires. Each capability crate exports its reconcilers; the daemon registers them.
+  - `flotilla-admission`: standing-convoy ensure and vessel placement.
+  - `flotilla-crew`: the convoy phase and landing reconciler, vessel, terminal session, settlement-claim publishing.
+  - **`flotilla-provisioning`** (new): environment, image build, checkout, clone and repository reconcilers, which realise environments, images and checkouts on hosts. It is distinct from the executor, which runs command steps.
+  - `flotilla-projections`: principal attention, and the host and fleet read models (host registry, host summary, fleet views and fleet health). The peer-connection parts of the host registry are Plane-A peer-layer state and stay with the daemon's peer layer until it is deleted.
+  - `flotilla-charter`: the project hierarchy extension.
+- **Environments.** The live environment table (per-environment runner, environment bag, provider registry, path mapping and mounts) is implemented in `flotilla-discovery` as its per-environment runtime. Capability crates consume it through a narrow `Environments` port; the daemon wires the implementation.
+- **Host identity** (HostId and NodeId resolution) lives in `flotilla-daemon`: the composition root resolves it once at startup and injects it.
 
 ## Consequences
 
