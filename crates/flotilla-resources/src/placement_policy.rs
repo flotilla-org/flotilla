@@ -45,6 +45,9 @@ impl FieldOwnedResource for PlacementPolicy {
     const OWNERSHIP_ENFORCEMENT: OwnershipEnforcement = OwnershipEnforcement::Observe;
 
     fn field_owner(ownership: &FieldOwnership, name: &str) -> WriterRole {
+        // These are the only FIELD_OWNERSHIP entries with seed-scoped owners.
+        // New Docker fields declare their default owner in that table; add them
+        // here only if their owner also differs for operator-authored policies.
         if matches!(ownership.field, "spec.docker_per_vessel" | "spec.docker_per_vessel.checkout")
             && !name.starts_with(DOCKER_POLICY_NAME_PREFIX)
             && !name.starts_with(HOST_DIRECT_NAME_PREFIX)
