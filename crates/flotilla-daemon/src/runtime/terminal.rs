@@ -498,7 +498,8 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let mut configured_limits = None;
         if let Some(host_ref) = host_ref {
             let jobs = self.state.rust_build_jobs(host_ref).await?;
-            configured_limits = Some(ConfiguredResourceLimits { cpus: None, build_jobs: Some(jobs), linker_threads: Some(jobs) });
+            configured_limits =
+                Some(ConfiguredResourceLimits { cpus: None, cpu_shares: None, build_jobs: Some(jobs), linker_threads: Some(jobs) });
             let wrapper = self.state.rustc_wrapper_for_environment(&spec.env_ref).await?;
             // The fulfilment cap owns the workspace wrapper for host-direct
             // terminals, including Tool sessions that can run Cargo. It

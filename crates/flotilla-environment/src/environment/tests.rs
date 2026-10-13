@@ -445,8 +445,9 @@ async fn create_removes_container_when_local_image_id_cannot_be_resolved() {
     assert_eq!(calls[2].1, ["rm", "-f", "flotilla-env-invalid-digest"]);
 }
 
+// Docker crews retain pull and memory policies while sharing CPU without a quota.
 #[tokio::test]
-async fn create_translates_image_pull_policy_to_docker_run() {
+async fn create_translates_image_pull_policy_and_crew_limits_to_docker_run() {
     use flotilla_protocol::ImageId;
 
     for (policy, docker_value) in
@@ -462,7 +463,7 @@ async fn create_translates_image_pull_policy_to_docker_run() {
             provisioned_mounts: Vec::new(),
             image_pull_policy: policy,
             prepared_auth: Default::default(),
-            cpu_limit: Some(8),
+            cpu_limit: None,
             memory_policy: Default::default(),
         };
 
@@ -472,7 +473,11 @@ async fn create_translates_image_pull_policy_to_docker_run() {
         assert_eq!(calls.len(), 2);
         let (_, args, _) = &calls[0];
         assert!(args.windows(2).any(|pair| pair == ["--pull", docker_value]));
-        assert!(args.windows(2).any(|pair| pair == ["--cpus", "8"]));
+        // Crew vessels share CPU by equal weight and retain memory bounds.
+        assert!(args.windows(2).any(|pair| pair == ["--cpu-shares", "1024"]));
+        assert!(!args.iter().any(|arg| arg == "--cpus"));
+        assert!(args.iter().any(|arg| arg == "--memory"));
+        assert!(args.iter().any(|arg| arg == "--memory-swap"));
         assert!(!calls.iter().any(|(_, args, _)| args.first().is_some_and(|arg| arg == "pull")));
     }
 }
@@ -1777,5 +1782,30 @@ async fn live_baseline_tag_without_image_build_provisions_a_digest() {
         assert!(calls[3].1.contains(&digest));
         assert!(!calls[3].1.contains(&tag.to_string()));
         assert!(calls[3].1.windows(2).any(|args| args == ["--pull", "never"]));
+    }
+}
+
+// Host-side Docker inspection seam: distinguish weight from old quotas and
+// accept inspections that predate explicit CPU settings.
+#[tokio::test]
+async fn inspection_reports_weight_and_legacy_quotas() {
+    for (cpu, cpus, shares) in [
+        (serde_json::json!({"CpuShares": 1024, "NanoCpus": 0}), None, Some(1024)),
+        (serde_json::json!({"NanoCpus": 8_000_000_000_u64}), Some(8), None),
+        (serde_json::json!({"CpuQuota": 400000, "CpuPeriod": 100000, "CpuShares": 1024}), Some(4), Some(1024)),
+        (serde_json::json!({"CpuQuota": -1, "CpuPeriod": 100000}), None, None),
+        (serde_json::json!({}), None, None),
+    ] {
+        // Construct inspection responses at the Docker subprocess boundary.
+        let mut inspect: serde_json::Value = serde_json::from_str(include_str!("fixtures/normal-stop.json")).expect("fixture");
+        for (key, value) in cpu.as_object().expect("CPU fields") {
+            inspect[0]["HostConfig"][key] = value.clone();
+        }
+        let runner = Arc::new(InspectionRunner { inspect: inspect.to_string(), usage: None, oomd: None, calls: Mutex::new(Vec::new()) });
+        let provider = DockerEnvironmentProvider::new(runner);
+        let handles = provider.list().await.expect("list");
+        let observed = handles[0].runtime_observation().await.expect("inspect").expect("observation");
+        let limits = observed.configured_limits.expect("inspected CPU settings");
+        assert_eq!((limits.cpus, limits.cpu_shares), (cpus, shares));
     }
 }

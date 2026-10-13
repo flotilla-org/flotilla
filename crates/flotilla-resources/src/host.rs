@@ -71,12 +71,10 @@ pub struct HostSpec {
     pub display_name: String,
     #[serde(default, skip_serializing_if = "HostConnection::is_daemon")]
     pub connection: HostConnection,
-    /// Expected concurrent Rust crews on this host. This is a fulfilment
-    /// setting until capacity facts have a single source of truth (#2361).
+    /// Number of Rust crews this host is sized for; does not divide CPU
+    /// capacity or build parallelism. Retained for stored-record compatibility.
     /// Previous-generation Host records omit it (ADR 0047); remove this
     /// decoder default one fleet roll after all hosts write the field.
-    /// Zero is treated as the four-crew default so an invalid value does not
-    /// silently remove the build cap.
     #[serde(default = "default_expected_concurrent_rust_crews")]
     pub expected_concurrent_rust_crews: u32,
     /// ADR 0047: absent means placement-host builds; retain default for one roll.
@@ -101,12 +99,7 @@ impl Default for HostSpec {
 
 impl HostSpec {
     pub fn rust_build_jobs(&self, host_cores: usize) -> usize {
-        let expected_crews = if self.expected_concurrent_rust_crews == 0 {
-            default_expected_concurrent_rust_crews()
-        } else {
-            self.expected_concurrent_rust_crews
-        };
-        (host_cores / expected_crews as usize).max(2)
+        host_cores.max(1)
     }
 }
 
@@ -386,15 +379,23 @@ impl FulfilmentFacts {
 mod build_parallelism_tests {
     use super::HostSpec;
 
+    // Every crew can use the host's cores, independently of sizing expectations.
+    #[hegel::test]
+    fn host_build_jobs_use_all_cores(tc: hegel::TestCase) {
+        // Covers zero/one-core boundaries, small hosts and fleet-sized hosts,
+        // with zero, default and oversized crew counts.
+        let cores = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(128));
+        let crews = tc.draw(hegel::generators::integers::<u32>().min_value(0).max_value(64));
+        let host = HostSpec { expected_concurrent_rust_crews: crews, ..Default::default() };
+        assert_eq!(host.rust_build_jobs(cores), cores.max(1));
+    }
+
     #[test]
-    fn host_build_share_has_two_job_floor_and_divides_available_cores() {
-        let mut host = HostSpec::default();
-        assert_eq!(host.rust_build_jobs(32), 8);
-        assert_eq!(host.rust_build_jobs(4), 2);
-        host.expected_concurrent_rust_crews = 8;
-        assert_eq!(host.rust_build_jobs(32), 4);
-        host.expected_concurrent_rust_crews = 0;
-        assert_eq!(host.rust_build_jobs(32), 8);
+    fn feta_and_small_hosts_use_all_cores() {
+        let host = HostSpec::default();
+        assert_eq!(host.rust_build_jobs(32), 32);
+        assert_eq!(host.rust_build_jobs(4), 4);
+        assert_eq!(host.rust_build_jobs(1), 1);
     }
 
     #[test]

@@ -95,8 +95,8 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
     )));
     assert!(opts.tools[2].environment.contains(&EnvironmentVariableUpdate::prepend_path("PATH", CONTAINED_CARGO_SHIM_DIRECTORY)));
     assert!(opts.tools[2].assets.iter().any(|asset| asset.environment_path.as_path() == Path::new(CONTAINED_CARGO_SHIM_PATH)));
-    let jobs = opts.cpu_limit.expect("container CPU quota");
-    assert!(jobs >= 2);
+    assert_eq!(opts.cpu_limit, None);
+    let jobs = std::thread::available_parallelism().expect("host cores").get();
     assert!(opts.tools[2].environment.contains(&EnvironmentVariableUpdate::set(
         "CARGO_BUILD_JOBS",
         jobs.to_string(),

@@ -6015,7 +6015,7 @@ mod tests {
         assert_eq!(vessel.environment_ref.as_deref(), Some("env-work"));
         assert_eq!(
             vessel.configured_limits,
-            Some(ConfiguredResourceLimits { cpus: Some(4), build_jobs: Some(4), linker_threads: Some(4) })
+            Some(ConfiguredResourceLimits { cpus: Some(4), cpu_shares: None, build_jobs: Some(4), linker_threads: Some(4) })
         );
         assert_eq!(vessel.crew[0].adapter, None);
         assert_eq!(vessel.crew[0].model, None);
@@ -6068,7 +6068,7 @@ mod tests {
                         .build(),
                 );
                 session.status.as_mut().expect("session status").configured_limits =
-                    Some(ConfiguredResourceLimits { cpus: None, build_jobs: Some(2), linker_threads: None });
+                    Some(ConfiguredResourceLimits { cpus: None, cpu_shares: None, build_jobs: Some(2), linker_threads: None });
                 aggregator.replace_replica_sessions(vec![ReadResourceObject { object: session, provenance }]).await;
                 let resource = ResourceRef::new("flotilla/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
                 let row = aggregator.summarize_vessel(&resource, &definition, Some(work), None, None);
@@ -6076,7 +6076,7 @@ mod tests {
                 assert_eq!(row.crew[0].model, model);
                 assert_eq!(
                     row.configured_limits,
-                    Some(ConfiguredResourceLimits { cpus: Some(8), build_jobs: Some(2), linker_threads: Some(4) })
+                    Some(ConfiguredResourceLimits { cpus: Some(8), cpu_shares: None, build_jobs: Some(2), linker_threads: Some(4) })
                 );
                 assert_eq!(row.crew[0].session.as_deref(), Some(format!("{host}/flotilla/terminal-placement-coder").as_str()));
             }
