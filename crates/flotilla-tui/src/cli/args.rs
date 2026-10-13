@@ -299,6 +299,8 @@ pub enum DomainCommand {
     WorkflowTemplate(flotilla_commands::commands::workflow_template::WorkflowTemplateNoun),
     /// Manage projects
     Project(flotilla_commands::commands::project::ProjectNoun),
+    /// Build and probe composed crew images
+    Image(flotilla_commands::commands::image::ImageNoun),
 }
 
 #[derive(clap::Args)]
@@ -360,6 +362,7 @@ impl DomainCommand {
             DomainCommand::Fulfilment(noun) => noun.resolve(),
             DomainCommand::WorkflowTemplate(noun) => noun.resolve(),
             DomainCommand::Project(noun) => noun.resolve(),
+            DomainCommand::Image(noun) => noun.resolve(),
         }
         .map_err(|e| color_eyre::eyre::eyre!(e))
     }

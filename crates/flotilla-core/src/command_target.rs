@@ -81,6 +81,10 @@ impl InProcessDaemon {
         // semantics here, before the transport sees it.
         let (mut reason, mut delivery) = match action {
             A::FleetPostInstall { .. } => (TargetReason::LocalMutation, RemoteDelivery::Command),
+            // Any daemon may ask for a composed image: the check reads the
+            // project's repository and get-or-creates a replicated ImageBuild
+            // that its builder host executes.
+            A::ImageCheck { .. } => (TargetReason::LocalMutation, RemoteDelivery::Command),
             A::ConvoyStart { .. } | A::ConvoyCreate { .. } => (TargetReason::Admission, RemoteDelivery::Command),
             A::ConvoyDelete { .. }
             | A::ConvoyLink { .. }
@@ -116,6 +120,7 @@ impl InProcessDaemon {
             | A::QueryHostProviders { .. }
             | A::QueryFleetHealth { .. }
             | A::QueryFulfilmentList { .. }
+            | A::QueryImageBuild { .. }
             | A::QueryFleetList { .. }
             | A::QueryCrewStalls { .. }
             | A::QueryMessageContacts { .. }

@@ -7,6 +7,7 @@ pub mod dispatch;
 pub mod environment;
 pub mod fulfilment;
 pub mod host;
+pub mod image;
 pub mod issue;
 pub mod project;
 pub mod repo;

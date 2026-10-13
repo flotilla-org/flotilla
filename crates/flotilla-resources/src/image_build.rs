@@ -322,6 +322,27 @@ pub struct ImageBuildStatus {
     pub failure: Option<ImageBuildFailure>,
 }
 
+impl ImageBuildStatus {
+    /// Whether this status returns to Queued: a bounded infrastructure
+    /// failure with attempts remaining. Recipe failures, failures without a
+    /// recorded class and exhausted attempts are terminal.
+    pub fn will_retry(&self) -> bool {
+        self.phase == ImageBuildPhase::Failed
+            && self.failure.as_ref().is_some_and(|failure| failure.class == ImageBuildFailureClass::Infrastructure)
+            && self.attempt < IMAGE_BUILD_MAX_ATTEMPTS
+    }
+
+    /// Whether the build has reached its final outcome for this identity:
+    /// built, or failed with no retry to come.
+    pub fn is_settled(&self) -> bool {
+        match self.phase {
+            ImageBuildPhase::Built => true,
+            ImageBuildPhase::Failed => !self.will_retry(),
+            ImageBuildPhase::Queued | ImageBuildPhase::Building => false,
+        }
+    }
+}
+
 /// Accepted stored status. ADR 0053 fields (`availability`, `parent_digest`,
 /// `identity`, `verified_provides`) are accepted and dropped. ADR 0047: remove
 /// them one roll after ADR 0062 builds land.

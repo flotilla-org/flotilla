@@ -92,6 +92,7 @@ pub(super) trait ProjectionsActionPort: Send + Sync {
     async fn get_host_status_internal(&self, environment_id: &EnvironmentId) -> Result<HostStatusResponse, String>;
     async fn get_host_providers_internal(&self, environment_id: &EnvironmentId) -> Result<HostProvidersResponse, String>;
     async fn fulfilment_list_internal(&self) -> Result<FulfilmentListResponse, String>;
+    async fn provisioning_namespace(&self) -> String;
     async fn fleet_health_internal(&self) -> Result<FleetHealthResponse, String>;
     async fn explain_project_internal(&self, name: &str) -> Result<serde_json::Value, String>;
     async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String>;
@@ -226,6 +227,13 @@ impl ProjectionsActions<'_> {
                 Ok(v) => Ok(CommandValue::FulfilmentList(Box::new(v))),
                 Err(message) => Ok(CommandValue::Error { message }),
             },
+            CommandAction::QueryImageBuild { name } => {
+                let namespace = self.port.provisioning_namespace().await;
+                match super::image_check::image_build_report(self.resource_backend, &namespace, name).await {
+                    Ok(report) => Ok(CommandValue::ImageBuild(Box::new(report))),
+                    Err(message) => Ok(CommandValue::Error { message }),
+                }
+            }
             CommandAction::QueryFleetList { project, crew_id, convoy } => {
                 match self.port.scoped_fleet_list(project.as_deref(), crew_id.as_deref(), convoy.as_deref()).await {
                     Ok(v) => Ok(CommandValue::FleetList(Box::new(v))),

@@ -8,6 +8,7 @@ pub mod environment;
 pub mod framing;
 mod host;
 mod host_summary;
+pub mod image_check;
 pub mod issue_query;
 pub mod leaf;
 mod message_reference;

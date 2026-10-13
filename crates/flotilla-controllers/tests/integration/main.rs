@@ -8,6 +8,7 @@ mod common;
 mod convoy_reconcile;
 mod environment_reconciler;
 mod image_build;
+mod image_check;
 mod in_process_daemon;
 mod liveness_contract;
 mod provisioning_in_memory;

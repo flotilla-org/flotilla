@@ -389,13 +389,42 @@ the next admission re-creates it.
 ## Checking a branch before merge
 
 ```sh
-flotilla image check --project <project> --ref <branch>
+flotilla image check --project <project> --ref <branch> \
+  [--need <capability>]... [--agent <adapter>]... [--arch <arch>] \
+  [--no-wait] [--timeout <seconds>] [--json]
 ```
 
 builds and probes the composition a branch would produce, through the same
-build service and with no CI. It reports definition errors, clashes, shadowing
-and unresolvable needs, naming the layers. Crews editing a project layer use it
-before opening a pull request.
+build service and with no CI. The daemon fetches the branch of the project's
+primary repository and reads its `.flotilla/image/` through the VCS seam. That
+layer replaces the synced primary-repository layer in the replica-inclusive
+catalogue; a branch without the directory composes none. A layer the project's
+charter authors at `<charter path>/image/` is kept, so a branch that also
+defines `.flotilla/image/` is refused for defining the project layer twice,
+as the sync refuses it. The composition then resolves as admission resolves
+it: the project's `image:` or the installation defaults, the `--need` image
+needs, and the harness adapters named by `--agent` (default: those the
+project's default workflow's agent roles use).
+
+Definition errors, clashes and resolution refusals (unresolvable needs,
+duplicate providers, an invalid layer directory) are reported naming their
+layers, and create no build. Otherwise the check get-or-creates the
+composition's `ImageBuild` exactly as admission does. Builds happen once per
+identity: re-checking an unchanged composition reuses the existing build and
+its result, and a recipe failure is not retried. Change the layer to change
+the identity, or delete the `ImageBuild` to rebuild it. Without a fleet image
+cache the build runs on the asking host for its own architecture, so `--arch`
+must match it.
+
+By default the command waits for the build, polling until it is built, fails
+with a recipe failure, or exhausts its infrastructure retries (`--timeout`,
+default one hour; the build continues on its builder after a timeout). It
+reports the identity, the `ImageBuild` name, the builder host, the digest, and
+one row per layer with its source, version and probe outcome (`passed`,
+`failed: <reason>`, `not run`). A failed build also reports its failure class
+and reason, and names the build-log artifact. `--json` prints the same report as
+one document. The command exits non-zero on a refusal, a failed build or a
+timeout. Crews editing a project layer use it before opening a pull request.
 
 ## Contained terminal sessions
 

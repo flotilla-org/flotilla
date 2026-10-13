@@ -34,8 +34,8 @@ use flotilla_store::{apply_status_patch, controller::Reconciler, ResourceBackend
 use flotilla_store_testkit::VirtualClock;
 use tokio::sync::Notify;
 
-const NS: &str = "test";
-const HOST: &str = "builder";
+pub(crate) const NS: &str = "test";
+pub(crate) const HOST: &str = "builder";
 const WRAPPER: &str = "flotilla_run_with_preludes exec \"$@\"";
 const REPOSITORY: &str = "registry.test/flotilla/crew-images";
 
@@ -71,11 +71,11 @@ fn build_spec(layers: Vec<ImageLayerSpec>, architecture: &str, delivery: ImageDe
         .build()
 }
 
-fn digest(fill: char) -> String {
+pub(crate) fn digest(fill: char) -> String {
     format!("sha256:{}", fill.to_string().repeat(64))
 }
 
-async fn host(backend: &ResourceBackend, architecture: &str, capacity: Option<ImageBuildCapacity>) {
+pub(crate) async fn host(backend: &ResourceBackend, architecture: &str, capacity: Option<ImageBuildCapacity>) {
     let hosts = backend.using::<Host>(NS);
     let obj = hosts
         .create(&InputMeta::builder().name(HOST.into()).build(), &HostSpec { image_build_capacity: capacity, ..Default::default() })
@@ -95,7 +95,7 @@ async fn host(backend: &ResourceBackend, architecture: &str, capacity: Option<Im
     hosts.update_status(HOST, &obj.metadata.resource_version, &status).await.expect("host status");
 }
 
-fn builder(slots: u32) -> Option<ImageBuildCapacity> {
+pub(crate) fn builder(slots: u32) -> Option<ImageBuildCapacity> {
     Some(ImageBuildCapacity::Builder { architecture: "amd64".into(), slots, reservation: ImageBuildReservation { cpu: 2, disk_bytes: 1 } })
 }
 
@@ -107,7 +107,7 @@ async fn create(backend: &ResourceBackend, spec: &ImageBuildSpec) -> String {
 
 /// What a test wants the service to do for one call.
 #[derive(Clone)]
-enum Behaviour {
+pub(crate) enum Behaviour {
     Succeed,
     Fail {
         class: ImageBuildFailureClass,
@@ -127,10 +127,10 @@ enum Behaviour {
 /// the registry cache sibling and a credential admitted for that repository);
 /// exactly the declared build secrets are passed; and the probe wrapper is
 /// the configured prelude wrapper.
-struct BuildService {
+pub(crate) struct BuildService {
     expected: Mutex<BTreeMap<String, ImageBuildSpec>>,
     behaviour: Mutex<Behaviour>,
-    calls: AtomicUsize,
+    pub(crate) calls: AtomicUsize,
     running: AtomicUsize,
     peak: AtomicUsize,
     release: Notify,
@@ -138,7 +138,7 @@ struct BuildService {
 }
 
 impl BuildService {
-    fn new(behaviour: Behaviour) -> Arc<Self> {
+    pub(crate) fn new(behaviour: Behaviour) -> Arc<Self> {
         Arc::new(Self {
             expected: Mutex::new(BTreeMap::new()),
             behaviour: Mutex::new(behaviour),
@@ -150,7 +150,7 @@ impl BuildService {
         })
     }
 
-    fn expect(&self, spec: &ImageBuildSpec) {
+    pub(crate) fn expect(&self, spec: &ImageBuildSpec) {
         self.expected.lock().expect("expected").insert(spec.identity.clone(), spec.clone());
     }
 }
@@ -235,7 +235,7 @@ impl RegistryAuthMaterial for PushMaterial {
 
 /// Stand-in for the daemon's credential store and blob store.
 #[derive(Default)]
-struct Materials {
+pub(crate) struct Materials {
     granted: BTreeSet<String>,
     push_auths: AtomicUsize,
     logs: Mutex<BTreeMap<String, String>>,
@@ -261,7 +261,7 @@ impl ImageBuildMaterials for Materials {
     }
 }
 
-fn reconciler(
+pub(crate) fn reconciler(
     backend: &ResourceBackend,
     service: &Arc<BuildService>,
     materials: &Arc<Materials>,
@@ -280,7 +280,7 @@ fn reconciler(
 }
 
 /// One controller step for `name`, as the controller loop performs it.
-async fn tick(backend: &ResourceBackend, reconciler: &ImageBuildReconciler, clock: &VirtualClock, name: &str) {
+pub(crate) async fn tick(backend: &ResourceBackend, reconciler: &ImageBuildReconciler, clock: &VirtualClock, name: &str) {
     let builds = backend.using::<ImageBuild>(NS);
     let Ok(obj) = builds.get(name).await else { return };
     let prepared = reconciler.prepare(&obj).await.expect("prepare");
@@ -292,7 +292,7 @@ async fn tick(backend: &ResourceBackend, reconciler: &ImageBuildReconciler, cloc
 
 /// Step until `name` settles (Built, or Failed with no retry pending) or a
 /// step budget runs out, letting background jobs run between steps.
-async fn settle(backend: &ResourceBackend, reconciler: &ImageBuildReconciler, clock: &VirtualClock, name: &str) {
+pub(crate) async fn settle(backend: &ResourceBackend, reconciler: &ImageBuildReconciler, clock: &VirtualClock, name: &str) {
     for _ in 0..200 {
         tick(backend, reconciler, clock, name).await;
         let status = backend.using::<ImageBuild>(NS).get(name).await.expect("build").status.unwrap_or_default();

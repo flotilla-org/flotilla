@@ -211,6 +211,8 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::FleetHealth(_)
         | CommandValue::FleetPostInstall { .. }
         | CommandValue::FulfilmentList(_)
+        | CommandValue::ImageCheck(_)
+        | CommandValue::ImageBuild(_)
         | CommandValue::FleetList(_)
         | CommandValue::CrewStalls(_)
         | CommandValue::CrewCapabilities { .. }

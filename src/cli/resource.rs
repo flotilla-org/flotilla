@@ -150,7 +150,7 @@ fn should_exec_convoy_attach(format: OutputFormat, stdin_is_terminal: bool, auto
         }
 }
 
-fn exit_command_error(message: String, format: OutputFormat) -> ! {
+pub(super) fn exit_command_error(message: String, format: OutputFormat) -> ! {
     match format {
         OutputFormat::Human => eprintln!("error: {message}"),
         OutputFormat::Json => println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::Error { message })),
