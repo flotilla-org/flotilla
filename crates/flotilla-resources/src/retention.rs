@@ -81,6 +81,17 @@ pub struct ResourceEventDecodeQuarantine {
     pub quarantined_at: DateTime<Utc>,
 }
 
+/// A rejected replica is retained separately from authoritative objects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceReplicaQuarantine {
+    pub origin_root: flotilla_protocol::NodeId,
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub error: String,
+    pub quarantined_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ResourceStoreDiagnostics {
     pub object_count: u64,
@@ -93,6 +104,8 @@ pub struct ResourceStoreDiagnostics {
     pub decode_quarantines: Vec<ResourceDecodeQuarantine>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_decode_quarantines: Vec<ResourceEventDecodeQuarantine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replica_quarantines: Vec<ResourceReplicaQuarantine>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub field_ownership_violations: Vec<FieldOwnershipViolation>,
 }
@@ -118,6 +131,7 @@ impl ResourceStoreDiagnostics {
             warnings,
             decode_quarantines: Vec::new(),
             event_decode_quarantines: Vec::new(),
+            replica_quarantines: Vec::new(),
             field_ownership_violations: Vec::new(),
         }
     }
