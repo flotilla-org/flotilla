@@ -21,12 +21,13 @@ use rusqlite::{
 
 /// Distinct fixed SQL texts a connection can prepare through its cache.
 ///
-/// `sqlite.rs` and `sqlite/digest.rs` hold 56 fixed texts on cached paths
+/// `sqlite.rs` and `sqlite/digest.rs` hold the fixed texts on cached paths
 /// (shared statements are `*_SQL` constants, so whitespace never splits them)
 /// and `MessageQuery` adds [`MESSAGE_QUERY_SHAPES`]. The
 /// in-memory backend serves reads on its writer, so one connection must be able
-/// to hold all 66. The remainder is headroom for new statements.
-const FIXED_STATEMENTS: usize = 70 + MESSAGE_QUERY_SHAPES;
+/// to hold the full set, including replica savepoints and quarantine writes.
+/// The remainder is headroom for new statements.
+const FIXED_STATEMENTS: usize = 80 + MESSAGE_QUERY_SHAPES;
 
 /// Generated `declared_sql` shapes kept warm per connection.
 ///
@@ -48,7 +49,7 @@ const REGISTERED_KINDS: usize = 36;
 /// `MessageQuery` shapes: five variants over two tables.
 const MESSAGE_QUERY_SHAPES: usize = 10;
 
-/// Statement-cache capacity for every connection (224).
+/// Statement-cache capacity for every connection (234).
 ///
 /// rusqlite's default of 16 would evict hot statements continuously. Memory
 /// is dominated by the few writes that carry the TEMP triggers: a cached

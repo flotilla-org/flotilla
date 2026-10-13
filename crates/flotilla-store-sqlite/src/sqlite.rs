@@ -2086,7 +2086,7 @@ impl SqliteBackend {
                     if applied { accepted.insert(name.clone()); }
                 }
                 let new_names = encoded.iter().map(|(name, _)| name.clone()).collect::<std::collections::HashSet<_>>();
-                tx.execute("DELETE FROM replica_apply_quarantine WHERE origin_root=?1 AND group_name=?2 AND version=?3 AND kind=?4 AND namespace=?5
+                tx.execute_cached("DELETE FROM replica_apply_quarantine WHERE origin_root=?1 AND group_name=?2 AND version=?3 AND kind=?4 AND namespace=?5
                     AND (?6 IS NULL OR digest_bucket(name)=?6) AND name NOT IN (SELECT value FROM json_each(?7))",
                     params![origin,key.0,key.1,key.2,key.3,bucket,serde_json::json!(new_names).to_string()])
                     .map_err(|err| Self::map_sqlite(err, "prune snapshot-absent replica quarantines"))?;
@@ -2289,7 +2289,7 @@ impl SqliteBackend {
         mutation: &ReplicaMutation,
         apply: impl FnOnce() -> Result<bool, ReplicaApplyError>,
     ) -> Result<bool, ResourceError> {
-        tx.execute_batch("SAVEPOINT replica_record").map_err(|err| Self::map_sqlite(err, "begin replica record"))?;
+        tx.execute_cached("SAVEPOINT replica_record", []).map_err(|err| Self::map_sqlite(err, "begin replica record"))?;
         let result = if matches!(mutation.kind, StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified) {
             resource_kind.validate_stored_object(&mutation.value).map_err(ReplicaApplyError::Rejected).and_then(|()| apply())
         } else {
@@ -2298,17 +2298,17 @@ impl SqliteBackend {
         match result {
             Ok(changed) => {
                 if changed {
-                    tx.execute("DELETE FROM replica_apply_quarantine WHERE origin_root=?1 AND group_name=?2 AND version=?3 AND kind=?4 AND namespace=?5 AND name=?6",
+                    tx.execute_cached("DELETE FROM replica_apply_quarantine WHERE origin_root=?1 AND group_name=?2 AND version=?3 AND kind=?4 AND namespace=?5 AND name=?6",
                     params![origin, key.0, key.1, key.2, key.3, mutation.name])
                     .map_err(|err| Self::map_sqlite(err, "clear replica quarantine"))?;
                 }
-                tx.execute_batch("RELEASE replica_record").map_err(|err| Self::map_sqlite(err, "commit replica record"))?;
+                tx.execute_cached("RELEASE replica_record", []).map_err(|err| Self::map_sqlite(err, "commit replica record"))?;
                 Ok(changed)
             }
             Err(ReplicaApplyError::Storage(error)) => Err(error),
             Err(ReplicaApplyError::Rejected(error)) => {
-                tx.execute_batch("ROLLBACK TO replica_record; RELEASE replica_record")
-                    .map_err(|err| Self::map_sqlite(err, "rollback rejected replica"))?;
+                tx.execute_cached("ROLLBACK TO replica_record", []).map_err(|err| Self::map_sqlite(err, "rollback rejected replica"))?;
+                tx.execute_cached("RELEASE replica_record", []).map_err(|err| Self::map_sqlite(err, "release rejected replica"))?;
                 // Preserve payload, stable event type and receipt time for operator
                 // inspection. This is forensic evidence, not a replay queue;
                 // compact diagnostics deliberately omit the payload.
@@ -2317,7 +2317,7 @@ impl SqliteBackend {
                     StoredReplicaEventKind::Modified => "MODIFIED",
                     StoredReplicaEventKind::Deleted => "DELETED",
                 };
-                let changed = tx.execute("INSERT INTO replica_apply_quarantine
+                let changed = tx.execute_cached("INSERT INTO replica_apply_quarantine
                     (origin_root,group_name,version,kind,namespace,name,body_json,event_type,last_synced_at,error,quarantined_at)
                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
                     ON CONFLICT(origin_root,group_name,version,kind,namespace,name) DO UPDATE SET
