@@ -923,8 +923,13 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
         let current = convoys.get("checks-wake").await.expect("convoy");
         assert_eq!(current.status.expect("status").turn_deliveries["merged-unclaimed"].episodes.len(), 1);
     }
+    let brief = actuator.requests.lock().expect("requests")[0].brief.clone();
+    // With no pending promises, merged settlement preserves the existing brief
+    // without appending an empty promise-resolution section.
+    if !stalled {
+        assert!(!brief.contains("Resolve these non-terminal promises"));
+    }
     if stalled {
-        let brief = actuator.requests.lock().expect("requests")[0].brief.clone();
         assert_eq!(brief.contains("- `settlement-ledger` (decision-ledger)"), open_ledger);
         assert!(!brief.contains("- `implementation-pr`"));
         let current = convoys.get("checks-wake").await.expect("resumed");
