@@ -1,8 +1,11 @@
 """Derived checks for WORKLOAD.md.
 
-Run with `uv run --with marimo marimo edit docs/workload/model.py`
-(or `marimo run` for a read-only view). Driver defaults mirror the Target
-column of the root WORKLOAD.md; move the sliders to the Ceiling to check it.
+Run with `uv run --with marimo==0.25.1 marimo edit docs/workload/model.py`
+(or `marimo run` for a read-only view). The driver sliders are read from the
+Scale drivers table of the root WORKLOAD.md: each defaults to its Target and
+slides up to its Ceiling, so the notebook and the table cannot drift apart.
+Assumptions that are not drivers are listed under Derived checks in
+WORKLOAD.md; keep that list and the constants cell here in step.
 """
 
 import marimo
@@ -24,19 +27,58 @@ def _(mo):
     # Flotilla workload model: derived checks
 
     Each cell computes one check from the scale drivers in `WORKLOAD.md`.
-    Entity sizes are kiwi measurements (2026-10-12); counts are owner-set.
-    When a driver in `WORKLOAD.md` changes, update the default here and rerun.
+    Driver sliders are read from its Scale drivers table: each defaults to its
+    Target and slides up to its Ceiling. Entity sizes are kiwi measurements
+    (2026-10-12); counts are owner-set.
     """)
     return
 
 
 @app.cell
 def _(mo):
-    running_convoys = mo.ui.slider(10, 10_000, value=1_000, label="running_convoys", show_value=True)
-    view_clients = mo.ui.slider(1, 500, value=50, label="view_clients", show_value=True)
-    hosts = mo.ui.slider(3, 500, value=50, label="hosts", show_value=True)
-    change_events = mo.ui.slider(10, 10_000, value=1_000, label="change_events per s", show_value=True)
-    history_window_days = mo.ui.slider(1, 30, value=7, label="history_window (days)", show_value=True)
+    import re
+
+    def read_drivers(path):
+        """Return {driver: (target, ceiling)} from the Scale drivers table."""
+        drivers = {}
+        in_section = False
+        for line in path.read_text().splitlines():
+            if line.startswith("## "):
+                in_section = line.strip() == "## Scale drivers"
+                continue
+            if not (in_section and line.startswith("| `")):
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            name = re.match(r"`([a-z_]+)`", cells[0]).group(1)
+            target, ceiling = (parse_count(cell) for cell in cells[2:4])
+            if target is not None and ceiling is not None:
+                drivers[name] = (target, ceiling)
+        return drivers
+
+    def parse_count(cell):
+        """First number in a cell: "1,000 sustained" -> 1000, "100k" -> 100000, "1M" -> 1000000."""
+        found = re.search(r"(\d[\d,]*)([kM]?)", cell)
+        if not found:
+            return None
+        return int(found.group(1).replace(",", "")) * {"": 1, "k": 1_000, "M": 1_000_000}[found.group(2)]
+
+    workload_md = mo.notebook_dir().parents[1] / "WORKLOAD.md"
+    drivers = read_drivers(workload_md)
+    return (drivers,)
+
+
+@app.cell
+def _(drivers, mo):
+    def driver_slider(name, start, label=None, stop=None):
+        target, ceiling = drivers[name]
+        return mo.ui.slider(start, stop or ceiling, value=target, label=label or name, show_value=True)
+
+    running_convoys = driver_slider("running_convoys", 10)
+    view_clients = driver_slider("view_clients", 1)
+    hosts = driver_slider("hosts", 3)
+    change_events = driver_slider("change_events", 10, label="change_events per s")
+    # The window is fixed by policy (Target = Ceiling); slide past it to explore the policy.
+    history_window_days = driver_slider("history_window", 1, label="history_window (days)", stop=30)
     navigator_share = mo.ui.slider(0.0, 1.0, value=0.2, step=0.05, label="share of convoys that are navigator sessions", show_value=True)
     mo.vstack([running_convoys, view_clients, hosts, change_events, history_window_days, navigator_share])
     return (
@@ -67,17 +109,33 @@ def _():
     heartbeat_wal_bytes = 91 * KB  # per Host status write today
     heartbeat_interval_s = 5
     convoys_finished_per_day_per_running = 0.5  # turnover estimate
+    match_fraction = 0.05  # share of events a filtered client subscribes to
+    # Compact resident form: frozen workflow snapshots shared by content hash,
+    # typed live records without embedded snapshots, finished convoys as summaries.
+    live_convoy_compact = 4 * KB  # typed record; snapshot referenced, not embedded
+    vessel_compact = 1 * KB
+    session_compact = 1 * KB
+    finished_summary = 1 * KB  # subject, outcome, timestamps, links; full body stays in the store
+    distinct_snapshots = 200  # workflow templates x revisions in use
+    snapshot_bytes = 16 * KB
     return (
         MB,
         convoy_bytes,
         convoys_finished_per_day_per_running,
         decode_ms_per_mb,
+        distinct_snapshots,
+        finished_summary,
         heartbeat_interval_s,
         heartbeat_wal_bytes,
         host_bytes,
+        live_convoy_compact,
+        match_fraction,
         session_bytes,
+        session_compact,
+        snapshot_bytes,
         typed_factor,
         vessel_bytes,
+        vessel_compact,
         vessels_navigator,
         vessels_regimented,
     )
@@ -109,14 +167,16 @@ def _(
     resident_typed = resident_text * typed_factor
     mo.md(
         f"""
-        ## Resident memory
+        ## Resident memory, naive full-body form
 
         Mean vessels per convoy: **{mean_vessels:.1f}**.
         Live work: **{live / MB:,.0f} MB** JSON text; finished within the window: **{recent_finished / MB:,.0f} MB**.
-        Resident typed state: **{resident_typed / MB:,.0f} MB** (budget: under 1 GB at the ceiling).
+        Holding today's full stored bodies as typed state: **{resident_typed / MB:,.0f} MB**.
+        This is the naive form and is expected to exceed the budget (under 1 GB at the ceiling);
+        the compact form below is the one measured against it.
         """
     )
-    return mean_vessels, per_convoy, resident_text
+    return mean_vessels, resident_text
 
 
 @app.cell
@@ -125,7 +185,6 @@ def _(
     change_events,
     decode_ms_per_mb,
     mo,
-    per_convoy,
     resident_text,
     running_convoys,
 ):
@@ -133,14 +192,13 @@ def _(
     whole_kind_mb = resident_text / MB
     naive_ms_per_wake = whole_kind_mb * decode_ms_per_mb
     naive_cpu_cores = change_events.value * naive_ms_per_wake / 1000
-    indexed_ms_per_wake = per_convoy / MB * decode_ms_per_mb  # one object, if it were even decoded
     mo.md(
         f"""
         ## Controller wake: naive versus resident
 
         A whole-kind list-and-decode per wake costs **{naive_ms_per_wake:,.0f} ms**.
         At `change_events` = {change_events.value:,}/s that is **{naive_cpu_cores:,.0f} CPU cores** of decode alone.
-        One indexed resident lookup touches one object (about {indexed_ms_per_wake:.2f} ms even if decoded, ~0 when resident and typed),
+        An indexed lookup into typed resident state touches one object and decodes nothing,
         so wake cost stops depending on `running_convoys` ({running_convoys.value:,}).
         """
     )
@@ -148,8 +206,7 @@ def _(
 
 
 @app.cell
-def _(change_events, mo, view_clients):
-    match_fraction = 0.05  # share of events a filtered client subscribes to
+def _(change_events, match_fraction, mo, view_clients):
     deliveries_per_s = change_events.value * view_clients.value * match_fraction
     naive_store_reads_per_s = change_events.value * view_clients.value  # one read per event per watcher today
     mo.md(
@@ -164,16 +221,20 @@ def _(change_events, mo, view_clients):
 
 
 @app.cell
-def _(MB, convoys_finished_per_day_per_running, history_window_days, mean_vessels, mo, running_convoys):
-    # Compact resident form: frozen workflow snapshots shared by content hash,
-    # typed live records without embedded snapshots, finished convoys as summaries.
-    KB_ = 1024
-    live_convoy_compact = 4 * KB_  # typed record; snapshot referenced, not embedded
-    vessel_compact = 1 * KB_
-    session_compact = 1 * KB_
-    finished_summary = 1 * KB_  # subject, outcome, timestamps, links; full body stays in the store
-    distinct_snapshots = 200  # workflow templates x revisions in use
-    snapshot_bytes = 16 * KB_
+def _(
+    MB,
+    convoys_finished_per_day_per_running,
+    distinct_snapshots,
+    finished_summary,
+    history_window_days,
+    live_convoy_compact,
+    mean_vessels,
+    mo,
+    running_convoys,
+    session_compact,
+    snapshot_bytes,
+    vessel_compact,
+):
     compact = (
         running_convoys.value * (live_convoy_compact + mean_vessels * (vessel_compact + session_compact))
         + running_convoys.value * convoys_finished_per_day_per_running * history_window_days.value * finished_summary
@@ -184,8 +245,8 @@ def _(MB, convoys_finished_per_day_per_running, history_window_days, mean_vessel
         ## Compact resident form
 
         Sharing snapshots by content hash and keeping finished convoys as summaries
-        gives **{compact / MB:,.0f} MB** resident for `running_convoys` = {running_convoys.value:,},
-        against the full-body copy above. The resident representation is a design choice, not the stored JSON.
+        gives **{compact / MB:,.0f} MB** resident for `running_convoys` = {running_convoys.value:,}
+        (budget: under 1 GB at the ceiling), against the naive full-body copy above. The resident representation is a design choice, not the stored JSON.
         """
     )
     return

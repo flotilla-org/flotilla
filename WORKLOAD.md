@@ -1,6 +1,7 @@
 # Workload model: Flotilla
 
-Design and review data-touching work with the `production-shape` skill: production shape,
+Design and review data-touching work with the `production-shape` skill (from the `rjw-sdlc`
+plugin in rjw-skills, bundled in the fleet's skills component): production shape,
 profiler test, naive shape, workload note, candidate walk, bounded consumer, snapshot then
 deltas, query cover, operation lowering, single writer, steady state, match the defence to
 the boundary, evolution level.
@@ -58,23 +59,40 @@ Every number that grows. Other tables refer to these by the name in backticks.
 | `host_heartbeat` | per host: one write every 5 s | 5 KB | | owned | observation (latest only) |
 | `change_request` | per convoy: 1 / 1 / 10 | 4 KB | stacks carry the tail | forge | while referenced |
 
-Sizes are kiwi measurements from 2026-10-12 (`docs/research/store-query-schema-dive.md`),
-rounded; counts are owner-set.
+Sizes are kiwi measurements from 2026-10-12, rounded; counts are owner-set. The measurements
+are in `docs/research/store-query-schema-dive.md` on the
+[`research/store-query-schema-dive`](https://github.com/flotilla-org/flotilla/blob/research/store-query-schema-dive/docs/research/store-query-schema-dive.md)
+branch, not yet on `main`.
 
 ## Derived checks
 
-Computed in `docs/workload/model.py`; values at Target / Ceiling, 2026-10-13. The navigator
-share is assumed to be 20% of convoys, giving 3.6 mean vessels per convoy.
+Computed in `docs/workload/model.py`; values at Target / Ceiling, 2026-10-13 (binary units).
+The notebook reads the drivers from the table above. Its other assumptions are not drivers
+and are listed here; the notebook's constants cell holds the same values:
+
+- Navigator sessions are 20% of convoys, giving 3.6 mean vessels per convoy.
+- Turnover: each running convoy slot finishes 0.5 convoys per day. Finished convoys within
+  `history_window` are therefore `running_convoys` x 0.5 x `history_window` days. At that rate, `history_total` at
+  Target and Ceiling corresponds to about 200 days of retained finished work.
+- Typed in-memory state is 2x the stored JSON text.
+- A filtered view client matches 5% of `change_events`.
+- Compact form: 4 KB per live convoy record (snapshot referenced, not embedded), 1 KB per
+  vessel and per terminal session, 1 KB per finished-convoy summary, and 200 distinct frozen
+  workflow snapshots of 16 KB each.
+
+The checks:
 
 - **Resident memory, holding today's full stored bodies**:
   `running_convoys` x (`convoy` + vessels x (`vessel` + `terminal_session`)), plus finished
-  convoys within `history_window` = ~1.0 GB / ~9.8 GB typed. **Fails** the 1 GB budget.
+  convoys within `history_window` = ~0.95 GB / ~9.5 GB typed. **Fails** the 1 GB budget at
+  the ceiling.
 - **Resident memory, compact form** (snapshots shared by content hash, finished convoys as
   summaries) = ~17 MB / ~150 MB. The resident representation is a design choice, not a copy
   of the stored JSON.
 - **Controller wake, naive** (list and decode a whole kind per wake at today's 7.4 ms/MB)
-  = ~3.6 s per wake; at `change_events` that is thousands of cores. Wakes must be indexed
-  resident lookups, so their cost is independent of `running_convoys`.
+  = ~3.6 s / ~36 s per wake; at `change_events` that is ~3,600 / ~360,000 cores of decode
+  alone. Wakes must be indexed resident lookups, so their cost is independent of
+  `running_convoys`.
 - **Delivery, naive** (one store read per event per watcher) = `change_events` x
   `view_clients` = 50k / 5M store reads per second. Target: zero.
 - **Heartbeat WAL at today's amplification** (~91 KB per Host status write, every 5 s) =
@@ -144,13 +162,13 @@ Component files below this one follow the standard format, and also record:
 - Open questions: GitHub issues on `flotilla-org/flotilla`.
 - ADRs: `docs/adr/`.
 - Implementation choices: `docs/implementation-choices/<name>.md`, linked from a doc comment on
-  the type or module.
+  the type or module. The directory is created with its first record.
 
 ## Validation
 
 - **Derived checks**: `docs/workload/model.py`, a marimo notebook that computes operations x
-  cardinality, resident memory and store crossings from the drivers above. Rerun it when a
-  driver changes.
+  cardinality, resident memory and store crossings from the drivers above, which it reads
+  from this file. Rerun it and update Derived checks when a driver or assumption changes.
 - **Load**: an in-process load harness with tiny fake vessels and agents drives one daemon to
   `running_convoys` and `view_clients` at target, then ceiling. Its measurements build the
   load model that replaces these ballparks.
