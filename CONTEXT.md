@@ -977,8 +977,8 @@ _Avoid_: recipe.
 
 **Image Identity**:
 The hash of an **Image Composition**'s ordered definitions. Equal identities
-are the same image, built once per architecture by one `ImageBuild` and
-recorded with its digest in the status of each vessel that runs it.
+are the same image, built once per architecture (and, without a registry, per
+builder host) by one `ImageBuild` and recorded with its digest in the status of each vessel that runs it.
 _Avoid_: recipe key, execution key.
 
 **Build Service**:

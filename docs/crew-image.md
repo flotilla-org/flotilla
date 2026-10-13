@@ -1,7 +1,7 @@
 # Crew image
 
 [ADR 0062](adr/0062-crew-images-are-ordered-layer-lists-built-once-per-identity.md)
-(landing via #3147) defines crew images: a composed image is an ordered list of
+defines crew images: a composed image is an ordered list of
 layer definitions, built once per identity by a build service and delivered by
 digest. It supersedes ADR 0053's declared layers, cover search and staged
 freeze. A `docker_per_vessel` placement policy that omits `image` runs the
@@ -106,15 +106,18 @@ build_secrets: []
   without a URL records a version whose integrity comes from elsewhere, such as
   the base's apt snapshot or an npm lockfile declared as a context file.
 - **Context files** are only the files listed in `context_files`, relative to
-  the layer directory, 256 KiB in total. Each layer that declares any gets a
+  the layer directory: UTF-8 text, carried inline in the `ImageLayer`
+  definition, 256 KiB in total per layer, so the identity hashes their
+  contents directly. Binary assets are not context files; fetch them in the
+  fragment from a pinned URL with a `sha256`. Each layer that declares any gets a
   named build context named after the layer, so fragments copy them with
   `COPY --from=<layer-name> <path> <destination>`. Executable bits are set in
   the fragment, for example with `COPY --chmod=0755`.
 - **Build secrets** are declared by name. The fragment mounts them with
   `RUN --mount=type=secret,id=<name>`, so they never land in a layer. The daemon
   resolves each name from the installation credential store and passes it only
-  to the build service. Unknown names are refused on apply; an ungranted name
-  refuses the build, naming the secret.
+  to the build service. Names are not checked against the credential store on
+  apply: an unknown or ungranted name refuses the build, naming the secret.
 - **Network** is allowed at build time, with every download pinned by SHA-256
   or by a lockfile in declared context. Probes run without network.
 
@@ -128,13 +131,17 @@ checksum, a malformed digest, an invalid capability, a fragment that breaks the
 Definitions come from three sources, resolved in this order:
 
 1. the **project**: `.flotilla/image/` (`layer.yaml`, `Dockerfile.fragment`
-   and declared files). It is read from the project's named ops home when any
-   member repository has a charter-store binding, otherwise from the first
-   repository with the code role. Only the project tier lives here, and other
-   repositories of a multi-repository project contribute nothing. A registered
-   charter's directory is applied through charter delegation;
-2. the **installation**: layer directories in its ops repository (fleet or
-   project-map), for additions and overrides;
+   and declared files) at the root of the project's primary repository (its
+   first repository with the code role), for every project, charter-delegated
+   ones included. A charter-delegated project may instead author the layer at
+   `<charter path>/image/` in its charter, applied through charter delegation.
+   A project defining both is refused, naming both locations. Only the project
+   tier lives here, and other repositories of a multi-repository project
+   contribute nothing. Removing the directory removes the layer;
+2. the **installation**: `ImageLayer` documents with `source: installation`
+   under the fleet ops repository's manifest root, for additions and
+   overrides. The manifest reconciler applies them like any other manifest
+   document; there is no separate sync;
 3. the **flotilla stdlib**: [`stdlib/image-layers/`](../stdlib/image-layers),
    shipped as data in each release and applied by the daemon at startup.
 
@@ -143,7 +150,7 @@ sources is allowed and shown by admission explanations and `flotilla image
 check`. Two definitions with the same source, name and version are a clash.
 Project and installation layers are applied through the manifest and charter
 reconcilers, and stdlib layers by the daemon at startup as
-`stdlib-<name>-<version>`; nothing is applied by hand.
+`stdlib-<name>-<version>-<hash>`; nothing is applied by hand.
 
 Admission uses the project layer at the default-branch head as last synced.
 Only a merged change to the layer rebuilds the project's image.
@@ -281,8 +288,10 @@ harness layer.
 - An unversioned name resolves to the highest version of that name in the
   effective catalogue. `zig@0.15` selects the highest version equal to, or
   dotted-prefixed by, `0.15`.
-- A need resolves by direct lookup on `provides`, with no cover search. A need
-  already provided by a selected layer adds nothing.
+- A need resolves by direct lookup on `provides`, with no cover search:
+  `toolchain:rust` matches any provide of that capability, `toolchain:rust@1.99.0`
+  only that exact version, and `harness:codex>=0.160.0` a dotted version at or
+  above the minimum. A need already provided by a selected layer adds nothing.
 - The base is the selection's `base`, otherwise the installation default,
   otherwise the only base-tier layer in the catalogue.
 
@@ -302,9 +311,14 @@ image in `VesselStatus.image`: the identity when provisioning starts and the
 built digest once it resolves. A recorded identity is kept until relaunch.
 
 **One build per identity × architecture.** Admission gets or creates the
-`ImageBuild` named for the identity and architecture (`image-<hex>-<arch>`); later admissions wait for
-it or reuse it. Each architecture is built on a same-architecture builder,
-selected from hosts with `Host.spec.image_build_capacity`, with no emulation.
+`ImageBuild` named for the identity and architecture; later admissions wait for
+it or reuse it. With a registry the name is `image-<hex>-<arch>`, where `<hex>`
+is the first 40 hex digits of the identity, and the build runs on the
+lowest-named same-architecture host declaring
+`image_build_capacity: {kind: builder, slots > 0}`, with no emulation. A local
+build exists only on its builder, so its name also carries the sanitised
+builder host: `image-<hex>-<arch>-<host>`. See
+[Image builds](controllers/image-build.md) for the controller.
 
 **Build service.** Input is the ordered layer list and the architecture; output
 is a digest. One build generates one multi-stage Dockerfile: each fragment's
@@ -314,14 +328,23 @@ owned-BuildKit implementation runs `docker buildx build` on the builder host; a
 remote or managed builder can implement the same port. No user CI is involved.
 
 **Delivery.** With a registry configured in `FleetDesignation.image_cache`,
-every image is pushed to `<repository>/…` and pulled by digest, and
-`--cache-to/--cache-from type=registry,mode=max` shares a build cache between
-builders. The builder's local copy is only a cache. The daemon holds the push
-credential named by `image_cache.push_credential` (the fleet names it
-`crew-image-registry-push`) and uses it only on builders. Providers receive the
-pull credential named by `image_cache.pull_credential`. Crews see neither. A
-single-host installation without a registry builds with `--load` on the
-placement host and uses the image locally.
+every image is pushed to `<repository>:<hex40>-<arch>` and pulled by digest, and
+`--cache-to/--cache-from type=registry,ref=<repository>/buildcache:<arch>,mode=max`
+shares a build cache between builders. For the lab fleet the repository is
+`<forgejo>/flotilla/crew-images`. The builder's local copy is only a cache.
+
+- **Push.** The builder's daemon resolves the credential named by
+  `image_cache.push_credential` (the fleet names it `crew-image-registry-push`)
+  for each attempt. Only hosts with an `image-push` host-action grant and a
+  positive build capacity can resolve it.
+- **Pull.** Providers pull with the credential named by
+  `image_cache.pull_credential`, which needs an `image-pull` host-action grant
+  on the placement host. Crew credentials are never used.
+- **Build secrets** need `image-build-secret` host-action grants on the builder.
+
+Host-action grants never match work, so crews see none of these. A single-host
+installation without a registry builds with `--load` on the placement host and
+runs the local image ID with pull policy `Never`.
 
 Layer reuse across compositions comes from BuildKit's cache and the registry's
 blob deduplication. A harness bump rebuilds and pulls only its layer; a
@@ -354,12 +377,14 @@ waits in Provisioning with the reason.
 
 ### Failures and retries
 
-Infrastructure failures (builder unavailable, registry or network errors) move
-the `ImageBuild` back to Queued after backoff, with bounded attempts. Recipe
-failures, such as a failing `RUN`, a checksum mismatch or a failed probe, are
-terminal for that identity: identical inputs are not retried. Change the
-definition to get a new identity, or delete the `ImageBuild` to retry the same
-identity deliberately.
+Infrastructure failures (builder unavailable, registry, network or disk
+errors, deadlines, a missing push credential) move the `ImageBuild` back to
+Queued after `30 s × 2^(attempt−1)`, capped at 30 minutes, for at most five
+attempts; it then stays Failed. Recipe failures, such as a failing `RUN`, a
+checksum mismatch, a failed probe or an ungranted build secret, are terminal
+for that identity: identical inputs are not retried. Change the definition to
+get a new identity, or delete the `ImageBuild` to rebuild the same identity;
+the next admission re-creates it.
 
 ## Checking a branch before merge
 
@@ -453,11 +478,15 @@ roll between them. Then:
    registry, `flotilla/crew-images` with `…/buildcache` as the build cache.
    The owner installs a Forgejo package-write token as
    `crew-image-registry-push` in the credential store of feta's and udder's
-   daemons. Existing per-host pull credentials remain.
+   daemons, and fleet-ops grants it to them with an `image-push` host-action
+   grant. Existing per-host pull credentials remain, granted to vessel hosts
+   with `image-pull` host-action grants.
 3. Roll the fleet daemon cohort together.
 4. Companion changes outside this repository: a project-map change adds
    `image:` to flotilla, cleat and wheelhouse (selections above). A fleet change
-   deletes its `image-layers/` definitions and drops `image.composition` and
+   deletes its `image-layers/` definitions (re-authoring any it still needs as
+   `ImageLayer` documents with `source: installation` under its manifest
+   root) and drops `image.composition` and
    `agent_adapters` from the per-host crew-image placement policies, matching `.flotilla/placement-policy.crew-image*.yaml`
    here. Projects with native dependencies add `.flotilla/image/` in their
    primary repository.
