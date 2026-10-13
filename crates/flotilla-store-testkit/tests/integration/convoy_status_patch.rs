@@ -791,7 +791,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         lifecycle_mutations: Vec::new(),
     };
 
-    external_patches::resume_crew_work("implement".to_string(), "coder".to_string(), ts(20), "Rebase onto main".to_string(), None)
+    external_patches::resume_crew_work("implement".to_string(), "coder".to_string(), ts(20), "Rebase onto main".to_string(), None, true)
         .apply(&mut status);
 
     assert_eq!(status.phase, ConvoyPhase::Active);
@@ -1490,7 +1490,7 @@ fn turn_activation_restoration_preserves_concurrent_status(tc: hegel::TestCase) 
         ..Default::default()
     };
     let mut activated = previous.clone();
-    external_patches::resume_crew_work("implement".into(), "coder".into(), ts(20), "continue".into(), Some("intent".into()))
+    external_patches::resume_crew_work("implement".into(), "coder".into(), ts(20), "continue".into(), Some("intent".into()), true)
         .apply(&mut activated);
     let mut current = activated.clone();
     if target_changed {
@@ -1604,7 +1604,7 @@ fn landing_claims_wait_for_every_crew_and_remain_frozen(tc: hegel::TestCase) {
     assert_eq!(decoded.phase, ConvoyPhase::Landing);
     assert!(decoded.landing_entry.is_none() && decoded.landing_settlement.is_none());
 
-    external_patches::resume_crew_work("work".into(), roles[0].clone(), ts(110), "review follow-up".into(), None).apply(&mut status);
+    external_patches::resume_crew_work("work".into(), roles[0].clone(), ts(110), "review follow-up".into(), None, true).apply(&mut status);
     assert_eq!(status.phase, ConvoyPhase::Active);
     assert_eq!(status.landing_entry.as_ref(), Some(&entry), "historical evidence survives reopening");
     external_patches::mark_crew_completed_with_context(

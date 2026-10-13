@@ -617,7 +617,7 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
             .await
             .expect("agent exited");
         daemon
-            .convoy_resume_internal("flotilla", "resume-staging", "Recover the unfinished review", Some("work"), Some("coder"))
+            .convoy_resume_internal("flotilla", "resume-staging", "Recover the unfinished review", Some("work"), Some("coder"), false)
             .await
             .expect("resume exited agent");
         let session = sessions.get("resume-staging-session").await.expect("same session");

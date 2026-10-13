@@ -89,6 +89,9 @@ pub struct ConvoyAbandonArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
 pub struct ConvoyResumeArgs {
+    /// Explicitly reopen an accepted crew completion
+    #[arg(long, conflicts_with = "withdraw")]
+    pub reopen: bool,
     /// Convoy role or role@project address
     pub name: String,
     /// Follow-up brief delivered to the existing crew session
@@ -367,7 +370,7 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 })
             }
-            ConvoyVerb::Resume(ConvoyResumeArgs { name, prompt, withdraw, vessel, role }) => {
+            ConvoyVerb::Resume(ConvoyResumeArgs { name, prompt, withdraw, vessel, role, reopen }) => {
                 if self.subject.is_some() {
                     return Err("convoy resume takes its name after `resume`".to_string());
                 }
@@ -375,7 +378,7 @@ impl ConvoyNoun {
                     return Err("convoy resume requires a non-empty --prompt".to_string());
                 }
                 let action = match prompt {
-                    Some(prompt) => CommandAction::ConvoyResume { namespace: None, name, prompt, vessel, role },
+                    Some(prompt) => CommandAction::ConvoyResume { reopen, namespace: None, name, prompt, vessel, role },
                     None if withdraw => CommandAction::ConvoyWithdrawPendingBrief { namespace: None, name },
                     None => return Err("convoy resume requires --prompt or --withdraw".to_string()),
                 };
@@ -585,8 +588,11 @@ impl std::fmt::Display for ConvoyNoun {
             ConvoyVerb::Abandon(ConvoyAbandonArgs { name, reason }) => {
                 write!(f, " abandon {} --reason {}", quote_value(name), quote_value(reason))?;
             }
-            ConvoyVerb::Resume(ConvoyResumeArgs { name, prompt, withdraw, vessel, role }) => {
+            ConvoyVerb::Resume(ConvoyResumeArgs { name, prompt, withdraw, vessel, role, reopen }) => {
                 write!(f, " resume {}", quote_value(name))?;
+                if *reopen {
+                    write!(f, " --reopen")?;
+                }
                 if let Some(prompt) = prompt {
                     write!(f, " --prompt {}", quote_value(prompt))?;
                 }
@@ -874,11 +880,31 @@ mod tests {
         crate::test_utils::assert_needs_context(
             resolved,
             CommandAction::ConvoyResume {
+                reopen: false,
                 namespace: None,
                 name: "convoy-a".into(),
                 prompt: "Rebase onto main and shepherd the PR".into(),
                 vessel: Some("implement".into()),
                 role: Some("coder".into()),
+            },
+            RepoContext::None,
+            HostResolution::Local,
+        );
+    }
+
+    // CLI glue: the opt-in survives display/parse and command resolution.
+    #[test]
+    fn convoy_resume_reopen_is_explicit() {
+        assert_round_trip::<ConvoyNoun>(&["convoy", "resume", "convoy-a", "--prompt", "continue", "--reopen"]);
+        crate::test_utils::assert_needs_context(
+            parse(&["convoy", "resume", "convoy-a", "--prompt", "continue", "--reopen"]).resolve().unwrap(),
+            CommandAction::ConvoyResume {
+                namespace: None,
+                name: "convoy-a".into(),
+                prompt: "continue".into(),
+                vessel: None,
+                role: None,
+                reopen: true,
             },
             RepoContext::None,
             HostResolution::Local,

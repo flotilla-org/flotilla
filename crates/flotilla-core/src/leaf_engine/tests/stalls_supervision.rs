@@ -561,6 +561,7 @@ async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
             resumed_at,
             "Continue with the operator's guidance".into(),
             Some("resume-brief".into()),
+            true,
         ),
     )
     .await

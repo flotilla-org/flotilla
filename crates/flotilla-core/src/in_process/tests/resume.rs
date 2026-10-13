@@ -28,7 +28,7 @@ async fn working_resume_uses_message_delivery_instead_of_pending_brief_release()
     status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
     convoys.update_status(&current.metadata.name, &current.metadata.resource_version, &status).await.expect("working crew");
     daemon
-        .convoy_resume_internal("flotilla", "resume-staging", "operator guidance", Some("work"), Some("coder"))
+        .convoy_resume_internal("flotilla", "resume-staging", "operator guidance", Some("work"), Some("coder"), false)
         .await
         .expect("queue intent");
     daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("migration scan");
@@ -46,7 +46,7 @@ async fn resume_stages_credentials_before_message_and_retries_failure() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
-    let resume = || daemon.convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"));
+    let resume = || daemon.convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"), true);
     assert!(resume().await.expect_err("staging should fail").contains("credential staging failed"));
     assert_eq!(
         convoys.get("resume-staging").await.expect("convoy").status.expect("status").crew_work["work"]["coder"].phase,
@@ -76,7 +76,7 @@ async fn resume_retries_a_racing_session_write_after_staging() {
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     probe.invalidate_next.store(true, std::sync::atomic::Ordering::SeqCst);
     let outcome = daemon
-        .convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"))
+        .convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"), true)
         .await
         .expect("stale session write retried");
     assert_eq!(outcome, ConvoyResumeOutcome::Queued { displaced: None });
@@ -414,6 +414,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
             chrono::Utc::now(),
             "implicit stall test".to_string(),
             None,
+            true,
         ),
     )
     .await
@@ -495,4 +496,83 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     .await
     .expect("implicit stall cleared");
     task.abort();
+}
+
+// #3145: information after a claim neither stages credentials nor changes the
+// completion, even if no terminal session remains intact. Explicit reopen does.
+#[tokio::test]
+async fn claimed_resume_delivers_information_without_reopening() {
+    let (daemon, backend, probe) = resume_staging_fixture().await;
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let claimed = convoys.get("resume-staging").await.unwrap().status.unwrap();
+    let outcome = daemon.convoy_resume_internal("flotilla", "resume-staging", "please complete", None, None, false).await.unwrap();
+    assert_eq!(outcome, ConvoyResumeOutcome::Informational);
+    assert_eq!(convoys.get("resume-staging").await.unwrap().status.unwrap(), claimed);
+    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.unwrap().items;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].spec.body, "please complete");
+    assert_eq!(messages[0].spec.expectation, flotilla_resources::MessageExpectation::None);
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let session = sessions.get("resume-staging-session").await.unwrap();
+    sessions.delete(&session.metadata.name).await.unwrap();
+    daemon.convoy_resume_internal("flotilla", "resume-staging", "duplicate reminder", None, None, false).await.unwrap();
+    assert_eq!(convoys.get("resume-staging").await.unwrap().status.unwrap(), claimed);
+}
+
+// #3145: the command reports information-only delivery without a lifecycle
+// mutation; --reopen records the principal and time through the existing audit.
+#[tokio::test]
+async fn claimed_resume_command_reports_outcome_and_audits_explicit_reopen() {
+    use flotilla_daemon_api::daemon::DaemonHandle;
+    use flotilla_protocol::{Command, CommandAction, CommandCaller, CommandValue, DaemonEvent, PrincipalRef};
+    let (daemon, backend, probe) = resume_staging_fixture().await;
+    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+    let caller = CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace("flotilla"), process: None, crew: None };
+    let mut events = daemon.subscribe();
+    for reopen in [false, true] {
+        let id = daemon
+            .execute_for_caller(
+                Command::builder()
+                    .action(CommandAction::ConvoyResume {
+                        namespace: Some("flotilla".into()),
+                        name: "resume-staging".into(),
+                        prompt: "please complete".into(),
+                        vessel: None,
+                        role: None,
+                        reopen,
+                    })
+                    .build(),
+                Some(caller.clone()),
+            )
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let DaemonEvent::CommandFinished { command_id, result, .. } = events.recv().await.unwrap() {
+                    if command_id == id {
+                        break result;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let status = backend.using::<ResourceConvoy>("flotilla").get("resume-staging").await.unwrap().status.unwrap();
+        if reopen {
+            assert!(matches!(result, CommandValue::ConvoyBriefQueued { .. }), "{result:?}");
+            assert_eq!(status.phase, flotilla_resources::ConvoyPhase::Active);
+            assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+            assert_eq!(status.lifecycle_mutations.len(), 1);
+            assert_eq!(status.lifecycle_mutations[0].action, "reopened");
+            assert_eq!(status.lifecycle_mutations[0].caller, caller);
+        } else {
+            assert_eq!(
+                result,
+                CommandValue::ConvoyBriefInformational { message: "crew already claimed; delivered without reopening".into() }
+            );
+            assert_eq!(status.phase, flotilla_resources::ConvoyPhase::Landing);
+            assert!(status.lifecycle_mutations.is_empty());
+        }
+    }
 }

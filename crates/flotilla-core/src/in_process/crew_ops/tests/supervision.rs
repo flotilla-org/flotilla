@@ -823,6 +823,7 @@ impl TurnDeliveryActuator for Delivery {
                     Utc::now(),
                     request.brief.clone(),
                     Some(record.metadata.name.clone()),
+                    true,
                 ),
             )
             .await

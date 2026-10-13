@@ -914,3 +914,11 @@ fn escalation_outcomes_name_receiver_or_missing_rung() {
         "escalation refused at operator rung: no receiver bound"
     );
 }
+
+// #3145: text and JSON explicitly report that a claimed crew was not reopened.
+#[test]
+fn claimed_resume_reports_information_only() {
+    let result = CommandValue::ConvoyBriefInformational { message: "crew already claimed; delivered without reopening".into() };
+    assert_eq!(format_command_result(&result), "crew already claimed; delivered without reopening");
+    assert!(serde_json::to_string(&result).unwrap().contains("crew already claimed; delivered without reopening"));
+}

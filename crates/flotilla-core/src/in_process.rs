@@ -5352,8 +5352,22 @@ impl InProcessDaemon {
         prompt: &str,
         requested_vessel: Option<&str>,
         requested_role: Option<&str>,
+        reopen: bool,
     ) -> Result<ConvoyResumeOutcome, String> {
-        self.crew_ops.resume(namespace, name, prompt, requested_vessel, requested_role).await
+        if !reopen {
+            return self.crew_ops.resume(namespace, name, prompt, requested_vessel, requested_role).await;
+        }
+        self.crew_ops
+            .convoy_resume_with_sender_internal(
+                namespace,
+                name,
+                prompt,
+                requested_vessel,
+                requested_role,
+                crew_ops::MessageAttribution::operator(None),
+                reopen,
+            )
+            .await
     }
 
     pub async fn convoy_withdraw_pending_brief_internal(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {

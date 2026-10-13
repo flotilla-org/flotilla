@@ -208,6 +208,7 @@ async fn missing_resumed_session_does_not_suppress_supervision_forever() {
             Utc::now() - chrono::Duration::minutes(3),
             "Continue with the operator's guidance".into(),
             Some("lost-resume-brief".into()),
+            true,
         ),
     )
     .await

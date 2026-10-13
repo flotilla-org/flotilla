@@ -1758,6 +1758,52 @@ async fn completed_crew_cannot_stall_landing_while_change_request_merges() {
     assert_eq!(status.phase, ConvoyPhase::Landed);
 }
 
+// #3145: a resume milliseconds after an accepted claim must preserve Landing
+// and its completion evidence so the ordinary settlement harness reaches Landed.
+#[tokio::test]
+async fn resume_after_claim_preserves_landing() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        work: BTreeMap::from([("implement".into(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
+        crew_work: BTreeMap::from([(
+            "implement".into(),
+            BTreeMap::from([("coder".into(), flotilla_resources::CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+        )]),
+        ..Default::default()
+    };
+    external_patches::mark_crew_completed("implement".into(), "coder".into(), timestamp(20), Some("accepted claim".into()), None, None)
+        .apply(&mut status);
+    let claimed = status.clone();
+    external_patches::resume_crew_work(
+        "implement".into(),
+        "coder".into(),
+        timestamp(20) + chrono::Duration::milliseconds(1),
+        "please complete".into(),
+        None,
+        false,
+    )
+    .apply(&mut status);
+    assert_eq!(status, claimed);
+    let mut explicitly_reopened = claimed.clone();
+    ConvoyStatusPatch::ResumeCrewWork {
+        vessel: "implement".into(),
+        role: "coder".into(),
+        resumed_at: timestamp(20) + chrono::Duration::milliseconds(2),
+        prompt: "continue".into(),
+        brief_id: None,
+        reopen: true,
+    }
+    .apply(&mut explicitly_reopened);
+    assert_eq!(explicitly_reopened.phase, ConvoyPhase::Active);
+    assert_eq!(explicitly_reopened.work["implement"].phase, WorkPhase::Running);
+    assert_eq!(explicitly_reopened.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
+    assert!(explicitly_reopened.crew_work["implement"]["coder"].finished_at.is_none());
+
+    let merged = reconcile_with_observed_change_request(status.phase, Some(ConditionValue::True), Some("main"), timestamp(40)).await;
+    merged.patch.expect("settlement remains reachable").apply(&mut status);
+    assert_eq!(status.phase, ConvoyPhase::Landed);
+}
+
 #[tokio::test]
 async fn landing_on_a_different_target_records_a_fact_and_still_becomes_landed() {
     let outcome =

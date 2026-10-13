@@ -369,6 +369,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
             Utc::now(),
             "follow-up".to_string(),
             None,
+            true,
         ),
     )
     .await
