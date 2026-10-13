@@ -450,7 +450,7 @@ async fn deliver_legacy(sink: &dyn PatchSink, patches: &[MetadataPatch]) -> Resu
             loop {
                 match sink.send(patch).await {
                     Ok(()) => break,
-                    Err(error) => warn!(%error, "retrying legacy catalog publication"),
+                    Err(error) => warn!(%error, target = ?patch.target, "retrying legacy catalog publication"),
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }

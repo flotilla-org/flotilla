@@ -39,8 +39,12 @@ retry unchanged with exponential delays from 250 ms to 2 seconds, within a
 that deadline exits with an error, allowing a restart's replacing snapshot to
 repair the provider. Legacy delivery retries the remaining individual patches
 within the same deadline, logging each failed attempt. The publication deadline
-is terminal for **both** liveness modes, as required by issue #3022 item 4; TTL
-in-process reconnects apply to daemon loss, not indefinitely uncertain delivery.
+is terminal for **both** liveness modes, as required by issue #3022 item 4.
+Zellij retries transient sends but exits if its pipe remains blocked or failing
+for the entire 15-second deadline. That connector then needs relaunch; its TTL
+facts expire normally. Zellij's in-process reconnects apply to daemon loss, not
+indefinitely uncertain sink delivery. Legacy retry warnings identify the stuck
+patch target.
 
 After the first connection-mode publication, daemon-session loss exits with an
 error so Wheelhouse can mark the provider stale and restart it. Before publication,
