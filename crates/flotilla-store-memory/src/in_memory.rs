@@ -115,6 +115,7 @@ type ReplicaKey = (NodeId, StoreKey);
 struct ReplicaState {
     partitions: HashMap<ReplicaKey, ReplicaPartition>,
     watchers: HashMap<StoreKey, WatchChannel<StoredReplicaEvent>>,
+    quarantines: HashMap<(ReplicaKey, String), (Value, flotilla_resources::ResourceReplicaQuarantine)>,
 }
 
 #[derive(Debug, Default)]
@@ -350,6 +351,13 @@ impl InMemoryBackend {
         let cutoff = Utc::now() - chrono::Duration::hours(FIELD_OWNERSHIP_VIOLATION_TTL_HOURS);
         violations.retain(|violation| violation.observed_at >= cutoff);
         diagnostics.field_ownership_violations = violations.clone();
+        diagnostics.replica_quarantines =
+            self.replicas.lock().await.quarantines.values().map(|(_, diagnostic)| diagnostic.clone()).collect();
+        if let Some(backend) = &self.durable_replicas {
+            if let Some(durable) = backend.store().diagnostics().await? {
+                diagnostics.replica_quarantines.extend(durable.replica_quarantines);
+            }
+        }
         Ok(diagnostics)
     }
 
@@ -586,6 +594,32 @@ impl InMemoryBackend {
         .boxed())
     }
 
+    fn validate_replica_record(
+        state: &mut ReplicaState,
+        resource_kind: ResourceKind,
+        replica_key: &ReplicaKey,
+        name: &str,
+        encoded: &Value,
+    ) -> bool {
+        let quarantine_key = (replica_key.clone(), name.to_string());
+        match Self::decode_object(resource_kind, encoded.clone()) {
+            Ok(_) => true,
+            Err(error) => {
+                let diagnostic = flotilla_resources::ResourceReplicaQuarantine {
+                    origin_root: replica_key.0.clone(),
+                    kind: replica_key.1 .2.clone(),
+                    namespace: replica_key.1 .3.clone(),
+                    name: name.to_string(),
+                    error: error.to_string(),
+                    quarantined_at: Utc::now(),
+                };
+                tracing::warn!(origin=%diagnostic.origin_root, kind=diagnostic.kind, namespace=diagnostic.namespace, name, %error, "quarantined rejected replica; continuing batch");
+                state.quarantines.insert(quarantine_key, (encoded.clone(), diagnostic));
+                false
+            }
+        }
+    }
+
     pub async fn replace_replicas_raw(
         &self,
         resource_kind: ResourceKind,
@@ -601,6 +635,16 @@ impl InMemoryBackend {
         let store_key = Self::store_key(resource_kind, namespace);
         let replica_key = (origin_root.clone(), store_key.clone());
         let mut state = self.replicas.lock().await;
+        let mut listed = listed.clone();
+        let mut rejected = Vec::new();
+        listed.items.retain(|object| {
+            let encoded = Self::encode_object(resource_kind, object).expect("JSON values encode");
+            let valid = Self::validate_replica_record(&mut state, resource_kind, &replica_key, &object.metadata.name, &encoded);
+            if !valid {
+                rejected.push(object.metadata.name.clone());
+            }
+            valid
+        });
         let mut old = state.partitions.remove(&replica_key).unwrap_or_default();
         let mut digest = std::mem::take(&mut old.digest);
         let mut queries = std::mem::take(&mut old.queries);
@@ -624,6 +668,7 @@ impl InMemoryBackend {
         for object in &listed.items {
             let name = &object.metadata.name;
             let encoded = Self::encode_object(resource_kind, object)?;
+            state.quarantines.remove(&(replica_key.clone(), name.clone()));
             let unchanged = old.objects.get(name) == Some(&encoded);
             queries.update(name, Some(&encoded));
             messages.update(name, Some(&encoded));
@@ -631,6 +676,11 @@ impl InMemoryBackend {
             digest.set(name, Some(&object.metadata.resource_version));
             if !unchanged {
                 synced_at_by_name.insert(name.clone(), synced_at);
+            }
+        }
+        for name in rejected {
+            if let Some(value) = old.objects.remove(&name) {
+                objects.insert(name, value);
             }
         }
         let mut events = Vec::new();
@@ -699,6 +749,11 @@ impl InMemoryBackend {
         let replica_key = (origin_root.clone(), store_key.clone());
         let encoded = Self::encode_object(resource_kind, object)?;
         let mut state = self.replicas.lock().await;
+        if matches!(kind, StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified)
+            && !Self::validate_replica_record(&mut state, resource_kind, &replica_key, &object.metadata.name, &encoded)
+        {
+            return Ok(());
+        }
         let partition = state.partitions.entry(replica_key).or_default();
         let unchanged = match kind {
             StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
@@ -739,6 +794,7 @@ impl InMemoryBackend {
                 partition.synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
             }
         }
+        state.quarantines.remove(&((origin_root.clone(), store_key.clone()), object.metadata.name.clone()));
         Self::notify_replica_watchers(
             &mut state,
             &store_key,
@@ -776,6 +832,7 @@ impl InMemoryBackend {
         partition.objects.remove(&tombstone.name);
         partition.digest.set(&tombstone.name, None);
         partition.synced_at_by_name.insert(tombstone.name.clone(), synced_at);
+        state.quarantines.remove(&((origin_root.clone(), store_key.clone()), tombstone.name.clone()));
         Self::notify_replica_watchers(
             &mut state,
             &store_key,

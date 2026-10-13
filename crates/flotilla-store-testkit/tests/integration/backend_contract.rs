@@ -343,3 +343,189 @@ async fn read_counts_include_missing_gets(#[case] adapter: &str) {
     assert!(matches!(counted.using::<Convoy>("flotilla").get("absent").await, Err(ResourceError::NotFound { .. })));
     assert_eq!(counted.read_snapshot().tally("Convoy", ReadOperation::Get), ReadTally { calls: 1, objects: 0 });
 }
+
+// Collection membership is set-valued even when the stored subject list repeats
+// a subject under the same or different relationships (#3171).
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[case("sqlite-reopen")]
+#[tokio::test]
+async fn duplicate_collection_values(#[case] adapter: &str) {
+    use flotilla_store::StoreQuery;
+    let directory = (adapter == "sqlite-reopen").then(|| tempfile::tempdir().unwrap());
+    let path = directory.as_ref().map(|dir| dir.path().join("store.sqlite"));
+    let (backend, _server) =
+        if let Some(path) = &path { (ResourceBackend::new(SqliteBackend::open(path).unwrap()), None) } else { backend(adapter).await };
+    let resolver = backend.using::<Convoy>("flotilla");
+    let created = resolver.create(&ConvoyFixture::meta("duplicates"), &ConvoyFixture::spec()).await.unwrap();
+    let subject = flotilla_protocol::Subject {
+        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+        id: "2524".into(),
+    };
+    let mut status = created.status.unwrap_or_default();
+    status.discover_subject(
+        subject.clone(),
+        flotilla_protocol::Relationship::Produces,
+        SubjectDiscoverySource::Operator,
+        chrono::Utc::now(),
+    );
+    status.subjects.push(status.subjects[0].clone());
+    let updated =
+        resolver.update_status("duplicates", &created.metadata.resource_version, &status).await.expect("apply duplicate local subjects");
+    let origin = flotilla_protocol::NodeId::new("peer");
+    backend
+        .replica_writer::<Convoy>(origin, "remote")
+        .replace(
+            &ResourceList { items: vec![updated.clone()], resource_version: updated.metadata.resource_version.clone(), generation: None },
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("apply duplicate replica subjects");
+    drop(resolver);
+    let backend = if let Some(path) = &path {
+        drop(backend);
+        // Simulate an older/unconfigured writer leaving projections empty while
+        // duplicate subjects are already durable. Open must rebuild both sides.
+        let raw = rusqlite::Connection::open(path).unwrap();
+        for table in ["resource_objects_Convoy_status_subjects___subject_values", "replica_objects_Convoy_status_subjects___subject_values"]
+        {
+            raw.execute(&format!("DELETE FROM {table}"), []).unwrap();
+        }
+        drop(raw);
+        ResourceBackend::new(SqliteBackend::open(path).expect("reopen repairs duplicate projections"))
+    } else {
+        backend
+    };
+    for namespace in ["flotilla", "remote"] {
+        let result = backend
+            .query_declared::<Convoy>(
+                namespace,
+                &StoreQuery {
+                    fields: BTreeMap::from([("status.subjects.*.subject".into(), serde_json::to_value(&subject).unwrap().to_string())]),
+                    include_replicas: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.items.len(), 1, "membership returns the convoy once");
+        assert_eq!(result.items[0].object.status.as_ref().unwrap().subjects.len(), 2, "stored list remains unchanged");
+    }
+}
+
+// One undecodable object in a replica delivery is quarantined by identity;
+// valid objects on both sides still apply, and a corrected delivery clears it.
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[tokio::test]
+async fn replica_batch_quarantines_one_object(#[case] adapter: &str, #[values(false, true)] snapshot: bool) {
+    use flotilla_store::{SerializedResource, StoreExt};
+    let (backend, _server) = backend(adapter).await;
+    let source = ResourceBackend::new(InMemoryBackend::default());
+    let mut objects = Vec::new();
+    for name in ["before", "bad", "after"] {
+        let object = source.using::<Convoy>("flotilla").create(&ConvoyFixture::meta(name), &ConvoyFixture::spec()).await.unwrap();
+        objects.push(flotilla_store::transcode::<_, ResourceObject<SerializedResource>>(object).unwrap());
+    }
+    let corrected = objects[1].clone();
+    objects[1].spec = json!(null);
+    let origin = flotilla_protocol::NodeId::new("peer");
+    let kind = ResourceKind::of::<Convoy>();
+    let at = chrono::Utc::now();
+    if snapshot {
+        backend
+            .store()
+            .replace_replicas_raw(
+                kind,
+                &origin,
+                "flotilla",
+                &ResourceList { items: objects, resource_version: "3".into(), generation: None },
+                at,
+                None,
+            )
+            .await
+            .unwrap();
+    } else {
+        let events = objects.into_iter().map(|object| (WatchEvent::Added(object), at)).collect::<Vec<_>>();
+        backend.store().apply_replica_batch_raw(kind, &origin, "flotilla", &events).await.unwrap();
+    }
+    let names = backend
+        .including_replicas::<Convoy>("flotilla")
+        .list()
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|item| item.object.metadata.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(names, std::collections::BTreeSet::from(["before".into(), "after".into()]));
+    let diagnostics = backend.store().diagnostics().await.unwrap().unwrap();
+    assert_eq!(diagnostics.replica_quarantines.len(), 1);
+    assert_eq!(diagnostics.replica_quarantines[0].name, "bad");
+    assert_eq!(diagnostics.replica_quarantines[0].origin_root, origin);
+    assert!(!diagnostics.replica_quarantines[0].error.is_empty());
+    backend
+        .store()
+        .apply_replica_batch_raw(kind, &origin, "flotilla", &[(WatchEvent::Modified(corrected), at + chrono::Duration::seconds(1))])
+        .await
+        .unwrap();
+    assert_eq!(backend.store().list_replicas_typed::<Convoy>("flotilla").await.unwrap().len(), 3);
+    assert!(backend.store().diagnostics().await.unwrap().unwrap().replica_quarantines.is_empty());
+}
+
+// A valid decoded object can still fail in SQLite maintenance. Its savepoint
+// must undo the object and every trigger side effect while the batch continues.
+#[rstest::rstest]
+#[tokio::test]
+async fn replica_sql_failure_rolls_back_only_one_record(#[values(false, true)] snapshot: bool) {
+    use flotilla_store::StoreExt;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("store.sqlite");
+    let sqlite = SqliteBackend::open(&path).unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch("CREATE TRIGGER reject_bad_replica AFTER INSERT ON replica_objects WHEN NEW.name='bad' BEGIN SELECT RAISE(FAIL, 'test unappliable replica'); END;").unwrap();
+    drop(raw);
+    let backend = ResourceBackend::new(sqlite);
+    let source = ResourceBackend::new(InMemoryBackend::default());
+    for name in ["before", "bad", "after"] {
+        source.using::<Convoy>("flotilla").create(&ConvoyFixture::meta(name), &ConvoyFixture::spec()).await.unwrap();
+    }
+    let origin = flotilla_protocol::NodeId::new("peer");
+    let listed = source.using::<Convoy>("flotilla").list().await.unwrap();
+    let mut watch = backend.including_replicas::<Convoy>("flotilla").watch().await.unwrap();
+    if snapshot {
+        backend.replica_writer::<Convoy>(origin.clone(), "flotilla").replace(&listed, chrono::Utc::now()).await.unwrap();
+    } else {
+        let events = listed.items.into_iter().map(WatchEvent::Added).collect::<Vec<_>>();
+        backend.replica_writer::<Convoy>(origin.clone(), "flotilla").apply_batch(&events, chrono::Utc::now()).await.unwrap();
+    }
+    for _ in 0..2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), watch.next()).await.unwrap().unwrap().unwrap();
+        let ReadWatchEvent::Added(item) = event else { panic!("expected committed addition") };
+        assert_ne!(item.object.metadata.name, "bad", "rejected record must never publish");
+    }
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(10), watch.next()).await.is_err(), "only committed objects publish");
+    drop(watch);
+    let names = backend
+        .store()
+        .list_replicas_typed::<Convoy>("flotilla")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|item| item.object.metadata.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(names, std::collections::BTreeSet::from(["before".into(), "after".into()]));
+    drop(backend);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let digest_count: usize =
+        raw.query_row("SELECT count(*) FROM digest_entries WHERE origin='peer' AND name='bad'", [], |row| row.get(0)).unwrap();
+    assert_eq!(digest_count, 0, "trigger projection rolled back with rejected object");
+    drop(raw);
+    let reopened = ResourceBackend::new(SqliteBackend::open(&path).unwrap());
+    let diagnostics = reopened.store().diagnostics().await.unwrap().unwrap();
+    assert_eq!(diagnostics.replica_quarantines.len(), 1, "quarantine survives restart");
+    assert!(diagnostics.replica_quarantines[0].error.contains("test unappliable replica"));
+}
