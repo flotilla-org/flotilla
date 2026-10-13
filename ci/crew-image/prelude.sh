@@ -4,6 +4,15 @@ flotilla_run_with_preludes() (
     # Sourced in the launch shell, so exports reach the agent/probe. No image
     # entrypoint or installed Flotilla executable is required for arbitrary images.
     flotilla_prelude_dir=${FLOTILLA_PRELUDE_DIR:-/etc/flotilla/prelude.d}
+    # An unsearchable parent hides the directory from `[ -d ]`; refuse rather
+    # than launch without the preludes the image declared.
+    flotilla_prelude_parent=${flotilla_prelude_dir%/*}
+    if { [ -e "$flotilla_prelude_dir" ] && { [ ! -r "$flotilla_prelude_dir" ] || [ ! -x "$flotilla_prelude_dir" ]; }; } \
+        || { [ ! -e "$flotilla_prelude_dir" ] && [ -n "$flotilla_prelude_parent" ] && [ -d "$flotilla_prelude_parent" ] \
+            && [ ! -x "$flotilla_prelude_parent" ]; }; then
+        printf 'Flotilla prelude directory is not readable: %s\n' "$flotilla_prelude_dir" >&2
+        exit 1
+    fi
     if [ -d "$flotilla_prelude_dir" ]; then
         flotilla_prelude_restore_nomatch=0
         if [ -n "${ZSH_VERSION-}" ] && [[ -o nomatch ]]; then

@@ -26,7 +26,12 @@ probe: |
   done
   locale -a | grep -qx 'en_US.utf8'
   test "$LANG" = en_US.UTF-8
-  case ":$PATH:" in /opt/flotilla/bin:*) ;; *) echo "PATH must start with /opt/flotilla/bin: $PATH" >&2; exit 1 ;; esac
+  case ":$PATH:" in :/opt/flotilla/bin:*) ;; *) echo "PATH must start with /opt/flotilla/bin: $PATH" >&2; exit 1 ;; esac
+  # Probes run unprivileged on the final image, so this also catches a layer
+  # above that made these directories unsearchable.
+  for dir in /etc/flotilla/prelude.d /opt/flotilla /opt/flotilla/bin; do
+      { test -r "$dir" && test -x "$dir"; } || { echo "$dir must be readable and searchable by any UID" >&2; exit 1; }
+  done
   test "$TERMINFO_DIRS" = /opt/flotilla/share/terminfo:/usr/share/terminfo
   work="$(mktemp -d)"
   printf '#include <stdio.h>\nint main(void) { puts("c toolchain ready"); return 0; }\n' > "$work/probe.c"
