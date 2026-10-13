@@ -183,7 +183,10 @@ impl EnvironmentToolFactory for FleetToolsTool {
             &self.root,
             &flotilla_environment::tools::ToolsSource { flotilla: &flotilla, cleat: binary, library, terminfo: &terminfo },
         )
-        .map_err(|error| format!("publish fleet tools: {error}"))?;
+        .map_err(|error| format!(
+            "publish fleet tools: {error}; Docker vessel provisioning requires Linux fleet tools: flotilla, cleat, libghostty-vt.so.0, and compiled xterm-ghostty at {}; build/install a complete fleet candidate (cleat prepare supplies share/terminfo)",
+            terminfo.display()
+        ))?;
         cli.assets.remove(0);
         for directory in ["tools", "bin", "lib", "share/terminfo"] {
             cli.assets.push(EnvironmentToolAsset::new(
@@ -774,6 +777,18 @@ pub(crate) mod tests {
         factory.prepare("another-vessel", &TestToolContext).await.unwrap();
         assert_eq!(fs::read(parent.host_path.as_path().join("cleat")).unwrap(), b"second");
         assert_eq!(fs::read(factory.root.join("share/terminfo/x/xterm-ghostty")).unwrap(), b"first");
+        // Missing assets refuse provisioning with an actionable installation
+        // requirement, retaining the last complete generation.
+        for missing in ["share/terminfo/x/xterm-ghostty", "lib/libghostty-vt.so.0"] {
+            let path = release.join(missing);
+            let bytes = fs::read(&path).unwrap();
+            fs::remove_file(&path).unwrap();
+            let error = factory.prepare("missing-assets", &TestToolContext).await.unwrap_err();
+            assert!(error.contains("Docker vessel provisioning requires Linux fleet tools"), "{error}");
+            assert!(error.contains("share/terminfo"), "{error}");
+            assert_eq!(fs::read(factory.root.join("bin/cleat")).unwrap(), b"second");
+            fs::write(path, bytes).unwrap();
+        }
     }
 
     #[test]

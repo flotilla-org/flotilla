@@ -298,6 +298,15 @@ verbatim, including its license. A missing `x/xterm-ghostty` entry refuses the
 candidate. This depends on cleat #337; the fleet cleat source pin must select
 that change. No image builds Ghostty or supplies Flotilla binaries.
 
+Docker vessel provisioning requires a complete Linux tools install, including
+cleat's prepared terminfo database next to the resolved library prefix. Desk
+builds must run cleat prepare and supply that tree, or install a fleet candidate;
+missing assets refuse provisioning with the expected path and build guidance.
+There is no per-file fallback: it would silently create vessels that cannot
+upgrade in place. The delivered library uses the Linux SONAME
+`libghostty-vt.so.0`, including when its source resolves to a versioned filename.
+A native macOS dylib is not a Linux Docker vessel runtime asset.
+
 Local Docker binds the provider-owned `environment-tools/fleet` directories
 `tools`, `bin`, `lib`, and `share/terminfo` to matching `/opt/flotilla` children,
 read-only to the vessel. This preserves the image's sibling harness paths. The

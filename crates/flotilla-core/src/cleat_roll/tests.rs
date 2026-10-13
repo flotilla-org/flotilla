@@ -210,6 +210,27 @@ async fn partial_handover_results_are_actionable_without_session_destruction() {
     }
 }
 
+// Summary and per-session warnings may name the same forwarder event. Keep
+// that diagnostic once, while preserving the complete raw handover evidence.
+#[tokio::test]
+async fn duplicate_handover_warnings_are_reported_once() {
+    let mut value: Value = serde_json::from_str(&recorded("success").stdout).unwrap();
+    value["warning"] = serde_json::json!("forwarder retained");
+    value["moved"] = serde_json::json!([
+        {"session_id":"shell", "warning":"forwarder retained"},
+        {"session_id":"shell", "warning":"distinct warning"},
+        {"session_id":"shell", "warning":"distinct warning"}
+    ]);
+    let stdout = value.to_string();
+    let runner =
+        Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput { stdout: stdout.clone(), stderr: String::new(), exit_code: Some(0) })]));
+    let report = drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner, "default", true)], vec![]).await;
+    let error = report.attempts[0].error.as_ref().unwrap();
+    assert_eq!(error.matches("forwarder retained").count(), 1);
+    assert_eq!(error.matches("distinct warning").count(), 1);
+    assert_eq!(report.attempts[0].stdout, stdout);
+}
+
 // Host health compares the host-installed SHA with each current serving SHA;
 // matching builds are healthy, differing or unavailable builds remain visible.
 #[tokio::test]
@@ -250,15 +271,26 @@ async fn serving_sha_skew_is_visible_per_runtime() {
 // Real cleat protocol behavior is covered by the candidate's host handover gate.
 #[tokio::test]
 async fn contained_old_sessions_remain_skewed_without_a_captured_roll_report() {
-    for remaining in [Some(0), Some(1), Some(3), None] {
+    for (response, actionable, diagnostic) in [
+        (Ok(r#"{"session_count":0}"#.into()), false, ""),
+        (Ok(r#"{"session_count":1}"#.into()), true, "1 sessions remain"),
+        (Ok(r#"{"session_count":3}"#.into()), true, "3 sessions remain"),
+        (Ok("{}".into()), true, "lacks session_count"),
+        (Ok("invalid".into()), true, "invalid old daemon health JSON"),
+        (Err("curl executable not found".into()), true, "health probe unavailable"),
+        (Err("socket disappeared".into()), true, "socket disappeared"),
+    ] {
         let runner = Arc::new(MockRunner::with_outputs(vec![
             Ok(CommandOutput { stdout: "default@2".into(), stderr: String::new(), exit_code: Some(0) }),
             Ok(CommandOutput { stdout: serde_json::json!({"daemon":{"git_sha":"new"},"generation":2}).to_string(), stderr: String::new(), exit_code: Some(0) }),
             Ok(CommandOutput { stdout: serde_json::json!([{"name":"default@1","runtime_root":"/state/crew cleat","alive":true,"drain_state":"draining","build":{"git_sha":"old"}}]).to_string(), stderr: String::new(), exit_code: Some(0) }),
-            Ok(CommandOutput { stdout: serde_json::json!({"session_count":remaining}).to_string(), stderr: String::new(), exit_code: Some(0) }),
+            response.map(|stdout| CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
         ]));
         let assessment = build_skew(Some("new"), &[target(runner.clone(), "default", true)], None).await;
-        assert_eq!(!assessment.actionable.is_empty(), remaining != Some(0));
+        assert_eq!(!assessment.actionable.is_empty(), actionable);
+        if actionable {
+            assert!(assessment.actionable.join("; ").contains(diagnostic));
+        }
         assert_eq!(
             runner.calls()[3],
             (

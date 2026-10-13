@@ -30,37 +30,53 @@ pub fn publish(root: &Path, source: &ToolsSource<'_>) -> io::Result<PathBuf> {
         return Err(io::Error::new(io::ErrorKind::NotFound, "cleat release lacks xterm-ghostty terminfo"));
     }
     files.sort();
-    let mut hash = Sha256::new();
-    // Hash framed paths and bytes, so identity includes all delivered contents.
-    let mut contents = Vec::new();
-    for (name, path) in &files {
-        let bytes = fs::read(path)?;
-        let name = name.to_string_lossy();
-        hash.update((name.len() as u64).to_le_bytes());
-        hash.update(name.as_bytes());
-        hash.update((bytes.len() as u64).to_le_bytes());
-        hash.update(&bytes);
-        contents.push(bytes);
-    }
-    let generation = format!("{:x}", hash.finalize());
     fs::create_dir_all(root.join("tools"))?;
-    let target = root.join("tools").join(&generation);
-    if !target.exists() {
-        let staging = root.join("tools").join(format!(".staging-{}", uuid::Uuid::new_v4()));
-        let result = (|| {
-            for ((name, path), bytes) in files.iter().zip(&contents) {
-                let destination = staging.join(name);
-                fs::create_dir_all(destination.parent().expect("asset parent"))?;
-                fs::write(&destination, bytes)?;
-                fs::set_permissions(&destination, fs::metadata(path)?.permissions())?;
+    let staging = root.join("tools").join(format!(".staging-{}", uuid::Uuid::new_v4()));
+    // Stream each immutable staged snapshot into the framed digest. Memory is
+    // bounded by one buffer rather than the size of the entire release.
+    let result = (|| -> io::Result<PathBuf> {
+        use io::{Read, Write};
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        for (name, path) in &files {
+            let destination = staging.join(name);
+            fs::create_dir_all(destination.parent().expect("asset parent"))?;
+            let mut source = fs::File::open(path)?;
+            let metadata = source.metadata()?;
+            let mut output = fs::File::create(&destination)?;
+            let name = name.to_string_lossy();
+            hash.update((name.len() as u64).to_le_bytes());
+            hash.update(name.as_bytes());
+            hash.update(metadata.len().to_le_bytes());
+            let mut copied = 0_u64;
+            loop {
+                let length = source.read(&mut buffer)?;
+                if length == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..length])?;
+                hash.update(&buffer[..length]);
+                copied += length as u64;
             }
-            fs::rename(&staging, &target)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_dir_all(staging);
+            if copied != metadata.len() {
+                return Err(io::Error::other("tools asset changed length during publication"));
+            }
+            fs::set_permissions(&destination, metadata.permissions())?;
         }
-        result?;
+        let generation = format!("{:x}", hash.finalize());
+        let target = root.join("tools").join(generation);
+        if target.exists() {
+            fs::remove_dir_all(&staging)?;
+        } else {
+            fs::rename(&staging, &target)?;
+        }
+        Ok(target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
     }
+    let target = result?;
+    let generation = target.file_name().expect("generation name");
     // Mount these real directories separately, leaving image-owned harnesses
     // under /opt/flotilla visible. Relative links resolve on both host and guest.
     for directory in ["bin", "lib", "share/terminfo"] {
@@ -75,7 +91,15 @@ pub fn publish(root: &Path, source: &ToolsSource<'_>) -> io::Result<PathBuf> {
         let name = entry.file_name();
         link(&root.join("share/terminfo"), &name, &Path::new("../../tools/current/share/terminfo").join(&name))?;
     }
-    link(&root.join("tools"), "current", Path::new(&generation))?;
+    link(&root.join("tools"), "current", Path::new(generation))?;
+    // Remove retired top-level links only after current is published; active
+    // readers still resolve old entries until the atomic generation flip.
+    for entry in fs::read_dir(root.join("share/terminfo"))? {
+        let entry = entry?;
+        if !target.join("share/terminfo").join(entry.file_name()).exists() && entry.file_type()?.is_symlink() {
+            fs::remove_file(entry.path())?;
+        }
+    }
     Ok(target)
 }
 
@@ -122,7 +146,11 @@ pub fn prune(root: &Path, unused: impl FnMut(&Path) -> bool) -> io::Result<()> {
 }
 
 fn prune_locked(root: &Path, mut unused: impl FnMut(&Path) -> bool) -> io::Result<()> {
-    let current = fs::read_link(root.join("tools/current"))?;
+    let current = match fs::read_link(root.join("tools/current")) {
+        Ok(current) => current,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
     for entry in fs::read_dir(root.join("tools"))? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() || entry.file_name().to_string_lossy().starts_with('.') {
@@ -221,6 +249,32 @@ fn prune_local_for(root: &Path, processes: &Path, owner: u32) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // An empty/failed first installation is safe to prune. Later publication
+    // removes retired terminfo entries without disturbing the current database.
+    #[test]
+    fn empty_publication_and_retired_terminfo_entries_are_cleaned_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("provider");
+        prune(&root, |_| panic!("no generation was published")).unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("terminfo/x")).unwrap();
+        for file in ["flotilla", "cleat", "library", "terminfo/x/xterm-ghostty", "terminfo/LICENSE"] {
+            fs::write(source.join(file), b"contents").unwrap();
+        }
+        let assets = ToolsSource {
+            flotilla: &source.join("flotilla"),
+            cleat: &source.join("cleat"),
+            library: &source.join("library"),
+            terminfo: &source.join("terminfo"),
+        };
+        publish(&root, &assets).unwrap();
+        assert!(root.join("share/terminfo/LICENSE").is_file());
+        fs::remove_file(source.join("terminfo/LICENSE")).unwrap();
+        publish(&root, &assets).unwrap();
+        assert!(fs::symlink_metadata(root.join("share/terminfo/LICENSE")).is_err());
+        assert_eq!(fs::read(root.join("share/terminfo/x/xterm-ghostty")).unwrap(), b"contents");
+    }
+
     // Generated rolls span duplicate publications, missing assets, changing
     // bytes, active leases and lease release. Every step preserves the current
     // complete generation and pruning conserves all leased generations.

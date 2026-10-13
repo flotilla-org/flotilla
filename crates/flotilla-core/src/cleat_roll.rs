@@ -194,7 +194,12 @@ pub async fn drain(host: String, generation: String, incoming: &Path, targets: &
             }
             for session in value["moved"].as_array().into_iter().flatten() {
                 if let Some(warning) = session["warning"].as_str() {
-                    failures.push(format!("{}: {warning}", session["session_id"].as_str().unwrap_or("unknown")));
+                    if parsed_report.as_ref().and_then(|report| report.warning.as_deref()) != Some(warning) {
+                        let message = format!("{}: {warning}", session["session_id"].as_str().unwrap_or("unknown"));
+                        if !failures.contains(&message) {
+                            failures.push(message);
+                        }
+                    }
                 }
             }
             if !failures.is_empty() {
@@ -461,21 +466,26 @@ async fn observe(installed: Option<&str>, target: &CleatTarget, report: Option<&
                         Duration::from_secs(5),
                     )
                     .await
-                    .ok()
-                    .and_then(|body| serde_json::from_str::<Value>(&body).ok()),
-                None => None,
+                    .map_err(|error| format!("old daemon health probe unavailable: {error}"))
+                    .and_then(|body| {
+                        serde_json::from_str::<Value>(&body).map_err(|error| format!("invalid old daemon health JSON: {error}"))
+                    })
+                    .and_then(|status| {
+                        status["session_count"].as_u64().ok_or_else(|| "old daemon health response lacks session_count".into())
+                    }),
+                None => Err("old daemon socket path is not UTF-8".into()),
             };
-            match status.as_ref().and_then(|status| status["session_count"].as_u64()) {
-                Some(remaining) if remaining > 0 => assessment.actionable.push(format!(
+            match status {
+                Ok(remaining) if remaining > 0 => assessment.actionable.push(format!(
                     "{} {}/{}: {remaining} sessions remain on old cleat {}; relaunch to clear build skew",
                     target.label(),
                     target.runtime_root.display(),
                     name,
                     sha(&daemon["build"]).unwrap_or("unknown")
                 )),
-                Some(_) => {}
-                None => assessment.actionable.push(format!(
-                    "{} {}/{}: cannot confirm old generation has no sessions",
+                Ok(_) => {}
+                Err(error) => assessment.actionable.push(format!(
+                    "{} {}/{}: cannot confirm old generation has no sessions ({error})",
                     target.label(),
                     target.runtime_root.display(),
                     name

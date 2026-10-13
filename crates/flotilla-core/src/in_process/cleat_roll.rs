@@ -377,6 +377,20 @@ mod tests {
         assert_eq!(targets.iter().filter(|target| target.name == "named").count(), 1);
         assert!(!targets.iter().any(|target| target.environment == "remote"));
         assert!(runner.calls().is_empty(), "enumeration is a resource/environment read");
+        // A failed first publication records the error without handing over any
+        // contained target or reporting a second spurious prune error.
+        let report = daemon
+            .post_install_cleat(
+                &directory.path().join("missing-release/bin/cleat"),
+                "test-generation",
+                &directory.path().join("diagnostics"),
+            )
+            .await
+            .unwrap();
+        assert!(report.errors.iter().any(|error| error.starts_with("publish vessel tools:")));
+        assert!(!report.errors.iter().any(|error| error.starts_with("prune vessel tools:")));
+        assert!(report.attempts.iter().all(|attempt| attempt.environment != "contained-work"));
+        assert!(runner.calls().is_empty(), "publication failure must leave contained sessions alone");
     }
 
     // The advisory host condition gives fleet-wide users exact installed and
