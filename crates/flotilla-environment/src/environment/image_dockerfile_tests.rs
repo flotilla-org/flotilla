@@ -343,14 +343,15 @@ fn read_layer(directory: &Path) -> ImageLayerSpec {
     parse_layer_directory_with_executables(&files, &executable, ImageLayerSource::Stdlib, None).expect("stdlib layer parses")
 }
 
-// The stdlib layer fixtures (a copy inside this crate, read from nothing
-// outside it) compose into one Dockerfile per architecture: the
+// The shipped stdlib layers (`stdlib/image-layers/` at the workspace root,
+// the same directories the daemon embeds) compose into one Dockerfile per
+// architecture: the
 // structural contract holds, `{arch}` pin URLs are emitted verbatim, the
 // architecture's checksum is selected, and declared context files (with
 // their executable bits) become one named context per layer.
 #[test]
 fn stdlib_layers_generate_for_both_architectures() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/environment/fixtures/image-layers");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stdlib/image-layers");
     let order = [
         "base-ubuntu-24.04",
         "display-x11",
