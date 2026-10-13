@@ -51,11 +51,16 @@ pub fn vessel_image_request(
         .build())
 }
 
-/// Every current layer definition visible to this namespace, replicas
-/// included. Retired records, records being deleted and definitions whose
-/// replicas disagree are not resolvable.
-pub async fn read_image_catalogue(backend: &ResourceBackend, namespace: &str) -> Result<ImageCatalogue, String> {
-    let layers = backend
+/// Every resolvable layer record visible to this namespace, replicas
+/// included. Records being deleted and definitions whose replicas disagree
+/// are not resolvable; retired records are kept here and dropped by
+/// [`ImageCatalogue::from_specs`].
+///
+/// Admission ([`read_image_catalogue`]) and `flotilla image check` both read
+/// the catalogue through this function, so a check of the default branch
+/// reproduces admission's identity.
+pub async fn declared_image_layers(backend: &ResourceBackend, namespace: &str) -> Result<Vec<ResourceObject<ImageLayer>>, String> {
+    Ok(backend
         .query_declared::<ImageLayer>(
             namespace,
             &StoreQuery { include_replicas: true, suppress_self_origin: false, merged_definitions: true, ..Default::default() },
@@ -68,8 +73,13 @@ pub async fn read_image_catalogue(backend: &ResourceBackend, namespace: &str) ->
         .filter(|layer| {
             layer.metadata.deletion_timestamp.is_none() && layer.metadata.merge.as_ref().is_none_or(|merge| merge.conflicts.is_empty())
         })
-        .collect::<Vec<_>>();
-    Ok(ImageCatalogue::from_specs(layers.iter().map(|layer| &layer.spec)))
+        .collect())
+}
+
+/// Every current layer definition visible to this namespace, replicas
+/// included (see [`declared_image_layers`]).
+pub async fn read_image_catalogue(backend: &ResourceBackend, namespace: &str) -> Result<ImageCatalogue, String> {
+    Ok(ImageCatalogue::from_specs(declared_image_layers(backend, namespace).await?.iter().map(|layer| &layer.spec)))
 }
 
 /// One record per host name, preferring the authoritative local copy.

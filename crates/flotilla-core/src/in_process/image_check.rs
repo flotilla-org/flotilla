@@ -24,10 +24,10 @@ use flotilla_protocol::image_check::{
 };
 use flotilla_resources::{
     parse_layer_directory, CapabilityNeed, CharterSource, ImageBuildFailureClass, ImageBuildPhase, ImageBuildSpec, ImageBuildStatus,
-    ImageCatalogue, ImageDelivery, ImageLayer, ImageLayerSource, ImageLayerSpec, ImageProbeOutcome, ImageRequest, ImageResolutionError,
-    Project, ProjectSpec, ResourceError, IMAGE_BUILD_MAX_ATTEMPTS, MANAGED_BY_LABEL,
+    ImageCatalogue, ImageDelivery, ImageLayerResourceSpec, ImageLayerSource, ImageLayerSpec, ImageProbeOutcome, ImageRequest,
+    ImageResolutionError, Project, ProjectSpec, ResourceError, IMAGE_BUILD_MAX_ATTEMPTS, MANAGED_BY_LABEL,
 };
-use flotilla_store::{ResourceBackend, StoreQuery};
+use flotilla_store::ResourceBackend;
 
 use super::{
     convoy_admission::installation_image_defaults,
@@ -192,44 +192,32 @@ pub async fn check_image(
     Ok(report)
 }
 
-/// The replica-inclusive catalogue `flotilla_core::image_build::read_image_catalogue`
-/// reads, with the project's primary-repository layer replaced by the one at
-/// the checked ref (`None`: the ref has no project layer). Also returns a
-/// charter-authored project layer for this project, if any.
+/// The replica-inclusive catalogue admission reads
+/// ([`crate::image_build::declared_image_layers`]), with the project's
+/// primary-repository layer replaced by the one at the checked ref (`None`:
+/// the ref has no project layer). Also returns a charter-authored project
+/// layer for this project, if any.
 async fn catalogue_with_branch_layer(
     backend: &ResourceBackend,
     namespace: &str,
     project: &str,
     branch_layer: Option<ImageLayerSpec>,
 ) -> Result<(ImageCatalogue, Option<String>), String> {
-    let layers = backend
-        .query_declared::<ImageLayer>(
-            namespace,
-            &StoreQuery { include_replicas: true, suppress_self_origin: false, merged_definitions: true, ..Default::default() },
-        )
-        .await
-        .map_err(|error| error.to_string())?
-        .items
-        .into_iter()
-        .map(|source| source.object)
-        .filter(|layer| {
-            layer.metadata.deletion_timestamp.is_none() && layer.metadata.merge.as_ref().is_none_or(|merge| merge.conflicts.is_empty())
-        })
-        .collect::<Vec<_>>();
     let mut charter_layer = None;
     let mut specs = Vec::new();
-    for layer in layers {
-        let Some(spec) = layer.spec.into_current() else { continue };
-        if spec.source == ImageLayerSource::Project && spec.project.as_deref() == Some(project) {
-            if layer.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(PROJECT_IMAGE_MANAGER) {
-                continue;
+    for layer in crate::image_build::declared_image_layers(backend, namespace).await? {
+        if let Some(spec) = layer.spec.current() {
+            if spec.source == ImageLayerSource::Project && spec.project.as_deref() == Some(project) {
+                if layer.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(PROJECT_IMAGE_MANAGER) {
+                    continue;
+                }
+                charter_layer = Some(layer.metadata.name.clone());
             }
-            charter_layer = Some(layer.metadata.name.clone());
         }
-        specs.push(spec);
+        specs.push(layer.spec);
     }
-    specs.extend(branch_layer);
-    Ok((ImageCatalogue::new(specs), charter_layer))
+    specs.extend(branch_layer.map(ImageLayerResourceSpec::from));
+    Ok((ImageCatalogue::from_specs(&specs), charter_layer))
 }
 
 /// The layer names a resolution error names.
