@@ -49,7 +49,10 @@ def _(mo):
             if not (in_section and line.startswith("| `")):
                 continue
             cells = [cell.strip() for cell in line.strip("|").split("|")]
-            name = re.match(r"`([a-z_]+)`", cells[0]).group(1)
+            named = re.match(r"`([a-z_]+)`", cells[0])
+            if not named or len(cells) < 4:
+                raise ValueError(f"unrecognised Scale drivers row in {path}: {line}")
+            name = named.group(1)
             target, ceiling = (parse_count(cell) for cell in cells[2:4])
             if target is not None and ceiling is not None:
                 drivers[name] = (target, ceiling)
@@ -64,6 +67,10 @@ def _(mo):
 
     workload_md = mo.notebook_dir().parents[1] / "WORKLOAD.md"
     drivers = read_drivers(workload_md)
+    expected = {"running_convoys", "view_clients", "hosts", "change_events", "history_window"}
+    missing = expected - drivers.keys()
+    if missing:
+        raise ValueError(f"{workload_md} Scale drivers table lacks numeric Target/Ceiling for: {sorted(missing)}")
     return (drivers,)
 
 
