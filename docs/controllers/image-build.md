@@ -50,6 +50,15 @@ capacity. For each attempt it:
 The digest is `<repository>@sha256:…` for registry delivery and the local
 `sha256:…` image ID for local delivery.
 
+A job that panics ends its attempt as an infrastructure failure, so the
+backoff and the attempt limit below apply to it.
+
+A daemon restart during `Building` loses the running job. The restarted
+reconciler finds the build still `Building` with its slot held and runs the
+same attempt again from the start. In push mode the registry build cache keeps
+finished steps cheap. Local delivery has no persistent cache beyond the owned
+builder's own BuildKit state, so a restart can repeat the whole build.
+
 ### Failures and retries
 
 - **Infrastructure failures** (transport, registry, daemon, disk, deadlines, a
@@ -111,6 +120,19 @@ digest first. Probes run as `--user 65534:65534`, with `--network=none` and
 `--pull=never`, a tmpfs `HOME`, and through the prelude wrapper. Builds have a
 30-minute deadline and probes have a 60-second deadline. A timed-out probe
 container is force-removed.
+
+After the probes, push mode removes the pulled `<repository>@<digest>`, because
+the registry holds the delivered image. A failed removal is logged and does not
+fail the build. Local delivery keeps `flotilla-image:<hex40>-<arch>`, because
+that local image is the delivered artifact.
+
+Cancellation is graceful. A deadline, a deleted `ImageBuild` or an aborted job
+drops the running Docker command. The runner then sends SIGTERM to the
+command's process group, and SIGKILL 30 seconds later if the command is still
+running. On SIGTERM, Buildx cancels its BuildKit solve, so the build inside the
+owned builder stops. SIGKILL alone would only drop the client connection.
+`docker buildx stop` is never used, because it would stop the builds in every
+other slot.
 
 ## Credentials
 
