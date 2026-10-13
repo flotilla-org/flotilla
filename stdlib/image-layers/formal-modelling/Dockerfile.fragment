@@ -38,6 +38,8 @@ RUN set -eu; \
     ln -s ../npm/node_modules/.bin/quint "${quint_home}/bin/quint"; \
     rm -rf /tmp/jdk.tar.gz /tmp/evaluator.tar.gz /tmp/apalache.tgz /tmp/npm-cache; \
     chmod -R a+rX,a-w "${java_home}" "${quint_home}"
+# Created first: COPY --chmod would give a directory it creates the files' mode.
+RUN install -d -m 0755 /opt/flotilla/formal-modelling
 COPY --from=formal-modelling --chmod=0644 smoke.qnt smoke.tla smoke.cfg /opt/flotilla/formal-modelling/
 COPY --from=formal-modelling --chmod=0755 probe.sh /opt/flotilla/formal-modelling/probe.sh
 COPY --from=formal-modelling --chmod=0755 tlc /usr/local/bin/tlc
