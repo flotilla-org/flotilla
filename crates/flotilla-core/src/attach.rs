@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
 };
 
+use flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION;
 use flotilla_config::ConfigStore;
 use flotilla_environment::hop_chain::{
     environment::DockerEnvironmentHopResolver,
@@ -34,7 +35,6 @@ use super::{canonical_placement_host_ref, convoy_address, discover_repo_for_envi
 use crate::{
     aggregator_projection::AggregatorProjectionState,
     environment_manager::{EnvironmentManager, ManagedEnvironmentKind},
-    project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION,
 };
 use flotilla_discovery::{registry::ProviderRegistry, DiscoveryRuntime};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;

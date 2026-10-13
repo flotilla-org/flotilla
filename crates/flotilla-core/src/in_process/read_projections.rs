@@ -9,6 +9,10 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_charter::ops_entry::{
+    DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION, DECLARATION_REFUSED_SINCE_ANNOTATION,
+    DECLARATION_STALE_AFTER, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
+};
 use flotilla_config::ConfigStore;
 use flotilla_manifest::{
     keys::{
@@ -55,10 +59,6 @@ use crate::{
     },
     host_registry::HostCounts,
     leaf_engine::{LeafFiringRecord, LeafSubscriptionRow, LeafSubscriptionTable, LeafWatcher},
-    ops_entry::{
-        DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION, DECLARATION_REFUSED_SINCE_ANNOTATION,
-        DECLARATION_STALE_AFTER, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
-    },
     resource_explain::{explain_condition, explain_unmet_expectation, explained_provenance, observed_freshness},
 };
 

@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_resources::{ForgeSpec, Project, ProjectRepositoryRole, RepositoryKey, RepositorySpec, ResourceObject};
 
-use crate::ops_entry::OperationalEntryFile;
+use flotilla_charter::ops_entry::OperationalEntryFile;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
@@ -65,7 +65,10 @@ pub trait RepositoryInspector: Send + Sync {
     fn owns_charter(&self, _host: &str) -> bool {
         true
     }
-    async fn charter_snapshot(&self, _source: &flotilla_resources::CharterSource) -> Result<crate::charter_store::CharterSnapshot, String> {
+    async fn charter_snapshot(
+        &self,
+        _source: &flotilla_resources::CharterSource,
+    ) -> Result<flotilla_charter::charter_store::CharterSnapshot, String> {
         Err("bound charter inspection is unavailable".into())
     }
 
@@ -90,7 +93,7 @@ pub trait RepositoryInspector: Send + Sync {
 
     async fn inspect_project_declaration(&self, path: &Path) -> Result<ProjectDeclarationInspection, String> {
         let repository = self.inspect_path(path, None).await?;
-        let declaration_path = repository.checkout.path.join(crate::project_declaration::DECLARATION_FILE);
+        let declaration_path = repository.checkout.path.join(flotilla_charter::project_declaration::DECLARATION_FILE);
         let yaml = std::fs::read_to_string(&declaration_path).map_err(|error| format!("read {}: {error}", declaration_path.display()))?;
         Ok(ProjectDeclarationInspection { commit: repository.checkout.git_ref.clone(), repository, yaml })
     }
@@ -396,13 +399,16 @@ impl RepositoryInspector for GitRepositoryInspector {
         self.host_ref == host
     }
 
-    async fn charter_snapshot(&self, source: &flotilla_resources::CharterSource) -> Result<crate::charter_store::CharterSnapshot, String> {
+    async fn charter_snapshot(
+        &self,
+        source: &flotilla_resources::CharterSource,
+    ) -> Result<flotilla_charter::charter_store::CharterSnapshot, String> {
         let vcs = flotilla_vcs::vcs::FlotillaVcs::new(
             flotilla_paths::path_context::ExecutionEnvironmentPath::new("/"),
             self.runner.clone(),
             flotilla_vcs::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), self.runner.clone()))),
         );
-        crate::charter_store::read_charter_source(source, &self.charter_cache, Some(&vcs)).await
+        flotilla_charter::charter_store::read_charter_source(source, &self.charter_cache, Some(&vcs)).await
     }
 
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
@@ -449,11 +455,11 @@ impl RepositoryInspector for GitRepositoryInspector {
     async fn inspect_project_declaration(&self, path: &Path) -> Result<ProjectDeclarationInspection, String> {
         let repository = self.inspect_path(path, None).await?;
         let commit = self.read(&repository.checkout.path, RepositoryRead::HeadRevision).await?;
-        let declaration_ref = format!("{commit}:{}", crate::project_declaration::DECLARATION_FILE);
+        let declaration_ref = format!("{commit}:{}", flotilla_charter::project_declaration::DECLARATION_FILE);
         let yaml = self.read(&repository.checkout.path, RepositoryRead::FileAtRevision(&declaration_ref)).await.map_err(|error| {
             format!(
                 "read {} from bootstrap commit {commit}: {error}",
-                repository.checkout.path.join(crate::project_declaration::DECLARATION_FILE).display()
+                repository.checkout.path.join(flotilla_charter::project_declaration::DECLARATION_FILE).display()
             )
         })?;
         Ok(ProjectDeclarationInspection { repository, yaml, commit })

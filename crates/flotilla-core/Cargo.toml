@@ -18,6 +18,7 @@ flotilla-change-request = { path = "../flotilla-change-request" }
 flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
 flotilla-forge-github = { path = "../flotilla-forge-github" }
 flotilla-vcs = { path = "../flotilla-vcs" }
+flotilla-charter = { path = "../flotilla-charter" }
 flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-cloud-agent = { path = "../flotilla-cloud-agent" }
 flotilla-agent = { path = "../flotilla-agent" }

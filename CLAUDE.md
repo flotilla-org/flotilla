@@ -143,6 +143,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-issue-tracker` | Source-addressed issue-provider trait, GitHub/Forgejo implementations, GitHub dispatch-board reader, mission-field decoding and factories |
 | `flotilla-agent` | Agent harness adapters and registry, crew brief rendering, hook parsing and installation, agent state store, process-exit receipts |
 | `flotilla-discovery` | Static factory-list assembly, default detector lists, detector runs, provider discovery, host-scoped provider cache, `ProviderRegistry` and provider status |
+| `flotilla-charter` | Charter inputs read through a `RevisionedTree` (Git via `Vcs`, or a local directory): `project.yaml` declarations, operational entries and their provenance annotations, charter locks and source status |
 | `flotilla-core` | Refresh, observed-resource projection, convoy admission and controller ports, executor, step plans, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |

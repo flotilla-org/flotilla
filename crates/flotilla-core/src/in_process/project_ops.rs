@@ -7,6 +7,17 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_charter::{
+    ops_entry::{
+        parse_operational_entry, OperationalEntryDefinition, DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION,
+        DECLARATION_REFUSED_SINCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
+        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
+    },
+    project_declaration::{
+        parse_project_declaration, ProjectDeclaration, BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION,
+        BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION,
+    },
+};
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     PrincipalRef, ProviderData, ResourceRef,
@@ -26,19 +37,8 @@ use tracing::{debug, warn};
 use super::{
     convoy_ensure_name, ensure_repository_and_default_project_workflow, project_not_ready_error, repository_matches_target, InProcessDaemon,
 };
-use crate::{
-    ops_entry::{
-        parse_operational_entry, OperationalEntryDefinition, DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION,
-        DECLARATION_REFUSED_SINCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
-        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
-    },
-    project_declaration::{
-        parse_project_declaration, ProjectDeclaration, BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION,
-        BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION,
-    },
-    repository_inspection::{
-        LocalCheckoutInspection, OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector,
-    },
+use crate::repository_inspection::{
+    LocalCheckoutInspection, OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector,
 };
 
 /// Request-local evidence builder. Definition catalogs preserve their merged
@@ -435,7 +435,7 @@ impl ProjectService<'_> {
         validate_project_name(&declaration.name)?;
         inspection.repository.spec = self.operations.resolve_forge_identity(inspection.repository.spec).await?;
         let namespace = self.provisioning_namespace();
-        let authoring_lock = crate::charter_store::authoring_lock(&namespace);
+        let authoring_lock = flotilla_charter::charter_store::authoring_lock(&namespace);
         let authoring_guard = authoring_lock.lock().await;
         let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
         let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
@@ -622,7 +622,7 @@ impl ProjectService<'_> {
                         .charter_store
                         .as_ref()
                         .filter(|binding| binding.host == self.repository_index.host)
-                        .map(|binding| crate::charter_store::ops_root_name(&project.metadata.name, member, &binding.host))
+                        .map(|binding| flotilla_charter::charter_store::ops_root_name(&project.metadata.name, member, &binding.host))
                 })
             })
             .collect::<BTreeSet<_>>();
@@ -701,7 +701,7 @@ impl ProjectService<'_> {
     ) -> Result<(Vec<String>, Vec<String>), String> {
         use flotilla_resources::{CharterSource, ManifestRoot, ManifestRootSpec};
         let namespace = self.provisioning_namespace();
-        let lock = crate::charter_store::authoring_lock(&namespace);
+        let lock = flotilla_charter::charter_store::authoring_lock(&namespace);
         let _guard = lock.lock().await;
         let project =
             self.resource_backend.definitions::<Project>(&namespace).get(project_name).await.map_err(|error| error.to_string())?;
@@ -719,7 +719,7 @@ impl ProjectService<'_> {
             if binding.host != self.repository_index.host {
                 continue;
             }
-            let name = crate::charter_store::ops_root_name(project_name, member, &binding.host);
+            let name = flotilla_charter::charter_store::ops_root_name(project_name, member, &binding.host);
             let (source, path) = match &binding.source {
                 CharterSource::Repository { repo, path, .. } => (repo.clone(), path.clone()),
                 CharterSource::LocalDirectory { directory } => ("local".into(), directory.clone()),
@@ -767,7 +767,7 @@ impl ProjectService<'_> {
                 Ok(_) => format!("publish ManifestRoot/{name} status: {error}"),
             };
             let root = roots.get(&name).await.map_err(publication_error)?;
-            let status = crate::charter_store::source_status(
+            let status = flotilla_charter::charter_store::source_status(
                 root.status.clone().unwrap_or_default(),
                 revisions.remove(&name),
                 result.as_ref().err().map(String::as_str),
@@ -812,7 +812,7 @@ impl ProjectService<'_> {
                     unavailable_source = true;
                     continue;
                 }
-                let snapshot = crate::charter_store::source_read(inspector.charter_snapshot(&binding.source)).await?;
+                let snapshot = flotilla_charter::charter_store::source_read(inspector.charter_snapshot(&binding.source)).await?;
                 let spec = self
                     .resource_backend
                     .including_replicas::<Repository>(&namespace)
@@ -821,10 +821,13 @@ impl ProjectService<'_> {
                     .map_err(|error| error.to_string())?
                     .object
                     .spec;
-                let source_root = crate::charter_store::ops_root_name(project_name, member, &binding.host);
+                let source_root = flotilla_charter::charter_store::ops_root_name(project_name, member, &binding.host);
                 bound_revisions.insert(source_root.clone(), snapshot.revision.clone());
-                let files =
-                    snapshot.files.into_iter().map(|(path, contents)| crate::ops_entry::OperationalEntryFile { path, contents }).collect();
+                let files = snapshot
+                    .files
+                    .into_iter()
+                    .map(|(path, contents)| flotilla_charter::ops_entry::OperationalEntryFile { path, contents })
+                    .collect();
                 sources.push(OperationalEntriesInspection {
                     source_root: Some(source_root),
                     repository: RepositoryInspection {
@@ -872,7 +875,7 @@ impl ProjectService<'_> {
                 RepositoryInspection { spec, checkout, transport_url: None, replaces_prior_repository: false }
             };
             let (mut commit, files) =
-                crate::charter_store::source_read(inspector.operational_entry_files_at(&repository.checkout.path)).await?;
+                flotilla_charter::charter_store::source_read(inspector.operational_entry_files_at(&repository.checkout.path)).await?;
             if let Some(bootstrap) = bootstrap.filter(|bootstrap| member.repo == bootstrap.repository.key()) {
                 commit.clone_from(&bootstrap.commit);
             }
@@ -916,7 +919,7 @@ impl ProjectService<'_> {
         let mut changes = Vec::new();
         for (name, (meta, spec)) in &workflows {
             *refused_entry_path = meta.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).cloned();
-            let stored_name = crate::ops_entry::materialized_workflow_name(project_name, name);
+            let stored_name = flotilla_charter::ops_entry::materialized_workflow_name(project_name, name);
             let mut stored_meta = meta.clone();
             stored_meta.name.clone_from(&stored_name);
             let current = match templates.get(&stored_name).await {
@@ -937,8 +940,10 @@ impl ProjectService<'_> {
             }
         }
         *refused_entry_path = None;
-        let desired_workflow_names =
-            workflows.keys().map(|name| crate::ops_entry::materialized_workflow_name(project_name, name)).collect::<BTreeSet<_>>();
+        let desired_workflow_names = workflows
+            .keys()
+            .map(|name| flotilla_charter::ops_entry::materialized_workflow_name(project_name, name))
+            .collect::<BTreeSet<_>>();
         let project_workflow_prefix = format!("{project_name}--");
         for stale in templates
             .list_selected(flotilla_store::StoreQuery {
@@ -961,7 +966,7 @@ impl ProjectService<'_> {
         let convoy_ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(&namespace);
         for (name, (meta, spec)) in &ensures {
             *refused_entry_path = meta.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).cloned();
-            let stored_workflow_ref = crate::ops_entry::materialized_workflow_name(project_name, &spec.workflow_ref);
+            let stored_workflow_ref = flotilla_charter::ops_entry::materialized_workflow_name(project_name, &spec.workflow_ref);
             let workflow = match templates.get(&stored_workflow_ref).await {
                 Ok(workflow) => Ok(workflow),
                 Err(ResourceError::NotFound { .. }) => templates.get(&spec.workflow_ref).await,
@@ -1732,7 +1737,7 @@ mod tests {
     use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
-    use crate::ops_entry::OperationalEntryFile;
+    use flotilla_charter::ops_entry::OperationalEntryFile;
 
     struct FakeRepositoryInspector {
         inspection: ProjectDeclarationInspection,
@@ -1861,7 +1866,7 @@ mod tests {
                     .expect("federate project");
             }
             service.reconcile_bound_charters().await.expect("first pass");
-            let root_name = crate::charter_store::ops_root_name("app", &spec.repositories[0], "local-host");
+            let root_name = flotilla_charter::charter_store::ops_root_name("app", &spec.repositories[0], "local-host");
             let roots = backend.using::<ManifestRoot>("flotilla");
             let first_status = roots.get(&root_name).await.expect("root").status.expect("status");
             assert!(first_status.source_error.is_none(), "{first_status:?}");
@@ -1985,7 +1990,7 @@ mod tests {
         // #2777 review: exercise bootstrap's handoff to ops materialization
         // while the fleet writer's namespace critical section contends. A
         // retained non-reentrant guard must fail this deadline, not hang CI.
-        let fleet_lock = crate::charter_store::authoring_lock("flotilla");
+        let fleet_lock = flotilla_charter::charter_store::authoring_lock("flotilla");
         let fleet_guard = fleet_lock.lock().await;
         let (registration, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(service.project_register(temp.path().to_str().expect("UTF-8 checkout path")), async {

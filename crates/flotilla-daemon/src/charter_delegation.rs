@@ -6,7 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::{
+use flotilla_charter::{
     charter_store::CharterSnapshot,
     ops_entry::{materialized_workflow_name, parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION},
 };
@@ -40,7 +40,7 @@ impl CharterReader for BoundCharterReader<'_> {
     async fn read(&self, source: &CharterSource) -> Result<CharterSnapshot, String> {
         let identity = serde_json::to_vec(source).map_err(|error| error.to_string())?;
         let cache = self.cache.join(format!("charter-{:x}", Sha256::digest(identity)));
-        flotilla_core::charter_store::read_charter_source(source, &cache, self.vcs).await
+        flotilla_charter::charter_store::read_charter_source(source, &cache, self.vcs).await
     }
 }
 
@@ -198,7 +198,7 @@ pub(crate) async fn expand_registered_charters(
                         repository_fetches += 1;
                         let source = CharterSource::Repository { repo: repo.clone(), branch: branch.clone(), path: path.clone() };
                         (
-                            flotilla_core::charter_store::source_read(reader.read(&source))
+                            flotilla_charter::charter_store::source_read(reader.read(&source))
                                 .await
                                 .map_err(|error| format!("charter scope `{ns}/{project}`: {error}"))?,
                             format!("{repo}@{branch}:{path}"),

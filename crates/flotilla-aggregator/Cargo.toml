@@ -17,6 +17,7 @@ flotilla-tls = { path = "../flotilla-tls" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 flotilla-core = { path = "../flotilla-core" }
+flotilla-charter = { path = "../flotilla-charter" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 async-trait = { workspace = true }

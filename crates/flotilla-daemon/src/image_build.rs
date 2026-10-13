@@ -107,7 +107,7 @@ impl LocalImageBuildRunner {
     async fn context(&self, layer: &FrozenImageLayer) -> Result<PathBuf, String> {
         let directory =
             self.directory.join(format!("source-{:x}", Sha256::digest(format!("{}\0{}", layer.spec.repository, layer.spec.revision))));
-        let lock = flotilla_core::charter_store::reconciliation_lock(&directory.to_string_lossy());
+        let lock = flotilla_charter::charter_store::reconciliation_lock(&directory.to_string_lossy());
         let _guard = lock.lock().await;
         if !tokio::fs::try_exists(directory.join("complete")).await.map_err(|error| error.to_string())? {
             let _ = tokio::fs::remove_dir_all(directory.join("context")).await;

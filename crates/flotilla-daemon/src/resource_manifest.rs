@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use flotilla_core::charter_store::read_charter_source;
+use flotilla_charter::charter_store::read_charter_source;
 use flotilla_resources::{
     CharterSource, ControllerRetry, DocumentKey, DocumentPhase, DocumentState, EventRegarding, InputMeta, LeafMaker, ManifestRoot,
     ManifestRootSpec, ManifestRootStatus, ObjectEvent, ResolutionAction, ResolutionOutcome, ResourceError, RetryCeiling,
@@ -338,7 +338,7 @@ impl ResourceManifestReconciler {
     }
 
     pub async fn reconcile_once(&mut self) -> Result<ManifestPassReport, String> {
-        let lock = flotilla_core::charter_store::authoring_lock(&self.default_namespace);
+        let lock = flotilla_charter::charter_store::authoring_lock(&self.default_namespace);
         let _guard = lock.lock().await;
         let root_resource = self
             .backend
@@ -356,7 +356,7 @@ impl ResourceManifestReconciler {
         };
         let reader =
             crate::charter_delegation::BoundCharterReader { cache: &self.root.with_extension("charter-cache"), vcs: self.vcs.as_deref() };
-        let registered = match flotilla_core::charter_store::source_read(crate::charter_delegation::expand_registered_charters(
+        let registered = match flotilla_charter::charter_store::source_read(crate::charter_delegation::expand_registered_charters(
             &files,
             &revision,
             &self.default_namespace,
@@ -575,7 +575,7 @@ impl ResourceManifestReconciler {
 
     async fn publish_source_failure(&self, root: &flotilla_resources::ResourceObject<ManifestRoot>, error: &str) -> Result<(), String> {
         let status =
-            flotilla_core::charter_store::source_status(root.status.clone().unwrap_or_default(), None, Some(error), &self.root_name());
+            flotilla_charter::charter_store::source_status(root.status.clone().unwrap_or_default(), None, Some(error), &self.root_name());
         self.publish_status(status).await
     }
 
@@ -629,7 +629,7 @@ impl ResourceManifestReconciler {
             && document.pointer("/spec/charter").is_some_and(|pointer| !pointer.is_null())
             && existing.pointer("/spec/charter").is_none_or(Value::is_null)
             && !annotations.contains_key(MANIFEST_RECONCILER_ROOT_ANNOTATION)
-            && (annotations.contains_key(flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION)
+            && (annotations.contains_key(flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION)
                 || labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some("whole-repository-project"))
         {
             // The explicit registration transfers a legacy-generated Project.
@@ -2179,7 +2179,7 @@ mod registered_charter_tests {
                 &InputMeta::builder()
                     .name("app".into())
                     .annotations(BTreeMap::from([(
-                        flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(),
+                        flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(),
                         "app-repo".into(),
                     )]))
                     .build(),
@@ -2195,7 +2195,7 @@ mod registered_charter_tests {
         let registered = backend.using::<Project>("flotilla").get("app").await.expect("transferred registration");
         assert!(registered.spec.charter.is_some());
         assert_eq!(registered.metadata.labels[MANAGED_BY_LABEL], MANIFEST_MANAGED_BY_VALUE);
-        assert_eq!(registered.metadata.annotations[flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION], "app-repo");
+        assert_eq!(registered.metadata.annotations[flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION], "app-repo");
         let ensures = backend.using::<flotilla_resources::ConvoyEnsure>("flotilla");
         assert_eq!(ensures.get("app-governor").await.expect("ensure").metadata.annotations[MANIFEST_REVISION_ANNOTATION], "first");
         reconciler.fixed_revision = Some("second".into());

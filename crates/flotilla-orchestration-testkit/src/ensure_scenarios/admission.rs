@@ -28,7 +28,7 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
     let admitted = convoys.get(&convoy_name).await.expect("admitted convoy");
     let workflow = backend
         .using::<WorkflowTemplate>("flotilla")
-        .get(&flotilla_core::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
+        .get(&flotilla_charter::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
         .await
         .expect("standing workflow");
     let mut status = admitted.status.clone().unwrap_or_default();
@@ -167,8 +167,8 @@ pub async fn declaration_refusal_staleness_uses_the_daemon_clock_at_the_24_hour_
             &InputMeta::builder()
                 .name("declaration-refused-standing-project".to_string())
                 .annotations(BTreeMap::from([
-                    (flotilla_core::ops_entry::DECLARATION_REFUSAL_REASON_ANNOTATION.into(), "invalid declaration".into()),
-                    (flotilla_core::ops_entry::DECLARATION_REFUSED_SINCE_ANNOTATION.into(), clock.now().to_rfc3339()),
+                    (flotilla_charter::ops_entry::DECLARATION_REFUSAL_REASON_ANNOTATION.into(), "invalid declaration".into()),
+                    (flotilla_charter::ops_entry::DECLARATION_REFUSED_SINCE_ANNOTATION.into(), clock.now().to_rfc3339()),
                 ]))
                 .build(),
             &DemandSpec::for_dispatching_principal(
@@ -816,7 +816,7 @@ pub async fn standing_ensure_does_not_capture_another_projects_bare_workflow_but
     factory: &dyn EnsureScenarioController,
 ) {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
-    let own_name = flotilla_core::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
+    let own_name = flotilla_charter::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
     let own = backend.definitions::<WorkflowTemplate>("flotilla").get(&own_name).await.expect("own workflow");
     backend.definitions::<WorkflowTemplate>("flotilla").delete(&own_name).await.expect("remove own workflow");
     backend
@@ -919,7 +919,7 @@ pub async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact
     project.spec.default_workflow_ref.clear();
     project.spec.charter_prose.insert("governor".into(), "Govern the child project from this delivered charter.".into());
     let mut meta = InputMeta::from(&project.metadata);
-    meta.annotations.insert(flotilla_core::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION.into(), "charter-2719".into());
+    meta.annotations.insert(flotilla_charter::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION.into(), "charter-2719".into());
     projects.apply(&meta, &project.spec).await.expect("local charter");
     let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
     let mut ensure = ensures.get("quartermaster").await.expect("presence");

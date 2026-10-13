@@ -73,7 +73,7 @@ pub(super) fn preview(templates: &[Value], projects: &[Value], designations: &[V
         let hierarchy = &hierarchies[namespace];
         let mut owners = vec![project.metadata.name.clone()];
         owners.extend(hierarchy.ancestors(&project.metadata.name)?);
-        let scoped = owners.iter().map(|owner| flotilla_core::ops_entry::materialized_workflow_name(owner, name)).find(|scoped| {
+        let scoped = owners.iter().map(|owner| flotilla_charter::ops_entry::materialized_workflow_name(owner, name)).find(|scoped| {
             templates.iter().any(|t| {
                 t.metadata.namespace == *namespace && t.metadata.name == *scoped && !retired.contains(&(namespace.clone(), scoped.clone()))
             })

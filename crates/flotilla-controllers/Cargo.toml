@@ -15,6 +15,7 @@ flotilla-paths = { path = "../flotilla-paths" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 flotilla-agent = { path = "../flotilla-agent" }
 flotilla-core = { path = "../flotilla-core" }
+flotilla-charter = { path = "../flotilla-charter" }
 flotilla-manifest = { path = "../flotilla-manifest" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }

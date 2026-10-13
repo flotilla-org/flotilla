@@ -1010,7 +1010,7 @@ impl ConvoyAdmission {
         let (reads, observed) = self.brief_read_inventory(namespace, name, spec, workflow, evidence).await?;
         let mut annotations = BTreeMap::new();
         if workflow.exit.is_none() {
-            annotations.insert(crate::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "standing".to_string());
+            annotations.insert(flotilla_charter::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "standing".to_string());
         }
         let convoy = ResourceObject::<ResourceConvoy> {
             metadata: ObjectMeta {
@@ -1709,7 +1709,7 @@ impl AdmissionReadContext<'_> {
             workflow_names.insert(reference.clone());
             workflow_names.insert(flotilla_resources::current_builtin_workflow_name(&reference).to_string());
             for project in &cascade.project_chain {
-                workflow_names.insert(crate::ops_entry::materialized_workflow_name(project, &reference));
+                workflow_names.insert(flotilla_charter::ops_entry::materialized_workflow_name(project, &reference));
             }
         }
         let workflows =
@@ -2143,7 +2143,7 @@ impl AdmissionReadContext<'_> {
         let owners = cascade.project_chain.iter().rev();
         let mut found = None;
         for owner in owners {
-            let scoped = crate::ops_entry::materialized_workflow_name(owner, &workflow_ref);
+            let scoped = flotilla_charter::ops_entry::materialized_workflow_name(owner, &workflow_ref);
             match templates.get(&scoped).await {
                 Ok(workflow) => {
                     if workflow.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).is_some_and(|declared| declared != owner) {

@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, sync::Arc};
 
 use color_eyre::{eyre::eyre, Result};
+#[cfg(unix)]
+use flotilla_charter::ops_entry::{parse_operational_entry, OperationalEntryFile};
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 #[cfg(unix)]
-use flotilla_core::{
-    ops_entry::{parse_operational_entry, OperationalEntryFile},
-    repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
+use flotilla_core::repository_inspection::{
+    inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector,
 };
 #[cfg(unix)]
 use flotilla_environment::environment::{command_provider, EnvironmentKind};
@@ -1087,7 +1088,7 @@ mod tests {
             .await
             .expect("charter inventory");
         assert_eq!(inputs.status(), reqwest::StatusCode::OK);
-        let inputs: Vec<flotilla_core::ops_entry::OperationalEntryFile> = inputs.json().await.expect("raw charter inputs");
+        let inputs: Vec<flotilla_charter::ops_entry::OperationalEntryFile> = inputs.json().await.expect("raw charter inputs");
         assert!(inputs.iter().any(|input| input.contents == charter_text));
         std::fs::write(&charter_file, "bad: [").expect("bad charter revision");
         assert!(validate_daemon(&socket, Some(&[]), None).await.is_err());
@@ -1209,7 +1210,7 @@ mod tests {
                 &InputMeta::builder()
                     .name("demo".to_string())
                     .annotations(std::collections::BTreeMap::from([(
-                        flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(),
+                        flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(),
                         spec.key().to_string(),
                     )]))
                     .build(),
@@ -1289,7 +1290,7 @@ mod tests {
                 &InputMeta::builder()
                     .name("demo".to_string())
                     .annotations(std::collections::BTreeMap::from([(
-                        flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(),
+                        flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(),
                         spec.key().to_string(),
                     )]))
                     .build(),
