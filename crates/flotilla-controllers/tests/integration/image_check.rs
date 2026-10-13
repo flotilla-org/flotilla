@@ -10,8 +10,13 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_charter::charter_store::{LayerDirectorySnapshot, PROJECT_IMAGE_LAYER_PATH, PROJECT_IMAGE_MANAGER};
-use flotilla_core::in_process::{check_image, image_build_report, ImageCheckSources};
+use flotilla_core::{
+    in_process::{check_image, image_build_report, ImageCheckSources},
+    repository_inspection::{GitRepositoryInspector, RepositoryInspector},
+};
+use flotilla_discovery_testkit::test_vcs_resolver;
 use flotilla_protocol::image_check::{ImageBuildReportPhase, ImageCheckAgentSource, ImageCheckReport, ImageCheckRequest, ImageProbeReport};
+use flotilla_provider_runtime::{ChannelLabel, CommandRunner, ProcessCommandRunner};
 use flotilla_resources::{
     parse_layer_directory, resolve_image, CharterSource, ImageBuild, ImageBuildFailureClass, ImageLayer, ImageLayerSource, ImageLayerSpec,
     ImageLayerTier, ImageProbeOutcome, ImageRequest, ImageSelection, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec,
@@ -307,4 +312,73 @@ async fn another_architecture_needs_the_fleet_image_cache() {
         .expect_err("refused");
     assert!(error.contains("no fleet image cache") && error.contains("arm64"), "{error}");
     assert!(build_names(&backend).await.is_empty());
+}
+
+/// The daemon's real layer read (`GitRepositoryInspector`, which fetches the
+/// branch into a bare object cache through the VCS seam) over a fixture
+/// repository standing in for the project's primary repository.
+struct GitSources {
+    inspector: GitRepositoryInspector,
+    repository: String,
+}
+
+#[async_trait]
+impl ImageCheckSources for GitSources {
+    async fn layer_snapshot(&self, source: &CharterSource) -> Result<Option<LayerDirectorySnapshot>, String> {
+        let CharterSource::Repository { repo, branch, path } = source else { panic!("the primary repository is a repository source") };
+        assert_eq!(repo, REPO);
+        let local = CharterSource::Repository { repo: self.repository.clone(), branch: branch.clone(), path: path.clone() };
+        self.inspector.image_layer_snapshot(&local).await
+    }
+
+    async fn default_harness_adapters(&self, _: &str, _: &str, _: &ProjectSpec) -> Result<BTreeSet<String>, String> {
+        Ok(BTreeSet::from(["codex".to_string()]))
+    }
+}
+
+async fn fixture_git(root: &std::path::Path, args: &[&str]) {
+    let args = [&["-c", "user.name=Test", "-c", "user.email=test@example.com"], args].concat();
+    ProcessCommandRunner.run("git", &args, root, &ChannelLabel::Default).await.expect("fixture git");
+}
+
+// A ref that does not exist is an error naming the ref, never a branch that
+// "composes no project layer": only a fetched branch without
+// `.flotilla/image/` reports no project layer. Exercised through the real
+// fetch-and-read the daemon uses.
+#[tokio::test]
+async fn a_missing_ref_is_an_error_not_an_absent_layer() {
+    let (backend, _) = fixture().await;
+    let repository = tempfile::tempdir().expect("repository");
+    let cache = tempfile::tempdir().expect("cache");
+    let root = repository.path();
+    fixture_git(root, &["init", "-q", "-b", "main"]).await;
+    let layer = root.join(PROJECT_IMAGE_LAYER_PATH);
+    std::fs::create_dir_all(&layer).expect("layer directory");
+    for (name, contents) in project_layer_files("1.0", "RUN app-install") {
+        std::fs::write(layer.join(name), contents).expect("layer file");
+    }
+    fixture_git(root, &["add", "."]).await;
+    fixture_git(root, &["commit", "-q", "-m", "layer"]).await;
+    fixture_git(root, &["checkout", "-q", "-b", "no-layer"]).await;
+    fixture_git(root, &["rm", "-rq", ".flotilla"]).await;
+    fixture_git(root, &["commit", "-q", "-m", "no layer"]).await;
+    let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
+    let sources = GitSources {
+        inspector: GitRepositoryInspector::new(runner.clone(), test_vcs_resolver(runner), HOST).with_charter_cache(cache.path().into()),
+        repository: root.to_str().expect("repository path").to_string(),
+    };
+
+    let main = check_image(&backend, NS, HOST, &sources, &request("main")).await.expect("main");
+    assert_eq!(main.project_layer.as_deref(), Some("app-native@1.0"));
+    assert!(main.revision.is_some());
+
+    let bare = check_image(&backend, NS, HOST, &sources, &request("no-layer")).await.expect("a branch without a layer");
+    assert_eq!(bare.project_layer, None);
+    assert!(bare.revision.is_none() && bare.refusals.is_empty() && bare.build.is_some(), "{bare:?}");
+
+    let builds = build_names(&backend).await;
+    let error = check_image(&backend, NS, HOST, &sources, &request("no-such-branch")).await.expect_err("a missing ref is an error");
+    assert!(error.contains(&format!("`{PROJECT_IMAGE_LAYER_PATH}/` at no-such-branch")), "{error}");
+    assert!(error.contains("refs/heads/no-such-branch"), "the fetch failure is reported: {error}");
+    assert_eq!(build_names(&backend).await, builds, "a missing ref creates no build");
 }
