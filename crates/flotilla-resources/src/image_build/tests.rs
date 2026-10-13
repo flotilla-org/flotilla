@@ -231,3 +231,42 @@ fn retries_are_bounded_and_terminal_outcomes_stay_terminal() {
     assert!(!write(&mut built, ImageBuildStatusPatch::Retry { not_before: at }));
     assert!(!write(&mut built, fail(ImageBuildFailureClass::Infrastructure)));
 }
+
+// A build is settled once built, or once failed with no retry to come. The
+// retry predicate the reconciler and checks share agrees with the status
+// transitions the resource admits: a failed build will retry exactly when its
+// return to Queued is valid, and a retrying build is never settled.
+#[hegel::test]
+fn settlement_is_the_complement_of_an_admitted_retry(tc: hegel::TestCase) {
+    let at = chrono::Utc.with_ymd_and_hms(2026, 10, 13, 0, 0, 0).single().expect("time");
+    let phase = match tc.draw(gs::integers::<u8>().min_value(0).max_value(3)) {
+        0 => ImageBuildPhase::Queued,
+        1 => ImageBuildPhase::Building,
+        2 => ImageBuildPhase::Built,
+        _ => ImageBuildPhase::Failed,
+    };
+    let class = match tc.draw(gs::integers::<u8>().min_value(0).max_value(2)) {
+        0 => None,
+        1 => Some(ImageBuildFailureClass::Infrastructure),
+        _ => Some(ImageBuildFailureClass::Recipe),
+    };
+    let attempt = tc.draw(gs::integers::<u32>().min_value(0).max_value(IMAGE_BUILD_MAX_ATTEMPTS + 2));
+    let status = ImageBuildStatus {
+        phase,
+        attempt,
+        finished_at: Some(at),
+        failure: class.map(|class| ImageBuildFailure { class, reason: "x".into() }),
+        ..Default::default()
+    };
+    let mut retried = status.clone();
+    ImageBuildStatusPatch::Retry { not_before: at }.apply(&mut retried);
+    let retry_admitted = ImageBuild::validate_status_update(Some(&status), &retried).is_ok();
+    if phase == ImageBuildPhase::Failed {
+        assert_eq!(status.will_retry(), retry_admitted, "{status:?}");
+        assert_eq!(status.is_settled(), !retry_admitted, "{status:?}");
+    } else {
+        assert!(!status.will_retry(), "only failed builds retry");
+        assert_eq!(status.is_settled(), phase == ImageBuildPhase::Built);
+    }
+    assert!(!(status.is_settled() && status.will_retry()));
+}

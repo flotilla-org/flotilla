@@ -25,7 +25,7 @@ use flotilla_protocol::image_check::{
 use flotilla_resources::{
     parse_layer_directory, CapabilityNeed, CharterSource, ImageBuildFailureClass, ImageBuildPhase, ImageBuildSpec, ImageBuildStatus,
     ImageCatalogue, ImageDelivery, ImageLayerResourceSpec, ImageLayerSource, ImageLayerSpec, ImageProbeOutcome, ImageRequest,
-    ImageResolutionError, Project, ProjectSpec, ResourceError, IMAGE_BUILD_MAX_ATTEMPTS, MANAGED_BY_LABEL,
+    ImageResolutionError, Project, ProjectSpec, ResourceError, MANAGED_BY_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
@@ -279,15 +279,7 @@ fn build_report(name: &str, spec: &ImageBuildSpec, status: Option<&ImageBuildSta
             },
         })
         .collect();
-    let settled = match status.phase {
-        ImageBuildPhase::Built => true,
-        // Infrastructure failures return to Queued while attempts remain.
-        ImageBuildPhase::Failed => status
-            .failure
-            .as_ref()
-            .is_none_or(|failure| failure.class == ImageBuildFailureClass::Recipe || status.attempt >= IMAGE_BUILD_MAX_ATTEMPTS),
-        ImageBuildPhase::Queued | ImageBuildPhase::Building => false,
-    };
+    let settled = status.is_settled();
     ImageBuildReport {
         name: name.to_string(),
         identity: spec.identity.clone(),

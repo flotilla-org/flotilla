@@ -24,7 +24,6 @@ use flotilla_environment::environment::{
 use flotilla_resources::{
     Clock, Host, ImageBuild, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass, ImageBuildPhase, ImageBuildSpec,
     ImageBuildStatusPatch, ImageDelivery, ImageLayerSource, ImageProbeOutcome, ResourceError, ResourceObject, StatusPatch, SystemClock,
-    IMAGE_BUILD_MAX_ATTEMPTS,
 };
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler},
@@ -443,11 +442,7 @@ impl Reconciler for ImageBuildReconciler {
             ImageBuildPrepared::None => {
                 // A bounded infrastructure failure goes back to Queued after
                 // its backoff; recipe failures never retry identical inputs.
-                let retry = spec.host_ref == self.local_host_ref
-                    && self.service.is_some()
-                    && status.phase == ImageBuildPhase::Failed
-                    && status.failure.as_ref().is_some_and(|failure| failure.class == ImageBuildFailureClass::Infrastructure)
-                    && status.attempt < IMAGE_BUILD_MAX_ATTEMPTS;
+                let retry = spec.host_ref == self.local_host_ref && self.service.is_some() && status.will_retry();
                 if retry {
                     let not_before = status.finished_at.unwrap_or(now) + image_build_retry_backoff(status.attempt);
                     let mut outcome = ReconcileOutcome::new(Some(ImageBuildStatusPatch::Retry { not_before }));
