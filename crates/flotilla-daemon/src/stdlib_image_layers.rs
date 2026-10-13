@@ -102,7 +102,7 @@ pub(crate) async fn apply_release_stdlib(backend: &ResourceBackend, namespace: &
 
 #[cfg(test)]
 mod tests {
-    use flotilla_resources::{ImageCatalogue, ImageLayerTier};
+    use flotilla_resources::{resolve_image, ImageCatalogue, ImageLayerTier, ImageRequest, ImageSelection, ResolvedImage};
     use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
@@ -145,6 +145,83 @@ mod tests {
         assert_eq!(layers.len(), STDLIB_IMAGE_LAYERS.len());
         assert!(layers.iter().all(|layer| layer.source == ImageLayerSource::Stdlib && layer.project.is_none()));
         ImageCatalogue::new(layers).effective("any-project").check().expect("clean catalogue");
+    }
+
+    fn shipped_catalogue() -> ImageCatalogue {
+        ImageCatalogue::new(parse_stdlib_layers(STDLIB_IMAGE_LAYERS).expect("shipped stdlib parses"))
+    }
+
+    fn resolve_shipped(catalogue: &ImageCatalogue, layers: &[&str], needs: &[&str]) -> ResolvedImage {
+        let request = ImageRequest::builder()
+            .project("p".to_string())
+            .selection(ImageSelection::builder().layers(layers.iter().map(|layer| layer.to_string()).collect()).build())
+            .needs(needs.iter().map(|need| need.to_string()).collect())
+            .harness_adapters(BTreeSet::from(["claude-code".to_string(), "codex".to_string()]))
+            .build();
+        resolve_image(catalogue, &request).unwrap_or_else(|error| panic!("resolve {layers:?} {needs:?}: {error}"))
+    }
+
+    fn names(resolved: &ResolvedImage) -> Vec<&str> {
+        resolved.layers.iter().map(|layer| layer.name.as_str()).collect()
+    }
+
+    const RUNTIME: [&str; 3] = ["crew-utilities", "harness-claude-code", "harness-codex"];
+
+    // The release ships exactly the ADR 0062 C1 catalogue, each layer at its
+    // expected tier.
+    #[test]
+    fn shipped_stdlib_has_the_c1_layer_set() {
+        let tiers = shipped_catalogue().layers().iter().map(|layer| (layer.name.clone(), layer.tier)).collect::<BTreeMap<_, _>>();
+        let expected = BTreeMap::from(
+            [
+                ("base-ubuntu-24.04", ImageLayerTier::Base),
+                ("crew-utilities", ImageLayerTier::AgentRuntime),
+                ("display-x11", ImageLayerTier::Shared),
+                ("formal-modelling", ImageLayerTier::Shared),
+                ("harness-claude-code", ImageLayerTier::AgentRuntime),
+                ("harness-codex", ImageLayerTier::AgentRuntime),
+                ("node", ImageLayerTier::Shared),
+                ("rust", ImageLayerTier::Shared),
+                ("zig", ImageLayerTier::Shared),
+            ]
+            .map(|(name, tier)| (name.to_string(), tier)),
+        );
+        assert_eq!(tiers, expected);
+    }
+
+    // The C1 projects' selections resolve to the expected ordered layers:
+    // base first, shared layers ordered by `requires` then name, and the agent
+    // runtime (both harnesses plus crew utilities) last.
+    #[test]
+    fn c1_selections_resolve_to_expected_layers() {
+        let catalogue = shipped_catalogue();
+        fn image(shared: &[&'static str]) -> Vec<&'static str> {
+            ["base-ubuntu-24.04"].into_iter().chain(shared.iter().copied()).chain(RUNTIME).collect()
+        }
+        let flotilla = resolve_shipped(&catalogue, &["rust"], &[]);
+        assert_eq!(names(&flotilla), image(&["rust"]));
+        let cleat = resolve_shipped(&catalogue, &["rust", "zig"], &[]);
+        assert_eq!(names(&cleat), image(&["rust", "zig"]));
+        let katzensteg = resolve_shipped(&catalogue, &["rust", "zig", "node"], &[]);
+        assert_eq!(names(&katzensteg), image(&["node", "rust", "zig"]));
+        assert_eq!(names(&resolve_shipped(&catalogue, &["rust"], &["display:x11"])), image(&["display-x11", "rust"]));
+
+        // formal-modelling requires toolchain:node, which pulls the node layer
+        // in and orders it first.
+        let formal = resolve_shipped(&catalogue, &["rust", "formal-modelling"], &[]);
+        assert_eq!(names(&formal), image(&["node", "formal-modelling", "rust"]));
+        assert_eq!(names(&resolve_shipped(&catalogue, &["rust"], &["tool:quint"])), names(&formal));
+
+        let identities = [&flotilla, &cleat, &katzensteg, &formal].map(|resolved| resolved.identity.clone());
+        assert_eq!(identities.iter().collect::<BTreeSet<_>>().len(), identities.len(), "distinct selections have distinct identities");
+    }
+
+    // Two independent loads of the release stdlib compose the same identity.
+    #[test]
+    fn shipped_identity_is_stable_across_loads() {
+        let first = resolve_shipped(&shipped_catalogue(), &["rust", "zig"], &["display:x11"]);
+        let second = resolve_shipped(&shipped_catalogue(), &["rust", "zig"], &["display:x11"]);
+        assert_eq!(first, second);
     }
 
     // Fixture directories parse with their declared context files and
