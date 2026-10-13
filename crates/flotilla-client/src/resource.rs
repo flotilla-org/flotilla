@@ -11,6 +11,24 @@ use flotilla_protocol::{
 use flotilla_resources::{is_prepared_snapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND};
 use tokio::sync::broadcast;
 
+/// Typed local-stream loss, distinct from a daemon or command failure.
+#[derive(Debug)]
+pub enum ResourceWatchError {
+    Lagged(u64),
+    Failed(String),
+}
+
+impl std::fmt::Display for ResourceWatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lagged(skipped) => {
+                write!(formatter, "resource watch fell behind by {skipped} events; resume from the last emitted cursor")
+            }
+            Self::Failed(error) => formatter.write_str(error),
+        }
+    }
+}
+
 #[derive(Debug, Clone, bon::Builder)]
 pub struct ResourceListRequest {
     pub kind: String,
@@ -392,6 +410,11 @@ pub struct ResourceWatch {
 
 impl ResourceWatch {
     pub async fn next(&mut self) -> Result<Option<ResourceReadEnvelope>, String> {
+        self.next_event().await.map_err(|error| error.to_string())
+    }
+
+    /// Consumers that repair gaps can distinguish lag without parsing diagnostics.
+    pub async fn next_event(&mut self) -> Result<Option<ResourceReadEnvelope>, ResourceWatchError> {
         if self.finished {
             return Ok(None);
         }
@@ -408,15 +431,17 @@ impl ResourceWatch {
                     self.finished = true;
                     return match result {
                         CommandValue::Ok | CommandValue::Cancelled => Ok(None),
-                        CommandValue::Error { message } => Err(message),
-                        other => Err(format!("unexpected resource watch result: {other:?}")),
+                        CommandValue::Error { message } => Err(ResourceWatchError::Failed(message)),
+                        other => Err(ResourceWatchError::Failed(format!("unexpected resource watch result: {other:?}"))),
                     };
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    return Err(format!("resource watch fell behind by {skipped} events; resume from the last emitted cursor"));
+                    return Err(ResourceWatchError::Lagged(skipped));
                 }
-                Err(broadcast::error::RecvError::Closed) => return Err("daemon disconnected during resource watch".to_string()),
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(ResourceWatchError::Failed("daemon disconnected during resource watch".to_string()))
+                }
             }
         }
     }

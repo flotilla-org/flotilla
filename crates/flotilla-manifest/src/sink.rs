@@ -13,7 +13,10 @@ use tokio::{
 };
 use tracing::warn;
 
-use crate::{keys::APPLY_METADATA_PATCH_PIPE, wire::MetadataPatch};
+use crate::{
+    keys::APPLY_METADATA_PATCH_PIPE,
+    wire::{MetadataPatch, WireMessage},
+};
 
 const BLOCKED_WRITE_WARNING_AFTER: Duration = Duration::from_secs(5);
 const HTTP_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -21,9 +24,42 @@ const RESPAWN_INITIAL_DELAY: Duration = Duration::from_millis(500);
 const RESPAWN_MAX_DELAY: Duration = Duration::from_secs(30);
 const RESPAWN_STABLE_AFTER: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivenessMode {
+    Connection,
+    Ttl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotAck {
+    Applied,
+    Unsupported,
+}
+
 #[async_trait]
 pub trait PatchSink: Send + Sync {
     async fn send(&self, patch: &MetadataPatch) -> Result<(), String>;
+
+    fn liveness(&self) -> LivenessMode {
+        LivenessMode::Ttl
+    }
+
+    /// TTL transports acknowledge the batch after every patch has been sent.
+    /// A failed batch is retried unchanged; metadata sets/unsets are idempotent.
+    async fn send_batch(&self, patches: &[MetadataPatch]) -> Result<(), String> {
+        for patch in patches {
+            self.send(patch).await?;
+        }
+        Ok(())
+    }
+
+    async fn replace(&self, _patches: &[MetadataPatch]) -> Result<SnapshotAck, String> {
+        Ok(SnapshotAck::Unsupported)
+    }
+
+    async fn health(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Sends patches with `zellij pipe`. Must run inside the target zellij
@@ -197,6 +233,19 @@ pub struct WheelhouseHttpSink {
 }
 
 impl WheelhouseHttpSink {
+    async fn post_catalog(&self, endpoint: &str, patches: &[MetadataPatch]) -> Result<reqwest::Response, String> {
+        let _serial = self.serial.lock().await;
+        let messages: Vec<_> = patches.iter().flat_map(MetadataPatch::compatibility_patches).map(WireMessage::MetadataPatch).collect();
+        self.client
+            .as_ref()
+            .map_err(Clone::clone)?
+            .post(format!("http://localhost/v1/metadata/{endpoint}"))
+            .json(&messages)
+            .send()
+            .await
+            .map_err(|error| format!("Wheelhouse metadata POST: {error}"))
+    }
+
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let builder = flotilla_tls::client_builder();
         #[cfg(unix)]
@@ -215,6 +264,42 @@ impl WheelhouseHttpSink {
 
 #[async_trait]
 impl PatchSink for WheelhouseHttpSink {
+    fn liveness(&self) -> LivenessMode {
+        LivenessMode::Connection
+    }
+
+    async fn send_batch(&self, patches: &[MetadataPatch]) -> Result<(), String> {
+        let response = self.post_catalog("patch", patches).await?;
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err(format!("Wheelhouse metadata batch returned {}", response.status()));
+        }
+        Ok(())
+    }
+
+    async fn replace(&self, patches: &[MetadataPatch]) -> Result<SnapshotAck, String> {
+        let response = self.post_catalog("snapshot", patches).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(SnapshotAck::Unsupported);
+        }
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err(format!("Wheelhouse metadata snapshot returned {}", response.status()));
+        }
+        Ok(SnapshotAck::Applied)
+    }
+
+    async fn health(&self) -> Result<(), String> {
+        // This measures connection liveness, not service readiness. Any HTTP
+        // response proves the PM is reachable, including an older server's 404.
+        self.client
+            .as_ref()
+            .map_err(Clone::clone)?
+            .get("http://localhost/v1/health")
+            .send()
+            .await
+            .map_err(|error| format!("Wheelhouse health: {error}"))?;
+        Ok(())
+    }
+
     async fn send(&self, patch: &MetadataPatch) -> Result<(), String> {
         let _serial = self.serial.lock().await;
         let client = self.client.as_ref().map_err(Clone::clone)?;
@@ -504,14 +589,34 @@ done
         }
     }
 
+    enum HttpOperation {
+        Single(MetadataPatch),
+        Batch(Vec<MetadataPatch>),
+        Snapshot(Vec<MetadataPatch>),
+        Health,
+    }
+
     async fn http_sink_case(
         patch: MetadataPatch,
         statuses: Vec<axum::http::StatusCode>,
         disconnect: bool,
     ) -> (Result<(), String>, Vec<Vec<u8>>) {
+        http_operation_case(HttpOperation::Single(patch), statuses, disconnect).await
+    }
+
+    async fn http_operation_case(
+        operation: HttpOperation,
+        statuses: Vec<axum::http::StatusCode>,
+        disconnect: bool,
+    ) -> (Result<(), String>, Vec<Vec<u8>>) {
         use std::{collections::VecDeque, sync::Arc};
 
-        use axum::{body::Bytes, extract::State, routing::post, Router};
+        use axum::{
+            body::Bytes,
+            extract::State,
+            routing::{get, post},
+            Router,
+        };
         type Calls = Arc<Mutex<(VecDeque<axum::http::StatusCode>, Vec<Vec<u8>>)>>;
         async fn receive(State(calls): State<Calls>, body: Bytes) -> axum::http::StatusCode {
             let mut calls = calls.lock().await;
@@ -535,7 +640,14 @@ done
         #[cfg(windows)]
         let mut listener = PipeListener::bind(path.clone());
         let calls: Calls = Arc::new(Mutex::new((statuses.into(), Vec::new())));
-        let app = Router::new().route("/v1/metadata/patch", post(receive)).with_state(Arc::clone(&calls));
+        let route = match &operation {
+            HttpOperation::Single(_) | HttpOperation::Batch(_) => "/v1/metadata/patch",
+            HttpOperation::Snapshot(_) => "/v1/metadata/snapshot",
+            HttpOperation::Health => "/v1/health",
+        };
+        let app = Router::new()
+            .route(route, if matches!(operation, HttpOperation::Health) { get(receive) } else { post(receive) })
+            .with_state(Arc::clone(&calls));
         let server = tokio::spawn(async move {
             if disconnect {
                 use tokio::io::AsyncReadExt;
@@ -547,7 +659,16 @@ done
             }
             axum::serve(listener, app).await.expect("HTTP server");
         });
-        let result = WheelhouseHttpSink::new(&path).send(&patch).await;
+        let sink = WheelhouseHttpSink::new(&path);
+        let result = match operation {
+            HttpOperation::Single(patch) => sink.send(&patch).await,
+            HttpOperation::Batch(patches) => sink.send_batch(&patches).await,
+            HttpOperation::Snapshot(patches) => sink.replace(&patches).await.and_then(|ack| match ack {
+                SnapshotAck::Applied => Ok(()),
+                SnapshotAck::Unsupported => Err("unsupported".into()),
+            }),
+            HttpOperation::Health => sink.health().await,
+        };
         server.abort();
         let bodies = calls.lock().await.1.clone();
         (result, bodies)
@@ -601,6 +722,31 @@ done
         result.expect("both patches acknowledged");
         let expected = patch.compatibility_patches().iter().map(|patch| patch.to_pipe_payload().into_bytes()).collect::<Vec<_>>();
         assert_eq!(bodies, expected);
+    }
+
+    // #3022: each catalog publication is one JSON array request, including
+    // compatibility messages; replacement uses the companion snapshot route.
+    #[tokio::test]
+    async fn wheelhouse_catalog_publications_are_one_request() {
+        let patches = vec![stamp_patch(), mixed_patch()];
+        let expected: Vec<_> = patches.iter().flat_map(MetadataPatch::compatibility_patches).map(WireMessage::MetadataPatch).collect();
+        for operation in [HttpOperation::Batch(patches.clone()), HttpOperation::Snapshot(patches)] {
+            let (result, bodies) = http_operation_case(operation, vec![axum::http::StatusCode::NO_CONTENT], false).await;
+            result.expect("acknowledged atomic publication");
+            assert_eq!(bodies.len(), 1);
+            assert_eq!(serde_json::from_slice::<Vec<WireMessage>>(&bodies[0]).expect("message array"), expected);
+        }
+    }
+
+    // #3022: 404 is distinguishable from delivery failure; health is a GET.
+    #[tokio::test]
+    async fn wheelhouse_snapshot_404_and_health_contract() {
+        let (result, bodies) = http_operation_case(HttpOperation::Snapshot(vec![]), vec![axum::http::StatusCode::NOT_FOUND], false).await;
+        assert_eq!(result, Err("unsupported".into()));
+        assert_eq!(bodies, vec![b"[]".to_vec()]);
+        let (result, bodies) = http_operation_case(HttpOperation::Health, vec![axum::http::StatusCode::OK], false).await;
+        result.expect("connected health endpoint");
+        assert_eq!(bodies, vec![Vec::<u8>::new()]);
     }
 
     #[cfg(unix)]
