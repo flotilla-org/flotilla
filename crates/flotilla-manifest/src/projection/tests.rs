@@ -2658,8 +2658,12 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
             })
             .build(),
     );
-    row.configured_limits =
-        Some(ConfiguredResourceLimits { cpus: contained.then_some(jobs), build_jobs: Some(jobs), linker_threads: Some(jobs) });
+    row.configured_limits = Some(ConfiguredResourceLimits {
+        cpus: contained.then_some(jobs),
+        cpu_shares: None,
+        build_jobs: Some(jobs),
+        linker_threads: Some(jobs),
+    });
     row.image_ref = contained.then(|| "crew:latest".into());
     row.local_image_id = contained.then(|| "sha256:abcdef1234567890".into());
     row.crew = vec![CrewMemberSummary {
@@ -2759,16 +2763,17 @@ fn placement_catalog_omits_unknown_facts() {
 #[hegel::test]
 fn launch_limits_preserve_unoverridden_environment_fields(tc: hegel::TestCase) {
     use flotilla_protocol::ConfiguredResourceLimits;
-    // Exhaust all 64 optional-field combinations for generated quota values,
+    // Exhaust all 256 optional-field combinations for generated quota values,
     // including zero and normal bounds; each run exercises quota preservation.
-    let values: Vec<usize> = (0..6).map(|_| tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(64))).collect();
-    for mask in 0..64 {
+    let values: Vec<usize> = (0..8).map(|_| tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(64))).collect();
+    for mask in 0..256 {
         let field = |index: usize| (mask & (1 << index) != 0).then_some(values[index]);
-        let environment = ConfiguredResourceLimits { cpus: field(0), build_jobs: field(1), linker_threads: field(2) };
-        let launch = ConfiguredResourceLimits { cpus: field(3), build_jobs: field(4), linker_threads: field(5) };
+        let environment = ConfiguredResourceLimits { cpus: field(0), cpu_shares: field(6), build_jobs: field(1), linker_threads: field(2) };
+        let launch = ConfiguredResourceLimits { cpus: field(3), cpu_shares: field(7), build_jobs: field(4), linker_threads: field(5) };
         let merged = environment.clone().with_overrides(launch.clone());
         for (prior, applied, observed) in [
             (environment.cpus, launch.cpus, merged.cpus),
+            (environment.cpu_shares, launch.cpu_shares, merged.cpu_shares),
             (environment.build_jobs, launch.build_jobs, merged.build_jobs),
             (environment.linker_threads, launch.linker_threads, merged.linker_threads),
         ] {

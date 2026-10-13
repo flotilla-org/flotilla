@@ -16,6 +16,10 @@ use crate::environment::{PrepareOpts, ProvisionOpts};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 
+/// Equal relative CPU scheduling weight for Docker crew environments.
+/// Docker translates shares to the native cgroup weight when using cgroup v2.
+pub const CREW_CPU_SHARES: usize = 1024;
+
 /// The `PATH` Docker gives a container whose image does not set one.
 const DOCKER_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -503,6 +507,14 @@ struct DockerState {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct DockerHostConfig {
+    #[serde(default)]
+    cpu_shares: usize,
+    #[serde(default)]
+    nano_cpus: u64,
+    #[serde(default)]
+    cpu_quota: i64,
+    #[serde(default)]
+    cpu_period: u64,
     memory: u64,
     memory_swap: i64,
 }
@@ -573,6 +585,17 @@ fn classify_inspection(inspect: &DockerInspection, oomd: &str, kernel: &str) -> 
         container_id: Some(inspect.id.clone()),
         started_at: Some(inspect.state.started_at.clone()),
         memory_limits,
+        configured_limits: Some(flotilla_protocol::ConfiguredResourceLimits {
+            cpus: if inspect.host_config.nano_cpus > 0 {
+                Some(inspect.host_config.nano_cpus.div_ceil(1_000_000_000) as usize)
+            } else if inspect.host_config.cpu_quota > 0 && inspect.host_config.cpu_period > 0 {
+                Some((inspect.host_config.cpu_quota as u64).div_ceil(inspect.host_config.cpu_period) as usize)
+            } else {
+                None
+            },
+            cpu_shares: (inspect.host_config.cpu_shares > 0).then_some(inspect.host_config.cpu_shares),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     if inspect.state.status != "exited" && inspect.state.status != "dead" {
@@ -738,7 +761,8 @@ impl DockerEnvironmentProvider {
             "-e",
             &env_id_env,
         ]);
-        args.extend(["--memory", memory.as_str(), "--memory-swap", memory_swap.as_str()]);
+        let cpu_shares = CREW_CPU_SHARES.to_string();
+        args.extend(["--memory", memory.as_str(), "--memory-swap", memory_swap.as_str(), "--cpu-shares", &cpu_shares]);
         let cpu_limit = opts.cpu_limit.map(|limit| limit.to_string());
         if let Some(limit) = cpu_limit.as_deref() {
             args.extend(["--cpus", limit]);

@@ -158,7 +158,15 @@ pub enum EnvironmentStatusPatch {
 impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
     fn apply(&self, status: &mut EnvironmentStatus) {
         match self {
-            Self::ObserveRuntime { observation } => status.runtime_observation.get_or_insert_with(Default::default).merge(observation),
+            Self::ObserveRuntime { observation } => {
+                if let Some(inspected) = &observation.configured_limits {
+                    let limits = status.configured_limits.get_or_insert_with(Default::default);
+                    // Inspection is authoritative, including removal of an old quota.
+                    limits.cpus = inspected.cpus;
+                    limits.cpu_shares = inspected.cpu_shares;
+                }
+                status.runtime_observation.get_or_insert_with(Default::default).merge(observation);
+            }
             Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
             Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),
             Self::MarkReady { configured_limits, docker_container_id, image_ref, local_image_id, registry_digest } => {
@@ -298,6 +306,31 @@ mod observation_tests {
     use hegel::generators as gs;
 
     use super::*;
+
+    // Adoption replaces CPU configuration facts but preserves launch parallelism.
+    #[test]
+    fn inspected_cpu_settings_replace_quota_without_erasing_build_jobs() {
+        let mut status = EnvironmentStatus {
+            configured_limits: Some(flotilla_protocol::ConfiguredResourceLimits {
+                cpus: Some(8),
+                build_jobs: Some(32),
+                linker_threads: Some(32),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for (cpus, shares) in [(Some(8), None), (None, Some(1024)), (None, None)] {
+            EnvironmentStatusPatch::ObserveRuntime {
+                observation: EnvironmentRuntimeObservation {
+                    configured_limits: Some(flotilla_protocol::ConfiguredResourceLimits { cpus, cpu_shares: shares, ..Default::default() }),
+                    ..Default::default()
+                },
+            }
+            .apply(&mut status);
+            let limits = status.configured_limits.as_ref().expect("configured settings");
+            assert_eq!((limits.cpus, limits.cpu_shares, limits.build_jobs, limits.linker_threads), (cpus, shares, Some(32), Some(32)));
+        }
+    }
 
     // Runtime observations preserve the last successful sample when later reads
     // are unavailable or backing has died. Generate empty/sample/death histories

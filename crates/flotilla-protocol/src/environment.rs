@@ -505,6 +505,9 @@ pub struct EnvironmentMemoryLimits {
 /// Persisted evidence, shared by environment, vessel, convoy and explain.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct EnvironmentRuntimeObservation {
+    /// Inspected CPU configuration; absent in previous-generation records (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_limits: Option<crate::ConfiguredResourceLimits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -575,6 +578,9 @@ impl EnvironmentRuntimeObservation {
         }
         if observation.started_at.is_some() {
             self.started_at.clone_from(&observation.started_at);
+        }
+        if observation.configured_limits.is_some() {
+            self.configured_limits.clone_from(&observation.configured_limits);
         }
         if observation.memory_limits.is_some() {
             self.memory_limits.clone_from(&observation.memory_limits);

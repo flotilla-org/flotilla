@@ -20,14 +20,16 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
 
     register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup resources");
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("host heartbeat");
-    let state = Arc::new(ControllerRuntimeState::new(
+    let mut state = ControllerRuntimeState::new(
         Arc::clone(&daemon),
         Arc::clone(&config),
         local_registry,
         None,
         profile.host_id.clone(),
         profile.host_direct_environment_name(),
-    ));
+    );
+    state.local_core_count = || Ok(std::num::NonZeroUsize::new(32).expect("32 cores"));
+    let state = Arc::new(state);
     let controller_handles = spawn_controller_loops(
         Arc::clone(&state),
         NAMESPACE,
@@ -157,14 +159,14 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     assert!(coder_launch
         .env_vars
         .iter()
-        .any(|(key, value)| key == "CARGO_BUILD_JOBS" && value.parse::<usize>().is_ok_and(|jobs| jobs >= 2)));
+        .any(|(key, value)| key == "CARGO_BUILD_JOBS" && value.parse::<usize>().is_ok_and(|jobs| jobs == 32)));
     assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "RUSTC_WORKSPACE_WRAPPER" && Path::new(value).is_file()));
     let watcher_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-watcher")).expect("watcher launch");
     assert!(watcher_launch.env_vars.iter().any(|(key, value)| key == "CARGO_INCREMENTAL" && value == "1"));
     assert!(watcher_launch
         .env_vars
         .iter()
-        .any(|(key, value)| key == "CARGO_BUILD_JOBS" && value.parse::<usize>().is_ok_and(|jobs| jobs >= 2)));
+        .any(|(key, value)| key == "CARGO_BUILD_JOBS" && value.parse::<usize>().is_ok_and(|jobs| jobs == 32)));
     assert!(watcher_launch.env_vars.iter().any(|(key, value)| key == "RUSTC_WORKSPACE_WRAPPER" && Path::new(value).is_file()));
     drop(ensured);
 

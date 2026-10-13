@@ -45,17 +45,17 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
         flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
     );
-    let state = Arc::new(
-        ControllerRuntimeState::new(
-            daemon,
-            Arc::clone(&config),
-            Arc::new(local_registry),
-            Some(DaemonHostPath::new("/tmp/flotilla.sock")),
-            "host-test".to_string(),
-            "host-direct-host-test".to_string(),
-        )
-        .with_environment_tools(with_fourth_tool(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))),
-    );
+    let mut state = ControllerRuntimeState::new(
+        daemon,
+        Arc::clone(&config),
+        Arc::new(local_registry),
+        Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+        "host-test".to_string(),
+        "host-direct-host-test".to_string(),
+    )
+    .with_environment_tools(with_fourth_tool(fixed_environment_tools(config.state_dir().as_path().to_path_buf())));
+    state.local_core_count = || Ok(std::num::NonZeroUsize::new(32).expect("32 cores"));
+    let state = Arc::new(state);
     let spec = flotilla_resources::DockerEnvironmentSpec {
         image_build_ref: None,
         memory_policy: Default::default(),
@@ -94,8 +94,8 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
     )));
     assert!(opts.tools[2].environment.contains(&EnvironmentVariableUpdate::prepend_path("PATH", CONTAINED_CARGO_SHIM_DIRECTORY)));
     assert!(opts.tools[2].assets.iter().any(|asset| asset.environment_path.as_path() == Path::new(CONTAINED_CARGO_SHIM_PATH)));
-    let jobs = opts.cpu_limit.expect("container CPU quota");
-    assert!(jobs >= 2);
+    assert_eq!(opts.cpu_limit, None);
+    let jobs = 32;
     assert!(opts.tools[2].environment.contains(&EnvironmentVariableUpdate::set(
         "CARGO_BUILD_JOBS",
         jobs.to_string(),

@@ -118,7 +118,11 @@ mod tests {
 /// unknown, rather than unlimited. These are configuration facts, not usage.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfiguredResourceLimits {
+    /// Hard CPU quota, independent of relative scheduling weight.
     pub cpus: Option<usize>,
+    /// Docker CPU shares. Absent in previous-generation records (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_shares: Option<usize>,
     pub build_jobs: Option<usize>,
     pub linker_threads: Option<usize>,
 }
@@ -129,6 +133,7 @@ impl ConfiguredResourceLimits {
     pub fn with_overrides(self, overrides: Self) -> Self {
         Self {
             cpus: overrides.cpus.or(self.cpus),
+            cpu_shares: overrides.cpu_shares.or(self.cpu_shares),
             build_jobs: overrides.build_jobs.or(self.build_jobs),
             linker_threads: overrides.linker_threads.or(self.linker_threads),
         }

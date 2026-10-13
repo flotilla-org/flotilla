@@ -329,7 +329,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             provisioned_mounts,
             tools,
             prepared_auth,
-            cpu_limit: Some(jobs),
+            cpu_limit: None,
             memory_policy: spec.memory_policy.clone(),
         };
         let prepared = match provider
@@ -608,7 +608,12 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             image_ref,
             local_image_id,
             registry_digest: handle_registry_digest,
-            configured_limits: Some(ConfiguredResourceLimits { cpus: Some(jobs), build_jobs: Some(jobs), linker_threads: Some(jobs) }),
+            configured_limits: Some(ConfiguredResourceLimits {
+                cpus: None,
+                cpu_shares: Some(flotilla_environment::environment::docker::CREW_CPU_SHARES),
+                build_jobs: Some(jobs),
+                linker_threads: Some(jobs),
+            }),
         })
     }
 

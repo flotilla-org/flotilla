@@ -524,3 +524,13 @@ The daily per-host sweep also removes session archives older than 30 days. Set
 that age. Environment teardown archives agent homes under
 `~/.local/share/flotilla/session-archive/<convoy>/<env>`; unowned environments use
 `unowned` as the convoy directory. Existing archives receive a timestamp suffix.
+
+
+### Crew CPU sharing
+
+Docker crew vessels use equal CPU shares (1024) rather than a hard CPU quota.
+A crew can use the whole host while other crews are idle; busy crews share CPU
+evenly. Memory and swap limits remain enforced. Cargo jobs and linker threads
+use the host core count for both Docker and host-direct crews (at least one).
+`expected_concurrent_rust_crews` describes how many Rust crews the host is sized
+for; it does not divide CPU or build parallelism. Image-build limits are unchanged.
