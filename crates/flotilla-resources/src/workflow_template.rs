@@ -306,6 +306,11 @@ pub struct VesselRequirement {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub credential_permissions: BTreeMap<String, BTreeMap<String, String>>,
     pub crew: Vec<CrewSpec>,
+    /// The leg's capability needs (ADR 0062), such as `display:x11`. Image
+    /// needs add shared layers to this vessel's composition by provides lookup.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub needs: BTreeSet<crate::CapabilityNeed>,
 }
 
 /// The accepted stored form of a [`VesselRequirement`]. Unknown fields are
@@ -328,6 +333,8 @@ struct VesselRequirementRecord {
     #[serde(default)]
     credential_permissions: BTreeMap<String, BTreeMap<String, String>>,
     crew: Vec<CrewSpec>,
+    #[serde(default)]
+    needs: BTreeSet<crate::CapabilityNeed>,
     #[serde(default, rename = "stance")]
     _legacy_stance: Option<serde::de::IgnoredAny>,
 }
@@ -342,6 +349,7 @@ impl From<VesselRequirementRecord> for VesselRequirement {
             credential_scopes: record.credential_scopes,
             credential_permissions: record.credential_permissions,
             crew: record.crew,
+            needs: record.needs,
         }
     }
 }
@@ -1390,6 +1398,24 @@ mod tests {
         let mut typo = serde_json::to_value(VesselRequirement::builder().name("work".to_string()).crew(vec![]).build()).expect("serialize");
         typo["neds"] = serde_json::json!([]);
         assert!(serde_json::from_value::<VesselRequirement>(typo).is_err());
+    }
+
+    // ADR 0062: a leg declares capability needs; previous records omit them,
+    // and an empty set is not written.
+    #[test]
+    fn vessel_needs_round_trip_and_default_empty() {
+        let plain = VesselRequirement::builder().name("work".to_string()).crew(vec![]).build();
+        let written = serde_json::to_value(&plain).expect("serialize");
+        assert!(written.get("needs").is_none());
+        let mut stored = written;
+        stored["needs"] = serde_json::json!(["display:x11", "toolchain:zig@0.15"]);
+        let vessel: VesselRequirement = serde_json::from_value(stored.clone()).expect("needs decode");
+        assert_eq!(
+            vessel.needs.iter().map(ToString::to_string).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["display:x11".to_string(), "toolchain:zig@0.15".to_string()])
+        );
+        let rewritten = serde_json::to_value(&vessel).expect("serialize");
+        assert_eq!(serde_json::from_value::<VesselRequirement>(rewritten).expect("round-trip"), vessel);
     }
 
     #[test]

@@ -1763,7 +1763,6 @@ async fn live_baseline_tag_without_image_build_provisions_a_digest() {
         let docker = spec.docker.as_mut().expect("docker");
         docker.image = tag.into();
         docker.image_build_ref = None;
-        docker.image_composition = None;
         docker.pull_policy = flotilla_resources::DockerImagePullPolicy::Always;
         let prepared = provider
             .prepare(&spec, &super::PrepareOpts { legacy_baseline: true, ..Default::default() })

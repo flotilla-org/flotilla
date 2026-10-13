@@ -92,12 +92,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         if !flotilla_resources::is_image_digest(&spec.image) && !registry_digest {
             // #2731 has not cut fleet baselines over to ImageBuild. Admission is
             // verified by the controller, never inferred from a tag's spelling.
-            if !opts.legacy_baseline
-                || spec.image_build_ref.is_some()
-                || spec.image_composition.is_some()
-                || spec.image.contains('@')
-                || spec.image.is_empty()
-            {
+            if !opts.legacy_baseline || spec.image_build_ref.is_some() || spec.image.contains('@') || spec.image.is_empty() {
                 return Err("Docker environments require a pinned digest; mutable tags are unsupported".into());
             }
             let held = self.inner.image_exists(&spec.image, Path::new("/")).await?;

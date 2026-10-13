@@ -367,7 +367,6 @@ pub fn legacy_environment_spec(spec: &flotilla_protocol::EnvironmentSpec) -> Res
             host_ref: String::new(),
             image: image.clone(),
             image_build_ref: None,
-            image_composition: None,
             declared_agent_adapters: Default::default(),
             required_agent_adapters: Default::default(),
             pull_policy: Default::default(),

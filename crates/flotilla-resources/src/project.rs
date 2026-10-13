@@ -95,6 +95,10 @@ pub struct ProjectSpec {
     /// reviewed policy while stopping it immediately.
     #[serde(default)]
     pub dispatch_policy: Option<DispatchPolicy>,
+    /// Crew image selection (ADR 0062). Omission applies the installation
+    /// defaults; a project layer at `.flotilla/image/` is included regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<crate::ImageSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -697,6 +701,7 @@ mod tests {
                 default_branch: None,
             }],
             dispatch_policy: Some(DispatchPolicy::builder().stale_after_seconds(0).build()),
+            image: None,
         };
 
         assert_eq!(
@@ -730,10 +735,35 @@ mod tests {
             issue_source_bindings: Vec::new(),
             repositories: vec![member("ghostty"), member("ghostty-ops")],
             dispatch_policy: None,
+            image: None,
         };
 
         let error = normalize_project_spec(spec).expect_err("duplicate repository must fail");
         assert!(error.contains("aliases `ghostty` and `ghostty-ops`"), "{error}");
         assert!(error.contains("repository repo-key"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod image_selection_tests {
+    use super::*;
+
+    // ADR 0062: Project and CrewDefaults carry an optional image selection;
+    // previous records omit it, and an absent selection is not written.
+    #[test]
+    fn image_selection_is_optional_and_strict() {
+        let project = ProjectSpec::builder().display_name("flotilla".into()).build();
+        let mut stored = serde_json::to_value(&project).expect("encode");
+        assert!(stored.get("image").is_none());
+        stored["image"] = serde_json::json!({"layers": ["rust", "zig@0.15"]});
+        let decoded: ProjectSpec = serde_json::from_value(stored.clone()).expect("decode");
+        assert_eq!(decoded.image, Some(crate::ImageSelection { base: None, layers: vec!["rust".into(), "zig@0.15".into()] }));
+        assert_eq!(serde_json::to_value(&decoded).expect("encode"), stored);
+        stored["image"] = serde_json::json!({"layer": ["rust"]});
+        assert!(serde_json::from_value::<ProjectSpec>(stored).is_err(), "selection fields are strict");
+        let defaults: crate::CrewDefaultsSpec =
+            serde_json::from_value(serde_json::json!({"image": {"base": "base-ubuntu-24.04"}})).expect("crew defaults image");
+        assert_eq!(defaults.image.and_then(|image| image.base).as_deref(), Some("base-ubuntu-24.04"));
+        assert!(serde_json::to_value(crate::CrewDefaultsSpec::default()).expect("encode").get("image").is_none());
     }
 }

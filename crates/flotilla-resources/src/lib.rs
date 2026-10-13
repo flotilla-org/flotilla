@@ -28,14 +28,16 @@ mod crew_image_baseline;
 #[doc(hidden)]
 pub mod image_build;
 pub use image_build::{
-    ImageBuild, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass, ImageBuildPhase, ImageBuildReason, ImageBuildReservation,
-    ImageBuildSpec, ImageBuildStatus, ImageBuildStatusPatch,
+    image_build_name, ImageBuild, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass, ImageBuildPhase, ImageBuildReservation,
+    ImageBuildResourceSpec, ImageBuildSpec, ImageBuildStatus, ImageBuildStatusPatch, ImageDelivery, ImageLayerProbe, ImageProbeOutcome,
+    PlacedImageIdentity, IMAGE_BUILD_MAX_ATTEMPTS,
 };
 mod image_layer;
 pub use image_layer::{
-    capability_satisfies, compose_image, validate_capability, FrozenImageLayer, FrozenImageLayers, ImageComposition, ImageInputAdoption,
-    ImageInputPin, ImageInputStability, ImageLayer, ImageLayerParent, ImageLayerSelection, ImageLayerSpec, ImageLayerStage,
-    PlacedImageIdentity, ResolvedImageInputs, IMAGE_LAYERS_ANNOTATION,
+    capability_satisfies, image_identity, parse_layer_directory, parse_layer_directory_with_executables, resolve_image,
+    validate_capability, EffectiveImageCatalogue, ImageCatalogue, ImageContextFile, ImageLayer, ImageLayerPin, ImageLayerResourceSpec,
+    ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImagePinDigest, ImageRequest, ImageResolutionError, ImageSelection, ResolvedImage,
+    ShadowedImageLayer, LAYER_DEFINITION_FILE, LAYER_FRAGMENT_FILE, MAX_CONTEXT_FILE_BYTES,
 };
 pub mod delivery_hold;
 #[doc(hidden)]
@@ -228,7 +230,7 @@ pub use terminal_session::{
 };
 pub use usage::{usage_record_name, Usage, UsagePace, UsageProviderCost, UsageSpec, UsageStatus, UsageStatusPatch, UsageWindow};
 pub use vessel::{
-    vessel_resource_name, Vessel, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION,
+    vessel_resource_name, Vessel, VesselImage, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 pub use watch::{ResourceList, ResourcePosition, ResourceTombstone, WatchEvent, WatchStart, WatchStream};
@@ -295,9 +297,7 @@ pub mod role_cascade;
 pub use convoy::promises;
 pub use credential::{HostActionSelector, HostImageAction};
 pub use fleet_designation::ImageCacheBinding;
-pub use image_build::{
-    is_image_digest, ImageAcquisitionCost, ImageAvailability, LocalImageCacheKey, LocalImageInventories, IMAGE_DIGESTS_CAPABILITY,
-};
+pub use image_build::{is_image_digest, ImageAcquisitionCost, LocalImageInventories, IMAGE_DIGESTS_CAPABILITY};
 pub use role_cascade::{ResolvedCascade, ResolvedSetting, RoleCascadeLayer, RoleDefinition, RoleSubscription};
 
 mod actuation;

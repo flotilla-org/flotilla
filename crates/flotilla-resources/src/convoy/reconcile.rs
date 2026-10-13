@@ -964,6 +964,7 @@ fn bootstrap_outcome(
                 credential_scopes: vessel.credential_scopes.clone(),
                 credential_permissions: vessel.credential_permissions.clone(),
                 crew: vessel.crew.iter().map(|member| instantiate_process(convoy, member)).collect(),
+                needs: vessel.needs.clone(),
             })
             .collect(),
     };

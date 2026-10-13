@@ -292,7 +292,15 @@ impl fmt::Display for FulfilmentCostClass {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "realisation", rename_all = "snake_case")]
 pub enum FulfilmentRealisation {
-    DockerPerVessel { image: crate::DockerImageSource },
+    DockerPerVessel {
+        /// `None` is the vessel's composed image.
+        #[serde(
+            default,
+            deserialize_with = "crate::placement_policy::decode_optional_image_source",
+            skip_serializing_if = "Option::is_none"
+        )]
+        image: Option<crate::DockerImageSource>,
+    },
     HostDirect,
 }
 

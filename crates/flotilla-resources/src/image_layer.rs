@@ -1,227 +1,294 @@
+//! Crew image layer definitions (ADR 0062).
+//!
+//! A composed image is an ordered list of layer definitions. Each definition is
+//! a Dockerfile fragment plus typed pins, provides, requires, a probe, declared
+//! context files and build secret names. The fragment is opaque apart from its
+//! declared `FROM` contract.
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{version_at_least, ApiPaths, InputMeta, NoStatusPatch, ReplicationClass, Resource, ResourceError};
+use crate::{ApiPaths, InputMeta, NoStatusPatch, ReplicationClass, Resource, ResourceError};
 
-pub const IMAGE_LAYERS_ANNOTATION: &str = "flotilla.work/frozen-image-layers";
+mod directory;
+mod resolve;
+
+pub use directory::{parse_layer_directory, parse_layer_directory_with_executables, LAYER_DEFINITION_FILE, LAYER_FRAGMENT_FILE};
+pub use resolve::{
+    resolve_image, EffectiveImageCatalogue, ImageCatalogue, ImageRequest, ImageResolutionError, ImageSelection, ResolvedImage,
+    ShadowedImageLayer,
+};
+
+/// Upper bound on the summed content of one layer's declared context files.
+pub const MAX_CONTEXT_FILE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageLayer;
 impl Resource for ImageLayer {
-    type Spec = ImageLayerSpec;
+    type Spec = ImageLayerResourceSpec;
     type Status = ();
     type StatusPatch = NoStatusPatch;
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "imagelayers", kind: "ImageLayer" };
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Definitions;
+    /// Retired records stay admissible so that previous-generation manifests in
+    /// ops repositories apply during the roll; they are inert for resolution.
     fn validate_spec(_meta: &InputMeta, spec: &Self::Spec) -> Result<(), ResourceError> {
-        spec.validate().map_err(ResourceError::decode)
+        match spec {
+            ImageLayerResourceSpec::Current(spec) => spec.validate().map_err(ResourceError::invalid),
+            ImageLayerResourceSpec::Retired => Ok(()),
+        }
     }
 }
 
-/// Authored build inputs. Revisions freeze intent; builders resolve file contents
-/// separately, since a commit or a host path is not an image's cache identity.
+/// The stored spec of an ImageLayer: a current definition, or a retired
+/// ADR 0053 record that decodes for one generation and is ignored by
+/// resolution. Retired values serialize as `{"retired": true}`, never as the
+/// old shape.
+///
+/// ADR 0047: remove `Retired` (and its decoders) one fleet roll after ADR 0062
+/// image layers land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageLayerResourceSpec {
+    Current(Box<ImageLayerSpec>),
+    Retired,
+}
+
+impl ImageLayerResourceSpec {
+    pub fn current(&self) -> Option<&ImageLayerSpec> {
+        match self {
+            Self::Current(spec) => Some(spec),
+            Self::Retired => None,
+        }
+    }
+
+    pub fn into_current(self) -> Option<ImageLayerSpec> {
+        match self {
+            Self::Current(spec) => Some(*spec),
+            Self::Retired => None,
+        }
+    }
+
+    pub fn is_retired(&self) -> bool {
+        matches!(self, Self::Retired)
+    }
+}
+
+impl From<ImageLayerSpec> for ImageLayerResourceSpec {
+    fn from(spec: ImageLayerSpec) -> Self {
+        Self::Current(Box::new(spec))
+    }
+}
+
+impl Serialize for ImageLayerResourceSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Current(spec) => spec.serialize(serializer),
+            Self::Retired => RetiredMarker { retired: true }.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageLayerResourceSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match retired_dispatch(&value, "tier", "stage") {
+            Shape::Current => serde_json::from_value(value).map(|spec: ImageLayerSpec| spec.into()).map_err(serde::de::Error::custom),
+            Shape::Retired => {
+                serde_json::from_value::<RetiredImageLayerRecord>(value).map_err(serde::de::Error::custom)?;
+                Ok(Self::Retired)
+            }
+            Shape::Marker => {
+                serde_json::from_value::<RetiredMarker>(value).map_err(serde::de::Error::custom)?;
+                Ok(Self::Retired)
+            }
+            Shape::Unknown => Err(serde::de::Error::custom("image layer spec needs `tier` (ADR 0062 definition)")),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetiredMarker {
+    pub(crate) retired: bool,
+}
+
+pub(crate) enum Shape {
+    Current,
+    Retired,
+    Marker,
+    Unknown,
+}
+
+/// Classify a stored object by its discriminating field: the current shape's
+/// required field, a retired shape's required field, or the retired marker.
+pub(crate) fn retired_dispatch(value: &serde_json::Value, current: &str, retired: &str) -> Shape {
+    let Some(object) = value.as_object() else { return Shape::Unknown };
+    if object.contains_key(current) {
+        Shape::Current
+    } else if object.contains_key(retired) {
+        Shape::Retired
+    } else if object.contains_key("retired") {
+        Shape::Marker
+    } else {
+        Shape::Unknown
+    }
+}
+
+/// ADR 0053 layer record (stage chain, repository revision, path fragment).
+/// Accepted and dropped for one generation; ADR 0047: remove one roll after
+/// ADR 0062 image layers land.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredImageLayerRecord {
+    #[serde(rename = "stage")]
+    _stage: serde::de::IgnoredAny,
+    #[serde(default, rename = "parent")]
+    _parent: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "repository")]
+    _repository: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "revision")]
+    _revision: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "fragment")]
+    _fragment: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "args")]
+    _args: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "pins")]
+    _pins: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "provides")]
+    _provides: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "requires")]
+    _requires: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "probes")]
+    _probes: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "input_stability")]
+    _input_stability: Option<serde::de::IgnoredAny>,
+}
+
+/// One layer definition. The spec, not the resource name, is authoritative.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[serde(deny_unknown_fields)]
 pub struct ImageLayerSpec {
-    pub stage: ImageLayerStage,
-    pub parent: ImageLayerParent,
-    pub repository: String,
-    pub revision: String,
+    /// Logical layer name, such as `rust` or `harness-codex`.
+    pub name: String,
+    /// Dotted version of this definition, such as `1.99.0`.
+    pub version: String,
+    pub tier: ImageLayerTier,
+    pub source: ImageLayerSource,
+    /// Owning project; required iff `source` is `project`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Base tier only: an image reference pinned by sha256 (multi-arch index) digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Dockerfile fragment text.
     pub fragment: String,
     #[builder(default)]
-    #[serde(default)]
-    pub args: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pins: BTreeMap<String, ImageLayerPin>,
     #[builder(default)]
-    #[serde(default)]
-    pub pins: BTreeMap<String, ImageInputPin>,
-    #[builder(default)]
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub provides: BTreeSet<String>,
     #[builder(default)]
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub requires: BTreeSet<String>,
-    /// Capability checks run in the completed stage with an empty Docker config.
-    /// ADR 0047: remove the decoder default one roll after probes land.
+    /// Non-empty POSIX sh script run on the composed image.
+    pub probe: String,
+    /// Relative path to content, consumed through the layer's named build context.
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub probes: BTreeMap<String, Vec<String>>,
-    /// Authored testimony that every external build input is pinned. Unknown
-    /// inputs get a non-shareable execution key. ADR 0047: default old layers
-    /// for one roll rather than assuming their package/network inputs are pinned.
+    pub context_files: BTreeMap<String, ImageContextFile>,
     #[builder(default)]
-    #[serde(default)]
-    pub input_stability: ImageInputStability,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub build_secrets: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// Fixed composition order, most stable first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ImageLayerStage {
+pub enum ImageLayerTier {
     Base,
-    Utilities,
-    Capability,
-    Harness,
+    Shared,
+    Project,
+    AgentRuntime,
+}
+
+/// Definition source, ordered by increasing resolution precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageLayerSource {
+    Stdlib,
+    Installation,
     Project,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum ImageLayerParent {
-    Image(String),
-    Layer(String),
-    /// The fragment starts FROM ${BASE}; the builder supplies the realised
-    /// digest underneath. This permits RUN and therefore does not imply that
-    /// OCI manifest-only rebasing (file-only, no RUN) is safe.
-    Rebasable,
+impl ImageLayerSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdlib => "stdlib",
+            Self::Installation => "installation",
+            Self::Project => "project",
+        }
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImageInputPin {
-    pub value: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adoption: Option<ImageInputAdoption>,
+impl std::fmt::Display for ImageLayerSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ImageInputAdoption {
-    Auto { constraint: Option<String> },
-    Approve,
+impl ImageLayerTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Shared => "shared",
+            Self::Project => "project",
+            Self::AgentRuntime => "agent_runtime",
+        }
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FrozenImageLayer {
-    pub name: String,
-    pub spec: ImageLayerSpec,
-}
-
-/// A selection is cascaded by the caller; the composer never picks another
-/// base or harness to paper over an unsatisfiable need.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-#[serde(deny_unknown_fields)]
-pub struct ImageLayerSelection {
-    pub base: String,
-    pub utilities: Option<String>,
-    pub harness: Option<String>,
-    pub project: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FrozenImageLayers {
-    pub layers: BTreeMap<String, ImageLayerSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selection: Option<ImageLayerSelection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub baseline_image: Option<String>,
-}
-impl FrozenImageLayers {
-    /// Append newly used capabilities without changing already frozen inputs.
-    pub fn include(&mut self, composition: &ImageComposition) -> Result<(), String> {
-        if composition.literal_base.is_some() && composition.layers.is_empty() {
-            return Ok(());
-        }
-        if self.selection.as_ref().is_some_and(|selection| selection != &composition.selection) {
-            return Err("convoy vessels must share their frozen image selection".into());
-        }
-        if self.baseline_image.as_ref().is_some_and(|image| composition.baseline_image.as_ref().is_some_and(|other| other != image)) {
-            return Err("convoy baseline image differs from its frozen image".into());
-        }
-        for layer in &composition.layers {
-            if self.layers.get(&layer.name).is_some_and(|previous| previous != &layer.spec) {
-                return Err(format!("convoy image layer `{}` differs from its frozen revision", layer.name));
-            }
-            if matches!(layer.spec.stage, ImageLayerStage::Base | ImageLayerStage::Harness)
-                && self.layers.iter().any(|(name, spec)| name != &layer.name && spec.stage == layer.spec.stage)
-            {
-                return Err(format!("convoy cannot use two {:?} image layers", layer.spec.stage));
-            }
-        }
-        self.layers.extend(composition.layers.iter().map(|layer| (layer.name.clone(), layer.spec.clone())));
-        self.selection.get_or_insert_with(|| composition.selection.clone());
-        if self.baseline_image.is_none() {
-            self.baseline_image = composition.baseline_image.clone();
-        }
-        Ok(())
+impl std::fmt::Display for ImageLayerTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[serde(deny_unknown_fields)]
-pub struct ImageComposition {
-    pub selection: ImageLayerSelection,
-    #[serde(default)]
-    pub needs: BTreeSet<String>,
-    #[serde(default)]
-    pub layers: Vec<FrozenImageLayer>,
-    /// Generation-1 frozen snapshots retain their literal until completion.
-    /// Decode bridge: remove after the generation-2 fleet roll (ADR 0047).
+pub struct ImageLayerPin {
+    pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub baseline_image: Option<String>,
-    /// A retired baseline resolves to a no-layer composition of its literal.
-    /// This is a source image, not a fallback from failed layer builds.
+    pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub literal_base: Option<String>,
-    /// Bound only when placed, never inferred from an admission-time tag.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<PlacedImageIdentity>,
-    /// ADR 0047: previous-generation compositions omit build dependencies;
-    /// remove the decoder default after one fleet roll.
-    #[builder(default)]
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub build_refs: Vec<String>,
+    pub sha256: Option<ImagePinDigest>,
+}
+
+/// A download checksum: one lowercase hex digest, or one per architecture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ImagePinDigest {
+    Single(String),
+    PerArchitecture(BTreeMap<String, String>),
+}
+
+impl ImagePinDigest {
+    /// The checksum used when building for `architecture` (`amd64`, `arm64`).
+    pub fn for_architecture(&self, architecture: &str) -> Option<&str> {
+        match self {
+            Self::Single(hex) => Some(hex),
+            Self::PerArchitecture(digests) => digests.get(architecture).map(String::as_str),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PlacedImageIdentity {
-    pub local_image_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registry_digest: Option<String>,
-}
-
-impl PlacedImageIdentity {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.local_image_id.trim().is_empty() || self.registry_digest.as_ref().is_some_and(|digest| digest.trim().is_empty()) {
-            return Err("placed image identity is empty".into());
-        }
-        Ok(())
-    }
-}
-
-impl ImageComposition {
-    /// Derive every stage key in frozen chain order. Actual parent digests
-    /// remain build inputs, while the parent key supplies Merkle invalidation.
-    pub fn recipe_keys(&self, inputs: &[ResolvedImageInputs]) -> Result<Vec<String>, String> {
-        if inputs.len() != self.layers.len() {
-            return Err("resolved image inputs do not match the frozen layer chain".into());
-        }
-        let mut keys = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            if inputs.first().is_some_and(|first| first.architecture != input.architecture) {
-                return Err("image composition cannot mix architectures".into());
-            }
-            let mut resolved = input.clone();
-            resolved.parent_recipe_key = keys.last().cloned();
-            keys.push(resolved.recipe_key()?);
-        }
-        Ok(keys)
-    }
-
-    pub fn bind(&mut self, identity: PlacedImageIdentity) -> Result<(), String> {
-        identity.validate()?;
-        if let Some(previous) = &self.identity {
-            if previous != &identity {
-                return Err("composition is already bound to a different image".into());
-            }
-        }
-        self.identity = Some(identity);
-        Ok(())
-    }
+pub struct ImageContextFile {
+    pub content: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub executable: bool,
 }
 
 /// Open namespaced capabilities with exact or dotted minimum versions.
@@ -229,7 +296,7 @@ impl ImageComposition {
 pub fn capability_satisfies(provided: &str, need: &str) -> bool {
     let (provided_name, version) = provided.split_once('@').map_or((provided, None), |(name, version)| (name, Some(version)));
     if let Some((name, minimum)) = need.split_once(">=") {
-        return name == provided_name && version.is_some_and(|version| version_at_least(version, minimum));
+        return name == provided_name && version.is_some_and(|version| crate::version_at_least(version, minimum));
     }
     if let Some((name, exact)) = need.split_once('@') {
         return name == provided_name && version == Some(exact);
@@ -247,239 +314,222 @@ pub fn validate_capability(value: &str) -> Result<(), String> {
 }
 
 impl ImageLayerSpec {
+    /// Per-definition validation applied on every write. Catalogue-level rules
+    /// (duplicate providers, unresolvable requires, clashes) live in
+    /// [`EffectiveImageCatalogue::check`].
     pub fn validate(&self) -> Result<(), String> {
-        if [&self.repository, &self.revision, &self.fragment].iter().any(|value| value.trim().is_empty()) {
-            return Err("image layer requires repository, revision and Dockerfile fragment".into());
+        let layer = &self.name;
+        validate_layer_name(&self.name)?;
+        if !is_dotted_version(&self.version) {
+            return Err(format!("image layer `{layer}`: version `{}` must be dotted alphanumeric segments", self.version));
         }
-        if !matches!(self.revision.len(), 40 | 64) || !self.revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err("image layer revision must be a full pinned commit".into());
+        if self.fragment.trim().is_empty() || self.probe.trim().is_empty() {
+            return Err(format!("image layer `{layer}`: fragment and probe must be non-empty"));
         }
-        match (&self.stage, &self.parent) {
-            (ImageLayerStage::Base, ImageLayerParent::Image(image))
-                if is_sha256(image) || image.rsplit_once('@').is_some_and(|(_, digest)| is_sha256(digest)) => {}
-            (ImageLayerStage::Utilities, ImageLayerParent::Layer(_)) => {}
-            (ImageLayerStage::Capability | ImageLayerStage::Harness | ImageLayerStage::Project, ImageLayerParent::Rebasable) => {}
-            _ => return Err(format!("invalid parent for {:?} image layer", self.stage)),
+        match (self.source, &self.project) {
+            (ImageLayerSource::Project, Some(project)) if !project.trim().is_empty() => {}
+            (ImageLayerSource::Project, _) => return Err(format!("image layer `{layer}`: project-source layers name their project")),
+            (_, Some(_)) => return Err(format!("image layer `{layer}`: only project-source layers name a project")),
+            (_, None) => {}
+        }
+        if (self.source == ImageLayerSource::Project) != (self.tier == ImageLayerTier::Project) {
+            return Err(format!("image layer `{layer}`: the project tier is exactly the project-source layers"));
+        }
+        match (self.tier, &self.from) {
+            (ImageLayerTier::Base, Some(from)) if is_digest_pinned_reference(from) => {}
+            (ImageLayerTier::Base, _) => {
+                return Err(format!("image layer `{layer}`: base layers declare `from` pinned by a sha256 digest"));
+            }
+            (_, Some(_)) => return Err(format!("image layer `{layer}`: only base layers declare `from`")),
+            (_, None) => {}
+        }
+        if self.tier == ImageLayerTier::Base && !self.requires.is_empty() {
+            return Err(format!("image layer `{layer}`: base layers cannot require capabilities"));
+        }
+        validate_fragment_stages(&self.name, &self.fragment).map_err(|error| format!("image layer `{layer}`: {error}"))?;
+        for (name, pin) in &self.pins {
+            validate_pin(name, pin).map_err(|error| format!("image layer `{layer}`: {error}"))?;
         }
         for capability in self.provides.iter().chain(&self.requires) {
-            validate_capability(capability)?;
+            validate_capability(capability).map_err(|error| format!("image layer `{layer}`: {error}"))?;
+        }
+        if let Some(adapter) = self.name.strip_prefix("harness-").filter(|_| self.tier == ImageLayerTier::AgentRuntime) {
+            if !self.provides.contains(&format!("harness:{adapter}")) {
+                return Err(format!("image layer `{layer}`: harness layers provide `harness:{adapter}`"));
+            }
+        }
+        if self.name == "crew-utilities" && !self.provides.contains("crew:utilities") {
+            return Err(format!("image layer `{layer}`: the crew utilities layer provides `crew:utilities`"));
+        }
+        let mut total = 0usize;
+        for (path, file) in &self.context_files {
+            validate_context_path(path).map_err(|error| format!("image layer `{layer}`: {error}"))?;
+            total = total.saturating_add(file.content.len());
+        }
+        if total > MAX_CONTEXT_FILE_BYTES {
+            return Err(format!("image layer `{layer}`: context files total {total} bytes, above {MAX_CONTEXT_FILE_BYTES}"));
+        }
+        for secret in &self.build_secrets {
+            if !is_kebab_token(secret) {
+                return Err(format!("image layer `{layer}`: build secret `{secret}` must match [a-z0-9-]+"));
+            }
         }
         Ok(())
     }
+
+    /// Conventional resource name: `<source>-<name>-<version>` or
+    /// `project-<project>-<name>-<version>`, restricted to `[a-z0-9.-]`.
+    pub fn resource_name(&self) -> String {
+        let raw = match (&self.source, &self.project) {
+            (ImageLayerSource::Project, Some(project)) => format!("project-{project}-{}-{}", self.name, self.version),
+            (source, _) => format!("{source}-{}-{}", self.name, self.version),
+        };
+        raw.chars().map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' { c } else { '-' }).collect()
+    }
 }
 
-/// Resolve a minimum-cardinality covering set, breaking ties by canonical names.
-/// Frozen entries win over current catalogue revisions; newly used capabilities
-/// are appended only after a successful composition, leaving failures atomic.
-pub fn compose_image(
-    selection: &ImageLayerSelection,
-    needs: &BTreeSet<String>,
-    catalogue: &BTreeMap<String, ImageLayerSpec>,
-    frozen: &mut FrozenImageLayers,
-) -> Result<ImageComposition, String> {
-    let selection = frozen.selection.as_ref().unwrap_or(selection).clone();
-    let mut available = catalogue.clone();
-    available.extend(frozen.layers.clone());
-    let mut fixed = Vec::new();
-    for (name, stage) in [
-        (Some(&selection.base), ImageLayerStage::Base),
-        (selection.utilities.as_ref(), ImageLayerStage::Utilities),
-        (selection.harness.as_ref(), ImageLayerStage::Harness),
-        (selection.project.as_ref(), ImageLayerStage::Project),
-    ] {
-        if let Some(name) = name {
-            let spec = available.get(name).ok_or_else(|| format!("image layer `{name}` missing"))?;
-            spec.validate().map_err(|error| format!("image layer `{name}`: {error}"))?;
-            if spec.stage != stage {
-                return Err(format!("image layer `{name}` is not a {stage:?} layer"));
-            }
-            fixed.push(FrozenImageLayer { name: name.clone(), spec: spec.clone() });
-        }
+/// `sha256:<64 hex>` of the canonical identity encoding of an ordered layer
+/// list (ADR 0062 A10). Included per layer: name, version, tier, `from`,
+/// fragment, pins, context files, probe and build secret names. Excluded:
+/// source, project, provides, requires, secret values and architecture.
+pub fn image_identity(layers: &[ImageLayerSpec]) -> String {
+    #[derive(Serialize)]
+    struct IdentityLayer<'a> {
+        name: &'a str,
+        version: &'a str,
+        tier: ImageLayerTier,
+        from: &'a Option<String>,
+        fragment: &'a str,
+        pins: &'a BTreeMap<String, ImageLayerPin>,
+        context_files: &'a BTreeMap<String, ImageContextFile>,
+        probe: &'a str,
+        build_secrets: &'a BTreeSet<String>,
     }
-    let mut optional = available
+    let canonical = layers
         .iter()
-        .filter(|(_, spec)| spec.stage == ImageLayerStage::Capability)
-        .map(|(name, spec)| FrozenImageLayer { name: name.clone(), spec: spec.clone() })
+        .map(|layer| IdentityLayer {
+            name: &layer.name,
+            version: &layer.version,
+            tier: layer.tier,
+            from: &layer.from,
+            fragment: &layer.fragment,
+            pins: &layer.pins,
+            context_files: &layer.context_files,
+            probe: &layer.probe,
+            build_secrets: &layer.build_secrets,
+        })
         .collect::<Vec<_>>();
-    // Only providers of requested capabilities or their transitive prerequisites
-    // can affect a minimum cover. Fixed upper layers' requires participate too.
-    let mut relevant = needs.clone();
-    relevant.extend(fixed.iter().flat_map(|layer| layer.spec.requires.iter().cloned()));
-    loop {
-        let previous = relevant.len();
-        for layer in &optional {
-            if layer.spec.provides.iter().any(|provided| relevant.iter().any(|need| capability_satisfies(provided, need))) {
-                relevant.extend(layer.spec.requires.clone());
-            }
-        }
-        if previous == relevant.len() {
-            break;
-        }
+    let bytes =
+        serde_json::to_vec(&("flotilla-image-identity-v1", canonical)).expect("identity encoding is infallible for owned strings and maps");
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn validate_layer_name(name: &str) -> Result<(), String> {
+    let valid = name.bytes().next().is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.');
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("image layer name `{name}` must match [a-z0-9][a-z0-9.-]*"))
     }
-    optional.retain(|layer| layer.spec.provides.iter().any(|provided| relevant.iter().any(|need| capability_satisfies(provided, need))));
-    // Capability order is lexical: an impossible earlier prerequisite cannot
-    // become satisfiable by selecting a later layer or the harness/project.
-    let mut possible = fixed
-        .iter()
-        .filter(|layer| layer.spec.stage < ImageLayerStage::Capability)
-        .flat_map(|layer| layer.spec.provides.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    optional.retain(|layer| {
-        let viable = layer.spec.validate().is_ok()
-            && layer.spec.requires.iter().all(|need| possible.iter().any(|provided| capability_satisfies(provided, need)));
-        if viable {
-            possible.extend(layer.spec.provides.clone());
-        }
-        viable
-    });
-    // Exact set cover is NP-hard even after pruning. Refuse excessive work
-    // explicitly rather than monopolising admission or returning a greedy cover.
-    if optional.len() > 64 {
-        return Err(format!("image composition search limit: {} relevant capability layers for needs {:?}", optional.len(), needs));
+}
+
+pub(crate) fn is_dotted_version(version: &str) -> bool {
+    !version.is_empty() && version.split('.').all(|segment| !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+}
+
+fn is_kebab_token(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_digest_pinned_reference(reference: &str) -> bool {
+    reference.rsplit_once('@').is_some_and(|(image, digest)| !image.is_empty() && crate::is_image_digest(digest))
+}
+
+fn validate_pin(name: &str, pin: &ImageLayerPin) -> Result<(), String> {
+    if !is_kebab_token(name) {
+        return Err(format!("pin `{name}` must match [a-z0-9-]+"));
     }
-    // A conservative first-release ceiling: at most 10,000 nodes, each with
-    // at most 64 optional layers. Count work, not time, so identical catalogues
-    // refuse identically on different hosts. Tune from fleet measurements;
-    // this is a safety bound, not a measured wall-time guarantee.
-    let mut search_budget = 10_000;
-    for need in needs {
-        validate_capability(need)?;
-        if !fixed.iter().chain(&optional).any(|layer| layer.spec.provides.iter().any(|provided| capability_satisfies(provided, need))) {
-            return Err(format!("unsatisfiable image need `{need}`"));
-        }
+    if pin.version.trim().is_empty() {
+        return Err(format!("pin `{name}` needs a version"));
     }
-    for count in 0..=optional.len() {
-        if let Some(layers) = covering_subset(&fixed, &optional, needs, count, 0, &mut Vec::new(), &mut search_budget)
-            .map_err(|()| format!("image composition search limit reached for needs {needs:?}"))?
+    if pin.url.as_ref().is_some_and(|url| url.trim().is_empty()) {
+        return Err(format!("pin `{name}` has an empty url"));
+    }
+    match &pin.sha256 {
+        None if pin.url.is_some() => Err(format!("pin `{name}` downloads a url without a sha256")),
+        None => Ok(()),
+        Some(ImagePinDigest::Single(hex)) if is_lower_hex_sha256(hex) => Ok(()),
+        Some(ImagePinDigest::PerArchitecture(digests))
+            if !digests.is_empty()
+                && digests.iter().all(|(architecture, hex)| is_kebab_token(architecture) && is_lower_hex_sha256(hex)) =>
         {
-            let composition = ImageComposition::builder()
-                .selection(selection.clone())
-                .needs(needs.clone())
-                .layers(layers)
-                .maybe_baseline_image(frozen.baseline_image.clone())
-                .build();
-            frozen.include(&composition)?;
-            return Ok(composition);
+            Ok(())
         }
+        Some(_) => Err(format!("pin `{name}` sha256 must be 64 lowercase hex (or a non-empty per-architecture map of them)")),
     }
-    let detail = needs.iter().cloned().collect::<Vec<_>>().join(", ");
-    Err(format!("unsatisfiable image needs `{detail}`: layer requirements or fixed parents cannot be satisfied in canonical order"))
 }
 
-fn covering_subset(
-    fixed: &[FrozenImageLayer],
-    optional: &[FrozenImageLayer],
-    needs: &BTreeSet<String>,
-    remaining: usize,
-    offset: usize,
-    selected: &mut Vec<FrozenImageLayer>,
-    search_budget: &mut usize,
-) -> Result<Option<Vec<FrozenImageLayer>>, ()> {
-    if *search_budget == 0 {
-        return Err(());
+fn validate_context_path(path: &str) -> Result<(), String> {
+    let normalised = !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && path.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+    if normalised {
+        Ok(())
+    } else {
+        Err(format!("context file path `{path}` must be relative and normalised"))
     }
-    *search_budget -= 1;
-    if remaining == 0 {
-        let mut chain = fixed.iter().chain(selected.iter()).cloned().collect::<Vec<_>>();
-        chain.sort_by(|left, right| (left.spec.stage, &left.name).cmp(&(right.spec.stage, &right.name)));
-        let mut provides = BTreeSet::new();
-        let mut previous: Option<&str> = None;
-        for layer in &chain {
-            if layer.spec.validate().is_err()
-                || layer.spec.requires.iter().any(|need| !provides.iter().any(|provided: &String| capability_satisfies(provided, need)))
-            {
-                return Ok(None);
+}
+
+/// The declared fragment contract, the only structural reading of fragment
+/// text: every `FROM` is `${BASE}` or `scratch`, optionally `AS <layer>-<suffix>`;
+/// the last `FROM` is the layer's output stage, `FROM ${BASE}` without an alias,
+/// and every earlier stage is aliased.
+fn validate_fragment_stages(layer: &str, fragment: &str) -> Result<(), String> {
+    let mut stages = Vec::new();
+    for line in fragment.lines() {
+        let mut words = line.split_whitespace();
+        let Some(first) = words.next() else { continue };
+        if !first.eq_ignore_ascii_case("FROM") {
+            continue;
+        }
+        let words = words.collect::<Vec<_>>();
+        let (image, alias) = match words.as_slice() {
+            [image] => (*image, None),
+            [image, keyword, alias] if keyword.eq_ignore_ascii_case("AS") => (*image, Some(*alias)),
+            _ => return Err(format!("fragment line `{}` must be `FROM ${{BASE}}|scratch [AS <alias>]`", line.trim())),
+        };
+        if image != "${BASE}" && image != "scratch" {
+            return Err(format!("fragment stages start FROM ${{BASE}} or scratch, not `{image}`"));
+        }
+        if let Some(alias) = alias {
+            let suffix = alias.strip_prefix(layer).and_then(|rest| rest.strip_prefix('-'));
+            if suffix.is_none_or(str::is_empty) {
+                return Err(format!("fragment stage alias `{alias}` must be `{layer}-<suffix>`"));
             }
-            if let ImageLayerParent::Layer(parent) = &layer.spec.parent {
-                if previous != Some(parent.as_str()) {
-                    return Ok(None);
-                }
-            }
-            provides.extend(layer.spec.provides.clone());
-            previous = Some(&layer.name);
         }
-        return Ok(needs.iter().all(|need| provides.iter().any(|provided| capability_satisfies(provided, need))).then_some(chain));
+        stages.push((image, alias));
     }
-    if optional.len().saturating_sub(offset) < remaining {
-        return Ok(None);
+    let Some((&(image, alias), earlier)) = stages.split_last() else {
+        return Err("fragment has no FROM ${BASE} output stage".into());
+    };
+    if image != "${BASE}" || alias.is_some() {
+        return Err("the last fragment stage must be `FROM ${BASE}` without an alias".into());
     }
-    for index in offset..optional.len() {
-        selected.push(optional[index].clone());
-        let found = covering_subset(fixed, optional, needs, remaining - 1, index + 1, selected, search_budget)?;
-        selected.pop();
-        if found.is_some() {
-            return Ok(found);
-        }
+    if earlier.iter().any(|(_, alias)| alias.is_none()) {
+        return Err("only the final output stage may omit `AS <alias>`".into());
     }
-    Ok(None)
+    let aliases = earlier.iter().filter_map(|(_, alias)| *alias).collect::<BTreeSet<_>>();
+    if aliases.len() != earlier.len() {
+        return Err("fragment stage aliases must be distinct".into());
+    }
+    Ok(())
 }
 
-/// Builder-resolved content, not paths, repository revisions, timestamps or host
-/// identity. Ordered maps normalise args and pins before hashing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct ResolvedImageInputs {
-    pub parent_digest: String,
-    pub parent_recipe_key: Option<String>,
-    pub content_hashes: Vec<String>,
-    #[builder(default)]
-    pub args: BTreeMap<String, String>,
-    #[builder(default)]
-    pub pins: BTreeMap<String, String>,
-    pub architecture: String,
-    /// Explicit builder evidence: unresolved package/base inputs are refused.
-    pub stability: ImageInputStability,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImageInputStability {
-    Pinned,
-    #[default]
-    Unpinned,
-}
-
-impl ResolvedImageInputs {
-    /// Unpinned recipes are executable but cannot make a fleet cache claim.
-    pub fn execution_key(&self, nonce: Option<&str>) -> Result<String, String> {
-        match (self.stability, nonce) {
-            (ImageInputStability::Pinned, None) => self.recipe_key(),
-            (ImageInputStability::Unpinned, Some(nonce)) if !nonce.is_empty() => {
-                let mut validated = self.clone();
-                validated.stability = ImageInputStability::Pinned;
-                let resolved = validated.recipe_key()?;
-                Ok(format!(
-                    "sha256:{:x}",
-                    Sha256::digest(
-                        serde_json::to_vec(&("flotilla-unshared-image-v1", resolved, nonce)).map_err(|error| error.to_string())?
-                    )
-                ))
-            }
-            _ => Err("unpinned image inputs require a non-shareable execution nonce".into()),
-        }
-    }
-
-    /// Only resolved, pinned inputs have a shareable Merkle key. Callers must
-    /// refuse unresolved inputs rather than manufacture a cache identity.
-    pub fn recipe_key(&self) -> Result<String, String> {
-        if self.stability != ImageInputStability::Pinned
-            || !is_sha256(&self.parent_digest)
-            || self.parent_recipe_key.as_ref().is_some_and(|key| !is_sha256(key))
-            || self.architecture.is_empty()
-            || self.content_hashes.is_empty()
-            || self.content_hashes.iter().any(|hash| !is_sha256(hash))
-            || self.pins.values().any(|value| value.is_empty())
-        {
-            return Err("cannot share an image recipe key with unresolved inputs".into());
-        }
-        let mut canonical = self.clone();
-        canonical.content_hashes.sort();
-        let bytes = serde_json::to_vec(&("flotilla-image-recipe-v1", canonical)).map_err(|error| error.to_string())?;
-        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
-    }
-}
-
-fn is_sha256(value: &str) -> bool {
-    value
-        .strip_prefix("sha256:")
-        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-}
+#[cfg(test)]
+pub(crate) mod tests;
