@@ -3403,9 +3403,11 @@ impl Store for SqliteBackend {
         SqliteBackend::watch_raw(self, resource_kind, namespace, start).await
     }
     async fn get_decoded(&self, resource_kind: ResourceKind, namespace: &str, name: &str) -> Result<DecodedObject, ResourceError> {
-        let result = SqliteBackend::get_decoded(self, resource_kind, namespace, name).await?;
-        self.observe(resource_kind, ReadOperation::Get, 1);
-        Ok(result)
+        let result = SqliteBackend::get_decoded(self, resource_kind, namespace, name).await;
+        // Missing, storage and decode errors still cost a crossing, but
+        // return zero objects to the caller, as for `get_raw`.
+        self.observe(resource_kind, ReadOperation::Get, usize::from(result.is_ok()));
+        result
     }
     async fn list_decoded(&self, resource_kind: ResourceKind, namespace: &str) -> Result<DecodedList, ResourceError> {
         let result = SqliteBackend::list_decoded(self, resource_kind, namespace).await?;
