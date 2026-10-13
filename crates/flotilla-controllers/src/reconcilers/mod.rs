@@ -2,6 +2,7 @@ pub mod checkout;
 pub mod clone;
 pub mod convoy_ensure;
 pub mod environment;
+pub mod image_build;
 pub mod repository;
 pub mod terminal_session;
 pub mod vessel;
@@ -12,6 +13,7 @@ pub use checkout::{
 };
 pub use clone::{CloneReconciler, CloneRuntime};
 pub use environment::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler};
+pub use image_build::{ImageBuildMaterials, ImageBuildReconciler};
 
 pub use repository::{ForgeDefaultBranchResolver, RepositoryReconciler};
 pub use terminal_session::{

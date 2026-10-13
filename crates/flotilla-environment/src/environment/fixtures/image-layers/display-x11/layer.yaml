@@ -1,0 +1,19 @@
+# Headless X11 with Mesa software rendering (ADR 0062, A9). Packages come
+# from the base's dated apt snapshot, so they carry no pins of their own.
+# `display:headless-x11` is the generation-2 capability name, kept so existing
+# workflow needs and `--need` invocations still resolve; remove it once those
+# authors use `display:x11`.
+name: display-x11
+version: 1.0.0
+tier: shared
+provides: [display:x11, display:headless-x11]
+requires: []
+pins: {}
+probe: |
+  set -eu
+  xdpyinfo -display "$DISPLAY" >/dev/null
+  glxinfo -B
+  test "$LIBGL_ALWAYS_SOFTWARE" = 1
+context_files:
+  - prelude.d/50-display-x11.sh
+build_secrets: []

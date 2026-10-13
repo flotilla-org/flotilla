@@ -59,8 +59,8 @@ fn host_user() -> String {
 
 #[async_trait]
 impl EnvironmentProvider for DockerEnvironmentProvider {
-    fn image_builder(&self) -> Option<Arc<dyn super::ImageBuilder>> {
-        Some(Arc::new(super::docker_image::BuildxImageBuilder::new(self.inner.runner.clone())))
+    fn image_build_service(&self, builder: super::OwnedBuilderSettings) -> Option<Arc<dyn super::ImageBuildService>> {
+        Some(Arc::new(super::docker_image::OwnedBuildKitService::new(self.inner.runner.clone(), builder)))
     }
     fn local_image_cache(&self) -> Option<&dyn super::LocalImageCache> {
         Some(self)

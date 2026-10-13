@@ -54,6 +54,7 @@ hegeltest = "=0.48.1"
 flotilla-resources = { path = "../flotilla-resources" }
 rstest = { workspace = true }
 tempfile = { workspace = true }
+reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [lints]

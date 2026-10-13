@@ -1636,6 +1636,7 @@ dependencies = [
  "flotilla-vcs",
  "futures",
  "hegeltest",
+ "reqwest 0.13.2",
  "rstest",
  "rusqlite",
  "serde",

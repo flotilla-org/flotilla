@@ -1,0 +1,18 @@
+# Zig (ADR 0062, shared tier), installed read-only under
+# /opt/flotilla/toolchains/zig.
+FROM ${BASE}
+ARG TARGETARCH
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+        amd64) arch=x86_64 ;; \
+        arm64) arch=aarch64 ;; \
+        *) echo "unsupported Zig architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "$(printf '%s' "${PIN_ZIG_URL}" | sed "s/{arch}/${arch}/g")" -o /tmp/zig.tar.xz; \
+    printf '%s  %s\n' "${PIN_ZIG_SHA256}" /tmp/zig.tar.xz | sha256sum --check --strict -; \
+    mkdir -p /opt/flotilla/toolchains/zig; \
+    tar -xJf /tmp/zig.tar.xz -C /opt/flotilla/toolchains/zig --strip-components=1 --no-same-owner; \
+    rm /tmp/zig.tar.xz; \
+    chmod -R a+rX,go-w /opt/flotilla/toolchains/zig; \
+    test "$(/opt/flotilla/toolchains/zig/zig version)" = "${PIN_ZIG_VERSION}"
+ENV PATH="/opt/flotilla/bin:/opt/flotilla/toolchains/zig:${PATH}"

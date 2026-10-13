@@ -1,9 +1,9 @@
 //! Local image inventory publication. A host's image cache inventory is an
-//! observation that placement uses as an acquisition-cost hint (ADR 0062:
-//! a Held composed digest costs nothing to start). Composed images are
-//! delivered by digest: the Environment reconciler hands the provider the
-//! ImageBuild's digest, and the provider pulls a registry digest with its pull
-//! credential. The build service (PR 2) replaces the rest of this module.
+//! observation that placement uses as an acquisition-cost hint (ADR 0062: a
+//! Held composed digest costs nothing to start). Composed images are built
+//! and delivered by the ImageBuild reconciler's build service; providers pull
+//! `repository@digest` with the fleet pull credential, or run a single-host
+//! local build's image ID directly.
 use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
@@ -12,12 +12,12 @@ use flotilla_store::ResourceBackend;
 
 /// The local image cache's held image IDs.
 #[async_trait]
-pub(crate) trait ImageDistributionIo: Send + Sync {
+pub(crate) trait ImageInventoryIo: Send + Sync {
     async fn inventory(&self) -> Result<BTreeSet<String>, String>;
 }
 
 #[derive(bon::Builder)]
-pub(crate) struct ImageDistributor<I> {
+pub(crate) struct ImageInventoryPublisher<I> {
     pub io: Arc<I>,
     pub backend: ResourceBackend,
     pub namespace: String,
@@ -26,7 +26,7 @@ pub(crate) struct ImageDistributor<I> {
     pub registered_instances: BTreeSet<String>,
 }
 
-impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
+impl<I: ImageInventoryIo + 'static> ImageInventoryPublisher<I> {
     /// Publish this provider instance's inventory on the local Host, dropping
     /// observations from instances that are no longer registered.
     pub async fn refresh(&self) -> Result<(), String> {
@@ -86,7 +86,7 @@ pub(crate) struct ProviderImageIo {
 }
 
 #[async_trait]
-impl ImageDistributionIo for ProviderImageIo {
+impl ImageInventoryIo for ProviderImageIo {
     async fn inventory(&self) -> Result<BTreeSet<String>, String> {
         self.provider.local_image_cache().ok_or("provider has no local image cache")?.inventory().await
     }
@@ -106,20 +106,20 @@ mod tests {
         held: Mutex<BTreeSet<String>>,
     }
     #[async_trait]
-    impl ImageDistributionIo for Docker {
+    impl ImageInventoryIo for Docker {
         async fn inventory(&self) -> Result<BTreeSet<String>, String> {
             Ok(self.held.lock().expect("inventory").clone())
         }
     }
 
-    async fn setup(digest: &str) -> ImageDistributor<Docker> {
+    async fn setup(digest: &str) -> ImageInventoryPublisher<Docker> {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         backend
             .using::<Host>("test")
             .create(&InputMeta::builder().name("builder".into()).build(), &HostSpec::default())
             .await
             .expect("host");
-        ImageDistributor::builder()
+        ImageInventoryPublisher::builder()
             .io(Arc::new(Docker { held: Mutex::new(BTreeSet::from([digest.to_string()])) }))
             .backend(backend)
             .namespace("test".into())
@@ -129,7 +129,7 @@ mod tests {
             .build()
     }
 
-    async fn inventory(delivery: &ImageDistributor<Docker>) -> serde_json::Value {
+    async fn inventory(delivery: &ImageInventoryPublisher<Docker>) -> serde_json::Value {
         delivery.backend.using::<Host>("test").get("builder").await.expect("host").status.expect("status").capabilities
             [IMAGE_DIGESTS_CAPABILITY]
             .clone()

@@ -1,0 +1,28 @@
+# Codex CLI as the official native package (ADR 0062, A6): no npm and no
+# Node. The package is the release's codex-package-<target>.tar.gz, which
+# carries bin/codex plus its bundled resources (rg, bwrap) located through
+# codex-package.json. sha256 values are the release asset digests published
+# by GitHub for openai/codex rust-v0.160.0, confirmed by downloading both.
+# `{arch}` is substituted by the fragment (x86_64 or aarch64).
+#
+# Codex has no self-updater and no environment switch for its update notice
+# (`check_for_update_on_startup` lives in the crew's config.toml); a harness
+# bump is a new version of this layer.
+name: harness-codex
+version: 0.160.0
+tier: agent_runtime
+provides: [harness:codex, harness:codex@0.160.0]
+requires: []
+pins:
+  codex:
+    version: 0.160.0
+    url: https://github.com/openai/codex/releases/download/rust-v0.160.0/codex-package-{arch}-unknown-linux-musl.tar.gz
+    sha256:
+      amd64: 4fcc47ab57f52ff75363951a8761146cd10c8288bd86fed45487dbb204a16b71
+      arm64: 7f0fe42ff22ecfa3a47bc4a34f5b22c4218b431a4ec0aba51c7d98299f07900c
+probe: |
+  set -eu
+  codex --version | grep -E '(^|[^0-9])0\.160\.0([^0-9.]|$)'
+  test "$(command -v codex)" = /opt/flotilla/harnesses/codex/0.160.0/bin/codex
+context_files: []
+build_secrets: []

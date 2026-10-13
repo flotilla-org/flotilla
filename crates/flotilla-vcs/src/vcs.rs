@@ -434,11 +434,6 @@ impl RevisionedFile for GitRevisionedFile {
 /// Flotilla operations bound to one checkout, independent of its VCS or storage medium.
 #[async_trait]
 pub trait Vcs: Send + Sync {
-    /// Materialise an immutable repository revision as a clean Docker context.
-    async fn image_build_context(&self, _directory: &Path, _repository: &str, _revision: &str) -> Result<(), String> {
-        Err("image build source materialisation is unavailable".into())
-    }
-
     /// Fetch a branch into an object cache and resolve it to an immutable commit.
     /// The fetch itself has a 60-second deadline; cache lock wait is excluded.
     async fn fetch_revision(&self, _cache: &Path, _repo: &str, _branch: &str) -> Result<String, String> {
@@ -672,35 +667,6 @@ impl FlotillaVcs {
 
 #[async_trait]
 impl Vcs for FlotillaVcs {
-    async fn image_build_context(&self, directory: &Path, repository: &str, revision: &str) -> Result<(), String> {
-        if !matches!(revision.len(), 40 | 64) || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err("image source revision must be a full commit".into());
-        }
-        tokio::fs::create_dir_all(directory).await.map_err(|error| error.to_string())?;
-        let cache = directory.join("objects");
-        tokio::fs::create_dir_all(&cache).await.map_err(|error| error.to_string())?;
-        let backend = GitCliBackend::new(&cache, &*self.runner);
-        backend.run(&["init", "--bare", "."]).await?;
-        backend.run(&["fetch", "--no-tags", "--", repository, revision]).await?;
-        if backend.resolve_ref("FETCH_HEAD^{commit}").await?.trim() != revision {
-            return Err("image source revision resolved to different content".into());
-        }
-        let archive = directory.join("context.tar");
-        let archive_arg = format!("--output={}", archive.display());
-        backend.run(&["archive", "--format=tar", &archive_arg, revision]).await?;
-        let context = directory.join("context");
-        tokio::fs::create_dir_all(&context).await.map_err(|error| error.to_string())?;
-        self.runner
-            .run(
-                "tar",
-                &["-xf", archive.to_str().ok_or("archive path is not UTF-8")?],
-                &context,
-                &flotilla_provider_runtime::ChannelLabel::Default,
-            )
-            .await?;
-        Ok(())
-    }
-
     async fn fetch_revision(&self, cache: &Path, repo: &str, branch: &str) -> Result<String, String> {
         // Keep fetch+resolve atomic across providers sharing an object cache.
         let directory = revision_cache(cache, repo);

@@ -214,6 +214,23 @@ impl CommandRunner for BudgetedRunner {
         });
         result
     }
+    async fn run_output_with_grace(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+        grace: Duration,
+    ) -> Result<CommandOutput, String> {
+        self.budgets.before(cmd, args)?;
+        let attempt = BudgetAttempt { budgets: &self.budgets, key: ForgeBudgets::key(cmd, args) };
+        let result = self.inner.run_output_with_grace(cmd, args, cwd, label, grace).await;
+        attempt.finish(match &result {
+            Ok(output) => &output.stdout,
+            Err(error) => error,
+        });
+        result
+    }
     async fn run_with_timeout(
         &self,
         cmd: &str,

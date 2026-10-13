@@ -1,0 +1,25 @@
+# Claude Code as Anthropic's native binary (ADR 0062, A6): no npm and no
+# Node. The URL is the distribution used by the official installer
+# (https://claude.ai/install.sh, DOWNLOAD_BASE_URL); sha256 values are the
+# `checksum` entries of that release's manifest.json, confirmed by
+# downloading the amd64 binary. `{arch}` is substituted by the fragment
+# (x64 or arm64; the glibc builds, since the base is Ubuntu).
+name: harness-claude-code
+version: 2.1.287
+tier: agent_runtime
+provides: [harness:claude-code, harness:claude-code@2.1.287]
+requires: []
+pins:
+  claude-code:
+    version: 2.1.287
+    url: https://downloads.claude.ai/claude-code-releases/2.1.287/linux-{arch}/claude
+    sha256:
+      amd64: 3920489a5109cff5786a1a392c25277408ff22bc796d5edb9c16a60e5a1718f0
+      arm64: e4daf793d1e74fb0d9874dd09e98690bbfd7be515f78a87fd05b9e2b4bb33b03
+probe: |
+  set -eu
+  claude --version | grep -E '(^|[^0-9])2\.1\.287([^0-9.]|$)'
+  test "$(command -v claude)" = /opt/flotilla/harnesses/claude-code/2.1.287/bin/claude
+  test "$DISABLE_AUTOUPDATER" = 1
+context_files: []
+build_secrets: []
