@@ -1,192 +1,148 @@
 # Image builds
 
-Explicit Docker compositions without a bound image join `ImageBuild` demand during
-convoy admission. Admission accepts the convoy while its Environment reports
-`Provisioning` and the current execution's queue, build, or failure reason. A
-failed execution never selects an older image. Layered generation-1 baselines
-retain their authoritative running image during the composition transition.
+[ADR 0062](../adr/0062-crew-images-are-ordered-layer-lists-built-once-per-identity.md) defines a crew image as an ordered list of `ImageLayer` definitions. The list's
+identity is a hash of those definitions. An image is built once per identity
+and architecture, as one `ImageBuild` named `image-<first 40 hex of identity>-<arch>`.
 
-Each immutable execution contains one frozen layer, source content hashes, target
-architecture, resolved arguments and pins, actual parent image ID, parent recipe
-key, reservation, and reason with old/new inputs. Only the first stage is created
-before its parent exists. Environment reconciliation advances the frozen
-composition after each successful stage, so later keys contain the realised
-parent rather than a predicted digest. Source commits identify acquisition;
-content identifies the recipe. Unpinned inputs use a host-scoped execution nonce
-and cannot claim fleet sharing. Authors opt into `input_stability: pinned` only
-when every package/base input is pinned.
+## Demand
 
-The placement host is the default builder (one slot, one CPU, 1 GiB disk
-reservation). `Host.spec.image_build_capacity` can explicitly disable builds:
+Convoy admission resolves each docker-per-vessel vessel's composition. It
+get-or-creates the identity's `ImageBuild` and freezes `Built { identity,
+image_build_ref }` into the vessel's placement snapshot. The spec is immutable
+and holds the ordered layers, the builder host, the delivery and the reservation.
 
-```yaml
-image_build_capacity:
-  kind: none
+- **Registry delivery.** When `FleetDesignation.spec.image_cache` is declared,
+  the build goes to the lowest-named host of the right architecture with
+  `image_build_capacity: {kind: builder, slots > 0}`. It is pushed to
+  `image_cache.repository`.
+- **Local delivery (single-host mode).** Without an image cache, the placement
+  host builds the image and keeps it locally. An undeclared
+  `image_build_capacity` gives that host one slot; `kind: none` forbids building.
+
+The builder copies replicated demand into its own store with actuator
+annotations, so its build service records evidence under its own authority.
+Replication then returns that evidence to the admitting root. Projection works
+in both directions. When the demand is deleted on its admitting root, the builder
+deletes its copy once its replica of that root has a snapshot cursor. A replica
+still waiting for its snapshot may only be lagging, so its copies are kept. A
+running attempt for a deleted build is abandoned.
+
+## Execution
+
+The `ImageBuild` reconciler (`flotilla-controllers`) runs on every daemon with
+controllers. It acts only on builds whose `host_ref` is the local host and whose
+architecture matches the host's reported architecture and declared builder
+capacity. For each attempt it:
+
+1. Writes `Start` (phase `Building`, attempt + 1). This claims a slot before any
+   build process runs. At most `slots` builds per host are `Building` at once.
+2. Runs the build as a background job through the provider-neutral
+   `ImageBuildService` port. The request carries:
+   - the ordered layers, identity and architecture;
+   - the delivery target;
+   - the declared build secrets, and only those;
+   - the prelude probe wrapper (`with_preludes("exec \"$@\"")`);
+   - the reservation's CPU count for probes.
+3. Records `Built { digest, probes, log_ref }` or `Failed { failure, probes, log_ref }`.
+
+The digest is `<repository>@sha256:…` for registry delivery and the local
+`sha256:…` image ID for local delivery.
+
+### Failures and retries
+
+- **Infrastructure failures** (transport, registry, daemon, disk, deadlines, a
+  missing push credential, an unreadable secret source) return to `Queued` with
+  `not_before = finished_at + 30 s × 2^(attempt−1)`, capped at 30 minutes. They
+  retry until `IMAGE_BUILD_MAX_ATTEMPTS` (5) attempts have run, then stay `Failed`.
+- **Recipe failures** (a failed `RUN` step, a failed probe, an ungranted build
+  secret) are terminal for the identity. The reason names the owner: the first
+  layer whose probe failed, otherwise the layer whose build step failed (read from
+  BuildKit's stage name), otherwise the composition.
+- **Operator retry.** Delete the `ImageBuild`. The next admission re-creates it.
+
+Environments wait in `Provisioning` with the build's phase and reason. No older
+image is used as a fallback.
+
+The full build and probe output is kept as a `build-log` Artifact named
+`image-build-log-<build>-<attempt>`, expiring after 30 days. Status holds a
+reason of at most 2,048 characters. Retired ADR 0053 per-stage `ImageBuild`
+records decode to an inert value, and the reconciler deletes them.
+
+## Owned BuildKit adapter
+
+The daemon composition root builds the Docker provider's `OwnedBuildKitService`
+with this daemon's state directory:
+
+| Setting | Value |
+|---------|-------|
+| Builder | `flotilla-images` |
+| Buildx state | `<state>/image-builder/buildx` |
+| Scratch directory | `<state>/image-builder/scratch` |
+| Staged build secrets | `<state>/image-builder/secrets` |
+
+Each operation uses a private Docker configuration. That configuration holds the
+push credential, when there is one, and a link to the builder's state. Before
+each build the adapter runs `docker buildx inspect flotilla-images`. If the
+builder is absent, it runs
+`docker buildx create --name flotilla-images --driver docker-container --bootstrap`.
+
+The build then runs:
+
+```
+docker buildx build --builder flotilla-images --platform linux/<arch> --file <generated> \
+  [--build-context <layer>=<dir> …] [--secret id=<name>,src=<file> …] \
+  --provenance=false --metadata-file … --progress=plain \
+  ( --push --tag <repository>:<hex40>-<arch> \
+      --cache-to type=registry,ref=<repository>/buildcache:<arch>,mode=max \
+      --cache-from type=registry,ref=<repository>/buildcache:<arch> \
+  | --load --tag flotilla-image:<hex40>-<arch> )
 ```
 
-Or declare capacity:
+The registry cache sits next to the images, at `<image_cache.repository>/buildcache`,
+with one tag per architecture. For the lab fleet (decision C4),
+`image_cache.repository` is `<forgejo>/flotilla/crew-images`. Images are tagged
+`crew-images:<hex40>-<arch>` and pulled by digest. The cache is
+`crew-images/buildcache:amd64`.
 
-```yaml
-image_build_capacity:
-  kind: builder
-  architecture: amd64
-  slots: 2
-  reservation:
-    cpu: 2
-    disk_bytes: 8589934592
-```
+Each layer's probe then runs on the delivered image. Push mode pulls the pushed
+digest first. Probes run as `--user 65534:65534`, with `--network=none` and
+`--pull=never`, a tmpfs `HOME`, and through the prelude wrapper. Builds have a
+30-minute deadline and probes have a 60-second deadline. A timed-out probe
+container is force-removed.
 
-When placement cannot build, admission chooses a declared builder with the same
-architecture. Architecture aliases are normalised; cross-architecture builds are
-refused. Reservations are persisted before starting a process. Slots bound
-concurrent executions without blocking admission or the controller watch loop.
-Remote demands are projected into the selected daemon's authoritative store;
-replicated actuator evidence takes precedence over demand-only records.
+## Credentials
 
-The daemon adapter acquires the full source revision through the typed VCS port,
-checks content against frozen inputs, and runs Buildx with the default Docker
-driver, `--load`, and a private Docker configuration. Dockerfile fragments consume
-`ARG BASE` / `FROM ${BASE}`. Each declared provide must have an argv probe:
+- **Push.** The builder resolves `image_cache.push_credential` freshly for each
+  attempt with `CredentialStore::registry_auth(host, ImagePush, …)`. The fleet
+  names it `crew-image-registry-push`. Resolution needs an `image-push`
+  host-action grant and a declared, positive build capacity.
+- **Pull.** A provider pulls `repository@digest` with `image_cache.pull_credential`,
+  resolved with `registry_auth(host, ImagePull, …)` on the placement host. This
+  needs an `image-pull` host-action grant. A local build's image ID runs with pull
+  policy `Never`.
+- **Build secrets.** A layer declares build secrets by name (`build_secrets`).
+  Each name resolves through `CredentialStore::build_secret(host, name)`, which
+  needs an `image-build-secret` host-action grant. The material is staged as a
+  `0600` file in a private directory, passed only to the build service, and
+  removed when the build ends. An unknown or ungranted name refuses the build and
+  names the secret.
 
-```yaml
-provides: [harness:codex@0.160.0]
-probes:
-  harness:codex@0.160.0: [codex, --version]
-```
-
-Probes override the image entrypoint and run without network or image pulling.
-Build output, probes, and failure reason are stored as a `build-log` Artifact
-(retained for 30 days). The adapter recovers an existing execution tag without
-rerunning Buildx, then verifies provides again. Transient failures create up to
-three immutable successors after 30, 60, and 120 seconds; deterministic failures
-never retry identical inputs. Failure evidence remains available on predecessors
-and produces an infrastructure log and Host health condition.
-
-A local successful build provisions the Environment using its image ID with
-pulling disabled. A remote successful build waits for the distribution adapter to
-deliver and verify its digest before provisioning (see Availability and distribution
-below). Build garbage collection belongs to #2733.
-
-Build args and pin values must be non-secret: they appear in Docker argv and may
-appear in build output. Credentials require a separate secret-delivery mechanism;
-never put them in these fields. Buildx has a 30-minute wall-clock deadline and
-probes have a 60-second deadline. Timed-out probes are explicitly removed because
-terminating the Docker CLI alone does not terminate the container. Probes use the
-reservation's CPU count, a 512 MiB memory limit, and a 128-process limit. Disk
-reservation remains a planning floor; portable Docker disk quotas are not implied.
-
-Resource failure reasons are capped at 2,048 characters; full output remains in the
-Artifact. Classification uses the final non-empty diagnostic line, recognises
-explicit HTTP rate-limit errors, and treats a recipe process's own exit as
-deterministic. Trailing BuildKit output can make that short status less informative;
-consult the full Artifact for the preceding error summary. A `RUN` step reporting
-`exit code: 137` with an outer Docker exit of 1 remains a deterministic recipe
-failure under this policy: identical inputs are not automatically retried. An outer
-Docker exit of 137 or a runner deadline is transient. Recipe OOM remediation
-requires changing the recipe or builder capacity rather than expecting a retry.
-Source hashes stream file contents on the blocking pool. VCS acquisition uses
-`git archive` into `context/`; its bare object cache, archive file, and completion
-marker are sibling entries outside the hashed Docker context.
-
-Build logs are shared by executions rather than owned by one convoy. Their empty
-`convoy` field deliberately excludes them from convoy-specific lists; unfiltered
-artifact listing and expiry/pinning-based retention still apply. Recovery preserves
-the first immutable execution log and emits a debug diagnostic for that reuse.
-
-## Availability and distribution
-
-Hosts publish full local image IDs and known registry manifest digests under
-Host.status.capabilities.image_digests as a map from provider instance identity
-to digest sets. Inventories are observations, refreshed every 30 seconds
-independently of asynchronous publication; placement still requires host readiness.
-Completed ImageBuild.status.availability.caches records host-plus-provider-instance
-pairs holding its exact local ID and an optional repository@manifest-digest
-publication. Availability may change after execution completes; identity, inputs,
-verification and build-log evidence remain immutable. Registration removes retired
-cache identities at startup, including on hosts with no remaining cache, and each
-refresh prunes inventory keys against the registered instances.
-
-A fleet can opt into a shared cache on its singleton FleetDesignation:
-
-~~~yaml
-spec:
-  project: fleet
-  image_cache:
-    repository: registry.example/fleet/crew-images
-    pull_credential: image-cache-pull
-    push_credential: image-cache-push
-~~~
-
-Each referenced CredentialSpec uses the docker-registry adapter and an
-operator-staged material source. Host permissions are separate from work grants:
+Crews never receive the push credential, the pull credential or a build secret.
+Host-action grants never match work. For example, this grant lets every host
+hold the build secret `npm-token`:
 
 ~~~yaml
 spec:
   selector:
     host_action:
-      action: image-push
-      hosts: [builder-host-resource-name]
-  credentials: [image-cache-push]
+      action: image-build-secret
+      hosts: []
+  credentials: [npm-token]
 ~~~
 
-Use image-pull for vessel hosts (and builders which consume remote parents).
-An empty hosts set selects all eligible hosts; push additionally requires an
-explicit, positive Host.spec.image_build_capacity declaration. A host-action
-selector cannot contain work selectors or landing credentials and never matches
-a crew, even when its work selectors would otherwise be empty. Work grants remain
-the only way to deliver registry material to a crew.
+## Inventory
 
-Builders publish through a temporary digest-derived tag, retaining only the
-registry's reported manifest digest as availability. Pulls use that manifest
-digest, then inspect both the registry digest and local image ID. Missing grants,
-missing publication, or mismatched IDs leave the Environment in Provisioning with
-the reason. No older image or tag substitutes for the requested execution.
-
-Without a held digest or a declared registry cache, a non-builder host remains
-in Provisioning with a visible reason: the requested digest is not held and no
-fleet registry cache is declared (#2272 ruling 6). A registry-less single-host
-installation still builds locally and provisions from its held image ID.
-Registry-less multi-host byte transfer is deferred to
-[#2850](https://github.com/flotilla-org/flotilla/issues/2850): a dedicated Tender
-raw-stream exposure between directly reachable peers, served separately from
-resource replication, with no relay routing.
-
-Placement prefers an exact held digest, then a published registry digest, then
-build cost, after host liveness. Completed pinned stages can be reused
-across hosts; unpinned inputs never claim a shared recipe. A builder must hold or pull a verified
-shared parent before building the next stage; missing availability waits visibly. Environment and Vessel status pin
-the realised local ID and, when pulled, the registry digest; the admitted layer
-revisions remain frozen.
-
-FleetDesignation and CredentialGrant are authored by fleet-ops/project-map;
-Host inventory and ImageBuild availability are daemon-authored. The new fields
-are optional with previous-generation decoder defaults. Existing external
-manifests remain valid; opting into the cache requires authoring the binding,
-registry declarations and host grants together. No workflow or CI registry
-credential is required.
-
-### Registry operations and failure handling
-
-Registry pulls and pushes use private per-operation Docker configs, removed on
-success, failure, or cancellation. Every delivered local ID is inspected; registry
-pulls additionally verify the published manifest digest. Failed publication and
-delivery attempts cool down for five minutes before retrying; restart clears
-that in-memory cooldown. Refresh failures are isolated per build. The
-administrative daemon socket remains owner-only (0600).
-
-Host inventory deliberately includes all held local image IDs and registry
-manifest digests in one set; placement compares each against its corresponding
-identity field. It is not capped, since silently omitting a held digest changes
-placement costs. Large stores therefore increase Host replication payloads;
-a future partitioned inventory can address that without hiding availability.
-
-## Prelude verification
-
-Provides verification sources image preludes before executing the declared argv.
-The runner overrides ENTRYPOINT with `sh`, passes argv positionally, and sources
-`/etc/flotilla/prelude.d/*` in lexical order inside a subshell shared with the
-probe, preserving the caller's EXIT trap. Prelude failures and probe mismatches
-fail the build with their output retained in its Artifact. The shared runner's
-contents also participate in input hashes; changes invalidate verification keys.
-See [crew image acceptance](../crew-image.md#composed-spine-and-display-acceptance)
-for the display layer and the operator's Docker-host acceptance command.
+Hosts publish their local image inventory under
+`Host.status.capabilities.image_digests`, per provider instance. Placement uses
+it as an acquisition-cost hint: a held digest costs nothing to start. Startup
+prunes inventories of unregistered cache instances.
