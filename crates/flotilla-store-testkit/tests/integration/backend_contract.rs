@@ -358,7 +358,11 @@ async fn duplicate_collection_values(#[case] adapter: &str) {
     let (backend, _server) =
         if let Some(path) = &path { (ResourceBackend::new(SqliteBackend::open(path).unwrap()), None) } else { backend(adapter).await };
     let resolver = backend.using::<Convoy>("flotilla");
-    let created = resolver.create(&ConvoyFixture::meta("duplicates"), &ConvoyFixture::spec()).await.unwrap();
+    let mut meta = ConvoyFixture::meta("duplicates");
+    meta.labels.insert("index-contract".into(), "same".into());
+    let owner = OwnerReference { api_version: "flotilla.work/v1".into(), kind: "Project".into(), name: "owner".into(), controller: false };
+    meta.owner_references = vec![owner.clone(), OwnerReference { controller: true, ..owner.clone() }, owner];
+    let created = resolver.create(&meta, &ConvoyFixture::spec()).await.expect("domain-accepted duplicate owners apply locally");
     let subject = flotilla_protocol::Subject {
         kind: flotilla_protocol::SubjectKind::ChangeRequest,
         source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
@@ -368,6 +372,12 @@ async fn duplicate_collection_values(#[case] adapter: &str) {
     status.discover_subject(
         subject.clone(),
         flotilla_protocol::Relationship::Produces,
+        SubjectDiscoverySource::Operator,
+        chrono::Utc::now(),
+    );
+    status.discover_subject(
+        subject.clone(),
+        flotilla_protocol::Relationship::Supersedes,
         SubjectDiscoverySource::Operator,
         chrono::Utc::now(),
     );
@@ -389,8 +399,22 @@ async fn duplicate_collection_values(#[case] adapter: &str) {
         // Simulate an older/unconfigured writer leaving projections empty while
         // duplicate subjects are already durable. Open must rebuild both sides.
         let raw = rusqlite::Connection::open(path).unwrap();
-        for table in ["resource_objects_Convoy_status_subjects___subject_values", "replica_objects_Convoy_status_subjects___subject_values"]
-        {
+        // Legacy/external JSON can repeat a label key. The domain decoder takes
+        // its last value; rebuilding the lookup must accept the same body.
+        for table in ["resource_objects", "replica_objects"] {
+            let body: String =
+                raw.query_row(&format!("SELECT body_json FROM {table} WHERE name='duplicates'"), [], |row| row.get(0)).unwrap();
+            let body = body.replace("\"index-contract\":\"same\"", "\"index-contract\":\"old\",\"index-contract\":\"same\"");
+            raw.execute(&format!("UPDATE {table} SET body_json=?1 WHERE name='duplicates'"), [body]).unwrap();
+        }
+        for table in [
+            "resource_objects_Convoy_status_subjects___subject_values",
+            "replica_objects_Convoy_status_subjects___subject_values",
+            "resource_objects_labels",
+            "resource_objects_owners",
+            "replica_objects_labels",
+            "replica_objects_owners",
+        ] {
             raw.execute(&format!("DELETE FROM {table}"), []).unwrap();
         }
         drop(raw);
@@ -403,7 +427,19 @@ async fn duplicate_collection_values(#[case] adapter: &str) {
             .query_declared::<Convoy>(
                 namespace,
                 &StoreQuery {
-                    fields: BTreeMap::from([("status.subjects.*.subject".into(), serde_json::to_value(&subject).unwrap().to_string())]),
+                    fields: BTreeMap::from([
+                        ("status.subjects.*.subject".into(), serde_json::to_value(&subject).unwrap().to_string()),
+                        (
+                            "status.phase".into(),
+                            serde_json::to_value(updated.status.as_ref().unwrap().phase).unwrap().as_str().unwrap().into(),
+                        ),
+                    ]),
+                    labels: BTreeMap::from([("index-contract".into(), "same".into())]),
+                    owner: Some(flotilla_store::OwnerQuery {
+                        api_version: "flotilla.work/v1".into(),
+                        kind: "Project".into(),
+                        name: "owner".into(),
+                    }),
                     include_replicas: true,
                     ..Default::default()
                 },
@@ -411,7 +447,12 @@ async fn duplicate_collection_values(#[case] adapter: &str) {
             .await
             .unwrap();
         assert_eq!(result.items.len(), 1, "membership returns the convoy once");
-        assert_eq!(result.items[0].object.status.as_ref().unwrap().subjects.len(), 2, "stored list remains unchanged");
+        assert_eq!(
+            &result.items[0].object.status.as_ref().unwrap().subjects,
+            &updated.status.as_ref().unwrap().subjects,
+            "relationship history remains unchanged"
+        );
+        assert_eq!(result.items[0].object.metadata.owner_references.len(), 3, "owner-reference bodies are unchanged");
     }
 }
 

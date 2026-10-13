@@ -791,36 +791,53 @@ impl SqliteBackend {
             let done: bool = tx
                 .query_row("SELECT EXISTS(SELECT 1 FROM resource_store_migrations WHERE name=?1)", [migration], |r| r.get(0))
                 .map_err(|e| Self::map_sqlite(e, "inspect query migration"))?;
-            if done {
-                continue;
-            }
             let labels = format!("{table}_labels");
             let owners = format!("{table}_owners");
             let identity = "group_name,version,kind,namespace,name,origin";
+            if !done {
+                tx.execute_batch(&format!("
+                    CREATE TABLE {labels} (group_name TEXT, version TEXT, kind TEXT, namespace TEXT, name TEXT, origin TEXT, key TEXT, value TEXT, PRIMARY KEY ({identity},key));
+                    CREATE INDEX {labels}_lookup ON {labels} (group_name,version,kind,namespace,key,value,name,origin);
+                    CREATE TABLE {owners} (group_name TEXT, version TEXT, kind TEXT, namespace TEXT, name TEXT, origin TEXT, owner_key TEXT, PRIMARY KEY ({identity},owner_key));
+                    CREATE INDEX {owners}_lookup ON {owners} (group_name,version,kind,namespace,owner_key,name,origin);
+                ")).map_err(|e| Self::map_sqlite(e, "create metadata query indexes"))?;
+                tx.execute("INSERT INTO resource_store_migrations(name) VALUES (?1)", [migration])
+                    .map_err(|e| Self::map_sqlite(e, "record query migration"))?;
+            }
             let new_origin: String = if origin == "''" { "''".into() } else { format!("NEW.{origin}") };
             let old_origin: String = if origin == "''" { "''".into() } else { format!("OLD.{origin}") };
             let delete_identity = format!("group_name=OLD.group_name AND version=OLD.version AND kind=OLD.kind AND namespace=OLD.namespace AND name=OLD.name AND origin={old_origin}");
             let new_identity = format!("NEW.group_name,NEW.version,NEW.kind,NEW.namespace,NEW.name,{new_origin}");
+            let body = "CASE WHEN json_valid(NEW.body_json) THEN NEW.body_json ELSE '{}' END";
+            // Labels decode as a map: if legacy JSON repeats a key, its last
+            // value wins. SQLite's single max aggregate selects that row's value.
+            let label_values = format!(
+                "SELECT key,value FROM (SELECT key,value,max(id) AS last_id FROM json_each({body},'$.metadata.labels') GROUP BY key)"
+            );
+            // Owner membership ignores controller flags. Deduplicate the projected
+            // key, not the body, before an outer UPSERT can override OR REPLACE.
+            let insert = format!("
+                INSERT INTO {labels} SELECT {new_identity},key,value FROM ({label_values});
+                INSERT INTO {owners} SELECT DISTINCT {new_identity},json_array(json_extract(value,'$.apiVersion'),json_extract(value,'$.kind'),json_extract(value,'$.name')) FROM json_each({body},'$.metadata.ownerReferences');
+            ");
+            for action in ["insert", "update", "delete"] {
+                tx.execute_batch(&format!("DROP TRIGGER IF EXISTS {table}_query_{action};"))
+                    .map_err(|e| Self::map_sqlite(e, "replace metadata query trigger"))?;
+            }
             tx.execute_batch(&format!("
-                CREATE TABLE {labels} (group_name TEXT, version TEXT, kind TEXT, namespace TEXT, name TEXT, origin TEXT, key TEXT, value TEXT, PRIMARY KEY ({identity},key));
-                CREATE INDEX {labels}_lookup ON {labels} (group_name,version,kind,namespace,key,value,name,origin);
-                CREATE TABLE {owners} (group_name TEXT, version TEXT, kind TEXT, namespace TEXT, name TEXT, origin TEXT, owner_key TEXT, PRIMARY KEY ({identity},owner_key));
-                CREATE INDEX {owners}_lookup ON {owners} (group_name,version,kind,namespace,owner_key,name,origin);
-                CREATE TRIGGER {table}_query_insert AFTER INSERT ON {table} BEGIN
-                    INSERT OR REPLACE INTO {labels} SELECT {new_identity},key,value FROM json_each(CASE WHEN json_valid(NEW.body_json) THEN NEW.body_json ELSE '{{}}' END,'$.metadata.labels');
-                    INSERT OR REPLACE INTO {owners} SELECT {new_identity},json_array(json_extract(value,'$.apiVersion'),json_extract(value,'$.kind'),json_extract(value,'$.name')) FROM json_each(CASE WHEN json_valid(NEW.body_json) THEN NEW.body_json ELSE '{{}}' END,'$.metadata.ownerReferences');
-                END;
+                CREATE TRIGGER {table}_query_insert AFTER INSERT ON {table} BEGIN {insert} END;
                 CREATE TRIGGER {table}_query_update AFTER UPDATE ON {table} BEGIN
-                    DELETE FROM {labels} WHERE {delete_identity}; DELETE FROM {owners} WHERE {delete_identity};
-                    INSERT OR REPLACE INTO {labels} SELECT {new_identity},key,value FROM json_each(CASE WHEN json_valid(NEW.body_json) THEN NEW.body_json ELSE '{{}}' END,'$.metadata.labels');
-                    INSERT OR REPLACE INTO {owners} SELECT {new_identity},json_array(json_extract(value,'$.apiVersion'),json_extract(value,'$.kind'),json_extract(value,'$.name')) FROM json_each(CASE WHEN json_valid(NEW.body_json) THEN NEW.body_json ELSE '{{}}' END,'$.metadata.ownerReferences');
+                    DELETE FROM {labels} WHERE {delete_identity}; DELETE FROM {owners} WHERE {delete_identity}; {insert}
                 END;
                 CREATE TRIGGER {table}_query_delete AFTER DELETE ON {table} BEGIN DELETE FROM {labels} WHERE {delete_identity}; DELETE FROM {owners} WHERE {delete_identity}; END;
-                INSERT OR REPLACE INTO {labels} SELECT o.group_name,o.version,o.kind,o.namespace,o.name,{origin},j.key,j.value FROM {table} o,json_each(CASE WHEN json_valid(o.body_json) THEN o.body_json ELSE '{{}}' END,'$.metadata.labels') j WHERE json_valid(o.body_json);
-                INSERT OR REPLACE INTO {owners} SELECT o.group_name,o.version,o.kind,o.namespace,o.name,{origin},json_array(json_extract(j.value,'$.apiVersion'),json_extract(j.value,'$.kind'),json_extract(j.value,'$.name')) FROM {table} o,json_each(CASE WHEN json_valid(o.body_json) THEN o.body_json ELSE '{{}}' END,'$.metadata.ownerReferences') j WHERE json_valid(o.body_json);
-            ")).map_err(|e| Self::map_sqlite(e, "create and backfill query indexes"))?;
-            tx.execute("INSERT INTO resource_store_migrations(name) VALUES (?1)", [migration])
-                .map_err(|e| Self::map_sqlite(e, "record query migration"))?;
+                DELETE FROM {labels}; DELETE FROM {owners};
+                INSERT INTO {labels} SELECT group_name,version,kind,namespace,name,origin,key,value FROM (
+                    SELECT o.group_name,o.version,o.kind,o.namespace,o.name,{origin} AS origin,j.key,j.value,max(j.id) AS last_id
+                    FROM {table} o,json_each(CASE WHEN json_valid(o.body_json) THEN o.body_json ELSE '{{}}' END,'$.metadata.labels') j
+                    GROUP BY o.group_name,o.version,o.kind,o.namespace,o.name,{origin},j.key
+                );
+                INSERT INTO {owners} SELECT DISTINCT o.group_name,o.version,o.kind,o.namespace,o.name,{origin},json_array(json_extract(j.value,'$.apiVersion'),json_extract(j.value,'$.kind'),json_extract(j.value,'$.name')) FROM {table} o,json_each(CASE WHEN json_valid(o.body_json) THEN o.body_json ELSE '{{}}' END,'$.metadata.ownerReferences') j;
+            ")).map_err(|e| Self::map_sqlite(e, "install and repair metadata query indexes"))?;
         }
         // Pre-release query schemas used persistent function-dependent objects.
         // Remove those automatically before installing connection-local triggers.
