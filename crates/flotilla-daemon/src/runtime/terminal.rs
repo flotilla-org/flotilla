@@ -485,8 +485,6 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 (flotilla_agent::process::monitored_command(&plan.command, &crew.id), env, Some(crew))
             }
         };
-        env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
-
         let is_agent_session = matches!(spec.source, TerminalSessionSource::Agent { .. });
         let host_ref = if spec.env_ref == self.state.host_direct_environment_name {
             Some(self.state.local_host_ref.as_str())
