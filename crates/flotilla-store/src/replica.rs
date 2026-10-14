@@ -20,3 +20,13 @@ pub enum StoredReplicaEventKind {
     Modified,
     Deleted,
 }
+
+/// A retained replica deletion, ordered by its origin's sync timestamp rather
+/// than an authoritative log position. Relay snapshots must include these
+/// fences so late subscribers cannot keep or resurrect an older live record.
+#[derive(Debug, Clone)]
+pub struct ReplicaDeletion {
+    pub origin_root: NodeId,
+    pub name: String,
+    pub last_synced_at: DateTime<Utc>,
+}

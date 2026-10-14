@@ -710,3 +710,92 @@ async fn admission_placement_is_published_with_convoy(#[case] adapter: &str) {
     let updated = convoys.update(&changed_meta, &created.metadata.resource_version, &spec).await.expect("metadata update");
     assert_eq!(updated.status, created.status);
 }
+
+// ADR 0016: a peer joining after a deletion must learn the retained deletion
+// fence, including after a complete snapshot removed the last live replica.
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[case("sqlite-reopened")]
+#[tokio::test]
+async fn late_relay_watch_includes_retained_deletions(#[case] adapter: &str, #[values("object", "name", "snapshot")] deletion: &str) {
+    let temp = tempfile::tempdir().expect("create relay test directory");
+    let path = temp.path().join("relay.sqlite");
+    let (backend, _server) = if adapter == "sqlite-reopened" {
+        (ResourceBackend::new(SqliteBackend::open(&path).expect("open persistent relay store")), None)
+    } else {
+        backend(adapter).await
+    };
+    let origin = flotilla_protocol::NodeId::new("origin");
+    let source = ResourceBackend::new(InMemoryBackend::default());
+    let object = source
+        .using::<Convoy>("flotilla")
+        .create(&ConvoyFixture::meta("gone"), &ConvoyFixture::spec())
+        .await
+        .expect("create source record");
+    let at = chrono::Utc::now();
+    let writer = backend.replica_writer::<Convoy>(origin.clone(), "flotilla");
+    writer.apply(WatchEvent::Added(object.clone()), at - chrono::Duration::seconds(1)).await.expect("seed stale replica");
+    if deletion == "snapshot" {
+        writer
+            .replace(&ResourceList { items: vec![], resource_version: "2".into(), generation: None }, at)
+            .await
+            .expect("apply empty authority snapshot");
+    } else if deletion == "name" {
+        writer
+            .apply(
+                WatchEvent::DeletedByName(ResourceTombstone {
+                    name: "gone".into(),
+                    namespace: "flotilla".into(),
+                    resource_version: "2".into(),
+                    annotations: BTreeMap::new(),
+                }),
+                at,
+            )
+            .await
+            .expect("apply name-only deletion");
+    } else {
+        writer.apply(WatchEvent::Deleted(object), at).await.expect("apply object deletion");
+    }
+    // Fences in another namespace must not leak into this relay.
+    backend
+        .replica_writer::<Convoy>(origin.clone(), "other")
+        .apply(
+            WatchEvent::DeletedByName(ResourceTombstone {
+                name: "other-only".into(),
+                namespace: "other".into(),
+                resource_version: "2".into(),
+                annotations: BTreeMap::new(),
+            }),
+            at,
+        )
+        .await
+        .expect("seed unrelated namespace deletion");
+    drop(writer);
+    let backend = if adapter == "sqlite-reopened" {
+        drop(backend);
+        ResourceBackend::new(SqliteBackend::open(&path).expect("reopen relay store"))
+    } else {
+        backend
+    };
+    let writer = backend.replica_writer::<Convoy>(origin.clone(), "flotilla");
+    let watch =
+        flotilla_store::watch_resource_kind_replica_sources(&backend, "flotilla", "convoys").await.expect("watch late relay snapshot");
+    assert_eq!(watch.initial.len(), 1, "late subscribers receive the retained deletion");
+    let event = &watch.initial[0];
+    assert_eq!(event["type"], "DELETED");
+    assert_eq!(event["object"]["metadata"]["name"], "gone");
+    assert_eq!(event["object"]["metadata"]["annotations"]["flotilla.work/origin-root"], origin.to_string());
+    assert_eq!(event["object"]["metadata"]["annotations"]["flotilla.work/last-synced-at"], at.to_rfc3339());
+    assert!(
+        backend.including_replicas::<Convoy>("flotilla").list().await.expect("list live replica rows").items.is_empty(),
+        "deletion fences are not live rows"
+    );
+    // A subsequent recreation supersedes the fence in the next relay snapshot.
+    let object = source.using::<Convoy>("flotilla").get("gone").await.expect("read source fixture");
+    writer.apply(WatchEvent::Added(object), at + chrono::Duration::seconds(1)).await.expect("recreate replica after deletion");
+    let watch =
+        flotilla_store::watch_resource_kind_replica_sources(&backend, "flotilla", "convoys").await.expect("watch recreated replica");
+    assert_eq!(watch.initial.len(), 1);
+    assert_eq!(watch.initial[0]["type"], "ADDED");
+}

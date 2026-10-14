@@ -79,6 +79,8 @@ type WatchersByStore = HashMap<StoreKey, WatchChannel<StoredEvent>>;
 type ReplicaWatchersByStore = HashMap<StoreKey, WatchChannel<StoredReplicaEvent>>;
 type CleanupKey = (StoreKey, &'static str);
 
+const REPLICA_DELETIONS_SELECT_SQL: &str = "SELECT origin_root, name, last_synced_at FROM replica_tombstones WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 ORDER BY origin_root, name";
+
 const READER_COUNT: usize = 4;
 const READ_DEADLINE: Duration = Duration::from_secs(2);
 const READ_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
@@ -682,6 +684,9 @@ impl SqliteBackend {
                     last_synced_at TEXT NOT NULL,
                     PRIMARY KEY (origin_root, group_name, version, kind, namespace, name)
                 );
+
+                CREATE INDEX IF NOT EXISTS replica_tombstones_relay_snapshot
+                    ON replica_tombstones (group_name, version, kind, namespace, origin_root, name, last_synced_at);
 
                 CREATE TABLE IF NOT EXISTS resource_tombstones (
                     group_name TEXT NOT NULL,
@@ -3553,6 +3558,32 @@ impl Store for SqliteBackend {
     ) -> Result<(), ResourceError> {
         SqliteBackend::apply_replica_raw(self, resource_kind, origin_root, namespace, kind, object, synced_at).await
     }
+    async fn list_replica_deletions_raw(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+    ) -> Result<Vec<crate::replica::ReplicaDeletion>, ResourceError> {
+        let key = Self::store_key(resource_kind, namespace);
+        self.read_call("list replica deletions", move |connection| {
+            let mut statement = connection
+                .prepare_cached(REPLICA_DELETIONS_SELECT_SQL)
+                .map_err(|error| Self::map_sqlite(error, "prepare replica deletions"))?;
+            let rows = statement
+                .query_map(params![key.0, key.1, key.2, key.3], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })
+                .map_err(|error| Self::map_sqlite(error, "query replica deletions"))?;
+            rows.map(|row| {
+                let (origin, name, synced_at) = row.map_err(|error| Self::map_sqlite(error, "read replica deletion"))?;
+                let last_synced_at = DateTime::parse_from_rfc3339(&synced_at)
+                    .map_err(|error| ResourceError::decode(format!("decode replica deletion timestamp: {error}")))?
+                    .with_timezone(&Utc);
+                Ok(crate::replica::ReplicaDeletion { origin_root: NodeId::new(origin), name, last_synced_at })
+            })
+            .collect()
+        })
+        .await
+    }
     async fn apply_replica_tombstone_raw(
         &self,
         resource_kind: ResourceKind,
@@ -4572,6 +4603,30 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    // WORKLOAD.md: relay catch-up reads only the requested kind/namespace's
+    // deletion metadata. One case covers this SQL shape for all bound keys.
+    #[tokio::test]
+    async fn relay_deletion_snapshot_searches_covering_partition_index() {
+        let backend = SqliteBackend::open_in_memory().expect("open relay store");
+        let plans = backend
+            .read_call("explain relay deletion snapshot", |connection| {
+                let mut statement = connection
+                    .prepare(&format!("EXPLAIN QUERY PLAN {REPLICA_DELETIONS_SELECT_SQL}"))
+                    .map_err(|error| SqliteBackend::map_sqlite(error, "explain relay deletion snapshot"))?;
+                let rows = statement
+                    .query_map(params!["flotilla.work", "v1", "Convoy", "flotilla"], |row| row.get::<_, String>(3))
+                    .map_err(|error| SqliteBackend::map_sqlite(error, "query relay deletion plan"))?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(|error| SqliteBackend::map_sqlite(error, "read relay deletion plan"))
+            })
+            .await
+            .expect("relay deletion query plan");
+        assert!(
+            plans.iter().any(|plan| plan.contains("SEARCH replica_tombstones USING COVERING INDEX replica_tombstones_relay_snapshot")),
+            "{plans:?}"
+        );
+        assert!(!plans.iter().any(|plan| plan.contains("USE TEMP B-TREE")), "partition index also supplies relay ordering: {plans:?}");
     }
 
     #[tokio::test]

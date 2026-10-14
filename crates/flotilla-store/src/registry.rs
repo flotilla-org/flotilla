@@ -1364,13 +1364,29 @@ async fn watch_typed_replica_sources<T: Resource>(
 ) -> Result<DynamicResourceWatch, ResourceError> {
     let resolver = backend.including_replicas::<T>(namespace);
     let stream = resolver.watch_sources().await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
-    let initial = resolver
+    let mut initial = resolver
         .list_sources()
         .await?
         .items
         .iter()
         .map(|object| Ok(json!({"type": "ADDED", "object": read_object_value(object)?})))
         .collect::<Result<Vec<_>, ResourceError>>()?;
+    // Subscribe before reading both live rows and deletion fences. Events that
+    // race either read are replayed afterwards with their original sync stamp.
+    for deleted in backend.list_replica_deletions_raw(crate::ResourceKind::of::<T>(), namespace).await? {
+        let event = ReadWatchEvent::<T>::DeletedByName {
+            tombstone: crate::ResourceTombstone {
+                name: deleted.name,
+                namespace: namespace.to_string(),
+                // A relay fence proves no origin log position. Relay apply is
+                // ordered by last-synced-at and never advances the direct cursor.
+                resource_version: "overlay".to_string(),
+                annotations: Default::default(),
+            },
+            provenance: ResourceProvenance::Replica { origin_root: deleted.origin_root, last_synced_at: deleted.last_synced_at },
+        };
+        initial.push(read_watch_event_value(&event)?);
+    }
     Ok(DynamicResourceWatch {
         kind: T::API_PATHS.kind.to_string(),
         plural: T::API_PATHS.plural.to_string(),
