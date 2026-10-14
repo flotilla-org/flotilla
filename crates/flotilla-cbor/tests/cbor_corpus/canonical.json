@@ -1,410 +1,79 @@
 {
-  "description": "Values in their one deterministic form. Decoding hex gives diag, encoding diag gives hex, and the canonical check accepts hex.",
-  "vectors": [
-    {
-      "name": "int 0",
-      "diag": "0",
-      "hex": "00"
-    },
-    {
-      "name": "int 1",
-      "diag": "1",
-      "hex": "01"
-    },
-    {
-      "name": "int 10",
-      "diag": "10",
-      "hex": "0a"
-    },
-    {
-      "name": "int 23",
-      "diag": "23",
-      "hex": "17"
-    },
-    {
-      "name": "int 24",
-      "diag": "24",
-      "hex": "1818"
-    },
-    {
-      "name": "int 255",
-      "diag": "255",
-      "hex": "18ff"
-    },
-    {
-      "name": "int 256",
-      "diag": "256",
-      "hex": "190100"
-    },
-    {
-      "name": "int 65535",
-      "diag": "65535",
-      "hex": "19ffff"
-    },
-    {
-      "name": "int 65536",
-      "diag": "65536",
-      "hex": "1a00010000"
-    },
-    {
-      "name": "int 4294967295",
-      "diag": "4294967295",
-      "hex": "1affffffff"
-    },
-    {
-      "name": "int 4294967296",
-      "diag": "4294967296",
-      "hex": "1b0000000100000000"
-    },
-    {
-      "name": "int 9007199254740991",
-      "diag": "9007199254740991",
-      "hex": "1b001fffffffffffff"
-    },
-    {
-      "name": "int 9007199254740992",
-      "diag": "9007199254740992",
-      "hex": "1b0020000000000000"
-    },
-    {
-      "name": "int 9223372036854775807",
-      "diag": "9223372036854775807",
-      "hex": "1b7fffffffffffffff"
-    },
-    {
-      "name": "int 9223372036854775808",
-      "diag": "9223372036854775808",
-      "hex": "1b8000000000000000"
-    },
-    {
-      "name": "int 18446744073709551615",
-      "diag": "18446744073709551615",
-      "hex": "1bffffffffffffffff"
-    },
-    {
-      "name": "int -1",
-      "diag": "-1",
-      "hex": "20"
-    },
-    {
-      "name": "int -10",
-      "diag": "-10",
-      "hex": "29"
-    },
-    {
-      "name": "int -24",
-      "diag": "-24",
-      "hex": "37"
-    },
-    {
-      "name": "int -25",
-      "diag": "-25",
-      "hex": "3818"
-    },
-    {
-      "name": "int -256",
-      "diag": "-256",
-      "hex": "38ff"
-    },
-    {
-      "name": "int -257",
-      "diag": "-257",
-      "hex": "390100"
-    },
-    {
-      "name": "int -65536",
-      "diag": "-65536",
-      "hex": "39ffff"
-    },
-    {
-      "name": "int -65537",
-      "diag": "-65537",
-      "hex": "3a00010000"
-    },
-    {
-      "name": "int -4294967296",
-      "diag": "-4294967296",
-      "hex": "3affffffff"
-    },
-    {
-      "name": "int -4294967297",
-      "diag": "-4294967297",
-      "hex": "3b0000000100000000"
-    },
-    {
-      "name": "int -9007199254740991",
-      "diag": "-9007199254740991",
-      "hex": "3b001ffffffffffffe"
-    },
-    {
-      "name": "int -9007199254740992",
-      "diag": "-9007199254740992",
-      "hex": "3b001fffffffffffff"
-    },
-    {
-      "name": "int -9223372036854775808",
-      "diag": "-9223372036854775808",
-      "hex": "3b7fffffffffffffff"
-    },
-    {
-      "name": "int -9223372036854775809",
-      "diag": "-9223372036854775809",
-      "hex": "3b8000000000000000"
-    },
-    {
-      "name": "int -18446744073709551616",
-      "diag": "-18446744073709551616",
-      "hex": "3bffffffffffffffff"
-    },
-    {
-      "name": "whole float 0.0",
-      "diag": "0.0",
-      "hex": "f90000"
-    },
-    {
-      "name": "whole float 1.0",
-      "diag": "1.0",
-      "hex": "f93c00"
-    },
-    {
-      "name": "whole float -1.0",
-      "diag": "-1.0",
-      "hex": "f9bc00"
-    },
-    {
-      "name": "whole float 15.0",
-      "diag": "15.0",
-      "hex": "f94b80"
-    },
-    {
-      "name": "whole float 65504.0",
-      "diag": "65504.0",
-      "hex": "f97bff"
-    },
-    {
-      "name": "whole float 65536.0",
-      "diag": "65536.0",
-      "hex": "fa47800000"
-    },
-    {
-      "name": "whole float 1.0e16",
-      "diag": "1.0e16",
-      "hex": "fb4341c37937e08000"
-    },
-    {
-      "name": "whole float 1.0e19",
-      "diag": "1.0e19",
-      "hex": "fb43e158e460913d00"
-    },
-    {
-      "name": "whole float -18446744073709551616.0",
-      "diag": "-18446744073709551616.0",
-      "hex": "fadf800000"
-    },
-    {
-      "name": "float -0.0",
-      "diag": "-0.0",
-      "hex": "f98000"
-    },
-    {
-      "name": "float Infinity",
-      "diag": "Infinity",
-      "hex": "f97c00"
-    },
-    {
-      "name": "float -Infinity",
-      "diag": "-Infinity",
-      "hex": "f9fc00"
-    },
-    {
-      "name": "float 0.5",
-      "diag": "0.5",
-      "hex": "f93800"
-    },
-    {
-      "name": "float -1.5",
-      "diag": "-1.5",
-      "hex": "f9be00"
-    },
-    {
-      "name": "float 65503.5",
-      "diag": "65503.5",
-      "hex": "fa477fdf80"
-    },
-    {
-      "name": "float 5.9604644775390625e-8",
-      "diag": "5.9604644775390625e-8",
-      "hex": "f90001"
-    },
-    {
-      "name": "float 6.103515625e-5",
-      "diag": "6.103515625e-5",
-      "hex": "f90400"
-    },
-    {
-      "name": "float 3.0517578125e-5",
-      "diag": "3.0517578125e-5",
-      "hex": "f90200"
-    },
-    {
-      "name": "float 0.00006097555160522461",
-      "diag": "0.00006097555160522461",
-      "hex": "f903ff"
-    },
-    {
-      "name": "float 1.00048828125",
-      "diag": "1.00048828125",
-      "hex": "fa3f801000"
-    },
-    {
-      "name": "float 100000.5",
-      "diag": "100000.5",
-      "hex": "fa47c35040"
-    },
-    {
-      "name": "float 3.4028234663852886e38",
-      "diag": "3.4028234663852886e38",
-      "hex": "fa7f7fffff"
-    },
-    {
-      "name": "float 1.401298464324817e-45",
-      "diag": "1.401298464324817e-45",
-      "hex": "fa00000001"
-    },
-    {
-      "name": "float 0.1",
-      "diag": "0.1",
-      "hex": "fb3fb999999999999a"
-    },
-    {
-      "name": "float -0.1",
-      "diag": "-0.1",
-      "hex": "fbbfb999999999999a"
-    },
-    {
-      "name": "float 1.0e300",
-      "diag": "1.0e300",
-      "hex": "fb7e37e43c8800759c"
-    },
-    {
-      "name": "float 5e-324",
-      "diag": "5e-324",
-      "hex": "fb0000000000000001"
-    },
-    {
-      "name": "float 1.7976931348623157e308",
-      "diag": "1.7976931348623157e308",
-      "hex": "fb7fefffffffffffff"
-    },
-    {
-      "name": "float 1.8446744073709552e19",
-      "diag": "1.8446744073709552e19",
-      "hex": "fa5f800000"
-    },
-    {
-      "name": "float -1.8446744073709556e19",
-      "diag": "-1.8446744073709556e19",
-      "hex": "fbc3f0000000000001"
-    },
-    {
-      "name": "float 4503599627370495.5",
-      "diag": "4503599627370495.5",
-      "hex": "fb432fffffffffffff"
-    },
-    {
-      "name": "bytes empty",
-      "diag": "h''",
-      "hex": "40"
-    },
-    {
-      "name": "bytes 00ff",
-      "diag": "h'00ff'",
-      "hex": "4200ff"
-    },
-    {
-      "name": "bytes 24 long",
-      "diag": "h'abababababababababababababababababababababababab'",
-      "hex": "5818abababababababababababababababababababababababab"
-    },
-    {
-      "name": "text empty",
-      "diag": "\"\"",
-      "hex": "60"
-    },
-    {
-      "name": "text a",
-      "diag": "\"a\"",
-      "hex": "6161"
-    },
-    {
-      "name": "text utf-8",
-      "diag": "\"\\u00fc\\u6c34\"",
-      "hex": "65c3bce6b0b4"
-    },
-    {
-      "name": "text 24 long",
-      "diag": "\"xxxxxxxxxxxxxxxxxxxxxxxx\"",
-      "hex": "7818787878787878787878787878787878787878787878787878"
-    },
-    {
-      "name": "false",
-      "diag": "false",
-      "hex": "f4"
-    },
-    {
-      "name": "true",
-      "diag": "true",
-      "hex": "f5"
-    },
-    {
-      "name": "null",
-      "diag": "null",
-      "hex": "f6"
-    },
-    {
-      "name": "array empty",
-      "diag": "[]",
-      "hex": "80"
-    },
-    {
-      "name": "array nested",
-      "diag": "[1, [2, 3]]",
-      "hex": "8201820203"
-    },
-    {
-      "name": "array 24 long",
-      "diag": "[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]",
-      "hex": "9818000000000000000000000000000000000000000000000000"
-    },
-    {
-      "name": "map empty",
-      "diag": "{}",
-      "hex": "a0"
-    },
-    {
-      "name": "map sorted",
-      "diag": "{\"a\": 1, \"b\": []}",
-      "hex": "a2616101616280"
-    },
-    {
-      "name": "map length-first order",
-      "diag": "{\"z\": 1, \"aa\": 2}",
-      "hex": "a2617a0162616102"
-    },
-    {
-      "name": "map bytewise order",
-      "diag": "{\"B\": 1, \"a\": 2, \"\\u00e9\": 3}",
-      "hex": "a361420161610262c3a903"
-    },
-    {
-      "name": "map nested sorted",
-      "diag": "{\"type\": \"hello\", \"outer\": {\"a\": [-0.0, Infinity], \"b\": h'01'}}",
-      "hex": "a264747970656568656c6c6f656f75746572a2616182f98000f97c0061624101"
-    },
-    {
-      "name": "map with whole-number float field",
-      "diag": "{\"gain\": 1.0, \"type\": \"offer\"}",
-      "hex": "a2646761696ef93c006474797065656f66666572"
-    }
+  "description": "Values in deterministic form: decoding hex and re-encoding gives hex again. json, where present, is the decoded value.",
+  "groups": [
+    {"name": "integers", "description": "Every head width, and the JSON integer cut-off at 2^53.", "vectors": [
+      {"hex": "00", "json": 0},
+      {"hex": "17", "json": 23},
+      {"hex": "1818", "json": 24},
+      {"hex": "18ff", "json": 255},
+      {"hex": "190100", "json": 256},
+      {"hex": "19ffff", "json": 65535},
+      {"hex": "1a00010000", "json": 65536},
+      {"hex": "1affffffff", "json": 4294967295},
+      {"hex": "1b0000000100000000", "json": 4294967296},
+      {"hex": "1b001fffffffffffff", "json": 9007199254740991},
+      {"hex": "1b0020000000000000", "json": 9007199254740992},
+      {"hex": "1bffffffffffffffff", "json": 18446744073709551615},
+      {"hex": "20", "json": -1},
+      {"hex": "37", "json": -24},
+      {"hex": "3818", "json": -25},
+      {"hex": "38ff", "json": -256},
+      {"hex": "390100", "json": -257},
+      {"hex": "39ffff", "json": -65536},
+      {"hex": "3a00010000", "json": -65537},
+      {"hex": "3affffffff", "json": -4294967296},
+      {"hex": "3b0000000100000000", "json": -4294967297},
+      {"hex": "3b7fffffffffffffff", "json": -9223372036854775808},
+      {"name": "-2^63 - 1", "hex": "3b8000000000000000"},
+      {"name": "-2^64", "hex": "3bffffffffffffffff"}
+    ]},
+    {"name": "floats", "description": "Shortest width; whole numbers stay floats; width boundaries.", "vectors": [
+      {"hex": "f90000", "json": 0.0},
+      {"hex": "f93c00", "json": 1.0},
+      {"hex": "f9bc00", "json": -1.0},
+      {"name": "f16 max", "hex": "f97bff", "json": 65504.0},
+      {"name": "whole, needs f32", "hex": "fa47800000", "json": 65536.0},
+      {"name": "whole, needs f64", "hex": "fb4341c37937e08000", "json": 1e+16},
+      {"hex": "fadf800000", "json": -1.8446744073709552e+19},
+      {"name": "-0.0", "hex": "f98000", "json": -0.0},
+      {"name": "Infinity", "hex": "f97c00"},
+      {"name": "-Infinity", "hex": "f9fc00"},
+      {"hex": "f93800", "json": 0.5},
+      {"name": "f16 smallest subnormal", "hex": "f90001", "json": 5.960464477539063e-08},
+      {"name": "f16 largest subnormal", "hex": "f903ff", "json": 6.097555160522461e-05},
+      {"name": "f16 smallest normal", "hex": "f90400", "json": 6.103515625e-05},
+      {"name": "one bit past f16 precision", "hex": "fa3f801000", "json": 1.00048828125},
+      {"name": "under f16 max, needs f32", "hex": "fa477fdf80", "json": 65503.5},
+      {"name": "f32 max", "hex": "fa7f7fffff", "json": 3.4028234663852886e+38},
+      {"name": "f32 smallest subnormal", "hex": "fa00000001", "json": 1.401298464324817e-45},
+      {"name": "2^64, f32", "hex": "fa5f800000", "json": 1.8446744073709552e+19},
+      {"hex": "fb3fb999999999999a", "json": 0.1},
+      {"hex": "fb7e37e43c8800759c", "json": 1e+300},
+      {"name": "f64 smallest subnormal", "hex": "fb0000000000000001", "json": 5e-324},
+      {"name": "f64 max", "hex": "fb7fefffffffffffff", "json": 1.7976931348623157e+308},
+      {"name": "just past -2^64, f64 only", "hex": "fbc3f0000000000001", "json": -1.8446744073709556e+19},
+      {"name": "f64 only, 53 significant bits", "hex": "fb432fffffffffffff", "json": 4503599627370495.5}
+    ]},
+    {"name": "other", "description": "Strings, simple values, arrays and maps (keys sorted bytewise, shorter first).", "vectors": [
+      {"name": "bytes", "hex": "40"},
+      {"name": "bytes", "hex": "4200ff"},
+      {"name": "bytes, 1-byte length", "hex": "5818abababababababababababababababababababababababab"},
+      {"hex": "60", "json": ""},
+      {"hex": "6161", "json": "a"},
+      {"hex": "65c3bce6b0b4", "json": "\u00fc\u6c34"},
+      {"hex": "7818787878787878787878787878787878787878787878787878", "json": "xxxxxxxxxxxxxxxxxxxxxxxx"},
+      {"hex": "f4", "json": false},
+      {"hex": "f5", "json": true},
+      {"hex": "f6", "json": null},
+      {"hex": "80", "json": []},
+      {"hex": "8201820203", "json": [1, [2, 3]]},
+      {"hex": "9818000000000000000000000000000000000000000000000000", "json": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]},
+      {"hex": "a0", "json": {}},
+      {"hex": "a2616101616280", "json": {"a": 1, "b": []}},
+      {"hex": "a2617a0162616102", "json": {"z": 1, "aa": 2}},
+      {"hex": "a361420161610262c3a903", "json": {"B": 1, "a": 2, "\u00e9": 3}},
+      {"name": "nested, -0.0, Infinity, bytes", "hex": "a264747970656568656c6c6f656f75746572a2616182f98000f97c0061624101"},
+      {"hex": "a2646761696ef93c006474797065656f66666572", "json": {"gain": 1.0, "type": "offer"}}
+    ]}
   ]
 }

@@ -3,7 +3,7 @@
 //! prefixes and bootstrap fields, the first adopter.
 use std::io::{self, Read, Write};
 
-use crate::{decode_message, encode_message, Error, Limits, Message};
+use crate::{decode_message, encode_message, Error, ErrorKind, Limits, Message};
 
 pub const MAGIC_LEN: usize = 8;
 /// Magic plus length prefix.
@@ -25,11 +25,11 @@ impl Framing {
     /// so a caller can bound its allocation before reading the body.
     pub fn body_len(&self, header: &[u8; HEADER_LEN]) -> Result<usize, Error> {
         if header[..MAGIC_LEN] != self.magic {
-            return Err(Error::BadMagic);
+            return Err(ErrorKind::BadMagic.into());
         }
         let len = u32::from_be_bytes(header[MAGIC_LEN..].try_into().unwrap());
         if len as u64 > self.limits.max_message as u64 {
-            return Err(Error::MessageLimit { len: len.into(), limit: self.limits.max_message });
+            return Err(Error::detail(ErrorKind::MessageLimit, format!("{len}, limit {}", self.limits.max_message)));
         }
         Ok(len as usize)
     }
@@ -37,7 +37,7 @@ impl Framing {
     /// One complete frame.
     pub fn encode<M: Message>(&self, message: &M) -> Result<Vec<u8>, Error> {
         let body = encode_message(message, &self.limits)?;
-        let len = u32::try_from(body.len()).map_err(|_| Error::MessageLimit { len: body.len() as u64, limit: self.limits.max_message })?;
+        let len = u32::try_from(body.len()).map_err(|_| ErrorKind::MessageLimit)?;
         let mut frame = Vec::with_capacity(HEADER_LEN + body.len());
         frame.extend_from_slice(&self.magic);
         frame.extend_from_slice(&len.to_be_bytes());
@@ -47,14 +47,11 @@ impl Framing {
 
     /// Exactly one complete frame: nothing missing and nothing after it.
     pub fn decode<M: Message>(&self, frame: &[u8]) -> Result<M, Error> {
-        let header: &[u8; HEADER_LEN] = frame.get(..HEADER_LEN).ok_or(Error::Truncated)?.try_into().unwrap();
+        let header: &[u8; HEADER_LEN] = frame.get(..HEADER_LEN).ok_or(ErrorKind::Truncated)?.try_into().unwrap();
         let len = self.body_len(header)?;
         let body = &frame[HEADER_LEN..];
-        if body.len() < len {
-            return Err(Error::Truncated);
-        }
-        if body.len() > len {
-            return Err(Error::TrailingBytes);
+        if body.len() != len {
+            return Err(if body.len() < len { ErrorKind::Truncated } else { ErrorKind::TrailingBytes }.into());
         }
         decode_message(body, &self.limits)
     }
@@ -64,7 +61,7 @@ impl Framing {
     ///
     /// A stream that ends cleanly before the frame starts is an
     /// [`Error::Io`] of kind `UnexpectedEof`: the peer closed between frames.
-    /// A stream that ends inside the frame is [`Error::Truncated`], as in
+    /// A stream that ends inside the frame is [`ErrorKind::Truncated`], as in
     /// [`Self::decode`].
     pub fn read<M: Message, R: Read + ?Sized>(&self, reader: &mut R) -> Result<M, Error> {
         let mut header = [0; HEADER_LEN];
@@ -72,7 +69,7 @@ impl Framing {
         while filled < HEADER_LEN {
             match reader.read(&mut header[filled..]) {
                 Ok(0) if filled == 0 => return Err(Error::Io(io::ErrorKind::UnexpectedEof.into())),
-                Ok(0) => return Err(Error::Truncated),
+                Ok(0) => return Err(ErrorKind::Truncated.into()),
                 Ok(n) => filled += n,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(Error::Io(error)),
@@ -82,7 +79,7 @@ impl Framing {
         let mut body = Vec::new();
         reader.take(len as u64).read_to_end(&mut body)?;
         if body.len() < len {
-            return Err(Error::Truncated);
+            return Err(ErrorKind::Truncated.into());
         }
         decode_message(&body, &self.limits)
     }

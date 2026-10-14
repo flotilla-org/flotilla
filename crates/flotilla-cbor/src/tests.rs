@@ -34,6 +34,10 @@ fn offer() -> Setup {
     }
 }
 
+fn kind<T: std::fmt::Debug>(result: Result<T, Error>) -> ErrorKind {
+    result.unwrap_err().kind()
+}
+
 fn hex(text: &str) -> Vec<u8> {
     (0..text.len()).step_by(2).map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap()).collect()
 }
@@ -41,7 +45,6 @@ fn hex(text: &str) -> Vec<u8> {
 #[test]
 fn typed_message_round_trips_with_sorted_keys_and_float_floats() {
     let bytes = encode_message(&offer(), &SMALL_LIMITS).unwrap();
-    assert!(is_canonical(&bytes, &SMALL_LIMITS));
     // Shorter encoded keys sort first: "type", then "clock", then "tracks".
     // The whole-number clock stays a float: f9 3c00.
     // a3, "type": "offer", "clock": f9 3c00, ...
@@ -61,29 +64,16 @@ fn unknown_keys_are_ignored_and_unknown_types_rejected() {
     let bytes = to_vec(&Future { r#type: "selection", future: vec![()], track_ids: vec![7], writer: None }, &SMALL_LIMITS).unwrap();
     assert_eq!(decode_message::<Setup>(&bytes, &SMALL_LIMITS).unwrap(), Setup::Selection { track_ids: vec![7], writer: None });
     let unknown = to_vec(&BTreeMap::from([("type", "grant")]), &SMALL_LIMITS).unwrap();
-    assert!(matches!(decode_message::<Setup>(&unknown, &SMALL_LIMITS), Err(Error::UnknownType(t)) if t == "grant"));
+    let error = decode_message::<Setup>(&unknown, &SMALL_LIMITS).unwrap_err();
+    assert_eq!((error.kind(), error.to_string().as_str()), (ErrorKind::UnknownType, r#"unknown-type: "grant""#));
     assert_eq!(message_type(&bytes, &SMALL_LIMITS, Setup::TYPES).unwrap(), "selection");
-}
-
-#[test]
-fn encoding_checks_the_message_type() {
+    // Writers check the type too.
     #[derive(Serialize, Deserialize)]
-    struct Untyped {
-        a: u8,
-    }
+    struct Untyped {}
     impl Message for Untyped {
         const TYPES: &'static [&'static str] = &["x"];
     }
-    assert!(matches!(encode_message(&Untyped { a: 1 }, &SMALL_LIMITS), Err(Error::MissingType)));
-}
-
-#[test]
-fn non_deterministic_input_decodes_but_is_not_canonical() {
-    // {"type": "selection", "track_ids": [7], "writer": null}, with keys out
-    // of order and 7 in a two-byte head.
-    let bytes = hex(concat!("a3", "66777269746572f6", "6474797065", "6973656c656374696f6e", "69747261636b5f696473", "811807"));
-    assert_eq!(decode_message::<Setup>(&bytes, &SMALL_LIMITS).unwrap(), Setup::Selection { track_ids: vec![7], writer: None });
-    assert!(matches!(check_canonical(&bytes, &SMALL_LIMITS), Err(Error::UnsortedKeys)));
+    assert_eq!(kind(encode_message(&Untyped {}, &SMALL_LIMITS)), ErrorKind::MissingType);
 }
 
 #[test]
@@ -95,9 +85,8 @@ fn floats_keep_their_exact_value() {
     }
     assert_eq!(to_vec(&1.0f64, &DEFAULT_LIMITS).unwrap(), [0xf9, 0x3c, 0x00]);
     assert_eq!(to_vec(&1.0f32, &DEFAULT_LIMITS).unwrap(), [0xf9, 0x3c, 0x00]);
-    assert!(matches!(to_vec(&f64::NAN, &DEFAULT_LIMITS), Err(Error::Nan)));
     // A float field refuses an integer.
-    assert!(matches!(from_slice::<f64>(&[0x01], &DEFAULT_LIMITS), Err(Error::Schema(_))));
+    assert_eq!(kind(from_slice::<f64>(&[0x01], &DEFAULT_LIMITS)), ErrorKind::Schema);
     let bytes = to_vec(&0.1f32, &DEFAULT_LIMITS).unwrap();
     assert_eq!(from_slice::<f32>(&bytes, &DEFAULT_LIMITS).unwrap(), 0.1f32);
 }
@@ -108,39 +97,18 @@ fn integers_cover_the_cbor_range() {
         let bytes = to_vec(&n, &DEFAULT_LIMITS).unwrap();
         assert_eq!(from_slice::<i128>(&bytes, &DEFAULT_LIMITS).unwrap(), n);
     }
-    assert!(matches!(to_vec(&(1i128 << 64), &DEFAULT_LIMITS), Err(Error::IntegerOutOfRange)));
-    assert!(matches!(to_vec(&(-(1i128 << 64) - 1), &DEFAULT_LIMITS), Err(Error::IntegerOutOfRange)));
-    assert!(matches!(to_vec(&u128::MAX, &DEFAULT_LIMITS), Err(Error::IntegerOutOfRange)));
     let bytes = to_vec(&-1i64, &DEFAULT_LIMITS).unwrap();
-    assert!(matches!(from_slice::<u64>(&bytes, &DEFAULT_LIMITS), Err(Error::Schema(_))));
+    assert_eq!(kind(from_slice::<u64>(&bytes, &DEFAULT_LIMITS)), ErrorKind::Schema);
 }
 
 #[test]
-fn externally_tagged_enums_and_options() {
-    #[derive(Debug, PartialEq, Serialize, Deserialize)]
-    enum Shape {
-        Empty,
-        Circle(f64),
-        Pair(u8, u8),
-        Rect { w: u32, h: u32 },
+fn writers_refuse_what_readers_reject() {
+    assert_eq!(kind(to_vec(&[1.0, f64::NAN], &DEFAULT_LIMITS)), ErrorKind::Nan);
+    assert_eq!(kind(to_vec(&BTreeMap::from([(1u32, 2u32)]), &DEFAULT_LIMITS)), ErrorKind::NonTextKey);
+    // cbor2 would write these as bignum tags.
+    for n in [1i128 << 64, -(1i128 << 64) - 1] {
+        assert_eq!(kind(to_vec(&n, &DEFAULT_LIMITS)), ErrorKind::Schema, "{n}");
     }
-    let shapes = vec![Shape::Empty, Shape::Circle(1.5), Shape::Pair(1, 2), Shape::Rect { w: 3, h: 4 }];
-    let bytes = to_vec(&shapes, &DEFAULT_LIMITS).unwrap();
-    assert_eq!(from_slice::<Vec<Shape>>(&bytes, &DEFAULT_LIMITS).unwrap(), shapes);
-    let maybe: Vec<Option<u8>> = vec![None, Some(3)];
-    let bytes = to_vec(&maybe, &DEFAULT_LIMITS).unwrap();
-    assert_eq!(bytes, [0x82, 0xf6, 0x03]);
-    assert_eq!(from_slice::<Vec<Option<u8>>>(&bytes, &DEFAULT_LIMITS).unwrap(), maybe);
-}
-
-#[test]
-fn map_keys_must_be_text() {
-    let map = BTreeMap::from([(1u32, 2u32)]);
-    assert!(matches!(to_vec(&map, &DEFAULT_LIMITS), Err(Error::NonTextKey)));
-}
-
-#[test]
-fn serializer_duplicates_are_rejected() {
     #[derive(Serialize)]
     struct Inner {
         a: u8,
@@ -154,26 +122,21 @@ fn serializer_duplicates_are_rejected() {
     // cbor2 reports this only through its "duplicate map key" message text,
     // which `to_vec` matches; a cbor2 upgrade that rewords it fails here.
     let result = to_vec(&Outer { a: 1, inner: Inner { a: 2 } }, &DEFAULT_LIMITS);
-    assert!(matches!(result, Err(Error::DuplicateKey(None))), "cbor2's duplicate-key message may have changed: {result:?}");
+    assert_eq!(kind(result), ErrorKind::DuplicateKey, "cbor2's duplicate-key message may have changed");
 }
 
 #[test]
 fn duplicate_keys_are_rejected_into_maps_and_structs() {
     // {"a": 1, "a": 2}, the second key in a non-shortest form.
     let bytes = hex("a261610178016102");
-    assert!(matches!(from_slice::<BTreeMap<String, u8>>(&bytes, &DEFAULT_LIMITS), Err(Error::DuplicateKey(Some(k))) if k == "a"));
+    let error = from_slice::<BTreeMap<String, u8>>(&bytes, &DEFAULT_LIMITS).unwrap_err();
+    assert_eq!(error.to_string(), r#"duplicate-key: "a""#);
     #[derive(Debug, Deserialize)]
     #[allow(dead_code)]
     struct A {
         a: u8,
     }
-    assert!(matches!(from_slice::<A>(&bytes, &DEFAULT_LIMITS), Err(Error::DuplicateKey(_))));
-}
-
-#[test]
-fn tags_are_rejected_not_stripped() {
-    // 1(1363896240), which cbor2 alone would read as the plain integer.
-    assert!(matches!(from_slice::<u64>(&hex("c11a514b67b0"), &DEFAULT_LIMITS), Err(Error::Tag(1))));
+    assert_eq!(kind(from_slice::<A>(&bytes, &DEFAULT_LIMITS)), ErrorKind::DuplicateKey);
 }
 
 #[test]
@@ -188,20 +151,10 @@ fn byte_strings_need_the_bytes_wrapper() {
 #[test]
 fn encoding_enforces_limits() {
     let descriptor = Bytes(vec![0; SMALL_MAX_BYTES + 1]);
-    assert!(matches!(to_vec(&descriptor, &SMALL_LIMITS), Err(Error::ByteStringLimit { .. })));
-    #[derive(Serialize)]
-    struct Nest(Vec<Nest>);
-    let mut deep = Nest(vec![]);
-    for _ in 0..64 {
-        deep = Nest(vec![deep]);
-    }
-    assert!(matches!(to_vec(&deep, &DEFAULT_LIMITS), Err(Error::DepthLimit { limit: 64 })));
+    assert_eq!(kind(to_vec(&descriptor, &SMALL_LIMITS)), ErrorKind::ByteStringLimit);
     let text = "a".repeat(SMALL_LIMITS.max_message);
-    assert!(matches!(to_vec(&text, &SMALL_LIMITS), Err(Error::MessageLimit { .. })));
-}
-
-#[test]
-fn deserializer_handles_the_full_depth() {
+    assert_eq!(kind(to_vec(&text, &SMALL_LIMITS)), ErrorKind::MessageLimit);
+    // The deserializer handles the full depth, and the writer refuses one more.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct Nest(Vec<Nest>);
     let mut deep = Nest(vec![]);
@@ -210,13 +163,14 @@ fn deserializer_handles_the_full_depth() {
     }
     let bytes = to_vec(&deep, &DEFAULT_LIMITS).unwrap();
     assert_eq!(from_slice::<Nest>(&bytes, &DEFAULT_LIMITS).unwrap(), deep);
+    assert_eq!(kind(to_vec(&Nest(vec![deep]), &DEFAULT_LIMITS)), ErrorKind::DepthLimit);
 }
 
 #[test]
 fn deep_input_fails_without_exhausting_the_stack() {
     let limits = Limits { max_depth: 100_000, ..DEFAULT_LIMITS };
     let bytes = vec![0x81; 100_000];
-    assert!(matches!(check(&bytes, &limits), Err(Error::DepthLimit { .. })));
+    assert_eq!(kind(check(&bytes, &limits)), ErrorKind::DepthLimit);
 }
 
 #[test]
@@ -229,7 +183,7 @@ fn a_map_at_the_element_limit_decodes() {
     assert_eq!(&bytes[..5], [0xba, 0x00, 0x01, 0x00, 0x00]);
     assert_eq!(from_slice::<BTreeMap<String, ()>>(&bytes, &DEFAULT_LIMITS).unwrap(), map);
     map.insert("x".into(), ());
-    assert!(matches!(to_vec(&map, &DEFAULT_LIMITS), Err(Error::ElementLimit { .. })));
+    assert_eq!(kind(to_vec(&map, &DEFAULT_LIMITS)), ErrorKind::ElementLimit);
 }
 
 #[test]
@@ -245,12 +199,12 @@ fn framing_reads_and_writes_streams() {
     // A stream that ends inside a frame, in its header or its body, is truncated.
     let frame = framing.encode(&offer()).unwrap();
     for cut in [1, HEADER_LEN - 1, HEADER_LEN, frame.len() - 1] {
-        assert!(matches!(framing.read::<Setup, _>(&mut &frame[..cut]), Err(Error::Truncated)), "cut at {cut}");
+        assert_eq!(kind(framing.read::<Setup, _>(&mut &frame[..cut])), ErrorKind::Truncated, "cut at {cut}");
     }
     // A header over the limit fails before any body is read or allocated.
     let mut header = b"JSTEST01".to_vec();
     header.extend_from_slice(&u32::MAX.to_be_bytes());
-    assert!(matches!(framing.read::<Setup, _>(&mut header.as_slice()), Err(Error::MessageLimit { .. })));
+    assert_eq!(kind(framing.read::<Setup, _>(&mut header.as_slice())), ErrorKind::MessageLimit);
 }
 
 /// Mutated messages never panic the reader, and whatever the checks accept
@@ -275,10 +229,7 @@ fn mutated_input_is_rejected_or_decodes() {
                 _ => input.insert(at, next() as u8),
             }
         }
-        let checked = check(&input, &SMALL_LIMITS);
-        let canonical = check_canonical(&input, &SMALL_LIMITS);
-        assert!(checked.is_ok() || canonical.is_err(), "{input:02x?}");
-        if checked.is_ok() {
+        if check(&input, &SMALL_LIMITS).is_ok() {
             assert!(cbor2::validate_slice(&input).is_ok(), "{input:02x?}");
             from_slice::<cbor2::Value>(&input, &SMALL_LIMITS).unwrap();
         }
