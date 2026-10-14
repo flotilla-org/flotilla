@@ -30,8 +30,8 @@ Our consumers are written in Rust, C, Zig and Swift. Most non-Rust code reaches 
 "CBOR" alone means many formats. Ours is:
 
 - **Deterministic writers** (RFC 8949 §4.2.1): shortest integer and float forms, definite lengths only, map keys sorted bytewise. Every value our writers produce has one byte form, so messages and log entries can later be hashed, signed or content-addressed.
-- **Floats stay floats.** A float is written in its shortest (preferred) serialization and is never rewritten as an integer, so typed float fields round-trip through ordinary CBOR libraries. NaN is rejected; `-0.0` and the infinities currently pass through. These float details are current choices, not commitments, and the corpus records them.
-- **Safe readers.** A reader rejects what is ambiguous or unsafe: duplicate map keys, tags outside the allowed list, non-text map keys, invalid UTF-8, trailing bytes after the message, and anything over its limits. It accepts well-formed input that merely isn't in deterministic form (a longer integer or float form, unsorted keys). Indefinite lengths are currently rejected, because they make limits harder to enforce.
+- **Floats stay floats.** A float is written in its shortest (preferred) serialization and is never rewritten as an integer, so typed float fields round-trip through ordinary CBOR libraries. Every writer, in any language, writes a float-typed field as a float even when its value is whole; a reader may refuse an integer there. NaN, in any width, is rejected; `-0.0` and the infinities currently pass through. These float details are current choices, not commitments, and the corpus records them.
+- **Safe readers.** A reader rejects what is ambiguous or unsafe: duplicate map keys (compared as decoded text, whatever their encoded form, and wherever they sit in the map), tags outside the allowed list, non-text map keys, invalid UTF-8, trailing bytes after the message, and anything over its limits. It accepts well-formed input that merely isn't in deterministic form (a longer integer or float form, unsorted keys). Indefinite lengths are currently rejected, because they make limits harder to enforce.
 - **Canonical check on demand.** Where bytes are hashed, signed or compared, the reader also requires deterministic form, through one shared check. Nothing needs it yet.
 - **Text map keys**, so the JSON rendering of the same data stays natural.
 - **A short allowed-tag list, initially empty.** Byte strings are native and need no tag; any tag (for example a content-ID tag, if logs need hashing) is added to the list deliberately.
@@ -67,6 +67,7 @@ No repo converts now. Each protocol adopts this when it is next reshaped. Jackst
 
 - One binary format across the stack, inspectable through CBOR diagnostic notation without schemas.
 - Nothing enforces CDDL schemas at compile time. Validation lives in code and tests, ideally contract tests run by each implementation.
+- The same logical message may arrive in more than one byte form from a non-Rust or older writer. Nothing may deduplicate, compare or cache on raw bytes without first passing the canonical check.
 - Event logs, when they exist, still need their own decisions on message versioning and any schema registry; deterministic encoding keeps hashing and signing open.
 - Rust code moves from `serde_json` to the shared wrapper protocol by protocol. C, Zig and Swift peers that must parse use `tinycbor`/`QCBOR`, `zbor` or a Swift CBOR library.
 
@@ -79,4 +80,3 @@ The original profile made every reader strict: it rejected any input not in dete
 - **What remains rejected** is what could make two readers see different messages in the same bytes (duplicate keys, unknown tags) or what threatens the reader (limits, trailing bytes, invalid UTF-8).
 
 With the relaxed profile an off-the-shelf serde CBOR crate covers most of the work, so the shared wrapper only adds the reader checks, the limits and the framing.
-
