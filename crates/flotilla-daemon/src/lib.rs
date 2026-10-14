@@ -7,6 +7,7 @@ pub mod blob_store;
 mod charter_delegation;
 pub mod cli;
 mod dispatch_reconciler;
+pub mod dummy_fleet;
 mod environment_orphans;
 mod environment_tools;
 mod event_relay;

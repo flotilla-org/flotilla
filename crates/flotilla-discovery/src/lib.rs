@@ -11,7 +11,7 @@
 //! type crates; never on core, storage or composition roots. The build-graph
 //! gate enforces the upward-dependency prohibition.
 
-use flotilla_agent::adapter::AgentAdapterRegistry;
+use flotilla_agent::adapter::{AgentAdapterFactory, AgentAdapterRegistry};
 use flotilla_discovery_api::provider_config::ProviderConfigView;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
@@ -68,6 +68,8 @@ pub struct FactoryRegistry {
     pub ai_utilities: Vec<Box<AiUtilityFactory>>,
     pub terminal_pools: Vec<Box<TerminalPoolFactory>>,
     pub environment_providers: Vec<Box<EnvironmentProviderFactory>>,
+    /// Adapters beyond the built-in harnesses, probed in every environment.
+    pub agent_adapters: Vec<Arc<dyn AgentAdapterFactory>>,
 }
 
 impl FactoryRegistry {
@@ -98,7 +100,7 @@ impl FactoryRegistry {
         }
 
         let mut registry = ProviderRegistry::new();
-        registry.agent_adapters = AgentAdapterRegistry::discover(env, Arc::clone(&runner));
+        registry.agent_adapters = AgentAdapterRegistry::discover_with(env, Arc::clone(&runner), &self.agent_adapters);
 
         for (desc, p) in probe_category(&self.vcs, env, config, repo_root, &runner).await {
             registry.vcs.insert(desc.implementation.clone(), desc, p);
@@ -269,7 +271,7 @@ impl HostScopedProviderCache {
 
             HostScopedDiscovery {
                 registry: HostRegistry::builder()
-                    .agent_adapters(AgentAdapterRegistry::discover(host_bag, Arc::clone(&runner)))
+                    .agent_adapters(AgentAdapterRegistry::discover_with(host_bag, Arc::clone(&runner), &factories.agent_adapters))
                     .cloud_agents(cloud_agents)
                     .ai_utilities(ai_utilities)
                     .terminal_pools(terminal_pools)
@@ -750,6 +752,7 @@ mod orchestrator_tests {
             ai_utilities: vec![],
             terminal_pools: vec![],
             environment_providers: vec![],
+            agent_adapters: vec![],
         };
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
@@ -777,6 +780,7 @@ mod orchestrator_tests {
             ai_utilities: vec![],
             terminal_pools: vec![],
             environment_providers: vec![],
+            agent_adapters: vec![],
         };
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;

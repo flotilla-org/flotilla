@@ -1290,6 +1290,7 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
             ai_utilities: vec![],
             terminal_pools: terminal_pool_factories,
             environment_providers: vec![Box::new(flotilla_environment::factories::host_direct::HostDirectEnvironmentFactory)],
+            agent_adapters: vec![],
         })
         .build()
 }

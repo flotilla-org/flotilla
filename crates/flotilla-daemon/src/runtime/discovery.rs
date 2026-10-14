@@ -321,8 +321,14 @@ pub(super) fn build_local_profile(
 
     let host_direct_pool = local_registry.terminal_pools.preferred_name().unwrap_or("passthrough").to_string();
     let docker_pool = "cleat".to_string();
-    let docker_available = local_registry.environment_providers.for_kind(EnvironmentKind::Docker).is_some()
-        && local_registry.terminal_pools.contains_key(&docker_pool);
+    // Per-vessel placement needs a Docker-kind instance whose environments can
+    // host crews: one receiving the host's cleat, or one bringing its own crew
+    // runtime. A host with only the dummy instance therefore offers per-vessel
+    // placement without a cleat pool; its crews run in the dummy pool.
+    let docker_available = local_registry.environment_providers.iter().any(|(_, provider)| {
+        provider.kind() == EnvironmentKind::Docker
+            && (!provider.receives_host_tools() || local_registry.terminal_pools.contains_key(&docker_pool))
+    });
     let available_agent_adapters = local_registry.agent_adapters.ids().map(ToString::to_string).collect();
 
     Ok(LocalProvisioningProfile {

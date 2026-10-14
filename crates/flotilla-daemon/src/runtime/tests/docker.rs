@@ -583,7 +583,17 @@ async fn docker_provisioning_reports_unavailable_flotilla_cli() {
     let state = Arc::new(ControllerRuntimeState::new(
         daemon,
         config,
-        Arc::new(ProviderRegistry::new()),
+        {
+            // Host tools are prepared for the selected Docker instance.
+            let mut registry = ProviderRegistry::new();
+            registry.environment_providers.insert(
+                "docker",
+                flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
+                Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None), prepared_auth: Mutex::new(None) })
+                    as Arc<dyn EnvironmentProvider>,
+            );
+            Arc::new(registry)
+        },
         Some(DaemonHostPath::new("/tmp/flotilla.sock")),
         "host-test".to_string(),
         "host-direct-host-test".to_string(),

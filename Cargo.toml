@@ -28,6 +28,7 @@ members = [
     "crates/flotilla-discovery",
     "crates/flotilla-discovery-api",
     "crates/flotilla-discovery-testkit",
+    "crates/flotilla-dummy-fleet",
     "crates/flotilla-forge-forgejo",
     "crates/flotilla-issue-tracker",
     "crates/flotilla-manifest",

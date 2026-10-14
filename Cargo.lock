@@ -1840,6 +1840,7 @@ dependencies = [
  "flotilla-discovery",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
+ "flotilla-dummy-fleet",
  "flotilla-environment",
  "flotilla-executor",
  "flotilla-issue-tracker",
@@ -1999,6 +2000,37 @@ dependencies = [
  "flotilla-terminal",
  "flotilla-vcs",
  "tokio",
+]
+
+[[package]]
+name = "flotilla-dummy-fleet"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "flotilla-agent",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-http",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-change-request",
+ "flotilla-config",
+ "flotilla-daemon-api",
+ "flotilla-discovery",
+ "flotilla-discovery-api",
+ "flotilla-environment",
+ "flotilla-paths",
+ "flotilla-protocol",
+ "flotilla-provider-runtime",
+ "flotilla-resources",
+ "flotilla-terminal",
+ "flotilla-vcs",
+ "hegeltest",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
