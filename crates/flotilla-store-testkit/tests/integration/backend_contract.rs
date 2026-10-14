@@ -717,12 +717,20 @@ async fn admission_placement_is_published_with_convoy(#[case] adapter: &str) {
 #[case("memory")]
 #[case("sqlite")]
 #[case("sqlite-reopened")]
+#[case("observed-durable")]
 #[tokio::test]
 async fn late_relay_watch_includes_retained_deletions(#[case] adapter: &str, #[values("object", "name", "snapshot")] deletion: &str) {
     let temp = tempfile::tempdir().expect("create relay test directory");
     let path = temp.path().join("relay.sqlite");
     let (backend, _server) = if adapter == "sqlite-reopened" {
         (ResourceBackend::new(SqliteBackend::open(&path).expect("open persistent relay store")), None)
+    } else if adapter == "observed-durable" {
+        (
+            ResourceBackend::new(InMemoryBackend::observed_with_durable_replicas(
+                SqliteBackend::open(&path).expect("open durable observation replicas"),
+            )),
+            None,
+        )
     } else {
         backend(adapter).await
     };
