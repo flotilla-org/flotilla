@@ -162,11 +162,14 @@ pub enum EnvironmentToolAssetAccess {
 }
 
 /// Stable directory used for the host daemon socket inside contained
-/// environments. Docker bind-mounts the host socket's parent directory here
-/// so a daemon restart can replace the socket inode without breaking the
-/// container's view of it.
+/// environments. Provisioning supplies a dedicated directory containing only
+/// that environment's socket, so daemon restart can replace the socket inode
+/// without exposing the host's administrative run directory.
 pub const CONTAINED_DAEMON_SOCKET_DIRECTORY: &str = "/run/flotilla-daemon";
 pub const CONTAINED_DAEMON_REQUIRED_ENV: &str = "FLOTILLA_CONTAINED_HOST_DAEMON";
+
+/// Shared name for the host-daemon socket delivered to contained tools.
+pub const DAEMON_SOCKET_ENV: &str = "FLOTILLA_DAEMON_SOCKET";
 
 pub fn contained_daemon_socket_path(host_socket_path: &Path) -> PathBuf {
     let file_name = host_socket_path.file_name().expect("daemon socket path must name a socket file");

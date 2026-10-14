@@ -307,8 +307,8 @@ pub struct DaemonServer {
     remote_command_router: RemoteCommandRouter,
     peer_resource_socket_dir: PathBuf,
     agent_state_store: SharedAgentStateStore,
-    /// Registry of per-environment Unix sockets. Initialized on startup and
-    /// populated when environments are created (wired in Phase D).
+    /// Registry of per-environment sockets, populated by provisioning/adoption
+    /// and retired by teardown through EnvironmentSocketService.
     pub environment_sockets: Arc<tokio::sync::Mutex<EnvironmentSocketRegistry>>,
 }
 

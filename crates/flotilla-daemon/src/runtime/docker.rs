@@ -13,11 +13,11 @@ use flotilla_credentials::{compose_agent_environment, AgentMaterialRegistry, Cre
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery::run_provisioned_host_detectors;
 use flotilla_discovery_api::EnvironmentBag;
-use flotilla_environment::environment::contained_daemon_socket_path;
 use flotilla_environment::environment::CreateOpts;
 use flotilla_environment::environment::EnvironmentHandle;
 use flotilla_environment::environment::EnvironmentToolAssetKind;
 use flotilla_environment::environment::EnvironmentVariableUpdate;
+use flotilla_environment::environment::{contained_daemon_socket_path, DAEMON_SOCKET_ENV};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
@@ -181,7 +181,7 @@ impl DockerControllerRuntime {
             for tool in &mut tools {
                 for update in &mut tool.environment {
                     if let EnvironmentVariableUpdate::Set { name, value, .. } = update {
-                        if name == "FLOTILLA_DAEMON_SOCKET" {
+                        if name == DAEMON_SOCKET_ENV {
                             *value = environment_socket.to_string_lossy().into_owned();
                         }
                     }
@@ -190,9 +190,12 @@ impl DockerControllerRuntime {
                     if asset.kind == EnvironmentToolAssetKind::UnixSocket {
                         // Mount a dedicated directory containing only this socket.
                         // Keeping the directory stable permits socket replacement on restart.
-                        asset.host_path = flotilla_protocol::DaemonHostPath::new(path.as_path().parent().expect("socket parent"));
-                        asset.environment_path =
-                            flotilla_protocol::ExecutionEnvironmentPath::new(environment_socket.parent().expect("socket parent"));
+                        asset.host_path = flotilla_protocol::DaemonHostPath::new(
+                            path.as_path().parent().ok_or("EnvironmentSocketInvalid: socket has no host directory")?,
+                        );
+                        asset.environment_path = flotilla_protocol::ExecutionEnvironmentPath::new(
+                            environment_socket.parent().ok_or("EnvironmentSocketInvalid: socket has no contained directory")?,
+                        );
                         asset.kind = EnvironmentToolAssetKind::Directory;
                     }
                 }

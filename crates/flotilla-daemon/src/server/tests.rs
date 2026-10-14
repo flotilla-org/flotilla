@@ -21,7 +21,7 @@ use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::git_process_discovery;
 use flotilla_discovery_testkit::init_git_repo_with_remote;
 use flotilla_protocol::{
-    commands::DaemonLogQuery,
+    commands::{CrewPromiseOperation, DaemonLogQuery},
     qualified_path::QualifiedPath,
     result_set::{QueryChanges, QueryId, ResultDelta},
     AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachableId, CheckoutTarget, Command, CommandAction,
@@ -5510,6 +5510,37 @@ async fn failed_connection_tasks_are_reaped() {
 async fn environment_transport_refuses_other_convoy_and_host_commands() {
     let (_tmp, daemon) = empty_daemon().await;
     let backend = daemon.resource_backend();
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys
+        .create(&InputMeta::builder().name("own".into()).build(), &ConvoySpec::builder().workflow_ref("single-agent".into()).build())
+        .await
+        .expect("convoy");
+    convoys
+        .update_status(
+            "own",
+            &convoy.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([(
+                        "coder".into(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                    )]),
+                )]),
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    vessels: flotilla_resources::single_agent_workflow_spec().vessels,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("active crew work");
     backend
         .using::<Vessel>("flotilla")
         .create(
@@ -5599,6 +5630,46 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
             other => panic!("unexpected response {other:?}"),
         }
     }
+    // An admitted promise must reach the dispatcher, relay only its completion,
+    // and persist the promised work in the caller's convoy.
+    client
+        .write(Message::Request {
+            id: 10,
+            request: Request::Execute {
+                command: Command::builder()
+                    .action(CommandAction::CrewPromise {
+                        context: CrewCommandContext::default(),
+                        operation: CrewPromiseOperation::Promise { id: "relay-proof".into(), kind: "pr".into() },
+                    })
+                    .build(),
+            },
+        })
+        .await
+        .expect("allowed request");
+    let Response::Execute { command_id } = ok_response(read_session_message(&client).await, 10) else {
+        panic!("expected dispatched command")
+    };
+    assert!(matches!(read_session_message(&client).await, Message::Event { event }
+        if matches!(event.as_ref(), DaemonEvent::CommandFinished { command_id: finished, result: CommandValue::Ok, .. } if *finished == command_id)));
+    let convoy = convoys.get("own").await.expect("updated convoy");
+    assert!(flotilla_resources::promises::owned(convoy.status.as_ref().expect("status"), "work", "coder")
+        .iter()
+        .any(|promise| promise.id == "relay-proof"));
     drop(client);
     task.await.expect("transport ended");
+}
+
+// The environment lease prevents idle shutdown only while a connection exists;
+// releasing or aborting it wakes the idle watcher. Explicit shutdown is independent.
+#[tokio::test]
+async fn environment_client_lease_releases_idle_accounting() {
+    let count = Arc::new(AtomicUsize::new(1));
+    let notify = Arc::new(Notify::new());
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let lease = super::EnvironmentClientLease { count: count.clone(), notify: notify.clone() };
+    drop(lease);
+    notified.await;
+    assert_eq!(count.load(Ordering::SeqCst), 0);
 }

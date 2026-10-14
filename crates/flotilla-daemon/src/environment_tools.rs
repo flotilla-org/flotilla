@@ -8,13 +8,13 @@ use std::{
 use async_trait::async_trait;
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_environment::environment::contained_daemon_socket_path;
 use flotilla_environment::environment::EnvironmentTool;
 use flotilla_environment::environment::EnvironmentToolAsset;
 use flotilla_environment::environment::EnvironmentToolAssetAccess;
 use flotilla_environment::environment::EnvironmentToolAssetKind;
 use flotilla_environment::environment::EnvironmentVariableUpdate;
 use flotilla_environment::environment::CONTAINED_DAEMON_REQUIRED_ENV;
+use flotilla_environment::environment::{contained_daemon_socket_path, DAEMON_SOCKET_ENV};
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -259,7 +259,7 @@ impl EnvironmentToolFactory for FlotillaCliTool {
                 "the daemon socket",
             ))
             .with_environment(EnvironmentVariableUpdate::set(
-                "FLOTILLA_DAEMON_SOCKET",
+                DAEMON_SOCKET_ENV,
                 environment_socket_path.to_string_lossy(),
                 "the daemon socket",
             ))

@@ -214,6 +214,12 @@ pub(super) async fn reconcile_provisioned_environment(
         }
     }
 
+    // Retry the socket even when the interior registry was already adopted.
+    // A bind failure must not become a permanently skipped reconciliation step.
+    if let Some(sockets) = &state.environment_sockets {
+        sockets.prepare(env_id.clone()).await?;
+    }
+
     if state.daemon.environment_registry_for_environment(&env_id).is_none() {
         let adoption = async {
             let (bag, registry) = probe_provisioned_environment(state, &env_id, &handle).await?;
@@ -234,9 +240,6 @@ pub(super) async fn reconcile_provisioned_environment(
                 &format!("environment adoption failed: {error}"),
             )
             .await;
-        }
-        if let Some(sockets) = &state.environment_sockets {
-            sockets.prepare(env_id.clone()).await?;
         }
         info!(environment = %env_id, container = %container_id, "restored provisioned environment registration");
     }

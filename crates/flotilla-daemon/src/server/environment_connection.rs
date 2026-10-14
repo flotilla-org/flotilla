@@ -47,6 +47,15 @@ pub(super) async fn environment_crews(daemon: &InProcessDaemon, environment: &En
     Ok(crews)
 }
 
+fn select_crew(crews: Vec<CallerCrew>, role: Option<&str>) -> Result<CallerCrew, String> {
+    let mut matching = crews.into_iter().filter(|crew| role.is_none_or(|role| role == crew.role));
+    let crew = matching.next().ok_or("EnvironmentIdentityUnavailable: no placed crew")?;
+    if matching.next().is_some() {
+        return Err("EnvironmentIdentityAmbiguous: select a placed crew role".into());
+    }
+    Ok(crew)
+}
+
 fn authorize_context(context: &mut CrewCommandContext, crew: &CallerCrew) -> Result<(), String> {
     if context.namespace.as_ref().is_some_and(|value| value != &crew.namespace)
         || context.convoy.as_ref().is_some_and(|value| value != &crew.convoy)
@@ -105,6 +114,18 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
     }
 }
 
+/// One command is in flight per environment connection. Crew clients are serial;
+/// this avoids subscribing an idle connection to the host's event stream.
+async fn command_completion(events: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> Result<DaemonEvent, String> {
+    loop {
+        match events.recv().await {
+            Ok(event @ DaemonEvent::CommandFinished { command_id: finished, .. }) if finished == command_id => return Ok(event),
+            Ok(_) => {},
+            Err(error) => return Err(format!("EnvironmentCompletionLost: command {command_id} outcome unavailable ({error}); it may have completed, do not retry blindly")),
+        }
+    }
+}
+
 pub(super) async fn serve(
     session: MessageSession,
     daemon: Arc<InProcessDaemon>,
@@ -160,11 +181,7 @@ pub(super) async fn serve(
         // Re-resolve for every request: a retired session cannot retain authority.
         let identity = async {
             let crews = environment_crews(&daemon, &environment).await?;
-            let mut matching = crews.into_iter().filter(|crew| role.as_ref().is_none_or(|role| role == &crew.role));
-            let crew = matching.next().ok_or("EnvironmentIdentityUnavailable: no placed crew")?;
-            if matching.next().is_some() {
-                return Err("EnvironmentIdentityAmbiguous: select a placed crew role".into());
-            }
+            let crew = select_crew(crews, role.as_deref())?;
             authorize(&mut request, &crew)?;
             Ok::<_, String>(crew)
         }
@@ -206,18 +223,23 @@ pub(super) async fn serve(
         }
         // Relay only this request's completion, never the host's event stream.
         if let Some(command_id) = command_id {
-            loop {
-                let event = tokio::select! { event = events.recv() => event, _ = shutdown.changed() => return };
-                match event {
-                    Ok(event @ DaemonEvent::CommandFinished { command_id: finished, .. }) if finished == command_id => {
-                        if session.write(Message::Event { event: Box::new(event) }).await.is_err() {
-                            return;
-                        }
-                        break;
-                    }
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(_) => return,
+            let completion = tokio::select! {
+                result = command_completion(&mut events, command_id) => result,
+                _ = shutdown.changed() => return,
+            };
+            let lost = completion.is_err();
+            let event = completion.unwrap_or_else(|message| {
+                tracing::warn!(%environment, %command_id, %message, "environment command completion unavailable");
+                DaemonEvent::CommandFinished {
+                    command_id,
+                    node_id: daemon.node_id().clone(),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: String::new() },
+                    repo: None,
+                    result: flotilla_protocol::CommandValue::Error { message },
                 }
+            });
+            if session.write(Message::Event { event: Box::new(event) }).await.is_err() || lost {
+                return;
             }
         }
     }
@@ -315,5 +337,84 @@ mod tests {
         let mut request = Request::ArtifactList { convoy: None, kind: None, subject: None };
         authorize(&mut request, &placed).expect("own artifact list");
         assert!(matches!(request, Request::ArtifactList { convoy: Some(convoy), .. } if convoy == "own-convoy"));
+    }
+    // A dropped completion is an unknown outcome, never an infinite wait.
+    // The broadcast channel is the actual event transport, with capacity one
+    // to force a deterministic lag instead of relying on scheduler timing.
+    #[tokio::test]
+    async fn command_relay_returns_own_completion_and_refuses_lag() {
+        fn finished(id: u64) -> DaemonEvent {
+            DaemonEvent::CommandFinished {
+                command_id: id,
+                node_id: flotilla_protocol::NodeId::new("local"),
+                repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: String::new() },
+                repo: None,
+                result: flotilla_protocol::CommandValue::Ok,
+            }
+        }
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        tx.send(finished(99)).expect("unrelated completion");
+        tx.send(finished(1)).expect("own completion");
+        assert!(matches!(command_completion(&mut rx, 1).await.expect("own event"), DaemonEvent::CommandFinished { command_id: 1, .. }));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        tx.send(finished(1)).expect("completion that will be lost");
+        tx.send(finished(99)).expect("force lag");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), command_completion(&mut rx, 1)).await.expect("lag must not hang");
+        assert!(result.expect_err("unknown outcome").starts_with("EnvironmentCompletionLost:"));
+    }
+
+    // Selection may narrow an environment's placed roles, but cannot invent a
+    // role or resolve two matching sessions arbitrarily. Alternating roles span
+    // empty, singleton, distinct roles and duplicate-role sessions.
+    #[hegel::test]
+    fn role_selection_requires_exactly_one_placed_session(tc: hegel::TestCase) {
+        let sample_count = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
+        let sample_selector = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        for (count, selector) in
+            (0..7).flat_map(|count| (0..4).map(move |selector| (count, selector))).chain(std::iter::once((sample_count, sample_selector)))
+        {
+            let role = [None, Some("coder"), Some("reviewer"), Some("foreign")][selector];
+            let crews = (0..count)
+                .map(|index| CallerCrew {
+                    role: if index % 2 == 0 { "coder" } else { "reviewer" }.into(),
+                    crew_id: format!("crew-{index}"),
+                    ..placed()
+                })
+                .collect();
+            let candidates = match selector {
+                0 => count,
+                1 => count.div_ceil(2),
+                2 => count / 2,
+                _ => 0,
+            };
+            assert_eq!(select_crew(crews, role).is_ok(), candidates == 1);
+        }
+    }
+
+    // Only the placed terminal may submit hooks, and caller attachable IDs
+    // cannot retarget the hook's attribution to another agent.
+    #[test]
+    fn hooks_require_the_placed_terminal() {
+        for terminal in [None, Some(("other", "own-terminal")), Some(("flotilla", "other-terminal")), Some(("flotilla", "own-terminal"))] {
+            let mut request = Request::AgentHook {
+                event: flotilla_protocol::AgentHookEvent::builder()
+                    .attachable_id(flotilla_protocol::AttachableId::new("forged"))
+                    .harness(flotilla_protocol::AgentHarness::Codex)
+                    .event_type(flotilla_protocol::AgentEventType::Active)
+                    .maybe_terminal(terminal.map(|(namespace, session)| flotilla_protocol::AgentHookTerminalRef {
+                        namespace: namespace.into(),
+                        session_name: session.into(),
+                    }))
+                    .build(),
+            };
+            let accepted = terminal == Some(("flotilla", "own-terminal"));
+            assert_eq!(authorize(&mut request, &placed()).is_ok(), accepted);
+            if accepted {
+                assert!(
+                    matches!(request, Request::AgentHook { event } if event.attachable_id == flotilla_protocol::AttachableId::new("terminal:flotilla/own-terminal"))
+                );
+            }
+        }
     }
 }

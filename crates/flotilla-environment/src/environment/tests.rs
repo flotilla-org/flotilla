@@ -1808,3 +1808,26 @@ async fn inspection_reports_weight_and_legacy_quotas() {
         assert_eq!((limits.cpus, limits.cpu_shares), (cpus, shares));
     }
 }
+
+// Reserved tool directories reject ancestor and descendant mount overlaps;
+// adjacent names sharing a text prefix remain independent filesystem paths.
+#[tokio::test]
+async fn create_rejects_nested_tool_mounts_but_accepts_adjacent_paths() {
+    for (target, rejected) in [("/reserved", true), ("/reserved/child", true), ("/", true), ("/reserved-other", false)] {
+        let runner = Arc::new(RecordingRunner::new_ok("container"));
+        let provider = DockerEnvironmentProvider::new(runner);
+        let opts = CreateOpts {
+            tools: vec![EnvironmentTool::new("tool", "/bin/tool").with_asset(EnvironmentToolAsset::new(
+                "/host/tool",
+                "/reserved",
+                EnvironmentToolAssetKind::Directory,
+                EnvironmentToolAssetAccess::ReadOnly,
+                "the tool",
+            ))],
+            provisioned_mounts: vec![ProvisionedMount::new("/host/request", target, ProvisionedMountMode::Ro)],
+            ..Default::default()
+        };
+        let result = provider.create(EnvironmentId::new("nested"), &flotilla_protocol::ImageId::new("image"), opts).await;
+        assert_eq!(result.is_err(), rejected, "target {target}");
+    }
+}
