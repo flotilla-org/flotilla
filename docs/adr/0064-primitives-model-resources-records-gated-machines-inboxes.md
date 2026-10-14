@@ -1,6 +1,6 @@
 # 64. The primitives model: resources, records, gated machines and inboxes
 
-**Status:** Accepted (owner grilling, 2026-10-13 and 2026-10-14). Implemented by the #3108 PR stacks; until the cut-over roll, the running system still follows the ADRs this one amends.
+**Status:** Accepted, not yet implemented (owner grilling, 2026-10-13 and 2026-10-14). The #3108 PR stacks implement it. Until the cut-over roll, the running system follows the ADRs this one amends.
 **Date:** 2026-10-14
 **Amends:**
 - [ADR 0024](0024-declared-state-machines-and-field-ownership.md): machines are declared and gated; per-field ownership is retired.
@@ -67,6 +67,8 @@ The decided machines:
 How the Convoy and Message machines behave:
 - **A convoy ends when its work is delivered.** A crew's "done" is a submission of evidence against a deliverable, not a convoy edge.
 - **A Demand is a Message that expects an outcome,** and the Demand kind retires. Escalation is `drop(expired)` plus a follow-up message.
+- **`settle` is declared only from Awaiting.** Whether an outcome met while a message is still Pending settles it directly, or drops it, is open. The Quint specs (#3214) model the case before it is decided.
+- **Dropped is the state; `drop(reason)` is the edge into it.** The reason is recorded on the edge event and shown with the state.
 
 ### Roles, inboxes and delivery
 
@@ -139,4 +141,6 @@ There is no double-write path and no long-lived branch.
 - **Smaller machines.** Convoy goes from 49 patch variants to 2 edges plus records. Message goes from 11 phases to 4 states. Six kinds share one lifecycle. Every stored retry counter, condition struct, mirror and heartbeat goes.
 - **Crews on any host.** Crew members can be on any host and can be replaced without stranding messages. Handoffs, resumes and nudges are messages, and no convoy transition is involved.
 - **The importer is the largest hand-written piece.** After the cut-over, ADR 0047 is enforced by a checked-in schema snapshot and explicit migration steps, and the golden corpus becomes a SQLite file.
+- **Peer merge goes away.** The Plane-A peer-merge layer (`crates/flotilla-daemon/src/peer/`) stays bugfix-only and is deleted by this work, because subscription-based replication supersedes it.
+- **CLAUDE.md changes at the cut-over roll.** Its "Development Phase" rules (serde aliases and defaults, the JSON golden corpus) change to the schema-snapshot form in the same roll.
 - **Interactions are model-checked in Quint (#3214).** The implementation is split into PR stacks (#3215).

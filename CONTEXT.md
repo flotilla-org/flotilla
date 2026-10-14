@@ -20,7 +20,8 @@ judged only by the expectation: satisfaction means a reply or outcome has met
 it (ADR 0055, amended by ADR 0059).
 Under ADR 0064 a Message lives in its role's **Inbox** and has four states:
 Pending; Awaiting, which means delivered and waiting for a reply or outcome;
-Settled; and Dropped, with a reason: undeliverable, expired or superseded. A
+Settled; and Dropped. A message enters Dropped through the `drop` edge, whose
+reason (undeliverable, expired or superseded) is recorded on the edge event. A
 Demand is a Message that expects an outcome.
 _Avoid_: Delivered (as a claim that the agent acted), prompt.
 
