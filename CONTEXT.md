@@ -947,7 +947,7 @@ the dispatch, or the crew, and has a kind (`pr`, `ref`, `decision-ledger`,
 template or dispatch promise it cannot keep is a `retraction-proposed`
 **Stall**. Stored in Convoy status per crew member.
 *(ADR 0064, effective at the #3108 cut-over: promise kinds are declared, not
-built in. Each kind declares its submission shape, what it observes and where,
+built in, including the kinds named above. Each kind declares its submission shape, what it observes and where,
 and what keeps it; kind names never appear in a machine, a gate or the storage
 schema. A `decision` promise, for example, is kept when an existing issue is
 closed with a resolution, or when a submitted issue of a declared shape, created
