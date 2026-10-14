@@ -2461,7 +2461,8 @@ impl CrewService {
                         Ok(_) => {}
                         // Reopening the target's work above lets the vessel controller
                         // create its session concurrently. A session that now exists in
-                        // the same environment receives the message like a starting one.
+                        // the same environment receives the message like a starting one;
+                        // one without a status yet is that session, before its first launch.
                         Err(ResourceError::Conflict { .. })
                             if sessions.get(&terminal_name).await.is_ok_and(|existing| {
                                 existing.spec.env_ref == anchor_environment
