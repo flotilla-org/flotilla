@@ -31,8 +31,8 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 tracing = { workspace = true }
-serde_yml = "0.0.12"
-tokio-util = { version = "0.7", features = ["rt"] }
+serde_yml = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
@@ -41,9 +41,7 @@ flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
 flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
-hegeltest = "=0.48.1"
-flotilla-protocol = { path = "../flotilla-protocol" }
-flotilla-resources = { path = "../flotilla-resources" }
+hegeltest = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
