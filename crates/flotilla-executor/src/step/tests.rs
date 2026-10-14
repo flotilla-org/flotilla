@@ -4,7 +4,7 @@ use flotilla_protocol::qualified_path::{HostId, QualifiedPath};
 use tokio::sync::{broadcast, Mutex, Notify};
 
 use super::*;
-use crate::event_sink::{broadcast_test_sink, RecordingEventSink};
+use flotilla_protocol_testkit::event_sink::{broadcast_test_sink, RecordingEventSink};
 
 struct TestResolver {
     outcomes: std::sync::Mutex<Vec<Result<StepOutcome, String>>>,

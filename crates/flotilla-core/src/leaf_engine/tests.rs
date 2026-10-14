@@ -41,12 +41,12 @@ use super::subscriptions::*;
 use super::wake::*;
 use super::*;
 use crate::change_request_observer::ChangeRequestRefresher;
-use crate::event_sink::broadcast_test_sink;
 use crate::issue_observer::IssueRefreshCadence;
 use crate::issue_observer::IssueRefresher;
 use crate::testkits::replay::test_runner;
 use crate::testkits::replay::Masks;
 use crate::testkits::replay::Session;
+use flotilla_protocol_testkit::event_sink::broadcast_test_sink;
 
 #[derive(Clone)]
 struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);

@@ -5,18 +5,20 @@
 
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
+use flotilla_executor::action_support::{empty_repo_identity, fallback_repo_identity, AddRepoOutcome};
 use flotilla_resources::ResumeIntent;
+use flotilla_store::get_resource_kind;
 use flotilla_store::ResolvedCascadeStoreExt;
 use flotilla_store_memory::InMemoryBackend;
 
-mod action_events;
-mod action_namespace;
+use flotilla_executor::action_events;
+use flotilla_executor::action_namespace;
 mod admission_actions;
 #[path = "attach.rs"]
 mod attach;
 mod checkout_providers;
 mod crew_actions;
-mod executor_actions;
+use flotilla_executor::executor_actions;
 mod projections_actions;
 
 mod cleat_roll;
@@ -73,8 +75,8 @@ use flotilla_protocol::{
     HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress, NodeId, NodeInfo,
     PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef,
     ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary,
-    ResolvedAttachPlan, ResourceJsonResponse, ResourceRef, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute,
-    ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    ResolvedAttachPlan, ResourceRef, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress,
+    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 #[cfg(test)]
 use flotilla_resources::CrewMessageSender;
@@ -84,14 +86,14 @@ use flotilla_resources::{
     BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
     Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch,
-    CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionPending, CrewSource, CrewSpec, DocumentKey,
+    CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionPending, CrewSource, CrewSpec,
     Environment as ResourceEnvironment, EnvironmentPhase, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, Host as ResourceHost,
     HostStatus as ResourceHostStatus, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
     LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectMeta, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec,
-    ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resolution, ResolutionAction,
-    Resource, ResourceError, ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget, SystemClock, TerminalCrewContext,
-    TurnDeliveryRung, VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+    ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceError,
+    ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget, SystemClock, TerminalCrewContext, TurnDeliveryRung,
+    VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
 #[cfg(test)]
@@ -101,8 +103,7 @@ use flotilla_resources::{
 };
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::{
-    apply_resource_document, apply_status_patch as apply_resource_status_patch, get_resource_kind, get_resource_kind_including_replicas,
-    ResourceBackend,
+    apply_resource_document, apply_status_patch as apply_resource_status_patch, get_resource_kind_including_replicas, ResourceBackend,
 };
 use futures::{FutureExt, StreamExt};
 pub use image_check::{check_image, image_build_report, ImageCheckSources};
@@ -117,12 +118,6 @@ use crate::checkout_integration::convoy_change_request_id_for_checkout;
 use crate::checkout_integration::inspect_checkout_integration;
 use crate::checkout_integration::inspect_convoy_checkout_integration;
 pub use crate::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler, StandingConvoyBackingInspector};
-use crate::environment_manager::EnvironmentManager;
-use crate::environment_manager::ResolvedEnvironment;
-use crate::event_sink::BroadcastEventSink;
-use crate::event_sink::EventSink;
-use crate::executor;
-use crate::executor::checkout::CheckoutResolutionScope;
 use crate::fleet::FleetService;
 use crate::host_identity::resolve_local_environment_state_dir;
 use crate::host_identity::resolve_local_host_id;
@@ -146,11 +141,6 @@ use crate::repository_inspection::GitRepositoryInspector;
 use crate::repository_inspection::RepositoryContinuity;
 use crate::repository_inspection::RepositoryInspection;
 use crate::repository_inspection::RepositoryInspector;
-use crate::step::RemoteStepBatchRequest;
-use crate::step::RemoteStepExecutor;
-use crate::step::RemoteStepProgressSink;
-use crate::step::StepOutcome;
-use crate::step::StepResolver;
 use flotilla_agent::adapter::required_agent_adapters;
 use flotilla_agent::adapter::CapabilityTable;
 use flotilla_ai_utility::AiUtility;
@@ -162,6 +152,8 @@ use flotilla_cloud_agent::RepoCriteria;
 use flotilla_config::ConfigStore;
 use flotilla_config::StaticEnvironmentConfig;
 use flotilla_daemon_api::daemon::{DaemonHandle, QuerySubscription};
+use flotilla_daemon_api::event_sink::BroadcastEventSink;
+use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_discovery::discover_checkout_with_host_scoped;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery::run_host_detectors;
@@ -169,6 +161,15 @@ use flotilla_discovery::status::provider_names_from_registry;
 use flotilla_discovery::DiscoveryResult;
 use flotilla_discovery::DiscoveryRuntime;
 use flotilla_environment::environment::EnvironmentHandle;
+use flotilla_executor::environment_manager::EnvironmentManager;
+use flotilla_executor::environment_manager::ResolvedEnvironment;
+use flotilla_executor::executor;
+use flotilla_executor::executor::checkout::CheckoutResolutionScope;
+use flotilla_executor::step::RemoteStepBatchRequest;
+use flotilla_executor::step::RemoteStepExecutor;
+use flotilla_executor::step::RemoteStepProgressSink;
+use flotilla_executor::step::StepOutcome;
+use flotilla_executor::step::StepResolver;
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_paths::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
 use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
@@ -904,14 +905,6 @@ async fn register_static_ssh_direct_environments(
     }
 }
 
-fn fallback_repo_identity(path: &Path) -> flotilla_protocol::RepoIdentity {
-    flotilla_protocol::RepoIdentity { authority: "local".into(), path: path.to_string_lossy().into_owned() }
-}
-
-fn empty_repo_identity() -> flotilla_protocol::RepoIdentity {
-    flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() }
-}
-
 fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTemplateSpec, String> {
     let spec: WorkflowTemplateSpec = serde_yml::from_str(yaml).map_err(|err| format!("invalid workflow template YAML: {err}"))?;
     flotilla_resources::validate(&spec).map_err(|errors| {
@@ -1566,7 +1559,6 @@ impl InProcessDaemon {
             namespace: &self.provisioning_namespace,
             port: self,
             resource_backend: &self.resource_backend,
-            observed_resource_backend: &self.observed_resource_backend,
             config: &self.config,
             active_commands: &self.active_commands,
             observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
@@ -1755,7 +1747,7 @@ impl InProcessDaemon {
             let identity = startup_inspection
                 .as_ref()
                 .ok()
-                .map(|inspection| repository_operations::repository_event_identity(&inspection.spec, None))
+                .map(|inspection| flotilla_executor::action_support::repository_event_identity(&inspection.spec, None))
                 .unwrap_or_else(|| fallback_repo_identity(&path));
             let mut repository_key = None;
             match startup_inspection {
@@ -2668,12 +2660,12 @@ impl InProcessDaemon {
 
     /// Direct SSH environments explicitly opted into host-direct placement.
     /// Their environment key is derived from the remote host's stable ID.
-    pub fn agentless_ssh_environments(&self) -> Vec<(EnvironmentId, crate::environment_manager::DirectEnvironmentState)> {
+    pub fn agentless_ssh_environments(&self) -> Vec<(EnvironmentId, flotilla_executor::environment_manager::DirectEnvironmentState)> {
         self.environment_manager
             .managed_environments()
             .into_iter()
             .filter_map(|(id, managed)| match managed {
-                crate::environment_manager::ManagedEnvironmentKind::Direct(state)
+                flotilla_executor::environment_manager::ManagedEnvironmentKind::Direct(state)
                     if state.host_id.as_ref().is_some_and(|host| id.as_str() == host_direct_environment_name(host.as_str())) =>
                 {
                     Some((id, state))
@@ -3275,7 +3267,7 @@ impl InProcessDaemon {
 
     async fn detect_repo_identity(&self, repo_path: &Path) -> flotilla_protocol::RepoIdentity {
         match self.inspect_repository_path(repo_path, None).await {
-            Ok(inspection) => repository_operations::repository_event_identity(&inspection.spec, None),
+            Ok(inspection) => flotilla_executor::action_support::repository_event_identity(&inspection.spec, None),
             Err(_) => fallback_repo_identity(repo_path),
         }
     }
@@ -3961,13 +3953,6 @@ fn local_repository_matches_checkout(spec: &RepositorySpec, checkout: &crate::re
     }
 }
 
-#[derive(Debug)]
-pub struct AddRepoOutcome {
-    pub tracked_path: PathBuf,
-    pub resolved_from: Option<PathBuf>,
-    pub identity_change: Option<RepositoryIdentityChange>,
-}
-
 impl InProcessDaemon {
     #[cfg(test)]
     async fn resolve_convoy_admission_workflow(
@@ -4619,7 +4604,7 @@ impl InProcessDaemon {
         if !unmet.is_empty() {
             debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
         }
-        let identity = repository_operations::repository_event_identity(&repository_inspection.spec, None);
+        let identity = flotilla_executor::action_support::repository_event_identity(&repository_inspection.spec, None);
         // Resolve the storage identity before publishing RepoTracked so a
         // surface can subscribe to issues{repository} immediately. The
         // background refresh also reconciles the Repository resource and
@@ -5731,7 +5716,7 @@ impl InProcessDaemon {
     }
 
     pub async fn execute_for_caller(&self, command: Command, caller: Option<flotilla_protocol::CommandCaller>) -> Result<u64, String> {
-        self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false, caller).await
+        self.execute_impl(command, Arc::new(flotilla_executor::step::UnsupportedRemoteStepExecutor), false, caller).await
     }
 
     async fn executor_provider_data(&self, repo_identity: &RepoIdentity, _repo_root: &Path, registry: &ProviderRegistry) -> ProviderData {
@@ -5814,7 +5799,7 @@ impl InProcessDaemon {
         document: serde_json::Value,
     ) -> Result<flotilla_store::DynamicResourceObject, ResourceError> {
         use flotilla_resources::MessageSpec;
-        use flotilla_store::{get_resource_kind, MessageAdmission};
+        use flotilla_store::MessageAdmission;
         if document.get("kind").and_then(serde_json::Value::as_str) != Some("Message") {
             return apply_resource_document(&self.resource_backend, namespace, document).await;
         }
@@ -6017,7 +6002,7 @@ async fn execute_local_remote_step_batch(
         }
 
         progress_sink
-            .emit(crate::step::RemoteStepProgressUpdate {
+            .emit(flotilla_executor::step::RemoteStepProgressUpdate {
                 batch_step_index: index,
                 batch_step_count: step_count,
                 description: step.description.clone(),
@@ -6037,7 +6022,7 @@ async fn execute_local_remote_step_batch(
                     _ => flotilla_protocol::StepStatus::Succeeded,
                 };
                 progress_sink
-                    .emit(crate::step::RemoteStepProgressUpdate {
+                    .emit(flotilla_executor::step::RemoteStepProgressUpdate {
                         batch_step_index: index,
                         batch_step_count: step_count,
                         description: step.description,
@@ -6048,7 +6033,7 @@ async fn execute_local_remote_step_batch(
             }
             Err(message) => {
                 progress_sink
-                    .emit(crate::step::RemoteStepProgressUpdate {
+                    .emit(flotilla_executor::step::RemoteStepProgressUpdate {
                         batch_step_index: index,
                         batch_step_count: step_count,
                         description: step.description,
@@ -6124,7 +6109,7 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn execute(&self, command: Command) -> Result<u64, String> {
-        self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false, None).await
+        self.execute_impl(command, Arc::new(flotilla_executor::step::UnsupportedRemoteStepExecutor), false, None).await
     }
 
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
@@ -6206,106 +6191,6 @@ impl DaemonHandle for InProcessDaemon {
     async fn get_topology(&self) -> Result<TopologyResponse, String> {
         Ok(self.host_registry.get_topology().await)
     }
-}
-
-async fn request_manifest_resolution(
-    backend: &ResourceBackend,
-    namespace: &str,
-    kind: &str,
-    name: &str,
-    action: flotilla_protocol::ManifestResolution,
-    requested_by: &str,
-) -> Result<ResourceJsonResponse, String> {
-    let object = get_resource_kind(backend, namespace, kind, name).await.map_err(|error| error.to_string())?;
-    let annotations = object
-        .value
-        .get("metadata")
-        .and_then(|metadata| metadata.get("annotations"))
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| format!("{kind}/{name} has no manifest provenance"))?;
-    let root = annotations
-        .get("flotilla.work/manifest-reconciler-root")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("{kind}/{name} has no manifest root"))?;
-    let path = annotations
-        .get("flotilla.work/manifest-path")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("{kind}/{name} has no manifest path"))?;
-    let key = DocumentKey { path: path.to_string(), kind: object.kind, namespace: namespace.to_string(), name: name.to_string() };
-    let roots = backend.using::<ManifestRoot>(namespace);
-    // One-roll compatibility: older provenance named the host rather than the
-    // materialized ManifestRoot. Resolve that host together with its source.
-    // Host config declares one source today; remove this fallback after one roll.
-    let root_name = match roots.get(root).await {
-        Ok(_) => root.to_string(),
-        Err(ResourceError::NotFound { .. }) => {
-            let source = annotations
-                .get("flotilla.work/manifest-source")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("{kind}/{name} has no manifest source"))?;
-            let matching = roots
-                .list()
-                .await
-                .map_err(|error| error.to_string())?
-                .items
-                .into_iter()
-                .filter(|candidate| candidate.spec.host == root && candidate.spec.source == source)
-                .map(|candidate| candidate.metadata.name)
-                .collect::<Vec<_>>();
-            match matching.as_slice() {
-                [name] => name.clone(),
-                [] => return Err(format!("ManifestRoot for {kind}/{name} is no longer declared")),
-                _ => return Err(format!("ManifestRoot for {kind}/{name} is ambiguous")),
-            }
-        }
-        Err(error) => return Err(error.to_string()),
-    };
-    let action = match action {
-        flotilla_protocol::ManifestResolution::Sync => ResolutionAction::Sync,
-        flotilla_protocol::ManifestResolution::Adopt => ResolutionAction::Adopt,
-    };
-    for _ in 0..3 {
-        let existing = roots.get(&root_name).await.map_err(|error| error.to_string())?;
-        let mut spec = existing.spec;
-        spec.resolutions.insert(
-            key.clone(),
-            Resolution {
-                action,
-                token: uuid::Uuid::new_v4().to_string(),
-                requested_by: if requested_by.is_empty() { "unknown".to_string() } else { requested_by.to_string() },
-            },
-        );
-        match roots.update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &spec).await {
-            Ok(updated) => {
-                return Ok(ResourceJsonResponse {
-                    kind: "ManifestRoot".to_string(),
-                    plural: "manifestroots".to_string(),
-                    namespace: namespace.to_string(),
-                    value: serde_json::to_value(updated).map_err(|error| error.to_string())?,
-                    replica_origin: None,
-                })
-            }
-            Err(ResourceError::Conflict { .. }) => continue,
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Err("ManifestRoot spec conflict retry budget exhausted".to_string())
-}
-
-/// Retry only replay-safe mutations and only optimistic conflicts.
-async fn retry_resource_apply<T, F, Fut>(kind: &str, mut apply: F) -> Result<T, ResourceError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, ResourceError>>,
-{
-    let attempts = if matches!(kind, "Artifact" | "Message") { 16 } else { 1 };
-    for attempt in 0..attempts {
-        let result = apply().await;
-        if attempt + 1 == attempts || !matches!(result, Err(ResourceError::Conflict { .. })) {
-            return result;
-        }
-    }
-    unreachable!("retry budget always makes an attempt")
 }
 
 impl InProcessDaemon {
@@ -6482,8 +6367,12 @@ impl executor_actions::ExecutorActionPort for InProcessDaemon {
         incoming: &Path,
         generation: &str,
         diagnostics_dir: &Path,
-    ) -> Result<crate::cleat_roll::RollReport, String> {
-        InProcessDaemon::post_install_cleat(self, incoming, generation, diagnostics_dir).await
+    ) -> Result<executor_actions::PostInstallReport, String> {
+        let report = InProcessDaemon::post_install_cleat(self, incoming, generation, diagnostics_dir).await?;
+        Ok(executor_actions::PostInstallReport {
+            failed: report.failed(),
+            report: serde_json::to_value(report).map_err(|error| error.to_string()),
+        })
     }
     fn vcs_resolver(&self) -> Result<Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>, String> {
         Ok(self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")? as Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>)
@@ -6516,8 +6405,15 @@ impl executor_actions::ExecutorActionPort for InProcessDaemon {
     async fn local_checkout_for_repository(&self, key: &RepositoryKey) -> Result<Option<PathBuf>, String> {
         InProcessDaemon::local_checkout_for_repository(self, key).await
     }
-    async fn operator_reconciler(&self) -> Option<Arc<dyn OperatorReconciler>> {
-        self.operator_reconciler.read().await.clone()
+    async fn reconcile_now(&self, namespace: &str, kind: &str, name: &str) -> Result<String, String> {
+        let reconciler = self.operator_reconciler.read().await.clone();
+        match reconciler {
+            Some(reconciler) => reconciler.reconcile_now(namespace, kind, name).await,
+            None => Err("operator reconciliation is unavailable before runtime startup".to_string()),
+        }
+    }
+    async fn delete_stale_adopted_checkouts(&self, namespace: &str) -> Result<(), ResourceError> {
+        crate::observed_resources::delete_stale_adopted_checkouts(&self.resource_backend, &self.observed_resource_backend, namespace).await
     }
     async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState {
         InProcessDaemon::peer_connection_status(self, node_id).await

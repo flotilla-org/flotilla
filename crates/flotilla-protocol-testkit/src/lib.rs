@@ -177,3 +177,5 @@ impl TestIssue {
         }
     }
 }
+
+pub mod event_sink;

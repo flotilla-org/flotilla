@@ -1,5 +1,6 @@
 //! Read-side query projections over resource state and explicit runtime inputs.
 
+use flotilla_executor::environment_manager::EnvironmentManager;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
@@ -52,7 +53,6 @@ use tracing::warn;
 use super::{project_ops, resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 use crate::{
     checkout_integration::LANDING_EVIDENCE_TTL,
-    environment_manager::EnvironmentManager,
     fleet::{
         accumulate_fleet_health_counts, fleet_observation_agreement, format_resource_replication_failures, host_credential_attention,
         join_replica_errors, replica_sync_is_fresh, replicated_host_reports, FleetService, ResourceReplicationFailure,
@@ -2216,9 +2216,9 @@ mod tests {
     use crate::aggregator_projection::AggregatorProjectionState;
     use crate::change_request_observer::ChangeRequestRefreshCadence;
     use crate::change_request_observer::ChangeRequestRefresher;
-    use crate::event_sink::EventSink;
-    use crate::event_sink::RecordingEventSink;
     use flotilla_change_request::observation::GhChangeRequestObservationSource;
+    use flotilla_daemon_api::event_sink::EventSink;
+    use flotilla_protocol_testkit::event_sink::RecordingEventSink;
 
     // #2498: every distinct stalled actor is visible across namespaces and replica stores.
     // Generate empty through multi-convoy fleets, duplicate leaves, all rungs, shared and distinct

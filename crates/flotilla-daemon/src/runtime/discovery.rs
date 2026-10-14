@@ -85,7 +85,7 @@ pub(super) async fn discover_agentless_ssh_profile(
     daemon: &Arc<InProcessDaemon>,
     config: &ConfigStore,
     environment_id: EnvironmentId,
-    direct: flotilla_core::environment_manager::DirectEnvironmentState,
+    direct: flotilla_executor::environment_manager::DirectEnvironmentState,
 ) -> Result<AgentlessSshProfile, String> {
     let host_id = direct.host_id.as_ref().expect("agentless SSH environment has a host ID").to_string();
     let home = direct.env_bag.find_env_var("HOME").ok_or_else(|| format!("SSH host {host_id} has no HOME"))?;

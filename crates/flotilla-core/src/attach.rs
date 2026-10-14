@@ -1,5 +1,6 @@
 //! Attach target indexing, role resolution, and plan construction.
 
+use flotilla_executor::environment_manager::{EnvironmentManager, ManagedEnvironmentKind};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::Path,
@@ -32,10 +33,7 @@ use flotilla_store::{ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
 
 use super::{canonical_placement_host_ref, convoy_address, discover_repo_for_environment, LiveConvoyRecord, RoleAddress};
-use crate::{
-    aggregator_projection::AggregatorProjectionState,
-    environment_manager::{EnvironmentManager, ManagedEnvironmentKind},
-};
+use crate::aggregator_projection::AggregatorProjectionState;
 use flotilla_discovery::{registry::ProviderRegistry, DiscoveryRuntime};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_terminal::TerminalSessionLiveness;

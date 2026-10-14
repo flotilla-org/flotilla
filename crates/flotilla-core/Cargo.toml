@@ -7,9 +7,10 @@ license.workspace = true
 [features]
 default = []
 aws-lc-provider = ["flotilla-tls/aws-lc-provider"]
-skip-no-sandbox-tests = ["flotilla-store/skip-no-sandbox-tests", "flotilla-cloud-agent/skip-no-sandbox-tests", "flotilla-ai-utility/skip-no-sandbox-tests"]
+skip-no-sandbox-tests = ["flotilla-executor/skip-no-sandbox-tests", "flotilla-store/skip-no-sandbox-tests", "flotilla-cloud-agent/skip-no-sandbox-tests", "flotilla-ai-utility/skip-no-sandbox-tests"]
 
 [dependencies]
+flotilla-executor = { path = "../flotilla-executor" }
 flotilla-capability-contract = { path = "../flotilla-capability-contract" }
 flotilla-config = { path = "../flotilla-config" }
 flotilla-forge-forgejo = { path = "../flotilla-forge-forgejo" }
@@ -47,12 +48,12 @@ reqwest = { workspace = true, features = ["charset", "http2", "json", "system-pr
 http = { workspace = true }
 bytes = { workspace = true }
 minijinja.workspace = true
-serde_yml = "0.0.12"
+serde_yml = { workspace = true }
 futures.workspace = true
 url = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sysinfo = "0.38.4"
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { workspace = true, features = ["rt"] }
 uuid = { workspace = true, features = ["v4"] }
 sha2 = { workspace = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
@@ -71,7 +72,7 @@ flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
-hegeltest = "=0.48.1"
+hegeltest = { workspace = true }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 tempfile = { workspace = true }

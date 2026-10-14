@@ -1,9 +1,9 @@
 use super::super::action_events::ActionEvents;
 use super::super::convoy_admission::HandlerContractFixture;
 use super::*;
-use crate::event_sink::EventSink;
-use crate::event_sink::RecordingEventSink;
+use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_protocol::{ConvoyStartIntent, NodeId};
+use flotilla_protocol_testkit::event_sink::RecordingEventSink;
 use flotilla_resources::{Convoy, CrewSource, CrewSpec, VesselRequirement, WorkflowTemplateSpec};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

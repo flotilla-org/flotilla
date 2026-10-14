@@ -3,7 +3,7 @@
 //! Takes a `Command`, the repo context, and returns a `CommandValue`.
 //! No UI state mutation — all results are carried in the return value.
 
-pub(crate) mod checkout;
+pub mod checkout;
 mod session_actions;
 
 use std::sync::Arc;
@@ -421,7 +421,7 @@ fn build_remove_checkout_plan(branch: String, local_node_id: NodeId) -> StepPlan
 }
 
 /// Resolves symbolic `StepAction` variants using executor infrastructure.
-pub(crate) struct ExecutorStepResolver {
+pub struct ExecutorStepResolver {
     pub repo: RepoExecutionContext,
     pub registry: Arc<ProviderRegistry>,
     pub providers_data: Arc<ProviderData>,

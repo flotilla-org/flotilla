@@ -55,12 +55,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::{empty_repo_identity, read_projections};
-use crate::event_sink::EventSink;
 use crate::in_process::attach::ResolvedAttach;
 use crate::resource_explain::resource_read_envelope;
 use crate::resource_explain::resource_record;
 use crate::resource_explain::run_resource_watch_command;
 use crate::resource_explain::ResourceWatchCommandContext;
+use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_issue_tracker::IssueProvider;
 
 /// Host-specific read and attach orchestration. Store reads, clock, cancellation

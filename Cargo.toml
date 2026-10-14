@@ -16,6 +16,7 @@ members = [
     "crates/flotilla-config",
     "crates/flotilla-controllers",
     "crates/flotilla-core",
+    "crates/flotilla-executor",
     "crates/flotilla-environment",
     "crates/flotilla-forge-github",
     "crates/flotilla-vcs",
@@ -62,6 +63,9 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
+serde_yml = "0.0.12"
+tokio-util = "0.7"
+hegeltest = "=0.48.1"
 minijinja = "2"
 futures = "0.3"
 sha2 = "0.10"
@@ -122,7 +126,7 @@ bon = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
-serde_yml = "0.0.12"
+serde_yml = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 toml_edit = "0.22"
 libc = { workspace = true }
@@ -138,7 +142,7 @@ tokio = { workspace = true, features = ["test-util"] }
 async-trait = { workspace = true }
 flotilla-core = { path = "crates/flotilla-core" }
 flotilla-test-support = { path = "crates/flotilla-test-support" }
-hegeltest = "=0.48.1"
+hegeltest = { workspace = true }
 tempfile = { workspace = true }
 
 [[example]]

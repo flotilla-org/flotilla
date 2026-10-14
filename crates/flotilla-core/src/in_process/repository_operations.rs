@@ -4,22 +4,8 @@ use crate::in_process::convoy_admission::repository_provider_bag;
 use flotilla_discovery::registry::ProviderSet;
 use flotilla_discovery_api::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
 
-/// Forge identity or Repository key identifies a row independently of any
-/// execution location, including repositories that have no forge.
-pub(super) fn repository_event_identity(spec: &RepositorySpec, _path: Option<&Path>) -> RepoIdentity {
-    if let Some(forge) = spec.forge() {
-        let authority = forge
-            .service_url
-            .strip_prefix("https://")
-            .or_else(|| forge.service_url.strip_prefix("http://"))
-            .unwrap_or(&forge.service_url)
-            .trim_end_matches('/')
-            .to_string();
-        RepoIdentity { authority, path: forge.repository.clone() }
-    } else {
-        RepoIdentity { authority: "repository".into(), path: spec.key().to_string() }
-    }
-}
+#[cfg(test)]
+use flotilla_executor::action_support::repository_event_identity;
 
 #[derive(bon::Builder)]
 pub(super) struct RepositoryProviderLease {

@@ -152,11 +152,12 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-agent` | Agent harness adapters and registry, crew brief rendering, hook parsing and installation, agent state store, process-exit receipts |
 | `flotilla-discovery` | Static factory-list assembly, default detector lists, detector runs, provider discovery, host-scoped provider cache, `ProviderRegistry` and provider status |
 | `flotilla-charter` | Charter inputs read through a `RevisionedTree` (Git via `Vcs`, or a local directory): `project.yaml` declarations, operational entries and their provenance annotations, charter locks and source status |
-| `flotilla-core` | Refresh, observed-resource projection, convoy admission and controller ports, executor, step plans, `InProcessDaemon` composition root |
+| `flotilla-executor` | Provider-backed command handlers, step plans and resolution, remote step batches, environment management and host orchestration ports |
+| `flotilla-core` | Refresh, observed-resource projection, convoy admission and controller ports, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
 | `flotilla-config` | Host-local config files (`config.toml`, `daemon.toml`, `hosts.toml`, observation roots, open views), provider preference values, default checkout path and bounded log files |
-| `flotilla-daemon-api` | `DaemonHandle` interface, query subscription token, build identity and lifecycle lock file |
+| `flotilla-daemon-api` | `DaemonHandle` and event publication interfaces, query subscription token, build identity and lifecycle lock file |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
 | `flotilla-daemon` | Runtime supervision, socket server, replication composition and routed transport, peer networking, multi-host command routing |
@@ -189,12 +190,12 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-core/src/convoy_ensure.rs` | Narrow admission and controller ports for standing convoys |
 | `crates/flotilla-core/src/in_process/convoy_admission.rs` | Transaction-owning convoy admission primitive |
 | `crates/flotilla-controllers/src/reconcilers/convoy_ensure.rs` | Standing-convoy reconciliation, retry state and the complete ensure transaction guard |
-| `crates/flotilla-core/src/executor.rs` | Executes provider-backed command steps and returns `CommandValue` |
-| `crates/flotilla-core/src/executor/` | Executor submodules: checkout, workspace, terminals, session actions |
+| `crates/flotilla-executor/src/executor.rs` | Executes provider-backed command steps and returns `CommandValue` |
+| `crates/flotilla-executor/src/executor/` | Executor submodules: checkout, session actions and tests |
 | `crates/flotilla-core/src/model.rs` | `RepoModel` and provider label/name helpers |
-| `crates/flotilla-core/src/data.rs` | Checkout status inspection |
+| `crates/flotilla-executor/src/data.rs` | Checkout status inspection |
 | `crates/flotilla-core/src/observed_resources.rs` | Projects discovered and adopted Checkouts into the ephemeral observed-resource store |
-| `crates/flotilla-core/src/step.rs` | Step planning and execution system |
+| `crates/flotilla-executor/src/step.rs` | Step planning and execution system |
 | `crates/flotilla-agent/src/adapter.rs` | Agent harness adapters, `AgentAdapterRegistry`, capability table and crew brief rendering |
 | `crates/flotilla-agent/src/hooks.rs`, `crates/flotilla-agent/src/store.rs` | Agent hook handling and state management |
 | `crates/flotilla-agent/src/process.rs` | Process-exit receipts and image preludes for agents in persistent terminal shells |

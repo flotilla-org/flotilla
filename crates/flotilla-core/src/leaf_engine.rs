@@ -1,3 +1,4 @@
+use flotilla_daemon_api::event_sink::EventSink;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{
@@ -20,7 +21,6 @@ use tokio::{
 
 use crate::{
     change_request_observer::ChangeRequestRefresher,
-    event_sink::EventSink,
     issue_observer::{IssueObservationSource, IssueRef, IssueRefreshCadence, IssueRefresher},
 };
 use turn_delivery::UnavailableTurnDeliveryActuator;
