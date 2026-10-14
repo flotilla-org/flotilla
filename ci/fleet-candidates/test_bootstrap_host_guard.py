@@ -1,6 +1,9 @@
 """Host-side observations: no live daemon, host or service manager required."""
+import contextlib
 import datetime
+import io
 import json
+import sys
 import tempfile
 import unittest
 import subprocess
@@ -79,9 +82,6 @@ class HostGuardTests(unittest.TestCase):
     # CLI glue: observation commands return integer exit codes; existing helper
     # dispatch falls through with None, which sys.exit treats as success.
     def test_command_exit_codes(self):
-        import contextlib
-        import io
-        import sys
         for command in ("daemon-health", "startup-pending"):
             arguments = ["cli", "socket", "1"] if command == "daemon-health" else ["log", "1"]
             for success in (False, True):

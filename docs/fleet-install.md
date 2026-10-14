@@ -44,6 +44,9 @@ Override the floor with `--min-free-bytes N` (default `5368709120`) or
 `FLEET_INSTALL_MIN_FREE_BYTES`. On macOS, the read-only
 `kern.memorystatus_vm_pressure_level` sysctl supplies memory pressure (normal=1, warning=2, critical=4); critical
 refuses. On Linux, `MemAvailable` at or below 5% of `MemTotal` refuses.
+This Linux check reads host memory from `/proc/meminfo`; it does not inspect
+cgroup `memory.current` or `memory.max`. Running the installer inside a
+memory-limited container therefore does not establish cgroup memory headroom.
 Linux kernels without `MemAvailable` cannot pass admission; changing the disk
 floor does not bypass the memory check. Missing or malformed pressure
 observations refuse with a diagnostic. Relieve the reported pressure or free

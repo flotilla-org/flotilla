@@ -848,6 +848,8 @@ def host_preflight(state_dir, floor, platform, pressure=None):
 
 def daemon_health(cli, socket, timeout):
     # Bound each CLI invocation as well as the outer confirmation loop.
+    # The child inherits FLOTILLA_CONTAINED_HOST_DAEMON=1 from the shell's
+    # probe_daemon_health invocation, preventing client-side daemon spawning.
     try:
         result = subprocess.run([cli, "--socket", socket, "fleet", "check"],
                                 stdout=subprocess.DEVNULL, timeout=max(0.1, min(5, timeout)), check=False)
