@@ -13,6 +13,10 @@
 //!   cargo test --release -p flotilla-daemon --locked --test dummy_fleet_load load_baseline -- --ignored --nocapture
 //! ```
 //!
+//! `FLOTILLA_LOAD_MAX_RESIDENT_GIB` stops admitting convoys once the process
+//! holds that much memory, so a plan the host cannot hold reports how far it
+//! got. Progress lines every 30 s survive a run the host kills.
+//!
 //! This is its own test target: it reads the process's resident memory, which
 //! other tests in a shared binary would distort.
 
@@ -80,6 +84,8 @@ struct Home {
 
 struct InProcessFleet {
     homes: Vec<Home>,
+    /// Refuse dispatches once the process holds this much resident memory.
+    memory_limit: Option<u64>,
     _mesh: Option<InMemoryRequestMesh>,
     _dir: tempfile::TempDir,
 }
@@ -256,7 +262,11 @@ impl InProcessFleet {
         } else {
             None
         };
-        Self { homes: started, _mesh: mesh, _dir: dir }
+        let memory_limit = std::env::var("FLOTILLA_LOAD_MAX_RESIDENT_GIB")
+            .ok()
+            .and_then(|gib| gib.parse::<u64>().ok())
+            .map(|gib| gib * 1024 * 1024 * 1024);
+        Self { homes: started, memory_limit, _mesh: mesh, _dir: dir }
     }
 }
 
@@ -267,6 +277,13 @@ impl FleetTarget for InProcessFleet {
     }
 
     async fn dispatch(&self, home: usize, name: &str, mix: CrewMix) -> Result<(), String> {
+        // Stop admitting before the process outgrows the host, so a run that
+        // cannot reach its plan reports how far it got.
+        if let (Some(limit), Some(resident)) = (self.memory_limit, resident_bytes()) {
+            if resident >= limit {
+                return Err(format!("resident memory limit reached ({} MiB)", limit / (1024 * 1024)));
+            }
+        }
         let home = &self.homes[home];
         let forge = catalog::forge(&catalog_forge_url());
         let action = CommandAction::ConvoyCreate {
@@ -396,7 +413,27 @@ async fn load_baseline() {
         ..LoadPlan::default()
     };
     let started = Utc::now();
-    let report = flotilla_load_driver::run(&fleet, &plan).await.expect("load report");
+    let fleet = Arc::new(fleet);
+    // Progress survives a run the host kills: open convoys, memory and store size.
+    let progress = {
+        let fleet = Arc::clone(&fleet);
+        tokio::spawn(async move {
+            let began = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let open = fleet.homes.iter().map(|home| home.view.places.lock().expect("places").len()).sum::<usize>();
+                let database = fleet.homes.iter().filter_map(|home| database_bytes(&home.database)).sum::<u64>();
+                println!(
+                    "progress t={:.0}s open={open} resident={} MiB database={} MiB",
+                    began.elapsed().as_secs_f64(),
+                    resident_bytes().unwrap_or(0) / (1024 * 1024),
+                    database / (1024 * 1024)
+                );
+            }
+        })
+    };
+    let report = flotilla_load_driver::run(&*fleet, &plan).await.expect("load report");
+    progress.abort();
     let markdown = report.markdown();
     println!("{markdown}");
     if let Ok(prefix) = std::env::var("FLOTILLA_LOAD_REPORT") {
