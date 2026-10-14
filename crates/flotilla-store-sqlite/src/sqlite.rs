@@ -23,6 +23,7 @@ use flotilla_resources::{ResourceList, ResourceTombstone, WatchEvent, WatchStart
 use futures::{stream, StreamExt};
 use rusqlite::{params, Connection as RusqliteConnection, OpenFlags, OptionalExtension};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio_rusqlite::Connection;
 
 use crate::{
@@ -41,6 +42,9 @@ use crate::{
 mod digest;
 #[path = "sqlite/legacy_field_indexes.rs"]
 mod legacy_field_indexes;
+#[cfg(test)]
+#[path = "sqlite/query_projection_tests.rs"]
+mod query_projection_tests;
 #[path = "sqlite/statements.rs"]
 pub(crate) mod statements;
 #[cfg(test)]
@@ -394,6 +398,7 @@ impl SqliteBackend {
         let connection =
             RusqliteConnection::open(&path).map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
         let mut backend = Self::from_connection(connection, event_retention)?;
+        let started = Instant::now();
         for _ in 0..READER_COUNT {
             let read = RusqliteConnection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(|err| ResourceError::other(format!("open sqlite resource reader: {err}")))?;
@@ -405,6 +410,12 @@ impl SqliteBackend {
             read.busy_timeout(READ_BUSY_TIMEOUT).map_err(|err| Self::map_sqlite(err, "configure reader timeout"))?;
             backend.read_connections.push(read.into());
         }
+        tracing::info!(
+            step = "reader_opens",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            reader_count = READER_COUNT,
+            "sqlite store open step completed"
+        );
         backend.reader_slots = Arc::new(tokio::sync::Semaphore::new(READER_COUNT - 1));
         backend.available_readers = Arc::new(Mutex::new((0..READER_COUNT - 1).collect()));
         backend.discovery_readers = Arc::new(Mutex::new(vec![READER_COUNT - 1]));
@@ -414,6 +425,7 @@ impl SqliteBackend {
     pub async fn open_async(path: impl AsRef<Path>) -> Result<Self, ResourceError> {
         let connection = Connection::open(&path).await.map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
         let mut backend = Self::from_async_connection(connection, EventRetention::default()).await?;
+        let started = Instant::now();
         for _ in 0..READER_COUNT {
             let read = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .await
@@ -432,6 +444,12 @@ impl SqliteBackend {
             backend.read_connections.push(read);
             backend.reader_meters.push(meter);
         }
+        tracing::info!(
+            step = "reader_opens",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            reader_count = READER_COUNT,
+            "sqlite store open step completed"
+        );
         backend.reader_slots = Arc::new(tokio::sync::Semaphore::new(READER_COUNT - 1));
         backend.available_readers = Arc::new(Mutex::new((0..READER_COUNT - 1).collect()));
         backend.discovery_readers = Arc::new(Mutex::new(vec![READER_COUNT - 1]));
@@ -539,6 +557,7 @@ impl SqliteBackend {
     }
 
     fn initialize_connection(connection: &mut RusqliteConnection, event_retention: EventRetention) -> Result<(), ResourceError> {
+        let started = Instant::now();
         Self::register_query_functions(connection)?;
         connection
             .busy_timeout(Duration::from_secs(5))
@@ -778,8 +797,13 @@ impl SqliteBackend {
                 )
                 .map_err(|err| Self::map_sqlite(err, "migrate sqlite replica object timestamps"))?;
         }
+        tracing::info!(step = "schema", elapsed_ms = started.elapsed().as_millis() as u64, "sqlite store open step completed");
+        let started = Instant::now();
         Self::initialize_query_indexes(connection)?;
+        tracing::info!(step = "query_indexes", elapsed_ms = started.elapsed().as_millis() as u64, "sqlite store open step completed");
+        let started = Instant::now();
         let startup_diagnostics = Self::diagnostics_from_connection(connection, event_retention)?;
+        tracing::info!(step = "diagnostics", elapsed_ms = started.elapsed().as_millis() as u64, "sqlite store open step completed");
         if !startup_diagnostics.warnings.is_empty() {
             tracing::warn!(
                 event_count = startup_diagnostics.event_count,
@@ -790,13 +814,58 @@ impl SqliteBackend {
                 "resource event log tripwire triggered on startup; compacting",
             );
         }
+        let started = Instant::now();
         Self::compact_existing_events(connection, event_retention)?;
+        tracing::info!(
+            step = "compact_existing_events",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "sqlite store open step completed"
+        );
+        let started = Instant::now();
         Self::initialize_digests(connection)?;
+        tracing::info!(step = "initialize_digests", elapsed_ms = started.elapsed().as_millis() as u64, "sqlite store open step completed");
         Ok(())
     }
 
+    /// Versioned, transactional materialized-view repair with a per-write native
+    /// proof. See `docs/implementation-choices/sqlite-query-projection-validity.md`.
     fn initialize_query_indexes(connection: &mut rusqlite::Connection) -> Result<(), ResourceError> {
         let tx = connection.transaction().map_err(|e| Self::map_sqlite(e, "begin query indexes"))?;
+        let started = Instant::now();
+        // Rebuildable projection schema: bump v1 when extraction semantics change.
+        // Field additions/removals and kind identity changes are detected automatically.
+        let mut declarations = crate::declared_resource_kinds()
+            .into_iter()
+            .map(|kind| format!("{}/{}/{}:{:?}", kind.paths.group, kind.paths.version, kind.paths.kind, kind.queryable_fields))
+            .collect::<Vec<_>>();
+        declarations.sort();
+        let schema = format!("{:x}", Sha256::digest(format!("query-projections-v1:{declarations:?}")));
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS resource_query_projection (singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS resource_query_native_write (singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema TEXT NOT NULL);")
+            .map_err(|e| Self::map_sqlite(e, "create query projection marker"))?;
+        let initialized = tx
+            .query_row("SELECT schema FROM resource_query_projection WHERE singleton=1", [], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(|e| Self::map_sqlite(e, "read query projection marker"))?;
+        let repair = initialized.as_deref() != Some(&schema);
+        for table in ["resource_objects", "replica_objects"] {
+            for action in ["INSERT", "UPDATE", "DELETE"] {
+                // BEFORE and AFTER phases give an ordering guarantee independent
+                // of SQLite's ordering of triggers within each phase. A native
+                // write supplies a one-row proof; every writer consumes it.
+                // Both proof and invalidation roll back with the object mutation.
+                tx.execute_batch(&format!(
+                    "CREATE TEMP TRIGGER IF NOT EXISTS {table}_query_native_{action} BEFORE {action} ON main.{table}
+                    BEGIN INSERT INTO resource_query_native_write(singleton,schema) VALUES (1,'{schema}')
+                    ON CONFLICT(singleton) DO UPDATE SET schema=excluded.schema; END;
+                    CREATE TRIGGER IF NOT EXISTS {table}_query_dirty_{action} AFTER {action} ON {table}
+                    BEGIN DELETE FROM resource_query_projection WHERE NOT EXISTS (
+                        SELECT 1 FROM resource_query_native_write n WHERE n.singleton=1 AND n.schema=resource_query_projection.schema);
+                    DELETE FROM resource_query_native_write; END;"
+                ))
+                .map_err(|e| Self::map_sqlite(e, "install query projection invalidation"))?;
+            }
+        }
         for (migration, table, origin) in
             [("resource-labels-v1", "resource_objects", "''"), ("replica-labels-v1", "replica_objects", "origin_root")]
         {
@@ -832,16 +901,21 @@ impl SqliteBackend {
                 INSERT INTO {labels} SELECT {new_identity},key,value FROM ({label_values});
                 INSERT INTO {owners} SELECT DISTINCT {new_identity},json_array(json_extract(value,'$.apiVersion'),json_extract(value,'$.kind'),json_extract(value,'$.name')) FROM json_each({body},'$.metadata.ownerReferences');
             ");
-            for action in ["insert", "update", "delete"] {
-                tx.execute_batch(&format!("DROP TRIGGER IF EXISTS {table}_query_{action};"))
-                    .map_err(|e| Self::map_sqlite(e, "replace metadata query trigger"))?;
+            if repair {
+                for action in ["insert", "update", "delete"] {
+                    tx.execute_batch(&format!("DROP TRIGGER IF EXISTS main.{table}_query_{action};"))
+                        .map_err(|e| Self::map_sqlite(e, "replace metadata query trigger"))?;
+                }
             }
             tx.execute_batch(&format!("
-                CREATE TRIGGER {table}_query_insert AFTER INSERT ON {table} BEGIN {insert} END;
-                CREATE TRIGGER {table}_query_update AFTER UPDATE ON {table} BEGIN
+                CREATE TRIGGER IF NOT EXISTS {table}_query_insert AFTER INSERT ON {table} BEGIN {insert} END;
+                CREATE TRIGGER IF NOT EXISTS {table}_query_update AFTER UPDATE ON {table} BEGIN
                     DELETE FROM {labels} WHERE {delete_identity}; DELETE FROM {owners} WHERE {delete_identity}; {insert}
                 END;
-                CREATE TRIGGER {table}_query_delete AFTER DELETE ON {table} BEGIN DELETE FROM {labels} WHERE {delete_identity}; DELETE FROM {owners} WHERE {delete_identity}; END;
+                CREATE TRIGGER IF NOT EXISTS {table}_query_delete AFTER DELETE ON {table} BEGIN DELETE FROM {labels} WHERE {delete_identity}; DELETE FROM {owners} WHERE {delete_identity}; END;
+            ")).map_err(|e| Self::map_sqlite(e, "install metadata query triggers"))?;
+            if repair || !done {
+                tx.execute_batch(&format!("
                 DELETE FROM {labels}; DELETE FROM {owners};
                 INSERT INTO {labels} SELECT group_name,version,kind,namespace,name,origin,key,value FROM (
                     SELECT o.group_name,o.version,o.kind,o.namespace,o.name,{origin} AS origin,j.key,j.value,max(j.id) AS last_id
@@ -849,8 +923,16 @@ impl SqliteBackend {
                     GROUP BY o.group_name,o.version,o.kind,o.namespace,o.name,{origin},j.key
                 );
                 INSERT INTO {owners} SELECT DISTINCT o.group_name,o.version,o.kind,o.namespace,o.name,{origin},json_array(json_extract(j.value,'$.apiVersion'),json_extract(j.value,'$.kind'),json_extract(j.value,'$.name')) FROM {table} o,json_each(CASE WHEN json_valid(o.body_json) THEN o.body_json ELSE '{{}}' END,'$.metadata.ownerReferences') j;
-            ")).map_err(|e| Self::map_sqlite(e, "install and repair metadata query indexes"))?;
+            ")).map_err(|e| Self::map_sqlite(e, "repair metadata query indexes"))?;
+            }
         }
+        tracing::info!(
+            step = "query_indexes_metadata",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            repaired = repair,
+            "sqlite store open step completed"
+        );
+        let started = Instant::now();
         // Pre-release query schemas used persistent function-dependent objects.
         // Remove those automatically before installing connection-local triggers.
         let obsolete = {
@@ -910,14 +992,25 @@ impl SqliteBackend {
                         CREATE TEMP TRIGGER IF NOT EXISTS {index}_update AFTER UPDATE ON main.{table} WHEN NEW.kind='{}' BEGIN {delete} {insert} END;
                         CREATE TEMP TRIGGER IF NOT EXISTS {index}_delete AFTER DELETE ON main.{table} WHEN OLD.kind='{}' BEGIN {delete} END;
                     ",kind.paths.kind,kind.paths.kind,kind.paths.kind)).map_err(|e| Self::map_sqlite(e,"install temporary field triggers"))?;
-                    // Unknown writers cannot maintain these projections. Repair on
-                    // every native open, including deletions and unchanged versions.
-                    tx.execute_batch(&format!("DELETE FROM {values}; INSERT OR IGNORE INTO {values} SELECT DISTINCT o.group_name,o.version,o.kind,o.namespace,o.name,{origin},j.value FROM main.{table} o,json_each(flotilla_declared_values(o.body_json,'{path}')) j WHERE o.kind='{}' AND j.type='text';",kind.paths.kind))
+                    if repair || !done {
+                        tx.execute_batch(&format!("DELETE FROM {values}; INSERT OR IGNORE INTO {values} SELECT DISTINCT o.group_name,o.version,o.kind,o.namespace,o.name,{origin},j.value FROM main.{table} o,json_each(flotilla_declared_values(o.body_json,'{path}')) j WHERE o.kind='{}' AND j.type='text';",kind.paths.kind))
                         .map_err(|e| Self::map_sqlite(e,"repair declared field values"))?;
+                    }
                 }
             }
         }
-        tx.commit().map_err(|e| Self::map_sqlite(e, "commit query indexes"))
+        if repair {
+            tx.execute("INSERT INTO resource_query_projection(singleton,schema) VALUES (1,?1) ON CONFLICT(singleton) DO UPDATE SET schema=excluded.schema", [&schema])
+                .map_err(|e| Self::map_sqlite(e, "record query projection schema"))?;
+        }
+        tx.commit().map_err(|e| Self::map_sqlite(e, "commit query indexes"))?;
+        tracing::info!(
+            step = "query_indexes_fields",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            repaired = repair,
+            "sqlite store open step completed"
+        );
+        Ok(())
     }
     fn field_index(table: &str, kind: ResourceKind, path: &str) -> String {
         format!(
@@ -3915,6 +4008,28 @@ mod latency_tests {
         assert_eq!(position.resource_version, created.metadata.resource_version);
         assert_eq!(position.generation, None);
         assert!(backend.diagnostics().await.expect("diagnostics").decode_quarantines.is_empty());
+    }
+
+    // Issue 3197: initialized native connections maintain projections incrementally;
+    // reopening an empty or populated store must not rewrite their rows.
+    #[test]
+    fn native_reopen_does_not_rewrite_query_projections() {
+        use super::{EventRetention, RusqliteConnection};
+        for populated in [false, true] {
+            let mut connection = RusqliteConnection::open_in_memory().expect("connection");
+            SqliteBackend::initialize_connection(&mut connection, EventRetention::default()).expect("initialize");
+            if populated {
+                connection.execute_batch(r#"
+                    INSERT INTO resource_objects VALUES ('flotilla.work','v1','Project','flotilla','test',1,
+                    '{"metadata":{"labels":{"test":"yes"},"ownerReferences":[{"apiVersion":"flotilla.work/v1","kind":"Host","name":"owner"}]},"spec":{"repositories":[{"repo":"repo"}]}}');
+                    INSERT INTO replica_objects (origin_root,group_name,version,kind,namespace,name,body_json,last_synced_at)
+                    SELECT 'foreign',group_name,version,kind,namespace,name,body_json,'2026-10-14T00:00:00Z' FROM resource_objects;
+                "#).expect("native writes");
+            }
+            let before = connection.total_changes();
+            SqliteBackend::initialize_connection(&mut connection, EventRetention::default()).expect("reopen");
+            assert_eq!(connection.total_changes(), before, "steady-state open must not rewrite derived rows");
+        }
     }
 
     #[tokio::test]
