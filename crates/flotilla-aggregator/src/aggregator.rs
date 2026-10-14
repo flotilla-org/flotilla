@@ -1124,7 +1124,9 @@ impl Aggregator {
         // across a live phase change. Replacing it would defer the convoy's first
         // branch scan by a whole refresh interval, as admission's Pending→Active
         // step otherwise does (#3206).
-        let lookup_in_flight = self.change_request_refresh_tasks.get(reference).is_some_and(|task| !task.is_finished());
+        // A lookup is pending until its resolution is applied, which removes
+        // its task; a finished task's resolution may still be queued.
+        let lookup_in_flight = self.change_request_refresh_tasks.contains_key(reference);
         let ended = current.and_then(|convoy| convoy.status.as_ref()).is_some_and(|status| convoy_phase_is_terminal(status.phase));
         if association_changed || (phase_changed && (ended || !lookup_in_flight)) {
             if let Some(current) = current {
@@ -1292,6 +1294,13 @@ impl Aggregator {
                 continue;
             }
             if convoy.status.as_ref().is_some_and(|status| convoy_phase_is_terminal(status.phase)) {
+                continue;
+            }
+            // A lookup already scheduled, running or awaiting application answers
+            // the trigger no later than a replacement would: replacing it would
+            // restart its wait from the last start, so a busy repository could
+            // defer a convoy's first branch scan indefinitely (#3206).
+            if self.change_request_refresh_tasks.contains_key(&reference) {
                 continue;
             }
             let generation = uuid::Uuid::new_v4();
@@ -5417,6 +5426,58 @@ mod tests {
         aggregator.schedule_change_request_refresh(&convoy);
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(landed)).await;
         assert!(!aggregator.change_request_refresh_tasks.contains_key(&reference), "an ended convoy still cancels its lookup");
+    }
+
+    // Behaviour (#3206): a lookup that finished while its resolution waits in
+    // the queue is still pending; a phase change before it is applied keeps it
+    // rather than replacing it and dropping its result as stale.
+    #[tokio::test(start_paused = true)]
+    async fn a_phase_change_keeps_a_finished_lookup_awaiting_application() {
+        let (event_tx, _) = broadcast::channel(8);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::new()),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+            .with_change_request_resolver(Arc::clone(&resolver));
+        let mut convoy = convoy_with_branch("convoy-a").await;
+        convoy.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Pending, ..Default::default() });
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        let reference = aggregator.convoy_ref("flotilla", "convoy-a");
+        while !aggregator.change_request_refresh_tasks[&reference].is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut active = convoy;
+        active.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Active, ..Default::default() });
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(active)).await;
+        apply_next_change_request_resolution(&mut aggregator).await;
+        assert!(
+            !aggregator.change_request_refresh_tasks.contains_key(&reference),
+            "the queued resolution was applied, not dropped as stale"
+        );
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Behaviour (#3206): repository change-request churn does not defer a
+    // convoy's pending first lookup; it completes without waiting an interval.
+    #[tokio::test(start_paused = true)]
+    async fn repository_triggers_keep_a_pending_first_lookup() {
+        let (event_tx, _) = broadcast::channel(8);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::new()),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+            .with_change_request_resolver(Arc::clone(&resolver));
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
+        let repo = RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() };
+        for _ in 0..3 {
+            aggregator.refresh_repository_change_requests(&repo).await;
+        }
+        apply_next_change_request_resolution(&mut aggregator).await;
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1, "the admission lookup ran at once");
     }
 
     #[tokio::test]
