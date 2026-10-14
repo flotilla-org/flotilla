@@ -1,0 +1,11 @@
+[package]
+name = "state-machine-prototype"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Prototype for flotilla#3209: the state-machine engine API (machines, gated edges, records, judgements)"
+
+# Deliberately dependency-free and outside the workspace gates (see the root
+# Cargo.toml `exclude`). Storage is out of scope; `record.rs` shows where the
+# storage derive from #3208 would attach.
+[dependencies]
