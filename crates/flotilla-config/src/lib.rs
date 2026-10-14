@@ -31,6 +31,21 @@ pub fn default_checkout_path() -> String {
 /// Blocking `config.toml` read handed to a caller-supplied offloader.
 pub type ConfigFileRead = Box<dyn FnOnce() -> Result<FlotillaConfig, String> + Send + 'static>;
 
+/// Missing config is normal; unreadable or malformed config warns and uses defaults.
+fn read_config_file(path: &DaemonHostPath) -> FlotillaConfig {
+    match std::fs::read_to_string(path.as_path()) {
+        Ok(contents) => toml::from_str(&contents).unwrap_or_else(|error| {
+            tracing::warn!(%path, err = %error, "failed to parse config; using defaults");
+            FlotillaConfig::default()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => FlotillaConfig::default(),
+        Err(error) => {
+            tracing::warn!(%path, err = %error, "failed to read config; using defaults");
+            FlotillaConfig::default()
+        }
+    }
+}
+
 /// Global flotilla config from ~/.config/flotilla/config.toml
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct FlotillaConfig {
@@ -692,18 +707,7 @@ impl ConfigStore {
             return Ok(config.lock().expect("config cache mutex poisoned").clone());
         }
         let path = self.base.join("config.toml");
-        let loaded = offload(Box::new(move || match std::fs::read_to_string(path.as_path()) {
-            Ok(contents) => Ok(toml::from_str(&contents).unwrap_or_else(|error| {
-                tracing::warn!(%path, err = %error, "failed to parse config; using defaults");
-                FlotillaConfig::default()
-            })),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FlotillaConfig::default()),
-            Err(error) => {
-                tracing::warn!(%path, err = %error, "failed to read config; using defaults");
-                Ok(FlotillaConfig::default())
-            }
-        }))
-        .await?;
+        let loaded = offload(Box::new(move || Ok(read_config_file(&path)))).await?;
         // Concurrent cold-cache callers may each read the file; the first
         // result wins and later reads are discarded, so the race is harmless.
         let cached = self.global_config.get_or_init(|| Mutex::new(loaded));
@@ -713,15 +717,7 @@ impl ConfigStore {
     /// Load global flotilla config (cached for the lifetime of the store).
     pub fn load_config(&self) -> FlotillaConfig {
         self.global_config
-            .get_or_init(|| {
-                Mutex::new({
-                    let path = self.base.join("config.toml");
-                    std::fs::read_to_string(path.as_path())
-                        .ok()
-                        .and_then(|content| toml::from_str(&content).map_err(|e| tracing::warn!(%path, err = %e, "failed to parse")).ok())
-                        .unwrap_or_default()
-                })
-            })
+            .get_or_init(|| Mutex::new(read_config_file(&self.base.join("config.toml"))))
             .lock()
             .expect("config cache mutex poisoned")
             .clone()
