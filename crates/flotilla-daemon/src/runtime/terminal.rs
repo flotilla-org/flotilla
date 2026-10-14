@@ -67,6 +67,8 @@ pub(super) struct TerminalControllerRuntime {
     pub(super) state: Arc<ControllerRuntimeState>,
 }
 
+// The dummy fleet (`crate::dummy_fleet`) warns when its turn delay is below
+// STABLE_FOR + POLL; keep that warning in mind when changing either.
 pub(crate) const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
 
 pub(super) const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(4);

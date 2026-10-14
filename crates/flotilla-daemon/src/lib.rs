@@ -2,6 +2,7 @@
 // Remove when async_trait or Clippy stops producing this warning.
 #![allow(clippy::double_must_use)]
 
+mod agent_attention;
 pub mod artifact;
 pub mod blob_store;
 mod charter_delegation;

@@ -70,6 +70,7 @@ http = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+flotilla-load-driver = { path = "../flotilla-load-driver" }
 flotilla-change-request = { path = "../flotilla-change-request" }
 flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
 flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }

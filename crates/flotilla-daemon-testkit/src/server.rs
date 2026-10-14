@@ -167,11 +167,34 @@ pub async fn spawn_in_memory_request_mesh_with_digest_driver(
     spawn_request_mesh(hosts, replication_kinds, filter, Some(DigestDriver::default())).await
 }
 
+/// A full mesh whose hosts record replication into the given metrics, one per
+/// host in order, for load measurement (#3206).
+pub async fn spawn_in_memory_request_mesh_with_replication_metrics(
+    hosts: Vec<Arc<InProcessDaemon>>,
+    replication_metrics: Vec<Arc<flotilla_store::load_metrics::ReplicationLoadMetrics>>,
+) -> Result<InMemoryRequestMesh, String> {
+    if replication_metrics.len() != hosts.len() {
+        return Err("replication metrics must name one entry per host".into());
+    }
+    spawn_request_mesh_with_metrics(hosts, None, Arc::new(Some), None, replication_metrics).await
+}
+
 async fn spawn_request_mesh(
     hosts: Vec<Arc<InProcessDaemon>>,
     replication_kinds: Option<&'static [&'static str]>,
     filter: EnvelopeFilter,
     digest_driver: Option<DigestDriver>,
+) -> Result<InMemoryRequestMesh, String> {
+    let replication_metrics = hosts.iter().map(|_| Arc::default()).collect();
+    spawn_request_mesh_with_metrics(hosts, replication_kinds, filter, digest_driver, replication_metrics).await
+}
+
+async fn spawn_request_mesh_with_metrics(
+    hosts: Vec<Arc<InProcessDaemon>>,
+    replication_kinds: Option<&'static [&'static str]>,
+    filter: EnvelopeFilter,
+    digest_driver: Option<DigestDriver>,
+    replication_metrics: Vec<Arc<flotilla_store::load_metrics::ReplicationLoadMetrics>>,
 ) -> Result<InMemoryRequestMesh, String> {
     if hosts.is_empty() {
         return Err("request mesh needs at least one host".into());
@@ -208,7 +231,7 @@ async fn spawn_request_mesh(
     let mut clients = Vec::with_capacity(hosts.len());
     let mut shutdown_txs = Vec::with_capacity(hosts.len());
     let mut tasks = Vec::with_capacity(hosts.len() * 2);
-    for (host, peer_manager) in hosts.iter().zip(&peer_managers) {
+    for ((host, peer_manager), replication_metrics) in hosts.iter().zip(&peer_managers).zip(replication_metrics) {
         let (inbound_peer_tx, inbound_peer_rx) = mpsc::channel(256);
         let router = build_remote_command_router(host, peer_manager);
         let (runtime, _connected_tx) = PeerRuntime::new(
@@ -221,6 +244,7 @@ async fn spawn_request_mesh(
         )
         .with_replication_kinds(replication_kinds)
         .with_digest_driver(digest_driver.clone().map(|driver| Arc::new(driver) as Arc<dyn DigestScheduler>))
+        .with_replication_metrics(replication_metrics)
         .spawn();
         tasks.push(runtime);
 

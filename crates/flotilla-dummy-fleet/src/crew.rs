@@ -108,6 +108,8 @@ impl CrewScript {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CrewIdentity {
     pub(crate) crew_id: String,
+    /// The crew's TerminalSession, which hook-style attention reports name.
+    pub(crate) session: Option<String>,
     pub(crate) namespace: String,
     pub(crate) convoy: String,
     pub(crate) vessel: String,
@@ -119,6 +121,7 @@ impl CrewIdentity {
         let get = |key: &str| environment.iter().rev().find(|(name, _)| name == key).map(|(_, value)| value.clone());
         Some(Self {
             crew_id: get("FLOTILLA_CREW_ID")?,
+            session: get("FLOTILLA_TERMINAL_SESSION"),
             namespace: get("FLOTILLA_NAMESPACE")?,
             convoy: get("FLOTILLA_CONVOY")?,
             vessel: get("FLOTILLA_VESSEL")?,
@@ -167,7 +170,7 @@ impl Crew {
 
     pub(crate) async fn run(mut self, script: CrewScript) {
         // The launch prompt is the first turn.
-        self.session.set_working(true);
+        self.mark(true).await;
         self.think().await;
         let ending = match self.begin().await {
             Some(ending) => Some(ending),
@@ -183,7 +186,7 @@ impl Crew {
             None => {}
         }
         // A finished crew stays idle in its session until teardown kills it.
-        self.session.set_working(false);
+        self.mark(false).await;
         while self.turns.recv().await.is_some() {}
     }
 
@@ -301,9 +304,9 @@ impl Crew {
     /// Peer tasks arriving meanwhile are held for the script.
     async fn await_guidance(&mut self) -> Option<()> {
         loop {
-            self.session.set_working(false);
+            self.mark(false).await;
             let turn = self.turns.recv().await?;
-            self.session.set_working(true);
+            self.mark(true).await;
             if is_peer_turn(&turn) {
                 self.held.push_back(turn);
             } else {
@@ -356,20 +359,28 @@ impl Crew {
     /// Wait idle for the next turn, then work on it. `None` once the session
     /// is gone.
     async fn next_turn(&mut self) -> Option<String> {
-        self.session.set_working(false);
+        self.mark(false).await;
         let turn = match self.held.pop_front() {
             Some(turn) => turn,
             None => self.turns.recv().await?,
         };
-        self.session.set_working(true);
+        self.mark(true).await;
         self.think().await;
         Some(turn)
     }
 
     async fn idle_for(&self, duration: Duration) {
-        self.session.set_working(false);
+        self.mark(false).await;
         tokio::time::sleep(duration).await;
-        self.session.set_working(true);
+        self.mark(true).await;
+    }
+
+    /// Show working or idle on the screen, and report it as a harness hook would.
+    async fn mark(&self, working: bool) {
+        self.session.set_working(working);
+        if let Some(session) = &self.identity.session {
+            self.fleet.report_attention(&self.identity.namespace, session, working).await;
+        }
     }
 
     async fn think(&self) {

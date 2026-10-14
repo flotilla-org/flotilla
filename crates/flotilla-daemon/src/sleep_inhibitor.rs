@@ -493,12 +493,27 @@ async fn platform_sleep_capability() -> Result<SleepCapability, String> {
         Ok(_) => {}
         Err(error) => warn!(%error, "container virtualization probe unavailable; checking kernel sleep states"),
     }
+    // Containers without systemd tooling still see the host kernel's sleep
+    // states; their runtime's marker file says the host's sleep is not ours.
+    if container_marker_present(|path| std::path::Path::new(path).exists()) {
+        return Ok(classify_linux_sleep_capability(true, None));
+    }
 
     match tokio::fs::read_to_string("/sys/power/state").await {
         Ok(states) => Ok(classify_linux_sleep_capability(false, Some(&states))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(classify_linux_sleep_capability(false, None)),
         Err(error) => Err(format!("read /sys/power/state: {error}")),
     }
+}
+
+/// Files container runtimes place at a container's root: Docker's
+/// `/.dockerenv` and Podman's `/run/.containerenv`.
+#[cfg(target_os = "linux")]
+const CONTAINER_MARKERS: [&str; 2] = ["/.dockerenv", "/run/.containerenv"];
+
+#[cfg(target_os = "linux")]
+fn container_marker_present(exists: impl Fn(&str) -> bool) -> bool {
+    CONTAINER_MARKERS.iter().any(|marker| exists(marker))
 }
 
 #[cfg(target_os = "linux")]
@@ -1096,5 +1111,9 @@ mod tests {
         assert_eq!(classify_linux_sleep_capability(false, None), SleepCapability::Unavailable);
         assert_eq!(classify_linux_sleep_capability(false, Some("  \n")), SleepCapability::Unavailable);
         assert_eq!(classify_linux_sleep_capability(false, Some("freeze mem disk")), SleepCapability::Available);
+        // #3206: a container without systemd-detect-virt is still recognised.
+        assert!(container_marker_present(|path| path == "/.dockerenv"));
+        assert!(container_marker_present(|path| path == "/run/.containerenv"));
+        assert!(!container_marker_present(|_| false));
     }
 }

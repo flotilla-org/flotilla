@@ -550,23 +550,27 @@ impl<'a> RequestDispatcher<'a> {
             AgentEventType::WaitingForPermission => flotilla_resources::TerminalAttentionState::NeedsInput,
             AgentEventType::Ended | AgentEventType::NoChange => return Ok(()),
         };
+        if !event.native_codex_hook {
+            return crate::agent_attention::observe_hook_attention(
+                &self.daemon.resource_backend(),
+                &terminal.namespace,
+                &terminal.session_name,
+                state,
+                event.event_type == AgentEventType::ToolActive,
+            )
+            .await;
+        }
         let sessions = self.daemon.resource_backend().using::<flotilla_resources::TerminalSession>(&terminal.namespace);
-        let session = sessions.get(&terminal.session_name).await.map_err(|error| error.to_string())?;
+        sessions.get(&terminal.session_name).await.map_err(|error| error.to_string())?;
         let attention = flotilla_resources::TerminalAttention {
             state,
             as_of: chrono::Utc::now(),
             source: flotilla_resources::TerminalAttentionSource::Hook,
         };
-        if !event.native_codex_hook
-            && event.event_type != AgentEventType::ToolActive
-            && session.status.as_ref().is_some_and(|status| !status.should_record_attention(&attention))
-        {
-            return Ok(());
-        }
         flotilla_store::apply_status_patch(
             &sessions,
             &terminal.session_name,
-            &if event.harness == flotilla_protocol::AgentHarness::Codex && event.native_codex_hook {
+            &if event.harness == flotilla_protocol::AgentHarness::Codex {
                 flotilla_resources::TerminalSessionStatusPatch::ObserveNativeCodexHook {
                     attention,
                     tool_activity: event.event_type == AgentEventType::ToolActive,

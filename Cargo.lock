@@ -1844,6 +1844,7 @@ dependencies = [
  "flotilla-environment",
  "flotilla-executor",
  "flotilla-issue-tracker",
+ "flotilla-load-driver",
  "flotilla-orchestration-testkit",
  "flotilla-paths",
  "flotilla-protocol",
@@ -1916,6 +1917,7 @@ dependencies = [
  "flotilla-protocol",
  "flotilla-replication",
  "flotilla-resources",
+ "flotilla-store",
  "flotilla-transport",
  "tokio",
  "uuid",
@@ -2206,6 +2208,27 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
+]
+
+[[package]]
+name = "flotilla-load-driver"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-dummy-fleet",
+ "flotilla-store",
+ "futures",
+ "hegeltest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -22,6 +22,13 @@ use crate::{forge::DummyForge, terminal::DummySessions, vcs::DummyCheckouts};
 #[async_trait]
 pub trait CrewCommandPort: Send + Sync {
     async fn execute(&self, action: CommandAction) -> Result<CommandValue, String>;
+
+    /// Report the crew working or idle in its terminal session, as a real
+    /// harness's hooks do. Ports without a hook path ignore it; the session's
+    /// screen still shows the same state.
+    async fn report_attention(&self, _namespace: &str, _session: &str, _working: bool) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// One daemon's dummy fleet: its settings, the forge its crews open change
@@ -67,6 +74,13 @@ impl DummyFleet {
         match result {
             Ok(CommandValue::Error { message }) => Err(message),
             result => result,
+        }
+    }
+
+    pub(crate) async fn report_attention(&self, namespace: &str, session: &str, working: bool) {
+        let Some(port) = self.port.get() else { return };
+        if let Err(error) = port.report_attention(namespace, session, working).await {
+            tracing::debug!(%session, %error, "dummy crew attention report failed");
         }
     }
 
