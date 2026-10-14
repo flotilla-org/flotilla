@@ -40,7 +40,9 @@ fn bucket_upper(index: usize) -> u64 {
     }
     let exponent = (index as u32 - SUB_BUCKETS) / SUB_BUCKETS + SUB_BITS;
     let sub = (index as u64 - u64::from(SUB_BUCKETS)) % u64::from(SUB_BUCKETS);
-    ((u64::from(SUB_BUCKETS) + sub + 1) << (exponent - SUB_BITS)).saturating_sub(1)
+    // The top bucket's bound is 2^64 - 1: compute in u128 so its shift cannot wrap.
+    let upper = ((u128::from(SUB_BUCKETS) + u128::from(sub) + 1) << (exponent - SUB_BITS)) - 1;
+    u64::try_from(upper).unwrap_or(u64::MAX)
 }
 
 /// A latency distribution recorded in microseconds.
@@ -92,18 +94,18 @@ impl HistogramSnapshot {
         self.buckets.iter().sum()
     }
 
-    /// Records made after `earlier`. The maximum stays the run's maximum.
+    /// Records made after `earlier`. Their maximum is bounded by the highest
+    /// bucket they occupy (within 1/16 above the true value) and by the run's
+    /// maximum, since individual values are not kept.
     pub fn since(&self, earlier: &Self) -> Self {
-        Self {
-            buckets: self
-                .buckets
-                .iter()
-                .enumerate()
-                .map(|(index, count)| count.saturating_sub(earlier.buckets.get(index).copied().unwrap_or(0)))
-                .collect(),
-            sum_micros: self.sum_micros.saturating_sub(earlier.sum_micros),
-            max_micros: self.max_micros,
-        }
+        let buckets = self
+            .buckets
+            .iter()
+            .enumerate()
+            .map(|(index, count)| count.saturating_sub(earlier.buckets.get(index).copied().unwrap_or(0)))
+            .collect::<Vec<_>>();
+        let highest = buckets.iter().rposition(|count| *count > 0).map_or(0, bucket_upper);
+        Self { buckets, sum_micros: self.sum_micros.saturating_sub(earlier.sum_micros), max_micros: highest.min(self.max_micros) }
     }
 
     /// The smallest bucket bound below which `quantile` of the records fall.
@@ -136,6 +138,8 @@ impl HistogramSnapshot {
     }
 }
 
+/// Quantiles report the bound of the bucket they fall in, within 1/16 above
+/// the recorded values. For a phase (`since`), `max_micros` is bounded the same way.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct LatencySummary {
     pub count: u64,
@@ -183,10 +187,12 @@ pub struct StoreLoadMetrics {
     /// Time from a write's submission until the writer thread starts it.
     pub write_wait: LatencyHistogram,
     pub write_execution: LatencyHistogram,
-    /// Writes queued behind the running one, observed as each write starts.
+    /// Writes queued behind the running one, observed as each write starts;
+    /// a burst that drains between starts is not seen.
     pub write_queue_peak: Peak,
     pub read_wait: LatencyHistogram,
     pub read_execution: LatencyHistogram,
+    /// Reads queued behind those running, observed as each read starts.
     pub read_queue_peak: Peak,
     /// Reads the reader skipped because their caller gave up or their
     /// deadline passed while they queued; counted once, when skipped.
@@ -247,6 +253,7 @@ pub struct ControllerLoadMetrics {
     /// Periodic full resyncs and the objects each enqueued.
     pub resyncs: Counter,
     pub resync_enqueued: Counter,
+    /// Work queue length, observed as each wake starts.
     pub queue_peak: Peak,
 }
 
@@ -378,6 +385,19 @@ mod tests {
         }
     }
 
+    // The top bucket's bound must not wrap: values near u64::MAX microseconds
+    // (as_micros saturating) land there.
+    #[test]
+    fn the_top_bucket_bounds_the_largest_values() {
+        for value in [u64::MAX, u64::MAX - 1, (1 << 63) | (15 << 59)] {
+            assert_eq!(bucket(value), BUCKETS - 1, "{value}");
+            assert_eq!(bucket_upper(bucket(value)), u64::MAX);
+        }
+        let histogram = LatencyHistogram::default();
+        histogram.record(Duration::MAX);
+        assert_eq!(histogram.snapshot().summary().p99_micros, u64::MAX);
+    }
+
     // Behaviour: quantiles of recorded latencies are bounded by the recorded
     // values (within the bucket precision), and `since` keeps only later records.
     #[hegel::test]
@@ -405,7 +425,7 @@ mod tests {
                 phase.p50_micros
             );
             assert!(phase.p99_micros >= phase.p50_micros && phase.p99_micros <= phase.max_micros);
-            assert!(phase.max_micros >= *last);
+            assert!(phase.max_micros >= *last && phase.max_micros <= last + last / 16 + 1, "phase max {} for {last}", phase.max_micros);
             assert_eq!(phase.mean_micros, during.iter().sum::<u64>() / during.len() as u64);
             assert!(phase.p50_micros >= *first);
         } else {
