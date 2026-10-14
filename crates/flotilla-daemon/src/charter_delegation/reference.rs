@@ -1,5 +1,10 @@
 //! Test oracle for #2778: the clone-and-scan scope authorization this module
 //! replaced, kept verbatim so property tests can compare refusals and output.
+//! It shares document parsing helpers with the production path through
+//! `super::`, so only the authorization logic is compared. Change the two
+//! together: a scope-semantics change updates this oracle in the same PR.
+//! Delete this module and its equivalence tests once a later change to scope
+//! semantics makes the old behavior no longer the intended contract.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use flotilla_charter::{
