@@ -49,7 +49,7 @@ pub struct Attempt {
 impl Record for Attempt {
     const TABLE: &'static str = "attempts";
     const COLUMNS: &'static [Column] = &[
-        Column { name: "what", ty: ColumnType::Tag },
+        Column { name: "what", ty: ColumnType::Text },
         Column { name: "target", ty: ColumnType::Text },
         Column { name: "at", ty: ColumnType::Time },
         Column { name: "outcome", ty: ColumnType::Tag },

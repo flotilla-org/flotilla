@@ -8,6 +8,7 @@ use std::time::Duration;
 pub struct Time(pub u64);
 
 impl Time {
+    /// Sub-millisecond durations truncate to zero; policies must use whole milliseconds or more.
     pub fn plus(self, d: Duration) -> Time {
         Time(self.0.saturating_add(d.as_millis() as u64))
     }

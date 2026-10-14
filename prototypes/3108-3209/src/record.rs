@@ -23,7 +23,7 @@ pub struct RecordKey {
 pub enum ColumnType {
     Integer,
     Text,
-    /// INTEGER microseconds (see #3208 risks about nanosecond truncation).
+    /// INTEGER milliseconds, matching [`crate::base::Time`]. #3208 proposes microseconds; the units must be reconciled before the derive lands.
     Time,
     Bool,
     /// Closed set stored as a stable code; the derive pins codes against serde renames.
@@ -84,7 +84,7 @@ impl<R> RecordLog<R> {
 
     /// Positions are dense and never reused.
     pub fn append(&mut self, row: R) -> RecordKey {
-        let position = self.rows.len() as u32;
+        let position = u32::try_from(self.rows.len()).expect("record position exceeds u32; the real store needs a wider key");
         self.rows.push(row);
         RecordKey { owner: self.owner.clone(), position }
     }

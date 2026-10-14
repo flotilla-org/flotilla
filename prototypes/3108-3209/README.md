@@ -8,7 +8,7 @@ Everything is in memory. It is outside the workspace (`exclude` in the root
 
 ```bash
 cd prototypes/3108-3209
-cargo test            # 39 tests
+cargo test            # 40 tests
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -181,6 +181,12 @@ collection is a child table. Nothing is stored.
 5. **Edge dispatch by `name()`.** `Edge` variants map to `EdgeDef`s by name
    string; the match in each gate (`let ... else unreachable!`) is the weak
    point a derive would remove.
-6. **Not covered:** archival of attempts after the next success, Convoy and
+6. **Units and widths (from review).** `Time` is milliseconds here while #3208
+   sketches microseconds; record positions are `u32` and `append` panics
+   rather than wrapping. Both need settling when the derive lands.
+7. **Records and gate inputs.** `record_attempt` bumps the resource version
+   but is an input only when a gate reads `own_attempts`, which records the
+   log length as its version. That is deliberate.
+8. **Not covered:** archival of attempts after the next success, Convoy and
    Ensure machines, cross-host replication of events, authorisation of the
    `by` arguments (e.g. who may `abandon`).

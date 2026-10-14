@@ -228,6 +228,18 @@ fn backoff_is_capped() {
 }
 
 #[test]
+fn backoff_never_exceeds_the_cap_even_when_base_is_larger() {
+    let p = state_machine_prototype::attempt::AttemptPolicy {
+        max_attempts: 3,
+        base: Duration::from_secs(500),
+        factor: 2,
+        cap: Duration::from_secs(60),
+    };
+    assert_eq!(p.backoff(1), Duration::from_secs(60));
+    assert_eq!(p.backoff(3), Duration::from_secs(60));
+}
+
+#[test]
 fn ready_and_staleness_come_from_the_observer_link_never_from_stored_fields() {
     let (mut home, id, mut view) = setup();
     assert_eq!(ready(home.get(&id).unwrap(), &view), Ready::No("not realised yet"));
@@ -300,7 +312,7 @@ fn storage_derive_attach_points_describe_the_record_tables() {
     use state_machine_prototype::attempt::Attempt;
     use state_machine_prototype::home::EdgeEvent;
     let sql = ddl::<Attempt>();
-    assert!(sql.starts_with("CREATE TABLE attempts (owner INTEGER NOT NULL, position INTEGER NOT NULL, what INTEGER"), "{sql}");
+    assert!(sql.starts_with("CREATE TABLE attempts (owner INTEGER NOT NULL, position INTEGER NOT NULL, what TEXT"), "{sql}");
     assert!(sql.ends_with("PRIMARY KEY (owner, position))"), "{sql}");
     assert_eq!(child_tables::<EdgeEvent<CloneMachine>>(), vec!["edge_event_inputs"]);
     assert!(!ddl::<EdgeEvent<CloneMachine>>().contains("inputs"));
