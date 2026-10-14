@@ -143,7 +143,7 @@ stop ALLOCATION
 ```
 
 A Namespace/existing project provider can implement the same small interface.
-The trap collects partial results and stops the allocation even when start or
+The trap collects partial results once run is reached and always stops the allocation, even when start or
 execution fails; start/run/cleanup have independent timeout limits, and signals
 enter the same cleanup path; teardown failure is a failed run. EC2 start is idempotent by
 client token, and stop searches that token even if start failed before saving an
@@ -169,3 +169,12 @@ engine layer moves the Rust replay test/import onto that crate and retargets the
 checker Cargo commands, then deletes `prototypes/3108-3209` and
 `prototypes/3108-3214` as #3220 specifies. The decided specs stay here. Do not turn
 the independent prototype types into a second production implementation.
+
+The optional EC2 adapter uses trust-on-first-use SSH host keys (`accept-new`)
+with a separate known-hosts file per throwaway allocation, trusting the public
+IP supplied by the authenticated EC2 API. It refuses missing public addresses
+before attempting SSH. Its AMI must support cloud-init shell user data and
+`shutdown`: launch configures instance-initiated shutdown to terminate and
+schedules shutdown after `QUINT_MAX_LIFETIME_MINUTES` (default 30). Choose a
+lifetime longer than the intended run; this independent deadline bounds leaks
+if the local driver is killed. Normal teardown still terminates immediately.

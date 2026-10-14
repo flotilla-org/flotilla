@@ -16,8 +16,13 @@ connection() {
 }
 case "$verb" in
   start)
+    lifetime=${QUINT_MAX_LIFETIME_MINUTES:-30}
+    [[ "$lifetime" =~ ^[1-9][0-9]*$ ]] || { echo 'QUINT_MAX_LIFETIME_MINUTES must be a positive integer' >&2; exit 2; }
+    # Cloud-init schedules termination independently of the driver/SSH connection.
+    printf '#!/bin/sh\nshutdown -h +%s\n' "$lifetime" > "$state/user-data"
     aws ec2 run-instances --image-id "${QUINT_AMI_ID:?formal-modelling AMI required}" \
       --instance-type "${QUINT_INSTANCE_TYPE:-c7i.8xlarge}" --count 1 \
+      --instance-initiated-shutdown-behavior terminate --user-data "file://$state/user-data" \
       --subnet-id "${QUINT_SUBNET_ID:?subnet required}" --security-group-ids "${QUINT_SECURITY_GROUP_ID:?SSH security group required}" \
       --key-name "${QUINT_KEY_NAME:?EC2 key pair required}" --client-token "$allocation" \
       --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$allocation}]" \
@@ -25,6 +30,11 @@ case "$verb" in
     aws ec2 wait instance-running --instance-ids "$(cat "$state/id")"
     aws ec2 describe-instances --instance-ids "$(cat "$state/id")" \
       --query 'Reservations[0].Instances[0].PublicIpAddress' --output text > "$state/ip"
+    ip=$(cat "$state/ip")
+    if [ -z "$ip" ] || [ "$ip" = None ]; then
+      echo 'EC2 allocation has no public IP; check subnet public-address assignment' >&2
+      exit 2
+    fi
     connection
     ready=false
     for _ in {1..30}; do
