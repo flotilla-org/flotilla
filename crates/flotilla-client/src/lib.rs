@@ -38,9 +38,8 @@ pub use flotilla_daemon_api::build_info::build_id;
 /// arrives.
 type SeqMap = std::sync::RwLock<HashMap<StreamKey, u64>>;
 
-/// Named queries this client is currently subscribed to. Gap recovery
-/// re-subscribes with the full set, since `SubscribeQueries` replaces the
-/// connection's subscription.
+/// Named queries this client is currently subscribed to. Recovery replays
+/// selected queries without replacing the connection subscription.
 type QuerySet = std::sync::RwLock<HashSet<QueryId>>;
 
 /// RAII guard that holds the daemon spawn flock.
@@ -1052,7 +1051,7 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
 
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
-                        recover_query_gap(&ctx).await;
+                        recover_query_gap(&ctx, &query).await;
                     });
                 }
             }
@@ -1074,15 +1073,14 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
     }
 }
 
-/// Build subscribe cursors for the currently subscribed queries from local
-/// seq tracking.
-fn encode_query_cursors(subscribed_queries: &QuerySet, local_seqs: &SeqMap) -> Vec<QueryCursor> {
+/// Read one subscribed query's held cursor without walking sibling queries.
+fn query_cursor(subscribed_queries: &QuerySet, local_seqs: &SeqMap, query: &QueryId) -> Option<QueryCursor> {
     let subscribed = subscribed_queries.read().expect("subscribed queries lock poisoned");
+    if !subscribed.contains(query) {
+        return None;
+    }
     let seqs = local_seqs.read().expect("sequence lock poisoned");
-    subscribed
-        .iter()
-        .map(|query| QueryCursor { query: query.clone(), since: seqs.get(&StreamKey::Query { query: query.clone() }).copied() })
-        .collect()
+    Some(QueryCursor { query: query.clone(), since: seqs.get(&StreamKey::Query { query: query.clone() }).copied() })
 }
 
 /// Seed local seq tracking from subscribe-replay result sets, monotonically —
@@ -1098,28 +1096,17 @@ fn seed_query_seqs(local_seqs: &SeqMap, events: &[DaemonEvent]) {
     }
 }
 
-/// Recover from a result-set seq gap by re-subscribing with current cursors;
-/// the daemon replays a full `ResultSet` for each stale query.
-///
-/// Unlike repo recovery there is deliberately no in-flight coalescing buffer:
-/// concurrent resubscribes are idempotent (each replaces the subscription and
-/// returns full result sets, seeded monotonically), and stale deltas are
-/// dropped in `handle_event` rather than re-triggering recovery.
-async fn recover_query_gap(ctx: &EventContext) {
+/// Replay only the gapped query; recovery never changes connection interest.
+async fn recover_query_gap(ctx: &EventContext, query: &QueryId) {
     let EventContext { local_seqs, subscribed_queries, event_tx, session, pending, next_id, .. } = ctx;
-    let queries = encode_query_cursors(subscribed_queries, local_seqs);
-    // A delta for an unsubscribed query cannot reach this connection, so an
-    // unknown-query gap implies a subscription exists; still, guard the
-    // degenerate empty case.
-    if queries.is_empty() {
-        warn!("query gap recovery skipped: no subscribed queries");
+    let Some(cursor) = query_cursor(subscribed_queries, local_seqs, query) else {
         return;
-    }
-    let resp = send_request(session.as_ref(), pending, next_id, Request::SubscribeQueries { queries }).await;
+    };
+    let resp = send_request(session.as_ref(), pending, next_id, Request::RecoverQueries { queries: vec![cursor] }).await;
 
     match resp {
         Ok(result) => match into_success_response(result) {
-            Ok(Response::SubscribeQueries(events)) => {
+            Ok(Response::RecoverQueries(events)) => {
                 debug!(event_count = events.len(), "query gap recovery: got result sets");
                 seed_query_seqs(local_seqs, &events);
                 for event in events {
@@ -1127,14 +1114,14 @@ async fn recover_query_gap(ctx: &EventContext) {
                 }
             }
             Ok(other) => {
-                error!(response = ?other, "query gap recovery: unexpected subscribe_queries response");
+                error!(response = ?other, "query gap recovery: unexpected recover_queries response");
             }
             Err(e) => {
-                error!(err = %e, "query gap recovery: subscribe_queries returned error response");
+                error!(err = %e, "query gap recovery: recover_queries returned error response");
             }
         },
         Err(e) => {
-            error!(err = %e, "query gap recovery: subscribe_queries request failed");
+            error!(err = %e, "query gap recovery: recover_queries request failed");
         }
     }
 }
@@ -1248,6 +1235,15 @@ impl DaemonHandle for SocketDaemon {
         };
         seed_query_seqs(&self.local_seqs, &events);
         self.initial_sync_complete.store(true, Ordering::Release);
+        Ok(events)
+    }
+
+    async fn recover_queries(&self, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+        let events = match into_success_response(self.request(Request::RecoverQueries { queries: queries.to_vec() }).await?)? {
+            Response::RecoverQueries(events) => events,
+            other => return Err(format!("unexpected response for recover_queries: {other:?}")),
+        };
+        seed_query_seqs(&self.local_seqs, &events);
         Ok(events)
     }
 

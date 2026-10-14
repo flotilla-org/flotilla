@@ -8,8 +8,12 @@
 //! itself never touches a PM.
 //!
 //! Wheelhouse owns connection liveness: one replacing snapshot, then atomic
-//! diffs without TTLs. Zellij (and older Wheelhouse) retain TTL heartbeats.
+//! diffs without TTLs. Zellij retains TTL heartbeats.
 //! Delivery uncertainty is bounded; supervised daemon loss exits for restart.
+//!
+//! Recovery preserves unrelated sources; watch snapshots must remain scoped.
+//! See `docs/implementation-choices/pm-connect-recovery.md` for the workload
+//! and subscription/recovery ownership choices.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -32,7 +36,7 @@ use flotilla_manifest::{
     pm::PmInstance,
     projection::{project_catalog_with_ttl, Catalog, CatalogInput},
     recipe::{FlotillaRecipes, RecipeMint},
-    sink::{LivenessMode, PatchSink, SnapshotAck},
+    sink::{LivenessMode, PatchSink},
     wire::MetadataPatch,
 };
 use flotilla_protocol::{
@@ -229,7 +233,10 @@ impl ConnectorState {
             Rows::Awareness { rows, .. } => {
                 self.awareness = rows.clone();
             }
-            Rows::DispatchReady { .. } | Rows::Issues { .. } | Rows::Checkouts { .. } => return Applied::Ignored,
+            Rows::DispatchReady { .. } | Rows::Issues { .. } | Rows::Checkouts { .. } => {
+                self.seqs.insert(query, set.seq);
+                return Applied::Ignored;
+            }
         }
         self.seqs.insert(query, set.seq);
         Applied::Updated
@@ -237,11 +244,6 @@ impl ConnectorState {
 
     fn apply_delta(&mut self, delta: &ResultDelta) -> Applied {
         let query = delta.query();
-        // These families participate in the startup barrier but have no
-        // catalog rows. Their live updates cannot invalidate held rows.
-        if matches!(&query, QueryId::DispatchReady { .. } | QueryId::Issues { .. } | QueryId::Checkouts { .. }) {
-            return Applied::Ignored;
-        }
         let Some(&seen) = self.seqs.get(&query) else {
             return Applied::Gap(query);
         };
@@ -300,6 +302,7 @@ impl ConnectorState {
                 self.awareness.sort_by(|left, right| (&left.label, &left.id).cmp(&(&right.label, &right.id)));
             }
             QueryChanges::DispatchReady { .. } | QueryChanges::Issues { .. } | QueryChanges::Checkouts { .. } => {
+                self.seqs.insert(query, delta.seq);
                 return Applied::Ignored;
             }
         }
@@ -346,15 +349,6 @@ impl ConnectorState {
         next
     }
 
-    fn reset_sources(&mut self) {
-        *self = Self {
-            catalog: self.catalog.clone(),
-            subscriber_id: self.subscriber_id,
-            uncovered_services: self.uncovered_services.clone(),
-            ..Self::default()
-        };
-    }
-
     fn snapshots_complete(&self) -> bool {
         self.cursors().iter().all(|cursor| self.snapshots.contains(&cursor.query))
     }
@@ -380,13 +374,13 @@ impl ConnectorState {
 
 // Bound uncertainty, including a blocked transport. A restart replaces any
 // remotely applied publication whose acknowledgement was lost.
-async fn deliver(sink: &dyn PatchSink, patches: &[MetadataPatch], replace: bool) -> Result<SnapshotAck, SessionFailure> {
+async fn deliver(sink: &dyn PatchSink, patches: &[MetadataPatch], replace: bool) -> Result<(), SessionFailure> {
     tokio::time::timeout(Duration::from_secs(15), async {
         let mut delay = Duration::from_millis(250);
         loop {
-            let result = if replace { sink.replace(patches).await } else { sink.send_batch(patches).await.map(|()| SnapshotAck::Applied) };
+            let result = if replace { sink.replace(patches).await } else { sink.send_batch(patches).await };
             match result {
-                Ok(ack) => return ack,
+                Ok(()) => return,
                 Err(error) => warn!(%error, ?delay, "retrying catalog publication"),
             }
             tokio::time::sleep(delay).await;
@@ -421,43 +415,11 @@ async fn publish(
         next.diff_patches(&state.catalog.lock().expect("published catalog"))
     };
     if !patches.is_empty() || first {
-        let ack = if mode == LivenessMode::Ttl && sink.liveness() == LivenessMode::Connection {
-            deliver_legacy(sink, &patches).await?;
-            SnapshotAck::Applied
-        } else {
-            deliver(sink, &patches, first && mode == LivenessMode::Connection).await?
-        };
-        if ack == SnapshotAck::Unsupported {
-            *connector.liveness.lock().expect("liveness mode") = Some(LivenessMode::Ttl);
-            // The rejected replacing request wrote nothing. Reproject with TTL
-            // and use the legacy transport for this entire process lifetime.
-            let next = state.project_at(mint, chrono::Utc::now(), Some(CATALOG_TTL_MS));
-            let patches = next.reassert_patches();
-            deliver_legacy(sink, &patches).await?;
-            *state.catalog.lock().expect("published catalog") = next;
-        } else {
-            *state.catalog.lock().expect("published catalog") = next;
-        }
+        deliver(sink, &patches, first && mode == LivenessMode::Connection).await?;
+        *state.catalog.lock().expect("published catalog") = next;
         connector.published.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     Ok(())
-}
-
-async fn deliver_legacy(sink: &dyn PatchSink, patches: &[MetadataPatch]) -> Result<(), SessionFailure> {
-    // An older Wheelhouse accepts individual messages, not atomic arrays.
-    tokio::time::timeout(Duration::from_secs(15), async {
-        for patch in patches {
-            loop {
-                match sink.send(patch).await {
-                    Ok(()) => break,
-                    Err(error) => warn!(%error, target = ?patch.target, "retrying legacy catalog publication"),
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        }
-    })
-    .await
-    .map_err(|_| SessionFailure::PublicationDeadline)
 }
 
 /// (Re)subscribe to every named query; publish only after subject bootstrap.
@@ -475,18 +437,40 @@ async fn bootstrap_queries(
 ) -> Result<(), String> {
     resubscribe(&**daemon, state).await?;
     while !state.snapshots_complete() {
-        let restart = match events.recv().await {
-            Ok(event) => matches!(state.apply_event(&event), Applied::Gap(_)),
-            Err(RecvError::Lagged(_)) => true,
+        match events.recv().await {
+            Ok(event) => {
+                if let Applied::Gap(query) = state.apply_event(&event) {
+                    recover_queries(&**daemon, state, Some(&query)).await?;
+                }
+            }
+            Err(RecvError::Lagged(_)) => {
+                *events = daemon.subscribe();
+                recover_queries(&**daemon, state, None).await?;
+            }
             Err(RecvError::Closed) => return Err("daemon event stream closed during bootstrap".to_owned()),
-        };
-        if restart {
-            *events = daemon.subscribe();
-            state.reset_sources();
-            resubscribe(&**daemon, state).await?;
         }
     }
     Ok(())
+}
+
+enum ResourceUpdate {
+    Delta(flotilla_protocol::ResourceReadEnvelope),
+    Snapshot { namespace: String, kind: String, envelopes: Vec<flotilla_protocol::ResourceReadEnvelope> },
+}
+
+impl ResourceUpdate {
+    fn apply(self, state: &mut ConnectorState) -> Result<(), String> {
+        match self {
+            Self::Delta(envelope) => state.apply_resource_records(&envelope),
+            Self::Snapshot { namespace, kind, envelopes } => {
+                state.resources.clear_scope(&namespace, &kind);
+                for envelope in envelopes {
+                    state.apply_resource_records(&envelope)?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Bootstrap from each merged watch's initial snapshot, never a separate list.
@@ -497,7 +481,7 @@ async fn ensure_resource_watches(
     state: &mut ConnectorState,
     watched: &mut BTreeSet<String>,
     tasks: &mut tokio::task::JoinSet<()>,
-    updates: &tokio::sync::mpsc::Sender<Result<flotilla_protocol::ResourceReadEnvelope, ResourceWatchError>>,
+    updates: &tokio::sync::mpsc::Sender<Result<ResourceUpdate, String>>,
 ) -> Result<(), String> {
     use flotilla_client::resource::{ResourceClient, ResourceWatchRequest};
     // Scope follows the named-query graph. Namespaces with no convoy, role or
@@ -524,14 +508,59 @@ async fn ensure_resource_watches(
                     ResourceWatchRequest::builder().kind((*kind).to_string()).namespace(namespace.clone()).include_replicas(true).build(),
                 )
                 .await?;
-            bootstrap_subject_watch(&mut watch, state, &namespace, kind).await?;
+            for envelope in read_subject_snapshot(&mut watch, &namespace, kind).await? {
+                state.apply_resource_records(&envelope)?;
+            }
             let updates = updates.clone();
+            let client = ResourceClient::new(Arc::clone(daemon));
+            let namespace = namespace.clone();
             tasks.spawn(async move {
                 loop {
                     let update = match watch.next_event().await {
-                        Ok(Some(envelope)) => Ok(envelope),
-                        Ok(None) => Err(ResourceWatchError::Failed("subject catalog resource watch ended".to_string())),
-                        Err(error) => Err(error),
+                        Ok(Some(envelope)) => Ok(ResourceUpdate::Delta(envelope)),
+                        Ok(None) => Err("subject catalog resource watch ended".to_string()),
+                        Err(ResourceWatchError::Lagged(skipped)) => {
+                            warn!(%namespace, kind, skipped, "subject watch lagged; rebuilding its scope");
+                            // Retire this watch before opening its replacement. Only
+                            // this task owns its scope, so no old updates follow the snapshot.
+                            drop(watch);
+                            let restarted = async {
+                                let mut next = client
+                                    .watch(
+                                        ResourceWatchRequest::builder()
+                                            .kind((*kind).to_string())
+                                            .namespace(namespace.clone())
+                                            .include_replicas(true)
+                                            .build(),
+                                    )
+                                    .await?;
+                                let envelopes = read_subject_snapshot(&mut next, &namespace, kind).await?;
+                                Ok::<_, String>((next, envelopes))
+                            }
+                            .await;
+                            match restarted {
+                                Ok((next, envelopes)) => {
+                                    watch = next;
+                                    if updates
+                                        .send(Ok(ResourceUpdate::Snapshot {
+                                            namespace: namespace.clone(),
+                                            kind: (*kind).into(),
+                                            envelopes,
+                                        }))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                Err(error) => {
+                                    let _ = updates.send(Err(error)).await;
+                                    return;
+                                }
+                            }
+                        }
+                        Err(error) => Err(error.to_string()),
                     };
                     let ended = update.is_err();
                     if updates.send(update).await.is_err() || ended {
@@ -550,15 +579,15 @@ async fn ensure_resource_watches(
 // The daemon emits snapshot envelopes followed by a bookmark, then live
 // events. Consume through that explicit boundary, allowing fragmentation but
 // refusing live updates or a mismatched scope before setup can publish.
-async fn bootstrap_subject_watch(
+async fn read_subject_snapshot(
     watch: &mut flotilla_client::resource::ResourceWatch,
-    state: &mut ConnectorState,
     namespace: &str,
     plural: &str,
-) -> Result<(), String> {
+) -> Result<Vec<flotilla_protocol::ResourceReadEnvelope>, String> {
     use flotilla_protocol::ResourceRecordType;
     use flotilla_resources::ResourceError;
 
+    let mut envelopes = Vec::new();
     loop {
         let envelope = watch.next().await?.ok_or_else(|| "subject catalog resource watch ended during bootstrap".to_string())?;
         if envelope.namespace != namespace || envelope.plural != plural {
@@ -568,17 +597,17 @@ async fn bootstrap_subject_watch(
             if envelope.records.len() != 1 || envelope.records[0].object.is_some() {
                 return Err(ResourceError::invalid("subject resource snapshot bookmark must be a separate envelope").to_string());
             }
-            return Ok(());
+            return Ok(envelopes);
         }
         if envelope.records.iter().any(|record| !matches!(record.record_type, ResourceRecordType::Current | ResourceRecordType::Added)) {
             return Err(ResourceError::invalid("subject resource snapshot contains a live event before its bookmark").to_string());
         }
-        state.apply_resource_records(&envelope)?;
+        envelopes.push(envelope);
     }
 }
 
 /// Subscribe, wait for complete snapshots, then publish acknowledged diffs.
-/// The sink selects connection or TTL liveness; gaps rebuild every source.
+/// Query recovery preserves unrelated cursors and resource watches.
 pub async fn run_connector(
     daemon: Arc<dyn DaemonHandle>,
     sink: Arc<dyn PatchSink>,
@@ -594,13 +623,12 @@ pub async fn run_connector(
 #[derive(Default)]
 pub struct Connector {
     catalog: Arc<Mutex<Catalog>>,
-    liveness: Mutex<Option<LivenessMode>>,
     published: std::sync::atomic::AtomicBool,
 }
 
 impl Connector {
     fn mode(&self, sink: &dyn PatchSink) -> LivenessMode {
-        self.liveness.lock().expect("liveness mode").unwrap_or_else(|| sink.liveness())
+        sink.liveness()
     }
 
     pub async fn run(
@@ -666,16 +694,7 @@ async fn run_connector_subscribed(
                 publish(&mut state, sink, mint, connector, connector.mode(sink) == LivenessMode::Ttl).await?;
             }
             update = resource_rx.recv() => {
-                // Watch end/gap/error restarts the whole snapshot via run_reconnecting.
-                // Dropping resource_tasks aborts sibling tasks and ResourceWatch::drop
-                // cancels their commands; no partial subscription survives a retry.
-                match update.ok_or_else(|| "subject catalog watch channel ended".to_string())? {
-                    Ok(envelope) => state.apply_resource_records(&envelope)?,
-                    Err(ResourceWatchError::Lagged(_)) => {
-                        resnapshot(daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &mut resource_rx, &resource_tx, &mut events).await?;
-                    }
-                    Err(error) => return Err(error.to_string().into()),
-                }
+                update.ok_or_else(|| "subject catalog watch channel ended".to_string())??.apply(&mut state)?;
                 publish(&mut state, sink, mint, connector, false).await?;
             }
             received = events.recv() => match received {
@@ -687,13 +706,16 @@ async fn run_connector_subscribed(
                     Applied::Ignored => {}
                     Applied::Gap(query) => {
                         debug!(%query, "result stream gap; resubscribing");
-                        resnapshot(daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &mut resource_rx, &resource_tx, &mut events).await?;
+                        recover_queries(&**daemon, &mut state, Some(&query)).await?;
+                        ensure_resource_watches(daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &resource_tx).await?;
                         publish(&mut state, sink, mint, connector, false).await?;
                     }
                 },
                 Err(RecvError::Lagged(skipped)) => {
                     warn!(skipped, "event stream lagged; resubscribing");
-                    resnapshot(daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &mut resource_rx, &resource_tx, &mut events).await?;
+                    events = daemon.subscribe();
+                    recover_queries(&**daemon, &mut state, None).await?;
+                    ensure_resource_watches(daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &resource_tx).await?;
                     publish(&mut state, sink, mint, connector, false).await?;
                 }
                 Err(RecvError::Closed) => {
@@ -704,23 +726,14 @@ async fn run_connector_subscribed(
     }
 }
 
-async fn resnapshot(
-    daemon: &Arc<dyn DaemonHandle>,
-    state: &mut ConnectorState,
-    watched: &mut BTreeSet<String>,
-    tasks: &mut tokio::task::JoinSet<()>,
-    updates: &mut tokio::sync::mpsc::Receiver<Result<flotilla_protocol::ResourceReadEnvelope, ResourceWatchError>>,
-    sender: &tokio::sync::mpsc::Sender<Result<flotilla_protocol::ResourceReadEnvelope, ResourceWatchError>>,
-    events: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
-) -> Result<(), String> {
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
-    *events = daemon.subscribe();
-    while updates.try_recv().is_ok() {}
-    watched.clear();
-    state.reset_sources();
-    bootstrap_queries(daemon, state, events).await?;
-    ensure_resource_watches(daemon, state, watched, tasks, sender).await
+async fn recover_queries(daemon: &dyn DaemonHandle, state: &mut ConnectorState, query: Option<&QueryId>) -> Result<(), String> {
+    let cursors: Vec<_> = state.cursors().into_iter().filter(|cursor| query.is_none_or(|query| &cursor.query == query)).collect();
+    for event in daemon.recover_queries(&cursors).await? {
+        if let Applied::Gap(query) = state.apply_event(&event) {
+            return Err(format!("query recovery returned a gap: {query}"));
+        }
+    }
+    Ok(())
 }
 
 async fn monitor_health(connector: &Connector, sink: &dyn PatchSink) -> String {

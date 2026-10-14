@@ -471,6 +471,10 @@ pub enum Request {
     SubscribeQueries {
         queries: Vec<QueryCursor>,
     },
+    /// Replay only these already-subscribed queries without replacing interest.
+    RecoverQueries {
+        queries: Vec<QueryCursor>,
+    },
     /// Extend a live demand-backed result-set window. The appended rows are
     /// delivered as ordinary `ResultDelta` events.
     FetchMore {
@@ -525,6 +529,7 @@ pub enum Response {
     /// Replay events for the newly subscribed queries: a full [`ResultSet`]
     /// per query whose cursor was absent or stale.
     SubscribeQueries(Vec<DaemonEvent>),
+    RecoverQueries(Vec<DaemonEvent>),
     FetchMore,
     ObserveFocus,
     WaitSubscribed {

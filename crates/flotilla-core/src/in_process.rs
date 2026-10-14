@@ -6173,6 +6173,20 @@ impl DaemonHandle for InProcessDaemon {
         Ok(events)
     }
 
+    async fn recover_queries(&self, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+        let state = self.aggregator_projection_state().await;
+        // Recovery reads existing materializations without changing demand.
+        // Socket dispatch verifies this connection's interest before calling.
+        let mut events = Vec::new();
+        for cursor in queries {
+            let set = state.result_set_for(&cursor.query).await.ok_or_else(|| format!("query is not materialized: {}", cursor.query))?;
+            if cursor.since != Some(set.seq) {
+                events.push(DaemonEvent::ResultSet(Box::new(set)));
+            }
+        }
+        Ok(events)
+    }
+
     async fn unsubscribe_queries(&self, subscriber_id: uuid::Uuid) {
         self.aggregator_projection_state().await.remove_subscriber(subscriber_id);
     }

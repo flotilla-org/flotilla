@@ -30,12 +30,6 @@ pub enum LivenessMode {
     Ttl,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnapshotAck {
-    Applied,
-    Unsupported,
-}
-
 #[async_trait]
 pub trait PatchSink: Send + Sync {
     async fn send(&self, patch: &MetadataPatch) -> Result<(), String>;
@@ -53,8 +47,8 @@ pub trait PatchSink: Send + Sync {
         Ok(())
     }
 
-    async fn replace(&self, _patches: &[MetadataPatch]) -> Result<SnapshotAck, String> {
-        Ok(SnapshotAck::Unsupported)
+    async fn replace(&self, _patches: &[MetadataPatch]) -> Result<(), String> {
+        Err("replacing snapshots are unsupported".into())
     }
 
     async fn health(&self) -> Result<(), String> {
@@ -276,15 +270,12 @@ impl PatchSink for WheelhouseHttpSink {
         Ok(())
     }
 
-    async fn replace(&self, patches: &[MetadataPatch]) -> Result<SnapshotAck, String> {
+    async fn replace(&self, patches: &[MetadataPatch]) -> Result<(), String> {
         let response = self.post_catalog("snapshot", patches).await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(SnapshotAck::Unsupported);
-        }
         if response.status() != reqwest::StatusCode::NO_CONTENT {
             return Err(format!("Wheelhouse metadata snapshot returned {}", response.status()));
         }
-        Ok(SnapshotAck::Applied)
+        Ok(())
     }
 
     async fn health(&self) -> Result<(), String> {
@@ -663,10 +654,7 @@ done
         let result = match operation {
             HttpOperation::Single(patch) => sink.send(&patch).await,
             HttpOperation::Batch(patches) => sink.send_batch(&patches).await,
-            HttpOperation::Snapshot(patches) => sink.replace(&patches).await.and_then(|ack| match ack {
-                SnapshotAck::Applied => Ok(()),
-                SnapshotAck::Unsupported => Err("unsupported".into()),
-            }),
+            HttpOperation::Snapshot(patches) => sink.replace(&patches).await,
             HttpOperation::Health => sink.health().await,
         };
         server.abort();
@@ -738,11 +726,11 @@ done
         }
     }
 
-    // #3022: 404 is distinguishable from delivery failure; health is a GET.
+    // #3244: an unsupported snapshot fails delivery; health is a GET.
     #[tokio::test]
     async fn wheelhouse_snapshot_404_and_health_contract() {
         let (result, bodies) = http_operation_case(HttpOperation::Snapshot(vec![]), vec![axum::http::StatusCode::NOT_FOUND], false).await;
-        assert_eq!(result, Err("unsupported".into()));
+        assert!(result.expect_err("snapshot support required").contains("404"));
         assert_eq!(bodies, vec![b"[]".to_vec()]);
         let (result, bodies) = http_operation_case(HttpOperation::Health, vec![axum::http::StatusCode::OK], false).await;
         result.expect("connected health endpoint");

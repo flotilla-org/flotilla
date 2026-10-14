@@ -71,6 +71,12 @@ pub trait DaemonHandle: Send + Sync {
     /// `InProcessDaemon`'s shared broadcast may over-deliver.
     async fn subscribe_queries(&self, subscriber_id: Uuid, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String>;
 
+    /// Replay current state for selected queries, preserving subscription membership.
+    /// Returns full sets for stale/absent cursors and nothing for current cursors.
+    async fn recover_queries(&self, _queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+        Err("query recovery is unsupported".into())
+    }
+
     /// Remove a subscriber and tear down demand-backed materializations that
     /// no longer have an owner. Socket transports call this on disconnect;
     /// in-process consumers call it when their explicit session ends.

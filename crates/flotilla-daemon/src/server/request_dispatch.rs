@@ -18,7 +18,10 @@ fn is_interactive_request(request: &Request) -> bool {
     // cancelled setup could leave a live subscription after an error response.
     // FetchMore performs its side effect only after its last await.
     matches!(request, Request::Execute { command } if command.action.is_query())
-        || matches!(request, Request::ListRepos | Request::GetStatus | Request::GetTopology | Request::FetchMore { .. })
+        || matches!(
+            request,
+            Request::ListRepos | Request::GetStatus | Request::GetTopology | Request::FetchMore { .. } | Request::RecoverQueries { .. }
+        )
 }
 
 fn absolute_crew_path(path: &Path, cwd: &str) -> std::path::PathBuf {
@@ -376,6 +379,20 @@ impl<'a> RequestDispatcher<'a> {
         }
     }
 
+    async fn dispatch_request_recover_queries(&self, id: u64, queries: &[flotilla_protocol::QueryCursor]) -> Message {
+        let subscribed = {
+            let subscriptions = self.query_subscriptions.read().expect("query subscriptions lock poisoned");
+            queries.iter().all(|cursor| subscriptions.contains(&cursor.query))
+        };
+        if !subscribed {
+            return Message::error_response(id, "query is not subscribed on this connection");
+        }
+        match self.daemon.recover_queries(queries).await {
+            Ok(events) => Message::ok_response(id, Response::RecoverQueries(events)),
+            Err(error) => Message::error_response(id, error),
+        }
+    }
+
     async fn dispatch_request_fetch_more(&self, id: u64, request: Request) -> Message {
         let Request::FetchMore { query } = request else {
             return Message::error_response(id, "FetchMore request selected the wrong handler");
@@ -453,6 +470,7 @@ impl<'a> RequestDispatcher<'a> {
             request @ Request::AddRepo { .. } => Box::pin(self.dispatch_request_add_repo(id, request)).await,
             request @ Request::RemoveRepo { .. } => Box::pin(self.dispatch_request_remove_repo(id, request)).await,
             request @ Request::ReplaySince { .. } => Box::pin(self.dispatch_request_replay_since(id, request)).await,
+            Request::RecoverQueries { queries } => Box::pin(self.dispatch_request_recover_queries(id, &queries)).await,
             request @ Request::SubscribeQueries { .. } => Box::pin(self.dispatch_request_subscribe_queries(id, request)).await,
             request @ Request::FetchMore { .. } => Box::pin(self.dispatch_request_fetch_more(id, request)).await,
             request @ Request::ObserveFocus { .. } => Box::pin(self.dispatch_request_observe_focus(id, request)).await,

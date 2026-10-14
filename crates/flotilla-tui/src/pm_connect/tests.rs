@@ -229,12 +229,12 @@ impl PatchSink for RecordingSink {
     async fn send_batch(&self, patches: &[MetadataPatch]) -> Result<(), String> {
         self.record_batch(false, patches)
     }
-    async fn replace(&self, patches: &[MetadataPatch]) -> Result<SnapshotAck, String> {
+    async fn replace(&self, patches: &[MetadataPatch]) -> Result<(), String> {
         if self.snapshot_404 {
-            return Ok(SnapshotAck::Unsupported);
+            return Err("snapshot unsupported".into());
         }
         self.record_batch(true, patches)?;
-        Ok(SnapshotAck::Applied)
+        Ok(())
     }
     async fn health(&self) -> Result<(), String> {
         if self.health_failed.load(Ordering::SeqCst) {
@@ -245,8 +245,7 @@ impl PatchSink for RecordingSink {
     }
 
     async fn send(&self, patch: &MetadataPatch) -> Result<(), String> {
-        self.patches.lock().expect("sink lock").push(patch.clone());
-        Ok(())
+        panic!("connector must publish batches, not individual patches: {:?}", patch.target)
     }
 }
 
@@ -268,10 +267,13 @@ impl EventSender {
 
 struct MockDaemon {
     tx: EventSender,
+    isolated_watch: Mutex<Option<broadcast::Sender<DaemonEvent>>>,
+    receivers: AtomicUsize,
     deferred_queries: Mutex<HashSet<QueryId>>,
     watch_gate: Mutex<Option<(String, Arc<tokio::sync::Notify>)>>,
     bootstrap: Mutex<Vec<DaemonEvent>>,
     subscribe_calls: AtomicUsize,
+    recoveries: Mutex<Vec<Vec<QueryCursor>>>,
     resource_lists: Mutex<HashMap<(String, String), flotilla_protocol::ResourceReadEnvelope>>,
     watch_commands: Mutex<HashMap<(String, String), u64>>,
     watch_starts: AtomicUsize,
@@ -285,10 +287,13 @@ impl MockDaemon {
         let (tx, _) = broadcast::channel(64);
         Self {
             tx: EventSender(Mutex::new(Some(tx))),
+            isolated_watch: Mutex::new(None),
+            receivers: AtomicUsize::new(0),
             deferred_queries: Mutex::new(HashSet::new()),
             watch_gate: Mutex::new(None),
             bootstrap: Mutex::new(bootstrap),
             subscribe_calls: AtomicUsize::new(0),
+            recoveries: Mutex::new(Vec::new()),
             resource_lists: Mutex::new(HashMap::new()),
             watch_commands: Mutex::new(HashMap::new()),
             watch_starts: AtomicUsize::new(0),
@@ -302,6 +307,13 @@ impl MockDaemon {
 #[async_trait]
 impl DaemonHandle for MockDaemon {
     fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
+        // The first resource watch can have an isolated socket-event queue,
+        // letting scenarios lag just that consumer without lagging siblings.
+        if self.receivers.fetch_add(1, Ordering::SeqCst) == 1 {
+            if let Some(tx) = &*self.isolated_watch.lock().expect("isolated watch") {
+                return tx.subscribe();
+            }
+        }
         self.tx.subscribe()
     }
 
@@ -359,20 +371,20 @@ impl DaemonHandle for MockDaemon {
             }];
             bookmark
         }]) {
-            self.tx
-                .send(DaemonEvent::CommandStepUpdate {
-                    command_id: id,
-                    node_id: flotilla_protocol::NodeId::new("kiwi"),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "resource".into() },
-                    repo: None,
-                    step_index: 0,
-                    step_count: 1,
-                    description: "initial snapshot".into(),
-                    status: flotilla_protocol::StepStatus::Produced {
-                        value: Box::new(CommandValue::ResourceWatchEvent(Box::new(fragment))),
-                    },
-                })
-                .expect("initial watch snapshot");
+            let event = DaemonEvent::CommandStepUpdate {
+                command_id: id,
+                node_id: flotilla_protocol::NodeId::new("kiwi"),
+                repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "resource".into() },
+                repo: None,
+                step_index: 0,
+                step_count: 1,
+                description: "initial snapshot".into(),
+                status: flotilla_protocol::StepStatus::Produced { value: Box::new(CommandValue::ResourceWatchEvent(Box::new(fragment))) },
+            };
+            if let Some(tx) = &*self.isolated_watch.lock().expect("isolated watch") {
+                let _ = tx.send(event.clone());
+            }
+            self.tx.send(event).expect("initial watch snapshot");
         }
         Ok(id)
     }
@@ -411,7 +423,9 @@ impl DaemonHandle for MockDaemon {
 
     async fn subscribe_queries(&self, _subscriber_id: uuid::Uuid, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
         self.subscribe_calls.fetch_add(1, Ordering::SeqCst);
-        let mut events = self.bootstrap.lock().expect("bootstrap lock").clone();
+        let mut events: Vec<_> = self.bootstrap.lock().expect("bootstrap lock").iter().filter(|event| {
+            matches!(event, DaemonEvent::ResultSet(set) if queries.iter().any(|cursor| cursor.query == set.query() && cursor.since != Some(set.seq)))
+        }).cloned().collect();
         let deferred = self.deferred_queries.lock().expect("deferred queries");
         for cursor in queries {
             if deferred.contains(&cursor.query)
@@ -432,6 +446,15 @@ impl DaemonHandle for MockDaemon {
             };
             events.push(DaemonEvent::ResultSet(Box::new(ResultSet { seq: 1, rows, state: Default::default() })));
         }
+        Ok(events)
+    }
+
+    async fn recover_queries(&self, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+        self.recoveries.lock().expect("recoveries").push(queries.to_vec());
+        // Socket seam: replay selected full sets without replacing query interest.
+        let before = self.subscribe_calls.load(Ordering::SeqCst);
+        let events = self.subscribe_queries(uuid::Uuid::nil(), queries).await?;
+        self.subscribe_calls.store(before, Ordering::SeqCst);
         Ok(events)
     }
 
@@ -489,9 +512,9 @@ async fn connector_publishes_bootstrap_deltas_gap_recovery_and_reasserts() {
 
     // A gapped delta triggers resubscription (the mock replies with its
     // bootstrap sets again).
-    let calls_before = daemon.subscribe_calls.load(Ordering::SeqCst);
+    let calls_before = daemon.recoveries.lock().expect("recoveries").len();
     daemon.tx.send(independents_delta(9, vec![], vec![])).expect("send gapped delta");
-    wait_until(|| daemon.subscribe_calls.load(Ordering::SeqCst) > calls_before).await;
+    wait_until(|| daemon.recoveries.lock().expect("recoveries").len() > calls_before).await;
 
     handle.abort();
 }
@@ -1162,7 +1185,7 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
     writer.apply(WatchEvent::Modified(object.clone()), chrono::Utc::now()).await.expect("update");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            state.apply_resource_records(&rx.recv().await.expect("update channel").expect("watch event")).expect("apply");
+            rx.recv().await.expect("update channel").expect("watch event").apply(&mut state).expect("apply");
             if state.resources.projection().change_requests[0].status.as_ref().expect("status").state.value
                 == Some(flotilla_resources::ObservedChangeRequestState::Merged)
             {
@@ -1175,7 +1198,7 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
     writer.apply(WatchEvent::Deleted(object), chrono::Utc::now()).await.expect("deletion");
     tokio::time::timeout(Duration::from_secs(2), async {
         while !state.resources.projection().change_requests.is_empty() {
-            state.apply_resource_records(&rx.recv().await.expect("update channel").expect("watch event")).expect("apply");
+            rx.recv().await.expect("update channel").expect("watch event").apply(&mut state).expect("apply");
         }
     })
     .await
@@ -1473,20 +1496,16 @@ async fn failed_publication_retries_before_advancing_and_expires() {
     assert_eq!(*connector.catalog.lock().expect("catalog"), prior);
 }
 
-// #3022: a 404 locks the process into TTL delivery and heartbeat behavior.
+// #3244: Wheelhouse must support replacing batches; refusal never sends TTL patches.
 #[tokio::test(start_paused = true)]
-async fn snapshot_404_falls_back_to_ttl_for_the_process() {
+async fn snapshot_refusal_exits_without_legacy_delivery() {
     let daemon = Arc::new(MockDaemon::new(vec![independents_set(1, vec![independent_row("scratch", SessionPhase::Running)])]));
     let sink = Arc::new(RecordingSink { snapshot_404: true, ..RecordingSink::connection() });
-    let connector = Arc::new(Connector::default());
-    let handle = spawn_connection(&daemon, &sink, connector.clone());
-    wait_until(|| !sink.recorded().is_empty()).await;
-    assert_eq!(connector.mode(&*sink), LivenessMode::Ttl);
-    assert!(sink.recorded().iter().flat_map(|patch| patch.set.values()).all(|fact| fact.ttl_ms == Some(CATALOG_TTL_MS)));
-    let before = sink.recorded().len();
-    tokio::time::advance(Duration::from_secs(10)).await;
-    wait_until(|| sink.recorded().len() > before).await;
-    handle.abort();
+    let handle = spawn_connection(&daemon, &sink, Arc::new(Connector::default()));
+    let error = handle.await.expect("task").expect_err("snapshot support required");
+    assert!(error.contains("acknowledgement deadline"));
+    assert!(sink.recorded().is_empty());
+    assert!(sink.publications().is_empty());
 }
 
 // #3022: parent death cancels all work, including connection/bootstrap/retry.
@@ -1528,9 +1547,9 @@ async fn health_failure_ends_connection_after_fifteen_seconds() {
     assert!(error.contains("health connection failed for 15 seconds"));
 }
 
-// #3022: both gaps and broadcast lag replace source state, then send one exact diff.
+// #3244: recovery replays selected cursors and publishes one exact diff.
 #[tokio::test(start_paused = true)]
-async fn gaps_and_lag_resync_all_sources_in_one_diff_publication() {
+async fn gaps_and_lag_preserve_cursors_in_one_diff_publication() {
     for lagged in [false, true] {
         let daemon = Arc::new(MockDaemon::new(vec![independents_set(1, vec![independent_row("old", SessionPhase::Running)])]));
         let sink = Arc::new(RecordingSink::connection());
@@ -1552,7 +1571,17 @@ async fn gaps_and_lag_resync_all_sources_in_one_diff_publication() {
         assert_eq!(sink.publications()[1], (false, next.diff_patches(&prior)));
         assert_eq!(sink.publications()[1].1.len(), 2);
         assert!(sink.publications()[1].1.iter().any(|patch| patch.target == independent_entity("old") && !patch.unset.is_empty()));
-        assert!(daemon.watch_starts.load(Ordering::SeqCst) >= resources::KINDS.len() * 2);
+        if !lagged {
+            assert_eq!(daemon.watch_starts.load(Ordering::SeqCst), resources::KINDS.len());
+        }
+        let recoveries = daemon.recoveries.lock().expect("recoveries");
+        let request = &recoveries[0];
+        if lagged {
+            assert_eq!(request.len(), ConnectorState::default().cursors().len());
+            assert!(request.iter().all(|cursor| cursor.since == Some(1)));
+        } else {
+            assert_eq!(request, &vec![QueryCursor { query: QueryId::Independents { scope: None }, since: Some(1) }]);
+        }
         handle.abort();
     }
 }
@@ -1655,4 +1684,93 @@ async fn publication_deadline_is_terminal_for_ttl_and_connection_sinks() {
         assert_eq!(attempts.load(Ordering::SeqCst), 1, "a deadline never becomes a daemon reconnect");
         assert!(connector.catalog.lock().expect("catalog").is_empty());
     }
+}
+
+// #3244: a lagged watch replaces only its own kind/namespace, removing absent
+// records, while unrelated namespace watches and named-query cursors survive.
+#[tokio::test(start_paused = true)]
+async fn lagged_watch_replaces_only_its_scope() {
+    let mut convoy = linked_subject_convoy();
+    convoy.resource.namespace = "other".into();
+    let daemon = Arc::new(MockDaemon::new(vec![DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 1,
+        rows: Rows::Convoys { scope: None, rows: vec![convoy] },
+        state: Default::default(),
+    }))]));
+    daemon.resource_lists.lock().expect("lists").insert(("flotilla".into(), "changerequests".into()), subject_envelope());
+    let mut other = subject_envelope();
+    other.namespace = "other".into();
+    let object = other.records[0].object.as_mut().expect("other observation");
+    object["metadata"]["namespace"] = serde_json::json!("other");
+    object["spec"]["number"] = serde_json::json!(43);
+    daemon.resource_lists.lock().expect("lists").insert(("other".into(), "changerequests".into()), other);
+    let (isolated, _) = broadcast::channel(64);
+    *daemon.isolated_watch.lock().expect("isolated") = Some(isolated.clone());
+    let sink = Arc::new(RecordingSink::connection());
+    let handle = spawn_connection(&daemon, &sink, Arc::new(Connector::default()));
+    wait_until(|| sink.publications().len() == 1).await;
+    let before = daemon.watch_commands.lock().expect("watches").clone();
+    daemon.resource_lists.lock().expect("lists").remove(&("flotilla".into(), "changerequests".into()));
+    // Overflow only this watch's event receiver, without yielding.
+    for _ in 0..100 {
+        isolated.send(convoys_set(1)).expect("lag isolated watch");
+    }
+    wait_until(|| sink.publications().len() == 2).await;
+    let after = daemon.watch_commands.lock().expect("watches").clone();
+    assert_eq!(daemon.watch_starts.load(Ordering::SeqCst), before.len() + 1);
+    for (scope, id) in &before {
+        if scope == &("flotilla".into(), "changerequests".into()) {
+            assert_ne!(after[scope], *id);
+        } else {
+            assert_eq!(after[scope], *id, "unrelated watch must survive");
+        }
+    }
+    assert_eq!(daemon.subscribe_calls.load(Ordering::SeqCst), 1);
+    assert!(daemon.recoveries.lock().expect("recoveries").is_empty());
+    let publications = sink.publications();
+    assert!(!publications[1].0);
+    assert!(
+        publications[1]
+            .1
+            .iter()
+            .all(|patch| patch.target != MetadataTarget::Entity(entity::change_request("github.com", "org/flotilla", "43"))),
+        "unrelated namespace facts remain unchanged"
+    );
+    assert!(publications[1].1.iter().any(|patch| patch.unset.contains(&"flotilla.change_request.readiness".into())));
+    handle.abort();
+}
+
+// #3244: recovering one query leaves another at its latest cursor, accepts
+// its next delta, and preserves the cursor used by a later broadcast repair.
+#[tokio::test(start_paused = true)]
+async fn query_gap_preserves_other_queries_and_their_next_deltas() {
+    let daemon = Arc::new(MockDaemon::new(vec![convoys_set(7), independents_set(1, vec![])]));
+    let sink = Arc::new(RecordingSink::connection());
+    let connector = Arc::new(Connector::default());
+    let handle = spawn_connection(&daemon, &sink, connector.clone());
+    wait_until(|| sink.publications().len() == 1).await;
+    *daemon.bootstrap.lock().expect("bootstrap") = vec![independents_set(9, vec![independent_row("recovered", SessionPhase::Running)])];
+    daemon.tx.send(independents_delta(9, vec![], vec![])).expect("gap");
+    wait_until(|| sink.publications().len() == 2).await;
+    assert_eq!(
+        *daemon.recoveries.lock().expect("recoveries"),
+        vec![vec![QueryCursor { query: QueryId::Independents { scope: None }, since: Some(1) }]]
+    );
+    daemon
+        .tx
+        .send(DaemonEvent::ResultDelta(Box::new(ResultDelta {
+            seq: 8,
+            changes: QueryChanges::Convoys { scope: None, changed: vec![linked_subject_convoy()], removed: vec![] },
+            state: None,
+        })))
+        .expect("contiguous unaffected delta");
+    wait_until(|| sink.publications().len() == 3).await;
+    assert_eq!(daemon.recoveries.lock().expect("recoveries").len(), 1);
+    assert!(sink.publications()[2]
+        .1
+        .iter()
+        .any(|patch| patch.target == MetadataTarget::Entity(entity::convoy("flotilla", "ship-it", "kiwi"))));
+    assert_eq!(daemon.subscribe_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(daemon.watch_starts.load(Ordering::SeqCst), resources::KINDS.len());
+    handle.abort();
 }

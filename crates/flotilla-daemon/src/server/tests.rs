@@ -4538,19 +4538,58 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
     client_session
         .write(Message::Request {
             id: 2,
-            request: Request::SubscribeQueries { queries: vec![QueryCursor { query: QueryId::Convoys { scope: None }, since: None }] },
+            request: Request::SubscribeQueries {
+                queries: vec![
+                    QueryCursor { query: QueryId::Convoys { scope: None }, since: None },
+                    QueryCursor { query: QueryId::StandingRoles { scope: None }, since: None },
+                ],
+            },
         })
         .await
         .expect("write subscribe request");
     match ok_response(read_session_message(&client_session).await, 2) {
         Response::SubscribeQueries(events) => {
-            assert!(
-                matches!(events.as_slice(), [DaemonEvent::ResultSet(result_set)] if result_set.query() == QueryId::Convoys { scope: None }),
-                "subscribe should replay one convoys result set, got {events:?}"
-            );
+            assert_eq!(events.len(), 2, "both subscribed queries get initial snapshots");
         }
         other => panic!("expected SubscribeQueries response, got {other:?}"),
     }
+
+    // #3244: recovery returns only requested stale queries, leaves current
+    // cursors alone, and refuses queries outside this connection's interest.
+    let mut recovered_seq = None;
+    for (id, query, since) in [
+        (3, QueryId::Convoys { scope: None }, None),
+        (4, QueryId::Convoys { scope: None }, Some(0)),
+        (5, QueryId::Independents { scope: None }, None),
+    ] {
+        let since = if id == 4 { recovered_seq } else { since };
+        client_session
+            .write(Message::Request { id, request: Request::RecoverQueries { queries: vec![QueryCursor { query, since }] } })
+            .await
+            .expect("recover request");
+        let reply = read_session_message(&client_session).await;
+        if id == 5 {
+            assert!(matches!(&reply, Message::Response { response, .. } if matches!(**response, ResponseResult::Err { .. })), "{reply:?}");
+        } else {
+            let Response::RecoverQueries(events) = ok_response(reply, id) else { panic!("recovery response") };
+            if id == 3 {
+                assert_eq!(events.len(), 1);
+                let DaemonEvent::ResultSet(set) = &events[0] else { panic!("full recovery set") };
+                assert_eq!(set.query(), QueryId::Convoys { scope: None });
+                recovered_seq = Some(set.seq);
+            } else {
+                assert!(events.is_empty(), "current cursor needs no replay");
+            }
+        }
+    }
+    // Recovery must not silently remove a sibling subscription.
+    daemon.send_event(DaemonEvent::ResultDelta(Box::new(ResultDelta {
+        seq: 2,
+        changes: QueryChanges::StandingRoles { scope: None, changed: vec![], removed: vec![] },
+        state: None,
+    })));
+    assert!(matches!(read_session_message(&client_session).await, Message::Event { event }
+        if matches!(&*event, DaemonEvent::ResultDelta(delta) if delta.query() == QueryId::StandingRoles { scope: None })));
 
     // After subscribing, query deltas reach the socket.
     daemon.send_event(result_delta(2));
