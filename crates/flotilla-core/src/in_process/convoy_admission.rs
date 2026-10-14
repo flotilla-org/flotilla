@@ -2384,23 +2384,15 @@ impl AdmissionReadContext<'_> {
                             .flat_map(|status| status.fulfilment_facts.values())
                             .filter_map(|facts| facts.harnesses.get(adapter))
                             .collect::<Vec<_>>();
-                        let minimum = observed_harnesses
-                            .iter()
-                            .filter(|harness| harness.models.get(model).is_some_and(|model| model.usable))
-                            .map(|harness| harness.version.as_str())
-                            .reduce(
-                                |minimum, version| if flotilla_resources::version_at_least(minimum, version) { version } else { minimum },
-                            );
                         let rejected_everywhere = !observed_harnesses.is_empty()
                             && observed_harnesses.iter().all(|harness| harness.models.get(model).is_some_and(|model| !model.usable));
-                        if let Some(minimum) = minimum {
-                            crew.needs.insert(CapabilityNeed::Harness { adapter: adapter.clone(), minimum_version: minimum.to_string() });
-                        } else if rejected_everywhere {
+                        // An observed version is evidence that the model works with that
+                        // version, never a minimum: host installs auto-update ahead of
+                        // pinned image layers. A model adds a version need only through a
+                        // declared fact (see `minimum_harness_version`).
+                        if rejected_everywhere {
                             return Err(format!("no observed {adapter} harness accepts model {model}"));
-                        } else if !observed_harnesses.is_empty() {
-                            // Acceptance is unknown on at least one observed harness:
-                            // admit without a version floor.
-                        } else {
+                        } else if observed_harnesses.is_empty() {
                             let kinds = fulfilment_kinds
                                 .get_or_try_init(|| async { self.backend.including_replicas::<FulfilmentKind>(namespace).list().await })
                                 .await
@@ -6066,6 +6058,85 @@ mod tests {
         let needs = daemon.convoy_admission.compose_convoy_needs("flotilla", &project, &[], &intent, &mut workflow).await.expect("needs");
         assert!(needs.contains(&CapabilityNeed::Harness { adapter: "codex".into(), minimum_version: "0.160.0".into() }));
     }
+    /// Compose the needs of a one-crew workflow whose selector names `claude-code`
+    /// and `opus`, on hosts that each observe the given `(version, opus usable)`.
+    async fn compose_claude_opus_needs(observations: &[(&str, bool)]) -> Result<BTreeSet<CapabilityNeed>, String> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"model-floor-test\"\n").expect("daemon config");
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            fake_discovery(false),
+            HostName::new("test-host"),
+            backend.clone(),
+        )
+        .await;
+        let hosts = backend.using::<ResourceHost>("flotilla");
+        for (index, (version, usable)) in observations.iter().enumerate() {
+            let name = format!("host-{index}");
+            let host =
+                hosts.create(&InputMeta::builder().name(name.clone()).build(), &flotilla_resources::HostSpec::default()).await.unwrap();
+            let harness = flotilla_resources::HarnessFacts {
+                version: version.to_string(),
+                models: BTreeMap::from([(
+                    "opus".to_string(),
+                    flotilla_resources::ModelFact { usable: *usable, source: flotilla_resources::ModelFactSource::Probe },
+                )]),
+            };
+            let facts = flotilla_resources::FulfilmentFacts {
+                harnesses: BTreeMap::from([("claude-code".to_string(), harness)]),
+                observed_at: Utc::now(),
+                ..Default::default()
+            };
+            let status =
+                flotilla_resources::HostStatus { fulfilment_facts: BTreeMap::from([("kind".to_string(), facts)]), ..Default::default() };
+            hosts.update_status(&name, &host.metadata.resource_version, &status).await.unwrap();
+        }
+        let project = ProjectSpec::builder().display_name("Example".into()).default_workflow_ref("work".into()).build();
+        let mut workflow = WorkflowTemplateSpec::builder()
+            .vessels(vec![VesselRequirement::builder()
+                .name("work".into())
+                .crew(vec![CrewSpec::builder()
+                    .role("coder".into())
+                    .source(CrewSource::Agent {
+                        selector: flotilla_resources::Selector {
+                            capability: "code".into(),
+                            adapter: Some("claude-code".into()),
+                            model: Some("opus".into()),
+                        },
+                        prompt: None,
+                        brief_template: None,
+                    })
+                    .build()])
+                .build()])
+            .build();
+        let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("example".into()).build();
+        daemon.convoy_admission.compose_convoy_needs("flotilla", &project, &[], &intent, &mut workflow).await
+    }
+
+    // #3202: a newer harness observed with the model usable is evidence, not a
+    // floor; a pinned image layer older than every host install must still admit.
+    #[tokio::test]
+    async fn observed_newer_harness_with_usable_model_adds_no_version_floor() {
+        let needs = compose_claude_opus_needs(&[("2.1.295", true), ("2.1.301", true)]).await.expect("admitted");
+        assert!(
+            !needs.iter().any(|need| matches!(need, CapabilityNeed::Harness { adapter, .. } if adapter == "claude-code")),
+            "observed versions leaked into needs: {needs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_rejected_on_every_observed_harness_still_refuses() {
+        let error = compose_claude_opus_needs(&[("2.1.295", false), ("2.1.301", false)]).await.expect_err("refused");
+        assert_eq!(error, "no observed claude-code harness accepts model opus");
+    }
+
+    #[tokio::test]
+    async fn model_usable_on_one_observed_harness_is_not_rejected_everywhere() {
+        compose_claude_opus_needs(&[("2.1.295", true), ("2.1.301", false)]).await.expect("admitted");
+    }
+
     // #2972: frozen provider-instance labels must not borrow legacy host-only
     // evidence or another instance's digest on the same host.
     #[hegel::test]
