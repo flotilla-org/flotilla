@@ -62,6 +62,9 @@ type SessionKey = (String, String, Option<flotilla_protocol::NodeId>);
 const CONVOY_PROJECTION_COALESCE_INTERVAL: Duration = Duration::from_millis(25);
 
 const CHANGE_REQUEST_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// A lookup that runs longer fails, so a hung resolver cannot hold a convoy's
+/// refresh slot; matches the forge observation load timeout.
+const CHANGE_REQUEST_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CHANGE_REQUEST_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const CHANGE_REQUEST_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
@@ -121,6 +124,26 @@ pub(crate) trait AttachCapabilityResolver: Send + Sync {
     async fn origin_host_names(&self, origins: &HashSet<flotilla_protocol::NodeId>) -> HashMap<flotilla_protocol::NodeId, HostName> {
         let _ = origins;
         HashMap::new()
+    }
+}
+
+/// A lookup bounded by [`CHANGE_REQUEST_LOOKUP_TIMEOUT`]; on timeout every
+/// repository reports the failure, so discovery fails and retries with backoff.
+async fn bounded_refresh(
+    resolver: &dyn ConvoyChangeRequestResolver,
+    repositories: &[RepositoryKey],
+    branch: &str,
+    binding: Option<&flotilla_resources::BoundChangeRequest>,
+) -> ConvoyBranchRefresh {
+    match tokio::time::timeout(CHANGE_REQUEST_LOOKUP_TIMEOUT, resolver.refresh_branch(repositories, branch, binding)).await {
+        Ok(refresh) => refresh,
+        Err(_) => {
+            let error = format!("change request lookup timed out after {CHANGE_REQUEST_LOOKUP_TIMEOUT:?}");
+            ConvoyBranchRefresh {
+                primary: Err(error.clone()),
+                repositories: repositories.iter().map(|repository| (repository.clone(), Err(error.clone()))).collect(),
+            }
+        }
     }
 }
 
@@ -244,6 +267,9 @@ pub struct Aggregator {
     change_request_refresh_started: HashMap<ResourceRef, Instant>,
     #[builder(skip)]
     change_request_refresh_failures: HashMap<ResourceRef, u32>,
+    /// Convoys whose running lookup was overtaken by a repository trigger; each
+    /// looks again (at its next interval) once that lookup's result is applied.
+    change_request_retriggers: HashSet<ResourceRef>,
     #[builder(skip)]
     change_request_refresh_queue: ChangeRequestRefreshQueue,
     #[builder(skip)]
@@ -336,6 +362,7 @@ impl Aggregator {
             change_request_refresh_tasks: HashMap::new(),
             change_request_refresh_started: HashMap::new(),
             change_request_refresh_failures: HashMap::new(),
+            change_request_retriggers: HashSet::new(),
             change_request_refresh_queue: ChangeRequestRefreshQueue::default(),
             issue_materializer: None,
             event_sink,
@@ -1152,6 +1179,7 @@ impl Aggregator {
         }
         self.convoy_change_requests.remove(reference);
         self.change_request_refresh_failures.remove(reference);
+        self.change_request_retriggers.remove(reference);
     }
 
     fn is_home_convoy(&self, reference: &ResourceRef) -> bool {
@@ -1208,7 +1236,7 @@ impl Aggregator {
         let task_reference = reference.clone();
         let task = tokio::spawn(async move {
             tokio::time::sleep_until(refresh_at).await;
-            let result = resolver.refresh_branch(&repositories, &branch, binding.as_ref()).await;
+            let result = bounded_refresh(&*resolver, &repositories, &branch, binding.as_ref()).await;
             let _ = refresh_tx.send(ChangeRequestResolution { reference: task_reference, generation, branch, result });
         });
         self.change_request_refresh_tasks.insert(reference, task);
@@ -1220,6 +1248,7 @@ impl Aggregator {
             return;
         }
         self.change_request_refresh_tasks.remove(&reference);
+        let retrigger = self.change_request_retriggers.remove(&reference);
         let discovery_resolution = result.clone();
         let mut failed = false;
         match result.primary {
@@ -1248,6 +1277,8 @@ impl Aggregator {
         }
         if failed {
             *self.change_request_refresh_failures.entry(reference.clone()).or_default() += 1;
+        }
+        if failed || retrigger {
             if let Some(convoy) = self.effective_convoys().get(&reference) {
                 self.schedule_change_request_refresh(convoy);
             }
@@ -1296,18 +1327,20 @@ impl Aggregator {
             if convoy.status.as_ref().is_some_and(|status| convoy_phase_is_terminal(status.phase)) {
                 continue;
             }
-            // A lookup already scheduled, running or awaiting application answers
-            // the trigger no later than a replacement would: replacing it would
-            // restart its wait from the last start, so a busy repository could
-            // defer a convoy's first branch scan indefinitely (#3206).
+            // Keep a pending lookup: replacing it would restart its wait from its
+            // last start, so a busy repository could defer a convoy's first branch
+            // scan indefinitely (#3206). One not yet started will read the
+            // triggering change; one already running may not, so it looks again
+            // once its result is applied.
             if self.change_request_refresh_tasks.contains_key(&reference) {
+                let started = self.change_request_refresh_started.get(&reference).is_some_and(|at| *at <= Instant::now());
+                if started {
+                    self.change_request_retriggers.insert(reference);
+                }
                 continue;
             }
             let generation = uuid::Uuid::new_v4();
             self.change_request_refresh_generations.insert(reference.clone(), generation);
-            if let Some(task) = self.change_request_refresh_tasks.remove(&reference) {
-                task.abort();
-            }
             let Some(branch) = convoy.spec.r#ref.clone() else {
                 self.convoy_change_requests.remove(&reference);
                 continue;
@@ -1338,7 +1371,7 @@ impl Aggregator {
             let lookup_branch = branch.clone();
             let lookup = async move {
                 tokio::time::sleep_until(refresh_at).await;
-                resolver.refresh_branch(&repositories, &lookup_branch, binding.as_ref()).await
+                bounded_refresh(&*resolver, &repositories, &lookup_branch, binding.as_ref()).await
             }
             .boxed()
             .shared();
@@ -5457,6 +5490,53 @@ mod tests {
             "the queued resolution was applied, not dropped as stale"
         );
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Behaviour (#3206): a repository trigger arriving after a lookup started
+    // (here, finished but not yet applied) does not replace it, but the convoy
+    // looks again at its next interval, so the trigger's change is still read.
+    #[tokio::test(start_paused = true)]
+    async fn a_trigger_during_a_running_lookup_looks_again() {
+        let (event_tx, _) = broadcast::channel(8);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::new()),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+            .with_change_request_resolver(Arc::clone(&resolver));
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
+        let reference = aggregator.convoy_ref("flotilla", "convoy-a");
+        while !aggregator.change_request_refresh_tasks[&reference].is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let repo = RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() };
+        aggregator.refresh_repository_change_requests(&repo).await;
+        apply_next_change_request_resolution(&mut aggregator).await;
+        assert!(aggregator.change_request_refresh_tasks.contains_key(&reference), "a follow-up lookup is scheduled");
+        tokio::time::advance(CHANGE_REQUEST_MIN_REFRESH_INTERVAL).await;
+        apply_next_change_request_resolution(&mut aggregator).await;
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+        assert!(!aggregator.change_request_refresh_tasks.contains_key(&reference), "and only one");
+    }
+
+    // Behaviour: a resolver that never answers fails its lookup after the
+    // lookup timeout, so the convoy's refresh slot is released and retried.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_lookup_fails_at_the_timeout() {
+        let (event_tx, _) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+            .with_change_request_resolver(Arc::new(BlockingChangeRequestResolver));
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
+        let reference = aggregator.convoy_ref("flotilla", "convoy-a");
+        // Let the lookup start, so its timeout is running, then pass it.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(CHANGE_REQUEST_LOOKUP_TIMEOUT + Duration::from_secs(1)).await;
+        apply_next_change_request_resolution(&mut aggregator).await;
+        assert_eq!(aggregator.change_request_refresh_failures.get(&reference), Some(&1));
+        assert!(aggregator.change_request_refresh_tasks.contains_key(&reference), "the failed lookup is retried");
     }
 
     // Behaviour (#3206): repository change-request churn does not defer a
