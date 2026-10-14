@@ -16,7 +16,7 @@ outside the Cargo workspace and no CI gate runs it.
 
 ## Results in one screen
 
-**222 checks, 0 deviating from expectation** (`results/results.json`; the race rows are from the rerun after the 2026-10-14 `settle`-from-`Pending` addition, the others from the original 202-check run in `results/run.txt`; 8 GiB container).
+**222 checks, 0 deviating from expectation** (`results/results.json`; the race rows are from the rerun after the 2026-10-14 `settle`-from-`Pending` addition, the others from the original 202-check run in `results/run.txt`; the race run is `results/run_race.txt`; 8 GiB container).
 Every safety property holds in its declared design, every liveness property holds under its stated fairness, every mutant
 is caught by the property aimed at it, and every witness is reachable.
 
