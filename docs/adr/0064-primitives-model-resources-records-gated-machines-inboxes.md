@@ -49,7 +49,7 @@ Convoys assumed that their vessels were co-located and fixed. Many writers could
 - **Legibility.** Every diagram must be legible in a GUI to a competent person.
 - **Gates.** Each edge declares a gate, enforced on the home's write path. The edge event records what the gate read, as references and versions. Gates read only local, versioned inputs and never liveness.
 - **Ends are ends.** A late edge on an ended resource is refused, with a reason returned to the caller and not recorded.
-- **Attempts are a history.** Retry counts, the schedule and giving up are judgements over attempt records and a policy. Giving up records a final failure and sends a message.
+- **Attempts are a history.** Retry counts, the schedule and giving up are judgements over attempt records and a policy. Giving up records a final failure and sends a message. Each `resume` starts a new attempt window: the judgements count only attempts since the last `resume`, and older attempts stay in the history (#3214).
 - **No mirrors.** Each fact has one home. Facts replicate, and judgements are computed where they are needed.
 - **Replacement, not reincarnation.** When a realised thing is lost and still wanted, a new resource replaces it, and the owning relation records the swap.
 - **API.** Machines are declared with a builder (`MachineDef` / `EdgeDef`) that validates the rules and renders the diagram. Edge dispatch is typed: a fieldless kind enum is derived from the edge enum, and each edge has its own argument struct. Gates and judgements read through one recording handle (#3209).
@@ -61,14 +61,18 @@ The decided machines:
 | Shared lifecycle: Vessel, Environment, Checkout, Clone, ImageBuild, TerminalSession | Requested, Realised, Gone, GaveUp | `realise(identity)` Requested→Realised; `release` Requested or Realised→Gone; `vanish` Realised→Gone; `give up(cause)` Requested→GaveUp |
 | Convoy | Open, Delivered, Abandoned | `deliver` (gate: every promise kept, or retracted with acceptance); `abandon(by, reason)`, always a decision by an authorised party. Nothing fails a convoy automatically. |
 | Message | Pending, Awaiting, Settled, Dropped | `deliver(consumer, receipt)` to Settled when nothing is expected, otherwise to Awaiting; `settle(answered)` from Awaiting; `settle(outcome observed)` from Pending or Awaiting; `drop(undeliverable \| expired \| superseded)` |
-| Ensure | Unfulfilled, Fulfilled, Held, Retired | `bind(fulfiller)` when the fulfiller can receive; `unbind(gone \| replaced)`; `give up` from Unfulfilled; `resume(by)`; `retire` |
+| Ensure | Unfulfilled, Fulfilled, Held, Retired | `bind(fulfiller)` when the fulfiller is Realised and can receive; `unbind(gone \| replaced)`; `give up` from Unfulfilled; `resume(by)`; `retire` |
 | AgentSession | conversation: Live, Ended (completed \| lost); channel: Detached ⇄ Attached | "running" is a judgement |
+
+An Ensure records each fulfiller before it asks for it, and `retire` releases every fulfiller it recorded, bound or not. Replacing a fulfiller means releasing the old one, observing it Gone, then creating the new one (#3214).
 
 How the Convoy and Message machines behave:
 - **A convoy ends when its work is delivered.** A crew's "done" is a submission of evidence against a deliverable, not a convoy edge.
+- **Every convoy promises something.** Admission refuses a convoy with no promises, because the `deliver` gate holds trivially over an empty set (#3214). A free-form convoy, such as a navigator session, promises a decision: kept by observing its map ticket, or a similar record, change or resolve. A human sign-off verdict is the fallback.
 - **A Demand is a Message that expects an outcome,** and the Demand kind retires. Escalation is `drop(expired)` plus a follow-up message.
 - **An outcome observed while Pending settles the message directly** (owner, 2026-10-14). Take a demand to fix a failing build: if the build goes green before delivery, the message did its job, and the consumer never sees the turn. A receipt that arrives afterwards cannot record `deliver` on a Settled message.
 - **Dropped is the state; `drop(reason)` is the edge into it.** The reason is recorded on the edge event and shown with the state.
+- **An expiry never beats a reply written in time** (#3214). `drop(expired)` also requires that the home has applied the bound consumer's host stream past the deadline; its keepalive marks make that a local, versioned input. With no consumer bound, the message expires on time. If the consumer's host stays silent, the message stays Awaiting. The listing shows that silence as a judgement, and the sender's supervisor or a human may drop the message deliberately, with the reason recorded.
 
 ### Roles, inboxes and delivery
 
@@ -81,7 +85,13 @@ How the Convoy and Message machines behave:
   2. It delivers each turn through its AgentChannel, using the adapter's transport.
   3. It appends a **receipt** row on its AgentSession.
   4. The inbox's home records `deliver`, gated on observing that receipt.
-- **`drop(undeliverable)`** is gated on what the home can observe: no consumer bound past a threshold, or a delivery-failure record published by the consumer.
+- **Turn first, then receipt.** The consumer's host hands over the turn before it writes the receipt. A crash in between can repeat a turn to the same session, so adapters ignore a message ID they have already turned.
+- **`drop(undeliverable)`** is gated on what the home can observe: no consumer bound past a threshold, or a delivery-failure record published by the consumer, and no receipt observed. It means "no receipt was confirmed within the policy", not "no agent saw it", because a consumer acting on a lagging replica can still turn the message.
+- **At least once across a replacement** (#3214). The home cannot tell a consumer that received a message and died from one that never did, so two sessions may both turn a message across a replacement. The window is kept to that:
+  - `bind` waits until every observed receipt has its `deliver` edge;
+  - `deliver` accepts a receipt from a session that is no longer bound;
+  - `deliver` records exactly one receiver, and later receipts are refused.
+- **Unbind reactions.** The inbox's owner unbinds a consumer when it observes the AgentSession's end row, and when the consumer's host has been silent past the role's policy threshold. The silence trigger is a reaction on a judgement, never a gate, and the unbind records its reason. Without these reactions, a dead bound consumer blocks the inbox for ever.
 - **The plug is the whole inbox.** An `InboxBackend` contract covers enqueue, pending-for-consumer, receipts, the edges and watch. Every implementation passes one shared contract-test suite. Resource-backed replication is the first implementation.
 - **Filtering** chooses how a message is delivered, never whether: turn, notify or mute. Mute counts as delivered.
 - **Dead letters** go to the sender's supervisor, unless the sender is that supervisor.
@@ -143,4 +153,4 @@ There is no double-write path and no long-lived branch.
 - **The importer is the largest hand-written piece.** After the cut-over, ADR 0047 is enforced by a checked-in schema snapshot and explicit migration steps, and the golden corpus becomes a SQLite file.
 - **Peer merge goes away.** The Plane-A peer-merge layer (`crates/flotilla-daemon/src/peer/`) stays bugfix-only and is deleted by this work, because subscription-based replication supersedes it.
 - **CLAUDE.md changes at the cut-over roll.** Its "Development Phase" rules (serde aliases and defaults, the JSON golden corpus) change to the schema-snapshot form in the same roll.
-- **Interactions are model-checked in Quint (#3214).** The implementation is split into PR stacks (#3215).
+- **Interactions are model-checked in Quint.** The exploratory specs (#3214) found the races ruled above. Minimal per-machine specs, replayed as traces against the engine (#3220), gate the implementation, which is split into PR stacks (#3215).
