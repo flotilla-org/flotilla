@@ -1,0 +1,3 @@
+{"machine":"message","initial":"Pending","ends":["Settled","Dropped"],"edges":[["Pending","deliver","Settled"],["Pending","deliver","Awaiting"],["Awaiting","settle","Settled"],["Pending","drop","Dropped"],["Awaiting","drop","Dropped"]]}
+{"machine":"lifecycle(Clone)","initial":"Requested","ends":["Gone","GaveUp"],"edges":[["Requested","realise","Realised"],["Realised","vanish","Gone"],["Realised","release","Gone"],["Requested","give up","GaveUp"]]}
+{"machine":"lifecycle(ImageBuild)","initial":"Requested","ends":["Gone","GaveUp"],"edges":[["Requested","realise","Realised"],["Realised","vanish","Gone"],["Realised","release","Gone"],["Requested","give up","GaveUp"]]}

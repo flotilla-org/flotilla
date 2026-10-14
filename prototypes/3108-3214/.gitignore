@@ -1,0 +1,4 @@
+build/
+_apalache-out/
+__pycache__/
+tmp/

@@ -1,0 +1,1820 @@
+[
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "deliverOnlyWhenSettled",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 3.3
+ },
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "deliveredNonVacuous",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 3.2
+ },
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "endFreezesRecords",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 3.2
+ },
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "waivedOnlyByGovernor",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 2.3
+ },
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "abandonedByDecision",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 2.6
+ },
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 20.0
+ },
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "gateIsLive",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 10.1
+ },
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "observationsConverge",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 6.5
+ },
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "witnessDelivered",
+  "want": "violated",
+  "got": "violated",
+  "states": 983,
+  "secs": 0.6
+ },
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "witnessAbandoned",
+  "want": "violated",
+  "got": "violated",
+  "states": 24,
+  "secs": 0.5
+ },
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "witnessDeliveredByWaiver",
+  "want": "violated",
+  "got": "violated",
+  "states": 987,
+  "secs": 0.4
+ },
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "witnessLaggingView",
+  "want": "violated",
+  "got": "violated",
+  "states": 68,
+  "secs": 0.4
+ },
+ {
+  "spec": "convoy",
+  "case": "base",
+  "prop": "convergeWithoutReplicationFairness",
+  "want": "violated",
+  "got": "violated",
+  "states": 179810,
+  "secs": 3.4
+ },
+ {
+  "spec": "convoy",
+  "case": "vacuous",
+  "prop": "deliverOnlyWhenSettled",
+  "want": "hold",
+  "got": "hold",
+  "states": 381632,
+  "secs": 2.9
+ },
+ {
+  "spec": "convoy",
+  "case": "vacuous",
+  "prop": "deliveredNonVacuous",
+  "want": "violated",
+  "got": "violated",
+  "states": 192,
+  "secs": 0.4
+ },
+ {
+  "spec": "convoy",
+  "case": "vacuous",
+  "prop": "endFreezesRecords",
+  "want": "hold",
+  "got": "hold",
+  "states": 381632,
+  "secs": 2.5
+ },
+ {
+  "spec": "convoy",
+  "case": "vacuous",
+  "prop": "waivedOnlyByGovernor",
+  "want": "hold",
+  "got": "hold",
+  "states": 381632,
+  "secs": 2.7
+ },
+ {
+  "spec": "convoy",
+  "case": "vacuous",
+  "prop": "abandonedByDecision",
+  "want": "hold",
+  "got": "hold",
+  "states": 381632,
+  "secs": 3.4
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_bare_retraction",
+  "prop": "deliverOnlyWhenSettled",
+  "want": "violated",
+  "got": "violated",
+  "states": 316,
+  "secs": 0.4
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_bare_retraction",
+  "prop": "deliveredNonVacuous",
+  "want": "hold",
+  "got": "hold",
+  "states": 398740,
+  "secs": 3.4
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_bare_retraction",
+  "prop": "endFreezesRecords",
+  "want": "hold",
+  "got": "hold",
+  "states": 398740,
+  "secs": 3.7
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_bare_retraction",
+  "prop": "waivedOnlyByGovernor",
+  "want": "hold",
+  "got": "hold",
+  "states": 398740,
+  "secs": 2.9
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_bare_retraction",
+  "prop": "abandonedByDecision",
+  "want": "hold",
+  "got": "hold",
+  "states": 398740,
+  "secs": 2.5
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_submission_is_kept",
+  "prop": "deliverOnlyWhenSettled",
+  "want": "violated",
+  "got": "violated",
+  "states": 113,
+  "secs": 0.4
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_submission_is_kept",
+  "prop": "deliveredNonVacuous",
+  "want": "hold",
+  "got": "hold",
+  "states": 413264,
+  "secs": 2.5
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_submission_is_kept",
+  "prop": "endFreezesRecords",
+  "want": "hold",
+  "got": "hold",
+  "states": 413264,
+  "secs": 2.6
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_submission_is_kept",
+  "prop": "waivedOnlyByGovernor",
+  "want": "hold",
+  "got": "hold",
+  "states": 413264,
+  "secs": 2.9
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_submission_is_kept",
+  "prop": "abandonedByDecision",
+  "want": "hold",
+  "got": "hold",
+  "states": 413264,
+  "secs": 3.9
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_self_accept",
+  "prop": "deliverOnlyWhenSettled",
+  "want": "violated",
+  "got": "violated",
+  "states": 948,
+  "secs": 0.4
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_self_accept",
+  "prop": "deliveredNonVacuous",
+  "want": "hold",
+  "got": "hold",
+  "states": 587812,
+  "secs": 4.6
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_self_accept",
+  "prop": "endFreezesRecords",
+  "want": "hold",
+  "got": "hold",
+  "states": 587812,
+  "secs": 4.4
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_self_accept",
+  "prop": "waivedOnlyByGovernor",
+  "want": "violated",
+  "got": "violated",
+  "states": 137,
+  "secs": 0.4
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_self_accept",
+  "prop": "abandonedByDecision",
+  "want": "hold",
+  "got": "hold",
+  "states": 587812,
+  "secs": 5.9
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_writes_after_end",
+  "prop": "deliverOnlyWhenSettled",
+  "want": "hold",
+  "got": "hold",
+  "states": 3661522,
+  "secs": 32.2
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_writes_after_end",
+  "prop": "deliveredNonVacuous",
+  "want": "hold",
+  "got": "hold",
+  "states": 3661522,
+  "secs": 31.9
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_writes_after_end",
+  "prop": "endFreezesRecords",
+  "want": "violated",
+  "got": "violated",
+  "states": 204,
+  "secs": 0.4
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_writes_after_end",
+  "prop": "waivedOnlyByGovernor",
+  "want": "hold",
+  "got": "hold",
+  "states": 3661522,
+  "secs": 30.8
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_writes_after_end",
+  "prop": "abandonedByDecision",
+  "want": "hold",
+  "got": "hold",
+  "states": 3661522,
+  "secs": 28.3
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_deliver_from_end",
+  "prop": "endsAreFinal",
+  "want": "violated",
+  "got": "violated",
+  "states": 2051,
+  "secs": 0.5
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_auto_fail",
+  "prop": "deliverOnlyWhenSettled",
+  "want": "hold",
+  "got": "hold",
+  "states": 425296,
+  "secs": 3.7
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_auto_fail",
+  "prop": "deliveredNonVacuous",
+  "want": "hold",
+  "got": "hold",
+  "states": 425296,
+  "secs": 2.6
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_auto_fail",
+  "prop": "endFreezesRecords",
+  "want": "hold",
+  "got": "hold",
+  "states": 425296,
+  "secs": 3.1
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_auto_fail",
+  "prop": "waivedOnlyByGovernor",
+  "want": "hold",
+  "got": "hold",
+  "states": 425296,
+  "secs": 4.4
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_auto_fail",
+  "prop": "abandonedByDecision",
+  "want": "violated",
+  "got": "violated",
+  "states": 356,
+  "secs": 0.4
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_link_gate",
+  "prop": "gateIsLive",
+  "want": "violated",
+  "got": "violated",
+  "states": 156279,
+  "secs": 3.5
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_link_gate",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 19.8
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_link_gate",
+  "prop": "deliverOnlyWhenSettled",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 2.8
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_link_gate",
+  "prop": "deliveredNonVacuous",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 2.3
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_link_gate",
+  "prop": "endFreezesRecords",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 2.9
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_link_gate",
+  "prop": "waivedOnlyByGovernor",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 2.2
+ },
+ {
+  "spec": "convoy",
+  "case": "mut_link_gate",
+  "prop": "abandonedByDecision",
+  "want": "hold",
+  "got": "hold",
+  "states": 345304,
+  "secs": 3.5
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "deliverAfterReceipt",
+  "want": "hold",
+  "got": "hold",
+  "states": 7873022,
+  "secs": 67.8
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "deliveredImpliesTurned",
+  "want": "hold",
+  "got": "hold",
+  "states": 7873022,
+  "secs": 65.2
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "deliverOnce",
+  "want": "hold",
+  "got": "hold",
+  "states": 7873022,
+  "secs": 60.7
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "noDuplicateTurnPerSession",
+  "want": "hold",
+  "got": "hold",
+  "states": 7873022,
+  "secs": 65.6
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "noDoubleTurnAfterObservedReceipt",
+  "want": "hold",
+  "got": "hold",
+  "states": 7873022,
+  "secs": 67.3
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "receiverTurned",
+  "want": "hold",
+  "got": "hold",
+  "states": 7873022,
+  "secs": 64.6
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "oneConsumer",
+  "want": "hold",
+  "got": "hold",
+  "states": 7873022,
+  "secs": 64.9
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 7873022,
+  "secs": 516.5
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "pendingLeaves",
+  "want": "hold",
+  "got": "hold",
+  "states": 7873022,
+  "secs": 406.7
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "everyMessageEnds",
+  "want": "hold",
+  "got": "hold",
+  "states": 7873022,
+  "secs": 430.9
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "droppedImpliesNeverTurned",
+  "want": "violated",
+  "got": "violated",
+  "states": 4188,
+  "secs": 0.6
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "noDropWithObservedReceipt",
+  "want": "violated",
+  "got": "violated",
+  "states": 20577,
+  "secs": 0.7
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "witnessDelivered",
+  "want": "violated",
+  "got": "violated",
+  "states": 8440,
+  "secs": 0.7
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "witnessDropped",
+  "want": "violated",
+  "got": "violated",
+  "states": 327,
+  "secs": 0.4
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "witnessDoubleTurn",
+  "want": "violated",
+  "got": "violated",
+  "states": 12616,
+  "secs": 0.7
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "witnessZombieTurn",
+  "want": "violated",
+  "got": "violated",
+  "states": 607,
+  "secs": 0.4
+ },
+ {
+  "spec": "inbox",
+  "case": "base",
+  "prop": "witnessReplacementDelivery",
+  "want": "violated",
+  "got": "violated",
+  "states": 30591,
+  "secs": 0.8
+ },
+ {
+  "spec": "inbox",
+  "case": "drop_checks_receipt",
+  "prop": "deliverAfterReceipt",
+  "want": "hold",
+  "got": "hold",
+  "states": 6708229,
+  "secs": 56.6
+ },
+ {
+  "spec": "inbox",
+  "case": "drop_checks_receipt",
+  "prop": "deliveredImpliesTurned",
+  "want": "hold",
+  "got": "hold",
+  "states": 6708229,
+  "secs": 58.3
+ },
+ {
+  "spec": "inbox",
+  "case": "drop_checks_receipt",
+  "prop": "deliverOnce",
+  "want": "hold",
+  "got": "hold",
+  "states": 6708229,
+  "secs": 52.0
+ },
+ {
+  "spec": "inbox",
+  "case": "drop_checks_receipt",
+  "prop": "noDuplicateTurnPerSession",
+  "want": "hold",
+  "got": "hold",
+  "states": 6708229,
+  "secs": 52.9
+ },
+ {
+  "spec": "inbox",
+  "case": "drop_checks_receipt",
+  "prop": "noDoubleTurnAfterObservedReceipt",
+  "want": "hold",
+  "got": "hold",
+  "states": 6708229,
+  "secs": 57.6
+ },
+ {
+  "spec": "inbox",
+  "case": "drop_checks_receipt",
+  "prop": "receiverTurned",
+  "want": "hold",
+  "got": "hold",
+  "states": 6708229,
+  "secs": 59.2
+ },
+ {
+  "spec": "inbox",
+  "case": "drop_checks_receipt",
+  "prop": "oneConsumer",
+  "want": "hold",
+  "got": "hold",
+  "states": 6708229,
+  "secs": 54.0
+ },
+ {
+  "spec": "inbox",
+  "case": "drop_checks_receipt",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 6708229,
+  "secs": 445.9
+ },
+ {
+  "spec": "inbox",
+  "case": "drop_checks_receipt",
+  "prop": "pendingLeaves",
+  "want": "hold",
+  "got": "hold",
+  "states": 6708229,
+  "secs": 360.5
+ },
+ {
+  "spec": "inbox",
+  "case": "drop_checks_receipt",
+  "prop": "everyMessageEnds",
+  "want": "hold",
+  "got": "hold",
+  "states": 6708229,
+  "secs": 384.3
+ },
+ {
+  "spec": "inbox",
+  "case": "drop_checks_receipt",
+  "prop": "noDropWithObservedReceipt",
+  "want": "hold",
+  "got": "hold",
+  "states": 6708229,
+  "secs": 52.4
+ },
+ {
+  "spec": "inbox",
+  "case": "drop_checks_receipt",
+  "prop": "droppedImpliesNeverTurned",
+  "want": "violated",
+  "got": "violated",
+  "states": 4075,
+  "secs": 0.5
+ },
+ {
+  "spec": "inbox",
+  "case": "two_messages",
+  "prop": "deliverAfterReceipt",
+  "want": "hold",
+  "got": "hold",
+  "states": 123368,
+  "secs": 1.4
+ },
+ {
+  "spec": "inbox",
+  "case": "two_messages",
+  "prop": "deliveredImpliesTurned",
+  "want": "hold",
+  "got": "hold",
+  "states": 123368,
+  "secs": 1.4
+ },
+ {
+  "spec": "inbox",
+  "case": "two_messages",
+  "prop": "deliverOnce",
+  "want": "hold",
+  "got": "hold",
+  "states": 123368,
+  "secs": 1.4
+ },
+ {
+  "spec": "inbox",
+  "case": "two_messages",
+  "prop": "noDuplicateTurnPerSession",
+  "want": "hold",
+  "got": "hold",
+  "states": 123368,
+  "secs": 1.4
+ },
+ {
+  "spec": "inbox",
+  "case": "two_messages",
+  "prop": "receiverTurned",
+  "want": "hold",
+  "got": "hold",
+  "states": 123368,
+  "secs": 1.4
+ },
+ {
+  "spec": "inbox",
+  "case": "two_messages",
+  "prop": "oneConsumer",
+  "want": "hold",
+  "got": "hold",
+  "states": 123368,
+  "secs": 1.4
+ },
+ {
+  "spec": "inbox",
+  "case": "two_messages",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 123368,
+  "secs": 19.3
+ },
+ {
+  "spec": "inbox",
+  "case": "two_messages",
+  "prop": "pendingLeaves",
+  "want": "hold",
+  "got": "hold",
+  "states": 123368,
+  "secs": 8.1
+ },
+ {
+  "spec": "inbox",
+  "case": "two_messages",
+  "prop": "everyMessageEnds",
+  "want": "hold",
+  "got": "hold",
+  "states": 123368,
+  "secs": 8.2
+ },
+ {
+  "spec": "inbox",
+  "case": "two_messages",
+  "prop": "witnessDelivered",
+  "want": "violated",
+  "got": "violated",
+  "states": 730,
+  "secs": 0.5
+ },
+ {
+  "spec": "inbox",
+  "case": "two_messages",
+  "prop": "witnessDropped",
+  "want": "violated",
+  "got": "violated",
+  "states": 78,
+  "secs": 0.4
+ },
+ {
+  "spec": "inbox",
+  "case": "mut_deliver_without_receipt",
+  "prop": "deliverAfterReceipt",
+  "want": "violated",
+  "got": "violated",
+  "states": 161,
+  "secs": 0.4
+ },
+ {
+  "spec": "inbox",
+  "case": "mut_ends_not_final",
+  "prop": "endsAreFinal",
+  "want": "violated",
+  "got": "violated",
+  "states": 120961,
+  "secs": 3.3
+ },
+ {
+  "spec": "inbox",
+  "case": "mut_ends_not_final",
+  "prop": "deliverOnce",
+  "want": "violated",
+  "got": "violated",
+  "states": 21581,
+  "secs": 1.0
+ },
+ {
+  "spec": "inbox",
+  "case": "no_drain",
+  "prop": "noDoubleTurnAfterObservedReceipt",
+  "want": "violated",
+  "got": "violated",
+  "states": 89510,
+  "secs": 1.3
+ },
+ {
+  "spec": "inbox",
+  "case": "no_drain",
+  "prop": "deliverAfterReceipt",
+  "want": "hold",
+  "got": "hold",
+  "states": 9631629,
+  "secs": 73.2
+ },
+ {
+  "spec": "inbox",
+  "case": "crash",
+  "prop": "noDuplicateTurnPerSession",
+  "want": "violated",
+  "got": "violated",
+  "states": 2454,
+  "secs": 0.6
+ },
+ {
+  "spec": "inbox",
+  "case": "crash",
+  "prop": "deliveredImpliesTurned",
+  "want": "hold",
+  "got": "hold",
+  "states": 24880260,
+  "secs": 212.6
+ },
+ {
+  "spec": "inbox",
+  "case": "crash",
+  "prop": "deliverAfterReceipt",
+  "want": "hold",
+  "got": "hold",
+  "states": 24880260,
+  "secs": 215.7
+ },
+ {
+  "spec": "inbox",
+  "case": "receipt_first_crash",
+  "prop": "deliveredImpliesTurned",
+  "want": "violated",
+  "got": "violated",
+  "states": 2454,
+  "secs": 1.1
+ },
+ {
+  "spec": "inbox",
+  "case": "receipt_first_crash",
+  "prop": "noDuplicateTurnPerSession",
+  "want": "hold",
+  "got": "hold",
+  "states": 16366221,
+  "secs": 119.4
+ },
+ {
+  "spec": "inbox",
+  "case": "receipt_first_crash",
+  "prop": "deliverAfterReceipt",
+  "want": "hold",
+  "got": "hold",
+  "states": 16366221,
+  "secs": 123.3
+ },
+ {
+  "spec": "inbox",
+  "case": "requires_binding",
+  "prop": "deliverAfterReceipt",
+  "want": "hold",
+  "got": "hold",
+  "states": 6602062,
+  "secs": 46.8
+ },
+ {
+  "spec": "inbox",
+  "case": "requires_binding",
+  "prop": "noDoubleTurnAfterObservedReceipt",
+  "want": "hold",
+  "got": "hold",
+  "states": 6602062,
+  "secs": 48.8
+ },
+ {
+  "spec": "inbox",
+  "case": "requires_binding",
+  "prop": "noDropWithObservedReceipt",
+  "want": "violated",
+  "got": "violated",
+  "states": 15918,
+  "secs": 0.6
+ },
+ {
+  "spec": "inbox",
+  "case": "requires_binding",
+  "prop": "pendingLeaves",
+  "want": "hold",
+  "got": "hold",
+  "states": 6602062,
+  "secs": 395.4
+ },
+ {
+  "spec": "inbox",
+  "case": "requires_binding_and_drop_check",
+  "prop": "noDropWithObservedReceipt",
+  "want": "hold",
+  "got": "hold",
+  "states": 5437269,
+  "secs": 59.2
+ },
+ {
+  "spec": "inbox",
+  "case": "requires_binding_and_drop_check",
+  "prop": "pendingLeaves",
+  "want": "hold",
+  "got": "hold",
+  "states": 5437269,
+  "secs": 333.9
+ },
+ {
+  "spec": "inbox",
+  "case": "requires_binding_and_drop_check",
+  "prop": "everyMessageEnds",
+  "want": "violated",
+  "got": "violated",
+  "states": 1753009,
+  "secs": 69.2
+ },
+ {
+  "spec": "inbox",
+  "case": "mut_no_unbind_on_end",
+  "prop": "everyMessageEnds",
+  "want": "violated",
+  "got": "violated",
+  "states": 84791,
+  "secs": 3.5
+ },
+ {
+  "spec": "inbox",
+  "case": "mut_no_unbind_on_end",
+  "prop": "pendingLeaves",
+  "want": "hold",
+  "got": "hold",
+  "states": 7873022,
+  "secs": 424.7
+ },
+ {
+  "spec": "inbox",
+  "case": "mut_no_unbind_on_silence",
+  "prop": "everyMessageEnds",
+  "want": "violated",
+  "got": "violated",
+  "states": 55312,
+  "secs": 3.5
+ },
+ {
+  "spec": "inbox",
+  "case": "mut_no_unbind_on_silence",
+  "prop": "pendingLeaves",
+  "want": "hold",
+  "got": "hold",
+  "states": 7873022,
+  "secs": 428.3
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "boundConsistent",
+  "want": "hold",
+  "got": "hold",
+  "states": 27392,
+  "secs": 0.9
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "atMostOneLive",
+  "want": "hold",
+  "got": "hold",
+  "states": 27392,
+  "secs": 0.7
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "noCreateAfterRetire",
+  "want": "hold",
+  "got": "hold",
+  "states": 27392,
+  "secs": 0.7
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "fulfilledImpliesRealised",
+  "want": "hold",
+  "got": "hold",
+  "states": 27392,
+  "secs": 0.9
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "noOrphanAfterUnbind",
+  "want": "hold",
+  "got": "hold",
+  "states": 27392,
+  "secs": 0.8
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 27392,
+  "secs": 3.1
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "retireReleases",
+  "want": "hold",
+  "got": "hold",
+  "states": 27392,
+  "secs": 2.0
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "fulfilledGoneUnbinds",
+  "want": "hold",
+  "got": "hold",
+  "states": 27392,
+  "secs": 1.7
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "fulfilmentConverges",
+  "want": "hold",
+  "got": "hold",
+  "states": 27392,
+  "secs": 1.5
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "witnessFulfilled",
+  "want": "violated",
+  "got": "violated",
+  "states": 295,
+  "secs": 0.4
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "witnessReplaced",
+  "want": "violated",
+  "got": "violated",
+  "states": 404,
+  "secs": 0.4
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "witnessHeld",
+  "want": "violated",
+  "got": "violated",
+  "states": 1265,
+  "secs": 0.5
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "witnessRetiredFromFulfilled",
+  "want": "violated",
+  "got": "violated",
+  "states": 450,
+  "secs": 0.4
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "witnessRealisedAfterRetire",
+  "want": "violated",
+  "got": "violated",
+  "states": 161,
+  "secs": 0.4
+ },
+ {
+  "spec": "ensure",
+  "case": "base",
+  "prop": "witnessStaleFulfilled",
+  "want": "violated",
+  "got": "violated",
+  "states": 397,
+  "secs": 0.4
+ },
+ {
+  "spec": "ensure",
+  "case": "resume_keeps_history",
+  "prop": "fulfilmentConverges",
+  "want": "violated",
+  "got": "violated",
+  "states": 24896,
+  "secs": 1.4
+ },
+ {
+  "spec": "ensure",
+  "case": "resume_keeps_history",
+  "prop": "boundConsistent",
+  "want": "hold",
+  "got": "hold",
+  "states": 24896,
+  "secs": 0.7
+ },
+ {
+  "spec": "ensure",
+  "case": "resume_keeps_history",
+  "prop": "atMostOneLive",
+  "want": "hold",
+  "got": "hold",
+  "states": 24896,
+  "secs": 0.7
+ },
+ {
+  "spec": "ensure",
+  "case": "resume_keeps_history",
+  "prop": "retireReleases",
+  "want": "hold",
+  "got": "hold",
+  "states": 24896,
+  "secs": 1.8
+ },
+ {
+  "spec": "ensure",
+  "case": "bind_on_creation",
+  "prop": "fulfilledImpliesRealised",
+  "want": "violated",
+  "got": "violated",
+  "states": 242,
+  "secs": 0.4
+ },
+ {
+  "spec": "ensure",
+  "case": "bind_on_creation",
+  "prop": "boundConsistent",
+  "want": "hold",
+  "got": "hold",
+  "states": 136784,
+  "secs": 1.7
+ },
+ {
+  "spec": "ensure",
+  "case": "bind_on_creation",
+  "prop": "atMostOneLive",
+  "want": "hold",
+  "got": "hold",
+  "states": 136784,
+  "secs": 1.6
+ },
+ {
+  "spec": "ensure",
+  "case": "bind_on_creation",
+  "prop": "retireReleases",
+  "want": "hold",
+  "got": "hold",
+  "states": 136784,
+  "secs": 8.3
+ },
+ {
+  "spec": "ensure",
+  "case": "bind_on_creation",
+  "prop": "fulfilmentConverges",
+  "want": "hold",
+  "got": "hold",
+  "states": 136784,
+  "secs": 5.3
+ },
+ {
+  "spec": "ensure",
+  "case": "mut_no_release_from_requested",
+  "prop": "retireReleases",
+  "want": "violated",
+  "got": "violated",
+  "states": 25040,
+  "secs": 1.6
+ },
+ {
+  "spec": "ensure",
+  "case": "mut_no_release_from_requested",
+  "prop": "atMostOneLive",
+  "want": "hold",
+  "got": "hold",
+  "states": 25040,
+  "secs": 0.7
+ },
+ {
+  "spec": "ensure",
+  "case": "mut_no_release_from_requested",
+  "prop": "fulfilmentConverges",
+  "want": "hold",
+  "got": "hold",
+  "states": 25040,
+  "secs": 1.4
+ },
+ {
+  "spec": "ensure",
+  "case": "mut_replace_without_release",
+  "prop": "noOrphanAfterUnbind",
+  "want": "violated",
+  "got": "violated",
+  "states": 443,
+  "secs": 0.4
+ },
+ {
+  "spec": "ensure",
+  "case": "mut_replace_without_release",
+  "prop": "boundConsistent",
+  "want": "hold",
+  "got": "hold",
+  "states": 12080,
+  "secs": 0.7
+ },
+ {
+  "spec": "ensure",
+  "case": "mut_double_create",
+  "prop": "atMostOneLive",
+  "want": "violated",
+  "got": "violated",
+  "states": 78,
+  "secs": 0.4
+ },
+ {
+  "spec": "ensure",
+  "case": "mut_retire_releases_bound_only",
+  "prop": "retireReleases",
+  "want": "violated",
+  "got": "violated",
+  "states": 19536,
+  "secs": 1.4
+ },
+ {
+  "spec": "ensure",
+  "case": "mut_retire_releases_bound_only",
+  "prop": "atMostOneLive",
+  "want": "hold",
+  "got": "hold",
+  "states": 19536,
+  "secs": 0.6
+ },
+ {
+  "spec": "ensure",
+  "case": "mut_create_after_retire",
+  "prop": "noCreateAfterRetire",
+  "want": "violated",
+  "got": "violated",
+  "states": 180,
+  "secs": 0.4
+ },
+ {
+  "spec": "ensure",
+  "case": "mut_create_after_retire",
+  "prop": "boundConsistent",
+  "want": "hold",
+  "got": "hold",
+  "states": 138608,
+  "secs": 1.7
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 972288,
+  "secs": 8.2
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "arrivedAreResolved",
+  "want": "hold",
+  "got": "hold",
+  "states": 972288,
+  "secs": 9.0
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "outcomesTruthful",
+  "want": "hold",
+  "got": "hold",
+  "states": 972288,
+  "secs": 10.1
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "dropReasonSound",
+  "want": "hold",
+  "got": "hold",
+  "states": 972288,
+  "secs": 10.1
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "settledHasEvidence",
+  "want": "hold",
+  "got": "hold",
+  "states": 972288,
+  "secs": 8.4
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 972288,
+  "secs": 75.6
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "whyIsFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 972288,
+  "secs": 67.6
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "everyMessageEnds",
+  "want": "hold",
+  "got": "hold",
+  "states": 972288,
+  "secs": 36.2
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "endsDespitePartition",
+  "want": "hold",
+  "got": "hold",
+  "states": 972288,
+  "secs": 36.7
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "noInTimeReplyLost",
+  "want": "violated",
+  "got": "violated",
+  "states": 6057,
+  "secs": 0.6
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessSettled",
+  "want": "violated",
+  "got": "violated",
+  "states": 5751,
+  "secs": 0.7
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessExpired",
+  "want": "violated",
+  "got": "violated",
+  "states": 553,
+  "secs": 0.5
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessSuperseded",
+  "want": "violated",
+  "got": "violated",
+  "states": 210,
+  "secs": 0.5
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessUndeliverable",
+  "want": "violated",
+  "got": "violated",
+  "states": 212,
+  "secs": 0.5
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessLateSupersedeRefused",
+  "want": "violated",
+  "got": "violated",
+  "states": 685,
+  "secs": 0.5
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessLateExpireRefused",
+  "want": "violated",
+  "got": "violated",
+  "states": 800,
+  "secs": 0.6
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessLateSettleRefused",
+  "want": "violated",
+  "got": "violated",
+  "states": 727,
+  "secs": 0.5
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessLateDeliverRefused",
+  "want": "violated",
+  "got": "violated",
+  "states": 791,
+  "secs": 0.5
+ },
+ {
+  "spec": "race",
+  "case": "watermark",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 849168,
+  "secs": 8.1
+ },
+ {
+  "spec": "race",
+  "case": "watermark",
+  "prop": "arrivedAreResolved",
+  "want": "hold",
+  "got": "hold",
+  "states": 849168,
+  "secs": 8.1
+ },
+ {
+  "spec": "race",
+  "case": "watermark",
+  "prop": "outcomesTruthful",
+  "want": "hold",
+  "got": "hold",
+  "states": 849168,
+  "secs": 8.8
+ },
+ {
+  "spec": "race",
+  "case": "watermark",
+  "prop": "dropReasonSound",
+  "want": "hold",
+  "got": "hold",
+  "states": 849168,
+  "secs": 8.6
+ },
+ {
+  "spec": "race",
+  "case": "watermark",
+  "prop": "settledHasEvidence",
+  "want": "hold",
+  "got": "hold",
+  "states": 849168,
+  "secs": 8.6
+ },
+ {
+  "spec": "race",
+  "case": "watermark",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 849168,
+  "secs": 65.3
+ },
+ {
+  "spec": "race",
+  "case": "watermark",
+  "prop": "whyIsFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 849168,
+  "secs": 58.9
+ },
+ {
+  "spec": "race",
+  "case": "watermark",
+  "prop": "everyMessageEnds",
+  "want": "hold",
+  "got": "hold",
+  "states": 849168,
+  "secs": 33.3
+ },
+ {
+  "spec": "race",
+  "case": "watermark",
+  "prop": "noInTimeReplyLost",
+  "want": "hold",
+  "got": "hold",
+  "states": 849168,
+  "secs": 7.4
+ },
+ {
+  "spec": "race",
+  "case": "watermark",
+  "prop": "endsDespitePartition",
+  "want": "violated",
+  "got": "violated",
+  "states": 849168,
+  "secs": 33.1
+ },
+ {
+  "spec": "race",
+  "case": "expects_nothing",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 273640,
+  "secs": 2.8
+ },
+ {
+  "spec": "race",
+  "case": "expects_nothing",
+  "prop": "arrivedAreResolved",
+  "want": "hold",
+  "got": "hold",
+  "states": 273640,
+  "secs": 2.5
+ },
+ {
+  "spec": "race",
+  "case": "expects_nothing",
+  "prop": "outcomesTruthful",
+  "want": "hold",
+  "got": "hold",
+  "states": 273640,
+  "secs": 2.7
+ },
+ {
+  "spec": "race",
+  "case": "expects_nothing",
+  "prop": "dropReasonSound",
+  "want": "hold",
+  "got": "hold",
+  "states": 273640,
+  "secs": 2.6
+ },
+ {
+  "spec": "race",
+  "case": "expects_nothing",
+  "prop": "settledHasEvidence",
+  "want": "hold",
+  "got": "hold",
+  "states": 273640,
+  "secs": 2.5
+ },
+ {
+  "spec": "race",
+  "case": "expects_nothing",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 273640,
+  "secs": 20.7
+ },
+ {
+  "spec": "race",
+  "case": "expects_nothing",
+  "prop": "whyIsFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 273640,
+  "secs": 18.9
+ },
+ {
+  "spec": "race",
+  "case": "expects_nothing",
+  "prop": "everyMessageEnds",
+  "want": "hold",
+  "got": "hold",
+  "states": 273640,
+  "secs": 10.8
+ },
+ {
+  "spec": "race",
+  "case": "expects_nothing",
+  "prop": "endsDespitePartition",
+  "want": "hold",
+  "got": "hold",
+  "states": 273640,
+  "secs": 10.7
+ },
+ {
+  "spec": "race",
+  "case": "mut_drop_from_any",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 792808,
+  "secs": 9.2
+ },
+ {
+  "spec": "race",
+  "case": "mut_drop_from_any",
+  "prop": "endsAreFinal",
+  "want": "violated",
+  "got": "violated",
+  "states": 99328,
+  "secs": 3.1
+ },
+ {
+  "spec": "race",
+  "case": "mut_drop_from_any",
+  "prop": "arrivedAreResolved",
+  "want": "hold",
+  "got": "hold",
+  "states": 792808,
+  "secs": 8.8
+ },
+ {
+  "spec": "race",
+  "case": "mut_silent_refusal",
+  "prop": "arrivedAreResolved",
+  "want": "violated",
+  "got": "violated",
+  "states": 794,
+  "secs": 0.5
+ },
+ {
+  "spec": "race",
+  "case": "mut_silent_refusal",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 972288,
+  "secs": 8.7
+ },
+ {
+  "spec": "race",
+  "case": "mut_silent_refusal",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 972288,
+  "secs": 67.3
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_deadline",
+  "prop": "dropReasonSound",
+  "want": "violated",
+  "got": "violated",
+  "states": 8,
+  "secs": 0.4
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_deadline",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 1004352,
+  "secs": 9.5
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_deadline",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 1004352,
+  "secs": 75.8
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_reply",
+  "prop": "dropReasonSound",
+  "want": "violated",
+  "got": "violated",
+  "states": 16782,
+  "secs": 0.7
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_reply",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 1012032,
+  "secs": 8.0
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_reply",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 1012032,
+  "secs": 75.7
+ },
+ {
+  "spec": "race",
+  "case": "mut_undeliverable_anywhere",
+  "prop": "dropReasonSound",
+  "want": "violated",
+  "got": "violated",
+  "states": 7539,
+  "secs": 0.5
+ },
+ {
+  "spec": "race",
+  "case": "mut_undeliverable_anywhere",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 1042056,
+  "secs": 8.6
+ },
+ {
+  "spec": "race",
+  "case": "mut_undeliverable_anywhere",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 1042056,
+  "secs": 77.1
+ },
+ {
+  "spec": "race",
+  "case": "mut_supersede_unchecked",
+  "prop": "dropReasonSound",
+  "want": "violated",
+  "got": "violated",
+  "states": 12,
+  "secs": 0.4
+ },
+ {
+  "spec": "race",
+  "case": "mut_supersede_unchecked",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 986688,
+  "secs": 8.2
+ },
+ {
+  "spec": "race",
+  "case": "mut_supersede_unchecked",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 986688,
+  "secs": 87.1
+ }
+]
