@@ -1,5 +1,6 @@
 use super::*;
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
+use flotilla_environment::environment::EnvironmentToolAssetKind;
 
 #[tokio::test]
 async fn local_profile_does_not_advertise_docker_without_interior_cleat() {
@@ -112,7 +113,12 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
         "the Rust linker cap"
     )));
     assert_eq!(opts.tools[0].executable.as_path(), Path::new(ENVIRONMENT_FLOTILLA_PATH));
-    assert_eq!(opts.tools[0].assets[2].environment_path.as_path(), Path::new(ENVIRONMENT_DAEMON_SOCKET_PATH));
+    // #3270: the mount source is an isolated per-environment directory,
+    // containing only its socket; the host's main run directory is absent.
+    let socket_mount = &opts.tools[0].assets[2];
+    assert_eq!(socket_mount.environment_path.as_path(), Path::new("/run/flotilla-daemon"));
+    assert_eq!(socket_mount.kind, EnvironmentToolAssetKind::Directory);
+    assert_ne!(socket_mount.host_path.as_path(), Path::new("/tmp"));
     assert_eq!(
         opts.tools[0].environment[1],
         EnvironmentVariableUpdate::set("FLOTILLA_CONTAINED_HOST_DAEMON", "1", "the contained host-daemon requirement",),

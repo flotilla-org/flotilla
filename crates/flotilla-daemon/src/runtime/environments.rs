@@ -235,6 +235,9 @@ pub(super) async fn reconcile_provisioned_environment(
             )
             .await;
         }
+        if let Some(sockets) = &state.environment_sockets {
+            sockets.prepare(env_id.clone()).await?;
+        }
         info!(environment = %env_id, container = %container_id, "restored provisioned environment registration");
     }
     state.provisioned_environments.lock().await.entry(container_id).or_insert(ActiveProvisionedEnvironment { handle });

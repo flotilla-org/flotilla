@@ -535,13 +535,13 @@ async fn create_reports_infrastructure_and_requested_mount_metadata() {
     let calls = runner.calls();
     let (_, args, _) = &calls[0];
     assert!(
-        args.windows(2).any(|pair| pair == ["-v", "/host/daemon:/run/flotilla-daemon:rw"]),
-        "daemon socket parent directory should be mounted read-write; args: {args:?}",
+        args.windows(2).any(|pair| pair == ["-v", "/host/daemon/flotilla.sock:/run/flotilla-daemon/flotilla.sock:rw"]),
+        "only the socket itself may be mounted; args: {args:?}",
     );
     assert_eq!(
         handle.provisioned_mounts(),
         vec![
-            ProvisionedMount::new("/host/daemon", "/run/flotilla-daemon", ProvisionedMountMode::Rw),
+            ProvisionedMount::new("/host/daemon/flotilla.sock", "/run/flotilla-daemon/flotilla.sock", ProvisionedMountMode::Rw),
             ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo", ProvisionedMountMode::Ro),
         ],
         "docker provisioned environments should report infrastructure and requested bind mount metadata",

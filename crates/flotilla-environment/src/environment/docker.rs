@@ -671,24 +671,15 @@ impl DockerEnvironmentProvider {
                     EnvironmentToolAssetAccess::SharedWritable => ProvisionedMountMode::Rw,
                 };
                 let (host_path, environment_path) = match asset.kind {
-                    EnvironmentToolAssetKind::UnixSocket => {
-                        let host_parent = asset
-                            .host_path
-                            .as_path()
-                            .parent()
-                            .ok_or_else(|| format!("Unix socket asset {} has no host parent directory", asset.host_path))?;
-                        let environment_parent =
-                            asset.environment_path.as_path().parent().ok_or_else(|| {
-                                format!("Unix socket asset {} has no environment parent directory", asset.environment_path)
-                            })?;
-                        (host_parent.to_path_buf(), environment_parent.to_path_buf())
-                    }
-                    EnvironmentToolAssetKind::File | EnvironmentToolAssetKind::Directory => {
+                    EnvironmentToolAssetKind::UnixSocket | EnvironmentToolAssetKind::File | EnvironmentToolAssetKind::Directory => {
                         (asset.host_path.as_path().to_path_buf(), asset.environment_path.as_path().to_path_buf())
                     }
                 };
-                if requested_mounts.iter().chain(&provisioned_mounts).any(|mount| mount.environment_path.as_path() == environment_path) {
-                    return Err(format!("mount target {} is reserved for {}", environment_path.display(), asset.purpose));
+                if let Some(mount) = requested_mounts.iter().chain(&provisioned_mounts).find(|mount| {
+                    environment_path.starts_with(mount.environment_path.as_path())
+                        || mount.environment_path.as_path().starts_with(&environment_path)
+                }) {
+                    return Err(format!("mount target {} is reserved for {}", mount.environment_path, asset.purpose));
                 }
                 provisioned_mounts.push(ProvisionedMount::new(host_path, environment_path, mode));
             }

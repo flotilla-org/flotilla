@@ -13,6 +13,7 @@ use flotilla_credentials::{compose_agent_environment, AgentMaterialRegistry, Cre
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery::run_provisioned_host_detectors;
 use flotilla_discovery_api::EnvironmentBag;
+use flotilla_environment::environment::contained_daemon_socket_path;
 use flotilla_environment::environment::CreateOpts;
 use flotilla_environment::environment::EnvironmentHandle;
 use flotilla_environment::environment::EnvironmentToolAssetKind;
@@ -155,34 +156,48 @@ impl EnvironmentToolContext for DockerToolContext<'_> {
     }
 }
 
-#[async_trait]
-impl DockerEnvironmentRuntime for DockerControllerRuntime {
-    async fn provision_environment(
+impl DockerControllerRuntime {
+    async fn provision_contained(
         &self,
         name: &str,
-        spec: &EnvironmentSpec,
-    ) -> Result<flotilla_controllers::reconcilers::environment::EnvironmentProvisioning, String> {
-        use flotilla_controllers::reconcilers::environment::EnvironmentProvisioning;
-        use flotilla_environment::environment::EnvironmentKind;
-        let kind = EnvironmentKind::of(spec)?;
-        if kind == EnvironmentKind::Docker {
-            return self.provision(name, spec.docker.as_ref().expect("kind checked")).await.map(EnvironmentProvisioning::Docker);
-        }
-        let provider = self.provider_for_environment(name, kind).await?;
-        let prepared = provider.prepare(spec, &Default::default()).await?;
-        provider.provision(EnvironmentId::new(name), &prepared, Default::default()).await?;
-        Ok(EnvironmentProvisioning::HostDirect)
-    }
-
-    async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+        spec: &flotilla_resources::DockerEnvironmentSpec,
+    ) -> Result<DockerProvisioning, String> {
         let legacy_baseline = self.legacy_baseline_for_environment(name).await?;
         let provider = self.provider_for_environment(name, flotilla_environment::environment::EnvironmentKind::Docker).await?;
         let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };
-        let tools = if provider.receives_host_tools() {
+        let mut tools = if provider.receives_host_tools() {
             self.state.environment_tools.prepare(DOCKER_PROVIDER_KIND, name, &context).await?
         } else {
             Vec::new()
         };
+        if provider.receives_host_tools() {
+            let sockets = self
+                .state
+                .environment_sockets
+                .as_ref()
+                .ok_or("EnvironmentSocketUnavailable: contained provisioning requires a crew socket server")?;
+            let path = sockets.prepare(EnvironmentId::new(name)).await?;
+            let environment_socket = contained_daemon_socket_path(path.as_path());
+            for tool in &mut tools {
+                for update in &mut tool.environment {
+                    if let EnvironmentVariableUpdate::Set { name, value, .. } = update {
+                        if name == "FLOTILLA_DAEMON_SOCKET" {
+                            *value = environment_socket.to_string_lossy().into_owned();
+                        }
+                    }
+                }
+                for asset in &mut tool.assets {
+                    if asset.kind == EnvironmentToolAssetKind::UnixSocket {
+                        // Mount a dedicated directory containing only this socket.
+                        // Keeping the directory stable permits socket replacement on restart.
+                        asset.host_path = flotilla_protocol::DaemonHostPath::new(path.as_path().parent().expect("socket parent"));
+                        asset.environment_path =
+                            flotilla_protocol::ExecutionEnvironmentPath::new(environment_socket.parent().expect("socket parent"));
+                        asset.kind = EnvironmentToolAssetKind::Directory;
+                    }
+                }
+            }
+        }
         for tool in &tools {
             for asset in &tool.assets {
                 let reserved_path = match asset.kind {
@@ -620,6 +635,36 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             }),
         })
     }
+}
+
+#[async_trait]
+impl DockerEnvironmentRuntime for DockerControllerRuntime {
+    async fn provision_environment(
+        &self,
+        name: &str,
+        spec: &EnvironmentSpec,
+    ) -> Result<flotilla_controllers::reconcilers::environment::EnvironmentProvisioning, String> {
+        use flotilla_controllers::reconcilers::environment::EnvironmentProvisioning;
+        use flotilla_environment::environment::EnvironmentKind;
+        let kind = EnvironmentKind::of(spec)?;
+        if kind == EnvironmentKind::Docker {
+            return self.provision(name, spec.docker.as_ref().expect("kind checked")).await.map(EnvironmentProvisioning::Docker);
+        }
+        let provider = self.provider_for_environment(name, kind).await?;
+        let prepared = provider.prepare(spec, &Default::default()).await?;
+        provider.provision(EnvironmentId::new(name), &prepared, Default::default()).await?;
+        Ok(EnvironmentProvisioning::HostDirect)
+    }
+
+    async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+        let result = self.provision_contained(name, spec).await;
+        if result.is_err() {
+            if let Some(sockets) = &self.state.environment_sockets {
+                sockets.remove(&EnvironmentId::new(name)).await?;
+            }
+        }
+        result
+    }
 
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String> {
         let active = self.state.provisioned_environments.lock().await.remove(container_id);
@@ -652,6 +697,9 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn cleanup(&self, environment_ref: &str) -> Result<(), String> {
+        if let Some(sockets) = &self.state.environment_sockets {
+            sockets.remove(&EnvironmentId::new(environment_ref)).await?;
+        }
         let resource = self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(environment_ref).await;
         match resource {
             Ok(environment) if environment.spec.host_direct.is_some() => {

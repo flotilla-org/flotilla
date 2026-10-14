@@ -5503,3 +5503,102 @@ async fn failed_connection_tasks_are_reaped() {
     }
     assert!(tasks.is_empty());
 }
+
+// #3270: the transport's environment constrains every request, independently of
+// command context. Exercise the real store and dispatcher over in-memory framing.
+#[tokio::test]
+async fn environment_transport_refuses_other_convoy_and_host_commands() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let backend = daemon.resource_backend();
+    backend
+        .using::<Vessel>("flotilla")
+        .create(
+            &InputMeta::builder().name("placed-vessel".into()).build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "own".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .expect("placed vessel");
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(
+            &InputMeta::builder().name("placed-session".into()).build(),
+            &TerminalSessionSpec {
+                env_ref: "placed-environment".into(),
+                role: "coder".into(),
+                cwd: "/workspace".into(),
+                pool: "cleat".into(),
+                env: Default::default(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("coding"),
+                    brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
+                    context: Box::new(TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "own".into(),
+                        vessel_ref: "placed-vessel".into(),
+                    }),
+                    message: None,
+                },
+            },
+        )
+        .await
+        .expect("placed session");
+    sessions
+        .update_status(
+            "placed-session",
+            &created.metadata.resource_version,
+            &TerminalSessionStatus {
+                crew: Some(
+                    CrewSessionStatus::builder().id("placed-crew".into()).adapter("codex".into()).stance("trusted-implicit".into()).build(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("crew identity");
+    let pm = Arc::new(Mutex::new(PeerManager::new(daemon.node_id().clone())));
+    // CallerCrew.vessel is the resource reference used by artifact attribution,
+    // not the within-convoy vessel display name.
+    let crews = super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("placed-environment"))
+        .await
+        .expect("placement identity");
+    assert_eq!(crews[0].vessel, "placed-vessel");
+    let router = empty_remote_command_router(&daemon, &pm);
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    let (client, server) = message_session_pair();
+    let task = tokio::spawn(super::environment_connection::serve(
+        server,
+        daemon,
+        router,
+        EnvironmentId::new("placed-environment"),
+        None,
+        shutdown_rx,
+    ));
+    complete_client_hello(&client).await;
+    for (index, request) in [
+        Request::Shutdown,
+        Request::GetStatus,
+        Request::Execute {
+            command: Command::builder()
+                .action(CommandAction::QueryCrewList { context: CrewCommandContext { convoy: Some("other".into()), ..Default::default() } })
+                .build(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        client.write(Message::Request { id: index as u64, request }).await.expect("request");
+        match read_session_message(&client).await {
+            Message::Response { response, .. } => {
+                assert!(matches!(response.as_ref(), ResponseResult::Err { message } if message.starts_with("Environment")))
+            }
+            other => panic!("unexpected response {other:?}"),
+        }
+    }
+    drop(client);
+    task.await.expect("transport ended");
+}

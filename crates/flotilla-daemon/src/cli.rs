@@ -75,7 +75,11 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
         daemon,
         Arc::clone(&config),
         Some(socket_path.to_path_buf()),
-        RuntimeOptions { startup_ready: Some(server.startup_ready()), ..RuntimeOptions::default() },
+        RuntimeOptions {
+            startup_ready: Some(server.startup_ready()),
+            environment_sockets: Some(server.environment_socket_service()),
+            ..RuntimeOptions::default()
+        },
     )
     .await?;
     server.install_blob_store(Arc::clone(&runtime.blob_store))?;

@@ -70,6 +70,7 @@ use self::tasks::{
     CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart, LIVENESS_WATCHDOG_INTERVAL, MANIFEST_RECONCILE_INTERVAL,
 };
 use self::terminal::TerminalControllerRuntime;
+use crate::server::environment_sockets::EnvironmentSocketService;
 use crate::{blob_store::TieredBlobStore, resource_manifest::manifest_root_name, startup::phase, supervisor::ControllerSupervision};
 pub(crate) use tasks::manifest_reconciler_enabled;
 pub use tasks::spawn_pending_supervisor_turn_task;
@@ -88,6 +89,7 @@ pub struct RuntimeOptions {
     /// Socket servers release restoration once their accept loop is ready.
     /// In-process runtimes omit the gate and restore in the background immediately.
     pub startup_ready: Option<watch::Receiver<bool>>,
+    pub environment_sockets: Option<EnvironmentSocketService>,
 }
 
 impl Default for RuntimeOptions {
@@ -99,6 +101,7 @@ impl Default for RuntimeOptions {
             controller_supervision: ControllerSupervision::default(),
             start_controllers: true,
             startup_ready: None,
+            environment_sockets: None,
             // Codex only proactively refreshes within 5 minutes of expiry; a
             // central login's access token lives far longer than that, so a
             // conservative fixed cadence comfortably inside that window
@@ -435,6 +438,7 @@ impl DaemonRuntime {
                     profile.host_id.clone(),
                     profile.host_direct_environment_name(),
                 )
+                .with_environment_sockets(options.environment_sockets.clone())
                 .with_checkout_removal_concurrency(daemon_config.checkout_removal_concurrency)
                 .with_namespace(options.namespace.clone())
                 .with_agentless_ssh(ssh_profiles.clone())

@@ -1,6 +1,7 @@
 use flotilla_store_sqlite::SqliteBackend;
 mod caller;
 mod client_connection;
+mod environment_connection;
 pub mod environment_sockets;
 mod peer_connection;
 pub mod peer_runtime;
@@ -311,7 +312,62 @@ pub struct DaemonServer {
     pub environment_sockets: Arc<tokio::sync::Mutex<EnvironmentSocketRegistry>>,
 }
 
+struct EnvironmentClientLease {
+    count: Arc<AtomicUsize>,
+    notify: Arc<Notify>,
+}
+
+impl Drop for EnvironmentClientLease {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+}
+
 impl DaemonServer {
+    pub fn environment_socket_service(&self) -> environment_sockets::EnvironmentSocketService {
+        let daemon = self.daemon.clone();
+        let router = self.remote_command_router.clone();
+        let client_count = self.client_count.clone();
+        let client_notify = self.client_notify.clone();
+        let shutdown = self.shutdown_rx.clone();
+        let directory = flotilla_protocol::DaemonHostPath::new(self.socket_path.with_extension("env"));
+        environment_sockets::EnvironmentSocketService::new(self.environment_sockets.clone(), directory, move |listener, environment| {
+            let daemon = daemon.clone();
+            let router = router.clone();
+            let client_count = client_count.clone();
+            let client_notify = client_notify.clone();
+            let mut shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let mut connections = JoinSet::new();
+                loop {
+                    tokio::select! {
+                        result = listener.accept() => match result {
+                            Ok((stream, _)) => {
+                                let caller = caller::caller_from_peer(caller::socket_peer_credential(&stream), &daemon.provisioning_namespace().await);
+                                let role = caller.crew.map(|crew| crew.role);
+                                let daemon = daemon.clone();
+                                let router = router.clone();
+                                let environment = environment.clone();
+                                let shutdown = shutdown.clone();
+                                client_count.fetch_add(1, Ordering::SeqCst);
+                                client_notify.notify_one();
+                                let lease = EnvironmentClientLease { count: client_count.clone(), notify: client_notify.clone() };
+                                connections.spawn(async move {
+                                    let _lease = lease;
+                                    environment_connection::serve(flotilla_transport::message::unix_message_session(stream), daemon, router, environment, role, shutdown).await;
+                                });
+                            }
+                            Err(error) => { warn!(%error, "environment socket accept failed"); return; }
+                        },
+                        _ = shutdown.changed() => return,
+                        _ = connections.join_next(), if !connections.is_empty() => {},
+                    }
+                }
+            })
+        })
+    }
+
     pub fn install_blob_store(&self, store: Arc<crate::blob_store::TieredBlobStore>) -> Result<(), String> {
         self.remote_command_router.install_blob_store(store)
     }
