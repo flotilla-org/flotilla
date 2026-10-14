@@ -8,9 +8,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_config::{dummy_fleet::DummyFleetConfig, DaemonConfig};
 use flotilla_controllers::reconcilers::ForgeDefaultBranchResolver;
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery::DiscoveryRuntime;
-use flotilla_dummy_fleet::{DaemonCommandPort, DummyFleet};
+use flotilla_dummy_fleet::{CrewCommandPort, DaemonCommandPort, DummyFleet};
+use flotilla_protocol::{commands::CommandValue, CommandAction};
+use flotilla_resources::TerminalAttentionState;
+use flotilla_store::ResourceBackend;
 use tracing::warn;
 
 /// Install the configured dummy fleet's factories, if any.
@@ -30,9 +34,29 @@ pub fn install_dummy_fleet(config: &DaemonConfig, discovery: &mut DiscoveryRunti
     Some(fleet)
 }
 
-/// Connect the fleet's crews to the daemon whose discovery installed it.
-pub fn attach_dummy_fleet(fleet: &DummyFleet, daemon: Arc<dyn DaemonHandle>) -> Result<(), String> {
-    fleet.attach(DaemonCommandPort::new(&daemon))
+/// Connect the fleet's crews to the daemon whose discovery installed it:
+/// their crew commands through its command path, and their attention reports
+/// through the same recording as harness hook events.
+pub fn attach_dummy_fleet(fleet: &DummyFleet, daemon: &Arc<InProcessDaemon>) -> Result<(), String> {
+    let handle = Arc::clone(daemon) as Arc<dyn DaemonHandle>;
+    fleet.attach(Arc::new(DaemonCrewPort { commands: DaemonCommandPort::new(&handle), backend: daemon.resource_backend() }))
+}
+
+struct DaemonCrewPort {
+    commands: Arc<DaemonCommandPort>,
+    backend: ResourceBackend,
+}
+
+#[async_trait]
+impl CrewCommandPort for DaemonCrewPort {
+    async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
+        self.commands.execute(action).await
+    }
+
+    async fn report_attention(&self, namespace: &str, session: &str, working: bool) -> Result<(), String> {
+        let state = if working { TerminalAttentionState::Working } else { TerminalAttentionState::Idle };
+        crate::agent_attention::observe_hook_attention(&self.backend, namespace, session, state, false).await
+    }
 }
 
 /// Every repository on the dummy forge has the default branch `main`.

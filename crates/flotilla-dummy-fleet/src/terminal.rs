@@ -246,6 +246,7 @@ mod tests {
         refusals: std::sync::Mutex<usize>,
         handoff_refusals: std::sync::Mutex<usize>,
         commands: mpsc::UnboundedSender<String>,
+        attention: std::sync::Mutex<Vec<(String, bool)>>,
     }
 
     #[async_trait]
@@ -287,6 +288,12 @@ mod tests {
             self.commands.send(entry).expect("test listens");
             Ok(value)
         }
+
+        async fn report_attention(&self, namespace: &str, session: &str, working: bool) -> Result<(), String> {
+            assert_eq!(namespace, "flotilla");
+            self.attention.lock().expect("attention").push((session.to_string(), working));
+            Ok(())
+        }
     }
 
     fn launch_environment(script: &CrewScript) -> TerminalEnvVars {
@@ -296,6 +303,7 @@ mod tests {
             ("FLOTILLA_CONVOY", "convoy-a"),
             ("FLOTILLA_VESSEL", "implement"),
             ("FLOTILLA_CREW_ROLE", "crew"),
+            ("FLOTILLA_TERMINAL_SESSION", SESSION),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -369,13 +377,13 @@ mod tests {
             };
             let fleet = DummyFleet::new(DummyFleetConfig { agent, ..DummyFleetConfig::default() });
             let (commands, mut recorded) = mpsc::unbounded_channel();
-            fleet
-                .attach(Arc::new(RecordingPort {
-                    refusals: std::sync::Mutex::new(refusals),
-                    handoff_refusals: std::sync::Mutex::new(handoff_refusals),
-                    commands,
-                }))
-                .expect("attach");
+            let port = Arc::new(RecordingPort {
+                refusals: std::sync::Mutex::new(refusals),
+                handoff_refusals: std::sync::Mutex::new(handoff_refusals),
+                commands,
+                attention: Default::default(),
+            });
+            fleet.attach(Arc::clone(&port) as Arc<dyn CrewCommandPort>).expect("attach");
             let pool = DummyTerminalPool { fleet: Arc::clone(&fleet) };
             let adapter = DummyAgentAdapter::new(1);
             let screen =
@@ -432,6 +440,11 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(120)).await;
             assert!(recorded.try_recv().is_err(), "no command after the script ends");
             assert_eq!(screen().await, Some(TerminalAttentionState::Idle));
+            // Hook-style reports name the crew's session, start working on the
+            // launch prompt and end idle, matching the screen.
+            let reports = port.attention.lock().expect("attention").clone();
+            assert!(reports.iter().all(|(session, _)| session == SESSION));
+            assert_eq!((reports.first().map(|report| report.1), reports.last().map(|report| report.1)), (Some(true), Some(false)));
             let snapshot = fleet.snapshot();
             assert_eq!(snapshot.turns_received, delivered);
             assert_eq!((snapshot.crews_completed, snapshot.crews_failed), (u64::from(!failed), u64::from(failed)));

@@ -55,7 +55,7 @@ impl DummyDaemon {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let daemon =
             InProcessDaemon::new_with_resource_backend(vec![], Arc::clone(&config), discovery, HostName::new("dummy-load"), backend).await;
-        attach_dummy_fleet(&fleet, Arc::clone(&daemon) as Arc<dyn DaemonHandle>).expect("attach fleet");
+        attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");
         let options = RuntimeOptions {
             namespace: NAMESPACE.into(),
             heartbeat_interval: Duration::from_secs(5),

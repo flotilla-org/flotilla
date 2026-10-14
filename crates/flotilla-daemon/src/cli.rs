@@ -69,7 +69,7 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     .await?;
     let daemon = server.daemon();
     if let Some(fleet) = &dummy_fleet {
-        crate::dummy_fleet::attach_dummy_fleet(fleet, Arc::clone(&daemon) as Arc<dyn flotilla_daemon_api::daemon::DaemonHandle>)?;
+        crate::dummy_fleet::attach_dummy_fleet(fleet, &daemon)?;
     }
     let runtime = DaemonRuntime::start_with_options(
         daemon,
