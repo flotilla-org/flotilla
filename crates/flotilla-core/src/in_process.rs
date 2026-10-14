@@ -186,6 +186,19 @@ fn forge_service_matches(service_url: &str, service: &str) -> bool {
     service_url.split_once("://").is_some_and(|(_, authority)| authority.trim_end_matches('/').eq_ignore_ascii_case(service))
 }
 
+/// Whether a change-request subject belongs to this repository. Subjects of a
+/// Forge-identity repository name its Forge definition (`forge_ref`); other
+/// repositories' subjects name the forge's web authority.
+fn repository_observes_subject(spec: &RepositorySpec, service: &str, scope: &str) -> bool {
+    let forge_ref = match spec.identity() {
+        flotilla_resources::RepositoryIdentity::Forge { forge_ref, .. } => Some(forge_ref.as_str()),
+        _ => None,
+    };
+    spec.forge().is_some_and(|forge| {
+        forge.repository == scope && (forge_ref == Some(service) || forge_service_matches(&forge.service_url, service))
+    })
+}
+
 #[derive(bon::Builder)]
 struct CachedObservation {
     expires_at: tokio::time::Instant,
@@ -593,16 +606,11 @@ impl ProviderChangeRequestObservationSource {
 
         let repositories =
             self.backend.including_replicas::<Repository>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
-        let repository =
-            repositories
-                .items
-                .into_iter()
-                .find(|repository| {
-                    repository.object.spec.forge().is_some_and(|forge| {
-                        forge.repository == subject.scope && forge_service_matches(&forge.service_url, &subject.service)
-                    })
-                })
-                .ok_or_else(|| format!("repository {}/{} has no discovered change request provider", subject.service, subject.scope))?;
+        let repository = repositories
+            .items
+            .into_iter()
+            .find(|repository| repository_observes_subject(&repository.object.spec, &subject.service, &subject.scope))
+            .ok_or_else(|| format!("repository {}/{} has no discovered change request provider", subject.service, subject.scope))?;
         let mut credential_refs_by_number = BTreeMap::<u64, BTreeSet<String>>::new();
         let convoys =
             self.backend.including_replicas::<ResourceConvoy>(&subject.namespace).list().await.map_err(|error| error.to_string())?.items;
