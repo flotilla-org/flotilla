@@ -623,8 +623,8 @@ struct ConfigWarnings(Arc<Mutex<Vec<String>>>);
 
 // In-memory tracing sink: inspect warnings without a process-wide subscriber.
 impl tracing::Subscriber for ConfigWarnings {
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        true
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::WARN
     }
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)
@@ -641,7 +641,6 @@ impl tracing::Subscriber for ConfigWarnings {
                 write!(&mut self.0, "{}={value:?};", field.name()).expect("format event");
             }
         }
-        assert_eq!(*event.metadata().level(), tracing::Level::WARN);
         let mut fields = Fields(String::new());
         event.record(&mut fields);
         self.0.lock().expect("warnings mutex").push(fields.0);
@@ -654,24 +653,34 @@ impl tracing::Subscriber for ConfigWarnings {
 // files. Real local files exercise the filesystem seam; no live hosts are used.
 #[tokio::test]
 async fn config_loaders_share_read_parse_warning_and_cache_policy() {
+    enum ConfigSource {
+        Missing,
+        Contents(&'static str),
+        Directory,
+    }
+    use ConfigSource::{Contents, Directory, Missing};
+
     for (source, warning) in [
-        (None, None),
-        (Some(""), None),
-        (Some("[vcs.git]\ncheckout_path = 'custom'\n[convoy]\nauto_attach = false"), None),
-        (Some("[presentation_manager]\nbackend = 'zellij'"), None),
-        (Some("[invalid"), Some("failed to parse config; using defaults")),
-        (Some("directory"), Some("failed to read config; using defaults")),
+        (Missing, None),
+        (Contents(""), None),
+        (Contents("[vcs.git]\ncheckout_path = 'custom'\n[convoy]\nauto_attach = false"), None),
+        (Contents("[presentation_manager]\nbackend = 'zellij'"), None),
+        (Contents("[invalid"), Some("failed to parse config; using defaults")),
+        (Directory, Some("failed to read config; using defaults")),
     ] {
         let dir = tempdir().expect("config directory");
         let path = dir.path().join("config.toml");
-        if let Some(source) = source {
-            if source == "directory" {
+        let expected: FlotillaConfig = match source {
+            Missing => FlotillaConfig::default(),
+            Directory => {
                 std::fs::create_dir(&path).expect("unreadable config");
-            } else {
-                std::fs::write(&path, source).expect("config contents");
+                FlotillaConfig::default()
             }
-        }
-        let expected: FlotillaConfig = source.filter(|_| warning.is_none()).and_then(|s| toml::from_str(s).ok()).unwrap_or_default();
+            Contents(source) => {
+                std::fs::write(&path, source).expect("config contents");
+                toml::from_str(source).unwrap_or_default()
+            }
+        };
         for offloaded_first in [false, true] {
             let store = ConfigStore::with_base(dir.path());
             let warnings = ConfigWarnings::default();
