@@ -83,7 +83,7 @@ How Checkouts and lends behave:
 - **A Checkout is owned by the role's owner:** the convoy for convoy roles, the Ensure for standing roles. Its home is the host it lives on. A replacement session on the same host reuses it. A replacement on another host means `release`, observing Gone, then creating a new Checkout from the last pushed commit.
 - **Inside a vessel is the crew's business.** Extra branches and worktrees inside a vessel, such as a stack lead's subagents, live inside the crew's Checkout. Flotilla knows the deliverables (promised branches and change requests, observed on the forge) and the Checkout, whose release removes everything inside it.
 - **A lend** lets another role, or a person, borrow a resource the owner holds: a Checkout, a process with an open port, or a jackstay stream. It is a relation asserted by the lender, with terms: who, mode (read-only or shared-write), and until a time or an event. The environment enforces the mode where it can. A co-placed coder and reviewer sharing local files is a lend, not a shared placement owner.
-- **A lend gates release.** The lender's `release` is refused while an unexpired lend exists, unless the borrower has returned it or an authorised override records a reason. Return is the borrower's edge. Loss is `vanish`, with a message to the borrower.
+- **A lend gates release.** The lender's `release` is refused while an unexpired lend exists, unless the borrower has returned it or an authorised override records a reason. A lend until an event that never comes stays unexpired until it is returned or overridden. Return is the borrower's edge. Loss is `vanish`, with a message to the borrower.
 
 ### Roles, inboxes and delivery
 
@@ -134,7 +134,7 @@ How Checkouts and lends behave:
 - **Shared tables.** Each kind has one table, with a home column. Only the replication applier writes rows homed elsewhere.
 
 **Archive.**
-- **Ended resources archive as a bundle.** Seven days after a resource reaches an end state, its home ships the resource with all its records (edge events, attempts, receipts, observations, deliverables) as one bundle to the archive host, then deletes them locally.
+- **Ended resources archive as a bundle.** Seven days after a resource reaches an end state, its home ships the resource with all its records (edge events, attempts, receipts, observations, deliverables) as one bundle to the archive host, then deletes them locally. The home keeps them until the archive host has the bundle.
 - **Standing inboxes never end.** Their messages archive one by one, seven days after they settle or drop.
 - **The archive is read-only and typed,** with the same derived relational schema. Retention is indefinite by default. Per-kind deletion comes later, terminal recordings first.
 - **Identity.** Archived-identity stubs live only on the archive host and the former home. Other hosts resolve an unknown name by routing to the archive. Live identity everywhere is unchanged.
