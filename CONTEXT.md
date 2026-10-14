@@ -32,7 +32,8 @@ supersession relationship.
 
 **Role Address**:
 The name of a communication recipient or sender, independent of which
-**AgentSession** currently fills it. The role forms are `project/role` (a
+**AgentSession** currently fills it. Until the #3108 cut-over (see the ADR 0064
+note below, which supersedes these forms), the role forms are `project/role` (a
 Project role, such as `andamento/governor`) and `project/convoy/vessel/role`
 (one crew role in one vessel). The other address forms are `principal:<name>`,
 `system:<subsystem>` and `topic:<project>/<name>` (ADR 0055). The fleet is an
