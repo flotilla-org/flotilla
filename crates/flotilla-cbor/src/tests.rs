@@ -239,7 +239,12 @@ fn framing_reads_and_writes_streams() {
     let mut reader = wire.as_slice();
     assert_eq!(framing.read::<Setup, _>(&mut reader).unwrap(), offer());
     assert!(matches!(framing.read::<Setup, _>(&mut reader).unwrap(), Setup::Selection { writer: Some(3), .. }));
-    assert!(matches!(framing.read::<Setup, _>(&mut reader), Err(Error::Io(_))));
+    assert!(matches!(framing.read::<Setup, _>(&mut reader), Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof));
+    // A stream that ends inside a frame, in its header or its body, is truncated.
+    let frame = framing.encode(&offer()).unwrap();
+    for cut in [1, HEADER_LEN - 1, HEADER_LEN, frame.len() - 1] {
+        assert!(matches!(framing.read::<Setup, _>(&mut &frame[..cut]), Err(Error::Truncated)), "cut at {cut}");
+    }
     // A header over the limit fails before any body is read or allocated.
     let mut header = b"JSTEST01".to_vec();
     header.extend_from_slice(&u32::MAX.to_be_bytes());

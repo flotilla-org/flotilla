@@ -1,7 +1,7 @@
 //! Stream framing: an 8-byte protocol magic, a big-endian u32 body length,
 //! then one message body. Big-endian matches Jackstay's existing length
 //! prefixes and bootstrap fields, the first adopter.
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 
 use crate::{decode_message, encode_message, Error, Limits, Message};
 
@@ -59,12 +59,31 @@ impl Framing {
         decode_message(body, &self.limits)
     }
 
-    /// Read one frame, allocating its body only after the length check.
+    /// Read one frame. The body buffer grows only as bytes arrive, so a header
+    /// announcing a large body costs nothing until the body is sent.
+    ///
+    /// A stream that ends cleanly before the frame starts is an
+    /// [`Error::Io`] of kind `UnexpectedEof`: the peer closed between frames.
+    /// A stream that ends inside the frame is [`Error::Truncated`], as in
+    /// [`Self::decode`].
     pub fn read<M: Message, R: Read + ?Sized>(&self, reader: &mut R) -> Result<M, Error> {
         let mut header = [0; HEADER_LEN];
-        reader.read_exact(&mut header)?;
-        let mut body = vec![0; self.body_len(&header)?];
-        reader.read_exact(&mut body)?;
+        let mut filled = 0;
+        while filled < HEADER_LEN {
+            match reader.read(&mut header[filled..]) {
+                Ok(0) if filled == 0 => return Err(Error::Io(io::ErrorKind::UnexpectedEof.into())),
+                Ok(0) => return Err(Error::Truncated),
+                Ok(n) => filled += n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(Error::Io(error)),
+            }
+        }
+        let len = self.body_len(&header)?;
+        let mut body = Vec::new();
+        reader.take(len as u64).read_to_end(&mut body)?;
+        if body.len() < len {
+            return Err(Error::Truncated);
+        }
         decode_message(&body, &self.limits)
     }
 

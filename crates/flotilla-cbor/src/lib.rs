@@ -223,9 +223,11 @@ impl<'de> Deserialize<'de> for Bytes {
 /// anything over the limits.
 pub fn to_vec<T: Serialize + ?Sized>(value: &T, limits: &Limits) -> Result<Vec<u8>, Error> {
     let bytes = cbor2::to_canonical_vec(value).map_err(|error| match error {
+        // cbor2 reports a duplicate key only through this message text. The
+        // corpus's duplicate-key encode vector fails if an upgrade changes it.
         cbor2::ser::Error::Value(message) if message == "duplicate map key" => Error::DuplicateKey(None),
         cbor2::ser::Error::Value(message) => Error::Schema(message),
-        cbor2::ser::Error::Io(error) => Error::Schema(error.to_string()),
+        cbor2::ser::Error::Io(error) => Error::Io(error),
     })?;
     check_size(bytes.len(), limits)?;
     scan(&bytes, limits, Mode::Canonical).map_err(|error| match error {

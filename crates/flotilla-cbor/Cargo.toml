@@ -12,6 +12,7 @@ description = "The stack CBOR profile of ADR 0063: deterministic writers, safe r
 # deliberate change that reruns the corpus.
 cbor2 = { version = "=1.1.6", default-features = false, features = ["std"] }
 serde = { workspace = true }
+# Declared directly rather than through the workspace, on purpose.
 thiserror = "2"
 
 [dev-dependencies]
