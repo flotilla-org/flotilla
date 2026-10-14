@@ -4,7 +4,7 @@
 //! alone, so the tests depend on no type of the CBOR crate underneath.
 use std::{fs, path::PathBuf};
 
-use flotilla_cbor::{Error, Framing, Limits, Message, DEFAULT_LIMITS, SETUP_LIMITS};
+use flotilla_cbor::{Error, Framing, Limits, Message, DEFAULT_LIMITS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
@@ -60,10 +60,13 @@ fn unhex(hex: &str) -> Vec<u8> {
     (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
 }
 
+/// The corpus's `small` limits, defined by its README.
+const SMALL_LIMITS: Limits = Limits { max_message: 64 * 1024, max_depth: 64, max_elements: 65_536, max_byte_string: 4 * 1024 };
+
 fn limits(vector: &Json) -> Limits {
     match vector["limits"].as_str().unwrap() {
         "default" => DEFAULT_LIMITS,
-        "setup" => SETUP_LIMITS,
+        "small" => SMALL_LIMITS,
         other => panic!("unknown limits {other}"),
     }
 }

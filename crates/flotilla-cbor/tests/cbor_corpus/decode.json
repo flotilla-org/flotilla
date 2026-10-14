@@ -813,7 +813,7 @@
         },
         {
           "name": "depth 64 in setup limits",
-          "limits": "setup",
+          "limits": "small",
           "hex": [
             {
               "repeat": "81",
@@ -825,7 +825,7 @@
         },
         {
           "name": "depth 65 in setup limits",
-          "limits": "setup",
+          "limits": "small",
           "hex": [
             {
               "repeat": "81",
@@ -885,7 +885,7 @@
         },
         {
           "name": "setup message of 65,536 bytes, just inside",
-          "limits": "setup",
+          "limits": "small",
           "hex": [
             "79fffd",
             {
@@ -897,7 +897,7 @@
         },
         {
           "name": "setup message of 65,537 bytes, just over",
-          "limits": "setup",
+          "limits": "small",
           "hex": [
             "79fffe",
             {
@@ -909,7 +909,7 @@
         },
         {
           "name": "setup descriptor of 4,096 bytes, just inside",
-          "limits": "setup",
+          "limits": "small",
           "hex": [
             "591000",
             {
@@ -921,7 +921,7 @@
         },
         {
           "name": "setup descriptor of 4,097 bytes, just over",
-          "limits": "setup",
+          "limits": "small",
           "hex": [
             "591001",
             {
@@ -933,13 +933,13 @@
         },
         {
           "name": "setup descriptor over the limit fails before its bytes",
-          "limits": "setup",
+          "limits": "small",
           "hex": "591001",
           "expect": "byte-string-limit"
         },
         {
           "name": "setup descriptor of 4,097 bytes nested in a message",
-          "limits": "setup",
+          "limits": "small",
           "hex": [
             "a26164",
             "591001",
@@ -954,7 +954,7 @@
         },
         {
           "name": "setup text of 4,097 bytes is not a descriptor",
-          "limits": "setup",
+          "limits": "small",
           "hex": [
             "791001",
             {
@@ -978,7 +978,7 @@
         },
         {
           "name": "setup descriptor of 4,097 bytes in a non-shortest head",
-          "limits": "setup",
+          "limits": "small",
           "hex": [
             "5a00001001",
             {

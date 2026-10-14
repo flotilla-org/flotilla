@@ -56,9 +56,8 @@ not a reader option.
   order elsewhere.
 - `limits`: `default` (ADR defaults: 1,048,576 bytes per message, depth 64,
   65,536 elements per array or map, byte strings up to the message limit) or
-  `setup` (Jackstay's setup plane: 65,536 bytes per message, depth 64, 65,536
-  elements, 4,096 bytes per byte string, which is where opaque descriptors
-  travel).
+  `small` (65,536 bytes per message, depth 64, 65,536 elements, 4,096 bytes
+  per byte string: a tighter profile like the one Jackstay's setup plane uses).
 - `expect`, `canonical` and `error`: `accept`, or the name of the first
   problem `flotilla_cbor` reports. A decoder in another language may report
   errors differently, but must accept and reject exactly these inputs.

@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
+/// A tighter profile, like the one Jackstay's setup plane uses.
+const SMALL_MAX_BYTES: usize = 4 * 1024;
+const SMALL_LIMITS: Limits = Limits { max_message: 64 * 1024, max_depth: 64, max_elements: 65_536, max_byte_string: SMALL_MAX_BYTES };
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Setup {
@@ -36,13 +40,13 @@ fn hex(text: &str) -> Vec<u8> {
 
 #[test]
 fn typed_message_round_trips_with_sorted_keys_and_float_floats() {
-    let bytes = encode_message(&offer(), &SETUP_LIMITS).unwrap();
-    assert!(is_canonical(&bytes, &SETUP_LIMITS));
+    let bytes = encode_message(&offer(), &SMALL_LIMITS).unwrap();
+    assert!(is_canonical(&bytes, &SMALL_LIMITS));
     // Shorter encoded keys sort first: "type", then "clock", then "tracks".
     // The whole-number clock stays a float: f9 3c00.
     // a3, "type": "offer", "clock": f9 3c00, ...
     assert!(bytes.starts_with(&hex("a36474797065656f6666657265636c6f636bf93c00")));
-    assert_eq!(decode_message::<Setup>(&bytes, &SETUP_LIMITS).unwrap(), offer());
+    assert_eq!(decode_message::<Setup>(&bytes, &SMALL_LIMITS).unwrap(), offer());
 }
 
 #[test]
@@ -54,11 +58,11 @@ fn unknown_keys_are_ignored_and_unknown_types_rejected() {
         track_ids: Vec<u64>,
         writer: Option<u64>,
     }
-    let bytes = to_vec(&Future { r#type: "selection", future: vec![()], track_ids: vec![7], writer: None }, &SETUP_LIMITS).unwrap();
-    assert_eq!(decode_message::<Setup>(&bytes, &SETUP_LIMITS).unwrap(), Setup::Selection { track_ids: vec![7], writer: None });
-    let unknown = to_vec(&BTreeMap::from([("type", "grant")]), &SETUP_LIMITS).unwrap();
-    assert!(matches!(decode_message::<Setup>(&unknown, &SETUP_LIMITS), Err(Error::UnknownType(t)) if t == "grant"));
-    assert_eq!(message_type(&bytes, &SETUP_LIMITS, Setup::TYPES).unwrap(), "selection");
+    let bytes = to_vec(&Future { r#type: "selection", future: vec![()], track_ids: vec![7], writer: None }, &SMALL_LIMITS).unwrap();
+    assert_eq!(decode_message::<Setup>(&bytes, &SMALL_LIMITS).unwrap(), Setup::Selection { track_ids: vec![7], writer: None });
+    let unknown = to_vec(&BTreeMap::from([("type", "grant")]), &SMALL_LIMITS).unwrap();
+    assert!(matches!(decode_message::<Setup>(&unknown, &SMALL_LIMITS), Err(Error::UnknownType(t)) if t == "grant"));
+    assert_eq!(message_type(&bytes, &SMALL_LIMITS, Setup::TYPES).unwrap(), "selection");
 }
 
 #[test]
@@ -70,7 +74,7 @@ fn encoding_checks_the_message_type() {
     impl Message for Untyped {
         const TYPES: &'static [&'static str] = &["x"];
     }
-    assert!(matches!(encode_message(&Untyped { a: 1 }, &SETUP_LIMITS), Err(Error::MissingType)));
+    assert!(matches!(encode_message(&Untyped { a: 1 }, &SMALL_LIMITS), Err(Error::MissingType)));
 }
 
 #[test]
@@ -78,8 +82,8 @@ fn non_deterministic_input_decodes_but_is_not_canonical() {
     // {"type": "selection", "track_ids": [7], "writer": null}, with keys out
     // of order and 7 in a two-byte head.
     let bytes = hex(concat!("a3", "66777269746572f6", "6474797065", "6973656c656374696f6e", "69747261636b5f696473", "811807"));
-    assert_eq!(decode_message::<Setup>(&bytes, &SETUP_LIMITS).unwrap(), Setup::Selection { track_ids: vec![7], writer: None });
-    assert!(matches!(check_canonical(&bytes, &SETUP_LIMITS), Err(Error::UnsortedKeys)));
+    assert_eq!(decode_message::<Setup>(&bytes, &SMALL_LIMITS).unwrap(), Setup::Selection { track_ids: vec![7], writer: None });
+    assert!(matches!(check_canonical(&bytes, &SMALL_LIMITS), Err(Error::UnsortedKeys)));
 }
 
 #[test]
@@ -181,8 +185,8 @@ fn byte_strings_need_the_bytes_wrapper() {
 
 #[test]
 fn encoding_enforces_limits() {
-    let descriptor = Bytes(vec![0; SETUP_MAX_DESCRIPTOR + 1]);
-    assert!(matches!(to_vec(&descriptor, &SETUP_LIMITS), Err(Error::ByteStringLimit { .. })));
+    let descriptor = Bytes(vec![0; SMALL_MAX_BYTES + 1]);
+    assert!(matches!(to_vec(&descriptor, &SMALL_LIMITS), Err(Error::ByteStringLimit { .. })));
     #[derive(Serialize)]
     struct Nest(Vec<Nest>);
     let mut deep = Nest(vec![]);
@@ -190,8 +194,8 @@ fn encoding_enforces_limits() {
         deep = Nest(vec![deep]);
     }
     assert!(matches!(to_vec(&deep, &DEFAULT_LIMITS), Err(Error::DepthLimit { limit: 64 })));
-    let text = "a".repeat(SETUP_LIMITS.max_message);
-    assert!(matches!(to_vec(&text, &SETUP_LIMITS), Err(Error::MessageLimit { .. })));
+    let text = "a".repeat(SMALL_LIMITS.max_message);
+    assert!(matches!(to_vec(&text, &SMALL_LIMITS), Err(Error::MessageLimit { .. })));
 }
 
 #[test]
@@ -228,7 +232,7 @@ fn a_map_at_the_element_limit_decodes() {
 
 #[test]
 fn framing_reads_and_writes_streams() {
-    let framing = Framing::new(*b"JSTEST01", SETUP_LIMITS);
+    let framing = Framing::new(*b"JSTEST01", SMALL_LIMITS);
     let mut wire = Vec::new();
     framing.write(&mut wire, &offer()).unwrap();
     framing.write(&mut wire, &Setup::Selection { track_ids: vec![], writer: Some(3) }).unwrap();
@@ -246,7 +250,7 @@ fn framing_reads_and_writes_streams() {
 /// also deserializes as a dynamic value.
 #[test]
 fn mutated_input_is_rejected_or_decodes() {
-    let message = encode_message(&offer(), &SETUP_LIMITS).unwrap();
+    let message = encode_message(&offer(), &SMALL_LIMITS).unwrap();
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = move || {
         state ^= state << 13;
@@ -264,12 +268,12 @@ fn mutated_input_is_rejected_or_decodes() {
                 _ => input.insert(at, next() as u8),
             }
         }
-        let checked = check(&input, &SETUP_LIMITS);
-        let canonical = check_canonical(&input, &SETUP_LIMITS);
+        let checked = check(&input, &SMALL_LIMITS);
+        let canonical = check_canonical(&input, &SMALL_LIMITS);
         assert!(checked.is_ok() || canonical.is_err(), "{input:02x?}");
         if checked.is_ok() {
             assert!(cbor2::validate_slice(&input).is_ok(), "{input:02x?}");
-            from_slice::<cbor2::Value>(&input, &SETUP_LIMITS).unwrap();
+            from_slice::<cbor2::Value>(&input, &SMALL_LIMITS).unwrap();
         }
     }
 }

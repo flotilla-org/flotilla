@@ -32,7 +32,7 @@ dependency.
 
 | Item | Purpose |
 | --- | --- |
-| `Limits`, `DEFAULT_LIMITS`, `SETUP_LIMITS`, `SETUP_MAX_DESCRIPTOR` | Message size, nesting depth, elements per array or map, byte-string size. The defaults are the ADR's (1 MiB, depth 64, 65,536 elements); `SETUP_LIMITS` is Jackstay's setup plane (64 KiB, 4 KiB byte strings). |
+| `Limits`, `DEFAULT_LIMITS` | Message size, nesting depth, elements per array or map, byte-string size. The defaults are the ADR's (1 MiB, depth 64, 65,536 elements). Each protocol defines its own tighter limits where it needs them. |
 | `to_vec(value, limits)` | Serialize deterministically. The output is scanned like any input, so a writer never produces what a reader rejects. |
 | `from_slice(bytes, limits)` | Check as a safe reader, then deserialize. |
 | `check(bytes, limits)` | The safe-reader check alone, without decoding. |

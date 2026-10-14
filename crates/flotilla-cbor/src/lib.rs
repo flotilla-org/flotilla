@@ -53,14 +53,6 @@ use self::scan::{scan, Mode};
 /// The ADR 0063 defaults for a protocol that sets no limits of its own.
 pub const DEFAULT_LIMITS: Limits = Limits { max_message: 1024 * 1024, max_depth: 64, max_elements: 65_536, max_byte_string: 1024 * 1024 };
 
-/// The largest opaque descriptor a Jackstay setup message may carry.
-pub const SETUP_MAX_DESCRIPTOR: usize = 4 * 1024;
-
-/// The Jackstay setup profile: 64 KiB per message, and no byte string (where
-/// opaque descriptors travel) longer than [`SETUP_MAX_DESCRIPTOR`].
-pub const SETUP_LIMITS: Limits =
-    Limits { max_message: 64 * 1024, max_depth: 64, max_elements: 65_536, max_byte_string: SETUP_MAX_DESCRIPTOR };
-
 /// Bounds a protocol places on one encoded message. Each limit is inclusive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
