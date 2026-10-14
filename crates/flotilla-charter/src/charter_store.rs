@@ -75,7 +75,7 @@ impl SourceTally {
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     let mut contents = Vec::new();
     std::fs::File::open(path)
-        .and_then(|file| file.take(limit + 1).read_to_end(&mut contents))
+        .and_then(|file| file.take(limit.saturating_add(1)).read_to_end(&mut contents))
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     if contents.len() as u64 > limit {
         return Err(format!("read {}: file exceeds the {limit}-byte file limit", path.display()));

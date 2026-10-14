@@ -10,7 +10,6 @@ use flotilla_resources::{ForgeSpec, Project, ProjectRepositoryRole, RepositoryKe
 use flotilla_charter::ops_entry::OperationalEntryFile;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
 use flotilla_vcs::vcs::CheckoutVcsResolver;
 use flotilla_vcs::vcs::RepositoryRead;
 use flotilla_vcs::vcs::Vcs;
@@ -418,11 +417,7 @@ impl RepositoryInspector for GitRepositoryInspector {
         &self,
         source: &flotilla_resources::CharterSource,
     ) -> Result<flotilla_charter::charter_store::CharterSnapshot, String> {
-        let vcs = flotilla_vcs::vcs::FlotillaVcs::new(
-            flotilla_paths::path_context::ExecutionEnvironmentPath::new("/"),
-            self.runner.clone(),
-            flotilla_vcs::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), self.runner.clone()))),
-        );
+        let vcs = flotilla_vcs::vcs::FlotillaVcs::object_cache(self.runner.clone());
         flotilla_charter::charter_store::read_charter_source(source, &self.charter_cache, Some(&vcs)).await
     }
 
@@ -430,22 +425,14 @@ impl RepositoryInspector for GitRepositoryInspector {
         &self,
         source: &flotilla_resources::CharterSource,
     ) -> Result<Option<flotilla_charter::charter_store::LayerDirectorySnapshot>, String> {
-        let vcs = flotilla_vcs::vcs::FlotillaVcs::new(
-            flotilla_paths::path_context::ExecutionEnvironmentPath::new("/"),
-            self.runner.clone(),
-            flotilla_vcs::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), self.runner.clone()))),
-        );
+        let vcs = flotilla_vcs::vcs::FlotillaVcs::object_cache(self.runner.clone());
         flotilla_charter::charter_store::read_layer_directory(source, &self.charter_cache, Some(&vcs)).await
     }
 
     // Ops bindings, project image layers and image checks share this cache,
     // so retention is by last use rather than by any one owner's live set.
     async fn retire_unused_charter_caches(&self) -> Result<Vec<PathBuf>, String> {
-        let vcs = flotilla_vcs::vcs::FlotillaVcs::new(
-            flotilla_paths::path_context::ExecutionEnvironmentPath::new("/"),
-            self.runner.clone(),
-            flotilla_vcs::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), self.runner.clone()))),
-        );
+        let vcs = flotilla_vcs::vcs::FlotillaVcs::object_cache(self.runner.clone());
         flotilla_charter::charter_store::retire_unused_caches(&self.charter_cache, &vcs).await
     }
 

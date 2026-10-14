@@ -629,6 +629,13 @@ impl FlotillaVcs {
         Self { checkout, runner, strategy, explicit_checkout: false }
     }
 
+    /// A provider for revision object caches only: fetching, tree reads and
+    /// retention address caches by path and never consult a checkout.
+    pub fn object_cache(runner: Arc<dyn CommandRunner>) -> Self {
+        let strategy = GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), Arc::clone(&runner))));
+        Self::new(ExecutionEnvironmentPath::new("/"), runner, strategy)
+    }
+
     async fn remove_reference_clone(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
         if !self.runner.path_exists(Path::new(target)).await? {
             return Ok(CheckoutRemoval::Removed);
@@ -713,6 +720,10 @@ impl Vcs for FlotillaVcs {
     }
 
     // FETCH_HEAD's mtime is the last use: every source read fetches first.
+    // The cache lock is process-local, so another process reading the same
+    // cache is not excluded. Such a reader fetches first, refreshing FETCH_HEAD,
+    // so retiring under it requires a read that straddles the whole retention
+    // window; the reader then fails once and the next read refetches.
     async fn retire_revision_caches(&self, cache: &Path, unused_since: SystemTime) -> Result<Vec<PathBuf>, String> {
         let mut entries = match tokio::fs::read_dir(cache).await {
             Ok(entries) => entries,
