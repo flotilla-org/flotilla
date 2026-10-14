@@ -2,7 +2,7 @@
 
 **Status:** Accepted, not yet implemented (owner grilling, 2026-10-13 and 2026-10-14). The #3108 PR stacks implement it. Until the cut-over roll, the running system follows the ADRs this one amends.
 **Date:** 2026-10-14
-**Amended:** 2026-10-14, with the owner's rulings on #3199 in comments [6166478785](https://github.com/flotilla-org/flotilla/issues/3199#issuecomment-6166478785) (rulings 1–7) and [6166860880](https://github.com/flotilla-org/flotilla/issues/3199#issuecomment-6166860880) (rulings 8–10).
+**Amended:** 2026-10-14, with the owner's rulings on #3199 in comments [6166478785](https://github.com/flotilla-org/flotilla/issues/3199#issuecomment-6166478785) (rulings 1–7), [6166860880](https://github.com/flotilla-org/flotilla/issues/3199#issuecomment-6166860880) (rulings 8–10) and [6177162679](https://github.com/flotilla-org/flotilla/issues/3199#issuecomment-6177162679) (rulings 11, 13 and 14; item 12 is a leaning, recorded under the addresses).
 **Amends:**
 - [ADR 0024](0024-declared-state-machines-and-field-ownership.md): machines are declared and gated; per-field ownership is retired.
 - [ADR 0047](0047-stored-data-stays-decodable-across-one-generation.md): after the cut-over, "decodable for one generation" means opening the previous generation's database.
@@ -55,6 +55,7 @@ Convoys assumed that their vessels were co-located and fixed. Many writers could
 - **Attempts are a history.** Retry counts, the schedule and giving up are judgements over attempt records and a policy. Giving up records a final failure and sends a message. Each `resume` starts a new attempt window: the judgements count only attempts since the last `resume`, and older attempts stay in the history (#3214).
 - **No mirrors.** Each fact has one home. Facts replicate, and judgements are computed where they are needed.
 - **Replacement, not reincarnation.** When a realised thing is lost and still wanted, a new resource replaces it, and the owning relation records the swap.
+- **No role names.** The engine knows only generic concepts: Role, Inbox, Message, Promise, Lend and the five machines below. Specific roles (coder, reviewer, governor, navigator, admission, gui-approver) and specific promise kinds (`pr`, `decision`, `demo-video`, `decision-ledger`) live in workflow templates and kind declarations. Their names never appear in a machine, a gate or the storage schema. They are affordances for one workflow, not substrate. Where this ADR names a role or a promise kind, it is a workflow example.
 - **API.** Machines are declared with a builder (`MachineDef` / `EdgeDef`) that validates the rules and renders the diagram. Edge dispatch is typed: a fieldless kind enum is derived from the edge enum, and each edge has its own argument struct. Gates and judgements read through one recording handle (#3209).
 
 The decided machines:
@@ -71,7 +72,7 @@ An Ensure records each fulfiller before it asks for it, and `retire` releases ev
 
 How the Convoy and Message machines behave:
 - **A convoy ends when its work is delivered.** A crew's "done" is a submission of evidence against a deliverable, not a convoy edge.
-- **Every convoy promises something.** Admission refuses a convoy with no promises, because the `deliver` gate holds trivially over an empty set (#3214). A free-form convoy, such as a navigator session, promises a decision: kept by observing its map ticket, or a similar record, change or resolve. A human sign-off verdict is the fallback.
+- **Every convoy promises something.** Admission refuses a convoy with no promises, because the `deliver` gate holds trivially over an empty set (#3214). A free-form convoy, such as a workflow's navigator session, can promise a decision (see "Promises" below).
 - **A Demand is a Message that expects an outcome,** and the Demand kind retires. Escalation is `drop(expired)` plus a follow-up message to the next role in the chain (see "Attention is a message" below).
 - **An outcome observed while Pending settles the message directly** (owner, 2026-10-14). Take a demand to fix a failing build: if the build goes green before delivery, the message did its job, and the consumer never sees the turn. A receipt that arrives afterwards cannot record `deliver` on a Settled message.
 - **Dropped is the state; `drop(reason)` is the edge into it.** The reason is recorded on the edge event and shown with the state.
@@ -82,20 +83,34 @@ How Checkouts and lends behave:
 - **One Checkout per writing role.** The shared unit is the branch, not a directory. Each writing role gets its own Checkout, a worktree made from a per-host, per-repository Clone that convoys on that host share. Roles share by pushing branches, and hand over by committing and pushing.
 - **A Checkout is owned by the role's owner:** the convoy for convoy roles, the Ensure for standing roles. Its home is the host it lives on. A replacement session on the same host reuses it. A replacement on another host means `release`, observing Gone, then creating a new Checkout from the last pushed commit.
 - **Inside a vessel is the crew's business.** Extra branches and worktrees inside a vessel, such as a stack lead's subagents, live inside the crew's Checkout. Flotilla knows the deliverables (promised branches and change requests, observed on the forge) and the Checkout, whose release removes everything inside it.
-- **A lend** lets another role, or a person, borrow a resource the owner holds: a Checkout, a process with an open port, or a jackstay stream. It is a relation asserted by the lender, with terms: who, mode (read-only or shared-write), and until a time or an event. The environment enforces the mode where it can. A co-placed coder and reviewer sharing local files is a lend, not a shared placement owner.
+- **A lend** lets another role, or a person, borrow a resource the owner holds: a Checkout, a process with an open port, or a jackstay stream. It is a relation asserted by the lender, with terms: who, mode (read-only or shared-write), and until a time or an event. The environment enforces the mode where it can. In a workflow with a co-placed coder and reviewer, their sharing of local files is a lend, not a shared placement owner.
 - **A lend gates release.** The lender's `release` is refused while an unexpired lend exists, unless the borrower has returned it or an authorised override records a reason. A lend until an event that never comes stays unexpired until it is returned or overridden. Return is the borrower's edge. Loss is `vanish`, with a message to the borrower.
+
+### Promises
+
+- **Promise kinds are declared, not built in.** The engine knows a Promise, its submissions and the `deliver` gate over them. Each kind is a declaration that says:
+  - its submission shape: what a submission names, such as a change request, a ref or an issue;
+  - what it observes and where, such as the forge;
+  - what keeps it: a judgement over those observations, with a human verdict on top where the declaration requires one.
+- **Example: the `decision` kind** has two forms.
+  1. Resolve an existing issue. The promise is kept when the issue is observed closed with a resolution.
+  2. Produce a new issue of a declared shape, such as a `wayfinder:map` issue with at least one child. The promise is kept when the submitted issue is observed with that shape and was created during the convoy.
+
+  Either form may also require a human verdict.
 
 ### Roles, inboxes and delivery
 
 - **Inboxes.** Each role instance owns an **Inbox** resource, homed with the role's owner: the convoy for convoy roles, and the project's declarations for standing roles. Messages queue there and outlive any fulfiller.
 - **Standing roles** are declared in the charter and own their inboxes, whether or not anything automatic fills them. An Ensure is optional, layered on a role: it keeps an agent bound. Retiring an Ensure leaves the role and its inbox in place. There is no separate person kind: a person's own inbox is a declared role with one holder.
 - **Addresses** are typed lists of segments over a closed kind enum: project, convoy and role to start. They are stored typed and shown as `project:flotilla/role:gui-approver` and `project:flotilla/convoy:stack-3152/role:coder`. There are two shapes to start, project/role and project/convoy/role, with no vessel segment. New kinds extend the enum without changing existing addresses.
+- **Session addresses (planned, not built).** A `session` kind, a leaf under a role, is the planned extension; which session ID it uses is still open.
 - **Every role is declared** with a one-line purpose. A message to an undeclared role is refused at send time, with the reason.
 - **Dynamic roles.** The convoy manages all its roles and inboxes at its home: declaring a role, its inbox and its brief. The workflow template says which roles may declare more (a stack lead, for example), and the supervisor may too. Role names may be dynamic (`coder-pr45`), with the role type as an attribute.
 - **The brief** is the inbox's first message. A new conversation reads the inbox from the top; a resumed one continues from its own position.
 - **Consumers.** A consumer of an inbox may be an **AgentSession**, a person (through a surface), or a deterministic controller. The consumer relation is the Role Binding, and convoy membership is "X consumes `project:P/convoy:C/role:R`", asserted by the convoy.
 - **Several consumers claim.** Any mix of people and agents may consume one inbox. The first to act on a message claims it and settles it.
-- **Attention is a message.** There is no separate human attention concept. An observer that sees something needing a hand (a permission prompt, an expiring credential) sends a message that expects the outcome to the role that must act. If it resolves unseen, the message settles from Pending. Escalation is a chain of roles. Salience becomes a judgement over pending messages. Regard stays a separate presentation concept: what someone looks at, not what waits for them. Inbox activity and workflow interaction diagrams are drawn from message records. Who may read which inboxes is still open (#3230).
+- **Attention is a message.** There is no separate human attention concept. An observer that sees something needing a hand (a permission prompt, an expiring credential) sends a message that expects the outcome to the role that must act. If it resolves unseen, the message settles from Pending. Escalation is a chain of roles. Salience becomes a judgement over pending messages. Regard stays a separate presentation concept: what someone looks at, not what waits for them. Inbox activity and workflow interaction diagrams are drawn from message records.
+- **Read access follows the project.** Anyone holding a role in a project reads all its inboxes and its convoys' history. A convoy's crew reads its own convoy's inboxes. Fleet roles read everything. Message bodies never carry secrets. This is a starting policy, not a settled one: a policy hook is expected later, and no policy language is fixed now (#3230).
 - **Pull delivery.**
   1. The consumer's host replicates the inboxes it consumes.
   2. It delivers each turn through its AgentChannel, using the adapter's transport.
@@ -114,7 +129,7 @@ How Checkouts and lends behave:
 
 ### Admission and capacity
 
-- **A convoy request is a message** to `project:fleet/role:admission` that expects an outcome. Its consumer is the admission controller. Footprints and crew details are its typed body.
+- **A convoy request is a message** that expects an outcome, sent to the role the fleet's workflow declares for admission (for example `project:fleet/role:admission`). Its consumer is a deterministic controller. Footprints and crew details are its typed body.
   - Receipt is `deliver`.
   - Position is a judgement over pending messages: class of service and holds.
   - Admitted is `settle(outcome observed)`, when the Convoy exists: from Awaiting after the receipt, or from Pending if the Convoy appears first.
