@@ -100,6 +100,7 @@ Controller rates and reconcile latencies are in each raw report. At `d1-n10000`:
 - **Shared process.** One process holds every daemon, controller, crew and the driver, and all of them share CPU and the vessel's memory limit. Per-daemon CPU and memory are not separated.
 - **In-memory transport.** It has no network latency. Replication lag here is controller and subscriber lag, not wire time.
 - **Watch-driven driver.** The driver's convoy and Message observations are watch-based in-process subscribers, comparable to one view client per daemon.
+- **Driver-side convoy latency.** Dispatch-to-delivered runs from the dispatch call, so it includes admission. The driver sees an end on its next tick (500 ms in these runs), so the figures are quantised to the tick. Compare controller-side latencies with the reconcile and turn-delivery histograms instead.
 - **Shorter runs at higher levels.** At 1,000 and 10,000 open convoys the plan's level is reached late, so the window measures a system still catching up. That is the point of those runs, and it is the state the ceiling would see.
 
 ## Next

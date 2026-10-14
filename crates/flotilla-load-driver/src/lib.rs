@@ -14,7 +14,7 @@ mod run;
 mod target;
 
 pub use plan::LoadPlan;
-pub use report::{ControllerReport, HomeReport, LoadReport, ReplicationReport, StoreReport, WindowSummary};
+pub use report::{ControllerReport, HomeReport, LoadReport, ReplicationReport, StoreReport, TargetErrors, WindowSummary};
 pub use run::run;
 pub use target::{ConvoyObservation, ConvoyState, FleetTarget, HomeSample, TargetSample};
 

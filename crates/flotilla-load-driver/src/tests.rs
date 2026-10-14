@@ -25,6 +25,12 @@ struct ScriptedFleet {
     dispatches: AtomicU64,
     abandons: AtomicU64,
     peak_open: AtomicU64,
+    /// Stands in for a target whose reads and abandons fail transiently: the
+    /// first `failing_abandons` abandons fail, and every `observe_fails_every`-th
+    /// observation (0: none) and window sample fails.
+    failing_abandons: u64,
+    observe_fails_every: u64,
+    observes: AtomicU64,
 }
 
 impl ScriptedFleet {
@@ -36,6 +42,18 @@ impl ScriptedFleet {
             dispatches: AtomicU64::new(0),
             abandons: AtomicU64::new(0),
             peak_open: AtomicU64::new(0),
+            failing_abandons: 0,
+            observe_fails_every: 0,
+            observes: AtomicU64::new(0),
+        }
+    }
+
+    fn observe_fault(&self) -> Result<(), String> {
+        let call = self.observes.fetch_add(1, Ordering::SeqCst) + 1;
+        match self.observe_fails_every {
+            0 => Ok(()),
+            every if call.is_multiple_of(every) => Err("transient read failure".into()),
+            _ => Ok(()),
         }
     }
 
@@ -63,6 +81,7 @@ impl FleetTarget for ScriptedFleet {
     }
 
     async fn convoys(&self, home: usize) -> Result<Vec<ConvoyObservation>, String> {
+        self.observe_fault()?;
         let convoys = self.convoys.lock().expect("convoys");
         Ok(convoys
             .iter()
@@ -72,7 +91,9 @@ impl FleetTarget for ScriptedFleet {
     }
 
     async fn abandon(&self, _home: usize, name: &str, _reason: &str) -> Result<(), String> {
-        self.abandons.fetch_add(1, Ordering::SeqCst);
+        if self.abandons.fetch_add(1, Ordering::SeqCst) < self.failing_abandons {
+            return Err("transient abandon failure".into());
+        }
         let mut convoys = self.convoys.lock().expect("convoys");
         let convoy = convoys.get_mut(name).ok_or("unknown convoy")?;
         convoy.3 = Some(ConvoyState::Abandoned);
@@ -80,6 +101,7 @@ impl FleetTarget for ScriptedFleet {
     }
 
     async fn sample(&self) -> Result<TargetSample, String> {
+        self.observe_fault()?;
         Ok(TargetSample { homes: vec![Default::default(); self.homes], resident_bytes: Some(1 << 20) })
     }
 }
@@ -153,4 +175,48 @@ async fn an_unreachable_plan_is_measured_at_the_ramp_deadline() {
     assert!((30.0..31.0).contains(&report.ramp.seconds), "{:?}", report.ramp);
     assert!(report.window.delivered > 0);
     assert!(report.markdown().contains("**not reached**"));
+}
+
+// Behaviour (review of #3234): transient target failures neither end the run
+// nor lose work. A failed abandon is retried, so overdue convoys still end
+// and are replaced; failed reads are counted and reported. Long runners never
+// end on their own, the first 5 abandons fail, and every 4th read fails.
+#[tokio::test(start_paused = true)]
+async fn transient_target_failures_are_retried_and_reported() {
+    let mut fleet = ScriptedFleet::new(2, |_| None);
+    fleet.failing_abandons = 5;
+    fleet.observe_fails_every = 4;
+    let mut plan = plan(6);
+    plan.mix = vec![(CrewMix::LongRunner, 1)];
+    let report = run(&fleet, &plan).await.expect("transient failures do not end the run");
+    assert!(report.ramp.reached, "{:?}", report.ramp);
+    let window = &report.window;
+    assert!(window.abandoned_by_deadline > 0 && window.abandoned == window.abandoned_by_deadline, "{window:?}");
+    // Every dispatch beyond the first `running` replaced a convoy that ended,
+    // and each ended only by an abandon that eventually succeeded.
+    let succeeded = fleet.abandons.load(Ordering::SeqCst) - 5;
+    assert!(report.dispatch.dispatched > 6 && report.dispatch.dispatched - 6 <= succeeded, "{:?}", report.dispatch);
+    // No convoy outlives its deadline by more than a few retried ticks.
+    let stuck = fleet
+        .convoys
+        .lock()
+        .expect("convoys")
+        .values()
+        .filter(|(_, _, at, decided)| decided.is_none() && at.elapsed() > plan.convoy_deadline + Duration::from_secs(2))
+        .count();
+    assert_eq!(stuck, 0, "a failed abandon is retried");
+    assert!(report.target_errors.count >= 5, "{:?}", report.target_errors);
+    assert!(report.target_errors.samples.iter().any(|error| error.contains("abandon")), "{:?}", report.target_errors);
+    assert!(report.target_errors.samples.iter().any(|error| error.contains("transient read")), "{:?}", report.target_errors);
+    assert!(report.markdown().contains("Target errors (retried)"));
+}
+
+// Behaviour: a target that fails every read gives up with an error instead of
+// waiting forever for a window that cannot start.
+#[tokio::test(start_paused = true)]
+async fn a_target_that_always_fails_ends_the_run_with_an_error() {
+    let mut fleet = ScriptedFleet::new(1, |_| None);
+    fleet.observe_fails_every = 1;
+    let error = run(&fleet, &plan(3)).await.expect_err("a dead target ends the run");
+    assert!(error.contains("consecutive ticks"), "{error}");
 }

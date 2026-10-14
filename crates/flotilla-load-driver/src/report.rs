@@ -15,6 +15,8 @@ pub struct LoadReport {
     pub mix: Vec<(String, u32)>,
     pub ramp: RampSummary,
     pub dispatch: DispatchSummary,
+    /// Failed target reads and abandons, each retried on the next tick.
+    pub target_errors: TargetErrors,
     pub window: WindowSummary,
     pub home_metrics: Vec<HomeReport>,
     pub resident_bytes: Option<u64>,
@@ -41,6 +43,12 @@ pub struct DispatchSummary {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct TargetErrors {
+    pub count: u64,
+    pub samples: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct WindowSummary {
     pub seconds: f64,
     pub delivered: u64,
@@ -50,6 +58,8 @@ pub struct WindowSummary {
     pub abandoned_by_deadline: u64,
     pub delivered_per_second: f64,
     /// Time from dispatch until delivery, for convoys delivered in the window.
+    /// It includes admission, and an end is seen on the driver's next tick,
+    /// so values are quantised to `LoadPlan::tick`.
     pub convoy_latency: LatencySummary,
     pub by_mix: BTreeMap<String, MixSummary>,
 }
@@ -242,6 +252,9 @@ impl LoadReport {
         }
         let _ = writeln!(out, "| Admission | {} |", latency(&self.dispatch.admission));
         let _ = writeln!(out, "| Dispatch errors | {} of {} |", self.dispatch.errors, self.dispatch.dispatched);
+        if self.target_errors.count > 0 {
+            let _ = writeln!(out, "| Target errors (retried) | {} |", self.target_errors.count);
+        }
         if let Some(resident) = self.resident_bytes {
             let _ = writeln!(out, "| Resident memory (process) | {} |", mebibytes(resident));
         }
@@ -299,6 +312,12 @@ impl LoadReport {
         if !self.dispatch.error_samples.is_empty() {
             let _ = writeln!(out, "\nDispatch error samples:\n");
             for error in &self.dispatch.error_samples {
+                let _ = writeln!(out, "- `{error}`");
+            }
+        }
+        if !self.target_errors.samples.is_empty() {
+            let _ = writeln!(out, "\nTarget error samples:\n");
+            for error in &self.target_errors.samples {
                 let _ = writeln!(out, "- `{error}`");
             }
         }

@@ -13,7 +13,7 @@ use tokio::time::Instant;
 
 use crate::{
     plan::LoadPlan,
-    report::{summary, window_metrics, DispatchSummary, LoadReport, MixSummary, RampSummary, SeriesPoint, WindowSummary},
+    report::{summary, window_metrics, DispatchSummary, LoadReport, MixSummary, RampSummary, SeriesPoint, TargetErrors, WindowSummary},
     target::{ConvoyState, FleetTarget, TargetSample},
 };
 
@@ -31,7 +31,15 @@ struct Outcomes {
     failed: u64,
     by_deadline: u64,
     latency: LatencyHistogram,
-    by_mix: BTreeMap<String, (u64, u64, u64, LatencyHistogram)>,
+    by_mix: BTreeMap<String, MixOutcomes>,
+}
+
+#[derive(Default)]
+struct MixOutcomes {
+    delivered: u64,
+    abandoned: u64,
+    failed: u64,
+    latency: LatencyHistogram,
 }
 
 impl Outcomes {
@@ -40,18 +48,18 @@ impl Outcomes {
         match state {
             ConvoyState::Delivered => {
                 self.delivered += 1;
-                entry.0 += 1;
+                entry.delivered += 1;
                 self.latency.record(latency);
-                entry.3.record(latency);
+                entry.latency.record(latency);
             }
             ConvoyState::Abandoned => {
                 self.abandoned += 1;
-                entry.1 += 1;
+                entry.abandoned += 1;
                 self.by_deadline += u64::from(by_deadline);
             }
             ConvoyState::Failed => {
                 self.failed += 1;
-                entry.2 += 1;
+                entry.failed += 1;
             }
             ConvoyState::Open => {}
         }
@@ -69,11 +77,10 @@ impl Outcomes {
             by_mix: self
                 .by_mix
                 .iter()
-                .map(|(mix, (delivered, abandoned, failed, latency))| {
-                    (
-                        mix.clone(),
-                        MixSummary { delivered: *delivered, abandoned: *abandoned, failed: *failed, latency: summary(&latency.snapshot()) },
-                    )
+                .map(|(mix, outcomes)| {
+                    let MixOutcomes { delivered, abandoned, failed, latency } = outcomes;
+                    let latency = summary(&latency.snapshot());
+                    (mix.clone(), MixSummary { delivered: *delivered, abandoned: *abandoned, failed: *failed, latency })
                 })
                 .collect(),
         }
@@ -81,6 +88,15 @@ impl Outcomes {
 }
 
 const ERROR_SAMPLES: usize = 5;
+/// Consecutive ticks with a failed target call after which the run gives up.
+const MAX_FAILING_TICKS: u32 = 120;
+
+fn note_error(count: &mut u64, samples: &mut Vec<String>, error: String) {
+    *count += 1;
+    if samples.len() < ERROR_SAMPLES && !samples.contains(&error) {
+        samples.push(error);
+    }
+}
 
 /// Run `plan` against `target` and report. The run ends after the window;
 /// convoys still open are left as they are.
@@ -97,6 +113,11 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
     let mut dispatched = 0u64;
     let mut dispatch_errors = 0u64;
     let mut error_samples = Vec::new();
+    // Failed target reads and abandons; a long run outlives transient failures
+    // and retries on the next tick.
+    let mut target_errors = 0u64;
+    let mut target_error_samples = Vec::new();
+    let mut failing_ticks = 0u32;
     let admission = LatencyHistogram::default();
     let mut window_outcomes = Outcomes::default();
     let mut ended_total = 0u64;
@@ -117,46 +138,63 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
                         admission.record(began.elapsed());
                         open.insert(name, Dispatched { home, mix, at: began });
                     }
-                    Err(error) => {
-                        dispatch_errors += 1;
-                        if error_samples.len() < ERROR_SAMPLES && !error_samples.contains(&error) {
-                            error_samples.push(error);
-                        }
-                    }
+                    Err(error) => note_error(&mut dispatch_errors, &mut error_samples, error),
                 }
                 continue;
             }
             _ = tick.tick() => {}
         }
         let now = Instant::now();
+        let errors_before = target_errors;
 
-        // Settle convoys that ended.
+        // Settle convoys that ended. A target lists every convoy it holds, so
+        // one that ends before its admission resolves here settles on the
+        // tick after it does.
         for home in 0..homes {
-            for observation in target.convoys(home).await? {
+            let observations = match target.convoys(home).await {
+                Ok(observations) => observations,
+                Err(error) => {
+                    note_error(&mut target_errors, &mut target_error_samples, format!("observe home {home}: {error}"));
+                    continue;
+                }
+            };
+            for observation in observations {
                 if !observation.state.ended() {
                     continue;
                 }
                 let Some(dispatch) = open.remove(&observation.name) else { continue };
                 ended_total += 1;
                 delivered_total += u64::from(observation.state == ConvoyState::Delivered);
+                let by_deadline = deadline_abandoned.remove(&observation.name);
                 if window_start.is_some() {
-                    let by_deadline = deadline_abandoned.remove(&observation.name);
                     window_outcomes.record(dispatch.mix, observation.state, now.duration_since(dispatch.at), by_deadline);
                 }
             }
         }
 
-        // Abandon convoys past their deadline, once each.
+        // Abandon convoys past their deadline, once each; a failed abandon is
+        // retried on the next tick.
         let overdue = open
             .iter()
             .filter(|(name, dispatch)| now.duration_since(dispatch.at) >= plan.convoy_deadline && !deadline_abandoned.contains(*name))
             .map(|(name, dispatch)| (name.clone(), dispatch.home))
             .collect::<Vec<_>>();
         for (name, home) in overdue {
-            if let Err(error) = target.abandon(home, &name, "load driver: open past the convoy deadline").await {
-                tracing::warn!(convoy = %name, %error, "load driver could not abandon an overdue convoy");
+            match target.abandon(home, &name, "load driver: open past the convoy deadline").await {
+                Ok(()) => {
+                    deadline_abandoned.insert(name);
+                }
+                Err(error) => note_error(&mut target_errors, &mut target_error_samples, format!("abandon {name}: {error}")),
             }
-            deadline_abandoned.insert(name);
+        }
+
+        if target_errors > errors_before {
+            failing_ticks += 1;
+            if failing_ticks >= MAX_FAILING_TICKS {
+                return Err(format!("the target failed on {failing_ticks} consecutive ticks: {target_error_samples:?}"));
+            }
+        } else {
+            failing_ticks = 0;
         }
 
         let running = open.len();
@@ -175,8 +213,13 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
 
         // Start the window once the plan's convoys are open, or at the ramp deadline.
         if window_start.is_none() && (running >= plan.running || now.duration_since(started) >= plan.max_ramp) {
-            ramp_end = Some(now);
-            window_start = Some((now, target.sample().await?));
+            match target.sample().await {
+                Ok(sample) => {
+                    ramp_end = Some(now);
+                    window_start = Some((now, sample));
+                }
+                Err(error) => note_error(&mut target_errors, &mut target_error_samples, format!("sample: {error}")),
+            }
         }
         if let Some((window_began, _)) = &window_start {
             if now.duration_since(*window_began) >= plan.window {
@@ -204,7 +247,10 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
     let (window_began, start_sample) = window_start.expect("the loop ends only inside a window");
     let window = window_began.elapsed();
     let end_sample = target.sample().await?;
-    let open_at_end = target.open_breakdown().await?;
+    let open_at_end = target.open_breakdown().await.unwrap_or_else(|error| {
+        note_error(&mut target_errors, &mut target_error_samples, format!("open breakdown: {error}"));
+        BTreeMap::new()
+    });
     let ramp_end = ramp_end.expect("ramp ends when the window starts");
     Ok(LoadReport {
         running: plan.running,
@@ -212,6 +258,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
         mix: plan.mix.iter().map(|(mix, weight)| (format!("{mix:?}"), *weight)).collect(),
         ramp: RampSummary { reached: peak_running >= plan.running, seconds: ramp_end.duration_since(started).as_secs_f64(), peak_running },
         dispatch: DispatchSummary { dispatched, errors: dispatch_errors, admission: summary(&admission.snapshot()), error_samples },
+        target_errors: TargetErrors { count: target_errors, samples: target_error_samples },
         window: window_outcomes.summary(window.as_secs_f64()),
         home_metrics: window_metrics(&start_sample, &end_sample, window),
         resident_bytes: end_sample.resident_bytes,
