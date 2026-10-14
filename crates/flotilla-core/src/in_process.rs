@@ -177,7 +177,6 @@ use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_provider_runtime::ObservationError;
-use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
 
 type ObservationScope = (String, String, String);
 const OBSERVATION_CACHE_FALLBACK_DELAY: Duration = Duration::from_secs(9);
@@ -2639,11 +2638,7 @@ impl InProcessDaemon {
     /// discovered checkout or a worktree registration.
     pub fn local_charter_vcs(&self) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, String> {
         let runner = self.local_command_runner().ok_or("local charter runner unavailable")?;
-        Ok(Arc::new(flotilla_vcs::vcs::FlotillaVcs::new(
-            ExecutionEnvironmentPath::new("/"),
-            runner.clone(),
-            flotilla_vcs::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner))),
-        )))
+        Ok(Arc::new(flotilla_vcs::vcs::FlotillaVcs::object_cache(runner)))
     }
 
     pub async fn local_vcs_for_checkout(&self, checkout: &Path) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, String> {
@@ -4276,6 +4271,15 @@ impl InProcessDaemon {
         // Project image layers ride the same periodic charter reconciliation.
         if let Err(error) = self.project_service().reconcile_project_image_layers().await {
             warn!(%error, "project image layer reconciliation failed");
+        }
+        // Cache retention is housekeeping and never fails the sweep.
+        match project_ops::ProjectOperations::repository_inspector(self).await {
+            Ok(inspector) => {
+                if let Err(error) = inspector.retire_unused_charter_caches().await {
+                    warn!(%error, "charter cache retention failed");
+                }
+            }
+            Err(error) => warn!(%error, "charter cache retention unavailable"),
         }
         charters
     }

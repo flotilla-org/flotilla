@@ -371,6 +371,22 @@ whose names are not charter files, including gitlinks and symlinked directories;
 charter-named non-regular entries are refused. Both sources require UTF-8 charter
 contents, and refusal reasons identify the file.
 
+Each source read is bounded. A read refuses a source with more than 2,000
+charter files, any file over 1 MiB, or more than 16 MiB of charter files in
+total; image layer directories apply the same bounds to all of their files.
+Git sources are checked against tree metadata before any blob is read; local
+directories are checked before a file is read. An oversized source is a source
+refusal like any other: its last applied revision and records remain in place
+until it shrinks.
+
+The private cache fetches only the branch tip (`--depth=1`) and records no
+refs, so advanced, rewound or force-pushed heads resolve without history. A
+repository's object cache is retired once no read has fetched it for seven
+days; a source still in use simply refetches its tip. Retention removes only
+the cache directories Flotilla created (digest-named object stores, and the
+per-source `charter-<digest>` directories of registered charters in the
+sibling `<dir>.charter-cache`); other entries in the directory are untouched.
+
 Ops members use the same reader. Declare their source in `project.yaml`, or in
 `Project.spec.repositories[].charter_store`:
 

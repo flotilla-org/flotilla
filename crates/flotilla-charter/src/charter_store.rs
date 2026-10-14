@@ -1,8 +1,10 @@
 //! Read immutable charter inputs through the VCS seam or a local directory.
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, Weak},
+    time::{Duration, SystemTime},
 };
 
 use flotilla_resources::CharterSource;
@@ -16,6 +18,75 @@ pub async fn source_read<T>(read: impl std::future::Future<Output = Result<T, St
     tokio::time::timeout(std::time::Duration::from_secs(30), read)
         .await
         .map_err(|_| "charter source read exceeded 30 seconds".to_string())?
+}
+
+/// Bounds on one source read. A read that would exceed any bound is refused
+/// before the offending contents are read; like any source refusal, it keeps
+/// the last applied revision and records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceLimits {
+    /// Files read: selected charter files, or every file of a layer directory.
+    pub max_files: usize,
+    pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
+}
+
+/// Documented in docs/configuration.md. Charters are small declarative text;
+/// image layer contents are further bounded when parsed.
+pub const SOURCE_LIMITS: SourceLimits = SourceLimits { max_files: 2_000, max_file_bytes: 1024 * 1024, max_total_bytes: 16 * 1024 * 1024 };
+
+/// Object caches whose last fetch is older than this are retired. A source
+/// still in use simply refetches its tip.
+pub const CHARTER_CACHE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Running admission of one read's files against its limits.
+struct SourceTally {
+    limits: SourceLimits,
+    input: &'static str,
+    files: usize,
+    bytes: u64,
+}
+
+impl SourceTally {
+    fn new(limits: SourceLimits, input: &'static str) -> Self {
+        Self { limits, input, files: 0, bytes: 0 }
+    }
+
+    fn admit(&mut self, name: &str, size: u64) -> Result<(), String> {
+        let SourceLimits { max_files, max_file_bytes, max_total_bytes } = self.limits;
+        let input = self.input;
+        if size > max_file_bytes {
+            return Err(format!("{input} file {name} is {size} bytes, above the {max_file_bytes}-byte file limit"));
+        }
+        self.files += 1;
+        if self.files > max_files {
+            return Err(format!("{input} source exceeds the {max_files}-file limit at {name}"));
+        }
+        self.bytes += size;
+        if self.bytes > max_total_bytes {
+            return Err(format!("{input} source exceeds the {max_total_bytes}-byte total limit at {name}"));
+        }
+        Ok(())
+    }
+}
+
+/// Read at most the admitted size, so a file growing after its size check
+/// cannot exceed the limit either.
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    let mut contents = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(limit.saturating_add(1)).read_to_end(&mut contents))
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if contents.len() as u64 > limit {
+        return Err(format!("read {}: file exceeds the {limit}-byte file limit", path.display()));
+    }
+    Ok(contents)
+}
+
+/// Retire object caches below `cache` unused for [`CHARTER_CACHE_RETENTION`].
+pub async fn retire_unused_caches(cache: &Path, vcs: &dyn Vcs) -> Result<Vec<PathBuf>, String> {
+    let cutoff = SystemTime::now().checked_sub(CHARTER_CACHE_RETENTION).unwrap_or(SystemTime::UNIX_EPOCH);
+    vcs.retire_revision_caches(cache, cutoff).await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,12 +109,18 @@ pub trait RevisionedTree: Send + Sync {
 /// per source read, as read_charter_source does, to bound retained snapshots.
 pub struct LocalDirectoryTree {
     directory: PathBuf,
+    limits: SourceLimits,
     snapshots: Mutex<HashMap<String, LocalRevision>>,
 }
 
 impl LocalDirectoryTree {
     pub fn new(directory: PathBuf) -> Self {
-        Self { directory, snapshots: Mutex::default() }
+        Self { directory, limits: SOURCE_LIMITS, snapshots: Mutex::default() }
+    }
+
+    pub fn with_limits(mut self, limits: SourceLimits) -> Self {
+        self.limits = limits;
+        self
     }
 }
 
@@ -51,9 +128,10 @@ impl LocalDirectoryTree {
 impl RevisionedTree for LocalDirectoryTree {
     async fn resolve(&self, _reference: &str) -> Result<String, String> {
         let directory = self.directory.clone();
+        let limits = self.limits;
         let local =
             flotilla_provider_runtime::probe::blocking("local charter", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
-                local_tree_snapshot(&directory)
+                local_tree_snapshot(&directory, limits)
             })
             .await?;
         let revision = local.snapshot.revision.clone();
@@ -87,6 +165,7 @@ pub struct GitRevisionedTree<'a> {
     pub vcs: &'a dyn Vcs,
     pub cache: &'a Path,
     pub repo: &'a str,
+    pub limits: SourceLimits,
 }
 
 #[async_trait::async_trait]
@@ -106,16 +185,25 @@ impl RevisionedTree for GitRevisionedTree<'_> {
         if !prefix.is_empty() && entries.is_empty() {
             return Err(format!("charter path {path} has no files at {revision}"));
         }
-        let mut files = BTreeMap::new();
+        // Admit every selected file from tree metadata before reading any blob.
+        let mut tally = SourceTally::new(self.limits, "charter");
+        let mut selected = Vec::new();
         for (name, entry) in entries {
             if !is_charter_file(Path::new(&name)) {
                 continue;
             }
             let full = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
-            let contents = match entry {
-                TreeEntry::File(file) => file.read().await.map_err(|error| format!("read charter {full}: {error}"))?,
+            match entry {
+                TreeEntry::File(file) => {
+                    tally.admit(&full, file.size())?;
+                    selected.push((name, full, file));
+                }
                 TreeEntry::Other => return Err(format!("charter path {full} is not a regular file")),
-            };
+            }
+        }
+        let mut files = BTreeMap::new();
+        for (name, full, file) in selected {
+            let contents = file.read().await.map_err(|error| format!("read charter {full}: {error}"))?;
             let contents = String::from_utf8(contents).map_err(|_| format!("read charter {full}: stream did not contain valid UTF-8"))?;
             files.insert(name, contents);
         }
@@ -151,7 +239,7 @@ pub async fn read_charter_source(source: &CharterSource, cache: &Path, vcs: Opti
         match source {
             CharterSource::Repository { repo, branch, path } => {
                 let vcs = vcs.ok_or("charter VCS provider unavailable")?;
-                let tree = GitRevisionedTree { vcs, cache, repo };
+                let tree = GitRevisionedTree { vcs, cache, repo, limits: SOURCE_LIMITS };
                 let revision = tree.resolve(branch).await?;
                 let files = tree.read_files(&revision, path).await?;
                 Ok(CharterSnapshot { revision, files })
@@ -214,19 +302,26 @@ pub async fn read_layer_directory(
         match source {
             CharterSource::Repository { repo, branch, path } => {
                 let vcs = vcs.ok_or("layer VCS provider unavailable")?;
-                let tree = GitRevisionedTree { vcs, cache, repo };
+                let tree = GitRevisionedTree { vcs, cache, repo, limits: SOURCE_LIMITS };
                 let revision = tree.resolve(branch).await?;
                 let entries = vcs.files_at_revision(cache, repo, &revision, path).await?;
                 if entries.is_empty() {
                     return Ok(None);
                 }
-                let mut files = BTreeMap::new();
+                let mut tally = SourceTally::new(SOURCE_LIMITS, "layer");
+                let mut selected = Vec::new();
                 for (name, entry) in entries {
-                    let contents = match entry {
-                        TreeEntry::File(file) => file.read().await.map_err(|error| format!("read layer file {name}: {error}"))?,
+                    match entry {
+                        TreeEntry::File(file) => {
+                            tally.admit(&name, file.size())?;
+                            selected.push((name, file));
+                        }
                         TreeEntry::Other => return Err(format!("layer path {name} is not a regular file")),
-                    };
-                    files.insert(name, contents);
+                    }
+                }
+                let mut files = BTreeMap::new();
+                for (name, file) in selected {
+                    files.insert(name.clone(), file.read().await.map_err(|error| format!("read layer file {name}: {error}"))?);
                 }
                 Ok(Some(LayerDirectorySnapshot { revision, files }))
             }
@@ -235,7 +330,7 @@ pub async fn read_layer_directory(
                 flotilla_provider_runtime::probe::blocking(
                     "local image layer",
                     flotilla_provider_runtime::probe::PROBE_TIMEOUT,
-                    move || local_layer_directory(&directory),
+                    move || local_layer_directory(&directory, SOURCE_LIMITS),
                 )
                 .await
             }
@@ -244,8 +339,8 @@ pub async fn read_layer_directory(
     .await
 }
 
-fn local_layer_directory(root: &Path) -> Result<Option<LayerDirectorySnapshot>, String> {
-    fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) -> Result<(), String> {
+fn local_layer_directory(root: &Path, limits: SourceLimits) -> Result<Option<LayerDirectorySnapshot>, String> {
+    fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>, tally: &mut SourceTally) -> Result<(), String> {
         for entry in std::fs::read_dir(dir).map_err(|error| format!("read {}: {error}", dir.display()))? {
             let entry = entry.map_err(|error| error.to_string())?;
             let path = entry.path();
@@ -254,11 +349,13 @@ fn local_layer_directory(root: &Path) -> Result<Option<LayerDirectorySnapshot>, 
                 return Err(format!("layer directory contains symlink {}", path.display()));
             }
             if kind.is_dir() {
-                collect(root, &path, files)?;
+                collect(root, &path, files, tally)?;
             } else if kind.is_file() {
                 let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
                 let relative = relative.to_str().ok_or("layer path is not UTF-8")?.replace(std::path::MAIN_SEPARATOR, "/");
-                files.insert(relative, std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?);
+                let size = entry.metadata().map_err(|error| format!("inspect {}: {error}", path.display()))?.len();
+                tally.admit(&relative, size)?;
+                files.insert(relative, read_bounded(&path, tally.limits.max_file_bytes)?);
             }
         }
         Ok(())
@@ -267,7 +364,7 @@ fn local_layer_directory(root: &Path) -> Result<Option<LayerDirectorySnapshot>, 
         return Ok(None);
     }
     let mut files = BTreeMap::new();
-    collect(root, root, &mut files)?;
+    collect(root, root, &mut files, &mut SourceTally::new(limits, "layer"))?;
     let mut digest = Sha256::new();
     for (path, contents) in &files {
         digest.update((path.len() as u64).to_be_bytes());
@@ -289,8 +386,14 @@ struct LocalRevision {
     paths: BTreeSet<String>,
 }
 
-fn local_tree_snapshot(root: &Path) -> Result<LocalRevision, String> {
-    fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<String, String>, paths: &mut BTreeSet<String>) -> Result<(), String> {
+fn local_tree_snapshot(root: &Path, limits: SourceLimits) -> Result<LocalRevision, String> {
+    fn collect(
+        root: &Path,
+        dir: &Path,
+        files: &mut BTreeMap<String, String>,
+        paths: &mut BTreeSet<String>,
+        tally: &mut SourceTally,
+    ) -> Result<(), String> {
         for entry in std::fs::read_dir(dir).map_err(|error| format!("read {}: {error}", dir.display()))? {
             let entry = entry.map_err(|error| error.to_string())?;
             let path = entry.path();
@@ -302,7 +405,7 @@ fn local_tree_snapshot(root: &Path) -> Result<LocalRevision, String> {
                 return Err(format!("charter source contains symlink {}", path.display()));
             }
             if kind.is_dir() {
-                collect(root, &path, files, paths)?;
+                collect(root, &path, files, paths, tally)?;
             } else if kind.is_file() {
                 let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
                 paths.insert(relative.to_string_lossy().into_owned());
@@ -310,7 +413,10 @@ fn local_tree_snapshot(root: &Path) -> Result<LocalRevision, String> {
                     continue;
                 }
                 let relative = relative.to_str().ok_or("charter path is not UTF-8")?.to_string();
-                let contents = std::fs::read_to_string(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+                let size = entry.metadata().map_err(|error| format!("inspect {}: {error}", path.display()))?.len();
+                tally.admit(&relative, size)?;
+                let contents = String::from_utf8(read_bounded(&path, tally.limits.max_file_bytes)?)
+                    .map_err(|_| format!("read {}: stream did not contain valid UTF-8", path.display()))?;
                 files.insert(relative, contents);
             }
         }
@@ -318,7 +424,7 @@ fn local_tree_snapshot(root: &Path) -> Result<LocalRevision, String> {
     }
     let mut files = BTreeMap::new();
     let mut paths = BTreeSet::new();
-    collect(root, root, &mut files, &mut paths)?;
+    collect(root, root, &mut files, &mut paths, &mut SourceTally::new(limits, "charter"))?;
     let mut digest = Sha256::new();
     for (path, contents) in &files {
         digest.update((path.len() as u64).to_be_bytes());
@@ -498,7 +604,7 @@ mod tests {
         write_tree(dir.path()).await;
         let vcs = git_tree_provider(dir.path());
         let repo = dir.path().to_str().expect("repository path");
-        let tree = GitRevisionedTree { vcs: &vcs, cache: cache.path(), repo };
+        let tree = GitRevisionedTree { vcs: &vcs, cache: cache.path(), repo, limits: SOURCE_LIMITS };
         let revision = revisioned_tree_contract(&tree).await;
         // The generic VCS operation includes non-charter binary blobs unchanged.
         let files = vcs.files_at_revision(cache.path(), repo, &revision, "ops").await.expect("generic tree");
@@ -527,7 +633,12 @@ mod tests {
         let vcs = git_tree_provider(dir.path());
         let cache = tempfile::tempdir().expect("cache");
         let local = LocalDirectoryTree::new(dir.path().to_path_buf());
-        let git = GitRevisionedTree { vcs: &vcs, cache: cache.path(), repo: dir.path().to_str().expect("repository path") };
+        let git = GitRevisionedTree {
+            vcs: &vcs,
+            cache: cache.path(),
+            repo: dir.path().to_str().expect("repository path"),
+            limits: SOURCE_LIMITS,
+        };
         for tree in [&local as &dyn RevisionedTree, &git] {
             let revision = tree.resolve("main").await.expect("empty revision");
             assert!(tree.read_files(&revision, ".").await.expect("empty tree").is_empty());
@@ -595,7 +706,7 @@ mod tests {
         let runner = Arc::new(ObservedBlobRunner { reads: Mutex::default() });
         let vcs = git_tree_provider_with_runner(dir.path(), runner.clone());
         let repo = dir.path().to_str().expect("repository path");
-        let tree = GitRevisionedTree { vcs: &vcs, cache: cache.path(), repo };
+        let tree = GitRevisionedTree { vcs: &vcs, cache: cache.path(), repo, limits: SOURCE_LIMITS };
         let revision = tree.resolve("main").await.expect("revision");
         let files = vcs.files_at_revision(cache.path(), repo, &revision, "ops").await.expect("generic enumeration");
         assert!(files.contains_key("blob.bin"));
@@ -609,6 +720,107 @@ mod tests {
             panic!("regular blob");
         };
         assert_eq!(file.read().await.expect("generic binary read"), [0xff, 0x00]);
+    }
+
+    // #2743: both adapters admit a source exactly when its selected files fit
+    // every limit. Refusals name the limit, and the Git adapter refuses from
+    // tree metadata without reading any blob. Ignored files never count.
+    #[hegel::test(test_cases = 30)]
+    fn source_limits_refuse_oversized_charters(tc: hegel::TestCase) {
+        // Sizes straddle the per-file bound; counts straddle the file bound.
+        let sizes = tc.draw(gs::vecs(gs::integers::<usize>().min_value(0).max_value(12)).min_size(0).max_size(5));
+        let limits = SourceLimits {
+            max_files: tc.draw(gs::integers::<usize>().min_value(0).max_value(4)),
+            max_file_bytes: tc.draw(gs::integers::<u64>().min_value(0).max_value(10)),
+            max_total_bytes: tc.draw(gs::integers::<u64>().min_value(0).max_value(30)),
+        };
+        let admitted = sizes.len() <= limits.max_files
+            && sizes.iter().all(|size| *size as u64 <= limits.max_file_bytes)
+            && sizes.iter().sum::<usize>() as u64 <= limits.max_total_bytes;
+        tokio::runtime::Runtime::new().expect("runtime").block_on(async {
+            let dir = tempfile::tempdir().expect("source");
+            let cache = tempfile::tempdir().expect("cache");
+            let expected =
+                sizes.iter().enumerate().map(|(index, size)| (format!("f{index}.yaml"), "x".repeat(*size))).collect::<BTreeMap<_, _>>();
+            for (name, contents) in &expected {
+                std::fs::write(dir.path().join(name), contents).expect("charter file");
+            }
+            std::fs::write(dir.path().join("ignored.bin"), vec![0; 64]).expect("ignored file");
+            fixture_git(dir.path(), &["init", "-b", "main"]).await;
+            fixture_git(dir.path(), &["add", "."]).await;
+            fixture_git(
+                dir.path(),
+                &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "sized"],
+            )
+            .await;
+            let runner = Arc::new(ObservedBlobRunner { reads: Mutex::default() });
+            let vcs = git_tree_provider_with_runner(dir.path(), runner.clone());
+            let git = GitRevisionedTree { vcs: &vcs, cache: cache.path(), repo: dir.path().to_str().expect("repository path"), limits };
+            let local = LocalDirectoryTree::new(dir.path().to_path_buf()).with_limits(limits);
+            let revision = git.resolve("main").await.expect("git revision");
+            let read = git.read_files(&revision, ".").await;
+            assert_eq!(runner.reads.lock().expect("blob read log").is_empty(), !admitted || expected.is_empty(), "{read:?}");
+            let local_read = match local.resolve("main").await {
+                Ok(revision) => local.read_files(&revision, ".").await,
+                Err(error) => Err(error),
+            };
+            for result in [read, local_read] {
+                match result {
+                    Ok(files) => {
+                        assert!(admitted);
+                        assert_eq!(files, expected);
+                    }
+                    Err(error) => {
+                        assert!(!admitted, "{error}");
+                        assert!(error.contains("limit"), "{error}");
+                    }
+                }
+            }
+        });
+    }
+
+    // #2743: the documented default bounds refuse a layer or charter file one
+    // byte over 1 MiB through both sources, and admit one exactly at it.
+    #[tokio::test]
+    async fn default_limits_bound_layer_and_charter_files() {
+        let dir = tempfile::tempdir().expect("source");
+        let cache = tempfile::tempdir().expect("cache");
+        let layer = dir.path().join("ops").join(CHARTER_IMAGE_LAYER_PATH);
+        std::fs::create_dir_all(&layer).expect("layer directory");
+        let limit = SOURCE_LIMITS.max_file_bytes as usize;
+        std::fs::write(layer.join("context.bin"), vec![b'x'; limit]).expect("boundary layer file");
+        std::fs::write(dir.path().join("ops/policy.yaml"), "x".repeat(limit)).expect("boundary charter file");
+        fixture_git(dir.path(), &["init", "-b", "main"]).await;
+        fixture_git(dir.path(), &["add", "."]).await;
+        fixture_git(dir.path(), &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "boundary"]).await;
+        let vcs = git_tree_provider(dir.path());
+        let repo = dir.path().to_str().expect("repository path").to_string();
+        let git = CharterSource::Repository { repo, branch: "main".into(), path: "ops".into() };
+        let local = CharterSource::LocalDirectory { directory: dir.path().join("ops").to_string_lossy().into_owned() };
+        for source in [&git, &local] {
+            assert!(read_charter_source(source, cache.path(), Some(&vcs))
+                .await
+                .expect("boundary charter")
+                .files
+                .contains_key("policy.yaml"));
+            assert!(read_layer_directory(&charter_image_layer_source(source), cache.path(), Some(&vcs))
+                .await
+                .expect("boundary layer")
+                .is_some());
+        }
+        std::fs::write(layer.join("context.bin"), vec![b'x'; limit + 1]).expect("oversized layer file");
+        std::fs::write(dir.path().join("ops/policy.yaml"), "x".repeat(limit + 1)).expect("oversized charter file");
+        fixture_git(dir.path(), &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-am", "oversized"]).await;
+        for source in [&git, &local] {
+            let error = read_charter_source(source, cache.path(), Some(&vcs)).await.expect_err("oversized charter");
+            assert!(
+                error.contains("charter file ") && error.contains("policy.yaml is 1048577 bytes, above the 1048576-byte file limit"),
+                "{error}"
+            );
+            let error =
+                read_layer_directory(&charter_image_layer_source(source), cache.path(), Some(&vcs)).await.expect_err("oversized layer");
+            assert_eq!(error, "layer file context.bin is 1048577 bytes, above the 1048576-byte file limit");
+        }
     }
 
     // This double stands in for a hung Git subprocess; all earlier commands finish.
@@ -646,7 +858,7 @@ mod tests {
         let strategy =
             GitCheckoutStrategy::ReferenceClone(ReferenceCloneStrategy::new(runner.clone(), ExecutionEnvironmentPath::new(dir.path())));
         let vcs = FlotillaVcs::new(ExecutionEnvironmentPath::new(dir.path()), runner, strategy);
-        let tree = GitRevisionedTree { vcs: &vcs, cache: dir.path(), repo: "https://example.test/repo" };
+        let tree = GitRevisionedTree { vcs: &vcs, cache: dir.path(), repo: "https://example.test/repo", limits: SOURCE_LIMITS };
         assert_eq!(tree.resolve("main").await.expect_err("source refusal"), "fetch charter branch main: timed out after 60s");
         let source = CharterSource::Repository { repo: "https://example.test/repo".into(), branch: "main".into(), path: ".".into() };
         assert_eq!(
@@ -670,7 +882,12 @@ mod tests {
             .expect_err("source refusal")
             .contains("invalid.yaml"));
         let vcs = git_tree_provider(dir.path());
-        let tree = GitRevisionedTree { vcs: &vcs, cache: cache.path(), repo: dir.path().to_str().expect("repository path") };
+        let tree = GitRevisionedTree {
+            vcs: &vcs,
+            cache: cache.path(),
+            repo: dir.path().to_str().expect("repository path"),
+            limits: SOURCE_LIMITS,
+        };
         let revision = tree.resolve("main").await.expect("git resolves invalid text");
         assert_eq!(
             tree.read_files(&revision, ".").await.expect_err("source refusal"),
@@ -682,7 +899,7 @@ mod tests {
     #[tokio::test]
     async fn unavailable_revisioned_tree_preserves_charter_error() {
         let vcs = FakeCheckoutManager::new();
-        let tree = GitRevisionedTree { vcs: &vcs, cache: Path::new("unused"), repo: "https://example.test/repo" };
+        let tree = GitRevisionedTree { vcs: &vcs, cache: Path::new("unused"), repo: "https://example.test/repo", limits: SOURCE_LIMITS };
         assert_eq!(tree.resolve("main").await.expect_err("source refusal"), "bound charter inspection is unavailable");
     }
 
@@ -735,17 +952,17 @@ mod tests {
         let text = if tc.draw(gs::booleans()) { "é\0\n" } else { "a" }.repeat(length);
         let dir = tempfile::tempdir().expect("local source");
         std::fs::write(dir.path().join("input.yaml"), &text).expect("write source");
-        let first = local_tree_snapshot(dir.path()).expect("snapshot").snapshot;
+        let first = local_tree_snapshot(dir.path(), SOURCE_LIMITS).expect("snapshot").snapshot;
         assert_eq!(first.files["input.yaml"], text);
-        assert_eq!(local_tree_snapshot(dir.path()).expect("reread").snapshot, first);
+        assert_eq!(local_tree_snapshot(dir.path(), SOURCE_LIMITS).expect("reread").snapshot, first);
         // Equal-length edits must change provenance, too.
         std::fs::write(dir.path().join("input.yaml"), format!("{text}x")).expect("edit source");
-        let edited = local_tree_snapshot(dir.path()).expect("edited snapshot").snapshot;
+        let edited = local_tree_snapshot(dir.path(), SOURCE_LIMITS).expect("edited snapshot").snapshot;
         std::fs::write(dir.path().join("input.yaml"), format!("{text}y")).expect("same-length edit");
-        assert_ne!(local_tree_snapshot(dir.path()).expect("same-length snapshot").snapshot.revision, edited.revision);
-        assert_ne!(local_tree_snapshot(dir.path()).expect("changed snapshot").snapshot.revision, first.revision);
+        assert_ne!(local_tree_snapshot(dir.path(), SOURCE_LIMITS).expect("same-length snapshot").snapshot.revision, edited.revision);
+        assert_ne!(local_tree_snapshot(dir.path(), SOURCE_LIMITS).expect("changed snapshot").snapshot.revision, first.revision);
         std::fs::write(dir.path().join("input.yaml"), &text).expect("restore contents");
         std::fs::rename(dir.path().join("input.yaml"), dir.path().join("renamed.yaml")).expect("rename source");
-        assert_ne!(local_tree_snapshot(dir.path()).expect("renamed snapshot").snapshot.revision, first.revision);
+        assert_ne!(local_tree_snapshot(dir.path(), SOURCE_LIMITS).expect("renamed snapshot").snapshot.revision, first.revision);
     }
 }

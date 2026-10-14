@@ -42,6 +42,36 @@ pub(crate) struct BoundCharterReader<'a> {
     pub vcs: Option<&'a dyn flotilla_vcs::vcs::Vcs>,
 }
 
+impl BoundCharterReader<'_> {
+    /// Retire unused caches inside each per-source `charter-<digest>`
+    /// directory, then remove the directory once it is empty. Other entries
+    /// are never touched.
+    pub(crate) async fn retire_unused(&self) -> Result<(), String> {
+        let Some(vcs) = self.vcs else {
+            return Ok(());
+        };
+        let mut entries = match tokio::fs::read_dir(self.cache).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("read {}: {error}", self.cache.display())),
+        };
+        while let Some(entry) = entries.next_entry().await.map_err(|error| format!("read {}: {error}", self.cache.display()))? {
+            let per_source = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("charter-"))
+                .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
+            if !per_source || !entry.file_type().await.map_err(|error| error.to_string())?.is_dir() {
+                continue;
+            }
+            flotilla_charter::charter_store::retire_unused_caches(&entry.path(), vcs).await?;
+            // Fails harmlessly while a cache remains.
+            let _ = tokio::fs::remove_dir(entry.path()).await;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl CharterReader for BoundCharterReader<'_> {
     async fn read(&self, source: &CharterSource) -> Result<CharterSnapshot, String> {
