@@ -1,0 +1,11 @@
+{
+  "description": "Encoding json gives hex.",
+  "groups": [
+    {"name": "encode", "description": "Key sorting and floats kept as floats.", "vectors": [
+      {"name": "keys sorted bytewise", "json": {"b": 1, "a": 2}, "hex": "a2616102616201"},
+      {"name": "keys sorted length first", "json": {"aa": 1, "z": 2}, "hex": "a2617a0262616101"},
+      {"name": "nested keys sorted", "json": [{"y": {"d": 1, "c": 2}, "x": 0}], "hex": "81a26178006179a2616302616401"},
+      {"name": "whole-number floats stay floats in a map", "json": {"b": 2.0, "a": -0.0}, "hex": "a26161f980006162f94000"}
+    ]}
+  ]
+}
