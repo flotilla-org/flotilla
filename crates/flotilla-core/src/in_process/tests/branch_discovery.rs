@@ -60,7 +60,11 @@ async fn branch_discovery_ignores_preexisting_terminal_request() {
             .expect("convoy");
         fixture.daemon.discover_convoy_branch_subjects("flotilla", "new-work", "reused").await.expect("discovery");
         let convoy = convoys.get("new-work").await.expect("convoy");
-        assert!(convoy.status.unwrap_or_default().subjects.is_empty(), "old terminal PR must not become produced work");
+        let status = convoy.status.unwrap_or_default();
+        assert!(status.subjects.is_empty(), "old terminal PR must not become produced work");
+        // #3206: a convoy scanned before admission wrote its status still
+        // records the scan, so landing need not wait for the next interval.
+        assert!(status.branch_subject_scan_at.is_some(), "the scan is recorded");
     }
 }
 

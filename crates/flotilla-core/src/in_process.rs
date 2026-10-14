@@ -3633,11 +3633,13 @@ impl InProcessDaemon {
             .await
             .map_err(|error| error.to_string())?;
         }
+        // A convoy whose status admission has not written yet still records
+        // its scan; otherwise the next scan waits a whole refresh interval.
         if errors.is_empty()
             && convoy
                 .status
                 .as_ref()
-                .is_some_and(|status| status.branch_subject_scan_at.is_none() || status.branch_subject_scan_error.is_some())
+                .is_none_or(|status| status.branch_subject_scan_at.is_none() || status.branch_subject_scan_error.is_some())
         {
             apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::RecordBranchSubjectScan { at: self.clock.now() })
                 .await
