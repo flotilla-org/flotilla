@@ -18,18 +18,19 @@ use std::{
 
 use serde::Serialize;
 
-/// Four sub-buckets per power of two keep every quantile within 25% of the
-/// recorded value, over the whole `u64` range of microseconds.
-const SUB_BUCKETS: u32 = 4;
-const BUCKETS: usize = (SUB_BUCKETS + (64 - 2) * SUB_BUCKETS) as usize;
+/// Sixteen sub-buckets per power of two keep every quantile within 1/16
+/// (6.25%) of the recorded value, over the whole `u64` range of microseconds.
+const SUB_BITS: u32 = 4;
+const SUB_BUCKETS: u32 = 1 << SUB_BITS;
+const BUCKETS: usize = (SUB_BUCKETS + (64 - SUB_BITS) * SUB_BUCKETS) as usize;
 
 fn bucket(micros: u64) -> usize {
     if micros < u64::from(SUB_BUCKETS) {
         return micros as usize;
     }
     let exponent = 63 - micros.leading_zeros();
-    let sub = (micros >> (exponent - 2)) & u64::from(SUB_BUCKETS - 1);
-    (SUB_BUCKETS + (exponent - 2) * SUB_BUCKETS) as usize + sub as usize
+    let sub = (micros >> (exponent - SUB_BITS)) & u64::from(SUB_BUCKETS - 1);
+    (SUB_BUCKETS + (exponent - SUB_BITS) * SUB_BUCKETS) as usize + sub as usize
 }
 
 /// The largest value a bucket holds: quantiles report this conservative bound.
@@ -37,9 +38,9 @@ fn bucket_upper(index: usize) -> u64 {
     if index < SUB_BUCKETS as usize {
         return index as u64;
     }
-    let exponent = (index as u32 - SUB_BUCKETS) / SUB_BUCKETS + 2;
+    let exponent = (index as u32 - SUB_BUCKETS) / SUB_BUCKETS + SUB_BITS;
     let sub = (index as u64 - u64::from(SUB_BUCKETS)) % u64::from(SUB_BUCKETS);
-    ((u64::from(SUB_BUCKETS) + sub + 1) << (exponent - 2)).saturating_sub(1)
+    ((u64::from(SUB_BUCKETS) + sub + 1) << (exponent - SUB_BITS)).saturating_sub(1)
 }
 
 /// A latency distribution recorded in microseconds.
@@ -360,18 +361,18 @@ mod tests {
     use super::*;
 
     // Behaviour: every value lands in a bucket whose bound is at least the
-    // value and within 25% of it, and buckets are ordered. The generator spans
+    // value and within 1/16 of it, and buckets are ordered. The generator spans
     // zero, the exact sub-bucket boundaries and the whole u64 range.
     #[hegel::test]
-    fn buckets_bound_their_values_within_a_quarter(tc: hegel::TestCase) {
+    fn buckets_bound_their_values_within_a_sixteenth(tc: hegel::TestCase) {
         let exponent = tc.draw(gs::integers::<u32>().min_value(0).max_value(63));
         let offset = tc.draw(gs::integers::<u64>().min_value(0).max_value(u64::MAX));
-        let value = if exponent == 0 { offset % 4 } else { (1u64 << exponent) | (offset >> (64 - exponent)) };
+        let value = if exponent == 0 { offset % u64::from(SUB_BUCKETS) } else { (1u64 << exponent) | (offset >> (64 - exponent)) };
         let index = bucket(value);
         let upper = bucket_upper(index);
         assert!(index < BUCKETS);
         assert!(upper >= value, "bucket {index} bound {upper} below {value}");
-        assert!(upper - value <= value / 4 + 1, "bucket {index} bound {upper} too far above {value}");
+        assert!(upper - value <= value / 16 + 1, "bucket {index} bound {upper} too far above {value}");
         if index > 0 {
             assert!(bucket_upper(index - 1) < value, "{value} belongs in an earlier bucket than {index}");
         }
