@@ -11,7 +11,8 @@ import sys; sys.path.insert(0, ".")
 import check, cases
 spec = [s for s in cases.SPECS if s["name"] == "inbox"][0]
 case = dict(name="deep", over=dict(NM=2, NS=2, HOST_MAY_DIE=True, ALLOW_FAIL=True, ALLOW_END=True), props={p: "hold" for p in spec["invariants"]})
-check.compile_case(spec, case, 8870)
+check.compile_case(spec, case)
+print(",".join(p for p in spec["invariants"] if not p.startswith("witness") and p != "droppedImpliesNeverTurned"), file=open("build/inbox_deep.invariants", "w"))
 P
 quint verify build/inbox_deep.qnt --main inbox_deep --max-steps "$STEPS" \
-  --invariant deliverAfterReceipt,deliveredImpliesTurned,deliverOnce,receiverTurned,oneConsumer,noDuplicateTurnPerSession,noDoubleTurnAfterObservedReceipt
+  --invariant "$(cat build/inbox_deep.invariants)"

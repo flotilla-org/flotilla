@@ -24,7 +24,7 @@ from cases import SPECS  # noqa: E402
 
 APALACHE_VERSION = "0.62.1"
 JAR = Path(os.environ.get("APALACHE_JAR", Path.home() / ".quint" / f"apalache-dist-{APALACHE_VERSION}" / "apalache" / "lib" / "apalache.jar"))
-TLC_WORKERS = os.environ.get("TLC_WORKERS", "4")
+TLC_WORKERS = os.environ.get("TLC_WORKERS", str(max(1, min(4, (os.cpu_count() or 2) // 2))))
 # Heap budget shared by concurrent TLC runs (the crew container has an 8 GiB limit). A case may ask for
 # more heap with `heap=<MiB>`; a run waits until its heap fits in the budget.
 MEM_BUDGET_MB = int(os.environ.get("MEM_BUDGET_MB", "7000"))
@@ -44,7 +44,15 @@ def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
-def compile_case(spec, case, port):
+def free_port():
+    import socket
+    with socket.socket() as sk:
+        sk.bind(("localhost", 0))
+        return sk.getsockname()[1]
+
+
+def compile_case(spec, case, port=None):
+    port = port or free_port()
     mod, src = instance_source(spec, case)
     BUILD.mkdir(exist_ok=True)
     qnt = BUILD / f"{mod}.qnt"
@@ -62,7 +70,7 @@ def compile_case(spec, case, port):
     i = out.find("---- MODULE") if "---- MODULE" in out else out.find("-- MODULE")
     if r.returncode != 0 or i < 0:
         raise RuntimeError(f"compile failed for {mod}:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
-    (BUILD / f"{mod}.tla").write_text(out[out.rfind("\n", 0, i) + 1 if False else i:])
+    (BUILD / f"{mod}.tla").write_text(out[i:])
     return mod
 
 
@@ -97,7 +105,7 @@ def _tlc_property(spec, mod, prop, heap_mb):
     states = int(m[-1][1]) if m else None
     if "Model checking completed. No error has been found" in out:
         verdict = "hold"
-    elif re.search(r"(is|was|were) violated", out):
+    elif re.search(r"^Error: (Invariant \S+ is violated|Temporal propert\w+ \S+ (was|were) violated)", out, re.M):
         verdict = "violated"
     else:
         verdict = "error"
@@ -147,10 +155,15 @@ def main():
     jobs = []
     compiled = {}
     with cf.ThreadPoolExecutor(max_workers=3) as cx:  # each compile runs an Apalache server (JVM)
-        futs = {cx.submit(compile_case, s, c, 8830 + i): (s, c) for i, (s, c) in enumerate(todo)}
+        futs = {cx.submit(compile_case, s, c): (s, c) for s, c in todo}
         for f in cf.as_completed(futs):
             s, c = futs[f]
-            compiled[(s["name"], c["name"])] = f.result()
+            try:
+                compiled[(s["name"], c["name"])] = f.result()
+            except Exception as e:  # report every failing case, not only the first
+                print(f'COMPILE FAILED {s["name"]}:{c["name"]}\n{e}', file=sys.stderr)
+    failed = [(s, c) for s, c in todo if (s["name"], c["name"]) not in compiled]
+    todo = [(s, c) for s, c in todo if (s["name"], c["name"]) in compiled]
     with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
         results = {}
         futs = {}
@@ -183,7 +196,8 @@ def main():
             rows.append({"spec": s["name"], "case": c["name"], "prop": p, "want": want, "got": r["verdict"], "states": r["states"], "secs": r["secs"]})
     if a.json:
         Path(a.json).write_text(json.dumps(rows, indent=1))
-    print(f"\n{len(rows)} checks, {bad} deviating from expectation")
+    bad += len(failed)
+    print(f"\n{len(rows)} checks, {bad} deviating from expectation" + (f" ({len(failed)} cases did not compile)" if failed else ""))
     return 1 if bad else 0
 
 

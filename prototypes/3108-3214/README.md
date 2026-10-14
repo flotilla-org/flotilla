@@ -41,6 +41,8 @@ python3 check.py inbox:base                # one case
 python3 check.py inbox --props pendingLeaves,everyMessageEnds   # re-run chosen properties
 python3 check.py --json results/results.json > results/run.txt  # everything: about one hour, 7 GiB of JVM heap
 python3 tie/results_table.py results/results.json               # Markdown tables
+# results/ and tie/pr3216-edges.jsonl are snapshots: regenerate them after any spec or case change.
+# pr3216-edges.jsonl dumps the unmerged PR #3216 (13cc297d4); tie/dump_edges.rs only builds inside that crate.
 quint test machines.qnt --main machines                         # the edge tables are well formed
 python3 tie/compare_tables.py tie/pr3216-edges.jsonl            # tables vs the Rust engine of PR #3216
 ./deep_check.sh 8                                               # Apalache, 2 messages x 2 sessions, to a step bound

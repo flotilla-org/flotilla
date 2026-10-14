@@ -1,3 +1,5 @@
+// Not buildable in this repository: it is an `examples/` program for the PR #3216 crate
+// (`state_machine_prototype`, prototypes/3108-3209). Copy it there to regenerate pr3216-edges.jsonl.
 //! Prints every machine's edge table as JSON lines: {"machine", "initial", "ends", "edges": [[from, edge, to], ...]}.
 use state_machine_prototype::kinds::lifecycle::{CloneMachine, ImageBuildMachine};
 use state_machine_prototype::kinds::message::Message;

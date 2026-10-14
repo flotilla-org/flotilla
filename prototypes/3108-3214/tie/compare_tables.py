@@ -22,6 +22,8 @@ def quint_table(name):
     edges = set(re.findall(r'\("([^"]*)",\s*"([^"]*)",\s*"([^"]*)"\)', out.split("ends:")[0]))
     ends = set(re.findall(r'"([^"]*)"', re.search(r"ends:\s*Set\((.*?)\)", out, re.S).group(1)))
     initial = re.search(r'initial:\s*"([^"]*)"', out).group(1)
+    if not edges or not ends:  # a changed `quint repl` output format must not pass as "no edges"
+        sys.exit(f"could not parse the table for {name!r} from quint repl output:\n{out}")
     return {"initial": initial, "ends": ends, "edges": edges}
 
 
