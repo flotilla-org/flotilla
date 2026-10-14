@@ -4555,12 +4555,13 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
     }
 
     // #3244: recovery returns only requested stale queries, leaves current
-    // cursors alone, and refuses queries outside this connection's interest.
+    // cursors alone, replays full sets for ahead cursors, and refuses unowned queries.
     let mut recovered_seq = None;
     for (id, query, since) in [
         (3, QueryId::Convoys { scope: None }, None),
         (4, QueryId::Convoys { scope: None }, Some(0)),
-        (5, QueryId::Independents { scope: None }, None),
+        (5, QueryId::Convoys { scope: None }, Some(u64::MAX)),
+        (6, QueryId::Independents { scope: None }, None),
     ] {
         let since = if id == 4 { recovered_seq } else { since };
         client_session
@@ -4568,14 +4569,17 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
             .await
             .expect("recover request");
         let reply = read_session_message(&client_session).await;
-        if id == 5 {
+        if id == 6 {
             assert!(matches!(&reply, Message::Response { response, .. } if matches!(**response, ResponseResult::Err { .. })), "{reply:?}");
         } else {
             let Response::RecoverQueries(events) = ok_response(reply, id) else { panic!("recovery response") };
-            if id == 3 {
+            if id == 3 || id == 5 {
                 assert_eq!(events.len(), 1);
                 let DaemonEvent::ResultSet(set) = &events[0] else { panic!("full recovery set") };
                 assert_eq!(set.query(), QueryId::Convoys { scope: None });
+                if id == 5 {
+                    assert_eq!(Some(set.seq), recovered_seq, "ahead cursor must replay the current full set");
+                }
                 recovered_seq = Some(set.seq);
             } else {
                 assert!(events.is_empty(), "current cursor needs no replay");
