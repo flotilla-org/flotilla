@@ -66,7 +66,9 @@ in place for #3173.
 The proof exists only between an object's BEFORE and AFTER phases, and rolls back
 with failed writes. No production projection trigger recursively mutates either
 object table. If recursive object writes are introduced, or the projected-field
-set stops being closed, revisit this proof protocol. Direct administrative edits
+set stops being closed, revisit this proof protocol. Also revisit it if the
+additional singleton-page WAL traffic or write latency becomes a constraint at
+the target or ceiling; the measurements below do not establish those budgets. Direct administrative edits
 to projection tables/markers or disabling persistent triggers are outside the
 writer-detection contract. Concurrent mixed-schema native connections invalidate
 one another's markers conservatively; mixed-version serving is not supported.
@@ -74,7 +76,10 @@ one another's markers conservatively; mixed-version serving is not supported.
 ## Validation
 
 Host-side tests use real SQLite connections, including two connections sharing an
-in-memory database for generated writer/commit/rollback interleavings. A file-backed
+in-memory database for generated writer/commit/rollback interleavings. These
+shared-cache scenarios stay sequential: table-level shared-cache locking can
+produce SQLITE_LOCKED under contention. Concurrent scenarios should use separate
+connections to a file-backed WAL database instead. A file-backed
 observer's `PRAGMA data_version` proves sync and async reopens commit no persistent
 writes. Failure injection proves metadata and field repairs roll back together,
 while the pre-existing unconfigured-writer test verifies repaired field queries
@@ -145,7 +150,8 @@ were measured with the same new measurement fixture:
 | Round 3 | 2.1248 ms | 1.2397 ms |
 | Median | 1.5003 ms | 1.2920 ms |
 
-Observed median delta: **−0.2083 ms (−13.9%)**. This comparison explicitly covers
+No measurable regression was observed in these samples. The observed median
+delta was **−0.2083 ms (−13.9%)**. This comparison explicitly covers
 the local write path, rather than extrapolating replica timings. The spread,
 especially the third original round, reflects host/I/O variability; it is not
 evidence of an attributable speedup. The singleton proof mechanism still adds

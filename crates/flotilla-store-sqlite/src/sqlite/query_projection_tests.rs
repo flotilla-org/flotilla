@@ -45,6 +45,8 @@ fn writer_interleavings_preserve_projection_validity(tc: hegel::TestCase) {
     // Both object tables, all mutation kinds, both connection types and commit /
     // rollback, with empty sequences and repeated/no-op deletions included.
     let steps = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
+    // Keep shared-cache writes sequential: contention can yield SQLITE_LOCKED.
+    // Use file-backed WAL connections if this scenario becomes concurrent.
     let uri = format!("file:query-projections-{}?mode=memory&cache=shared", uuid::Uuid::new_v4());
     let mut native = RusqliteConnection::open(&uri).expect("shared in-memory native connection");
     SqliteBackend::initialize_connection(&mut native, EventRetention::default()).expect("initialize");
@@ -210,6 +212,8 @@ fn failed_native_statement_preserves_marker_and_projections() {
 // data. An old no-op dirty trigger must not survive the schema repair.
 #[test]
 fn projection_schema_change_upgrades_persistent_invalidation_triggers() {
+    // Shared-cache connections are used sequentially; a concurrent version
+    // needs file-backed WAL connections to avoid table-lock contention.
     let uri = format!("file:query-trigger-upgrade-{}?mode=memory&cache=shared", uuid::Uuid::new_v4());
     let mut native = RusqliteConnection::open(&uri).expect("native connection");
     SqliteBackend::initialize_connection(&mut native, EventRetention::default()).expect("initialize");
