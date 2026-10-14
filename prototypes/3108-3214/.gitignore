@@ -1,0 +1,6 @@
+build/
+_apalache-out/
+__pycache__/
+tmp/
+results/
+tie/pr3216-edges.jsonl
