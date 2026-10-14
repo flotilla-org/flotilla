@@ -68,6 +68,7 @@ impl<M: Machine> Resource<M> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
+    Admission(GateFailure),
     NoSuchResource(ObjRef),
     AlreadyExists(ObjRef),
     /// The resource is at an end; nothing leaves it. `reason` is the end's declared reason.
@@ -95,6 +96,7 @@ pub enum Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Refusal::Admission(why) => write!(f, "admission refused: {}", why.0),
             Refusal::NoSuchResource(r) => write!(f, "no such resource {r}"),
             Refusal::AlreadyExists(r) => write!(f, "{r} already exists"),
             Refusal::End { state, attempted, reason } => write!(f, "refused {attempted}: resource is {state}, an end state ({reason})"),
@@ -126,6 +128,7 @@ impl<M: Machine> Home<M> {
     }
 
     pub fn create(&mut self, name: &str, spec: M::Spec) -> Result<ObjRef, Refusal> {
+        M::admit(&spec).map_err(Refusal::Admission)?;
         let id = ObjRef::new(M::NAME, name);
         if self.resources.contains_key(&id) {
             return Err(Refusal::AlreadyExists(id));
@@ -164,7 +167,7 @@ impl<M: Machine> Home<M> {
         let to = match def.target.as_ref().expect("validated: every edge has a target") {
             Target::To(s) => *s,
             Target::Chosen { may_reach, pick } => {
-                let picked = pick(&res.spec, &edge);
+                let picked = pick(res, &edge);
                 if !may_reach.contains(&picked) {
                     return Err(Refusal::BadTarget { edge: def.name, picked: picked.name() });
                 }

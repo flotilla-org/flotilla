@@ -55,6 +55,9 @@ pub trait Machine: Clone + Debug + Sized + 'static {
     type Edge: Clone + Debug + Named;
 
     fn initial() -> Self::State;
+    fn admit(_: &Self::Spec) -> Result<(), GateFailure> {
+        Ok(())
+    }
     fn definition() -> MachineDef<Self>;
     /// Policy for the resource's attempts, if it has any.
     fn attempt_policy() -> Option<AttemptPolicy> {
@@ -68,7 +71,7 @@ pub enum Target<M: Machine> {
     /// is declared so the diagram and the validator can see every outcome.
     Chosen {
         may_reach: Vec<M::State>,
-        pick: fn(&M::Spec, &M::Edge) -> M::State,
+        pick: fn(&Resource<M>, &M::Edge) -> M::State,
     },
 }
 
@@ -94,7 +97,7 @@ impl<M: Machine> EdgeDef<M> {
         self
     }
 
-    pub fn to_chosen(mut self, may_reach: Vec<M::State>, pick: fn(&M::Spec, &M::Edge) -> M::State) -> Self {
+    pub fn to_chosen(mut self, may_reach: Vec<M::State>, pick: fn(&Resource<M>, &M::Edge) -> M::State) -> Self {
         self.target = Some(Target::Chosen { may_reach, pick });
         self
     }

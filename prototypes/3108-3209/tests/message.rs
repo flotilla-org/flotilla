@@ -13,6 +13,7 @@ fn spec(expectation: Expectation) -> MessageSpec {
         body: "ready for review".into(),
         expectation,
         deadline: None,
+        unbound_after: std::time::Duration::from_secs(600),
     }
 }
 
@@ -70,7 +71,7 @@ fn settle_requires_the_matching_observation() {
     let (mut home, id, mut view) = setup(Expectation::Reply);
     let reply = ObjRef::new("message", "r1");
     let settle = MessageEdge::Settle { by: Settlement::Answered { reply: reply.clone() } };
-    assert!(matches!(home.apply(&id, settle.clone(), &view), Err(Refusal::WrongState { state: "Pending", .. })));
+    assert!(why(home.apply(&id, settle.clone(), &view)).contains("requires Awaiting"));
     see_receipt(&mut view, Transport::Turn);
     home.apply(&id, deliver(Transport::Turn), &view).unwrap();
     assert!(why(home.apply(&id, settle.clone(), &view)).contains("no reply"));
@@ -120,14 +121,16 @@ fn drop_expired_needs_a_deadline_that_has_passed_and_an_unmet_expectation() {
 }
 
 #[test]
-fn drop_undeliverable_only_from_pending_and_only_when_attempts_are_exhausted() {
-    let (mut home, id, view) = setup(Expectation::Reply);
+fn drop_undeliverable_requires_a_published_failure_not_just_failed_attempts() {
+    let (mut home, id, mut view) = setup(Expectation::Reply);
     let cause = Cause::new(CauseCategory::Transient, "session unreachable");
     let drop = MessageEdge::Drop { reason: DropReason::Undeliverable { cause: cause.clone() } };
-    assert!(why(home.apply(&id, drop.clone(), &view)).contains("not exhausted"));
+    assert!(why(home.apply(&id, drop.clone(), &view)).contains("no matching delivery-failure"));
     for _ in 0..5 {
         home.record_attempt(&id, "deliver", "S", Outcome::Failure { cause: cause.clone(), retryable: true }, &view).unwrap();
     }
+    assert!(home.apply(&id, drop.clone(), &view).is_err(), "attempts alone do not confirm a consumer failure");
+    view.observe(&ObjRef::new("delivery-failure", id.to_string()), "consumer", Fact::DeliveryFailure { cause: cause.clone() });
     home.apply(&id, drop.clone(), &view).unwrap();
 
     // From Awaiting the same reason is refused by its gate, though `drop` itself is allowed there.
@@ -205,11 +208,12 @@ fn muting_changes_the_transport_not_the_outcome() {
 #[test]
 fn undeliverable_sends_a_dead_letter_to_the_supervisor_unless_the_sender_is_the_supervisor() {
     let cause = Cause::new(CauseCategory::Transient, "unreachable");
-    let (mut home, id, view) = setup(Expectation::Nothing);
+    let (mut home, id, mut view) = setup(Expectation::Nothing);
     for _ in 0..5 {
         home.record_attempt(&id, "deliver", "S", Outcome::Failure { cause: cause.clone(), retryable: true }, &view).unwrap();
     }
     assert_eq!(dead_letter(home.get(&id).unwrap(), "gov"), None, "not dropped yet");
+    view.observe(&ObjRef::new("delivery-failure", id.to_string()), "consumer", Fact::DeliveryFailure { cause: cause.clone() });
     home.apply(&id, MessageEdge::Drop { reason: DropReason::Undeliverable { cause } }, &view).unwrap();
     let r = home.get(&id).unwrap();
     let dl = dead_letter(r, "gov").expect("dead letter");

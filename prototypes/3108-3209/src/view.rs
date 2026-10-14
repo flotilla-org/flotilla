@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::attempt::Attempt;
+use crate::attempt::{Attempt, Cause};
 use crate::base::{ObjRef, Time};
 use crate::record::RecordLog;
 
@@ -21,10 +21,41 @@ pub enum Transport {
     Muted,
 }
 
-/// What an observer reported. Observations are records of the observed thing,
-/// written by the observer's host and replicated to the home.
+/// Typed local inputs. Replica rows and versioned query projections share this
+/// prototype port; aggregate variants are not proposed stored resource shapes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fact {
+    DeliveryFailure {
+        cause: Cause,
+    },
+    Consumer {
+        host: String,
+    },
+    UnboundSince(Time),
+    AppliedThrough(Time),
+    Receipts {
+        sessions: Vec<String>,
+    },
+    ReplyObserved(bool),
+    FulfillerRecorded {
+        fulfiller: ObjRef,
+    },
+    Fulfiller {
+        realised: bool,
+        can_receive: bool,
+        gone: bool,
+    },
+    ChannelPresent(bool),
+    ConversationEnded {
+        reason: String,
+    },
+    Promise {
+        kept: bool,
+        accepted_retraction: bool,
+    },
+    Authorised {
+        party: String,
+    },
     Present {
         identity: String,
     },
@@ -60,8 +91,8 @@ pub trait HomeView {
     fn link_age(&self, host: &str) -> Option<Duration>;
 }
 
-/// A reference and the version of it a gate read. `version == 0` means the gate
-/// looked and found nothing, which is also something the gate relied on.
+/// A reference and version a gate read. Observation version zero records absence.
+/// Synthetic clock/attempt inputs use their timestamp/length, including zero.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputRead {
     pub subject: ObjRef,
@@ -79,7 +110,9 @@ impl<'a> Gate<'a> {
     }
 
     pub fn now(&self) -> Time {
-        self.view.now()
+        let now = self.view.now();
+        self.reads.borrow_mut().push(InputRead { subject: ObjRef::new("clock", "home"), version: now.0 });
+        now
     }
 
     pub fn observe(&self, subject: &ObjRef) -> Option<Observation> {
