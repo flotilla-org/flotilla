@@ -2,7 +2,7 @@
 
 **Status:** Accepted, not yet implemented (owner grilling, 2026-10-13 and 2026-10-14). The #3108 PR stacks implement it. Until the cut-over roll, the running system follows the ADRs this one amends.
 **Date:** 2026-10-14
-**Amended:** 2026-10-14, with the owner's rulings on #3199 in comments [6166478785](https://github.com/flotilla-org/flotilla/issues/3199#issuecomment-6166478785) (rulings 1–7), [6166860880](https://github.com/flotilla-org/flotilla/issues/3199#issuecomment-6166860880) (rulings 8–10) and [6177162679](https://github.com/flotilla-org/flotilla/issues/3199#issuecomment-6177162679) (rulings 11, 13 and 14; item 12 is a leaning, recorded under the addresses).
+**Amended:** 2026-10-14, with the owner's rulings on #3199 in comments [6166478785](https://github.com/flotilla-org/flotilla/issues/3199#issuecomment-6166478785) (rulings 1–7), [6166860880](https://github.com/flotilla-org/flotilla/issues/3199#issuecomment-6166860880) (rulings 8–10), [6177162679](https://github.com/flotilla-org/flotilla/issues/3199#issuecomment-6177162679) (rulings 11, 13 and 14; item 12 is a leaning, recorded under the addresses) and [6177712045](https://github.com/flotilla-org/flotilla/issues/3199#issuecomment-6177712045) (ruling 15).
 **Amends:**
 - [ADR 0024](0024-declared-state-machines-and-field-ownership.md): machines are declared and gated; per-field ownership is retired.
 - [ADR 0047](0047-stored-data-stays-decodable-across-one-generation.md): after the cut-over, "decodable for one generation" means opening the previous generation's database.
@@ -163,7 +163,11 @@ How Checkouts and lends behave:
 **Liveness.** Liveness is judged from the observer host's link. Observations are written only when they change. Heartbeat-only writes go away.
 
 **Views.**
-- **Resident state.** State is loaded at startup into typed resident structures and kept current from writes and the stream. Delivery to surfaces never reads the store, and SQL serves only history and archive.
+- **Resident state is a filtered replica.** State is loaded into typed resident structures and kept current from writes and the stream. Resident state is not a ban on database reads (owner, 2026-10-14):
+  - every query has a working, correct in-memory implementation;
+  - almost all live queries are served from it, and each access method's default is examined deliberately;
+  - queries that need the database go to it, and are sane too, with pushdown and indexes.
+- **A memory budget bounds it.** Every resident structure has a size model, and eviction keeps the resident set within the budget. The time period the resident set covers is then a reported fact, not a fixed seven days. Target environments include memory-constrained hosts, such as a Durable Object, with a much larger database. Later, the size model can drive sharding decisions.
 - **Incremental judgements.** Judgements are maintained incrementally through a compressed-bitmap reverse index from inputs to rows and one timer queue, with Bloom pre-filters on arriving changes and per view client.
 - **Surface protocol.** The named-query surface protocol stays.
 
