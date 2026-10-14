@@ -75,3 +75,40 @@ impl ForgeDefaultBranchResolver for DummyForgeDefaultBranch {
         Ok((forge.service_url.trim_end_matches('/') == self.service_url).then(|| "main".to_string()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use flotilla_config::{dummy_fleet::DummyFleetConfig, DaemonConfig};
+    use flotilla_discovery::{DiscoveryRuntime, FactoryRegistry};
+
+    use super::install_dummy_fleet;
+
+    /// Every factory's implementation name that is a dummy, by category.
+    fn dummy_implementations(factories: &FactoryRegistry) -> Vec<String> {
+        let mut names = Vec::new();
+        names.extend(factories.vcs.iter().map(|factory| factory.descriptor().implementation));
+        names.extend(factories.change_requests.iter().map(|factory| factory.descriptor().implementation));
+        names.extend(factories.terminal_pools.iter().map(|factory| factory.descriptor().implementation));
+        names.extend(factories.environment_providers.iter().map(|factory| factory.descriptor().implementation));
+        names.retain(|name| name == "dummy");
+        names
+    }
+
+    // Behaviour (#3206): the dummy providers exist only in a daemon whose
+    // `daemon.toml` has a `[dummy_fleet]` section. Without it the default
+    // factories are untouched, so default discovery can never select one.
+    #[test]
+    fn dummy_providers_are_installed_only_with_the_config_section() {
+        let mut discovery = DiscoveryRuntime::for_process();
+        assert!(dummy_implementations(&discovery.factories).is_empty(), "default factories hold no dummies");
+        let adapters = discovery.factories.agent_adapters.len();
+        assert!(install_dummy_fleet(&DaemonConfig::default(), &mut discovery).is_none());
+        assert!(dummy_implementations(&discovery.factories).is_empty(), "no section installs nothing");
+        assert_eq!(discovery.factories.agent_adapters.len(), adapters);
+
+        let config = DaemonConfig { dummy_fleet: Some(DummyFleetConfig::default()), ..DaemonConfig::default() };
+        assert!(install_dummy_fleet(&config, &mut discovery).is_some());
+        assert_eq!(dummy_implementations(&discovery.factories).len(), 4, "VCS, change requests, terminal pool, environment");
+        assert_eq!(discovery.factories.agent_adapters.len(), adapters + 1);
+    }
+}
