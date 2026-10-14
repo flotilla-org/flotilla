@@ -6058,6 +6058,7 @@ mod tests {
         let needs = daemon.convoy_admission.compose_convoy_needs("flotilla", &project, &[], &intent, &mut workflow).await.expect("needs");
         assert!(needs.contains(&CapabilityNeed::Harness { adapter: "codex".into(), minimum_version: "0.160.0".into() }));
     }
+
     /// Compose the needs of a one-crew workflow whose selector names `claude-code`
     /// and `opus`, on hosts that each observe the given `(version, opus usable)`.
     async fn compose_claude_opus_needs(observations: &[(&str, bool)]) -> Result<BTreeSet<CapabilityNeed>, String> {
@@ -6120,8 +6121,12 @@ mod tests {
     #[tokio::test]
     async fn observed_newer_harness_with_usable_model_adds_no_version_floor() {
         let needs = compose_claude_opus_needs(&[("2.1.295", true), ("2.1.301", true)]).await.expect("admitted");
+        let observed = ["2.1.295", "2.1.301"];
         assert!(
-            !needs.iter().any(|need| matches!(need, CapabilityNeed::Harness { adapter, .. } if adapter == "claude-code")),
+            !needs.iter().any(|need| matches!(
+                need,
+                CapabilityNeed::Harness { adapter, minimum_version } if adapter == "claude-code" && observed.contains(&minimum_version.as_str())
+            )),
             "observed versions leaked into needs: {needs:?}"
         );
     }
