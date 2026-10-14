@@ -16,7 +16,8 @@ module machines {
     edges: Set(
       ("Pending", "deliver", "Settled"),   // the message expects nothing
       ("Pending", "deliver", "Awaiting"),  // it expects a reply or an outcome (fixed in the spec)
-      ("Awaiting", "settle", "Settled"),
+      ("Awaiting", "settle", "Settled"),   // answered
+      ("Pending", "settle", "Settled"),    // the expected outcome was observed before delivery (owner, 2026-10-14)
       ("Pending", "drop", "Dropped"),
       ("Awaiting", "drop", "Dropped"))
   }

@@ -1328,8 +1328,8 @@
   "prop": "oneWinner",
   "want": "hold",
   "got": "hold",
-  "states": 972288,
-  "secs": 8.2
+  "states": 3061040,
+  "secs": 38.9
  },
  {
   "spec": "race",
@@ -1337,8 +1337,8 @@
   "prop": "arrivedAreResolved",
   "want": "hold",
   "got": "hold",
-  "states": 972288,
-  "secs": 9.0
+  "states": 3061040,
+  "secs": 38.5
  },
  {
   "spec": "race",
@@ -1346,8 +1346,8 @@
   "prop": "outcomesTruthful",
   "want": "hold",
   "got": "hold",
-  "states": 972288,
-  "secs": 10.1
+  "states": 3061040,
+  "secs": 37.9
  },
  {
   "spec": "race",
@@ -1355,8 +1355,8 @@
   "prop": "dropReasonSound",
   "want": "hold",
   "got": "hold",
-  "states": 972288,
-  "secs": 10.1
+  "states": 3061040,
+  "secs": 37.0
  },
  {
   "spec": "race",
@@ -1364,8 +1364,17 @@
   "prop": "settledHasEvidence",
   "want": "hold",
   "got": "hold",
-  "states": 972288,
-  "secs": 8.4
+  "states": 3061040,
+  "secs": 37.9
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "noDeliverOnPendingSettled",
+  "want": "hold",
+  "got": "hold",
+  "states": 3061040,
+  "secs": 38.4
  },
  {
   "spec": "race",
@@ -1373,8 +1382,8 @@
   "prop": "endsAreFinal",
   "want": "hold",
   "got": "hold",
-  "states": 972288,
-  "secs": 75.6
+  "states": 3061040,
+  "secs": 338.2
  },
  {
   "spec": "race",
@@ -1382,8 +1391,8 @@
   "prop": "whyIsFinal",
   "want": "hold",
   "got": "hold",
-  "states": 972288,
-  "secs": 67.6
+  "states": 3061040,
+  "secs": 305.1
  },
  {
   "spec": "race",
@@ -1391,8 +1400,8 @@
   "prop": "everyMessageEnds",
   "want": "hold",
   "got": "hold",
-  "states": 972288,
-  "secs": 36.2
+  "states": 3061040,
+  "secs": 152.3
  },
  {
   "spec": "race",
@@ -1400,8 +1409,8 @@
   "prop": "endsDespitePartition",
   "want": "hold",
   "got": "hold",
-  "states": 972288,
-  "secs": 36.7
+  "states": 3061040,
+  "secs": 153.3
  },
  {
   "spec": "race",
@@ -1409,8 +1418,8 @@
   "prop": "noInTimeReplyLost",
   "want": "violated",
   "got": "violated",
-  "states": 6057,
-  "secs": 0.6
+  "states": 13425,
+  "secs": 0.8
  },
  {
   "spec": "race",
@@ -1418,8 +1427,8 @@
   "prop": "witnessSettled",
   "want": "violated",
   "got": "violated",
-  "states": 5751,
-  "secs": 0.7
+  "states": 315,
+  "secs": 0.5
  },
  {
   "spec": "race",
@@ -1427,7 +1436,7 @@
   "prop": "witnessExpired",
   "want": "violated",
   "got": "violated",
-  "states": 553,
+  "states": 1071,
   "secs": 0.5
  },
  {
@@ -1436,7 +1445,7 @@
   "prop": "witnessSuperseded",
   "want": "violated",
   "got": "violated",
-  "states": 210,
+  "states": 329,
   "secs": 0.5
  },
  {
@@ -1445,8 +1454,8 @@
   "prop": "witnessUndeliverable",
   "want": "violated",
   "got": "violated",
-  "states": 212,
-  "secs": 0.5
+  "states": 300,
+  "secs": 0.4
  },
  {
   "spec": "race",
@@ -1454,8 +1463,8 @@
   "prop": "witnessLateSupersedeRefused",
   "want": "violated",
   "got": "violated",
-  "states": 685,
-  "secs": 0.5
+  "states": 1218,
+  "secs": 0.6
  },
  {
   "spec": "race",
@@ -1463,8 +1472,8 @@
   "prop": "witnessLateExpireRefused",
   "want": "violated",
   "got": "violated",
-  "states": 800,
-  "secs": 0.6
+  "states": 1228,
+  "secs": 0.5
  },
  {
   "spec": "race",
@@ -1472,7 +1481,7 @@
   "prop": "witnessLateSettleRefused",
   "want": "violated",
   "got": "violated",
-  "states": 727,
+  "states": 1232,
   "secs": 0.5
  },
  {
@@ -1481,7 +1490,52 @@
   "prop": "witnessLateDeliverRefused",
   "want": "violated",
   "got": "violated",
-  "states": 791,
+  "states": 1170,
+  "secs": 0.5
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessSettledWhilePending",
+  "want": "violated",
+  "got": "violated",
+  "states": 307,
+  "secs": 0.4
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessSettledFromAwaiting",
+  "want": "violated",
+  "got": "violated",
+  "states": 14291,
+  "secs": 0.7
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessLateOutcomeRefused",
+  "want": "violated",
+  "got": "violated",
+  "states": 1112,
+  "secs": 0.5
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessLateReceiptRefused",
+  "want": "violated",
+  "got": "violated",
+  "states": 17020,
+  "secs": 0.7
+ },
+ {
+  "spec": "race",
+  "case": "base",
+  "prop": "witnessTurnBeforeSettle",
+  "want": "violated",
+  "got": "violated",
+  "states": 1180,
   "secs": 0.5
  },
  {
@@ -1490,8 +1544,8 @@
   "prop": "oneWinner",
   "want": "hold",
   "got": "hold",
-  "states": 849168,
-  "secs": 8.1
+  "states": 2871824,
+  "secs": 31.8
  },
  {
   "spec": "race",
@@ -1499,8 +1553,8 @@
   "prop": "arrivedAreResolved",
   "want": "hold",
   "got": "hold",
-  "states": 849168,
-  "secs": 8.1
+  "states": 2871824,
+  "secs": 32.7
  },
  {
   "spec": "race",
@@ -1508,8 +1562,8 @@
   "prop": "outcomesTruthful",
   "want": "hold",
   "got": "hold",
-  "states": 849168,
-  "secs": 8.8
+  "states": 2871824,
+  "secs": 34.3
  },
  {
   "spec": "race",
@@ -1517,8 +1571,8 @@
   "prop": "dropReasonSound",
   "want": "hold",
   "got": "hold",
-  "states": 849168,
-  "secs": 8.6
+  "states": 2871824,
+  "secs": 34.0
  },
  {
   "spec": "race",
@@ -1526,8 +1580,17 @@
   "prop": "settledHasEvidence",
   "want": "hold",
   "got": "hold",
-  "states": 849168,
-  "secs": 8.6
+  "states": 2871824,
+  "secs": 34.6
+ },
+ {
+  "spec": "race",
+  "case": "watermark",
+  "prop": "noDeliverOnPendingSettled",
+  "want": "hold",
+  "got": "hold",
+  "states": 2871824,
+  "secs": 31.5
  },
  {
   "spec": "race",
@@ -1535,8 +1598,8 @@
   "prop": "endsAreFinal",
   "want": "hold",
   "got": "hold",
-  "states": 849168,
-  "secs": 65.3
+  "states": 2871824,
+  "secs": 310.0
  },
  {
   "spec": "race",
@@ -1544,8 +1607,8 @@
   "prop": "whyIsFinal",
   "want": "hold",
   "got": "hold",
-  "states": 849168,
-  "secs": 58.9
+  "states": 2871824,
+  "secs": 279.6
  },
  {
   "spec": "race",
@@ -1553,8 +1616,8 @@
   "prop": "everyMessageEnds",
   "want": "hold",
   "got": "hold",
-  "states": 849168,
-  "secs": 33.3
+  "states": 2871824,
+  "secs": 151.9
  },
  {
   "spec": "race",
@@ -1562,8 +1625,8 @@
   "prop": "noInTimeReplyLost",
   "want": "hold",
   "got": "hold",
-  "states": 849168,
-  "secs": 7.4
+  "states": 2871824,
+  "secs": 32.1
  },
  {
   "spec": "race",
@@ -1571,8 +1634,8 @@
   "prop": "endsDespitePartition",
   "want": "violated",
   "got": "violated",
-  "states": 849168,
-  "secs": 33.1
+  "states": 1527415,
+  "secs": 63.9
  },
  {
   "spec": "race",
@@ -1580,8 +1643,8 @@
   "prop": "oneWinner",
   "want": "hold",
   "got": "hold",
-  "states": 273640,
-  "secs": 2.8
+  "states": 638480,
+  "secs": 6.7
  },
  {
   "spec": "race",
@@ -1589,8 +1652,8 @@
   "prop": "arrivedAreResolved",
   "want": "hold",
   "got": "hold",
-  "states": 273640,
-  "secs": 2.5
+  "states": 638480,
+  "secs": 7.6
  },
  {
   "spec": "race",
@@ -1598,8 +1661,8 @@
   "prop": "outcomesTruthful",
   "want": "hold",
   "got": "hold",
-  "states": 273640,
-  "secs": 2.7
+  "states": 638480,
+  "secs": 6.8
  },
  {
   "spec": "race",
@@ -1607,8 +1670,8 @@
   "prop": "dropReasonSound",
   "want": "hold",
   "got": "hold",
-  "states": 273640,
-  "secs": 2.6
+  "states": 638480,
+  "secs": 6.8
  },
  {
   "spec": "race",
@@ -1616,8 +1679,17 @@
   "prop": "settledHasEvidence",
   "want": "hold",
   "got": "hold",
-  "states": 273640,
-  "secs": 2.5
+  "states": 638480,
+  "secs": 6.9
+ },
+ {
+  "spec": "race",
+  "case": "expects_nothing",
+  "prop": "noDeliverOnPendingSettled",
+  "want": "hold",
+  "got": "hold",
+  "states": 638480,
+  "secs": 6.5
  },
  {
   "spec": "race",
@@ -1625,8 +1697,8 @@
   "prop": "endsAreFinal",
   "want": "hold",
   "got": "hold",
-  "states": 273640,
-  "secs": 20.7
+  "states": 638480,
+  "secs": 58.2
  },
  {
   "spec": "race",
@@ -1634,8 +1706,8 @@
   "prop": "whyIsFinal",
   "want": "hold",
   "got": "hold",
-  "states": 273640,
-  "secs": 18.9
+  "states": 638480,
+  "secs": 53.5
  },
  {
   "spec": "race",
@@ -1643,8 +1715,8 @@
   "prop": "everyMessageEnds",
   "want": "hold",
   "got": "hold",
-  "states": 273640,
-  "secs": 10.8
+  "states": 638480,
+  "secs": 33.1
  },
  {
   "spec": "race",
@@ -1652,147 +1724,174 @@
   "prop": "endsDespitePartition",
   "want": "hold",
   "got": "hold",
-  "states": 273640,
-  "secs": 10.7
+  "states": 638480,
+  "secs": 32.8
  },
  {
   "spec": "race",
-  "case": "mut_drop_from_any",
-  "prop": "oneWinner",
-  "want": "hold",
-  "got": "hold",
-  "states": 792808,
-  "secs": 9.2
- },
- {
-  "spec": "race",
-  "case": "mut_drop_from_any",
+  "case": "mut_deliver_from_any",
   "prop": "endsAreFinal",
   "want": "violated",
   "got": "violated",
-  "states": 99328,
-  "secs": 3.1
+  "states": 40411,
+  "secs": 1.4
  },
  {
   "spec": "race",
-  "case": "mut_drop_from_any",
-  "prop": "arrivedAreResolved",
-  "want": "hold",
-  "got": "hold",
-  "states": 792808,
-  "secs": 8.8
- },
- {
-  "spec": "race",
-  "case": "mut_silent_refusal",
-  "prop": "arrivedAreResolved",
-  "want": "violated",
-  "got": "violated",
-  "states": 794,
-  "secs": 0.5
- },
- {
-  "spec": "race",
-  "case": "mut_silent_refusal",
+  "case": "mut_deliver_from_any",
   "prop": "oneWinner",
-  "want": "hold",
-  "got": "hold",
-  "states": 972288,
-  "secs": 8.7
- },
- {
-  "spec": "race",
-  "case": "mut_silent_refusal",
-  "prop": "endsAreFinal",
-  "want": "hold",
-  "got": "hold",
-  "states": 972288,
-  "secs": 67.3
- },
- {
-  "spec": "race",
-  "case": "mut_expire_ignores_deadline",
-  "prop": "dropReasonSound",
   "want": "violated",
   "got": "violated",
-  "states": 8,
-  "secs": 0.4
- },
- {
-  "spec": "race",
-  "case": "mut_expire_ignores_deadline",
-  "prop": "oneWinner",
-  "want": "hold",
-  "got": "hold",
-  "states": 1004352,
-  "secs": 9.5
- },
- {
-  "spec": "race",
-  "case": "mut_expire_ignores_deadline",
-  "prop": "endsAreFinal",
-  "want": "hold",
-  "got": "hold",
-  "states": 1004352,
-  "secs": 75.8
- },
- {
-  "spec": "race",
-  "case": "mut_expire_ignores_reply",
-  "prop": "dropReasonSound",
-  "want": "violated",
-  "got": "violated",
-  "states": 16782,
+  "states": 14527,
   "secs": 0.7
  },
  {
   "spec": "race",
-  "case": "mut_expire_ignores_reply",
-  "prop": "oneWinner",
-  "want": "hold",
-  "got": "hold",
-  "states": 1012032,
-  "secs": 8.0
+  "case": "mut_deliver_from_any",
+  "prop": "noDeliverOnPendingSettled",
+  "want": "violated",
+  "got": "violated",
+  "states": 16502,
+  "secs": 0.7
  },
  {
   "spec": "race",
-  "case": "mut_expire_ignores_reply",
+  "case": "mut_observe_from_any",
   "prop": "endsAreFinal",
-  "want": "hold",
-  "got": "hold",
-  "states": 1012032,
-  "secs": 75.7
+  "want": "violated",
+  "got": "violated",
+  "states": 14977,
+  "secs": 0.9
  },
  {
   "spec": "race",
-  "case": "mut_undeliverable_anywhere",
+  "case": "mut_observe_from_any",
+  "prop": "oneWinner",
+  "want": "violated",
+  "got": "violated",
+  "states": 4759,
+  "secs": 0.6
+ },
+ {
+  "spec": "race",
+  "case": "mut_observe_from_any",
+  "prop": "noDeliverOnPendingSettled",
+  "want": "hold",
+  "got": "hold",
+  "states": 3016328,
+  "secs": 38.3
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_outcome",
   "prop": "dropReasonSound",
   "want": "violated",
   "got": "violated",
-  "states": 7539,
+  "states": 3692,
+  "secs": 0.6
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_outcome",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 3184808,
+  "secs": 40.0
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_outcome",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 3184808,
+  "secs": 340.2
+ },
+ {
+  "spec": "race",
+  "case": "mut_observe_unexpected",
+  "prop": "settledHasEvidence",
+  "want": "violated",
+  "got": "violated",
+  "states": 294,
+  "secs": 0.4
+ },
+ {
+  "spec": "race",
+  "case": "mut_observe_unexpected",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 757064,
+  "secs": 8.3
+ },
+ {
+  "spec": "race",
+  "case": "mut_observe_unexpected",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 757064,
+  "secs": 68.1
+ },
+ {
+  "spec": "race",
+  "case": "mut_drop_from_any",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 2426792,
+  "secs": 34.3
+ },
+ {
+  "spec": "race",
+  "case": "mut_drop_from_any",
+  "prop": "endsAreFinal",
+  "want": "violated",
+  "got": "violated",
+  "states": 15323,
+  "secs": 0.8
+ },
+ {
+  "spec": "race",
+  "case": "mut_drop_from_any",
+  "prop": "arrivedAreResolved",
+  "want": "hold",
+  "got": "hold",
+  "states": 2426792,
+  "secs": 32.9
+ },
+ {
+  "spec": "race",
+  "case": "mut_silent_refusal",
+  "prop": "arrivedAreResolved",
+  "want": "violated",
+  "got": "violated",
+  "states": 1128,
   "secs": 0.5
  },
  {
   "spec": "race",
-  "case": "mut_undeliverable_anywhere",
+  "case": "mut_silent_refusal",
   "prop": "oneWinner",
   "want": "hold",
   "got": "hold",
-  "states": 1042056,
-  "secs": 8.6
+  "states": 3061040,
+  "secs": 33.3
  },
  {
   "spec": "race",
-  "case": "mut_undeliverable_anywhere",
+  "case": "mut_silent_refusal",
   "prop": "endsAreFinal",
   "want": "hold",
   "got": "hold",
-  "states": 1042056,
-  "secs": 77.1
+  "states": 3061040,
+  "secs": 310.9
  },
  {
   "spec": "race",
-  "case": "mut_supersede_unchecked",
+  "case": "mut_expire_ignores_deadline",
   "prop": "dropReasonSound",
   "want": "violated",
   "got": "violated",
@@ -1801,12 +1900,93 @@
  },
  {
   "spec": "race",
+  "case": "mut_expire_ignores_deadline",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 3323328,
+  "secs": 37.6
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_deadline",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 3323328,
+  "secs": 369.3
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_reply",
+  "prop": "dropReasonSound",
+  "want": "violated",
+  "got": "violated",
+  "states": 38242,
+  "secs": 0.8
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_reply",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 3112880,
+  "secs": 36.2
+ },
+ {
+  "spec": "race",
+  "case": "mut_expire_ignores_reply",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 3112880,
+  "secs": 332.4
+ },
+ {
+  "spec": "race",
+  "case": "mut_undeliverable_anywhere",
+  "prop": "dropReasonSound",
+  "want": "violated",
+  "got": "violated",
+  "states": 13260,
+  "secs": 0.7
+ },
+ {
+  "spec": "race",
+  "case": "mut_undeliverable_anywhere",
+  "prop": "oneWinner",
+  "want": "hold",
+  "got": "hold",
+  "states": 3280712,
+  "secs": 38.4
+ },
+ {
+  "spec": "race",
+  "case": "mut_undeliverable_anywhere",
+  "prop": "endsAreFinal",
+  "want": "hold",
+  "got": "hold",
+  "states": 3280712,
+  "secs": 342.5
+ },
+ {
+  "spec": "race",
+  "case": "mut_supersede_unchecked",
+  "prop": "dropReasonSound",
+  "want": "violated",
+  "got": "violated",
+  "states": 16,
+  "secs": 0.4
+ },
+ {
+  "spec": "race",
   "case": "mut_supersede_unchecked",
   "prop": "oneWinner",
   "want": "hold",
   "got": "hold",
-  "states": 986688,
-  "secs": 8.2
+  "states": 3152032,
+  "secs": 33.5
  },
  {
   "spec": "race",
@@ -1814,7 +1994,7 @@
   "prop": "endsAreFinal",
   "want": "hold",
   "got": "hold",
-  "states": 986688,
-  "secs": 87.1
+  "states": 3152032,
+  "secs": 332.7
  }
 ]

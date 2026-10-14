@@ -16,7 +16,7 @@ outside the Cargo workspace and no CI gate runs it.
 
 ## Results in one screen
 
-**202 checks, 0 deviating from expectation** (`results/run.txt`, `results/results.json`; 1 h 25 min wall, 8 GiB container).
+**222 checks, 0 deviating from expectation** (`results/results.json`; the race rows are from the rerun after the 2026-10-14 `settle`-from-`Pending` addition, the others from the original 202-check run in `results/run.txt`; 8 GiB container).
 Every safety property holds in its declared design, every liveness property holds under its stated fairness, every mutant
 is caught by the property aimed at it, and every witness is reachable.
 
@@ -25,7 +25,7 @@ is caught by the property aimed at it, and every witness is reachable.
 | convoy | 51 | 345,304 | vacuous delivery of an empty convoy |
 | inbox | 62 | 7,873,022 (1 message, 2 sessions, every failure mode); 123,368 (2 messages, 1 session) | dropped-but-turned; drop races deliver at the home; double turn window; crash/receipt order; dead bound consumer |
 | ensure | 34 | 27,392 | give-up livelock after `resume`; `Fulfilled` before the fulfiller can receive |
-| race | 55 | 972,288 | an expiry loses a reply written in time |
+| race | 75 | 3,061,040 | an expiry loses a reply written in time; a turn can precede a settle-while-Pending |
 
 Findings (details below): a counterexample is a result, so none of the properties was weakened to make a run pass.
 Where a property fails in the declared design, the failure is expected in `cases.py` and a named variant shows the fix holding.
@@ -211,8 +211,12 @@ failures, 1 replacement, give-up after 2 failed fulfillers, per-fulfiller links 
 ## 4. Message: drop racing settle (`message_race.qnt`)
 
 **Scope.** One message with the four-state machine and `deliver`, `settle`, `drop{undeliverable | expired | superseded}`.
+`settle` has two forms (owner ruling, 2026-10-14): *answered* (from `Awaiting`, gate: the reply was observed) and *outcome
+observed* (from `Pending` or `Awaiting`, gate: the expected outcome was observed at the home; for example a demand to fix a
+failing build, where the build goes green first). The outcome is a home-local observation (it needs no link). From
+`Pending` the consumer is never handed the message after the settle is applied.
 The consumer's host writes a receipt, a reply and a tick mark per tick to its stream; the home applies a prefix of it.
-Five request kinds (`deliver`, `settle`, `expire`, `supersede`, `undeliverable`) reach the home at any time, each
+Six request kinds (`deliver`, `settle`, `observe`, `expire`, `supersede`, `undeliverable`) reach the home at any time, each
 applied or **refused with a recorded reason** (`RefusedEnded` for a late request on an end, `RefusedGate` when the gate
 does not hold, retried level-triggered). A newer message from the sender exists or not; delivery evidence toggles.
 
@@ -223,19 +227,23 @@ does not hold, retried level-triggered). A newer message from the sender exists 
 | `oneWinner` | safety | exactly one end: `Settled` has no drop reason, `Dropped` has exactly one |
 | `arrivedAreResolved` | safety | every request that arrived has a recorded outcome: a late one is refused visibly, never silently ignored |
 | `outcomesTruthful` | safety | `RefusedEnded` only on an end; `Applied` matches the message state |
-| `dropReasonSound` | safety | each drop reason was justified by what the home had applied: undeliverable only from `Pending`; expired only after the deadline and with no reply observed; superseded only with a newer message naming this one |
-| `settledHasEvidence` | safety | `Settled` implies the receipt (expects nothing) or the reply (expects a reply) exists |
+| `dropReasonSound` | safety | each drop reason was justified by what the home had applied: undeliverable only from `Pending`; expired only after the deadline and with neither reply nor outcome observed; superseded only with a newer message naming this one |
+| `settledHasEvidence` | safety | `Settled` is justified by the edge that took it there: the receipt (expects nothing), the reply (answered, from `Awaiting`) or the observed outcome (only a message that expects one) |
+| `noDeliverOnPendingSettled` | safety | a message settled while `Pending` by an observed outcome is never recorded as delivered, whatever receipt arrives later: the late `deliver` is refused with `RefusedEnded` |
 | `noInTimeReplyLost` | safety | a reply written in time is never lost to an expiry (**fails in the declared design**: finding 1) |
 | `endsAreFinal`, `whyIsFinal` | temporal | no edge leaves an end; a drop reason never changes |
 | `everyMessageEnds` | liveness | with the link eventually up for good, the message ends |
 | `endsDespitePartition` | liveness | the same without any link assumption |
 
-**Bounds.** deadline at tick 1, 3 ticks, link that flaps, newer message and delivery evidence toggling freely: **972,288
+**Bounds.** deadline at tick 1, 2 ticks (3 ticks with the outcome variable is 8.6M states and made the temporal checks impractical; the one-tick-later deadline passes within the bound, so every gate is exercised), link that flaps, newer message and delivery evidence toggling freely: **3,061,040
 distinct states**.
 
 **Mutants.** `mut_drop_from_any` (drop not refused from an end): `endsAreFinal`; `mut_silent_refusal`:
 `arrivedAreResolved`; `mut_expire_ignores_deadline`, `mut_expire_ignores_reply`, `mut_undeliverable_anywhere`,
-`mut_supersede_unchecked`: `dropReasonSound`. The witnesses `witnessLate{Deliver,Settle,Expire,Supersede}Refused` show the
+`mut_supersede_unchecked`: `dropReasonSound`; `mut_expire_ignores_outcome` (expiry although the outcome was observed):
+`dropReasonSound`; `mut_deliver_from_any` (a late receipt re-opens an ended message): `endsAreFinal`, `oneWinner`,
+`noDeliverOnPendingSettled`; `mut_observe_from_any`: `endsAreFinal`, `oneWinner`; `mut_observe_unexpected` (outcome
+settle for a message that expects nothing): `settledHasEvidence`. The witnesses `witnessLate{Deliver,Settle,Expire,Supersede}Refused` show the
 late-refusal paths are reachable: **supersede and expiry arriving after settle are refused, with a visible reason**.
 
 
@@ -331,7 +339,22 @@ specified as engine reactions. `pendingLeaves`, the ticket's bounded liveness, h
 **10. No link age in gates** (`convoy:mut_link_gate`): a `deliver` gate that also needs a live link never fires on a link
 that flaps, although the declared gate holds throughout (`gateIsLive` fails). This is the executable form of the #3209 ruling.
 
-**11. The Rust prototype predates the `release`-from-`Requested` ruling** (see "Tying the specs", below).
+**12. Settle-while-Pending (owner, 2026-10-14): a late receipt cannot record `deliver`, but a turn can precede the settle** (`race:base`).
+A message that expects an outcome settles straight from `Pending` when the outcome is observed at the home.
+`noDeliverOnPendingSettled` holds: the late `deliver` request is refused (`RefusedEnded`) and the message is never recorded
+as delivered (`witnessLateReceiptRefused`, 6 steps: `cReceipt`, `outcomeObserved`, settle request, deliver request refused,
+`replicate`). `mut_deliver_from_any` (deliver not refused from an end) breaks it, and also `endsAreFinal` and `oneWinner`.
+The claim "the consumer never sees a turn for a message settled while Pending" holds only **once the settle has replicated to
+the consumer**. `witnessTurnBeforeSettle` (4 steps: the consumer writes its receipt, the outcome is observed, the home settles)
+shows a turn that predates the settle; the home cannot know about it, and the receipt is then ignored with a visible refusal.
+The design must read "never" as "never after the settle is visible to the consumer", and the consumer-side fence (act only on
+a replica where the message is not an end) narrows the window without closing it. Two gates were needed: expiry is
+refused once the expected outcome is observed (`mut_expire_ignores_outcome` breaks `dropReasonSound`), and an outcome settles
+only a message that expects one (`mut_observe_unexpected` breaks `settledHasEvidence`). A first model that let any observed
+outcome block expiry stranded a message that expects nothing (`endsDespitePartition` failed in `expects_nothing`): the
+outcome gate must be conditional on the expectation.
+
+**11. The Rust prototype predates the `release`-from-`Requested` and `settle`-from-`Pending` rulings** (see "Tying the specs", below).
 
 ## Tying the specs to the Rust step functions
 
@@ -346,7 +369,8 @@ engine's `validate()` enforces (no edge leaves an end, every state reachable, ev
 PR #3216 at `13cc297d4`:
 
 ```text
-message: conforms
+message: DIFFERS
+  spec has, Rust lacks : Pending --settle--> Settled
 lifecycle(Clone): DIFFERS
   spec has, Rust lacks : Requested --release--> Gone
 lifecycle(ImageBuild): DIFFERS
@@ -355,8 +379,9 @@ convoy: no Rust machine yet (spec table only)
 ensure: no Rust machine yet (spec table only)
 ```
 
-This is the check working as designed: the prototype engine predates the owner ruling that `release` is also allowed from
-`Requested`, and the comparison finds exactly that drift, in the direction a replay-only check cannot see (an edge the
+This is the check working as designed: the prototype engine predates two owner rulings, that `release` is also allowed from
+`Requested` and (2026-10-14) that `settle` is also allowed from `Pending` when the expected outcome is observed before
+delivery, and the comparison finds exactly that drift, in the direction a replay-only check cannot see (an edge the
 spec has and the code lacks is found by replay; an edge only the code has is not). The `compare` script reports both
 directions. In the real engine the dump is `MachineDef::edges()` over each registered machine, run as a `cargo test`;
 `compare_tables.py` evaluates the tables with `quint repl`, so no one copies them by hand.
@@ -572,59 +597,78 @@ Generated by `python3 tie/results_table.py results/results.json`. Every row matc
 
 | case | property | expected | result | states | seconds |
 |---|---|---|---|---:|---:|
-| `base` | `oneWinner` | hold | hold (ok) | 972,288 | 8.2 |
-| `base` | `arrivedAreResolved` | hold | hold (ok) | 972,288 | 9.0 |
-| `base` | `outcomesTruthful` | hold | hold (ok) | 972,288 | 10.1 |
-| `base` | `dropReasonSound` | hold | hold (ok) | 972,288 | 10.1 |
-| `base` | `settledHasEvidence` | hold | hold (ok) | 972,288 | 8.4 |
-| `base` | `endsAreFinal` | hold | hold (ok) | 972,288 | 75.6 |
-| `base` | `whyIsFinal` | hold | hold (ok) | 972,288 | 67.6 |
-| `base` | `everyMessageEnds` | hold | hold (ok) | 972,288 | 36.2 |
-| `base` | `endsDespitePartition` | hold | hold (ok) | 972,288 | 36.7 |
-| `base` | `noInTimeReplyLost` | violated | violated (ok) | 6,057 | 0.6 |
-| `base` | `witnessSettled` | violated | violated (ok) | 5,751 | 0.7 |
-| `base` | `witnessExpired` | violated | violated (ok) | 553 | 0.5 |
-| `base` | `witnessSuperseded` | violated | violated (ok) | 210 | 0.5 |
-| `base` | `witnessUndeliverable` | violated | violated (ok) | 212 | 0.5 |
-| `base` | `witnessLateSupersedeRefused` | violated | violated (ok) | 685 | 0.5 |
-| `base` | `witnessLateExpireRefused` | violated | violated (ok) | 800 | 0.6 |
-| `base` | `witnessLateSettleRefused` | violated | violated (ok) | 727 | 0.5 |
-| `base` | `witnessLateDeliverRefused` | violated | violated (ok) | 791 | 0.5 |
-| `watermark` | `oneWinner` | hold | hold (ok) | 849,168 | 8.1 |
-| `watermark` | `arrivedAreResolved` | hold | hold (ok) | 849,168 | 8.1 |
-| `watermark` | `outcomesTruthful` | hold | hold (ok) | 849,168 | 8.8 |
-| `watermark` | `dropReasonSound` | hold | hold (ok) | 849,168 | 8.6 |
-| `watermark` | `settledHasEvidence` | hold | hold (ok) | 849,168 | 8.6 |
-| `watermark` | `endsAreFinal` | hold | hold (ok) | 849,168 | 65.3 |
-| `watermark` | `whyIsFinal` | hold | hold (ok) | 849,168 | 58.9 |
-| `watermark` | `everyMessageEnds` | hold | hold (ok) | 849,168 | 33.3 |
-| `watermark` | `noInTimeReplyLost` | hold | hold (ok) | 849,168 | 7.4 |
-| `watermark` | `endsDespitePartition` | violated | violated (ok) | 849,168 | 33.1 |
-| `expects_nothing` | `oneWinner` | hold | hold (ok) | 273,640 | 2.8 |
-| `expects_nothing` | `arrivedAreResolved` | hold | hold (ok) | 273,640 | 2.5 |
-| `expects_nothing` | `outcomesTruthful` | hold | hold (ok) | 273,640 | 2.7 |
-| `expects_nothing` | `dropReasonSound` | hold | hold (ok) | 273,640 | 2.6 |
-| `expects_nothing` | `settledHasEvidence` | hold | hold (ok) | 273,640 | 2.5 |
-| `expects_nothing` | `endsAreFinal` | hold | hold (ok) | 273,640 | 20.7 |
-| `expects_nothing` | `whyIsFinal` | hold | hold (ok) | 273,640 | 18.9 |
-| `expects_nothing` | `everyMessageEnds` | hold | hold (ok) | 273,640 | 10.8 |
-| `expects_nothing` | `endsDespitePartition` | hold | hold (ok) | 273,640 | 10.7 |
-| `mut_drop_from_any` | `oneWinner` | hold | hold (ok) | 792,808 | 9.2 |
-| `mut_drop_from_any` | `endsAreFinal` | violated | violated (ok) | 99,328 | 3.1 |
-| `mut_drop_from_any` | `arrivedAreResolved` | hold | hold (ok) | 792,808 | 8.8 |
-| `mut_silent_refusal` | `arrivedAreResolved` | violated | violated (ok) | 794 | 0.5 |
-| `mut_silent_refusal` | `oneWinner` | hold | hold (ok) | 972,288 | 8.7 |
-| `mut_silent_refusal` | `endsAreFinal` | hold | hold (ok) | 972,288 | 67.3 |
-| `mut_expire_ignores_deadline` | `dropReasonSound` | violated | violated (ok) | 8 | 0.4 |
-| `mut_expire_ignores_deadline` | `oneWinner` | hold | hold (ok) | 1,004,352 | 9.5 |
-| `mut_expire_ignores_deadline` | `endsAreFinal` | hold | hold (ok) | 1,004,352 | 75.8 |
-| `mut_expire_ignores_reply` | `dropReasonSound` | violated | violated (ok) | 16,782 | 0.7 |
-| `mut_expire_ignores_reply` | `oneWinner` | hold | hold (ok) | 1,012,032 | 8.0 |
-| `mut_expire_ignores_reply` | `endsAreFinal` | hold | hold (ok) | 1,012,032 | 75.7 |
-| `mut_undeliverable_anywhere` | `dropReasonSound` | violated | violated (ok) | 7,539 | 0.5 |
-| `mut_undeliverable_anywhere` | `oneWinner` | hold | hold (ok) | 1,042,056 | 8.6 |
-| `mut_undeliverable_anywhere` | `endsAreFinal` | hold | hold (ok) | 1,042,056 | 77.1 |
-| `mut_supersede_unchecked` | `dropReasonSound` | violated | violated (ok) | 12 | 0.4 |
-| `mut_supersede_unchecked` | `oneWinner` | hold | hold (ok) | 986,688 | 8.2 |
-| `mut_supersede_unchecked` | `endsAreFinal` | hold | hold (ok) | 986,688 | 87.1 |
-
+| `base` | `oneWinner` | hold | hold (ok) | 3,061,040 | 38.9 |
+| `base` | `arrivedAreResolved` | hold | hold (ok) | 3,061,040 | 38.5 |
+| `base` | `outcomesTruthful` | hold | hold (ok) | 3,061,040 | 37.9 |
+| `base` | `dropReasonSound` | hold | hold (ok) | 3,061,040 | 37.0 |
+| `base` | `settledHasEvidence` | hold | hold (ok) | 3,061,040 | 37.9 |
+| `base` | `noDeliverOnPendingSettled` | hold | hold (ok) | 3,061,040 | 38.4 |
+| `base` | `endsAreFinal` | hold | hold (ok) | 3,061,040 | 338.2 |
+| `base` | `whyIsFinal` | hold | hold (ok) | 3,061,040 | 305.1 |
+| `base` | `everyMessageEnds` | hold | hold (ok) | 3,061,040 | 152.3 |
+| `base` | `endsDespitePartition` | hold | hold (ok) | 3,061,040 | 153.3 |
+| `base` | `noInTimeReplyLost` | violated | violated (ok) | 13,425 | 0.8 |
+| `base` | `witnessSettled` | violated | violated (ok) | 315 | 0.5 |
+| `base` | `witnessExpired` | violated | violated (ok) | 1,071 | 0.5 |
+| `base` | `witnessSuperseded` | violated | violated (ok) | 329 | 0.5 |
+| `base` | `witnessUndeliverable` | violated | violated (ok) | 300 | 0.4 |
+| `base` | `witnessLateSupersedeRefused` | violated | violated (ok) | 1,218 | 0.6 |
+| `base` | `witnessLateExpireRefused` | violated | violated (ok) | 1,228 | 0.5 |
+| `base` | `witnessLateSettleRefused` | violated | violated (ok) | 1,232 | 0.5 |
+| `base` | `witnessLateDeliverRefused` | violated | violated (ok) | 1,170 | 0.5 |
+| `base` | `witnessSettledWhilePending` | violated | violated (ok) | 307 | 0.4 |
+| `base` | `witnessSettledFromAwaiting` | violated | violated (ok) | 14,291 | 0.7 |
+| `base` | `witnessLateOutcomeRefused` | violated | violated (ok) | 1,112 | 0.5 |
+| `base` | `witnessLateReceiptRefused` | violated | violated (ok) | 17,020 | 0.7 |
+| `base` | `witnessTurnBeforeSettle` | violated | violated (ok) | 1,180 | 0.5 |
+| `watermark` | `oneWinner` | hold | hold (ok) | 2,871,824 | 31.8 |
+| `watermark` | `arrivedAreResolved` | hold | hold (ok) | 2,871,824 | 32.7 |
+| `watermark` | `outcomesTruthful` | hold | hold (ok) | 2,871,824 | 34.3 |
+| `watermark` | `dropReasonSound` | hold | hold (ok) | 2,871,824 | 34.0 |
+| `watermark` | `settledHasEvidence` | hold | hold (ok) | 2,871,824 | 34.6 |
+| `watermark` | `noDeliverOnPendingSettled` | hold | hold (ok) | 2,871,824 | 31.5 |
+| `watermark` | `endsAreFinal` | hold | hold (ok) | 2,871,824 | 310.0 |
+| `watermark` | `whyIsFinal` | hold | hold (ok) | 2,871,824 | 279.6 |
+| `watermark` | `everyMessageEnds` | hold | hold (ok) | 2,871,824 | 151.9 |
+| `watermark` | `noInTimeReplyLost` | hold | hold (ok) | 2,871,824 | 32.1 |
+| `watermark` | `endsDespitePartition` | violated | violated (ok) | 1,527,415 | 63.9 |
+| `expects_nothing` | `oneWinner` | hold | hold (ok) | 638,480 | 6.7 |
+| `expects_nothing` | `arrivedAreResolved` | hold | hold (ok) | 638,480 | 7.6 |
+| `expects_nothing` | `outcomesTruthful` | hold | hold (ok) | 638,480 | 6.8 |
+| `expects_nothing` | `dropReasonSound` | hold | hold (ok) | 638,480 | 6.8 |
+| `expects_nothing` | `settledHasEvidence` | hold | hold (ok) | 638,480 | 6.9 |
+| `expects_nothing` | `noDeliverOnPendingSettled` | hold | hold (ok) | 638,480 | 6.5 |
+| `expects_nothing` | `endsAreFinal` | hold | hold (ok) | 638,480 | 58.2 |
+| `expects_nothing` | `whyIsFinal` | hold | hold (ok) | 638,480 | 53.5 |
+| `expects_nothing` | `everyMessageEnds` | hold | hold (ok) | 638,480 | 33.1 |
+| `expects_nothing` | `endsDespitePartition` | hold | hold (ok) | 638,480 | 32.8 |
+| `mut_deliver_from_any` | `endsAreFinal` | violated | violated (ok) | 40,411 | 1.4 |
+| `mut_deliver_from_any` | `oneWinner` | violated | violated (ok) | 14,527 | 0.7 |
+| `mut_deliver_from_any` | `noDeliverOnPendingSettled` | violated | violated (ok) | 16,502 | 0.7 |
+| `mut_observe_from_any` | `endsAreFinal` | violated | violated (ok) | 14,977 | 0.9 |
+| `mut_observe_from_any` | `oneWinner` | violated | violated (ok) | 4,759 | 0.6 |
+| `mut_observe_from_any` | `noDeliverOnPendingSettled` | hold | hold (ok) | 3,016,328 | 38.3 |
+| `mut_expire_ignores_outcome` | `dropReasonSound` | violated | violated (ok) | 3,692 | 0.6 |
+| `mut_expire_ignores_outcome` | `oneWinner` | hold | hold (ok) | 3,184,808 | 40.0 |
+| `mut_expire_ignores_outcome` | `endsAreFinal` | hold | hold (ok) | 3,184,808 | 340.2 |
+| `mut_observe_unexpected` | `settledHasEvidence` | violated | violated (ok) | 294 | 0.4 |
+| `mut_observe_unexpected` | `oneWinner` | hold | hold (ok) | 757,064 | 8.3 |
+| `mut_observe_unexpected` | `endsAreFinal` | hold | hold (ok) | 757,064 | 68.1 |
+| `mut_drop_from_any` | `oneWinner` | hold | hold (ok) | 2,426,792 | 34.3 |
+| `mut_drop_from_any` | `endsAreFinal` | violated | violated (ok) | 15,323 | 0.8 |
+| `mut_drop_from_any` | `arrivedAreResolved` | hold | hold (ok) | 2,426,792 | 32.9 |
+| `mut_silent_refusal` | `arrivedAreResolved` | violated | violated (ok) | 1,128 | 0.5 |
+| `mut_silent_refusal` | `oneWinner` | hold | hold (ok) | 3,061,040 | 33.3 |
+| `mut_silent_refusal` | `endsAreFinal` | hold | hold (ok) | 3,061,040 | 310.9 |
+| `mut_expire_ignores_deadline` | `dropReasonSound` | violated | violated (ok) | 12 | 0.4 |
+| `mut_expire_ignores_deadline` | `oneWinner` | hold | hold (ok) | 3,323,328 | 37.6 |
+| `mut_expire_ignores_deadline` | `endsAreFinal` | hold | hold (ok) | 3,323,328 | 369.3 |
+| `mut_expire_ignores_reply` | `dropReasonSound` | violated | violated (ok) | 38,242 | 0.8 |
+| `mut_expire_ignores_reply` | `oneWinner` | hold | hold (ok) | 3,112,880 | 36.2 |
+| `mut_expire_ignores_reply` | `endsAreFinal` | hold | hold (ok) | 3,112,880 | 332.4 |
+| `mut_undeliverable_anywhere` | `dropReasonSound` | violated | violated (ok) | 13,260 | 0.7 |
+| `mut_undeliverable_anywhere` | `oneWinner` | hold | hold (ok) | 3,280,712 | 38.4 |
+| `mut_undeliverable_anywhere` | `endsAreFinal` | hold | hold (ok) | 3,280,712 | 342.5 |
+| `mut_supersede_unchecked` | `dropReasonSound` | violated | violated (ok) | 16 | 0.4 |
+| `mut_supersede_unchecked` | `oneWinner` | hold | hold (ok) | 3,152,032 | 33.5 |
+| `mut_supersede_unchecked` | `endsAreFinal` | hold | hold (ok) | 3,152,032 | 332.7 |

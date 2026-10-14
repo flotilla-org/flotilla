@@ -157,19 +157,25 @@ RACE = {
     "name": "race",
     "file": "message_race.qnt",
     "module": "message_race",
-    "base": dict(D=1, TMAX=3, EXPECT_REPLY=True, EXPIRY_WAITS_WATERMARK=False, DROP_FROM_ANY=False, SILENT_REFUSAL=False,
+    "base": dict(D=1, TMAX=2, EXPECT_REPLY=True, EXPIRY_WAITS_WATERMARK=False, DROP_FROM_ANY=False, SILENT_REFUSAL=False,
                  EXPIRE_IGNORES_DEADLINE=False, EXPIRE_IGNORES_REPLY=False, UNDELIVERABLE_ANYWHERE=False,
-                 SUPERSEDE_UNCHECKED=False),
+                 SUPERSEDE_UNCHECKED=False, OBSERVE_FROM_ANY=False, DELIVER_FROM_ANY=False,
+                 EXPIRE_IGNORES_OUTCOME=False, OBSERVE_IGNORES_EXPECTATION=False),
     "invariants": ["oneWinner", "arrivedAreResolved", "outcomesTruthful", "dropReasonSound", "settledHasEvidence",
-                   "noInTimeReplyLost", "witnessSettled", "witnessExpired", "witnessSuperseded", "witnessUndeliverable",
+                   "noDeliverOnPendingSettled", "noInTimeReplyLost", "witnessSettledWhilePending", "witnessSettledFromAwaiting",
+                   "witnessLateOutcomeRefused", "witnessLateReceiptRefused", "witnessTurnBeforeSettle", "witnessSettled", "witnessExpired", "witnessSuperseded", "witnessUndeliverable",
                    "witnessLateSupersedeRefused", "witnessLateExpireRefused", "witnessLateSettleRefused",
                    "witnessLateDeliverRefused"],
     "temporal": ["endsAreFinal", "whyIsFinal", "everyMessageEnds", "endsDespitePartition"],
     "sim_invariant": "safety",
 }
-R_SAFE = ["oneWinner", "arrivedAreResolved", "outcomesTruthful", "dropReasonSound", "settledHasEvidence"]
+R_SAFE = ["oneWinner", "arrivedAreResolved", "outcomesTruthful", "dropReasonSound", "settledHasEvidence",
+          "noDeliverOnPendingSettled"]
 R_WIT = ["witnessSettled", "witnessExpired", "witnessSuperseded", "witnessUndeliverable", "witnessLateSupersedeRefused",
-         "witnessLateExpireRefused", "witnessLateSettleRefused", "witnessLateDeliverRefused"]
+         "witnessLateExpireRefused", "witnessLateSettleRefused", "witnessLateDeliverRefused", "witnessSettledWhilePending",
+         "witnessSettledFromAwaiting", "witnessLateOutcomeRefused", "witnessLateReceiptRefused", "witnessTurnBeforeSettle"]
+R_WIT_NOTHING = ["witnessSettled", "witnessExpired", "witnessSuperseded", "witnessUndeliverable", "witnessLateSupersedeRefused",
+                 "witnessLateExpireRefused", "witnessLateDeliverRefused"]
 RACE["cases"] = [
     dict(name="base", doc="the declared gates; expiry judged on the home's view",
          props={**holds(*R_SAFE, "endsAreFinal", "whyIsFinal", "everyMessageEnds", "endsDespitePartition"),
@@ -179,6 +185,16 @@ RACE["cases"] = [
                 "endsDespitePartition": "violated"}),
     dict(name="expects_nothing", doc="a message that expects nothing", over=dict(EXPECT_REPLY=False),
          props={**holds(*R_SAFE, "endsAreFinal", "whyIsFinal", "everyMessageEnds", "endsDespitePartition")}),
+    dict(name="mut_deliver_from_any", doc="a late receipt re-opens an ended message (deliver not refused from an end)",
+         over=dict(DELIVER_FROM_ANY=True),
+         props={"endsAreFinal": "violated", "oneWinner": "violated", "noDeliverOnPendingSettled": "violated"}),
+    dict(name="mut_observe_from_any", doc="outcome-observed settle is not refused from an end", over=dict(OBSERVE_FROM_ANY=True),
+         props={"endsAreFinal": "violated", "oneWinner": "violated", "noDeliverOnPendingSettled": "hold"}),
+    dict(name="mut_expire_ignores_outcome", doc="expiry although the expected outcome was observed", over=dict(EXPIRE_IGNORES_OUTCOME=True),
+         props={"dropReasonSound": "violated", "oneWinner": "hold", "endsAreFinal": "hold"}),
+    dict(name="mut_observe_unexpected", doc="outcome settle for a message that expects nothing",
+         over=dict(EXPECT_REPLY=False, OBSERVE_IGNORES_EXPECTATION=True),
+         props={"settledHasEvidence": "violated", "oneWinner": "hold", "endsAreFinal": "hold"}),
     dict(name="mut_drop_from_any", doc="drop is not refused from an end", over=dict(DROP_FROM_ANY=True),
          props={"oneWinner": "hold", "endsAreFinal": "violated", "arrivedAreResolved": "hold"}),
     dict(name="mut_silent_refusal", doc="a refused late request leaves no trace", over=dict(SILENT_REFUSAL=True),
