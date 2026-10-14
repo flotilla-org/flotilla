@@ -1,3 +1,4 @@
+use crate::load_metrics::StoreLoadMetrics;
 use crate::Store;
 #[cfg(test)]
 use crate::StoreExt;
@@ -135,6 +136,9 @@ pub struct SqliteBackend {
     pub(crate) hierarchy_admission: Arc<tokio::sync::Mutex<()>>,
     #[builder(default)]
     replay_probe: ReplayProbe,
+    /// Queue and execution timings for load measurement (#3206).
+    #[builder(default)]
+    load_metrics: Arc<StoreLoadMetrics>,
 }
 
 // The worker owns leases and depth claims, including after a caller disappears.
@@ -466,6 +470,7 @@ impl SqliteBackend {
             read_observer: None,
             hierarchy_admission: Arc::default(),
             replay_probe: ReplayProbe::default(),
+            load_metrics: Arc::default(),
         })
     }
 
@@ -497,6 +502,7 @@ impl SqliteBackend {
             read_observer: None,
             hierarchy_admission: Arc::default(),
             replay_probe: ReplayProbe::default(),
+            load_metrics: Arc::default(),
         })
     }
 
@@ -1185,6 +1191,11 @@ impl SqliteBackend {
         )
     }
 
+    /// Writer and reader timings since this store opened (#3206).
+    pub fn load_metrics(&self) -> Arc<StoreLoadMetrics> {
+        Arc::clone(&self.load_metrics)
+    }
+
     fn lock_watchers(watchers: &Mutex<WatchersByStore>) -> Result<MutexGuard<'_, WatchersByStore>, ResourceError> {
         watchers.lock().map_err(|_| ResourceError::other("sqlite resource watch lock poisoned"))
     }
@@ -1197,14 +1208,18 @@ impl SqliteBackend {
         let started = Instant::now();
         let depth = DepthClaim::new(self.writer_depth.clone());
         let meter = Arc::clone(&self.writer_meter);
+        let load_metrics = Arc::clone(&self.load_metrics);
         self.connection
             .call(move |connection| {
                 let queue_wait = started.elapsed();
                 let queue_depth = depth.depth.load(Ordering::Relaxed).saturating_sub(1);
                 drop(depth);
                 meter.record_operation();
+                load_metrics.write_wait.record(queue_wait);
+                load_metrics.write_queue_peak.observe(queue_depth as u64);
                 let execution = Instant::now();
                 let result = operation(connection);
+                load_metrics.write_execution.record(execution.elapsed());
                 if started.elapsed() >= SLOW_STORE_OPERATION {
                     tracing::warn!(
                         operation = operation_name,
@@ -1264,13 +1279,17 @@ impl SqliteBackend {
             let lease = ReaderLease { index, available: available.clone(), _permit: permit };
             let connection = self.read_connections.get(index).unwrap_or(&self.connection);
             let meter = Arc::clone(self.reader_meters.get(index).unwrap_or(&self.writer_meter));
+            let load_metrics = Arc::clone(&self.load_metrics);
             connection
                 .call(move |connection| {
                     let _lease = lease;
                     let queue_wait = started.elapsed();
                     let queue_depth = depth.depth.load(Ordering::Relaxed).saturating_sub(1);
                     drop(depth);
+                    load_metrics.read_wait.record(queue_wait);
+                    load_metrics.read_queue_peak.observe(queue_depth as u64);
                     if !alive.load(Ordering::Acquire) || queue_wait >= READ_DEADLINE {
+                        load_metrics.reads_shed.increment();
                         if queue_wait >= SLOW_STORE_OPERATION {
                             tracing::warn!(
                                 operation = operation_name,
@@ -1288,6 +1307,7 @@ impl SqliteBackend {
                         *timing = Some(execution);
                     }
                     let result = operation(connection);
+                    load_metrics.read_execution.record(execution.elapsed());
                     if started.elapsed() >= SLOW_STORE_OPERATION {
                         tracing::warn!(
                             operation = operation_name,
@@ -4714,6 +4734,48 @@ mod queue_contract {
         assert!(!result.unwrap().unwrap().is_empty());
     }
 
+    // Behaviour (#3206): every write and read records its queue wait and
+    // execution, and the writer's queue peak counts writes behind a running one.
+    #[tokio::test]
+    async fn load_metrics_time_the_writer_queue_and_reads() {
+        let backend = SqliteBackend::open_in_memory().unwrap();
+        let before = backend.load_metrics().snapshot();
+        let blocked = backend.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::spawn(async move {
+            blocked
+                .call("blocking write", move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+        let queued = (0..3).map(|_| {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.call("queued write", |_| Ok(())).await })
+        });
+        let queued = queued.collect::<Vec<_>>();
+        // The running write released its claim when it started; three are queued.
+        while backend.writer_depth.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        for write in queued {
+            write.await.unwrap().unwrap();
+        }
+        backend.read_call("read", |_| Ok(())).await.unwrap();
+        let phase = backend.load_metrics().snapshot().since(&before);
+        assert_eq!(phase.write_wait.count(), 4);
+        assert_eq!(phase.write_execution.count(), 4);
+        assert!(phase.write_queue_peak >= 2, "writes queued behind the blocked one: {}", phase.write_queue_peak);
+        assert!(phase.read_execution.count() >= 1);
+        assert_eq!(phase.reads_shed, 0);
+    }
+
     // Deadlines expire queued reads before they execute, even when the caller
     // waits for the error rather than cancelling its future.
     #[tokio::test]
@@ -4745,6 +4807,11 @@ mod queue_contract {
         blocker.await.unwrap();
         backend.read_call("recovered read", |_| Ok(())).await.unwrap();
         assert!(result.unwrap_err().to_string().contains("read deadline exceeded"));
+        // The load metrics count the shed read once and time only reads that ran.
+        let metrics = backend.load_metrics().snapshot();
+        assert_eq!(metrics.reads_shed, 1);
+        assert!(metrics.read_execution.count() >= 1);
+        assert!(metrics.read_wait.summary().max_micros >= READ_DEADLINE.as_micros() as u64);
         assert_eq!(executed.load(Ordering::SeqCst), 0);
     }
 

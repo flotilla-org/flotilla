@@ -11,6 +11,7 @@ use flotilla_executor::step::RemoteStepBatchRequest;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfigLabel, NodeId, NodeInfo, PeerConnectionState, PeerWireMessage, RepoIdentity};
 use flotilla_replication::{DigestScheduler, PeerReplicatorSupervisors, ReplicationOptions};
+use flotilla_store::load_metrics::ReplicationLoadMetrics;
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinSet,
@@ -164,6 +165,7 @@ pub struct PeerRuntime {
     remote_command_router: RemoteCommandRouter,
     resource_socket_dir: Option<PathBuf>,
     replication_options: ReplicationOptions,
+    replication_metrics: Arc<ReplicationLoadMetrics>,
 }
 
 impl PeerRuntime {
@@ -183,7 +185,14 @@ impl PeerRuntime {
             remote_command_router,
             resource_socket_dir,
             replication_options: ReplicationOptions::default(),
+            replication_metrics: Arc::default(),
         }
+    }
+
+    /// Share this daemon's replication load metrics (#3206).
+    pub fn with_replication_metrics(mut self, metrics: Arc<ReplicationLoadMetrics>) -> Self {
+        self.replication_metrics = metrics;
+        self
     }
 
     pub fn with_replication_kinds(mut self, kinds: Option<&'static [&'static str]>) -> Self {
@@ -588,6 +597,7 @@ impl PeerRuntime {
         });
 
         let replication_options = self.replication_options;
+        let replication_metrics = self.replication_metrics;
         let outbound_daemon = Arc::clone(&self.daemon);
         let outbound_remote_command_router = self.remote_command_router.clone();
         let mut peer_connected_rx = peer_connected_rx;
@@ -595,7 +605,7 @@ impl PeerRuntime {
             // Composition: the daemon's stores, identity and health, with
             // direct peers over forwarded sockets and routed peers over the router.
             let mut peer_replicators = PeerReplicatorSupervisors::new(
-                replication_host(&outbound_daemon),
+                replication_host(&outbound_daemon).with_metrics(replication_metrics),
                 peer_sources(Arc::clone(&outbound_daemon), outbound_remote_command_router),
                 replication_options,
             );

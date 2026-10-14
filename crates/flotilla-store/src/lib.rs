@@ -11,6 +11,7 @@ mod backend;
 pub use backend::*;
 pub mod controller;
 mod convoy;
+pub mod load_metrics;
 pub use convoy::*;
 mod crew_image_baseline;
 pub use crew_image_baseline::*;

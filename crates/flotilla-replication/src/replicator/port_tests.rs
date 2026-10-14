@@ -79,6 +79,10 @@ async fn direct_peer_store_replicates_snapshot_and_live_log() {
 
     assert!(health.reports().contains(&HealthReport::Healthy(authority_id.clone(), "Convoy".into())));
     assert!(replica_origins(&holder.stores().observed).await.is_empty(), "durable replication must not write the observed store");
+    // Load metrics (#3206): one snapshot, then the live create and delete as events.
+    let metrics = holder.metrics().snapshot();
+    assert_eq!((metrics.snapshots, metrics.lag_resets), (1, 0));
+    assert!(metrics.events_applied >= 2, "{metrics:?}");
     task.abort();
 }
 
@@ -199,6 +203,8 @@ async fn routed_watch_snapshot_replaces_replicas_at_the_bookmark() {
         [RoutedWatchRequest { namespace: REPLICATION_NAMESPACE.into(), kind: "convoys".into(), replica_sources: false, cursor: None }]
     );
     assert_eq!(health.reports(), vec![HealthReport::Healthy(peer_id, "Convoy".into())]);
+    let metrics = holder.metrics().snapshot();
+    assert_eq!((metrics.snapshots, metrics.events_applied), (1, 0), "a snapshot's records are not live events");
 }
 
 // Relay applies only third-origin records: records originating at this host
@@ -235,6 +241,7 @@ async fn routed_watch_lag_is_a_sequence_gap() {
         .await
         .expect_err("lag cannot continue the log");
     assert!(error.contains("sequence gap"), "{error}");
+    assert_eq!(holder.metrics().snapshot().lag_resets, 1);
 }
 
 // The direct watch's speculative version must never survive an apply error.
@@ -255,9 +262,10 @@ async fn direct_watch_terminates_on_apply_error() {
     let events = futures::stream::iter([Ok(WatchEvent::Added(object))]).chain(futures::stream::pending()).boxed();
     let watch = flotilla_resources::WatchStream::new(None, events);
     let remote = backend.using::<Convoy>(REPLICATION_NAMESPACE);
-    let result = tokio::time::timeout(Duration::from_secs(2), apply_direct_watch(watch, &writer, "0".into(), &remote, &peer))
-        .await
-        .expect("apply error must terminate the open watch");
+    let result =
+        tokio::time::timeout(Duration::from_secs(2), apply_direct_watch(watch, &writer, "0".into(), &remote, &peer, &Default::default()))
+            .await
+            .expect("apply error must terminate the open watch");
     assert!(matches!(result, Err(OriginWatchFailure::SnapshotRequired(message)) if message.contains("replica prefix missing")));
     assert!(writer.cursor().await.unwrap().is_none());
 }

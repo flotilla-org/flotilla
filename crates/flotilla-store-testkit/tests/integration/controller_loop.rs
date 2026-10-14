@@ -1882,3 +1882,80 @@ async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resourc
 
     harness.shutdown().await;
 }
+
+/// Asks for one more pass a millisecond after each of its first passes per object.
+#[derive(Clone)]
+struct RequeuingReconciler {
+    passes: Arc<AtomicUsize>,
+}
+
+impl Reconciler for RequeuingReconciler {
+    type Resource = PrimaryResource;
+    type Prepared = ();
+
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        _obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Prepared,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        self.passes.fetch_add(1, Ordering::SeqCst);
+        let mut outcome = ReconcileOutcome::new(None);
+        outcome.requeue_after = Some(Duration::from_millis(1));
+        outcome
+    }
+
+    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+// Behaviour (#3206): an observed loop counts every object it takes from its
+// queue, times each reconcile, counts the requeues reconciles ask for, and
+// counts each periodic resync with the objects it enqueued.
+#[tokio::test]
+async fn an_observed_controller_loop_records_wakes_requeues_and_resyncs() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    for name in ["alpha", "beta"] {
+        primaries.create(&primary_meta(name), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+    }
+    let passes = Arc::new(AtomicUsize::new(0));
+    let metrics = Arc::new(flotilla_store::load_metrics::ControllerLoadMetrics::default());
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: RequeuingReconciler { passes: Arc::clone(&passes) },
+            resync_interval: Duration::from_millis(50),
+            backend,
+        }
+        .run_observed(Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::clone(&metrics)),
+    );
+    timeout(Duration::from_secs(5), async {
+        while metrics.resyncs.get() < 2 || passes.load(Ordering::SeqCst) < 6 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the loop requeues and resyncs");
+    harness.shutdown().await;
+
+    let snapshot = metrics.snapshot();
+    let passes = passes.load(Ordering::SeqCst) as u64;
+    assert_eq!(snapshot.reconcile.count(), passes, "one timing per reconcile");
+    assert_eq!(snapshot.requeues, passes, "every pass asked to run again");
+    assert!(snapshot.wakes >= passes, "every reconcile began with a wake");
+    assert_eq!(snapshot.resync_enqueued, snapshot.resyncs * 2, "each resync enqueues both objects");
+    assert_eq!(snapshot.failures, 0);
+    assert!(snapshot.queue_peak >= 1);
+}
