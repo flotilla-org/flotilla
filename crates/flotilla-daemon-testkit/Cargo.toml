@@ -13,6 +13,7 @@ flotilla-core = { path = "../flotilla-core" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-replication = { path = "../flotilla-replication" }
 flotilla-resources = { path = "../flotilla-resources" }
+flotilla-store = { path = "../flotilla-store" }
 flotilla-transport = { path = "../flotilla-transport" }
 tokio = { workspace = true }
 async-trait = { workspace = true }

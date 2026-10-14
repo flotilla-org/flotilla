@@ -1,0 +1,34 @@
+# Load driver for the dummy fleet (#3206): keeps N convoys running against a
+# FleetTarget, measures outcomes and samples the target's load metrics. Generic
+# over the target so the same plan runs against the current control plane and
+# the ADR 0064 path once it exists.
+[package]
+name = "flotilla-load-driver"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-dummy-fleet = { path = "../flotilla-dummy-fleet" }
+flotilla-store = { path = "../flotilla-store" }
+async-trait.workspace = true
+futures.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hegeltest = "=0.48.1"
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }
+
+[lints]
+workspace = true
