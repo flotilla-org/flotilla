@@ -31,6 +31,7 @@ define_resource!(
     ConvoyStatus,
     ConvoyStatusPatch,
     replication = ReplicationClass::HomeBoundRuntime,
+    initial_status = initial_convoy_status,
     queryable = &[
         "metadata.name",
         "status.phase",
@@ -46,6 +47,18 @@ define_resource!(
         "metadata.annotations.\"flotilla.work/ensured-from\"",
     ]
 );
+
+/// The frozen admission decision is a creation input, like the prepared snapshots.
+/// Keeping it in metadata lets every authoritative backend seed the existing
+/// status shape atomically; older records without it still start without status.
+pub const ADMISSION_PLACEMENT_ANNOTATION: &str = "flotilla.work/admission-placement";
+
+fn initial_convoy_status(meta: &crate::InputMeta) -> Result<Option<ConvoyStatus>, crate::ResourceError> {
+    let Some(encoded) = meta.annotations.get(ADMISSION_PLACEMENT_ANNOTATION) else { return Ok(None) };
+    let placement_decision = serde_json::from_str(encoded)
+        .map_err(|error| crate::ResourceError::invalid(format!("invalid admission placement decision: {error}")))?;
+    Ok(Some(ConvoyStatus { placement_decision: Some(placement_decision), ..ConvoyStatus::default() }))
+}
 
 pub const WORKFLOW_SNAPSHOT_ANNOTATION: &str = "flotilla.work/workflow-snapshot";
 pub const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapshot";
@@ -3973,5 +3986,42 @@ mod claimed_resume_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    // Frozen admission evidence round-trips into the initial placement decision;
+    // every other status field keeps its default and absent evidence stays absent.
+    #[hegel::test]
+    fn initial_status_preserves_admission_placement(tc: hegel::TestCase) {
+        use flotilla_protocol::{CanonicalHostId, PlacementTargetHost};
+        use hegel::generators as gs;
+        // Cover absent/present evidence, empty/nonempty alternatives and optional
+        // escalation, with distinct policy and host identities across cases.
+        let present = tc.draw(gs::booleans());
+        let identity = tc.draw(gs::integers::<u32>().min_value(0).max_value(10));
+        let alternatives = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        let escalation = tc.draw(gs::booleans());
+        let decision = PlacementDecision {
+            policy_name: format!("policy-{identity}"),
+            target_host: PlacementTargetHost {
+                reference: CanonicalHostId::resolved(format!("host-{identity}")),
+                display_name: format!("Host {identity}"),
+            },
+            minimal_alternatives: (0..alternatives).map(|i| format!("alternative-{i}")).collect(),
+            escalation_reason: escalation.then(|| "admission escalation".into()),
+            refused_candidates: Vec::new(),
+            viable_not_selected: Vec::new(),
+            allocation: None,
+        };
+        let mut meta = crate::InputMeta::builder().name("admitted".into()).build();
+        if present {
+            meta.annotations.insert(ADMISSION_PLACEMENT_ANNOTATION.into(), serde_json::to_string(&decision).unwrap());
+        }
+        let initial = Convoy::initial_status(&meta).expect("valid admission metadata");
+        assert_eq!(initial, present.then(|| ConvoyStatus { placement_decision: Some(decision), ..ConvoyStatus::default() }));
     }
 }

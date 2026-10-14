@@ -1192,8 +1192,16 @@ impl ConvoyAdmission {
         spec: &ConvoySpec,
         placement_decision: Option<PlacementDecision>,
         dispatch_regard: ConvoyDispatchRegard,
-        annotations: BTreeMap<String, String>,
+        mut annotations: BTreeMap<String, String>,
     ) -> Result<(), String> {
+        // Publish admission inputs and initial status in one create. Publishing
+        // first and patching status later races finalization/bootstrap/roll-up.
+        if let Some(placement_decision) = placement_decision {
+            annotations.insert(
+                flotilla_resources::convoy::ADMISSION_PLACEMENT_ANNOTATION.to_string(),
+                serde_json::to_string(&placement_decision).map_err(|error| error.to_string())?,
+            );
+        }
         let convoys = self.backend.clone().using::<ResourceConvoy>(namespace);
         let labels = BTreeMap::from([
             (PROJECT_LABEL.to_string(), spec.project_ref.clone().unwrap_or_default()),
@@ -1204,11 +1212,6 @@ impl ConvoyAdmission {
             .create(&InputMeta::builder().name(name.to_string()).labels(labels).annotations(annotations).build(), spec)
             .await
             .map_err(|error| error.to_string())?;
-        if let Some(placement_decision) = placement_decision {
-            apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::SetPlacementDecision { placement_decision })
-                .await
-                .map_err(|error| error.to_string())?;
-        }
         if dispatch_regard == ConvoyDispatchRegard::Emit {
             if let Err(error) = self.emit_implicit_convoy_regard(namespace, name, &spec.dispatching_principal_ref).await {
                 warn!(%error, %namespace, %name, "failed to emit convoy dispatch regard");

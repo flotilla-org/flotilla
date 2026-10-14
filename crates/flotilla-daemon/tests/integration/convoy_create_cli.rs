@@ -3,6 +3,7 @@
 
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
+use futures::StreamExt;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use flotilla_config::ConfigStore;
@@ -12,7 +13,8 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, PrincipalRef};
 use flotilla_resources::{
-    single_agent_workflow_spec, Convoy, ConvoyPhase, CrewSource, InputMeta, PlacementPolicy, WorkflowTemplate, MANAGED_BY_LABEL, ROLE_LABEL,
+    single_agent_workflow_spec, Convoy, ConvoyPhase, CrewSource, InputMeta, PlacementPolicy, WatchEvent, WatchStart, WorkflowTemplate,
+    MANAGED_BY_LABEL, ROLE_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
@@ -321,6 +323,7 @@ async fn workflow_template_apply_rejects_invalid_yaml() {
 async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
     let (daemon, backend, _config, _runtime, _tmp) = start_sqlite_daemon(true).await;
     let mut rx = daemon.subscribe();
+    let mut convoy_watch = backend.using::<Convoy>("flotilla").watch(WatchStart::Now).await.expect("watch convoys");
 
     let id = daemon
         .execute(
@@ -340,6 +343,19 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
         .await
         .expect("execute");
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "sqlite-scratch".into() });
+
+    // Admission must publish the placement decision with the convoy. Controllers
+    // can act on Added immediately; a later status patch races their writes.
+    let added = tokio::time::timeout(Duration::from_secs(5), convoy_watch.next())
+        .await
+        .expect("Added deadline")
+        .expect("Added event")
+        .expect("watch succeeds");
+    let WatchEvent::Added(added) = added else { panic!("first event must be Added") };
+    assert!(
+        added.status.as_ref().and_then(|status| status.placement_decision.as_ref()).is_some(),
+        "convoy was published before its admission placement decision: {added:?}"
+    );
 
     let convoys = backend.using::<Convoy>("flotilla");
     let record_name = convoy_record_name(&backend, "sqlite-scratch").await;

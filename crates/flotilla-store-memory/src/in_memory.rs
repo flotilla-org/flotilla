@@ -1272,6 +1272,7 @@ impl InMemoryBackend {
         merge: Option<MergeMetadata>,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
         resource_kind.validate_spec(meta, spec)?;
+        let initial_status = resource_kind.initial_status(meta)?;
         self.with_store_mut(resource_kind, namespace, |store| {
             if store.objects.contains_key(&meta.name) {
                 return Err(ResourceError::conflict(&meta.name, "resource already exists"));
@@ -1293,7 +1294,7 @@ impl InMemoryBackend {
                     merge,
                 },
                 spec: Self::clone_through_serde(spec)?,
-                status: None,
+                status: initial_status,
             };
 
             let encoded = Self::encode_object(resource_kind, &object)?;

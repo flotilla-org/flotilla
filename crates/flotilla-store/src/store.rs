@@ -50,6 +50,7 @@ pub struct ResourceKind {
     validate_stored_fn: fn(&K8sResourceObject<SerializedResource>) -> Result<(), ResourceError>,
     decode_typed_text_fn: fn(&str) -> Result<DecodedObject, ResourceError>,
     decode_typed_value_fn: fn(&Value) -> Result<DecodedObject, ResourceError>,
+    initial_status_fn: fn(&InputMeta) -> Result<Option<Value>, ResourceError>,
     validate_spec_fn: fn(&InputMeta, &Value) -> Result<(), ResourceError>,
     validate_spec_update_fn: fn(&Value, &Value) -> Result<(), ResourceError>,
     validate_status_update_fn: fn(Option<&Value>, &Value) -> Result<(), ResourceError>,
@@ -103,6 +104,7 @@ impl ResourceKind {
             validate_stored_fn: validate_stored::<T>,
             decode_typed_text_fn: decode_typed_text::<T>,
             decode_typed_value_fn: decode_typed_value::<T>,
+            initial_status_fn: |meta| T::initial_status(meta)?.map(transcode).transpose(),
             validate_spec_fn: |meta, spec| T::validate_spec(meta, &transcode(spec)?),
             validate_spec_update_fn: |current, requested| T::validate_spec_update(&transcode(current)?, &transcode(requested)?),
             validate_status_update_fn: |current, requested| {
@@ -156,6 +158,14 @@ impl ResourceKind {
         })
         .map_err(|e| ResourceError::decode(e.to_string()))
     }
+    pub fn initial_status(self, meta: &InputMeta) -> Result<Option<Value>, ResourceError> {
+        let status = (self.initial_status_fn)(meta)?;
+        if let Some(status) = &status {
+            self.validate_status_update(None, status)?;
+        }
+        Ok(status)
+    }
+
     pub fn validate_spec(self, meta: &InputMeta, spec: &Value) -> Result<(), ResourceError> {
         (self.validate_spec_fn)(meta, spec)
     }
@@ -935,6 +945,32 @@ async fn transcode_request<A: Serialize + Send + 'static, B: DeserializeOwned + 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RefusedInitialStatus;
+    impl Resource for RefusedInitialStatus {
+        type Spec = ();
+        type Status = ();
+        type StatusPatch = flotilla_resources::NoStatusPatch;
+        const API_PATHS: ApiPaths = ApiPaths { group: "test", version: "v1", plural: "initialized", kind: "Initialized" };
+
+        fn initial_status(_: &InputMeta) -> Result<Option<Self::Status>, ResourceError> {
+            Ok(Some(()))
+        }
+
+        fn validate_status_update(current: Option<&Self::Status>, _: &Self::Status) -> Result<(), ResourceError> {
+            assert!(current.is_none(), "initialization must validate as the first write");
+            Err(ResourceError::invalid("initial status refused"))
+        }
+    }
+
+    // A kind's initial status is subject to its status-write validation, even
+    // though creation commits it together with the spec rather than via a patch.
+    #[test]
+    fn initial_status_cannot_bypass_status_validation() {
+        let meta = InputMeta::builder().name("initialized".into()).build();
+        assert!(matches!(ResourceKind::of::<RefusedInitialStatus>().initial_status(&meta),
+            Err(ResourceError::Invalid { message }) if message == "initial status refused"));
+    }
 
     struct PanickingSerializer;
     impl Serialize for PanickingSerializer {
