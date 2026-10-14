@@ -11,8 +11,8 @@ use crate::{
     resource::define_resource,
     status_patch::StatusPatch,
     workflow_template::{ExitDeclaration, SubjectVariable, TurnDeliveryRule, VesselRequirement},
-    ReadResourceObject, ReplicationClass, RepositoryKey, Resource, ResourceObject, ResourceProvenance, SettlementClaimEvidence,
-    ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
+    InputMeta, ReadResourceObject, ReplicationClass, RepositoryKey, Resource, ResourceError, ResourceObject, ResourceProvenance,
+    SettlementClaimEvidence, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
 };
 
 pub mod promises;
@@ -51,12 +51,14 @@ define_resource!(
 /// The frozen admission decision is a creation input, like the prepared snapshots.
 /// Keeping it in metadata lets every authoritative backend seed the existing
 /// status shape atomically; older records without it still start without status.
+/// After creation, `status.placement_decision` is authoritative. This annotation
+/// is historical admission evidence; changing it does not update live placement.
 pub const ADMISSION_PLACEMENT_ANNOTATION: &str = "flotilla.work/admission-placement";
 
-fn initial_convoy_status(meta: &crate::InputMeta) -> Result<Option<ConvoyStatus>, crate::ResourceError> {
+fn initial_convoy_status(meta: &InputMeta) -> Result<Option<ConvoyStatus>, ResourceError> {
     let Some(encoded) = meta.annotations.get(ADMISSION_PLACEMENT_ANNOTATION) else { return Ok(None) };
-    let placement_decision = serde_json::from_str(encoded)
-        .map_err(|error| crate::ResourceError::invalid(format!("invalid admission placement decision: {error}")))?;
+    let placement_decision =
+        serde_json::from_str(encoded).map_err(|error| ResourceError::invalid(format!("invalid admission placement decision: {error}")))?;
     Ok(Some(ConvoyStatus { placement_decision: Some(placement_decision), ..ConvoyStatus::default() }))
 }
 
