@@ -1,0 +1,6 @@
+module adapter {
+  // Adapter acceptance, not an extra machine edge: one message ID per session.
+  pure def turn(pending: bool, bound: bool, live: bool, alive: bool, alreadyTurned: bool): bool =
+    pending and bound and live and alive and not(alreadyTurned)
+  pure def bind(unbound: bool, live: bool, receiptsDrained: bool): bool = unbound and live and receiptsDrained
+}

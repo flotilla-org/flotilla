@@ -9,3 +9,6 @@ description = "Prototype for flotilla#3209: the state-machine engine API (machin
 # Cargo.toml `exclude`). Storage is out of scope; `record.rs` shows where the
 # storage derive from #3208 would attach.
 [dependencies]
+
+[dev-dependencies]
+serde_json = "1"

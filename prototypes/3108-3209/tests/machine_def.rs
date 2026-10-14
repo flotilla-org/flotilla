@@ -122,11 +122,15 @@ fn the_message_machine_draws_as_the_agreed_diagram() {
 }
 
 #[test]
-fn the_lifecycle_draws_as_four_states_four_edges() {
+fn the_shared_lifecycle_renders_all_declared_edges() {
     let d = CloneMachine::definition().mermaid();
-    for line in
-        ["Requested --> Realised: realise", "Realised --> Gone: vanish", "Realised --> Gone: release", "Requested --> GaveUp: give up"]
-    {
+    for line in [
+        "Requested --> Realised: realise",
+        "Realised --> Gone: vanish",
+        "Realised --> Gone: release",
+        "Requested --> Gone: release",
+        "Requested --> GaveUp: give up",
+    ] {
         assert!(d.contains(line), "missing {line:?} in\n{d}");
     }
     let docs = CloneMachine::definition().gate_docs();

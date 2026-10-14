@@ -1,3 +1,11 @@
+> #3220 update: this prototype is now the ITF conformance target for
+> [the decided specs](../../specs/primitives/README.md). It declares all five machines,
+> admits only nonempty convoys, permits cancellation from Requested, settles
+> observed outcomes from Pending, and enforces the receipt/expiry/drop rulings.
+> `Target::Chosen` now reads the resource so AgentSession can retain its channel
+> when ending. `serde_json` is dev-only for ITF; production code stays dependency-free.
+> The original design discussion below is historical context.
+
 # Prototype: the state-machine engine API (flotilla#3209, part of #3108)
 
 A standalone, dependency-free crate that declares machines, applies gated edges

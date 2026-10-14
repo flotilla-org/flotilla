@@ -147,7 +147,7 @@ impl<K: LifecycleSpec> Machine for Lifecycle<K> {
                     .gate("an observation of the real thing, with its identity", gate_realise::<K>),
             )
             .edge(EdgeDef::new("vanish").from([Realised]).to(Gone).gate("an observation that it is absent", gate_vanish::<K>))
-            .edge(EdgeDef::new("release").from([Realised]).to(Gone).gate("a deliberate teardown completed", gate_release::<K>))
+            .edge(EdgeDef::new("release").from([Requested, Realised]).to(Gone).gate("a deliberate teardown completed", gate_release::<K>))
             .edge(EdgeDef::new("give up").from([Requested]).to(GaveUp).gate("the attempt policy is exhausted", gate_give_up::<K>))
             .end(Gone, "the real thing no longer exists; if still wanted, a new resource replaces it")
             .end(GaveUp, "attempts were exhausted; a new request is a new resource")

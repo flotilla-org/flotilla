@@ -10,7 +10,7 @@
 //! *transport* recorded on the `deliver` edge; they never change whether the
 //! message reaches an end.
 
-use crate::attempt::{retry, AttemptPolicy, Cause};
+use crate::attempt::{AttemptPolicy, Cause};
 use crate::base::{ObjRef, Time};
 use crate::home::Resource;
 use crate::machine::{EdgeDef, GateFailure, Machine, MachineDef, Named, StateSet};
@@ -60,6 +60,8 @@ pub struct MessageSpec {
     pub body: String,
     pub expectation: Expectation,
     pub deadline: Option<Time>,
+    /// Role policy: how long an unbound inbox waits before undeliverable.
+    pub unbound_after: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +74,8 @@ pub enum Settlement {
 pub enum DropReason {
     Undeliverable { cause: Cause },
     Expired,
+    Withdrawn { by: String, authority: ObjRef },
+    ConsumerUnreachable { by: String, authority: ObjRef },
     Superseded { by: ObjRef },
 }
 
@@ -122,6 +126,9 @@ fn gate_deliver(g: &Gate<'_>, _: &R, e: &MessageEdge) -> Result<(), GateFailure>
 fn gate_settle(g: &Gate<'_>, r: &R, e: &MessageEdge) -> Result<(), GateFailure> {
     let MessageEdge::Settle { by } = e else { unreachable!("edge dispatch by name") };
     match (by, &r.spec.expectation) {
+        (Settlement::Answered { .. }, Expectation::Reply) if r.state() != MessageState::Awaiting => {
+            Err("reply settlement requires Awaiting".into())
+        }
         (Settlement::Answered { reply }, Expectation::Reply) => match g.observe(reply).map(|o| o.fact) {
             Some(Fact::Reply) => Ok(()),
             _ => Err("no reply observed".into()),
@@ -139,33 +146,73 @@ fn gate_settle(g: &Gate<'_>, r: &R, e: &MessageEdge) -> Result<(), GateFailure> 
     }
 }
 
+fn gate_undeliverable(g: &Gate<'_>, r: &R, cause: &Cause) -> Result<(), GateFailure> {
+    if r.state() != MessageState::Pending {
+        return Err("undeliverable applies only to a Pending message".into());
+    }
+    if matches!(g.observe(&ObjRef::new("receipts", r.id.to_string())).map(|o| o.fact), Some(Fact::Receipts { sessions }) if !sessions.is_empty())
+    {
+        return Err("a receipt is already observed".into());
+    }
+    if matches!(g.observe(&ObjRef::new("binding", &r.spec.inbox)).map(|o| o.fact), Some(Fact::UnboundSince(t)) if g.now().since(t) > r.spec.unbound_after)
+    {
+        return Ok(());
+    }
+    match g.observe(&ObjRef::new("delivery-failure", r.id.to_string())).map(|o| o.fact) {
+        Some(Fact::DeliveryFailure { cause: observed }) if observed == *cause => Ok(()),
+        _ => Err("no matching delivery-failure record or elapsed unbound policy".into()),
+    }
+}
+
+fn gate_expired(g: &Gate<'_>, r: &R) -> Result<(), GateFailure> {
+    let deadline = r.spec.deadline.ok_or(GateFailure::from("message has no deadline"))?;
+    if g.now() <= deadline {
+        return Err("deadline has not passed".into());
+    }
+    // A delivered message retains its receiver even if the role binding changes.
+    // Otherwise a silence-triggered unbind would accidentally bypass the watermark.
+    let consumer_host = if let Some(event) = r.last_event("deliver") {
+        let MessageEdge::Deliver { receipt, .. } = &event.edge else { unreachable!() };
+        let observed = g.observe(receipt).ok_or(GateFailure::from("recorded receiver receipt is not visible"))?;
+        if !matches!(observed.fact, Fact::Receipt { .. }) {
+            return Err("recorded receiver receipt is not visible".into());
+        }
+        Some(observed.observer)
+    } else {
+        match g.observe(&ObjRef::new("binding", &r.spec.inbox)).map(|o| o.fact) {
+            Some(Fact::Consumer { host }) => Some(host),
+            _ => None,
+        }
+    };
+    if let Some(host) = consumer_host {
+        if !matches!(g.observe(&ObjRef::new("keepalive", host)).map(|o| o.fact), Some(Fact::AppliedThrough(t)) if t > deadline) {
+            return Err("consumer stream has not passed the deadline".into());
+        }
+    }
+    if matches!(r.spec.expectation, Expectation::Reply)
+        && matches!(g.observe(&ObjRef::new("reply-index", r.id.to_string())).map(|o| o.fact), Some(Fact::ReplyObserved(true)))
+    {
+        return Err("expectation is met".into());
+    }
+    if let Expectation::Outcome { condition } = &r.spec.expectation {
+        if matches!(g.observe(condition).map(|o| o.fact), Some(Fact::OutcomeMet(true))) {
+            return Err("expectation is met".into());
+        }
+    }
+    Ok(())
+}
+
 fn gate_drop(g: &Gate<'_>, r: &R, e: &MessageEdge) -> Result<(), GateFailure> {
     let MessageEdge::Drop { reason } = e else { unreachable!("edge dispatch by name") };
     match reason {
-        DropReason::Undeliverable { cause } => {
-            if r.state() != MessageState::Pending {
-                return Err("undeliverable applies only to a Pending message".into());
+        DropReason::Undeliverable { cause } => gate_undeliverable(g, r, cause),
+        DropReason::Expired => gate_expired(g, r),
+        DropReason::Withdrawn { by, authority } | DropReason::ConsumerUnreachable { by, authority } => {
+            if matches!(g.observe(authority).map(|o| o.fact), Some(Fact::Authorised { party }) if party == *by) {
+                Ok(())
+            } else {
+                Err("authorised decision required".into())
             }
-            let j = retry(g.own_attempts(&r.attempts), &delivery_policy());
-            if !j.exhausted() {
-                return Err("delivery attempts are not exhausted".into());
-            }
-            if j.last_cause.as_ref() != Some(cause) {
-                return Err("cause must be the last recorded failure's cause".into());
-            }
-            Ok(())
-        }
-        DropReason::Expired => {
-            let deadline = r.spec.deadline.ok_or(GateFailure::from("message has no deadline"))?;
-            if g.now() <= deadline {
-                return Err("deadline has not passed".into());
-            }
-            if let Expectation::Outcome { condition } = &r.spec.expectation {
-                if matches!(g.observe(condition).map(|o| o.fact), Some(Fact::OutcomeMet(true))) {
-                    return Err("expectation is met".into());
-                }
-            }
-            Ok(())
         }
         DropReason::Superseded { by } => match g.observe(by).map(|o| o.fact) {
             Some(Fact::Supersedes { older }) if older == r.id => Ok(()),
@@ -174,8 +221,8 @@ fn gate_drop(g: &Gate<'_>, r: &R, e: &MessageEdge) -> Result<(), GateFailure> {
     }
 }
 
-fn deliver_target(spec: &MessageSpec, _: &MessageEdge) -> MessageState {
-    match spec.expectation {
+fn deliver_target(r: &R, _: &MessageEdge) -> MessageState {
+    match r.spec.expectation {
         Expectation::Nothing => MessageState::Settled,
         _ => MessageState::Awaiting,
     }
@@ -201,7 +248,10 @@ impl Machine for Message {
                     .gate("the consumer's receipt has been seen", gate_deliver),
             )
             .edge(
-                EdgeDef::new("settle").from([Awaiting]).to(Settled).gate("the reply or the awaited outcome has been observed", gate_settle),
+                EdgeDef::new("settle")
+                    .from([Pending, Awaiting])
+                    .to(Settled)
+                    .gate("the reply or the awaited outcome has been observed", gate_settle),
             )
             .edge(
                 EdgeDef::new("drop")
@@ -283,5 +333,6 @@ pub fn dead_letter(r: &R, sender_supervisor: &str) -> Option<MessageSpec> {
         body: format!("message {} to {} was undeliverable: {}", r.id, r.spec.inbox, cause.detail),
         expectation: Expectation::Nothing,
         deadline: None,
+        unbound_after: r.spec.unbound_after,
     })
 }
