@@ -340,6 +340,29 @@ impl ResourceManifestReconciler {
     pub async fn reconcile_once(&mut self) -> Result<ManifestPassReport, String> {
         let lock = flotilla_charter::charter_store::authoring_lock(&self.default_namespace);
         let _guard = lock.lock().await;
+        let result = self.reconcile_pass().await;
+        self.retire_unused_caches().await;
+        result
+    }
+
+    /// Retire this root's unused object caches (#2743). Retention is
+    /// housekeeping: a failure is logged and never refuses the source.
+    async fn retire_unused_caches(&self) {
+        let Some(vcs) = self.vcs.as_deref() else {
+            return;
+        };
+        if matches!(self.binding, Some(CharterSource::Repository { .. })) {
+            if let Err(error) = flotilla_charter::charter_store::retire_unused_caches(&self.root, vcs).await {
+                warn!(root = %self.root.display(), %error, "charter cache retention failed");
+            }
+        }
+        let delegated = self.root.with_extension("charter-cache");
+        if let Err(error) = (crate::charter_delegation::BoundCharterReader { cache: &delegated, vcs: Some(vcs) }).retire_unused().await {
+            warn!(cache = %delegated.display(), %error, "delegated charter cache retention failed");
+        }
+    }
+
+    async fn reconcile_pass(&mut self) -> Result<ManifestPassReport, String> {
         let root_resource = self
             .backend
             .using::<ManifestRoot>(&self.default_namespace)
@@ -1289,6 +1312,93 @@ mod tests {
         let status = test_root(&backend).await.status.expect("recovery");
         assert!(status.source_error.is_none());
         assert_ne!(status.applied_revision.as_deref(), Some(first.as_str()));
+    }
+
+    // #2743: a source growing past the size limits is refused like any other
+    // source failure: its last applied revision and records stay in place, and
+    // the source recovers once it shrinks again. Pinned for both source kinds.
+    #[tokio::test]
+    async fn oversized_bound_sources_keep_last_applied_records() {
+        for repository in [false, true] {
+            let repo = committed_manifest_repo();
+            git(repo.path(), &["branch", "-M", "main"]);
+            let cache = tempfile::tempdir().expect("charter cache");
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let binding = if repository {
+                CharterSource::Repository { repo: repo.path().to_string_lossy().into_owned(), branch: "main".into(), path: String::new() }
+            } else {
+                CharterSource::LocalDirectory { directory: repo.path().to_string_lossy().into_owned() }
+            };
+            let mut reconciler = versioned_reconciler(repo.path(), backend.clone()).await;
+            reconciler.root = cache.path().to_path_buf();
+            reconciler = reconciler.with_binding(Some(binding));
+            reconciler.reconcile_once_for_test().await.expect("apply source");
+            let applied = test_root(&backend).await.status.expect("status").applied_revision.expect("revision");
+            let live = backend.using::<PlacementPolicy>(NAMESPACE).get("versioned").await.expect("policy");
+
+            let limit = flotilla_charter::charter_store::SOURCE_LIMITS.max_file_bytes as usize;
+            write(&repo.path().join("policy.yaml"), &manifest("versioned", "must-not-apply"));
+            write(&repo.path().join("large.yaml"), &format!("# {}\n", "x".repeat(limit)));
+            git(repo.path(), &["add", "."]);
+            git(repo.path(), &["commit", "-m", "oversized"]);
+            let error = reconciler.reconcile_once().await.expect_err("oversized source refused");
+            assert!(error.contains("large.yaml") && error.contains("byte file limit"), "{error}");
+            let status = test_root(&backend).await.status.expect("refusal status");
+            assert_eq!(status.applied_revision.as_deref(), Some(applied.as_str()));
+            assert_eq!(status.source_error.as_deref(), Some(error.as_str()));
+            assert!(status.stalled.is_some());
+            let kept = backend.using::<PlacementPolicy>(NAMESPACE).get("versioned").await.expect("kept policy");
+            assert_eq!((kept.spec, kept.metadata.annotations), (live.spec, live.metadata.annotations));
+
+            git(repo.path(), &["rm", "-q", "large.yaml"]);
+            git(repo.path(), &["commit", "-m", "shrink"]);
+            reconciler.reconcile_once().await.expect("recovered source");
+            let status = test_root(&backend).await.status.expect("recovered status");
+            assert!(status.source_error.is_none() && status.applied_revision.as_deref() != Some(applied.as_str()));
+            assert_eq!(backend.using::<PlacementPolicy>(NAMESPACE).get("versioned").await.expect("policy").spec.pool, "must-not-apply");
+        }
+    }
+
+    // #2743: each pass retires fleet and delegated object caches unused for
+    // the retention window, keeps the bound source's live cache, and leaves
+    // entries it did not create alone.
+    #[tokio::test]
+    async fn reconcile_retires_unused_charter_caches() {
+        let repo = committed_manifest_repo();
+        git(repo.path(), &["branch", "-M", "main"]);
+        let retired = committed_manifest_repo();
+        git(retired.path(), &["branch", "-M", "main"]);
+        let state = tempfile::tempdir().expect("state");
+        let cache = state.path().join("charter-stores");
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let repo_url = repo.path().to_string_lossy().into_owned();
+        let mut reconciler = versioned_reconciler(repo.path(), backend.clone()).await;
+        reconciler.root = cache.clone();
+        reconciler =
+            reconciler.with_binding(Some(CharterSource::Repository { repo: repo_url.clone(), branch: "main".into(), path: String::new() }));
+        reconciler.reconcile_once_for_test().await.expect("apply source");
+        let digest = |repo: &str| format!("{:x}", Sha256::digest(repo.as_bytes()));
+        let live = cache.join(digest(&repo_url));
+        let retired_url = retired.path().to_string_lossy().into_owned();
+        let vcs = reconciler.vcs.clone().expect("vcs");
+        let delegated = cache.with_extension("charter-cache");
+        let wrapper = delegated.join(format!("charter-{}", "c".repeat(64)));
+        let stale = [cache.join(digest(&retired_url)), wrapper.join(digest(&retired_url))];
+        for root in [&cache, &wrapper] {
+            vcs.fetch_revision(root, &retired_url, "main").await.expect("unused cache");
+        }
+        let aged = std::time::SystemTime::now() - flotilla_charter::charter_store::CHARTER_CACHE_RETENTION - Duration::from_secs(60);
+        for directory in &stale {
+            std::fs::File::options().write(true).open(directory.join("FETCH_HEAD")).expect("FETCH_HEAD").set_modified(aged).expect("age");
+        }
+        let foreign = delegated.join("notes");
+        std::fs::create_dir_all(&foreign).expect("foreign entry");
+
+        reconciler.reconcile_once().await.expect("pass");
+        assert!(stale.iter().all(|directory| !directory.exists()));
+        assert!(!wrapper.exists(), "an emptied per-source directory is removed");
+        assert!(live.join("FETCH_HEAD").is_file() && foreign.is_dir());
+        assert!(test_root(&backend).await.status.expect("status").source_error.is_none());
     }
 
     // #2720: source-level failures expose their reason in fleet health even

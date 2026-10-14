@@ -8,7 +8,7 @@ use std::{
     fmt,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, Weak},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -29,6 +29,16 @@ use flotilla_provider_runtime::CommandRunner;
 
 fn revision_cache(cache: &Path, repo: &str) -> PathBuf {
     cache.join(format!("{:x}", Sha256::digest(repo.as_bytes())))
+}
+
+/// A child of a cache root is a revision cache only when its name has the
+/// digest form above and it holds the files a completed fetch leaves behind.
+/// Anything else (including a misconfigured root's own contents) is never retired.
+fn is_revision_cache(name: &str, directory: &Path) -> bool {
+    name.len() == 64
+        && name.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && directory.join("FETCH_HEAD").is_file()
+        && directory.join("objects").is_dir()
 }
 
 fn object_cache_lock(directory: &Path) -> Arc<tokio::sync::Mutex<()>> {
@@ -395,6 +405,9 @@ pub const REVISION_FETCH_TIMEOUT: &str = "revision fetch exceeded 60 seconds";
 /// for it, so generic tree enumeration does not force reads of unrelated files.
 #[async_trait]
 pub trait RevisionedFile: Send + Sync {
+    /// The blob's byte length, known without reading it, so consumers can
+    /// refuse oversized inputs before any blob I/O.
+    fn size(&self) -> u64;
     async fn read(&self) -> Result<Vec<u8>, String>;
 }
 
@@ -411,10 +424,15 @@ struct GitRevisionedFile {
     directory: PathBuf,
     revision: String,
     name: String,
+    size: u64,
 }
 
 #[async_trait]
 impl RevisionedFile for GitRevisionedFile {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
     async fn read(&self) -> Result<Vec<u8>, String> {
         let lock = object_cache_lock(&self.directory);
         let _guard = lock.lock().await;
@@ -438,6 +456,13 @@ pub trait Vcs: Send + Sync {
     /// The fetch itself has a 60-second deadline; cache lock wait is excluded.
     async fn fetch_revision(&self, _cache: &Path, _repo: &str, _branch: &str) -> Result<String, String> {
         Err(REVISION_FETCH_UNAVAILABLE.into())
+    }
+
+    /// Remove the object caches under `cache` whose last fetch predates
+    /// `unused_since`, returning the retired directories. Providers without
+    /// revision fetching keep no caches to retire.
+    async fn retire_revision_caches(&self, _cache: &Path, _unused_since: SystemTime) -> Result<Vec<PathBuf>, String> {
+        Ok(Vec::new())
     }
 
     /// Read every entry under a path at an immutable revision, relative to that path.
@@ -676,10 +701,60 @@ impl Vcs for FlotillaVcs {
         let backend = GitCliBackend::new(&directory, &*self.runner);
         backend.run(&["init", "--bare", "."]).await?;
         backend.run(&["check-ref-format", &format!("refs/heads/{branch}")]).await?;
-        tokio::time::timeout(Duration::from_secs(60), backend.run(&["fetch", "--no-tags", "--", repo, &format!("refs/heads/{branch}")]))
-            .await
-            .map_err(|_| REVISION_FETCH_TIMEOUT.to_string())??;
+        // Readers need only the tip tree. No ref records it, so a later shallow
+        // fetch of an advanced or rewritten head never needs the old history.
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            backend.run(&["fetch", "--depth=1", "--no-tags", "--", repo, &format!("refs/heads/{branch}")]),
+        )
+        .await
+        .map_err(|_| REVISION_FETCH_TIMEOUT.to_string())??;
         Ok(backend.resolve_ref("FETCH_HEAD^{commit}").await?.trim().to_string())
+    }
+
+    // FETCH_HEAD's mtime is the last use: every source read fetches first.
+    async fn retire_revision_caches(&self, cache: &Path, unused_since: SystemTime) -> Result<Vec<PathBuf>, String> {
+        let mut entries = match tokio::fs::read_dir(cache).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("read cache {}: {error}", cache.display())),
+        };
+        let mut retired = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(|error| format!("read cache {}: {error}", cache.display()))? {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let directory = entry.path();
+            if !entry.file_type().await.map_err(|error| error.to_string())?.is_dir() {
+                continue;
+            }
+            // A removal interrupted after its rename leaves only this tombstone.
+            if name.strip_prefix('.').and_then(|rest| rest.strip_suffix(".retiring")).is_some_and(|digest| digest.len() == 64) {
+                tokio::fs::remove_dir_all(&directory).await.map_err(|error| format!("remove {}: {error}", directory.display()))?;
+                continue;
+            }
+            if !is_revision_cache(&name, &directory) {
+                continue;
+            }
+            let lock = object_cache_lock(&directory);
+            let _guard = lock.lock().await;
+            let last_fetch = match tokio::fs::metadata(directory.join("FETCH_HEAD")).await.and_then(|metadata| metadata.modified()) {
+                Ok(modified) => modified,
+                // Retired concurrently by another sweep.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("inspect {}: {error}", directory.display())),
+            };
+            if last_fetch >= unused_since {
+                continue;
+            }
+            // Rename under the lock, so a failed removal never leaves a
+            // partial object store at the path the next fetch reuses.
+            let tombstone = cache.join(format!(".{name}.retiring"));
+            tokio::fs::rename(&directory, &tombstone).await.map_err(|error| format!("retire {}: {error}", directory.display()))?;
+            tokio::fs::remove_dir_all(&tombstone).await.map_err(|error| format!("remove {}: {error}", tombstone.display()))?;
+            retired.push(directory);
+        }
+        Ok(retired)
     }
 
     async fn files_at_revision(&self, cache: &Path, repo: &str, revision: &str, path: &str) -> Result<BTreeMap<String, TreeEntry>, String> {
@@ -687,9 +762,14 @@ impl Vcs for FlotillaVcs {
         let lock = object_cache_lock(&directory);
         let _guard = lock.lock().await;
         let backend = GitCliBackend::new(&directory, &*self.runner);
-        let tree = backend.run(&["ls-tree", "-r", "-z", revision]).await?;
         let normalized_path: PathBuf = Path::new(path).components().filter(|part| matches!(part, Component::Normal(_))).collect();
         let prefix = normalized_path.to_str().ok_or("tree path is not UTF-8")?;
+        // `--long` reports blob sizes; a pathspec keeps large unrelated trees out of the listing.
+        let mut args = vec!["ls-tree", "-r", "-z", "--long", revision];
+        if !prefix.is_empty() {
+            args.extend(["--", prefix]);
+        }
+        let tree = backend.run(&args).await?;
         let mut files = BTreeMap::new();
         for entry in tree.split('\0').filter(|entry| !entry.is_empty()) {
             let (meta, name) = entry.split_once('\t').ok_or("invalid tree entry")?;
@@ -702,12 +782,14 @@ impl Vcs for FlotillaVcs {
                 relative
             };
             let contents = if meta.starts_with("100644 blob ") || meta.starts_with("100755 blob ") {
+                let size = meta.split_whitespace().nth(3).and_then(|size| size.parse().ok()).ok_or("invalid tree entry size")?;
                 TreeEntry::File(Arc::new(
                     GitRevisionedFile::builder()
                         .runner(Arc::clone(&self.runner))
                         .directory(directory.clone())
                         .revision(revision.to_string())
                         .name(name.to_string())
+                        .size(size)
                         .build(),
                 ))
             } else {
@@ -2218,6 +2300,130 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(task.is_finished(), "fetch itself must expire after 60 seconds");
         assert_eq!(task.await.expect("fetch task").expect_err("fetch deadline"), "revision fetch exceeded 60 seconds");
+    }
+
+    fn git_text(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git").args(args).current_dir(cwd).output().expect("spawn git");
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).expect("git output").trim().to_string()
+    }
+
+    fn commit_file(repo: &Path, name: &str, contents: &str) -> String {
+        std::fs::write(repo.join(name), contents).expect("fixture file");
+        git(repo, &["add", "."]);
+        git(repo, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "-m", name]);
+        git_text(repo, &["rev-parse", "HEAD"])
+    }
+
+    // #2743: revision caches hold the fetched tip only, and advancing,
+    // rewinding or replacing the branch head still resolves to the new tip.
+    #[tokio::test]
+    async fn revision_fetch_is_shallow_and_follows_rewritten_heads() {
+        let source = tempfile::tempdir().expect("source");
+        let cache = tempfile::tempdir().expect("cache");
+        git(source.path(), &["init", "-q", "-b", "main"]);
+        for index in 0..3 {
+            commit_file(source.path(), "charter.yaml", &format!("generation {index}"));
+        }
+        let repo = source.path().to_str().expect("repository path");
+        let vcs = test_fl(cache.path(), Arc::new(flotilla_provider_runtime::ProcessCommandRunner), true);
+        let directory = revision_cache(cache.path(), repo);
+        let depth = |tip: &str| git_text(&directory, &["rev-list", "--count", tip]);
+
+        let tip = vcs.fetch_revision(cache.path(), repo, "main").await.expect("first fetch");
+        assert_eq!(tip, git_text(source.path(), &["rev-parse", "HEAD"]));
+        assert_eq!(depth(&tip), "1", "the cache holds no history behind the tip");
+
+        let advanced = commit_file(source.path(), "charter.yaml", "advanced");
+        assert_eq!(vcs.fetch_revision(cache.path(), repo, "main").await.expect("advanced head"), advanced);
+        assert_eq!(depth(&advanced), "1");
+
+        git(source.path(), &["reset", "-q", "--hard", "HEAD~2"]);
+        let rewound = git_text(source.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(vcs.fetch_revision(cache.path(), repo, "main").await.expect("rewound head"), rewound);
+
+        git(source.path(), &["checkout", "-q", "--orphan", "replacement"]);
+        let unrelated = commit_file(source.path(), "other.yaml", "unrelated");
+        git(source.path(), &["branch", "-q", "-f", "main", "replacement"]);
+        assert_eq!(vcs.fetch_revision(cache.path(), repo, "main").await.expect("unrelated head"), unrelated);
+        let files = vcs.files_at_revision(cache.path(), repo, &unrelated, ".").await.expect("tip tree");
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["charter.yaml", "other.yaml"]);
+    }
+
+    // #2743: tree entries carry blob sizes before any blob is read, and a
+    // subtree listing excludes similarly prefixed siblings.
+    #[tokio::test]
+    async fn revision_tree_entries_report_sizes() {
+        let source = tempfile::tempdir().expect("source");
+        let cache = tempfile::tempdir().expect("cache");
+        git(source.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(source.path().join("ops/nested")).expect("subtree");
+        std::fs::create_dir_all(source.path().join("ops-other")).expect("sibling");
+        std::fs::write(source.path().join("ops/nested/a.yaml"), "x".repeat(1234)).expect("sized file");
+        std::fs::write(source.path().join("ops-other/b.yaml"), "sibling").expect("sibling file");
+        commit_file(source.path(), "ops/empty.md", "");
+        let repo = source.path().to_str().expect("repository path");
+        let vcs = test_fl(cache.path(), Arc::new(flotilla_provider_runtime::ProcessCommandRunner), true);
+        let tip = vcs.fetch_revision(cache.path(), repo, "main").await.expect("fetch");
+        let files = vcs.files_at_revision(cache.path(), repo, &tip, "./ops/").await.expect("subtree");
+        let sizes = files
+            .iter()
+            .map(|(name, entry)| match entry {
+                TreeEntry::File(file) => (name.as_str(), file.size()),
+                TreeEntry::Other => panic!("regular file"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sizes, [("empty.md", 0), ("nested/a.yaml", 1234)]);
+    }
+
+    fn age_fetch(directory: &Path, age: Duration) {
+        let file = std::fs::File::options().write(true).open(directory.join("FETCH_HEAD")).expect("FETCH_HEAD");
+        file.set_modified(SystemTime::now() - age).expect("age FETCH_HEAD");
+    }
+
+    // #2743: retention removes only identified caches unused since the cutoff;
+    // fresh caches, foreign directories and files survive, and a retired cache
+    // is refetched transparently on the next read.
+    #[tokio::test]
+    async fn revision_cache_retention_retires_only_stale_caches() {
+        let stale_source = tempfile::tempdir().expect("stale source");
+        let fresh_source = tempfile::tempdir().expect("fresh source");
+        let cache = tempfile::tempdir().expect("cache");
+        let vcs = test_fl(cache.path(), Arc::new(flotilla_provider_runtime::ProcessCommandRunner), true);
+        let mut tips = Vec::new();
+        for source in [&stale_source, &fresh_source] {
+            git(source.path(), &["init", "-q", "-b", "main"]);
+            let tip = commit_file(source.path(), "charter.yaml", "contents");
+            let repo = source.path().to_str().expect("repository path");
+            assert_eq!(vcs.fetch_revision(cache.path(), repo, "main").await.expect("fetch"), tip);
+            tips.push(tip);
+        }
+        let stale_repo = stale_source.path().to_str().expect("repository path");
+        let stale = revision_cache(cache.path(), stale_repo);
+        let fresh = revision_cache(cache.path(), fresh_source.path().to_str().expect("repository path"));
+        age_fetch(&stale, Duration::from_secs(3600));
+        // Foreign entries: a non-digest name with fetch files, a digest-named
+        // directory that never completed a fetch, a plain file and an unrelated tree.
+        let foreign = cache.path().join("checkout");
+        std::fs::create_dir_all(foreign.join("objects")).expect("foreign directory");
+        std::fs::write(foreign.join("FETCH_HEAD"), "").expect("foreign FETCH_HEAD");
+        age_fetch(&foreign, Duration::from_secs(3600));
+        let incomplete = cache.path().join("f".repeat(64));
+        std::fs::create_dir_all(incomplete.join("objects")).expect("incomplete cache");
+        std::fs::write(cache.path().join("a".repeat(64)), "file").expect("plain file");
+        let tombstone = cache.path().join(format!(".{}.retiring", "b".repeat(64)));
+        std::fs::create_dir_all(tombstone.join("objects")).expect("interrupted retirement");
+
+        let retired = vcs.retire_revision_caches(cache.path(), SystemTime::now() - Duration::from_secs(60)).await.expect("retire");
+        assert_eq!(retired, std::slice::from_ref(&stale));
+        assert!(!stale.exists() && !tombstone.exists());
+        assert!(fresh.join("FETCH_HEAD").is_file());
+        assert!(foreign.join("FETCH_HEAD").is_file() && incomplete.is_dir() && cache.path().join("a".repeat(64)).is_file());
+
+        assert_eq!(vcs.fetch_revision(cache.path(), stale_repo, "main").await.expect("refetch"), tips[0]);
+        let files = vcs.files_at_revision(cache.path(), stale_repo, &tips[0], ".").await.expect("refetched tree");
+        assert!(files.contains_key("charter.yaml"));
+        assert!(vcs.retire_revision_caches(&cache.path().join("missing"), SystemTime::now()).await.expect("absent root").is_empty());
     }
 
     fn git(cwd: &Path, args: &[&str]) {

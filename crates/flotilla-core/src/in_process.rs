@@ -4292,6 +4292,15 @@ impl InProcessDaemon {
         if let Err(error) = self.project_service().reconcile_project_image_layers().await {
             warn!(%error, "project image layer reconciliation failed");
         }
+        // Cache retention is housekeeping and never fails the sweep.
+        match project_ops::ProjectOperations::repository_inspector(self).await {
+            Ok(inspector) => {
+                if let Err(error) = inspector.retire_unused_charter_caches().await {
+                    warn!(%error, "charter cache retention failed");
+                }
+            }
+            Err(error) => warn!(%error, "charter cache retention unavailable"),
+        }
         charters
     }
 

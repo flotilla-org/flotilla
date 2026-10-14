@@ -81,6 +81,12 @@ pub trait RepositoryInspector: Send + Sync {
         Err("image layer inspection is unavailable".into())
     }
 
+    /// Retire charter object caches unused for the retention window (#2743).
+    /// Inspectors without a cache have nothing to retire.
+    async fn retire_unused_charter_caches(&self) -> Result<Vec<PathBuf>, String> {
+        Ok(Vec::new())
+    }
+
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String>;
 
     /// Enumerate every local checkout that belongs to an inspected repository.
@@ -432,6 +438,17 @@ impl RepositoryInspector for GitRepositoryInspector {
         flotilla_charter::charter_store::read_layer_directory(source, &self.charter_cache, Some(&vcs)).await
     }
 
+    // Ops bindings, project image layers and image checks share this cache,
+    // so retention is by last use rather than by any one owner's live set.
+    async fn retire_unused_charter_caches(&self) -> Result<Vec<PathBuf>, String> {
+        let vcs = flotilla_vcs::vcs::FlotillaVcs::new(
+            flotilla_paths::path_context::ExecutionEnvironmentPath::new("/"),
+            self.runner.clone(),
+            flotilla_vcs::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), self.runner.clone()))),
+        );
+        flotilla_charter::charter_store::retire_unused_caches(&self.charter_cache, &vcs).await
+    }
+
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
         let path = flotilla_provider_runtime::probe::canonicalize(path).await?;
         let top_level = PathBuf::from(self.read(&path, RepositoryRead::CheckoutRoot).await?);
@@ -620,6 +637,37 @@ mod tests {
 
     fn test_inspector(runner: Arc<dyn CommandRunner>, host_ref: &str) -> GitRepositoryInspector {
         GitRepositoryInspector::new(Arc::clone(&runner), test_vcs_resolver(runner), host_ref)
+    }
+
+    // #2743: the shared charter cache retires a source's objects once unused
+    // for the retention window; a recent read keeps them, and a later read refetches.
+    #[tokio::test]
+    async fn charter_cache_retires_sources_unused_for_the_retention_window() {
+        let source = tempfile::tempdir().expect("source");
+        let cache = tempfile::tempdir().expect("cache");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git").args(args).current_dir(source.path()).output().expect("fixture git");
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        };
+        std::fs::write(source.path().join("entry.md"), "charter").expect("entry");
+        git(&["init", "-b", "main"]);
+        git(&["add", "."]);
+        git(&["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"]);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
+        let inspector = test_inspector(runner, "local-host").with_charter_cache(cache.path().to_path_buf());
+        let charter = flotilla_resources::CharterSource::Repository {
+            repo: source.path().to_string_lossy().into_owned(),
+            branch: "main".into(),
+            path: String::new(),
+        };
+        inspector.charter_snapshot(&charter).await.expect("first read");
+        assert!(inspector.retire_unused_charter_caches().await.expect("recent use").is_empty());
+        let directory = std::fs::read_dir(cache.path()).expect("cache").next().expect("one cache").expect("entry").path();
+        let aged = std::time::SystemTime::now() - flotilla_charter::charter_store::CHARTER_CACHE_RETENTION;
+        std::fs::File::options().write(true).open(directory.join("FETCH_HEAD")).expect("FETCH_HEAD").set_modified(aged).expect("age");
+        assert_eq!(inspector.retire_unused_charter_caches().await.expect("retire"), std::slice::from_ref(&directory));
+        assert!(!directory.exists());
+        assert!(inspector.charter_snapshot(&charter).await.expect("refetch").files.contains_key("entry.md"));
     }
 
     fn git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
