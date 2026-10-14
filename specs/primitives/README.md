@@ -17,18 +17,48 @@ viewer.html   local, standalone ITF viewer
 
 ## Reading the design
 
-Each machine module has an initial state, ends, pure gates over declared inputs,
-and `transition`. Typed edge arguments remain in the Rust declarations under
-`../../prototypes/3108-3209/src/kinds/`. Gates have the same names there; Message's reason-specific
-helpers feed `gate_drop`, and Ensure's resume gate also records the attempt-window
-boundary. `gate_retire` is the shared authorisation check for retire/resume.
-AgentSession's state is the product of conversation and channel; an ended
-conversation freezes both dimensions, following “ends are ends”.
+Each resource-kind module owns a store `id -> Absent | Present(State)`.
+Its states, events and refusals are sum types. State data belongs to its variant:
+`Awaiting` carries its receiver; `Dropped` its reason and expiry evidence;
+`Abandoned` its reason; an AgentSession is `Live(channel) | Ended`.
+A pure `step(state, event)` uses `match` and returns `Moved(state) | Refused(reason)`.
+Every gate reads typed local evidence on the event inside `step`. Admission
+validates a typed request before creating a slot. Named actions look up a slot,
+run the rule and guard a single store assignment; `unchanged` composes with other
+machines. Refused actions are disabled and write nothing.
+
+Scenarios choose identities and model only the world: ordered streams, clock,
+host death, adapter acceptance and capacities. Their `any` lists pair machine
+actions with assignments for the world they leave unchanged. They contain no
+machine events, transitions or gates. Imported variants use bare names in
+`match` patterns (constructors in expressions remain qualified).
+
+Convoy admission accepts `{project, promises, quota, priority}`. The promise map
+is nonempty and preserves opaque kind/target data. Resolution is a map from
+promise id to `Pending | Kept | Retracted`; a settled promise cannot be kept or
+retracted again (`PromiseSettled`), and `Kept` is final. Terminal variants retain
+the work record so delivery and finality remain state properties. A continuing
+commitment is a lend with terms; its breach becomes a message to the lender.
+A demo promise delivers a running demo plus a recipe to reactivate it.
+
+Admission grants a per-class cap, never a host reservation. Increasing a cap is
+readmission of the same convoy; the model keeps the class domain fixed and refuses decreases. Vessel placement
+fits one whole multidimensional request on one host and holds its lease through
+Requested and Realised until Gone. Waiting placement requests are not leased
+vessels. A lower-priority request cannot pass any waiting higher-priority request
+that fits that host's available capacity, even if that higher-priority convoy
+is currently capped. No borrowing or spend accounting is modeled.
+
+The Vessel module composes the shared lifecycle's pure rules and owns placement
+state; it does not duplicate a lifecycle store. Placement evidence carries the
+observed caps, live counts, available capacity and waiting requests. Allocation
+records retain the placement snapshot, allowing the priority invariant to be a
+property of state rather than a scenario flag. Ensure carries its binding,
+recorded fulfillers and attempt window on the relevant variants.
 
 A gate's booleans represent **versioned local evidence**, not remote queries or
-link health. For example, `gate_bind` receives realised/can-receive/recorded facts;
-`gate_expired` receives the applied keepalive watermark, never link liveness.
-Bindings and adapter acceptance are relations/reactions, not a sixth machine.
+link health. Bind receives realised/can-receive facts; expiry reads the applied
+keepalive watermark. Bindings and adapter acceptance remain world relations.
 
 `world/stream.qnt` represents one home's append-only stream. The other home applies
 one row at a time. Keepalive rows advance an applied-prefix watermark; repeated
@@ -47,58 +77,68 @@ The scenarios encode these rulings:
 | Inbox / replacement / unbind | turn before receipt; per-session dedupe; drain observed receipts before bind; accept an old session's receipt; one receiver; no undeliverable drop with an observed receipt; unbound timeout starts at unbind | observed receipts make progress under fair home delivery; observed session ends and sustained silence trigger owner unbind reactions |
 | Ensure | record before create; bind only Realised/receiving; release and observe Gone before replacement; retire releases every created fulfiller, including Requested; resume retains history and moves the window | a bound fulfiller observed Gone is eventually unbound under a fair owner reaction |
 | Message race | outcome may settle Pending; terminal edges refuse; expiry waits for the consumer prefix past the deadline and loses to visible evidence; supersede and withdrawn reasons | visible expected evidence eventually settles under fair settlement; ends remain final |
+| Admission / placement | two convoys, two hosts, three placement requests, two abstract classes and two capacity dimensions; convoy caps, host leases, Gone lease return, priority order | no availability fairness assumed |
 | Machine edges | all lifecycle and session edges, matching/missing evidence, exhausted attempts, ended resources | finite gate/edge coverage in the fast tier |
 
-The scenario monitor flags are verification history, not stored resource fields
-or semantic switches. These are **conditional** liveness claims. A delivered message keeps its receiver host for expiry even after the inbox
-consumer is unbound or replaced. A permanently silent receiver does not have
-unconditional message termination: the watermark deliberately blocks expiry.
-Deliberate `consumer unreachable` and `withdrawn` drops require authorisation.
-Ensure/Convoy retirement or abandonment is never assumed to happen automatically.
+Safety is expressed over typed state wherever possible: delivery promises,
+recorded bindings, retirement, receiver identity, drop reasons, expiry evidence
+and placement receipts. The receipt-drain monitor remains world history because
+a receipt can arrive after binding. Per-session turn counts are adapter state.
+These are **conditional** liveness claims. An Awaiting message retains its
+receiver for expiry after inbox unbind or replacement. A permanently silent
+receiver blocks expiry. Deliberate unreachable/withdrawn drops need authority.
+No automatic Ensure retirement or Convoy abandonment is assumed.
 
 ## Fast tier (CI)
 
 Requires Quint **0.33.0**, JDK **21**, and the pinned Rust toolchain. Quint downloads
 Apalache **0.62.1** on its first TLA+ compilation; its jar also contains TLC.
+The runners default `JVM_ARGS` to `-Xmx3g -Xss16m`: expanded typed compositions
+need a larger parser stack (the default stack can fail with an empty INTERNAL
+error). An explicit override should retain an adequate `-Xss` value.
 For example:
 
 ```sh
+# First use only: bootstrap the pinned Apalache distribution before jar preflight.
+export JVM_ARGS="${JVM_ARGS:--Xmx3g -Xss16m}"
+npm exec --yes --package=@informalsystems/quint@0.33.0 -- quint compile specs/primitives/scenarios/convoy_deliver.qnt --target tlaplus --invariant safety > /dev/null
 npm exec --yes --package=@informalsystems/quint@0.33.0 -- specs/primitives/check.sh
 ```
 
-The existing Linux Test CI job sets up Node/Java and runs this command. There is
+The PR description supplies an owner-applied patch for the existing Linux Test
+job; crews cannot push workflow files. Until it is applied, formal coverage is
+local. There is
 one TLC run per scenario for its aggregate safety invariant, not one per property.
 The fast bounds use two named sessions (initial consumer and replacement), two
 fulfillers, one message per scenario, two inbox stream rows, and three race stream
 rows. Sessions are intentionally distinguished by the initial binding; there is
 no interchangeable session/message population needing a symmetry permutation.
 
-TLC `VIEW view` removes only replay metadata (last operation/actor/evidence).
-No transition or checked safety property reads the removed values. This is a
-quotient over equivalent states, not a depth cutoff. The complete fast tier is designed to stay below about five minutes; logs retain
-actual states, elapsed time, and counterexamples so a budget regression is visible.
+TLC `VIEW view` includes all semantic state. There are no last-operation, actor
+or edge bookkeeping variables. Logs retain actual bounds, state counts and
+counterexamples. The fast tier runs one aggregate TLC safety check per scenario,
+then generates 128 ITF traces of up to 80 steps for **each of six** scenarios
+with seed 3220 and `quint run --mbt` in a fresh directory.
 
-The runner then generates 128 ITF traces of up to 80 steps for **each** of five
-scenarios, using seed 3220, and runs the Rust replay test. It uses a fresh output
-directory each time, so stale traces cannot satisfy coverage. The replay drives
-`Home::apply` with typed edges, including refused attempts, and compares every
-machine state after each step. It also checks delivery-event count/receiver,
-fulfiller lifecycle states and session channels. World actions supply local
-replica inputs; they do not pretend that the prototype is a production transport
-or inbox backend. Additional exhaustive Rust gate tests span independent invalid
-inputs that the causal scenarios cannot reach.
+Rust replay reads `mbt::actionTaken` and the `Some`/`None` picks from
+`mbt::nondetPicks`, and decodes sum values from `{tag,value}`. It drives typed
+`Home::apply` and compares every resulting machine state, delivery count and
+receiver. It also drives the prototype placement seam and compares every vessel
+lifecycle/lease against the model. Accepted operations are generated by guarded
+machine actions; existing prototype gate tests cover independently refused
+inputs. World changes supply replica observations rather than impersonating a
+production transport. Ended AgentSessions deliberately retain no channel in the
+Quint state.
 
-Four external mutants each override one definition: expiry without a watermark,
-cancellation only from Realised, duplicate turns, and binding without draining.
-The runner accepts only an actual invariant counterexample, never a parse/tool
-failure. The override modules forward unchanged functions to the original
-module; they contain the altered rule. The production modules contain no mutants.
-
-The new gate has **no Python harness**. The historical exploration retains its
-Python under `prototypes/3108-3214` only until the deletion scheduled in #3220. Shell only connects Quint compilation to TLC
-(`VIEW` is not exposed by Quint's TLC runtime config), generates ITF, and invokes
-Cargo. The Rust ITF reader uses `serde_json` solely as a dev-dependency. No generated
-TLA+, ITF, logs, model-checker output, or results tables are committed.
+Ten external patches each change one rule in an isolated copy: missing expiry
+watermark, cancellation only from Realised, duplicate turns, bind without drain,
+resettling a promise, exceeding convoy caps, overbooking hosts and bypassing the
+priority queue, and retaining a lease after Gone, and undeliverable drops with confirmed receipts. Each must produce an actual TLC invariant counterexample;
+parse, compiler and tool failures are errors, never mutant detection. Production
+modules contain no mutant switches. Generated specs, ITF and logs stay in `build/`.
+Shell connects compilation to TLC (`VIEW` is not exposed by Quint's TLC runtime
+config) and invokes Cargo. Python tests cover allocation-runner contracts, not
+machine semantics. The historical exploration remains separate.
 
 Open `viewer.html` directly, choose an ITF file from the printed fast-run directory,
 and use Previous/Next or the slider. It draws the states/edges visited in that
@@ -114,7 +154,7 @@ SYMBOLIC_DEPTH=6 specs/primitives/symbolic.sh
 
 Apalache checks Convoy's `inductive` invariant by initial inclusion and one-step
 preservation. This proves that invariant for **every depth**, at the stated
-finite promise bound. For inbox and race it checks `safety` with six stream rows
+finite promise bound. For inbox, race and admission/placement it checks `safety` with six stream rows where streams apply,
 at the chosen depth (default 10); these are bounded SMT results, not induction or
 unbounded liveness proofs. The baseline TLC and Rust checks remain necessary:
 SMT does not replace trace replay. Logs go under `build/`.

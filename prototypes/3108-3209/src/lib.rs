@@ -17,5 +17,6 @@ pub mod base;
 pub mod home;
 pub mod kinds;
 pub mod machine;
+pub mod placement;
 pub mod record;
 pub mod view;

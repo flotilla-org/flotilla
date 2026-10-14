@@ -1,107 +1,304 @@
 module inbox_delivery {
-  import message as M from "../machines/message"
-  import agent_session as A from "../machines/agent_session"
+  import message(IDS = Set(1)) as M from "../machines/message"
+  import agent_session(IDS = Set(1, 2)) as A from "../machines/agent_session"
   import stream as S from "../world/stream"
-  import host as H from "../world/host"
   import adapter as D from "../world/adapter"
   import clock as C from "../world/clock"
-  var state: str
-  var sessions: int -> A::State
   var alive: bool
   var now: int
   var stream: S::Stream
   var homeStream: S::Stream
-  var capacity: int
   var bound: int
   var turned: Set[int]
   var turns: int -> int
-  var droppedWithReceipt: bool
-  var replacedBeforeDrain: bool
-  var expiredBeforeReceiverPrefix: bool
-  var receiver: int
   var lastHeard: int
-  var reason: str
-  var operation: str
-  var actor: int
   var unboundAt: int
+  var replacedBeforeDrain: bool
   val ids = Set(1, 2)
   pure val maxRows = 2
-  val deadline = 1
-  val threshold = 1
-  val replicaState = if (homeStream.applied == 0) "Pending" else homeStream.rows[homeStream.applied - 1].kind
+  val current = match M::messages.get(1) { | Present(s) => s | Absent => M::Pending({ expectation: M::Reply, hasDeadline: true, deadline: 1 }) }
   val observedReceipt = ids.exists(i => S::seen(stream, "receipt", i))
   val observedReply = ids.exists(i => S::seen(stream, "reply", i))
+  val replicaPending = if (homeStream.applied == 0) true else homeStream.rows[homeStream.applied - 1].kind == "Pending"
+  val canWrite = alive and stream.rows.length() < maxRows
+  val dropEvidence = { reason: M::Expired, now: now, bound: bound != 0, appliedThrough: S::watermark(stream), met: observedReply,
+    receipt: observedReceipt, noConsumerPastThreshold: bound == 0 and now - unboundAt > 1, failure: ids.exists(i => S::seen(stream, "failure", i)), supersedes: false, authorised: false }
   action init = all {
-    state' = M::initial, sessions' = ids.mapBy(_ => A::initial), alive' = true,
-    now' = 0, stream' = S::initial, homeStream' = S::initial, capacity' = maxRows, bound' = 1, turned' = Set(), receiver' = 0,
-    lastHeard' = 0, turns' = ids.mapBy(_ => 0), droppedWithReceipt' = false, replacedBeforeDrain' = false, expiredBeforeReceiverPrefix' = false, reason' = "", operation' = "init", actor' = 0, unboundAt' = 0
+    M::initWith(1, { expectation: M::Reply, hasDeadline: true, deadline: 1 }), A::initLive, alive' = true, now' = 0, stream' = S::initial, homeStream' = S::initial,
+    bound' = 1, turned' = Set(), turns' = ids.mapBy(_ => 0), lastHeard' = 0, unboundAt' = 0, replacedBeforeDrain' = false
   }
-  action advance(op: str, who: int): bool = {
-    val canWrite = alive and stream.rows.length() < capacity
-    val doTurn = op == "turn" and D::turn(replicaState == "Pending", bound == who, sessions.get(who).conversation == "Live", alive, turned.contains(who))
-    val doReceipt = op == "receipt" and canWrite and turned.contains(who) and not(stream.rows.indices().exists(i => stream.rows[i].kind == "receipt" and stream.rows[i].session == who))
-    val doReply = op == "reply" and canWrite and turned.contains(who) and not(stream.rows.indices().exists(i => stream.rows[i].kind == "reply" and stream.rows[i].session == who))
-    val doDeliver = op == "deliver" and M::gate_deliver(S::seen(stream, "receipt", who), true, true)
-    val doExpire = op == "expire" and M::gate_expired(true, now, deadline, bound != 0 or receiver != 0, S::watermark(stream), observedReply)
-    val doDrop = op == "undeliverable" and M::gate_undeliverable(state, observedReceipt, bound == 0 and now - unboundAt > threshold, ids.exists(i => S::seen(stream, "failure", i)))
-    val nextState = if (doDeliver) M::transition(state, "deliver", "reply", true)
-      else if (op == "settle") M::transition(state, "settle", "reply", M::gate_settle(state, "reply", "answered", observedReply))
-      else if (doExpire or doDrop) M::transition(state, "drop", "reply", true) else state
-    val doBind = op == "bind" and D::bind(bound == 0, sessions.get(who).conversation == "Live", not(observedReceipt) or state != "Pending")
+  action turn(who: int): bool = all {
+    D::turn(replicaPending, bound == who, A::live(A::sessions.get(who)), alive, turned.contains(who)),
+    alive' = alive,
+    now' = now,
+    stream' = stream,
+    homeStream' = homeStream,
+    bound' = bound,
+    turned' = turned.union(Set(who)),
+    turns' = turns.set(who, turns.get(who) + 1),
+    lastHeard' = lastHeard,
+    unboundAt' = unboundAt,
+    replacedBeforeDrain' = replacedBeforeDrain,
+  }
+  action publish(who: int): bool = {
+    nondet kind = Set("receipt", "reply", "failure", "keepalive").oneOf()
     all {
-      turns' = if (doTurn) turns.set(who, turns.get(who) + 1) else turns,
-      droppedWithReceipt' = (droppedWithReceipt or (nextState == "Dropped" and state != "Dropped" and doDrop and observedReceipt)),
-      replacedBeforeDrain' = (replacedBeforeDrain or (doBind and state == "Pending" and observedReceipt)),
-      expiredBeforeReceiverPrefix' = (expiredBeforeReceiverPrefix or (nextState == "Dropped" and state != "Dropped" and op == "expire" and receiver != 0 and S::watermark(stream) <= deadline)),
-      state' = nextState,
-      capacity' = capacity,
-      homeStream' = if (nextState != state) S::publish(homeStream, { at: now, kind: nextState, session: 0 })
-        else if (op == "apply home" and alive) S::apply(homeStream)
-        else if (op == "disconnect") S::link(homeStream, false)
-        else if (op == "connect") S::link(homeStream, true) else homeStream,
-      sessions' = if (op == "end" and canWrite) sessions.set(who, A::transition(sessions.get(who), "end", A::gate_end("completed", true))) else sessions,
-      alive' = if (op == "die") H::die(alive) else if (op == "recover") H::recover(alive) else alive,
-      now' = if (op == "tick") C::tick(now, 3) else now,
-      stream' = if (op == "disconnect") S::link(stream, false)
-        else if (op == "connect") S::link(stream, true)
-        else if (op == "apply") S::apply(stream)
-        else if (doReceipt) S::publish(stream, { at: now, kind: "receipt", session: who })
-        else if (op == "failure" and canWrite) S::publish(stream, { at: now, kind: "failure", session: who })
-        else if (doReply) S::publish(stream, { at: now, kind: "reply", session: who })
-        else if (op == "keepalive" and canWrite) S::publish(stream, { at: now, kind: "keepalive", session: 0 })
-        else if (op == "end" and canWrite) S::publish(stream, { at: now, kind: "end", session: who }) else stream,
-      bound' = if ((op == "unbind end" and S::seen(stream, "end", bound)) or (op == "unbind silence" and bound != 0 and now - lastHeard > threshold)) 0
-        else if (op == "bind" and D::bind(bound == 0, sessions.get(who).conversation == "Live", not(observedReceipt) or state != "Pending")) who else bound,
-      turned' = if (doTurn) turned.union(Set(who)) else turned,
-      receiver' = if (doDeliver and state == "Pending") who else receiver,
-      lastHeard' = if (op == "apply" and stream.linked and stream.applied < stream.rows.length()) now else lastHeard,
-      reason' = if (nextState == "Dropped" and state != "Dropped") (if (doExpire) "expired" else "undeliverable") else reason,
-      unboundAt' = if (bound != 0 and ((op == "unbind end" and S::seen(stream, "end", bound)) or (op == "unbind silence" and now - lastHeard > threshold))) now else unboundAt,
-      operation' = op, actor' = who
+      canWrite,
+      (kind == "failure" or kind == "keepalive" or (turned.contains(who) and Set("receipt", "reply").contains(kind) and not(stream.rows.indices().exists(i => stream.rows[i].kind == kind and stream.rows[i].session == who)))),
+      alive' = alive,
+      now' = now,
+      stream' = S::publish(stream, { at: now, kind: kind, session: who }),
+      homeStream' = homeStream,
+      bound' = bound,
+      turned' = turned,
+      turns' = turns,
+      lastHeard' = lastHeard,
+      unboundAt' = unboundAt,
+      replacedBeforeDrain' = replacedBeforeDrain,
     }
   }
-  action step = {
-    nondet op = Set("tick", "disconnect", "connect", "die", "recover", "turn", "receipt", "apply", "apply home", "keepalive", "end", "unbind end", "unbind silence", "bind", "deliver", "reply", "failure", "settle", "expire", "undeliverable").oneOf()
-    nondet who = ids.oneOf()
-    advance(op, who)
+  action bind(who: int): bool = all {
+    D::bind(bound == 0, A::live(A::sessions.get(who)), not(observedReceipt) or not(M::pending(M::messages.get(1)))),
+    alive' = alive,
+    now' = now,
+    stream' = stream,
+    homeStream' = homeStream,
+    bound' = who,
+    turned' = turned,
+    turns' = turns,
+    lastHeard' = lastHeard,
+    unboundAt' = unboundAt,
+    replacedBeforeDrain' = (replacedBeforeDrain or (M::pending(M::messages.get(1)) and observedReceipt)),
   }
-  // At least once across replacement: both sessions may turn. A confirmed receiver must have turned.
-  val safety = ids.forall(i => turns.get(i) <= 1) and not(droppedWithReceipt) and not(replacedBeforeDrain) and not(expiredBeforeReceiverPrefix) and (receiver == 0 or turned.contains(receiver)) and
-    (state != "Awaiting" or receiver != 0) and
-    (reason != "undeliverable" or receiver == 0) and
-    stream.applied <= stream.rows.length()
-  val view = (state, sessions, alive, now, stream, bound, turned, receiver, lastHeard, reason, unboundAt, homeStream, turns, droppedWithReceipt, replacedBeforeDrain, expiredBeforeReceiverPrefix)
-  temporal endsAreFinal = M::ends.forall(s => always(state == s implies always(state == s)))
-  action deliver1 = advance("deliver", 1)
-  action deliver2 = advance("deliver", 2)
-  action unbindEnded = advance("unbind end", 1)
-  action unbindSilent = advance("unbind silence", 1)
-  temporal receiptProgress = (weakFair(deliver1, view) and weakFair(deliver2, view)) implies
-    always((state == "Pending" and observedReceipt) implies eventually(state != "Pending"))
-  temporal endedUnbinds = weakFair(unbindEnded, view) implies ids.forall(i =>
-    always((bound == i and S::seen(stream, "end", i)) implies eventually(bound != i)))
-  temporal silentUnbinds = (weakFair(unbindSilent, view) and eventually(always(now - lastHeard > threshold))) implies
-    always(eventually(bound == 0))
-  temporal liveness = receiptProgress and endedUnbinds and silentUnbinds and endsAreFinal
-
+  action unbindEndedWorld(who: int): bool = all {
+    bound != 0,
+    S::seen(stream, "end", bound),
+    alive' = alive,
+    now' = now,
+    stream' = stream,
+    homeStream' = homeStream,
+    bound' = 0,
+    turned' = turned,
+    turns' = turns,
+    lastHeard' = lastHeard,
+    unboundAt' = now,
+    replacedBeforeDrain' = replacedBeforeDrain,
+  }
+  action unbindSilentWorld(who: int): bool = all {
+    bound != 0,
+    now - lastHeard > 1,
+    alive' = alive,
+    now' = now,
+    stream' = stream,
+    homeStream' = homeStream,
+    bound' = 0,
+    turned' = turned,
+    turns' = turns,
+    lastHeard' = lastHeard,
+    unboundAt' = now,
+    replacedBeforeDrain' = replacedBeforeDrain,
+  }
+  action applySource(who: int): bool = all {
+    alive' = alive,
+    now' = now,
+    stream' = S::apply(stream),
+    homeStream' = homeStream,
+    bound' = bound,
+    turned' = turned,
+    turns' = turns,
+    lastHeard' = if (stream.linked and stream.applied < stream.rows.length()) now else lastHeard,
+    unboundAt' = unboundAt,
+    replacedBeforeDrain' = replacedBeforeDrain,
+  }
+  action applyHome(who: int): bool = all {
+    alive' = alive,
+    now' = now,
+    stream' = stream,
+    homeStream' = if (alive) S::apply(homeStream) else homeStream,
+    bound' = bound,
+    turned' = turned,
+    turns' = turns,
+    lastHeard' = lastHeard,
+    unboundAt' = unboundAt,
+    replacedBeforeDrain' = replacedBeforeDrain,
+  }
+  action disconnect(who: int): bool = all {
+    alive' = alive,
+    now' = now,
+    stream' = S::link(stream, false),
+    homeStream' = S::link(homeStream, false),
+    bound' = bound,
+    turned' = turned,
+    turns' = turns,
+    lastHeard' = lastHeard,
+    unboundAt' = unboundAt,
+    replacedBeforeDrain' = replacedBeforeDrain,
+  }
+  action connect(who: int): bool = all {
+    alive' = alive,
+    now' = now,
+    stream' = S::link(stream, true),
+    homeStream' = S::link(homeStream, true),
+    bound' = bound,
+    turned' = turned,
+    turns' = turns,
+    lastHeard' = lastHeard,
+    unboundAt' = unboundAt,
+    replacedBeforeDrain' = replacedBeforeDrain,
+  }
+  action die(who: int): bool = all {
+    alive' = false,
+    now' = now,
+    stream' = stream,
+    homeStream' = homeStream,
+    bound' = bound,
+    turned' = turned,
+    turns' = turns,
+    lastHeard' = lastHeard,
+    unboundAt' = unboundAt,
+    replacedBeforeDrain' = replacedBeforeDrain,
+  }
+  action recover(who: int): bool = all {
+    alive' = true,
+    now' = now,
+    stream' = stream,
+    homeStream' = homeStream,
+    bound' = bound,
+    turned' = turned,
+    turns' = turns,
+    lastHeard' = lastHeard,
+    unboundAt' = unboundAt,
+    replacedBeforeDrain' = replacedBeforeDrain,
+  }
+  action tick(who: int): bool = all {
+    alive' = alive,
+    now' = C::tick(now, 3),
+    stream' = stream,
+    homeStream' = homeStream,
+    bound' = bound,
+    turned' = turned,
+    turns' = turns,
+    lastHeard' = lastHeard,
+    unboundAt' = unboundAt,
+    replacedBeforeDrain' = replacedBeforeDrain,
+  }
+  action step = {
+    nondet who = ids.oneOf()
+    any {
+      all {
+        M::deliver(1, { observed: S::seen(stream, "receipt", who), receiverMatches: true, transportMatches: true, receiver: { session: who, host: "consumer" } }),
+        A::unchanged,
+        alive' = alive,
+        now' = now,
+        stream' = stream,
+        homeStream' = S::publish(homeStream, { at: now, kind: "Awaiting", session: 0 }),
+        bound' = bound,
+        turned' = turned,
+        turns' = turns,
+        lastHeard' = lastHeard,
+        unboundAt' = unboundAt,
+        replacedBeforeDrain' = replacedBeforeDrain,
+      },
+      all {
+        M::settle(1, M::Answered({ observed: observedReply })),
+        A::unchanged,
+        alive' = alive,
+        now' = now,
+        stream' = stream,
+        homeStream' = S::publish(homeStream, { at: now, kind: "Settled", session: 0 }),
+        bound' = bound,
+        turned' = turned,
+        turns' = turns,
+        lastHeard' = lastHeard,
+        unboundAt' = unboundAt,
+        replacedBeforeDrain' = replacedBeforeDrain,
+      },
+      all {
+        M::drop(1, { ...dropEvidence, reason: M::Expired }),
+        A::unchanged,
+        alive' = alive,
+        now' = now,
+        stream' = stream,
+        homeStream' = S::publish(homeStream, { at: now, kind: "Dropped", session: 0 }),
+        bound' = bound,
+        turned' = turned,
+        turns' = turns,
+        lastHeard' = lastHeard,
+        unboundAt' = unboundAt,
+        replacedBeforeDrain' = replacedBeforeDrain,
+      },
+      all {
+        M::drop(1, { ...dropEvidence, reason: M::Undeliverable }),
+        A::unchanged,
+        alive' = alive,
+        now' = now,
+        stream' = stream,
+        homeStream' = S::publish(homeStream, { at: now, kind: "Dropped", session: 0 }),
+        bound' = bound,
+        turned' = turned,
+        turns' = turns,
+        lastHeard' = lastHeard,
+        unboundAt' = unboundAt,
+        replacedBeforeDrain' = replacedBeforeDrain,
+      },
+      all {
+        A::end(who, A::Completed, canWrite),
+        M::unchanged,
+        alive' = alive,
+        now' = now,
+        stream' = S::publish(stream, { at: now, kind: "end", session: who }),
+        homeStream' = homeStream,
+        bound' = bound,
+        turned' = turned,
+        turns' = turns,
+        lastHeard' = lastHeard,
+        unboundAt' = unboundAt,
+        replacedBeforeDrain' = replacedBeforeDrain,
+      },
+      all { turn(who), M::unchanged, A::unchanged },
+      all { publish(who), M::unchanged, A::unchanged },
+      all { bind(who), M::unchanged, A::unchanged },
+      all { unbindEndedWorld(who), M::unchanged, A::unchanged },
+      all { unbindSilentWorld(who), M::unchanged, A::unchanged },
+      all { applySource(who), M::unchanged, A::unchanged },
+      all { applyHome(who), M::unchanged, A::unchanged },
+      all { disconnect(who), M::unchanged, A::unchanged },
+      all { connect(who), M::unchanged, A::unchanged },
+      all { die(who), M::unchanged, A::unchanged },
+      all { recover(who), M::unchanged, A::unchanged },
+      all { tick(who), M::unchanged, A::unchanged },
+    }
+  }
+  val receiverTurned = M::receiver(current) == 0 or turned.contains(M::receiver(current))
+  val undeliverableHasNoReceiver = match current { | Dropped(d) => d.reason != M::Undeliverable or d.receiver == 0 | _ => true }
+  val expiryPastReceiverPrefix = match current { | Dropped(d) => d.reason != M::Expired or not(d.bound) or d.watermark > d.envelope.deadline | _ => true }
+  val noUndeliverableReceipt = match current { | Dropped(d) => d.reason != M::Undeliverable or not(d.receipt) | _ => true }
+  val safety = noUndeliverableReceipt and ids.forall(i => turns.get(i) <= 1) and not(replacedBeforeDrain) and receiverTurned and undeliverableHasNoReceiver and expiryPastReceiverPrefix and stream.applied <= stream.rows.length()
+  val view = (M::messages, A::sessions, alive, now, stream, homeStream, bound, turned, turns, lastHeard, unboundAt, replacedBeforeDrain)
+  action deliverObserved = {
+    nondet who = ids.oneOf()
+      all {
+        M::deliver(1, { observed: S::seen(stream, "receipt", who), receiverMatches: true, transportMatches: true, receiver: { session: who, host: "consumer" } }),
+        A::unchanged,
+        alive' = alive,
+        now' = now,
+        stream' = stream,
+        homeStream' = S::publish(homeStream, { at: now, kind: "Awaiting", session: 0 }),
+        bound' = bound,
+        turned' = turned,
+        turns' = turns,
+        lastHeard' = lastHeard,
+        unboundAt' = unboundAt,
+        replacedBeforeDrain' = replacedBeforeDrain,
+      }
+  }
+  action unbindEnded = all { M::unchanged, A::unchanged, bound != 0, S::seen(stream, "end", bound),
+alive' = alive, now' = now, stream' = stream, homeStream' = homeStream, bound' = 0, turned' = turned, turns' = turns, lastHeard' = lastHeard, unboundAt' = now, replacedBeforeDrain' = replacedBeforeDrain }
+  action unbindSilent = all { M::unchanged, A::unchanged, bound != 0, now - lastHeard > 1,
+alive' = alive, now' = now, stream' = stream, homeStream' = homeStream, bound' = 0, turned' = turned, turns' = turns, lastHeard' = lastHeard, unboundAt' = now, replacedBeforeDrain' = replacedBeforeDrain }
+  temporal endsAreFinal = always((M::ended(current) implies next(M::messages) == M::messages).orKeep(view))
+  temporal receiptProgress = weakFair(deliverObserved, view) implies always((M::pending(M::messages.get(1)) and observedReceipt) implies eventually(not(M::pending(M::messages.get(1)))))
+  temporal endedUnbinds = weakFair(unbindEnded, view) implies ids.forall(i => always((bound == i and S::seen(stream, "end", i)) implies eventually(bound != i)))
+  temporal silentUnbinds = (weakFair(unbindSilent, view) and eventually(always(now - lastHeard > 1))) implies always(eventually(bound == 0))
+  temporal liveness = endsAreFinal and receiptProgress and endedUnbinds and silentUnbinds
 }

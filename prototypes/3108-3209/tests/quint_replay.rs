@@ -44,36 +44,6 @@ fn states(trace: &Value) -> &[Value] {
     trace["states"].as_array().expect("ITF states")
 }
 
-fn convoy(trace: &Value) {
-    let mut home = Home::<Convoy>::new("home").expect("definition");
-    let promises = vec![reference("promise", 0), reference("promise", 1)];
-    assert!(home.create("empty", ConvoySpec { promises: vec![] }).is_err(), "admission refuses vacuity");
-    let id = home.create("convoy", ConvoySpec { promises: promises.clone() }).expect("admission");
-    let mut view = MemoryView::new();
-    for (index, pair) in states(trace).windows(2).enumerate() {
-        let (before, after) = (&pair[0], &pair[1]);
-        for (i, p) in promises.iter().enumerate() {
-            view.observe(
-                p,
-                "home",
-                Fact::Promise { kept: contains(&before["kept"], i as u64), accepted_retraction: contains(&before["accepted"], i as u64) },
-            );
-        }
-        authorize(&mut view, after["authorised"].as_bool().expect("authorised"));
-        match text(&after["edge"]) {
-            "deliver" => {
-                let _ = home.apply(&id, ConvoyEdge::Deliver, &view);
-            }
-            "abandon" => {
-                let _ =
-                    home.apply(&id, ConvoyEdge::Abandon { by: "owner".into(), reason: "decision".into(), authority: authority() }, &view);
-            }
-            _ => {}
-        }
-        assert_eq!(home.get(&id).expect("convoy").state().name(), text(&after["state"]), "convoy step {index}");
-    }
-}
-
 fn stream_view(before: &Value, stream_name: &str, id: &ObjRef, view: &mut MemoryView) {
     let stream = &before[stream_name];
     let rows = stream["rows"].as_array().expect("stream rows");
@@ -107,306 +77,492 @@ fn stream_view(before: &Value, stream_name: &str, id: &ObjRef, view: &mut Memory
     view.observe(&reference("keepalive", "consumer"), "home", Fact::AppliedThrough(Time(mark * UNIT)));
 }
 
-fn message(trace: &Value, inbox: bool) {
-    let initial = &states(trace)[0];
-    let expected = if inbox { "reply" } else { text(&initial["expectation"]) };
-    let expectation = match expected {
-        "nothing" => Expectation::Nothing,
-        "reply" => Expectation::Reply,
-        "outcome" => Expectation::Outcome { condition: reference("condition", "outcome") },
-        _ => panic!("expectation"),
+// Quint 0.33 emits sums as {tag,value}; imported stores have qualified names.
+fn tag(v: &Value) -> &str {
+    text(&v["tag"])
+}
+fn payload(v: &Value) -> &Value {
+    &v["value"]
+}
+fn store<'a>(state: &'a Value, suffix: &str) -> &'a Value {
+    let matches: Vec<_> = state.as_object().expect("ITF state").iter().filter(|(k, _)| k.ends_with(suffix)).collect();
+    assert_eq!(matches.len(), 1, "one store ending in {suffix}");
+    matches[0].1
+}
+fn slot_state(v: &Value) -> Option<&Value> {
+    match tag(v) {
+        "Absent" => None,
+        "Present" => Some(payload(v)),
+        other => panic!("slot {other}"),
+    }
+}
+fn state_at<'a>(s: &'a Value, suffix: &str, id: u64) -> Option<&'a Value> {
+    slot_state(map(store(s, suffix), id))
+}
+fn action(s: &Value) -> &str {
+    text(&s["mbt::actionTaken"])
+}
+fn pick<'a>(s: &'a Value, key: &str) -> &'a Value {
+    let v = &s["mbt::nondetPicks"][key];
+    assert_eq!(tag(v), "Some", "chosen {key}");
+    payload(v)
+}
+fn chosen(s: &Value, key: &str) -> u64 {
+    number(pick(s, key))
+}
+fn yes(s: &Value, key: &str) -> bool {
+    pick(s, key).as_bool().expect("boolean pick")
+}
+fn pairs(v: &Value) -> &[Value] {
+    v["#map"].as_array().expect("map")
+}
+fn verify_lives(home: &Home<CloneMachine>, ids: &std::collections::BTreeMap<u64, ObjRef>, state: &Value, suffix: &str) {
+    for row in pairs(store(state, suffix)) {
+        let i = number(&row[0]);
+        let expected = slot_state(&row[1]).map_or("Absent", tag);
+        let actual = ids.get(&i).map_or("Absent", |id| home.get(id).expect("lifecycle").state().name());
+        assert_eq!(actual, expected, "lifecycle {i}, {}", action(state));
+    }
+}
+fn apply_life(home: &mut Home<CloneMachine>, id: &ObjRef, op: &str, seen: bool, matching: bool, view: &mut MemoryView) {
+    // Each operation uses a fresh observation: missing evidence cannot inherit a prior fact.
+    let observed = reference("observation", format!("{}-{}", op, home.get(id).expect("life").events.len()));
+    let edge = match op {
+        "realise" => {
+            if seen {
+                view.observe(&observed, "home", Fact::Present { identity: if matching { "model" } else { "other" }.into() });
+            }
+            Some(LifecycleEdge::Realise { identity: "model".into(), observed })
+        }
+        "release" => {
+            if seen {
+                view.observe(&observed, "home", Fact::TeardownComplete);
+            }
+            Some(LifecycleEdge::Release { by: "owner".into(), teardown: observed })
+        }
+        "vanish" => {
+            if seen {
+                view.observe(&observed, "home", Fact::Absent);
+            }
+            Some(LifecycleEdge::Vanish { observed })
+        }
+        "giveUp" => Some(LifecycleEdge::GiveUp { cause: if matching { cause() } else { Cause::new(CauseCategory::Transient, "other") } }),
+        _ => None,
     };
+    if let Some(edge) = edge {
+        let _ = home.apply(id, edge, view);
+    }
+}
+fn convoy(trace: &Value) {
+    let mut home = Home::<Convoy>::new("home").expect("definition");
+    let mut ids = std::collections::BTreeMap::new();
+    let mut view = MemoryView::new();
+    for pair in states(trace).windows(2) {
+        let (before, after) = (&pair[0], &pair[1]);
+        let i = chosen(after, "id");
+        if action(after) == "admitRequest" {
+            let promises = pairs(&payload(state_at(after, "::convoys", i).expect("admitted"))["request"]["promises"])
+                .iter()
+                .map(|p| reference("promise", format!("{i}-{}", number(&p[0]))))
+                .collect();
+            ids.insert(i, home.create(&i.to_string(), ConvoySpec { promises }).expect("admission"));
+        } else if let Some(id) = ids.get(&i) {
+            if let Some(s) = state_at(before, "::convoys", i) {
+                let w = if tag(s) == "Abandoned" { &payload(s)["work"] } else { payload(s) };
+                for row in pairs(&w["promises"]) {
+                    view.observe(
+                        &reference("promise", format!("{i}-{}", number(&row[0]))),
+                        "home",
+                        Fact::Promise { kept: tag(&row[1]) == "Kept", accepted_retraction: tag(&row[1]) == "Retracted" },
+                    );
+                }
+            }
+            authorize(&mut view, yes(after, "auth"));
+            let edge = match action(after) {
+                "deliver" => Some(ConvoyEdge::Deliver),
+                "abandon" => {
+                    Some(ConvoyEdge::Abandon { by: "owner".into(), reason: text(pick(after, "reason")).into(), authority: authority() })
+                }
+                _ => None,
+            };
+            if let Some(e) = edge {
+                let _ = home.apply(id, e, &view);
+            }
+        }
+        for row in pairs(store(after, "::convoys")) {
+            let i = number(&row[0]);
+            assert_eq!(
+                ids.get(&i).map_or("Absent", |id| home.get(id).expect("convoy").state().name()),
+                slot_state(&row[1]).map_or("Absent", tag)
+            );
+        }
+    }
+}
+fn machine_edges(trace: &Value) {
+    let mut home = Home::<CloneMachine>::new("home").expect("definition");
+    let mut sessions = Home::<AgentSession>::new("consumer").expect("definition");
+    let mut ids = std::collections::BTreeMap::new();
+    let mut sid = None;
+    let mut failed = false;
+    for pair in states(trace).windows(2) {
+        let (before, after) = (&pair[0], &pair[1]);
+        let op = action(after);
+        let mut view = MemoryView::new(); // independent evidence attempts
+        if op == "request" {
+            if state_at(before, "::resources", 1).is_none() && state_at(after, "::resources", 1).is_some() {
+                ids.insert(1, home.create("clone", CloneRequest { url: "model".into(), path: "model".into() }).expect("create"));
+            } else {
+                sid = Some(sessions.create("session", ()).expect("session"));
+            }
+        }
+        if !failed && after["failed"] == true {
+            if let Some(id) = ids.get(&1) {
+                if home.get(id).expect("life").state().name() == "Requested" {
+                    let _ = home.record_attempt(id, "realise", "thing", Outcome::Failure { cause: cause(), retryable: false }, &view);
+                }
+            }
+            failed = true;
+        }
+        if let Some(id) = ids.get(&1) {
+            apply_life(&mut home, id, op, yes(after, "seen"), yes(after, "matches"), &mut view);
+        }
+        if let Some(id) = &sid {
+            let observed = reference("observation", "session");
+            let seen = yes(after, "seen");
+            let edge = match op {
+                "attach" => {
+                    if seen {
+                        view.observe(&observed, "consumer", Fact::ChannelPresent(true));
+                    }
+                    Some(SessionEdge::Attach { observed })
+                }
+                "detach" => {
+                    if seen {
+                        view.observe(&observed, "consumer", Fact::ChannelPresent(false));
+                    }
+                    Some(SessionEdge::Detach { observed })
+                }
+                "end" => {
+                    let reason = match tag(pick(after, "reason")) {
+                        "Completed" => EndReason::Completed,
+                        "Lost" => EndReason::Lost,
+                        _ => panic!("end reason"),
+                    };
+                    if seen && yes(after, "matches") {
+                        view.observe(&observed, "consumer", Fact::ConversationEnded { reason: reason.name().into() });
+                    }
+                    Some(SessionEdge::End { reason, observed })
+                }
+                _ => None,
+            };
+            if let Some(e) = edge {
+                let _ = sessions.apply(id, e, &view);
+            }
+        }
+        verify_lives(&home, &ids, after, "::resources");
+        verify_sessions(&sessions, &sid.iter().map(|id| (1, id.clone())).collect(), after);
+    }
+}
+fn verify_sessions(home: &Home<AgentSession>, ids: &std::collections::BTreeMap<u64, ObjRef>, s: &Value) {
+    for row in pairs(store(s, "::sessions")) {
+        let i = number(&row[0]);
+        match slot_state(&row[1]) {
+            None => assert!(!ids.contains_key(&i)),
+            Some(expected) => {
+                let actual = home.get(ids.get(&i).expect("session exists")).expect("session").state();
+                let conversation = if tag(expected) == "Live" { "Live" } else { "Ended" };
+                assert_eq!(format!("{:?}", actual.conversation), conversation);
+                if conversation == "Live" {
+                    assert_eq!(format!("{:?}", actual.channel), tag(payload(expected)));
+                }
+            }
+        }
+    }
+}
+fn ensure(trace: &Value) {
+    let mut home = Home::<Ensure>::new("home").expect("definition");
+    let mut eid = None;
+    let mut lifecycle = Home::<CloneMachine>::new("home").expect("definition");
+    let mut ids = std::collections::BTreeMap::new();
+    for pair in states(trace).windows(2) {
+        let (before, after) = (&pair[0], &pair[1]);
+        let who = chosen(after, "who");
+        let op = action(after);
+        let mut view = MemoryView::new();
+        authorize(&mut view, yes(after, "auth"));
+        if op == "request" {
+            eid = Some(home.create("ensure", EnsureSpec { policy: policy() }).expect("ensure"));
+        }
+        let Some(id) = &eid else { continue };
+        let old = state_at(before, "::ensures", 1);
+        if let Some(old) = old {
+            let w = if tag(old) == "Fulfilled" { &payload(old)["work"] } else { payload(old) };
+            let subject = reference("fulfiller", who);
+            let recorded = reference("recorded", who);
+            if contains(&w["recorded"], who) {
+                view.observe(&recorded, "home", Fact::FulfillerRecorded { fulfiller: subject.clone() });
+            }
+            for i in 1..=2 {
+                let life = state_at(before, "::resources", i).map_or("Absent", tag);
+                view.observe(
+                    &reference("fulfiller", i),
+                    "home",
+                    Fact::Fulfiller { realised: life == "Realised", can_receive: true, gone: life == "Gone" },
+                );
+            }
+            let bound = if tag(old) == "Fulfilled" { number(&payload(old)["bound"]) } else { 0 };
+            let edge = match op {
+                "bind" => Some(EnsureEdge::Bind { fulfiller: subject, recorded }),
+                "unbind" => Some(EnsureEdge::Unbind { reason: UnbindReason::Gone, observed: reference("fulfiller", who) }),
+                "giveUp" => Some(EnsureEdge::GiveUp),
+                "resume" => Some(EnsureEdge::Resume { by: "owner".into(), authority: authority() }),
+                "retire" => Some(EnsureEdge::Retire { by: "owner".into(), authority: authority() }),
+                _ => None,
+            };
+            if let Some(e) = edge {
+                assert!(home.apply(id, e, &view).is_ok(), "accepted model {op}, bound {bound}");
+            }
+            if op == "recordFailure" {
+                home.record_attempt(id, "fulfil", "role", Outcome::Failure { cause: cause(), retryable: true }, &view).expect("attempt");
+            }
+            if op == "create" {
+                ids.insert(
+                    who,
+                    lifecycle.create(&who.to_string(), CloneRequest { url: "model".into(), path: "model".into() }).expect("fulfiller"),
+                );
+            }
+            if let Some(target) = ids.get(&who) {
+                apply_life(&mut lifecycle, target, op, true, true, &mut view);
+            }
+            if op == "retire" {
+                for target in ids.values() {
+                    apply_life(&mut lifecycle, target, "release", true, true, &mut view);
+                }
+            }
+        }
+        assert_eq!(home.get(id).expect("ensure").state().name(), tag(state_at(after, "::ensures", 1).expect("ensure state")), "{op}");
+        verify_lives(&lifecycle, &ids, after, "::resources");
+    }
+}
+fn message(trace: &Value, inbox: bool) {
     let mut home = Home::<Message>::new("home").expect("definition");
-    let id = home
+    let model = state_at(&states(trace)[0], "::messages", 1).expect("initial message");
+    let env = payload(model);
+    let expected = tag(&env["expectation"]);
+    let mid = home
         .create(
             "message",
             MessageSpec {
                 sender: "sender".into(),
                 inbox: "role".into(),
                 body: "brief".into(),
-                expectation,
-                deadline: if inbox || initial["hasDeadline"].as_bool().expect("deadline presence") { Some(Time(UNIT)) } else { None },
+                expectation: match expected {
+                    "Nothing" => Expectation::Nothing,
+                    "Reply" => Expectation::Reply,
+                    "Outcome" => Expectation::Outcome { condition: reference("condition", "outcome") },
+                    _ => panic!("expectation"),
+                },
+                deadline: if env["hasDeadline"] == true { Some(Time(UNIT)) } else { None },
                 unbound_after: Duration::from_millis(UNIT),
             },
         )
         .expect("message");
-    let mut sessions = Home::<AgentSession>::new("consumer").expect("session definition");
-    let session_ids: Vec<_> = (1..=2).map(|i| sessions.create(&i.to_string(), ()).expect("session")).collect();
-    let mut expected_events = 0;
-    let mut view = MemoryView::new();
-    for (index, pair) in states(trace).windows(2).enumerate() {
-        let (before, after) = (&pair[0], &pair[1]);
-        view.set_now(Time(number(&before["now"]) * UNIT));
-        stream_view(before, if inbox { "stream" } else { "source" }, &id, &mut view);
-        let bound = if inbox { number(&before["bound"]) } else { 1 };
-        view.observe(
-            &reference("binding", "role"),
-            "home",
-            if bound == 0 {
-                Fact::UnboundSince(Time(number(&before["unboundAt"]) * UNIT))
-            } else {
-                Fact::Consumer { host: "consumer".into() }
-            },
-        );
-        authorize(&mut view, true);
-        let who = if inbox { number(&after["actor"]) } else { 1 };
-        let edge = match text(&after["operation"]) {
-            "deliver" => {
-                Some(MessageEdge::Deliver { receiver: who.to_string(), receipt: reference("receipt", who), transport: Transport::Turn })
-            }
-            "settle" => Some(MessageEdge::Settle {
-                by: if expected == "reply" {
-                    Settlement::Answered { reply: reference("reply", "message") }
-                } else {
-                    Settlement::OutcomeObserved { observation: reference("condition", "outcome") }
-                },
-            }),
-            "expire" => Some(MessageEdge::Drop { reason: DropReason::Expired }),
-            "undeliverable" => Some(MessageEdge::Drop { reason: DropReason::Undeliverable { cause: cause() } }),
-            "supersede" => {
-                let newer = reference("Message", "newer");
-                view.observe(&newer, "home", Fact::Supersedes { older: id.clone() });
-                Some(MessageEdge::Drop { reason: DropReason::Superseded { by: newer } })
-            }
-            "withdraw" => Some(MessageEdge::Drop { reason: DropReason::Withdrawn { by: "owner".into(), authority: authority() } }),
-            _ => None,
-        };
-        if let Some(edge) = edge {
-            let _ = home.apply(&id, edge, &view);
+    let mut sessions = Home::<AgentSession>::new("consumer").expect("definition");
+    let mut sids = std::collections::BTreeMap::new();
+    if inbox {
+        for i in 1..=2 {
+            sids.insert(i, sessions.create(&i.to_string(), ()).expect("session"));
         }
-        if inbox {
-            let can_write =
-                before["alive"] == true && before["stream"]["rows"].as_array().expect("rows").len() < number(&before["capacity"]) as usize;
-            if text(&after["operation"]) == "end" {
-                let observed = reference("end", who);
-                if can_write {
-                    view.observe(&observed, "consumer", Fact::ConversationEnded { reason: "completed".into() });
-                }
-                let _ = sessions.apply(&session_ids[who as usize - 1], SessionEdge::End { reason: EndReason::Completed, observed }, &view);
-            }
-            for who in 1..=2 {
-                let state = sessions.get(&session_ids[who - 1]).expect("session").state();
-                let expected = map(&after["sessions"], who as u64);
-                assert_eq!(format!("{:?}", state.conversation), text(&expected["conversation"]), "session step {index}");
-                assert_eq!(format!("{:?}", state.channel), text(&expected["channel"]), "channel step {index}");
-            }
-        }
-        if before["state"] != after["state"] {
-            expected_events += 1;
-        }
-        let resource = home.get(&id).expect("message");
-        assert_eq!(resource.events.len(), expected_events, "accepted and refused message edges at step {index}");
-        assert!(resource.events.rows().iter().filter(|event| event.edge.name() == "deliver").count() <= 1, "exactly one receiver");
-        if inbox {
-            let receiver = resource.last_event("deliver").map_or("0", |event| match &event.edge {
-                MessageEdge::Deliver { receiver, .. } => receiver,
-                _ => unreachable!(),
-            });
-            assert_eq!(receiver, number(&after["receiver"]).to_string(), "receiver at step {index}");
-        }
-        assert_eq!(
-            home.get(&id).expect("message").state().name(),
-            text(&after["state"]),
-            "message step {index}, operation {}",
-            after["operation"]
-        );
     }
-}
-
-fn ensure(trace: &Value) {
-    let mut home = Home::<Ensure>::new("home").expect("definition");
-    let id = home.create("ensure", EnsureSpec { policy: policy() }).expect("ensure");
-    let mut lifecycle = Home::<CloneMachine>::new("home").expect("lifecycle definition");
-    let mut fulfil: Vec<Option<ObjRef>> = vec![None, None];
-    let mut view = MemoryView::new();
+    let mut events = 0;
     for (index, pair) in states(trace).windows(2).enumerate() {
         let (before, after) = (&pair[0], &pair[1]);
+        let op = action(after);
+        let who = if inbox { chosen(after, "who") } else { 1 };
+        let mut view = MemoryView::new();
+        view.set_now(Time(number(&before["now"]) * UNIT));
         authorize(&mut view, true);
-        let who = number(&after["actor"]);
-        let op = text(&after["operation"]);
-        let subject = reference("fulfiller", who);
-        let recorded = reference("recorded", who);
-        if contains(&before["recorded"], who) {
-            view.observe(&recorded, "home", Fact::FulfillerRecorded { fulfiller: subject.clone() });
+        if inbox && op == "end" {
+            let observed = reference("end", who);
+            view.observe(&observed, "consumer", Fact::ConversationEnded { reason: "completed".into() });
+            let _ =
+                sessions.apply(sids.get(&who).expect("ending session"), SessionEdge::End { reason: EndReason::Completed, observed }, &view);
         }
-        let old_state = text(map(&before["fulfil"], who));
-        view.observe(&subject, "home", Fact::Fulfiller { realised: old_state == "Realised", can_receive: true, gone: old_state == "Gone" });
-        let old_bound = number(&before["bound"]);
-        let old = reference("fulfiller", old_bound);
-        if old_bound != who && old_bound != 0 {
+        {
+            let id = &mid;
+            stream_view(before, if inbox { "stream" } else { "source" }, id, &mut view);
+            let bound = if inbox { number(&before["bound"]) } else { 1 };
             view.observe(
-                &old,
+                &reference("binding", "role"),
                 "home",
-                Fact::Fulfiller {
-                    realised: text(map(&before["fulfil"], old_bound)) == "Realised",
-                    can_receive: true,
-                    gone: text(map(&before["fulfil"], old_bound)) == "Gone",
+                if bound == 0 {
+                    Fact::UnboundSince(Time(number(&before["unboundAt"]) * UNIT))
+                } else {
+                    Fact::Consumer { host: "consumer".into() }
                 },
             );
-        }
-        let edge = match op {
-            "bind" => Some(EnsureEdge::Bind { fulfiller: subject, recorded }),
-            "unbind" => Some(EnsureEdge::Unbind { reason: UnbindReason::Gone, observed: old }),
-            "give up" => Some(EnsureEdge::GiveUp),
-            "resume" => Some(EnsureEdge::Resume { by: "owner".into(), authority: authority() }),
-            "retire" => Some(EnsureEdge::Retire { by: "owner".into(), authority: authority() }),
-            _ => None,
-        };
-        let applied = edge.is_some_and(|e| home.apply(&id, e, &view).is_ok());
-        if op == "fail" && before["state"] == "Unfulfilled" && before["history"].as_array().expect("history").len() < 2 {
-            home.record_attempt(&id, "fulfil", "role", Outcome::Failure { cause: cause(), retryable: true }, &view).expect("attempt");
-        }
-        if op == "create"
-            && before["state"] == "Unfulfilled"
-            && old_state == "Absent"
-            && contains(&before["recorded"], who)
-            && (1..=2).all(|i| matches!(text(map(&before["fulfil"], i)), "Absent" | "Gone" | "GaveUp"))
-        {
-            fulfil[who as usize - 1] =
-                Some(lifecycle.create(&who.to_string(), CloneRequest { url: "model".into(), path: "model".into() }).expect("create"));
-        }
-        if let Some(target) = &fulfil[who as usize - 1] {
-            let observation = reference("observation", who);
             let edge = match op {
-                "realise" => {
-                    view.observe(&observation, "home", Fact::Present { identity: "model".into() });
-                    Some(LifecycleEdge::Realise { identity: "model".into(), observed: observation })
+                "deliver" => {
+                    Some(MessageEdge::Deliver { receiver: who.to_string(), receipt: reference("receipt", who), transport: Transport::Turn })
                 }
-                "vanish" => {
-                    view.observe(&observation, "home", Fact::Absent);
-                    Some(LifecycleEdge::Vanish { observed: observation })
-                }
-                "release" => {
-                    view.observe(&observation, "home", Fact::TeardownComplete);
-                    Some(LifecycleEdge::Release { by: "owner".into(), teardown: observation })
+                "settle" => Some(MessageEdge::Settle {
+                    by: if expected == "Reply" {
+                        Settlement::Answered { reply: reference("reply", "message") }
+                    } else {
+                        Settlement::OutcomeObserved { observation: reference("condition", "outcome") }
+                    },
+                }),
+                "drop" => {
+                    let model = state_at(after, "::messages", 1).expect("dropped");
+                    assert_eq!(tag(model), "Dropped");
+                    let reason = match tag(&payload(model)["reason"]) {
+                        "Expired" => DropReason::Expired,
+                        "Undeliverable" => DropReason::Undeliverable { cause: cause() },
+                        "Superseded" => {
+                            let newer = reference("Message", "newer");
+                            view.observe(&newer, "home", Fact::Supersedes { older: id.clone() });
+                            DropReason::Superseded { by: newer }
+                        }
+                        "Withdrawn" => DropReason::Withdrawn { by: "owner".into(), authority: authority() },
+                        "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: "owner".into(), authority: authority() },
+                        _ => panic!("drop reason"),
+                    };
+                    Some(MessageEdge::Drop { reason })
                 }
                 _ => None,
             };
-            if let Some(edge) = edge {
-                let _ = lifecycle.apply(target, edge, &view);
+            if let Some(e) = edge {
+                assert!(home.apply(id, e, &view).is_ok(), "model accepted message {op} at {index}");
+                events += 1;
+            }
+            let resource = home.get(id).expect("message");
+            let model = state_at(after, "::messages", 1).expect("message state");
+            assert_eq!(resource.state().name(), tag(model), "message {index}, {op}");
+            assert_eq!(resource.events.len(), events);
+            assert!(resource.events.rows().iter().filter(|e| e.edge.name() == "deliver").count() <= 1);
+            if tag(model) == "Awaiting" {
+                let receiver = resource
+                    .last_event("deliver")
+                    .map(|e| match &e.edge {
+                        MessageEdge::Deliver { receiver, .. } => receiver,
+                        _ => unreachable!(),
+                    })
+                    .expect("receiver");
+                assert_eq!(*receiver, number(&payload(model)["receiver"]["session"]).to_string());
+            }
+            // Ends refuse even an authorised deliberate drop and append no event.
+            if matches!(tag(model), "Settled" | "Dropped") {
+                assert!(home
+                    .apply(id, MessageEdge::Drop { reason: DropReason::Withdrawn { by: "owner".into(), authority: authority() } }, &view)
+                    .is_err());
+                assert_eq!(home.get(id).expect("message").events.len(), events);
             }
         }
-        if op == "retire" && applied {
-            let teardown = reference("teardown", "all");
-            view.observe(&teardown, "home", Fact::TeardownComplete);
-            for target in fulfil.iter().flatten() {
-                let _ = lifecycle.apply(target, LifecycleEdge::Release { by: "owner".into(), teardown: teardown.clone() }, &view);
-            }
-        }
-        assert_eq!(home.get(&id).expect("ensure").state().name(), text(&after["state"]), "ensure step {index}, operation {op}");
-        for (i, resource) in fulfil.iter().enumerate() {
-            let actual = resource.as_ref().map_or("Absent", |id| lifecycle.get(id).expect("fulfiller").state().name());
-            assert_eq!(actual, text(map(&after["fulfil"], i as u64 + 1)), "fulfiller step {index}, operation {op}");
+        if inbox {
+            verify_sessions(&sessions, &sids, after);
         }
     }
 }
-
-fn machine_edges(trace: &Value) {
-    let mut home = Home::<CloneMachine>::new("home").expect("definition");
-    let id = home.create("clone", CloneRequest { url: "model".into(), path: "model".into() }).expect("clone");
-    let mut sessions = Home::<AgentSession>::new("consumer").expect("definition");
-    let sid = sessions.create("session", ()).expect("session");
-    let mut view = MemoryView::new();
-    for (index, pair) in states(trace).windows(2).enumerate() {
-        let after = &pair[1];
-        let op = text(&after["operation"]);
-        let seen = after["evidence"].as_bool().expect("evidence");
-        let matches = after["matching"].as_bool().expect("matching");
-        let observed = reference("observation", "thing");
-        let edge = match op {
-            "realise" => {
-                if seen {
-                    view.observe(&observed, "home", Fact::Present { identity: if matches { "model" } else { "other" }.into() });
-                }
-                Some(LifecycleEdge::Realise { identity: "model".into(), observed: observed.clone() })
-            }
-            "release" => {
-                if seen {
-                    view.observe(&observed, "home", Fact::TeardownComplete);
-                }
-                Some(LifecycleEdge::Release { by: "owner".into(), teardown: observed.clone() })
-            }
-            "vanish" => {
-                if seen {
-                    view.observe(&observed, "home", Fact::Absent);
-                }
-                Some(LifecycleEdge::Vanish { observed: observed.clone() })
-            }
-            "give up" => {
-                Some(LifecycleEdge::GiveUp { cause: if matches { cause() } else { Cause::new(CauseCategory::Transient, "other") } })
-            }
-            _ => None,
-        };
-        if op == "fail" {
-            let _ = home.record_attempt(&id, "realise", "thing", Outcome::Failure { cause: cause(), retryable: false }, &view);
-        }
-        if let Some(edge) = edge {
-            let _ = home.apply(&id, edge, &view);
-        }
-        let edge = match op {
-            "attach" => {
-                if seen {
-                    view.observe(&observed, "consumer", Fact::ChannelPresent(true));
-                }
-                Some(SessionEdge::Attach { observed: observed.clone() })
-            }
-            "detach" => {
-                if seen {
-                    view.observe(&observed, "consumer", Fact::ChannelPresent(false));
-                }
-                Some(SessionEdge::Detach { observed: observed.clone() })
-            }
-            "end" => {
-                if seen && matches {
-                    view.observe(&observed, "consumer", Fact::ConversationEnded { reason: "completed".into() });
-                }
-                Some(SessionEdge::End { reason: EndReason::Completed, observed })
-            }
-            _ => None,
-        };
-        if let Some(edge) = edge {
-            let _ = sessions.apply(&sid, edge, &view);
-        }
-        assert_eq!(home.get(&id).expect("clone").state().name(), text(&after["life"]), "lifecycle step {index}, {op}");
-        let session = sessions.get(&sid).expect("session").state();
-        assert_eq!(format!("{:?}", session.conversation), text(&after["session"]["conversation"]), "conversation step {index}");
-        assert_eq!(format!("{:?}", session.channel), text(&after["session"]["channel"]), "channel step {index}");
-    }
-}
-
-// Issue #3220: replay every generated ITF transition through the real home write path;
-// compare state after accepted AND refused edges, including ends and gate boundaries.
+// Issue #3220: drive the actual typed home write path from MBT operations, not
+// scenario bookkeeping. Check every state and accepted event after every step.
 #[test]
-#[ignore = "run specs/primitives/check.sh to generate traces, then run this test"]
+#[ignore = "generate traces with specs/primitives/check.sh"]
 fn replay_quint_itf_traces() {
-    let directory = std::env::var("QUINT_TRACE_DIR").expect("QUINT_TRACE_DIR is required; traces must be generated");
-    let mut count = [0; 5];
-    for entry in fs::read_dir(Path::new(&directory)).expect("trace directory") {
-        let path = entry.expect("directory entry").path();
+    let directory = std::env::var("QUINT_TRACE_DIR").expect("QUINT_TRACE_DIR");
+    let mut counts = [0; 6];
+    for entry in fs::read_dir(Path::new(&directory)).expect("traces") {
+        let path = entry.expect("entry").path();
         let file = path.file_name().expect("filename").to_string_lossy();
         if !file.ends_with(".itf.json") {
             continue;
         }
-        let trace: Value = serde_json::from_slice(&fs::read(&path).expect("read ITF")).expect("ITF JSON");
+        let trace: Value = serde_json::from_slice(&fs::read(&path).expect("read trace")).expect("ITF JSON");
         eprintln!("replay {}", path.display());
-        if file.starts_with("machine_edges-") {
-            machine_edges(&trace);
-            count[4] += 1;
-        } else if file.starts_with("convoy_deliver-") {
+        let index = if file.starts_with("convoy_deliver-") {
             convoy(&trace);
-            count[0] += 1;
+            0
         } else if file.starts_with("ensure_bind-") {
             ensure(&trace);
-            count[1] += 1;
+            1
         } else if file.starts_with("inbox_delivery-") {
             message(&trace, true);
-            count[2] += 1;
+            2
         } else if file.starts_with("message_race-") {
             message(&trace, false);
-            count[3] += 1;
+            3
+        } else if file.starts_with("machine_edges-") {
+            machine_edges(&trace);
+            4
+        } else if file.starts_with("admission_placement-") {
+            placement(&trace);
+            5
         } else {
-            panic!("unrecognised ITF trace {}", path.display());
+            panic!("unknown trace {file}")
+        };
+        counts[index] += 1;
+    }
+    assert!(counts.iter().all(|n| *n > 0), "every scenario supplies traces: {counts:?}");
+}
+fn counts(v: &Value) -> state_machine_prototype::placement::Counts {
+    pairs(v).iter().map(|p| (number(&p[0]), number(&p[1]))).collect()
+}
+fn placement(trace: &Value) {
+    use state_machine_prototype::placement::{Phase, Placement, Request};
+    let mut engine = Placement::new([(1, [(0, 2), (1, 1)].into()), (2, [(0, 1), (1, 2)].into())].into());
+    for pair in states(trace).windows(2) {
+        let after = &pair[1];
+        let id = chosen(after, "id");
+        let convoy = chosen(after, "convoy");
+        match action(after) {
+            "admitRequest" => {
+                let s = state_at(after, "::convoys", convoy).expect("admitted");
+                assert!(engine.admit(convoy, counts(&payload(s)["request"]["quota"]), 1));
+            }
+            "readmit" => {
+                let s = state_at(after, "::convoys", convoy).expect("readmitted");
+                assert!(engine.readmit(convoy, counts(&payload(s)["request"]["quota"])));
+            }
+            "request" => {
+                let r = payload(state_at(after, "::vessels", id).expect("waiting"));
+                assert!(engine.request(
+                    id,
+                    Request {
+                        convoy: number(&r["convoy"]),
+                        class: number(&r["class"]),
+                        shape: counts(&r["shape"]),
+                        priority: number(&r["priority"])
+                    }
+                ));
+            }
+            "place" => assert!(engine.place(id, chosen(after, "host"))),
+            "realise" => assert!(engine.realise(id)),
+            "release" => assert!(engine.release(id)),
+            "vanish" => assert!(engine.vanish(id)),
+            "unchanged" => {}
+            op => panic!("placement operation {op}"),
+        }
+        for row in pairs(store(after, "::vessels")) {
+            let i = number(&row[0]);
+            match slot_state(&row[1]) {
+                None => assert!(!engine.vessels().contains_key(&i)),
+                Some(model) => {
+                    let expected = match tag(model) {
+                        "Waiting" => Phase::Waiting,
+                        "Gone" => Phase::Gone,
+                        "Leased" => {
+                            let v = payload(model);
+                            let host = number(&v["placement"]["host"]);
+                            match tag(&v["lifecycle"]) {
+                                "Requested" => Phase::Requested(host),
+                                "Realised" => Phase::Realised(host),
+                                s => panic!("leased lifecycle {s}"),
+                            }
+                        }
+                        s => panic!("vessel {s}"),
+                    };
+                    assert_eq!(engine.vessels()[&i].phase, expected, "vessel {i}, {}", action(after));
+                }
+            }
         }
     }
-    assert!(count.iter().all(|n| *n > 0), "each scenario must supply ITF traces: {count:?}");
 }

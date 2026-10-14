@@ -1,0 +1,11 @@
+--- a/machines/vessel.qnt
++++ b/machines/vessel.qnt
+@@ -12,7 +12,7 @@
+   pure def step(s: State, e: Event): Next = match s {
+     | Waiting(r) => match e {
+         | Place(o) => if (not(o.admitted)) Refused(NotAdmitted)
+-            else if (o.live >= o.cap) Refused(QuotaExceeded)
++            else if (false) Refused(QuotaExceeded)
+             else if (not(fits(r, o.available))) Refused(DoesNotFit)
+             else if (o.waiting.exists(w => w.priority > r.priority and fits(w, o.available))) Refused(HigherPriorityWaiting)
+             else Moved(Leased({ placement: { request: r, host: o.host, available: o.available, waiting: o.waiting }, lifecycle: L::Requested }))

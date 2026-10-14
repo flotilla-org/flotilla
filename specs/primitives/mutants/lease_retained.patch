@@ -1,0 +1,11 @@
+--- a/machines/vessel.qnt
++++ b/machines/vessel.qnt
+@@ -25,7 +25,7 @@
+         | Place(_) => L::Refused(L::WrongState)
+       }
+       match result {
+-        | Moved(life) => match life { | Gone => Moved(Gone(v.placement)) | _ => Moved(Leased({ ...v, lifecycle: life })) }
++        | Moved(life) => match life { | Gone => Moved(Leased({ ...v, lifecycle: life })) | _ => Moved(Leased({ ...v, lifecycle: life })) }
+         | Refused(_) => Refused(MissingEvidence)
+       }
+     | Gone(_) => Refused(WrongState)

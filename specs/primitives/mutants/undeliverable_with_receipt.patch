@@ -1,0 +1,11 @@
+--- a/machines/message.qnt
++++ b/machines/message.qnt
+@@ -48,7 +48,7 @@
+                   else if (bound and o.appliedThrough <= env.deadline) Refused(PrefixBeforeDeadline)
+                   else if (o.met) Refused(ExpectationMet) else Moved(s)
+               | Undeliverable => match s {
+-                  | Pending(_) => if (o.receipt) Refused(ReceiptConfirmed)
++                  | Pending(_) => if (false) Refused(ReceiptConfirmed)
+                       else if (o.noConsumerPastThreshold or o.failure) Moved(s) else Refused(MissingEvidence)
+                   | _ => Refused(WrongState)
+                 }

@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # Runs inside the allocated formal-modelling host. A budget exhaustion is not a proof.
 set -euo pipefail
+# Expanded typed compositions exceed the JVM's default parser stack.
+export JVM_ARGS="${JVM_ARGS:--Xmx3g -Xss16m}"
 cd "$(dirname "$0")"
 mkdir -p build/deep
 : > build/deep/results.txt
 jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
 status=0
-for scenario in convoy_deliver ensure_bind inbox_delivery message_race; do
+for scenario in convoy_deliver ensure_bind inbox_delivery message_race admission_placement; do
   sed 's/pure val maxRows = [0-9]*/pure val maxRows = 6/' "scenarios/$scenario.qnt" > "build/deep_$scenario.qnt"
   if [[ "$scenario" = inbox_delivery || "$scenario" = message_race ]]; then
     grep -q '^  pure val maxRows = 6$' "build/deep_$scenario.qnt" || {
       echo "$scenario: failed to set maxRows = 6" >&2; exit 2;
     }
   fi
-  quint run "build/deep_$scenario.qnt" --main "$scenario" --backend typescript --invariant safety --seed 3220 \
+  quint run "build/deep_$scenario.qnt" --main "$scenario" --backend typescript --mbt --invariant safety --seed 3220 \
     --max-samples 16 --n-traces 16 --max-steps 120 --out-itf "build/deep/$scenario-{seq}.itf.json" > "build/deep/$scenario.simulation.log"
   quint compile "build/deep_$scenario.qnt" --main "$scenario" --target tlaplus --invariant safety --temporal liveness > "build/deep/$scenario.compile.log"
   awk '/^-+ MODULE/{found=1} found' "build/deep/$scenario.compile.log" > "build/deep/$scenario.tla"
@@ -32,7 +34,7 @@ for scenario in convoy_deliver ensure_bind inbox_delivery message_race; do
     echo "$scenario: safety and liveness hold" | tee -a build/deep/results.txt
   fi
 done
-quint run scenarios/machine_edges.qnt --backend typescript --invariant safety --seed 3220 \
+quint run scenarios/machine_edges.qnt --backend typescript --mbt --invariant safety --seed 3220 \
   --max-samples 16 --n-traces 16 --max-steps 120 --out-itf "build/deep/machine_edges-{seq}.itf.json" > build/deep/machine_edges.simulation.log
 QUINT_TRACE_DIR="$PWD/build/deep" cargo test --manifest-path ../../prototypes/3108-3209/Cargo.toml --locked --test quint_replay -- --ignored
 symbolic=0

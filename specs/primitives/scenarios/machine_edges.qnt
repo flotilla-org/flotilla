@@ -1,36 +1,34 @@
-// Independent edge attempts cover all lifecycle and channel gates, including refusal.
 module machine_edges {
-  import lifecycle as L from "../machines/lifecycle"
-  import agent_session as A from "../machines/agent_session"
-  var life: str
-  var session: A::State
+  import lifecycle(IDS = Set(1)) as L from "../machines/lifecycle"
+  import agent_session(IDS = Set(1)) as A from "../machines/agent_session"
   var failed: bool
-  var operation: str
-  var evidence: bool
-  var matching: bool
-  var frozen: str
-  action init = all {
-    life' = L::initial, session' = A::initial, failed' = false,
-    operation' = "init", evidence' = false, matching' = false, frozen' = ""
-  }
+  action init = all { L::init, A::init, failed' = false }
+  action recordFailure = all { L::resources.get(1) == L::Present(L::Requested), failed' = true }
   action step = {
-    nondet op = Set("realise", "release", "vanish", "give up", "fail", "attach", "detach", "end").oneOf()
     nondet seen = Set(false, true).oneOf()
+    nondet reason = Set(A::Completed, A::Lost).oneOf()
     nondet matches = Set(false, true).oneOf()
-    val gate = if (op == "realise") L::gate_realise(seen, matches)
-      else if (op == "release") L::gate_release(seen)
-      else if (op == "vanish") L::gate_vanish(seen)
-      else L::gate_give_up(failed, matches)
-    val nextLife = L::transition(life, op, gate)
-    all {
-      life' = nextLife,
-      session' = A::transition(session, op, if (op == "attach") A::gate_attach(seen)
-        else if (op == "detach") A::gate_detach(seen) else A::gate_end(if (matches) "completed" else "invalid", seen)),
-      failed' = (failed or (op == "fail" and life == "Requested")),
-      operation' = op, evidence' = seen, matching' = matches,
-      frozen' = if (L::ends.contains(nextLife) and frozen == "") nextLife else frozen
+    any {
+      all { L::request(1), A::unchanged, failed' = failed },
+      all { A::request(1), L::unchanged, failed' = failed },
+      all { L::realise(1, seen, matches), A::unchanged, failed' = failed },
+      all { L::release(1, seen), A::unchanged, failed' = failed },
+      all { L::vanish(1, seen), A::unchanged, failed' = failed },
+      all { L::giveUp(1, failed, matches), A::unchanged, failed' = failed },
+      all { recordFailure, L::unchanged, A::unchanged },
+      all { A::attach(1, seen), L::unchanged, failed' = failed },
+      all { A::detach(1, seen), L::unchanged, failed' = failed },
+      all { A::end(1, reason, seen and matches), L::unchanged, failed' = failed },
     }
   }
-  val safety = (frozen == "" or frozen == life) and Set("Requested", "Realised", "Gone", "GaveUp").contains(life)
-  val view = (life, session, failed, frozen)
+  val terminalLifeRefuses = L::resources.keys().map(i => L::resources.get(i)).forall(slot => match slot {
+    | Present(s) => L::terminalRefuses(s)
+    | Absent => true
+  })
+  val terminalSessionRefuses = A::sessions.keys().map(i => A::sessions.get(i)).forall(slot => match slot {
+    | Present(s) => A::terminalRefuses(s)
+    | Absent => true
+  })
+  val safety = terminalLifeRefuses and terminalSessionRefuses
+  val view = (L::resources, A::sessions, failed)
 }

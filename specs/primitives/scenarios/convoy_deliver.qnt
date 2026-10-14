@@ -1,34 +1,53 @@
 module convoy_deliver {
-  import convoy as C from "../machines/convoy"
-  var state: str
-  var kept: Set[int]
-  var accepted: Set[int]
-  var authorised: bool
-  var edge: str
-  val promises = Set(0, 1)
-  action init = all { state' = C::initial, kept' = Set(), accepted' = Set(), authorised' = false, edge' = "init" }
-  action advance(operation: str, p: int, auth: bool): bool = {
-    all {
-      kept' = if (operation == "keep" and state == "Open") kept.union(Set(p)) else kept,
-      accepted' = if (operation == "retract" and auth and state == "Open") accepted.union(Set(p)) else accepted,
-      state' = C::transition(state, operation,
-        if (operation == "deliver") C::gate_deliver(promises, kept, accepted) else C::gate_abandon(auth, "decision")),
-      authorised' = auth,
-      edge' = operation
+  import convoy(IDS = Set(1, 2)) as C from "../machines/convoy"
+  var now: int
+  action init = all { C::init, now' = 0 }
+  action step = {
+    nondet id = Set(1, 2).oneOf()
+    nondet p = Set(0, 1, 2).oneOf()
+    nondet promises = Set(Set(), Set(0), Set(0, 1)).oneOf()
+    nondet auth = Set(false, true).oneOf()
+    nondet reason = Set("", "decision").oneOf()
+    any {
+      all {
+        C::admitRequest(id, { project: "project", promises: promises.mapBy(_ => { kind: "opaque", target: "target" }), quota: Map(0 -> 1, 1 -> 1), priority: id }),
+        now' = now,
+      },
+      all { C::keep(id, p), now' = now },
+      all { C::acceptRetraction(id, p, auth), now' = now },
+      all { C::deliver(id), now' = now },
+      all { C::abandon(id, auth, reason), now' = now },
+      all { C::readmit(id, Map(0 -> 2, 1 -> 1), auth), now' = now },
+      all { C::unchanged, now < 1, now' = now + 1 },
     }
   }
-  action step = {
-    nondet operation = Set("keep", "retract", "deliver", "abandon").oneOf()
-    nondet p = promises.oneOf()
-    nondet auth = Set(false, true).oneOf()
-    advance(operation, p, auth)
-  }
-  val view = (state, kept, accepted)
-  val inductive = state.in(Set("Open", "Delivered", "Abandoned")) and
-    kept.in(promises.powerset()) and accepted.in(promises.powerset()) and
-    authorised.in(Set(false, true)) and edge.in(Set("init", "keep", "retract", "deliver", "abandon")) and
-    (state != "Delivered" or C::gate_deliver(promises, kept, accepted))
-  action deliverReady = advance("deliver", 0, true)
-  temporal liveness = weakFair(deliverReady, view) implies always(C::gate_deliver(promises, kept, accepted) implies eventually(state != "Open"))
-  val safety = C::admit(promises) and (state != "Delivered" or C::gate_deliver(promises, kept, accepted))
+  val noEmptyConvoys = C::convoys.keys().map(i => C::convoys.get(i)).forall(slot => match slot {
+    | Absent => true | Present(s) => C::work(s).promises.keys().size() > 0
+  })
+  val deliveredPromisesSettled = C::convoys.keys().map(i => C::convoys.get(i)).forall(slot => match slot {
+    | Present(s) => match s { | Delivered(w) => w.promises.keys().map(i => w.promises.get(i)).forall(p => p != C::Pending) | _ => true }
+    | Absent => true
+  })
+  val settledPromisesFinal = C::convoys.keys().map(i => C::convoys.get(i)).forall(slot => match slot {
+    | Present(s) => C::settledFinal(s)
+    | Absent => true
+  })
+  val safety = noEmptyConvoys and deliveredPromisesSettled and settledPromisesFinal
+  // Induction needs an explicit finite universe, including the imported store.
+  pure val resolutions = Set(C::Pending, C::Kept, C::Retracted).map(a => Set(Map(0 -> a)).union(
+    Set(C::Pending, C::Kept, C::Retracted).map(b => Map(0 -> a, 1 -> b)))).flatten()
+  pure val works = Set(Map(0 -> 1, 1 -> 1), Map(0 -> 2, 1 -> 1)).map(q =>
+    Set(1, 2).map(priority => resolutions.map(ps => {
+      request: { project: "project", promises: ps.keys().mapBy(_ => { kind: "opaque", target: "target" }), quota: q, priority: priority },
+      promises: ps
+    }))).flatten().flatten()
+  pure val slots = Set(C::Absent).union(works.map(w => Set(C::Present(C::Open(w)), C::Present(C::Delivered(w)), C::Present(C::Abandoned({ work: w, reason: "decision" })))).flatten())
+  val inductive = C::convoys.in(Set(1, 2).setOfMaps(slots)) and now.in(Set(0, 1)) and safety
+  val view = (C::convoys, now)
+  action deliverReady(id: int): bool = all { C::deliver(id), now' = now }
+  temporal liveness = Set(1, 2).forall(id => weakFair(deliverReady(id), view) implies always(
+    (match C::convoys.get(id) {
+      | Present(s) => match s { | Open(w) => w.promises.keys().map(i => w.promises.get(i)).forall(p => p != C::Pending) | _ => false }
+      | Absent => false
+    }) implies eventually(match C::convoys.get(id) { | Present(s) => match s { | Open(_) => false | _ => true } | Absent => false })))
 }

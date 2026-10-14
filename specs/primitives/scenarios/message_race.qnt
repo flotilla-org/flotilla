@@ -1,60 +1,64 @@
 module message_race {
-  import message as M from "../machines/message"
+  import message(IDS = Set(1)) as M from "../machines/message"
   import stream as S from "../world/stream"
   import clock as C from "../world/clock"
-  var state: str
   var source: S::Stream
   var now: int
-  var operation: str
-  var expectation: str
-  var hasDeadline: bool
-  var reason: str
-  var winners: int
   pure val maxRows = 3
-  val met = S::seen(source, "outcome", 1)
+  val current = match M::messages.get(1) { | Present(s) => s | Absent => M::Pending({ expectation: M::Reply, hasDeadline: true, deadline: 1 }) }
+  val expectation = M::envelope(current).expectation
+  val met = (expectation == M::Outcome and S::seen(source, "outcome", 1)) or (expectation == M::Reply and S::seen(source, "reply", 1))
+  val dropEvidence = { reason: M::Expired, now: now, bound: true, appliedThrough: S::watermark(source), met: met,
+    receipt: S::seen(source, "receipt", 1), noConsumerPastThreshold: false, failure: S::seen(source, "failure", 1), supersedes: true, authorised: true }
   action init = {
-    nondet expected = Set("nothing", "reply", "outcome").oneOf()
+    nondet expected = Set(M::Nothing, M::Reply, M::Outcome).oneOf()
     nondet deadline = Set(false, true).oneOf()
-    all { hasDeadline' = deadline, state' = M::initial, source' = S::initial, now' = 0, operation' = "init", expectation' = expected, reason' = "", winners' = 0 }
+    all { M::initWith(1, { expectation: expected, hasDeadline: deadline, deadline: 1 }), source' = S::initial, now' = 0 }
   }
-  action advance(op: str): bool = {
-    val receipt = S::seen(source, "receipt", 1)
-    val reply = S::seen(source, "reply", 1)
-    val settled = M::gate_settle(state, expectation, if (expectation == "reply") "answered" else "outcome observed", if (expectation == "reply") reply else met)
-    val expectedMet = (expectation == "outcome" and met) or (expectation == "reply" and reply)
-    val expired = M::gate_expired(hasDeadline, now, 1, true, S::watermark(source), expectedMet)
-    val edge = if (op == "expire" or op == "supersede" or op == "withdraw" or op == "undeliverable") "drop" else op
-    val gate = if (op == "deliver") M::gate_deliver(receipt, true, true)
-      else if (op == "settle") settled else if (op == "expire") expired
-      else if (op == "undeliverable") M::gate_undeliverable(state, receipt, false, S::seen(source, "failure", 1))
-      else op == "supersede" or op == "withdraw"
-    val nextState = M::transition(state, edge, expectation, gate)
-    all {
-      state' = nextState,
-      source' = if (Set("outcome", "receipt", "reply", "failure", "keepalive").contains(op) and source.rows.length() < maxRows)
-          S::publish(source, { at: now, kind: op, session: 1 })
-        else if (op == "apply") S::apply(source)
-        else if (op == "disconnect") S::link(source, false)
-        else if (op == "connect") S::link(source, true) else source,
-      now' = if (op == "tick") C::tick(now, 2) else now,
-      operation' = op,
-      expectation' = expectation, hasDeadline' = hasDeadline,
-      reason' = if (nextState == "Dropped" and state != "Dropped") op else reason,
-      winners' = if (M::ends.contains(nextState) and not(M::ends.contains(state))) winners + 1 else winners
+  action publish: bool = {
+    nondet kind = Set("outcome", "receipt", "reply", "failure", "keepalive").oneOf()
+    all { source.rows.length() < maxRows, source' = S::publish(source, { at: now, kind: kind, session: 1 }), now' = now }
+  }
+  action applySource: bool = all { source' = S::apply(source), now' = now }
+  action disconnect: bool = all { source' = S::link(source, false), now' = now }
+  action connect: bool = all { source' = S::link(source, true), now' = now }
+  action tick: bool = all { source' = source, now' = C::tick(now, 2) }
+  action step = {
+    any {
+      all {
+        M::deliver(1, { observed: S::seen(source, "receipt", 1), receiverMatches: true, transportMatches: true, receiver: { session: 1, host: "consumer" } }),
+        source' = source,
+        now' = now,
+      },
+      all {
+        M::settle(1, if (expectation == M::Reply) M::Answered({ observed: S::seen(source, "reply", 1) }) else M::OutcomeObserved({ observed: S::seen(source, "outcome", 1) })),
+        source' = source,
+        now' = now,
+      },
+      all { M::drop(1, { ...dropEvidence, reason: M::Expired }), source' = source, now' = now },
+      all { M::drop(1, { ...dropEvidence, reason: M::Undeliverable }), source' = source, now' = now },
+      all { M::drop(1, { ...dropEvidence, reason: M::Superseded }), source' = source, now' = now },
+      all { M::drop(1, { ...dropEvidence, reason: M::Withdrawn }), source' = source, now' = now },
+      all { M::drop(1, { ...dropEvidence, reason: M::ConsumerUnreachable }), source' = source, now' = now },
+      all { publish, M::unchanged },
+      all { applySource, M::unchanged },
+      all { disconnect, M::unchanged },
+      all { connect, M::unchanged },
+      all { tick, M::unchanged },
     }
   }
-  action step = {
-    nondet op = Set("tick", "outcome", "receipt", "reply", "keepalive", "disconnect", "connect", "apply", "deliver", "settle", "expire", "supersede", "withdraw", "failure", "undeliverable").oneOf()
-    advance(op)
+  val inTimeEvidence = source.rows.indices().exists(i => ((expectation == M::Reply and source.rows[i].kind == "reply") or (expectation == M::Outcome and source.rows[i].kind == "outcome")) and source.rows[i].at <= 1)
+  val expiryLosesToEvidence = match current { | Dropped(d) => d.reason != M::Expired or not(inTimeEvidence) | _ => true }
+  val expiredPastPrefix = match current { | Dropped(d) => d.reason != M::Expired or (d.at > d.envelope.deadline and d.watermark > d.envelope.deadline) | _ => true }
+  val noUndeliverableReceipt = match current { | Dropped(d) => d.reason != M::Undeliverable or not(d.receipt) | _ => true }
+  val safety = noUndeliverableReceipt and expiryLosesToEvidence and expiredPastPrefix
+  val view = (M::messages, source, now)
+  action settleObserved = all {
+    M::settle(1, if (expectation == M::Reply) M::Answered({ observed: S::seen(source, "reply", 1) }) else M::OutcomeObserved({ observed: S::seen(source, "outcome", 1) })),
+    source' = source,
+    now' = now,
   }
-  val inTimeEvidence = source.rows.indices().exists(i => ((expectation == "reply" and source.rows[i].kind == "reply") or (expectation == "outcome" and source.rows[i].kind == "outcome")) and source.rows[i].at <= 1)
-  val safety = winners <= 1 and (reason != "expire" or not(inTimeEvidence))
-  val view = (state, source, now, expectation, hasDeadline, reason, winners)
-  temporal endsAreFinal = M::ends.forall(s => always(state == s implies always(state == s)))
-  action settleObserved = advance("settle")
-  temporal progress = weakFair(settleObserved, view) implies always(
-    ((expectation == "outcome" and met) or (expectation == "reply" and state == "Awaiting" and S::seen(source, "reply", 1))) implies
-      eventually(M::ends.contains(state)))
-  temporal liveness = progress and endsAreFinal
-
+  temporal endsAreFinal = always((M::ended(current) implies next(M::messages) == M::messages).orKeep(view))
+  temporal liveness = endsAreFinal and (weakFair(settleObserved, view) implies always(
+    ((expectation == M::Outcome and met) or (match current { | Awaiting(_) => expectation == M::Reply and met | _ => false })) implies eventually(M::ended(current))))
 }
