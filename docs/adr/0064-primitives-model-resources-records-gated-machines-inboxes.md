@@ -88,7 +88,7 @@ How Checkouts and lends behave:
 ### Roles, inboxes and delivery
 
 - **Inboxes.** Each role instance owns an **Inbox** resource, homed with the role's owner: the convoy for convoy roles, and the project's declarations for standing roles. Messages queue there and outlive any fulfiller.
-- **Standing roles** are declared in the charter and own their inboxes, whether or not anything automatic fills them. An Ensure is optional, layered on a role: it keeps an agent bound. There is no separate person kind: a person's own inbox is a declared role with one holder.
+- **Standing roles** are declared in the charter and own their inboxes, whether or not anything automatic fills them. An Ensure is optional, layered on a role: it keeps an agent bound. Retiring an Ensure leaves the role and its inbox in place. There is no separate person kind: a person's own inbox is a declared role with one holder.
 - **Addresses** are typed lists of segments over a closed kind enum: project, convoy and role to start. They are stored typed and shown as `project:flotilla/role:gui-approver` and `project:flotilla/convoy:stack-3152/role:coder`. There are two shapes to start, project/role and project/convoy/role, with no vessel segment. New kinds extend the enum without changing existing addresses.
 - **Every role is declared** with a one-line purpose. A message to an undeclared role is refused at send time, with the reason.
 - **Dynamic roles.** The convoy manages all its roles and inboxes at its home: declaring a role, its inbox and its brief. The workflow template says which roles may declare more (a stack lead, for example), and the supervisor may too. Role names may be dynamic (`coder-pr45`), with the role type as an attribute.
@@ -117,7 +117,7 @@ How Checkouts and lends behave:
 - **A convoy request is a message** to `project:fleet/role:admission` that expects an outcome. Its consumer is the admission controller. Footprints and crew details are its typed body.
   - Receipt is `deliver`.
   - Position is a judgement over pending messages: class of service and holds.
-  - Admitted is `settle(outcome observed)`, when the Convoy exists.
+  - Admitted is `settle(outcome observed)`, when the Convoy exists: from Awaiting after the receipt, or from Pending if the Convoy appears first.
   - Refused is `settle(answered)`, with the reason as the reply.
   - A revised batch supersedes the request; a request cancelled without a replacement is withdrawn.
 - **Other requests** can use the same inbox shape. There is one queue mechanism, not two.
