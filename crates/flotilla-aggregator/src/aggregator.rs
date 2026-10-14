@@ -1120,7 +1120,13 @@ impl Aggregator {
                 task.abort();
             }
         }
-        if association_changed || phase_changed {
+        // A lookup already in flight for an unchanged association stays valid
+        // across a live phase change. Replacing it would defer the convoy's first
+        // branch scan by a whole refresh interval, as admission's Pending→Active
+        // step otherwise does (#3206).
+        let lookup_in_flight = self.change_request_refresh_tasks.get(reference).is_some_and(|task| !task.is_finished());
+        let ended = current.and_then(|convoy| convoy.status.as_ref()).is_some_and(|status| convoy_phase_is_terminal(status.phase));
+        if association_changed || (phase_changed && (ended || !lookup_in_flight)) {
             if let Some(current) = current {
                 self.schedule_change_request_refresh(current);
             }
@@ -5382,6 +5388,35 @@ mod tests {
         apply_next_change_request_resolution(&mut aggregator).await;
         apply_next_change_request_resolution(&mut aggregator).await;
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_phase_change_keeps_the_admission_lookup_in_flight() {
+        let (event_tx, _) = broadcast::channel(8);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::new()),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+            .with_change_request_resolver(Arc::clone(&resolver));
+        let mut convoy = convoy_with_branch("convoy-a").await;
+        convoy.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Pending, ..Default::default() });
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        let reference = aggregator.convoy_ref("flotilla", "convoy-a");
+        assert!(aggregator.change_request_refresh_tasks.contains_key(&reference), "admission schedules a lookup at once");
+
+        let mut active = convoy.clone();
+        active.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Active, ..Default::default() });
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(active.clone())).await;
+        apply_next_change_request_resolution(&mut aggregator).await;
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1, "the admission lookup completes without waiting a refresh interval");
+
+        let mut landed = active;
+        landed.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Landed, ..Default::default() });
+        aggregator.schedule_change_request_refresh(&convoy);
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(landed)).await;
+        assert!(!aggregator.change_request_refresh_tasks.contains_key(&reference), "an ended convoy still cancels its lookup");
     }
 
     #[tokio::test]
