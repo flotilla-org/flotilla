@@ -5,6 +5,7 @@ export FLEET_INSTALL_SKIP_CANARY=1
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 installer="$repo_root/scripts/fleet-install"
+bash "$repo_root/scripts/test-fleet-host-guard.sh"
 python3 "$repo_root/scripts/test-fleet-preroll-checks.py"
 python3 -m unittest discover -s "$repo_root/ci/fleet-candidates" -p "test_bootstrap_*.py"
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/fleet-install-test.XXXXXX")"
@@ -302,6 +303,14 @@ if [[ "$*" == '--user is-enabled flotillad.service' ]]; then
 fi
 SH
 chmod 0755 "$fake_bin/systemctl"
+
+# Process boundary: Darwin memory pressure is supplied by the fixture host.
+cat >"$fake_bin/sysctl" <<'SH'
+#!/usr/bin/env bash
+[[ "$*" == '-n kern.memorystatus_vm_pressure_level' ]] || exit 98
+printf '%s\n' "${MEMORY_PRESSURE_LEVEL:-1}"
+SH
+chmod 0755 "$fake_bin/sysctl"
 
 cat >"$fake_bin/loginctl" <<'SH'
 #!/usr/bin/env bash
@@ -769,6 +778,17 @@ assert_darwin_tcc_payload() {
 
 run_darwin_installer "$darwin_home" "$generation_one" >"$test_root/darwin-install-one.out"
 assert_darwin_tcc_payload "$generation_one"
+# Critical memory pressure refuses before unloading the working daemon or
+# changing either generation link. Native sysctl is the process boundary double.
+: >"$test_root/launchctl.log"
+if MEMORY_PRESSURE_LEVEL=4 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/pressure-refusal.out" 2>&1; then
+  fail 'critical memory pressure allowed a roll'
+fi
+grep -Fq 'critical memory pressure' "$test_root/pressure-refusal.out" || fail 'pressure refusal was unclear'
+test ! -s "$test_root/launchctl.log" || fail 'pressure refusal touched launchd'
+test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'pressure refusal changed current'
+test ! -e "$darwin_home/.local/opt/flotilla-fleet/previous" || fail 'pressure refusal changed previous'
+test -f "$darwin_home/launchctl-state.running" || fail 'pressure refusal stopped daemon'
 # A client arriving between bootout and preflight must not resurrect the old
 # daemon. A spawn already admitted must survive a transient startup stop error.
 CLIENT_AFTER_BOOTOUT=1 LATE_SPAWN_AFTER_BOOTOUT=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-install-window.out" 2>&1 \

@@ -32,7 +32,9 @@ else
 fi
 readonly GENERATION_VALIDATOR
 readonly SKILL_PROBE_TOKENS="${FLEET_INSTALL_SKILL_PROBE_TOKENS:-}"
-readonly CONFIRM_TIMEOUT_SECONDS="${FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS:-30}"
+CONFIRM_TIMEOUT_SECONDS="${FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS:-90}"
+MIN_FREE_BYTES="${FLEET_INSTALL_MIN_FREE_BYTES:-5368709120}"
+MAX_WAIT_SECONDS="${FLEET_INSTALL_MAX_WAIT_SECONDS:-600}"
 PLATFORM=""
 AUTH_HEADER_FILE=""
 WORK_DIR=""
@@ -546,7 +548,7 @@ restart_darwin_daemon_service() {
 probe_daemon_health() {
   # This candidate CLI requires an exact wire-generation handshake and a local fleet
   # row. The check neither starts a daemon nor re-execs another generation.
-  FLOTILLA_CONTAINED_HOST_DAEMON=1 "$CURRENT_LINK/bin/flotilla" --socket "$DAEMON_SOCKET" fleet check >/dev/null 2>"$WORK_DIR/daemon-health.stderr"
+  FLOTILLA_CONTAINED_HOST_DAEMON=1 python3 "$GENERATION_VALIDATOR" daemon-health -- "$CURRENT_LINK/bin/flotilla" "$DAEMON_SOCKET" "$1" 2>"$WORK_DIR/daemon-health.stderr"
 }
 
 wait_for_daemon_generation() {
@@ -554,12 +556,20 @@ wait_for_daemon_generation() {
   [[ "$CONFIRM_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] \
     || die "health confirmation timeout must be a non-negative integer: $CONFIRM_TIMEOUT_SECONDS"
   local deadline=$((SECONDS + CONFIRM_TIMEOUT_SECONDS))
+  local maximum=$((SECONDS + MAX_WAIT_SECONDS))
+  local pending=0
   : >"$WORK_DIR/daemon-health.stderr"
   while true; do
-    if [[ "$(current_generation)" == "$generation" ]] && probe_daemon_health; then
+    if [[ "$(current_generation)" == "$generation" ]] && probe_daemon_health "$((maximum - SECONDS))"; then
       return 0
     fi
-    if ((SECONDS >= deadline)); then
+    if ((SECONDS < maximum && !pending)); then
+      if python3 "$GENERATION_VALIDATOR" startup-pending -- "$DAEMON_STATE_DIR/log/flotillad.jsonl" "${FLEET_INSTALL_STARTUP_SINCE:-0}"; then
+        pending=1
+        printf 'fleet-install: daemon startup remains pending; waiting up to %s seconds\n' "$MAX_WAIT_SECONDS"
+      fi
+    fi
+    if ((SECONDS >= maximum || (SECONDS >= deadline && !pending))); then
       # Keep retries quiet, but retain the last refusal in the failure log.
       [[ ! -s "$WORK_DIR/daemon-health.stderr" ]] || cat "$WORK_DIR/daemon-health.stderr" >&2
       return 1
@@ -599,6 +609,7 @@ automatic_rollback() {
   prepare_darwin_daemon_service || return 1
   atomic_link "releases/$rollback_generation" "$CURRENT_LINK" || return 1
   atomic_link "releases/$failed_generation" "$PREVIOUS_LINK" || return 1
+  FLEET_INSTALL_STARTUP_SINCE="$(python3 -c 'import time; print(time.time())')"
   restart_linux_daemon_service || return 1
   restart_darwin_daemon_service || return 1
   wait_for_daemon_generation "$rollback_generation" || return 1
@@ -655,6 +666,7 @@ start_confirmation_watchdog() {
     rm -f -- "${completed_log%.done}" "$completed_log"
   done
   CONFIRMATION_LOG="$FLEET_ROOT/.confirmation.$token.log"
+  export FLEET_INSTALL_STARTUP_SINCE="$(python3 -c 'import time; print(time.time())')"
   nohup "$installer" __confirm "$generation" "$rollback_generation" "$token" >"$CONFIRMATION_LOG" 2>&1 </dev/null &
   CONFIRMATION_PID=$!
 }
@@ -777,6 +789,7 @@ activate_staged_generation() {
   local rollback_generation="$2"
   local confirmation_token="$3"
   local release="$RELEASES_DIR/$generation"
+  host_preflight
   make_work_dir
   [[ -d "$release" ]] || die "staged generation is missing: $generation"
   [[ -f "$release/.generation.json" ]] || die "staged generation has no verified generation metadata: $generation"
@@ -796,6 +809,7 @@ activate_staged_generation() {
   # staging state while the detached health watchdog completes recovery.
   [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
   WORK_DIR=""
+  host_preflight
   ensure_launchers_and_path
   prepare_linux_daemon_service
   prepare_darwin_daemon_service
@@ -829,6 +843,7 @@ handoff_activation() {
   local rollback_generation="$2"
   local confirmation_token="$3"
   local incoming_installer="$RELEASES_DIR/$generation/install.sh"
+  host_preflight
   [[ -x "$incoming_installer" ]] || die "verified generation has no executable installer: $generation"
   printf 'fleet-install: handing off activation to generation %s installer\n' "$generation"
   # exec does not run this process's EXIT trap. Discard the bootstrap
@@ -895,6 +910,7 @@ install_generation() {
   local generation="$1"
   require_generation "$generation"
   require_generation_validator
+  host_preflight
   acquire_install_lock
   mkdir -p "$RELEASES_DIR"
   local old rollback_generation confirmation_token
@@ -961,6 +977,7 @@ show_status() {
 
 rollback() {
   require_generation_validator
+  host_preflight
   acquire_install_lock
   [[ -L "$CURRENT_LINK" ]] || die 'no current generation to roll back'
   [[ -L "$PREVIOUS_LINK" ]] || die 'no previous generation to roll back to'
@@ -1008,12 +1025,33 @@ prune_after_confirmation() {
   fi
 }
 
+host_preflight() {
+  python3 "$GENERATION_VALIDATOR" host-preflight -- "$DAEMON_STATE_DIR" "$MIN_FREE_BYTES" "$PLATFORM" \
+    || die 'host pre-flight refused the roll; selected generation and daemon are unchanged'
+}
+
 usage() {
-  echo 'usage: fleet-install [--skip-canary] <latest|generation> | --canary <generation> | status | rollback | --prune-dry-run | --prune' >&2
+  echo 'usage: fleet-install [--min-free-bytes N] [--max-wait-seconds N] [--skip-canary] <latest|generation> | --canary <generation> | status | rollback | --prune-dry-run | --prune' >&2
+  echo 'defaults: --min-free-bytes 5368709120 (5 GiB); --max-wait-seconds 600; ordinary confirmation 90 seconds' >&2
   exit 2
 }
 
 main() {
+  while [[ "${1:-}" == --min-free-bytes || "${1:-}" == --max-wait-seconds ]]; do
+    [[ $# -ge 2 ]] || usage
+    case "$1" in
+      --min-free-bytes) MIN_FREE_BYTES="$2" ;;
+      --max-wait-seconds) MAX_WAIT_SECONDS="$2" ;;
+    esac
+    shift 2
+  done
+  [[ "$MIN_FREE_BYTES" =~ ^[0-9]{1,15}$ ]] || die 'minimum free bytes must be a non-negative integer (at most 15 digits)'
+  [[ "$MAX_WAIT_SECONDS" =~ ^[0-9]{1,8}$ ]] || die 'maximum wait seconds must be a non-negative integer (at most 8 digits)'
+  [[ "$CONFIRM_TIMEOUT_SECONDS" =~ ^[0-9]{1,8}$ ]] || die 'confirmation timeout must be a non-negative integer (at most 8 digits)'
+  MIN_FREE_BYTES=$((10#$MIN_FREE_BYTES))
+  MAX_WAIT_SECONDS=$((10#$MAX_WAIT_SECONDS))
+  CONFIRM_TIMEOUT_SECONDS=$((10#$CONFIRM_TIMEOUT_SECONDS))
+  export FLEET_INSTALL_MIN_FREE_BYTES="$MIN_FREE_BYTES" FLEET_INSTALL_MAX_WAIT_SECONDS="$MAX_WAIT_SECONDS"
   if [[ "${1:-}" == --skip-canary ]]; then
     [[ $# -eq 2 && "$2" != -* && "$2" != rollback && "$2" != status ]] || usage
     export FLEET_INSTALL_SKIP_CANARY=1
@@ -1061,6 +1099,7 @@ main() {
       ;;
     latest)
       require_generation_validator
+      host_preflight
       local generation
       # Allocate in the parent shell so cleanup and the activation handoff
       # retain ownership when latest_generation runs in command substitution.
