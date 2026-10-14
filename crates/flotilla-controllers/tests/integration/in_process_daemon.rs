@@ -3298,7 +3298,7 @@ async fn codex_admission_refuses_old_host_and_explains_version_gap() {
 }
 
 #[tokio::test]
-async fn requested_model_derives_harness_need_and_selects_host_direct() {
+async fn requested_model_selects_host_direct_without_an_observed_version_floor() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
@@ -3384,10 +3384,10 @@ async fn requested_model_derives_harness_need_and_selects_host_direct() {
     let status = admitted.status.expect("admitted status");
     assert_eq!(status.placement_decision.expect("placement").policy_name, "host-direct-model");
     let needs = &snapshot.spec.vessels[0].crew[0].needs;
-    assert!(needs.contains(&flotilla_resources::CapabilityNeed::Harness {
-        adapter: "claude-code".to_string(),
-        minimum_version: "2.1.300".to_string(),
-    }));
+    // #3202: the observed 2.1.300 is evidence the model works, never a floor.
+    assert!(!needs
+        .iter()
+        .any(|need| matches!(need, flotilla_resources::CapabilityNeed::Harness { adapter, .. } if adapter == "claude-code")));
     let result = daemon
         .execute_query(
             Command::builder()
@@ -3400,7 +3400,7 @@ async fn requested_model_derives_harness_need_and_selects_host_direct() {
     let CommandValue::ConvoyExplanation(explanation) = result else {
         panic!("explanation should be available after admission: {result:?}");
     };
-    assert!(explanation.role_needs.values().flatten().any(|need| need == "harness:claude-code>=2.1.300"));
+    assert!(!explanation.role_needs.values().flatten().any(|need| need.starts_with("harness:claude-code")));
     assert_eq!(explanation.vessel_placements["work"].policy_name, "host-direct-model");
     let refused = start_capability_convoy(&daemon, "model-unavailable", |intent| {
         intent.agent_overrides.push(flotilla_protocol::AgentOverride {
