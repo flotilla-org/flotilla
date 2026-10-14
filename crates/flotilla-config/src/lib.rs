@@ -5,6 +5,7 @@
 //! C-free base crate. Depend only on base types (protocol, paths, resources);
 //! never on provider runtime, discovery, VCS, core, storage or composition
 //! roots. The build-graph gate enforces the same upward-dependency prohibition.
+pub mod dummy_fleet;
 pub mod log_file;
 pub mod provider_config;
 
@@ -310,6 +311,9 @@ pub struct DaemonConfig {
     /// Daemon-wide checkout removal concurrency, across execution environments.
     #[serde(default = "default_checkout_removal_concurrency", deserialize_with = "deserialize_checkout_removal_concurrency")]
     pub checkout_removal_concurrency: NonZeroUsize,
+    /// Opt-in dummy providers for load testing (#3206); absent in real fleets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dummy_fleet: Option<dummy_fleet::DummyFleetConfig>,
 }
 
 pub const DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(2).expect("default removal limit is positive");
@@ -330,6 +334,7 @@ impl Default for DaemonConfig {
             artifact_retention_days: default_artifact_retention_days(),
             checkout_archive_retention_days: default_checkout_archive_retention_days(),
             checkout_removal_concurrency: default_checkout_removal_concurrency(),
+            dummy_fleet: None,
         }
     }
 }

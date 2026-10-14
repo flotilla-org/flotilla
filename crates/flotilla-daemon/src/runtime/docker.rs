@@ -176,8 +176,13 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
 
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         let legacy_baseline = self.legacy_baseline_for_environment(name).await?;
+        let provider = self.provider_for_environment(name, flotilla_environment::environment::EnvironmentKind::Docker).await?;
         let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };
-        let tools = self.state.environment_tools.prepare(DOCKER_PROVIDER_KIND, name, &context).await?;
+        let tools = if provider.receives_host_tools() {
+            self.state.environment_tools.prepare(DOCKER_PROVIDER_KIND, name, &context).await?
+        } else {
+            Vec::new()
+        };
         for tool in &tools {
             for asset in &tool.assets {
                 let reserved_path = match asset.kind {
@@ -203,7 +208,6 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let credential_refs = credential_refs_from_environment(spec)?;
         let credential_scopes = credential_scopes_from_environment(spec)?;
         let credential_permissions = credential_permissions_from_environment(spec)?;
-        let provider = self.provider_for_environment(name, flotilla_environment::environment::EnvironmentKind::Docker).await?;
 
         let env_id = EnvironmentId::new(name.to_string());
         let mut environment_variables = spec

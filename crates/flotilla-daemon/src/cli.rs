@@ -55,7 +55,8 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     let repo_roots = config.load_observation_roots()?;
     info!(repo_count = repo_roots.len(), "starting daemon");
 
-    let discovery = DiscoveryRuntime::for_process();
+    let mut discovery = DiscoveryRuntime::for_process();
+    let dummy_fleet = crate::dummy_fleet::install_dummy_fleet(&daemon_config, &mut discovery);
     let repo_root_paths = repo_roots.into_iter().map(|p| p.into_path_buf()).collect();
     let server = DaemonServer::new_with_socket_discovery_path(
         repo_root_paths,
@@ -67,6 +68,9 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     )
     .await?;
     let daemon = server.daemon();
+    if let Some(fleet) = &dummy_fleet {
+        crate::dummy_fleet::attach_dummy_fleet(fleet, Arc::clone(&daemon) as Arc<dyn flotilla_daemon_api::daemon::DaemonHandle>)?;
+    }
     let runtime = DaemonRuntime::start_with_options(
         daemon,
         Arc::clone(&config),

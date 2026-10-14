@@ -150,6 +150,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-change-request` | Change-request tracker and observation-source traits, GitHub/Forgejo implementations, branch-absence observer and factories |
 | `flotilla-issue-tracker` | Source-addressed issue-provider trait, GitHub/Forgejo implementations, GitHub dispatch-board reader, mission-field decoding and factories |
 | `flotilla-agent` | Agent harness adapters and registry, crew brief rendering, hook parsing and installation, agent state store, process-exit receipts |
+| `flotilla-dummy-fleet` | Load-testing dummies installed behind `daemon.toml` `[dummy_fleet]`: scripted crews in an in-process terminal pool and agent adapter, a dummy VCS, a dummy forge's change-request tracker, and the workflow/policy catalog (#3206); the dummy environment provider lives in `flotilla-environment` |
 | `flotilla-discovery` | Static factory-list assembly, default detector lists, detector runs, provider discovery, host-scoped provider cache, `ProviderRegistry` and provider status |
 | `flotilla-charter` | Charter inputs read through a `RevisionedTree` (Git via `Vcs`, or a local directory): `project.yaml` declarations, operational entries and their provenance annotations, charter locks and source status |
 | `flotilla-executor` | Provider-backed command handlers, step plans and resolution, remote step batches, environment management and host orchestration ports |

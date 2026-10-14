@@ -17,6 +17,10 @@ flotilla-vcs = { path = "../flotilla-vcs" }
 flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-discovery = { path = "../flotilla-discovery" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
+# Deliberately a production dependency: the dummy fleet is a configured provider
+# set (#3206), run by load-test daemons and the shadow cluster, inert without
+# daemon.toml [dummy_fleet]; it is not test-support machinery.
+flotilla-dummy-fleet = { path = "../flotilla-dummy-fleet" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-review-bundle-object-store = { path = "../flotilla-review-bundle-object-store" }
 flotilla-store-http = { path = "../flotilla-store-http" }

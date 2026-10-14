@@ -2434,7 +2434,8 @@ impl CrewService {
                         brief.content.clear();
                     }
                     let terminal_meta = terminal_meta_with_vessel_credentials(identity.input_meta(), task);
-                    let _created = sessions
+                    let anchor_environment = anchor.spec.env_ref.clone();
+                    let created = sessions
                         .create(
                             &terminal_meta,
                             &flotilla_resources::TerminalSessionSpec {
@@ -2455,8 +2456,20 @@ impl CrewService {
                                 pool: anchor.spec.pool,
                             },
                         )
-                        .await
-                        .map_err(|err| err.to_string())?;
+                        .await;
+                    match created {
+                        Ok(_) => {}
+                        // Reopening the target's work above lets the vessel controller
+                        // create its session concurrently. A session that now exists in
+                        // the same environment receives the message like a starting one;
+                        // one without a status yet is that session, before its first launch.
+                        Err(ResourceError::Conflict { .. })
+                            if sessions.get(&terminal_name).await.is_ok_and(|existing| {
+                                existing.spec.env_ref == anchor_environment
+                                    && existing.status.as_ref().is_none_or(|status| status.phase != ResourceTerminalSessionPhase::Failed)
+                            }) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
                     self.publish_message_intent(&context.namespace, &message_name, &intent).await.map(|_| ())
                 }
                 Err(err) => Err(err.to_string()),

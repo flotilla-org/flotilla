@@ -17,6 +17,7 @@ use std::{
     sync::{atomic::AtomicU64, Arc},
     time::Duration,
 };
+pub(crate) use terminal::{DELIVERY_CONFIRMATION_POLL, DELIVERY_CONFIRMATION_STABLE_FOR};
 
 use chrono::Utc;
 use flotilla_config::ConfigStore;
@@ -54,7 +55,8 @@ use self::health::{
 };
 use self::message::{MessageController, MessageDependencyWatch};
 use self::ports::{
-    DaemonConvoyTeardownRuntime, GhForgeDefaultBranchResolver, RoutingCheckoutRuntime, RoutingCloneRuntime, RuntimeOperatorReconciler,
+    ChainedForgeDefaultBranchResolver, DaemonConvoyTeardownRuntime, GhForgeDefaultBranchResolver, RoutingCheckoutRuntime,
+    RoutingCloneRuntime, RuntimeOperatorReconciler,
 };
 use self::seed::register_startup_resources;
 use self::state::ControllerRuntimeState;
@@ -137,6 +139,7 @@ impl DaemonRuntime {
         let daemon_config = config.load_daemon_config()?;
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
+        let forge_default_branches = crate::dummy_fleet::dummy_forge_default_branches(daemon_config.dummy_fleet.as_ref());
         let blob_store = Arc::new(TieredBlobStore::from_config(config.state_dir().as_path(), &daemon_config.blob_stores)?);
         phase(
             "set_brief_artifact_writer",
@@ -436,7 +439,8 @@ impl DaemonRuntime {
                 .with_agent_material(agent_material)
                 .with_blob_store(Arc::clone(&blob_store))
                 .with_image_inventory(image_inventory)
-                .with_image_build_service(image_build_service),
+                .with_image_build_service(image_build_service)
+                .with_forge_default_branches(forge_default_branches),
             );
             phase(
                 "set_operator_reconciler",
@@ -679,10 +683,16 @@ fn spawn_controller_loops(
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
     let observed_backend = state.daemon.observed_resource_backend();
-    let forge_default_branch_resolver = state
+    let gh_default_branches = state
         .daemon
         .local_command_runner()
         .map(|runner| Arc::new(GhForgeDefaultBranchResolver { runner }) as Arc<dyn ForgeDefaultBranchResolver>);
+    let forge_default_branch_resolver = match (state.forge_default_branches.clone(), gh_default_branches) {
+        (Some(first), Some(then)) => {
+            Some(Arc::new(ChainedForgeDefaultBranchResolver(vec![first, then])) as Arc<dyn ForgeDefaultBranchResolver>)
+        }
+        (first, then) => first.or(then),
+    };
     let namespace_string = namespace.to_string();
 
     macro_rules! controller {

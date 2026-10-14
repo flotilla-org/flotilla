@@ -15,7 +15,7 @@ use flotilla_agent::process::ExitReceiptObserver;
 use flotilla_config::ConfigStore;
 use flotilla_config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY;
 use flotilla_controllers::reconcilers::clone::runtime::CloneFlights;
-use flotilla_controllers::reconcilers::CheckoutRemoval;
+use flotilla_controllers::reconcilers::{CheckoutRemoval, ForgeDefaultBranchResolver};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::StandingConvoyBackingInspector;
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
@@ -62,6 +62,8 @@ pub(super) struct ControllerRuntimeState {
     pub(super) archive_catalog_lock: Mutex<()>,
     pub(super) checkout_removal_concurrency: NonZeroUsize,
     pub(super) checkout_removals: Semaphore,
+    /// Forge default-branch observations consulted before the GitHub CLI.
+    pub(super) forge_default_branches: Option<Arc<dyn ForgeDefaultBranchResolver>>,
 }
 
 impl ControllerRuntimeState {
@@ -129,7 +131,13 @@ impl ControllerRuntimeState {
             archive_catalog_lock: Mutex::new(()),
             checkout_removal_concurrency: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
             checkout_removals: Semaphore::new(DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY.get()),
+            forge_default_branches: None,
         }
+    }
+
+    pub(super) fn with_forge_default_branches(mut self, resolver: Option<Arc<dyn ForgeDefaultBranchResolver>>) -> Self {
+        self.forge_default_branches = resolver;
+        self
     }
 
     pub(super) fn with_checkout_removal_concurrency(mut self, concurrency: NonZeroUsize) -> Self {

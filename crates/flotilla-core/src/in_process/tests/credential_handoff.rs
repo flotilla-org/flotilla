@@ -234,3 +234,162 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     let reviewer_after = sessions.get(&reviewer.metadata.name).await.expect("reviewer");
     assert_eq!(reviewer_after.metadata.resource_version, reviewer.metadata.resource_version);
 }
+
+// Stands in for the vessel controller: when the handoff writes the target's
+// brief, the controller has already created the target's session.
+struct ConcurrentSessionCreation {
+    sessions: flotilla_store::TypedResolver<ResourceTerminalSession>,
+    meta: flotilla_resources::InputMeta,
+    spec: ResourceTerminalSessionSpec,
+}
+
+#[async_trait::async_trait]
+impl crate::in_process::BriefArtifactWriter for ConcurrentSessionCreation {
+    async fn put_brief(&self, _: &str, _: &str, _: &str, _: &str, _: &[u8], _: Option<&str>) -> Result<String, String> {
+        self.sessions.create(&self.meta, &self.spec).await.map_err(|error| error.to_string())?;
+        Ok("sha256:brief".to_string())
+    }
+}
+
+// Behaviour (#3206): a handoff reopens its target's work, which lets the vessel
+// controller create the target's session while the handoff prepares its own.
+// The handoff then delivers to that session instead of failing on the conflict.
+#[tokio::test]
+async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"concurrent-handoff-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    let agent = |role: &str| {
+        CrewSpec::builder()
+            .role(role.to_string())
+            .source(CrewSource::Agent {
+                selector: Selector { capability: "code".to_string(), adapter: Some("codex".to_string()), model: None },
+                prompt: None,
+                brief_template: None,
+            })
+            .build()
+    };
+    let requirement = VesselRequirement::builder().name("work".to_string()).crew(vec![agent("governor"), agent("aide")]).build();
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let convoy = convoys
+        .create(&test_meta("convoy-concurrent"), &ConvoySpec::builder().workflow_ref("govern".to_string()).build())
+        .await
+        .expect("convoy");
+    convoys
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![requirement.clone()],
+                }),
+                crew_work: BTreeMap::from([(
+                    "work".to_string(),
+                    BTreeMap::from([
+                        ("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
+                        ("aide".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()),
+                    ]),
+                )]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("active convoy");
+    backend
+        .clone()
+        .using::<Vessel>("flotilla")
+        .create(
+            &test_meta("convoy-concurrent-work"),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "convoy-concurrent".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "contained".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("vessel");
+    let identity = |role: &str, crew_index| {
+        TerminalSessionIdentity::builder()
+            .vessel_ref("convoy-concurrent-work".to_string())
+            .convoy("convoy-concurrent".to_string())
+            .vessel("work".to_string())
+            .role(role.to_string())
+            .vessel_index(0)
+            .crew_index(crew_index)
+            .build()
+    };
+    let session_spec = |role: &str, brief: &str| ResourceTerminalSessionSpec {
+        env_ref: "contained-env".to_string(),
+        role: role.to_string(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector { capability: "code".to_string(), adapter: Some("codex".to_string()), model: None },
+            brief: flotilla_resources::TerminalBrief {
+                artifact_digest: None,
+                path: format!(".flotilla/briefs/{role}.md"),
+                content: brief.to_string(),
+                copies: Vec::new(),
+            },
+            context: Box::new(flotilla_resources::TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "convoy-concurrent".to_string(),
+                vessel_ref: "convoy-concurrent-work".to_string(),
+            }),
+            message: None,
+        },
+        cwd: "/workspace".to_string(),
+        env: Default::default(),
+        pool: "contained".to_string(),
+    };
+    let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
+    sessions
+        .create(
+            &terminal_meta_with_vessel_credentials(identity("governor", 0).input_meta(), &requirement),
+            &session_spec("governor", "Govern."),
+        )
+        .await
+        .expect("anchor session");
+    let aide = identity("aide", 1);
+    daemon
+        .set_brief_artifact_writer(Arc::new(ConcurrentSessionCreation {
+            sessions: sessions.clone(),
+            meta: terminal_meta_with_vessel_credentials(aide.input_meta(), &requirement),
+            spec: session_spec("aide", "Created by the vessel controller."),
+        }))
+        .await;
+
+    let requested = CrewCommandContext {
+        crew_id: None,
+        namespace: Some("flotilla".to_string()),
+        convoy: Some("convoy-concurrent".to_string()),
+        vessel_ref: Some("convoy-concurrent-work".to_string()),
+        role: Some("governor".to_string()),
+    };
+    daemon.crew_handoff_internal(&requested, "aide", "Task 1.").await.expect("handoff to a concurrently created session");
+
+    let target = sessions.get(&aide.name()).await.expect("aide session");
+    let TerminalSessionSource::Agent { brief, .. } = &target.spec.source else { panic!("aide must be an agent session") };
+    assert_eq!(brief.content, "Created by the vessel controller.", "the controller's session is kept");
+    let messages = backend.clone().using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items;
+    assert!(
+        messages.iter().any(|message| message.spec.receiver.ends_with("/work/aide") && message.spec.body == "Task 1."),
+        "the handoff is queued for the aide: {:?}",
+        messages.iter().map(|message| (&message.spec.receiver, &message.spec.body)).collect::<Vec<_>>()
+    );
+    let status = convoys.get("convoy-concurrent").await.expect("convoy").status.expect("status");
+    assert_ne!(status.crew_work["work"]["aide"].phase, CrewWorkPhase::Pending, "the aide's work is reopened");
+}

@@ -1140,12 +1140,31 @@ async fn remove_agent_files(runner: &dyn CommandRunner, cwd: &Path, brief: &Term
     Ok(())
 }
 
+/// Contributes an adapter beyond the built-in harnesses when an environment's
+/// discovery bag selects it. The composition root installs these; discovery
+/// probes them in every environment beside the built-in detection.
+pub trait AgentAdapterFactory: Send + Sync {
+    fn probe(&self, env: &EnvironmentBag, runner: Arc<dyn CommandRunner>) -> Option<Arc<dyn AgentAdapter>>;
+}
+
 #[derive(Clone, Default)]
 pub struct AgentAdapterRegistry {
     adapters: BTreeMap<String, Arc<dyn AgentAdapter>>,
 }
 
 impl AgentAdapterRegistry {
+    /// Built-in detection plus every installed factory that accepts the bag.
+    /// An installed adapter never replaces a built-in with the same id.
+    pub fn discover_with(env: &EnvironmentBag, runner: Arc<dyn CommandRunner>, factories: &[Arc<dyn AgentAdapterFactory>]) -> Self {
+        let mut registry = Self::discover(env, Arc::clone(&runner));
+        for factory in factories {
+            if let Some(adapter) = factory.probe(env, Arc::clone(&runner)) {
+                registry.adapters.entry(adapter.id().to_string()).or_insert(adapter);
+            }
+        }
+        registry
+    }
+
     pub fn discover(env: &EnvironmentBag, runner: Arc<dyn CommandRunner>) -> Self {
         let mut registry = Self::default();
         if env.find_env_var("FLOTILLA_FLEET_CANARY") == Some("1") {

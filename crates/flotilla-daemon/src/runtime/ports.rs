@@ -247,6 +247,27 @@ impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
     }
 }
 
+/// The first resolver that knows the forge answers. A failing resolver does
+/// not hide a later one's answer; its error is reported only when none answers.
+pub(super) struct ChainedForgeDefaultBranchResolver(pub(super) Vec<Arc<dyn ForgeDefaultBranchResolver>>);
+
+#[async_trait]
+impl ForgeDefaultBranchResolver for ChainedForgeDefaultBranchResolver {
+    async fn default_branch(&self, forge: &ForgeIdentity) -> Result<Option<String>, String> {
+        let mut first_error = None;
+        for resolver in &self.0 {
+            match resolver.default_branch(forge).await {
+                Ok(Some(branch)) => return Ok(Some(branch)),
+                Ok(None) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(None), Err)
+    }
+}
+
 pub(super) struct RoutingCloneRuntime {
     pub(super) state: Arc<ControllerRuntimeState>,
 }
@@ -494,3 +515,35 @@ pub(super) const RECLAIM_REFUSAL_ATTENTION_AFTER: u64 = 3;
 pub(super) const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
 
 pub(super) const RECONCILE_NOW_ANNOTATION: &str = "flotilla.work/reconcile-now-at";
+
+#[cfg(test)]
+mod chained_default_branch_tests {
+    use super::*;
+
+    struct Answer(Result<Option<&'static str>, &'static str>);
+
+    #[async_trait]
+    impl ForgeDefaultBranchResolver for Answer {
+        async fn default_branch(&self, _forge: &ForgeIdentity) -> Result<Option<String>, String> {
+            self.0.map(|branch| branch.map(str::to_string)).map_err(str::to_string)
+        }
+    }
+
+    async fn resolve(answers: Vec<Result<Option<&'static str>, &'static str>>) -> Result<Option<String>, String> {
+        let chain = ChainedForgeDefaultBranchResolver(
+            answers.into_iter().map(|answer| Arc::new(Answer(answer)) as Arc<dyn ForgeDefaultBranchResolver>).collect(),
+        );
+        chain.default_branch(&ForgeIdentity { service_url: "https://forge.example".into(), repository: "team/app".into() }).await
+    }
+
+    // Behaviour: the first resolver with an answer wins; an earlier failure
+    // neither hides a later answer nor is lost when nobody answers.
+    #[tokio::test]
+    async fn the_first_answer_wins_and_errors_surface_only_without_one() {
+        assert_eq!(resolve(vec![Ok(None), Ok(Some("main")), Ok(Some("trunk"))]).await, Ok(Some("main".into())));
+        assert_eq!(resolve(vec![Err("unreachable"), Ok(Some("main"))]).await, Ok(Some("main".into())));
+        assert_eq!(resolve(vec![Ok(None), Err("first"), Err("second")]).await, Err("first".into()));
+        assert_eq!(resolve(vec![Ok(None), Ok(None)]).await, Ok(None));
+        assert_eq!(resolve(Vec::new()).await, Ok(None));
+    }
+}

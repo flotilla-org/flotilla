@@ -1,5 +1,6 @@
 pub mod docker;
 pub mod docker_image;
+pub mod dummy;
 pub mod host_direct;
 pub mod image;
 pub mod image_dockerfile;
@@ -295,6 +296,13 @@ pub trait EnvironmentProvider: Send + Sync {
     /// Optional image capability owned by this exact provider instance.
     fn local_image_cache(&self) -> Option<&dyn LocalImageCache> {
         None
+    }
+    /// Whether this instance's environments receive the host's tools (the
+    /// flotilla CLI, cleat and build limits) and run crews in the delivered
+    /// cleat pool. Per-vessel (Docker-kind) environments do unless their
+    /// instance brings its own crew runtime; host adoption never does.
+    fn receives_host_tools(&self) -> bool {
+        self.kind() == EnvironmentKind::Docker
     }
     /// Optional owned build service using the same endpoint as this
     /// instance's local cache, bound to the host's owned builder settings.

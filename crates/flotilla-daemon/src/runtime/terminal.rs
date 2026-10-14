@@ -67,11 +67,11 @@ pub(super) struct TerminalControllerRuntime {
     pub(super) state: Arc<ControllerRuntimeState>,
 }
 
-pub(super) const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
+pub(crate) const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
 
 pub(super) const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(4);
 
-pub(super) const DELIVERY_CONFIRMATION_STABLE_FOR: Duration = Duration::from_secs(1);
+pub(crate) const DELIVERY_CONFIRMATION_STABLE_FOR: Duration = Duration::from_secs(1);
 
 pub(super) const DELIVERY_READY_POLLS: usize = 150;
 
