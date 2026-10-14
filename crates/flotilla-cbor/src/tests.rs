@@ -151,8 +151,10 @@ fn serializer_duplicates_are_rejected() {
         #[serde(flatten)]
         inner: Inner,
     }
+    // cbor2 reports this only through its "duplicate map key" message text,
+    // which `to_vec` matches; a cbor2 upgrade that rewords it fails here.
     let result = to_vec(&Outer { a: 1, inner: Inner { a: 2 } }, &DEFAULT_LIMITS);
-    assert!(matches!(result, Err(Error::DuplicateKey(_))), "{result:?}");
+    assert!(matches!(result, Err(Error::DuplicateKey(None))), "cbor2's duplicate-key message may have changed: {result:?}");
 }
 
 #[test]
