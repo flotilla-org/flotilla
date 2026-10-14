@@ -62,6 +62,7 @@ case "$verb" in
       aws ec2 terminate-instances --instance-ids "${ids[@]}" >/dev/null
       aws ec2 wait instance-terminated --instance-ids "${ids[@]}"
     fi
+    # Retain state on AWS failure for retry diagnostics; delete only after successful teardown.
     rm -rf -- "$state"
     ;;
   *) echo "unknown provider verb: $verb" >&2; exit 2 ;;
