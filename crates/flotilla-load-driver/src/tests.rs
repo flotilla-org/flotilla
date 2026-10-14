@@ -14,11 +14,14 @@ use tokio::time::Instant;
 
 use crate::{run, ConvoyObservation, ConvoyState, FleetTarget, LoadPlan, TargetSample};
 
+/// A dispatched convoy: its home, mix, dispatch time and any decided end.
+type Dispatched = (usize, CrewMix, Instant, Option<ConvoyState>);
+
 /// An in-memory fleet: each mix ends in a fixed state after a fixed time.
 struct ScriptedFleet {
     homes: usize,
     outcome: fn(CrewMix) -> Option<(ConvoyState, Duration)>,
-    convoys: Mutex<HashMap<String, (usize, CrewMix, Instant, Option<ConvoyState>)>>,
+    convoys: Mutex<HashMap<String, Dispatched>>,
     dispatches: AtomicU64,
     abandons: AtomicU64,
     peak_open: AtomicU64,
