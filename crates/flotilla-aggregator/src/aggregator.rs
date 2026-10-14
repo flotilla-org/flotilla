@@ -1331,7 +1331,10 @@ impl Aggregator {
             // last start, so a busy repository could defer a convoy's first branch
             // scan indefinitely (#3206). One not yet started will read the
             // triggering change; one already running may not, so it looks again
-            // once its result is applied.
+            // once its result is applied. The kept lookup captured the convoy's
+            // branch, repositories and binding: this pass serves sweeps and
+            // repository triggers only; spec changes go through
+            // `schedule_change_request_refresh`, which replaces the task.
             if self.change_request_refresh_tasks.contains_key(&reference) {
                 let started = self.change_request_refresh_started.get(&reference).is_some_and(|at| *at <= Instant::now());
                 if started {
