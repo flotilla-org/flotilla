@@ -256,7 +256,9 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
         }
     }
 
-    let (window_began, start_sample) = window_start.expect("the loop ends only inside a window");
+    let (Some((window_began, start_sample)), Some(ramp_end)) = (window_start, ramp_end) else {
+        return Err("load driver: the loop ended outside a window".into());
+    };
     if admitted == 0 {
         return Err(format!("no dispatch was admitted ({dispatch_errors} failed): {error_samples:?}"));
     }
@@ -286,7 +288,6 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
         note_error(&mut target_errors, &mut target_error_samples, format!("open breakdown: {error}"));
         BTreeMap::new()
     });
-    let ramp_end = ramp_end.expect("ramp ends when the window starts");
     Ok(LoadReport {
         running: plan.running,
         homes,
