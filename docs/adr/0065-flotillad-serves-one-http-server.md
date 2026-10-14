@@ -44,8 +44,9 @@ So hooks and MCP need loopback TCP. The socket already carries two protocols, an
 
 - **One ordered channel per connection.** Subscribe, unsubscribe, full result sets and numbered deltas all travel on one WebSocket, so a delta never overtakes the result set it applies to.
 - **Resume uses query cursors.** A subscription names a query and the last sequence number the client applied (today's `QueryCursor`). The daemon resends a full result set when the cursor is absent or stale.
+- **A cursor is bound to one daemon incarnation.** Sequence numbers restart when the daemon does, so the daemon's `hello` carries an incarnation id and every cursor names it. A cursor from another incarnation counts as stale and gets a full result set, so a client never applies deltas from one sequence to state from another.
 - **Connection-owned state lives on the socket.** `FetchMore`, focus observation and wait subscriptions belong to a connection, so they are WebSocket messages too, and they end when the socket closes.
-- **A `hello` exchange opens the channel.** The daemon's `hello` carries its build identity and protocol fingerprint. flotilla's own clients (CLI, TUI, the pm bridge) refuse a mismatch, as the framed handshake does now (ADR 0047). Other consumers rely on the subprotocol version and on readers ignoring unknown keys.
+- **A `hello` exchange opens the channel.** The daemon's `hello` carries its build identity, protocol fingerprint and incarnation id. flotilla's own clients (CLI, TUI, the pm bridge) refuse a mismatch, as the framed handshake does now (ADR 0047). Other consumers rely on the subprotocol version and on readers ignoring unknown keys.
 - **Commands are plain HTTP requests,** not WebSocket messages. A long-running command returns its id at once. Its progress and outcome are a resource of the command that can be read over HTTP, and are also delivered on the surface channel to a subscriber that asks for them.
 
 ### Encoding follows ADR 0063
@@ -63,9 +64,11 @@ So hooks and MCP need loopback TCP. The socket already carries two protocols, an
 - **Declared and off by default.** The TCP listener is declared in `daemon.toml`. A `flotillad` flag overrides the address, and without either there is no TCP listener.
 - **Loopback only.** flotillad refuses to start when the declared address is not loopback. That refusal stays until token authentication exists (out of scope here).
 - **A bearer token in a private file.** At startup flotillad writes a fresh random token to a file in its state directory that only the user can read (mode 0600). Local clients send it in an `Authorization: Bearer` header. Unix-socket callers are authenticated by the socket and need no token.
-- **Browsers log in through a one-time URL.** `flotilla` prints a login URL carrying a one-time code. Visiting it exchanges the code for an HTTP-only, same-site cookie, so the bearer token never sits in browser history or in page scripts. The listener also refuses requests whose `Origin` or `Host` it does not expect, which closes DNS-rebinding and cross-site WebSocket attacks on a loopback port.
+- **Browsers log in through a one-time URL.** `flotilla` prints a login URL carrying a one-time code. The code is single-use and expires within minutes. Visiting it exchanges the code for an HTTP-only, `SameSite=Strict` session cookie, so the bearer token never sits in browser history or in page scripts. Codes and sessions are held in memory and end when the daemon restarts, as the token does.
+- **Every TCP request passes a `Host` and `Origin` check,** on every route, including WebSocket upgrades. `Host` must name the listener. A request carrying `Origin` must come from the listener's own origin, and a cookie-authenticated request that changes state must carry a matching `Origin`. This closes DNS rebinding, cross-site WebSocket hijacking and cross-site request forgery against the loopback port. Bearer-token requests are not forgeable cross-site, because a browser never adds that header itself.
 - **No runtime command opens a listener.** Listeners come only from config and flags at startup. Opening one on request could return later as a lend with terms.
-- **Public or HTTPS exposure** goes through an authenticating reverse proxy. The proxy can reach flotillad over the Unix socket, and flotillad never terminates TLS for the surface.
+- **Unix sockets are full-trust contexts.** A caller that can open the main socket acts as the user, so the socket stays readable and writable only by the user (mode 0600, as today). A per-environment socket grants exactly that environment's identity.
+- **Public or HTTPS exposure** goes through an authenticating reverse proxy. The proxy can reach flotillad over the Unix socket, and flotillad never terminates TLS for the surface. In that deployment the proxy does all the authentication: flotillad sees one full-trust socket caller, and every remote user the proxy admits acts as the local user.
 
 ### Direction
 
