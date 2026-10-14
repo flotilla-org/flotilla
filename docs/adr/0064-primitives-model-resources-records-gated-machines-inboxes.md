@@ -1,0 +1,142 @@
+# 64. The primitives model: resources, records, gated machines and inboxes
+
+**Status:** Accepted (owner grilling, 2026-10-13 and 2026-10-14). Implemented by the #3108 PR stacks; until the cut-over roll, the running system still follows the ADRs this one amends.
+**Date:** 2026-10-14
+**Amends:**
+- [ADR 0024](0024-declared-state-machines-and-field-ownership.md): machines are declared and gated; per-field ownership is retired.
+- [ADR 0047](0047-stored-data-stays-decodable-across-one-generation.md): after the cut-over, "decodable for one generation" means opening the previous generation's database.
+- [ADR 0048](0048-manifest-state-lives-on-a-manifest-root-resource.md): declared definitions are homed at their ManifestRoot.
+- [ADR 0055](0055-agent-messages-are-durable-receiver-homed-records.md): role inboxes, the four-state Message, and Demand as a Message.
+- [ADR 0059](0059-agent-sessions-processes-and-channels.md): a Role Binding is the consumer relation on an Inbox.
+
+**Relates to:**
+- map #3108 and its tickets #3207–#3215;
+- #3199, where every ruling is recorded as a comment;
+- #3205 (pm connect);
+- #3206 (dummy fleet);
+- the explainer at https://claude.ai/artifact/WCKM5uJGrztnf1y39dfTHU.
+
+## Context
+
+Flotilla's control plane grew around user-visible operations and copied Kubernetes shapes. The audit behind #3199 found the following:
+- **Status patches:** about 140 variants across 19 kinds. Convoy alone has 49, and they carry crew phases, turn deliveries, nudges, stall ladders and landing.
+- **Conditions:** five unrelated condition structs.
+- **Retry counters:** ten stored counters.
+- **Copied facts:** facts mirrored from Environment to Vessel to Convoy.
+- **Heartbeats:** writes that carry no new information.
+- **Storage:** every object stored as JSON, compared as strings, and filtered through 192 per-field value tables.
+
+Convoys assumed that their vessels were co-located and fixed. Many writers could set a phase, and nothing checked why.
+
+## Decision
+
+### Primitives
+
+- **A resource** has its own identity that others refer to. Someone wants it to exist or watches whether it does. It has exactly one **home** host, which alone writes it.
+- **A record** belongs to exactly one resource, identified by owner and position. It has no identity, watch or lifecycle of its own, and it is stored, replicated and archived with its owner. Records include:
+  - deliverables (promises, submissions, retractions);
+  - relations (written by the side that asserts them);
+  - observations (written by their observer);
+  - attempts;
+  - receipts;
+  - last-checked values for polled external data.
+- **A judgement** is computed and never stored. Examples are ready, stalled, landing, kept, retry count, next attempt, stale and drift. Each judgement is a declared function with declared inputs, and it returns a value and the moment it could next change. The same function gates edges and renders listings, so the two cannot disagree.
+- **No host writes another home's resource.** It sends a message to that home, or it publishes a record of its own that the home observes.
+
+### Machines
+
+- **Declaration.** States are nouns, edges are verbs, and the two never share a word. Edges carry typed arguments: one structured edge with arguments, not near-identical variants.
+- **Legibility.** Every diagram must be legible in a GUI to a competent person.
+- **Gates.** Each edge declares a gate, enforced on the home's write path. The edge event records what the gate read, as references and versions. Gates read only local, versioned inputs and never liveness.
+- **Ends are ends.** A late edge on an ended resource is refused, with a reason returned to the caller and not recorded.
+- **Attempts are a history.** Retry counts, the schedule and giving up are judgements over attempt records and a policy. Giving up records a final failure and sends a message.
+- **No mirrors.** Each fact has one home. Facts replicate, and judgements are computed where they are needed.
+- **Replacement, not reincarnation.** When a realised thing is lost and still wanted, a new resource replaces it, and the owning relation records the swap.
+- **API.** Machines are declared with a builder (`MachineDef` / `EdgeDef`) that validates the rules and renders the diagram. Edge dispatch is typed: a fieldless kind enum is derived from the edge enum, and each edge has its own argument struct. Gates and judgements read through one recording handle (#3209).
+
+The decided machines:
+
+| Machine | States | Edges |
+|---|---|---|
+| Shared lifecycle: Vessel, Environment, Checkout, Clone, ImageBuild, TerminalSession | Requested, Realised, Gone, GaveUp | `realise(identity)` Requested→Realised; `release` Requested or Realised→Gone; `vanish` Realised→Gone; `give up(cause)` Requested→GaveUp |
+| Convoy | Open, Delivered, Abandoned | `deliver` (gate: every promise kept, or retracted with acceptance); `abandon(by, reason)`, always a decision by an authorised party. Nothing fails a convoy automatically. |
+| Message | Pending, Awaiting, Settled, Dropped | `deliver(consumer, receipt)` to Settled when nothing is expected, otherwise to Awaiting; `settle(answered \| outcome observed)`; `drop(undeliverable \| expired \| superseded)` |
+| Ensure | Unfulfilled, Fulfilled, Held, Retired | `bind(fulfiller)` when the fulfiller can receive; `unbind(gone \| replaced)`; `give up` from Unfulfilled; `resume(by)`; `retire` |
+| AgentSession | conversation: Live, Ended (completed \| lost); channel: Detached ⇄ Attached | "running" is a judgement |
+
+How the Convoy and Message machines behave:
+- **A convoy ends when its work is delivered.** A crew's "done" is a submission of evidence against a deliverable, not a convoy edge.
+- **A Demand is a Message that expects an outcome,** and the Demand kind retires. Escalation is `drop(expired)` plus a follow-up message.
+
+### Roles, inboxes and delivery
+
+- **Inboxes.** Each role instance owns an **Inbox** resource, homed with the role's owner: the convoy, or the ensure. Messages queue there and outlive any fulfiller.
+- **Addresses.** Role addresses drop the vessel segment, giving `project/role` and `project/convoy/role`. Role names may be dynamic (`coder-pr45`), with the role type as an attribute.
+- **The brief** is the inbox's first message. A new conversation reads the inbox from the top; a resumed one continues from its own position.
+- **The consumer** of an inbox is an **AgentSession**. The consumer relation is the Role Binding, and convoy membership is "X consumes `project/C/role`", asserted by the convoy. One consumer per inbox to start.
+- **Pull delivery.**
+  1. The consumer's host replicates the inboxes it consumes.
+  2. It delivers each turn through its AgentChannel, using the adapter's transport.
+  3. It appends a **receipt** row on its AgentSession.
+  4. The inbox's home records `deliver`, gated on observing that receipt.
+- **`drop(undeliverable)`** is gated on what the home can observe: no consumer bound past a threshold, or a delivery-failure record published by the consumer.
+- **The plug is the whole inbox.** An `InboxBackend` contract covers enqueue, pending-for-consumer, receipts, the edges and watch. Every implementation passes one shared contract-test suite. Resource-backed replication is the first implementation.
+- **Filtering** chooses how a message is delivered, never whether: turn, notify or mute. Mute counts as delivered.
+- **Dead letters** go to the sender's supervisor, unless the sender is that supervisor.
+
+### Storage, replication, views
+
+**Storage.**
+- **Tables from Rust types.** Data is stored as relational tables generated from the Rust types by our own derive on rusqlite (#3208). Collections are child tables, records are owner-plus-position rows, edge events are rows, frozen documents are stored by hash, and strings are interned. JSON is not the stored form.
+- **Serde views.** YAML and JSON stay valid documents for disk, manifests and CLI output. Their content follows the model.
+- **Shared tables.** Each kind has one table, with a home column. Only the replication applier writes rows homed elsewhere.
+
+**Replication.**
+- **One sequence per home.** Its value is a resource's `version`. Each write appends row changes in home order. Replicas apply rows and do not re-run machines.
+- **Encoding and liveness.** The stream is CBOR (ADR 0063). Its keepalive is the link-liveness signal.
+- **Subscriptions.** Every host holds the identity row (kind, name, home) of every live resource. Full rows travel by subscription to coarse scopes: a project, a time window, or "related to host H". The old per-kind rules become default subscriptions.
+- **Misses** are routed to the home or the archive. Gates make a home subscribe to any input they need, and never query remotely. Subscription maintenance must never dominate: subscriptions are tagged once at write time and fanned out by a bitmap lookup.
+
+**Liveness.** Liveness is judged from the observer host's link. Observations are written only when they change. Heartbeat-only writes go away.
+
+**Views.**
+- **Resident state.** State is loaded at startup into typed resident structures and kept current from writes and the stream. Delivery to surfaces never reads the store, and SQL serves only history and archive.
+- **Incremental judgements.** Judgements are maintained incrementally through a compressed-bitmap reverse index from inputs to rows and one timer queue, with Bloom pre-filters on arriving changes and per view client.
+- **Surface protocol.** The named-query surface protocol stays.
+
+**Definitions.** A definition is homed at the ManifestRoot that declares it, and edited through git. Undeclared definitions are homed where they were created. Multi-writer merge metadata and field ownership are removed.
+
+### Not Kubernetes
+
+Flotilla resources will not be Kubernetes CRDs. Kubernetes, if used, is an environment provider. The following are dropped:
+- namespace;
+- API group and version;
+- the CRD files and the Kubernetes write client;
+- the generic `patch-status`.
+
+The following are replaced:
+- finalizers, by a typed teardown step;
+- owner references, by a parent key or a gated relation;
+- about 80 `flotilla.work/*` labels and annotations, by columns and records;
+- JSON-path selectors, by named queries;
+- the Event kind, by edge events.
+
+The following stay:
+- the spec/status split;
+- `version` and `created_at`;
+- plural names and kubectl-style verbs.
+
+### Switch-over
+
+There is no double-write path and no long-lived branch.
+1. **Build alongside.** The new code is built on main in new crates, behind one switch in the composition root.
+2. **Prove it.** The new path is proven with the dummy fleet (#3206) at 100, 1,000 and 10,000 convoys, and with a shadow cluster.
+3. **Rehearse the import.** Pre-roll validation (#2167) rehearses the one-shot importer against every host's live store.
+4. **Cut over in one roll.** The old database file is left untouched, and rollback means returning to the previous generation.
+
+## Consequences
+
+- **Smaller machines.** Convoy goes from 49 patch variants to 2 edges plus records. Message goes from 11 phases to 4 states. Six kinds share one lifecycle. Every stored retry counter, condition struct, mirror and heartbeat goes.
+- **Crews on any host.** Crew members can be on any host and can be replaced without stranding messages. Handoffs, resumes and nudges are messages, and no convoy transition is involved.
+- **The importer is the largest hand-written piece.** After the cut-over, ADR 0047 is enforced by a checked-in schema snapshot and explicit migration steps, and the golden corpus becomes a SQLite file.
+- **Interactions are model-checked in Quint (#3214).** The implementation is split into PR stacks (#3215).
