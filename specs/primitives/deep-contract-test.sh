@@ -16,7 +16,7 @@ esac
 PROVIDER
 chmod +x "$scratch/provider"
 export DEEP_CONTRACT_LOG="$scratch/calls"
-# Success and each failure still collect and stop the allocation.
+# Collect only once run is reached; always stop, including a partial start.
 for phase in success start run collect stop timeout; do
   export DEEP_CONTRACT_START_STATUS=0 DEEP_CONTRACT_RUN_STATUS=0 DEEP_CONTRACT_STOP_STATUS=0 DEEP_CONTRACT_COLLECT_STATUS=0 DEEP_CONTRACT_HANG=0 DEEP_RUN_SECONDS=900
   case "$phase" in
@@ -30,7 +30,7 @@ for phase in success start run collect stop timeout; do
   result=0
   "$here/deep.sh" "$scratch/provider" "$scratch/out" > "$scratch/$phase.out" 2>&1 || result=$?
   case "$phase" in success) test "$result" = 0 ;; start|run) test "$result" = 23 ;; collect|stop) test "$result" = 1 ;; timeout) test "$result" = 124 ;; esac
-  if [ "$phase" = start ]; then printf 'start\ncollect\nstop\n' > "$scratch/expected";
+  if [ "$phase" = start ]; then printf 'start\nstop\n' > "$scratch/expected";
   else printf 'start\nrun\ncollect\nstop\n' > "$scratch/expected"; fi
   cmp "$scratch/expected" "$DEEP_CONTRACT_LOG"
 done

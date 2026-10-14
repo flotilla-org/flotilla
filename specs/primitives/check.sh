@@ -2,10 +2,14 @@
 # Fast safety + generated ITF replay. Generated files stay beneath build/.
 set -euo pipefail
 cd "$(dirname "$0")"
+for tool in quint java; do
+  command -v "$tool" >/dev/null || { echo "missing required tool: $tool; see specs/primitives/README.md" >&2; exit 2; }
+done
+jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
+[ -r "$jar" ] || { echo "missing readable Apalache jar: $jar; install Apalache or set APALACHE_JAR" >&2; exit 2; }
 mkdir -p build
 quint test tests/stream_properties.qnt --backend typescript
 run=$(mktemp -d "$PWD/build/fast.XXXXXX")
-jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
 for scenario in convoy_deliver ensure_bind inbox_delivery message_race machine_edges; do
   quint compile "scenarios/$scenario.qnt" --target tlaplus --invariant safety > "$run/$scenario.compile.log"
   awk '/^-+ MODULE/{found=1} found' "$run/$scenario.compile.log" > "$run/$scenario.tla"
@@ -24,4 +28,5 @@ QUINT_TRACE_DIR="$run" cargo test --manifest-path ../../prototypes/3108-3209/Car
 ./mutants/check.sh
 
 ./deep-contract-test.sh
+python3 ./runner-contract-test.py
 printf 'Fast-tier artifacts: %s\n' "$run"
