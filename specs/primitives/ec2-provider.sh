@@ -41,7 +41,7 @@ case "$verb" in
       if ssh "${options[@]}" "$user@$ip" 'command -v quint && command -v java && command -v cargo' >/dev/null; then ready=true; break; fi
       sleep 2
     done
-    "$ready"
+    "$ready" || { echo 'instance never became SSH-ready with the required tools' >&2; exit 1; }
     ;;
   run)
     connection
@@ -62,6 +62,7 @@ case "$verb" in
       aws ec2 terminate-instances --instance-ids "${ids[@]}" >/dev/null
       aws ec2 wait instance-terminated --instance-ids "${ids[@]}"
     fi
+    rm -rf -- "$state"
     ;;
   *) echo "unknown provider verb: $verb" >&2; exit 2 ;;
 esac

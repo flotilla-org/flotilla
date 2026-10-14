@@ -9,7 +9,7 @@ set -euo pipefail
 printf '%s\n' "$1" >> "$DEEP_CONTRACT_LOG"
 case "$1" in
   start) exit "${DEEP_CONTRACT_START_STATUS:-0}" ;;
-  run) test -s "$3"; if [ "${DEEP_CONTRACT_HANG:-0}" = 1 ]; then sleep 3; fi; exit "${DEEP_CONTRACT_RUN_STATUS:-0}" ;;
+  run) test -s "$3"; touch "${3%/*}/extra-file"; if [ "${DEEP_CONTRACT_HANG:-0}" = 1 ]; then sleep 3; fi; exit "${DEEP_CONTRACT_RUN_STATUS:-0}" ;;
   collect) mkdir -p "$3"; exit "${DEEP_CONTRACT_COLLECT_STATUS:-0}" ;;
   stop) exit "${DEEP_CONTRACT_STOP_STATUS:-0}" ;;
 esac

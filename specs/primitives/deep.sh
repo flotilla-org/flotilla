@@ -16,7 +16,7 @@ cleanup() {
   fi
   timeout --kill-after=10s "${DEEP_CLEANUP_SECONDS:-120}s" "$provider" stop "$allocation" || { echo 'deep allocation teardown failed' >&2; result=1; }
   if [ -f "$scratch/source.tgz" ]; then rm -- "$scratch/source.tgz"; fi
-  rmdir "$scratch"
+  rm -rf -- "$scratch"
   exit "$result"
 }
 trap cleanup EXIT
