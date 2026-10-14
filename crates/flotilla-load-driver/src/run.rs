@@ -31,7 +31,7 @@ struct Outcomes {
     failed: u64,
     by_deadline: u64,
     latency: LatencyHistogram,
-    by_mix: BTreeMap<String, MixOutcomes>,
+    by_mix: BTreeMap<CrewMix, MixOutcomes>,
 }
 
 #[derive(Default)]
@@ -44,7 +44,7 @@ struct MixOutcomes {
 
 impl Outcomes {
     fn record(&mut self, mix: CrewMix, state: ConvoyState, latency: Duration, by_deadline: bool) {
-        let entry = self.by_mix.entry(format!("{mix:?}")).or_default();
+        let entry = self.by_mix.entry(mix).or_default();
         match state {
             ConvoyState::Delivered => {
                 self.delivered += 1;
@@ -80,7 +80,7 @@ impl Outcomes {
                 .map(|(mix, outcomes)| {
                     let MixOutcomes { delivered, abandoned, failed, latency } = outcomes;
                     let latency = summary(&latency.snapshot());
-                    (mix.clone(), MixSummary { delivered: *delivered, abandoned: *abandoned, failed: *failed, latency })
+                    (format!("{mix:?}"), MixSummary { delivered: *delivered, abandoned: *abandoned, failed: *failed, latency })
                 })
                 .collect(),
         }
@@ -90,6 +90,9 @@ impl Outcomes {
 const ERROR_SAMPLES: usize = 5;
 /// Consecutive ticks with a failed target call after which the run gives up.
 const MAX_FAILING_TICKS: u32 = 120;
+/// Attempts at the closing sample before the run falls back to the last
+/// sample taken inside the window.
+const CLOSING_SAMPLE_ATTEMPTS: u32 = 3;
 
 fn note_error(count: &mut u64, samples: &mut Vec<String>, error: String) {
     *count += 1;
@@ -112,6 +115,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
     let mut next_index = 0u64;
     let mut dispatched = 0u64;
     let mut dispatch_errors = 0u64;
+    let mut admitted = 0u64;
     let mut error_samples = Vec::new();
     // Failed target reads and abandons; a long run outlives transient failures
     // and retries on the next tick.
@@ -126,6 +130,8 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
     let mut ramp_end: Option<Instant> = None;
     let mut window_start: Option<(Instant, TargetSample)> = None;
     let mut series = Vec::new();
+    // The latest series sample, kept as the window's closing sample of last resort.
+    let mut last_sample: Option<(Instant, TargetSample)> = None;
     let mut next_series = started;
     let mut tick = tokio::time::interval(plan.tick);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -136,6 +142,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
                 match result {
                     Ok(()) => {
                         admission.record(began.elapsed());
+                        admitted += 1;
                         open.insert(name, Dispatched { home, mix, at: began });
                     }
                     Err(error) => note_error(&mut dispatch_errors, &mut error_samples, error),
@@ -200,7 +207,11 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
         let running = open.len();
         peak_running = peak_running.max(running);
         if now >= next_series {
-            let resident_bytes = target.sample().await.ok().and_then(|sample| sample.resident_bytes);
+            let sample = target.sample().await.ok();
+            let resident_bytes = sample.as_ref().and_then(|sample| sample.resident_bytes);
+            if let Some(sample) = sample {
+                last_sample = Some((now, sample));
+            }
             series.push(SeriesPoint {
                 seconds: now.duration_since(started).as_secs_f64(),
                 running,
@@ -227,7 +238,8 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
             }
         }
 
-        // Top up within the ramp rate and the admission concurrency.
+        // Top up within the ramp rate and the admission concurrency. The budget
+        // truncates, so the first dispatch waits `1 / ramp_per_second`.
         let budget = (plan.ramp_per_second * now.duration_since(started).as_secs_f64()) as u64;
         while open.len() + admitting.len() < plan.running && dispatched < budget && admitting.len() < plan.dispatch_concurrency {
             let index = next_index;
@@ -245,8 +257,31 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
     }
 
     let (window_began, start_sample) = window_start.expect("the loop ends only inside a window");
-    let window = window_began.elapsed();
-    let end_sample = target.sample().await?;
+    if admitted == 0 {
+        return Err(format!("no dispatch was admitted ({dispatch_errors} failed): {error_samples:?}"));
+    }
+    let mut closing = None;
+    for attempt in 1..=CLOSING_SAMPLE_ATTEMPTS {
+        match target.sample().await {
+            Ok(sample) => {
+                closing = Some((Instant::now(), sample));
+                break;
+            }
+            Err(error) => {
+                note_error(&mut target_errors, &mut target_error_samples, format!("closing sample: {error}"));
+                if attempt < CLOSING_SAMPLE_ATTEMPTS {
+                    tokio::time::sleep(plan.tick).await;
+                }
+            }
+        }
+    }
+    let (window_ended, end_sample) = match closing {
+        Some(closing) => closing,
+        None => last_sample
+            .filter(|(at, _)| *at > window_began)
+            .ok_or_else(|| format!("no sample of the window's end after {CLOSING_SAMPLE_ATTEMPTS} attempts: {target_error_samples:?}"))?,
+    };
+    let window = window_ended.duration_since(window_began);
     let open_at_end = target.open_breakdown().await.unwrap_or_else(|error| {
         note_error(&mut target_errors, &mut target_error_samples, format!("open breakdown: {error}"));
         BTreeMap::new()

@@ -31,6 +31,11 @@ struct ScriptedFleet {
     failing_abandons: u64,
     observe_fails_every: u64,
     observes: AtomicU64,
+    /// Every dispatch is refused.
+    refuse_dispatches: bool,
+    /// Samples fail from this long after the fleet starts.
+    sample_outage_after: Option<Duration>,
+    started: Instant,
 }
 
 impl ScriptedFleet {
@@ -45,6 +50,9 @@ impl ScriptedFleet {
             failing_abandons: 0,
             observe_fails_every: 0,
             observes: AtomicU64::new(0),
+            refuse_dispatches: false,
+            sample_outage_after: None,
+            started: Instant::now(),
         }
     }
 
@@ -73,6 +81,9 @@ impl FleetTarget for ScriptedFleet {
 
     async fn dispatch(&self, home: usize, name: &str, mix: CrewMix) -> Result<(), String> {
         self.dispatches.fetch_add(1, Ordering::SeqCst);
+        if self.refuse_dispatches {
+            return Err("admission refused".into());
+        }
         let mut convoys = self.convoys.lock().expect("convoys");
         assert!(convoys.insert(name.into(), (home, mix, Instant::now(), None)).is_none(), "names are unique");
         let open = convoys.values().filter(|(_, mix, at, decided)| !self.state(*mix, *at, *decided).ended()).count() as u64;
@@ -102,6 +113,9 @@ impl FleetTarget for ScriptedFleet {
 
     async fn sample(&self) -> Result<TargetSample, String> {
         self.observe_fault()?;
+        if self.sample_outage_after.is_some_and(|after| self.started.elapsed() >= after) {
+            return Err("sampling unavailable".into());
+        }
         Ok(TargetSample { homes: vec![Default::default(); self.homes], resident_bytes: Some(1 << 20) })
     }
 }
@@ -219,4 +233,31 @@ async fn a_target_that_always_fails_ends_the_run_with_an_error() {
     fleet.observe_fails_every = 1;
     let error = run(&fleet, &plan(3)).await.expect_err("a dead target ends the run");
     assert!(error.contains("consecutive ticks"), "{error}");
+}
+
+// Behaviour: a closing sample that keeps failing does not discard the window;
+// the run closes it at the last sample taken inside it and reports the error.
+// Sampling fails from 55 s; the window runs from about 1 s to 61 s and the
+// series samples every 10 s, so the window closes at the 51 s sample.
+#[tokio::test(start_paused = true)]
+async fn a_failing_closing_sample_falls_back_to_the_last_window_sample() {
+    let mut fleet = ScriptedFleet::new(1, |_| Some((ConvoyState::Delivered, Duration::from_secs(5))));
+    fleet.sample_outage_after = Some(Duration::from_secs(55));
+    let report = run(&fleet, &plan(6)).await.expect("the window is kept");
+    assert!((45.0..55.0).contains(&report.window.seconds), "closed at the last sample: {}", report.window.seconds);
+    assert!(report.window.delivered > 0);
+    assert!(report.target_errors.samples.iter().any(|error| error.contains("closing sample")), "{:?}", report.target_errors);
+}
+
+// Behaviour: a run in which no dispatch was ever admitted is an error, not a
+// report of an empty window.
+#[tokio::test(start_paused = true)]
+async fn a_run_with_no_admitted_convoy_is_an_error() {
+    let mut fleet = ScriptedFleet::new(1, |_| None);
+    fleet.refuse_dispatches = true;
+    let mut plan = plan(3);
+    plan.max_ramp = Duration::from_secs(5);
+    plan.window = Duration::from_secs(5);
+    let error = run(&fleet, &plan).await.expect_err("nothing was admitted");
+    assert!(error.contains("no dispatch was admitted") && error.contains("admission refused"), "{error}");
 }

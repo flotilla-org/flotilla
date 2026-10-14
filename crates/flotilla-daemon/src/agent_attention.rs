@@ -7,6 +7,9 @@ use flotilla_store::ResourceBackend;
 
 /// Record a hook's attention observation. A tool-activity event is always
 /// recorded; a plain state change only when the session would accept it.
+/// The early check only skips a write that would change nothing: the patch
+/// re-applies `should_record_attention` to the current status on every
+/// optimistic retry, so concurrent hooks cannot record stale attention.
 pub(crate) async fn observe_hook_attention(
     backend: &ResourceBackend,
     namespace: &str,
