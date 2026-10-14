@@ -84,6 +84,8 @@ type ReplicaWatchersByStore = HashMap<StoreKey, WatchChannel<StoredReplicaEvent>
 type CleanupKey = (StoreKey, &'static str);
 
 const READER_COUNT: usize = 4;
+// Bump when metadata or declared-field extraction semantics change.
+const QUERY_PROJECTION_SCHEMA_VERSION: &str = "query-projections-v1";
 const READ_DEADLINE: Duration = Duration::from_secs(2);
 const READ_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 const SLOW_STORE_OPERATION: Duration = Duration::from_millis(100);
@@ -410,12 +412,7 @@ impl SqliteBackend {
             read.busy_timeout(READ_BUSY_TIMEOUT).map_err(|err| Self::map_sqlite(err, "configure reader timeout"))?;
             backend.read_connections.push(read.into());
         }
-        tracing::info!(
-            step = "reader_opens",
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            reader_count = READER_COUNT,
-            "sqlite store open step completed"
-        );
+        Self::log_open_step("reader_opens", started, None);
         backend.reader_slots = Arc::new(tokio::sync::Semaphore::new(READER_COUNT - 1));
         backend.available_readers = Arc::new(Mutex::new((0..READER_COUNT - 1).collect()));
         backend.discovery_readers = Arc::new(Mutex::new(vec![READER_COUNT - 1]));
@@ -444,12 +441,7 @@ impl SqliteBackend {
             backend.read_connections.push(read);
             backend.reader_meters.push(meter);
         }
-        tracing::info!(
-            step = "reader_opens",
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            reader_count = READER_COUNT,
-            "sqlite store open step completed"
-        );
+        Self::log_open_step("reader_opens", started, None);
         backend.reader_slots = Arc::new(tokio::sync::Semaphore::new(READER_COUNT - 1));
         backend.available_readers = Arc::new(Mutex::new((0..READER_COUNT - 1).collect()));
         backend.discovery_readers = Arc::new(Mutex::new(vec![READER_COUNT - 1]));
@@ -554,6 +546,15 @@ impl SqliteBackend {
             )
             .map_err(|error| Self::map_sqlite(error, "register declared field projection"))?;
         Ok(())
+    }
+
+    fn log_open_step(step: &'static str, started: Instant, repaired: Option<bool>) {
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(repaired) = repaired {
+            tracing::info!(step, elapsed_ms, repaired, "sqlite store open step completed");
+        } else {
+            tracing::info!(step, elapsed_ms, "sqlite store open step completed");
+        }
     }
 
     fn initialize_connection(connection: &mut RusqliteConnection, event_retention: EventRetention) -> Result<(), ResourceError> {
@@ -797,13 +798,13 @@ impl SqliteBackend {
                 )
                 .map_err(|err| Self::map_sqlite(err, "migrate sqlite replica object timestamps"))?;
         }
-        tracing::info!(step = "schema", elapsed_ms = started.elapsed().as_millis() as u64, "sqlite store open step completed");
+        Self::log_open_step("schema", started, None);
         let started = Instant::now();
         Self::initialize_query_indexes(connection)?;
-        tracing::info!(step = "query_indexes", elapsed_ms = started.elapsed().as_millis() as u64, "sqlite store open step completed");
+        Self::log_open_step("query_indexes", started, None);
         let started = Instant::now();
         let startup_diagnostics = Self::diagnostics_from_connection(connection, event_retention)?;
-        tracing::info!(step = "diagnostics", elapsed_ms = started.elapsed().as_millis() as u64, "sqlite store open step completed");
+        Self::log_open_step("diagnostics", started, None);
         if !startup_diagnostics.warnings.is_empty() {
             tracing::warn!(
                 event_count = startup_diagnostics.event_count,
@@ -816,14 +817,10 @@ impl SqliteBackend {
         }
         let started = Instant::now();
         Self::compact_existing_events(connection, event_retention)?;
-        tracing::info!(
-            step = "compact_existing_events",
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "sqlite store open step completed"
-        );
+        Self::log_open_step("compact_existing_events", started, None);
         let started = Instant::now();
         Self::initialize_digests(connection)?;
-        tracing::info!(step = "initialize_digests", elapsed_ms = started.elapsed().as_millis() as u64, "sqlite store open step completed");
+        Self::log_open_step("initialize_digests", started, None);
         Ok(())
     }
 
@@ -832,14 +829,14 @@ impl SqliteBackend {
     fn initialize_query_indexes(connection: &mut rusqlite::Connection) -> Result<(), ResourceError> {
         let tx = connection.transaction().map_err(|e| Self::map_sqlite(e, "begin query indexes"))?;
         let started = Instant::now();
-        // Rebuildable projection schema: bump v1 when extraction semantics change.
         // Field additions/removals and kind identity changes are detected automatically.
+        // A Debug formatting change only causes a benign one-off projection repair.
         let mut declarations = crate::declared_resource_kinds()
             .into_iter()
             .map(|kind| format!("{}/{}/{}:{:?}", kind.paths.group, kind.paths.version, kind.paths.kind, kind.queryable_fields))
             .collect::<Vec<_>>();
         declarations.sort();
-        let schema = format!("{:x}", Sha256::digest(format!("query-projections-v1:{declarations:?}")));
+        let schema = format!("{:x}", Sha256::digest(format!("{QUERY_PROJECTION_SCHEMA_VERSION}:{declarations:?}")));
         tx.execute_batch("CREATE TABLE IF NOT EXISTS resource_query_projection (singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS resource_query_native_write (singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema TEXT NOT NULL);")
             .map_err(|e| Self::map_sqlite(e, "create query projection marker"))?;
@@ -926,12 +923,7 @@ impl SqliteBackend {
             ")).map_err(|e| Self::map_sqlite(e, "repair metadata query indexes"))?;
             }
         }
-        tracing::info!(
-            step = "query_indexes_metadata",
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            repaired = repair,
-            "sqlite store open step completed"
-        );
+        Self::log_open_step("query_indexes_metadata", started, Some(repair));
         let started = Instant::now();
         // Pre-release query schemas used persistent function-dependent objects.
         // Remove those automatically before installing connection-local triggers.
@@ -1004,12 +996,7 @@ impl SqliteBackend {
                 .map_err(|e| Self::map_sqlite(e, "record query projection schema"))?;
         }
         tx.commit().map_err(|e| Self::map_sqlite(e, "commit query indexes"))?;
-        tracing::info!(
-            step = "query_indexes_fields",
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            repaired = repair,
-            "sqlite store open step completed"
-        );
+        Self::log_open_step("query_indexes_fields", started, Some(repair));
         Ok(())
     }
     fn field_index(table: &str, kind: ResourceKind, path: &str) -> String {

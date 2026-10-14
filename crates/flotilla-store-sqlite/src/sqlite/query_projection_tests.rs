@@ -162,3 +162,46 @@ async fn native_file_reopens_do_not_commit_writes() {
         }
     }
 }
+
+// A failed implicit object statement rolls back its native proof and projection
+// changes, including earlier rows of a multi-row statement, without an explicit
+// transaction. Subsequent native writes still maintain the clean marker.
+#[test]
+fn failed_native_statement_preserves_marker_and_projections() {
+    let mut connection = RusqliteConnection::open_in_memory().expect("connection");
+    SqliteBackend::initialize_connection(&mut connection, EventRetention::default()).expect("initialize");
+    seed(&connection);
+    let field = format!(
+        "{}_values",
+        SqliteBackend::field_index("resource_objects", ResourceKind::of::<flotilla_resources::Project>(), "spec.repositories[].repo")
+    );
+    connection
+        .execute_batch(&format!(
+            "CREATE TEMP TRIGGER reject_native_projection BEFORE INSERT ON {field}
+        WHEN NEW.name='reject' BEGIN SELECT RAISE(ABORT,'projection constraint'); END;"
+        ))
+        .expect("reject second inserted row");
+    let error = connection.execute(
+        "INSERT INTO resource_objects VALUES
+        ('flotilla.work','v1','Project','flotilla','first',1,?1),
+        ('flotilla.work','v1','Project','flotilla','reject',1,?1)",
+        [BODY],
+    );
+    let error = error.expect_err("native multi-row statement fails during field projection");
+    assert!(
+        matches!(error, rusqlite::Error::SqliteFailure(_, Some(ref message)) if message == "projection constraint"),
+        "the injected field constraint causes the failure"
+    );
+    assert!(connection.is_autocommit(), "SQLite owns the implicit transaction");
+    assert!(initialized(&connection), "failed native write preserves the clean marker");
+    let proofs: i64 = connection.query_row("SELECT count(*) FROM resource_query_native_write", [], |row| row.get(0)).expect("proof count");
+    assert_eq!(proofs, 0, "failed statement leaves no write proof");
+    let inserted: i64 = connection
+        .query_row("SELECT count(*) FROM resource_objects WHERE name IN ('first','reject')", [], |row| row.get(0))
+        .expect("rows after failure");
+    assert_eq!(inserted, 0, "every row of the failed statement rolls back");
+    assert_projections(&connection);
+    connection.execute("UPDATE resource_objects SET body_json=body_json", []).expect("subsequent native write");
+    assert!(initialized(&connection));
+    assert_projections(&connection);
+}

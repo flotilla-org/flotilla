@@ -45,8 +45,9 @@ There is no network traffic, new resident object copy, or unbounded result.
   continue to assert zero statement preparations after warm-up.
 
 The durable marker fingerprints kind identities, field declarations and an
-explicit extraction-semantics version (`query-projections-v1`). Change the version
-when projection semantics change. A missing or mismatched marker repairs metadata
+explicit extraction-semantics version (`query-projections-v1`). Bump the named
+`QUERY_PROJECTION_SCHEMA_VERSION` constant when projection semantics change.
+Debug-formatting changes conservatively force a benign one-off repair. A missing or mismatched marker repairs metadata
 and field projections in one transaction and publishes the current marker only
 on commit. A native write never restores an invalid marker. Both empty and
 populated stores are marked after successful bootstrap.
@@ -77,3 +78,43 @@ writes. Failure injection proves metadata and field repairs roll back together,
 while the pre-existing unconfigured-writer test verifies repaired field queries
 and unchanged bodies. Thread-local tracing capture in an isolated integration binary checks all phase
 durations without racing other tests' process-wide callsite registration.
+
+## Write-path measurements (PR #3255 review)
+
+Compared the parent of the initial PR commit (`f4aa51c5b`) with the revised code on
+this Linux vessel, using the existing ignored measurements and real SQLite file
+connections. Both variants retain all their native projection/digest triggers.
+Each replica-upsert measurement runs 500 iterations; each replay uses 1,024
+25 KiB events. Commands:
+
+```sh
+cargo test -p flotilla-store-sqlite --release --locked measure_ -- --ignored --nocapture --test-threads=1
+cargo test -p flotilla-store-sqlite --locked measure_replica_upsert_prepare_cost -- --ignored --nocapture --test-threads=1
+```
+
+Release-profile observations (one run per variant):
+
+| Measurement | Original | Revised |
+|---|---:|---:|
+| Cached replica upsert within a transaction | 0.0349 ms | 0.0365 ms |
+| Uncached replica upsert | 3.7368 ms | 4.2325 ms |
+| Replica apply, one transaction per call | 1.1095 ms | 1.1430 ms |
+| Point get, end to end | 0.0118 ms | 0.0168 ms |
+| Replay on writer, range over 5 runs | 12.73–21.53 ms | 15.34–22.65 ms |
+| Longest writer no-op during reader replay, range over 5 runs | 7.93–13.58 µs | 10.89–21.63 µs |
+| Cached replica-upsert statement memory | 860,912 bytes | 867,064 bytes |
+
+The production cached upsert added 1.6 µs (4.6%) in this sample, and complete
+replica apply added 33.5 µs (3.0%). Statement memory grew by 6,152 bytes. The
+uncached comparison illustrates why retaining the zero-preparation contract
+matters; it is not the production write path. Reader-replay probes remained
+below 22 µs. The replay/no-op benchmark probes queue placement rather than object
+write throughput; its timings and unchanged point-get path also show host noise.
+
+Three additional debug runs per variant gave median cached upserts of 0.1025 ms
+(original, range 0.0990–0.1038) and 0.1043 ms (revised, range 0.1042–0.1473),
+and median complete replica applies of 1.3984 ms (range 1.3742–1.6193) and
+1.4182 ms (range 1.2544–1.9031). One revised run had elevated latency across
+writes and point reads. These observations support accepting the bounded proof
+cost for this startup fix, but do not establish sustained throughput at the
+workload ceiling or claim a performance improvement on unrelated paths.
