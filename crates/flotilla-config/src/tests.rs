@@ -617,3 +617,91 @@ fn naming_model_config_decodes_old_and_new_shapes() {
     let decoded: super::FlotillaConfig = toml::from_str(&encoded).expect("round trip");
     assert_eq!(decoded.ai_utility.model, "custom-model");
 }
+
+#[derive(Clone, Default)]
+struct ConfigWarnings(Arc<Mutex<Vec<String>>>);
+
+// In-memory tracing sink: inspect warnings without a process-wide subscriber.
+impl tracing::Subscriber for ConfigWarnings {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                write!(&mut self.0, "{}={value:?};", field.name()).expect("format event");
+            }
+        }
+        assert_eq!(*event.metadata().level(), tracing::Level::WARN);
+        let mut fields = Fields(String::new());
+        event.record(&mut fields);
+        self.0.lock().expect("warnings mutex").push(fields.0);
+    }
+}
+
+// #3165: both loaders decode identically, silently default for missing files,
+// warn for other read/parse errors, and reuse the cache across entry points.
+// Scenario table covers empty, partial, legacy, malformed, missing and unreadable
+// files. Real local files exercise the filesystem seam; no live hosts are used.
+#[tokio::test]
+async fn config_loaders_share_read_parse_warning_and_cache_policy() {
+    for (source, warning) in [
+        (None, None),
+        (Some(""), None),
+        (Some("[vcs.git]\ncheckout_path = 'custom'\n[convoy]\nauto_attach = false"), None),
+        (Some("[presentation_manager]\nbackend = 'zellij'"), None),
+        (Some("[invalid"), Some("failed to parse config; using defaults")),
+        (Some("directory"), Some("failed to read config; using defaults")),
+    ] {
+        let dir = tempdir().expect("config directory");
+        let path = dir.path().join("config.toml");
+        if let Some(source) = source {
+            if source == "directory" {
+                std::fs::create_dir(&path).expect("unreadable config");
+            } else {
+                std::fs::write(&path, source).expect("config contents");
+            }
+        }
+        let expected: FlotillaConfig = source.filter(|_| warning.is_none()).and_then(|s| toml::from_str(s).ok()).unwrap_or_default();
+        for offloaded_first in [false, true] {
+            let store = ConfigStore::with_base(dir.path());
+            let warnings = ConfigWarnings::default();
+            let config = if offloaded_first {
+                store
+                    .load_config_offloaded(|read| std::future::ready(tracing::subscriber::with_default(warnings.clone(), read)))
+                    .await
+                    .expect("offloaded config")
+            } else {
+                tracing::subscriber::with_default(warnings.clone(), || store.load_config())
+            };
+            assert_eq!(toml::to_string(&config).expect("loaded config"), toml::to_string(&expected).expect("expected config"));
+            {
+                let events = warnings.0.lock().expect("warnings mutex");
+                assert_eq!(events.len(), usize::from(warning.is_some()));
+                if let Some(warning) = warning {
+                    assert!(events[0].contains(warning), "{}", events[0]);
+                    assert!(events[0].contains(&format!("path={}", path.display())), "{}", events[0]);
+                    assert!(events[0].contains("err="));
+                }
+            }
+            let cached = store.load_config();
+            let offloaded = store
+                .load_config_offloaded(|_| -> std::future::Ready<Result<FlotillaConfig, String>> {
+                    panic!("warm cache must skip offloader")
+                })
+                .await
+                .expect("cached config");
+            assert_eq!(toml::to_string(&cached).expect("cached config"), toml::to_string(&config).expect("original config"));
+            assert_eq!(toml::to_string(&offloaded).expect("offloaded cache"), toml::to_string(&config).expect("original config"));
+        }
+    }
+}
