@@ -279,8 +279,11 @@ fn supervise(convoy: &ResourceObject<Convoy>, operation: CrewSupervisionAction) 
 async fn a_failing_crew_proposes_failure_and_its_supervisor_fails_the_convoy() {
     let fleet = DummyDaemon::start(&format!("{SCENARIO_AGENT}fail_rate = 1.0\n"), "").await;
     fleet.dispatch("failing", CrewMix::Coder).await;
-    let convoy = fleet.wait_for_stall("failing").await;
+    // The stall is published before the script records its failure. Wait for
+    // accounting before supervision can tear down the crew session.
+    fleet.wait_for("failing", "failure accounting", |_| fleet.fleet.snapshot().crews_failed > 0).await;
     assert_eq!(fleet.fleet.snapshot().crews_failed, 1);
+    let convoy = fleet.wait_for_stall("failing").await;
     let failed = fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Fail)).await;
     assert!(!matches!(failed, CommandValue::Error { .. }), "{failed:?}");
     fleet.wait_for_crew("failing", CrewWorkPhase::Failed).await;
