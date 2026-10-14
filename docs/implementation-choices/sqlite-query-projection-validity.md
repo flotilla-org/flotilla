@@ -49,7 +49,9 @@ explicit extraction-semantics version (`query-projections-v1`). Bump the named
 `QUERY_PROJECTION_SCHEMA_VERSION` constant when projection semantics change.
 Debug-formatting changes conservatively force a benign one-off repair. A missing or mismatched marker repairs metadata
 and field projections in one transaction and publishes the current marker only
-on commit. A native write never restores an invalid marker. Both empty and
+on commit. Persistent invalidation triggers are also replaced inside the repair
+transaction so a schema-version bump upgrades their bodies along with the data.
+A native write never restores an invalid marker. Both empty and
 populated stores are marked after successful bootstrap.
 
 ## Evolution and assumptions
@@ -118,3 +120,37 @@ and median complete replica applies of 1.3984 ms (range 1.3742–1.6193) and
 writes and point reads. These observations support accepting the bounded proof
 cost for this startup fix, but do not establish sustained throughput at the
 workload ceiling or claim a performance improvement on unrelated paths.
+
+
+### Local resource-object write comparison
+
+The replica-upsert benchmark above does **not** measure plain `resource_objects`
+writes. PR review prompted a separate retained ignored measurement,
+`measure_local_status_write_cost`, which drives `update_status_raw` on a local
+Host through the real file-backed backend, including local projection/digest
+triggers, event recording, and one transaction per status change. After one
+warm-up write it measures three consecutive rounds of 500 writes each:
+
+```sh
+cargo test -p flotilla-store-sqlite --release --locked measure_local_status_write_cost -- --ignored --nocapture --test-threads=1
+```
+
+The original implementation (parent of `f4aa51c5b`) and the revised implementation
+were measured with the same new measurement fixture:
+
+| Local `resource_objects` status write | Original | Revised |
+|---|---:|---:|
+| Round 1 | 1.3847 ms | 1.2920 ms |
+| Round 2 | 1.5003 ms | 1.3914 ms |
+| Round 3 | 2.1248 ms | 1.2397 ms |
+| Median | 1.5003 ms | 1.2920 ms |
+
+Observed median delta: **−0.2083 ms (−13.9%)**. This comparison explicitly covers
+the local write path, rather than extrapolating replica timings. The spread,
+especially the third original round, reflects host/I/O variability; it is not
+evidence of an attributable speedup. The singleton proof mechanism still adds
+bounded work to both paths. These samples do not establish ceiling throughput.
+
+Every startup phase stays at INFO per #3197, including fast phases. Keeping the
+complete phase history in normal logs allows attribution of a missed health
+window without first enabling a debug logger or deciding a latency threshold.

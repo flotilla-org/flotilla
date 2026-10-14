@@ -548,6 +548,8 @@ impl SqliteBackend {
         Ok(())
     }
 
+    // Issue 3197 requires every phase in normal startup logs, including fast
+    // phases, so missed health windows can be attributed after the fact.
     fn log_open_step(step: &'static str, started: Instant, repaired: Option<bool>) {
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Some(repaired) = repaired {
@@ -847,6 +849,10 @@ impl SqliteBackend {
         let repair = initialized.as_deref() != Some(&schema);
         for table in ["resource_objects", "replica_objects"] {
             for action in ["INSERT", "UPDATE", "DELETE"] {
+                if repair {
+                    tx.execute_batch(&format!("DROP TRIGGER IF EXISTS main.{table}_query_dirty_{action};"))
+                        .map_err(|e| Self::map_sqlite(e, "upgrade query projection invalidation"))?;
+                }
                 // BEFORE and AFTER phases give an ordering guarantee independent
                 // of SQLite's ordering of triggers within each phase. A native
                 // write supplies a one-row proof; every writer consumes it.
@@ -3995,28 +4001,6 @@ mod latency_tests {
         assert_eq!(position.resource_version, created.metadata.resource_version);
         assert_eq!(position.generation, None);
         assert!(backend.diagnostics().await.expect("diagnostics").decode_quarantines.is_empty());
-    }
-
-    // Issue 3197: initialized native connections maintain projections incrementally;
-    // reopening an empty or populated store must not rewrite their rows.
-    #[test]
-    fn native_reopen_does_not_rewrite_query_projections() {
-        use super::{EventRetention, RusqliteConnection};
-        for populated in [false, true] {
-            let mut connection = RusqliteConnection::open_in_memory().expect("connection");
-            SqliteBackend::initialize_connection(&mut connection, EventRetention::default()).expect("initialize");
-            if populated {
-                connection.execute_batch(r#"
-                    INSERT INTO resource_objects VALUES ('flotilla.work','v1','Project','flotilla','test',1,
-                    '{"metadata":{"labels":{"test":"yes"},"ownerReferences":[{"apiVersion":"flotilla.work/v1","kind":"Host","name":"owner"}]},"spec":{"repositories":[{"repo":"repo"}]}}');
-                    INSERT INTO replica_objects (origin_root,group_name,version,kind,namespace,name,body_json,last_synced_at)
-                    SELECT 'foreign',group_name,version,kind,namespace,name,body_json,'2026-10-14T00:00:00Z' FROM resource_objects;
-                "#).expect("native writes");
-            }
-            let before = connection.total_changes();
-            SqliteBackend::initialize_connection(&mut connection, EventRetention::default()).expect("reopen");
-            assert_eq!(connection.total_changes(), before, "steady-state open must not rewrite derived rows");
-        }
     }
 
     #[tokio::test]

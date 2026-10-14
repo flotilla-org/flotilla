@@ -205,3 +205,41 @@ fn failed_native_statement_preserves_marker_and_projections() {
     assert!(initialized(&connection));
     assert_projections(&connection);
 }
+
+// A projection-version change upgrades persisted invalidation logic as well as
+// data. An old no-op dirty trigger must not survive the schema repair.
+#[test]
+fn projection_schema_change_upgrades_persistent_invalidation_triggers() {
+    let uri = format!("file:query-trigger-upgrade-{}?mode=memory&cache=shared", uuid::Uuid::new_v4());
+    let mut native = RusqliteConnection::open(&uri).expect("native connection");
+    SqliteBackend::initialize_connection(&mut native, EventRetention::default()).expect("initialize");
+    seed(&native);
+    native
+        .execute_batch(
+            "DROP TRIGGER main.resource_objects_query_dirty_UPDATE;
+        CREATE TRIGGER resource_objects_query_dirty_UPDATE AFTER UPDATE ON resource_objects BEGIN SELECT 1; END;
+        UPDATE resource_query_projection SET schema='old-projection-schema';",
+        )
+        .expect("old invalidation schema");
+    SqliteBackend::initialize_query_indexes(&mut native).expect("upgrade projection schema");
+    assert!(initialized(&native));
+    let foreign = RusqliteConnection::open(&uri).expect("unconfigured writer");
+    foreign.execute("UPDATE resource_objects SET body_json=body_json", []).expect("foreign mutation");
+    assert!(!initialized(&native), "schema repair replaces old invalidation trigger logic");
+}
+
+// Issue 3197: native reopen avoids all row rewrites, even uncommitted ones.
+// File-backed data_version separately checks for persistent commits.
+#[test]
+fn native_reopen_does_not_rewrite_query_projections() {
+    for populated in [false, true] {
+        let mut connection = RusqliteConnection::open_in_memory().expect("connection");
+        SqliteBackend::initialize_connection(&mut connection, EventRetention::default()).expect("initialize");
+        if populated {
+            seed(&connection);
+        }
+        let before = connection.total_changes();
+        SqliteBackend::initialize_connection(&mut connection, EventRetention::default()).expect("reopen");
+        assert_eq!(connection.total_changes(), before, "steady-state open must not rewrite derived rows");
+    }
+}
