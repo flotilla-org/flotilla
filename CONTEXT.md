@@ -18,6 +18,11 @@ accepted the input) or `received` (the harness echoed it back). Activity after
 delivery is a separate derived observation. Whether the input was acted on is
 judged only by the expectation: satisfaction means a reply or outcome has met
 it (ADR 0055, amended by ADR 0059).
+Under ADR 0064 a Message lives in its role's **Inbox** and has four states:
+Pending; Awaiting, which means delivered and waiting for a reply or outcome;
+Settled; and Dropped. A message enters Dropped through the `drop` edge, whose
+reason (undeliverable, expired or superseded) is recorded on the edge event. A
+Demand is a Message that expects an outcome.
 _Avoid_: Delivered (as a claim that the agent acted), prompt.
 
 **Message Subject**:
@@ -45,6 +50,59 @@ are never a human surface. *(Reconciled 2026-10-08, #2913: this entry and a
 second "Role address" entry for the standing-convoy identity were merged.)*
 _Avoid_: Holder (retired), convoy name (for the human-facing identity),
 triple-barrelled generated names.
+*(ADR 0064, effective at the #3108 cut-over: the convoy role form becomes
+`project/convoy/role`, without the vessel segment, so replacing a vessel never
+changes an address. Role names may be dynamic, such as `coder-pr45`, with the
+role type as an attribute of the **Inbox**.)*
+
+**Resource**:
+A thing with its own identity that others refer to, which someone wants to
+exist or watches. Each resource has exactly one **home** host, and only that
+home writes it. Other hosts act on it by sending a Message to the home, or by
+publishing a record of their own that the home observes (ADR 0064).
+_Avoid_: object (for records), CRD.
+
+**Record**:
+Data belonging to exactly one Resource, identified by its owner and its
+position. It has no identity, watch or lifecycle of its own, and it is stored,
+replicated and archived with its owner. Examples are deliverables, relations
+(owned by the side that asserts them), observations (written by their
+observer), attempts and **Receipts** (ADR 0064).
+_Avoid_: sub-resource, annotation (as storage).
+
+**Judgement**:
+Something computed from resources, records and time, and never stored: ready,
+stalled, landing, kept, retry count, next attempt, stale, drift. A judgement is
+a declared function with declared inputs. It returns a value and the moment it
+could next change. The same function gates edges and renders listings (ADR
+0064).
+_Avoid_: condition (as a stored field), status flag.
+
+**Gate**:
+The declared check on a state-machine edge, enforced on the home's write path.
+The edge is refused unless the gate holds. The edge event records what the gate
+read, as references and versions. Gates read only local, versioned inputs (ADR
+0064).
+
+**Inbox**:
+The Resource a role instance owns, where Messages to that role queue. It is
+homed with the role's owner: the convoy for convoy roles, the ensure for
+standing roles. Its first message is the role's **Brief**. Messages in it
+outlive any fulfiller: unsettled messages pass to a replacement consumer (ADR
+0064).
+_Avoid_: mailbox, queue (bare).
+
+**Receipt**:
+A record on an **AgentSession** saying it received a given Message, with when,
+through which transport, and the evidence. The consumer's host writes it. The
+Inbox's home records the Message's `deliver` edge once it observes the receipt
+through replication (ADR 0064).
+
+**Delivery Mode**:
+A consumer's choice of how a matching Message reaches it: `turn` (pushed),
+`notify` (listed for the agent to read, receipt on read) or `mute` (receipt
+recorded immediately). Filtering chooses how a message is delivered, never
+whether (ADR 0064).
 
 **Fleet**:
 The whole set of development resources Flotilla coordinates across hosts. The
@@ -361,6 +419,9 @@ when, kept with history. A role resolves to the AgentSession its current
 binding names. With no current binding the role is *unbound*, and Messages to
 it wait. More than one current binding for a role is refused. Starting a new
 conversation for a role means a new AgentSession and a new binding (ADR 0059).
+Under ADR 0064 a Role Binding is the **consumer** relation on the role's
+**Inbox**. Convoy membership is a binding the convoy asserts. An AgentSession
+may consume several inboxes, and one consumer per inbox is the starting rule.
 _Avoid_: Holder, assignment.
 
 **AgentChannel**:
