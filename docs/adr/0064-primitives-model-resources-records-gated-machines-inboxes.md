@@ -60,14 +60,14 @@ The decided machines:
 |---|---|---|
 | Shared lifecycle: Vessel, Environment, Checkout, Clone, ImageBuild, TerminalSession | Requested, Realised, Gone, GaveUp | `realise(identity)` Requested→Realised; `release` Requested or Realised→Gone; `vanish` Realised→Gone; `give up(cause)` Requested→GaveUp |
 | Convoy | Open, Delivered, Abandoned | `deliver` (gate: every promise kept, or retracted with acceptance); `abandon(by, reason)`, always a decision by an authorised party. Nothing fails a convoy automatically. |
-| Message | Pending, Awaiting, Settled, Dropped | `deliver(consumer, receipt)` to Settled when nothing is expected, otherwise to Awaiting; `settle(answered \| outcome observed)`; `drop(undeliverable \| expired \| superseded)` |
+| Message | Pending, Awaiting, Settled, Dropped | `deliver(consumer, receipt)` to Settled when nothing is expected, otherwise to Awaiting; `settle(answered)` from Awaiting; `settle(outcome observed)` from Pending or Awaiting; `drop(undeliverable \| expired \| superseded)` |
 | Ensure | Unfulfilled, Fulfilled, Held, Retired | `bind(fulfiller)` when the fulfiller can receive; `unbind(gone \| replaced)`; `give up` from Unfulfilled; `resume(by)`; `retire` |
 | AgentSession | conversation: Live, Ended (completed \| lost); channel: Detached ⇄ Attached | "running" is a judgement |
 
 How the Convoy and Message machines behave:
 - **A convoy ends when its work is delivered.** A crew's "done" is a submission of evidence against a deliverable, not a convoy edge.
 - **A Demand is a Message that expects an outcome,** and the Demand kind retires. Escalation is `drop(expired)` plus a follow-up message.
-- **`settle` is declared only from Awaiting.** Whether an outcome met while a message is still Pending settles it directly, or drops it, is open. The Quint specs (#3214) model the case before it is decided.
+- **An outcome observed while Pending settles the message directly** (owner, 2026-10-14). Take a demand to fix a failing build: if the build goes green before delivery, the message did its job, and the consumer never sees the turn. A receipt that arrives afterwards cannot record `deliver` on a Settled message.
 - **Dropped is the state; `drop(reason)` is the edge into it.** The reason is recorded on the edge event and shown with the state.
 
 ### Roles, inboxes and delivery
