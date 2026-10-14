@@ -62,6 +62,16 @@ esac''')
         self.assertIn('--instance-initiated-shutdown-behavior terminate', args)
         self.assertIn('--user-data file://', args)
         self.assertIn('shutdown -h +30', (self.root / 'state/quint-3220-test/user-data').read_text())
+        self.env['FAKE_IP'] = '192.0.2.1'
+        self.stub('sleep', 'exit 0')
+        result = self.run_script(HERE / 'ec2-provider.sh', 'start', 'quint-3220-test')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('never became SSH-ready', result.stderr)
+        # No matching instance is also a successful, idempotent stop.
+        self.env['FAKE_IP'] = ''
+        result = self.run_script(HERE / 'ec2-provider.sh', 'stop', 'quint-3220-test')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / 'state/quint-3220-test').exists())
 
     def test_deep_bound_change_is_verified_before_quint(self):
         copy = self.root / 'specs'
