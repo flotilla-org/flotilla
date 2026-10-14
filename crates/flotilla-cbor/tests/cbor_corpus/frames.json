@@ -1,0 +1,196 @@
+{
+  "description": "Framed messages: magic JSTEST01, big-endian u32 body length, one map whose type is hello or goodbye.",
+  "vectors": [
+    {
+      "name": "hello",
+      "limits": "setup",
+      "hex": "4a535445535430310000000ca164747970656568656c6c6f",
+      "expect": "accept"
+    },
+    {
+      "name": "goodbye",
+      "limits": "setup",
+      "hex": "4a535445535430310000000ea1647479706567676f6f64627965",
+      "expect": "accept"
+    },
+    {
+      "name": "unknown key ignored",
+      "limits": "setup",
+      "hex": "4a5354455354303100000018a264747970656568656c6c6f6565787472618201a16178f6",
+      "expect": "accept"
+    },
+    {
+      "name": "non-deterministic body accepted",
+      "limits": "setup",
+      "hex": "4a5354455354303100000010a2617a180064747970656568656c6c6f",
+      "expect": "accept"
+    },
+    {
+      "name": "unknown type",
+      "limits": "setup",
+      "hex": "4a535445535430310000000ca1647479706565626f677573",
+      "expect": "unknown-type"
+    },
+    {
+      "name": "missing type",
+      "limits": "setup",
+      "hex": "4a535445535430310000000ca1646b696e646568656c6c6f",
+      "expect": "missing-type"
+    },
+    {
+      "name": "type not text",
+      "limits": "setup",
+      "hex": "4a5354455354303100000007a1647479706501",
+      "expect": "type-not-text"
+    },
+    {
+      "name": "body not a map",
+      "limits": "setup",
+      "hex": "4a535445535430310000000180",
+      "expect": "not-a-map"
+    },
+    {
+      "name": "body not a map, text",
+      "limits": "setup",
+      "hex": "4a53544553543031000000066568656c6c6f",
+      "expect": "not-a-map"
+    },
+    {
+      "name": "bad magic",
+      "limits": "setup",
+      "hex": "4a535445535430320000000ca164747970656568656c6c6f",
+      "expect": "bad-magic"
+    },
+    {
+      "name": "empty body",
+      "limits": "setup",
+      "hex": "4a5354455354303100000000",
+      "expect": "truncated"
+    },
+    {
+      "name": "header only, 7 bytes",
+      "limits": "setup",
+      "hex": "4a535445535430",
+      "expect": "truncated"
+    },
+    {
+      "name": "header only, 11 bytes",
+      "limits": "setup",
+      "hex": "4a53544553543031000000",
+      "expect": "truncated"
+    },
+    {
+      "name": "body shorter than its length",
+      "limits": "setup",
+      "hex": "4a535445535430310000000da164747970656568656c6c6f",
+      "expect": "truncated"
+    },
+    {
+      "name": "frame followed by another byte",
+      "limits": "setup",
+      "hex": "4a535445535430310000000ca164747970656568656c6c6f00",
+      "expect": "trailing-bytes"
+    },
+    {
+      "name": "body with bytes after its map",
+      "limits": "setup",
+      "hex": "4a535445535430310000000da164747970656568656c6c6f00",
+      "expect": "trailing-bytes"
+    },
+    {
+      "name": "body duplicate type, second in a non-shortest form",
+      "limits": "setup",
+      "hex": "4a5354455354303100000018a264747970656568656c6c6f7804747970656568656c6c6f",
+      "expect": "duplicate-key"
+    },
+    {
+      "name": "body with a tag",
+      "limits": "setup",
+      "hex": "4a5354455354303100000010a264747970656568656c6c6f6178c100",
+      "expect": "tag"
+    },
+    {
+      "name": "body duplicate keys",
+      "limits": "setup",
+      "hex": "4a5354455354303100000017a264747970656568656c6c6f64747970656568656c6c6f",
+      "expect": "duplicate-key"
+    },
+    {
+      "name": "length over the limit, no body",
+      "limits": "setup",
+      "hex": "4a5354455354303100010001",
+      "expect": "message-limit"
+    },
+    {
+      "name": "length 2^32-1, no body",
+      "limits": "setup",
+      "hex": "4a53544553543031ffffffff",
+      "expect": "message-limit"
+    },
+    {
+      "name": "message of 65,536 bytes, just inside",
+      "limits": "setup",
+      "hex": [
+        "4a5354455354303100010000a26370616479ffed",
+        {
+          "repeat": "61",
+          "count": 65517
+        },
+        "64747970656568656c6c6f"
+      ],
+      "expect": "accept"
+    },
+    {
+      "name": "message of 65,537 bytes, just over",
+      "limits": "setup",
+      "hex": [
+        "4a5354455354303100010001a26370616479ffee",
+        {
+          "repeat": "61",
+          "count": 65518
+        },
+        "64747970656568656c6c6f"
+      ],
+      "expect": "message-limit"
+    },
+    {
+      "name": "descriptor of 4096 bytes, just inside",
+      "limits": "setup",
+      "hex": [
+        "4a5354455354303100001011a26164591000",
+        {
+          "repeat": "00",
+          "count": 4096
+        },
+        "64747970656568656c6c6f"
+      ],
+      "expect": "accept"
+    },
+    {
+      "name": "descriptor of 4097 bytes, just over",
+      "limits": "setup",
+      "hex": [
+        "4a5354455354303100001012a26164591001",
+        {
+          "repeat": "00",
+          "count": 4097
+        },
+        "64747970656568656c6c6f"
+      ],
+      "expect": "byte-string-limit"
+    },
+    {
+      "name": "default limits allow a 65,537-byte message",
+      "limits": "default",
+      "hex": [
+        "4a5354455354303100010001a26370616479ffee",
+        {
+          "repeat": "61",
+          "count": 65518
+        },
+        "64747970656568656c6c6f"
+      ],
+      "expect": "accept"
+    }
+  ]
+}

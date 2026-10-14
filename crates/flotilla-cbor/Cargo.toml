@@ -1,0 +1,31 @@
+[package]
+name = "flotilla-cbor"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "The stack CBOR profile of ADR 0063: deterministic writers, safe readers, limits and framing"
+
+# Depends on no other flotilla crate: Jackstay and other sibling projects use it
+# as a git dependency.
+[dependencies]
+# Pinned exactly: the conformance corpus pins its behaviour, and an upgrade is a
+# deliberate change that reruns the corpus.
+cbor2 = { version = "=1.1.6", default-features = false, features = ["std"] }
+serde = { workspace = true }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
+
+# Feature anchors for ci/build-graph/check.py (see
+# docs/measurements/2747-build-graph.md), declared inline rather than through
+# the flotilla-build-features crates so this crate depends on no other flotilla
+# crate. They select features of dependencies already in the graph and add none.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+serde_core = { version = "1", features = ["alloc"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.build-dependencies]
+syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }

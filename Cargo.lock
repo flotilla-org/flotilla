@@ -337,6 +337,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cbor2"
+version = "1.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddf90b4df9f396c3b5dad07dcdaf0627f2b8ae533ea9be9937f9d6b8713cb888"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1431,6 +1440,18 @@ dependencies = [
  "hegeltest",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "flotilla-cbor"
+version = "0.1.0"
+dependencies = [
+ "cbor2",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "syn 2.0.117",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

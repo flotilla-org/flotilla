@@ -1,0 +1,994 @@
+{
+  "description": "Decoder vectors. Decoding hex under the named limits is accepted or fails with expect; the canonical check gives canonical, or else the same result as expect.",
+  "groups": [
+    {
+      "name": "accepted-not-deterministic",
+      "description": "Well-formed input that is not in deterministic form. Safe readers accept it and decode it to diag; the canonical check rejects it with canonical.",
+      "vectors": [
+        {
+          "name": "non-shortest integer: 0 in one byte",
+          "limits": "default",
+          "hex": "1800",
+          "expect": "accept",
+          "diag": "0",
+          "canonical": "non-shortest-integer"
+        },
+        {
+          "name": "non-shortest integer: 23 in one byte",
+          "limits": "default",
+          "hex": "1817",
+          "expect": "accept",
+          "diag": "23",
+          "canonical": "non-shortest-integer"
+        },
+        {
+          "name": "non-shortest integer: 0 in two bytes",
+          "limits": "default",
+          "hex": "190000",
+          "expect": "accept",
+          "diag": "0",
+          "canonical": "non-shortest-integer"
+        },
+        {
+          "name": "non-shortest integer: 255 in two bytes",
+          "limits": "default",
+          "hex": "1900ff",
+          "expect": "accept",
+          "diag": "255",
+          "canonical": "non-shortest-integer"
+        },
+        {
+          "name": "non-shortest integer: 65535 in four bytes",
+          "limits": "default",
+          "hex": "1a0000ffff",
+          "expect": "accept",
+          "diag": "65535",
+          "canonical": "non-shortest-integer"
+        },
+        {
+          "name": "non-shortest integer: 2^32-1 in eight bytes",
+          "limits": "default",
+          "hex": "1b00000000ffffffff",
+          "expect": "accept",
+          "diag": "4294967295",
+          "canonical": "non-shortest-integer"
+        },
+        {
+          "name": "non-shortest integer: -1 in one byte",
+          "limits": "default",
+          "hex": "3800",
+          "expect": "accept",
+          "diag": "-1",
+          "canonical": "non-shortest-integer"
+        },
+        {
+          "name": "non-shortest integer: -24 in one byte",
+          "limits": "default",
+          "hex": "3817",
+          "expect": "accept",
+          "diag": "-24",
+          "canonical": "non-shortest-integer"
+        },
+        {
+          "name": "non-shortest integer: -256 in two bytes",
+          "limits": "default",
+          "hex": "3900ff",
+          "expect": "accept",
+          "diag": "-256",
+          "canonical": "non-shortest-integer"
+        },
+        {
+          "name": "non-shortest integer: -2^32 in eight bytes",
+          "limits": "default",
+          "hex": "3b00000000ffffffff",
+          "expect": "accept",
+          "diag": "-4294967296",
+          "canonical": "non-shortest-integer"
+        },
+        {
+          "name": "non-shortest length: byte string length in one byte",
+          "limits": "default",
+          "hex": "5800",
+          "expect": "accept",
+          "diag": "h''",
+          "canonical": "non-shortest-length"
+        },
+        {
+          "name": "non-shortest length: byte string length 23 in one byte",
+          "limits": "default",
+          "hex": "58170000000000000000000000000000000000000000000000",
+          "expect": "accept",
+          "diag": "h'0000000000000000000000000000000000000000000000'",
+          "canonical": "non-shortest-length"
+        },
+        {
+          "name": "non-shortest length: text length in one byte",
+          "limits": "default",
+          "hex": "780161",
+          "expect": "accept",
+          "diag": "\"a\"",
+          "canonical": "non-shortest-length"
+        },
+        {
+          "name": "non-shortest length: text length in two bytes",
+          "limits": "default",
+          "hex": "79000161",
+          "expect": "accept",
+          "diag": "\"a\"",
+          "canonical": "non-shortest-length"
+        },
+        {
+          "name": "non-shortest length: array length in one byte",
+          "limits": "default",
+          "hex": "9800",
+          "expect": "accept",
+          "diag": "[]",
+          "canonical": "non-shortest-length"
+        },
+        {
+          "name": "non-shortest length: array length in four bytes",
+          "limits": "default",
+          "hex": "9a0000000100",
+          "expect": "accept",
+          "diag": "[0]",
+          "canonical": "non-shortest-length"
+        },
+        {
+          "name": "non-shortest length: map length in one byte",
+          "limits": "default",
+          "hex": "b800",
+          "expect": "accept",
+          "diag": "{}",
+          "canonical": "non-shortest-length"
+        },
+        {
+          "name": "non-shortest length: map length in eight bytes",
+          "limits": "default",
+          "hex": "bb0000000000000000",
+          "expect": "accept",
+          "diag": "{}",
+          "canonical": "non-shortest-length"
+        },
+        {
+          "name": "non-shortest float: 1.5 as f32",
+          "limits": "default",
+          "hex": "fa3fc00000",
+          "expect": "accept",
+          "diag": "1.5",
+          "canonical": "non-shortest-float"
+        },
+        {
+          "name": "non-shortest float: 1.5 as f64",
+          "limits": "default",
+          "hex": "fb3ff8000000000000",
+          "expect": "accept",
+          "diag": "1.5",
+          "canonical": "non-shortest-float"
+        },
+        {
+          "name": "non-shortest float: Infinity as f32",
+          "limits": "default",
+          "hex": "fa7f800000",
+          "expect": "accept",
+          "diag": "Infinity",
+          "canonical": "non-shortest-float"
+        },
+        {
+          "name": "non-shortest float: -Infinity as f64",
+          "limits": "default",
+          "hex": "fbfff0000000000000",
+          "expect": "accept",
+          "diag": "-Infinity",
+          "canonical": "non-shortest-float"
+        },
+        {
+          "name": "non-shortest float: -0.0 as f32",
+          "limits": "default",
+          "hex": "fa80000000",
+          "expect": "accept",
+          "diag": "-0.0",
+          "canonical": "non-shortest-float"
+        },
+        {
+          "name": "non-shortest float: -0.0 as f64",
+          "limits": "default",
+          "hex": "fb8000000000000000",
+          "expect": "accept",
+          "diag": "-0.0",
+          "canonical": "non-shortest-float"
+        },
+        {
+          "name": "non-shortest float: 2^-24 as f64",
+          "limits": "default",
+          "hex": "fb3e70000000000000",
+          "expect": "accept",
+          "diag": "5.9604644775390625e-8",
+          "canonical": "non-shortest-float"
+        },
+        {
+          "name": "non-shortest float: 100000.5 as f64",
+          "limits": "default",
+          "hex": "fb40f86a0800000000",
+          "expect": "accept",
+          "diag": "100000.5",
+          "canonical": "non-shortest-float"
+        },
+        {
+          "name": "non-shortest float: 2^64 as f64",
+          "limits": "default",
+          "hex": "fb43f0000000000000",
+          "expect": "accept",
+          "diag": "1.8446744073709552e19",
+          "canonical": "non-shortest-float"
+        },
+        {
+          "name": "non-shortest float: 1.0 as f64",
+          "limits": "default",
+          "hex": "fb3ff0000000000000",
+          "expect": "accept",
+          "diag": "1.0",
+          "canonical": "non-shortest-float"
+        },
+        {
+          "name": "non-shortest float: 1.0 as f32",
+          "limits": "default",
+          "hex": "fa3f800000",
+          "expect": "accept",
+          "diag": "1.0",
+          "canonical": "non-shortest-float"
+        },
+        {
+          "name": "non-shortest float: 0.0 as f64",
+          "limits": "default",
+          "hex": "fb0000000000000000",
+          "expect": "accept",
+          "diag": "0.0",
+          "canonical": "non-shortest-float"
+        },
+        {
+          "name": "unsorted keys",
+          "limits": "default",
+          "hex": "a2616201616101",
+          "expect": "accept",
+          "diag": "{\"b\": 1, \"a\": 1}",
+          "canonical": "unsorted-keys"
+        },
+        {
+          "name": "unsorted keys, longer first",
+          "limits": "default",
+          "hex": "a262616101617902",
+          "expect": "accept",
+          "diag": "{\"aa\": 1, \"y\": 2}",
+          "canonical": "unsorted-keys"
+        },
+        {
+          "name": "unsorted keys in nested map",
+          "limits": "default",
+          "hex": "a16161a2616201616101",
+          "expect": "accept",
+          "diag": "{\"a\": {\"b\": 1, \"a\": 1}}",
+          "canonical": "unsorted-keys"
+        },
+        {
+          "name": "non-shortest key length",
+          "limits": "default",
+          "hex": "a1780161f6",
+          "expect": "accept",
+          "diag": "{\"a\": null}",
+          "canonical": "non-shortest-length"
+        },
+        {
+          "name": "non-shortest integer inside a message",
+          "limits": "default",
+          "hex": "a26178181764747970656568656c6c6f",
+          "expect": "accept",
+          "diag": "{\"x\": 23, \"type\": \"hello\"}",
+          "canonical": "non-shortest-integer"
+        }
+      ]
+    },
+    {
+      "name": "rejected",
+      "description": "Input every reader rejects, safe or canonical. Indefinite lengths are here deliberately: admitting them is a corpus change.",
+      "vectors": [
+        {
+          "name": "indefinite length: byte string",
+          "limits": "default",
+          "hex": "5f4100ff",
+          "expect": "indefinite-length"
+        },
+        {
+          "name": "indefinite length: text",
+          "limits": "default",
+          "hex": "7f6161ff",
+          "expect": "indefinite-length"
+        },
+        {
+          "name": "indefinite length: array",
+          "limits": "default",
+          "hex": "9f01ff",
+          "expect": "indefinite-length"
+        },
+        {
+          "name": "indefinite length: map",
+          "limits": "default",
+          "hex": "bf616101ff",
+          "expect": "indefinite-length"
+        },
+        {
+          "name": "indefinite length: empty array",
+          "limits": "default",
+          "hex": "9fff",
+          "expect": "indefinite-length"
+        },
+        {
+          "name": "indefinite length: nested in a map",
+          "limits": "default",
+          "hex": "a161619f01ff",
+          "expect": "indefinite-length"
+        },
+        {
+          "name": "NaN: f16 quiet",
+          "limits": "default",
+          "hex": "f97e00",
+          "expect": "nan"
+        },
+        {
+          "name": "NaN: f16 signalling",
+          "limits": "default",
+          "hex": "f97c01",
+          "expect": "nan"
+        },
+        {
+          "name": "NaN: f16 negative",
+          "limits": "default",
+          "hex": "f9fe00",
+          "expect": "nan"
+        },
+        {
+          "name": "NaN: f32",
+          "limits": "default",
+          "hex": "fa7fc00000",
+          "expect": "nan"
+        },
+        {
+          "name": "NaN: f64",
+          "limits": "default",
+          "hex": "fb7ff8000000000000",
+          "expect": "nan"
+        },
+        {
+          "name": "NaN: f32 with payload",
+          "limits": "default",
+          "hex": "fa7fc00001",
+          "expect": "nan"
+        },
+        {
+          "name": "NaN: f64 negative with payload",
+          "limits": "default",
+          "hex": "fbfff8000000000001",
+          "expect": "nan"
+        },
+        {
+          "name": "NaN: as a map value",
+          "limits": "default",
+          "hex": "a16161f97e00",
+          "expect": "nan"
+        },
+        {
+          "name": "tag: tag 0 date",
+          "limits": "default",
+          "hex": "c074323031332d30332d32315432303a30343a30305a",
+          "expect": "tag"
+        },
+        {
+          "name": "tag: tag 1 epoch",
+          "limits": "default",
+          "hex": "c11a514b67b0",
+          "expect": "tag"
+        },
+        {
+          "name": "tag: tag 2 bignum",
+          "limits": "default",
+          "hex": "c249010000000000000000",
+          "expect": "tag"
+        },
+        {
+          "name": "tag: tag 42 CID",
+          "limits": "default",
+          "hex": "d82a4100",
+          "expect": "tag"
+        },
+        {
+          "name": "tag: self-described CBOR 55799",
+          "limits": "default",
+          "hex": "d9d9f700",
+          "expect": "tag"
+        },
+        {
+          "name": "tag: tag inside map",
+          "limits": "default",
+          "hex": "a16161c100",
+          "expect": "tag"
+        },
+        {
+          "name": "simple value: undefined",
+          "limits": "default",
+          "hex": "f7",
+          "expect": "unsupported-simple"
+        },
+        {
+          "name": "simple value: simple 0",
+          "limits": "default",
+          "hex": "e0",
+          "expect": "unsupported-simple"
+        },
+        {
+          "name": "simple value: simple 19",
+          "limits": "default",
+          "hex": "f3",
+          "expect": "unsupported-simple"
+        },
+        {
+          "name": "simple value: simple 32",
+          "limits": "default",
+          "hex": "f820",
+          "expect": "unsupported-simple"
+        },
+        {
+          "name": "duplicate keys",
+          "limits": "default",
+          "hex": "a2616101616102",
+          "expect": "duplicate-key"
+        },
+        {
+          "name": "duplicate keys after others",
+          "limits": "default",
+          "hex": "a3616101616202616202",
+          "expect": "duplicate-key"
+        },
+        {
+          "name": "duplicate keys, second in a non-shortest form",
+          "limits": "default",
+          "hex": "a261610178016102",
+          "expect": "duplicate-key"
+        },
+        {
+          "name": "duplicate keys, first in a non-shortest form",
+          "limits": "default",
+          "hex": "a278016101616102",
+          "expect": "duplicate-key",
+          "canonical": "non-shortest-length"
+        },
+        {
+          "name": "duplicate keys, not adjacent and unsorted",
+          "limits": "default",
+          "hex": "a3616101617a02616103",
+          "expect": "duplicate-key"
+        },
+        {
+          "name": "duplicate keys in a nested map",
+          "limits": "default",
+          "hex": "a16178a2616101616102",
+          "expect": "duplicate-key"
+        },
+        {
+          "name": "integer key",
+          "limits": "default",
+          "hex": "a10101",
+          "expect": "non-text-key"
+        },
+        {
+          "name": "byte string key",
+          "limits": "default",
+          "hex": "a1410001",
+          "expect": "non-text-key"
+        },
+        {
+          "name": "array key",
+          "limits": "default",
+          "hex": "a18001",
+          "expect": "non-text-key"
+        },
+        {
+          "name": "invalid UTF-8",
+          "limits": "default",
+          "hex": "61ff",
+          "expect": "invalid-utf8"
+        },
+        {
+          "name": "truncated UTF-8 sequence",
+          "limits": "default",
+          "hex": "62c328",
+          "expect": "invalid-utf8"
+        },
+        {
+          "name": "UTF-8 surrogate",
+          "limits": "default",
+          "hex": "63eda080",
+          "expect": "invalid-utf8"
+        },
+        {
+          "name": "invalid UTF-8 key",
+          "limits": "default",
+          "hex": "a161ff01",
+          "expect": "invalid-utf8"
+        },
+        {
+          "name": "break outside indefinite item",
+          "limits": "default",
+          "hex": "ff",
+          "expect": "malformed"
+        },
+        {
+          "name": "break inside array",
+          "limits": "default",
+          "hex": "8201ff",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head 1c",
+          "limits": "default",
+          "hex": "1c",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head 1d",
+          "limits": "default",
+          "hex": "1d",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head 1e",
+          "limits": "default",
+          "hex": "1e",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head 1f",
+          "limits": "default",
+          "hex": "1f",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head 3c",
+          "limits": "default",
+          "hex": "3c",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head 3f",
+          "limits": "default",
+          "hex": "3f",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head 5c",
+          "limits": "default",
+          "hex": "5c",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head 7d",
+          "limits": "default",
+          "hex": "7d",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head 9e",
+          "limits": "default",
+          "hex": "9e",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head bc",
+          "limits": "default",
+          "hex": "bc",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head dc",
+          "limits": "default",
+          "hex": "dc",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head df",
+          "limits": "default",
+          "hex": "df",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head fc",
+          "limits": "default",
+          "hex": "fc",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head fd",
+          "limits": "default",
+          "hex": "fd",
+          "expect": "malformed"
+        },
+        {
+          "name": "reserved or ill-formed head fe",
+          "limits": "default",
+          "hex": "fe",
+          "expect": "malformed"
+        },
+        {
+          "name": "two-byte simple value below 32",
+          "limits": "default",
+          "hex": "f818",
+          "expect": "malformed"
+        },
+        {
+          "name": "truncated: empty input",
+          "limits": "default",
+          "hex": "",
+          "expect": "truncated"
+        },
+        {
+          "name": "truncated: one-byte argument",
+          "limits": "default",
+          "hex": "18",
+          "expect": "truncated"
+        },
+        {
+          "name": "truncated: two-byte argument",
+          "limits": "default",
+          "hex": "1901",
+          "expect": "truncated"
+        },
+        {
+          "name": "truncated: four-byte argument",
+          "limits": "default",
+          "hex": "1a000000",
+          "expect": "truncated"
+        },
+        {
+          "name": "truncated: eight-byte argument",
+          "limits": "default",
+          "hex": "1b00000000000000",
+          "expect": "truncated"
+        },
+        {
+          "name": "truncated: byte string",
+          "limits": "default",
+          "hex": "4201",
+          "expect": "truncated"
+        },
+        {
+          "name": "truncated: text",
+          "limits": "default",
+          "hex": "6261",
+          "expect": "truncated"
+        },
+        {
+          "name": "truncated: array",
+          "limits": "default",
+          "hex": "8201",
+          "expect": "truncated"
+        },
+        {
+          "name": "truncated: map value",
+          "limits": "default",
+          "hex": "a16161",
+          "expect": "truncated"
+        },
+        {
+          "name": "truncated: map key",
+          "limits": "default",
+          "hex": "a2616101",
+          "expect": "truncated"
+        },
+        {
+          "name": "truncated: f16",
+          "limits": "default",
+          "hex": "f93c",
+          "expect": "truncated"
+        },
+        {
+          "name": "truncated: f64",
+          "limits": "default",
+          "hex": "fb3ff8",
+          "expect": "truncated"
+        },
+        {
+          "name": "trailing bytes",
+          "limits": "default",
+          "hex": "0000",
+          "expect": "trailing-bytes"
+        },
+        {
+          "name": "trailing bytes after map",
+          "limits": "default",
+          "hex": "a000",
+          "expect": "trailing-bytes"
+        },
+        {
+          "name": "trailing bytes after a non-shortest integer",
+          "limits": "default",
+          "hex": "180000",
+          "expect": "trailing-bytes",
+          "canonical": "non-shortest-integer"
+        }
+      ]
+    },
+    {
+      "name": "limits",
+      "description": "Limits, checked against declared sizes before anything is allocated for them. Every reader, safe or canonical, gives expect.",
+      "vectors": [
+        {
+          "name": "byte string claims 2^64-1 bytes",
+          "limits": "default",
+          "hex": "5bffffffffffffffff00",
+          "expect": "byte-string-limit"
+        },
+        {
+          "name": "byte string claims more than remains",
+          "limits": "default",
+          "hex": "5a0001000000",
+          "expect": "truncated"
+        },
+        {
+          "name": "text claims 2^32-1 bytes",
+          "limits": "default",
+          "hex": "7affffffff61",
+          "expect": "truncated"
+        },
+        {
+          "name": "array claims 65,536 elements in a short message",
+          "limits": "default",
+          "hex": "9a0001000000",
+          "expect": "truncated"
+        },
+        {
+          "name": "map claims 65,536 entries in a short message",
+          "limits": "default",
+          "hex": "ba00010000",
+          "expect": "truncated"
+        },
+        {
+          "name": "array claims 2^64-1 elements",
+          "limits": "default",
+          "hex": "9bffffffffffffffff",
+          "expect": "element-limit"
+        },
+        {
+          "name": "map claims 65,537 entries",
+          "limits": "default",
+          "hex": "ba00010001",
+          "expect": "element-limit"
+        },
+        {
+          "name": "depth 64, just inside",
+          "limits": "default",
+          "hex": [
+            {
+              "repeat": "81",
+              "count": 63
+            },
+            "80"
+          ],
+          "expect": "accept"
+        },
+        {
+          "name": "depth 65, just over",
+          "limits": "default",
+          "hex": [
+            {
+              "repeat": "81",
+              "count": 64
+            },
+            "80"
+          ],
+          "expect": "depth-limit"
+        },
+        {
+          "name": "depth 65 under a map, just over",
+          "limits": "default",
+          "hex": [
+            "a16161",
+            {
+              "repeat": "81",
+              "count": 63
+            },
+            "80"
+          ],
+          "expect": "depth-limit"
+        },
+        {
+          "name": "depth 64 under a map, just inside",
+          "limits": "default",
+          "hex": [
+            "a16161",
+            {
+              "repeat": "81",
+              "count": 62
+            },
+            "80"
+          ],
+          "expect": "accept"
+        },
+        {
+          "name": "depth 64 in setup limits",
+          "limits": "setup",
+          "hex": [
+            {
+              "repeat": "81",
+              "count": 63
+            },
+            "80"
+          ],
+          "expect": "accept"
+        },
+        {
+          "name": "depth 65 in setup limits",
+          "limits": "setup",
+          "hex": [
+            {
+              "repeat": "81",
+              "count": 64
+            },
+            "80"
+          ],
+          "expect": "depth-limit"
+        },
+        {
+          "name": "array of 65,536 elements, just inside",
+          "limits": "default",
+          "hex": [
+            "9a00010000",
+            {
+              "repeat": "00",
+              "count": 65536
+            }
+          ],
+          "expect": "accept"
+        },
+        {
+          "name": "array of 65,537 elements, just over",
+          "limits": "default",
+          "hex": [
+            "9a00010001",
+            {
+              "repeat": "00",
+              "count": 65537
+            }
+          ],
+          "expect": "element-limit"
+        },
+        {
+          "name": "message of 1,048,576 bytes, just inside",
+          "limits": "default",
+          "hex": [
+            "5a000ffffb",
+            {
+              "repeat": "00",
+              "count": 1048571
+            }
+          ],
+          "expect": "accept"
+        },
+        {
+          "name": "message of 1,048,577 bytes, just over",
+          "limits": "default",
+          "hex": [
+            "5a000ffffc",
+            {
+              "repeat": "00",
+              "count": 1048572
+            }
+          ],
+          "expect": "message-limit"
+        },
+        {
+          "name": "setup message of 65,536 bytes, just inside",
+          "limits": "setup",
+          "hex": [
+            "79fffd",
+            {
+              "repeat": "61",
+              "count": 65533
+            }
+          ],
+          "expect": "accept"
+        },
+        {
+          "name": "setup message of 65,537 bytes, just over",
+          "limits": "setup",
+          "hex": [
+            "79fffe",
+            {
+              "repeat": "61",
+              "count": 65534
+            }
+          ],
+          "expect": "message-limit"
+        },
+        {
+          "name": "setup descriptor of 4,096 bytes, just inside",
+          "limits": "setup",
+          "hex": [
+            "591000",
+            {
+              "repeat": "00",
+              "count": 4096
+            }
+          ],
+          "expect": "accept"
+        },
+        {
+          "name": "setup descriptor of 4,097 bytes, just over",
+          "limits": "setup",
+          "hex": [
+            "591001",
+            {
+              "repeat": "00",
+              "count": 4097
+            }
+          ],
+          "expect": "byte-string-limit"
+        },
+        {
+          "name": "setup descriptor over the limit fails before its bytes",
+          "limits": "setup",
+          "hex": "591001",
+          "expect": "byte-string-limit"
+        },
+        {
+          "name": "setup descriptor of 4,097 bytes nested in a message",
+          "limits": "setup",
+          "hex": [
+            "a26164",
+            "591001",
+            {
+              "repeat": "00",
+              "count": 4097
+            },
+            "6474797065",
+            "6568656c6c6f"
+          ],
+          "expect": "byte-string-limit"
+        },
+        {
+          "name": "setup text of 4,097 bytes is not a descriptor",
+          "limits": "setup",
+          "hex": [
+            "791001",
+            {
+              "repeat": "61",
+              "count": 4097
+            }
+          ],
+          "expect": "accept"
+        },
+        {
+          "name": "depth 300 fails without exhausting the stack",
+          "limits": "default",
+          "hex": [
+            {
+              "repeat": "81",
+              "count": 300
+            },
+            "80"
+          ],
+          "expect": "depth-limit"
+        },
+        {
+          "name": "setup descriptor of 4,097 bytes in a non-shortest head",
+          "limits": "setup",
+          "hex": [
+            "5a00001001",
+            {
+              "repeat": "00",
+              "count": 4097
+            }
+          ],
+          "expect": "byte-string-limit"
+        }
+      ]
+    }
+  ]
+}
