@@ -9,7 +9,7 @@ use std::{path::Path, sync::Arc};
 
 use flotilla_protocol::{CommandValue, NodeId, ResourceReadEnvelope};
 use flotilla_resources::{DigestQuery, PartitionDigest, ReplicaCursor};
-use flotilla_store::ResourceBackend;
+use flotilla_store::{load_metrics::ReplicationLoadMetrics, ResourceBackend};
 
 use crate::ReplicationStore;
 
@@ -19,11 +19,23 @@ pub struct ReplicationHost {
     node_id: NodeId,
     stores: LocalStores,
     health: Arc<dyn ReplicationHealth>,
+    metrics: Arc<ReplicationLoadMetrics>,
 }
 
 impl ReplicationHost {
     pub fn new(node_id: NodeId, stores: LocalStores, health: Arc<dyn ReplicationHealth>) -> Self {
-        Self { node_id, stores, health }
+        Self { node_id, stores, health, metrics: Arc::default() }
+    }
+
+    /// Record snapshots, lag resets, stream failures and applied events into
+    /// `metrics`, shared with the host for load measurement (#3206).
+    pub fn with_metrics(mut self, metrics: Arc<ReplicationLoadMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    pub fn metrics(&self) -> &ReplicationLoadMetrics {
+        &self.metrics
     }
 
     /// Records whose origin root is this node are never written back locally.

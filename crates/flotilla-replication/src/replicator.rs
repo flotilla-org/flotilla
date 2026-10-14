@@ -369,6 +369,7 @@ fn spawn_kind<T: Resource>(
                             let remote = connector.connect(&path, store)?;
                             let result = replicate_kind_direct::<T>(remote, &host, &peer, store).await;
                             if let Err(error) = &result {
+                                host.metrics().stream_failures.increment();
                                 host.health().failure(&peer, &store.health_kind::<T>(), error).await;
                             }
                             result
@@ -395,6 +396,7 @@ fn spawn_kind<T: Resource>(
                         async move {
                             let result = replicate_kind_over_routed_watch::<T>(&*routed, &host, &peer, store, digest_control).await;
                             if let Err(error) = &result {
+                                host.metrics().stream_failures.increment();
                                 host.health().failure(&peer, &store.health_kind::<T>(), error).await;
                             }
                             result
@@ -541,6 +543,7 @@ pub async fn replicate_kind_direct<T: Resource>(
             let listed = remote.list().await.map_err(|error| error.to_string())?;
             store.backend(host).including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
             writer.replace(&listed, Utc::now()).await.map_err(|error| error.to_string())?;
+            host.metrics().snapshots.increment();
             cursor = writer.cursor().await.map_err(|error| error.to_string())?;
         }
         let prefix = cursor.as_ref().ok_or_else(|| "snapshot did not establish replica prefix".to_string())?;
@@ -553,12 +556,13 @@ pub async fn replicate_kind_direct<T: Resource>(
         let result = match remote.watch(start).await {
             Ok(watch) => {
                 host.health().healthy(peer, &store.health_kind::<T>()).await;
-                apply_direct_watch(watch, &writer, prefix.resource_version.clone(), &remote, peer).await
+                apply_direct_watch(watch, &writer, prefix.resource_version.clone(), &remote, peer, host.metrics()).await
             }
             Err(error) => Err(OriginWatchFailure::from_resource(error)),
         };
         match result {
             Err(OriginWatchFailure::SnapshotRequired(error)) => {
+                host.metrics().lag_resets.increment();
                 writer.invalidate_cursor().await.map_err(|error| error.to_string())?;
                 if repaired {
                     return Err(error);
@@ -579,6 +583,7 @@ async fn apply_direct_watch<T: Resource>(
     snapshot_version: String,
     remote: &flotilla_store::TypedResolver<T>,
     peer: &NodeId,
+    metrics: &flotilla_store::load_metrics::ReplicationLoadMetrics,
 ) -> Result<(), OriginWatchFailure> {
     // Relay updates share the writer but cannot move this direct stream's
     // expected sequence. Its position starts at the authoritative snapshot.
@@ -609,6 +614,7 @@ async fn apply_direct_watch<T: Resource>(
             check_sequence(&mut version, event).map_err(OriginWatchFailure::SnapshotRequired)?;
         }
         writer.apply_direct_batch(&batch, Utc::now()).await.map_err(OriginWatchFailure::from_resource)?;
+        metrics.events_applied.add(batch.len() as u64);
     }
 }
 
@@ -859,7 +865,11 @@ async fn run_routed_watch<T: Resource>(
                 }
                 let bookmark = response.records.iter().any(|record| record.record_type == ResourceRecordType::Bookmark);
                 let was_initializing = initializing;
-                apply_response(&writer, &mut initial, &mut initializing, *response).await?;
+                let applied = apply_response(&writer, &mut initial, &mut initializing, *response).await?;
+                host.metrics().events_applied.add(applied as u64);
+                if was_initializing && !initializing {
+                    host.metrics().snapshots.increment();
+                }
                 if bookmark {
                     if let Some(control) = &digest_control {
                         control.ready.send_replace(true);
@@ -879,6 +889,7 @@ async fn run_routed_watch<T: Resource>(
                 };
             }
             RoutedWatchItem::Lagged(skipped) => {
+                host.metrics().lag_resets.increment();
                 warn!(%peer, kind = T::API_PATHS.kind, skipped, "resource replicator lagged; reconnect will resnapshot");
                 events.cancel().await;
                 return Err("resourceVersion sequence gap: event subscriber lagged".to_string());
@@ -920,6 +931,7 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
                 };
             }
             RoutedWatchItem::Lagged(skipped) => {
+                host.metrics().lag_resets.increment();
                 warn!(%peer, kind = T::API_PATHS.kind, skipped, "resource relay lagged; reconnect will relist");
                 return Err("resource relay event subscriber lagged".to_string());
             }
@@ -1009,7 +1021,7 @@ async fn apply_response<T: Resource>(
     initial: &mut Vec<ResourceObject<T>>,
     initializing: &mut bool,
     response: ResourceReadEnvelope,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let (resource_version, generation) = response.cursor.position()?;
     // Decode failures discard this uncommitted batch. The caller aborts the
     // watch, then resumes from the durable cursor, which only advances below.
@@ -1043,7 +1055,7 @@ async fn apply_response<T: Resource>(
         }
     }
     writer.apply_direct_batch(&batch, Utc::now()).await.map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(batch.len())
 }
 
 fn record_watch_event<T: Resource>(record: ResourceReadRecord) -> Result<Option<WatchEvent<T>>, String> {

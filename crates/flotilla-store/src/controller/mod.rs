@@ -25,6 +25,7 @@ use crate::{
     backend::{ReplicaReadResolver, ResourceBackend, TypedResolver},
     error::ResourceError,
     labels::LifecycleAuthority,
+    load_metrics::ControllerLoadMetrics,
     resource::{InputMeta, Resource, ResourceObject},
     EventRecorder, ObjectEvent,
 };
@@ -723,7 +724,23 @@ impl<R: Reconciler> ControllerLoop<R> {
         self.run_with_optional_heartbeat(Some(heartbeat)).await
     }
 
+    /// [`Self::run_with_heartbeat`], also recording wakes, reconcile latency,
+    /// requeues and resyncs into `metrics` for load measurement (#3206).
+    pub async fn run_observed(self, heartbeat: Arc<AtomicU64>, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
+    where
+        <R::Resource as Resource>::Status: Default,
+    {
+        self.run_instrumented(Some(heartbeat), metrics).await
+    }
+
     async fn run_with_optional_heartbeat(self, heartbeat: Option<Arc<AtomicU64>>) -> Result<(), ResourceError>
+    where
+        <R::Resource as Resource>::Status: Default,
+    {
+        self.run_instrumented(heartbeat, Arc::default()).await
+    }
+
+    async fn run_instrumented(self, heartbeat: Option<Arc<AtomicU64>>, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
     where
         <R::Resource as Resource>::Status: Default,
     {
@@ -759,6 +776,9 @@ impl<R: Reconciler> ControllerLoop<R> {
                 heartbeat.fetch_add(1, Ordering::Relaxed);
             }
             if let Some(name) = pending.pop_front() {
+                metrics.wakes.increment();
+                metrics.queue_peak.observe(pending.len() as u64 + 1);
+                let woke_at = Instant::now();
                 sender.start(&name);
                 let object = match primary.get(&name).await {
                     Ok(object) => object,
@@ -885,8 +905,11 @@ impl<R: Reconciler> ControllerLoop<R> {
                         Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await?;
                     }
                     if let Some(delay) = outcome.requeue_after {
+                        metrics.requeues.increment();
                         let mut scheduled = scheduled_requeues.lock().await;
-                        if scheduled.insert(name.clone()) {
+                        if !scheduled.insert(name.clone()) {
+                            metrics.requeues_coalesced.increment();
+                        } else {
                             let scheduled_requeues = Arc::clone(&scheduled_requeues);
                             let sender = sender.clone();
                             let name = name.clone();
@@ -900,6 +923,12 @@ impl<R: Reconciler> ControllerLoop<R> {
                     Ok(())
                 }
                 .await;
+                if attempted_reconcile {
+                    metrics.reconcile.record(woke_at.elapsed());
+                }
+                if matches!(&result, Err(error) if !matches!(error, ResourceError::FinalizerPending)) {
+                    metrics.failures.increment();
+                }
                 match result {
                     Err(ResourceError::FinalizerPending) => {
                         let mut scheduled = scheduled_requeues.lock().await;
@@ -1031,6 +1060,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                 }
                 _ = resync.tick() => {
                     let live_names = Self::resync_all(&primary, &sender).await?;
+                    metrics.resyncs.increment();
+                    metrics.resync_enqueued.add(live_names.len() as u64);
                     finalizer_failures.retain(|name, _| live_names.contains(name));
                 }
                 Some(exited) = watch_exited_rx.recv() => {

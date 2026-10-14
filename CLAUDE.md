@@ -216,6 +216,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-aggregator/src/lib.rs` | Runtime-facing aggregator future; owns daemon collaborator and watch-source wiring |
 | `crates/flotilla-aggregator/src/aggregator.rs` | Watches durable and observed resources and maintains query result sets |
 | `crates/flotilla-credentials/src/lib.rs` | Runtime-facing credential/material operations and agent-environment composition |
+| `crates/flotilla-store/src/load_metrics.rs` | Load metrics: store queue, controller loop and replication counters and latency histograms that load drivers sample (#3206) |
 | `crates/flotilla-replication/src/replicator.rs` | Store-to-store replication engine: per-kind list/watch/resume, relay origin filtering, digest repair, peer generations |
 | `crates/flotilla-replication/src/ports.rs` | Replication host ports: local stores and node identity, health, direct and routed peer sources |
 | `crates/flotilla-daemon/src/server/replication.rs` | Daemon port implementations: `InProcessDaemon` stores/health, `HttpBackend` direct peers, routed watches over the remote command router |

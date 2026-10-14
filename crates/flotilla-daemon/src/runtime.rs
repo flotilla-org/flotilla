@@ -111,6 +111,8 @@ impl Default for RuntimeOptions {
 pub struct DaemonRuntime {
     tasks: Vec<JoinHandle<()>>,
     pub blob_store: Arc<TieredBlobStore>,
+    /// Per-kind controller loop load metrics (#3206).
+    pub controller_metrics: Arc<flotilla_store::load_metrics::ControllerMetricsRegistry>,
     /// Set by `shutdown` so `Drop` can tell an intended stop from a runtime
     /// that vanished while the daemon was meant to keep working.
     stop_expected: bool,
@@ -381,6 +383,7 @@ impl DaemonRuntime {
             }
         }
 
+        let controller_metrics = Arc::new(flotilla_store::load_metrics::ControllerMetricsRegistry::default());
         let mut controller_state = None;
         daemon
             .install_convoy_ensure_reconciler(Arc::new(
@@ -440,7 +443,8 @@ impl DaemonRuntime {
                 .with_blob_store(Arc::clone(&blob_store))
                 .with_image_inventory(image_inventory)
                 .with_image_build_service(image_build_service)
-                .with_forge_default_branches(forge_default_branches),
+                .with_forge_default_branches(forge_default_branches)
+                .with_controller_metrics(Arc::clone(&controller_metrics)),
             );
             phase(
                 "set_operator_reconciler",
@@ -477,7 +481,7 @@ impl DaemonRuntime {
         let supervisory_tasks = tasks.len() + 1;
         tasks.push(spawn_liveness_watchdog_task(supervisory_tasks, LIVENESS_WATCHDOG_INTERVAL));
 
-        Ok(Self { tasks, blob_store, stop_expected: false })
+        Ok(Self { tasks, blob_store, controller_metrics, stop_expected: false })
     }
 }
 
@@ -699,6 +703,7 @@ fn spawn_controller_loops(
         ($primary:ty, $make_parts:expr) => {{
             let make_parts = $make_parts;
             let loop_health = runtime_health.clone();
+            let loop_metrics = Arc::clone(&state.controller_metrics);
             spawn_resource_controller::<$primary, _, _>(
                 backend.clone(),
                 namespace_string.clone(),
@@ -715,6 +720,7 @@ fn spawn_controller_loops(
                     };
                     let heartbeat = Arc::new(AtomicU64::new(0));
                     let health = loop_health.clone();
+                    let metrics = loop_metrics.for_kind(<$primary>::API_PATHS.kind);
                     async move {
                         let watchdog = spawn_controller_loop_watchdog(
                             <$primary>::API_PATHS.kind,
@@ -722,7 +728,7 @@ fn spawn_controller_loops(
                             controller_resync_interval,
                             health.clone(),
                         );
-                        let result = controller.run_with_heartbeat(heartbeat).await;
+                        let result = controller.run_observed(heartbeat, metrics).await;
                         watchdog.abort();
                         health.clear_controller_loop_stall(<$primary>::API_PATHS.kind);
                         result

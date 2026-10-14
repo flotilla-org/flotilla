@@ -24,6 +24,7 @@ use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_resources::{Convoy, ConvoyProvisioningState, Environment, Host, HostSpec, ResourceError, ResourceObject};
+use flotilla_store::load_metrics::ControllerMetricsRegistry;
 use tokio::sync::{Mutex, Semaphore};
 
 use super::discovery::AgentlessSshProfile;
@@ -64,6 +65,8 @@ pub(super) struct ControllerRuntimeState {
     pub(super) checkout_removals: Semaphore,
     /// Forge default-branch observations consulted before the GitHub CLI.
     pub(super) forge_default_branches: Option<Arc<dyn ForgeDefaultBranchResolver>>,
+    /// Per-kind controller loop load metrics (#3206).
+    pub(super) controller_metrics: Arc<ControllerMetricsRegistry>,
 }
 
 impl ControllerRuntimeState {
@@ -132,7 +135,13 @@ impl ControllerRuntimeState {
             checkout_removal_concurrency: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
             checkout_removals: Semaphore::new(DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY.get()),
             forge_default_branches: None,
+            controller_metrics: Arc::default(),
         }
+    }
+
+    pub(super) fn with_controller_metrics(mut self, metrics: Arc<ControllerMetricsRegistry>) -> Self {
+        self.controller_metrics = metrics;
+        self
     }
 
     pub(super) fn with_forge_default_branches(mut self, resolver: Option<Arc<dyn ForgeDefaultBranchResolver>>) -> Self {
