@@ -592,7 +592,10 @@ pub trait Store: std::fmt::Debug + Send + Sync {
         Err(self.unsupported_operation("replicas"))
     }
     /// Retained replica deletion fences for a relay's initial snapshot.
-    /// Ordinary list/query APIs continue to return only live objects.
+    /// Ordinary list/query APIs continue to return only live objects. This
+    /// initial catch-up result contains one metadata fence per deleted
+    /// origin/name pair in the partition, with no fixed count bound. Live
+    /// delivery uses deltas.
     async fn list_replica_deletions_raw(
         &self,
         _resource_kind: ResourceKind,

@@ -799,3 +799,51 @@ async fn late_relay_watch_includes_retained_deletions(#[case] adapter: &str, #[v
     assert_eq!(watch.initial.len(), 1);
     assert_eq!(watch.initial[0]["type"], "ADDED");
 }
+
+// The registry builds watches only for local stores. HTTP-backed clients use
+// Store::watch_replica_sources_raw to consume the remote resource API instead.
+#[tokio::test]
+async fn replica_source_registry_rejects_http_backed_stores_before_io() {
+    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), "http://unused.invalid"));
+    let error = flotilla_store::watch_resource_kind_replica_sources(&backend, "flotilla", "convoys")
+        .await
+        .err()
+        .expect("registry must reject remote view stores");
+    assert!(error.to_string().contains("HTTP replica-source watches use the resource API"), "{error}");
+}
+
+// Both adapters expose exactly the absent identities, in stable origin/name
+// order. A live row and its deletion fence must never coexist in a quiescent snapshot.
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[tokio::test]
+async fn relay_deletions_are_sorted_and_disjoint_from_live_rows(#[case] adapter: &str) {
+    use flotilla_store::StoreExt;
+    let (backend, _server) = backend(adapter).await;
+    let source = ResourceBackend::new(InMemoryBackend::default());
+    let at = chrono::Utc::now();
+    for name in ["a", "b", "c"] {
+        source.using::<Convoy>("flotilla").create(&ConvoyFixture::meta(name), &ConvoyFixture::spec()).await.expect("source fixture");
+    }
+    for (origin, name) in [("z", "b"), ("a", "c"), ("z", "a"), ("a", "a")] {
+        let object = source.using::<Convoy>("flotilla").get(name).await.expect("source object");
+        let writer = backend.replica_writer::<Convoy>(flotilla_protocol::NodeId::new(origin), "flotilla");
+        writer.apply(WatchEvent::Deleted(object), at).await.expect("retain deletion");
+    }
+    let object = source.using::<Convoy>("flotilla").get("a").await.expect("recreation fixture");
+    backend
+        .replica_writer::<Convoy>(flotilla_protocol::NodeId::new("a"), "flotilla")
+        .apply(WatchEvent::Added(object), at + chrono::Duration::seconds(1))
+        .await
+        .expect("recreate one identity");
+    let deleted = backend.store().list_replica_deletions_raw(ResourceKind::of::<Convoy>(), "flotilla").await.expect("deletion fences");
+    let identities = deleted.iter().map(|row| (row.origin_root.to_string(), row.name.clone())).collect::<Vec<_>>();
+    assert_eq!(identities, [("a", "c"), ("z", "a"), ("z", "b")].map(|(origin, name)| (origin.to_string(), name.to_string())));
+    let live = backend.store().list_replicas_typed::<Convoy>("flotilla").await.expect("live replicas");
+    assert_eq!(live.len(), 1, "one recreated origin/name is live");
+    for row in live {
+        let ResourceProvenance::Replica { origin_root, .. } = row.provenance else { panic!("replica provenance") };
+        assert!(!identities.contains(&(origin_root.to_string(), row.object.metadata.name)), "live identities cannot also be fenced");
+    }
+}

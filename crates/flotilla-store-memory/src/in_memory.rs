@@ -1804,6 +1804,7 @@ impl Store for InMemoryBackend {
                 }
             }
         }
+        deleted.sort_by(|left, right| left.origin_root.cmp(&right.origin_root).then_with(|| left.name.cmp(&right.name)));
         Ok(deleted)
     }
     async fn apply_replica_tombstone_raw(

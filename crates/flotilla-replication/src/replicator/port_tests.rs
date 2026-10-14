@@ -269,3 +269,45 @@ async fn direct_watch_terminates_on_apply_error() {
     assert!(matches!(result, Err(OriginWatchFailure::SnapshotRequired(message)) if message.contains("replica prefix missing")));
     assert!(writer.cursor().await.unwrap().is_none());
 }
+
+// A relay snapshot can race the source's deletion/recreation. Original sync
+// stamps, not arrival order, decide which record survives, without proving a log prefix.
+#[tokio::test]
+async fn routed_relay_recreation_survives_every_snapshot_event_order() {
+    let peer = NodeId::new("relay");
+    let origin = NodeId::new("origin");
+    let scratch = stores(&origin);
+    let mut old = author(&scratch.durable, "record").await;
+    old.metadata.annotations.insert("flotilla.work/origin-root".into(), origin.to_string());
+    old.metadata.annotations.insert("flotilla.work/last-synced-at".into(), "2026-10-01T00:00:01Z".into());
+    let mut deleted = old.clone();
+    deleted.metadata.annotations.insert("flotilla.work/last-synced-at".into(), "2026-10-01T00:00:02Z".into());
+    let mut recreated = old.clone();
+    recreated.spec = spec("recreated");
+    recreated.metadata.resource_version = "3".into();
+    recreated.metadata.annotations.insert("flotilla.work/last-synced-at".into(), "2026-10-01T00:00:03Z".into());
+    let mut tombstone = record(ResourceRecordType::Deleted, &deleted);
+    tombstone.object.as_mut().expect("tombstone body").as_object_mut().expect("object").remove("spec");
+    let records = [record(ResourceRecordType::Added, &old), tombstone, record(ResourceRecordType::Added, &recreated)];
+    // Exhaust all arrival permutations of the older live row, name-only fence,
+    // and recreation, including stale deletion arriving after recreation.
+    for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+        for batch_size in [1, 3] {
+            let holder = host("holder", Arc::new(RecordingHealth::default()));
+            let routed = Arc::new(ScriptedRoutedPeer::default());
+            {
+                let mut items = routed.items.lock().expect("items");
+                for indices in order.chunks(batch_size) {
+                    items.push_back(envelope("overlay", indices.iter().map(|index| records[*index].clone()).collect()));
+                }
+                items.push_back(RoutedWatchItem::Finished(Box::new(CommandValue::Ok)));
+            }
+            replicate_relay_over_routed_watch::<Convoy>(&routed, &holder, &peer, ReplicationStore::Durable).await.expect("relay snapshot");
+            let backend = holder.stores().durable.clone();
+            let live = backend.including_replicas::<Convoy>(REPLICATION_NAMESPACE).get("record").await.expect("recreated record");
+            assert_eq!(live.object.spec.workflow_ref, "recreated", "arrival order {order:?}");
+            assert_eq!(live.object.metadata.resource_version, "3");
+            assert!(backend.replica_writer::<Convoy>(origin.clone(), REPLICATION_NAMESPACE).cursor().await.expect("prefix").is_none());
+        }
+    }
+}

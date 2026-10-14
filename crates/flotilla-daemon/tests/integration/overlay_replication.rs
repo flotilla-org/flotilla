@@ -418,7 +418,7 @@ async fn lost_authority_record_tombstone_converges_through_two_peers() {
             .items
             .is_empty()
         {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
@@ -440,7 +440,7 @@ async fn lost_authority_record_tombstone_converges_through_two_peers() {
             if converged {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await

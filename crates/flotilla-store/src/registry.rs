@@ -1373,6 +1373,8 @@ async fn watch_typed_replica_sources<T: Resource>(
         .collect::<Result<Vec<_>, ResourceError>>()?;
     // Subscribe before reading both live rows and deletion fences. Events that
     // race either read are replayed afterwards with their original sync stamp.
+    // Receivers compare those stamps, not arrival order: an older fence cannot
+    // remove a newer recreation, including when it appears later in this batch.
     for deleted in backend.list_replica_deletions_raw(crate::ResourceKind::of::<T>(), namespace).await? {
         let event = ReadWatchEvent::<T>::DeletedByName {
             tombstone: crate::ResourceTombstone {
