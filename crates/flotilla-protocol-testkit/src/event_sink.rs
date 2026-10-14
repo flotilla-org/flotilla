@@ -1,59 +1,24 @@
-//! Event publication port for in-process services.
-
-#[cfg(test)]
-use std::sync::{Arc, Mutex};
-
+use flotilla_daemon_api::event_sink::{BroadcastEventSink, EventSink};
 use flotilla_protocol::DaemonEvent;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
-
-/// Publishes synchronously. Sequential emissions to the same sink preserve their call order.
-/// The broadcast adapter discards delivery failures.
-pub trait EventSink: Send + Sync {
-    fn emit(&self, event: DaemonEvent);
-}
-
-/// Keeps the daemon's existing broadcast delivery and receiver semantics.
-pub struct BroadcastEventSink {
-    sender: broadcast::Sender<DaemonEvent>,
-}
-
-impl BroadcastEventSink {
-    pub fn new(sender: broadcast::Sender<DaemonEvent>) -> Self {
-        Self { sender }
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
-        self.sender.subscribe()
-    }
-}
-
-impl EventSink for BroadcastEventSink {
-    fn emit(&self, event: DaemonEvent) {
-        let _ = self.sender.send(event);
-    }
-}
-
 /// Broadcast adapter for tests that exercise subscriptions or asynchronous delivery.
-#[cfg(test)]
-pub(crate) fn broadcast_test_sink(sender: broadcast::Sender<DaemonEvent>) -> Arc<dyn EventSink> {
+pub fn broadcast_test_sink(sender: broadcast::Sender<DaemonEvent>) -> Arc<dyn EventSink> {
     Arc::new(BroadcastEventSink::new(sender))
 }
 
 /// Retains events in this sink's emission order without requiring subscribers.
-#[cfg(test)]
 #[derive(Default)]
-pub(crate) struct RecordingEventSink {
+pub struct RecordingEventSink {
     events: Mutex<Vec<DaemonEvent>>,
 }
 
-#[cfg(test)]
 impl RecordingEventSink {
     pub fn events(&self) -> Vec<DaemonEvent> {
         self.events.lock().expect("recording event sink lock poisoned").clone()
     }
 }
 
-#[cfg(test)]
 impl EventSink for RecordingEventSink {
     fn emit(&self, event: DaemonEvent) {
         self.events.lock().expect("recording event sink lock poisoned").push(event);

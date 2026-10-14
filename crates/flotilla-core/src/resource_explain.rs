@@ -15,7 +15,7 @@ use flotilla_store::{
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::event_sink::EventSink;
+use flotilla_daemon_api::event_sink::EventSink;
 
 #[derive(bon::Builder)]
 pub(crate) struct ResourceWatchCommandContext {

@@ -280,7 +280,7 @@ async fn project_issue_binding_keeps_conditional_lease_after_checkout_removal() 
         .expect("Project binding");
     let path = Path::new("/checkouts/issues");
     observe(&daemon, &daemon.observed_resource_backend, "issues", path, &key).await;
-    let identity = repository_operations::repository_event_identity(&spec, None);
+    let identity = flotilla_executor::action_support::repository_event_identity(&spec, None);
     let mut stale = ProviderRegistry::new();
     stale.issue_trackers.insert(
         "stale",

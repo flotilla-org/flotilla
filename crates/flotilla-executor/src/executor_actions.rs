@@ -38,9 +38,9 @@ use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    empty_repo_identity, fallback_repo_identity, repository_operations, request_manifest_resolution, retry_resource_apply, AddRepoOutcome,
-    OperatorReconciler,
+use crate::action_support::{
+    empty_repo_identity, fallback_repo_identity, repository_event_identity, request_manifest_resolution, retry_resource_apply,
+    AddRepoOutcome,
 };
 use crate::environment_manager::EnvironmentManager;
 use crate::executor;
@@ -50,17 +50,19 @@ use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 
+/// Host-owned rollout result. Serialization failure remains distinct from an
+/// installation failure: the former refuses the command before its finish event.
+pub struct PostInstallReport {
+    pub failed: bool,
+    pub report: Result<serde_json::Value, String>,
+}
+
 /// Host-owned provider discovery, repository administration and intent admission.
 /// Execution collaborators and shared resource/cancellation state are supplied
 /// directly; the port contains only orchestration that remains owned by the host.
 #[async_trait]
-pub(super) trait ExecutorActionPort: Send + Sync {
-    async fn post_install_cleat(
-        &self,
-        incoming: &Path,
-        generation: &str,
-        diagnostics_dir: &Path,
-    ) -> Result<crate::cleat_roll::RollReport, String>;
+pub trait ExecutorActionPort: Send + Sync {
+    async fn post_install_cleat(&self, incoming: &Path, generation: &str, diagnostics_dir: &Path) -> Result<PostInstallReport, String>;
     fn vcs_resolver(&self) -> Result<Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>, String>;
     async fn resolve_repo_for_command(&self, command: &Command) -> Result<PathBuf, String>;
     async fn repository_registry(&self, repository: &ResourceObject<Repository>) -> Result<Arc<ProviderRegistry>, String>;
@@ -70,7 +72,8 @@ pub(super) trait ExecutorActionPort: Send + Sync {
     async fn apply_intent_document(&self, namespace: &str, document: serde_json::Value) -> Result<DynamicResourceObject, ResourceError>;
     async fn detect_repo_identity(&self, repo_path: &Path) -> RepoIdentity;
     async fn local_checkout_for_repository(&self, key: &RepositoryKey) -> Result<Option<PathBuf>, String>;
-    async fn operator_reconciler(&self) -> Option<Arc<dyn OperatorReconciler>>;
+    async fn reconcile_now(&self, namespace: &str, kind: &str, name: &str) -> Result<String, String>;
+    async fn delete_stale_adopted_checkouts(&self, namespace: &str) -> Result<(), ResourceError>;
     async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState;
     async fn refresh(&self, repo: &RepoSelector) -> Result<Option<RepositoryIdentityChange>, String>;
     async fn remove_repo(&self, path: &Path) -> Result<(), String>;
@@ -80,27 +83,26 @@ pub(super) trait ExecutorActionPort: Send + Sync {
     async fn tracked_repo_identity_for_path(&self, repo_path: &Path) -> Option<RepoIdentity>;
 }
 
-pub(super) struct ExecutorActions<'a> {
-    pub(super) port: &'a dyn ExecutorActionPort,
-    pub(super) namespace: &'a std::sync::RwLock<String>,
-    pub(super) resource_backend: &'a ResourceBackend,
-    pub(super) observed_resource_backend: &'a ResourceBackend,
-    pub(super) config: &'a Arc<ConfigStore>,
-    pub(super) active_commands: &'a Arc<Mutex<HashMap<u64, CancellationToken>>>,
-    pub(super) observed_checkout_reconciliation: &'a Arc<Mutex<()>>,
-    pub(super) environment_manager: &'a Arc<EnvironmentManager>,
-    pub(super) runner: &'a Arc<dyn CommandRunner>,
-    pub(super) env: &'a Arc<dyn EnvVars>,
-    pub(super) daemon_socket_path: &'a RwLock<Option<PathBuf>>,
-    pub(super) host_name: &'a HostName,
-    pub(super) events: super::action_events::ActionEvents<'a>,
+pub struct ExecutorActions<'a> {
+    pub port: &'a dyn ExecutorActionPort,
+    pub namespace: &'a std::sync::RwLock<String>,
+    pub resource_backend: &'a ResourceBackend,
+    pub config: &'a Arc<ConfigStore>,
+    pub active_commands: &'a Arc<Mutex<HashMap<u64, CancellationToken>>>,
+    pub observed_checkout_reconciliation: &'a Arc<Mutex<()>>,
+    pub environment_manager: &'a Arc<EnvironmentManager>,
+    pub runner: &'a Arc<dyn CommandRunner>,
+    pub env: &'a Arc<dyn EnvVars>,
+    pub daemon_socket_path: &'a RwLock<Option<PathBuf>>,
+    pub host_name: &'a HostName,
+    pub events: crate::action_events::ActionEvents<'a>,
 }
 
 impl ExecutorActions<'_> {
     async fn provisioning_namespace(&self) -> String {
-        super::action_namespace::provisioning_namespace(self.namespace)
+        crate::action_namespace::provisioning_namespace(self.namespace)
     }
-    pub(super) async fn execute_action_resource_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_resource_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceApply { namespace, document } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             // Artifact reservations and Message admission can race status writers.
@@ -123,7 +125,7 @@ impl ExecutorActions<'_> {
         Err("ResourceApply action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_repository_remote_remove(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_repository_remote_remove(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::RepositoryRemoteRemove { namespace, name, remote } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let repositories = self.resource_backend.clone().using::<Repository>(namespace);
@@ -146,7 +148,7 @@ impl ExecutorActions<'_> {
         Err("RepositoryRemoteRemove action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_resource_manifest_resolve(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_resource_manifest_resolve(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceManifestResolve { namespace, kind, name, resolution, requested_by } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let result = request_manifest_resolution(self.resource_backend, namespace, kind, name, *resolution, requested_by).await;
@@ -163,15 +165,12 @@ impl ExecutorActions<'_> {
         Err("ResourceManifestResolve action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_resource_reconcile_now(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_resource_reconcile_now(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceReconcileNow { namespace, kind, name } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
-            let result = match self.port.operator_reconciler().await {
-                Some(reconciler) => match reconciler.reconcile_now(namespace, kind, name).await {
-                    Ok(message) => CommandValue::ResourceReconciled { resource_kind: kind.clone(), name: name.clone(), message },
-                    Err(message) => CommandValue::Error { message },
-                },
-                None => CommandValue::Error { message: "operator reconciliation is unavailable before runtime startup".to_string() },
+            let result = match self.port.reconcile_now(namespace, kind, name).await {
+                Ok(message) => CommandValue::ResourceReconciled { resource_kind: kind.clone(), name: name.clone(), message },
+                Err(message) => CommandValue::Error { message },
             };
             self.events.finish(id, empty_identity, result);
             return Ok(id);
@@ -179,7 +178,7 @@ impl ExecutorActions<'_> {
         Err("ResourceReconcileNow action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_resource_status_patch(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_resource_status_patch(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceStatusPatch { namespace, kind, name, status, expected_resource_version } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let patched = match expected_resource_version {
@@ -205,7 +204,7 @@ impl ExecutorActions<'_> {
         Err("ResourceStatusPatch action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_resource_delete(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_resource_delete(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceDelete { namespace, kind, name, replica_origin } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let result = if let Some(origin_root) = replica_origin {
@@ -232,12 +231,7 @@ impl ExecutorActions<'_> {
                 let deleted = async {
                     let deleted = flotilla_store::delete_resource_kind(self.resource_backend, namespace, kind, name).await?;
                     if deleted.object.kind == ResourceCheckout::API_PATHS.kind {
-                        crate::observed_resources::delete_stale_adopted_checkouts(
-                            self.resource_backend,
-                            self.observed_resource_backend,
-                            namespace,
-                        )
-                        .await?;
+                        self.port.delete_stale_adopted_checkouts(namespace).await?;
                     }
                     Ok::<_, ResourceError>(deleted)
                 }
@@ -266,7 +260,7 @@ impl ExecutorActions<'_> {
         Err("ResourceDelete action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_refresh_all(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_refresh_all(&self, id: u64, command: &Command) -> Result<u64, String> {
         if matches!(command.action, CommandAction::Refresh { repo: None }) {
             let repositories = self
                 .resource_backend
@@ -315,7 +309,7 @@ impl ExecutorActions<'_> {
         Err("Refresh action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_track_repo_path(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_track_repo_path(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::TrackRepoPath { path } = &command.action {
             let description = command.description().to_string();
             let repo_path = path.clone();
@@ -347,7 +341,7 @@ impl ExecutorActions<'_> {
         Err("TrackRepoPath action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_untrack_repo(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_untrack_repo(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::UntrackRepo { repo } = &command.action {
             let repo_path = match self.port.resolve_repo_selector(repo).await {
                 Ok(path) => path,
@@ -379,12 +373,12 @@ impl ExecutorActions<'_> {
         Err("UntrackRepo action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_refresh_repo(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_refresh_repo(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::Refresh { repo: Some(selector) } = &command.action {
             let repository = self.port.repository_for_selector(selector).await?;
             let repo_path = self.port.local_checkout_for_repository(&repository.spec.key()).await?;
             let description = command.description().to_string();
-            let repo_identity = repository_operations::repository_event_identity(&repository.spec, repo_path.as_deref());
+            let repo_identity = repository_event_identity(&repository.spec, repo_path.as_deref());
             self.events.sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.events.node_id.clone(),
@@ -414,7 +408,7 @@ impl ExecutorActions<'_> {
 }
 
 impl ExecutorActions<'_> {
-    pub(super) async fn execute_provider_action(
+    pub async fn execute_provider_action(
         &self,
         id: u64,
         command: Command,
@@ -427,7 +421,7 @@ impl ExecutorActions<'_> {
         let env = Arc::clone(self.env);
         let event_sink = self.events.sink.clone();
         let repository = self.port.repository_for_selector(&RepoSelector::Path(repo.clone())).await?;
-        let repo_identity = repository_operations::repository_event_identity(&repository.spec, None);
+        let repo_identity = repository_event_identity(&repository.spec, None);
         let registry = self.port.execution_registry(&repository, &repo).await?;
         let providers_data = Arc::new(self.port.executor_provider_data(&repo_identity, &repo, &registry).await);
 
@@ -525,13 +519,13 @@ impl ExecutorActions<'_> {
 
         Ok(id)
     }
-    pub(super) async fn execute_action_repository_forge(&self, command_id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_repository_forge(&self, command_id: u64, command: &Command) -> Result<u64, String> {
         let selector = command.context_repo.as_ref().ok_or("command requires Repository context")?;
         let repository = self.port.repository_for_selector(selector).await?;
         if repository.spec.forge().is_none() {
             return Err("Repository has no forge identity".into());
         }
-        let identity = repository_operations::repository_event_identity(&repository.spec, None);
+        let identity = repository_event_identity(&repository.spec, None);
         let registry = self.port.repository_registry(&repository).await?;
         let action = command.action.clone();
         let event_sink = self.events.sink.clone();
@@ -585,14 +579,11 @@ impl ExecutorActions<'_> {
 }
 
 impl ExecutorActions<'_> {
-    pub(super) async fn execute_action_fleet_post_install(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_fleet_post_install(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::FleetPostInstall { cleat_bin, generation, diagnostics_dir } = &command.action {
             let identity = self.events.start(id, command.description().to_string());
             let result = match self.port.post_install_cleat(cleat_bin, generation, diagnostics_dir).await {
-                Ok(report) => CommandValue::FleetPostInstall {
-                    failed: report.failed(),
-                    report: serde_json::to_value(report).map_err(|error| error.to_string())?,
-                },
+                Ok(report) => CommandValue::FleetPostInstall { failed: report.failed, report: report.report? },
                 Err(message) => CommandValue::Error { message },
             };
             self.events.finish(id, identity, result);

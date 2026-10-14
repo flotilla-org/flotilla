@@ -16,6 +16,7 @@ members = [
     "crates/flotilla-config",
     "crates/flotilla-controllers",
     "crates/flotilla-core",
+    "crates/flotilla-executor",
     "crates/flotilla-environment",
     "crates/flotilla-forge-github",
     "crates/flotilla-vcs",

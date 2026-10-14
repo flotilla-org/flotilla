@@ -11,7 +11,7 @@ use flotilla_store::ResourceBackend;
 use super::support::test_meta;
 use crate::in_process::convoy_admission::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 use crate::in_process::crew_ops::{convoy_message_address, convoy_sender_address};
-use crate::in_process::{retry_resource_apply, InProcessDaemon};
+use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 
 // #2597: failed reads retain the resource identity and emit scoped debug diagnostics;
@@ -336,43 +336,6 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         .await
         .unwrap_err()
         .contains("undeclared vessel"));
-}
-
-#[tokio::test]
-async fn message_apply_retries_only_conflicts_with_a_finite_budget() {
-    for kind in ["Message", "Artifact"] {
-        let mut attempts = 0;
-        let result = retry_resource_apply(kind, || {
-            attempts += 1;
-            std::future::ready(if attempts < 3 { Err(ResourceError::conflict("message", "concurrent status")) } else { Ok(attempts) })
-        })
-        .await;
-        assert_eq!(result.unwrap(), 3);
-        let mut attempts = 0;
-        let result: Result<(), _> = retry_resource_apply(kind, || {
-            attempts += 1;
-            std::future::ready(Err(ResourceError::conflict("message", "persistent conflict")))
-        })
-        .await;
-        assert!(matches!(result, Err(ResourceError::Conflict { .. })));
-        assert_eq!(attempts, 16);
-        let mut attempts = 0;
-        let result: Result<(), _> = retry_resource_apply(kind, || {
-            attempts += 1;
-            std::future::ready(Err(ResourceError::invalid("invalid intent")))
-        })
-        .await;
-        assert!(matches!(result, Err(ResourceError::Invalid { .. })));
-        assert_eq!(attempts, 1);
-    }
-    let mut attempts = 0;
-    let result: Result<(), _> = retry_resource_apply("Convoy", || {
-        attempts += 1;
-        std::future::ready(Err(ResourceError::conflict("convoy", "no replay contract")))
-    })
-    .await;
-    assert!(result.is_err());
-    assert_eq!(attempts, 1);
 }
 
 // #3045: sending a message is an interactive request: routing it to the

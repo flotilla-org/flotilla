@@ -21,7 +21,6 @@ use super::{
     ExecutorStepResolver, PlannerRefusal, RepoExecutionContext,
 };
 use crate::environment_manager::EnvironmentManager;
-use crate::event_sink::RecordingEventSink;
 use crate::provider_data::ProviderData;
 use crate::step::StepAction;
 use crate::step::StepExecutionContext;
@@ -37,6 +36,7 @@ use flotilla_environment::environment::ProvisionedMount;
 use flotilla_environment::environment::{EnvironmentKind, PrepareOpts, PreparedEnvironment, ProvisionOpts};
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_protocol::{ChangeRequest, Checkout, CloudAgentSession, Issue};
+use flotilla_protocol_testkit::event_sink::RecordingEventSink;
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)

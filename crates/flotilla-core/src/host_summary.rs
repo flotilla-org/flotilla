@@ -4,7 +4,7 @@ use flotilla_protocol::{EnvironmentId, HostEnvironment, HostName, HostProviderSt
 use sysinfo::System;
 
 use crate::convert::inventory_from_bag;
-use crate::environment_manager::EnvironmentManager;
+use flotilla_executor::environment_manager::EnvironmentManager;
 use flotilla_provider_runtime::EnvVars;
 
 /// Resident bytes of this daemon process, sampled for the host heartbeat.
@@ -99,12 +99,12 @@ mod tests {
         assert!(daemon_rss_bytes().is_some_and(|bytes| bytes > 0));
     }
 
-    use crate::environment_manager::EnvironmentManager;
     use crate::testkits::discovery::TestEnvVars as FixtureEnvVars;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_environment::environment::EnvironmentHandle;
     use flotilla_environment::environment::ProvisionedEnvironment;
+    use flotilla_executor::environment_manager::EnvironmentManager;
     use flotilla_provider_runtime::CommandRunner;
 
     #[test]

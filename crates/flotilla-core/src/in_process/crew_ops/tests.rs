@@ -21,8 +21,6 @@ use tokio::sync::RwLock;
 
 use crate::change_request_observer::ChangeRequestRefreshCadence;
 use crate::change_request_observer::ChangeRequestRefresher;
-use crate::environment_manager::EnvironmentManager;
-use crate::event_sink::RecordingEventSink;
 use crate::in_process::checkout_providers::CheckoutProviders;
 use crate::in_process::crew_ops::frame_crew_message;
 use crate::in_process::crew_ops::CrewService;
@@ -31,6 +29,8 @@ use crate::in_process::CrewMessageSender;
 use crate::in_process::WorkCredentialReconciler;
 use crate::leaf_engine::LeafSubscriptionTable;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_executor::environment_manager::EnvironmentManager;
+use flotilla_protocol_testkit::event_sink::RecordingEventSink;
 
 // Stand-in for forge I/O; these crew scenarios never request forge observations.
 struct UnusedForge;

@@ -1,7 +1,7 @@
 use super::*;
-use crate::event_sink::EventSink;
 use crate::in_process::action_events::ActionEvents;
 use crate::in_process::crew_actions::{CrewActionPort, CrewActions};
+use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_protocol::{Command, CommandAction, CommandCaller, CommandValue, CrewCommandContext, DaemonEvent, NodeId, PrincipalRef};
 use flotilla_resources::{Vessel, VesselSpec};
 

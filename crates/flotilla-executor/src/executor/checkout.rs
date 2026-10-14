@@ -22,7 +22,7 @@ pub(crate) fn checkout_is_local_owned(host_path: &QualifiedPath, local_host: &Ho
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CheckoutResolutionScope {
+pub enum CheckoutResolutionScope {
     Any,
     Local,
     Host(HostName),

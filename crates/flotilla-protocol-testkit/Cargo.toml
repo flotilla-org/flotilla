@@ -6,6 +6,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+flotilla-daemon-api = { path = "../flotilla-daemon-api" }
+tokio = { workspace = true }
 
 flotilla-protocol = { path = "../flotilla-protocol" }
 
@@ -13,4 +15,5 @@ flotilla-protocol = { path = "../flotilla-protocol" }
 workspace = true
 
 [dev-dependencies]
+hegeltest = "=0.48.1"
 tokio = { workspace = true, features = ["test-util"] }

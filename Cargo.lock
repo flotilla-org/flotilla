@@ -1697,6 +1697,7 @@ dependencies = [
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-environment",
+ "flotilla-executor",
  "flotilla-forge-forgejo",
  "flotilla-forge-github",
  "flotilla-issue-tracker",
@@ -1840,6 +1841,7 @@ dependencies = [
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-environment",
+ "flotilla-executor",
  "flotilla-issue-tracker",
  "flotilla-orchestration-testkit",
  "flotilla-paths",
@@ -2033,6 +2035,50 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "flotilla-executor"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bon",
+ "flotilla-ai-utility",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-http",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-change-request",
+ "flotilla-cloud-agent",
+ "flotilla-config",
+ "flotilla-daemon-api",
+ "flotilla-discovery",
+ "flotilla-discovery-api",
+ "flotilla-discovery-testkit",
+ "flotilla-environment",
+ "flotilla-forge-github",
+ "flotilla-issue-tracker",
+ "flotilla-paths",
+ "flotilla-protocol",
+ "flotilla-protocol-testkit",
+ "flotilla-provider-runtime",
+ "flotilla-replay-testkit",
+ "flotilla-resources",
+ "flotilla-store",
+ "flotilla-terminal",
+ "flotilla-vcs",
+ "hegeltest",
+ "serde_json",
+ "serde_yml",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -2233,7 +2279,9 @@ dependencies = [
 name = "flotilla-protocol-testkit"
 version = "0.1.0"
 dependencies = [
+ "flotilla-daemon-api",
  "flotilla-protocol",
+ "hegeltest",
  "tokio",
 ]
 

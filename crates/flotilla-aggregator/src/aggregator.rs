@@ -1,5 +1,6 @@
 //! Resource-store Aggregator maintaining named-query result sets.
 
+use flotilla_daemon_api::event_sink::EventSink;
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
 use std::{
@@ -9,16 +10,15 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_charter::ops_entry::{ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION};
-#[cfg(test)]
-use flotilla_core::event_sink::BroadcastEventSink;
 use flotilla_core::{
     aggregator_projection::AggregatorProjectionState,
     convoy_branch_refresh::ConvoyBranchRefresh,
-    event_sink::EventSink,
     in_process::InProcessDaemon,
     salience::{AttentionFact, DemandFact, RegardFact, SalienceFacts},
     terminal_health,
 };
+#[cfg(test)]
+use flotilla_daemon_api::event_sink::BroadcastEventSink;
 use flotilla_protocol::{
     result_set::{
         CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, ProjectRepositoriesRow,

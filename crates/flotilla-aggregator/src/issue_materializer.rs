@@ -2,6 +2,7 @@
 //! family. External provider I/O lives in per-query tasks so it cannot stall
 //! the resource-store Aggregator loop.
 
+use flotilla_daemon_api::event_sink::EventSink;
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
@@ -11,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_core::{aggregator_projection::AggregatorProjectionState, event_sink::EventSink, in_process::InProcessDaemon};
+use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
 use flotilla_forge_github::github::{core_rate_limit_reset, rate_limit_reset};
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_protocol::{
@@ -954,7 +955,7 @@ mod tests {
     use std::{collections::VecDeque, path::Path, sync::Mutex as StdMutex};
 
     use chrono::{Duration as ChronoDuration, Utc};
-    use flotilla_core::event_sink::BroadcastEventSink;
+    use flotilla_daemon_api::event_sink::BroadcastEventSink;
     use flotilla_forge_github::github::GhApiClient;
     use flotilla_issue_tracker::github::GitHubIssueProvider;
     use flotilla_protocol::issue_query::IssueResultPage;

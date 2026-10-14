@@ -1,3 +1,4 @@
+use flotilla_executor::step::{RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, RemoteStepProgressUpdate, StepOutcome};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -12,7 +13,6 @@ use async_trait::async_trait;
 use flotilla_core::{
     command_target::{RemoteDelivery, TargetError, TargetHost, TargetReason},
     in_process::InProcessDaemon,
-    step::{RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, RemoteStepProgressUpdate, StepOutcome},
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{

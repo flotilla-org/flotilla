@@ -5,7 +5,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from check import (C_FREE_BASE, RESOURCE_EXEMPTIONS, c_free_violations,
+from check import (CAPABILITY_CRATES, C_FREE_BASE, RESOURCE_EXEMPTIONS, c_free_violations,
                    feature_differences, is_testkit, layer, main, tree_features, violations)
 
 
@@ -31,6 +31,42 @@ def graph(*packages):
 
 
 class BuildGraphContract(unittest.TestCase):
+    def test_capability_reads_store_and_lower_crates(self):
+        # ADR 0060 stream 3: executor may read resources, while core composes it.
+        self.assertIn("flotilla-executor", CAPABILITY_CRATES)
+        self.assertEqual(violations(graph(
+            package("flotilla-core", normal=("flotilla-executor",)),
+            package("flotilla-executor", normal=("flotilla-store", "flotilla-discovery")),
+            package("flotilla-store", normal=("flotilla-resources",)),
+            package("flotilla-resources"), package("flotilla-discovery"),
+        )), [])
+
+    def test_capabilities_refuse_upward_and_other_capability_edges(self):
+        # Explicit finite generator spans direct/transitive normal/build edges.
+        # A second capability proves that ports cannot be replaced by crate edges.
+        for target in ("flotilla-core", "flotilla-daemon", "flotilla-controllers",
+                       "flotilla-aggregator", "flotilla-credentials", "flotilla-provisioning"):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        with patch("check.CAPABILITY_CRATES",
+                                   frozenset({"flotilla-executor", "flotilla-provisioning"})):
+                            self.assertIn(
+                                f"flotilla-executor: must not depend on {target}, directly or transitively",
+                                violations(graph(
+                                    package("flotilla-executor", **{kind: (middle,)}),
+                                    package("adapter", normal=(target,)), package(target),
+                                )),
+                            )
+
+    def test_components_refuse_capability_reachbacks(self):
+        # A lower component cannot gain an upward dependency on the executor.
+        self.assertIn(
+            "flotilla-discovery: must not depend on flotilla-executor, directly or transitively",
+            violations(graph(package("flotilla-discovery", normal=("flotilla-executor",)),
+                             package("flotilla-executor"))),
+        )
+
     def test_provider_runtime_is_native_and_independent(self):
         # ADR 0060: runtime is native, but cannot reach composition or store crates.
         self.assertEqual(layer("flotilla-provider-runtime"), "native")
