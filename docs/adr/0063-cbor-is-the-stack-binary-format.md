@@ -1,6 +1,6 @@
 # 63. CBOR is the stack's binary format for messages between our own programs
 
-**Status:** Accepted (owner grilling, 2026-10-13)
+**Status:** Accepted (owner grilling, 2026-10-13); amended 2026-10-14 (see Amendment below)
 **Date:** 2026-10-13
 **Scope:** Flotilla and its sibling projects: Jackstay, Katzensteg, porthole, Wheelhouse, cleat, Tender
 **Relates to:** ADR 0047 (wire formats change freely; stored data stays decodable for one generation), flotilla-org/jackstay#104 (first adopter)
@@ -29,15 +29,16 @@ Our consumers are written in Rust, C, Zig and Swift. Most non-Rust code reaches 
 
 "CBOR" alone means many formats. Ours is:
 
-- **Deterministic encoding** (RFC 8949 §4.2): shortest integer forms, definite lengths only, map keys sorted. Every value has one byte form, so messages and log entries can later be hashed, signed or content-addressed, as atproto's DAG-CBOR does.
-- **Floats** are allowed, always in their shortest (preferred) serialization. An integer value is encoded as an integer, never as a float. **NaN is not allowed.** `-0.0` and the infinities are allowed and keep their exact sign and value.
-- **Strict readers.** A reader rejects input that isn't in this profile: duplicate map keys (always an error), indefinite lengths, unsorted keys, non-shortest forms, NaN and tags outside the allowed list. Two byte strings never stand for the same value.
+- **Deterministic writers** (RFC 8949 §4.2.1): shortest integer and float forms, definite lengths only, map keys sorted bytewise. Every value our writers produce has one byte form, so messages and log entries can later be hashed, signed or content-addressed.
+- **Floats stay floats.** A float is written in its shortest (preferred) serialization and is never rewritten as an integer, so typed float fields round-trip through ordinary CBOR libraries. Every writer, in any language, writes a float-typed field as a float even when its value is whole; a reader may refuse an integer there. NaN, in any width, is rejected; `-0.0` and the infinities currently pass through. These float details are current choices, not commitments, and the corpus records them.
+- **Safe readers.** A reader rejects what is ambiguous or unsafe: duplicate map keys (compared as decoded text, whatever their encoded form, and wherever they sit in the map), tags outside the allowed list, non-text map keys, invalid UTF-8, trailing bytes after the message, and anything over its limits. It accepts well-formed input that merely isn't in deterministic form (a longer integer or float form, unsorted keys). Indefinite lengths are currently rejected, because they make limits harder to enforce.
+- **Canonical check on demand.** Where bytes are hashed, signed or compared, the reader also requires deterministic form, through one shared check. Nothing needs it yet.
 - **Text map keys**, so the JSON rendering of the same data stays natural.
 - **A short allowed-tag list, initially empty.** Byte strings are native and need no tag; any tag (for example a content-ID tag, if logs need hashing) is added to the list deliberately.
 - **Evolution:** readers ignore unknown keys and reject unknown message types. A key is never reused with a new meaning.
 - **Hashing and signing use the original bytes.** Because readers drop unknown keys, a signed or content-addressed message is verified over the bytes as received, never over a re-encoding of the decoded value.
 - **Stream framing:** a protocol-specific magic, a u32 length, then one CBOR map carrying a `type` field. A reader checks the length prefix (the size of one framed message body) against its limit **before** allocating. Each protocol sets its own limits; one that sets none uses the defaults: 1 MiB per message, nesting depth 64, and 65,536 elements per array or map.
-- **One conformance corpus.** A shared set of golden vectors (values and their exact deterministic bytes, including floats, `-0.0`, infinities, large integers and rejected inputs) defines the profile. Every encoder and decoder in the stack must pass it; in Rust, protocols use one shared wrapper that enforces the profile rather than calling a CBOR crate directly. Both live with the first adopter until a second repo needs them.
+- **One conformance corpus.** A shared set of golden vectors defines the profile: values and the exact bytes writers must produce, inputs safe readers must accept although they are not deterministic, inputs every reader rejects, and inputs only the canonical check rejects. Every encoder and decoder in the stack must pass it. In Rust, protocols use one shared wrapper crate that enforces the profile around an ordinary CBOR crate, rather than calling that crate directly; the crate underneath is an implementation detail the corpus pins down. The wrapper crate, `flotilla-cbor`, and the corpus live in this repo; other repos depend on the crate through Git.
 
 ### Where it applies, and where it doesn't
 
@@ -66,5 +67,16 @@ No repo converts now. Each protocol adopts this when it is next reshaped. Jackst
 
 - One binary format across the stack, inspectable through CBOR diagnostic notation without schemas.
 - Nothing enforces CDDL schemas at compile time. Validation lives in code and tests, ideally contract tests run by each implementation.
+- The same logical message may arrive in more than one byte form from a non-Rust or older writer. Nothing may deduplicate, compare or cache on raw bytes without first passing the canonical check.
 - Event logs, when they exist, still need their own decisions on message versioning and any schema registry; deterministic encoding keeps hashing and signing open.
-- Rust code moves from `serde_json` to a serde CBOR crate (`ciborium` or `minicbor`) protocol by protocol. C, Zig and Swift peers that must parse use `tinycbor`/`QCBOR`, `zbor` or a Swift CBOR library.
+- Rust code moves from `serde_json` to the shared wrapper protocol by protocol. C, Zig and Swift peers that must parse use `tinycbor`/`QCBOR`, `zbor` or a Swift CBOR library.
+
+## Amendment (2026-10-14): deterministic writers, safe readers
+
+The original profile made every reader strict: it rejected any input not in deterministic form, and it rewrote integral floats as integers. Both rules were dropped before any protocol adopted the profile.
+
+- **Strict readers bought little.** Determinism only matters where bytes are hashed, signed or compared, and nothing in the stack does that yet. atproto, whose records are all signed and content-addressed, reaches the same split: DRISL and DAG-CBOR writers are deterministic, while the DAG-CBOR spec lets decoders relax strictness by default and offer it as an opt-in, and its reference JavaScript and Go decoders do. Strict readers also force every peer, including C, Zig and Swift libraries, to produce exactly canonical bytes.
+- **Integral floats as integers broke typed round trips.** A Rust `f64` field holding `1.0` would arrive as the integer `1`, which serde CBOR crates (cbor2, for one) refuse to read back into a float. The rule only served byte uniqueness, which deterministic writers already give for our own output.
+- **What remains rejected** is what could make two readers see different messages in the same bytes (duplicate keys, unknown tags) or what threatens the reader (limits, trailing bytes, invalid UTF-8).
+
+With the relaxed profile an off-the-shelf serde CBOR crate covers most of the work, so the shared wrapper only adds the reader checks, the limits and the framing.
