@@ -21,8 +21,8 @@ it (ADR 0055, amended by ADR 0059).
 Under ADR 0064 a Message lives in its role's **Inbox** and has four states:
 Pending; Awaiting, which means delivered and waiting for a reply or outcome;
 Settled; and Dropped. A message enters Dropped through the `drop` edge, whose
-reason (undeliverable, expired or superseded) is recorded on the edge event. A
-Demand is a Message that expects an outcome.
+reason (undeliverable, expired, superseded or withdrawn) is recorded on the edge
+event. A Demand is a Message that expects an outcome.
 _Avoid_: Delivered (as a claim that the agent acted), prompt.
 
 **Message Subject**:
@@ -32,7 +32,8 @@ supersession relationship.
 
 **Role Address**:
 The name of a communication recipient or sender, independent of which
-**AgentSession** currently fills it. The role forms are `project/role` (a
+**AgentSession** currently fills it. Until the #3108 cut-over (see the ADR 0064
+note below, which supersedes these forms), the role forms are `project/role` (a
 Project role, such as `andamento/governor`) and `project/convoy/vessel/role`
 (one crew role in one vessel). The other address forms are `principal:<name>`,
 `system:<subsystem>` and `topic:<project>/<name>` (ADR 0055). The fleet is an
@@ -50,10 +51,16 @@ are never a human surface. *(Reconciled 2026-10-08, #2913: this entry and a
 second "Role address" entry for the standing-convoy identity were merged.)*
 _Avoid_: Holder (retired), convoy name (for the human-facing identity),
 triple-barrelled generated names.
-*(ADR 0064, effective at the #3108 cut-over: the convoy role form becomes
-`project/convoy/role`, without the vessel segment, so replacing a vessel never
-changes an address. Role names may be dynamic, such as `coder-pr45`, with the
-role type as an attribute of the **Inbox**.)*
+*(ADR 0064, effective at the #3108 cut-over: an address is a typed list of
+segments over a closed kind enum, project, convoy and role to start, shown as
+`project:flotilla/role:gui-approver` or
+`project:flotilla/convoy:stack-3152/role:coder`. There is no vessel segment, so
+replacing a vessel never changes an address, and new kinds never change
+existing addresses. Every role is declared with a one-line purpose; a Message
+to an undeclared role is refused at send time with the reason. A person's own
+inbox is a declared role, replacing `principal:<name>`. Role names may be
+dynamic, such as `coder-pr45`, with the role type as an attribute of the
+**Inbox**.)*
 
 **Resource**:
 A thing with its own identity that others refer to, which someone wants to
@@ -86,10 +93,13 @@ read, as references and versions. Gates read only local, versioned inputs (ADR
 
 **Inbox**:
 The Resource a role instance owns, where Messages to that role queue. It is
-homed with the role's owner: the convoy for convoy roles, the ensure for
-standing roles. Its first message is the role's **Brief**. Messages in it
-outlive any fulfiller: unsettled messages pass to a replacement consumer (ADR
-0064).
+homed with the role's owner: the convoy for convoy roles, and the project's
+declarations for standing roles, which are declared in the **Charter** and own
+their inboxes whether or not anything fills them. An Ensure is optional,
+layered on a role. Its first message is the role's **Brief**. Messages in it
+outlive any fulfiller: unsettled messages pass to a replacement consumer. The
+**Convoy Admission Queue** is the inbox of `project:fleet/role:admission`
+(ADR 0064, amended 2026-10-14).
 _Avoid_: mailbox, queue (bare).
 
 **Receipt**:
@@ -153,6 +163,14 @@ request). Observed checkouts are **Convergent Facts**.
 _Avoid_: Worktree (one kind), clone, repo, Workspace Set (the list a convoy's
 vessels get).
 
+**Lend**:
+A relation a resource's owner asserts to let another role, or a person, borrow
+it: a **Checkout**, a process with an open port, a jackstay stream. Its terms
+name who, the mode (read-only or shared-write) and until when (a time or an
+event). The owner's `release` waits while an unexpired lend exists, unless the
+borrower returned it or an authorised override records a reason (ADR 0064).
+_Avoid_: share, loan.
+
 **Membership Claim**:
 How a **Project** includes a **Repository**: a `(Repository, optional subpath)`
 pair carrying a **role** — **member** (the Project changes it: checkouts,
@@ -211,6 +229,15 @@ Fleet-wide grills, maps and brainstorms organised for operator selection.
 **Convoy Admission Queue**:
 Briefed convoy requests with resolved workflows awaiting whole-convoy admission,
 ordered globally across the fleet.
+*(ADR 0064: the queue is the admission role's **Inbox**, and admission grants a
+**Capacity Budget**.)*
+
+**Capacity Budget**:
+The capacity admission grants a **Convoy**. The **WorkflowTemplate** proposes
+it, and admission may grant less. Within it the convoy asks placement for
+vessels directly, and the host that owns the capacity decides. Going beyond it
+is a new request to admission. A subagent inside a vessel uses none (ADR 0064).
+_Avoid_: quota, allocation (the ledger's word).
 
 **Placement Queue**:
 A host's resource users awaiting reservations, inheriting the priority of their
@@ -420,8 +447,10 @@ binding names. With no current binding the role is *unbound*, and Messages to
 it wait. More than one current binding for a role is refused. Starting a new
 conversation for a role means a new AgentSession and a new binding (ADR 0059).
 Under ADR 0064 a Role Binding is the **consumer** relation on the role's
-**Inbox**. Convoy membership is a binding the convoy asserts. An AgentSession
-may consume several inboxes, and one consumer per inbox is the starting rule.
+**Inbox**. A consumer may be an AgentSession, a person through a **Surface**, or
+a deterministic controller. Convoy membership is a binding the convoy asserts.
+A consumer may consume several inboxes, and an inbox may have several
+consumers: the first to act on a Message claims it.
 _Avoid_: Holder, assignment.
 
 **AgentChannel**:
@@ -728,6 +757,8 @@ without a person — a permission prompt, a workflow human-gate, a review/demo
 approval. Queue-natured (raised, routed, satisfied/acknowledged) and addressed
 through the principal's **Regards** for surfacing. Derived from attention
 observations and explicit gates; never itself a phase.
+*(ADR 0064: the Demand kind retires. A Demand is a Message that expects an
+outcome, sent to the role that must act; escalation is a chain of roles.)*
 _Avoid_: Notification, alert (those are renderings of a routed Demand).
 
 **Regard**:
@@ -747,6 +778,9 @@ thing).
 A person whose attention the system routes and economises. Principals hold
 **Regards**, receive **Demands**, and act with human authority (overrides,
 approvals). Agents are never principals.
+*(ADR 0064: Principal retires into roles. A person acts by consuming a declared
+role; a person's own inbox is a role with one holder. This entry stays as a
+pointer for one generation.)*
 _Avoid_: User (ambiguous with OS users), operator.
 
 **Latent**:
