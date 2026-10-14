@@ -861,7 +861,8 @@ def startup_pending(path, since):
     """Only this attempt's structured pending warnings can extend its deadline.
 
     Read a bounded tail on each poll: the log rotates and an incomplete last
-    line can become valid next time. Missing evidence retains the normal timeout.
+    line can become valid next time. A chatty daemon can push a warning beyond
+    this window before it is observed; missing evidence retains the normal timeout.
     """
     try:
         with open(path, "rb") as stream:

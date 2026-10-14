@@ -75,3 +75,21 @@ class HostGuardTests(unittest.TestCase):
             with patch.object(validation.subprocess, "run", side_effect=subprocess.TimeoutExpired("cli", expected)) as run:
                 self.assertFalse(validation.daemon_health("cli", "socket", remaining))
                 self.assertEqual(run.call_args.kwargs["timeout"], expected)
+
+    # CLI glue: observation commands return integer exit codes; existing helper
+    # dispatch falls through with None, which sys.exit treats as success.
+    def test_command_exit_codes(self):
+        import contextlib
+        import io
+        import sys
+        for command in ("daemon-health", "startup-pending"):
+            arguments = ["cli", "socket", "1"] if command == "daemon-health" else ["log", "1"]
+            for success in (False, True):
+                helper = command.replace("-", "_")
+                with patch.object(sys, "argv", ["validator", command, *arguments]), \
+                     patch.object(validation, helper, return_value=success):
+                    result = validation.main()
+                    self.assertIs(type(result), int)
+                    self.assertEqual(result, 0 if success else 1)
+        with patch.object(sys, "argv", ["validator", "nonce"]), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(validation.main())

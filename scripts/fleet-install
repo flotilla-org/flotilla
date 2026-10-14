@@ -551,6 +551,13 @@ probe_daemon_health() {
   FLOTILLA_CONTAINED_HOST_DAEMON=1 python3 "$GENERATION_VALIDATOR" daemon-health -- "$CURRENT_LINK/bin/flotilla" "$DAEMON_SOCKET" "$1" 2>"$WORK_DIR/daemon-health.stderr"
 }
 
+startup_timestamp() {
+  python3 -c 'import time; print(time.time())' || {
+    printf 'fleet-install: could not capture startup timestamp\n' >&2
+    return 1
+  }
+}
+
 wait_for_daemon_generation() {
   local generation="$1"
   [[ "$CONFIRM_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] \
@@ -558,13 +565,17 @@ wait_for_daemon_generation() {
   local deadline=$((SECONDS + CONFIRM_TIMEOUT_SECONDS))
   local maximum=$((SECONDS + MAX_WAIT_SECONDS))
   local pending=0
+  local startup_since="${FLEET_INSTALL_STARTUP_SINCE:-}"
+  if [[ -z "$startup_since" ]]; then
+    startup_since="$(startup_timestamp)" || return 1
+  fi
   : >"$WORK_DIR/daemon-health.stderr"
   while true; do
     if [[ "$(current_generation)" == "$generation" ]] && probe_daemon_health "$((maximum - SECONDS))"; then
       return 0
     fi
     if ((SECONDS < maximum && !pending)); then
-      if python3 "$GENERATION_VALIDATOR" startup-pending -- "$DAEMON_STATE_DIR/log/flotillad.jsonl" "${FLEET_INSTALL_STARTUP_SINCE:-0}"; then
+      if python3 "$GENERATION_VALIDATOR" startup-pending -- "$DAEMON_STATE_DIR/log/flotillad.jsonl" "$startup_since"; then
         pending=1
         printf 'fleet-install: daemon startup remains pending; waiting up to %s seconds\n' "$MAX_WAIT_SECONDS"
       fi
@@ -607,9 +618,9 @@ automatic_rollback() {
   # launchd must unload the candidate before the symlink flip. systemd has no
   # equivalent race and its stable unit was already refreshed by the parent.
   prepare_darwin_daemon_service || return 1
+  FLEET_INSTALL_STARTUP_SINCE="$(startup_timestamp)" || return 1
   atomic_link "releases/$rollback_generation" "$CURRENT_LINK" || return 1
   atomic_link "releases/$failed_generation" "$PREVIOUS_LINK" || return 1
-  FLEET_INSTALL_STARTUP_SINCE="$(python3 -c 'import time; print(time.time())')"
   restart_linux_daemon_service || return 1
   restart_darwin_daemon_service || return 1
   wait_for_daemon_generation "$rollback_generation" || return 1
@@ -666,7 +677,8 @@ start_confirmation_watchdog() {
     rm -f -- "${completed_log%.done}" "$completed_log"
   done
   CONFIRMATION_LOG="$FLEET_ROOT/.confirmation.$token.log"
-  export FLEET_INSTALL_STARTUP_SINCE="$(python3 -c 'import time; print(time.time())')"
+  FLEET_INSTALL_STARTUP_SINCE="$(startup_timestamp)" || die 'cannot start health confirmation without a startup timestamp'
+  export FLEET_INSTALL_STARTUP_SINCE
   nohup "$installer" __confirm "$generation" "$rollback_generation" "$token" >"$CONFIRMATION_LOG" 2>&1 </dev/null &
   CONFIRMATION_PID=$!
 }
