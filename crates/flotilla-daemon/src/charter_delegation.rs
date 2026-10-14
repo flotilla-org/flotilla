@@ -132,10 +132,13 @@ pub(crate) async fn expand_registered_charters(
         return Ok(None);
     }
     let mut pending = VecDeque::new();
+    let mut frontier = Frontier::default();
     for (path, parsed) in files {
         for value in parsed.as_ref().map_err(|error| format!("{}: {error}", path.display()))? {
-            pending.push_back(
+            frontier.enqueue(
+                &mut pending,
                 Document::builder().path(path.clone()).value(value.clone()).source("fleet store".into()).revision(revision.into()).build(),
+                default_namespace,
             );
         }
     }
@@ -207,15 +210,12 @@ pub(crate) async fn expand_registered_charters(
                         registration_catalogs.insert(scope_ns.clone(), catalog);
                     }
                     let original = &registration_catalogs[scope_ns];
-                    let mut candidate = original.clone();
-                    for known in documents.iter().chain(pending.iter()).chain(std::iter::once(&document)) {
-                        if is_kind(&known.value, "Project") && namespace(&known.value, default_namespace) == *scope_ns {
-                            candidate.insert(
-                                name(&known.value)?.into(),
-                                serde_json::from_value(known.value["spec"].clone()).map_err(|error| error.to_string())?,
-                            );
-                        }
+                    // The candidate is the trusted catalog overlaid by every
+                    // enqueued Project, with this document's spec on top.
+                    if let Some(error) = frontier.malformed.get(scope_ns) {
+                        return Err(error.clone());
                     }
+                    let candidate = CandidateCatalog { current: (&project, &spec), frontier: frontier.projects.get(scope_ns), original };
                     let fleet = registration_fleets.get(scope_ns).map(String::as_str);
                     if !belongs_to_scope(&project, scope_project, &candidate, fleet)
                         || (original.contains_key(&project) && !belongs_to_scope(&project, scope_project, original, fleet))
@@ -264,7 +264,8 @@ pub(crate) async fn expand_registered_charters(
                 let prefix = document.path.with_extension("").join(format!("charter-{project}"));
                 for (index, mut value) in inline_documents.into_iter().enumerate() {
                     inherit_namespace(&mut value, &ns)?;
-                    pending.push_back(
+                    frontier.enqueue(
+                        &mut pending,
                         Document::builder()
                             .path(prefix.join(format!("inline-{index}.yaml")))
                             .value(value)
@@ -272,6 +273,7 @@ pub(crate) async fn expand_registered_charters(
                             .source(source.clone())
                             .revision(snapshot.revision.clone())
                             .build(),
+                        default_namespace,
                     );
                 }
                 // A delegated charter's `image/` (its project's named ops
@@ -304,7 +306,8 @@ pub(crate) async fn expand_registered_charters(
                             ));
                         }
                     }
-                    pending.push_back(
+                    frontier.enqueue(
+                        &mut pending,
                         Document::builder()
                             .path(prefix.join(CHARTER_IMAGE_LAYER_PATH))
                             .value(json!({
@@ -316,6 +319,7 @@ pub(crate) async fn expand_registered_charters(
                             .source(source.clone())
                             .revision(snapshot.revision.clone())
                             .build(),
+                        default_namespace,
                     );
                 }
                 for (path, contents) in snapshot.files {
@@ -327,7 +331,8 @@ pub(crate) async fn expand_registered_charters(
                     for (index, mut value) in values.into_iter().enumerate() {
                         // A delegated source's omitted namespace inherits the registration.
                         inherit_namespace(&mut value, &ns)?;
-                        pending.push_back(
+                        frontier.enqueue(
+                            &mut pending,
                             Document::builder()
                                 .path(prefix.join(format!("{path}#{index}")))
                                 .value(value)
@@ -335,6 +340,7 @@ pub(crate) async fn expand_registered_charters(
                                 .source(source.clone())
                                 .revision(snapshot.revision.clone())
                                 .build(),
+                            default_namespace,
                         );
                     }
                 }
@@ -398,6 +404,19 @@ pub(crate) async fn expand_registered_charters(
         )
         .map_err(|error| format!("charter namespace `{ns}`: {error}"))?;
     }
+    // Index member repositories once; scope checks then visit only their owners.
+    let owners = catalogs
+        .iter()
+        .map(|(ns, catalog)| {
+            let mut owners = BTreeMap::<&str, Vec<&str>>::new();
+            for (name, spec) in catalog {
+                for member in &spec.repositories {
+                    owners.entry(member.repo.0.as_str()).or_default().push(name.as_str());
+                }
+            }
+            (ns.clone(), owners)
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut identities = BTreeMap::new();
     let mut result = Vec::new();
     for mut document in documents {
@@ -411,6 +430,7 @@ pub(crate) async fn expand_registered_charters(
         }
         if let Some((scope_ns, project)) = &document.scope {
             let catalog = &catalogs[scope_ns];
+            let owners = &owners[scope_ns];
             let in_scope = |target: &str| belongs_to_scope(target, project, catalog, fleets.get(scope_ns).map(String::as_str));
             let allowed = ns == *scope_ns
                 && match kind {
@@ -433,10 +453,10 @@ pub(crate) async fn expand_registered_charters(
                             .is_some_and(in_scope)
                             && document.value.pointer("/spec/repository_refs").and_then(Value::as_array).is_some_and(|refs| {
                                 refs.iter()
-                                    .all(|reference| reference.as_str().is_some_and(|repo| repository_in_scope(repo, &in_scope, catalog)))
+                                    .all(|reference| reference.as_str().is_some_and(|repo| repository_in_scope(repo, &in_scope, owners)))
                             })
                     }
-                    "Repository" => repository_in_scope(object_name, &in_scope, catalog),
+                    "Repository" => repository_in_scope(object_name, &in_scope, owners),
                     // Only the delegated project's own project-source layer,
                     // under its conventional name.
                     "ImageLayer" => serde_json::from_value::<flotilla_resources::ImageLayerResourceSpec>(document.value["spec"].clone())
@@ -467,7 +487,7 @@ pub(crate) async fn expand_registered_charters(
                     ));
                 }
             }
-            validate_repository_targets(&document.value, kind, &in_scope, catalog)
+            validate_repository_targets(&document.value, kind, &in_scope, owners)
                 .map_err(|error| format!("{} exceeds delegated scope `{scope_ns}/{project}`: {error}", document.source))?;
             let annotations = document.value["metadata"]
                 .as_object_mut()
@@ -486,35 +506,94 @@ pub(crate) async fn expand_registered_charters(
     Ok(Some(result))
 }
 
-fn belongs_to_scope(target: &str, scope: &str, catalog: &BTreeMap<String, ProjectSpec>, fleet: Option<&str>) -> bool {
+/// Parent lookups for scope authorization: `None` for an unknown Project,
+/// otherwise its declared parent.
+trait ProjectParents {
+    fn parent(&self, name: &str) -> Option<Option<&str>>;
+}
+
+impl ProjectParents for BTreeMap<String, ProjectSpec> {
+    fn parent(&self, name: &str) -> Option<Option<&str>> {
+        self.get(name).map(|spec| spec.parent.as_deref())
+    }
+}
+
+/// Every Project enqueued for expansion, parsed once, by namespace. Later
+/// enqueues replace earlier ones, matching the FIFO overlay order.
+#[derive(Default)]
+struct Frontier {
+    projects: BTreeMap<String, BTreeMap<String, ProjectSpec>>,
+    /// The first malformed Project per namespace, refused by the next scope
+    /// check there; its own pop refuses it with the Project name.
+    malformed: BTreeMap<String, String>,
+}
+
+impl Frontier {
+    fn enqueue(&mut self, pending: &mut VecDeque<Document>, document: Document, default_namespace: &str) {
+        if is_kind(&document.value, "Project") {
+            let ns = namespace(&document.value, default_namespace);
+            let parsed = name(&document.value).and_then(|name| {
+                Ok((name.to_string(), serde_json::from_value(document.value["spec"].clone()).map_err(|error| error.to_string())?))
+            });
+            match parsed {
+                Ok((name, spec)) => {
+                    self.projects.entry(ns).or_default().insert(name, spec);
+                }
+                Err(error) => {
+                    self.malformed.entry(ns).or_insert(error);
+                }
+            }
+        }
+        pending.push_back(document);
+    }
+}
+
+/// The candidate catalog for one nested pointer, layered without copying:
+/// the pointer's own Project, then the frontier, then the trusted catalog.
+struct CandidateCatalog<'a> {
+    current: (&'a str, &'a ProjectSpec),
+    frontier: Option<&'a BTreeMap<String, ProjectSpec>>,
+    original: &'a BTreeMap<String, ProjectSpec>,
+}
+
+impl ProjectParents for CandidateCatalog<'_> {
+    fn parent(&self, name: &str) -> Option<Option<&str>> {
+        if name == self.current.0 {
+            return Some(self.current.1.parent.as_deref());
+        }
+        self.frontier.and_then(|frontier| frontier.parent(name)).or_else(|| self.original.parent(name))
+    }
+}
+
+fn belongs_to_scope<'a>(target: &'a str, scope: &str, catalog: &'a impl ProjectParents, fleet: Option<&'a str>) -> bool {
     let mut current = target;
     let mut seen = BTreeSet::new();
     loop {
         if !seen.insert(current) {
             return false;
         }
-        let Some(project) = catalog.get(current) else {
+        let Some(parent) = catalog.parent(current) else {
             return false;
         };
         if current == scope {
             return true;
         }
-        match project.parent.as_deref().or_else(|| fleet.filter(|fleet| *fleet != current)) {
+        match parent.or_else(|| fleet.filter(|fleet| *fleet != current)) {
             Some(parent) => current = parent,
             None => return false,
         }
     }
 }
 
-fn repository_in_scope(repo: &str, in_scope: &impl Fn(&str) -> bool, catalog: &BTreeMap<String, ProjectSpec>) -> bool {
-    catalog.iter().any(|(name, spec)| in_scope(name) && spec.repositories.iter().any(|member| member.repo.0 == repo))
+fn repository_in_scope(repo: &str, in_scope: &impl Fn(&str) -> bool, owners: &BTreeMap<&str, Vec<&str>>) -> bool {
+    owners.get(repo).is_some_and(|owners| owners.iter().any(|name| in_scope(name)))
 }
 
 fn validate_repository_targets(
     document: &Value,
     kind: &str,
     in_scope: &impl Fn(&str) -> bool,
-    catalog: &BTreeMap<String, ProjectSpec>,
+    owners: &BTreeMap<&str, Vec<&str>>,
 ) -> Result<(), String> {
     let mut references = Vec::new();
     if kind == "ConvoyEnsure" {
@@ -527,7 +606,7 @@ fn validate_repository_targets(
         }
     }
     for reference in references {
-        if !reference.as_str().is_some_and(|repo| repository_in_scope(repo, in_scope, catalog)) {
+        if !reference.as_str().is_some_and(|repo| repository_in_scope(repo, in_scope, owners)) {
             return Err(format!("{kind} targets out-of-scope repository {reference}"));
         }
     }
@@ -603,6 +682,9 @@ fn parse_charter_file(path: &str, contents: &str, project: &str, spec: &ProjectS
         }
     }
 }
+
+#[cfg(test)]
+mod reference;
 
 #[cfg(test)]
 mod tests {
@@ -956,6 +1038,263 @@ mod tests {
                 .await
                 .expect_err("malformed metadata refused");
         assert!(error.contains("metadata must be an object"), "{error}");
+    }
+
+    // Nested registrations over mostly fresh names, so expansion usually runs
+    // deep; reused names give duplicates and reparenting, and shared
+    // repositories, malformed Projects, escapes and fetched pointers mix in.
+    struct Registrations<'a> {
+        tc: &'a hegel::TestCase,
+        names: Vec<String>,
+    }
+
+    impl Registrations<'_> {
+        fn pick(&self, choices: usize) -> usize {
+            self.tc.draw(gs::integers::<usize>().min_value(0).max_value(choices - 1))
+        }
+
+        fn known(&self) -> String {
+            let index = self.pick(self.names.len() + 2);
+            match index {
+                0 => "app".into(),
+                1 => "s0".into(),
+                index => self.names[index - 2].clone(),
+            }
+        }
+
+        fn name(&mut self) -> String {
+            if !self.names.is_empty() && self.pick(5) == 0 {
+                return self.known();
+            }
+            let name = format!("p{}", self.names.len());
+            self.names.push(name.clone());
+            name
+        }
+
+        fn parent(&self, scope: &str) -> Option<String> {
+            match self.pick(4) {
+                0 => None,
+                1 => Some(scope.into()),
+                _ => Some(self.known()),
+            }
+        }
+
+        fn ensure(&self) -> Value {
+            let mut document = ensure(&self.known());
+            if self.pick(3) == 0 {
+                document["spec"]["repositories"] = json!(["repo-shared"]);
+            }
+            document
+        }
+
+        fn project(&mut self, scope: &str, depth: usize) -> Value {
+            let name = self.name();
+            let parent = self.parent(scope);
+            let charter = match self.pick(if depth < 3 { 4 } else { 1 }) {
+                0 => None,
+                1 => Some(CharterPointer::Repository {
+                    repo: format!("https://example.test/{name}-ops"),
+                    branch: "main".into(),
+                    path: String::new(),
+                }),
+                _ => Some(inline((0..self.pick(4)).map(|_| self.charter_document(&name, depth)).collect())),
+            };
+            let mut document = project(&name, parent.as_deref(), charter);
+            if self.pick(3) == 0 {
+                document["spec"]["repositories"][0]["repo"] = json!("repo-shared");
+            }
+            document
+        }
+
+        fn charter_document(&mut self, scope: &str, depth: usize) -> Value {
+            match self.pick(12) {
+                0 => json!({"apiVersion": "flotilla.work/v1", "kind": "Project", "metadata": {"name": self.name()}, "spec": {"parent": 7}}),
+                1 => json!({"apiVersion": "flotilla.work/v1", "kind": "Project", "metadata": {}, "spec": {}}),
+                2 => {
+                    let mut escaped = self.project(scope, 3);
+                    escaped["metadata"]["namespace"] = json!("other");
+                    escaped
+                }
+                3..=5 => self.ensure(),
+                _ => self.project(scope, depth + 1),
+            }
+        }
+    }
+
+    // #2778: the incremental candidate catalog authorizes exactly as the
+    // clone-and-scan catalog did: same records, or the same refusal text.
+    #[hegel::test(test_cases = 400)]
+    fn generated_authorization_matches_clone_and_scan_reference(tc: hegel::TestCase) {
+        let mut registrations = Registrations { tc: &tc, names: Vec::new() };
+        // Stored Projects may share generated names: reparenting them is theft.
+        let stored = (0..registrations.pick(4))
+            .map(|index| (["s0", "p0", "p1", "p2"][index].to_string(), registrations.parent("s0").filter(|parent| parent != "app")))
+            .collect::<Vec<_>>();
+        let stored_fleet = registrations.pick(2) == 0;
+        let mut roots = vec![project(
+            "app",
+            None,
+            Some(inline((0..registrations.pick(5) + 1).map(|_| registrations.charter_document("app", 0)).collect())),
+        )];
+        if registrations.pick(3) == 0 {
+            roots.push(registrations.project("app", 0));
+        }
+        if registrations.pick(3) == 0 {
+            let fleet = registrations.known();
+            roots.push(json!({
+                "apiVersion": "flotilla.work/v1", "kind": "FleetDesignation",
+                "metadata": {"name": FLEET_DESIGNATION_NAME}, "spec": {"project": fleet},
+            }));
+        }
+        tokio::runtime::Runtime::new().expect("runtime").block_on(async {
+            let backend = backend();
+            // The store refuses drawn hierarchies it cannot hold (cycles, a fleet
+            // over an undeclared Project); those draws simply store less.
+            for (name, parent) in &stored {
+                let spec: ProjectSpec = serde_json::from_value(project(name, parent.as_deref(), None)["spec"].clone()).expect("spec");
+                let meta = flotilla_resources::InputMeta::builder().name(name.clone()).build();
+                let _ = backend.definitions::<Project>("flotilla").create(&meta, &spec).await;
+            }
+            if stored_fleet && !stored.is_empty() {
+                let spec = flotilla_resources::FleetDesignationSpec { project: stored[0].0.clone(), image_cache: None };
+                let meta = flotilla_resources::InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build();
+                let _ = backend.definitions::<FleetDesignation>("flotilla").create(&meta, &spec).await;
+            }
+            let files = BTreeMap::from([("child.yaml".into(), serde_json::to_string(&ensure("p1")).expect("encode"))]);
+            let incremental =
+                expand_registered_charters(&inputs(roots.clone()), "commit-a", "flotilla", &backend, &reader(files.clone())).await;
+            let reference = reference::expand_registered_charters(&inputs(roots), "commit-a", "flotilla", &backend, &reader(files)).await;
+            assert_eq!(incremental, reference);
+        });
+    }
+
+    // #2778: shapes the generator rarely reaches. A duplicate sibling is a
+    // claim conflict, not a scope escape (the pointer's own spec decides its
+    // check); a later duplicate overrides earlier ones for other checks; and a
+    // repository shared with a foreign Project stays in scope via its owner.
+    #[tokio::test]
+    async fn duplicate_names_and_shared_repositories_match_reference() {
+        let shared = |mut document: Value| {
+            document["spec"]["repositories"][0]["repo"] = json!("repo-shared");
+            document
+        };
+        let mut shared_ensure = ensure("p1");
+        shared_ensure["spec"]["repositories"] = json!(["repo-shared"]);
+        let cases = [
+            vec![project(
+                "app",
+                None,
+                Some(inline(vec![project("x", Some("app"), Some(inline(vec![]))), project("x", Some("nowhere"), None)])),
+            )],
+            vec![project(
+                "app",
+                None,
+                Some(inline(vec![
+                    project("y", Some("app"), Some(inline(vec![project("z", Some("x"), Some(inline(vec![])))]))),
+                    project("a", Some("app"), Some(inline(vec![project("x", Some("nowhere"), None)]))),
+                    project("x", Some("y"), None),
+                ])),
+            )],
+            vec![
+                shared(project("a0", None, None)),
+                project("app", None, Some(inline(vec![shared(project("p1", Some("app"), None)), shared_ensure]))),
+            ],
+        ];
+        let mut outcomes = Vec::new();
+        for roots in cases {
+            let incremental =
+                expand_registered_charters(&inputs(roots.clone()), "commit-a", "flotilla", &backend(), &reader(BTreeMap::new())).await;
+            let reference =
+                reference::expand_registered_charters(&inputs(roots), "commit-a", "flotilla", &backend(), &reader(BTreeMap::new())).await;
+            assert_eq!(incremental, reference);
+            outcomes.push(incremental.map(|_| ()));
+        }
+        assert!(outcomes[0].as_ref().expect_err("duplicate").contains("claimed by two sources"), "{outcomes:?}");
+        assert!(
+            outcomes[1].as_ref().expect_err("later duplicate").contains("delegated scope `flotilla/y` with Project `flotilla/z`"),
+            "{outcomes:?}"
+        );
+        assert_eq!(outcomes[2], Ok(()));
+    }
+
+    // Delegated records only: the root registration echoes its input order.
+    fn accepted_documents(output: &[LoadedManifestFile]) -> BTreeSet<String> {
+        output
+            .iter()
+            .flat_map(|(_, parsed)| parsed.as_ref().expect("parsed"))
+            .filter(|document| document["metadata"]["annotations"].get(CHARTER_SCOPE).is_some())
+            .map(Value::to_string)
+            .collect()
+    }
+
+    // #2778: a child may name a sibling registered later in the same charter as
+    // its parent; sibling order does not change what is accepted.
+    #[hegel::test]
+    fn sibling_order_does_not_change_accepted_records(tc: hegel::TestCase) {
+        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+        // Parents are the scope or an earlier sibling, so the hierarchy is acyclic.
+        let children = (0..count)
+            .map(|index| {
+                let parent = match tc.draw(gs::integers::<usize>().min_value(0).max_value(index)) {
+                    0 => "app".to_string(),
+                    sibling => format!("c{}", sibling - 1),
+                };
+                let name = format!("c{index}");
+                let mut charter = vec![ensure(&name)];
+                if tc.draw(gs::booleans()) {
+                    let grandchild = format!("{name}-g");
+                    charter.push(project(&grandchild, Some(name.as_str()), Some(inline(vec![ensure(&grandchild)]))));
+                }
+                project(&name, Some(parent.as_str()), Some(inline(charter)))
+            })
+            .collect::<Vec<_>>();
+        let mut shuffled = children.clone();
+        for index in (1..shuffled.len()).rev() {
+            shuffled.swap(index, tc.draw(gs::integers::<usize>().min_value(0).max_value(index)));
+        }
+        tokio::runtime::Runtime::new().expect("runtime").block_on(async {
+            let canonical = expand(vec![project("app", None, Some(inline(children)))], &backend(), &reader(BTreeMap::new()))
+                .await
+                .expect("canonical order");
+            let shuffled = expand(vec![project("app", None, Some(inline(shuffled)))], &backend(), &reader(BTreeMap::new()))
+                .await
+                .expect("shuffled order");
+            assert_eq!(accepted_documents(&canonical), accepted_documents(&shuffled));
+        });
+    }
+
+    fn large_nested_charter(children: usize) -> Vec<Value> {
+        let children = (0..children)
+            .map(|index| {
+                let name = format!("child-{index}");
+                let mut charter = vec![ensure(&name)];
+                if index % 2 == 0 {
+                    let grandchild = format!("grandchild-{index}");
+                    charter.push(project(&grandchild, Some(name.as_str()), Some(inline(vec![ensure(&grandchild)]))));
+                }
+                project(&name, Some("app"), Some(inline(charter)))
+            })
+            .collect();
+        vec![project("app", None, Some(inline(children)))]
+    }
+
+    // #2778: a large nested charter (1,500 delegated scopes, 3,001 documents)
+    // expands with every record scoped to its own registering Project.
+    #[tokio::test]
+    async fn large_nested_charter_expands_every_scope() {
+        let output = expand(large_nested_charter(1_000), &backend(), &reader(BTreeMap::new())).await.expect("large charter");
+        assert_eq!(output.len(), 3_001);
+        let mut ensures = BTreeMap::new();
+        for document in output.iter().flat_map(|(_, parsed)| parsed.as_ref().expect("parsed")) {
+            if document["kind"] == "ConvoyEnsure" {
+                let project = document["spec"]["project_ref"].as_str().expect("project").to_string();
+                ensures.insert(project, document["metadata"]["annotations"][CHARTER_SCOPE].clone());
+            }
+        }
+        assert_eq!(ensures.len(), 1_500);
+        for (project, scope) in ensures {
+            assert_eq!(scope, json!(format!("flotilla/{project}")));
+        }
     }
 
     // #2721: a parent charter can register a new child and delegate its charter;
