@@ -144,7 +144,10 @@ stop ALLOCATION
 
 A Namespace/existing project provider can implement the same small interface.
 The trap collects partial results once run is reached and always stops the allocation, even when start or
-execution fails; start/run/cleanup have independent timeout limits, and signals
+execution fails. The driver marks run reached before invoking the provider, so
+collection still runs after an execution timeout. Failed AWS teardown retains
+the local allocation state for retry diagnostics; successful teardown removes it.
+Start/run/cleanup have independent timeout limits, and signals
 enter the same cleanup path; teardown failure is a failed run. EC2 start is idempotent by
 client token, and stop searches that token even if start failed before saving an
 instance ID. `deep-contract-test.sh` checks success/start/run/collect/stop failures and execution timeout with a
