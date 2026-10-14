@@ -6177,6 +6177,9 @@ impl DaemonHandle for InProcessDaemon {
         let state = self.aggregator_projection_state().await;
         // Recovery reads existing materializations without changing demand.
         // Socket dispatch verifies this connection's interest before calling.
+        // If demand disappears concurrently, fail the whole batch rather than
+        // publish a partially recovered view. The connector discards this
+        // session and its cursors; a new session subscribes to rebuild demand.
         let mut events = Vec::new();
         for cursor in queries {
             let set = state.result_set_for(&cursor.query).await.ok_or_else(|| format!("query is not materialized: {}", cursor.query))?;

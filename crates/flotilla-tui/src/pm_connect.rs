@@ -244,6 +244,9 @@ impl ConnectorState {
 
     fn apply_delta(&mut self, delta: &ResultDelta) -> Applied {
         let query = delta.query();
+        // Even families without catalog rows retain accurate resume cursors.
+        // Recover their gaps too, so broadcast repair never resumes from a
+        // cursor whose intervening updates we did not receive.
         let Some(&seen) = self.seqs.get(&query) else {
             return Applied::Gap(query);
         };
@@ -459,6 +462,8 @@ enum ResourceUpdate {
 }
 
 impl ResourceUpdate {
+    /// On error the caller must discard the session state without publishing.
+    /// Snapshot application can have cleared or partially rebuilt its scope.
     fn apply(self, state: &mut ConnectorState) -> Result<(), String> {
         match self {
             Self::Delta(envelope) => state.apply_resource_records(&envelope),

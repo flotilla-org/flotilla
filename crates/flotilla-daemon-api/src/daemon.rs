@@ -73,9 +73,9 @@ pub trait DaemonHandle: Send + Sync {
 
     /// Replay current state for selected queries, preserving subscription membership.
     /// Returns full sets for stale/absent cursors and nothing for current cursors.
-    async fn recover_queries(&self, _queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
-        Err("query recovery is unsupported".into())
-    }
+    /// Any missing materialization fails the whole request; callers must not
+    /// publish a partial recovery. Recovery does not recreate subscription demand.
+    async fn recover_queries(&self, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String>;
 
     /// Remove a subscriber and tear down demand-backed materializations that
     /// no longer have an owner. Socket transports call this on disconnect;
