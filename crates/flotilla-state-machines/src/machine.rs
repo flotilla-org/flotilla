@@ -107,7 +107,10 @@ impl<M: Machine, A: EdgeArg<Edge = M::Edge>> EdgeDef<M, A> {
     /// The data this edge changes: each datum of the next state that is new
     /// or holds another value. Changing an undeclared datum is a declaration
     /// fault, so an edge into a label that carries data names the data it
-    /// writes there, even when the label changes too.
+    /// writes there, even when the label changes too. A datum carried into
+    /// the next label with the same value is not a change (`Armed { shots: 1 }`
+    /// to `Spent { shots: 1 }`), and data the next label does not carry goes
+    /// with the old label.
     pub fn changes(mut self, data: impl IntoIterator<Item = &'static str>) -> Self {
         self.changes.extend(data);
         self
