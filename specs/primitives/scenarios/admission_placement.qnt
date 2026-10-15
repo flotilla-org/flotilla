@@ -1,4 +1,5 @@
 module admission_placement {
+  // If these bounds grow, re-check complete TLC and coverage in symbolic.sh.
   import convoy(IDS = Set(1, 2)) as C from "../machines/convoy"
   import vessel(IDS = Set(1, 2, 3)) as V from "../machines/vessel"
   val ids = Set(1, 2, 3)
