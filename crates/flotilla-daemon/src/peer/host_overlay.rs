@@ -5,6 +5,7 @@ use flotilla_protocol::{
 };
 use std::collections::HashMap;
 use tokio::sync::RwLock;
+
 #[derive(Default)]
 pub struct HostPeerOverlay {
     node_connectivity: RwLock<HashMap<NodeId, PeerConnectionState>>,
@@ -12,6 +13,7 @@ pub struct HostPeerOverlay {
     topology_routes: RwLock<Vec<TopologyRoute>>,
     peer_identities: RwLock<HashMap<EnvironmentId, HostIdentity>>,
 }
+
 impl PeerOverlay for HostPeerOverlay {
     fn node_connectivity(&self) -> &RwLock<HashMap<NodeId, PeerConnectionState>> {
         &self.node_connectivity
