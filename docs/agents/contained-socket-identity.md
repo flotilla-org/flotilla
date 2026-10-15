@@ -64,6 +64,45 @@ Neither change requires a resource schema migration or new out-of-repository
 manifest inputs. The stored-record golden corpus must continue to decode
 unchanged.
 
+## Caller claims after #3271
+
+Environment sockets and new-style container callers on the main socket check
+all supplied identity claims: namespace, convoy, vessel resource reference,
+role, crew ID and TerminalSession. Placement alone supplies identity when there
+is exactly one placed crew, including for a shell or tool with a scrubbed
+environment. Claims may narrow placed sessions but never widen this authority.
+Disagreement returns `CallerIdentityMismatch` and logs a refusal; multiple
+remaining sessions return `CallerIdentityAmbiguous`. Environment connections
+resolve placement on every request. Main-socket container callers use the kernel
+cgroup ID and an indexed lookup of `status.runtime_observation.container_id`.
+The separate `status.docker_container_id` field is a Docker actuation name, not
+this immutable ID. Nested cgroups retain their container ID and hexadecimal IDs
+normalize to lowercase.
+
+Host-direct crews remain unchanged and continue to use the older identity path
+from process variables. Their lack of an isolation boundary is explicitly out
+of scope. A host CLI without crew variables remains a host principal. No new
+operator impersonation override is introduced. HTTP token authority and peer
+handshakes retain their existing paths. A transport-bound caller's Hello cannot
+replace its resolved principal; host-direct and legacy surfaces keep their
+previous declaration behavior.
+
+Vessels provisioned before #3270 retain their old mounts and identity path until
+they end. Kernel device/inode identity proves that the caller still mounts
+this daemon's original run directory. New-style mounts instead use the dedicated environment
+socket directory, validated through the kernel mount table. This works immediately
+after restart, independently of controller adoption or newly created socket
+listeners; caller variables cannot select the compatibility path. The code has
+a removal comment: delete this contained compatibility branch once no pre-#3270
+vessels remain. Host-direct compatibility is a separate out-of-scope path.
+
+Unknown container placements, unavailable peer credentials (on any platform),
+unreadable Linux cgroups or mount tables, and malformed mount evidence refuse
+with `CallerIdentityUnavailable`, rather than guessing that a container is a
+legacy vessel or a host. A process exiting before `/proc` evidence is read can
+therefore receive a named refusal; the warning log identifies this case. The
+Environment lookup index changes no serialized records or authored inputs.
+
 ## Project supervisors
 
 A live project role holder whose resolved role definition subscribes to
@@ -79,3 +118,9 @@ remain refused. Dispatch-board, queue and fleet reads are pinned to the bound
 project. Stall reads filter rows to that project and recompute shared-cause
 counts after filtering. Forced settlement and host administration remain outside
 the contained supervisor interface.
+
+Compatibility removal is tracked in #3279. If both a legacy main-directory mount and a dedicated environment socket mount are present, environment-bound identity wins; the extra legacy mount cannot enable variable-derived identity. The short-lived-peer race also applies between reading mountinfo and statting `/proc/<pid>/root`: disappearing evidence produces `CallerIdentityUnavailable` without a downgrade.
+
+Peer credentials capture a PID at accept, while later `/proc` evidence reads use that PID rather than a pinned kernel process handle. A peer that exits and has its PID reused leaves a narrow pre-existing evidence race; the mechanism does not guarantee process-instance pinning. Missing or disappearing evidence still refuses.
+
+Contained peers must expose the canonical `/run/flotilla-daemon` mount; alternate main-socket access without that directory is unsupported and refuses. Mount-root verification expects the dedicated hash directory source used by Docker bind mounts. Unrecognized btrfs subvolume or Docker Desktop mount-root forms fail closed with a mount mismatch; octal escapes elsewhere do not affect the hash directory name. Nested Docker-in-Docker cgroups select the outermost container, the provisioned vessel socket boundary.

@@ -345,8 +345,7 @@ impl DaemonServer {
                     tokio::select! {
                         result = listener.accept() => match result {
                             Ok((stream, _)) => {
-                                let caller = caller::caller_from_peer(caller::socket_peer_credential(&stream), &daemon.provisioning_namespace().await);
-                                let role = caller.crew.map(|crew| crew.role);
+                                let peer = caller::socket_peer_credential(&stream);
                                 let daemon = daemon.clone();
                                 let router = router.clone();
                                 let environment = environment.clone();
@@ -356,7 +355,11 @@ impl DaemonServer {
                                 let lease = EnvironmentClientLease { count: client_count.clone(), notify: client_notify.clone() };
                                 connections.spawn(async move {
                                     let _lease = lease;
-                                    environment_connection::serve(flotilla_transport::message::unix_message_session(stream), daemon, router, environment, role, shutdown).await;
+                                    let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
+                                        Ok(claims) => Some(claims),
+                                        Err(error) => { warn!(%error, "environment peer evidence unavailable"); return; }
+                                    };
+                                    environment_connection::serve(flotilla_transport::message::unix_message_session(stream), daemon, router, environment, claims, shutdown).await;
                                 });
                             }
                             Err(error) => { warn!(%error, "environment socket accept failed"); return; }
@@ -561,7 +564,6 @@ impl DaemonServer {
                     match accept_result {
                         Ok((stream, _addr)) => {
                             accept_error_backoff.reset();
-                            let peer_credential = caller::socket_peer_credential(&stream);
                             let daemon = Arc::clone(&daemon);
                             let client_count = Arc::clone(&client_count);
                             let client_notify = Arc::clone(&client_notify);
@@ -574,10 +576,6 @@ impl DaemonServer {
 
                             let shutdown_request_tx = shutdown_request_tx.clone();
                             connection_tasks.spawn(async move {
-                                let namespace = daemon.provisioning_namespace().await;
-                                let caller = tokio::task::spawn_blocking(move || caller::caller_from_peer(peer_credential, &namespace))
-                                    .await
-                                    .ok();
                                 handle_client_with_caller(
                                     stream,
                                     daemon,
@@ -591,7 +589,7 @@ impl DaemonServer {
                                     peer_connected_tx,
                                     agent_state_store,
                                     None,
-                                    caller,
+                                    None,
                                 )
                                 .await;
                             });
@@ -783,7 +781,9 @@ async fn handle_client_with_caller(
             return;
         }
     }
-    handle_client_session_with_caller(
+    let peer = caller::socket_peer_credential(&stream);
+    let socket_path = stream.local_addr().ok().and_then(|address| address.as_pathname().map(Path::to_path_buf));
+    handle_client_session_with_identity(
         unix_message_session_with_prefix(stream, first_byte.to_vec()),
         daemon,
         shutdown_request_tx,
@@ -796,7 +796,7 @@ async fn handle_client_with_caller(
         peer_connected_tx,
         agent_state_store,
         environment_context,
-        caller,
+        caller.map_or(CallerIdentity::UnixPeer { peer, socket_path }, |caller| CallerIdentity::Supplied(Some(Box::new(caller)))),
     )
     .await;
 }
@@ -840,7 +840,7 @@ pub async fn handle_client_session_with_caller(
     session: MessageSession,
     daemon: Arc<InProcessDaemon>,
     shutdown_request_tx: mpsc::UnboundedSender<()>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
     inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     peer_manager: Arc<Mutex<PeerManager>>,
     remote_command_router: RemoteCommandRouter,
@@ -850,6 +850,56 @@ pub async fn handle_client_session_with_caller(
     agent_state_store: SharedAgentStateStore,
     environment_context: Option<EnvironmentId>,
     caller: Option<flotilla_protocol::CommandCaller>,
+) {
+    handle_client_session_with_identity(
+        session,
+        daemon,
+        shutdown_request_tx,
+        shutdown_rx,
+        inbound_peer_tx,
+        peer_manager,
+        remote_command_router,
+        client_count,
+        client_notify,
+        peer_connected_tx,
+        agent_state_store,
+        environment_context,
+        CallerIdentity::Supplied(caller.map(Box::new)),
+    )
+    .await;
+}
+
+fn bind_surface_principal(
+    surface: &mut flotilla_protocol::SurfaceDeclaration,
+    caller: &flotilla_protocol::CommandCaller,
+    transport_bound: bool,
+) {
+    if transport_bound {
+        surface.principal_ref = caller.principal_ref.clone();
+    }
+}
+
+enum CallerIdentity {
+    // In-process callers have already crossed their authentication boundary.
+    Supplied(Option<Box<flotilla_protocol::CommandCaller>>),
+    UnixPeer { peer: Option<caller::PeerCredential>, socket_path: Option<PathBuf> },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_session_with_identity(
+    session: MessageSession,
+    daemon: Arc<InProcessDaemon>,
+    shutdown_request_tx: mpsc::UnboundedSender<()>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
+    peer_manager: Arc<Mutex<PeerManager>>,
+    remote_command_router: RemoteCommandRouter,
+    client_count: Arc<AtomicUsize>,
+    client_notify: Arc<Notify>,
+    peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
+    agent_state_store: SharedAgentStateStore,
+    environment_context: Option<EnvironmentId>,
+    identity: CallerIdentity,
 ) {
     let session = Arc::new(session);
     let first_msg = tokio::select! {
@@ -883,6 +933,41 @@ pub async fn handle_client_session_with_caller(
             }
 
             if connection_role == Some(ConnectionRole::Client) {
+                // Only framed clients use crew identity. Peer and HTTP authority
+                // remain on their existing transport-specific paths.
+                let (caller, transport_bound) = match identity {
+                    CallerIdentity::UnixPeer { peer, socket_path } => {
+                        let namespace = daemon.provisioning_namespace().await;
+                        let evidence = tokio::task::spawn_blocking(move || {
+                            let claims = caller::claims_from_peer(peer);
+                            let caller = caller::caller_from_peer(peer, &namespace)?;
+                            let mounts = caller
+                                .process
+                                .as_ref()
+                                .filter(|process| process.container.is_some())
+                                .map(|process| caller::peer_mounts(process.pid, socket_path.as_deref()))
+                                .transpose()?;
+                            Ok::<_, String>((caller, claims, mounts))
+                        })
+                        .await;
+                        let resolved = match evidence {
+                            Ok(Ok((evidence, claims, mounts))) => {
+                                caller::resolve_main_caller(&daemon, evidence, &claims, mounts.as_ref()).await
+                            }
+                            Ok(Err(error)) => Err(error),
+                            Err(error) => Err(format!("CallerIdentityUnavailable: {error}")),
+                        };
+                        match resolved {
+                            Ok(resolution) => (Some(resolution.caller), resolution.transport_bound),
+                            Err(error) => {
+                                warn!(%error, "main socket caller refused");
+                                let _ = session.write(Message::error_response(0, error)).await;
+                                return;
+                            }
+                        }
+                    }
+                    CallerIdentity::Supplied(caller) => (caller.map(|caller| *caller), false),
+                };
                 // Stateful client handshake: reply with server Hello, then enter
                 // stateful client loop (session_id used for cursor ownership).
                 // The reply is sent even on a generation/version mismatch so
@@ -920,12 +1005,13 @@ pub async fn handle_client_session_with_caller(
                     run_shutdown_only_session(&session, &shutdown_request_tx, &mut shutdown_rx).await;
                     return;
                 }
-                let surface = match surface {
+                let mut surface = match surface {
                     Some(surface) => surface,
                     None => flotilla_protocol::SurfaceDeclaration::focal_for_namespace(daemon.provisioning_namespace().await),
                 };
                 let caller = caller
                     .map(|mut caller| {
+                        bind_surface_principal(&mut surface, &caller, transport_bound);
                         caller.principal_ref = surface.principal_ref.clone();
                         caller
                     })

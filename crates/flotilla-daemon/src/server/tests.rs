@@ -3969,6 +3969,39 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
     assert_eq!(client_count.load(Ordering::SeqCst), 0, "request client should be removed after disconnect");
 }
 
+// A named identity refusal must reach the client's handshake, rather than an
+// unmatched response after Hello that the request multiplexer would discard.
+#[tokio::test]
+async fn unavailable_main_peer_reports_named_error_before_hello() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
+    let pm = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, _shutdown_requests) = mpsc::unbounded_channel();
+    let (peer_connected_tx, _peer_connected) = mpsc::unbounded_channel();
+    let (client, server) = message_session_pair();
+    let router = empty_remote_command_router(&daemon, &pm);
+    let task = tokio::spawn(super::handle_client_session_with_identity(
+        server,
+        daemon,
+        shutdown_request_tx,
+        shutdown_rx,
+        peer_data_tx,
+        pm,
+        router,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(Notify::new()),
+        peer_connected_tx,
+        flotilla_agent::shared_in_memory_agent_state_store(),
+        None,
+        super::CallerIdentity::UnixPeer { peer: None, socket_path: None },
+    ));
+    client.write(current_client_hello()).await.unwrap();
+    let Message::Response { response, .. } = read_session_message(&client).await else { panic!("identity refusal precedes Hello") };
+    assert!(matches!(*response, ResponseResult::Err { message } if message.starts_with("CallerIdentityUnavailable:")));
+    task.await.unwrap();
+}
+
 #[tokio::test]
 async fn handle_client_session_dispatches_request_messages() {
     let (_tmp, daemon) = empty_daemon().await;
@@ -5547,10 +5580,7 @@ async fn failed_connection_tasks_are_reaped() {
     assert!(tasks.is_empty());
 }
 
-// #3270: the transport's environment constrains every request, independently of
-// command context. Exercise the real store and dispatcher over in-memory framing.
-#[tokio::test]
-async fn environment_transport_refuses_other_convoy_and_host_commands() {
+async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     let (_tmp, daemon) = empty_daemon().await;
     let backend = daemon.resource_backend();
     let convoys = backend.using::<Convoy>("flotilla");
@@ -5602,7 +5632,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         .create(
             &InputMeta::builder().name("placed-session".into()).build(),
             &TerminalSessionSpec {
-                env_ref: "placed-environment".into(),
+                env_ref: environment.into(),
                 role: "coder".into(),
                 cwd: "/workspace".into(),
                 pool: "cleat".into(),
@@ -5634,6 +5664,16 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         )
         .await
         .expect("crew identity");
+    (_tmp, daemon)
+}
+
+// #3270: the transport's environment constrains every request, independently of
+// command context. Exercise the real store and dispatcher over in-memory framing.
+#[tokio::test]
+async fn environment_transport_refuses_other_convoy_and_host_commands() {
+    let (_tmp, daemon) = placed_crew_daemon("placed-environment").await;
+    let backend = daemon.resource_backend();
+    let convoys = backend.using::<Convoy>("flotilla");
     let pm = Arc::new(Mutex::new(PeerManager::new(daemon.node_id().clone())));
     // CallerCrew.vessel is the resource reference used by artifact attribution,
     // not the within-convoy vessel display name.
@@ -5641,6 +5681,94 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         .await
         .expect("placement identity");
     assert_eq!(crews[0].vessel, "placed-vessel");
+    // #3271: real indexed placement maps a kernel-derived container identity;
+    // new-style container claims never select a crew outside that environment.
+    let environments = backend.using::<flotilla_resources::Environment>("flotilla");
+    let environment = environments
+        .create(
+            &InputMeta::builder().name("placed-environment".into()).build(),
+            &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
+                serde_json::json!({"docker": {"host_ref": "host", "image": "image"}}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    environments
+        .update_status(
+            "placed-environment",
+            &environment.metadata.resource_version,
+            &flotilla_resources::EnvironmentStatus {
+                docker_container_id: Some("actuation-container-name".into()),
+                runtime_observation: Some(flotilla_protocol::EnvironmentRuntimeObservation {
+                    container_id: Some("kernel-container".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mounts = caller_mountinfo(&EnvironmentId::new("placed-environment"), true);
+    let evidence = flotilla_protocol::CommandCaller {
+        principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
+        process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).container("kernel-container".into()).build()),
+        crew: None,
+    };
+    let claims = std::collections::HashMap::from([
+        ("FLOTILLA_NAMESPACE".into(), "flotilla".into()),
+        ("FLOTILLA_CONVOY".into(), "own".into()),
+        ("FLOTILLA_VESSEL".into(), "placed-vessel".into()),
+        ("FLOTILLA_CREW_ROLE".into(), "coder".into()),
+        ("FLOTILLA_CREW_ID".into(), "placed-crew".into()),
+        ("FLOTILLA_TERMINAL_SESSION".into(), "placed-session".into()),
+    ]);
+    let resolved = super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&mounts)).await.unwrap();
+    assert!(resolved.transport_bound);
+    assert_eq!(resolved.caller.crew.as_ref().unwrap(), &crews[0]);
+    for key in claims.keys() {
+        let mut forged = claims.clone();
+        forged.insert(key.clone(), "other".into());
+        assert!(super::caller::resolve_main_caller(&daemon, evidence.clone(), &forged, Some(&mounts))
+            .await
+            .unwrap_err()
+            .starts_with("CallerIdentityMismatch:"));
+    }
+    let mut host = evidence.clone();
+    host.process.as_mut().unwrap().container = None;
+    let host = super::caller::resolve_main_caller(&daemon, host, &claims, None).await.unwrap();
+    assert!(!host.transport_bound);
+    assert_eq!(host.caller.crew.as_ref(), Some(&crews[0]));
+    for identity in ["unknown", "actuation-container-name"] {
+        let mut unknown = evidence.clone();
+        unknown.process.as_mut().unwrap().container = Some(identity.into());
+        assert!(super::caller::resolve_main_caller(&daemon, unknown, &claims, Some(&mounts))
+            .await
+            .unwrap_err()
+            .starts_with("CallerIdentityUnavailable:"));
+    }
+
+    // Environment binding checks all process claims too, before dispatching.
+    let mut forged = claims.clone();
+    forged.insert("FLOTILLA_CONVOY".into(), "other".into());
+    let (forged_client, forged_server) = message_session_pair();
+    let (_forged_shutdown, forged_rx) = watch::channel(false);
+    let forged_task = tokio::spawn(super::environment_connection::serve(
+        forged_server,
+        daemon.clone(),
+        empty_remote_command_router(&daemon, &pm),
+        EnvironmentId::new("placed-environment"),
+        Some(forged),
+        forged_rx,
+    ));
+    complete_client_hello(&forged_client).await;
+    forged_client.write(Message::Request { id: 44, request: Request::GetStatus }).await.unwrap();
+    let Message::Response { id, response } = read_session_message(&forged_client).await else { panic!("expected refusal") };
+    assert_eq!(id, 44);
+    assert!(matches!(*response, ResponseResult::Err { message } if message.starts_with("CallerIdentityMismatch:")));
+    drop(forged_client);
+    forged_task.await.unwrap();
+
     let router = empty_remote_command_router(&daemon, &pm);
     router.install_blob_store(Arc::new(crate::blob_store::TieredBlobStore::new(_tmp.path(), Vec::new()))).unwrap();
     let (_shutdown, shutdown_rx) = watch::channel(false);
@@ -5650,7 +5778,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         daemon,
         router,
         EnvironmentId::new("placed-environment"),
-        None,
+        Some(claims),
         shutdown_rx,
     ));
     complete_client_hello(&client).await;
@@ -5985,4 +6113,236 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     assert!(super::environment_supervision::authorize(&daemon, &mut read, &ordinary).await.is_err());
     ensures.delete("holder").await.unwrap();
     assert!(super::environment_supervision::authorize(&daemon, &mut read, &crew).await.is_err(), "retired role binding loses authority");
+}
+
+fn caller_mountinfo(environment: &EnvironmentId, bound: bool) -> super::caller::PeerMounts {
+    // Kernel mount-table boundary: bind roots distinguish the old run directory
+    // from the dedicated per-environment socket directory without Docker.
+    let source = if bound {
+        format!("/daemon/flotilla.env/{}", super::environment_sockets::directory_name(environment))
+    } else {
+        "/daemon/run".into()
+    };
+    super::caller::PeerMounts {
+        mountinfo: format!("1 0 0:1 / / rw - overlay overlay rw\n2 1 8:1 {source} /run/flotilla-daemon rw - ext4 /dev/example rw\n"),
+        legacy_main_directory: !bound,
+    }
+}
+
+fn placed_caller_claims() -> HashMap<String, String> {
+    HashMap::from([
+        ("FLOTILLA_NAMESPACE".into(), "flotilla".into()),
+        ("FLOTILLA_CONVOY".into(), "own".into()),
+        ("FLOTILLA_VESSEL".into(), "placed-vessel".into()),
+        ("FLOTILLA_CREW_ROLE".into(), "coder".into()),
+        ("FLOTILLA_CREW_ID".into(), "placed-crew".into()),
+        ("FLOTILLA_TERMINAL_SESSION".into(), "placed-session".into()),
+    ])
+}
+
+async fn caller_can_stall_and_complete(daemon: &InProcessDaemon, caller: flotilla_protocol::CommandCaller) {
+    let backend = daemon.resource_backend();
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys.get("own").await.unwrap();
+    let mut status = convoy.status.unwrap();
+    let coder = &mut status.workflow_snapshot.as_mut().unwrap().vessels[0].crew[0];
+    // This identity scenario has no PR deliverable. It still supplies real
+    // admitted ledger metadata, so completion exercises the normal lifecycle.
+    coder.deliverer = false;
+    coder.completion_conditions.clear();
+    coder.promises.clear();
+    convoys.update_status("own", &convoy.metadata.resource_version, &status).await.unwrap();
+    let name = flotilla_resources::artifact_record_name("own", "coder", "decision-ledger", "own");
+    backend
+        .using::<flotilla_resources::Artifact>("flotilla")
+        .create(
+            &InputMeta::builder().name(name).build(),
+            &flotilla_resources::ArtifactSpec::builder()
+                .convoy("own".into())
+                .producer("coder".into())
+                .kind("decision-ledger".into())
+                .subject("own".into())
+                .digest("admitted-ledger".into())
+                .size(1)
+                .media_type("text/markdown".into())
+                .expires_at(chrono::Utc::now() + chrono::Duration::days(1))
+                .build(),
+        )
+        .await
+        .unwrap();
+    let context = CrewCommandContext { crew_id: caller.crew.as_ref().map(|crew| crew.crew_id.clone()), ..Default::default() };
+    for action in [
+        CommandAction::CrewStall {
+            context: context.clone(),
+            reason: flotilla_protocol::StallReason::Other,
+            proposed_disposition: None,
+            message: "waiting for dependency".into(),
+        },
+        CommandAction::CrewComplete { context, message: Some("done".into()), disposition: None, decision_ledger_ref: None, force: false },
+    ] {
+        let stalling = matches!(action, CommandAction::CrewStall { .. });
+        let mut events = daemon.subscribe();
+        let id = daemon.execute_for_caller(Command::builder().action(action).build(), Some(caller.clone())).await.unwrap();
+        let event = super::environment_connection::command_completion(&mut events, id).await.unwrap();
+        assert!(matches!(event, DaemonEvent::CommandFinished { result: flotilla_protocol::CommandValue::Ok, .. }), "{event:?}");
+        let status = convoys.get("own").await.unwrap().status.unwrap();
+        let work = &status.crew_work["work"]["coder"];
+        if stalling {
+            assert_eq!(work.phase, flotilla_resources::CrewWorkPhase::Stalled);
+        } else {
+            assert_eq!(work.phase, flotilla_resources::CrewWorkPhase::Done);
+        }
+    }
+}
+
+// Host-direct is out of scope: keep its existing variable-derived crew identity
+// and prove both stall and completion still persist through the real lifecycle.
+#[tokio::test]
+async fn host_direct_caller_keeps_crew_completion_and_stall() {
+    let (_tmp, daemon) = placed_crew_daemon("host-direct-fixture").await;
+    daemon
+        .resource_backend()
+        .using::<flotilla_resources::Environment>("flotilla")
+        .create(
+            &InputMeta::builder().name("host-direct-fixture".into()).build(),
+            &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
+                serde_json::json!({"host_direct": {"host_ref": "local", "repo_default_dir": "/workspace"}}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let evidence = flotilla_protocol::CommandCaller {
+        principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
+        process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).build()),
+        crew: None,
+    };
+    // A stale container observation on a host-direct record cannot establish
+    // container authority, even when its ID and dedicated mount name match.
+    let environments = daemon.resource_backend().using::<flotilla_resources::Environment>("flotilla");
+    let current = environments.get("host-direct-fixture").await.unwrap();
+    environments
+        .update_status(
+            "host-direct-fixture",
+            &current.metadata.resource_version,
+            &flotilla_resources::EnvironmentStatus {
+                runtime_observation: Some(flotilla_protocol::EnvironmentRuntimeObservation {
+                    container_id: Some("stale-container".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut contained = evidence.clone();
+    contained.process.as_mut().unwrap().container = Some("stale-container".into());
+    let mounts = caller_mountinfo(&EnvironmentId::new("host-direct-fixture"), true);
+    for claims in [Default::default(), placed_caller_claims()] {
+        assert_eq!(
+            super::caller::resolve_main_caller(&daemon, contained.clone(), &claims, Some(&mounts)).await.unwrap_err(),
+            "CallerIdentityUnavailable: container has no placed environment"
+        );
+    }
+    let resolution = super::caller::resolve_main_caller(&daemon, evidence, &placed_caller_claims(), None).await.unwrap();
+    assert!(!resolution.transport_bound);
+    assert_eq!(resolution.caller.crew.as_ref().unwrap().crew_id, "placed-crew");
+    caller_can_stall_and_complete(&daemon, resolution.caller).await;
+}
+
+// A pre-#3270 mount set continues to work independently of socket adoption.
+// The same caller with a new socket mount must take the strict identity path.
+#[tokio::test]
+async fn legacy_mount_caller_keeps_working_until_vessel_ends() {
+    let (_tmp, daemon) = placed_crew_daemon("placed-environment").await;
+    let backend = daemon.resource_backend();
+    let environments = backend.using::<flotilla_resources::Environment>("flotilla");
+    let created = environments
+        .create(
+            &InputMeta::builder().name("placed-environment".into()).build(),
+            &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
+                serde_json::json!({"docker": {"host_ref": "host", "image": "image"}}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    environments
+        .update_status(
+            "placed-environment",
+            &created.metadata.resource_version,
+            &flotilla_resources::EnvironmentStatus { docker_container_id: Some("actuation-container-name".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    let evidence = flotilla_protocol::CommandCaller {
+        principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
+        process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).container("kernel-container".into()).build()),
+        crew: None,
+    };
+    let claims = placed_caller_claims();
+    let environment = EnvironmentId::new("placed-environment");
+    let old_mounts = caller_mountinfo(&environment, false);
+    let legacy = super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&old_mounts)).await.unwrap();
+    assert!(!legacy.transport_bound);
+    caller_can_stall_and_complete(&daemon, legacy.caller).await;
+    // Legacy operation did not need an inspected ID (as at first restart).
+    // Once inspection is available, its immutable ID enables the strict path;
+    // the Docker actuation name deliberately remains a different value.
+    let current = environments.get("placed-environment").await.unwrap();
+    let mut status = current.status.unwrap();
+    assert!(status.runtime_observation.is_none());
+    status.runtime_observation =
+        Some(flotilla_protocol::EnvironmentRuntimeObservation { container_id: Some("kernel-container".into()), ..Default::default() });
+    environments.update_status("placed-environment", &current.metadata.resource_version, &status).await.unwrap();
+    let new_mounts = caller_mountinfo(&environment, true);
+    let bound = super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&new_mounts)).await.unwrap();
+    assert!(bound.transport_bound);
+    let mut forged = claims.clone();
+    forged.insert("FLOTILLA_CREW_ID".into(), "other".into());
+    assert!(super::caller::resolve_main_caller(&daemon, evidence.clone(), &forged, Some(&new_mounts))
+        .await
+        .unwrap_err()
+        .starts_with("CallerIdentityMismatch:"));
+    // A mixed mount table is new-style: adding legacy main-directory evidence
+    // must never downgrade mounted environment-socket authority.
+    let mut mixed = caller_mountinfo(&environment, true);
+    mixed.mountinfo.push('\n');
+    mixed.mountinfo.push_str(&caller_mountinfo(&environment, false).mountinfo);
+    mixed.legacy_main_directory = true;
+    assert!(super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&mixed)).await.unwrap().transport_bound);
+    assert!(super::caller::resolve_main_caller(&daemon, evidence.clone(), &forged, Some(&mixed))
+        .await
+        .unwrap_err()
+        .starts_with("CallerIdentityMismatch:"));
+    let mut unproven = caller_mountinfo(&environment, false);
+    unproven.legacy_main_directory = false;
+    assert!(super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&unproven))
+        .await
+        .unwrap_err()
+        .starts_with("CallerIdentityMismatch:"));
+    for mounts in [None, Some(""), Some("malformed")] {
+        let mounts = mounts.map(|mountinfo| super::caller::PeerMounts { mountinfo: mountinfo.into(), legacy_main_directory: false });
+        assert!(super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, mounts.as_ref())
+            .await
+            .unwrap_err()
+            .starts_with("CallerIdentityUnavailable:"));
+    }
+}
+
+// A client Hello cannot replace a transport-bound principal. Host-direct and
+// transitional legacy callers retain their previous surface declaration path.
+#[test]
+fn bound_caller_surface_cannot_replace_principal() {
+    let caller = flotilla_protocol::CommandCaller {
+        principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
+        process: None,
+        crew: None,
+    };
+    for bound in [false, true] {
+        let mut surface = flotilla_protocol::SurfaceDeclaration::focal_for_namespace("forged");
+        let declared = surface.principal_ref.clone();
+        super::bind_surface_principal(&mut surface, &caller, bound);
+        assert_eq!(surface.principal_ref, if bound { caller.principal_ref.clone() } else { declared });
+    }
 }
