@@ -13,7 +13,7 @@ flotilla-resources = { path = "../flotilla-resources" }
 flotilla-tls = { path = "../flotilla-tls" }
 reqwest = { workspace = true, features = ["json"] }
 serde_json.workspace = true
-urlencoding = "2"
+urlencoding.workspace = true
 tracing.workspace = true
 dirs = "6"
 
