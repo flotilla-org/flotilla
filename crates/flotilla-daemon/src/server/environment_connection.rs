@@ -71,6 +71,8 @@ fn authorize_context(context: &mut CrewCommandContext, crew: &CallerCrew) -> Res
 }
 
 pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), String> {
+    // New crew operations are denied until explicitly added to this allowlist
+    // with validation against the transport-bound identity.
     match request {
         Request::Execute { command } => {
             if command.node_id.is_some() || command.provisioning_target.is_some() || command.context_repo.is_some() {
