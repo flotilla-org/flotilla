@@ -1,7 +1,7 @@
 # 66. Addresses name things by natural key, in one typed-segment grammar
 
 **Status:** Proposed (owner grilling, 2026-10-15 and 2026-10-16; #3350)
-**Date:** 2026-10-15
+**Date:** 2026-10-15, amended 2026-10-16 (§8, owner rulings on artifacts, work and usage)
 **Amends:**
 - [ADR 0047](0047-stored-data-stays-decodable-across-one-generation.md): a stored-data shim retires only after an explicit re-encode step has run on every host.
 - [ADR 0064](0064-primitives-model-resources-records-gated-machines-inboxes.md): its typed-segment inbox addresses become the grammar for every address, receivers and things alike.
@@ -72,7 +72,7 @@ Every address is a list of `kind:value` segments over a closed kind enum. Receiv
   - Hex digits are uppercase (`%2F`, never `%2f`).
   - The parser refuses non-canonical input in stored data. Lenient input is canonicalised first; see below.
 - **The kind enum is closed.** Adding a kind changes the parser. Under ADR 0047 that is fine, but it is a deliberate change, not an extension point.
-- **The path shows ownership.** "Everything in this convoy" or "everything under this repo" is a prefix match **on segment boundaries**. `X` is under `P` when `X = P` or `X` starts with `P/`. A raw string prefix is wrong: `…/convoy:demo` must not match `…/convoy:demo2`. Queries use `= P OR (>= P || '/' AND < P || '0')`, since `0` is the byte after `/`.
+- **The path shows ownership.** "Everything in this convoy" or "everything under this repo" is a prefix match **on segment boundaries**. `X` is under `P` when `X = P` or `X` starts with `P/`. A raw string prefix is wrong: `…/convoy:demo` must not match `…/convoy:demo2`. Queries use `= P OR (>= P || '/' AND < P || '0')`, since `0` is the byte after `/`. The bound is sound because no canonical value ever contains a bare `/`, which is always encoded, so every address under `P` begins exactly `P/`.
 
 ```
 project:flotilla/convoy:demo/role:coder                     a convoy role's inbox (ADR 0064)
@@ -94,7 +94,7 @@ forge:github/repo:flotilla-org%2Fflotilla/commit:<sha>      a commit (the full 4
 ### 5. Storage: interned canonical text
 
 - **Interned canonical text.** In Rust an address is a typed value. It is stored as its canonical print through the storage derive's `#[store(intern)]`, as one integer column into the `strings` table. Equality is integer equality, and a prefix query is a range scan on the intern table's unique index. That index must use byte-wise (`BINARY`) collation, which the segment-prefix range query in §4 depends on.
-- **Address or `Ref`.** A field means "the thing named this", which may not exist or may be outside flotilla, holds an Address. A field means "this stored record, which must exist" holds a `Ref` foreign key.
+- **Address or `Ref`.** A field naming a thing that may not exist, or may be outside flotilla, holds an Address. A field naming a stored record that must exist holds a `Ref` foreign key.
 - **The canonical printer is part of the stored shape.** Interned rows are keyed by the canonical print, so any change to it is a stored-shape change. That includes a new escape rule or a normalisation fix like #3351. Before the cut-over it needs the re-encode step (§6); after it, an explicit migration step.
 - **Unused intern entries are cleaned up later.** That is part of archiving: a reference-count or distinct query over the live set, then removing unreferenced intern rows.
 
@@ -132,6 +132,10 @@ For those kinds a shim never actually becomes removable, and the roll-time live 
   - The artifact record is a named **slot** pointing at the current file. Publishing to the same slot stores the new file and moves the pointer. Files no longer referenced are swept (`reap_expired`, `crates/flotilla-daemon/src/artifact.rs`).
   - Code finds artifacts by slot ("the coder's brief", "the convoy's decision ledger", "the reviewer's review round for this head"), so the slot is what an address names. This is the same pattern as a branch name pointing at a commit, or a container tag pointing at an image digest.
   - A slot sits under the role that produces it: `project:P/convoy:C/role:reviewer/artifact:review-round/of:<subject>`. Each artifact kind declares what its subject means; a review round's subject is a commit.
+  - **How `of:` is encoded.** An artifact address always ends `artifact:<kind>/of:<subject>`. The `of` segment belongs to the artifact's grammar; it is not a kind of its own. Its value is one percent-encoded value like any other.
+    - When the kind's subject is a plain key, such as a convoy name, the value is that key.
+    - When the subject is itself an address, such as a commit, the value is the subject's canonical text encoded as one value, so its `/` and `:` become `%2F` and `%3A`. For example: `…/artifact:review-round/of:forge%3Agithub%2Frepo%3Aflotilla-org%252Fflotilla%2Fcommit%3A<sha>`.
+    - Decoding the value yields the subject's canonical text, which then parses as an address.
   - A reference that pins an exact version adds the digest as its revision.
   - Image-build logs, which today have no convoy and no role and are named outside the artifact scheme (`crates/flotilla-daemon/src/image_build.rs`), need an owning role or root when they move to this scheme.
 - **There is no `work` kind.**
