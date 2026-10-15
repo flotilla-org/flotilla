@@ -76,6 +76,11 @@ class DependencyCacheTests(unittest.TestCase):
         self.assertLess(workflow.index('Fetch pinned dependency inputs'), workflow.index('Restore dependency'))
         self.assertLess(workflow.index('dependency_cache.py prune sources'), workflow.index('actions/cache/save@'))
         self.assertNotIn('fleet-linux-v1-', workflow)
+        # The builder overrides Cleat's pin with Flotilla's compiler; pruning
+        # must use that same installed compiler even when the pins differ.
+        prune_step = workflow.split('      - name: Prune workspace artifacts before caching', 1)[1].split('      - name: Save dependency', 1)[0]
+        self.assertIn('export RUSTUP_TOOLCHAIN="$(read_rust_pin "$PWD/sources/flotilla/rust-toolchain.toml")"', prune_step)
+        self.assertLess(prune_step.index('export RUSTUP_TOOLCHAIN='), prune_step.index('dependency_cache.py prune sources'))
 
 
 if __name__ == '__main__':

@@ -376,14 +376,19 @@ real-host acceptance is performed after merge.
 
 The `fleet-linux-v2-` key hashes both selected source trees' `Cargo.lock` and
 `rust-toolchain.toml` files plus Cleat's `tools/ghostty-toolchain.toml` (Zig and
-Ghostty pins). Sources are fetched before restore; source commit IDs and skill
+Ghostty pins). Cleat's Rust pin is a conservative extra input: the coordinated
+build and cache pruning both override it with the selected Flotilla Rust pin.
+This avoids downloading Cleat's potentially different compiler just to prune.
+Sources are fetched before restore; source commit IDs and skill
 revisions do not enter the key. Missing inputs refuse the build rather than
 silently producing a partial key. The v2 restore prefix can seed a changed
 lockfile or pin from the last dependency cache, but only an exact hit skips save.
 
 After a successful candidate build, validation and upload, a cache miss cleans
 all workspace packages in both Cargo profiles and removes incremental output
-before saving. Cargo metadata supplies workspace membership and Cargo owns the
+before saving. Candidate commands use only the native debug and release profiles;
+adding custom profiles or explicit cross targets requires extending pruning and
+its tests. Cargo metadata supplies workspace membership and Cargo owns the
 artifact names; registry/git dependencies and toolchains remain cached. Failed
 or cancelled runs never save a partial cache. Darwin currently has no cache.
 

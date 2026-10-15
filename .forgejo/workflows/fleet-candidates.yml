@@ -128,6 +128,8 @@ jobs:
         run: |
           set -euo pipefail
           source orchestration/ci/fleet-candidates/setup-linux-toolchain.sh
+          # Match build-candidate.sh: Cleat also builds with the Flotilla pin.
+          export RUSTUP_TOOLCHAIN="$(read_rust_pin "$PWD/sources/flotilla/rust-toolchain.toml")"
           python3 orchestration/ci/fleet-candidates/dependency_cache.py prune sources
 
       - name: Save dependency and compiler caches
