@@ -299,6 +299,11 @@ Provider refreshes publish discovered checkout facts into the daemon's ephemeral
 
 Every PR that changes a resource kind's serialized shape must name the out-of-repo sources that author that kind. Update those sources in a companion change, or explicitly state that none exist. Reviewers should verify the statement and the companion change before approval.
 
+**Schema review before build.** Show the owner the resulting schema before work goes beyond the first layer of any change that creates or reshapes generated tables. That covers a new stored kind, a new or changed storage attribute, and a field added to a stored type.
+- Present the schema as a readable view of each table: its column count, which columns come from expanding an enum, and its child tables.
+- Call out any table wider than about 30 columns.
+- Include the DDL snapshot diff, with those numbers, in the PR description.
+
 See [CODING_STANDARDS.md](CODING_STANDARDS.md) for coding conventions and judgement-call standards.
 
 - **Formatting**: `cargo fmt` — uses `max_width=140` and `use_small_heuristics="Max"`. See `rustfmt.toml`.
