@@ -1,6 +1,8 @@
 module convoy_deliver {
   import convoy(IDS = Set(1, 2)) as C from "../machines/convoy"
   var now: int
+  action keepWorld = now' = now
+  action tick = all { now < 1, now' = now + 1 }
   action init = all { C::init, now' = 0 }
   action step = {
     nondet id = Set(1, 2).oneOf()
@@ -11,14 +13,14 @@ module convoy_deliver {
     any {
       all {
         C::admitRequest(id, { project: "project", promises: promises.mapBy(_ => { kind: "opaque", target: "target" }), quota: Map(0 -> 1, 1 -> 1), priority: id }),
-        now' = now,
+        keepWorld,
       },
-      all { C::keep(id, p), now' = now },
-      all { C::acceptRetraction(id, p, auth), now' = now },
-      all { C::deliver(id), now' = now },
-      all { C::abandon(id, auth, reason), now' = now },
-      all { C::readmit(id, Map(0 -> 2, 1 -> 1), auth), now' = now },
-      all { C::unchanged, now < 1, now' = now + 1 },
+      all { C::keep(id, p), keepWorld },
+      all { C::acceptRetraction(id, p, auth), keepWorld },
+      all { C::deliver(id), keepWorld },
+      all { C::abandon(id, auth, reason), keepWorld },
+      all { C::readmit(id, Map(0 -> 2, 1 -> 1), auth), keepWorld },
+      all { C::unchanged, tick },
     }
   }
   val noEmptyConvoys = C::convoys.keys().map(i => C::convoys.get(i)).forall(slot => match slot {
@@ -44,7 +46,7 @@ module convoy_deliver {
   pure val slots = Set(C::Absent).union(works.map(w => Set(C::Present(C::Open(w)), C::Present(C::Delivered(w)), C::Present(C::Abandoned({ work: w, reason: "decision" })))).flatten())
   val inductive = C::convoys.in(Set(1, 2).setOfMaps(slots)) and now.in(Set(0, 1)) and safety
   val view = (C::convoys, now)
-  action deliverReady(id: int): bool = all { C::deliver(id), now' = now }
+  action deliverReady(id: int): bool = all { C::deliver(id), keepWorld }
   temporal liveness = Set(1, 2).forall(id => weakFair(deliverReady(id), view) implies always(
     (match C::convoys.get(id) {
       | Present(s) => match s { | Open(w) => w.promises.keys().map(i => w.promises.get(i)).forall(p => p != C::Pending) | _ => false }

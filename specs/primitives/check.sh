@@ -13,6 +13,9 @@ mkdir -p build
 quint test tests/stream_properties.qnt --backend typescript
 run=$(mktemp -d "$PWD/build/fast.XXXXXX")
 for scenario in convoy_deliver ensure_bind inbox_delivery message_race machine_edges admission_placement; do
+  # Assignment coverage is mandatory even for branches unreachable at depth one.
+  # Simulation/typecheck alone can silently lose an unassigned world variable.
+  quint verify "scenarios/$scenario.qnt" --invariant safety --max-steps 1 > "$run/$scenario.frames.log" 2>&1
   quint compile "scenarios/$scenario.qnt" --target tlaplus --invariant safety > "$run/$scenario.compile.log"
   awk '/^-+ MODULE/{found=1} found' "$run/$scenario.compile.log" > "$run/$scenario.tla"
   printf 'INIT q_init\nNEXT q_step\nINVARIANT q_inv\nVIEW view\n' > "$run/$scenario.cfg"

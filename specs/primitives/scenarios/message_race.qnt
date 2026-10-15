@@ -10,6 +10,9 @@ module message_race {
   val met = (expectation == M::Outcome and S::seen(source, "outcome", 1)) or (expectation == M::Reply and S::seen(source, "reply", 1))
   val dropEvidence = { reason: M::Expired, now: now, bound: true, appliedThrough: S::watermark(source), met: met,
     receipt: S::seen(source, "receipt", 1), noConsumerPastThreshold: false, failure: S::seen(source, "failure", 1), supersedes: true, authorised: true }
+  action keepSource = source' = source
+  action keepClock = now' = now
+  action keepWorld = all { keepSource, keepClock }
   action init = {
     nondet expected = Set(M::Nothing, M::Reply, M::Outcome).oneOf()
     nondet deadline = Set(false, true).oneOf()
@@ -17,27 +20,25 @@ module message_race {
   }
   action publish: bool = {
     nondet kind = Set("outcome", "receipt", "reply", "failure", "keepalive").oneOf()
-    all { source.rows.length() < maxRows, source' = S::publish(source, { at: now, kind: kind, session: 1 }), now' = now }
+    all { source.rows.length() < maxRows, source' = S::publish(source, { at: now, kind: kind, session: 1 }), keepClock }
   }
-  action applySource: bool = all { source' = S::apply(source), now' = now }
-  action disconnect: bool = all { source' = S::link(source, false), now' = now }
-  action connect: bool = all { source' = S::link(source, true), now' = now }
-  action tick: bool = all { source' = source, now' = C::tick(now, 2) }
+  action applySource: bool = all { source' = S::apply(source), keepClock }
+  action disconnect: bool = all { source' = S::link(source, false), keepClock }
+  action connect: bool = all { source' = S::link(source, true), keepClock }
+  action tick: bool = all { keepSource, now' = C::tick(now, 2) }
   action step = {
     // Share the typed drop rule instead of expanding it once per reason in SMT.
     nondet reason = M::dropReasons.oneOf()
     any {
       all {
         M::deliver(1, { observed: S::seen(source, "receipt", 1), receiverMatches: true, transportMatches: true, receiver: { session: 1, host: "consumer" } }),
-        source' = source,
-        now' = now,
+        keepWorld,
       },
       all {
         M::settle(1, if (expectation == M::Reply) M::Answered({ observed: S::seen(source, "reply", 1) }) else M::OutcomeObserved({ observed: S::seen(source, "outcome", 1) })),
-        source' = source,
-        now' = now,
+        keepWorld,
       },
-      all { M::drop(1, { ...dropEvidence, reason: reason }), source' = source, now' = now },
+      all { M::drop(1, { ...dropEvidence, reason: reason }), keepWorld },
       all { publish, M::unchanged },
       all { applySource, M::unchanged },
       all { disconnect, M::unchanged },
@@ -53,8 +54,7 @@ module message_race {
   val view = (M::messages, source, now)
   action settleObserved = all {
     M::settle(1, if (expectation == M::Reply) M::Answered({ observed: S::seen(source, "reply", 1) }) else M::OutcomeObserved({ observed: S::seen(source, "outcome", 1) })),
-    source' = source,
-    now' = now,
+    keepWorld,
   }
   temporal endsAreFinal = always((M::ended(current) implies next(M::messages) == M::messages).orKeep(view))
   temporal liveness = endsAreFinal and (weakFair(settleObserved, view) implies always(
