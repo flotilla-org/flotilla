@@ -3969,6 +3969,39 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
     assert_eq!(client_count.load(Ordering::SeqCst), 0, "request client should be removed after disconnect");
 }
 
+// A named identity refusal must reach the client's handshake, rather than an
+// unmatched response after Hello that the request multiplexer would discard.
+#[tokio::test]
+async fn unavailable_main_peer_reports_named_error_before_hello() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
+    let pm = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, _shutdown_requests) = mpsc::unbounded_channel();
+    let (peer_connected_tx, _peer_connected) = mpsc::unbounded_channel();
+    let (client, server) = message_session_pair();
+    let router = empty_remote_command_router(&daemon, &pm);
+    let task = tokio::spawn(super::handle_client_session_with_identity(
+        server,
+        daemon,
+        shutdown_request_tx,
+        shutdown_rx,
+        peer_data_tx,
+        pm,
+        router,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(Notify::new()),
+        peer_connected_tx,
+        flotilla_agent::shared_in_memory_agent_state_store(),
+        None,
+        super::CallerIdentity::UnixPeer(None),
+    ));
+    client.write(current_client_hello()).await.unwrap();
+    let Message::Response { response, .. } = read_session_message(&client).await else { panic!("identity refusal precedes Hello") };
+    assert!(matches!(*response, ResponseResult::Err { message } if message.starts_with("CallerIdentityUnavailable:")));
+    task.await.unwrap();
+}
+
 #[tokio::test]
 async fn handle_client_session_dispatches_request_messages() {
     let (_tmp, daemon) = empty_daemon().await;
@@ -5641,6 +5674,78 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         .await
         .expect("placement identity");
     assert_eq!(crews[0].vessel, "placed-vessel");
+    // #3271: real indexed placement maps a kernel-derived container identity;
+    // claims never select a crew outside that environment, including host calls.
+    let environments = backend.using::<flotilla_resources::Environment>("flotilla");
+    let environment = environments
+        .create(
+            &InputMeta::builder().name("placed-environment".into()).build(),
+            &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
+                serde_json::json!({"docker": {"host_ref": "host", "image": "image"}}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    environments
+        .update_status(
+            "placed-environment",
+            &environment.metadata.resource_version,
+            &flotilla_resources::EnvironmentStatus { docker_container_id: Some("kernel-container".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    let evidence = flotilla_protocol::CommandCaller {
+        principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
+        process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).container("kernel-container".into()).build()),
+        crew: None,
+    };
+    let claims = std::collections::HashMap::from([
+        ("FLOTILLA_NAMESPACE".into(), "flotilla".into()),
+        ("FLOTILLA_CONVOY".into(), "own".into()),
+        ("FLOTILLA_VESSEL".into(), "placed-vessel".into()),
+        ("FLOTILLA_CREW_ROLE".into(), "coder".into()),
+        ("FLOTILLA_CREW_ID".into(), "placed-crew".into()),
+        ("FLOTILLA_TERMINAL_SESSION".into(), "placed-session".into()),
+    ]);
+    let resolved = super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims).await.unwrap();
+    assert_eq!(resolved.crew.as_ref().unwrap(), &crews[0]);
+    for key in claims.keys() {
+        let mut forged = claims.clone();
+        forged.insert(key.clone(), "other".into());
+        assert!(super::caller::resolve_main_caller(&daemon, evidence.clone(), &forged)
+            .await
+            .unwrap_err()
+            .starts_with("CallerIdentityMismatch:"));
+    }
+    let mut host = evidence.clone();
+    host.process.as_mut().unwrap().container = None;
+    assert!(super::caller::resolve_main_caller(&daemon, host, &claims).await.unwrap().crew.is_none());
+    let mut unknown = evidence.clone();
+    unknown.process.as_mut().unwrap().container = Some("unknown".into());
+    assert!(super::caller::resolve_main_caller(&daemon, unknown, &claims).await.unwrap_err().starts_with("CallerIdentityUnavailable:"));
+
+    // Environment binding checks all process claims too, before dispatching.
+    let mut forged = claims.clone();
+    forged.insert("FLOTILLA_CONVOY".into(), "other".into());
+    let (forged_client, forged_server) = message_session_pair();
+    let (_forged_shutdown, forged_rx) = watch::channel(false);
+    let forged_task = tokio::spawn(super::environment_connection::serve(
+        forged_server,
+        daemon.clone(),
+        empty_remote_command_router(&daemon, &pm),
+        EnvironmentId::new("placed-environment"),
+        Some(forged),
+        forged_rx,
+    ));
+    complete_client_hello(&forged_client).await;
+    forged_client.write(Message::Request { id: 44, request: Request::GetStatus }).await.unwrap();
+    let Message::Response { id, response } = read_session_message(&forged_client).await else { panic!("expected refusal") };
+    assert_eq!(id, 44);
+    assert!(matches!(*response, ResponseResult::Err { message } if message.starts_with("CallerIdentityMismatch:")));
+    drop(forged_client);
+    forged_task.await.unwrap();
+
     let router = empty_remote_command_router(&daemon, &pm);
     router.install_blob_store(Arc::new(crate::blob_store::TieredBlobStore::new(_tmp.path(), Vec::new()))).unwrap();
     let (_shutdown, shutdown_rx) = watch::channel(false);
@@ -5650,7 +5755,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         daemon,
         router,
         EnvironmentId::new("placed-environment"),
-        None,
+        Some(claims),
         shutdown_rx,
     ));
     complete_client_hello(&client).await;

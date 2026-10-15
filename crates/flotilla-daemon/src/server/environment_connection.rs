@@ -48,15 +48,6 @@ pub(super) async fn environment_crews(daemon: &InProcessDaemon, environment: &En
     Ok(crews)
 }
 
-fn select_crew(crews: Vec<CallerCrew>, role: Option<&str>) -> Result<CallerCrew, String> {
-    let mut matching = crews.into_iter().filter(|crew| role.is_none_or(|role| role == crew.role));
-    let crew = matching.next().ok_or("EnvironmentIdentityUnavailable: no placed crew")?;
-    if matching.next().is_some() {
-        return Err("EnvironmentIdentityAmbiguous: select a placed crew role".into());
-    }
-    Ok(crew)
-}
-
 fn authorize_context(context: &mut CrewCommandContext, crew: &CallerCrew) -> Result<(), String> {
     if context.namespace.as_ref().is_some_and(|value| value != &crew.namespace)
         || context.convoy.as_ref().is_some_and(|value| value != &crew.convoy)
@@ -142,7 +133,7 @@ pub(super) async fn serve(
     daemon: Arc<InProcessDaemon>,
     router: RemoteCommandRouter,
     environment: EnvironmentId,
-    role: Option<String>,
+    claims: Option<std::collections::HashMap<String, String>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let first = tokio::select! {
@@ -192,7 +183,7 @@ pub(super) async fn serve(
         // Re-resolve for every request: a retired session cannot retain authority.
         let identity = async {
             let crews = environment_crews(&daemon, &environment).await?;
-            let crew = select_crew(crews, role.as_deref())?;
+            let crew = super::caller::check_claims(crews, claims.as_ref().unwrap_or(&std::collections::HashMap::new()))?;
             let scope = super::environment_supervision::authorize(&daemon, &mut request, &crew).await?;
             Ok::<_, String>((crew, scope))
         }
@@ -200,6 +191,7 @@ pub(super) async fn serve(
         let (crew, scope) = match identity {
             Ok(crew) => crew,
             Err(error) => {
+                tracing::warn!(%error, environment = %environment, "environment caller refused");
                 if session.write(Message::error_response(id, error)).await.is_err() {
                     return;
                 }
@@ -437,7 +429,8 @@ mod tests {
                 2 => count / 2,
                 _ => 0,
             };
-            assert_eq!(select_crew(crews, role).is_ok(), candidates == 1);
+            let claims = role.map(|role| std::collections::HashMap::from([("FLOTILLA_CREW_ROLE".into(), role.into())])).unwrap_or_default();
+            assert_eq!(super::super::caller::check_claims(crews, &claims).is_ok(), candidates == 1);
         }
     }
 

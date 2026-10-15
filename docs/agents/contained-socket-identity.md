@@ -79,3 +79,26 @@ remain refused. Dispatch-board, queue and fleet reads are pinned to the bound
 project. Stall reads filter rows to that project and recompute shared-cause
 counts after filtering. Forced settlement and host administration remain outside
 the contained supervisor interface.
+## Caller claims after #3271
+
+Both framed client paths check all supplied identity claims: namespace, convoy,
+vessel resource reference, role, crew ID and TerminalSession. Claims may narrow
+placed sessions but never create an identity. Disagreement returns
+`CallerIdentityMismatch` and logs a refusal; multiple remaining sessions return
+`CallerIdentityAmbiguous`. Environment sockets retain per-request placement
+resolution. The main socket resolves the kernel cgroup container ID through an
+indexed Environment status lookup, then its placed sessions. Unknown containers,
+ambiguous placement and unreadable kernel evidence refuse; they never fall back
+to host authority. Nested container cgroups retain their container identity.
+
+A host CLI without a container remains a host principal. Its environment cannot
+make it a crew; identity variables are ignored with a diagnostic. No operator
+impersonation override is introduced. Host-direct crews are outside this contract.
+HTTP token authority and peer handshakes retain their existing paths. A contained
+client's Hello surface cannot replace its resolved principal.
+
+Running pre-#3270 vessels that still mount the main socket now receive this
+container check too. Missing placement or stale identity claims can therefore
+refuse after daemon restart; ending and reprovisioning the vessel establishes the
+current environment socket mount. The Environment container-ID query index does
+not change serialized records or require a manifest update.

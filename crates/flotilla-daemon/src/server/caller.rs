@@ -6,6 +6,7 @@ use std::{fs, path::Path};
 use flotilla_protocol::CallerProcess;
 use flotilla_protocol::{CallerCrew, CommandCaller, PrincipalRef};
 
+#[derive(Clone, Copy)]
 pub(super) struct PeerCredential {
     pid: Option<u32>,
     uid: u32,
@@ -16,11 +17,15 @@ pub(super) fn socket_peer_credential(stream: &tokio::net::UnixStream) -> Option<
     Some(PeerCredential { pid: credentials.pid().and_then(|pid| u32::try_from(pid).ok()), uid: credentials.uid() })
 }
 
-pub(super) fn caller_from_peer(peer: Option<PeerCredential>, namespace: &str) -> CommandCaller {
+pub(super) fn caller_from_peer(peer: Option<PeerCredential>, namespace: &str) -> Result<CommandCaller, String> {
     let principal_ref = PrincipalRef::implicit_for_namespace(namespace);
-    let process = peer.and_then(|credentials| credentials.pid.map(|pid| process_identity(pid, credentials.uid)));
-    let crew = process.as_ref().and_then(|process| read_environ(process.pid)).and_then(|environment| crew_identity(&environment));
-    CommandCaller { principal_ref, process, crew }
+    let credentials = peer.ok_or("CallerIdentityUnavailable: socket peer credentials unavailable")?;
+    #[cfg(target_os = "linux")]
+    if credentials.pid.is_none() {
+        return Err("CallerIdentityUnavailable: socket peer PID unavailable".into());
+    }
+    let process = credentials.pid.map(|pid| process_identity(pid, credentials.uid)).transpose()?;
+    Ok(CommandCaller { principal_ref, process, crew: None })
 }
 
 pub(super) fn missing_crew_message(action: &str) -> String {
@@ -36,12 +41,14 @@ fn missing_crew_message_for_os(action: &str, os: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn process_identity(pid: u32, uid: u32) -> CallerProcess {
+fn process_identity(pid: u32, uid: u32) -> Result<CallerProcess, String> {
     let proc = Path::new("/proc").join(pid.to_string());
     let executable = fs::read_link(proc.join("exe")).ok().map(|path| path.to_string_lossy().into_owned());
     let argv = fs::read(proc.join("cmdline")).ok().map(|bytes| split_nul(&bytes)).unwrap_or_default();
-    let container = fs::read_to_string(proc.join("cgroup")).ok().and_then(|contents| container_from_cgroup(&contents));
-    CallerProcess::builder().pid(pid).uid(uid).maybe_executable(executable).argv(argv).maybe_container(container).build()
+    let contents =
+        fs::read_to_string(proc.join("cgroup")).map_err(|error| format!("CallerIdentityUnavailable: cannot read peer cgroup: {error}"))?;
+    let container = container_from_cgroup(&contents);
+    Ok(CallerProcess::builder().pid(pid).uid(uid).maybe_executable(executable).argv(argv).maybe_container(container).build())
 }
 
 #[cfg(target_os = "linux")]
@@ -60,22 +67,74 @@ fn split_nul(bytes: &[u8]) -> Vec<String> {
     bytes.split(|byte| *byte == 0).filter(|part| !part.is_empty()).map(|part| String::from_utf8_lossy(part).into_owned()).collect()
 }
 
-fn crew_identity(environment: &HashMap<String, String>) -> Option<CallerCrew> {
-    Some(
-        CallerCrew::builder()
-            .namespace(environment.get("FLOTILLA_NAMESPACE")?.clone())
-            .convoy(environment.get("FLOTILLA_CONVOY")?.clone())
-            .vessel(environment.get("FLOTILLA_VESSEL")?.clone())
-            .role(environment.get("FLOTILLA_CREW_ROLE")?.clone())
-            .crew_id(environment.get("FLOTILLA_CREW_ID")?.clone())
-            .maybe_terminal_session(environment.get("FLOTILLA_TERMINAL_SESSION").cloned())
-            .build(),
-    )
+pub(super) fn claims_from_peer(peer: Option<PeerCredential>) -> HashMap<String, String> {
+    peer.and_then(|peer| peer.pid).and_then(read_environ).unwrap_or_default()
+}
+
+/// Claims can only narrow identities already established by placement.
+pub(super) fn check_claims(crews: Vec<CallerCrew>, claims: &HashMap<String, String>) -> Result<CallerCrew, String> {
+    if crews.is_empty() {
+        return Err("EnvironmentIdentityUnavailable: no placed crew".into());
+    }
+    let mut matching = crews.into_iter().filter(|crew| {
+        [
+            ("FLOTILLA_NAMESPACE", Some(crew.namespace.as_str())),
+            ("FLOTILLA_CONVOY", Some(crew.convoy.as_str())),
+            ("FLOTILLA_VESSEL", Some(crew.vessel.as_str())),
+            ("FLOTILLA_CREW_ROLE", Some(crew.role.as_str())),
+            ("FLOTILLA_CREW_ID", Some(crew.crew_id.as_str())),
+            ("FLOTILLA_TERMINAL_SESSION", crew.terminal_session.as_deref()),
+        ]
+        .into_iter()
+        .all(|(key, actual)| claims.get(key).is_none_or(|claim| Some(claim.as_str()) == actual))
+    });
+    let crew = matching.next().ok_or("CallerIdentityMismatch: claims disagree with placed crew identity")?;
+    if matching.next().is_some() {
+        return Err("CallerIdentityAmbiguous: multiple placed crew sessions".into());
+    }
+    Ok(crew)
+}
+
+pub(super) async fn resolve_main_caller(
+    daemon: &flotilla_core::in_process::InProcessDaemon,
+    mut caller: CommandCaller,
+    claims: &HashMap<String, String>,
+) -> Result<CommandCaller, String> {
+    use flotilla_resources::Environment;
+    use flotilla_store::StoreQuery;
+    use std::collections::BTreeMap;
+    let Some(container) = caller.process.as_ref().and_then(|process| process.container.as_ref()) else {
+        // Host variables are selectors, never evidence of a crew. No operator override.
+        if claims.keys().any(|key| key.starts_with("FLOTILLA_")) {
+            tracing::debug!("ignoring crew identity claims from host principal");
+        }
+        caller.crew = None;
+        return Ok(caller);
+    };
+    let namespace = daemon.provisioning_namespace().await;
+    let environments = daemon
+        .resource_backend()
+        .query_declared::<Environment>(
+            &namespace,
+            &StoreQuery { fields: BTreeMap::from([("status.docker_container_id".into(), container.clone())]), ..Default::default() },
+        )
+        .await
+        .map_err(|error| format!("CallerIdentityUnavailable: {error}"))?;
+    let mut environments = environments.items.into_iter().filter(|item| item.object.spec.docker.is_some());
+    let environment = environments.next().ok_or("CallerIdentityUnavailable: container has no placed environment")?;
+    if environments.next().is_some() {
+        return Err("CallerIdentityAmbiguous: container maps to multiple environments".into());
+    }
+    let crews =
+        super::environment_connection::environment_crews(daemon, &flotilla_protocol::EnvironmentId::new(environment.object.metadata.name))
+            .await?;
+    caller.crew = Some(check_claims(crews, claims)?);
+    Ok(caller)
 }
 
 #[cfg(target_os = "linux")]
 fn container_from_cgroup(contents: &str) -> Option<String> {
-    contents.lines().flat_map(|line| line.rsplit('/').next()).find_map(|component| {
+    contents.lines().flat_map(|line| line.split('/').skip(1)).find_map(|component| {
         let without_scope = component.strip_suffix(".scope").unwrap_or(component);
         let candidate = without_scope
             .strip_prefix("docker-")
@@ -93,7 +152,7 @@ mod macos {
     use flotilla_protocol::CallerProcess;
     use tracing::debug;
 
-    pub(super) fn process_identity(pid: u32, uid: u32) -> CallerProcess {
+    pub(super) fn process_identity(pid: u32, uid: u32) -> Result<CallerProcess, String> {
         let mut path = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
         // SAFETY: proc_pidpath writes at most path.len() bytes to the valid buffer.
         let path_len = unsafe { libc::proc_pidpath(pid as libc::c_int, path.as_mut_ptr().cast(), path.len() as u32) };
@@ -104,7 +163,7 @@ mod macos {
             None
         };
         let argv = proc_args(pid).map(|(argv, _)| argv).unwrap_or_default();
-        CallerProcess::builder().pid(pid).uid(uid).maybe_executable(executable).argv(argv).build()
+        Ok(CallerProcess::builder().pid(pid).uid(uid).maybe_executable(executable).argv(argv).build())
     }
 
     pub(super) fn read_environ(pid: u32) -> Option<HashMap<String, String>> {
@@ -185,8 +244,8 @@ mod macos {
 use macos::{process_identity, read_environ};
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_identity(pid: u32, uid: u32) -> CallerProcess {
-    CallerProcess::builder().pid(pid).uid(uid).argv(Vec::new()).build()
+fn process_identity(pid: u32, uid: u32) -> Result<CallerProcess, String> {
+    Ok(CallerProcess::builder().pid(pid).uid(uid).argv(Vec::new()).build())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -197,6 +256,48 @@ fn read_environ(_pid: u32) -> Option<HashMap<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Every field independently rejects forged and empty claims; absence and
+    // matching claims accept exactly one placed session, never duplicates.
+    #[hegel::test]
+    fn claims_only_narrow_placed_identity(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        let crew = CallerCrew::builder()
+            .namespace("ns".into())
+            .convoy("convoy".into())
+            .vessel("vessel".into())
+            .role("coder".into())
+            .crew_id("crew".into())
+            .terminal_session("session".into())
+            .build();
+        for (key, value) in [
+            ("FLOTILLA_NAMESPACE", "ns"),
+            ("FLOTILLA_CONVOY", "convoy"),
+            ("FLOTILLA_VESSEL", "vessel"),
+            ("FLOTILLA_CREW_ROLE", "coder"),
+            ("FLOTILLA_CREW_ID", "crew"),
+            ("FLOTILLA_TERMINAL_SESSION", "session"),
+        ] {
+            for claim in [None, Some(value), Some("forged"), Some("")] {
+                let claims = claim.map(|value| HashMap::from([(key.into(), value.into())])).unwrap_or_default();
+                assert_eq!(
+                    check_claims(vec![crew.clone(); count], &claims).is_ok(),
+                    count == 1 && (claim.is_none() || claim == Some(value))
+                );
+            }
+        }
+    }
+
+    // Unavailable kernel evidence must refuse, never downgrade a container to host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_peer_cgroup_refuses_identity() {
+        assert!(caller_from_peer(Some(PeerCredential { pid: Some(u32::MAX), uid: 0 }), "ns")
+            .unwrap_err()
+            .starts_with("CallerIdentityUnavailable:"));
+        assert!(caller_from_peer(None, "ns").is_err());
+    }
 
     #[test]
     fn unsupported_platform_refusal_explains_missing_peer_identity() {
@@ -217,12 +318,20 @@ mod tests {
     #[test]
     fn extracts_container_id_from_cgroup() {
         let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        assert_eq!(container_from_cgroup(&format!("0::/system.slice/docker-{id}.scope\n")), Some(id.to_string()));
+        for path in [
+            format!("/system.slice/docker-{id}.scope"),
+            format!("/docker/{id}/nested"),
+            format!("/kubepods/cri-containerd-{id}.scope/child"),
+            format!("/libpod-{id}.scope"),
+        ] {
+            assert_eq!(container_from_cgroup(&format!("0::{path}\n")), Some(id.to_string()));
+        }
+        assert_eq!(container_from_cgroup("0::/user.slice/host.scope\n"), None);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
-    async fn child_socket_peer_exposes_crew_identity() {
+    async fn child_socket_peer_exposes_claims_without_crew_authority() {
         use std::{os::unix::net::UnixListener, process::Command, thread, time::Duration};
 
         let directory = flotilla_test_support::TestSocketDir::new();
@@ -236,6 +345,7 @@ mod tests {
             .env("FLOTILLA_VESSEL", "test-vessel")
             .env("FLOTILLA_CREW_ROLE", "coder")
             .env("FLOTILLA_CREW_ID", "test-crew")
+            .env("FLOTILLA_TERMINAL_SESSION", "test-terminal")
             .spawn()
             .expect("spawn crew child");
         let (stream, _) = listener.accept().expect("accept crew child");
@@ -245,12 +355,25 @@ mod tests {
         let stream = tokio::net::UnixStream::from_std(stream).expect("tokio stream");
         let peer = socket_peer_credential(&stream).expect("peer credentials");
         assert_eq!(peer.pid, Some(child.id()));
-        let caller = caller_from_peer(Some(peer), "test-namespace");
+        let caller = caller_from_peer(Some(peer), "test-namespace").expect("peer identity");
         let process = caller.process.expect("peer process identity");
         assert_eq!(process.pid, child.id());
         assert!(process.executable.is_some());
         assert!(!process.argv.is_empty());
-        let crew = caller.crew.expect("crew identity from child environment");
+        assert!(caller.crew.is_none(), "variables never create crew identity");
+        let claims = claims_from_peer(socket_peer_credential(&stream));
+        let crew = check_claims(
+            vec![CallerCrew::builder()
+                .namespace("test-namespace".into())
+                .convoy("test-convoy".into())
+                .vessel("test-vessel".into())
+                .role("coder".into())
+                .crew_id("test-crew".into())
+                .terminal_session("test-terminal".into())
+                .build()],
+            &claims,
+        )
+        .expect("matching claims");
         assert_eq!(crew.namespace, "test-namespace");
         assert_eq!(crew.convoy, "test-convoy");
         assert_eq!(crew.vessel, "test-vessel");
@@ -282,7 +405,7 @@ mod tests {
         let (stream, _) = accepted.expect("accept unix peer");
         connected.expect("connect unix peer");
 
-        let caller = caller_from_peer(socket_peer_credential(&stream), "flotilla");
+        let caller = caller_from_peer(socket_peer_credential(&stream), "flotilla").expect("peer identity");
         let process = caller.process.expect("peer process identity");
         assert_eq!(process.pid, std::process::id());
         assert_eq!(process.uid, unsafe { libc::geteuid() });
