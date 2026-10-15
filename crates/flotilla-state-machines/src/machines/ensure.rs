@@ -115,6 +115,9 @@ pub enum UnbindReason {
 /// Unbinds the bound fulfiller once it is gone (spec `Unbind`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unbind {
+    /// Why it was unbound. No gate reads it: both reasons need the Gone
+    /// observation. It is recorded on the edge event, where listings and
+    /// audits show why the fulfiller went.
     pub reason: UnbindReason,
     pub fulfiller: Ref<Fulfiller>,
 }
