@@ -21,6 +21,7 @@ pub(crate) struct Field<'a> {
     /// preceded by the snake_case variant name inside a data enum.
     pub name: LitStr,
     pub ty: &'a Type,
+    pub vis: &'a syn::Visibility,
     pub shape: FieldShape,
 }
 
@@ -38,7 +39,7 @@ impl<'a> Field<'a> {
             Some(variant) => format_ident!("__store_{}_{}", variant, plain),
             None => format_ident!("__store_{}", plain),
         };
-        Ok(Field { ident, local, name: LitStr::new(&name, ident.span()), ty: &field.ty, shape })
+        Ok(Field { ident, local, name: LitStr::new(&name, ident.span()), ty: &field.ty, vis: &field.vis, shape })
     }
 
     /// The adapter type implementing `Adapter<FieldTy>` for this field's attribute.
@@ -122,6 +123,48 @@ impl<'a> Field<'a> {
     pub(crate) fn layout(&self, prefix: &TokenStream, required: &TokenStream) -> TokenStream {
         let (schema, via, name) = (schema(), self.via(), &self.name);
         quote!(#via::layout(layout, &#schema::Layout::join(#prefix, #name), #required);)
+    }
+
+    /// Declares the field as one of its row's own fields: column-shaped fields are recorded in the
+    /// table's `fields`, the unit an edge sets; table fields declare their table.
+    pub(crate) fn layout_row_field(&self) -> TokenStream {
+        let layout = self.layout(&quote!(""), &quote!(true));
+        if self.is_table() {
+            return layout;
+        }
+        let (name, state) = (&self.name, self.shape == FieldShape::State);
+        quote!(layout.field(#name, #state, |layout| { #layout });)
+    }
+
+    /// The edge handle's name: the field name in upper case (`state` is `STATE`).
+    pub(crate) fn handle_name(&self) -> String {
+        self.ident.unraw().to_string().to_uppercase()
+    }
+
+    /// The field's edge handle, an associated const of the struct: a `ColumnOf` for a
+    /// column-shaped field, a `RecordsOf` or `HistoryOf` for a records or history field, and
+    /// none for a spec collection, which changes only by a spec edit.
+    pub(crate) fn handle(&self) -> Option<TokenStream> {
+        let (schema, via, name, ty, vis) = (schema(), self.via(), &self.name, self.ty, self.vis);
+        let handle = format_ident!("{}", self.handle_name(), span = self.ident.span());
+        let inner = || shape::first_arg(ty).unwrap_or(ty);
+        let (doc, ty, value) = match self.shape {
+            FieldShape::Child(_) => return None,
+            FieldShape::Records => {
+                let inner = inner();
+                ("records", quote!(#schema::RecordsOf<Self, #inner>), quote!(#schema::RecordsOf::new(#name)))
+            }
+            FieldShape::History => {
+                let inner = inner();
+                ("history", quote!(#schema::HistoryOf<Self, #inner>), quote!(#schema::HistoryOf::new(#name)))
+            }
+            _ => ("column", quote!(#schema::ColumnOf<Self, #ty>), quote!(#schema::ColumnOf::new(#name, #via::TABLES, #via::encode))),
+        };
+        let doc = format!("Edge handle of the {doc} field `{}`.", name.value());
+        Some(quote! {
+            #[doc = #doc]
+            #vis const #handle: #ty = #value;
+        })
     }
 
     /// Encodes `value` (an expression of type `&FieldTy`).

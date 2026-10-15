@@ -338,6 +338,55 @@ mod tests {
         assert!(!data.contains("layout . guard (tag , 1i64"), "unit variants have no guard");
     }
 
+    // Behaviour (#3320 ruling 1): every field of a struct gets an edge handle named by the field in
+    // upper case, with the field's visibility: a `ColumnOf` for a column-shaped field (its adapter
+    // encodes it), a `HistoryOf` or `RecordsOf` for a table of records, and none for a spec
+    // collection. Column-shaped fields of a row are declared as its fields, state ones marked.
+    #[test]
+    fn fields_expand_to_edge_handles() {
+        let kind = expanded(quote! {
+            #[store(kind = "Message", code = 1)]
+            struct Message<T> {
+                #[store(state)] state: State<Phase>,
+                #[store(history)] pub edges: Records<Event<T>>,
+                #[store(records)] notes: Records<Note>,
+                #[store(child)] refs: Vec<Reference>,
+                pub(crate) body: T,
+                r#type: u8,
+            }
+        });
+        for expected in [
+            "const STATE : :: flotilla_schema :: ColumnOf < Self , State < Phase > > = :: flotilla_schema :: ColumnOf :: new (\"state\"",
+            "pub const EDGES : :: flotilla_schema :: HistoryOf < Self , Event < T > > = :: flotilla_schema :: HistoryOf :: new (\"edges\")",
+            "const NOTES : :: flotilla_schema :: RecordsOf < Self , Note >",
+            "pub (crate) const BODY : :: flotilla_schema :: ColumnOf < Self , T >",
+            "const TYPE : :: flotilla_schema :: ColumnOf < Self , u8 >",
+            "layout . field (\"state\" , true ,",
+            "layout . field (\"body\" , false ,",
+        ] {
+            assert!(kind.contains(expected), "missing {expected}");
+        }
+        assert!(!kind.contains("REFS"), "spec collections have no handle");
+        assert!(!kind.contains("layout . field (\"edges\""), "table fields are not row fields");
+    }
+
+    // Behaviour: a handle never shadows a stored trait's associated item (an inherent const wins
+    // over a trait's in `Message::KIND`): a kind's field named `kind` or `code`, or any struct's
+    // field named `tables`, is refused naming the list; a part's field named `kind` is fine.
+    #[test]
+    fn handles_that_would_shadow_trait_items_are_refused() {
+        for case in [
+            quote! { #[store(kind = "A", code = 1)] struct A { kind: String } },
+            quote! { #[store(kind = "A", code = 1)] struct A { code: u32 } },
+            quote! { struct A { tables: u32 } },
+            quote! { #[store(kind = "A", code = 1)] struct A { r#tables: u32 } },
+        ] {
+            let message = error(case.clone());
+            assert!(message.contains(SUPPORTED) && message.contains("edge handle"), "{case}: {message}");
+        }
+        assert!(expanded(quote! { struct Part { kind: Kind, code: u32 } }).contains("const KIND"));
+    }
+
     // Behaviour: a newtype wrapping String is internable; other newtypes are not.
     #[test]
     fn newtypes_of_string_intern() {

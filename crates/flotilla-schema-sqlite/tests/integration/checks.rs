@@ -159,5 +159,5 @@ fn record_stamps_are_never_null(tc: TestCase) {
             checked += 1;
         }
     }
-    assert_eq!(checked, 6, "edges, attempts, deliverables, evidence, events and attempts");
+    assert_eq!(checked, 7, "edges, attempts, deliverables, evidence, convoy edges, events and attempts");
 }

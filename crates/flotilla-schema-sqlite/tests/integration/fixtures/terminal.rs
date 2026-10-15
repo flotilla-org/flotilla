@@ -13,15 +13,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Flat, Frozen, Records, Ref, State, Stored, Timestamp};
+use flotilla_schema::{Edge, Flat, Frozen, Records, Ref, State, Stored, Timestamp};
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
 use super::{
+    appended,
     attempt::{Attempt, Cause},
     code_enum,
     convoy::map,
-    evolve_records, key, list, name, records, reference, stamp, text, timestamp, Fixture, Pick, SHAPES,
+    key, list, name, records, reference, stamp, text, timestamp, Fixture, Pick, SHAPES,
 };
 
 /// A minimal target kind for `TerminalSession::vessel`.
@@ -202,14 +203,39 @@ impl Fixture for TerminalSession {
         }
     }
 
-    /// Spec, env and labels drawn afresh; lifecycle events and attempts appended.
+    /// Spec, env and labels drawn afresh; the lifecycle, the realised identity, events and
+    /// attempts kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> TerminalSession {
-        let spec = TerminalSession::generate(tc, pick);
         TerminalSession {
-            events: evolve_records(tc, pick, &self.events, |event, _| event.clone(), |pick| event(tc, pick)),
-            attempts: evolve_records(tc, pick, &self.attempts, |attempt, _| attempt.clone(), |pick| attempt(tc, pick)),
-            ..spec
+            realised: self.realised.clone(),
+            events: self.events.clone(),
+            attempts: self.attempts.clone(),
+            lifecycle: self.lifecycle,
+            ..TerminalSession::generate(tc, pick)
         }
+    }
+
+    /// A lifecycle event appended and the lifecycle moved; a `Realise` sets the realised identity
+    /// (a flattened optional struct), and sometimes an attempt is appended.
+    fn edge(&self, tc: &TestCase, pick: Pick) -> (Edge<TerminalSession>, TerminalSession) {
+        use LifecycleState::*;
+        let event = event(tc, pick);
+        let lifecycle = State::new(code_enum(tc, pick.nth(1), &[Requested, Realised, Gone, GaveUp]), timestamp(tc));
+        let mut edge =
+            Edge::new(TerminalSession::EVENTS, &event).expect("event").set(TerminalSession::LIFECYCLE, &lifecycle).expect("state");
+        let mut next = TerminalSession { lifecycle, ..self.clone() };
+        if let LifecycleEdge::Realise { identity } = &event.edge {
+            let realised = Some(identity.clone());
+            edge = edge.set(TerminalSession::REALISED, &realised).expect("realised");
+            next.realised = realised;
+        }
+        if pick.nth(2).some(tc, 8) {
+            let attempt = attempt(tc, pick);
+            edge = edge.append(TerminalSession::ATTEMPTS, &attempt).expect("attempt");
+            next.attempts = appended(tc, &self.attempts, attempt);
+        }
+        next.events = appended(tc, &self.events, event);
+        (edge, next)
     }
 
     fn stamped(&self, before: Option<&TerminalSession>, version: u64) -> TerminalSession {

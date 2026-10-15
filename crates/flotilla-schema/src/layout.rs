@@ -6,7 +6,7 @@
 //! declared directly inside it.
 
 use crate::{
-    descriptor::{ColumnDef, ColumnType, Guard, Index, Table, TableRole, TableSet},
+    descriptor::{ColumnDef, ColumnType, FieldColumns, Guard, Index, Table, TableRole, TableSet},
     value::KindCode,
 };
 
@@ -21,6 +21,9 @@ struct Frame {
     table: usize,
     guards: Vec<Guard>,
     key_mode: bool,
+    /// Fields being declared: only a row's own fields (depth 0) are recorded, not the fields of a
+    /// struct flattened into one of them.
+    field_depth: usize,
 }
 
 impl Layout {
@@ -35,10 +38,11 @@ impl Layout {
             own_key: 0,
             columns: Vec::new(),
             guards: Vec::new(),
+            fields: Vec::new(),
         };
         Layout {
             set: TableSet { kind: kind.to_owned(), code, tables: vec![root], indexes: Vec::new() },
-            frames: vec![Frame { table: 0, guards: Vec::new(), key_mode: false }],
+            frames: vec![Frame { table: 0, guards: Vec::new(), key_mode: false, field_depth: 0 }],
         }
     }
 
@@ -136,12 +140,29 @@ impl Layout {
             own_key: 0,
             columns: Vec::new(),
             guards: Vec::new(),
+            fields: Vec::new(),
         };
         self.set.tables.push(table);
-        self.frames.push(Frame { table: self.set.tables.len() - 1, guards: Vec::new(), key_mode: false });
+        self.frames.push(Frame { table: self.set.tables.len() - 1, guards: Vec::new(), key_mode: false, field_depth: 0 });
         f(self);
         let frame = self.frames.pop().expect("table frame pushed above");
         assert!(frame.guards.is_empty() && !frame.key_mode, "guards and keys close inside their table");
+    }
+
+    /// Declares one column-shaped field of the current row: the columns `f` declares are recorded
+    /// as the field `name` when the row is the current table's own (not a struct flattened into a
+    /// field). Generated `layout_row` code wraps each column-shaped field of a struct in this.
+    pub fn field(&mut self, name: &str, state: bool, f: impl FnOnce(&mut Layout)) {
+        let frame = self.frames.last_mut().expect("layout has a current table");
+        let (table, record) = (frame.table, frame.field_depth == 0 && !frame.key_mode);
+        frame.field_depth += 1;
+        let start = self.set.tables[table].columns.len();
+        f(self);
+        self.frames.last_mut().expect("layout has a current table").field_depth -= 1;
+        let end = self.set.tables[table].columns.len();
+        if record {
+            self.set.tables[table].fields.push(FieldColumns { name: name.to_owned(), columns: start..end, state });
+        }
     }
 
     pub fn index(&mut self, index: Index) {

@@ -47,6 +47,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "convoy_deliverables",
             "convoy_deliverables_evidence",
             "convoy_deliverables_evidence_metadata",
+            "convoy_edges",
             "convoy_inputs",
             "convoy_inputs_list_items",
             "convoy_repositories",

@@ -99,7 +99,7 @@ fn check_messages(tc: &TestCase, store: &mut Store, model: &BTreeMap<ResourceId,
     assert_eq!(scan_all::<Message>(store, "elsewhere", limit), Vec::<ResourceId>::new());
 }
 
-// Behaviour (DESIGN queries, #3320): after any sequence of inserts, updates and deletes, paging a
+// Behaviour (DESIGN queries, #3320): after any sequence of inserts, spec edits, edges and deletes, paging a
 // declared index returns exactly the live resources its predicate and arguments select, ordered by
 // its order columns then id, each once, whatever the page size; the startup scan returns exactly
 // the kind's live resources at the home, in id order, skipping identities that references created
@@ -113,7 +113,7 @@ fn index_pages_and_scans_match_the_model(tc: TestCase) {
     for _ in 0..steps {
         let ids: Vec<ResourceId> = model.keys().copied().collect();
         let mut write = store.write().expect("write");
-        match tc.draw(gs::integers::<u8>().max_value(3)) {
+        match tc.draw(gs::integers::<u8>().max_value(4)) {
             0 | 1 => {
                 let value = message(&tc);
                 let stamp = write.insert(&format!("m{names}"), &value).expect("insert");
@@ -124,9 +124,19 @@ fn index_pages_and_scans_match_the_model(tc: TestCase) {
                 let id = ids[tc.draw(gs::integers::<usize>().max_value(ids.len() - 1))];
                 let current = write.load::<Message>(id).expect("load").expect("present");
                 if op == 2 {
-                    let next = Message { edges: current.value.edges.clone(), attempts: current.value.attempts.clone(), ..message(&tc) };
+                    let next = Message {
+                        state: current.value.state,
+                        edges: current.value.edges.clone(),
+                        attempts: current.value.attempts.clone(),
+                        ..message(&tc)
+                    };
                     write.update(&current, &next).expect("update");
                     model.insert(id, next.stored());
+                } else if op == 3 {
+                    // An edge moves the state, and with it membership of the state-filtered indexes.
+                    let (edge, next) = current.value.edge(&tc, Pick::Draw);
+                    write.apply_edge(current.stamp(), edge).expect("edge");
+                    model.insert(id, Message { state: next.state, ..current.value });
                 } else {
                     write.delete::<Message>(current.stamp()).expect("delete");
                     model.remove(&id);

@@ -28,7 +28,7 @@ fn logged(write: &mut Write<'_>, before: u64) -> RowChange {
     changes.remove(0)
 }
 
-/// One generated write to slot `live` of kind `K`: insert when absent, else an allowed update
+/// One generated write to slot `live` of kind `K`: insert when absent, else an edge, a spec edit
 /// (possibly changing no row) or a delete. Checks that the write logged exactly one change at
 /// its version naming the resource, or nothing when it changed no row.
 fn step<K: Fixture>(tc: &TestCase, write: &mut Write<'_>, live: &mut Option<Stamp>, name: &str, last: &mut u64) {
@@ -39,6 +39,16 @@ fn step<K: Fixture>(tc: &TestCase, write: &mut Write<'_>, live: &mut Option<Stam
             let change = logged(write, *last);
             assert!(matches!(&change.ops[..], [.., RowOp::Insert { .. }]));
             assert_eq!(change.home_seq, stamp.version);
+            change
+        }
+        Some(stamp) if tc.draw(gs::booleans()) => {
+            let current = write.load::<K>(stamp.id).expect("load").expect("present");
+            let (edge, _) = current.value.edge(tc, Pick::Draw);
+            let next = write.apply_edge(stamp, edge).expect("edge");
+            *live = Some(next);
+            let change = logged(write, *last);
+            assert_eq!(change.home_seq, next.version);
+            assert!(change.ops.iter().any(|op| matches!(op, RowOp::Insert { .. })), "an edge appends its event");
             change
         }
         Some(stamp) if tc.draw(gs::booleans()) => {
@@ -116,8 +126,8 @@ fn string_id(store: Store, string: &str) -> (Store, i64) {
 // objects) although the two databases number strings and identities differently. The target
 // relays the same log and the same home sequence. Replaying again is idempotent: every change is
 // a `Duplicate` and nothing moves. Writes span all three fixture kinds, two names each, with
-// inserts, allowed updates (records and history appended), deletes and re-inserts, over several
-// transactions. Every records and history row a change inserts carries the change's sequence.
+// inserts, generated edges (events, records and history appended, fields set), spec edits,
+// deletes and re-inserts, over several transactions. Every records and history row a change inserts carries the change's sequence.
 #[hegel::test]
 fn the_change_log_replays_into_another_store(tc: TestCase) {
     let mut source = store();
@@ -385,7 +395,11 @@ fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
         if n < updates {
             let mut write = source.write().expect("write");
             let current = write.load::<K>(stamp.id).expect("load").expect("present");
-            stamp = write.update(&current, &current.value.evolve(tc, Pick::Draw)).expect("update");
+            stamp = if tc.draw(gs::booleans()) {
+                write.apply_edge(stamp, current.value.edge(tc, Pick::Draw).0).expect("edge")
+            } else {
+                write.update(&current, &current.value.evolve(tc, Pick::Draw)).expect("update")
+            };
             write.commit().expect("commit");
         }
     }

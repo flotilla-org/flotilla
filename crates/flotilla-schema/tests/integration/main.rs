@@ -2,6 +2,7 @@
 mod change;
 mod codec;
 mod compile_fail;
+mod edges;
 mod indexes;
 mod tables;
 #[path = "../../../../tests/support/integration_modules.rs"]

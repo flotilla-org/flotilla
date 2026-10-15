@@ -2,15 +2,15 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{quote_ident, Hash, Identity, Kind, Records, Ref, State, Table, Timestamp};
-use flotilla_schema_sqlite::{Loaded, Store, StoreError};
+use flotilla_schema::{quote_ident, Edge, Hash, Identity, Kind, Records, Ref, State, Table, Timestamp};
+use flotilla_schema_sqlite::{Loaded, Stamp, Store, StoreError};
 use hegel::TestCase;
 use rusqlite::Connection;
 
 use crate::fixtures::{
     attempt::{Attempt, Outcome},
     convoy::{workflow, ConvoyRepository, Deliverable, DeliverableState, Evidence, InputValue, PromiseKind, PromiseSource},
-    message::{GateInput, MessageEdge, MessageEdgeEvent, Settlement},
+    message::{GateInput, MessageEdge, MessageEdgeEvent, MessageState, Settlement},
     registry, store, Convoy, Fixture, Message, Pick, TerminalSession, LOCAL,
 };
 
@@ -78,14 +78,22 @@ fn load<K: Kind>(store: &mut Store, current: &Loaded<K>) -> Loaded<K> {
     store.read().expect("read").load::<K>(current.id).expect("load").expect("present")
 }
 
-// Behaviour (#3320 rulings 2 and 5): through a whole-value write, `records` and `history` rows are
-// only appended. Changing or removing a `history` row (an edge event, its gate inputs, an attempt)
-// is `Immutable`; changing or removing a `records` row (a deliverable, its evidence) is
-// `AppendOnly`. A refused write changes nothing, and the transaction stays usable for later
-// writes, which may append edges, attempts and evidence to a kept deliverable; each appended row
-// is stamped with the write's version, while earlier rows keep the insert's.
+fn refused(result: Result<Stamp, StoreError>) -> String {
+    match result {
+        Err(StoreError::NotThroughEdge { table, column: Some(column) }) => format!("{table}.{column}"),
+        Err(StoreError::NotThroughEdge { table, column: None }) => table,
+        other => format!("{other:?}"),
+    }
+}
+
+// Behaviour (#3320 ruling 1): a spec edit (`update`) refuses what only an edge writes, naming the
+// table or column: a changed state column (`state`, `state_since`; a deliverable's state is part
+// of its records row), and any append to, change of or removal from a history table (edge events,
+// their gate inputs, attempts) or a records table (deliverables, evidence under a kept
+// deliverable). A refused write changes nothing and the transaction stays usable: a spec edit and
+// an edge then commit, the edge's rows stamped with its version.
 #[test]
-fn records_and_history_refusals_reach_the_caller() {
+fn spec_edits_refuse_what_only_edges_write() {
     let mut store = store();
     let message =
         Message { edges: records(vec![event("alice"), event("bob")]), attempts: records(vec![attempt("a")]), ..Message::sample() };
@@ -97,51 +105,53 @@ fn records_and_history_refusals_reach_the_caller() {
     assert_eq!(stamps.collect::<Vec<_>>(), [current.version, current.version, convoy_current.version], "the insert stamps every row");
 
     let mut write = store.write().expect("write");
-    let refused = |result: Result<_, StoreError>| match result {
-        Err(StoreError::Immutable { table }) => format!("Immutable {table}"),
-        Err(StoreError::AppendOnly { table }) => format!("AppendOnly {table}"),
-        other => format!("{other:?}"),
-    };
     let edges = |f: Edit<MessageEdgeEvent>| Message { edges: with_rows(&message.edges, f), ..message.clone() };
-    assert_eq!(refused(write.update(&current, &edges(&|rows| drop(rows.pop())))), "Immutable message_edges");
-    assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].1 = event("carol")))), "Immutable message_edges");
-    assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].0 += 1))), "Immutable message_edges", "the stamp is part of the row");
+    assert_eq!(refused(write.update(&current, &edges(&|rows| rows.push((0, event("carol")))))), "message_edges", "no append");
+    assert_eq!(refused(write.update(&current, &edges(&|rows| drop(rows.pop())))), "message_edges");
+    assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].1 = event("carol")))), "message_edges");
+    assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].0 += 1))), "message_edges", "the stamp is part of the row");
     let input = GateInput { observed: Identity { kind: Message::CODE, name: "m".into(), home: LOCAL.into() }, version: 1 };
     let with_input = edges(&|rows| rows[0].1.inputs.push(input.clone()));
-    assert_eq!(refused(write.update(&current, &with_input)), "Immutable message_edges", "gate inputs are part of the edge row");
-    let changed_attempt = Message { attempts: with_rows(&message.attempts, |rows| rows[0].1 = attempt("b")), ..message.clone() };
-    assert_eq!(refused(write.update(&current, &changed_attempt)), "Immutable message_attempts");
+    assert_eq!(refused(write.update(&current, &with_input)), "message_edges", "gate inputs are part of the edge row");
+    let more_attempts = Message { attempts: with_rows(&message.attempts, |rows| rows.push((0, attempt("b")))), ..message.clone() };
+    assert_eq!(refused(write.update(&current, &more_attempts)), "message_attempts");
     let fewer_attempts = Message { attempts: Records::new(), ..message.clone() };
-    assert_eq!(refused(write.update(&current, &fewer_attempts)), "Immutable message_attempts");
+    assert_eq!(refused(write.update(&current, &fewer_attempts)), "message_attempts");
+    let settled = Message { state: State::new(MessageState::Settled, message.state.since), ..message.clone() };
+    assert_eq!(refused(write.update(&current, &settled)), "message.state");
+    let later = Message { state: State::new(message.state.value, Timestamp(9)), body: "edited".into(), ..message.clone() };
+    assert_eq!(refused(write.update(&current, &later)), "message.state_since", "a spec field beside it does not excuse it");
     let deliverables = |f: Edit<Deliverable>| Convoy { deliverables: with_rows(&convoy.deliverables, f), ..convoy.clone() };
     let retracted = deliverables(&|rows| rows[0].1.state = State::new(DeliverableState::Retracted, Timestamp(5)));
-    assert_eq!(refused(write.update(&convoy_current, &retracted)), "AppendOnly convoy_deliverables", "only an edge moves a record");
-    assert_eq!(refused(write.update(&convoy_current, &deliverables(&|rows| rows.clear()))), "AppendOnly convoy_deliverables");
+    assert_eq!(refused(write.update(&convoy_current, &retracted)), "convoy_deliverables", "only an edge moves a record");
+    assert_eq!(refused(write.update(&convoy_current, &deliverables(&|rows| rows.clear()))), "convoy_deliverables");
+    let promised = deliverables(&|rows| rows.push((0, deliverable(Vec::new()))));
+    assert_eq!(refused(write.update(&convoy_current, &promised)), "convoy_deliverables");
+    let submitted =
+        deliverables(&|rows| rows[0].1.evidence = with_rows(&rows[0].1.evidence, |evidence| evidence.push((0, evidence_row()))));
+    assert_eq!(refused(write.update(&convoy_current, &submitted)), "convoy_deliverables_evidence");
     let fewer_evidence = deliverables(&|rows| rows[0].1.evidence = with_rows(&rows[0].1.evidence, |evidence| drop(evidence.pop())));
-    assert_eq!(refused(write.update(&convoy_current, &fewer_evidence)), "AppendOnly convoy_deliverables_evidence");
+    assert_eq!(refused(write.update(&convoy_current, &fewer_evidence)), "convoy_deliverables_evidence");
 
-    // Allowed in the same transaction: append an edge and an attempt, and evidence to the kept
-    // deliverable, whatever stamps the caller's rows hold.
-    let next = Message {
-        edges: with_rows(&message.edges, |rows| rows.push((u64::from(u32::MAX), event("dave")))),
-        attempts: with_rows(&message.attempts, |rows| rows.push((0, attempt("b")))),
-        ..message.clone()
-    };
-    let stamp = write.update(&current, &next).expect("append");
-    let more_evidence =
-        deliverables(&|rows| rows[0].1.evidence = with_rows(&rows[0].1.evidence, |evidence| evidence.push((7, evidence_row()))));
-    let convoy_stamp = write.update(&convoy_current, &more_evidence).expect("append evidence to a kept deliverable");
+    // Allowed in the same transaction: a spec edit, then an edge appending an event and an attempt
+    // and moving the state, whatever stamps the caller's rows hold.
+    let edited = Message { body: "edited".into(), ..message.clone() };
+    let stamp = write.update(&current, &edited).expect("spec edit");
+    let awaiting = State::new(MessageState::Awaiting, Timestamp(8));
+    let edge = Edge::new(Message::EDGES, &event("dave"))
+        .and_then(|edge| edge.append(Message::ATTEMPTS, &attempt("b")))
+        .and_then(|edge| edge.set(Message::STATE, &awaiting))
+        .expect("edge");
+    let stamp = write.apply_edge(stamp, edge).expect("edge");
     write.commit().expect("commit");
     let expected = Message {
         edges: with_rows(&message.edges, |rows| rows.push((stamp.version, event("dave")))),
         attempts: with_rows(&message.attempts, |rows| rows.push((stamp.version, attempt("b")))),
-        ..message.clone()
+        state: awaiting,
+        ..edited
     };
     assert_eq!(load(&mut store, &current).value, expected);
-    let expected = deliverables(&|rows| {
-        rows[0].1.evidence = with_rows(&rows[0].1.evidence, |evidence| evidence.push((convoy_stamp.version, evidence_row())))
-    });
-    assert_eq!(load(&mut store, &convoy_current).value, expected);
+    assert_eq!(load(&mut store, &convoy_current).value, *convoy, "the refused writes changed nothing");
 }
 
 fn evidence_row() -> Evidence {
@@ -165,15 +175,21 @@ fn update<K: Kind>(store: &mut Store, current: &Loaded<K>, next: &K) {
     write.commit().expect("commit");
 }
 
-// Behaviour (#3320 production shape): an update writes only the rows that changed, plus the root
-// row's version, the home sequence, the identity's sequence and one change-log row. Appending one
-// record is one insert; appending one with a gate input is two; changing one of three
-// repositories is one update; an unchanged collection writes nothing.
+fn apply_edge<K: Kind>(store: &mut Store, current: Stamp, edge: Edge<K>) {
+    let mut write = store.write().expect("write");
+    write.apply_edge(current, edge).expect("edge");
+    write.commit().expect("commit");
+}
+
+// Behaviour (#3320 production shape): a write touches only its rows, plus the home sequence, the
+// identity's sequence and one change-log row. An edge appending its event and moving the state is
+// two row writes (the event insert, and the state update that also moves the version); a gate
+// input is one more; an edge that sets no root field still moves the root's version. A spec edit
+// changing one of three repositories is one update and the root version; an unchanged value
+// writes nothing.
 #[test]
-fn updates_write_only_changed_rows() {
+fn writes_touch_only_their_rows() {
     let store = store();
-    let message =
-        Message { edges: records(vec![event("alice"), event("bob")]), attempts: records(vec![attempt("a")]), ..Message::sample() };
     let repository = |slug: &str| ConvoyRepository {
         url: "u".into(),
         repo_key: "k".into(),
@@ -183,20 +199,26 @@ fn updates_write_only_changed_rows() {
     };
     let convoy = Convoy { repositories: vec![repository("a"), repository("b"), repository("c")], ..Convoy::sample(0) };
     let (mut store, _) = rows_written(store, |_| {});
-    let current = insert(&mut store, "m", &message);
+    let current = insert(&mut store, "m", &Message { edges: records(vec![event("alice")]), ..Message::sample() });
     let convoy_current = insert(&mut store, "c", &convoy);
 
-    let appended = Message { edges: with_rows(&current.value.edges, |rows| rows.push((0, event("alice")))), ..current.value.clone() };
-    let (mut store, written) = rows_written(store, |store| update(store, &current, &appended));
-    assert_eq!(written, 5, "one record row, the root version, the home sequence, the identity sequence and the change log");
+    let moved = State::new(MessageState::Awaiting, Timestamp(5));
+    let edge = Edge::new(Message::EDGES, &event("alice")).and_then(|edge| edge.set(Message::STATE, &moved)).expect("edge");
+    let (mut store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
+    assert_eq!(written, 5, "the event row, the state with the version, the home and identity sequences and the change log");
 
     let current = load(&mut store, &current);
     // "alice" is already interned, so no `strings` row is written.
     let mut with_input = event("alice");
     with_input.inputs.push(GateInput { observed: Identity { kind: Message::CODE, name: "m".into(), home: LOCAL.into() }, version: 1 });
-    let appended = Message { edges: with_rows(&current.value.edges, |rows| rows.push((0, with_input))), ..current.value.clone() };
-    let (store, written) = rows_written(store, |store| update(store, &current, &appended));
-    assert_eq!(written, 6, "the record row, its gate input, the root version, the home and identity sequences and the change log");
+    let edge = Edge::new(Message::EDGES, &with_input).and_then(|edge| edge.set(Message::STATE, &moved)).expect("edge");
+    let (mut store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
+    assert_eq!(written, 6, "the event row, its gate input, the state with the version, the sequences and the change log");
+
+    let current = load(&mut store, &current);
+    let edge = Edge::new(Message::EDGES, &event("alice")).expect("edge");
+    let (store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
+    assert_eq!(written, 5, "the event row, the root version, the sequences and the change log");
 
     let changed = Convoy { repositories: vec![repository("a"), repository("B"), repository("c")], ..convoy.clone() };
     let (mut store, written) = rows_written(store, |store| update(store, &convoy_current, &changed));

@@ -351,8 +351,8 @@ impl<K: KeyColumn + Ord> Adapter<BTreeSet<K>> for AsChild {
     }
 }
 
-/// `#[store(records)]`: rows keyed by `pos`, appended and never removed. Until edges (#3320 layer
-/// 7), the store refuses any change to an existing row through a whole-value write.
+/// `#[store(records)]`: rows keyed by `pos`, appended and never removed; appended and changed only
+/// by edges (`Edge`), never by a spec edit.
 #[doc(hidden)]
 pub struct AsRecords;
 
