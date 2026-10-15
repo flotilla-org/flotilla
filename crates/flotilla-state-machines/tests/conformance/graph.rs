@@ -72,6 +72,12 @@ pub trait Conformance {
     /// Refusal variants the Rust machine keeps for parity with the spec's
     /// `Refusal` sum but never produces; producing one is a disagreement.
     const NEVER_REFUSED: &'static [&'static str] = &[];
+
+    /// Every reason this machine's probes may be unrealisable, with its exact
+    /// count over the exported graph. A skip for another reason, or another
+    /// count, is a disagreement, so adaptor drift cannot quietly turn probes
+    /// into skips.
+    const UNREALISABLE: &'static [(&'static str, usize)] = &[];
 }
 
 /// The exported graph of `machine`, from `$QUINT_GRAPH_DIR`.
@@ -282,6 +288,10 @@ pub fn check<M: Conformance>(nodes: &[Value], report: &mut Report) {
             }
             (_, step) => report.disagreements.push(disagree(describe(&step))),
         }
+    }
+    let expected: BTreeMap<&'static str, usize> = M::UNREALISABLE.iter().copied().collect();
+    if report.unrealisable != expected {
+        report.disagreements.push(format!("unrealisable probes {:?}, expected {:?}", report.unrealisable, expected));
     }
 }
 

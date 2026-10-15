@@ -102,12 +102,16 @@ fn work(e: &Resource<Ensure>) -> Value {
     json!({ "recorded": ids(state.recorded()), "created": ids(state.created()), "history": history, "window": int(window) })
 }
 
+/// Why the probes the spec refuses at its history bound are skipped.
+const HISTORY_FULL: &str = "the spec's HistoryFull model bound; Rust attempts are an unbounded log";
+
 struct EnsureConformance;
 
 impl Conformance for EnsureConformance {
     const MACHINE: &'static str = "ensure";
     // The spec's model bound on recorded failures; the attempt log is unbounded.
     const NEVER_REFUSED: &'static [&'static str] = &["HistoryFull"];
+    const UNREALISABLE: &'static [(&'static str, usize)] = &[(HISTORY_FULL, 27)];
     type Subject = Home<Ensure>;
 
     fn create(_: &Value) -> Home<Ensure> {
@@ -147,7 +151,7 @@ impl Conformance for EnsureConformance {
                 let e = home.get(NAME).expect("exists");
                 let limit = usize::try_from(number(&o["limit"])).expect("model limit");
                 if matches!(e.state(), EnsureState::Unfulfilled { .. }) && e.attempts().len() >= limit {
-                    return Step::Unrealisable("the spec's HistoryFull model bound; Rust attempts are an unbounded log");
+                    return Step::Unrealisable(HISTORY_FULL);
                 }
                 let named = f(number(&o["id"]));
                 let failed = Attempt::failed(at, Cause::new(CauseCategory::Transient, named.name()), true);
