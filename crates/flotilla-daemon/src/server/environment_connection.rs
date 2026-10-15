@@ -89,7 +89,9 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
                     // Short forms are qualified using the caller's convoy by handoff_with_carries,
                     // which independently rejects a resolved foreign convoy.
                     let parts = target.split('/').collect::<Vec<_>>();
-                    if parts.len() > 2 && !(parts.len() == 4 && parts[0] == crew.namespace && parts[1] == crew.convoy) {
+                    if parts.iter().any(|part| part.is_empty())
+                        || (parts.len() > 2 && !(parts.len() == 4 && parts[0] == crew.namespace && parts[1] == crew.convoy))
+                    {
                         return Err("EnvironmentIdentityMismatch: handoff names another convoy".into());
                     }
                     authorize_context(context, crew)
@@ -367,13 +369,27 @@ mod tests {
             };
             assert!(authorize(&mut request, &placed).is_ok());
         }
+        for target in ["own-convoy/work/coder", "", "work/", "/coder", "flotilla/own-convoy/work/", "flotilla//work/coder"] {
+            let mut request = Request::Execute {
+                command: flotilla_protocol::Command::builder()
+                    .action(CommandAction::CrewHandoff {
+                        context: CrewCommandContext::default(),
+                        target: target.into(),
+                        message: "handoff".into(),
+                        carries: Vec::new(),
+                    })
+                    .build(),
+            };
+            assert!(authorize(&mut request, &placed).is_err(), "malformed handoff {target}");
+        }
         let mut request = Request::ArtifactList { convoy: None, kind: None, subject: None };
         authorize(&mut request, &placed).expect("own artifact list");
         assert!(matches!(request, Request::ArtifactList { convoy: Some(convoy), .. } if convoy == "own-convoy"));
     }
+
     // A dropped completion is an unknown outcome, never an infinite wait.
-    // The broadcast channel is the actual event transport, with capacity one
-    // to force a deterministic lag instead of relying on scheduler timing.
+    // The second real broadcast channel has capacity one to force deterministic
+    // lag; the first has room for unrelated and own completion events.
     #[tokio::test]
     async fn command_relay_returns_own_completion_and_refuses_lag() {
         fn finished(id: u64) -> DaemonEvent {

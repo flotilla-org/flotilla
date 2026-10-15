@@ -5599,6 +5599,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         .expect("placement identity");
     assert_eq!(crews[0].vessel, "placed-vessel");
     let router = empty_remote_command_router(&daemon, &pm);
+    router.install_blob_store(Arc::new(crate::blob_store::TieredBlobStore::new(_tmp.path(), Vec::new()))).unwrap();
     let (_shutdown, shutdown_rx) = watch::channel(false);
     let (client, server) = message_session_pair();
     let task = tokio::spawn(super::environment_connection::serve(
@@ -5630,6 +5631,24 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
             other => panic!("unexpected response {other:?}"),
         }
     }
+    // Unknown JSON identity selectors cannot override the connection's crew.
+    // The real dispatcher chooses that crew's placed environment before reading
+    // a source file; this fixture deliberately has no runner at that boundary.
+    let mut artifact = serde_json::to_value(Request::ArtifactPut {
+        kind: "review-round".into(),
+        subject: "other-convoy".into(),
+        summary: Default::default(),
+        media_type: "text/plain".into(),
+        source_path: "/evidence.md".into(),
+    })
+    .unwrap();
+    artifact["params"]["caller_session"] = serde_json::json!("forged-session");
+    artifact["params"]["convoy"] = serde_json::json!("other-convoy");
+    client.write(Message::Request { id: 9, request: serde_json::from_value(artifact).unwrap() }).await.unwrap();
+    let Message::Response { response, .. } = read_session_message(&client).await else { panic!("artifact response") };
+    assert!(
+        matches!(response.as_ref(), ResponseResult::Err { message } if message == "artifact environment placed-environment is unavailable")
+    );
     // An admitted promise must reach the dispatcher, relay only its completion,
     // and persist the promised work in the caller's convoy.
     client
