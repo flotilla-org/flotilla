@@ -18,6 +18,10 @@ syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "vis
 
 [dev-dependencies]
 hegeltest = { workspace = true }
+# ITF traces and exported graphs are JSON; production code never decodes them.
+# `raw_value` and serde_core's `alloc`/`result` anchor the base layer's dev selections.
+serde_json = { workspace = true, features = ["raw_value"] }
+serde_core = { version = "1", features = ["alloc", "result"] }
 smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }
 
 [lints]

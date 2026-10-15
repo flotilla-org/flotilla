@@ -22,9 +22,10 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-# Only source and lockfiles travel; no checkout caches, credentials, or generated outputs.
-tar --exclude=target --exclude=build --exclude=_apalache-out --exclude=__pycache__ -czf "$scratch/source.tgz" -C "$repo" \
-  rust-toolchain.toml rustfmt.toml prototypes/3108-3209 specs/primitives
+# Only tracked source travels (the workspace, so `cargo test -p` resolves the
+# engine crate); no checkout caches, credentials, or generated outputs.
+git -C "$repo" ls-files -z | tar --null --ignore-failed-read --exclude=target --exclude=build --exclude=_apalache-out \
+  --exclude=__pycache__ -czf "$scratch/source.tgz" -C "$repo" -T -
 timeout --kill-after=10s "${DEEP_START_SECONDS:-600}s" "$provider" start "$allocation"
 run_reached=true
 timeout --kill-after=10s "${DEEP_RUN_SECONDS:-900}s" "$provider" run "$allocation" "$scratch/source.tgz"

@@ -44,10 +44,10 @@ windows_content='^[+-].*(cfg(_attr|!)?\(.*(windows|unix|target_os|target_family|
 macos_paths="${shared}|^(crates/flotilla-daemon/src/server/caller|crates/flotilla-transport/)"
 macos_content='^[+-].*(target_os *= *"macos"|target_vendor *= *"apple")'
 
-# The Quint quick tier (#3280) checks the typed machine specs and replays their
-# traces against the engine prototype. It reads only those trees, plus the
-# compiler pin, the workflow and this classifier.
-quint_paths='^(specs/primitives/|prototypes/3108-3209/|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/platform-changes/)'
+# The Quint quick tier (#3280) checks the typed machine specs, their full-graph
+# conformance and trace replay against the state-machine engine (#3319). It
+# reads only those trees, plus the compiler pin, the workflow and this classifier.
+quint_paths='^(specs/primitives/|crates/flotilla-state-machines/|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/platform-changes/)'
 
 # An empty content pattern decides on paths alone.
 decide() {

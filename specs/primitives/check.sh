@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fast safety + generated ITF replay. Generated files stay beneath build/.
+# Fast safety, full-graph conformance and generated ITF replay against
+# flotilla-state-machines. Generated files stay beneath build/.
 set -euo pipefail
 # Expanded typed compositions exceed the JVM's default parser stack.
 export JVM_ARGS="${JVM_ARGS:--Xmx3g -Xss16m}"
@@ -26,10 +27,13 @@ for scenario in convoy_deliver ensure_bind inbox_delivery message_race machine_e
   quint run "scenarios/$scenario.qnt" --backend typescript --mbt --invariant safety --seed 3220 \
     --max-samples 128 --n-traces 128 --max-steps 80 --out-itf "$run/$scenario-{seq}.itf.json" > "$run/$scenario.replay.log"
 done
-cargo fmt --manifest-path ../../prototypes/3108-3209/Cargo.toml --check
-cargo clippy --manifest-path ../../prototypes/3108-3209/Cargo.toml --all-targets --locked -- -D warnings
-cargo test --manifest-path ../../prototypes/3108-3209/Cargo.toml --locked
-QUINT_TRACE_DIR="$run" cargo test --manifest-path ../../prototypes/3108-3209/Cargo.toml --locked --test quint_replay -- --ignored
+# Full-graph conformance: TLC dumps every reachable state of each machine's
+# harness, and the engine must accept, reach and refuse exactly as the spec does.
+python3 conformance/test_dump2json.py
+./conformance/export.sh "$run/graphs"
+# Workspace CI runs the crate's fmt, Clippy and unit tests; these two need Quint's output.
+QUINT_TRACE_DIR="$run" QUINT_GRAPH_DIR="$run/graphs" cargo test -p flotilla-state-machines --locked \
+  --test conformance --test quint_replay -- --ignored --nocapture 2>&1 | tee "$run/engine.log"
 ./mutants/check.sh
 
 ./deep-contract-test.sh

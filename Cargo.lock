@@ -2572,6 +2572,8 @@ name = "flotilla-state-machines"
 version = "0.1.0"
 dependencies = [
  "hegeltest",
+ "serde_core",
+ "serde_json",
  "smallvec",
  "strum 0.28.0",
  "syn 2.0.117",
