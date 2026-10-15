@@ -83,15 +83,11 @@ mod tests {
         let reverse = tc.draw(hegel::generators::booleans());
         let mut deepest = std::path::PathBuf::from("volume");
         let mut mounts = vec![(deepest.clone(), bytes.wrapping_add(1))];
-        for _ in 0..depth {
-            deepest.push("nested");
-            mounts.push((deepest.clone(), bytes));
-        }
         // All shallower mounts deliberately report different bytes.
-        for (mount, available) in &mut mounts {
-            if mount != &deepest {
-                *available = bytes.wrapping_add(1);
-            }
+        for level in 1..=depth {
+            deepest.push("nested");
+            let available = if level == depth { bytes } else { bytes.wrapping_add(1) };
+            mounts.push((deepest.clone(), available));
         }
         if reverse {
             mounts.reverse();
