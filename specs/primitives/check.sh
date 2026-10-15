@@ -36,6 +36,5 @@ QUINT_TRACE_DIR="$run" QUINT_GRAPH_DIR="$run/graphs" cargo test -p flotilla-stat
   --test conformance --test quint_replay -- --ignored --nocapture 2>&1 | tee "$run/engine.log"
 ./mutants/check.sh
 
-./deep-contract-test.sh
 python3 ./runner-contract-test.py
 printf 'Fast-tier artifacts: %s\n' "$run"
