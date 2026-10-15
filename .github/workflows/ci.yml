@@ -370,9 +370,11 @@ jobs:
       # exhaustive TLC safety, generated trace replay against the prototype,
       # and mutants. The first compile bootstraps Quint's lazily fetched
       # Apalache jar, which check.sh's preflight requires. Deep and symbolic
-      # runs keep their own budgets outside CI.
+      # runs keep their own budgets outside CI. The first CI run took about
+      # 8 minutes; the owner raised the step budget to 20 (#3280) so the engine
+      # stack's conformance runs fit, and the job only runs on Quint inputs.
       - name: Check typed machines and replay Quint traces
-        timeout-minutes: 10
+        timeout-minutes: 20
         env:
           JVM_ARGS: -Xmx3g -Xss16m
         run: |
