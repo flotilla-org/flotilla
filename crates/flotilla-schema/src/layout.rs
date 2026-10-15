@@ -162,10 +162,18 @@ fn conjunction(terms: impl Iterator<Item = String>) -> String {
 
 /// `TerminalSession` becomes `terminal_session`.
 pub fn snake_case(name: &str) -> String {
+    // A table name is fixed once stored, so acronyms keep one word: `HTTPRoute` is
+    // `http_route`, not `h_t_t_p_route`. An uppercase letter starts a word after a lowercase
+    // letter or digit, or when it ends an acronym that a lowercase letter follows.
+    let characters: Vec<char> = name.chars().collect();
     let mut out = String::with_capacity(name.len() + 4);
-    for (index, character) in name.chars().enumerate() {
+    for (index, &character) in characters.iter().enumerate() {
         if character.is_ascii_uppercase() {
-            if index > 0 {
+            let previous = index.checked_sub(1).map(|index| characters[index]);
+            let next = characters.get(index + 1);
+            let after_word = previous.is_some_and(|previous| previous.is_ascii_lowercase() || previous.is_ascii_digit());
+            let ends_acronym = previous.is_some_and(|previous| previous.is_ascii_uppercase()) && next.is_some_and(char::is_ascii_lowercase);
+            if after_word || ends_acronym {
                 out.push('_');
             }
             out.push(character.to_ascii_lowercase());
@@ -188,7 +196,24 @@ mod tests {
     fn kind_names_become_snake_case_tables() {
         assert_eq!(snake_case("Message"), "message");
         assert_eq!(snake_case("TerminalSession"), "terminal_session");
+        assert_eq!(snake_case("HTTPRoute"), "http_route");
+        assert_eq!(snake_case("ResolvedHTTP"), "resolved_http");
+        assert_eq!(snake_case("Ipv4Address"), "ipv4_address");
+        assert_eq!(snake_case("snake_already"), "snake_already");
         assert_eq!(Layout::root("TerminalSession", KindCode(3)).finish().tables[0].name, "terminal_session");
+    }
+
+    // Behaviour: an element's unnamed column is `value`, so a field named `value` beside it in
+    // the same table is a duplicate the descriptor refuses rather than a silent collision.
+    #[test]
+    fn a_field_named_like_the_element_column_is_refused() {
+        let mut layout = Layout::root("Note", KindCode(1));
+        layout.table("items", TableRole::Child, |layout| {
+            layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
+            layout.column("", ColumnType::Text, true);
+            layout.column("value", ColumnType::Text, true);
+        });
+        assert!(matches!(layout.finish().validate(), Err(crate::DescriptorError::DuplicateColumn { column, .. }) if column == "value"));
     }
 
     // Behaviour (DESIGN guards): a required column inside a guard is nullable and required by that
