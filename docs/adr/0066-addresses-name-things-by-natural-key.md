@@ -58,6 +58,7 @@ An address says what a thing is, for example "CR 42 in this repo on this forge" 
 ### 3. Normalisation happens once, when an address is built
 
 - **A forge is named by its `forge_id`.** GitHub gets a built-in Forge, `github`. Hosts, SSH aliases and URLs are inputs only, resolved through Forge resources. A host that doesn't resolve to a Forge is an error, not a fallback spelling.
+  - **`github` is a reserved Forge id.** Because the built-in Forge needs no record, admission refuses a user-defined Forge resource with the id `github`. Otherwise one address could mean two forges.
 - **Case is decided by forge kind, in the constructor only.** GitHub and Forgejo both look up owner and repo case-insensitively (Forgejo compares `lower_name` after lowercasing, `models/repo/repo.go`), so both lowercase owner and repo.
   - **Display case is not stored in the address.** The address is an identity, not a display name. A surface that wants the forge's own casing reads it from the observation record or the forge.
   - **`ForgeKind` is a closed enum.** Adding a forge kind means declaring its case rule in the same change. There is no default, so a case-sensitive forge can't be lowercased by accident.
@@ -72,6 +73,8 @@ Every address is a list of `kind:value` segments over a closed kind enum. Receiv
   - Hex digits are uppercase (`%2F`, never `%2f`).
   - The parser refuses non-canonical input in stored data. Lenient input is canonicalised first; see below.
 - **The kind enum is closed.** Adding a kind changes the parser. Under ADR 0047 that is fine, but it is a deliberate change, not an extension point.
+  - **An unknown kind fails the parse.** A new kind needs no staging roll. The fingerprint handshake keeps hosts of different generations from replicating to each other, so a new kind is only ever read by its own generation or a later one. Like every stored-shape change, it is not readable after rolling back to an older generation.
+  - **`of` is a reserved grammar segment, not a kind.** It is valid only directly after an `artifact:` segment (§8), and the parser refuses it anywhere else.
 - **The path shows ownership.** "Everything in this convoy" or "everything under this repo" is a prefix match **on segment boundaries**. `X` is under `P` when `X = P` or `X` starts with `P/`. A raw string prefix is wrong: `…/convoy:demo` must not match `…/convoy:demo2`. Queries use `= P OR (>= P || '/' AND < P || '0')`, since `0` is the byte after `/`. The bound is sound because no canonical value ever contains a bare `/`, which is always encoded, so every address under `P` begins exactly `P/`.
 
 ```
@@ -116,6 +119,7 @@ For those kinds a shim never actually becomes removable, and the roll-time live 
 - **When a shim can go.** It is removable once that step has run on every host since the shim was added.
   - **The marker is per host,** in that host's own store.
   - **The pre-roll live-store gate (#2167) enforces it.** The gate refuses a candidate that removes a shim while any host's store lacks the step's marker. Retirement is then checked rather than procedural.
+  - **How a shim is tied to its marker.** Each shim's removal comment names the marker id of the re-encode step that retires it. The change that removes the shim adds that marker id to the candidate's list of required markers. The gate then compares that list with every host's markers, which is a mechanical check.
 - **After the cut-over,** ADR 0064's explicit migration steps cover the same need.
 
 ### 7. Rollout
