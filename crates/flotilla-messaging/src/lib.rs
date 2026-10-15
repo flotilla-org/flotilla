@@ -1,4 +1,7 @@
 //! Resource-backed message admission, delivery, retention and receiver routing.
+// Deliberate private imports preserve the moved modules' `crate::` paths during
+// this mechanical split. Only messaging-owned items are publicly re-exported;
+// resources and store helpers keep their existing ownership.
 use flotilla_resources::*;
 use flotilla_resources::{delivery_hold, message};
 use flotilla_store::*;

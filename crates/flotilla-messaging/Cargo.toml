@@ -20,12 +20,12 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-tracing = "0.1"
+tracing = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-futures = "0.3"
+futures = { workspace = true }
 flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }

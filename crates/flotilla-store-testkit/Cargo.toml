@@ -10,6 +10,9 @@ default = []
 skip-no-sandbox-tests = []
 
 [dependencies]
+# LegacyMessageFixture uses the library build of messaging. Messaging also
+# dev-depends on this testkit: tests mixing that fixture with MessageInbox belong
+# in messaging integration tests, where both use the same library type identity.
 flotilla-messaging = { path = "../flotilla-messaging" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-store-http = { path = "../flotilla-store-http" }
