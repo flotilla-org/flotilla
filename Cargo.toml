@@ -46,6 +46,7 @@ members = [
     "crates/flotilla-replay-testkit",
     "crates/flotilla-resources",
     "crates/flotilla-messaging",
+    "crates/flotilla-state-machines",
     "crates/flotilla-store",
     "crates/flotilla-store-memory",
     "crates/flotilla-store-sqlite",
@@ -91,6 +92,7 @@ bon = "3"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider"] }
 url = "2"
 urlencoding = "2"
+strum = { version = "0.28", features = ["derive"] }
 rustls = { version = "0.23.37", default-features = false, features = ["ring"] }
 
 [package]

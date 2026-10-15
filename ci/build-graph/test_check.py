@@ -5,7 +5,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from check import (CAPABILITY_CRATES, C_FREE_BASE, RESOURCE_EXEMPTIONS, c_free_violations,
+from check import (CAPABILITY_CRATES, C_FREE_BASE, RESOURCE_EXEMPTIONS, STATE_MACHINES, c_free_violations,
                    feature_differences, is_testkit, layer, main, tree_features, violations)
 
 
@@ -31,6 +31,38 @@ def graph(*packages):
 
 
 class BuildGraphContract(unittest.TestCase):
+    def test_state_machines_are_c_free_and_self_contained(self):
+        # ADR 0064 / #3319: the engine is base-tier, uses only external crates,
+        # and may be a dev-dependency of anything.
+        self.assertEqual(STATE_MACHINES, "flotilla-state-machines")
+        self.assertEqual(layer(STATE_MACHINES), "base")
+        self.assertEqual(violations(graph(
+            package(STATE_MACHINES),
+            package("flotilla-core", dev=(STATE_MACHINES,)),
+        )), [])
+
+    def test_state_machines_reach_no_workspace_crate(self):
+        # Finite generator: base and native targets, normal and build edges.
+        for target in ("flotilla-resources", "flotilla-store", "flotilla-cbor", "flotilla-core"):
+            for kind in ("normal", "build"):
+                with self.subTest(target=target, kind=kind):
+                    self.assertEqual(violations(graph(
+                        package(STATE_MACHINES, **{kind: (target,)}), package(target),
+                    )), [f"{STATE_MACHINES}: must not depend on workspace crate {target}"])
+
+    def test_no_production_crate_depends_on_state_machines(self):
+        # Rule 2 makes "no runtime use yet" mechanical; a named allowlist relaxes it.
+        for dependent in ("flotilla-core", "flotilla-daemon", "flotilla-store", "flotilla"):
+            for kind in ("normal", "build"):
+                with self.subTest(dependent=dependent, kind=kind):
+                    self.assertEqual(violations(graph(
+                        package(dependent, **{kind: (STATE_MACHINES,)}), package(STATE_MACHINES),
+                    )), [f"{dependent}: production dependency on {STATE_MACHINES} before the composition-root switch"])
+                    with patch("check.STATE_MACHINE_DEPENDENTS", frozenset({dependent})):
+                        self.assertEqual(violations(graph(
+                            package(dependent, **{kind: (STATE_MACHINES,)}), package(STATE_MACHINES),
+                        )), [])
+
     def test_messaging_reads_store_in_c_free_base(self):
         # Messaging is below capabilities, with resource-only receiver resolution.
         self.assertIn("flotilla-messaging", C_FREE_BASE)

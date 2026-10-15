@@ -2568,6 +2568,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-state-machines"
+version = "0.1.0"
+dependencies = [
+ "hegeltest",
+ "smallvec",
+ "strum 0.28.0",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "flotilla-store"
 version = "0.1.0"
 dependencies = [

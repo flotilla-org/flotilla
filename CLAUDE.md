@@ -167,6 +167,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-credentials` | Host-local credential minting/delivery, agent homes and skills, private vessel configuration composition |
 | `flotilla-projections` | Surface read models, host/fleet views, dispatch board, query actions, durable/observed aggregation and demand-backed issue materialization; reads host inputs through ports |
 | `flotilla-resources` | Resource kinds, lifecycle authority, typed list/watch shapes and shared pure helpers, including convoy-address selection, terminal delivery/attention evidence, unmet-expectation explanations and landing-evidence freshness; no storage dependencies |
+| `flotilla-state-machines` | Storage-free ADR 0064 engine: machine declarations with typed edge dispatch and stable codes, gated edges at a single writer, records, judgements and typed reads through a recording handle; no workspace dependencies and no production dependents yet |
 | `flotilla-messaging` | Resource-backed inbox admission, delivery, retention, conditions and receiver/role routing |
 | `flotilla-store` | Object-safe `Store`, typed resolvers, replica/watch machinery, store queries, generic request snapshots and merged definition-catalog reads, and the generic controller runtime || `flotilla-store-memory` | In-memory storage and observed replicas; no native persistence dependencies |
 | `flotilla-store-sqlite` | SQLite persistence, schema, transactions and decode quarantine |
