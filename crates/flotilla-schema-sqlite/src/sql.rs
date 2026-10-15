@@ -26,10 +26,12 @@ pub(crate) struct KindSql {
 }
 
 /// Interned columns read back as their strings through `strings`' primary key.
-fn select_expr(column: &ColumnDef) -> String {
-    let name = quote_ident(&column.name);
+/// The outer column is qualified with its table: unqualified, a field named `id` or `s` would
+/// resolve to the `strings` column inside the subquery and match the wrong row.
+fn select_expr(table: &str, column: &ColumnDef) -> String {
+    let name = format!("{table}.{}", quote_ident(&column.name));
     match column.ty {
-        ColumnType::Interned => format!("(SELECT \"s\" FROM \"strings\" WHERE \"id\" = {name})"),
+        ColumnType::Interned => format!("(SELECT \"strings\".\"s\" FROM \"strings\" WHERE \"strings\".\"id\" = {name})"),
         _ => name,
     }
 }
@@ -60,7 +62,7 @@ impl TableSql {
         let name = quote_ident(&table.name);
         let columns: Vec<ColumnDef> = table.key.iter().chain(&table.columns).cloned().collect();
         let names: Vec<String> = columns.iter().map(|column| quote_ident(&column.name)).collect();
-        let exprs: Vec<String> = columns.iter().map(select_expr).collect();
+        let exprs: Vec<String> = columns.iter().map(|column| select_expr(&name, column)).collect();
         let key_names = &names[..table.key.len()];
         let data = &table.columns;
         let (insert, update, delete, select) = if table.parent.is_none() {
@@ -126,9 +128,32 @@ fn prefixed_placeholders(from: usize, count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_schema::{ColumnType, KindCode, Layout, TableRole};
+    use flotilla_schema::{render_ddl, ColumnType, KindCode, Layout, TableRole};
+    use rusqlite::Connection;
 
     use super::KindSql;
+    use crate::shared::SHARED_DDL;
+
+    // Behaviour: an interned column named like a `strings` column (`s`, `id`) still reads its
+    // own row's string; unqualified, the subquery would compare `strings` with itself.
+    #[test]
+    fn interned_columns_named_like_strings_columns_read_their_own_string() {
+        let mut layout = Layout::root("Note", KindCode(1));
+        layout.column("s", ColumnType::Interned, true);
+        layout.column("id_text", ColumnType::Text, true);
+        let set = layout.finish();
+        let conn = Connection::open_in_memory().expect("open");
+        conn.execute_batch(&format!("{SHARED_DDL}{}", render_ddl(&set))).expect("ddl");
+        conn.execute_batch(
+            "INSERT INTO strings (id, s) VALUES (1, 'first'), (2, 'second'), (3, 'n'), (4, 'h');
+             INSERT INTO resource_identity (id, kind, name, home) VALUES (2, 1, 3, 4);
+             INSERT INTO note (id, version, s, id_text) VALUES (2, 1, 1, 'x');",
+        )
+        .expect("rows");
+        let select = &KindSql::render(&set).tables[0].select;
+        let s: String = conn.query_row(select, [2], |row| row.get(1)).expect("select");
+        assert_eq!(s, "first");
+    }
 
     // Glue: the rendered statements name rows by primary key and bind parameters in the order the
     // runtime passes them (data values, then owner and key).
@@ -146,12 +171,16 @@ mod tests {
         assert_eq!(root.update, "UPDATE \"convoy\" SET \"version\" = ?1, \"name\" = ?2 WHERE \"id\" = ?3 AND \"version\" = ?4");
         assert_eq!(
             root.select,
-            "SELECT \"version\", (SELECT \"s\" FROM \"strings\" WHERE \"id\" = \"name\") FROM \"convoy\" WHERE \"id\" = ?1"
+            "SELECT \"version\", (SELECT \"strings\".\"s\" FROM \"strings\" WHERE \"strings\".\"id\" = \"convoy\".\"name\") \
+             FROM \"convoy\" WHERE \"id\" = ?1"
         );
         let steps = &sql.tables[1];
         assert_eq!(steps.insert, "INSERT INTO \"convoy_steps\" (\"owner\", \"pos\", \"label\") VALUES (?1, ?2, ?3)");
         assert_eq!(steps.update, "UPDATE \"convoy_steps\" SET \"label\" = ?1 WHERE \"owner\" = ?2 AND \"pos\" = ?3");
         assert_eq!(steps.delete, "DELETE FROM \"convoy_steps\" WHERE \"owner\" = ?1 AND \"pos\" = ?2");
-        assert_eq!(steps.select, "SELECT \"pos\", \"label\" FROM \"convoy_steps\" WHERE \"owner\" = ?1 ORDER BY \"pos\"");
+        assert_eq!(
+            steps.select,
+            "SELECT \"convoy_steps\".\"pos\", \"convoy_steps\".\"label\" FROM \"convoy_steps\" WHERE \"owner\" = ?1 ORDER BY \"pos\""
+        );
     }
 }

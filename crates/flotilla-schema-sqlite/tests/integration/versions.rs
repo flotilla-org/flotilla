@@ -111,3 +111,36 @@ fn names_are_unique_per_kind_and_home() {
     assert!(again.version > stamp.version);
     write.commit().expect("commit");
 }
+
+// Behaviour (DESIGN writes, many writes per transaction): a refused write leaves the batch
+// transaction usable; the writes around it commit and the refused one leaves no trace.
+#[test]
+fn a_refused_write_does_not_spoil_its_batch() {
+    let mut store = store();
+    let mut write = store.write().expect("write");
+    let first = write.insert("a", &message("first")).expect("insert a");
+    let current = write.load::<Message>(first.id).expect("load").expect("present");
+    let moved = write.update(&current, &message("second")).expect("update");
+    let refused = write.update(&current, &message("stale"));
+    assert!(matches!(refused, Err(StoreError::Conflict { .. })), "{refused:?}");
+    let other = write.insert("b", &message("other")).expect("insert b");
+    write.commit().expect("commit");
+
+    let mut read = store.read().expect("read");
+    let a = read.load::<Message>(first.id).expect("load a").expect("a present");
+    assert_eq!((a.value.body.as_str(), a.version), ("second", moved.version));
+    assert_eq!(read.load::<Message>(other.id).expect("load b").expect("b present").value.body, "other");
+}
+
+// Behaviour: identity rows outlive their resource, so a write to a deleted resource is
+// `NotFound` rather than a version `Conflict`.
+#[test]
+fn writes_to_a_deleted_resource_are_not_found() {
+    let mut store = store();
+    let mut write = store.write().expect("write");
+    let stamp = write.insert("gone", &message("x")).expect("insert");
+    let current = write.load::<Message>(stamp.id).expect("load").expect("present");
+    write.delete::<Message>(stamp).expect("delete");
+    assert!(matches!(write.update(&current, &message("y")), Err(StoreError::NotFound { .. })));
+    assert!(matches!(write.delete::<Message>(stamp), Err(StoreError::NotFound { .. })));
+}

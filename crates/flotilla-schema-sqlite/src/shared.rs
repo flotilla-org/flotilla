@@ -7,7 +7,7 @@ use flotilla_schema::{render_ddl_with, DdlMode, KindRegistry};
 /// frozen documents by hash (media 1 is ADR 0063 CBOR); `home_sequence.last` is each home's
 /// sequence, which never decreases and does not depend on `change_log` rows, so deleting log
 /// rows never lets a sequence repeat; `change_log` holds every write's row changes per home.
-const SHARED_DDL: &str = "\
+pub(crate) const SHARED_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS strings (id INTEGER PRIMARY KEY, s TEXT NOT NULL UNIQUE) STRICT;
 CREATE TABLE IF NOT EXISTS resource_identity (
   id INTEGER PRIMARY KEY, kind INTEGER NOT NULL,

@@ -70,10 +70,15 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn decode<K: Kind>(&self) -> Result<K, StoreError> {
+        self.clone().into_value()
+    }
+
+    /// Like [`Snapshot::decode`], without copying the rows.
+    pub fn into_value<K: Kind>(self) -> Result<K, StoreError> {
         if self.kind != K::CODE {
             return Err(DecodeError::WrongKind { expected: K::KIND.to_owned(), found: self.kind.to_string() }.into());
         }
-        Ok(Decoder::decode::<K>(self.rows.clone())?)
+        Ok(Decoder::decode::<K>(self.rows)?)
     }
 }
 
@@ -166,9 +171,12 @@ pub struct Read<'s> {
 
 impl Read<'_> {
     fn ctx(&mut self) -> Ctx<'_> {
+        // A read transaction sees only committed rows, so its ids go straight into the caches.
         Ctx { conn: &self.tx, runtime: &mut *self.runtime, pending: None }
     }
 
+    // Reads inside a write journal ids into the overlay without a savepoint mark: they never
+    // need rewinding alone, and the whole overlay is dropped if the transaction rolls back.
     pub fn resolve(&mut self, kind: KindCode, name: &str, home: &str) -> Result<Option<ResourceId>, StoreError> {
         self.ctx().resolve(&Identity { kind, name: name.to_owned(), home: home.to_owned() })
     }
@@ -502,6 +510,9 @@ impl Ctx<'_> {
     fn update<K: Kind>(&mut self, current: Stamp, mut old: Rows, mut new: Rows) -> Result<Stamp, StoreError> {
         self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
+        // The encoder already emits each table in key order (positions ascend, maps are
+        // ordered, nested rows follow their parent); the diff's merge relies on that order,
+        // so it is restored here rather than trusted.
         old.sort();
         new.sort();
         let sql = self.sql(K::CODE)?;
@@ -513,7 +524,8 @@ impl Ctx<'_> {
                 self.conn.prepare_cached(&sql.root_version)?.query_row([current.id.0], |row| row.get(0)).optional()?;
             return match stored {
                 Some(stored) if stored == expected => Ok(current),
-                _ => Err(StoreError::Conflict { id: current.id, expected: current.version }),
+                Some(_) => Err(StoreError::Conflict { id: current.id, expected: current.version }),
+                None => Err(StoreError::NotFound { id: current.id }),
             };
         }
         let (sequence, version) = self.next_sequence()?;
@@ -529,7 +541,7 @@ impl Ctx<'_> {
             self.conn.prepare_cached(sql)?.execute(params![sequence, current.id.0, expected])?
         };
         if updated == 0 {
-            return Err(StoreError::Conflict { id: current.id, expected: current.version });
+            return Err(self.stale::<K>(current));
         }
         let changed = changes.iter().flatten().filter_map(|change| match change {
             Change::Insert(row) | Change::Update(row) => Some(*row),
@@ -577,9 +589,22 @@ impl Ctx<'_> {
         // Child rows go with the root row through their cascading foreign keys.
         let deleted = self.conn.prepare_cached(sql)?.execute(params![current.id.0, expected])?;
         if deleted == 0 {
-            return Err(StoreError::Conflict { id: current.id, expected: current.version });
+            return Err(self.stale::<K>(current));
         }
         Ok(())
+    }
+
+    /// Why a version-checked root write matched no row. Identity rows outlive their resource,
+    /// so a deleted resource still resolves; it is `NotFound`, while a newer version is `Conflict`.
+    fn stale<K: Kind>(&mut self, current: Stamp) -> StoreError {
+        let stored = self.sql(K::CODE).and_then(|sql| {
+            Ok(self.conn.prepare_cached(&sql.root_version)?.query_row([current.id.0], |row| row.get::<_, i64>(0)).optional()?)
+        });
+        match stored {
+            Ok(Some(_)) => StoreError::Conflict { id: current.id, expected: current.version },
+            Ok(None) => StoreError::NotFound { id: current.id },
+            Err(error) => error,
+        }
     }
 
     fn load<K: Kind>(&mut self, id: ResourceId) -> Result<Option<Loaded<K>>, StoreError> {
@@ -587,8 +612,9 @@ impl Ctx<'_> {
         if snapshot.kind != K::CODE {
             return Err(StoreError::WrongKind { id, expected: K::CODE, found: snapshot.kind });
         }
-        let value = snapshot.decode::<K>()?;
-        Ok(Some(Loaded { id, name: snapshot.name, home: snapshot.home, version: snapshot.version, value }))
+        let (name, home, version) = (snapshot.name.clone(), snapshot.home.clone(), snapshot.version);
+        let value = snapshot.into_value::<K>()?;
+        Ok(Some(Loaded { id, name, home, version, value }))
     }
 
     /// The root row and every child row of one resource, each read by primary key.
