@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Decide whether the Windows client and macOS peer-identity CI jobs need to run.
+# Decide whether the Windows client, macOS peer-identity and Quint quick-tier
+# CI jobs need to run.
 #
 # Usage: classify.sh <event> <full-label> <changed-files> <diff>
 #   event          GitHub event name (pull_request, merge_group, push, ...)
@@ -7,9 +8,9 @@
 #   changed-files  file listing changed paths, one per line
 #   diff           file holding the unified diff of those changes
 #
-# Prints `windows=<true|false>` and `macos=<true|false>`, suitable for
-# appending to $GITHUB_OUTPUT. Pull requests and merge groups run a job only
-# when its inputs changed; every other event, and ci:full, runs both.
+# Prints `windows=<true|false>`, `macos=<true|false>` and `quint=<true|false>`,
+# suitable for appending to $GITHUB_OUTPUT. Pull requests and merge groups run a
+# job only when its inputs changed; every other event, and ci:full, runs all.
 set -euo pipefail
 
 event=$1
@@ -18,10 +19,11 @@ changed_files=$3
 diff=$4
 
 # Only pull requests and merge groups carry a diff base; every other event
-# (push to main, workflow_dispatch, schedule, ...) runs both jobs.
+# (push to main, workflow_dispatch, schedule, ...) runs every job.
 if [[ ( "$event" != "pull_request" && "$event" != "merge_group" ) || "$full_label" == "true" ]]; then
   echo "windows=true"
   echo "macos=true"
+  echo "quint=true"
   exit 0
 fi
 
@@ -42,14 +44,20 @@ windows_content='^[+-].*(cfg(_attr|!)?\(.*(windows|unix|target_os|target_family|
 macos_paths="${shared}|^(crates/flotilla-daemon/src/server/caller|crates/flotilla-transport/)"
 macos_content='^[+-].*(target_os *= *"macos"|target_vendor *= *"apple")'
 
+# The Quint quick tier (#3280) checks the typed machine specs and replays their
+# traces against the engine prototype. It reads only those trees, plus the
+# compiler pin, the workflow and this classifier.
+quint_paths='^(specs/primitives/|prototypes/3108-3209/|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/platform-changes/)'
+
+# An empty content pattern decides on paths alone.
 decide() {
-  local paths=$1 content=$2
+  local paths=$1 content=${2:-}
   if grep -qE "$paths" "$changed_files"; then
     echo true
   # The content patterns anchor on added or removed lines. The final grep
   # reads its whole input rather than using -q: an early exit would SIGPIPE
   # the writer and, under pipefail, turn a match into a miss on large diffs.
-  elif grep -vE '^(\+\+\+|---) ' "$diff" | grep -E "$content" >/dev/null; then
+  elif [[ -n "$content" ]] && grep -vE '^(\+\+\+|---) ' "$diff" | grep -E "$content" >/dev/null; then
     echo true
   else
     echo false
@@ -58,3 +66,4 @@ decide() {
 
 echo "windows=$(decide "$windows_paths" "$windows_content")"
 echo "macos=$(decide "$macos_paths" "$macos_content")"
+echo "quint=$(decide "$quint_paths")"
