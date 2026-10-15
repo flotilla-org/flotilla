@@ -38,21 +38,27 @@
 //! }
 //! ```
 
+#[doc(hidden)]
+pub mod adapt;
 mod codec;
 mod ddl;
 mod descriptor;
 mod layout;
+mod reference;
 mod registry;
+mod state;
 mod time;
 mod traits;
 mod value;
 
 pub use codec::{DecodeError, Decoder, EncodeError, Encoder};
 pub use ddl::{quote_ident, render_ddl, render_ddl_with, DdlMode};
-pub use descriptor::{ColumnDef, ColumnType, DescriptorError, Index, Table, TableRole, TableSet, RESERVED_COLUMNS, SHARED_NAMES};
+pub use descriptor::{ColumnDef, ColumnType, DescriptorError, Guard, Index, Table, TableRole, TableSet, RESERVED_COLUMNS, SHARED_NAMES};
 pub use flotilla_schema_derive::Stored;
 pub use layout::{snake_case, Layout};
+pub use reference::Ref;
 pub use registry::{KindRegistry, RegistryError};
+pub use state::State;
 pub use time::Timestamp;
 pub use traits::{CodeEnum, Column, Columns, Element, Flat, Intern, Kind, SUPPORTED_ATTRIBUTES};
 pub use value::{Hash, Identity, KindCode, Row, Rows, Value};

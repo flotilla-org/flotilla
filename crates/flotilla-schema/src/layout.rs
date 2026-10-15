@@ -6,8 +6,7 @@
 //! declared directly inside it.
 
 use crate::{
-    ddl::quote_ident,
-    descriptor::{ColumnDef, ColumnType, Index, Table, TableRole, TableSet},
+    descriptor::{ColumnDef, ColumnType, Guard, Index, Table, TableRole, TableSet},
     value::KindCode,
 };
 
@@ -24,12 +23,6 @@ struct Frame {
     key_mode: bool,
 }
 
-struct Guard {
-    condition: String,
-    required: Vec<String>,
-    scope: Vec<String>,
-}
-
 impl Layout {
     /// Starts a kind: the root table is named by the snake_case kind name.
     pub fn root(kind: &str, code: KindCode) -> Layout {
@@ -41,7 +34,7 @@ impl Layout {
             key: Vec::new(),
             own_key: 0,
             columns: Vec::new(),
-            checks: Vec::new(),
+            guards: Vec::new(),
         };
         Layout {
             set: TableSet { kind: kind.to_owned(), code, tables: vec![root], indexes: Vec::new() },
@@ -97,14 +90,14 @@ impl Layout {
     /// be declared in the enclosing scope.
     pub fn guard(&mut self, column: &str, value: i64, f: impl FnOnce(&mut Layout)) {
         let frame = self.frames.last_mut().expect("layout has a current table");
-        frame.guards.push(Guard { condition: format!("{} = {value}", quote_ident(column)), required: Vec::new(), scope: Vec::new() });
+        frame.guards.push(Guard { column: column.to_owned(), value, required: Vec::new(), scope: Vec::new() });
+        // The table lists guards in the order they open, so an outer CHECK precedes its nested ones.
+        let slot = self.set.tables[frame.table].guards.len();
+        self.set.tables[frame.table].guards.push(Guard { column: String::new(), value, required: Vec::new(), scope: Vec::new() });
         f(self);
         let frame = self.frames.last_mut().expect("layout has a current table");
         let guard = frame.guards.pop().expect("guard opened above");
-        let then = conjunction(guard.required.iter().map(|name| format!("{} IS NOT NULL", quote_ident(name))));
-        let otherwise = conjunction(guard.scope.iter().map(|name| format!("{} IS NULL", quote_ident(name))));
-        let check = format!("CASE WHEN {} THEN {then} ELSE {otherwise} END", guard.condition);
-        self.set.tables[frame.table].checks.push(check);
+        self.set.tables[frame.table].guards[slot] = guard;
     }
 
     /// Declares a nested table storing `field` of the current table; `f` declares its own key and
@@ -132,7 +125,7 @@ impl Layout {
             key,
             own_key: 0,
             columns: Vec::new(),
-            checks: Vec::new(),
+            guards: Vec::new(),
         };
         self.set.tables.push(table);
         self.frames.push(Frame { table: self.set.tables.len() - 1, guards: Vec::new(), key_mode: false });
@@ -148,15 +141,6 @@ impl Layout {
     pub fn finish(self) -> TableSet {
         assert_eq!(self.frames.len(), 1, "every nested table closes before the layout finishes");
         self.set
-    }
-}
-
-fn conjunction(terms: impl Iterator<Item = String>) -> String {
-    let terms: Vec<String> = terms.collect();
-    if terms.is_empty() {
-        "1".to_owned()
-    } else {
-        terms.join(" AND ")
     }
 }
 
@@ -188,7 +172,7 @@ pub fn snake_case(name: &str) -> String {
 mod tests {
     use super::{snake_case, Layout};
     use crate::{
-        descriptor::{ColumnDef, ColumnType, TableRole},
+        descriptor::{ColumnDef, ColumnType, Guard, TableRole},
         value::KindCode,
     };
 
@@ -218,7 +202,8 @@ mod tests {
 
     // Behaviour (DESIGN guards): a required column inside a guard is nullable and required by that
     // guard's CHECK; a nested guard's controlling column is in the outer scope, while the nested
-    // guard's own columns are covered only by its own CHECK. Outside guards required means NOT NULL.
+    // guard's own columns are covered only by its own CHECK, which follows the outer one. Outside guards
+    // required means NOT NULL.
     #[test]
     fn nested_guards_emit_one_check_each() {
         let mut layout = Layout::root("Edge", KindCode(1));
@@ -245,13 +230,14 @@ mod tests {
                 ("event_drop_at", true),
             ]
         );
+        let checks: Vec<String> = root.guards.iter().map(Guard::check).collect();
         assert_eq!(
-            root.checks,
+            checks,
             [
-                "CASE WHEN \"event_drop_reason\" = 2 THEN \"event_drop_reason_undeliverable_cause\" IS NOT NULL \
-                 ELSE \"event_drop_reason_undeliverable_cause\" IS NULL AND \"event_drop_reason_undeliverable_note\" IS NULL END",
                 "CASE WHEN \"event\" = 1 THEN \"event_drop_reason\" IS NOT NULL \
                  ELSE \"event_drop_reason\" IS NULL AND \"event_drop_at\" IS NULL END",
+                "CASE WHEN \"event_drop_reason\" = 2 THEN \"event_drop_reason_undeliverable_cause\" IS NOT NULL \
+                 ELSE \"event_drop_reason_undeliverable_cause\" IS NULL AND \"event_drop_reason_undeliverable_note\" IS NULL END",
                 "CASE WHEN \"event\" = 2 THEN 1 ELSE 1 END",
             ]
         );
@@ -285,6 +271,6 @@ mod tests {
         assert_eq!(evidence.own_key, 1);
         assert_eq!(evidence.parent_key().len(), 1);
         assert_eq!(evidence.columns[0].name, "value");
-        assert_eq!(set.tables[0].checks, ["CASE WHEN \"state\" = 1 THEN 1 ELSE 1 END"]);
+        assert_eq!(set.tables[0].guards[0].check(), "CASE WHEN \"state\" = 1 THEN 1 ELSE 1 END");
     }
 }

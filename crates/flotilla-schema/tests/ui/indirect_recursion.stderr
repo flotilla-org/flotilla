@@ -1,0 +1,31 @@
+error[E0072]: recursive types `A` and `B` have infinite size
+  --> tests/ui/indirect_recursion.rs:5:1
+   |
+ 5 | struct A {
+   | ^^^^^^^^
+ 6 |     #[store(flatten)]
+ 7 |     b: B,
+   |        - recursive without indirection
+...
+11 | struct B {
+   | ^^^^^^^^
+12 |     #[store(flatten)]
+13 |     a: A,
+   |        - recursive without indirection
+   |
+help: insert some indirection (e.g., a `Box`, `Rc`, or `&`) to break the cycle
+   |
+ 7 ~     b: Box<B>,
+ 8 | }
+...
+12 |     #[store(flatten)]
+13 ~     a: Box<A>,
+   |
+
+error: reached the recursion limit finding the struct tail for `B`
+  |
+  = help: consider increasing the recursion limit by adding a `#![recursion_limit = "256"]`
+
+error: reached the recursion limit finding the struct tail for `A`
+  |
+  = help: consider increasing the recursion limit by adding a `#![recursion_limit = "256"]`

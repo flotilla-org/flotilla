@@ -1,0 +1,5 @@
+error: code 1 is used by both `Open` and `Closed`; the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+ --> tests/ui/duplicate_code.rs:7:20
+  |
+7 |     #[store(code = 1)]
+  |                    ^

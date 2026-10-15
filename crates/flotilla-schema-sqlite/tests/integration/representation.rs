@@ -1,11 +1,14 @@
 use chrono::DateTime;
-use flotilla_schema::EncodeError;
+use flotilla_schema::{EncodeError, Identity, Kind, KindCode, Ref};
 use flotilla_schema_sqlite::StoreError;
 
-use crate::fixtures::{store, Message};
+use crate::fixtures::{
+    message::{DropReason, MessageEdge},
+    store, Inbox, Message, LOCAL,
+};
 
 fn message(accepted_seq: u64) -> Message {
-    Message { body: "b".into(), body_digest: None, interrupting: true, accepted_seq, deadline: None, ordinal: u16::MAX }
+    Message { interrupting: true, accepted_seq, ordinal: u16::MAX, ..Message::sample() }
 }
 
 // Behaviour (#3320 representation): a u64 above i64::MAX is refused with a typed error naming
@@ -47,4 +50,58 @@ fn timestamps_truncate_to_microseconds() {
     let conn = store.into_connection();
     let stored: i64 = conn.query_row("SELECT deadline FROM message ORDER BY id LIMIT 1", [], |row| row.get(0)).expect("raw");
     assert_eq!(stored, 1_700_000_000_123_456);
+}
+
+// Behaviour (#3320 references): a reference may precede its target. Writing it creates the
+// target's identity row, and inserting the target later takes that same identity.
+#[test]
+fn references_to_missing_targets_create_their_identity() {
+    let mut store = store();
+    let mut write = store.write().expect("write");
+    let message = Message { inbox: Ref::new("later", LOCAL), in_reply_to: Some(Ref::new("gone", "elsewhere")), ..Message::sample() };
+    let stamp = write.insert("m", &message).expect("insert");
+    let inbox = write.resolve(Inbox::CODE, "later", LOCAL).expect("resolve").expect("identity created by the reference");
+    let reply = write.resolve(Message::CODE, "gone", "elsewhere").expect("resolve").expect("identity created by the reference");
+    assert_eq!(write.load::<Message>(reply).expect("load"), None, "an identity is not a resource");
+    let target = write.insert("later", &Inbox { role: "r".into() }).expect("target inserted after the reference");
+    assert_eq!(target.id, inbox);
+    write.commit().expect("commit");
+
+    let mut read = store.read().expect("read");
+    assert_eq!(read.load::<Message>(stamp.id).expect("load").expect("present").value, message);
+    drop(read);
+    let conn = store.into_connection();
+    let stored: (i64, i64) = conn
+        .query_row("SELECT inbox, in_reply_to FROM message WHERE id = ?1", [stamp.id.0], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("raw");
+    assert_eq!(stored, (inbox.0, reply.0));
+}
+
+// Behaviour (#3320 interning): equal interned strings share one `strings` row, whichever field,
+// variant or resource holds them.
+#[test]
+fn equal_interned_strings_share_one_row() {
+    let mut store = store();
+    let mut write = store.write().expect("write");
+    let edge = MessageEdge::Drop {
+        reason: DropReason::Withdrawn {
+            by: "carol".into(),
+            authority: Identity { kind: KindCode(9), name: "x".into(), home: LOCAL.into() },
+        },
+    };
+    for name in ["a", "b"] {
+        write.insert(name, &Message { sender: "carol".into(), last_edge: Some(edge.clone()), ..Message::sample() }).expect("insert");
+    }
+    write.commit().expect("commit");
+    let conn = store.into_connection();
+    let rows: i64 = conn.query_row("SELECT count(*) FROM strings WHERE s = 'carol'", [], |row| row.get(0)).expect("count");
+    assert_eq!(rows, 1);
+    let distinct: i64 = conn
+        .query_row("SELECT count(DISTINCT sender) + count(DISTINCT last_edge_drop_reason_withdrawn_by) FROM message", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(distinct, 2, "both columns of both rows name the one row");
+    let same: i64 = conn
+        .query_row("SELECT count(*) FROM message WHERE sender = last_edge_drop_reason_withdrawn_by", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(same, 2);
 }

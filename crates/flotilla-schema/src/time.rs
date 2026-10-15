@@ -1,9 +1,11 @@
 //! The stored time representation: INTEGER microseconds since the Unix epoch.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Microseconds since the Unix epoch, the unit every stored time uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Timestamp(pub i64);
 
 impl Timestamp {

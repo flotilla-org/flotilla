@@ -10,7 +10,7 @@ use crate::{
     descriptor::{ColumnType, TableSet},
     layout::Layout,
     time::Timestamp,
-    value::{KindCode, Value},
+    value::{Identity, KindCode, Value},
 };
 
 /// The closed attribute list, named by every refusal. The derive refuses with the same text.
@@ -51,10 +51,12 @@ pub trait Column: Columns {}
 )]
 pub trait Flat: Columns {}
 
-/// A unit enum with a stable code on every variant.
-pub trait CodeEnum: Column + Copy {
+/// A unit enum with a stable code on every variant: the target of `#[store(state)]` and of index
+/// predicates. Codes come from `#[store(code = N)]`, never from serde names or declaration order.
+pub trait CodeEnum: Column {
+    /// Every variant's code, ascending.
     const CODES: &'static [i64];
-    fn code(self) -> i64;
+    fn code(&self) -> i64;
 }
 
 /// A `#[store(intern)]` target: stored as an id in `strings`.
@@ -213,6 +215,12 @@ scalar!(Timestamp, ColumnType::Timestamp, |this| Ok(Value::Int(this.micros())), 
 scalar!(DateTime<Utc>, ColumnType::Timestamp, |this| Ok(Value::Int(Timestamp::from_datetime(this).micros())), |value| match value {
     Value::Int(micros) => Timestamp(micros).to_datetime().ok_or(DecodeError::OutOfRange { column: String::new(), value: micros }),
     other => Err(DecodeError::unexpected("integer", &other)),
+});
+
+// An untyped reference, for gate inputs that may name any kind.
+scalar!(Identity, ColumnType::Ref, |this| Ok(Value::Ref(this.clone())), |value| match value {
+    Value::Ref(identity) => Ok(identity),
+    other => Err(DecodeError::unexpected("reference", &other)),
 });
 
 /// An optional column is the inner type's columns, nullable.

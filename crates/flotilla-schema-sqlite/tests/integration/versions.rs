@@ -6,7 +6,7 @@ use chrono::{DateTime, Duration};
 use crate::fixtures::{floor, store, Message};
 
 fn message(body: &str) -> Message {
-    Message { body: body.into(), body_digest: None, interrupting: false, accepted_seq: 1, deadline: None, ordinal: 0 }
+    Message { body: body.into(), accepted_seq: 1, ..Message::sample() }
 }
 
 // Behaviour (ADR 0064, #3320 sequencing): every write takes the home's next sequence, so the

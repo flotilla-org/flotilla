@@ -25,8 +25,7 @@ fn fixture_ddl_matches_the_snapshot() {
 fn every_table_is_strict_and_foreign_keys_hold() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let message =
-        Message { body: "b".into(), body_digest: Some("d".into()), interrupting: true, accepted_seq: 3, deadline: None, ordinal: 4 };
+    let message = Message { body_digest: Some("d".into()), interrupting: true, accepted_seq: 3, ordinal: 4, ..Message::sample() };
     let stamp = write.insert("m", &message).expect("insert");
     let current = write.load::<Message>(stamp.id).expect("load").expect("present");
     write.update(&current, &Message { body: "c".into(), ..message }).expect("update");
@@ -39,7 +38,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
     let tables: Vec<(String, bool)> =
         statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).expect("query").collect::<Result<_, _>>().expect("rows");
     let names: Vec<&str> = tables.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, ["change_log", "home_sequence", "message", "objects", "resource_identity", "strings"]);
+    assert_eq!(names, ["agent_session", "change_log", "home_sequence", "inbox", "message", "objects", "resource_identity", "strings"]);
     for (name, strict) in &tables {
         assert!(strict, "{name} is not STRICT");
     }
@@ -54,7 +53,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
 fn reopening_keeps_tables_and_rows() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let message = Message { body: "kept".into(), body_digest: None, interrupting: false, accepted_seq: 0, deadline: None, ordinal: 0 };
+    let message = Message { body: "kept".into(), ..Message::sample() };
     let stamp = write.insert("m", &message).expect("insert");
     write.commit().expect("commit");
     let mut store = Store::open(store.into_connection(), LOCAL, registry()).expect("reopen");

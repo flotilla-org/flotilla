@@ -78,7 +78,7 @@ fn render_table(out: &mut String, set: &TableSet, table: &Table, exists: &str) {
         };
         lines.push(format!("{foreign} ON DELETE CASCADE"));
     }
-    lines.extend(table.checks.iter().map(|check| format!("CHECK ({check})")));
+    lines.extend(table.guards.iter().map(|guard| format!("CHECK ({})", guard.check_with("\n      "))));
     // Child tables cluster on their primary key, so loading one owner's rows is one range of one b-tree.
     let options = if table.parent.is_some() { "STRICT, WITHOUT ROWID" } else { "STRICT" };
     let _ = writeln!(out, "CREATE TABLE {exists}{} (\n  {}\n) {options};", quote_ident(&table.name), lines.join(",\n  "));
@@ -195,7 +195,7 @@ CREATE INDEX "convoy_open" ON "convoy" ("phase") WHERE "done" = 0;
         layout.guard("event", 1, |layout| layout.column("event_drop_cause", ColumnType::Text, true));
         let ddl = render_ddl(&layout.finish());
         assert!(ddl.contains(
-            "  \"event_drop_cause\" TEXT,\n  CHECK (CASE WHEN \"event\" = 1 THEN \"event_drop_cause\" IS NOT NULL ELSE \"event_drop_cause\" IS NULL END)\n) STRICT;"
+            "  \"event_drop_cause\" TEXT,\n  CHECK (CASE WHEN \"event\" = 1\n      THEN \"event_drop_cause\" IS NOT NULL\n      ELSE \"event_drop_cause\" IS NULL\n      END)\n) STRICT;"
         ));
     }
 

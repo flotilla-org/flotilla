@@ -5,19 +5,24 @@
 //! type deriving `Stored` compiles without any database backend.
 //!
 //! Modules: `attrs` parses `#[store(...)]`, `shape` classifies each field (attribute plus type)
-//! into a `FieldShape`, and `structs` generates the trait implementations.
+//! into a `FieldShape`, `fields` generates one field's code through the adapter its attribute
+//! selects, and `structs` and `enums` generate the trait implementations.
 //!
-//! Indirect recursion (`A` holds `B`, which holds `A`) is not visible to a derive; it is refused by
-//! the compiler as a cycle evaluating the `TABLES` constants (E0391).
+//! Indirect recursion (`A` holds `B`, which holds `A`) is not visible to a derive; the compiler
+//! refuses it: by value it is an infinitely sized type (E0072), and any indirection that a stored
+//! field could carry would cycle through the `TABLES` constants (E0391). `Ref<K>` names a kind
+//! without containing it, so references are not recursion.
 
 mod attrs;
+mod enums;
+mod fields;
 mod shape;
 mod structs;
 
 use proc_macro::TokenStream;
 use syn::{Data, DeriveInput, Fields, GenericParam};
 
-use crate::attrs::{not_yet, refuse};
+use crate::attrs::refuse;
 
 #[proc_macro_derive(Stored, attributes(store))]
 pub fn derive_stored(input: TokenStream) -> TokenStream {
@@ -33,31 +38,11 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     }
     match &input.data {
         Data::Union(data) => Err(refuse(data.union_token, "unions cannot be stored")),
-        Data::Enum(data) => {
-            // Parse every variant's attributes and fields now, so refusals of shapes outside the
-            // list are reported before the not-yet-supported error.
-            for variant in &data.variants {
-                attrs::variant_code(&variant.attrs)?;
-                match &variant.fields {
-                    Fields::Unnamed(fields) => return Err(refuse(fields, "tuple variants cannot be stored; use named fields")),
-                    Fields::Named(fields) => {
-                        for field in &fields.named {
-                            shape::classify(attrs::field_attr(&field.attrs)?, &field.ty, &input.ident)?;
-                        }
-                    }
-                    Fields::Unit => {}
-                }
-            }
-            Err(not_yet(&input.ident, "deriving `Stored` for an enum"))
-        }
+        Data::Enum(data) => enums::expand(input, data, type_attrs),
         Data::Struct(data) => match &data.fields {
             Fields::Named(fields) if fields.named.is_empty() => Err(structs::refuse_empty(input)),
             Fields::Named(fields) => structs::expand(input, fields, type_attrs),
-            Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
-                let field = &fields.unnamed[0];
-                shape::classify(attrs::field_attr(&field.attrs)?, &field.ty, &input.ident)?;
-                Err(not_yet(&input.ident, "a newtype struct"))
-            }
+            Fields::Unnamed(fields) if fields.unnamed.len() == 1 => structs::newtype(input, fields, type_attrs),
             Fields::Unnamed(fields) => Err(refuse(fields, "tuple structs with more than one field cannot be stored; use named fields")),
             Fields::Unit => Err(structs::refuse_empty(input)),
         },
@@ -121,6 +106,17 @@ mod tests {
             quote! { enum A { #[store(code = 1)] B(String) } },
             quote! { enum A { #[store(child)] B } },
             quote! { enum A { #[store(code = 1)] B { a: Vec<String> } } },
+            quote! { enum A { #[store(code = 1)] B, C } },
+            quote! { enum A { #[store(code = 1)] B, #[store(code = 1)] C } },
+            quote! { enum A { #[store(code = 1)] B { a: String }, #[store(code = 1)] C } },
+            quote! { enum A { #[store(code = 1)] B { a: String }, C { b: i64 } } },
+            quote! { enum A {} },
+            quote! { #[store(kind = "A", code = 1)] enum A { #[store(code = 1)] B } },
+            quote! { enum A { #[store(code = 1)] B { #[store(state)] a: String } } },
+            quote! { enum A { #[store(code = 1)] B { a: Option<A> } } },
+            quote! { struct A(#[store(intern)] String); },
+            quote! { struct A(Vec<String>); },
+            quote! { struct A(Option<Box<A>>); },
         ];
         for case in cases {
             let message = error(case.clone());
@@ -132,16 +128,13 @@ mod tests {
     #[test]
     fn listed_shapes_not_yet_implemented_say_so() {
         let cases = [
-            quote! { struct A { #[store(intern)] a: String } },
-            quote! { struct A { #[store(flatten)] a: Option<Part> } },
-            quote! { struct A { #[store(state)] a: State<Phase> } },
             quote! { struct A { #[store(frozen)] a: Option<Frozen<Doc>> } },
             quote! { struct A { #[store(child)] a: BTreeMap<String, String> } },
             quote! { struct A { #[store(records)] a: Records<Event> } },
             quote! { struct A { #[store(history)] a: Records<Event> } },
             quote! { #[store(kind = "A", code = 1, index(name = "x", eq(a)))] struct A { a: String } },
-            quote! { struct A(String); },
-            quote! { enum A { #[store(code = 1)] B, #[store(code = 2)] C { a: String } } },
+            quote! { enum A { #[store(code = 1)] B { #[store(child)] a: Vec<String> } } },
+            quote! { enum A { #[store(code = 1)] B { #[store(frozen)] a: Frozen<Doc> } } },
         ];
         for case in cases {
             let message = error(case.clone());
@@ -170,5 +163,73 @@ mod tests {
         assert!(expanded.contains("String : :: flotilla_schema :: Column"));
         assert!(expanded.contains("Option < T > : :: flotilla_schema :: Column"));
         assert!(expanded.contains("\"type\""), "raw identifiers store under their plain name");
+    }
+
+    fn expanded(input: proc_macro2::TokenStream) -> String {
+        let input: DeriveInput = syn::parse2(input).expect("parse input");
+        expand(&input).expect("expands").to_string()
+    }
+
+    // Glue: each attribute selects its adapter and the bound naming the trait it needs, so a
+    // field type outside the list is reported at that trait's diagnostic.
+    #[test]
+    fn attributes_select_adapters_and_bounds() {
+        let expanded = expanded(quote! {
+            struct Part {
+                #[store(intern)] a: String,
+                #[store(intern)] b: Option<Name>,
+                #[store(flatten)] c: Leaf,
+                #[store(flatten)] d: Option<Leaf>,
+                #[store(state)] e: State<Phase>,
+                f: Ref<Inbox>,
+                g: Option<Ref<Part>>,
+            }
+        });
+        for expected in [
+            "String : :: flotilla_schema :: Intern",
+            "Name : :: flotilla_schema :: Intern",
+            "Leaf : :: flotilla_schema :: Flat",
+            "Phase : :: flotilla_schema :: CodeEnum",
+            "Ref < Inbox > : :: flotilla_schema :: Column",
+            "adapt :: AsOptionalInterned as :: flotilla_schema :: adapt :: Adapter < Option < Name > >",
+            "adapt :: AsOptionalFlat as :: flotilla_schema :: adapt :: Adapter < Option < Leaf > >",
+            "adapt :: AsInterned as :: flotilla_schema :: adapt :: Adapter < String >",
+        ] {
+            assert!(expanded.contains(expected), "missing {expected}");
+        }
+    }
+
+    // Behaviour (DESIGN): a kind's `Kind` impl carries only bounds of fields that mention a type
+    // parameter, so a self-reference (`Ref<Message>`) does not make proving `Message: Kind` cyclic.
+    #[test]
+    fn kind_impls_bound_only_generic_fields() {
+        let expanded = expanded(quote! {
+            #[store(kind = "Message", code = 1)]
+            struct Message<T> { reply: Option<Ref<Message<T>>>, body: String, extra: T }
+        });
+        let kind = &expanded[expanded.find(":: flotilla_schema :: Kind for").expect("kind impl")..];
+        let header = &kind[..kind.find('{').expect("body")];
+        assert!(header.contains("T : :: flotilla_schema :: Column"));
+        assert!(header.contains("Option < Ref < Message < T > > > : :: flotilla_schema :: Column"), "mentions T");
+        assert!(!header.contains("String :"), "concrete fields are checked through Element only: {header}");
+    }
+
+    // Behaviour (DESIGN codes): a code enum's CODES are ascending whatever the declaration order,
+    // and a data enum's variant columns are `<variant>_<field>` below the prefix.
+    #[test]
+    fn enums_take_codes_and_variant_prefixes() {
+        let code = expanded(quote! { enum Phase { #[store(code = 3)] Late, #[store(code = 1)] Early } });
+        assert!(code.contains("const CODES : & 'static [i64] = & [1i64 , 3i64]"), "{code}");
+        let data = expanded(quote! { enum Edge { #[store(code = 2)] DropIt { #[store(intern)] by: String }, #[store(code = 1)] Go } });
+        assert!(data.contains("\"drop_it_by\""), "{data}");
+        assert!(data.contains("layout . guard (tag , 2i64"), "{data}");
+        assert!(!data.contains("layout . guard (tag , 1i64"), "unit variants have no guard");
+    }
+
+    // Behaviour: a newtype wrapping String is internable; other newtypes are not.
+    #[test]
+    fn newtypes_of_string_intern() {
+        assert!(expanded(quote! { struct Name(String); }).contains(":: flotilla_schema :: Intern for Name"));
+        assert!(!expanded(quote! { struct Count(u32); }).contains("Intern for"));
     }
 }
