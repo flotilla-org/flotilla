@@ -11,6 +11,7 @@ use crate::{
     codec::{DecodeError, Decoder, EncodeError, Encoder},
     descriptor::{ColumnType, TableRole, RECORD_VERSION},
     frozen::{Freezable, Frozen},
+    inline::{Cbor, INLINE_LIMITS},
     layout::Layout,
     records::Records,
     traits::{Columns, Element, Flat, Intern, KeyColumn},
@@ -237,6 +238,46 @@ impl<T: Freezable> Adapter<Option<Frozen<T>>> for AsOptionalFrozen {
 
     fn decode(d: &mut Decoder) -> Result<Option<Option<Frozen<T>>>, DecodeError> {
         <AsFrozen as Adapter<Frozen<T>>>::decode(d).map(Some)
+    }
+
+    fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {
+        null(d)
+    }
+}
+
+/// `#[store(cbor)]`: the value's canonical CBOR (ADR 0063), inline in one BLOB column. Any serde
+/// type, `Option` included: `None` is the CBOR document `null`, not a NULL column, so the column
+/// is null only under an inactive variant.
+#[doc(hidden)]
+pub struct AsCbor;
+
+impl<T: Cbor> Adapter<T> for AsCbor {
+    const TABLES: usize = 0;
+
+    fn layout(layout: &mut Layout, name: &str, required: bool) {
+        layout.column(name, ColumnType::Cbor, required);
+    }
+
+    fn encode(value: &T, e: &mut Encoder) -> Result<(), EncodeError> {
+        let bytes = flotilla_cbor::to_vec(value, &INLINE_LIMITS)
+            .map_err(|error| EncodeError::Cbor { column: String::new(), kind: error.kind() })?;
+        e.put(Value::Blob(bytes));
+        Ok(())
+    }
+
+    fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError> {
+        e.put(Value::Null);
+        Ok(())
+    }
+
+    fn decode(d: &mut Decoder) -> Result<Option<T>, DecodeError> {
+        match d.take()? {
+            Value::Null => Ok(None),
+            Value::Blob(bytes) => flotilla_cbor::from_slice(&bytes, &INLINE_LIMITS)
+                .map(Some)
+                .map_err(|error| DecodeError::Cbor { column: String::new(), kind: error.kind() }),
+            other => Err(DecodeError::unexpected("CBOR document", &other)),
+        }
     }
 
     fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {

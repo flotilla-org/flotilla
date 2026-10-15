@@ -92,7 +92,14 @@ impl KindSql {
             root_update_version: format!("UPDATE {root} SET \"version\" = ?1 WHERE \"id\" = ?2 AND \"version\" = ?3"),
             root_delete: format!("DELETE FROM {root} WHERE \"id\" = ?1 AND \"version\" = ?2"),
             root_version: format!("SELECT \"version\" FROM {root} WHERE \"id\" = ?1"),
-            indexes: set.indexes.iter().map(|index| (index.name.clone(), IndexSql::render(&set.tables[0], index))).collect(),
+            // Root indexes page resources; an index on a nested table (an edge log's) serves history
+            // reads, which have no query API yet.
+            indexes: set
+                .indexes
+                .iter()
+                .filter(|index| index.table == set.tables[0].name)
+                .map(|index| (index.name.clone(), IndexSql::render(&set.tables[0], index)))
+                .collect(),
             scan: format!(
                 "SELECT i.\"id\" FROM \"resource_identity\" AS i CROSS JOIN {root} AS r ON r.\"id\" = i.\"id\" \
                  WHERE i.\"home\" = ?1 AND i.\"kind\" = ?2 AND i.\"id\" > ?3 ORDER BY i.\"id\" LIMIT ?4"
@@ -174,7 +181,7 @@ impl IndexSql {
 fn lowest(ty: &ColumnType) -> &'static str {
     match ty {
         ColumnType::Text => "''",
-        ColumnType::Blob | ColumnType::Frozen => "x''",
+        ColumnType::Blob | ColumnType::Frozen | ColumnType::Cbor => "x''",
         ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp | ColumnType::Code(_) | ColumnType::Interned | ColumnType::Ref => {
             "-9223372036854775808"
         }

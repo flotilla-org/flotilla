@@ -1226,7 +1226,7 @@ impl Ctx<'_> {
             let logical = match (&column.ty, value) {
                 (_, SqlValue::Null) => Value::Null,
                 (ColumnType::Text, SqlValue::Text(text)) => Value::Text(text),
-                (ColumnType::Blob, SqlValue::Blob(bytes)) => Value::Blob(bytes),
+                (ColumnType::Blob | ColumnType::Cbor, SqlValue::Blob(bytes)) => Value::Blob(bytes),
                 (ColumnType::Interned, SqlValue::Text(text)) => Value::Str(text),
                 (ColumnType::Ref, SqlValue::Integer(id)) => Value::Ref(self.identity_of(ResourceId(id))?.ok_or_else(corrupt)?),
                 (ColumnType::Frozen, SqlValue::Blob(bytes)) => {

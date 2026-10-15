@@ -15,7 +15,7 @@ fn valid_value(conn: &Connection, column: &ColumnDef) -> SqlValue {
         ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp => SqlValue::Integer(1),
         ColumnType::Code(codes) => SqlValue::Integer(codes[0]),
         ColumnType::Text => SqlValue::Text("x".into()),
-        ColumnType::Blob => SqlValue::Blob(vec![0]),
+        ColumnType::Blob | ColumnType::Cbor => SqlValue::Blob(vec![0]),
         ColumnType::Frozen => any("SELECT hash FROM objects LIMIT 1"),
         ColumnType::Interned => any("SELECT min(id) FROM strings"),
         ColumnType::Ref => any("SELECT min(id) FROM resource_identity"),

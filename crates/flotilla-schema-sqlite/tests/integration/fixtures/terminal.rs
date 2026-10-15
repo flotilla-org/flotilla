@@ -3,8 +3,9 @@
 //! `TerminalIdentity`.
 //!
 //! Modelling decisions the storage list forces:
-//! - `LifecycleEdge<I>` carries the identity flattened into the edge row (`Realise { identity }`),
-//!   so the same generic shape gives Vessel, Environment and the others their own columns.
+//! - The edge log is an [`EdgeEvent`] header plus one document, whose `LifecycleEdge<I>` arguments
+//!   carry the identity (`Realise { identity }`): the same generic shape serves Vessel,
+//!   Environment and the others without a column per identity field.
 //! - The realised identity on the resource is a flattened `Option<TerminalIdentity>` with a
 //!   presence flag, rather than columns read from the latest edge.
 //! - An agent source's brief is frozen inside a data enum variant: a hash column guarded by the
@@ -13,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Edge, Flat, Frozen, Records, Ref, State, Stored, Timestamp};
+use flotilla_schema::{Edge, EdgeEvent, Frozen, Records, Ref, State, Stored};
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +23,7 @@ use super::{
     attempt::{Attempt, Cause},
     code_enum,
     convoy::map,
-    key, list, name, records, reference, stamp, text, timestamp, Fixture, Pick, SHAPES,
+    event, key, list, name, payload, records, reference, stamp, text, timestamp, Fixture, Payload, Pick, SHAPES,
 };
 
 /// A minimal target kind for `TerminalSession::vessel`.
@@ -83,7 +84,7 @@ pub struct Brief {
     pub skills: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]
 pub struct TerminalIdentity {
     pub session_id: String,
     pub pid: Option<i64>,
@@ -91,30 +92,28 @@ pub struct TerminalIdentity {
 }
 
 /// One lifecycle edge event; generic over the identity a `Realise` edge carries.
-#[derive(Debug, Clone, PartialEq, Eq, Stored)]
-pub struct LifecycleEvent<I> {
-    pub edge: LifecycleEdge<I>,
-    pub at: Timestamp,
-    #[store(intern)]
-    pub writer: String,
-}
+pub type LifecycleEvent<I> = EdgeEvent<LifecycleState, LifecycleEdgeName, Payload<LifecycleEdge<I>>>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Stored)]
-pub enum LifecycleEdge<I> {
+/// The edge column of a lifecycle's edge log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
+pub enum LifecycleEdgeName {
     #[store(code = 1)]
-    Realise {
-        #[store(flatten)]
-        identity: I,
-    },
+    Realise,
     #[store(code = 2)]
     Vanish,
     #[store(code = 3)]
     Release,
     #[store(code = 4)]
-    GiveUp {
-        #[store(flatten)]
-        cause: Cause,
-    },
+    GiveUp,
+}
+
+/// The lifecycle edges' arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LifecycleEdge<I> {
+    Realise { identity: I },
+    Vanish,
+    Release,
+    GiveUp { cause: Cause },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
@@ -149,21 +148,36 @@ impl TerminalIdentity {
     }
 }
 
-impl<I: Flat> LifecycleEvent<I> {
+impl<I> LifecycleEdge<I> {
     /// Every edge in turn when covering; `identity` draws the kind's own identity.
-    pub fn generate(tc: &TestCase, pick: Pick, identity: impl FnOnce() -> I) -> LifecycleEvent<I> {
-        let edge = match pick.variant(tc, 4, |index| index) {
+    pub fn generate(tc: &TestCase, pick: Pick, identity: impl FnOnce() -> I) -> LifecycleEdge<I> {
+        match pick.variant(tc, 4, |index| index) {
             0 => LifecycleEdge::Realise { identity: identity() },
             1 => LifecycleEdge::Vanish,
             2 => LifecycleEdge::Release,
             _ => LifecycleEdge::GiveUp { cause: Cause::generate(tc, pick) },
-        };
-        LifecycleEvent { edge, at: timestamp(tc), writer: name(tc) }
+        }
+    }
+
+    pub fn name(&self) -> LifecycleEdgeName {
+        match self {
+            LifecycleEdge::Realise { .. } => LifecycleEdgeName::Realise,
+            LifecycleEdge::Vanish => LifecycleEdgeName::Vanish,
+            LifecycleEdge::Release => LifecycleEdgeName::Release,
+            LifecycleEdge::GiveUp { .. } => LifecycleEdgeName::GiveUp,
+        }
     }
 }
 
-fn event(tc: &TestCase, pick: Pick) -> LifecycleEvent<TerminalIdentity> {
-    LifecycleEvent::generate(tc, pick, || TerminalIdentity::generate(tc, pick))
+fn args(tc: &TestCase, pick: Pick) -> LifecycleEdge<TerminalIdentity> {
+    LifecycleEdge::generate(tc, pick, || TerminalIdentity::generate(tc, pick))
+}
+
+/// An event of any edge between any labels.
+fn edge_event(tc: &TestCase, pick: Pick) -> LifecycleEvent<TerminalIdentity> {
+    use LifecycleState::*;
+    let (args, labels) = (args(tc, pick), [Requested, Realised, Gone, GaveUp]);
+    event(tc, args.name(), code_enum(tc, pick, &labels), code_enum(tc, pick.nth(1), &labels), payload(tc, pick, args))
 }
 
 fn attempt(tc: &TestCase, pick: Pick) -> Attempt<TerminalAction> {
@@ -197,7 +211,7 @@ impl Fixture for TerminalSession {
             env: map(tc, pick, 3, |_| text(tc)),
             labels: list(tc, pick, 3, |_| key(tc)).into_iter().collect(),
             realised: pick.some(tc, 7).then(|| TerminalIdentity::generate(tc, pick.nth(1))),
-            events: records(tc, pick, 3, |pick| event(tc, pick)),
+            events: records(tc, pick, 3, |pick| edge_event(tc, pick)),
             attempts: records(tc, pick, 2, |pick| attempt(tc, pick)),
             lifecycle: State::new(code_enum(tc, pick, &[Requested, Realised, Gone, GaveUp]), timestamp(tc)),
         }
@@ -215,16 +229,16 @@ impl Fixture for TerminalSession {
         }
     }
 
-    /// A lifecycle event appended and the lifecycle moved; a `Realise` sets the realised identity
+    /// The lifecycle moved and a lifecycle event appended; a `Realise` sets the realised identity
     /// (a flattened optional struct), and sometimes an attempt is appended.
     fn edge(&self, tc: &TestCase, pick: Pick) -> (Edge<TerminalSession>, TerminalSession) {
         use LifecycleState::*;
-        let event = event(tc, pick);
+        let args = args(tc, pick);
         let lifecycle = State::new(code_enum(tc, pick.nth(1), &[Requested, Realised, Gone, GaveUp]), timestamp(tc));
-        let mut edge =
-            Edge::new(TerminalSession::EVENTS, &event).expect("event").set(TerminalSession::LIFECYCLE, &lifecycle).expect("state");
+        let event = event(tc, args.name(), self.lifecycle.value, lifecycle.value, payload(tc, pick, args));
+        let mut edge = Edge::new(TerminalSession::LIFECYCLE, &lifecycle, TerminalSession::EVENTS, &event).expect("edge");
         let mut next = TerminalSession { lifecycle, ..self.clone() };
-        if let LifecycleEdge::Realise { identity } = &event.edge {
+        if let LifecycleEdge::Realise { identity } = &event.payload.args {
             let realised = Some(identity.clone());
             edge = edge.set(TerminalSession::REALISED, &realised).expect("realised");
             next.realised = realised;

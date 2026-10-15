@@ -3,7 +3,7 @@
 //! `#[derive(Stored)]` turns a type annotated with the closed attribute list into a [`TableSet`]
 //! descriptor and a codec between values and logical [`Rows`]. Logical rows carry strings,
 //! identities and hashes rather than local ids, so a backend (`flotilla-schema-sqlite`) owns
-//! every id and rows compare equal across databases. Serde is not used for stored fields.
+//! every id and rows compare equal across databases. Serde reaches storage only through `frozen` and `cbor` fields.
 //!
 //! ```
 //! use flotilla_schema::{render_ddl, Decoder, Encoder, Kind, Stored};
@@ -38,6 +38,9 @@
 //! }
 //! ```
 
+// Generated code names `::flotilla_schema`; this lets the crate derive `Stored` for its own types.
+extern crate self as flotilla_schema;
+
 #[doc(hidden)]
 pub mod adapt;
 mod change;
@@ -46,6 +49,8 @@ mod ddl;
 mod descriptor;
 mod edge;
 mod frozen;
+mod history;
+mod inline;
 mod layout;
 mod query;
 mod records;
@@ -55,6 +60,7 @@ mod state;
 mod time;
 mod traits;
 mod value;
+mod view;
 
 pub use change::{ChangeError, RowChange, RowOp, CHANGE_LIMITS};
 pub use codec::{DecodeError, Decoder, EncodeError, Encoder};
@@ -63,9 +69,11 @@ pub use descriptor::{
     ColumnDef, ColumnType, Condition, DescriptorError, FieldColumns, Guard, Index, IndexProblem, Table, TableRole, TableSet,
     RECORD_VERSION, RESERVED_CHILD_COLUMNS, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES,
 };
-pub use edge::{AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeParts, EdgeSet, HistoryOf, RecordsOf, RowPath};
+pub use edge::{AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeParts, EdgeSet, FieldOf, HistoryOf, RecordsOf, RowPath, StateOf};
 pub use flotilla_schema_derive::Stored;
 pub use frozen::{Freezable, Frozen};
+pub use history::{EdgeEvent, Labelled};
+pub use inline::{Cbor, INLINE_LIMITS};
 pub use layout::{snake_case, Layout};
 pub use query::{interned_value, key_value, IndexQuery};
 pub use records::{Position, RecordRow, Records};
@@ -75,3 +83,4 @@ pub use state::State;
 pub use time::Timestamp;
 pub use traits::{CodeEnum, Column, Columns, Element, Flat, Intern, KeyColumn, Kind, SUPPORTED_ATTRIBUTES};
 pub use value::{Hash, Identity, KindCode, Row, Rows, Value};
+pub use view::{column_count, enum_columns, render_view, WIDE};

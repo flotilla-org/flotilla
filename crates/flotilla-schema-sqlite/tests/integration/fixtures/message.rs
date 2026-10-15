@@ -6,25 +6,28 @@
 //! Modelling decisions the storage list forces:
 //! - The prototype's `ObjRef` becomes `Ref<K>` where the target kind is known (`Settlement::Answered`,
 //!   `DropReason::Superseded`, the deliver receipt) and `Identity` where it is not (an authority, an
-//!   observed condition, a reference's repository, a gate input).
+//!   observed condition, a reference's repository, a gate read).
 //! - `receiver` on the spec is the prototype's `inbox: Ref<Inbox>`; the deliver edge keeps the
 //!   receiving session's name, interned through the `AgentName` newtype.
 //! - `references` is a child table of the seven-variant reference enum; `subject` keeps one
 //!   reference as an optional column, as the spec does.
-//! - Edge events are `history` (#3320 ruling 2): each row is the edge (`Drop { reason: Undeliverable
-//!   { cause } }` nests a data enum in a data enum), when and by whom it was written, and a child
-//!   table of the gate's inputs. Attempts are `history` too.
+//! - Edge events are `history` (#3320 ruling 2), one row per event (ruling of 2026-10-15): the
+//!   [`EdgeEvent`] header (edge, from- and to-label, writer, time) and one inline CBOR document of
+//!   the edge's arguments (`Drop { reason: Undeliverable { cause } }` nests a data enum in a data
+//!   enum) and the gate's reads. Attempts are `history` too.
+//! - The sender is an `AgentName`: a newtype of `String`, interned.
 //!
 //! Serde attributes are the resource types' own; storage ignores them (codes are explicit).
 
 use chrono::{DateTime, Utc};
-use flotilla_schema::{Edge, Identity, Records, Ref, State, Stored, Timestamp};
+use flotilla_schema::{Edge, EdgeEvent, Identity, Records, Ref, State, Stored, Timestamp};
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
 pub use super::attempt::{Attempt, Cause};
 use super::{
-    appended, code_enum, floor, identity, list, name, records, reference, seq, stamp, text, time, timestamp, Fixture, Pick, SHAPES,
+    appended, code_enum, event, floor, identity, list, name, payload, records, reference, seq, stamp, text, time, timestamp, Fixture,
+    Payload, Pick, SHAPES,
 };
 
 /// A minimal target kind for `Message::inbox`.
@@ -53,7 +56,7 @@ pub struct AgentSession {
 )]
 pub struct Message {
     #[store(intern)]
-    pub sender: String,
+    pub sender: AgentName,
     pub inbox: Ref<Inbox>,
     pub relation: MessageRelation,
     pub body: String,
@@ -78,22 +81,18 @@ pub struct Message {
     pub attempts: Records<Attempt<String>>,
 }
 
-/// One edge event: the edge, when and by whom it was written, and what its gate relied on.
-#[derive(Debug, Clone, PartialEq, Stored)]
-pub struct MessageEdgeEvent {
-    pub edge: MessageEdge,
-    pub at: Timestamp,
-    #[store(intern)]
-    pub writer: String,
-    #[store(child)]
-    pub inputs: Vec<GateInput>,
-}
+/// One edge event: the header, and the edge's arguments and gate reads as one document.
+pub type MessageEdgeEvent = EdgeEvent<MessageState, MessageEdgeName, Payload<MessageEdge>>;
 
-/// A resource the gate observed, at the version it observed.
-#[derive(Debug, Clone, PartialEq, Eq, Stored)]
-pub struct GateInput {
-    pub observed: Identity,
-    pub version: u64,
+/// The edge column of the message's edge log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
+pub enum MessageEdgeName {
+    #[store(code = 1)]
+    Deliver,
+    #[store(code = 2)]
+    Settle,
+    #[store(code = 3)]
+    Drop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Stored)]
@@ -233,66 +232,56 @@ pub enum MessageState {
 }
 
 /// A session name: a newtype of `String`, interned where it is stored.
-#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]
 pub struct AgentName(pub String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Transport {
-    #[store(code = 1)]
     Turn,
-    #[store(code = 2)]
     Notify,
-    #[store(code = 3)]
     Muted,
 }
 
-#[derive(Debug, Clone, PartialEq, Stored)]
+/// The edges' arguments: serde only, stored inside each event's document.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MessageEdge {
     /// `receipt` is the receipt row on the consumer's AgentSession; `transport` must match it.
-    #[store(code = 1)]
     Deliver {
-        #[store(intern)]
         receiver: AgentName,
         receipt: Ref<AgentSession>,
         transport: Transport,
     },
-    #[store(code = 2)]
-    Settle { by: Settlement },
-    #[store(code = 3)]
-    Drop { reason: DropReason },
+    Settle {
+        by: Settlement,
+    },
+    Drop {
+        reason: DropReason,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Stored)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Settlement {
-    #[store(code = 1)]
     Answered { reply: Ref<Message> },
-    #[store(code = 2)]
     OutcomeObserved { observation: Identity },
 }
 
-#[derive(Debug, Clone, PartialEq, Stored)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DropReason {
-    #[store(code = 1)]
-    Undeliverable {
-        #[store(flatten)]
-        cause: Cause,
-    },
-    #[store(code = 2)]
+    Undeliverable { cause: Cause },
     Expired,
-    #[store(code = 3)]
-    Withdrawn {
-        #[store(intern)]
-        by: String,
-        authority: Identity,
-    },
-    #[store(code = 4)]
-    ConsumerUnreachable {
-        #[store(intern)]
-        by: String,
-        authority: Identity,
-    },
-    #[store(code = 5)]
+    Withdrawn { by: String, authority: Identity },
+    ConsumerUnreachable { by: String, authority: Identity },
     Superseded { by: Ref<Message> },
+}
+
+impl MessageEdge {
+    pub fn name(&self) -> MessageEdgeName {
+        match self {
+            MessageEdge::Deliver { .. } => MessageEdgeName::Deliver,
+            MessageEdge::Settle { .. } => MessageEdgeName::Settle,
+            MessageEdge::Drop { .. } => MessageEdgeName::Drop,
+        }
+    }
 }
 
 /// Structural shapes: indexes `0..SHAPES` reach, while their enclosing variants are active, every
@@ -380,7 +369,7 @@ impl Message {
         use MessageRelation::*;
         use MessageState::*;
         Message {
-            sender: name(tc),
+            sender: AgentName(name(tc)),
             inbox: reference(tc),
             relation: code_enum(tc, pick, &[Supervisor, Peer, Dependency, Dependee, System]),
             body: text(tc),
@@ -400,7 +389,7 @@ impl Message {
             accepted_seq: seq(tc),
             ordinal: tc.draw(gs::integers::<u16>()),
             state: State::new(code_enum(tc, pick, &[Pending, Awaiting, Settled, Dropped]), Timestamp(tc.draw(gs::integers::<i64>()))),
-            edges: records(tc, pick, 3, |pick| MessageEdgeEvent::generate(tc, pick)),
+            edges: records(tc, pick, 3, |pick| edge_event(tc, pick)),
             attempts: records(tc, pick, 2, |pick| Attempt::generate(tc, pick, text(tc))),
         }
     }
@@ -408,7 +397,7 @@ impl Message {
     /// A fixed message for example tests: no options, no edge, a pending state.
     pub fn sample() -> Message {
         Message {
-            sender: "alice".into(),
+            sender: AgentName("alice".into()),
             inbox: Ref::new("inbox", super::LOCAL),
             relation: MessageRelation::Peer,
             body: "b".into(),
@@ -442,13 +431,14 @@ impl Fixture for Message {
         Message { state: self.state, edges: self.edges.clone(), attempts: self.attempts.clone(), ..Message::generate(tc, pick) }
     }
 
-    /// An edge event appended, the state moved, and sometimes the subject set (a multi-column
+    /// The state moved and an edge event appended, and sometimes the subject set (a multi-column
     /// data enum, absent or present) and an attempt appended.
     fn edge(&self, tc: &TestCase, pick: Pick) -> (Edge<Message>, Message) {
         use MessageState::*;
-        let event = MessageEdgeEvent::generate(tc, pick);
+        let args = MessageEdge::generate(tc, pick);
         let state = State::new(code_enum(tc, pick.nth(1), &[Pending, Awaiting, Settled, Dropped]), timestamp(tc));
-        let mut edge = Edge::new(Message::EDGES, &event).expect("event").set(Message::STATE, &state).expect("state");
+        let event = event(tc, args.name(), self.state.value, state.value, payload(tc, pick, args));
+        let mut edge = Edge::new(Message::STATE, &state, Message::EDGES, &event).expect("edge");
         let mut next = Message { edges: appended(tc, &self.edges, event), state, ..self.clone() };
         if pick.some(tc, 6) {
             let subject = pick.nth(2).some(tc, 8).then(|| MessageReference::generate(tc, pick.nth(3)));
@@ -476,13 +466,11 @@ impl Fixture for Message {
     }
 }
 
-impl MessageEdgeEvent {
-    pub fn generate(tc: &TestCase, pick: Pick) -> MessageEdgeEvent {
-        MessageEdgeEvent {
-            edge: MessageEdge::generate(tc, pick),
-            at: timestamp(tc),
-            writer: name(tc),
-            inputs: list(tc, pick, 2, |_| GateInput { observed: identity(tc), version: seq(tc) }),
-        }
-    }
+/// An event of any edge between any labels: history is never read to decide, so a stored log
+/// need not be a path through the machine.
+pub fn edge_event(tc: &TestCase, pick: Pick) -> MessageEdgeEvent {
+    use MessageState::*;
+    let args = MessageEdge::generate(tc, pick);
+    let labels = [Pending, Awaiting, Settled, Dropped];
+    event(tc, args.name(), code_enum(tc, pick, &labels), code_enum(tc, pick.nth(1), &labels), payload(tc, pick, args))
 }

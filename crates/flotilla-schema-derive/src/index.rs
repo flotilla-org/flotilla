@@ -1,4 +1,6 @@
-//! `#[store(index(...))]` on a kind: the descriptor's `Index` and a typed query constructor.
+//! `#[store(index(...))]` on a kind: the descriptor's `Index` on its root table and a typed query
+//! constructor. On a part struct: an `Index` on each table holding its rows (an edge log's
+//! `EdgeEvent`), with no constructor; reads of those tables are the history views' to define.
 //!
 //! ```text
 //! index(name = "open_by_inbox", eq(inbox), order(accepted_seq), when(state in [Pending, Awaiting]))
@@ -107,7 +109,7 @@ impl<'f, 'a> Indexes<'f, 'a> {
             quote! {
                 layout.index(#schema::Index {
                     name: ::std::string::String::from(#name),
-                    table: #schema::snake_case(<Self as #schema::Kind>::KIND),
+                    table: ::std::string::String::from(layout.table_name()),
                     eq: ::std::vec![#(::std::string::String::from(#eq)),*],
                     order: ::std::vec![#(::std::string::String::from(#order)),*],
                     predicate: ::std::vec![#(#predicate),*],
@@ -115,6 +117,10 @@ impl<'f, 'a> Indexes<'f, 'a> {
             }
         });
         quote!(#(#indexes)*)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.indexes.is_empty()
     }
 
     /// The inherent impl holding one query constructor per index, named after it.
@@ -254,7 +260,7 @@ fn find<'f, 'a>(fields: &'f [Field<'a>], ident: &Ident) -> Option<&'f Field<'a>>
 fn field<'f, 'a>(fields: &'f [Field<'a>], ident: &Ident) -> syn::Result<&'f Field<'a>> {
     find(fields, ident).ok_or_else(|| {
         let known: Vec<String> = fields.iter().map(|field| field.ident.unraw().to_string()).collect();
-        refuse(ident, format_args!("index names `{ident}`, which is not a field of this kind (fields: {})", known.join(", ")))
+        refuse(ident, format_args!("index names `{ident}`, which is not a field of this struct (fields: {})", known.join(", ")))
     })
 }
 

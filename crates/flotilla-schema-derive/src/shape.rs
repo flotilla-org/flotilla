@@ -25,6 +25,8 @@ pub(crate) enum FieldShape {
     Frozen {
         optional: bool,
     },
+    /// `#[store(cbor)]`: any serde type, inline as one CBOR document.
+    Cbor,
     Child(Collection),
     Records,
     History,
@@ -76,6 +78,7 @@ pub(crate) fn classify(attr: Option<FieldAttr>, ty: &Type, owner: &Ident) -> syn
             (_, Some("Frozen")) => FieldShape::Frozen { optional: true },
             _ => return Err(refuse(ty, "`frozen` needs a Frozen<T> or Option<Frozen<T>> field")),
         },
+        Some(FieldAttr::Cbor) => FieldShape::Cbor,
         Some(FieldAttr::State) if name == "State" => FieldShape::State,
         Some(FieldAttr::State) => return Err(refuse(ty, "`state` needs a State<E> field")),
         Some(attr @ (FieldAttr::Intern | FieldAttr::Flatten)) => {

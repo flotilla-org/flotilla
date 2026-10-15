@@ -1,6 +1,6 @@
 use std::{env, fs, path::Path};
 
-use flotilla_schema::DdlMode;
+use flotilla_schema::{render_view, DdlMode};
 use flotilla_schema_sqlite::{schema_ddl, Store};
 
 use crate::fixtures::{registry, store, Message, LOCAL};
@@ -17,6 +17,24 @@ fn fixture_ddl_matches_the_snapshot() {
     }
     let snapshot = fs::read_to_string(&path).expect("read snapshot; run with UPDATE_DDL_SNAPSHOT=1 to create it");
     assert_eq!(ddl, snapshot, "fixture DDL changed; review and rerun with UPDATE_DDL_SNAPSHOT=1");
+}
+
+// Behaviour (CLAUDE.md schema review): the fixtures' schema view (widths, enum expansion, child
+// tables and indexes per table; `flotilla_schema::render_view`) is checked in beside the DDL, so a
+// shape change shows in review as a diff of both. `UPDATE_DDL_SNAPSHOT=1` rewrites it too.
+#[test]
+fn fixture_schema_view_matches_the_snapshot() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/snapshots/schema_view.md");
+    let view = format!(
+        "# Fixture schema view\n\nKind tables only; the shared tables are in `fixtures.sql`.\n\n{}",
+        render_view(registry().iter())
+    );
+    if env::var_os("UPDATE_DDL_SNAPSHOT").is_some_and(|value| value == "1") {
+        fs::write(&path, &view).expect("write snapshot");
+        return;
+    }
+    let snapshot = fs::read_to_string(&path).expect("read snapshot; run with UPDATE_DDL_SNAPSHOT=1 to create it");
+    assert_eq!(view, snapshot, "fixture schema view changed; review and rerun with UPDATE_DDL_SNAPSHOT=1");
 }
 
 // Behaviour (DESIGN DDL): every shared and fixture table is STRICT, and the stored rows satisfy
@@ -56,7 +74,6 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "message",
             "message_attempts",
             "message_edges",
-            "message_edges_inputs",
             "message_references",
             "objects",
             "project",

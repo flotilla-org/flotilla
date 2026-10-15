@@ -1,4 +1,4 @@
-error[E0277]: `Cause` is not a storage column: the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+error[E0277]: `Cause` is not a storage column: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code and index (types)
  --> tests/ui/nested_struct.rs:8:10
   |
 8 | #[derive(Stored)]
@@ -22,7 +22,7 @@ help: the trait `Column` is not implemented for `Cause`
           and $N others
   = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: `Cause` is not a storage column: the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+error[E0277]: `Cause` is not a storage column: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code and index (types)
   --> tests/ui/nested_struct.rs:10:8
    |
 10 | struct Ticket {
@@ -60,7 +60,7 @@ note: required by a bound in `Kind`
    | pub trait Kind: Element {
    |                 ^^^^^^^ required by this bound in `Kind`
 
-error[E0277]: `Cause` is not a storage column: the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+error[E0277]: `Cause` is not a storage column: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code and index (types)
   --> tests/ui/nested_struct.rs:8:10
    |
  8 | #[derive(Stored)]

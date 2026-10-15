@@ -1,10 +1,10 @@
 use chrono::DateTime;
-use flotilla_schema::{EncodeError, Identity, Kind, KindCode, Records, Ref, Timestamp};
+use flotilla_schema::{EdgeEvent, EncodeError, Kind, Records, Ref, Timestamp};
 use flotilla_schema_sqlite::StoreError;
 
 use crate::fixtures::{
-    message::{DropReason, MessageEdge, MessageEdgeEvent},
-    store, Inbox, Message, LOCAL,
+    message::{AgentName, MessageEdge, MessageEdgeEvent, MessageReference, MessageState, Settlement},
+    store, Inbox, Message, Payload, LOCAL,
 };
 
 fn message(accepted_seq: u64) -> Message {
@@ -83,17 +83,20 @@ fn references_to_missing_targets_create_their_identity() {
 fn equal_interned_strings_share_one_row() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let edge = MessageEdge::Drop {
-        reason: DropReason::Withdrawn {
-            by: "carol".into(),
-            authority: Identity { kind: KindCode(9), name: "x".into(), home: LOCAL.into() },
-        },
+    let args = MessageEdge::Settle { by: Settlement::Answered { reply: Ref::new("r", LOCAL) } };
+    let event: MessageEdgeEvent = EdgeEvent {
+        edge: args.name(),
+        from: MessageState::Pending,
+        to: MessageState::Settled,
+        writer: "carol".into(),
+        at: Timestamp(1),
+        payload: Payload { args, reads: Vec::new() },
     };
-    let event = MessageEdgeEvent { edge, at: Timestamp(1), writer: "carol".into(), inputs: Vec::new() };
+    let reference = MessageReference::ChangeRequest { service: "carol".into(), scope: "s".into(), number: 1, revision: "r".into() };
     for name in ["a", "b"] {
         let mut edges = Records::new();
         edges.append(0, event.clone());
-        let message = Message { sender: "carol".into(), edges, ..Message::sample() };
+        let message = Message { sender: AgentName("carol".into()), references: vec![reference.clone()], edges, ..Message::sample() };
         write.insert(name, &message).expect("insert");
     }
     write.commit().expect("commit");
@@ -102,8 +105,8 @@ fn equal_interned_strings_share_one_row() {
     assert_eq!(rows, 1);
     let distinct: i64 = conn
         .query_row(
-            "SELECT count(DISTINCT m.sender) + count(DISTINCT e.edge_drop_reason_withdrawn_by) + count(DISTINCT e.writer) \
-             FROM message m JOIN message_edges e ON e.owner = m.id",
+            "SELECT count(DISTINCT m.sender) + count(DISTINCT r.change_request_service) + count(DISTINCT e.writer) \
+             FROM message m JOIN message_edges e ON e.owner = m.id JOIN message_references r ON r.owner = m.id",
             [],
             |row| row.get(0),
         )
@@ -111,8 +114,8 @@ fn equal_interned_strings_share_one_row() {
     assert_eq!(distinct, 3, "every column of every row names the one row");
     let same: i64 = conn
         .query_row(
-            "SELECT count(*) FROM message m JOIN message_edges e ON e.owner = m.id \
-             WHERE m.sender = e.edge_drop_reason_withdrawn_by AND m.sender = e.writer",
+            "SELECT count(*) FROM message m JOIN message_edges e ON e.owner = m.id JOIN message_references r ON r.owner = m.id \
+             WHERE m.sender = r.change_request_service AND m.sender = e.writer",
             [],
             |row| row.get(0),
         )

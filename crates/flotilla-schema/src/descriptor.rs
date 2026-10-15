@@ -146,11 +146,16 @@ pub enum ColumnType {
     Ref,
     /// A hash in `objects`.
     Frozen,
+    /// Canonical CBOR of a serde value, stored inline in the row (`#[store(cbor)]`).
+    Cbor,
 }
 
-/// A declared index on a kind's root table: `eq` columns compared for equality, then `order`
-/// columns the query pages through, under a partial-index predicate. Every query the backend
-/// generates for it orders by `order..., id`, so the row id is the index's last key.
+/// A declared index on one of a kind's tables: `eq` columns compared for equality, then `order`
+/// columns, under a partial-index predicate. On the root table every query the backend generates
+/// for it orders by `order..., id`, so the row id is the index's last key. On a nested table
+/// (declared on the part struct whose rows it holds, such as an edge log's `EdgeEvent`) the
+/// table's primary key `owner, ..., pos` ends the index instead, as SQLite appends it to every
+/// index of a `WITHOUT ROWID` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index {
     /// The declared name; the schema object is [`Index::object_name`], `<table>_<name>`.
@@ -214,11 +219,11 @@ impl Index {
 /// Why a declared index cannot be rendered or queried.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IndexProblem {
-    #[error("it is not on the kind's root table {0}")]
+    #[error("it is not on a table of this kind: {0}")]
     Table(String),
     #[error("it names no eq or order column")]
     NoColumns,
-    #[error("column {0} is not a column of the root table")]
+    #[error("column {0} is not a data column of the index's table")]
     UnknownColumn(String),
     #[error("column {0} is named twice")]
     RepeatedColumn(String),
@@ -259,7 +264,7 @@ impl TableSet {
     /// data or key columns named like the backend's own columns: `id` and `version` on the root, `owner` on
     /// children (a child row may well have a `version` field, such as a gate input's observed version),
     /// `owner` and `version` beside the stamp on `records` and `history` tables, which must start with it,
-    /// and indexes that are not on the root table, name unknown or repeated columns, page through a
+    /// and indexes that are not on one of the kind's tables, name unknown or repeated columns, page through a
     /// nullable column the predicate does not require, or whose predicate cannot hold as written.
     pub fn validate(&self) -> Result<(), DescriptorError> {
         let kind = || self.kind.clone();
@@ -301,10 +306,7 @@ impl TableSet {
     }
 
     fn validate_index(&self, index: &Index) -> Result<(), IndexProblem> {
-        let root = &self.tables[0];
-        if index.table != root.name {
-            return Err(IndexProblem::Table(root.name.clone()));
-        }
+        let root = self.tables.iter().find(|table| table.name == index.table).ok_or_else(|| IndexProblem::Table(index.table.clone()))?;
         if index.eq.is_empty() && index.order.is_empty() {
             return Err(IndexProblem::NoColumns);
         }

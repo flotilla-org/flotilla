@@ -51,6 +51,7 @@ impl<'a> Field<'a> {
             FieldShape::Flatten { optional: true } => quote!(#schema::adapt::AsOptionalFlat),
             FieldShape::Frozen { optional: false } => quote!(#schema::adapt::AsFrozen),
             FieldShape::Frozen { optional: true } => quote!(#schema::adapt::AsOptionalFrozen),
+            FieldShape::Cbor => quote!(#schema::adapt::AsCbor),
             FieldShape::Child(_) => quote!(#schema::adapt::AsChild),
             FieldShape::Records => quote!(#schema::adapt::AsRecords),
             FieldShape::History => quote!(#schema::adapt::AsHistory),
@@ -93,6 +94,7 @@ impl<'a> Field<'a> {
                 let inner = shape::first_arg(inner()).unwrap_or(ty);
                 quote!(#inner: #schema::Freezable)
             }
+            FieldShape::Cbor => quote!(#ty: #schema::Cbor),
             FieldShape::Child(Collection::Vec) | FieldShape::Records | FieldShape::History => {
                 let inner = inner();
                 quote!(#inner: #schema::Element)
@@ -141,9 +143,9 @@ impl<'a> Field<'a> {
         self.ident.unraw().to_string().to_uppercase()
     }
 
-    /// The field's edge handle, an associated const of the struct: a `ColumnOf` for a
-    /// column-shaped field, a `RecordsOf` or `HistoryOf` for a records or history field, and
-    /// none for a spec collection, which changes only by a spec edit.
+    /// The field's edge handle, an associated const of the struct: a `StateOf` for a state field,
+    /// a `ColumnOf` for another column-shaped field, a `RecordsOf` or `HistoryOf` for a records or
+    /// history field, and none for a spec collection, which changes only by a spec edit.
     pub(crate) fn handle(&self) -> Option<TokenStream> {
         let (schema, via, name, ty, vis) = (schema(), self.via(), &self.name, self.ty, self.vis);
         let handle = format_ident!("{}", self.handle_name(), span = self.ident.span());
@@ -158,6 +160,11 @@ impl<'a> Field<'a> {
                 let inner = inner();
                 ("history", quote!(#schema::HistoryOf<Self, #inner>), quote!(#schema::HistoryOf::new(#name)))
             }
+            FieldShape::State => (
+                "state",
+                quote!(#schema::StateOf<Self, #ty>),
+                quote!(#schema::StateOf::new(#schema::ColumnOf::new(#name, #via::TABLES, #via::encode))),
+            ),
             _ => ("column", quote!(#schema::ColumnOf<Self, #ty>), quote!(#schema::ColumnOf::new(#name, #via::TABLES, #via::encode))),
         };
         let doc = format!("Edge handle of the {doc} field `{}`.", name.value());

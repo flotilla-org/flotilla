@@ -14,7 +14,8 @@ use crate::{
 };
 
 /// The closed attribute list, named by every refusal. The derive refuses with the same text.
-pub const SUPPORTED_ATTRIBUTES: &str = "the storage derive supports only the attributes child, records, history, frozen, intern, flatten, \
+pub const SUPPORTED_ATTRIBUTES: &str =
+    "the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, \
                                         state and code (fields and variants) and kind, code and index (types)";
 
 /// Anything that lays out as zero or more columns of the current row, plus nested tables.
@@ -36,7 +37,7 @@ pub trait Columns: Sized {
 
 /// A type usable as a field with no attribute.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` is not a storage column: the storage derive supports only the attributes child, records, history, frozen, intern, \
+    message = "`{Self}` is not a storage column: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
                flatten, state and code (fields and variants) and kind, code and index (types)",
     label = "needs a column type or one of the storage attributes",
     note = "column types are integers, bool, String, Vec<u8>, Timestamp, DateTime<Utc>, Option of a column, and enums and newtypes deriving Stored"
@@ -45,7 +46,7 @@ pub trait Column: Columns {}
 
 /// A struct usable under `#[store(flatten)]`: it derives `Stored` and has no table fields.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, intern, \
+    message = "`{Self}` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
                flatten, state and code (fields and variants) and kind, code and index (types)",
     label = "flatten needs a struct deriving Stored with no table fields"
 )]
@@ -56,7 +57,7 @@ pub trait Flat: Columns {}
 /// Scalars, code enums, references and newtypes of these; not options, data enums or structs,
 /// whose values span several columns or none.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` cannot key a child table or an index: the storage derive supports only the attributes child, records, history, frozen, \
+    message = "`{Self}` cannot key a child table or an index: the storage derive supports only the attributes child, records, history, frozen, cbor, \
                intern, flatten, state and code (fields and variants) and kind, code and index (types)",
     label = "map keys, set values and index columns are single-column types: scalars, code enums, references and their newtypes"
 )]
@@ -72,7 +73,7 @@ pub trait CodeEnum: Column {
 
 /// A `#[store(intern)]` target: stored as an id in `strings`.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` cannot be interned: the storage derive supports only the attributes child, records, history, frozen, intern, \
+    message = "`{Self}` cannot be interned: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
                flatten, state and code (fields and variants) and kind, code and index (types)",
     label = "intern needs String or a newtype of String"
 )]
@@ -83,7 +84,7 @@ pub trait Intern {
 
 /// A table row: a struct deriving `Stored`, or a primitive/enum element of a collection.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` is not a storage row: the storage derive supports only the attributes child, records, history, frozen, intern, \
+    message = "`{Self}` is not a storage row: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
                flatten, state and code (fields and variants) and kind, code and index (types)",
     label = "collection elements are structs, enums or newtypes deriving Stored, or column primitives"
 )]
@@ -230,7 +231,7 @@ scalar!(DateTime<Utc>, ColumnType::Timestamp, |this| Ok(Value::Int(Timestamp::fr
     other => Err(DecodeError::unexpected("integer", &other)),
 });
 
-// An untyped reference, for gate inputs that may name any kind.
+// An untyped reference, for fields that may name any kind (an authority, an observed condition).
 scalar!(Identity, ColumnType::Ref, |this| Ok(Value::Ref(this.clone())), |value| match value {
     Value::Ref(identity) => Ok(identity),
     other => Err(DecodeError::unexpected("reference", &other)),
