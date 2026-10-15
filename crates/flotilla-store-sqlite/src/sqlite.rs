@@ -40,8 +40,6 @@ use crate::{
 
 #[path = "sqlite/digest.rs"]
 mod digest;
-#[path = "sqlite/legacy_field_indexes.rs"]
-mod legacy_field_indexes;
 #[cfg(test)]
 #[path = "sqlite/query_projection_tests.rs"]
 mod query_projection_tests;
@@ -957,7 +955,6 @@ impl SqliteBackend {
                     .map_err(|e| Self::map_sqlite(e, "remove obsolete query migration marker"))?;
             }
         }
-        Self::drop_legacy_field_indexes(&tx)?;
         for kind in crate::declared_resource_kinds() {
             let names = kind
                 .queryable_fields
