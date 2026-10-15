@@ -5,7 +5,7 @@ CREATE TABLE resource_identity (
   seq INTEGER NOT NULL DEFAULT 0,
   UNIQUE (kind, name, home)) STRICT;
 CREATE INDEX resource_identity_by_home ON resource_identity (home, kind);
-CREATE TABLE objects (hash BLOB PRIMARY KEY, media INTEGER NOT NULL, bytes BLOB NOT NULL) STRICT;
+CREATE TABLE objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
 CREATE TABLE home_sequence (home INTEGER PRIMARY KEY REFERENCES strings(id), last INTEGER NOT NULL) STRICT;
 CREATE TABLE change_log (
   home INTEGER NOT NULL REFERENCES strings(id), home_seq INTEGER NOT NULL,
@@ -348,6 +348,7 @@ CREATE TABLE "message_references" (
 CREATE TABLE "message_edges" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
   "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3)),
   "edge_deliver_receiver" INTEGER REFERENCES "strings" ("id"),
   "edge_deliver_receipt" INTEGER REFERENCES "resource_identity" ("id"),
@@ -426,6 +427,7 @@ CREATE TABLE "message_edges_inputs" (
 CREATE TABLE "message_attempts" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
   "what" TEXT NOT NULL,
   "target" TEXT NOT NULL,
   "at" INTEGER NOT NULL,
@@ -518,6 +520,7 @@ CREATE TABLE "convoy_inputs_list_items" (
 CREATE TABLE "convoy_deliverables" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
   "label" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "kind" INTEGER NOT NULL CHECK ("kind" IN (1, 2, 3)),
   "role" INTEGER NOT NULL REFERENCES "strings" ("id"),
@@ -541,6 +544,7 @@ CREATE TABLE "convoy_deliverables_evidence" (
   "owner" INTEGER NOT NULL,
   "deliverables_pos" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
   "reference" TEXT NOT NULL,
   "submitted_at" INTEGER NOT NULL,
   "verdict_present" INTEGER NOT NULL CHECK ("verdict_present" IN (0, 1)),
@@ -622,6 +626,7 @@ CREATE TABLE "terminal_session_labels" (
 CREATE TABLE "terminal_session_events" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
   "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3, 4)),
   "edge_realise_identity_session_id" TEXT,
   "edge_realise_identity_pid" INTEGER,
@@ -648,6 +653,7 @@ CREATE TABLE "terminal_session_events" (
 CREATE TABLE "terminal_session_attempts" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
   "what" INTEGER NOT NULL CHECK ("what" IN (1, 2, 3)),
   "target" TEXT NOT NULL,
   "at" INTEGER NOT NULL,

@@ -4,7 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_schema::{
-    DecodeError, Decoder, Element, Encoder, Frozen, Hash, Identity, Kind, KindCode, Records, Row, Stored, TableRole, Timestamp, Value,
+    DecodeError, Decoder, Element, EncodeError, Encoder, Frozen, Hash, Identity, Kind, KindCode, Records, Row, Stored, TableRole,
+    Timestamp, Value,
 };
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
@@ -110,7 +111,7 @@ struct Plan {
     deliverables: Records<Deliverable>,
     #[store(history)]
     attempts: Records<Attempt<Phase>>,
-    #[store(records)]
+    #[store(history)]
     edges: Records<Edge<Ident>>,
 }
 
@@ -125,6 +126,15 @@ fn short(tc: &TestCase) -> String {
 fn up_to<T>(tc: &TestCase, max: usize, mut f: impl FnMut() -> T) -> Vec<T> {
     let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(max));
     (0..count).map(|_| f()).collect()
+}
+
+/// Up to `max` records, each stamped with a version across the storable `u64` range.
+fn records<T>(tc: &TestCase, max: usize, mut f: impl FnMut() -> T) -> Records<T> {
+    let mut records = Records::new();
+    for record in up_to(tc, max, &mut f) {
+        records.append(tc.draw(gs::integers::<u64>().max_value(i64::MAX as u64)), record);
+    }
+    records
 }
 
 fn phase(tc: &TestCase) -> Phase {
@@ -161,14 +171,12 @@ fn plan(tc: &TestCase) -> Plan {
         .into_iter()
         .collect(),
         phases: up_to(tc, 2, || phase(tc)).into_iter().collect(),
-        deliverables: up_to(tc, 2, || Deliverable {
+        deliverables: records(tc, 2, || Deliverable {
             label: short(tc),
-            evidence: up_to(tc, 2, || Evidence { note: short(tc), meta: up_to(tc, 2, || (short(tc), short(tc))).into_iter().collect() })
-                .into(),
-        })
-        .into(),
-        attempts: up_to(tc, 2, || Attempt { what: phase(tc), at: Timestamp(tc.draw(gs::integers::<i64>())) }).into(),
-        edges: up_to(tc, 2, || {
+            evidence: records(tc, 2, || Evidence { note: short(tc), meta: up_to(tc, 2, || (short(tc), short(tc))).into_iter().collect() }),
+        }),
+        attempts: records(tc, 2, || Attempt { what: phase(tc), at: Timestamp(tc.draw(gs::integers::<i64>())) }),
+        edges: records(tc, 2, || {
             if tc.draw(gs::booleans()) {
                 Edge::Realise {
                     identity: Ident { session: short(tc), pid: tc.draw(gs::booleans()).then(|| tc.draw(gs::integers::<i64>())) },
@@ -176,16 +184,15 @@ fn plan(tc: &TestCase) -> Plan {
             } else {
                 Edge::Vanish
             }
-        })
-        .into(),
+        }),
     }
 }
 
 // Behaviour (DESIGN naming): tables are numbered in pre-order; a child table is
 // `<parent>_<field>`, a table inside a variant `<parent>_<field>_<variant>_<subfield>`; keys are
 // the ancestors' own keys renamed `<ancestor field>_<column>` and then the table's own key: `pos`
-// for lists and records, `key` for maps, the element `value` for sets. A variant holding only a
-// table opens no CHECK.
+// for lists and records, `key` for maps, the element `value` for sets. A `records` or `history`
+// row starts with its `version` stamp. A variant holding only a table opens no CHECK.
 #[test]
 fn tables_follow_the_naming_and_key_rules() {
     let set = Plan::table_set();
@@ -209,11 +216,11 @@ fn tables_follow_the_naming_and_key_rules() {
             ("plan_inputs", Child, vec!["key"], vec!["tag", "text_value"]),
             ("plan_inputs_list_items", Child, vec!["inputs_key", "pos"], vec!["value"]),
             ("plan_phases", Child, vec!["value"], vec![]),
-            ("plan_deliverables", Records, vec!["pos"], vec!["label"]),
-            ("plan_deliverables_evidence", Records, vec!["deliverables_pos", "pos"], vec!["note"]),
+            ("plan_deliverables", Records, vec!["pos"], vec!["version", "label"]),
+            ("plan_deliverables_evidence", Records, vec!["deliverables_pos", "pos"], vec!["version", "note"]),
             ("plan_deliverables_evidence_meta", Child, vec!["deliverables_pos", "evidence_pos", "key"], vec!["value"]),
-            ("plan_attempts", History, vec!["pos"], vec!["what", "at"]),
-            ("plan_edges", Records, vec!["pos"], vec!["tag", "realise_identity_session", "realise_identity_pid"]),
+            ("plan_attempts", History, vec!["pos"], vec!["version", "what", "at"]),
+            ("plan_edges", History, vec!["pos"], vec!["version", "tag", "realise_identity_session", "realise_identity_pid"]),
         ]
     );
     let parents: Vec<Option<usize>> = set.tables.iter().map(|t| t.parent).collect();
@@ -264,6 +271,8 @@ fn frozen_fields_record_each_object_once() {
 // Behaviour (#3320 decode): stored rows the value cannot have produced are refused with typed
 // errors: a gap in list positions, rows of a variant table while another variant is active, a
 // missing object, and object bytes that do not hash to their key.
+// Records are the same; in addition a position outside `u32` and a negative version stamp are
+// out of range, and a version above `i64::MAX` cannot be encoded.
 #[test]
 fn decode_refuses_rows_the_value_cannot_hold() {
     let value = Plan {
@@ -277,6 +286,26 @@ fn decode_refuses_rows_the_value_cannot_hold() {
         edges: Records::new(),
     };
     let rows = Encoder::encode(&value).expect("encode");
+
+    let mut deliverables = Records::new();
+    deliverables.append(3, Deliverable { label: "d".into(), evidence: Records::new() });
+    let with_record = Plan { deliverables, ..value.clone() };
+    let record_rows = Encoder::encode(&with_record).expect("encode");
+    assert_eq!(record_rows.tables[7][0].values[0], Value::Int(3), "the stamp is the first value");
+    let mut far = record_rows.clone();
+    far.tables[7][0].key = vec![Value::Int(i64::from(u32::MAX) + 1)];
+    let out_of_range = DecodeError::OutOfRange { column: "deliverables_pos".into(), value: i64::from(u32::MAX) + 1 };
+    assert_eq!(Decoder::decode::<Plan>(far), Err(out_of_range));
+    let mut skipped = record_rows.clone();
+    skipped.tables[7][0].key = vec![Value::Int(1)];
+    assert_eq!(Decoder::decode::<Plan>(skipped), Err(DecodeError::Position { column: "deliverables_pos".into(), expected: 0, found: 1 }));
+    let mut negative = record_rows;
+    negative.tables[7][0].values[0] = Value::Int(-1);
+    assert_eq!(Decoder::decode::<Plan>(negative), Err(DecodeError::OutOfRange { column: "deliverables_version".into(), value: -1 }));
+    let mut deliverables = Records::new();
+    deliverables.append(u64::MAX, Deliverable { label: "d".into(), evidence: Records::new() });
+    let unstorable = Encoder::encode(&Plan { deliverables, ..value.clone() });
+    assert_eq!(unstorable.map(|_| ()), Err(EncodeError::OutOfRange { column: "deliverables_version".into(), value: u64::MAX }));
 
     let mut gap = rows.clone();
     gap.tables[1][0].key = vec![Value::Int(1)];

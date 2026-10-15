@@ -11,9 +11,9 @@
 //!   receiving session's name, interned through the `AgentName` newtype.
 //! - `references` is a child table of the seven-variant reference enum; `subject` keeps one
 //!   reference as an optional column, as the spec does.
-//! - Edge events are `records`: each row is the edge (`Drop { reason: Undeliverable { cause } }`
-//!   nests a data enum in a data enum), when and by whom it was written, and a child table of the
-//!   gate's inputs. Attempts are `history`.
+//! - Edge events are `history` (#3320 ruling 2): each row is the edge (`Drop { reason: Undeliverable
+//!   { cause } }` nests a data enum in a data enum), when and by whom it was written, and a child
+//!   table of the gate's inputs. Attempts are `history` too.
 //!
 //! Serde attributes are the resource types' own; storage ignores them (codes are explicit).
 
@@ -23,7 +23,9 @@ use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
 pub use super::attempt::{Attempt, Cause};
-use super::{code_enum, evolve_records, floor, identity, list, name, reference, seq, text, time, timestamp, Fixture, Pick, SHAPES};
+use super::{
+    code_enum, evolve_records, floor, identity, list, name, records, reference, seq, stamp, text, time, timestamp, Fixture, Pick, SHAPES,
+};
 
 /// A minimal target kind for `Message::inbox`.
 #[derive(Debug, Clone, PartialEq, Stored)]
@@ -70,7 +72,7 @@ pub struct Message {
     pub ordinal: u16,
     #[store(state)]
     pub state: State<MessageState>,
-    #[store(records)]
+    #[store(history)]
     pub edges: Records<MessageEdgeEvent>,
     #[store(history)]
     pub attempts: Records<Attempt<String>>,
@@ -398,8 +400,8 @@ impl Message {
             accepted_seq: seq(tc),
             ordinal: tc.draw(gs::integers::<u16>()),
             state: State::new(code_enum(tc, pick, &[Pending, Awaiting, Settled, Dropped]), Timestamp(tc.draw(gs::integers::<i64>()))),
-            edges: list(tc, pick, 3, |pick| MessageEdgeEvent::generate(tc, pick)).into(),
-            attempts: list(tc, pick, 2, |pick| Attempt::generate(tc, pick, text(tc))).into(),
+            edges: records(tc, pick, 3, |pick| MessageEdgeEvent::generate(tc, pick)),
+            attempts: records(tc, pick, 2, |pick| Attempt::generate(tc, pick, text(tc))),
         }
     }
 
@@ -435,20 +437,26 @@ impl Fixture for Message {
         Message::generate(tc, pick)
     }
 
-    /// The spec drawn afresh (references and all), edge events replaced in place or appended,
-    /// attempts appended.
+    /// The spec drawn afresh (references and all), edge events and attempts appended.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> Message {
         let spec = Message::generate(tc, pick);
-        let replace = |_: &MessageEdgeEvent, pick: Pick| MessageEdgeEvent::generate(tc, pick);
         Message {
-            edges: evolve_records(tc, pick, &self.edges, Some(&replace), |pick| MessageEdgeEvent::generate(tc, pick)),
-            attempts: evolve_records(tc, pick, &self.attempts, None, |pick| Attempt::generate(tc, pick, text(tc))),
+            edges: evolve_records(tc, pick, &self.edges, |edge, _| edge.clone(), |pick| MessageEdgeEvent::generate(tc, pick)),
+            attempts: evolve_records(tc, pick, &self.attempts, |attempt, _| attempt.clone(), |pick| Attempt::generate(tc, pick, text(tc))),
             ..spec
         }
     }
 
     fn stored(&self) -> Message {
         Message { deadline: self.deadline.map(floor), ..self.clone() }
+    }
+
+    fn stamped(&self, before: Option<&Message>, version: u64) -> Message {
+        Message {
+            edges: stamp(&self.edges, before.map(|before| &before.edges), version, |edge, _| edge.clone()),
+            attempts: stamp(&self.attempts, before.map(|before| &before.attempts), version, |attempt, _| attempt.clone()),
+            ..self.clone()
+        }
     }
 }
 

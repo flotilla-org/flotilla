@@ -116,7 +116,7 @@ fn column(column: &ColumnDef) -> String {
 mod tests {
     use super::{render_ddl, render_ddl_with, DdlMode};
     use crate::{
-        descriptor::{ColumnType, Condition, DescriptorError, Index, IndexProblem, TableRole},
+        descriptor::{ColumnType, Condition, DescriptorError, Index, IndexProblem, TableRole, RECORD_VERSION},
         layout::Layout,
         value::KindCode,
     };
@@ -129,9 +129,11 @@ mod tests {
         layout.column("workflow", ColumnType::Frozen, true);
         layout.table("deliverables", TableRole::Records, |layout| {
             layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
+            layout.column(RECORD_VERSION, ColumnType::Integer, true);
             layout.column("target", ColumnType::Ref, true);
             layout.table("evidence", TableRole::History, |layout| {
                 layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
+                layout.column(RECORD_VERSION, ColumnType::Integer, true);
                 layout.column("", ColumnType::Blob, true);
             });
         });
@@ -162,6 +164,7 @@ mod tests {
 CREATE TABLE "convoy_deliverables" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
   "target" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
   PRIMARY KEY ("owner", "pos"),
   FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
@@ -170,6 +173,7 @@ CREATE TABLE "convoy_deliverables_evidence" (
   "owner" INTEGER NOT NULL,
   "deliverables_pos" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
   "value" BLOB NOT NULL,
   PRIMARY KEY ("owner", "deliverables_pos", "pos"),
   FOREIGN KEY ("owner", "deliverables_pos") REFERENCES "convoy_deliverables" ("owner", "pos") ON DELETE CASCADE
@@ -226,6 +230,29 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
         assert!(matches!(child("owner"), Err(DescriptorError::ReservedColumn { column, .. }) if column == "owner"));
         assert_eq!(child("version"), Ok(()));
         assert_eq!(child("id"), Ok(()));
+        // `records` and `history` tables start with the version stamp, and reserve its name.
+        for role in [TableRole::Records, TableRole::History] {
+            let records = |columns: &[&str]| {
+                let mut layout = Layout::root("Edge", KindCode(1));
+                layout.table("events", role, |layout| {
+                    layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
+                    for name in columns {
+                        layout.column(name, ColumnType::Integer, true);
+                    }
+                });
+                layout.finish().validate()
+            };
+            assert_eq!(records(&[RECORD_VERSION, "at"]), Ok(()));
+            assert!(matches!(records(&["at"]), Err(DescriptorError::MissingStamp { table, .. }) if table == "edge_events"));
+            assert!(matches!(records(&["at", RECORD_VERSION]), Err(DescriptorError::MissingStamp { .. })));
+            for reserved in ["owner", RECORD_VERSION] {
+                let refused = records(&[RECORD_VERSION, reserved]);
+                assert!(
+                    matches!(refused, Err(DescriptorError::ReservedColumn { column, .. }) if column == reserved),
+                    "{role:?} {reserved}"
+                );
+            }
+        }
 
         // A data column colliding with the table's own key column.
         let mut layout = Layout::root("Edge", KindCode(1));

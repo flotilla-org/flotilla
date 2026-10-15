@@ -57,14 +57,12 @@ pub enum RowOp {
     /// A receiver holding the resource's earlier state (a snapshot, or the changes before) has
     /// every other object the rows name, so a change applies without other resources' changes,
     /// and an update that leaves a frozen column alone does not resend its document.
-    /// `apply` verifies the hash and inserts it if absent. `media` is the `objects` media code;
-    /// ADR 0063 CBOR (1) is the only media today, and `apply` refuses any other.
+    /// `apply` verifies the hash and inserts it if absent. The bytes are always ADR 0063
+    /// canonical CBOR (`Frozen` content), so an object carries no media code.
     #[serde(rename = "p")]
     PutObject {
         #[serde(rename = "h")]
         hash: Hash,
-        #[serde(rename = "m")]
-        media: u8,
         #[serde(rename = "b", with = "crate::value::byte_string")]
         bytes: Vec<u8>,
     },

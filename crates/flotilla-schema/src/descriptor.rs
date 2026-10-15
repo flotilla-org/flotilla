@@ -14,6 +14,13 @@ pub const RESERVED_ROOT_COLUMNS: &[&str] = &["id", "version"];
 /// Column names the backend adds to a kind's child tables.
 pub const RESERVED_CHILD_COLUMNS: &[&str] = &["owner"];
 
+/// The version stamp of a `records` or `history` row: the first data column of those tables, which
+/// the backend sets to the sequence of the write that appended the row.
+pub const RECORD_VERSION: &str = "version";
+
+/// Column names reserved in `records` and `history` tables: the owner id and the version stamp.
+pub const RESERVED_RECORD_COLUMNS: &[&str] = &["owner", RECORD_VERSION];
+
 /// One kind's storage. Tables are numbered in pre-order of declaration, root first; the
 /// encoder and decoder address tables by that index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,9 +38,10 @@ pub enum TableRole {
     Root,
     /// A collection: rows are inserted, updated and deleted freely.
     Child,
-    /// Append-only rows: new positions are inserted, existing rows may be replaced, none removed.
+    /// Append-only rows, each stamped with the version that appended it: none is removed, and an
+    /// existing row changes only through a declared edge (never through a whole-value write).
     Records,
-    /// Append-only immutable rows: new positions only.
+    /// Append-only immutable rows, each stamped with the version that appended it.
     History,
 }
 
@@ -224,6 +232,9 @@ pub enum DescriptorError {
     DuplicateColumn { kind: String, table: String, column: String },
     #[error("kind {kind}: table {table} uses the reserved column name {column}")]
     ReservedColumn { kind: String, table: String, column: String },
+    /// A `records` or `history` table whose first data column is not the version stamp.
+    #[error("kind {kind}: table {table} does not start with the version stamp column")]
+    MissingStamp { kind: String, table: String },
     #[error("kind {kind}: index {index}: {problem}")]
     Index { kind: String, index: String, problem: IndexProblem },
 }
@@ -233,6 +244,7 @@ impl TableSet {
     /// twice or taken by a shared table, column names declared twice in one table (key columns included), and
     /// data or key columns named like the backend's own columns: `id` and `version` on the root, `owner` on
     /// children (a child row may well have a `version` field, such as a gate input's observed version),
+    /// `owner` and `version` beside the stamp on `records` and `history` tables, which must start with it,
     /// and indexes that are not on the root table, name unknown or repeated columns, page through a
     /// nullable column the predicate does not require, or whose predicate cannot hold as written.
     pub fn validate(&self) -> Result<(), DescriptorError> {
@@ -251,8 +263,18 @@ impl TableSet {
         }
         for table in &self.tables {
             let mut columns = BTreeSet::new();
-            for column in table.key.iter().chain(&table.columns) {
-                let reserved = if table.parent.is_none() { RESERVED_ROOT_COLUMNS } else { RESERVED_CHILD_COLUMNS };
+            let (reserved, data) = match table.role {
+                TableRole::Root => (RESERVED_ROOT_COLUMNS, &table.columns[..]),
+                TableRole::Child => (RESERVED_CHILD_COLUMNS, &table.columns[..]),
+                TableRole::Records | TableRole::History => {
+                    let stamp = ColumnDef { name: RECORD_VERSION.to_owned(), ty: ColumnType::Integer, nullable: false };
+                    if table.columns.first() != Some(&stamp) {
+                        return Err(DescriptorError::MissingStamp { kind: kind(), table: table.name.clone() });
+                    }
+                    (RESERVED_RECORD_COLUMNS, &table.columns[1..])
+                }
+            };
+            for column in table.key.iter().chain(data) {
                 if reserved.contains(&column.name.as_str()) {
                     return Err(DescriptorError::ReservedColumn { kind: kind(), table: table.name.clone(), column: column.name.clone() });
                 }

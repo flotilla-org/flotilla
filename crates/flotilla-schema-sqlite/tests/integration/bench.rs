@@ -5,7 +5,7 @@
 //! ```
 //!
 //! A temp-file database in WAL mode with `synchronous = NORMAL` holds pre-created messages. Each
-//! event appends an edge record with one gate input and moves the message's state, through
+//! event appends an edge history row with one gate input and moves the message's state, through
 //! `Write::update`: the root row, the edge row, the gate-input row and the `change_log` row (plus
 //! the `home_sequence` counter), WORKLOAD.md's ~4 row writes per event. Events are committed in
 //! batches of 1, 10, 100 and 1000 per transaction.
@@ -69,19 +69,23 @@ fn seed(store: &mut Store) -> Vec<Loaded<Message>> {
 /// The next state of a message after one delivery event.
 fn event(current: &Message, n: usize) -> Message {
     let mut next = current.clone();
-    next.edges.push(MessageEdgeEvent {
-        edge: MessageEdge::Deliver {
-            receiver: AgentName("crew".into()),
-            receipt: Ref::new(format!("session-{}", n % 50), LOCAL),
-            transport: Transport::Turn,
+    // The store stamps the appended row with the write's sequence.
+    next.edges.append(
+        0,
+        MessageEdgeEvent {
+            edge: MessageEdge::Deliver {
+                receiver: AgentName("crew".into()),
+                receipt: Ref::new(format!("session-{}", n % 50), LOCAL),
+                transport: Transport::Turn,
+            },
+            at: Timestamp(n as i64),
+            writer: LOCAL.into(),
+            inputs: vec![GateInput {
+                observed: Identity { kind: AgentSession::CODE, name: format!("session-{}", n % 50), home: LOCAL.into() },
+                version: n as u64,
+            }],
         },
-        at: Timestamp(n as i64),
-        writer: LOCAL.into(),
-        inputs: vec![GateInput {
-            observed: Identity { kind: AgentSession::CODE, name: format!("session-{}", n % 50), home: LOCAL.into() },
-            version: n as u64,
-        }],
-    });
+    );
     let state = if current.state.value == MessageState::Pending { MessageState::Awaiting } else { MessageState::Pending };
     next.state = State::new(state, Timestamp(n as i64));
     next

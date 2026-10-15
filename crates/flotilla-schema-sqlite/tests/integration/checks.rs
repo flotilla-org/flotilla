@@ -1,6 +1,6 @@
 //! The database refuses rows that break a variant's column rule, whoever writes them.
 
-use flotilla_schema::{quote_ident, ColumnDef, ColumnType, Guard, Table};
+use flotilla_schema::{quote_ident, ColumnDef, ColumnType, Guard, Table, TableRole, RECORD_VERSION};
 use flotilla_schema_sqlite::Write;
 use hegel::TestCase;
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, ErrorCode};
@@ -132,4 +132,32 @@ fn check_table(conn: &Connection, table: &Table) {
             );
         }
     }
+}
+
+// Behaviour (#3320 ruling 3): every `records` and `history` table holds its rows' version stamp
+// as a `NOT NULL` integer, so a raw write cannot leave a row unstamped.
+#[hegel::test(test_cases = 5)]
+fn record_stamps_are_never_null(tc: TestCase) {
+    let mut store = store();
+    let mut write = store.write().expect("write");
+    insert_covering::<Message>(&mut write, &tc);
+    insert_covering::<Convoy>(&mut write, &tc);
+    insert_covering::<TerminalSession>(&mut write, &tc);
+    write.commit().expect("commit");
+    let conn = store.into_connection();
+    let mut checked = 0;
+    for set in registry().iter() {
+        for table in set.tables.iter().filter(|table| matches!(table.role, TableRole::Records | TableRole::History)) {
+            let sql = format!("UPDATE {} SET {} = NULL", quote_ident(&table.name), quote_ident(RECORD_VERSION));
+            match conn.execute(&sql, []) {
+                Err(rusqlite::Error::SqliteFailure(error, Some(message))) => {
+                    assert_eq!(error.code, ErrorCode::ConstraintViolation, "{sql}: {message}");
+                    assert!(message.starts_with("NOT NULL constraint failed"), "{sql}: {message}");
+                }
+                other => panic!("{sql} was not refused: {other:?}"),
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 6, "edges, attempts, deliverables, evidence, events and attempts");
 }

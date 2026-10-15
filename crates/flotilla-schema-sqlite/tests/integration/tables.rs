@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use flotilla_schema::{quote_ident, Hash, Identity, Kind, Records, Ref, State, Table, Timestamp};
-use flotilla_schema_sqlite::{Loaded, Store, StoreError, MEDIA_CBOR};
+use flotilla_schema_sqlite::{Loaded, Store, StoreError};
 use hegel::TestCase;
 use rusqlite::Connection;
 
@@ -37,9 +37,33 @@ fn deliverable(evidence: Vec<Evidence>) -> Deliverable {
         kind: PromiseKind::ChangeRequest,
         role: "coder".into(),
         source: PromiseSource::Dispatcher,
-        evidence: evidence.into(),
+        evidence: records(evidence),
         state: State::new(DeliverableState::Open, Timestamp(4)),
     }
+}
+
+/// Records of `rows` with placeholder stamps: the store stamps every row it appends.
+fn records<T>(rows: Vec<T>) -> Records<T> {
+    let mut records = Records::new();
+    for row in rows {
+        records.append(0, row);
+    }
+    records
+}
+
+/// An edit of records as (stamp, record) pairs; see [`with_rows`].
+type Edit<'a, T> = &'a dyn Fn(&mut Vec<(u64, T)>);
+
+/// `records` rebuilt from its rows, as (stamp, record) pairs, after `f` edits them: how a test
+/// writes a change the record type itself never makes, to see the store refuse it.
+fn with_rows<T: Clone>(records: &Records<T>, f: impl FnOnce(&mut Vec<(u64, T)>)) -> Records<T> {
+    let mut rows: Vec<(u64, T)> = records.iter().map(|row| (row.version, row.record.clone())).collect();
+    f(&mut rows);
+    let mut rebuilt = Records::new();
+    for (version, record) in rows {
+        rebuilt.append(version, record);
+    }
+    rebuilt
 }
 
 fn insert<K: Kind>(store: &mut Store, name: &str, value: &K) -> Loaded<K> {
@@ -54,44 +78,74 @@ fn load<K: Kind>(store: &mut Store, current: &Loaded<K>) -> Loaded<K> {
     store.read().expect("read").load::<K>(current.id).expect("load").expect("present")
 }
 
-// Behaviour (DESIGN writes): through the owner's write, a `records` row may be replaced or
-// appended but not removed (`AppendOnly`); a `history` row may only be appended (`Immutable` when
-// changed or removed); records nested in records keep the rule when their parent row is replaced.
-// A refused write changes nothing, and the transaction stays usable for later writes.
+// Behaviour (#3320 rulings 2 and 5): through a whole-value write, `records` and `history` rows are
+// only appended. Changing or removing a `history` row (an edge event, its gate inputs, an attempt)
+// is `Immutable`; changing or removing a `records` row (a deliverable, its evidence) is
+// `AppendOnly`. A refused write changes nothing, and the transaction stays usable for later
+// writes, which may append edges, attempts and evidence to a kept deliverable; each appended row
+// is stamped with the write's version, while earlier rows keep the insert's.
 #[test]
 fn records_and_history_refusals_reach_the_caller() {
     let mut store = store();
-    let message = Message { edges: vec![event("alice"), event("bob")].into(), attempts: vec![attempt("a")].into(), ..Message::sample() };
+    let message =
+        Message { edges: records(vec![event("alice"), event("bob")]), attempts: records(vec![attempt("a")]), ..Message::sample() };
     let current = insert(&mut store, "m", &message);
-    let convoy = Convoy { deliverables: vec![deliverable(vec![evidence("e0"), evidence("e1")])].into(), ..Convoy::sample(0) };
+    let convoy = Convoy { deliverables: records(vec![deliverable(vec![evidence("e0"), evidence("e1")])]), ..Convoy::sample(0) };
     let convoy_current = insert(&mut store, "c", &convoy);
+    let (message, convoy) = (&current.value, &convoy_current.value);
+    let stamps = message.edges.iter().map(|row| row.version).chain(convoy.deliverables.iter().map(|row| row.version));
+    assert_eq!(stamps.collect::<Vec<_>>(), [current.version, current.version, convoy_current.version], "the insert stamps every row");
 
     let mut write = store.write().expect("write");
-    let fewer_edges = Message { edges: vec![event("alice")].into(), ..message.clone() };
-    assert!(matches!(write.update(&current, &fewer_edges), Err(StoreError::AppendOnly { table }) if table == "message_edges"));
-    let changed_attempt = Message { attempts: vec![attempt("b")].into(), ..message.clone() };
-    assert!(matches!(write.update(&current, &changed_attempt), Err(StoreError::Immutable { table }) if table == "message_attempts"));
+    let refused = |result: Result<_, StoreError>| match result {
+        Err(StoreError::Immutable { table }) => format!("Immutable {table}"),
+        Err(StoreError::AppendOnly { table }) => format!("AppendOnly {table}"),
+        other => format!("{other:?}"),
+    };
+    let edges = |f: Edit<MessageEdgeEvent>| Message { edges: with_rows(&message.edges, f), ..message.clone() };
+    assert_eq!(refused(write.update(&current, &edges(&|rows| drop(rows.pop())))), "Immutable message_edges");
+    assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].1 = event("carol")))), "Immutable message_edges");
+    assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].0 += 1))), "Immutable message_edges", "the stamp is part of the row");
+    let input = GateInput { observed: Identity { kind: Message::CODE, name: "m".into(), home: LOCAL.into() }, version: 1 };
+    let with_input = edges(&|rows| rows[0].1.inputs.push(input.clone()));
+    assert_eq!(refused(write.update(&current, &with_input)), "Immutable message_edges", "gate inputs are part of the edge row");
+    let changed_attempt = Message { attempts: with_rows(&message.attempts, |rows| rows[0].1 = attempt("b")), ..message.clone() };
+    assert_eq!(refused(write.update(&current, &changed_attempt)), "Immutable message_attempts");
     let fewer_attempts = Message { attempts: Records::new(), ..message.clone() };
-    assert!(matches!(write.update(&current, &fewer_attempts), Err(StoreError::Immutable { table }) if table == "message_attempts"));
-    let mut replaced = convoy.deliverables.clone();
-    replaced.replace(0, deliverable(vec![evidence("e0")]));
-    let fewer_evidence = Convoy { deliverables: replaced, ..convoy.clone() };
-    assert!(matches!(
-        write.update(&convoy_current, &fewer_evidence),
-        Err(StoreError::AppendOnly { table }) if table == "convoy_deliverables_evidence"
-    ));
+    assert_eq!(refused(write.update(&current, &fewer_attempts)), "Immutable message_attempts");
+    let deliverables = |f: Edit<Deliverable>| Convoy { deliverables: with_rows(&convoy.deliverables, f), ..convoy.clone() };
+    let retracted = deliverables(&|rows| rows[0].1.state = State::new(DeliverableState::Retracted, Timestamp(5)));
+    assert_eq!(refused(write.update(&convoy_current, &retracted)), "AppendOnly convoy_deliverables", "only an edge moves a record");
+    assert_eq!(refused(write.update(&convoy_current, &deliverables(&|rows| rows.clear()))), "AppendOnly convoy_deliverables");
+    let fewer_evidence = deliverables(&|rows| rows[0].1.evidence = with_rows(&rows[0].1.evidence, |evidence| drop(evidence.pop())));
+    assert_eq!(refused(write.update(&convoy_current, &fewer_evidence)), "AppendOnly convoy_deliverables_evidence");
 
-    // Allowed in the same transaction: replace an edge in place, append one, append an attempt.
-    let mut edges = message.edges.clone();
-    edges.replace(1, event("carol"));
-    edges.push(event("dave"));
-    let mut attempts = message.attempts.clone();
-    attempts.push(attempt("b"));
-    let next = Message { edges, attempts, ..message.clone() };
-    write.update(&current, &next).expect("replace and append");
+    // Allowed in the same transaction: append an edge and an attempt, and evidence to the kept
+    // deliverable, whatever stamps the caller's rows hold.
+    let next = Message {
+        edges: with_rows(&message.edges, |rows| rows.push((u64::from(u32::MAX), event("dave")))),
+        attempts: with_rows(&message.attempts, |rows| rows.push((0, attempt("b")))),
+        ..message.clone()
+    };
+    let stamp = write.update(&current, &next).expect("append");
+    let more_evidence =
+        deliverables(&|rows| rows[0].1.evidence = with_rows(&rows[0].1.evidence, |evidence| evidence.push((7, evidence_row()))));
+    let convoy_stamp = write.update(&convoy_current, &more_evidence).expect("append evidence to a kept deliverable");
     write.commit().expect("commit");
-    assert_eq!(load(&mut store, &current).value, next);
-    assert_eq!(load(&mut store, &convoy_current).value, convoy, "the refused convoy write changed nothing");
+    let expected = Message {
+        edges: with_rows(&message.edges, |rows| rows.push((stamp.version, event("dave")))),
+        attempts: with_rows(&message.attempts, |rows| rows.push((stamp.version, attempt("b")))),
+        ..message.clone()
+    };
+    assert_eq!(load(&mut store, &current).value, expected);
+    let expected = deliverables(&|rows| {
+        rows[0].1.evidence = with_rows(&rows[0].1.evidence, |evidence| evidence.push((convoy_stamp.version, evidence_row())))
+    });
+    assert_eq!(load(&mut store, &convoy_current).value, expected);
+}
+
+fn evidence_row() -> Evidence {
+    evidence("e2")
 }
 
 /// Rows written by `f`: inserted, updated and deleted rows of every table, counted by SQLite.
@@ -112,13 +166,14 @@ fn update<K: Kind>(store: &mut Store, current: &Loaded<K>, next: &K) {
 }
 
 // Behaviour (#3320 production shape): an update writes only the rows that changed, plus the root
-// row's version, the home sequence, the identity's sequence and one change-log row. Appending one record is one insert; replacing one record
-// with one new gate input is one update and one insert; changing one of three repositories is
-// one update; an unchanged collection writes nothing.
+// row's version, the home sequence, the identity's sequence and one change-log row. Appending one
+// record is one insert; appending one with a gate input is two; changing one of three
+// repositories is one update; an unchanged collection writes nothing.
 #[test]
 fn updates_write_only_changed_rows() {
     let store = store();
-    let message = Message { edges: vec![event("alice"), event("bob")].into(), attempts: vec![attempt("a")].into(), ..Message::sample() };
+    let message =
+        Message { edges: records(vec![event("alice"), event("bob")]), attempts: records(vec![attempt("a")]), ..Message::sample() };
     let repository = |slug: &str| ConvoyRepository {
         url: "u".into(),
         repo_key: "k".into(),
@@ -131,19 +186,17 @@ fn updates_write_only_changed_rows() {
     let current = insert(&mut store, "m", &message);
     let convoy_current = insert(&mut store, "c", &convoy);
 
-    let mut appended = message.clone();
-    appended.edges.push(event("alice"));
+    let appended = Message { edges: with_rows(&current.value.edges, |rows| rows.push((0, event("alice")))), ..current.value.clone() };
     let (mut store, written) = rows_written(store, |store| update(store, &current, &appended));
     assert_eq!(written, 5, "one record row, the root version, the home sequence, the identity sequence and the change log");
 
     let current = load(&mut store, &current);
-    let mut replaced = appended.clone();
     // "alice" is already interned, so no `strings` row is written.
     let mut with_input = event("alice");
     with_input.inputs.push(GateInput { observed: Identity { kind: Message::CODE, name: "m".into(), home: LOCAL.into() }, version: 1 });
-    replaced.edges.replace(1, with_input);
-    let (store, written) = rows_written(store, |store| update(store, &current, &replaced));
-    assert_eq!(written, 6, "the record row, its new gate input, the root version, the home and identity sequences and the change log");
+    let appended = Message { edges: with_rows(&current.value.edges, |rows| rows.push((0, with_input))), ..current.value.clone() };
+    let (store, written) = rows_written(store, |store| update(store, &current, &appended));
+    assert_eq!(written, 6, "the record row, its gate input, the root version, the home and identity sequences and the change log");
 
     let changed = Convoy { repositories: vec![repository("a"), repository("B"), repository("c")], ..convoy.clone() };
     let (mut store, written) = rows_written(store, |store| update(store, &convoy_current, &changed));
@@ -154,24 +207,24 @@ fn updates_write_only_changed_rows() {
     assert_eq!(written, 0, "an unchanged value writes nothing");
 }
 
-// Behaviour (#3320 representation): equal frozen content is one `objects` row (media 1, keyed by
-// the SHA-256 of its bytes) shared by every resource naming it; different content is another row.
+// Behaviour (#3320 representation): equal frozen content is one `objects` row (keyed by the
+// SHA-256 of its bytes, which are canonical CBOR, so no media column) shared by every resource naming it; different content is another row.
 #[test]
 fn equal_frozen_snapshots_share_one_object_row() {
     let mut store = store();
     let first = insert(&mut store, "a", &Convoy::sample(0));
     insert(&mut store, "b", &Convoy::sample(0));
     let conn = store.into_connection();
-    let objects: Vec<(Vec<u8>, i64, Vec<u8>)> = conn
-        .prepare("SELECT hash, media, bytes FROM objects")
+    let objects: Vec<(Vec<u8>, Vec<u8>)> = conn
+        .prepare("SELECT hash, bytes FROM objects")
         .expect("prepare")
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .expect("query")
         .collect::<Result<_, _>>()
         .expect("rows");
     assert_eq!(objects.len(), 1, "two convoys with equal snapshots share one object");
-    let (hash, media, bytes) = &objects[0];
-    assert_eq!((hash.as_slice(), *media), (&workflow(0).hash().0[..], MEDIA_CBOR));
+    let (hash, bytes) = &objects[0];
+    assert_eq!(hash.as_slice(), &workflow(0).hash().0[..]);
     assert_eq!(Hash::of(bytes), workflow(0).hash());
     let distinct: i64 = conn.query_row("SELECT count(DISTINCT workflow_snapshot) FROM convoy", [], |row| row.get(0)).expect("count");
     assert_eq!(distinct, 1);
@@ -210,11 +263,11 @@ fn nested_rows_go_with_their_parent() {
     let list = |items: &[&str]| InputValue::List { items: items.iter().map(|item| item.to_string()).collect() };
     let convoy = Convoy {
         inputs: [("a".to_owned(), list(&["x", "y"])), ("b".to_owned(), list(&["z"]))].into(),
-        deliverables: vec![deliverable(vec![Evidence { metadata: [("k".to_owned(), "v".to_owned())].into(), ..evidence("e") }])].into(),
+        deliverables: records(vec![deliverable(vec![Evidence { metadata: [("k".to_owned(), "v".to_owned())].into(), ..evidence("e") }])]),
         ..Convoy::sample(0)
     };
     let current = insert(&mut store, "c", &convoy);
-    let next = Convoy { inputs: [("b".to_owned(), InputValue::Text { value: "t".into() })].into(), ..convoy.clone() };
+    let next = Convoy { inputs: [("b".to_owned(), InputValue::Text { value: "t".into() })].into(), ..current.value.clone() };
     update(&mut store, &current, &next);
     let conn = store.into_connection();
     let items: i64 = conn.query_row("SELECT count(*) FROM convoy_inputs_list_items", [], |row| row.get(0)).expect("count");

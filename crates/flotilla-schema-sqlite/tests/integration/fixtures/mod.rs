@@ -3,8 +3,9 @@
 //! Each fixture generates values in two modes ([`Pick`]): drawn by Hegel, or fixed by a covering
 //! index, so that a fixture's covering indexes `0..COVERING` reach every enum variant, nested ones
 //! included, and both empty and non-empty collections. [`Fixture::evolve`] generates an update the
-//! storage rules allow: spec fields and child tables change freely, `records` rows are replaced in
-//! place or appended, `history` rows are only appended.
+//! storage rules allow: spec fields and child tables change freely, `records` and `history` rows
+//! are only appended (records nested in a kept record included). Generated rows carry arbitrary
+//! version stamps; [`Fixture::stamped`] gives the stamps the store writes instead.
 
 pub mod attempt;
 pub mod convoy;
@@ -38,6 +39,9 @@ pub trait Fixture: Kind + Clone + PartialEq + Debug {
     fn stored(&self) -> Self {
         self.clone()
     }
+    /// `self` as written at `version`: every records and history row that `before` (the value the
+    /// write replaced; `None` for an insert) lacks is stamped with `version`.
+    fn stamped(&self, before: Option<&Self>, version: u64) -> Self;
 }
 
 pub fn registry() -> KindRegistry {
@@ -100,14 +104,6 @@ impl Pick {
             Pick::Cover(index) => Pick::Cover(index + n),
         }
     }
-
-    /// Whether to replace the `n`th existing record in place.
-    pub fn replace(self, tc: &TestCase, n: usize) -> bool {
-        match self {
-            Pick::Draw => tc.draw(gs::booleans()),
-            Pick::Cover(index) => (index + n).is_multiple_of(2),
-        }
-    }
 }
 
 /// A list of `pick.count(max)` elements, each with its own shifted pick.
@@ -115,30 +111,49 @@ pub fn list<T>(tc: &TestCase, pick: Pick, max: usize, mut element: impl FnMut(Pi
     (0..pick.count(tc, max)).map(|n| element(pick.nth(n))).collect()
 }
 
-/// Replaces one record in place, given the pick for its position.
-pub type Replace<'a, T> = &'a dyn Fn(&T, Pick) -> T;
+/// A version stamp as a generator leaves it: anywhere in the storable range, since the store
+/// replaces it with the appending write's sequence.
+pub fn version(tc: &TestCase) -> u64 {
+    tc.draw(gs::integers::<u64>().min_value(0).max_value(i64::MAX as u64))
+}
 
-/// Records after an allowed update: each existing row kept or replaced in place by `replace`,
-/// then up to two rows appended. `history` passes `None`: its rows never change.
-pub fn evolve_records<T: Clone>(
+/// Records of `pick.count(max)` elements, each with its own shifted pick and a drawn stamp.
+pub fn records<T>(tc: &TestCase, pick: Pick, max: usize, element: impl FnMut(Pick) -> T) -> Records<T> {
+    let mut records = Records::new();
+    for record in list(tc, pick, max, element) {
+        records.append(version(tc), record);
+    }
+    records
+}
+
+/// Records after an allowed update: each existing row kept at its position and stamp, its record
+/// passed through `keep` (which may append to records nested in it), then up to two rows appended.
+pub fn evolve_records<T>(
     tc: &TestCase,
     pick: Pick,
     old: &Records<T>,
-    replace: Option<Replace<'_, T>>,
+    mut keep: impl FnMut(&T, Pick) -> T,
     mut fresh: impl FnMut(Pick) -> T,
 ) -> Records<T> {
-    let mut next = old.clone();
-    if let Some(replace) = replace {
-        for pos in 0..old.len() {
-            if pick.replace(tc, pos) {
-                next.replace(pos, replace(&old[pos], pick.nth(pos)));
-            }
-        }
+    let mut next = Records::new();
+    for row in old {
+        next.append(row.version, keep(&row.record, pick.nth(row.position.0 as usize)));
     }
     for n in 0..pick.count(tc, 2) {
-        next.push(fresh(pick.nth(old.len() + n)));
+        next.append(version(tc), fresh(pick.nth(old.len() + n)));
     }
     next
+}
+
+/// `records` as written at `version`: rows at positions `before` lacks take `version`; each
+/// record passes through `inner` with its counterpart in `before`, for records nested in it.
+pub fn stamp<T>(records: &Records<T>, before: Option<&Records<T>>, version: u64, mut inner: impl FnMut(&T, Option<&T>) -> T) -> Records<T> {
+    let mut stamped = Records::new();
+    for row in records {
+        let previous = before.and_then(|before| before.get(row.position));
+        stamped.append(previous.map_or(version, |_| row.version), inner(&row.record, previous.map(|previous| &previous.record)));
+    }
+    stamped
 }
 
 pub fn code_enum<E: Copy>(tc: &TestCase, pick: Pick, all: &[E]) -> E {

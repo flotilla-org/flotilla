@@ -1,5 +1,0 @@
-error: tuple variants cannot be stored; use named fields; the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
- --> tests/ui/tuple_variant.rs:6:11
-  |
-6 |     Opened(String),
-  |           ^^^^^^^^

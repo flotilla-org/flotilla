@@ -81,6 +81,7 @@ fn the_enumeration_covers_every_kind_and_index() {
         "log_by_home",
         "message select",
         "message_edges_inputs delete",
+        "message_edges insert",
         "convoy_deliverables_evidence_metadata insert",
         "terminal_session_labels select",
         "message update version",

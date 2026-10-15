@@ -21,7 +21,7 @@ use super::{
     attempt::{Attempt, Cause},
     code_enum,
     convoy::map,
-    evolve_records, key, list, name, reference, text, timestamp, Fixture, Pick, SHAPES,
+    evolve_records, key, list, name, records, reference, stamp, text, timestamp, Fixture, Pick, SHAPES,
 };
 
 /// A minimal target kind for `TerminalSession::vessel`.
@@ -55,7 +55,7 @@ pub struct TerminalSession {
     pub labels: BTreeSet<String>,
     #[store(flatten)]
     pub realised: Option<TerminalIdentity>,
-    #[store(records)]
+    #[store(history)]
     pub events: Records<LifecycleEvent<TerminalIdentity>>,
     #[store(history)]
     pub attempts: Records<Attempt<TerminalAction>>,
@@ -196,20 +196,27 @@ impl Fixture for TerminalSession {
             env: map(tc, pick, 3, |_| text(tc)),
             labels: list(tc, pick, 3, |_| key(tc)).into_iter().collect(),
             realised: pick.some(tc, 7).then(|| TerminalIdentity::generate(tc, pick.nth(1))),
-            events: list(tc, pick, 3, |pick| event(tc, pick)).into(),
-            attempts: list(tc, pick, 2, |pick| attempt(tc, pick)).into(),
+            events: records(tc, pick, 3, |pick| event(tc, pick)),
+            attempts: records(tc, pick, 2, |pick| attempt(tc, pick)),
             lifecycle: State::new(code_enum(tc, pick, &[Requested, Realised, Gone, GaveUp]), timestamp(tc)),
         }
     }
 
-    /// Spec, env and labels drawn afresh; events replaced in place or appended; attempts appended.
+    /// Spec, env and labels drawn afresh; lifecycle events and attempts appended.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> TerminalSession {
         let spec = TerminalSession::generate(tc, pick);
-        let replace = |_: &LifecycleEvent<TerminalIdentity>, pick: Pick| event(tc, pick);
         TerminalSession {
-            events: evolve_records(tc, pick, &self.events, Some(&replace), |pick| event(tc, pick)),
-            attempts: evolve_records(tc, pick, &self.attempts, None, |pick| attempt(tc, pick)),
+            events: evolve_records(tc, pick, &self.events, |event, _| event.clone(), |pick| event(tc, pick)),
+            attempts: evolve_records(tc, pick, &self.attempts, |attempt, _| attempt.clone(), |pick| attempt(tc, pick)),
             ..spec
+        }
+    }
+
+    fn stamped(&self, before: Option<&TerminalSession>, version: u64) -> TerminalSession {
+        TerminalSession {
+            events: stamp(&self.events, before.map(|before| &before.events), version, |event, _| event.clone()),
+            attempts: stamp(&self.attempts, before.map(|before| &before.attempts), version, |attempt, _| attempt.clone()),
+            ..self.clone()
         }
     }
 }

@@ -6,8 +6,8 @@ use flotilla_schema::{render_ddl_with, DdlMode, KindRegistry};
 /// (kind, name, home), with homes filtered through `resource_identity_by_home`, and its `seq`:
 /// the home sequence of the last change written or applied for it, kept after a delete as a
 /// tombstone, so replaying an older change is a duplicate however much `change_log` is trimmed;
-/// `objects` holds frozen documents by hash (media 1 is ADR 0063 CBOR); `home_sequence.last` is each home's
-/// sequence, which never decreases and does not depend on `change_log` rows, so deleting log
+/// `objects` holds frozen documents by hash, always ADR 0063 canonical CBOR, so no media column; `home_sequence.last`
+/// is each home's sequence, which never decreases and does not depend on `change_log` rows, so deleting log
 /// rows never lets a sequence repeat; `change_log` holds every write's row changes per home.
 /// No database created by an earlier generation of these tables exists: the first production
 /// generation is the baseline, and ADR 0047's N→N+1 rule applies from then.
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS resource_identity (
   seq INTEGER NOT NULL DEFAULT 0,
   UNIQUE (kind, name, home)) STRICT;
 CREATE INDEX IF NOT EXISTS resource_identity_by_home ON resource_identity (home, kind);
-CREATE TABLE IF NOT EXISTS objects (hash BLOB PRIMARY KEY, media INTEGER NOT NULL, bytes BLOB NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS home_sequence (home INTEGER PRIMARY KEY REFERENCES strings(id), last INTEGER NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS change_log (
   home INTEGER NOT NULL REFERENCES strings(id), home_seq INTEGER NOT NULL,
@@ -61,7 +61,7 @@ pub(crate) const IDENTITY_OF: &str =
     "SELECT i.kind, n.s, h.s FROM resource_identity i JOIN strings n ON n.id = i.name JOIN strings h ON h.id = i.home WHERE i.id = ?1";
 pub(crate) const SEQUENCE_NEXT: &str =
     "INSERT INTO home_sequence (home, last) VALUES (?1, 1) ON CONFLICT (home) DO UPDATE SET last = last + 1 RETURNING last";
-pub(crate) const OBJECT_PUT: &str = "INSERT OR IGNORE INTO objects (hash, media, bytes) VALUES (?1, ?2, ?3)";
+pub(crate) const OBJECT_PUT: &str = "INSERT OR IGNORE INTO objects (hash, bytes) VALUES (?1, ?2)";
 pub(crate) const IDENTITY_SEQ: &str = "SELECT seq FROM resource_identity WHERE id = ?1";
 pub(crate) const IDENTITY_SET_SEQ: &str = "UPDATE resource_identity SET seq = ?1 WHERE id = ?2";
 pub(crate) const SEQUENCE_RAISE: &str =
@@ -72,9 +72,6 @@ pub(crate) const LOG_BY_RESOURCE: &str =
 pub(crate) const LOG_BY_HOME: &str = "SELECT change FROM change_log WHERE home = ?1 AND home_seq > ?2 ORDER BY home_seq LIMIT ?3";
 pub(crate) const SEQUENCE_LAST: &str = "SELECT last FROM home_sequence WHERE home = ?1";
 pub(crate) const OBJECT_BYTES: &str = "SELECT bytes FROM objects WHERE hash = ?1";
-
-/// The objects media code for ADR 0063 canonical CBOR.
-pub const MEDIA_CBOR: i64 = 1;
 
 /// The whole schema a store with these kinds holds: shared tables, then each kind in code order.
 pub fn schema_ddl(kinds: &KindRegistry, mode: DdlMode) -> String {

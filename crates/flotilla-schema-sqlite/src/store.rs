@@ -23,7 +23,7 @@ use crate::{
     query::{page_limit, Cursor, Page},
     shared::{
         schema_ddl, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_APPEND, LOG_BY_HOME,
-        LOG_BY_RESOURCE, LOG_TAKEN, MEDIA_CBOR, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE,
+        LOG_BY_RESOURCE, LOG_TAKEN, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE,
         SHARED_STATEMENTS, STRING_ID, STRING_INSERT,
     },
     sql::{KindSql, TableSql},
@@ -354,7 +354,8 @@ impl Write<'_> {
         self.ctx().scan::<K>(home, after, limit)
     }
 
-    /// Inserts a resource homed here. Its version is the next local home sequence.
+    /// Inserts a resource homed here. Its version is the next local home sequence, which also
+    /// stamps every `records` and `history` row it holds.
     pub fn insert<K: Kind>(&mut self, name: &str, value: &K) -> Result<Stamp, StoreError> {
         let rows = Encoder::encode(value)?;
         self.guarded(|ctx| ctx.insert::<K>(name, rows))
@@ -362,6 +363,8 @@ impl Write<'_> {
 
     /// Writes only the rows that differ between `current.value` and `next`, refusing if the
     /// resource moved past `current.version`. A write with no row changes is a no-op.
+    /// `records` and `history` rows are only appended (`AppendOnly`, `Immutable`), and each
+    /// appended row is stamped with this write's version, whatever `next` holds.
     pub fn update<K: Kind>(&mut self, current: &Loaded<K>, next: &K) -> Result<Stamp, StoreError> {
         let old = Encoder::encode(&current.value)?;
         let new = Encoder::encode(next)?;
@@ -579,8 +582,8 @@ impl Ctx<'_> {
         let mut ops = Vec::new();
         for hash in hashes {
             let bytes = objects.remove(&hash).ok_or(DecodeError::MissingObject { hash })?;
-            statement.execute(params![&hash.0[..], MEDIA_CBOR, &bytes])?;
-            ops.push(RowOp::PutObject { hash, media: MEDIA_CBOR as u8, bytes });
+            statement.execute(params![&hash.0[..], &bytes])?;
+            ops.push(RowOp::PutObject { hash, bytes });
         }
         Ok(ops)
     }
@@ -607,10 +610,14 @@ impl Ctx<'_> {
         let hashes = rows.tables.iter().flatten().flat_map(|row| set_objects(None, row)).collect();
         let mut ops = self.put_objects(hashes, &mut rows.objects)?;
         let objects = ops.len();
-        // Pre-order puts every parent table before its children.
+        // Pre-order puts every parent table before its children. Every records and history row is
+        // appended by this write, so each is stamped with its sequence.
         for (table, table_rows) in rows.tables.into_iter().enumerate() {
-            let name = &self.sql(K::CODE)?.tables[table].name;
-            ops.extend(table_rows.into_iter().map(|row| RowOp::Insert { table: name.clone(), key: row.key, values: row.values }));
+            let table = &self.sql(K::CODE)?.tables[table];
+            ops.extend(table_rows.into_iter().map(|mut row| {
+                stamp(table.role, &mut row.values, sequence);
+                RowOp::Insert { table: table.name.clone(), key: row.key, values: row.values }
+            }));
         }
         self.execute(K::CODE, id, &ops[objects..], sequence, None)?;
         self.append_log(identity, id, (sequence, version), ops)?;
@@ -657,9 +664,15 @@ impl Ctx<'_> {
         let objects = ops.len();
         let tables = &self.sql(K::CODE)?.tables;
         let op = |table: usize, change: &Change<'_>| {
-            let table = tables[table].name.clone();
+            let (role, table) = (tables[table].role, tables[table].name.clone());
             match change {
-                Change::Insert(row) => RowOp::Insert { table, key: row.key.clone(), values: row.values.clone() },
+                Change::Insert(row) => {
+                    // An inserted records or history row is appended by this write, whatever
+                    // version the caller's value held.
+                    let mut values = row.values.clone();
+                    stamp(role, &mut values, sequence);
+                    RowOp::Insert { table, key: row.key.clone(), values }
+                }
                 Change::Update(_, row) => RowOp::Update { table, key: row.key.clone(), values: row.values.clone() },
                 Change::Delete(row) => RowOp::Delete { table, key: row.key.clone() },
             }
@@ -765,10 +778,7 @@ impl Ctx<'_> {
         let mut statement = self.conn.prepare_cached(OBJECT_EXISTS)?;
         for op in ops {
             let (key, values) = match op {
-                RowOp::PutObject { hash, media, .. } => {
-                    if i64::from(*media) != MEDIA_CBOR {
-                        return Err(Malformed::Media { media: *media }.into());
-                    }
+                RowOp::PutObject { hash, .. } => {
                     put.insert(*hash);
                     continue;
                 }
@@ -869,11 +879,11 @@ impl Ctx<'_> {
         }
         for op in ops {
             match op {
-                RowOp::PutObject { hash, media, bytes } => {
+                RowOp::PutObject { hash, bytes } => {
                     if Hash::of(bytes) != *hash {
                         return Err(StoreError::TamperedObject { hash: *hash });
                     }
-                    self.conn.prepare_cached(OBJECT_PUT)?.execute(params![&hash.0[..], media, bytes])?;
+                    self.conn.prepare_cached(OBJECT_PUT)?.execute(params![&hash.0[..], bytes])?;
                 }
                 RowOp::Insert { table, key, values } => match self.table_of(code, table, key, Some(values))? {
                     0 => {
@@ -1083,20 +1093,50 @@ fn set_objects<'r>(before: Option<&'r Row>, after: &'r Row) -> impl Iterator<Ite
     })
 }
 
+/// Sets an appended `records` or `history` row's version stamp (its first value, as the
+/// descriptor validates) to the sequence of the write appending it.
+fn stamp(role: TableRole, values: &mut [Value], sequence: i64) {
+    if matches!(role, TableRole::Records | TableRole::History) {
+        values[0] = Value::Int(sequence);
+    }
+}
+
 /// A caller's version as stored. One that cannot be stored cannot be current either.
 fn expected_version(current: Stamp) -> Result<i64, StoreError> {
     i64::try_from(current.version).map_err(|_| StoreError::Conflict { id: current.id, expected: current.version })
 }
 
 /// Per-table row changes between two sorted encodings of one resource, enforcing each table's
-/// role. A removed `records` or `history` row is allowed only when its parent row is removed too
-/// (the rows go with it); otherwise it is `AppendOnly` or `Immutable`.
+/// role for a whole-value write: `child` rows change freely; `records` and `history` rows are only
+/// appended. An existing `records` row that changes or disappears is `AppendOnly`, a `history` row
+/// `Immutable`; that covers the child tables nested in such a row, which are part of it, while
+/// `records` and `history` tables nested in it may still be appended to. A removed row is allowed
+/// only when its parent row is removed too (the rows go with it).
 fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Result<Vec<Vec<Change<'r>>>, StoreError> {
     let mut changes: Vec<Vec<Change<'r>>> = (0..tables.len()).map(|_| Vec::new()).collect();
     let mut removed: Vec<BTreeSet<&'r [Value]>> = (0..tables.len()).map(|_| BTreeSet::new()).collect();
+    // Rows kept by this write that belong to an existing records or history row (the row itself or
+    // a child row nested in it), by key, with the index of that records or history table.
+    let mut sealed: Vec<BTreeMap<&'r [Value], usize>> = (0..tables.len()).map(|_| BTreeMap::new()).collect();
+    let refuse = |sealing: usize| {
+        let table = tables[sealing].name.clone();
+        match tables[sealing].role {
+            TableRole::History => StoreError::Immutable { table },
+            _ => StoreError::AppendOnly { table },
+        }
+    };
     for (index, table) in tables.iter().enumerate().skip(1) {
         let parent = table.parent.expect("child tables have a parent");
         let parent_key_len = tables[parent].key_len;
+        let appended = matches!(table.role, TableRole::Records | TableRole::History);
+        // The records or history row a row of this table belongs to, when it is kept by this write.
+        let seal = |sealed: &[BTreeMap<&[Value], usize>], row: &Row| {
+            if appended {
+                Some(index)
+            } else {
+                sealed[parent].get(&row.key[..parent_key_len]).copied()
+            }
+        };
         let mut old_rows = old[index].iter().peekable();
         let mut new_rows = new[index].iter().peekable();
         loop {
@@ -1110,22 +1150,32 @@ fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Re
                 Ordering::Less => {
                     let row = old_rows.next().expect("peeked");
                     let parent_removed = parent != 0 && removed[parent].contains(&row.key[..parent_key_len]);
-                    match table.role {
-                        TableRole::Records if !parent_removed => return Err(StoreError::AppendOnly { table: table.name.clone() }),
-                        TableRole::History if !parent_removed => return Err(StoreError::Immutable { table: table.name.clone() }),
-                        _ => {}
+                    if let Some(sealing) = seal(&sealed, row).filter(|_| !parent_removed) {
+                        return Err(refuse(sealing));
                     }
                     removed[index].insert(row.key.as_slice());
                     changes[index].push(Change::Delete(row));
                 }
-                Ordering::Greater => changes[index].push(Change::Insert(new_rows.next().expect("peeked"))),
+                Ordering::Greater => {
+                    let row = new_rows.next().expect("peeked");
+                    // A new records or history row is an append; a child row added inside a kept
+                    // one changes it.
+                    if let Some(sealing) = seal(&sealed, row).filter(|_| !appended) {
+                        return Err(refuse(sealing));
+                    }
+                    changes[index].push(Change::Insert(row));
+                }
                 Ordering::Equal => {
                     let (before, after) = (old_rows.next().expect("peeked"), new_rows.next().expect("peeked"));
+                    let sealing = seal(&sealed, before);
                     if before.values != after.values {
-                        if table.role == TableRole::History {
-                            return Err(StoreError::Immutable { table: table.name.clone() });
+                        if let Some(sealing) = sealing {
+                            return Err(refuse(sealing));
                         }
                         changes[index].push(Change::Update(before, after));
+                    }
+                    if let Some(sealing) = sealing {
+                        sealed[index].insert(before.key.as_slice(), sealing);
                     }
                 }
             }
@@ -1191,33 +1241,61 @@ mod tests {
         );
     }
 
-    // Behaviour (DESIGN writes): records rows may be replaced and appended, never removed; history
-    // rows may only be appended.
+    // Behaviour (#3320 rulings 2 and 5): through a whole-value write, records and history rows are
+    // only appended: changing or removing an existing records row is `AppendOnly`, a history row
+    // `Immutable`.
     #[test]
-    fn records_and_history_rules() {
-        let records = tables(TableRole::Records, TableRole::Child);
-        let (old, new) = (rows(vec![row(&[0], "a")], vec![]), rows(vec![row(&[0], "A"), row(&[1], "b")], vec![]));
-        assert_eq!(summary(&diff(&records.tables, &old.tables, &new.tables).expect("replace and append")).len(), 2);
-        assert!(matches!(
-            diff(&records.tables, &rows(vec![row(&[0], "a")], vec![]).tables, &rows(vec![], vec![]).tables),
-            Err(StoreError::AppendOnly { .. })
-        ));
+    fn records_and_history_rows_are_only_appended() {
+        for (role, refused) in [(TableRole::Records, "AppendOnly"), (TableRole::History, "Immutable")] {
+            let sql = tables(role, TableRole::Child);
+            let name = |result: Result<Vec<Vec<Change<'_>>>, StoreError>| match result {
+                Err(StoreError::AppendOnly { table }) => format!("AppendOnly {table}"),
+                Err(StoreError::Immutable { table }) => format!("Immutable {table}"),
+                other => format!("{:?}", other.map(|changes| summary(&changes))),
+            };
+            let old = rows(vec![row(&[0], "a")], vec![]);
+            let appended = rows(vec![row(&[0], "a"), row(&[1], "b")], vec![]);
+            assert_eq!(summary(&diff(&sql.tables, &old.tables, &appended.tables).expect("append")), [(1, "insert", vec![Value::Int(1)])]);
+            let changed = rows(vec![row(&[0], "A")], vec![]);
+            assert_eq!(name(diff(&sql.tables, &old.tables, &changed.tables)), format!("{refused} k_items"), "{role:?} changed");
+            let emptied = rows(vec![], vec![]);
+            assert_eq!(name(diff(&sql.tables, &old.tables, &emptied.tables)), format!("{refused} k_items"), "{role:?} removed");
+        }
+    }
 
-        let history = tables(TableRole::History, TableRole::Child);
-        assert!(matches!(
-            diff(&history.tables, &rows(vec![row(&[0], "a")], vec![]).tables, &rows(vec![row(&[0], "A")], vec![]).tables),
-            Err(StoreError::Immutable { .. })
-        ));
-        assert!(matches!(
-            diff(&history.tables, &rows(vec![row(&[0], "a")], vec![]).tables, &rows(vec![], vec![]).tables),
-            Err(StoreError::Immutable { .. })
-        ));
-        assert!(diff(
-            &history.tables,
-            &rows(vec![row(&[0], "a")], vec![]).tables,
-            &rows(vec![row(&[0], "a"), row(&[1], "b")], vec![]).tables
-        )
-        .is_ok());
+    // Behaviour (#3320 rulings 2 and 5): a child table nested in a records or history row is part
+    // of that row: once the row exists, adding, changing or removing its child rows is refused as
+    // a change of the row. A records table nested in it still takes appends.
+    #[test]
+    fn rows_nested_in_an_existing_record_change_it() {
+        for (role, refused) in [(TableRole::Records, "AppendOnly"), (TableRole::History, "Immutable")] {
+            let sql = tables(role, TableRole::Child);
+            let old = rows(vec![row(&[0], "a")], vec![row(&[0, 0], "n")]);
+            for (case, grandchild) in
+                [("added", vec![row(&[0, 0], "n"), row(&[0, 1], "m")]), ("changed", vec![row(&[0, 0], "N")]), ("removed", vec![])]
+            {
+                let new = rows(vec![row(&[0], "a")], grandchild);
+                let refusal = match diff(&sql.tables, &old.tables, &new.tables) {
+                    Err(StoreError::AppendOnly { table }) => format!("AppendOnly {table}"),
+                    Err(StoreError::Immutable { table }) => format!("Immutable {table}"),
+                    other => format!("{:?}", other.map(|changes| summary(&changes))),
+                };
+                assert_eq!(refusal, format!("{refused} k_items"), "{role:?}: a nested row {case}");
+            }
+            // A new record brings its nested rows with it.
+            let new = rows(vec![row(&[0], "a"), row(&[1], "b")], vec![row(&[0, 0], "n"), row(&[1, 0], "m")]);
+            let changes = diff(&sql.tables, &old.tables, &new.tables).expect("a new record with its rows");
+            assert_eq!(summary(&changes), [(1, "insert", vec![Value::Int(1)]), (2, "insert", vec![Value::Int(1), Value::Int(0)])]);
+        }
+        let sql = tables(TableRole::Records, TableRole::Records);
+        let old = rows(vec![row(&[0], "a")], vec![row(&[0, 0], "n")]);
+        let new = rows(vec![row(&[0], "a")], vec![row(&[0, 0], "n"), row(&[0, 1], "m")]);
+        let changes = diff(&sql.tables, &old.tables, &new.tables).expect("records nested in a kept record are appended to");
+        assert_eq!(summary(&changes), [(2, "insert", vec![Value::Int(0), Value::Int(1)])]);
+        let changed = rows(vec![row(&[0], "a")], vec![row(&[0, 0], "N")]);
+        assert!(
+            matches!(diff(&sql.tables, &old.tables, &changed.tables), Err(StoreError::AppendOnly { table }) if table == "k_items_notes")
+        );
     }
 
     // Behaviour (query-plan coverage): this module prepares only statements `Store::statements`
