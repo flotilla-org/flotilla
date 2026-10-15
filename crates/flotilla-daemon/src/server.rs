@@ -345,7 +345,7 @@ impl DaemonServer {
                     tokio::select! {
                         result = listener.accept() => match result {
                             Ok((stream, _)) => {
-                                let claims = Some(caller::claims_from_peer(caller::socket_peer_credential(&stream)));
+                                let peer = caller::socket_peer_credential(&stream);
                                 let daemon = daemon.clone();
                                 let router = router.clone();
                                 let environment = environment.clone();
@@ -355,6 +355,10 @@ impl DaemonServer {
                                 let lease = EnvironmentClientLease { count: client_count.clone(), notify: client_notify.clone() };
                                 connections.spawn(async move {
                                     let _lease = lease;
+                                    let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
+                                        Ok(claims) => Some(claims),
+                                        Err(error) => { warn!(%error, "environment peer evidence unavailable"); return; }
+                                    };
                                     environment_connection::serve(flotilla_transport::message::unix_message_session(stream), daemon, router, environment, claims, shutdown).await;
                                 });
                             }
@@ -778,6 +782,7 @@ async fn handle_client_with_caller(
         }
     }
     let peer = caller::socket_peer_credential(&stream);
+    let socket_path = stream.local_addr().ok().and_then(|address| address.as_pathname().map(Path::to_path_buf));
     handle_client_session_with_identity(
         unix_message_session_with_prefix(stream, first_byte.to_vec()),
         daemon,
@@ -791,7 +796,7 @@ async fn handle_client_with_caller(
         peer_connected_tx,
         agent_state_store,
         environment_context,
-        caller.map_or(CallerIdentity::UnixPeer(peer), |caller| CallerIdentity::Supplied(Some(Box::new(caller)))),
+        caller.map_or(CallerIdentity::UnixPeer { peer, socket_path }, |caller| CallerIdentity::Supplied(Some(Box::new(caller)))),
     )
     .await;
 }
@@ -864,10 +869,20 @@ pub async fn handle_client_session_with_caller(
     .await;
 }
 
+fn bind_surface_principal(
+    surface: &mut flotilla_protocol::SurfaceDeclaration,
+    caller: &flotilla_protocol::CommandCaller,
+    transport_bound: bool,
+) {
+    if transport_bound {
+        surface.principal_ref = caller.principal_ref.clone();
+    }
+}
+
 enum CallerIdentity {
     // In-process callers have already crossed their authentication boundary.
     Supplied(Option<Box<flotilla_protocol::CommandCaller>>),
-    UnixPeer(Option<caller::PeerCredential>),
+    UnixPeer { peer: Option<caller::PeerCredential>, socket_path: Option<PathBuf> },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -920,21 +935,30 @@ async fn handle_client_session_with_identity(
             if connection_role == Some(ConnectionRole::Client) {
                 // Only framed clients use crew identity. Peer and HTTP authority
                 // remain on their existing transport-specific paths.
-                let caller = match identity {
-                    CallerIdentity::UnixPeer(peer) => {
+                let (caller, transport_bound) = match identity {
+                    CallerIdentity::UnixPeer { peer, socket_path } => {
                         let namespace = daemon.provisioning_namespace().await;
                         let evidence = tokio::task::spawn_blocking(move || {
                             let claims = caller::claims_from_peer(peer);
-                            caller::caller_from_peer(peer, &namespace).map(|caller| (caller, claims))
+                            let caller = caller::caller_from_peer(peer, &namespace)?;
+                            let mounts = caller
+                                .process
+                                .as_ref()
+                                .filter(|process| process.container.is_some())
+                                .map(|process| caller::peer_mounts(process.pid, socket_path.as_deref()))
+                                .transpose()?;
+                            Ok::<_, String>((caller, claims, mounts))
                         })
                         .await;
                         let resolved = match evidence {
-                            Ok(Ok((evidence, claims))) => caller::resolve_main_caller(&daemon, evidence, &claims).await,
+                            Ok(Ok((evidence, claims, mounts))) => {
+                                caller::resolve_main_caller(&daemon, evidence, &claims, mounts.as_ref()).await
+                            }
                             Ok(Err(error)) => Err(error),
                             Err(error) => Err(format!("CallerIdentityUnavailable: {error}")),
                         };
                         match resolved {
-                            Ok(caller) => Some(caller),
+                            Ok(resolution) => (Some(resolution.caller), resolution.transport_bound),
                             Err(error) => {
                                 warn!(%error, "main socket caller refused");
                                 let _ = session.write(Message::error_response(0, error)).await;
@@ -942,7 +966,7 @@ async fn handle_client_session_with_identity(
                             }
                         }
                     }
-                    CallerIdentity::Supplied(caller) => caller.map(|caller| *caller),
+                    CallerIdentity::Supplied(caller) => (caller.map(|caller| *caller), false),
                 };
                 // Stateful client handshake: reply with server Hello, then enter
                 // stateful client loop (session_id used for cursor ownership).
@@ -987,9 +1011,7 @@ async fn handle_client_session_with_identity(
                 };
                 let caller = caller
                     .map(|mut caller| {
-                        if caller.crew.is_some() {
-                            surface.principal_ref = caller.principal_ref.clone();
-                        }
+                        bind_surface_principal(&mut surface, &caller, transport_bound);
                         caller.principal_ref = surface.principal_ref.clone();
                         caller
                     })

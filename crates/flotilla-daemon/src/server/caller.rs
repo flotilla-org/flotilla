@@ -95,41 +95,148 @@ pub(super) fn check_claims(crews: Vec<CallerCrew>, claims: &HashMap<String, Stri
     Ok(crew)
 }
 
+#[derive(Debug)]
+pub(super) struct CallerResolution {
+    pub caller: CommandCaller,
+    pub transport_bound: bool,
+}
+
+fn legacy_crew_identity(environment: &HashMap<String, String>) -> Option<CallerCrew> {
+    Some(
+        CallerCrew::builder()
+            .namespace(environment.get("FLOTILLA_NAMESPACE")?.clone())
+            .convoy(environment.get("FLOTILLA_CONVOY")?.clone())
+            .vessel(environment.get("FLOTILLA_VESSEL")?.clone())
+            .role(environment.get("FLOTILLA_CREW_ROLE")?.clone())
+            .crew_id(environment.get("FLOTILLA_CREW_ID")?.clone())
+            .maybe_terminal_session(environment.get("FLOTILLA_TERMINAL_SESSION").cloned())
+            .build(),
+    )
+}
+
+/// Read kernel mount evidence independently of controller adoption readiness.
+#[cfg(target_os = "linux")]
+pub(super) fn mountinfo(pid: u32) -> Result<String, String> {
+    fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("mountinfo"))
+        .map_err(|error| format!("CallerIdentityUnavailable: cannot read peer mounts: {error}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn mountinfo(_pid: u32) -> Result<String, String> {
+    Err("CallerIdentityUnavailable: container mount evidence unavailable".into())
+}
+
+#[derive(Debug)]
+pub(super) struct PeerMounts {
+    pub mountinfo: String,
+    pub legacy_main_directory: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn same_directory(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.is_dir() && right.is_dir() && left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+pub(super) fn peer_mounts(pid: u32, socket_path: Option<&std::path::Path>) -> Result<PeerMounts, String> {
+    let mountinfo = mountinfo(pid)?;
+    #[cfg(target_os = "linux")]
+    let legacy_main_directory = match socket_path.and_then(std::path::Path::parent) {
+        Some(directory) => {
+            let directory = if directory.as_os_str().is_empty() { Path::new(".") } else { directory };
+            let peer_directory = Path::new("/proc")
+                .join(pid.to_string())
+                .join("root")
+                .join(flotilla_environment::environment::CONTAINED_DAEMON_SOCKET_DIRECTORY.trim_start_matches('/'));
+            let peer =
+                fs::metadata(peer_directory).map_err(|e| format!("CallerIdentityUnavailable: cannot identify peer socket mount: {e}"))?;
+            let host =
+                fs::metadata(directory).map_err(|e| format!("CallerIdentityUnavailable: cannot identify main socket directory: {e}"))?;
+            same_directory(&peer, &host)
+        }
+        None => false,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let legacy_main_directory = {
+        let _ = socket_path;
+        false
+    };
+    Ok(PeerMounts { mountinfo, legacy_main_directory })
+}
+
+fn environment_socket_is_mounted(environment: &flotilla_protocol::EnvironmentId, mounts: &str) -> Result<bool, String> {
+    if mounts.trim().is_empty() {
+        return Err("CallerIdentityUnavailable: empty peer mount table".into());
+    }
+    let directory = super::environment_sockets::directory_name(environment);
+    for line in mounts.lines() {
+        let (fields, _) = line.split_once(" - ").ok_or("CallerIdentityUnavailable: malformed peer mount table")?;
+        let fields: Vec<_> = fields.split_whitespace().collect();
+        if fields.len() < 6 {
+            return Err("CallerIdentityUnavailable: malformed peer mount fields".into());
+        }
+        // Docker's immutable bind mount source is the daemon-created dedicated
+        // directory. The main socket used the daemon run directory instead.
+        if fields[4] == flotilla_environment::environment::CONTAINED_DAEMON_SOCKET_DIRECTORY
+            && std::path::Path::new(fields[3]).file_name().and_then(|name| name.to_str()) == Some(directory.as_str())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) async fn resolve_main_caller(
     daemon: &flotilla_core::in_process::InProcessDaemon,
     mut caller: CommandCaller,
     claims: &HashMap<String, String>,
-) -> Result<CommandCaller, String> {
+    mounts: Option<&PeerMounts>,
+) -> Result<CallerResolution, String> {
     use flotilla_resources::Environment;
     use flotilla_store::StoreQuery;
     use std::collections::BTreeMap;
     let Some(container) = caller.process.as_ref().and_then(|process| process.container.as_ref()) else {
-        // Host variables are selectors, never evidence of a crew. No operator override.
-        if claims.keys().any(|key| key.starts_with("FLOTILLA_")) {
-            tracing::debug!("ignoring crew identity claims from host principal");
-        }
-        caller.crew = None;
-        return Ok(caller);
+        // Host-direct has no isolation boundary and is explicitly out of scope.
+        // Preserve its existing variable-derived identity, without a new override.
+        caller.crew = legacy_crew_identity(claims);
+        return Ok(CallerResolution { caller, transport_bound: false });
     };
+    let mounts = mounts.ok_or("CallerIdentityUnavailable: peer mount evidence unavailable")?;
+    if mounts.legacy_main_directory {
+        // REMOVE this compatibility branch once no pre-#3270 vessels remain.
+        // A kernel device/inode comparison proves the peer still mounts this
+        // daemon's main run directory, not an environment socket directory.
+        // It works before adoption and without a prior immutable-ID observation.
+        tracing::info!(%container, "using pre-environment-socket vessel identity compatibility");
+        caller.crew = legacy_crew_identity(claims);
+        return Ok(CallerResolution { caller, transport_bound: false });
+    }
     let namespace = daemon.provisioning_namespace().await;
     let environments = daemon
         .resource_backend()
         .query_declared::<Environment>(
             &namespace,
-            &StoreQuery { fields: BTreeMap::from([("status.docker_container_id".into(), container.clone())]), ..Default::default() },
+            &StoreQuery {
+                fields: BTreeMap::from([("status.runtime_observation.container_id".into(), container.clone())]),
+                ..Default::default()
+            },
         )
         .await
         .map_err(|error| format!("CallerIdentityUnavailable: {error}"))?;
+    // Host-direct records cannot establish container authority, even if an
+    // obsolete observation still carries a Docker container ID.
     let mut environments = environments.items.into_iter().filter(|item| item.object.spec.docker.is_some());
     let environment = environments.next().ok_or("CallerIdentityUnavailable: container has no placed environment")?;
     if environments.next().is_some() {
         return Err("CallerIdentityAmbiguous: container maps to multiple environments".into());
     }
-    let crews =
-        super::environment_connection::environment_crews(daemon, &flotilla_protocol::EnvironmentId::new(environment.object.metadata.name))
-            .await?;
+    let environment = flotilla_protocol::EnvironmentId::new(environment.object.metadata.name);
+    if !environment_socket_is_mounted(&environment, &mounts.mountinfo)? {
+        return Err("CallerIdentityMismatch: container has no matching environment socket mount".into());
+    }
+    let crews = super::environment_connection::environment_crews(daemon, &environment).await?;
     caller.crew = Some(check_claims(crews, claims)?);
-    Ok(caller)
+    Ok(CallerResolution { caller, transport_bound: true })
 }
 
 #[cfg(target_os = "linux")]
@@ -141,7 +248,7 @@ fn container_from_cgroup(contents: &str) -> Option<String> {
             .or_else(|| without_scope.strip_prefix("cri-containerd-"))
             .or_else(|| without_scope.strip_prefix("libpod-"))
             .unwrap_or(without_scope);
-        (candidate.len() == 64 && candidate.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| candidate.to_string())
+        (candidate.len() == 64 && candidate.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| candidate.to_ascii_lowercase())
     })
 }
 
@@ -289,6 +396,26 @@ mod tests {
         }
     }
 
+    // Device/inode identity, rather than a directory name or an agent claim,
+    // proves the actual legacy main-directory mount. Symlink aliases preserve
+    // identity; a distinct socket directory and non-directory never match.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn main_mount_comparison_requires_directory_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("run");
+        let bound = root.path().join("environment");
+        let alias = root.path().join("alias");
+        fs::create_dir(&main).unwrap();
+        fs::create_dir(&bound).unwrap();
+        std::os::unix::fs::symlink(&main, &alias).unwrap();
+        fs::write(root.path().join("file"), "not a directory").unwrap();
+        let metadata = fs::metadata(&main).unwrap();
+        assert!(same_directory(&metadata, &fs::metadata(alias).unwrap()));
+        assert!(!same_directory(&metadata, &fs::metadata(bound).unwrap()));
+        assert!(!same_directory(&metadata, &fs::metadata(root.path().join("file")).unwrap()));
+    }
+
     // Unavailable kernel evidence must refuse, never downgrade a container to host.
     #[cfg(target_os = "linux")]
     #[test]
@@ -297,6 +424,7 @@ mod tests {
             .unwrap_err()
             .starts_with("CallerIdentityUnavailable:"));
         assert!(caller_from_peer(None, "ns").is_err());
+        assert!(mountinfo(u32::MAX).unwrap_err().starts_with("CallerIdentityUnavailable:"));
     }
 
     #[test]
@@ -326,6 +454,7 @@ mod tests {
         ] {
             assert_eq!(container_from_cgroup(&format!("0::{path}\n")), Some(id.to_string()));
         }
+        assert_eq!(container_from_cgroup(&format!("0::/docker/{}\n", id.to_ascii_uppercase())), Some(id.into()));
         assert_eq!(container_from_cgroup("0::/user.slice/host.scope\n"), None);
     }
 

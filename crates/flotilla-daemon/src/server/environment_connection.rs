@@ -118,7 +118,10 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
 
 /// One command is in flight per environment connection. Crew clients are serial;
 /// this avoids subscribing an idle connection to the host's event stream.
-async fn command_completion(events: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> Result<DaemonEvent, String> {
+pub(super) async fn command_completion(
+    events: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
+    command_id: u64,
+) -> Result<DaemonEvent, String> {
     loop {
         match events.recv().await {
             Ok(event @ DaemonEvent::CommandFinished { command_id: finished, .. }) if finished == command_id => return Ok(event),

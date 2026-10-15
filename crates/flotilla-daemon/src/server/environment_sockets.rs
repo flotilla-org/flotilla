@@ -5,6 +5,11 @@ use sha2::{Digest, Sha256};
 use tokio::{net::UnixListener, task::JoinHandle};
 use tracing::info;
 
+pub(super) fn directory_name(id: &EnvironmentId) -> String {
+    let digest = Sha256::digest(id.as_str().as_bytes());
+    digest[..16].iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 pub struct EnvironmentSocketRegistry {
     sockets: HashMap<EnvironmentId, (Option<JoinHandle<()>>, DaemonHostPath)>,
 }
@@ -46,8 +51,7 @@ impl EnvironmentSocketRegistry {
                 return Ok(path.clone());
             }
         }
-        let digest = Sha256::digest(id.as_str().as_bytes());
-        let directory_name = digest[..16].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let directory_name = directory_name(&id);
         let directory = state_dir.as_path().join(directory_name);
         tokio::fs::DirBuilder::new().recursive(true).mode(0o700).create(&directory).await.map_err(|error| error.to_string())?;
         tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await.map_err(|error| error.to_string())?;

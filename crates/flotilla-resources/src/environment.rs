@@ -12,7 +12,7 @@ define_resource!(
     EnvironmentStatus,
     EnvironmentStatusPatch,
     replication = crate::ReplicationClass::None,
-    queryable = &["metadata.name", "spec.host_direct.host_ref", "status.docker_container_id"]
+    queryable = &["metadata.name", "spec.host_direct.host_ref", "status.runtime_observation.container_id"]
 );
 
 /// Shared namespace for host-direct Environments and seeded PlacementPolicies.
