@@ -149,6 +149,7 @@ How Checkouts and lends behave:
 - **Tables from Rust types.** Data is stored as relational tables generated from the Rust types by our own derive on rusqlite (#3208). Collections are child tables, records are owner-plus-position rows, edge events are rows, frozen documents are stored by hash, and strings are interned. JSON is not the stored form.
 - **Serde views.** YAML and JSON stay valid documents for disk, manifests and CLI output. Their content follows the model.
 - **Shared tables.** Each kind has one table, with a home column. Only the replication applier writes rows homed elsewhere.
+- **Crates and attributes.** The derive is `flotilla-schema-derive`, re-exported by the backend-neutral `flotilla-schema` (descriptors, DDL, the kind-code registry); the rusqlite runtime is `flotilla-schema-sqlite`. As ruled on #3215, the attribute list is closed: field attributes `child`, `records`, `history`, `frozen`, `intern`, `flatten` and `state`, the variant attribute `code`, and the type attributes `kind`, `code` and `index`. Any other shape fails to compile; adding to the list is a reviewed decision.
 
 **Archive.**
 - **Ended resources archive as a bundle.** Seven days after a resource reaches an end state, its home ships the resource with all its records (edge events, attempts, receipts, observations, deliverables) as one bundle to the archive host, then deletes them locally. The home keeps them until the archive host has the bundle.

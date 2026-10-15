@@ -5,7 +5,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from check import (CAPABILITY_CRATES, C_FREE_BASE, RESOURCE_EXEMPTIONS, c_free_violations,
+from check import (CAPABILITY_CRATES, C_FREE_BASE, RESOURCE_EXEMPTIONS, SCHEMA_CRATES, c_free_violations,
                    feature_differences, is_testkit, layer, main, tree_features, violations)
 
 
@@ -52,6 +52,52 @@ class BuildGraphContract(unittest.TestCase):
                         self.assertIn(f"flotilla-messaging: must not depend on {target}, directly or transitively",
                             violations(graph(package("flotilla-messaging", **{kind: (middle,)}),
                                              package("adapter", normal=(target,)), package(target))))
+
+    def test_schema_crates_are_a_self_contained_stack(self):
+        # #3320: derive and schema are C-free base crates; sqlite is native. Each may use
+        # flotilla-cbor, the schema crates below it and the build-feature anchors.
+        self.assertEqual(SCHEMA_CRATES, ("flotilla-schema-derive", "flotilla-schema", "flotilla-schema-sqlite"))
+        self.assertEqual([layer(name) for name in SCHEMA_CRATES], ["base", "base", "native"])
+        self.assertEqual(violations(graph(
+            package("flotilla-schema-derive", normal=("flotilla-build-features",)),
+            package("flotilla-schema", normal=("flotilla-schema-derive", "flotilla-cbor", "flotilla-build-features-base")),
+            package("flotilla-schema-sqlite", normal=("flotilla-schema", "flotilla-cbor", "flotilla-build-features-sqlite"),
+                    build=("flotilla-build-features",), dev=("flotilla-resources",)),
+            package("flotilla-cbor"), package("flotilla-resources"),
+            package("flotilla-build-features"), package("flotilla-build-features-base", normal=("flotilla-build-features",)),
+            package("flotilla-build-features-sqlite", normal=("flotilla-build-features",)),
+        )), [])
+
+    def schema_error(self, schema, target):
+        return (f"{schema}: must not depend on {target}, directly or transitively; schema crates depend only "
+                "on flotilla-cbor, lower schema crates and flotilla-build-features anchors")
+
+    def test_schema_crates_refuse_other_workspace_crates(self):
+        # Explicit finite generator: every schema crate, each forbidden family named by #3320,
+        # normal and build edges, direct and through an otherwise-allowed crate.
+        for schema in SCHEMA_CRATES:
+            for target in ("flotilla-resources", "flotilla-store", "flotilla-store-sqlite", "flotilla-store-memory",
+                           "flotilla-replication", "flotilla-core", "flotilla-daemon", "flotilla-controllers",
+                           "flotilla-executor", "flotilla-protocol"):
+                for kind in ("normal", "build"):
+                    for middle in (target, "flotilla-cbor"):
+                        through = () if middle == target else (package(middle, normal=(target,)),)
+                        with self.subTest(schema=schema, target=target, kind=kind, middle=middle):
+                            self.assertEqual(violations(graph(
+                                package(schema, **{kind: (middle,)}), *through, package(target),
+                            )), [self.schema_error(schema, target)])
+
+    def test_schema_crates_refuse_upward_schema_edges(self):
+        # The stack runs derive, then schema, then sqlite; never upward, directly or transitively.
+        for low, high in (("flotilla-schema-derive", "flotilla-schema"), ("flotilla-schema-derive", "flotilla-schema-sqlite"),
+                          ("flotilla-schema", "flotilla-schema-sqlite")):
+            for kind in ("normal", "build"):
+                with self.subTest(low=low, high=high, kind=kind):
+                    errors = violations(graph(package(low, **{kind: (high,)}), package(high)))
+                    self.assertEqual(errors, [self.schema_error(low, high)])
+        errors = violations(graph(package("flotilla-schema-derive", normal=("flotilla-cbor",)),
+                                  package("flotilla-cbor", normal=("flotilla-schema",)), package("flotilla-schema")))
+        self.assertEqual(errors, [self.schema_error("flotilla-schema-derive", "flotilla-schema")])
 
     def test_capability_reads_store_and_lower_crates(self):
         # ADR 0060 stream 3: executor may read resources, while core composes it.
