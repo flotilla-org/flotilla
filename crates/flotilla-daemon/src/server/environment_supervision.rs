@@ -151,9 +151,10 @@ pub(super) async fn authorize(daemon: &InProcessDaemon, request: &mut Request, c
                 .map_err(|e| e.to_string())?;
             // CrewFail's native handler is operator-only. A bound supervisor
             // uses the existing audited supervision ruling, never an operator override.
+            // That handler requires this vessel/role to name the stalled obligation.
             command.action = CommandAction::CrewSupervise {
                 namespace: Some(crew.namespace.clone()),
-                convoy: context.convoy.clone().expect("scope establishes convoy"),
+                convoy: context.convoy.clone().ok_or("EnvironmentIdentityMismatch: missing target convoy")?,
                 vessel: vessel.object.spec.vessel_name,
                 role: context.role.clone().ok_or("EnvironmentIdentityMismatch: missing target role")?,
                 operation: flotilla_protocol::CrewSupervisionAction::Fail,
@@ -171,6 +172,8 @@ pub(super) async fn authorize(daemon: &InProcessDaemon, request: &mut Request, c
             *namespace = Some(crew.namespace.clone());
         }
         CommandAction::ConvoyStart { intent } => {
+            // Intent has no direct host/repository/checkout override. Admission
+            // resolves its issue/change-request inputs within this project charter.
             if intent.project_ref != project || intent.namespace.as_ref().is_some_and(|ns| ns != &crew.namespace) {
                 return Err("EnvironmentIdentityMismatch: foreign dispatch project".into());
             }
@@ -192,6 +195,9 @@ pub(super) async fn authorize(daemon: &InProcessDaemon, request: &mut Request, c
             }
             *selected = Some(project.clone());
         }
+        // This query has only a `full` flag, no project selector. Its response
+        // contains observed_at/full plus rows; scope_value filters rows and
+        // recomputes their only cross-row aggregate before either wire path.
         CommandAction::QueryCrewStalls { .. } => {}
         _ => return Err("EnvironmentCommandDenied: command is outside supervisor authority".into()),
     }

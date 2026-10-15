@@ -5844,6 +5844,36 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
             assert!(super::environment_supervision::authorize(&daemon, &mut request(action), &ordinary).await.is_err());
         }
     }
+    // Omitted project selectors are pinned before dispatch; an unknown crew ID
+    // cannot borrow an otherwise valid own-project convoy/vessel context.
+    for action in [
+        CommandAction::QueryDispatchBoard { project: None },
+        CommandAction::QueryDispatchQueue { project: None },
+        CommandAction::QueryFleetList { project: None, crew_id: None, convoy: None },
+    ] {
+        let mut scoped = request(action);
+        super::environment_supervision::authorize(&daemon, &mut scoped, &crew).await.unwrap();
+        let Request::Execute { command } = scoped else { panic!("execute") };
+        let selected = match command.action {
+            CommandAction::QueryDispatchBoard { project }
+            | CommandAction::QueryDispatchQueue { project }
+            | CommandAction::QueryFleetList { project, .. } => project,
+            _ => panic!("project query"),
+        };
+        assert_eq!(selected.as_deref(), Some("project-a"));
+    }
+    let mut forged = request(CommandAction::CrewFail {
+        context: CrewCommandContext {
+            crew_id: Some("forged-crew-id".into()),
+            convoy: Some("target".into()),
+            vessel_ref: Some("target-vessel".into()),
+            role: Some("coder".into()),
+            ..Default::default()
+        },
+        message: "failed".into(),
+        force: false,
+    });
+    assert!(super::environment_supervision::authorize(&daemon, &mut forged, &crew).await.is_err());
     // A valid own-project convoy cannot hide a foreign vessel or namespace.
     for context in [
         CrewCommandContext { convoy: Some("target".into()), vessel_ref: Some("foreign-vessel".into()), ..Default::default() },
