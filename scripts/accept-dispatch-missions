@@ -6,19 +6,22 @@ trap 'rm -f "$snapshot"' EXIT
 flotilla dispatch ready --json > "$snapshot"
 python3 - "$snapshot" <<'PY'
 import datetime
+from fractions import Fraction
 import json
 import sys
 
 with open(sys.argv[1]) as source:
     rows = json.load(source)["entries"]
 assert rows, "configure a ready ticket in a controlled Project first"
-classes = {"expedite": 0, "standard": 1, "background": 2}
+tiers = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
 def key(row):
     score = row["score"]
     attributes = score["attributes"]
     assert score["project_share"] > 0
-    assert set(score["attribute_sources"]) == {"value", "class_of_service", "crew_limit"}
-    return (classes[attributes["class_of_service"]], -attributes["value"],
+    assert set(score["attribute_sources"]) == {"priority", "weight"}
+    return (tiers[attributes["priority"]], attributes["weight"] == 0,
+            Fraction(score["project_active_crews"] + 1, score["project_share"]),
+            Fraction(score["mission_active_crews"] + 1) / Fraction(attributes["weight"] or 1),
             -score["unblock_count"], datetime.datetime.fromisoformat(row["ready_observed_at"].replace("Z", "+00:00")),
             score["conflict_penalty"], row["namespace"], row["project"],
             row["issue"]["source"]["service"], row["issue"]["source"]["scope"], row["issue"]["id"])

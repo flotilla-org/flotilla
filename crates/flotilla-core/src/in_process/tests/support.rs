@@ -682,6 +682,13 @@ impl SuspendedBoardProvider {
 
 #[async_trait]
 impl IssueProvider for SuspendedBoardProvider {
+    fn board_includes_mission_fields(&self) -> bool {
+        true
+    }
+    async fn mission_fields(&self, _: &flotilla_protocol::IssueRef) -> Result<flotilla_protocol::MissionFields, String> {
+        panic!("complete bulk boards must not cause per-ticket field requests")
+    }
+
     fn supports(&self, _: &flotilla_protocol::IssueSource) -> bool {
         true
     }

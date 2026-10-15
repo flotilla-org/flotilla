@@ -26,3 +26,31 @@ Dispatch returns a queued ID or typed refusal. Queued items show one current rea
 Service health and installation-specific deploy state are substrate facts. Degraded dependencies hold new admissions; running crews receive one superseding notice, infrastructure failures are reframed, and recovery reruns checks with one recovery notice. Rolls remain human/infra decisions, with their unblocking effect visible. Project and fleet surfaces show running placement, next work and reasons; graphs remain focused neighbourhood/mission/critical-path views.
 
 Implementation is sequenced in #2782–#2789. This ADR records the entire ruling; readiness and holds do not implement mission ranking, admission scheduling, service health or the navigator themselves.
+
+## 2026-10-15 amendment: Priority and Weight (#3313)
+
+This amendment supersedes the mission attributes and ordering above, and the
+mission crew-limit requirement in admission. Priority is a strict Urgent / High /
+Medium / Low tier (default Medium); Weight is a finite nonnegative share (default
+1), not a capacity cap. Each resolves field, label, then charter. Per-ticket
+Priority overrides the mission tier, superseding #3304's undecided boost.
+Mission and Map issue types, plus existing `:map` labels, identify missions.
+
+Within a tier, positive-weight ready work precedes zero-weight fallback work,
+then project fair share precedes mission share. Prefer the smallest prospective
+live crews per share, `(live + 1) / share`; mission crews are counted per tier.
+This deterministic live-crew stride needs no persistent history and naturally
+lends idle missions' shares to ready work. Deficit scheduling was rejected because
+it adds a cohort-dependent mutable balance; probabilistic sampling would weaken
+strict tiers. A ready snapshot ranks the next slot; live crew changes re-rank it.
+Within a mission, descendants, readiness age and conflict penalty remain.
+See [dispatch readiness](../dispatch-readiness.md) for normalization, explanation,
+and the companion charter roll requirement. Capacity enforcement remains #2785.
+
+GitHub Priority/Weight observations reuse `issue_field_values` from the existing
+REST inventory and its durable item cache, rather than polling each ticket's
+field endpoint. Per-ticket polling would multiply ready/live cardinality by the
+60-second refresh cadence and exceed WORKLOAD.md's shared API budget. Same-second
+field changes update cached REST items without refetching unchanged native graph
+details. Live convoy reads select projects and nonterminal phases before decode,
+so retained history does not increase accounting work.

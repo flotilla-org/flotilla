@@ -423,6 +423,11 @@ pub enum ConvoyNaming {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyExplanation {
+    /// Current mission ranking for each served ticket, keyed by source-qualified identity.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub dispatch_scores: std::collections::BTreeMap<String, crate::DispatchScore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_score_error: Option<String>,
     /// Conditions keyed by vessel-ref/checkout-ref so shared checkout names cannot collide.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub degraded_checkouts: std::collections::BTreeMap<String, String>,

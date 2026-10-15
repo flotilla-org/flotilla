@@ -79,9 +79,27 @@ impl GitHubIssueProvider {
             // cursor. Start their delta window before inventory acquisition;
             // the existing one-second overlap covers same-second additions.
             let inventory_started_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            let issues = existing.issues.board_changes(self.api.as_ref(), &self.host_root, &source.scope, "issues").await?;
+            // Older cache generations may lack REST items. Refill that inventory
+            // once, retaining native details; ordinary refreshes remain deltas.
+            let refill = existing.issues.details.keys().any(|id| !existing.issues.items.contains_key(id));
+            let issue_inventory = if refill { Default::default() } else { existing.issues.clone() };
+            let issues = issue_inventory.board_changes(self.api.as_ref(), &self.host_root, &source.scope, "issues").await?;
             let pulls = existing.pulls.board_changes(self.api.as_ref(), &self.host_root, &source.scope, "pulls").await?;
             let mut next = existing.clone();
+            if refill {
+                // The complete open inventory also removes cached issues closed
+                // while this legacy cache had no REST bodies. Retain native graph
+                // details for survivors, so bootstrap does not refetch each issue.
+                let open = issues
+                    .iter()
+                    .filter_map(|item| item["number"].as_u64())
+                    .map(|id| id.to_string())
+                    .collect::<std::collections::BTreeSet<_>>();
+                next.issues.details.retain(|id, _| open.contains(id));
+                next.issues.revisions.retain(|id, _| open.contains(id));
+                next.issues.items.clear();
+                next.issues.cursor = None;
+            }
             next.retry_at = None;
             let mut pending = PendingBoard::default();
             for (items, collection, jobs) in [(issues, &mut next.issues, &mut pending.issues), (pulls, &mut next.pulls, &mut pending.pulls)]
@@ -94,9 +112,15 @@ impl GitHubIssueProvider {
                         Some("open") => {
                             let id = item["number"].as_u64().ok_or("poll item lacks number")?.to_string();
                             let revision = item["updated_at"].as_str().ok_or("poll item lacks updated_at")?;
+                            // REST carries issue_field_values even when the native
+                            // graph revision is unchanged (including same-second edits).
+                            collection.items.insert(id.clone(), item.clone());
                             if collection.revisions.get(&id).is_none_or(|prior| prior != revision) || !collection.details.contains_key(&id)
                             {
                                 jobs.push(item);
+                            } else {
+                                let detail = collection.details[&id].clone();
+                                collection.commit(&item, detail)?;
                             }
                         }
                         Some("closed") => {
@@ -178,6 +202,13 @@ impl GitHubIssueProvider {
             existing.issues.details.values().filter(|detail| detail["state"] == "OPEN").cloned().collect(),
             existing.pulls.details.values().filter(|detail| detail["state"] == "OPEN").cloned().collect(),
         )?;
+        for issue in &mut board.issues {
+            let values = match existing.issues.items.get(&issue.id).and_then(|item| item.get("issue_field_values")) {
+                None | Some(serde_json::Value::Null) => &[][..],
+                Some(values) => values.as_array().ok_or("issue_field_values must be an array")?.as_slice(),
+            };
+            issue.mission_fields = mission_fields::parse_mission_fields(values)?;
+        }
         self.resolve_board_relations(&mut board).await?;
         let mut next = existing.clone();
         next.pending = None;
@@ -515,6 +546,10 @@ impl super::IssueProvider for GitHubIssueProvider {
 
     async fn dispatch_board(&self, source: &IssueSource) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
         self.poll_board(source).await
+    }
+
+    fn board_includes_mission_fields(&self) -> bool {
+        true
     }
 
     async fn mission_fields(&self, reference: &IssueRef) -> Result<flotilla_protocol::MissionFields, String> {

@@ -350,9 +350,13 @@ fn format_dispatch_queue_human(response: &flotilla_protocol::DispatchQueueRespon
             Cell::new(entry.score.as_ref().map_or("unranked", |score| score.mission.as_str())),
             Cell::new(entry.score.as_ref().map_or_else(String::new, |score| {
                 format!(
-                    "{:?} value={} unblocks={} conflict={}",
-                    score.attributes.class_of_service,
-                    f64::from(score.attributes.value),
+                    "{:?} ({}) weight={} live={} next/share={}/{} unblocks={} conflict={}",
+                    score.attributes.priority,
+                    score.attribute_sources.get("priority").map_or("charter", String::as_str),
+                    f64::from(score.attributes.weight),
+                    score.mission_active_crews,
+                    score.mission_active_crews as u128 + 1,
+                    f64::from(score.attributes.weight),
                     score.unblock_count,
                     score.conflict_penalty
                 )
@@ -908,6 +912,23 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         .map(|cascade| format!("\nResolved defaults:\n{}\n", serde_json::to_string_pretty(cascade).expect("serialize cascade")))
         .unwrap_or_default();
     let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
+    for (issue, score) in &explanation.dispatch_scores {
+        let _ = writeln!(
+            output,
+            "Dispatch {issue}: {:?} ({}) weight={} live={} next/share={}/{} project-live={} project-share={}",
+            score.attributes.priority,
+            score.attribute_sources.get("priority").map_or("charter", String::as_str),
+            f64::from(score.attributes.weight),
+            score.mission_active_crews,
+            score.mission_active_crews as u128 + 1,
+            f64::from(score.attributes.weight),
+            score.project_active_crews,
+            score.project_share
+        );
+    }
+    if let Some(error) = &explanation.dispatch_score_error {
+        let _ = writeln!(output, "Dispatch score unavailable: {error}");
+    }
     if let Some(naming) = &explanation.naming {
         match naming {
             flotilla_protocol::ConvoyNaming::Explicit => {

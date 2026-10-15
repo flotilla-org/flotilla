@@ -1,5 +1,5 @@
 //! Mission normalization and membership over one complete tracker observation.
-use flotilla_issue_tracker::mission_fields::{class, issue_ref_from_url};
+use flotilla_issue_tracker::mission_fields::{issue_ref_from_url, priority};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
@@ -7,6 +7,56 @@ use std::{
 
 use flotilla_protocol::{DispatchBoardRepository, DispatchScore, Issue, IssueRef, MissionAttributes, MissionFields};
 use flotilla_resources::DispatchPolicy;
+
+pub use flotilla_projections::dispatch_board::{active_crew_count, live_project_convoys_query};
+
+/// Shared live-crew accounting for ready scores and convoy explanations.
+#[derive(Default)]
+pub struct MissionOccupancy {
+    pub project_active: usize,
+    pub missions: BTreeMap<(String, flotilla_protocol::Priority), usize>,
+}
+impl MissionOccupancy {
+    pub fn collect<'a>(
+        board: &MissionBoard,
+        policy: &DispatchPolicy,
+        convoys: impl IntoIterator<Item = &'a flotilla_resources::ResourceObject<flotilla_resources::Convoy>>,
+    ) -> Result<Self, String> {
+        let mut result = Self::default();
+        for convoy in convoys {
+            let count = active_crew_count(convoy.status.as_ref());
+            if count == 0 {
+                continue;
+            }
+            result.project_active += count;
+            let mut served_missions = BTreeSet::new();
+            for served in &convoy.spec.issues {
+                let score = board.score(&issue_from_convoy(served), policy)?;
+                served_missions.insert((score.mission, score.attributes.priority));
+            }
+            for key in served_missions {
+                *result.missions.entry(key).or_default() += count;
+            }
+        }
+        Ok(result)
+    }
+    pub fn apply(&self, score: &mut DispatchScore) {
+        score.project_active_crews = self.project_active;
+        score.mission_active_crews = self.missions.get(&(score.mission.clone(), score.attributes.priority)).copied().unwrap_or(0);
+    }
+}
+
+pub fn issue_from_convoy(served: &flotilla_resources::ConvoyIssue) -> Issue {
+    Issue::builder()
+        .reference(served.reference.clone())
+        .title(served.snapshot.title.clone())
+        .labels(served.snapshot.labels.clone())
+        .state(served.snapshot.state)
+        .as_of(served.snapshot.as_of)
+        .provider_name(String::new())
+        .provider_display_name(String::new())
+        .build()
+}
 
 fn canonical_reference(reference: &IssueRef) -> IssueRef {
     let mut result = reference.clone();
@@ -29,29 +79,23 @@ pub fn normalize_attributes(
     let mut seen = BTreeSet::new();
     for label in labels {
         let Some((name, value)) = label.split_once(':') else { continue };
-        if !matches!(name, "value" | "cos" | "crew-limit") {
+        if !matches!(name, "priority" | "weight") {
             continue;
         }
-        // A field overrides even a stale/invalid label for that attribute.
-        if matches!(name, "value") && fields.value.is_some()
-            || matches!(name, "cos") && fields.class_of_service.is_some()
-            || matches!(name, "crew-limit") && fields.crew_limit.is_some()
-        {
+        if name == "priority" && fields.priority.is_some() || name == "weight" && fields.weight.is_some() {
             continue;
         }
         if !seen.insert(name) {
             return Err(format!("duplicate mission label {name}"));
         }
         match name {
-            "value" => fallback.value = Some(value.parse::<f64>().map_err(|_| "invalid value label")?.try_into()?),
-            "cos" => fallback.class_of_service = Some(class(value)?),
-            _ => fallback.crew_limit = Some(value.parse().map_err(|_| format!("invalid crew-limit label crew-limit:{value}"))?),
+            "priority" => fallback.priority = Some(priority(value)?),
+            _ => fallback.weight = Some(value.trim().parse::<f64>().map_err(|_| "invalid weight label")?.try_into()?),
         }
     }
     let sources = [
-        ("value", fields.value.is_some(), fallback.value.is_some()),
-        ("class_of_service", fields.class_of_service.is_some(), fallback.class_of_service.is_some()),
-        ("crew_limit", fields.crew_limit.is_some(), fallback.crew_limit.is_some()),
+        ("priority", fields.priority.is_some(), fallback.priority.is_some()),
+        ("weight", fields.weight.is_some(), fallback.weight.is_some()),
     ]
     .into_iter()
     .map(|(name, field, label)| {
@@ -70,9 +114,8 @@ pub fn normalize_attributes(
     .collect();
     Ok((
         MissionAttributes {
-            value: fields.value.or(fallback.value).unwrap_or(defaults.value),
-            class_of_service: fields.class_of_service.or(fallback.class_of_service).unwrap_or(defaults.class_of_service),
-            crew_limit: fields.crew_limit.or(fallback.crew_limit).or(defaults.crew_limit),
+            priority: fields.priority.or(fallback.priority).unwrap_or(defaults.priority),
+            weight: fields.weight.or(fallback.weight).unwrap_or(defaults.weight),
         },
         sources,
     ))
@@ -225,7 +268,7 @@ impl MissionBoard {
                     result.parents.insert(reference.clone(), canonical_reference(parent));
                 }
                 result.fields.insert(reference.clone(), issue.mission_fields.clone());
-                if issue.issue_type.as_ref().is_some_and(|kind| kind.eq_ignore_ascii_case("map"))
+                if issue.issue_type.as_ref().is_some_and(|kind| kind.eq_ignore_ascii_case("map") || kind.eq_ignore_ascii_case("mission"))
                     || issue.labels.iter().any(|label| label.rsplit(':').next().is_some_and(|name| name.eq_ignore_ascii_case("map")))
                 {
                     result.maps.insert(reference.clone());
@@ -293,7 +336,7 @@ impl MissionBoard {
                 if let Some(parent) = &issue.parent {
                     self.parents.insert(reference.clone(), canonical_reference(parent));
                 }
-                if issue.issue_type.as_ref().is_some_and(|kind| kind.eq_ignore_ascii_case("map"))
+                if issue.issue_type.as_ref().is_some_and(|kind| kind.eq_ignore_ascii_case("map") || kind.eq_ignore_ascii_case("mission"))
                     || issue.labels.iter().any(|label| label.rsplit(':').next().is_some_and(|name| name.eq_ignore_ascii_case("map")))
                 {
                     self.maps.insert(reference.clone());
@@ -384,11 +427,22 @@ impl MissionBoard {
             return Err("mission tracking issue is outside the observed project sources".into());
         }
         let defaults = declared.map(|m| m.attributes.clone()).unwrap_or_default();
-        let (attributes, attribute_sources) = normalize_attributes(
+        let (mut attributes, mut attribute_sources) = normalize_attributes(
             &tracking.as_ref().and_then(|i| self.fields.get(i)).cloned().unwrap_or_default(),
             tracking.as_ref().and_then(|i| self.labels.get(i)).map(Vec::as_slice).unwrap_or_default(),
             &defaults,
         )?;
+        // A ticket's own priority overrides its mission, in either direction.
+        let ticket_fields = self.fields.get(&reference).cloned().unwrap_or_default();
+        let (ticket, sources) = normalize_attributes(
+            &MissionFields { priority: ticket_fields.priority, weight: None },
+            &issue.labels.iter().filter(|label| label.starts_with("priority:")).cloned().collect::<Vec<_>>(),
+            &attributes,
+        )?;
+        if sources["priority"] != "charter" {
+            attributes.priority = ticket.priority;
+            attribute_sources.insert("priority".into(), format!("ticket_{}", sources["priority"]));
+        }
         Ok(DispatchScore::builder()
             .mission(declared.map(|m| m.name.clone()).unwrap_or_else(|| {
                 map.map_or_else(|| policy.routine_lane.clone(), |i| format!("{}/{}#{}", i.source.service, i.source.scope, i.id))
@@ -418,7 +472,7 @@ impl MissionBoard {
 #[cfg(test)]
 mod tests {
     use flotilla_issue_tracker::mission_fields::parse_mission_fields;
-    use flotilla_protocol::ClassOfService;
+    use flotilla_protocol::Priority;
     use std::cmp::Ordering;
 
     use flotilla_protocol::{
@@ -456,52 +510,200 @@ mod tests {
             .build()
     }
 
-    // #2783: each term dominates every later term, globally across Projects.
-    // Generator covers each priority axis, all classes, zeros and large penalties;
-    // fair-share inputs deliberately do not alter work-queue rank (#2785).
+    // WORKLOAD.md: retained history must not multiply decoded live-accounting
+    // objects. Compare zero history to 1,000 terminal records using the real
+    // indexed store; unrelated projects and missing-status convoys are included.
+    #[tokio::test]
+    async fn live_inventory_reads_are_flat_with_terminal_history() {
+        use flotilla_resources::{Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta};
+        use flotilla_store::ResourceBackend;
+        use flotilla_store_memory::InMemoryBackend;
+        use flotilla_store_testkit::{assert_flat_reads, measure_reads, ReadCountsBackendExt};
+        assert_flat_reads([0, 1000], |history| async move {
+            let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+            let convoys = backend.using::<Convoy>("ns");
+            for index in 0..history + 3 {
+                let record = convoys
+                    .create(
+                        &InputMeta::builder().name(format!("c-{index}")).build(),
+                        &ConvoySpec::builder()
+                            .workflow_ref("workflow".into())
+                            .project_ref(if index == history + 2 { "other" } else { "p" }.into())
+                            .build(),
+                    )
+                    .await
+                    .expect("convoy");
+                if index < history {
+                    convoys
+                        .update_status(
+                            &record.metadata.name,
+                            &record.metadata.resource_version,
+                            &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
+                        )
+                        .await
+                        .expect("terminal history");
+                }
+            }
+            let (rows, reads) = measure_reads(backend.query_declared::<Convoy>("ns", &live_project_convoys_query(["p".into()]))).await;
+            assert_eq!(rows.expect("live query").items.len(), 2);
+            assert!(backend
+                .query_declared::<Convoy>("ns", &live_project_convoys_query([]))
+                .await
+                .expect("empty projects")
+                .items
+                .is_empty());
+            reads.of(&backend)
+        })
+        .await;
+    }
+
+    // #3313: strict tiers dominate share and every within-mission term.
+    // Generator covers all four tiers and nonzero live occupancy.
     #[hegel::test]
-    fn lexicographic_rank_and_breakdown(tc: hegel::TestCase) {
+    fn tiers_dominate_shares(tc: hegel::TestCase) {
         use hegel::generators as gs;
-        let axis = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
-        let penalty = tc.draw(gs::integers::<u64>().min_value(1).max_value(100000));
+        let tiers = [Priority::Urgent, Priority::High, Priority::Medium, Priority::Low];
+        let tier = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+        let live = tc.draw(gs::integers::<usize>().min_value(1).max_value(10000));
         let mut better = row("z");
         let mut worse = row("a");
-        let left = better.score.as_mut().expect("score");
-        let right = worse.score.as_mut().expect("score");
-        // All later terms favor the worse row, independently of the selected axis.
-        if axis < 4 {
-            left.conflict_penalty = penalty;
-        }
+        let score = better.score.as_mut().expect("score");
+        score.attributes.priority = tiers[tier];
+        score.attributes.weight = 0.0.try_into().expect("zero");
+        score.project_active_crews = live;
+        score.mission_active_crews = live;
+        worse.score.as_mut().expect("score").attributes.priority = tiers[tier + 1];
+        assert_eq!(compare_dispatch_rows(&better, &worse), Ordering::Less);
+        assert_eq!(compare_dispatch_rows(&worse, &better), Ordering::Greater);
+    }
+
+    // Project share dominates mission share, then the existing within-mission
+    // terms dominate each subsequent term. Generated counts cross zero.
+    #[hegel::test]
+    fn project_and_within_mission_order(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let axis = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(1000));
+        let mut better = row("z");
+        let mut worse = row("a");
+        better.score.as_mut().expect("score").conflict_penalty = 100;
         if axis < 3 {
             worse.ready_observed_at -= chrono::Duration::days(1);
         }
         if axis < 2 {
-            right.unblock_count = 100;
-        }
-        if axis < 1 {
-            right.attributes.value = 100.0.try_into().expect("value");
+            worse.score.as_mut().expect("score").unblock_count = 100;
         }
         match axis {
             0 => {
-                left.attributes.class_of_service = ClassOfService::Expedite;
-                right.attributes.class_of_service = ClassOfService::Background;
+                better.score.as_mut().expect("score").project_active_crews = count;
+                worse.score.as_mut().expect("score").project_active_crews = count + 1;
+                better.score.as_mut().expect("score").mission_active_crews = 10000;
             }
-            1 => {
-                left.attributes.value = 2.5.try_into().expect("value");
-                right.attributes.value = 2.0.try_into().expect("value");
-            }
-            2 => left.unblock_count = 101,
-            3 => better.ready_observed_at -= chrono::Duration::days(2),
-            _ => right.conflict_penalty = penalty,
+            1 => better.score.as_mut().expect("score").unblock_count = 101,
+            2 => better.ready_observed_at -= chrono::Duration::days(2),
+            _ => worse.score.as_mut().expect("score").conflict_penalty = 101,
         }
-        left.project_active_crews = 1000;
-        right.project_share = 1000;
         assert_eq!(compare_dispatch_rows(&better, &worse), Ordering::Less);
         assert_eq!(compare_dispatch_rows(&worse, &better), Ordering::Greater);
         assert_eq!(compare_dispatch_rows(&better, &better), Ordering::Equal);
-        let mut rows = [worse, better.clone()];
-        rows.sort_by(compare_dispatch_rows);
-        assert_eq!(rows[0], better);
+    }
+
+    // #3313: each next slot uses current live occupancy. Ready missions with
+    // weights 2:1 split three crews 2:1, while absent missions reserve nothing.
+    #[test]
+    fn weighted_slots_are_work_conserving() {
+        let mut rows = vec![row("a"), row("b")];
+        for row in &mut rows {
+            row.project = "same".into();
+            row.score.as_mut().expect("score").mission = row.issue.id.clone();
+            row.score.as_mut().expect("score").attributes.priority = Priority::High;
+        }
+        rows[0].score.as_mut().expect("score").attributes.weight = 2.0.try_into().expect("weight");
+        for _ in 0..3 {
+            rows.sort_by(compare_dispatch_rows);
+            rows[0].score.as_mut().expect("score").mission_active_crews += 1;
+            for row in &mut rows {
+                row.score.as_mut().expect("score").project_active_crews += 1;
+            }
+        }
+        rows.sort_by_key(|row| row.issue.id.clone());
+        assert_eq!(rows.iter().map(|row| row.score.as_ref().expect("score").mission_active_crews).collect::<Vec<_>>(), vec![2, 1]);
+        for candidate in &rows {
+            let mut lone = [candidate.clone()];
+            let before = lone[0].score.as_ref().expect("score").mission_active_crews;
+            for _ in 0..3 {
+                lone.sort_by(compare_dispatch_rows);
+                lone[0].score.as_mut().expect("score").mission_active_crews += 1;
+            }
+            assert_eq!(lone[0].score.as_ref().expect("score").mission_active_crews, before + 3);
+        }
+        let mut zero = row("zero");
+        zero.score.as_mut().expect("score").attributes.weight = 0.0.try_into().expect("weight");
+        let mut positive = row("positive");
+        positive.score.as_mut().expect("score").project_active_crews = 10000;
+        assert_eq!(compare_dispatch_rows(&zero, &positive), Ordering::Greater);
+        // A higher tier still wins with zero weight; empty tiers have no rows.
+        positive.score.as_mut().expect("score").attributes.priority = Priority::Low;
+        assert_eq!(compare_dispatch_rows(&zero, &positive), Ordering::Less);
+        let mut medium_only = [row("medium")];
+        medium_only.sort_by(compare_dispatch_rows);
+        assert_eq!(medium_only[0].score.as_ref().expect("score").attributes.priority, Priority::Medium);
+    }
+
+    // #3313: field > label > charter independently per attribute, including
+    // null fields and stale invalid labels hidden by present fields.
+    #[hegel::test]
+    fn sources_normalize_per_attribute(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let ps = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+        let ws = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+        let weight = f64::from(tc.draw(gs::integers::<u32>().min_value(0).max_value(1000))) / 4.0;
+        let fields = parse_mission_fields(&[
+            serde_json::json!({"issue_field_name":"Priority","value":if ps == 0 {Some(1)} else {None},"single_select_option":{"name":" Urgent "}}),
+            serde_json::json!({"issue_field_name":"Weight","value":if ws == 0 {Some(weight)} else {None}}),
+        ]).expect("field shape");
+        let labels = [(ps, "priority:High".into()), (ws, format!("weight:{weight}"))]
+            .into_iter()
+            .filter_map(|(source, label)| (source < 2).then_some(label))
+            .collect::<Vec<_>>();
+        let (attrs, sources) = normalize_attributes(&fields, &labels, &MissionAttributes::default()).expect("normalized");
+        assert_eq!(attrs.priority, [Priority::Urgent, Priority::High, Priority::Medium][ps]);
+        assert_eq!(f64::from(attrs.weight), if ws < 2 { weight } else { 1.0 });
+        assert_eq!(sources["priority"], ["issue_field", "label", "charter"][ps]);
+        assert_eq!(sources["weight"], ["issue_field", "label", "charter"][ws]);
+        assert!(normalize_attributes(
+            &MissionFields { priority: Some(Priority::High), weight: Some(1.0.try_into().expect("weight")) },
+            &["priority:bad".into(), "weight:bad".into()],
+            &MissionAttributes::default()
+        )
+        .is_ok());
+    }
+
+    // #3313: a Mission issue type defines ancestry just like Map, and a
+    // ticket's own field overrides its label and its Low mission tier.
+    #[test]
+    fn ticket_priority_overrides_mission() {
+        let mut mission = board_issue("mission", None, &["priority:low"], &[]);
+        mission.issue_type = Some("Mission".into());
+        let mut ticket = board_issue("1", Some("mission"), &["priority:high"], &[]);
+        ticket.mission_fields.priority = Some(Priority::Urgent);
+        let mission_board = board(vec![mission, ticket]);
+        let mut candidate = issue("1");
+        candidate.labels = vec!["priority:high".into()];
+        let score = mission_board.score(&candidate, &DispatchPolicy::builder().build()).expect("score");
+        assert_eq!(score.attributes.priority, Priority::Urgent);
+        assert_eq!(score.attribute_sources["priority"], "ticket_issue_field");
+        assert_eq!(score.mission_issue, Some(reference("mission")));
+        let mut boosted = row("boosted");
+        boosted.score = Some(score);
+        let ordinary = row("ordinary");
+        assert_eq!(compare_dispatch_rows(&boosted, &ordinary), Ordering::Less);
+        let board = board(vec![board_issue("mission", None, &["map", "priority:low"], &[]), board_issue("2", Some("mission"), &[], &[])]);
+        let mut candidate = issue("2");
+        candidate.labels = vec!["priority:urgent".into()];
+        let score = board.score(&candidate, &DispatchPolicy::builder().build()).expect("label override");
+        assert_eq!(score.attributes.priority, Priority::Urgent);
+        assert_eq!(score.attribute_sources["priority"], "ticket_label");
     }
 
     fn reference(id: &str) -> IssueRef {
@@ -548,52 +750,12 @@ mod tests {
         .expect("mission board")
     }
 
-    // #2783: each attribute independently selects field, label, then charter;
-    // generators cover every source, zero/max limits, negative and decimal values.
-    #[hegel::test]
-    fn sources_normalize_per_attribute(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let value_source = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
-        let class_source = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
-        let limit_source = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
-        let value = f64::from(tc.draw(gs::integers::<i32>().min_value(-100).max_value(100))) / 4.0;
-        let class_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
-        let class_names = ["expedite", "standard", "background"];
-        let classes = [ClassOfService::Expedite, ClassOfService::Standard, ClassOfService::Background];
-        let limit = if tc.draw(gs::booleans()) { 0 } else { u32::MAX };
-        let defaults = MissionAttributes {
-            value: (-999.0).try_into().expect("value"),
-            class_of_service: ClassOfService::Background,
-            crew_limit: Some(4),
-        };
-        let fields = parse_mission_fields(&[
-            serde_json::json!({"issue_field_name":"Value", "value": if value_source == 0 { Some(value) } else { None }}),
-            serde_json::json!({"issue_field_name":"Class of service", "value": if class_source == 0 { Some(1) } else { None }, "single_select_option":{"name":class_names[class_index]}}),
-            serde_json::json!({"issue_field_name":"Crew limit", "value": if limit_source == 0 { Some(limit) } else { None }}),
-        ]).expect("documented issue field shape");
-        let labels = [
-            (value_source, format!("value:{value}")),
-            (class_source, format!("cos:{}", class_names[class_index])),
-            (limit_source, format!("crew-limit:{limit}")),
-        ]
-        .into_iter()
-        .filter_map(|(source, label)| (source < 2).then_some(label))
-        .collect::<Vec<_>>();
-        let (actual, sources) = normalize_attributes(&fields, &labels, &defaults).expect("normalized");
-        assert_eq!(f64::from(actual.value), if value_source < 2 { value } else { -999.0 });
-        assert_eq!(actual.class_of_service, if class_source < 2 { classes[class_index] } else { ClassOfService::Background });
-        assert_eq!(actual.crew_limit, Some(if limit_source < 2 { limit } else { 4 }));
-        for (name, source) in [("value", value_source), ("class_of_service", class_source), ("crew_limit", limit_source)] {
-            assert_eq!(sources[name], ["issue_field", "label", "charter"][source]);
-        }
-    }
-
     // #2783: native map ancestry wins over ordered lane rules, whose first match
     // wins over routine. DAG descendants count unique tickets, not diamond paths.
     #[test]
     fn membership_and_descendants_follow_native_graph() {
         let board = board(vec![
-            board_issue("map", None, &["wayfinder:map", "value:9"], &[]),
+            board_issue("map", None, &["wayfinder:map", "weight:9"], &[]),
             board_issue("1", Some("map"), &[], &[]),
             board_issue("2", Some("1"), &[], &["1"]),
             board_issue("3", None, &[], &["1"]),
@@ -612,7 +774,7 @@ mod tests {
         let score = board.score(&issue("1"), &policy).expect("map member");
         assert_eq!(score.mission_issue, Some(reference("map")));
         assert_eq!(score.membership, "map_sub_issue");
-        assert_eq!(f64::from(score.attributes.value), 9.0);
+        assert_eq!(f64::from(score.attributes.weight), 9.0);
         assert_eq!(score.unblock_count, 3);
         assert_eq!(board.score(&issue("2"), &policy).expect("nested").mission_issue, Some(reference("map")));
         assert_eq!(board.score(&issue("3"), &policy).expect("lane").mission, "stability");
@@ -666,7 +828,7 @@ mod tests {
                 0 => observations[id].issues.clear(),
                 1 => {
                     observations[id].issues =
-                        vec![board_issue("map", None, &["map", "value:4"], &[]), board_issue("1", Some("map"), &[], &[])]
+                        vec![board_issue("map", None, &["map", "weight:4"], &[]), board_issue("1", Some("map"), &[], &[])]
                 }
                 2 => {
                     observations[id].issues =
@@ -754,7 +916,7 @@ mod tests {
         index.scope("project", BTreeSet::from([source.clone()])).expect("initial");
         let other = index.scope("other", BTreeSet::from([unrelated.clone()])).expect("unrelated");
         let recovered =
-            vec![board_issue("1", None, &["value:7"], &[]), board_issue("2", None, &[], &["1"]), board_issue("3", None, &[], &["2"])];
+            vec![board_issue("1", None, &["weight:7"], &[]), board_issue("2", None, &[], &["1"]), board_issue("3", None, &[], &["2"])];
         let mut malformed = recovered.clone();
         malformed[1].blocked_by[0].url = "not an issue URL".into();
         index.apply_source(source.clone(), Some((3, Arc::new(observation(source.clone(), malformed)))));
@@ -771,27 +933,20 @@ mod tests {
         }
     }
 
-    // Invalid explicit inputs are unavailable evidence; duplicate inputs cannot
-    // silently make priority depend on tracker array ordering.
+    // Invalid explicit inputs fail closed, while retired labels are ignored.
     #[test]
     fn malformed_attributes_are_errors() {
-        for labels in [
-            vec!["value:nope".into()],
-            vec!["cos:urgent".into()],
-            vec!["crew-limit:-1".into()],
-            vec!["value:1".into(), "value:2".into()],
-            vec!["value:NaN".into()],
-        ] {
+        for labels in
+            [vec!["weight:-1".into()], vec!["weight:NaN".into()], vec!["priority:nope".into()], vec!["weight:1".into(), "weight:2".into()]]
+        {
             assert!(normalize_attributes(&MissionFields::default(), &labels, &MissionAttributes::default()).is_err());
         }
-        let fields = MissionFields { value: Some(3.0.try_into().expect("value")), ..Default::default() };
-        assert_eq!(
-            normalize_attributes(&fields, &["value:nope".into()], &MissionAttributes::default())
-                .expect("field overrides stale label")
-                .0
-                .value,
-            fields.value.expect("value")
-        );
-        assert!(parse_mission_fields(&[serde_json::json!({"issue_field_name":"Value","value":"high"})]).is_err());
+        assert!(normalize_attributes(
+            &MissionFields::default(),
+            &["value:nope".into(), "cos:bad".into(), "crew-limit:-1".into()],
+            &MissionAttributes::default()
+        )
+        .is_ok());
+        assert!(parse_mission_fields(&[serde_json::json!({"issue_field_name":"Weight","value":"high"})]).is_err());
     }
 }

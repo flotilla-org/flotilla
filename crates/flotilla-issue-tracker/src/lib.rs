@@ -53,6 +53,12 @@ pub trait IssueProvider: Send + Sync {
         Err("board facts unavailable for this issue provider".into())
     }
 
+    /// True when dispatch_board already includes field observations for every issue.
+    /// Consumers must not issue redundant per-ticket reads for these providers.
+    fn board_includes_mission_fields(&self) -> bool {
+        false
+    }
+
     /// Normalized optional mission fields. Unsupported sources use labels/charter.
     async fn mission_fields(&self, _reference: &IssueRef) -> Result<flotilla_protocol::MissionFields, String> {
         Ok(Default::default())

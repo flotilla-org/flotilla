@@ -540,6 +540,9 @@ impl IssueProvider for ObservedIssueProvider {
         }
         Ok(board)
     }
+    fn board_includes_mission_fields(&self) -> bool {
+        self.inner.board_includes_mission_fields()
+    }
     async fn mission_fields(&self, reference: &IssueRef) -> Result<flotilla_protocol::MissionFields, String> {
         self.reads
             .read(&reference.source, ForgeReadRequest::Mission { id: reference.id.clone() }, || self.inner.mission_fields(reference))

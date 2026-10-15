@@ -6,7 +6,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use flotilla_core::{
-    dispatch_missions::{MissionBoard, MissionBoardIndex, MissionSourceSnapshot},
+    dispatch_missions::{MissionBoard, MissionBoardIndex, MissionOccupancy, MissionSourceSnapshot},
     in_process::InProcessDaemon,
 };
 use flotilla_protocol::{
@@ -44,8 +44,7 @@ struct MissionState {
 struct Occupancy {
     board: Arc<MissionBoard>,
     policy: DispatchPolicy,
-    project_active: usize,
-    missions: BTreeMap<String, usize>,
+    counts: MissionOccupancy,
 }
 
 #[derive(Default)]
@@ -407,32 +406,9 @@ impl DispatchReconciler {
             .get(&project.metadata.name)
             .is_none_or(|cached| !Arc::ptr_eq(&cached.board, &board) || cached.policy != *policy);
         if rebuild {
-            let live = existing.iter().filter(|convoy| !convoy.status.as_ref().is_some_and(|s| s.phase.is_terminal())).collect::<Vec<_>>();
-            let project_active = live.iter().map(|c| active_crew_count(c.status.as_ref())).sum();
-            let mut missions = BTreeMap::<String, usize>::new();
-            for convoy in live {
-                let mut served_missions = HashSet::new();
-                for served in &convoy.spec.issues {
-                    let issue = Issue::builder()
-                        .reference(served.reference.clone())
-                        .title(served.snapshot.title.clone())
-                        .labels(served.snapshot.labels.clone())
-                        .state(served.snapshot.state)
-                        .as_of(served.snapshot.as_of)
-                        .provider_name(String::new())
-                        .provider_display_name(String::new())
-                        .build();
-                    served_missions.insert(board.score(&issue, policy)?.mission);
-                }
-                for name in served_missions {
-                    *missions.entry(name).or_default() += active_crew_count(convoy.status.as_ref());
-                }
-            }
+            let counts = MissionOccupancy::collect(&board, policy, existing.iter().map(AsRef::as_ref))?;
             mission.occupancy_rebuilds += 1;
-            mission.occupancy.insert(
-                project.metadata.name.clone(),
-                Occupancy { board: board.clone(), policy: policy.clone(), project_active, missions },
-            );
+            mission.occupancy.insert(project.metadata.name.clone(), Occupancy { board: board.clone(), policy: policy.clone(), counts });
         }
         let occupancy = &mission.occupancy[&project.metadata.name];
         let mut ready = input.readiness.clone()?;
@@ -454,7 +430,8 @@ impl DispatchReconciler {
             let is_ideation = |kind: &str| {
                 matches!(kind.rsplit(':').next().unwrap_or(kind).to_ascii_lowercase().as_str(), "grill" | "grilling" | "map" | "brainstorm")
             };
-            let ideation = facts.issue_type.iter().chain(issue.labels.iter()).any(|kind| is_ideation(kind));
+            let ideation = facts.issue_type.as_ref().is_some_and(|kind| kind.eq_ignore_ascii_case("mission"))
+                || facts.issue_type.iter().chain(issue.labels.iter()).any(|kind| is_ideation(kind));
             if issue.labels.iter().any(|label| label.eq_ignore_ascii_case("map"))
                 && !facts.issue_type.iter().any(|kind| is_ideation(kind))
                 && !issue.labels.iter().any(|label| !label.eq_ignore_ascii_case("map") && is_ideation(label))
@@ -500,8 +477,7 @@ impl DispatchReconciler {
                 .filter(|entry| entry.issue_as_of == issue.as_of && entry.title == issue.title)
                 .map_or(now, |entry| entry.observed_at);
             let mut score = board.score(&issue, policy)?;
-            score.project_active_crews = occupancy.project_active;
-            score.mission_active_crews = occupancy.missions.get(&score.mission).copied().unwrap_or(0);
+            occupancy.counts.apply(&mut score);
             queue.push(DispatchQueueEntry {
                 score: Some(score),
                 issue: issue.reference,
@@ -720,31 +696,6 @@ impl DispatchReconciler {
     }
 }
 
-/// A settled role releases mission share even while its convoy awaits landing.
-/// Before publication of any role state, reserve one provisional crew.
-fn active_crew_count(status: Option<&flotilla_resources::ConvoyStatus>) -> usize {
-    if status.is_some_and(|status| status.phase.is_terminal()) {
-        return 0;
-    }
-    let Some(status) = status.filter(|status| status.crew_work.values().any(|crew| !crew.is_empty())) else {
-        return 1;
-    };
-    status
-        .crew_work
-        .values()
-        .flat_map(|crew| crew.values())
-        .filter(|state| {
-            matches!(
-                state.phase,
-                flotilla_resources::CrewWorkPhase::Pending
-                    | flotilla_resources::CrewWorkPhase::Working
-                    | flotilla_resources::CrewWorkPhase::Interrupted
-                    | flotilla_resources::CrewWorkPhase::Stalled
-            )
-        })
-        .count()
-}
-
 fn dispatch_queue_attention(
     queue: &[DispatchQueueEntry],
     policy: &DispatchPolicy,
@@ -779,6 +730,7 @@ mod tests {
     use flotilla_store_testkit::VirtualClock;
 
     use super::*;
+    use flotilla_core::dispatch_missions::active_crew_count;
 
     const NAMESPACE: &str = "flotilla";
 
@@ -1218,7 +1170,7 @@ mod tests {
             .state(IssueState::Open)
             .url("https://github.com/acme/widgets/issues/99".into())
             .updated_at(String::new())
-            .labels(vec!["value:2".into(), "crew-limit:0".into()])
+            .labels(vec!["weight:2".into(), "priority:high".into()])
             .blocked_by(vec![])
             .pull_requests(vec![])
             .build();
@@ -1228,19 +1180,19 @@ mod tests {
         reconciler.reconcile_once().await.expect("first pass");
         let first = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
         let score = first.dispatch_queue[0].score.as_ref().expect("score");
-        assert_eq!(f64::from(score.attributes.value), 2.0);
-        assert_eq!(score.attributes.crew_limit, Some(0));
+        assert_eq!(f64::from(score.attributes.weight), 2.0);
+        assert_eq!(score.attributes.priority, flotilla_protocol::Priority::High);
         assert_eq!(score.project_share, 3);
         assert_eq!(score.project_active_crews, 0);
-        boards[0].issues.last_mut().expect("tracking").mission_fields.value = Some(7.5.try_into().expect("value"));
+        boards[0].issues.last_mut().expect("tracking").mission_fields.weight = Some(7.5.try_into().expect("value"));
         *issues.board_override.lock().expect("board") = Some(boards);
         clock.advance(Duration::seconds(60));
         reconciler.reconcile_once().await.expect("re-rank pass");
         let second = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
         assert_eq!(second.dispatch_queue[0].ready_observed_at, first.dispatch_queue[0].ready_observed_at);
         let score = second.dispatch_queue[0].score.as_ref().expect("score");
-        assert_eq!(f64::from(score.attributes.value), 7.5);
-        assert_eq!(score.attribute_sources["value"], "issue_field");
+        assert_eq!(f64::from(score.attributes.weight), 7.5);
+        assert_eq!(score.attribute_sources["weight"], "issue_field");
         assert!(second.dispatch_queue_attention.is_some());
     }
 
@@ -1416,7 +1368,7 @@ mod tests {
     async fn a_missing_observation_workflow_does_not_freeze_the_queue_or_staleness_attention() {
         let dispatched = issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open);
         let waiting = issue("3", &[READY_ISSUE_LABEL], None, IssueState::Open);
-        let (backend, _, clock, reconciler) = harness(vec![dispatched.clone(), waiting.clone()], vec![], policy(60)).await;
+        let (backend, issues, clock, reconciler) = harness(vec![dispatched.clone(), waiting.clone()], vec![], policy(60)).await;
         reconciler.reconcile_once().await.expect("queue pass");
         backend
             .clone()
@@ -1465,6 +1417,19 @@ mod tests {
         assert_eq!(status.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 1);
         assert_eq!(status.dispatch_queue[0].score.as_ref().expect("score").mission_active_crews, 1);
         assert_eq!(status.dispatch_queue_attention.expect("stale attention").count, 1);
+        // #3313: changing a live ticket's field moves its mission occupancy to
+        // that effective tier, leaving the Project's crew count unchanged.
+        let project = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project");
+        let mut boards = issues.boards(&project).await.expect("boards");
+        boards[0].issues.iter_mut().find(|issue| issue.id == "2").expect("served ticket").mission_fields.priority =
+            Some(flotilla_protocol::Priority::Urgent);
+        *issues.board_override.lock().expect("board") = Some(boards);
+        reconciler.reconcile_once().await.expect("tier change pass");
+        let status = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
+        let score = status.dispatch_queue[0].score.as_ref().expect("score");
+        assert_eq!(score.attributes.priority, flotilla_protocol::Priority::Medium);
+        assert_eq!(score.mission_active_crews, 0);
+        assert_eq!(score.project_active_crews, 1);
     }
 
     #[tokio::test]
@@ -1522,12 +1487,12 @@ mod tests {
         reconciler.reconcile_once().await.expect("initial pass");
         let before = projects.get("widgets").await.expect("project").status.expect("status");
         let mut boards = issues.boards(&projects.get("widgets").await.expect("project")).await.expect("board");
-        boards[0].issues[0].labels.push("value:abc".into());
+        boards[0].issues[0].labels.push("weight:abc".into());
         *issues.board_override.lock().expect("board") = Some(boards);
         assert_eq!(reconciler.reconcile_once().await.expect("invalid pass").project_errors, 1);
         let failed = projects.get("widgets").await.expect("project").status.expect("status");
         assert_eq!(failed.dispatch_queue, before.dispatch_queue);
-        assert!(failed.dispatch_queue_error.as_deref().expect("visible error").contains("value"));
+        assert!(failed.dispatch_queue_error.as_deref().expect("visible error").contains("weight"));
         *issues.board_override.lock().expect("board") = None;
         reconciler.reconcile_once().await.expect("recovery");
         let recovered = projects.get("widgets").await.expect("project").status.expect("status");
@@ -1668,8 +1633,9 @@ mod tests {
         let ready_label = tc.draw(gs::booleans());
         let native_blocked = tc.draw(gs::booleans());
         let serving_pr = tc.draw(gs::booleans());
-        let ideation = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
-        let kinds = [None, Some("grill"), Some("map"), Some("brainstorm"), Some("Grilling"), Some("Map"), Some("Brainstorm")];
+        let ideation = tc.draw(gs::integers::<usize>().min_value(0).max_value(7));
+        let kinds =
+            [None, Some("grill"), Some("map"), Some("brainstorm"), Some("Grilling"), Some("Map"), Some("Brainstorm"), Some("Mission")];
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
             let mut candidate = issue(

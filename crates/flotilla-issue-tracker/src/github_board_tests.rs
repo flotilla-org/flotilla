@@ -28,6 +28,8 @@ struct BoardForge {
     #[builder(default)]
     calls: AtomicUsize,
     #[builder(default)]
+    rest_calls: AtomicUsize,
+    #[builder(default)]
     completed: AtomicUsize,
     #[builder(default = 5000)]
     remaining: u64,
@@ -48,6 +50,7 @@ impl CommandRunner for BoardForge {
         assert_eq!(cmd, "gh");
         assert_eq!(args[0], "api");
         let body = if args[1] == "--include" {
+            self.rest_calls.fetch_add(1, Ordering::SeqCst);
             let endpoint = args[2];
             assert!(endpoint.starts_with("repos/team/repo/"));
             assert!(endpoint.contains("state=open&sort=updated&direction=desc&per_page=100&page="));
@@ -57,7 +60,13 @@ impl CommandRunner for BoardForge {
                 let page = endpoint.rsplit("page=").next().expect("page").parse::<usize>().expect("page number");
                 let start = (page - 1) * 100;
                 let items: Vec<_> = (start..(start + 100).min(self.count))
-                    .map(|i| json!({"number":i+1,"updated_at":"2026-10-08T00:00:00Z","state":"open"}))
+                    .map(|i| {
+                        json!({"number":i+1,"updated_at":"2026-10-08T00:00:00Z","state":"open",
+                        "issue_field_values":[
+                            {"issue_field_name":"Priority","value":1,"single_select_option":{"name":"High"}},
+                            {"issue_field_name":"Weight","value":2.5}
+                        ]})
+                    })
                     .collect();
                 let link = if start + 100 < self.count { "Link: <next>; rel=\"next\"\r\n" } else { "" };
                 return Ok(CommandOutput {
@@ -180,6 +189,17 @@ fn board_bulk_boundaries_and_low_budget(tc: hegel::TestCase) {
         let state = first.poll.load("team/repo").expect("durable batch");
         assert_eq!(state.issues.details.len(), if remaining < 100 { count.min(BOARD_BATCH_SIZE) } else { count });
         assert_eq!(result.is_ok(), remaining >= 100 || count <= BOARD_BATCH_SIZE);
+        // #3313: fields ride the existing paginated REST inventory. No per-ticket
+        // field requests are allowed, including for a large native-detail batch.
+        assert_eq!(forge.rest_calls.load(Ordering::SeqCst), count.div_ceil(100).max(1) + 1);
+        if let Ok(board) = &result {
+            assert!(first.board_includes_mission_fields());
+            for issue in &board.issues {
+                assert_eq!(issue.mission_fields.priority, Some(flotilla_protocol::Priority::High));
+                assert_eq!(issue.mission_fields.weight.map(f64::from), Some(2.5));
+            }
+        }
+
         if count > 0 && remaining < 100 {
             let restarted = provider(forge.clone(), directory.path());
             assert!(restarted.dispatch_board(&source()).await.is_err());
@@ -278,9 +298,12 @@ async fn board_incremental_closures_resolve_cached_blockers_and_linked_prs() {
     let issue_list = "repos/team/repo/issues?state=";
     let pull_list = "repos/team/repo/pulls?state=";
     let listing = |prefix: &str, state: &str| format!("{prefix}{state}&sort=updated&direction=desc&per_page=100&page=1");
-    let a = json!({"number":7,"state":"open","updated_at":"2026-10-08T00:00:00Z"});
+    let a = json!({"number":7,"state":"open","updated_at":"2026-10-08T00:00:00Z",
+        "issue_field_values":[{"issue_field_name":"Priority","value":1,"single_select_option":{"name":"High"}}]});
     let b = json!({"number":8,"state":"open","updated_at":"2026-10-08T00:00:00Z"});
     let pr = json!({"number":10,"state":"open","updated_at":"2026-10-08T00:00:00Z"});
+    let mut changed_a = a.clone();
+    changed_a["issue_field_values"][0]["single_select_option"]["name"] = json!("Urgent");
     let closed_b = json!({"number":8,"state":"closed","updated_at":"2026-10-08T00:01:00Z"});
     let closed_pr = json!({"number":10,"state":"closed","updated_at":"2026-10-08T00:01:00Z"});
     let mut detail = issue_detail(7);
@@ -307,7 +330,7 @@ async fn board_incremental_closures_resolve_cached_blockers_and_linked_prs() {
         ("repos/team/repo/pulls/11".into(), rest("linked", json!({"state":"closed","merged_at":"2026-10-08T00:00:00Z"}))),
         // A is unchanged; B and PR10 close. Their closed revisions require no GraphQL detail.
         (listing(issue_list, "all"), rest("issues-closed", json!([closed_b.clone(), a]))),
-        (format!("{}&since=2026-10-07T23%3A59%3A59Z", listing(issue_list, "all")), rest("delta", json!([closed_b]))),
+        (format!("{}&since=2026-10-07T23%3A59%3A59Z", listing(issue_list, "all")), rest("delta", json!([closed_b, changed_a]))),
         (listing(pull_list, "all"), rest("pulls-closed", json!([closed_pr]))),
         ("repos/other/repo/issues/9".into(), rest("blocker-closed", json!({"state":"closed"}))),
         ("repos/team/repo/pulls/11".into(), unchanged.clone()),
@@ -330,6 +353,10 @@ async fn board_incremental_closures_resolve_cached_blockers_and_linked_prs() {
     };
     let first = make().dispatch_board(&source()).await.expect("initial open inventory");
     assert_eq!(first.issues.len(), 2);
+    assert_eq!(
+        first.issues.iter().find(|issue| issue.id == "7").expect("A").mission_fields.priority,
+        Some(flotilla_protocol::Priority::High)
+    );
     assert!(first
         .issues
         .iter()
@@ -345,6 +372,8 @@ async fn board_incremental_closures_resolve_cached_blockers_and_linked_prs() {
     for _ in 0..2 {
         let board = restarted.dispatch_board(&source()).await.expect("incremental close/quiet pass");
         assert_eq!(board.issues.len(), 1);
+        // A same-second field change updates scoring without another GraphQL read.
+        assert_eq!(board.issues[0].mission_fields.priority, Some(flotilla_protocol::Priority::Urgent));
         assert!(board.issues[0].blocked_by.iter().all(|blocker| blocker.state == flotilla_protocol::IssueState::Closed));
         assert_eq!(board.pull_requests.len(), 1, "unlinked closed PR10 is dropped");
         assert_eq!(board.pull_requests[0].id, "11");
@@ -511,4 +540,42 @@ async fn board_ci_rollup_waits_for_pr_revision_change() {
     assert_eq!(provider(forge.clone(), directory.path()).dispatch_board(&source()).await.unwrap().pull_requests[0].ci, "success");
     assert_eq!(forge.graphql_calls.load(Ordering::SeqCst), 2);
     assert!(forge.requests.lock().unwrap().is_empty());
+}
+
+// #3313 / ADR 0047: a cache without REST bodies gets one bulk inventory refill,
+// retaining unchanged graph details and dropping closed issues, then uses deltas.
+#[tokio::test]
+async fn board_legacy_rest_inventory_refills_once_without_native_refetch() {
+    let listing = |kind, state| format!("repos/team/repo/{kind}?state={state}&sort=updated&direction=desc&per_page=100&page=1");
+    let item = json!({"number":7,"state":"open","updated_at":"2026-10-08T00:00:00Z",
+        "issue_field_values":[{"issue_field_name":"Priority","value":1,"single_select_option":{"name":"Urgent"}}]});
+    let requests = vec![
+        (listing("issues", "open"), rest("refill", json!([item.clone()]))),
+        (listing("pulls", "open"), rest("pulls", json!([]))),
+        (listing("issues", "all"), rest("steady", json!([item.clone()]))),
+        (format!("{}&since=2026-10-07T23%3A59%3A59Z", listing("issues", "all")), rest("delta", json!([item]))),
+        (listing("pulls", "all"), rest("pulls-all", json!([]))),
+        (listing("issues", "all"), "HTTP/2 304 Not Modified\r\n\r\n".into()),
+        (listing("pulls", "all"), "HTTP/2 304 Not Modified\r\n\r\n".into()),
+    ];
+    let runner = Arc::new(ScriptForge { requests: Mutex::new(requests.into()), graphql_calls: AtomicUsize::new(0) });
+    let directory = tempfile::tempdir().expect("legacy cache");
+    let provider = provider(runner.clone(), directory.path());
+    let mut legacy = BoardState::default();
+    legacy.issues.cursor = Some("2026-10-08T00:00:00Z".into());
+    for id in [7, 8] {
+        let mut detail = issue_detail(id);
+        super::normalize_board_detail("issue", &mut detail).expect("cached native shape");
+        legacy.issues.details.insert(id.to_string(), detail);
+        legacy.issues.revisions.insert(id.to_string(), "2026-10-08T00:00:00Z".into());
+    }
+    provider.poll.save("team/repo", &legacy).expect("stored legacy cache");
+    for _ in 0..3 {
+        let board = provider.dispatch_board(&source()).await.expect("bulk refill and quiet delta");
+        assert_eq!(board.issues.len(), 1);
+        assert_eq!(board.issues[0].id, "7");
+        assert_eq!(board.issues[0].mission_fields.priority, Some(flotilla_protocol::Priority::Urgent));
+    }
+    assert_eq!(runner.graphql_calls.load(Ordering::SeqCst), 0);
+    assert!(runner.requests.lock().expect("requests").is_empty());
 }

@@ -120,6 +120,50 @@ pub type DispatchBoardInputs = BTreeMap<
     Result<(Vec<flotilla_resources::ResolvedIssueSourceBinding>, Vec<(u64, Arc<flotilla_protocol::DispatchBoardRepository>)>), String>,
 >;
 
+/// Indexed live inventory: retained terminal history never enters accounting reads.
+pub fn live_project_convoys_query(projects: impl IntoIterator<Item = String>) -> flotilla_store::StoreQuery {
+    use flotilla_store::StoreQuery;
+    StoreQuery {
+        field_values: BTreeMap::from([("spec.project_ref".into(), projects.into_iter().collect())]),
+        any_of: Some(vec![
+            StoreQuery {
+                field_values: BTreeMap::from([(
+                    "status.phase".into(),
+                    ["Pending", "Active", "Interrupted", "Landing", "Anchored"].map(String::from).to_vec(),
+                )]),
+                ..Default::default()
+            },
+            StoreQuery { missing_fields: BTreeSet::from(["status.phase".into()]), ..Default::default() },
+        ]),
+        include_replicas: true,
+        ..Default::default()
+    }
+}
+
+/// Settled roles release share before landing; unpublished crew state counts one.
+pub fn active_crew_count(status: Option<&flotilla_resources::ConvoyStatus>) -> usize {
+    if status.is_some_and(|status| status.phase.is_terminal()) {
+        return 0;
+    }
+    let Some(status) = status.filter(|status| status.crew_work.values().any(|crew| !crew.is_empty())) else {
+        return 1;
+    };
+    status
+        .crew_work
+        .values()
+        .flat_map(|crew| crew.values())
+        .filter(|state| {
+            matches!(
+                state.phase,
+                flotilla_resources::CrewWorkPhase::Pending
+                    | flotilla_resources::CrewWorkPhase::Working
+                    | flotilla_resources::CrewWorkPhase::Interrupted
+                    | flotilla_resources::CrewWorkPhase::Stalled
+            )
+        })
+        .count()
+}
+
 pub struct DispatchBoard<'a> {
     pub backend: &'a ResourceBackend,
     pub cache: &'a DispatchBoardCache,
@@ -182,6 +226,22 @@ impl DispatchBoard<'_> {
         let mut bindings_by_project = BTreeMap::new();
         let mut sources = std::collections::BTreeSet::new();
         let mut mission_issues = std::collections::BTreeSet::new();
+        // Running tickets need current fields for tier-specific crew accounting,
+        // even after their ready label is removed. Do not fetch inactive backlog.
+        let live = self
+            .backend
+            .query_declared::<flotilla_resources::Convoy>(
+                &namespace,
+                &live_project_convoys_query(projects.iter().map(|project| project.metadata.name.clone())),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        for record in live.items {
+            if active_crew_count(record.object.status.as_ref()) > 0 {
+                mission_issues.extend(record.object.spec.issues.into_iter().map(|issue| issue.reference));
+            }
+        }
+
         for project in projects {
             if let Some(policy) = &project.spec.dispatch_policy {
                 mission_issues.extend(policy.missions.iter().filter_map(|mission| mission.issue.clone()));
@@ -208,15 +268,23 @@ impl DispatchBoard<'_> {
                     let mut board = provider.dispatch_board(&tracker_source).await?;
                     for issue in &mut board.issues {
                         let reference = flotilla_protocol::IssueRef { source: tracker_source.clone(), id: issue.id.clone() };
-                        if mission_issues.iter().any(|mission| {
-                            mission.id == reference.id
-                                && mission.source.scope.eq_ignore_ascii_case(&reference.source.scope)
-                                && matches!(mission.source.service.trim_end_matches('/'), "github" | "github.com" | "https://github.com")
-                        }) || issue.issue_type.as_ref().is_some_and(|kind| kind.eq_ignore_ascii_case("map"))
-                            || issue
-                                .labels
-                                .iter()
-                                .any(|label| label.rsplit(':').next().is_some_and(|kind| kind.eq_ignore_ascii_case("map")))
+                        if !provider.board_includes_mission_fields()
+                            && (mission_issues.iter().any(|mission| {
+                                mission.id == reference.id
+                                    && mission.source.scope.eq_ignore_ascii_case(&reference.source.scope)
+                                    && matches!(
+                                        mission.source.service.trim_end_matches('/'),
+                                        "github" | "github.com" | "https://github.com"
+                                    )
+                            }) || issue.labels.iter().any(|label| label == "ready")
+                                || issue
+                                    .issue_type
+                                    .as_ref()
+                                    .is_some_and(|kind| kind.eq_ignore_ascii_case("map") || kind.eq_ignore_ascii_case("mission"))
+                                || issue
+                                    .labels
+                                    .iter()
+                                    .any(|label| label.rsplit(':').next().is_some_and(|kind| kind.eq_ignore_ascii_case("map"))))
                         {
                             issue.mission_fields = provider.mission_fields(&reference).await?;
                         }

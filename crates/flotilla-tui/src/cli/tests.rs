@@ -188,6 +188,8 @@ fn fulfilment_list_distinguishes_image_and_host_model_support() {
 #[test]
 fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     let explanation = ConvoyExplanation {
+        dispatch_scores: Default::default(),
+        dispatch_score_error: None,
         degraded_checkouts: Default::default(),
         naming: None,
         promises: vec![
@@ -357,6 +359,8 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
 #[test]
 fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
     let explanation = ConvoyExplanation {
+        dispatch_scores: Default::default(),
+        dispatch_score_error: None,
         degraded_checkouts: BTreeMap::from([("vessel-local/checkout-local".into(), "objects copied across filesystems".into())]),
         naming: None,
         promises: Vec::new(),
