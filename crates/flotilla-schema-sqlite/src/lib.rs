@@ -26,4 +26,4 @@ mod store;
 
 pub use error::{Malformed, StoreError};
 pub use shared::{schema_ddl, MEDIA_CBOR};
-pub use store::{Applied, Loaded, Read, ResourceId, Snapshot, Stamp, Store, StoreOptions, Write};
+pub use store::{Applied, Loaded, Read, ResourceId, Snapshot, Stamp, Store, StoreOptions, Write, MAX_CHANGES_PAGE, MAX_CHANGES_PAGE_BYTES};

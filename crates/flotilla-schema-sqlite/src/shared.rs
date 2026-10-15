@@ -9,6 +9,8 @@ use flotilla_schema::{render_ddl_with, DdlMode, KindRegistry};
 /// `objects` holds frozen documents by hash (media 1 is ADR 0063 CBOR); `home_sequence.last` is each home's
 /// sequence, which never decreases and does not depend on `change_log` rows, so deleting log
 /// rows never lets a sequence repeat; `change_log` holds every write's row changes per home.
+/// No database created by an earlier generation of these tables exists: the first production
+/// generation is the baseline, and ADR 0047's N→N+1 rule applies from then.
 pub(crate) const SHARED_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS strings (id INTEGER PRIMARY KEY, s TEXT NOT NULL UNIQUE) STRICT;
 CREATE TABLE IF NOT EXISTS resource_identity (

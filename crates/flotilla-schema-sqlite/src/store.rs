@@ -92,11 +92,13 @@ pub struct StoreOptions {
     pub identity_cache: usize,
     /// Prepared statements kept by the connection. Each kind has a handful per table.
     pub statement_cache: usize,
+    /// Encoded bytes one `changes` or `changes_since` page may hold; see [`MAX_CHANGES_PAGE_BYTES`].
+    pub change_page_bytes: usize,
 }
 
 impl Default for StoreOptions {
     fn default() -> StoreOptions {
-        StoreOptions { string_cache: 65_536, identity_cache: 65_536, statement_cache: 512 }
+        StoreOptions { string_cache: 65_536, identity_cache: 65_536, statement_cache: 512, change_page_bytes: MAX_CHANGES_PAGE_BYTES }
     }
 }
 
@@ -106,6 +108,7 @@ pub struct Store {
 }
 
 struct Runtime {
+    change_page_bytes: usize,
     home: String,
     kinds: KindRegistry,
     sql: BTreeMap<KindCode, KindSql>,
@@ -135,6 +138,7 @@ impl Store {
             strings: TwoGen::new(options.string_cache),
             identities: TwoGen::new(options.identity_cache),
             ids: TwoGen::new(options.identity_cache),
+            change_page_bytes: options.change_page_bytes,
         };
         Ok(Store { conn, runtime })
     }
@@ -190,13 +194,15 @@ impl Read<'_> {
         self.ctx().snapshot(id)
     }
 
-    /// Up to `limit` (at most [`MAX_CHANGES_PAGE`]; 0 returns none) logged changes of resource
+    /// Up to `limit` (at most [`MAX_CHANGES_PAGE`], and within the store's page byte budget,
+    /// [`MAX_CHANGES_PAGE_BYTES`] by default; 0 returns none) logged changes of resource
     /// `id` after `after`, in sequence order: the tail that follows a snapshot at version `after`.
     pub fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
         self.ctx().changes(id, after, limit)
     }
 
-    /// Up to `limit` (at most [`MAX_CHANGES_PAGE`]; 0 returns none) logged changes homed at
+    /// Up to `limit` (at most [`MAX_CHANGES_PAGE`], and within the store's page byte budget,
+    /// [`MAX_CHANGES_PAGE_BYTES`] by default; 0 returns none) logged changes homed at
     /// `home` after sequence `after`, in home order; page with the last returned `home_seq`.
     pub fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
         self.ctx().changes_since(home, after, limit)
@@ -278,13 +284,15 @@ impl Write<'_> {
         self.ctx().snapshot(id)
     }
 
-    /// Up to `limit` (at most [`MAX_CHANGES_PAGE`]; 0 returns none) logged changes of resource
+    /// Up to `limit` (at most [`MAX_CHANGES_PAGE`], and within the store's page byte budget,
+    /// [`MAX_CHANGES_PAGE_BYTES`] by default; 0 returns none) logged changes of resource
     /// `id` after `after`, in sequence order: the tail that follows a snapshot at version `after`.
     pub fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
         self.ctx().changes(id, after, limit)
     }
 
-    /// Up to `limit` (at most [`MAX_CHANGES_PAGE`]; 0 returns none) logged changes homed at
+    /// Up to `limit` (at most [`MAX_CHANGES_PAGE`], and within the store's page byte budget,
+    /// [`MAX_CHANGES_PAGE_BYTES`] by default; 0 returns none) logged changes homed at
     /// `home` after sequence `after`, in home order; page with the last returned `home_seq`.
     pub fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
         self.ctx().changes_since(home, after, limit)
@@ -348,6 +356,11 @@ impl Write<'_> {
 /// The most changes one `changes` or `changes_since` call returns, whatever limit it asks for:
 /// a page holds whole entries of up to 16 MiB each, so a caller pages rather than lists.
 pub const MAX_CHANGES_PAGE: u32 = 10_000;
+
+/// The default byte budget of one `changes` or `changes_since` page (`StoreOptions`): a page
+/// stops before the entry that would take its encoded size past the budget, but always holds at
+/// least one entry, so paging progresses even past an entry larger than the budget.
+pub const MAX_CHANGES_PAGE_BYTES: usize = 32 * 1024 * 1024;
 
 const LOG_APPEND: &str = "INSERT INTO change_log (home, home_seq, resource_id, change) VALUES (?1, ?2, ?3, ?4)";
 
@@ -662,17 +675,26 @@ impl Ctx<'_> {
         if change.home == self.runtime.home {
             return Err(StoreError::OwnHome { home: change.home.clone() });
         }
-        let sequence = i64::try_from(change.home_seq).map_err(|_| Malformed::Sequence { home_seq: change.home_seq })?;
+        let sequence = i64::try_from(change.home_seq)
+            .ok()
+            .filter(|sequence| *sequence > 0)
+            .ok_or(Malformed::Sequence { home_seq: change.home_seq })?;
         let identity = Identity { kind: change.kind, name: change.name.clone(), home: change.home.clone() };
-        let id = self.ensure_identity(&identity)?;
-        // The identity's sequence outlives a delete, so it alone decides duplicates and gaps.
-        let current = self.identity_seq(id)?;
-        if change.home_seq <= current {
+        // Read-only first: a duplicate or a gap creates no identity or string row. The identity's
+        // sequence outlives a delete, so it alone decides both; an unknown identity is at 0, and
+        // no change is at 0, so an unknown identity is never a duplicate.
+        let known = self.resolve(&identity)?;
+        let current = known.map_or(Ok(0), |id| self.identity_seq(id))?;
+        if let Some(id) = known.filter(|_| change.home_seq <= current) {
             return Ok(Applied::Duplicate(id));
         }
         if change.prev_seq != current {
-            return Err(StoreError::Gap { id, expected: current, found: change.prev_seq });
+            return Err(StoreError::Gap { expected: current, found: change.prev_seq });
         }
+        let id = match known {
+            Some(id) => id,
+            None => self.ensure_identity(&identity)?,
+        };
         let stored: Option<i64> = self.conn.prepare_cached(&root)?.query_row([id.0], |row| row.get(0)).optional()?;
         self.check_ops(&identity, &root_table, stored.is_some(), &change.ops)?;
         if !self.execute(change.kind, id, &change.ops, sequence, stored)? {
@@ -704,10 +726,14 @@ impl Ctx<'_> {
             })
             .collect();
         let mut put = BTreeSet::new();
+        // One primary-key probe per object a row names; batch it if replication measures it.
         let mut statement = self.conn.prepare_cached("SELECT 1 FROM objects WHERE hash = ?1")?;
         for op in ops {
             let (key, values) = match op {
-                RowOp::PutObject { hash, .. } => {
+                RowOp::PutObject { hash, media, .. } => {
+                    if i64::from(*media) != MEDIA_CBOR {
+                        return Err(Malformed::Media { media: *media }.into());
+                    }
                     put.insert(*hash);
                     continue;
                 }
@@ -874,7 +900,7 @@ impl Ctx<'_> {
             .conn
             .prepare_cached("SELECT change FROM change_log WHERE resource_id = ?1 AND home_seq > ?2 ORDER BY home_seq LIMIT ?3")?;
         let rows = statement.query_map(params![id.0, after, limit], |row| row.get::<_, Vec<u8>>(0))?;
-        rows.map(|bytes| Ok(RowChange::decode(&bytes?)?)).collect()
+        page(rows, self.runtime.change_page_bytes)
     }
 
     /// Logged changes homed at `home` after `after`, in home order, by the primary key.
@@ -885,7 +911,7 @@ impl Ctx<'_> {
         let mut statement =
             self.conn.prepare_cached("SELECT change FROM change_log WHERE home = ?1 AND home_seq > ?2 ORDER BY home_seq LIMIT ?3")?;
         let rows = statement.query_map(params![home, after, limit], |row| row.get::<_, Vec<u8>>(0))?;
-        rows.map(|bytes| Ok(RowChange::decode(&bytes?)?)).collect()
+        page(rows, self.runtime.change_page_bytes)
     }
 
     /// The highest sequence taken (this home) or applied (another home) for `home`; 0 when none.
@@ -998,6 +1024,22 @@ impl Ctx<'_> {
         let row_values = values.split_off(key_len);
         Ok(Row { key: values, values: row_values })
     }
+}
+
+/// Decodes log entries until the next would take the page past `budget` encoded bytes; the
+/// first entry is always taken, so a page is never empty while entries remain.
+fn page(entries: impl Iterator<Item = rusqlite::Result<Vec<u8>>>, budget: usize) -> Result<Vec<RowChange>, StoreError> {
+    let mut changes = Vec::new();
+    let mut used = 0usize;
+    for bytes in entries {
+        let bytes = bytes?;
+        used = used.saturating_add(bytes.len());
+        if !changes.is_empty() && used > budget {
+            break;
+        }
+        changes.push(RowChange::decode(&bytes)?);
+    }
+    Ok(changes)
 }
 
 /// The objects a row write sets: every object of an inserted row (`before` is `None`), and the

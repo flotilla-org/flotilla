@@ -50,8 +50,8 @@ pub enum StoreError {
     MissingObject { hash: Hash },
     /// A change that does not follow the identity's last applied change: `found` is its
     /// `prev_seq`, `expected` the identity's sequence here.
-    #[error("resource {id} is at sequence {expected}; the change follows {found}")]
-    Gap { id: ResourceId, expected: u64, found: u64 },
+    #[error("resource is at sequence {expected}; the change follows {found}")]
+    Gap { expected: u64, found: u64 },
     #[error("malformed change: {0}")]
     MalformedChange(#[from] Malformed),
 }
@@ -70,6 +70,10 @@ pub enum Malformed {
     /// A row names an object the change puts only after it.
     #[error("object {hash:?} is named before the change puts it")]
     ObjectOrder { hash: Hash },
+    /// A `PutObject` of a media other than ADR 0063 CBOR, the only media today.
+    #[error("object media {media} is not CBOR")]
+    Media { media: u8 },
+    /// Above `i64::MAX`, or 0, which no write takes (sequences start at 1).
     #[error("home sequence {home_seq} cannot be stored")]
     Sequence { home_seq: u64 },
 }

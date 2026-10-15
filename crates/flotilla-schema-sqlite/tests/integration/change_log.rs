@@ -6,7 +6,7 @@ use std::{
 };
 
 use flotilla_schema::{Hash, Kind, KindCode, RowChange, RowOp, Value};
-use flotilla_schema_sqlite::{Applied, Malformed, ResourceId, Snapshot, Stamp, Store, StoreError, Write};
+use flotilla_schema_sqlite::{Applied, Malformed, ResourceId, Snapshot, Stamp, Store, StoreError, StoreOptions, Write};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
@@ -579,4 +579,92 @@ fn change_pages_respect_their_limit() {
     let id = read.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
     assert_eq!(read.changes(id, 0, 0).expect("page"), []);
     assert_eq!(read.changes(id, 0, u32::MAX).expect("page").len(), 3);
+}
+
+// Behaviour (#3338 review): ADR 0063 CBOR is the only object media; `apply` refuses a
+// `PutObject` of any other media before any statement runs, writing nothing.
+#[test]
+fn objects_of_another_media_are_refused() {
+    let mut source = store();
+    let mut write = source.write().expect("write");
+    write.insert("c", &Convoy::sample(0)).expect("insert");
+    write.commit().expect("commit");
+    let mut change = first_change(&mut source, LOCAL);
+    let Some(RowOp::PutObject { media, .. }) = change.ops.first_mut() else { panic!("object first: {change:?}") };
+    *media = 2;
+    let mut target = replica();
+    let mut write = target.write().expect("write");
+    assert!(matches!(write.apply(&change), Err(StoreError::MalformedChange(Malformed::Media { media: 2 }))));
+    assert_eq!(write.resolve(Convoy::CODE, "c", LOCAL).expect("resolve"), None);
+}
+
+// Behaviour (MAX_CHANGES_PAGE_BYTES): a page stops before the entry that would take it past the
+// byte budget, yet always holds one entry, so paging with a budget below every entry still walks
+// the whole log, one entry per page.
+#[test]
+fn change_pages_respect_their_byte_budget() {
+    let mut source = store();
+    write_history(&mut source, "m", &["second", "third"]);
+    let changes = log(&mut source, LOCAL);
+    let sizes: Vec<usize> = changes.iter().map(|change| change.encode().expect("encode").len()).collect();
+    let with_budget = |store: Store, bytes: usize| {
+        let options = StoreOptions { change_page_bytes: bytes, ..StoreOptions::default() };
+        Store::open_with(store.into_connection(), LOCAL, registry(), options).expect("reopen")
+    };
+    let mut store = with_budget(source, sizes[0] + sizes[1]);
+    assert_eq!(store.read().expect("read").changes_since(LOCAL, 0, 100).expect("page"), changes[..2]);
+    let mut store = with_budget(store, sizes[0] + sizes[1] - 1);
+    assert_eq!(store.read().expect("read").changes_since(LOCAL, 0, 100).expect("page"), changes[..1]);
+    let mut store = with_budget(store, 1);
+    let id = store.read().expect("read").resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
+    let mut walked = Vec::new();
+    let mut after = 0;
+    loop {
+        let page = store.read().expect("read").changes(id, after, 100).expect("page");
+        let Some(last) = page.last() else { break };
+        assert_eq!(page.len(), 1);
+        after = last.home_seq;
+        walked.extend(page);
+    }
+    assert_eq!(walked, changes);
+}
+
+/// Identity and string rows, and the rows any statement on this connection has written so far
+/// (rolled back or not).
+fn row_counts(store: Store) -> (Store, (i64, i64, u64)) {
+    let home = store.home().to_owned();
+    let conn = store.into_connection();
+    let count = |table: &str| conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get::<_, i64>(0)).expect("count");
+    let counts = (count("resource_identity"), count("strings"), conn.total_changes());
+    (Store::open(conn, &home, registry()).expect("reopen"), counts)
+}
+
+// Behaviour (#3338 review): `apply` decides duplicates and gaps on a read-only lookup, so a
+// refused change for a never-seen name (a gap, or the impossible sequence 0) writes no identity or
+// string row, not even one its savepoint rolls back; and a replay at or below the identity's sequence is `Duplicate` even when its
+// `prev_seq` no longer matches: duplicate takes precedence over gap.
+#[test]
+fn refusals_and_duplicates_create_no_rows() {
+    let mut source = Store::open(Connection::open_in_memory().expect("db"), "elsewhere", registry()).expect("open");
+    write_history(&mut source, "ghost", &["second"]);
+    let changes = log(&mut source, "elsewhere");
+
+    let (mut target, before) = row_counts(replica());
+    let mut write = target.write().expect("write");
+    assert!(matches!(write.apply(&changes[1]), Err(StoreError::Gap { expected: 0, .. })));
+    let zero = RowChange { home_seq: 0, ..changes[0].clone() };
+    assert!(matches!(write.apply(&zero), Err(StoreError::MalformedChange(Malformed::Sequence { home_seq: 0 }))));
+    write.commit().expect("commit");
+    let (mut target, after) = row_counts(target);
+    assert_eq!(after, before, "a refused never-seen name writes no row, not even one rolled back");
+
+    let mut write = target.write().expect("write");
+    for change in &changes {
+        write.apply(change).expect("apply");
+    }
+    let stale = RowChange { prev_seq: 999, ..changes[1].clone() };
+    assert!(matches!(write.apply(&stale).expect("duplicate"), Applied::Duplicate(_)));
+    let stale_first = RowChange { prev_seq: 7, ..changes[0].clone() };
+    assert!(matches!(write.apply(&stale_first).expect("duplicate"), Applied::Duplicate(_)));
+    write.commit().expect("commit");
 }
