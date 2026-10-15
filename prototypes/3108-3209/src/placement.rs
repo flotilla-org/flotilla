@@ -1,6 +1,8 @@
 //! Admission grants per-class caps; placement leases a whole request on one host.
 //! This prototype seam has no transport or persistence. The production engine
 //! will own the local observations supplied to admission and placement.
+//! Prototype input and invariant failures panic; production integration must
+//! surface explicit errors at those boundaries.
 use std::collections::BTreeMap;
 
 pub type Counts = BTreeMap<u64, u64>;
@@ -48,6 +50,7 @@ impl Placement {
         let Some(old) = self.quotas.get(&convoy) else {
             return false;
         };
+        // Readmission raises counts within the original abstract class domain.
         if old.len() != quota.len() || old.iter().any(|(k, v)| quota.get(k).is_none_or(|new| new < v)) {
             return false;
         }
@@ -71,7 +74,8 @@ impl Placement {
         let mut free = self.capacities.get(&host).expect("known host").clone();
         for vessel in self.vessels.values().filter(|v| Self::host(&v.phase) == Some(host)) {
             for (dim, amount) in &vessel.request.shape {
-                *free.get_mut(dim).expect("known dimension") -= amount;
+                let remaining = free.get_mut(dim).expect("known dimension");
+                *remaining = remaining.checked_sub(*amount).expect("host leases stay within capacity");
             }
         }
         free
