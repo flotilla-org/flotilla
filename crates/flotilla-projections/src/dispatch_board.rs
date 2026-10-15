@@ -228,6 +228,8 @@ impl DispatchBoard<'_> {
         let mut mission_issues = std::collections::BTreeSet::new();
         // Running tickets need current fields for tier-specific crew accounting,
         // even after their ready label is removed. Do not fetch inactive backlog.
+        // Fail closed on store failure: missing live tickets would omit their
+        // Priority fields from fallback observations and bias tier occupancy.
         let live = self
             .backend
             .query_declared::<flotilla_resources::Convoy>(
@@ -286,6 +288,9 @@ impl DispatchBoard<'_> {
                                     .iter()
                                     .any(|label| label.rsplit(':').next().is_some_and(|kind| kind.eq_ignore_ascii_case("map"))))
                         {
+                            // ObservedIssueProvider coalesces this source/ticket
+                            // through ForgeReadRequest::Mission for 60 seconds.
+                            // Only ready/live tickets and tracking issues qualify.
                             issue.mission_fields = provider.mission_fields(&reference).await?;
                         }
                     }

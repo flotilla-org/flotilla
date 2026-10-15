@@ -79,10 +79,32 @@ impl From<MissionAttributesRecord> for MissionAttributes {
     }
 }
 
+/// Tracker observations also live in ForgeRead.status.value. Keep their stored
+/// decoder strict, with the same one-generation retirement as Project attributes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "MissionFieldsRecord")]
 pub struct MissionFields {
     pub priority: Option<Priority>,
     pub weight: Option<MissionWeight>,
+}
+
+// Remove in N+2, one roll after #3313's Priority/Weight observation generation.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct MissionFieldsRecord {
+    priority: Option<Priority>,
+    weight: Option<MissionWeight>,
+    #[serde(rename = "value")]
+    _value: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "class_of_service")]
+    _class_of_service: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "crew_limit")]
+    _crew_limit: Option<serde::de::IgnoredAny>,
+}
+impl From<MissionFieldsRecord> for MissionFields {
+    fn from(record: MissionFieldsRecord) -> Self {
+        Self { priority: record.priority, weight: record.weight }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -189,6 +211,17 @@ mod tests {
         assert_eq!(compare_share(usize::MAX, f64::MAX, usize::MAX, tiny), Ordering::Less);
         assert_eq!(compare_share(usize::MAX, 1.0, usize::MAX, 1.0), Ordering::Equal);
         assert_eq!(compare_share(0, f64::MIN_POSITIVE, 1, f64::MIN_POSITIVE * 2.0), Ordering::Equal);
+    }
+
+    // The previous generation stored normalized mission fields inside generic
+    // ForgeRead values. Retired fields decode but never appear in new writes.
+    #[test]
+    fn stored_mission_field_observations_drop_retired_attributes() {
+        let old = serde_json::json!({"value":3, "class_of_service":"expedite", "crew_limit":0});
+        let fields: MissionFields = serde_json::from_value(old).expect("old observation");
+        assert_eq!(fields, MissionFields::default());
+        assert_eq!(serde_json::to_value(fields).expect("new observation"), serde_json::json!({"priority":null, "weight":null}));
+        assert!(serde_json::from_value::<MissionFields>(serde_json::json!({"unknown":1})).is_err());
     }
 
     // #3313: finite nonnegative weights round trip; retired attributes decode

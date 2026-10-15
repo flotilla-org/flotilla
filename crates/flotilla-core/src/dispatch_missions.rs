@@ -34,6 +34,9 @@ impl MissionOccupancy {
                 let score = board.score(&issue_from_convoy(served), policy)?;
                 served_missions.insert((score.mission, score.attributes.priority));
             }
+            // A multi-tier convoy contributes its full crew to each tier it
+            // serves: tiers run independent stride competitions. Project count
+            // remains once per convoy, and duplicate tickets never multiply it.
             for key in served_missions {
                 *result.missions.entry(key).or_default() += count;
             }
@@ -75,6 +78,7 @@ pub fn normalize_attributes(
     labels: &[String],
     defaults: &MissionAttributes,
 ) -> Result<(MissionAttributes, BTreeMap<String, String>), String> {
+    // Label prefixes are exact lowercase; only Priority values are case-folded.
     let mut fallback = MissionFields::default();
     let mut seen = BTreeSet::new();
     for label in labels {
@@ -555,6 +559,77 @@ mod tests {
             reads.of(&backend)
         })
         .await;
+    }
+
+    // A convoy with two live roles serves both tier competitions with two crews,
+    // while its Project has two crews total. Duplicate tickets in a tier add none.
+    #[tokio::test]
+    async fn mixed_tier_convoy_counts_once_in_each_served_tier() {
+        use flotilla_resources::{
+            Convoy, ConvoyIssue, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, IssueSnapshot,
+        };
+        use flotilla_store::ResourceBackend;
+        use flotilla_store_memory::InMemoryBackend;
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let convoys = backend.using::<Convoy>("ns");
+        let board = board(vec![board_issue("1", None, &[], &[]), board_issue("2", None, &[], &[])]);
+        let mut urgent = issue("1");
+        urgent.labels = vec!["priority:urgent".into()];
+        let medium = issue("2");
+        let served = [&urgent, &medium, &urgent]
+            .into_iter()
+            .map(|ticket| ConvoyIssue {
+                reference: ticket.reference.clone(),
+                repository_ref: None,
+                snapshot: IssueSnapshot {
+                    title: ticket.title.clone(),
+                    body: None,
+                    state: ticket.state,
+                    labels: ticket.labels.clone(),
+                    as_of: ticket.as_of,
+                },
+            })
+            .collect();
+        let convoy = convoys
+            .create(
+                &InputMeta::builder().name("mixed".into()).build(),
+                &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("p".into()).issues(served).build(),
+            )
+            .await
+            .expect("convoy");
+        convoys
+            .update_status(
+                &convoy.metadata.name,
+                &convoy.metadata.resource_version,
+                &ConvoyStatus {
+                    crew_work: BTreeMap::from([(
+                        "work".into(),
+                        ["coder", "reviewer"]
+                            .into_iter()
+                            .map(|role| (role.into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()))
+                            .collect(),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("crew state");
+        let convoy = convoys.get("mixed").await.expect("live convoy");
+        let policy = DispatchPolicy::builder().build();
+        let occupancy = MissionOccupancy::collect(&board, &policy, [&convoy]).expect("live counts");
+        assert_eq!(occupancy.project_active, 2);
+        assert_eq!(occupancy.missions.len(), 2);
+        for ticket in [&urgent, &medium] {
+            let mut score = board.score(ticket, &policy).expect("tier score");
+            occupancy.apply(&mut score);
+            assert_eq!(score.mission_active_crews, 2);
+            assert_eq!(score.project_active_crews, 2);
+        }
+        let mut terminal = convoy.clone();
+        terminal.status.as_mut().expect("status").phase = ConvoyPhase::Landed;
+        let released = MissionOccupancy::collect(&board, &policy, [&terminal]).expect("settled counts");
+        assert_eq!(released.project_active, 0);
+        assert!(released.missions.is_empty());
     }
 
     // #3313: strict tiers dominate share and every within-mission term.

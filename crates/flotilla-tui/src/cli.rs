@@ -336,6 +336,21 @@ pub(crate) fn format_fulfilment_list_human(response: &FulfilmentListResponse) ->
     format!("{table}\n")
 }
 
+fn format_dispatch_score(score: &flotilla_protocol::DispatchScore) -> String {
+    let weight = f64::from(score.attributes.weight);
+    let share = if weight == 0.0 { "fallback".into() } else { format!("{}/{weight}", score.mission_active_crews as u128 + 1) };
+    format!(
+        "{:?} ({}) weight={weight} live={} next/share={share} project-live={} project-share={} unblocks={} conflict={}",
+        score.attributes.priority,
+        score.attribute_sources.get("priority").map_or("charter", String::as_str),
+        score.mission_active_crews,
+        score.project_active_crews,
+        score.project_share,
+        score.unblock_count,
+        score.conflict_penalty
+    )
+}
+
 fn format_dispatch_queue_human(response: &flotilla_protocol::DispatchQueueResponse) -> String {
     if response.entries.is_empty() {
         return "No dispatchable issues.\n".to_string();
@@ -348,19 +363,7 @@ fn format_dispatch_queue_human(response: &flotilla_protocol::DispatchQueueRespon
             Cell::new(format!("{}/{}", entry.namespace, entry.project)),
             Cell::new(format!("{}#{}", entry.issue.source.scope, entry.issue.id)),
             Cell::new(entry.score.as_ref().map_or("unranked", |score| score.mission.as_str())),
-            Cell::new(entry.score.as_ref().map_or_else(String::new, |score| {
-                format!(
-                    "{:?} ({}) weight={} live={} next/share={}/{} unblocks={} conflict={}",
-                    score.attributes.priority,
-                    score.attribute_sources.get("priority").map_or("charter", String::as_str),
-                    f64::from(score.attributes.weight),
-                    score.mission_active_crews,
-                    score.mission_active_crews as u128 + 1,
-                    f64::from(score.attributes.weight),
-                    score.unblock_count,
-                    score.conflict_penalty
-                )
-            })),
+            Cell::new(entry.score.as_ref().map_or_else(String::new, format_dispatch_score)),
             Cell::new(format!("{}s", entry.age_seconds)),
             Cell::new(if entry.attention { "! stale" } else { "" }),
             Cell::new(&entry.title),
@@ -913,18 +916,7 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         .unwrap_or_default();
     let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
     for (issue, score) in &explanation.dispatch_scores {
-        let _ = writeln!(
-            output,
-            "Dispatch {issue}: {:?} ({}) weight={} live={} next/share={}/{} project-live={} project-share={}",
-            score.attributes.priority,
-            score.attribute_sources.get("priority").map_or("charter", String::as_str),
-            f64::from(score.attributes.weight),
-            score.mission_active_crews,
-            score.mission_active_crews as u128 + 1,
-            f64::from(score.attributes.weight),
-            score.project_active_crews,
-            score.project_share
-        );
+        let _ = writeln!(output, "Dispatch {issue}: {}", format_dispatch_score(score));
     }
     if let Some(error) = &explanation.dispatch_score_error {
         let _ = writeln!(output, "Dispatch score unavailable: {error}");

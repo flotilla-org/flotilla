@@ -926,3 +926,26 @@ fn claimed_resume_reports_information_only() {
     assert_eq!(format_command_result(&result), "crew already claimed; delivered without reopening");
     assert!(serde_json::to_string(&result).unwrap().contains("crew already claimed; delivered without reopening"));
 }
+
+// Zero-weight missions are fallback work, not a division by zero. The queue
+// and convoy explanation use the same score formatter for all share displays.
+#[test]
+fn dispatch_score_formats_fallback_and_positive_share() {
+    let mut score = flotilla_protocol::DispatchScore::builder()
+        .mission("routine".into())
+        .attributes(flotilla_protocol::MissionAttributes::default())
+        .membership("routine".into())
+        .attribute_sources(Default::default())
+        .unblock_count(0)
+        .conflict_penalty(0)
+        .project_share(1)
+        .project_active_crews(2)
+        .mission_active_crews(2)
+        .build();
+    score.attributes.weight = 0.0.try_into().expect("zero weight");
+    let output = super::format_dispatch_score(&score);
+    assert!(output.contains("next/share=fallback"), "{output}");
+    assert!(!output.contains("/0"), "{output}");
+    score.attributes.weight = 2.0.try_into().expect("positive weight");
+    assert!(super::format_dispatch_score(&score).contains("next/share=3/2"));
+}

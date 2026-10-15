@@ -6038,6 +6038,9 @@ impl InProcessDaemon {
         let Some(policy) = &project.spec.dispatch_policy else {
             return Ok(BTreeMap::new());
         };
+        // This reads the shared immutable board snapshot, scheduling background
+        // warming when cold/stale; it never waits for HTTP. Explanation rebuilds
+        // one project's mission graph and reads only its live convoy subset.
         let inputs = self.collect_dispatch_board_inputs(std::slice::from_ref(project)).await?;
         let (_, snapshots) = inputs.get(project_name).ok_or("project board unavailable")?.as_ref().map_err(Clone::clone)?;
         let board = MissionBoard::new(&snapshots.iter().map(|(_, board)| board.as_ref().clone()).collect::<Vec<_>>())?;

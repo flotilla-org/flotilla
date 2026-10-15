@@ -888,6 +888,29 @@ mod tests {
         assert!(peer.using::<ForgeReadHeartbeat>("flotilla").get(&name).await.is_ok());
     }
 
+    // Fallback mission fields use the same per-source/ticket 60s cache as other
+    // ForgeReads. Repeated board users share a read until the freshness edge.
+    #[tokio::test]
+    async fn fallback_mission_fields_share_the_per_ticket_freshness_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (reads, clock) = clocked_reads("owner");
+        let calls = AtomicUsize::new(0);
+        let source = source();
+        let expected = flotilla_protocol::MissionFields { priority: Some(flotilla_protocol::Priority::High), ..Default::default() };
+        for (id, elapsed, count) in [("1", 0, 1), ("1", 0, 1), ("2", 0, 2), ("1", 59, 2), ("1", 1, 3)] {
+            clock.advance(Duration::seconds(elapsed));
+            let actual = reads
+                .read(&source, ForgeReadRequest::Mission { id: id.into() }, || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(expected.clone())
+                })
+                .await
+                .expect("field observation");
+            assert_eq!(actual, expected);
+            assert_eq!(calls.load(Ordering::SeqCst), count);
+        }
+    }
+
     // Minute refreshes retain one whole-board publication, while demand renews
     // in its small companion and observation heartbeats publish every 5 minutes.
     // Generate elapsed poll counts across heartbeat edges and domain changes.

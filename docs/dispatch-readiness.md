@@ -73,7 +73,8 @@ default `medium`) and **Weight** (a finite nonnegative number, default 1).
 Each resolves independently from the tracking issue's `Priority` single-select or
 `Weight` number issue field, then a `priority:<tier>` or `weight:N` label, then
 charter defaults. Priority names ignore case and surrounding whitespace; stored
-names are lowercase. Null fields fall back. A present field overrides even an
+names are lowercase. Label prefixes are exact lowercase (`priority:` and
+`weight:`); only the Priority value ignores case. Null fields fall back. A present field overrides even an
 invalid stale label. Duplicate or invalid explicit attributes fail the Project
 closed, with `status.dispatch_queue_error`; readiness clocks remain stored.
 Retired `value:`, `cos:` and `crew-limit:` labels have no effect.
@@ -147,7 +148,8 @@ never wait for forge calls. Live convoy accounting queries exclude terminal
 history in the store, before decoding records.
 
 `dispatch ready` shows tier/source, weight, live crews and prospective crews per
-weight (`next/share`); JSON includes the source and the numeric inputs in `score`.
+weight (`next/share`, or `fallback` at zero weight); JSON includes the source and
+the numeric inputs in `score`.
 `convoy explain` reports the same current score for every served ticket, including
 per-ticket overrides, or an explicit score-unavailable reason if the board is not
 warm. It does not silently invent a tier from missing tracker evidence.
@@ -177,3 +179,5 @@ attributes need companion conversion to Priority/Weight in the same roll.
 Verify the registered declarations and ship their companion conversions in the
 same roll; do not treat successful legacy decoding as preservation of the old
 scheduling policy.
+A retired `crew_limit: 0` hard pause is not preserved: no Weight value is a hard
+pause. Weight zero is the nearest share setting, but can still run fallback work.
