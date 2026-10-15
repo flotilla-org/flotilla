@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -23,7 +23,7 @@
+@@ -27,7 +27,7 @@
    pure def step(s: State, e: Event): Next = match s {
      | Open(w) => match e {
        | Keep(p) => if (not(w.promises.keys().contains(p))) Refused(UnknownPromise)

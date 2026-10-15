@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs inside the allocated formal-modelling host. A budget exhaustion is not a proof.
+# The deep tier, run directly on a host with the formal-modelling tools and the
+# pinned Rust toolchain. A budget exhaustion is not a proof.
 set -euo pipefail
 # Expanded typed compositions exceed the JVM's default parser stack.
 export JVM_ARGS="${JVM_ARGS:--Xmx3g -Xss16m}"

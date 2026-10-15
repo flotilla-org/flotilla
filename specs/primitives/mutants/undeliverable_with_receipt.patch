@@ -1,6 +1,6 @@
 --- a/machines/message.qnt
 +++ b/machines/message.qnt
-@@ -48,7 +48,7 @@
+@@ -51,7 +51,7 @@
                    else if (bound and o.appliedThrough <= env.deadline) Refused(PrefixBeforeDeadline)
                    else if (o.met) Refused(ExpectationMet) else Moved(s)
                | Undeliverable => match s {

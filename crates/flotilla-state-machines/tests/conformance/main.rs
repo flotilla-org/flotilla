@@ -19,10 +19,9 @@
 //! `Resource::state()`, plus the immutable spec where the Quint state carries
 //! request data, plus attempt records where its history is attempts) in the
 //! spec's ITF shape, and the comparison is equality with the spec's state. No
-//! adaptor reads edge events. One spec state is projected before comparison:
-//! a message drop's `watermark` and `bound` outside an expiry, which the spec
-//! records but no rule consulted (see `message`). Each adaptor's module doc
-//! lists the field mapping and every remaining encoding choice.
+//! adaptor reads edge events, and no spec state is projected before
+//! comparison. Each adaptor's module doc lists the field mapping and every
+//! remaining encoding choice.
 
 #[path = "../common/itf.rs"]
 mod itf;

@@ -4,8 +4,10 @@ module convoy {
   type VesselClass = int
   type Promise = { kind: str, target: str }
   type ConvoyRequest = { project: str, promises: PromiseId -> Promise, quota: VesselClass -> int, priority: int }
+  // What admission fixes for the convoy's life; the quota in force is work state.
+  type ConvoySpec = { project: str, promises: PromiseId -> Promise, priority: int }
   type PromiseState = Pending | Kept | Retracted
-  type Work = { request: ConvoyRequest, promises: PromiseId -> PromiseState }
+  type Work = { spec: ConvoySpec, promises: PromiseId -> PromiseState, quota: VesselClass -> int }
   type State = Open(Work) | Delivered(Work) | Abandoned({ work: Work, reason: str })
   type Event = Keep(PromiseId) | AcceptRetraction({ promise: PromiseId, authorised: bool })
     | Deliver | Abandon({ authorised: bool, reason: str })
@@ -17,7 +19,8 @@ module convoy {
   pure def admit(r: ConvoyRequest): Next =
     if (r.promises.keys().size() == 0) Refused(NoPromises)
     else if (not(validQuota(r.quota))) Refused(InvalidQuota)
-    else Moved(Open({ request: r, promises: r.promises.keys().mapBy(_ => Pending) }))
+    else Moved(Open({ spec: { project: r.project, promises: r.promises, priority: r.priority },
+      promises: r.promises.keys().mapBy(_ => Pending), quota: r.quota }))
   pure def work(s: State): Work = match s {
     | Open(w) => w | Delivered(w) => w | Abandoned(a) => a.work
   }
@@ -36,8 +39,8 @@ module convoy {
           else Moved(Abandoned({ work: w, reason: a.reason }))
       | Readmit(a) => if (not(a.authorised)) Refused(Unauthorised)
           else if (not(validQuota(a.quota))) Refused(InvalidQuota)
-          else if (a.quota.keys() != w.request.quota.keys() or not(a.quota.keys().forall(c => a.quota.get(c) >= w.request.quota.get(c)))) Refused(QuotaNotIncrease)
-          else Moved(Open({ ...w, request: { ...w.request, quota: a.quota } }))
+          else if (a.quota.keys() != w.quota.keys() or not(a.quota.keys().forall(c => a.quota.get(c) >= w.quota.get(c)))) Refused(QuotaNotIncrease)
+          else Moved(Open({ ...w, quota: a.quota }))
     }
     | _ => Refused(NotOpen)
   }

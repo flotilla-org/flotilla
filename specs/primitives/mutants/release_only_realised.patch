@@ -1,6 +1,6 @@
 --- a/machines/lifecycle.qnt
 +++ b/machines/lifecycle.qnt
-@@ -11,7 +11,7 @@
+@@ -12,7 +12,7 @@
      | _ => match e {
        | Realise(o) => if (s != Requested) Refused(WrongState)
            else if (o.present and o.matches) Moved(Realised(o.identity)) else Refused(MissingEvidence)

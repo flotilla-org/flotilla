@@ -20,9 +20,11 @@ viewer.html   local, standalone ITF viewer
 ## Reading the design
 
 Each resource-kind module owns a store `id -> Absent | Present(State)`.
-Its states, events and refusals are sum types. State data belongs to its variant:
-`Awaiting` carries its receiver; `Dropped` its reason and expiry evidence;
-`Abandoned` its reason; an AgentSession is `Live(channel) | Ended`.
+Its states, events and refusals are sum types. A state is a value: its label
+plus the data that label carries, exactly what the Rust engine stores and
+compares. `Awaiting` carries its receiver; `Dropped` its reason and the evidence
+its rule consulted; `Abandoned` its reason; an AgentSession is
+`Live(channel) | Ended(reason)`.
 A pure `step(state, event)` uses `match` and returns `Moved(state) | Refused(reason)`.
 Every gate reads typed local evidence on the event inside `step`. Admission
 validates a typed request before creating a slot. Named actions look up a slot,
@@ -38,7 +40,9 @@ The step blocks contain no assignment lists or machine rules. Imported variants 
 `match` patterns (constructors in expressions remain qualified).
 
 Convoy admission accepts `{project, promises, quota, priority}`. The promise map
-is nonempty and preserves opaque kind/target data. Resolution is a map from
+is nonempty and preserves opaque kind/target data. Admission fixes the project,
+the promise definitions and the priority; the quota in force is work state, which
+readmission raises, so no admitted copy of it can go stale. Resolution is a map from
 promise id to `Pending | Kept | Retracted`; a settled promise cannot be kept or
 retracted again (`PromiseSettled`), and `Kept` is final. Terminal variants retain
 the work record so delivery and finality remain state properties. A continuing
@@ -55,9 +59,10 @@ is currently capped. No borrowing or spend accounting is modeled.
 
 The Vessel module composes the shared lifecycle's pure rules and owns placement
 state; it does not duplicate a lifecycle store. Placement evidence carries the
-observed caps, live counts, available capacity and waiting requests. Allocation
-records retain the placement snapshot, allowing the priority invariant to be a
-property of state rather than a scenario flag. Ensure carries its binding,
+observed caps, live counts, available capacity and waiting requests. A lease
+holds only its request and host. The scenario keeps what each placement's
+priority rule read (available capacity and waiting requests), so the priority
+invariant checks the evidence the rule used. Ensure carries its binding,
 recorded fulfillers and attempt window on the relevant variants.
 
 A gate's booleans represent **versioned local evidence**, not remote queries or
@@ -149,8 +154,8 @@ decodes sum values from `{tag,value}`. Race drops replay the chosen reason and
 check it against the stored reason. It drives the engine's `Home::apply` and,
 after every step, compares every machine's state value with the model's store. It
 also drives the placement ledger and compares every vessel's lifecycle and lease
-with the model. It keeps the evidence each placement read, to compare with the
-model's placement snapshot and to check the priority rule. Accepted operations come from guarded machine actions, and graph
+with the model, and it keeps the evidence each placement read to compare with
+`placedOn` and check the priority rule. Accepted operations come from guarded machine actions, and graph
 conformance covers refused inputs. World changes supply replica observations
 rather than impersonating a production transport. Ended AgentSessions
 deliberately retain no channel in the Quint state. Both checks are `#[ignore]`d
@@ -163,8 +168,8 @@ priority queue, and retaining a lease after Gone, and undeliverable drops with c
 parse, compiler and tool failures are errors, never mutant detection. Production
 modules contain no mutant switches. Generated specs, ITF and logs stay in `build/`.
 Shell connects compilation to TLC (`VIEW` is not exposed by Quint's TLC runtime
-config) and invokes Cargo. Python tests cover allocation-runner contracts, not
-machine semantics. The historical exploration remains separate.
+config) and invokes Cargo. Python tests cover the runners' tool checks and the
+deep bound change, not machine semantics. The historical exploration remains separate.
 
 Open `viewer.html` directly, choose an ITF file from the printed fast-run directory,
 and use Previous/Next or the slider. It draws the states/edges visited in that
@@ -196,63 +201,26 @@ at the chosen depth (default 10); these are bounded SMT results, not induction o
 unbounded liveness proofs. The baseline TLC and Rust checks remain necessary:
 SMT does not replace trace replay. Logs go under `build/`.
 
-## Deep tier and allocation ownership
+## Deep tier
 
 ```sh
-specs/primitives/deep.sh specs/primitives/ec2-provider.sh /tmp/quint-results
+specs/primitives/deep-local.sh
 ```
 
-The optional EC2 provider needs externally supplied AWS credentials, AWS CLI,
-`QUINT_AMI_ID` (x86_64 image with the formal-modelling tools and pinned Rust),
-`QUINT_SUBNET_ID`, `QUINT_SECURITY_GROUP_ID` (SSH access), and `QUINT_KEY_NAME`.
-`QUINT_SSH_KEY_FILE` is optional when the key is already available to SSH;
-`QUINT_SSH_USER` defaults to ubuntu. The default instance is `c7i.8xlarge`,
-overridable with `QUINT_INSTANCE_TYPE`. This repository supplies no credentials
-or account/network defaults. The local gate never allocates a host.
-
-`deep.sh` owns a unique allocation and calls an executable provider with:
-
-```text
-start ALLOCATION
-run ALLOCATION SOURCE_BUNDLE
-collect ALLOCATION OUTPUT_DIRECTORY
-stop ALLOCATION
-```
-
-A Namespace/existing project provider can implement the same small interface.
-The trap collects partial results once run is reached and always stops the allocation, even when start or
-execution fails. The driver marks run reached before invoking the provider, so
-collection still runs after an execution timeout. Failed AWS teardown retains
-the local allocation state for retry diagnostics; successful teardown removes it.
-Start/run/cleanup have independent timeout limits, and signals
-enter the same cleanup path; teardown failure is a failed run. EC2 start is idempotent by
-client token, and stop searches that token even if start failed before saving an
-instance ID. `deep-contract-test.sh` checks success/start/run/collect/stop failures and execution timeout with a
-subprocess-boundary fake, without Docker or live hosts.
-
-The remote local runner uses all available TLC workers, six stream rows, safety
-and conditional liveness in one run per interaction, and a per-scenario time
-budget (default 60 seconds). It generates additional ITF traces and replays them,
-then runs the symbolic tier (default budget 180 seconds). `TLC_HEAP` defaults to
-8g. A budget exhaustion is reported separately and returns nonzero; it is never
-called a proof. Results include logs, configs, generated specs and ITF; TLC
-counterexamples are also retained in its text output. The provider collects them
-before terminating the box. Inspect `results.txt` and the individual logs, not
-only process completion.
+Run it directly on a host with Quint, JDK 21, the pinned Apalache jar and the
+pinned Rust toolchain; it allocates nothing and needs no credentials. It uses
+all available TLC workers, six stream rows, safety and conditional liveness in
+one run per interaction, and a per-scenario time budget (default 60 seconds). It
+generates additional ITF traces and replays them, then runs the symbolic tier
+(default budget 180 seconds). `TLC_HEAP` defaults to 8g. A budget exhaustion is
+reported separately and returns nonzero; it is never called a proof. Results,
+including logs, configs, generated specs and ITF, stay under `build/deep/`, and
+TLC counterexamples are retained in its text output. Inspect `results.txt` and
+the individual logs, not only process completion.
 
 ## Shape and handoff
 
 The decided specs stay here, and `flotilla-state-machines` is their one Rust
 implementation. Where the Rust and a spec disagree, fix the Rust. Production
 resource shapes, the stored-record corpus and out-of-repo manifests are
-unchanged; no production crate uses the engine yet. The deep bundle carries the
-tracked workspace, so `cargo test -p flotilla-state-machines` resolves remotely.
-
-The optional EC2 adapter uses trust-on-first-use SSH host keys (`accept-new`)
-with a separate known-hosts file per throwaway allocation, trusting the public
-IP supplied by the authenticated EC2 API. It refuses missing public addresses
-before attempting SSH. Its AMI must support cloud-init shell user data and
-`shutdown`: launch configures instance-initiated shutdown to terminate and
-schedules shutdown after `QUINT_MAX_LIFETIME_MINUTES` (default 30). Choose a
-lifetime longer than the intended run; this independent deadline bounds leaks
-if the local driver is killed. Normal teardown still terminates immediately.
+unchanged; no production crate uses the engine yet.

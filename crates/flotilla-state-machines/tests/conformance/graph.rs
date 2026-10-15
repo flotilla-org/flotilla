@@ -7,8 +7,7 @@
 //! the shortest event path to every reachable state. A [`Conformance`]
 //! adaptor rebuilds the Rust resource at a state by replaying that path
 //! through the real engine, then applies a probe's event and encodes the Rust
-//! state value in the spec's ITF shape, which must equal the spec's state
-//! (as [`Conformance::compared`] presents it).
+//! state value in the spec's ITF shape, which must equal the spec's state.
 
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque},
@@ -66,14 +65,6 @@ pub trait Conformance {
     /// request data, and attempt records where its history is attempts.
     /// Never from edge events.
     fn encode(subject: &Self::Subject) -> Value;
-
-    /// The spec state as compared with [`Conformance::encode`]: the state
-    /// itself, except where an adaptor's module doc names a field the spec
-    /// records but its rule never consulted, which this replaces with the
-    /// value the Rust encoding gives it.
-    fn compared(state: &Value) -> Value {
-        state.clone()
-    }
 
     /// Rises on every accepted write, so an unchanged version means a refusal recorded nothing.
     fn version(subject: &Self::Subject) -> u64;
@@ -175,7 +166,7 @@ fn describe(step: &Step) -> String {
 fn build<M: Conformance>(path: &Path) -> Result<M::Subject, String> {
     let mut subject = M::create(&path.initial);
     let rust = normalise(&M::encode(&subject));
-    if rust != normalise(&M::compared(&path.initial)) {
+    if rust != normalise(&path.initial) {
         return Err(format!("initial {}: rust created {}", show(&path.initial), show(&rust)));
     }
     for (index, edge) in path.steps.iter().enumerate() {
@@ -186,7 +177,7 @@ fn build<M: Conformance>(path: &Path) -> Result<M::Subject, String> {
             other => return Err(format!("{}: spec moved to {}, rust {}", context(), show(&edge.to), describe(&other))),
         }
         let rust = normalise(&M::encode(&subject));
-        if rust != normalise(&M::compared(&edge.to)) {
+        if rust != normalise(&edge.to) {
             return Err(format!("{}: spec moved to {}, rust reached {}", context(), show(&edge.to), show(&rust)));
         }
     }
@@ -275,7 +266,7 @@ pub fn check<M: Conformance>(nodes: &[Value], report: &mut Report) {
         match (tag(&probe.result), step) {
             ("Moved", Step::Accepted) => {
                 let rust = normalise(&M::encode(&subject));
-                if rust != normalise(&M::compared(payload(&probe.result))) {
+                if rust != normalise(payload(&probe.result)) {
                     report.disagreements.push(disagree(format!("moved to {}", show(&rust))));
                 }
             }
