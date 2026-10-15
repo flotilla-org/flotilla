@@ -1,0 +1,2 @@
+# Hegel keeps failing examples locally; they are never fixtures.
+.hegel/

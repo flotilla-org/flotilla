@@ -112,6 +112,7 @@ impl Machine for LatchMachine {
             )
             .end(Spent, "the latch fired for good")
             .end(Withdrawn, "the latch was withdrawn")
+            .attempts_in([Armed])
     }
 
     fn admit(spent: bool) -> Result<(bool, Latch), LatchRefusal> {
