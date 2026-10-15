@@ -535,13 +535,13 @@ async fn create_reports_infrastructure_and_requested_mount_metadata() {
     let calls = runner.calls();
     let (_, args, _) = &calls[0];
     assert!(
-        args.windows(2).any(|pair| pair == ["-v", "/host/daemon:/run/flotilla-daemon:rw"]),
-        "daemon socket parent directory should be mounted read-write; args: {args:?}",
+        args.windows(2).any(|pair| pair == ["-v", "/host/daemon/flotilla.sock:/run/flotilla-daemon/flotilla.sock:rw"]),
+        "only the socket itself may be mounted; args: {args:?}",
     );
     assert_eq!(
         handle.provisioned_mounts(),
         vec![
-            ProvisionedMount::new("/host/daemon", "/run/flotilla-daemon", ProvisionedMountMode::Rw),
+            ProvisionedMount::new("/host/daemon/flotilla.sock", "/run/flotilla-daemon/flotilla.sock", ProvisionedMountMode::Rw),
             ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo", ProvisionedMountMode::Ro),
         ],
         "docker provisioned environments should report infrastructure and requested bind mount metadata",
@@ -1806,5 +1806,28 @@ async fn inspection_reports_weight_and_legacy_quotas() {
         let observed = handles[0].runtime_observation().await.expect("inspect").expect("observation");
         let limits = observed.configured_limits.expect("inspected CPU settings");
         assert_eq!((limits.cpus, limits.cpu_shares), (cpus, shares));
+    }
+}
+
+// Reserved tool directories reject ancestor and descendant mount overlaps;
+// adjacent names sharing a text prefix remain independent filesystem paths.
+#[tokio::test]
+async fn create_rejects_nested_tool_mounts_but_accepts_adjacent_paths() {
+    for (target, rejected) in [("/reserved", true), ("/reserved/child", true), ("/", true), ("/reserved-other", false)] {
+        let runner = Arc::new(RecordingRunner::new_ok("container"));
+        let provider = DockerEnvironmentProvider::new(runner);
+        let opts = CreateOpts {
+            tools: vec![EnvironmentTool::new("tool", "/bin/tool").with_asset(EnvironmentToolAsset::new(
+                "/host/tool",
+                "/reserved",
+                EnvironmentToolAssetKind::Directory,
+                EnvironmentToolAssetAccess::ReadOnly,
+                "the tool",
+            ))],
+            provisioned_mounts: vec![ProvisionedMount::new("/host/request", target, ProvisionedMountMode::Ro)],
+            ..Default::default()
+        };
+        let result = provider.create(EnvironmentId::new("nested"), &flotilla_protocol::ImageId::new("image"), opts).await;
+        assert_eq!(result.is_err(), rejected, "target {target}");
     }
 }

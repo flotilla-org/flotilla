@@ -8,13 +8,13 @@ use std::{
 use async_trait::async_trait;
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_environment::environment::contained_daemon_socket_path;
 use flotilla_environment::environment::EnvironmentTool;
 use flotilla_environment::environment::EnvironmentToolAsset;
 use flotilla_environment::environment::EnvironmentToolAssetAccess;
 use flotilla_environment::environment::EnvironmentToolAssetKind;
 use flotilla_environment::environment::EnvironmentVariableUpdate;
 use flotilla_environment::environment::CONTAINED_DAEMON_REQUIRED_ENV;
+use flotilla_environment::environment::{contained_daemon_socket_path, DAEMON_SOCKET_ENV};
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -31,8 +31,6 @@ pub(crate) const ENVIRONMENT_FLOTILLA_DIRECTORY: &str = "/opt/flotilla/bin";
 pub(crate) const ENVIRONMENT_FLOTILLA_PATH: &str = "/usr/local/bin/flotilla";
 const FLOTILLA_LAUNCHER_NAME: &str = "contained-flotilla-launcher";
 const FLOTILLA_LAUNCHER: &str = "#!/bin/sh\nexec /opt/flotilla/bin/flotilla \"$@\"\n";
-#[cfg(test)]
-pub(crate) const ENVIRONMENT_DAEMON_SOCKET_PATH: &str = "/run/flotilla-daemon/flotilla.sock";
 pub(crate) const ENVIRONMENT_CLEAT_PATH: &str = "/usr/local/bin/cleat";
 pub(crate) const ENVIRONMENT_CLEAT_LIBRARY_DIR: &str = "/usr/local/lib/flotilla";
 pub(crate) const ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH: &str = "/usr/local/lib/flotilla/libghostty-vt.so.0";
@@ -261,7 +259,7 @@ impl EnvironmentToolFactory for FlotillaCliTool {
                 "the daemon socket",
             ))
             .with_environment(EnvironmentVariableUpdate::set(
-                "FLOTILLA_DAEMON_SOCKET",
+                DAEMON_SOCKET_ENV,
                 environment_socket_path.to_string_lossy(),
                 "the daemon socket",
             ))

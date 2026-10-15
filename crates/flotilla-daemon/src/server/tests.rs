@@ -21,7 +21,7 @@ use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::git_process_discovery;
 use flotilla_discovery_testkit::init_git_repo_with_remote;
 use flotilla_protocol::{
-    commands::DaemonLogQuery,
+    commands::{CrewPromiseOperation, DaemonLogQuery},
     qualified_path::QualifiedPath,
     result_set::{QueryChanges, QueryId, ResultDelta},
     AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachableId, CheckoutTarget, Command, CommandAction,
@@ -5545,4 +5545,444 @@ async fn failed_connection_tasks_are_reaped() {
         assert!(super::next_connection_event(std::future::pending::<()>(), &mut tasks).await.is_none());
     }
     assert!(tasks.is_empty());
+}
+
+// #3270: the transport's environment constrains every request, independently of
+// command context. Exercise the real store and dispatcher over in-memory framing.
+#[tokio::test]
+async fn environment_transport_refuses_other_convoy_and_host_commands() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let backend = daemon.resource_backend();
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys
+        .create(&InputMeta::builder().name("own".into()).build(), &ConvoySpec::builder().workflow_ref("single-agent".into()).build())
+        .await
+        .expect("convoy");
+    convoys
+        .update_status(
+            "own",
+            &convoy.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([(
+                        "coder".into(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                    )]),
+                )]),
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    vessels: flotilla_resources::single_agent_workflow_spec().vessels,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("active crew work");
+    backend
+        .using::<Vessel>("flotilla")
+        .create(
+            &InputMeta::builder().name("placed-vessel".into()).build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "own".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .expect("placed vessel");
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(
+            &InputMeta::builder().name("placed-session".into()).build(),
+            &TerminalSessionSpec {
+                env_ref: "placed-environment".into(),
+                role: "coder".into(),
+                cwd: "/workspace".into(),
+                pool: "cleat".into(),
+                env: Default::default(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("coding"),
+                    brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
+                    context: Box::new(TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "own".into(),
+                        vessel_ref: "placed-vessel".into(),
+                    }),
+                    message: None,
+                },
+            },
+        )
+        .await
+        .expect("placed session");
+    sessions
+        .update_status(
+            "placed-session",
+            &created.metadata.resource_version,
+            &TerminalSessionStatus {
+                crew: Some(
+                    CrewSessionStatus::builder().id("placed-crew".into()).adapter("codex".into()).stance("trusted-implicit".into()).build(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("crew identity");
+    let pm = Arc::new(Mutex::new(PeerManager::new(daemon.node_id().clone())));
+    // CallerCrew.vessel is the resource reference used by artifact attribution,
+    // not the within-convoy vessel display name.
+    let crews = super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("placed-environment"))
+        .await
+        .expect("placement identity");
+    assert_eq!(crews[0].vessel, "placed-vessel");
+    let router = empty_remote_command_router(&daemon, &pm);
+    router.install_blob_store(Arc::new(crate::blob_store::TieredBlobStore::new(_tmp.path(), Vec::new()))).unwrap();
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    let (client, server) = message_session_pair();
+    let task = tokio::spawn(super::environment_connection::serve(
+        server,
+        daemon,
+        router,
+        EnvironmentId::new("placed-environment"),
+        None,
+        shutdown_rx,
+    ));
+    complete_client_hello(&client).await;
+    for (index, request) in [
+        Request::Shutdown,
+        Request::GetStatus,
+        Request::Execute {
+            command: Command::builder()
+                .action(CommandAction::QueryCrewList { context: CrewCommandContext { convoy: Some("other".into()), ..Default::default() } })
+                .build(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        client.write(Message::Request { id: index as u64, request }).await.expect("request");
+        match read_session_message(&client).await {
+            Message::Response { response, .. } => {
+                assert!(matches!(response.as_ref(), ResponseResult::Err { message } if message.starts_with("Environment")))
+            }
+            other => panic!("unexpected response {other:?}"),
+        }
+    }
+    // Unknown JSON identity selectors cannot override the connection's crew.
+    // The real dispatcher chooses that crew's placed environment before reading
+    // a source file; this fixture deliberately has no runner at that boundary.
+    let mut artifact = serde_json::to_value(Request::ArtifactPut {
+        kind: "review-round".into(),
+        subject: "other-convoy".into(),
+        summary: Default::default(),
+        media_type: "text/plain".into(),
+        source_path: "/evidence.md".into(),
+    })
+    .unwrap();
+    artifact["params"]["caller_session"] = serde_json::json!("forged-session");
+    artifact["params"]["convoy"] = serde_json::json!("other-convoy");
+    client.write(Message::Request { id: 9, request: serde_json::from_value(artifact).unwrap() }).await.unwrap();
+    let Message::Response { response, .. } = read_session_message(&client).await else { panic!("artifact response") };
+    assert!(
+        matches!(response.as_ref(), ResponseResult::Err { message } if message == "artifact environment placed-environment is unavailable")
+    );
+    // An admitted promise must reach the dispatcher, relay only its completion,
+    // and persist the promised work in the caller's convoy.
+    client
+        .write(Message::Request {
+            id: 10,
+            request: Request::Execute {
+                command: Command::builder()
+                    .action(CommandAction::CrewPromise {
+                        context: CrewCommandContext::default(),
+                        operation: CrewPromiseOperation::Promise { id: "relay-proof".into(), kind: "pr".into() },
+                    })
+                    .build(),
+            },
+        })
+        .await
+        .expect("allowed request");
+    let Response::Execute { command_id } = ok_response(read_session_message(&client).await, 10) else {
+        panic!("expected dispatched command")
+    };
+    assert!(matches!(read_session_message(&client).await, Message::Event { event }
+        if matches!(event.as_ref(), DaemonEvent::CommandFinished { command_id: finished, result: CommandValue::Ok, .. } if *finished == command_id)));
+    let convoy = convoys.get("own").await.expect("updated convoy");
+    assert!(flotilla_resources::promises::owned(convoy.status.as_ref().expect("status"), "work", "coder")
+        .iter()
+        .any(|promise| promise.id == "relay-proof"));
+    drop(client);
+    task.await.expect("transport ended");
+}
+
+// The environment lease prevents idle shutdown only while a connection exists;
+// releasing or aborting it wakes the idle watcher. Explicit shutdown is independent.
+#[tokio::test]
+async fn environment_client_lease_releases_idle_accounting() {
+    let count = Arc::new(AtomicUsize::new(1));
+    let notify = Arc::new(Notify::new());
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let lease = super::EnvironmentClientLease { count: count.clone(), notify: notify.clone() };
+    drop(lease);
+    notified.await;
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+// Supervision is conferred by a current role holder's subscription, not by a
+// caller's role spelling. Every extra command stays within that bound Project.
+#[tokio::test]
+async fn environment_supervisor_authority_is_project_bound_and_revocable() {
+    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Project, ProjectSpec};
+    let (_tmp, daemon) = empty_daemon().await;
+    let backend = daemon.resource_backend();
+    backend
+        .using::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("project-a".into()).build(),
+            &serde_json::from_value::<ProjectSpec>(
+                serde_json::json!({"display_name": "A", "role_definitions": {"lead": {"subscriptions": [{"topic": "supervision"}]}}}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    for (name, project) in [("supervisor", "project-a"), ("target", "project-a"), ("foreign", "project-b")] {
+        backend
+            .using::<Convoy>("flotilla")
+            .create(
+                &InputMeta::builder().name(name.into()).build(),
+                &ConvoySpec::builder().workflow_ref("single-agent".into()).project_ref(project.into()).build(),
+            )
+            .await
+            .unwrap();
+    }
+    for (vessel, convoy) in [("supervisor-vessel", "supervisor"), ("target-vessel", "target"), ("foreign-vessel", "foreign")] {
+        backend
+            .using::<Vessel>("flotilla")
+            .create(
+                &InputMeta::builder().name(vessel.into()).build(),
+                &flotilla_resources::VesselSpec {
+                    convoy_ref: convoy.into(),
+                    vessel_name: "work".into(),
+                    placement_policy_ref: "policy".into(),
+                    adopted_checkout_refs: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(
+            &InputMeta::builder()
+                .name("supervisor-session".into())
+                .labels(BTreeMap::from([
+                    (flotilla_resources::CONVOY_LABEL.into(), "supervisor".into()),
+                    (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
+                    (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
+                ]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "supervisor-environment".into(),
+                role: "coder".into(),
+                cwd: "/workspace".into(),
+                pool: "cleat".into(),
+                env: Default::default(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("coding"),
+                    brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
+                    context: Box::new(TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "supervisor".into(),
+                        vessel_ref: "supervisor-vessel".into(),
+                    }),
+                    message: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    sessions
+        .update_status(
+            "supervisor-session",
+            &created.metadata.resource_version,
+            &TerminalSessionStatus {
+                crew: Some(
+                    CrewSessionStatus::builder()
+                        .id("supervisor-crew".into())
+                        .adapter("codex".into())
+                        .stance("trusted-implicit".into())
+                        .build(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let ensures = backend.using::<ConvoyEnsure>("flotilla");
+    ensures
+        .create(
+            &InputMeta::builder().name("holder".into()).build(),
+            &ConvoyEnsureSpec::builder().project_ref("project-a".into()).role("lead".into()).repositories(Vec::new()).build(),
+        )
+        .await
+        .unwrap();
+    ensures
+        .update_status(
+            "holder",
+            &ensures.get("holder").await.unwrap().metadata.resource_version,
+            &ConvoyEnsureStatus { convoy_ref: Some("supervisor".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    let crew =
+        super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("supervisor-environment")).await.unwrap().remove(0);
+    let mut ordinary = crew.clone();
+    ordinary.role = "governor".into(); // A name alone is never a binding.
+    ordinary.terminal_session = None;
+    let request = |action| Request::Execute { command: Command::builder().action(action).build() };
+    for (convoy, vessel, allowed) in [("target", "target-vessel", true), ("foreign", "foreign-vessel", false)] {
+        let context = CrewCommandContext {
+            convoy: Some(convoy.into()),
+            vessel_ref: Some(vessel.into()),
+            role: Some("coder".into()),
+            ..Default::default()
+        };
+        for action in [
+            CommandAction::CrewSupervise {
+                namespace: None,
+                convoy: convoy.into(),
+                vessel: "work".into(),
+                role: "coder".into(),
+                operation: flotilla_protocol::CrewSupervisionAction::Resume,
+                message: "resume".into(),
+                actor_crew_id: None,
+            },
+            CommandAction::CrewFail { context: context.clone(), message: "failed".into(), force: false },
+            CommandAction::ConvoyAbandon { namespace: None, name: convoy.into(), reason: "done".into() },
+            CommandAction::ConvoyResume {
+                namespace: None,
+                name: convoy.into(),
+                prompt: "resume".into(),
+                vessel: None,
+                role: None,
+                reopen: false,
+            },
+            CommandAction::QueryExplainConvoy { namespace: None, name: convoy.into() },
+            CommandAction::QueryCrewList { context },
+        ] {
+            assert_eq!(
+                super::environment_supervision::authorize(&daemon, &mut request(action.clone()), &crew).await.is_ok(),
+                allowed,
+                "{action:?}"
+            );
+            assert!(super::environment_supervision::authorize(&daemon, &mut request(action), &ordinary).await.is_err());
+        }
+    }
+    for project in ["project-a", "project-b"] {
+        let allowed = project == "project-a";
+        for action in [
+            CommandAction::ConvoyStart {
+                intent: Box::new(flotilla_protocol::ConvoyStartIntent::builder().project_ref(project.into()).build()),
+            },
+            CommandAction::QueryExplainProject { name: project.into() },
+            CommandAction::QueryDispatchBoard { project: Some(project.into()) },
+            CommandAction::QueryDispatchQueue { project: Some(project.into()) },
+            CommandAction::QueryFleetList { project: Some(project.into()), crew_id: None, convoy: None },
+        ] {
+            assert_eq!(
+                super::environment_supervision::authorize(&daemon, &mut request(action.clone()), &crew).await.is_ok(),
+                allowed,
+                "{action:?}"
+            );
+            assert!(super::environment_supervision::authorize(&daemon, &mut request(action), &ordinary).await.is_err());
+        }
+    }
+    // Omitted project selectors are pinned before dispatch; an unknown crew ID
+    // cannot borrow an otherwise valid own-project convoy/vessel context.
+    for action in [
+        CommandAction::QueryDispatchBoard { project: None },
+        CommandAction::QueryDispatchQueue { project: None },
+        CommandAction::QueryFleetList { project: None, crew_id: None, convoy: None },
+    ] {
+        let mut scoped = request(action);
+        super::environment_supervision::authorize(&daemon, &mut scoped, &crew).await.unwrap();
+        let Request::Execute { command } = scoped else { panic!("execute") };
+        let selected = match command.action {
+            CommandAction::QueryDispatchBoard { project }
+            | CommandAction::QueryDispatchQueue { project }
+            | CommandAction::QueryFleetList { project, .. } => project,
+            _ => panic!("project query"),
+        };
+        assert_eq!(selected.as_deref(), Some("project-a"));
+    }
+    let mut forged = request(CommandAction::CrewFail {
+        context: CrewCommandContext {
+            crew_id: Some("forged-crew-id".into()),
+            convoy: Some("target".into()),
+            vessel_ref: Some("target-vessel".into()),
+            role: Some("coder".into()),
+            ..Default::default()
+        },
+        message: "failed".into(),
+        force: false,
+    });
+    assert!(super::environment_supervision::authorize(&daemon, &mut forged, &crew).await.is_err());
+    // An unsupported action and an absent role binding return a uniform denial,
+    // without exposing authority record lookup errors. Conflicting selectors
+    // cannot silently change the crew selected by a valid crew ID.
+    let mut absent = crew.clone();
+    absent.convoy = "missing-convoy".into();
+    for action in [CommandAction::QueryCrewStalls { full: false }, CommandAction::QueryExplainProject { name: "project-a".into() }] {
+        let error = super::environment_supervision::authorize(&daemon, &mut request(action), &absent).await.unwrap_err();
+        assert_eq!(error, "EnvironmentCommandDenied: no current supervisor binding");
+    }
+    for context in [
+        CrewCommandContext { crew_id: Some(crew.crew_id.clone()), role: Some("forged-role".into()), ..Default::default() },
+        CrewCommandContext { crew_id: Some(crew.crew_id.clone()), vessel_ref: Some("foreign-vessel".into()), ..Default::default() },
+    ] {
+        assert!(super::environment_supervision::authorize(
+            &daemon,
+            &mut request(CommandAction::CrewFail { context, message: "failed".into(), force: false }),
+            &crew
+        )
+        .await
+        .is_err());
+    }
+    // A valid own-project convoy cannot hide a foreign vessel or namespace.
+    for context in [
+        CrewCommandContext { convoy: Some("target".into()), vessel_ref: Some("foreign-vessel".into()), ..Default::default() },
+        CrewCommandContext { namespace: Some("other".into()), convoy: Some("target".into()), ..Default::default() },
+    ] {
+        assert!(super::environment_supervision::authorize(&daemon, &mut request(CommandAction::QueryCrewList { context }), &crew)
+            .await
+            .is_err());
+    }
+    let mut fail = request(CommandAction::CrewFail {
+        context: CrewCommandContext {
+            convoy: Some("target".into()),
+            vessel_ref: Some("target-vessel".into()),
+            role: Some("coder".into()),
+            ..Default::default()
+        },
+        message: "failed".into(),
+        force: true,
+    });
+    super::environment_supervision::authorize(&daemon, &mut fail, &crew).await.unwrap();
+    assert!(
+        matches!(fail, Request::Execute { command } if matches!(&command.action, CommandAction::CrewSupervise { actor_crew_id: Some(id), operation: flotilla_protocol::CrewSupervisionAction::Fail, .. } if id == &crew.crew_id))
+    );
+    let mut read = request(CommandAction::QueryCrewStalls { full: true });
+    assert!(super::environment_supervision::authorize(&daemon, &mut read, &crew).await.is_ok());
+    assert!(super::environment_supervision::authorize(&daemon, &mut read, &ordinary).await.is_err());
+    ensures.delete("holder").await.unwrap();
+    assert!(super::environment_supervision::authorize(&daemon, &mut read, &crew).await.is_err(), "retired role binding loses authority");
 }

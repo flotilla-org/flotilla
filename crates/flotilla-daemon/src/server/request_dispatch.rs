@@ -32,6 +32,11 @@ fn absolute_crew_path(path: &Path, cwd: &str) -> std::path::PathBuf {
     }
 }
 
+enum HookIdentityPolicy {
+    NativeSession,
+    PlacedTerminal,
+}
+
 pub(super) struct RequestDispatcher<'a> {
     daemon: &'a Arc<InProcessDaemon>,
     remote_command_router: &'a RemoteCommandRouter,
@@ -39,6 +44,7 @@ pub(super) struct RequestDispatcher<'a> {
     session_id: uuid::Uuid,
     query_subscriptions: QuerySubscriptions,
     caller: CommandCaller,
+    hook_identity_policy: HookIdentityPolicy,
 }
 
 impl<'a> RequestDispatcher<'a> {
@@ -68,7 +74,21 @@ impl<'a> RequestDispatcher<'a> {
         query_subscriptions: QuerySubscriptions,
         caller: CommandCaller,
     ) -> Self {
-        Self { daemon, remote_command_router, agent_state_store, session_id, query_subscriptions, caller }
+        Self {
+            daemon,
+            remote_command_router,
+            agent_state_store,
+            session_id,
+            query_subscriptions,
+            caller,
+            hook_identity_policy: HookIdentityPolicy::NativeSession,
+        }
+    }
+
+    /// Environment transport hooks cannot alias another native agent session.
+    pub(super) fn with_placed_terminal_hooks(mut self) -> Self {
+        self.hook_identity_policy = HookIdentityPolicy::PlacedTerminal;
+        self
     }
 
     pub(super) fn dispatch(&self, id: u64, request: Request) -> std::pin::Pin<Box<impl Future<Output = Message> + '_>> {
@@ -503,7 +523,11 @@ impl<'a> RequestDispatcher<'a> {
         {
             let mut store = self.agent_state_store.lock().map_err(|_| "agent state store lock poisoned".to_string())?;
 
-            let attachable_id = if let Some(ref sid) = event.session_id {
+            let attachable_id = if matches!(self.hook_identity_policy, HookIdentityPolicy::PlacedTerminal) && event.terminal.is_some() {
+                // A transport-bound crew hook cannot alias another agent through
+                // a caller-supplied native session ID or attachable ID.
+                flotilla_agent::attachable::codex_hook_id(None, event.terminal.as_ref())
+            } else if let Some(ref sid) = event.session_id {
                 if managed_codex {
                     // Fold a pre-fix unmanaged candidate into the managed shim.
                     // Unknown notifications are NoChange and must leave the registry intact.

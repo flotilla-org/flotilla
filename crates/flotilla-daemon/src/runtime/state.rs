@@ -31,6 +31,9 @@ use super::discovery::AgentlessSshProfile;
 use super::environments::{stage_remote_rustc_wrapper, ActiveProvisionedEnvironment};
 use super::tasks::{load_checkout_archive_roots, CheckoutArchiveRoot};
 use super::terminal::PendingTerminalDelivery;
+#[cfg(test)]
+use crate::server::environment_sockets::EnvironmentSocketRegistry;
+use crate::server::environment_sockets::EnvironmentSocketService;
 use crate::{
     blob_store::TieredBlobStore,
     environment_tools::{stage_local_rustc_wrapper_async, EnvironmentToolProvisioner},
@@ -47,6 +50,7 @@ pub(super) struct ControllerRuntimeState {
     pub(super) host_direct_environment_name: String,
     pub(super) agentless_ssh: HashMap<String, AgentlessSshProfile>,
     pub(super) environment_tools: EnvironmentToolProvisioner,
+    pub(super) environment_sockets: Option<EnvironmentSocketService>,
     pub(super) credential_store: Option<Arc<CredentialStore>>,
     pub(super) agent_material: Option<Arc<AgentMaterialRegistry>>,
     pub(super) blob_store: Option<Arc<TieredBlobStore>>,
@@ -70,6 +74,11 @@ pub(super) struct ControllerRuntimeState {
 }
 
 impl ControllerRuntimeState {
+    pub(super) fn with_environment_sockets(mut self, sockets: Option<EnvironmentSocketService>) -> Self {
+        self.environment_sockets = sockets;
+        self
+    }
+
     pub(super) async fn rust_build_jobs(&self, host_ref: &str) -> Result<usize, String> {
         let host_spec = match self.daemon.resource_backend().using::<Host>(&self.namespace).get(host_ref).await {
             Ok(host) => host.spec,
@@ -121,6 +130,7 @@ impl ControllerRuntimeState {
             host_direct_environment_name,
             agentless_ssh: HashMap::new(),
             environment_tools,
+            environment_sockets: None,
             credential_store: None,
             agent_material: None,
             blob_store: None,
@@ -233,6 +243,18 @@ impl ControllerRuntimeState {
 
     #[cfg(test)]
     pub(super) fn with_environment_tools(mut self, environment_tools: EnvironmentToolProvisioner) -> Self {
+        // Test adapter for the socket-server process seam. Provisioning still
+        // binds and retires real sockets; no Docker or live host is involved.
+        self.environment_sockets = Some(EnvironmentSocketService::new(
+            Arc::new(Mutex::new(EnvironmentSocketRegistry::new())),
+            self.config.state_dir().join("env"),
+            |listener, _| {
+                tokio::spawn(async move {
+                    let _listener = listener;
+                    std::future::pending::<()>().await
+                })
+            },
+        ));
         self.environment_tools = environment_tools;
         self
     }
