@@ -243,6 +243,16 @@ fn edges_are_owner_checked_and_optimistic() {
     let change = remote.read().expect("read").changes_since("remote", 0, 1).expect("log").remove(0);
     let mut write = store.write().expect("write");
     let Applied::Applied(far) = write.apply(&change).expect("apply") else { panic!("applied") };
+    // A stale stamp is `Conflict` even when the edge is also wrong in another way (here, an
+    // append under a records row that does not exist): retrying callers re-read on `Conflict`.
+    let current = write.insert("stale", &Convoy::sample(0)).expect("insert");
+    let both_wrong = || {
+        Edge::new(Convoy::EDGES, &event(ConvoyEdge::Submit { deliverable: 9 }))
+            .and_then(|edge| edge.append_in(Convoy::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence("e")))
+            .expect("edge")
+    };
+    write.apply_edge(current, edge()).expect("edge");
+    assert!(matches!(write.apply_edge(current, both_wrong()), Err(StoreError::Conflict { .. })));
     assert!(matches!(write.apply_edge(far, edge()), Err(StoreError::NotHome { home, .. }) if home == "remote"));
 }
 

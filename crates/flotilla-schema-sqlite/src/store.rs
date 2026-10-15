@@ -722,6 +722,14 @@ impl Ctx<'_> {
     fn apply_edge<K: Kind>(&mut self, current: Stamp, parts: EdgeParts) -> Result<Stamp, StoreError> {
         let identity = self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
+        // A stale stamp is answered first: the caller re-reads on `Conflict`, which would show
+        // whatever else (such as a missing records row) also makes this edge wrong. The root
+        // update below checks the version again under the write.
+        let stored: Option<i64> =
+            self.conn.prepare_cached(&self.sql(K::CODE)?.root_version)?.query_row([current.id.0], |row| row.get(0)).optional()?;
+        if stored != Some(expected) {
+            return Err(self.stale::<K>(current));
+        }
         let EdgeParts { sets, appends, mut objects } = parts;
         let (mut root_sets, mut record_sets) = (Vec::new(), Vec::new());
         for set in sets {
