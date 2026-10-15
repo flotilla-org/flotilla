@@ -1,10 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "linux")]
 use std::{fs, path::Path};
 
+use flotilla_core::in_process::InProcessDaemon;
 #[cfg(not(target_os = "macos"))]
 use flotilla_protocol::CallerProcess;
-use flotilla_protocol::{CallerCrew, CommandCaller, PrincipalRef};
+use flotilla_protocol::{CallerCrew, CommandCaller, EnvironmentId, PrincipalRef};
+use flotilla_resources::Environment;
+use flotilla_store::StoreQuery;
 
 #[derive(Clone, Copy)]
 pub(super) struct PeerCredential {
@@ -139,6 +142,9 @@ fn same_directory(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
 }
 
 pub(super) fn peer_mounts(pid: u32, socket_path: Option<&std::path::Path>) -> Result<PeerMounts, String> {
+    // Both supported contained generations mount the canonical daemon socket
+    // directory. Alternate main-socket routes without it are unsupported and
+    // fail closed here; an absent directory must not enable legacy authority.
     let mountinfo = mountinfo(pid)?;
     #[cfg(target_os = "linux")]
     let legacy_main_directory = match socket_path.and_then(std::path::Path::parent) {
@@ -164,7 +170,7 @@ pub(super) fn peer_mounts(pid: u32, socket_path: Option<&std::path::Path>) -> Re
     Ok(PeerMounts { mountinfo, legacy_main_directory })
 }
 
-fn environment_socket_is_mounted(environment: Option<&flotilla_protocol::EnvironmentId>, mounts: &str) -> Result<bool, String> {
+fn environment_socket_is_mounted(environment: Option<&EnvironmentId>, mounts: &str) -> Result<bool, String> {
     if mounts.trim().is_empty() {
         return Err("CallerIdentityUnavailable: empty peer mount table".into());
     }
@@ -191,14 +197,11 @@ fn environment_socket_is_mounted(environment: Option<&flotilla_protocol::Environ
 }
 
 pub(super) async fn resolve_main_caller(
-    daemon: &flotilla_core::in_process::InProcessDaemon,
+    daemon: &InProcessDaemon,
     mut caller: CommandCaller,
     claims: &HashMap<String, String>,
     mounts: Option<&PeerMounts>,
 ) -> Result<CallerResolution, String> {
-    use flotilla_resources::Environment;
-    use flotilla_store::StoreQuery;
-    use std::collections::BTreeMap;
     let Some(container) = caller.process.as_ref().and_then(|process| process.container.as_ref()) else {
         // Host-direct has no isolation boundary and is explicitly out of scope.
         // Preserve its existing variable-derived identity, without a new override.
@@ -234,7 +237,7 @@ pub(super) async fn resolve_main_caller(
     if environments.next().is_some() {
         return Err("CallerIdentityAmbiguous: container maps to multiple environments".into());
     }
-    let environment = flotilla_protocol::EnvironmentId::new(environment.object.metadata.name);
+    let environment = EnvironmentId::new(environment.object.metadata.name);
     if !environment_socket_is_mounted(Some(&environment), &mounts.mountinfo)? {
         return Err("CallerIdentityMismatch: container has no matching environment socket mount".into());
     }
@@ -245,6 +248,8 @@ pub(super) async fn resolve_main_caller(
 
 #[cfg(target_os = "linux")]
 fn container_from_cgroup(contents: &str) -> Option<String> {
+    // The outermost container is the provisioned vessel and socket trust
+    // boundary; nested Docker-in-Docker IDs cannot select a different vessel.
     contents.lines().flat_map(|line| line.split('/').skip(1)).find_map(|component| {
         let without_scope = component.strip_suffix(".scope").unwrap_or(component);
         let candidate = without_scope

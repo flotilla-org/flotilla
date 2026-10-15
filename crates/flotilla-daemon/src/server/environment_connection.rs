@@ -1,6 +1,9 @@
 //! Framed crew transport. No HTTP, peer traffic, global subscriptions or
 //! unscoped administrative requests cross this interface.
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
@@ -136,7 +139,7 @@ pub(super) async fn serve(
     daemon: Arc<InProcessDaemon>,
     router: RemoteCommandRouter,
     environment: EnvironmentId,
-    claims: Option<std::collections::HashMap<String, String>>,
+    claims: Option<HashMap<String, String>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let first = tokio::select! {
@@ -186,7 +189,7 @@ pub(super) async fn serve(
         // Re-resolve for every request: a retired session cannot retain authority.
         let identity = async {
             let crews = environment_crews(&daemon, &environment).await?;
-            let crew = super::caller::check_claims(crews, claims.as_ref().unwrap_or(&std::collections::HashMap::new()))?;
+            let crew = super::caller::check_claims(crews, claims.as_ref().unwrap_or(&HashMap::new()))?;
             let scope = super::environment_supervision::authorize(&daemon, &mut request, &crew).await?;
             Ok::<_, String>((crew, scope))
         }
@@ -432,7 +435,7 @@ mod tests {
                 2 => count / 2,
                 _ => 0,
             };
-            let claims = role.map(|role| std::collections::HashMap::from([("FLOTILLA_CREW_ROLE".into(), role.into())])).unwrap_or_default();
+            let claims = role.map(|role| HashMap::from([("FLOTILLA_CREW_ROLE".into(), role.into())])).unwrap_or_default();
             assert_eq!(super::super::caller::check_claims(crews, &claims).is_ok(), candidates == 1);
         }
     }
