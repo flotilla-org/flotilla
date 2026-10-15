@@ -92,6 +92,8 @@ impl Layout {
         let frame = self.frames.last_mut().expect("layout has a current table");
         frame.guards.push(Guard { column: column.to_owned(), value, required: Vec::new(), scope: Vec::new() });
         // The table lists guards in the order they open, so an outer CHECK precedes its nested ones.
+        // The slot holds a placeholder until `f` returns and the finished guard replaces it; a
+        // layout is only read after `finish`, so the placeholder is never observed.
         let slot = self.set.tables[frame.table].guards.len();
         self.set.tables[frame.table].guards.push(Guard { column: String::new(), value, required: Vec::new(), scope: Vec::new() });
         f(self);

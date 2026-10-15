@@ -108,6 +108,7 @@ mod tests {
             quote! { enum A { #[store(code = 1)] B { a: Vec<String> } } },
             quote! { enum A { #[store(code = 1)] B, C } },
             quote! { enum A { #[store(code = 1)] B, #[store(code = 1)] C } },
+            quote! { enum A { #[store(code = 1)] Ab { c: String }, #[store(code = 2)] AB { c: String } } },
             quote! { enum A { #[store(code = 1)] B { a: String }, #[store(code = 1)] C } },
             quote! { enum A { #[store(code = 1)] B { a: String }, C { b: i64 } } },
             quote! { enum A {} },

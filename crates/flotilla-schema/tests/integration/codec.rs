@@ -2,8 +2,8 @@
 //! `state` and references, without a backend.
 
 use flotilla_schema::{
-    CodeEnum, ColumnType, DecodeError, Decoder, Element, Encoder, Identity, Kind, KindCode, Layout, Ref, Rows, State, Stored, Timestamp,
-    Value,
+    snake_case, CodeEnum, ColumnType, DecodeError, Decoder, Element, Encoder, Identity, Kind, KindCode, Layout, Ref, Rows, State, Stored,
+    Timestamp, Value,
 };
 use hegel::{generators as gs, TestCase};
 
@@ -187,6 +187,33 @@ fn derived_columns_follow_the_naming_rules() {
     assert_eq!(columns[2].1, Value::Int(0), "an absent flatten is present = 0, not null");
     assert_eq!((&columns[5].1, &columns[6].1), (&Value::Int(7), &Value::Int(5)));
     assert_eq!(columns[15].1, Value::Ref(Identity { kind: KindCode(4), name: "p".into(), home: "h".into() }));
+}
+
+// Behaviour: the derive names variant columns with its own copy of the snake-case rule; it must
+// agree with `flotilla_schema::snake_case`, acronyms included, or names would drift silently.
+#[derive(Stored)]
+enum Acronyms {
+    #[store(code = 1)]
+    HTTPRoute { to: String },
+    #[store(code = 2)]
+    ResolvedHTTP { by: String },
+    #[store(code = 3)]
+    Ipv4Address { at: String },
+}
+
+#[test]
+fn variant_columns_use_the_schema_snake_case() {
+    let mut layout = Layout::root("Acronyms", KindCode(1));
+    Acronyms::layout_row(&mut layout);
+    let names: Vec<String> = layout.finish().tables[0].columns.iter().map(|column| column.name.clone()).collect();
+    let expected: Vec<String> = std::iter::once("tag".to_owned())
+        .chain(
+            [("HTTPRoute", "to"), ("ResolvedHTTP", "by"), ("Ipv4Address", "at")]
+                .map(|(variant, field)| format!("{}_{field}", snake_case(variant))),
+        )
+        .collect();
+    assert_eq!(names, expected);
+    assert_eq!(names[1], "http_route_to");
 }
 
 // Behaviour (DESIGN elements): enums and newtypes are collection rows too; a data enum's tag is

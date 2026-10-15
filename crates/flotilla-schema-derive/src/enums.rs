@@ -9,12 +9,12 @@
 
 use std::collections::BTreeMap;
 
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{DataEnum, DeriveInput, Fields, Ident};
 
 use crate::{
-    attrs::{self, refuse, TypeAttrs},
+    attrs::{self, refuse, refuse_at, TypeAttrs},
     fields::{columns_element, schema, Field, Generics},
 };
 
@@ -58,6 +58,25 @@ pub(crate) fn expand(input: &DeriveInput, data: &DataEnum, type_attrs: TypeAttrs
         }
         variants.push(Variant { ident: &variant.ident, code, fields });
     }
+    // `A { b_c }` and `AB { c }` would both name the column `a_b_c`; refuse here with a span
+    // rather than leave it to the descriptor's duplicate-column check at runtime.
+    let mut columns: BTreeMap<String, &Ident> = BTreeMap::new();
+    for variant in &data.variants {
+        if let Fields::Named(fields) = &variant.fields {
+            let prefix = snake_case(&variant.ident.to_string());
+            for field in fields.named.iter().filter_map(|field| field.ident.as_ref()) {
+                let column = format!("{prefix}_{field}");
+                if let Some(previous) = columns.insert(column.clone(), &variant.ident) {
+                    if previous != &variant.ident {
+                        return Err(refuse(
+                            &variant.ident,
+                            format_args!("variants `{previous}` and `{}` both name the column `{column}`", variant.ident),
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let codes: Vec<i64> = seen.keys().copied().collect();
     if variants.iter().all(|variant| variant.fields.is_none()) {
         Ok(code_enum(input, &variants, &codes))
@@ -66,17 +85,19 @@ pub(crate) fn expand(input: &DeriveInput, data: &DataEnum, type_attrs: TypeAttrs
     }
 }
 
-fn refuse_at(span: Span, what: impl std::fmt::Display) -> syn::Error {
-    let error = refuse(quote!(), what);
-    syn::Error::new(span, error.to_string())
-}
-
-/// `TerminalSession` becomes `terminal_session`; the same rule as `flotilla_schema::snake_case`.
+/// `TerminalSession` becomes `terminal_session` and `HTTPRoute` becomes `http_route`. The same
+/// rule as `flotilla_schema::snake_case`, which names the columns; the schema crate's
+/// `variant_columns_use_the_schema_snake_case` test pins that the two agree.
 fn snake_case(name: &str) -> String {
+    let characters: Vec<char> = name.chars().collect();
     let mut out = String::with_capacity(name.len() + 4);
-    for (index, character) in name.chars().enumerate() {
+    for (index, &character) in characters.iter().enumerate() {
         if character.is_ascii_uppercase() {
-            if index > 0 {
+            let previous = index.checked_sub(1).map(|index| characters[index]);
+            let next = characters.get(index + 1);
+            let after_word = previous.is_some_and(|previous| previous.is_ascii_lowercase() || previous.is_ascii_digit());
+            let ends_acronym = previous.is_some_and(|previous| previous.is_ascii_uppercase()) && next.is_some_and(char::is_ascii_lowercase);
+            if after_word || ends_acronym {
                 out.push('_');
             }
             out.push(character.to_ascii_lowercase());

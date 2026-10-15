@@ -14,6 +14,11 @@ pub(crate) fn refuse(tokens: impl ToTokens, what: impl std::fmt::Display) -> syn
     syn::Error::new_spanned(tokens, format!("{what}; {SUPPORTED}"))
 }
 
+/// [`refuse`] at a span rather than a token tree.
+pub(crate) fn refuse_at(span: proc_macro2::Span, what: impl std::fmt::Display) -> syn::Error {
+    syn::Error::new(span, format!("{what}; {SUPPORTED}"))
+}
+
 /// A shape on the list that a later layer of the derive implements.
 pub(crate) fn not_yet(tokens: impl ToTokens, what: impl std::fmt::Display) -> syn::Error {
     syn::Error::new_spanned(tokens, format!("{what} is not supported yet"))
