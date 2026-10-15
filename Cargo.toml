@@ -63,7 +63,7 @@ members = [
     "crates/flotilla-tui",
     "crates/tender",
 ]
-exclude = ["crates/flotilla-manifest/fixtures/generator", "prototypes/3108-3209"]
+exclude = ["crates/flotilla-manifest/fixtures/generator"]
 resolver = "2"
 
 [workspace.package]
