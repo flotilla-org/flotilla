@@ -308,7 +308,11 @@ def extract_verified_candidate(archive_bytes, stage, generation, sources, protoc
     with archive:
         files = {}
         expanded_bytes = 0
-        for member in archive.getmembers():
+        try:
+            checked = validation.checked_archive_members(archive, INPUT_ROOT)
+        except validation.ValidationError as error:
+            raise SigningError(str(error)) from error
+        for member in checked:
             if member.isdir():
                 continue
             if not member.isfile():
@@ -368,6 +372,7 @@ def extract_verified_candidate(archive_bytes, stage, generation, sources, protoc
             destination.write_bytes(content)
             destination.chmod(files[path].mode & 0o777)
             unsigned_digests[path] = entry["sha256"]
+        validation.materialize_directory_links(checked, stage, INPUT_ROOT)
         try:
             skill_bundle = json.loads((stage / "share/flotilla/skills/.flotilla-sources.json").read_text())
             validation.validate_skill_bundle(skill_bundle, sources)
@@ -477,6 +482,12 @@ def build_archive(stage):
     tar_output = io.BytesIO()
     with tarfile.open(fileobj=tar_output, mode="w:") as archive:
         for path in sorted(stage.rglob("*")):
+            if path.is_symlink() and path.is_dir():
+                member = tarfile.TarInfo(f"{OUTPUT_ROOT}/{path.relative_to(stage)}")
+                member.type = tarfile.SYMTYPE
+                member.linkname = os.readlink(path)
+                archive.addfile(member)
+                continue
             if not path.is_file():
                 continue
             relative = str(path.relative_to(stage))

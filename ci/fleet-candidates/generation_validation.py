@@ -2,6 +2,7 @@
 """Canonical validation for fleet candidates and promoted generations."""
 
 import argparse
+import copy
 import datetime
 import hashlib
 import json
@@ -602,27 +603,118 @@ def file_size(path):
     print(os.path.getsize(path))
 
 
+class CheckedArchiveMember:
+    """A validated TarInfo view with optional deferred directory alias."""
+
+    def __init__(self, member, directory_target=None):
+        self.member = member
+        self.bundle_directory_target = directory_target
+
+    def __getattr__(self, name):
+        return getattr(self.member, name)
+
+
+def checked_archive_members(bundle, expected_root):
+    """Validate the whole archive before reading payloads or writing files.
+
+    Resolve links in the archive namespace, never against the host filesystem.
+    Return regular-file/directory views of links, preserving their archive names
+    but reading the resolved bytes. Manifests describe those bytes, not link
+    metadata; materialization also avoids extraction-order and symlink races.
+    """
+    members = {}
+    for member in bundle.getmembers():
+        path = PurePosixPath(member.name)
+        name = str(path)
+        if (path.is_absolute() or ".." in path.parts or not path.parts
+                or path.parts[0] != expected_root or name in members):
+            raise ValidationError(f"unsafe or duplicate archive path: {member.name}")
+        if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+            raise ValidationError(f"unsupported archive entry: {member.name}")
+        members[name] = member
+    if not members:
+        raise ValidationError("archive has no bundle directory")
+
+    def resolve(parts, active):
+        if len(active) > 128:
+            raise ValidationError("archive link chain is too deep")
+        current = []
+        pending = list(parts)
+        while pending:
+            part = pending.pop(0)
+            if part == ".":
+                continue
+            if part == "..":
+                if len(current) <= 1:
+                    raise ValidationError("archive link escapes the bundle")
+                current.pop()
+                continue
+            current.append(part)
+            name = "/".join(current)
+            member = members.get(name)
+            if member and (member.issym() or member.islnk()):
+                if name in active:
+                    raise ValidationError(f"archive link cycle: {name}")
+                target = PurePosixPath(member.linkname)
+                if target.is_absolute() or not member.linkname:
+                    raise ValidationError(f"absolute or empty archive link: {name}")
+                # Tar hard links are archive-root-relative; symlinks are relative
+                # to their containing directory. Resolve before consuming '..'.
+                base = current[:-1] if member.issym() else []
+                resolved = resolve(base + list(target.parts), active | {name})
+                current = list(PurePosixPath(resolved).parts)
+            elif member and not member.isdir() and pending:
+                raise ValidationError(f"archive path descends through a file: {name}")
+            if current and current[0] != expected_root:
+                raise ValidationError("archive link escapes the bundle")
+        name = "/".join(current)
+        if name not in members:
+            # Implicit directories are permitted, but dangling links are not.
+            if not any(key.startswith(name + "/") for key in members):
+                raise ValidationError(f"archive link target is missing: {name}")
+        return name
+
+    checked = []
+    for name, member in members.items():
+        resolved = resolve(PurePosixPath(name).parts, set())
+        target = members.get(resolved)
+        view = copy.copy(target or member)
+        view.name = name
+        if target is None:
+            view.type = tarfile.DIRTYPE
+            view.size = 0
+        directory_target = resolved if resolved != name and view.isdir() else None
+        checked.append(CheckedArchiveMember(view, directory_target))
+    return checked
+
+
+def materialize_directory_links(members, destination, archive_root):
+    """Install directory aliases only after all regular-file writes finish."""
+    destination = Path(destination)
+    for member in members:
+        resolved = getattr(member, "bundle_directory_target", None)
+        if resolved is None:
+            continue
+        relative = PurePosixPath(member.name).relative_to(archive_root)
+        target = PurePosixPath(resolved).relative_to(archive_root)
+        path = destination.joinpath(*relative.parts)
+        if path.exists():
+            # Explicit children have already been materialized under this name.
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(os.path.relpath(destination.joinpath(*target.parts), path.parent))
+
+
 def extract_archive(archive, destination, platform):
     archive = Path(archive)
     destination = Path(destination)
     expected_root = "fleet-signed-darwin-aarch64" if platform == "darwin-aarch64" else f"fleet-candidate-{platform}"
     with tarfile.open(archive, "r:gz") as bundle:
-        members = bundle.getmembers()
-        names = set()
-        roots = set()
-        for member in members:
-            path = PurePosixPath(member.name)
-            normalized = str(path)
-            if path.is_absolute() or ".." in path.parts or not path.parts or normalized in names:
-                raise ValidationError(f"unsafe or duplicate archive path: {member.name}")
-            if not (member.isfile() or member.isdir()):
-                raise ValidationError(f"unsupported archive entry: {member.name}")
-            names.add(normalized)
-            roots.add(path.parts[0])
-        if roots != {expected_root}:
-            raise ValidationError(f"archive has an unexpected bundle directory: expected {expected_root}, got {sorted(roots)}")
+        members = checked_archive_members(bundle, expected_root)
         for member in members:
             target = destination.joinpath(*PurePosixPath(member.name).parts)
+            if getattr(member, "bundle_directory_target", None):
+                continue
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
                 target.chmod(member.mode & 0o777)
@@ -634,6 +726,7 @@ def extract_archive(archive, destination, platform):
             with source, target.open("wb") as output:
                 shutil.copyfileobj(source, output)
             target.chmod(member.mode & 0o777)
+    materialize_directory_links(members, destination / expected_root, expected_root)
     shutil.move(str(destination / expected_root), str(destination / "release"))
 
 

@@ -156,9 +156,10 @@ def inspect_inner_archive(archive_bytes, platform, sources):
     manifest_path = f"{bundle_name}/manifest.json"
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
-            members = archive.getmembers()
-            if any(not (member.isdir() or member.isfile()) for member in members):
-                raise PromotionError(f"{platform} candidate contains a non-regular archive member")
+            try:
+                members = validation.checked_archive_members(archive, bundle_name)
+            except validation.ValidationError as error:
+                raise PromotionError(str(error)) from error
             if sum(member.size for member in members) > MAX_ARCHIVE_BYTES:
                 raise PromotionError(f"{platform} candidate expands beyond the size limit")
             files = {}

@@ -43,17 +43,11 @@ read_protocol_version() {
 
 package_cleat_terminfo() {
   local cleat_root="$1" bundle="$2"
-  # cleat #337 owns the emitter; package its pinned prepare output. Aliases
-  # such as g/ghostty are symlinks there; copy them as regular files because
-  # the generation validators accept only regular archive members.
+  # cleat #337 owns the emitter; preserve its in-bundle terminfo aliases.
   test -f "$cleat_root/.tools/ghostty-install/share/terminfo/x/xterm-ghostty"
   test -f "$cleat_root/.tools/ghostty-install/share/terminfo/LICENSE"
   mkdir -p "$bundle/share/terminfo"
-  cp -RL "$cleat_root/.tools/ghostty-install/share/terminfo/." "$bundle/share/terminfo/"
-  if find "$bundle/share/terminfo" -type l | grep -q .; then
-    echo 'packaged terminfo must contain only regular files' >&2
-    return 1
-  fi
+  cp -RP "$cleat_root/.tools/ghostty-install/share/terminfo/." "$bundle/share/terminfo/"
   infocmp -A "$bundle/share/terminfo" xterm-ghostty >/dev/null
 }
 
