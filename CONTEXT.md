@@ -207,7 +207,7 @@ label. Contract-readiness alone does not establish dispatchability.
 
 **Dispatchable Issue**:
 An open, contract-ready work issue with no open native dependency, active soft
-hold, live serving convoy or open serving change request. Grills, maps and
+hold, live serving convoy or open serving change request. Grills, maps, missions and
 brainstorms belong to ideation rather than this set.
 
 **Soft Hold**:
@@ -222,6 +222,19 @@ revision and time. A merged change alone is not a deployment receipt.
 **Work Queue**:
 A Project's contract-ready work issues, which governors may batch into convoy
 requests as they become dispatchable.
+
+**Mission**:
+A group of work pursuing one outcome, identified by a tracking issue or a charter
+lane. Its Priority establishes urgency and its Weight establishes relative share.
+
+**Priority**:
+A strict urgency tier: Urgent, High, Medium or Low. Ready work in a higher tier
+precedes all lower tiers. A ticket can carry a Priority overriding its mission.
+
+**Weight**:
+A mission's nonnegative relative share of live crews within its Priority tier.
+Idle missions lend their share to ready work; zero means fallback work when no
+positive-weight mission in that tier is ready.
 
 **Ideation Queue**:
 Fleet-wide grills, maps and brainstorms organised for operator selection.

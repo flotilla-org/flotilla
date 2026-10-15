@@ -12,7 +12,7 @@ dispatch_policy:
 
 Omitting it or setting `enabled: false` clears proposals and attention without querying or observing. The reconciler never creates a convoy. Real manual dispatches of queued issues produce immutable DispatchObservation records containing the issue, workflow, placement policy and time from observed readiness. The admitted workflow/placement snapshots retain the resolved capability requirements and fulfilment choices.
 
-Readiness requires an open issue, the `ready` judgment label, no open native dependency, no grill/map/brainstorm type or label (including qualified labels such as `wayfinder:grilling`), no live serving convoy or open serving PR, and no active hold. The reserved ideation names are case-insensitive `grill`, `grilling`, `map`, and `brainstorm`, including the suffix after the final colon. A plain `map` label therefore excludes work too; Projects must reserve these names for ideation. Terminal convoy history does not suppress a reopened, retriaged issue. GitHub supplies native dependency and PR facts through injected provider collaborators; unsupported sources fail closed.
+Readiness requires an open issue, the `ready` judgment label, no open native dependency, no grill/map/mission/brainstorm type or label (including qualified labels such as `wayfinder:grilling`), no live serving convoy or open serving PR, and no active hold. The reserved ideation names are case-insensitive `grill`, `grilling`, `map`, and `brainstorm`, including the suffix after the final colon. A plain `map` label therefore excludes work too; Projects must reserve these names for ideation. Terminal convoy history does not suppress a reopened, retriaged issue. GitHub supplies native dependency and PR facts through injected provider collaborators; unsupported sources fail closed.
 
 Governors and operators author serialisation inputs with the normal resource interface:
 
@@ -68,26 +68,56 @@ The runtime flotilla Project policy was enabled as part of #2782. Its live recor
 
 ## Missions, lanes and ordering
 
-Ready rows carry a `score` with normalized mission attributes, the source of each
-attribute, membership reason, unique DAG descendant count, conflict penalty, and
-admission inputs. CLI JSON and `DispatchReady` snapshots use the same global
-lexicographic order: expedite/standard/background, descending mission value,
-descending descendant count, oldest continuously observed readiness, then lowest
-conflict penalty. Namespace, Project and source-qualified issue break exact ties.
-The conflict term starts at zero; #2784 supplies it. Deltas carry changed scores;
-clients apply them by row identity and use the shared comparator to materialize
-order. Attention uses the oldest readiness clock, independent of priority.
+A mission has two attributes: **Priority** (`urgent`, `high`, `medium`, `low`,
+default `medium`) and **Weight** (a finite nonnegative number, default 1).
+Each resolves independently from the tracking issue's `Priority` single-select or
+`Weight` number issue field, then a `priority:<tier>` or `weight:N` label, then
+charter defaults. Priority names ignore case and surrounding whitespace; stored
+names are lowercase. Label prefixes are exact lowercase (`priority:` and
+`weight:`); only the Priority value ignores case. Null fields fall back. A present field overrides even an
+invalid stale label. Duplicate or invalid explicit attributes fail the Project
+closed, with `status.dispatch_queue_error`; readiness clocks remain stored.
+Retired `value:`, `cos:` and `crew-limit:` labels have no effect.
 
-Native map ancestry (nearest map, including nested sub-issues) takes precedence
-over the first matching charter lane. A map is identified by its Map issue type
-or a label whose final colon-separated segment is `map` (case-insensitive).
-This follows the same reserved ideation-label convention as readiness. Lane rules require all their labels and preserve
-charter declaration order. An empty label set is an intentional catch-all; place
-it after more specific lanes. Unmatched work belongs to `routine_lane`, default
-`routine`. A mission may reference a tracking issue or use charter attributes
-alone. Map missions without a charter name use the source-qualified map identity.
+A ticket's own Priority field or label overrides its mission tier in either
+direction. The score's priority source is `ticket_issue_field` or `ticket_label`
+when overridden, otherwise `issue_field`, `label`, or `charter`. Ticket Weight
+has no effect: share belongs to the mission.
 
-Author the policy in `project.yaml` or Project's `spec.dispatch_policy`:
+Ready rows use the same deterministic comparator in CLI reads and subscriptions:
+
+1. Strict Priority tier, across every Project. An Urgent ticket in a Low mission
+   precedes all High, Medium and Low tickets.
+2. Within the tier, zero-weight work waits until no positive-weight work is ready,
+   including in another Project. This fallback rule precedes project fair share.
+3. Project fair share: smallest `(project live crews + 1) / project_share`.
+4. Mission weighted share: smallest `(mission live crews in this tier + 1) / weight`.
+5. Descending unique DAG descendants, oldest continuously observed readiness,
+   then lowest conflict penalty. Namespace, Project and source-qualified issue
+   identity break exact ties.
+
+This live-crew stride calculation chooses the next crew, without probabilistic
+sampling or a historical reservation ledger. Reconcile after crew changes to
+rank the next slot: missions weighted 2 and 1 receive three slots 2:1. Only ready
+work competes. A lone mission can use every slot; a High mission without ready
+work cannot block Medium work. Weight zero is a fallback rather than a pause.
+These are ranking decisions; capacity enforcement remains #2785.
+
+Counts include replicated live convoys and unsettled crew roles (Pending,
+Working, Interrupted and Stalled). Settled roles release share before landing.
+An unpublished crew state contributes one provisional crew. A batch contributes
+once to each mission/tier it serves. Project counts count the convoy's crews once.
+Mission accounting uses current board ancestry/fields and the admitted label
+snapshot. Ready snapshots retain live inputs rather than predicting multiple
+future admissions from one observation.
+
+Mission membership follows nearest native ancestry, then the first matching
+charter lane, then `routine_lane` (default `routine`). A tracking ancestor is
+identified by its `Mission` or `Map` issue type, or a label whose last
+colon-separated component is `map`, ignoring case. Mission issues themselves
+are ideation and cannot enter the work queue. Lane rules require all labels;
+an empty rule is a catch-all and belongs last. A mission without a declared name
+uses its source-qualified tracking issue identity.
 
 ```yaml
 dispatch_policy:
@@ -98,74 +128,56 @@ dispatch_policy:
     - name: stability
       issue:
         source: {service: 'https://github.com', scope: flotilla-org/flotilla}
-        id: '<stability-lane-issue-number>'
-      attributes: {value: 5, class_of_service: standard, crew_limit: 2}
+        id: '<mission-issue-number>'
+      attributes: {priority: high, weight: 2}
     - name: routine
-      attributes: {value: 1, class_of_service: background}
+      attributes: {priority: low, weight: 1}
   lanes:
     - mission: stability
       labels: [bug]
 ```
 
-Each attribute resolves independently from the tracking issue's native field,
-then `value:N`, `cos:expedite|standard|background`, or `crew-limit:N` label, then
-charter defaults (value 0, standard, unlimited). Value is a finite number and may
-be fractional or negative. Crew limit is a nonnegative u32; zero pauses future
-admission. Duplicate or invalid explicit attributes in a published scoring snapshot make
-readiness unavailable. A failed field observation retains the last-good snapshot
-and exposes its refresh error, as other board observations do.
-A present native field overrides its label, even if that label is stale. Native
-fields with null values fall back. Tracking issues must be in the observed sources.
+GitHub fields come from `issue_field_values` in the existing paginated REST issue
+inventory, including cached unchanged graph details. A same-second field edit
+updates the field snapshot without another GraphQL detail fetch. No per-ticket
+HTTP field requests are added to a GitHub board refresh. Providers without bulk
+fields use the paginated issue-field-values seam for ready/live-served tickets
+and tracking issues; unsupported 404/410 responses permit fallback. Observation
+errors retain last-good board evidence and its refresh error. Interactive reads
+never wait for forge calls. Live convoy accounting queries exclude terminal
+history in the store, before decoding records.
 
-GitHub fields use the [documented issue-field-values endpoint](https://docs.github.com/en/rest/issues/issue-field-values)
-with pagination and exact field names `Value`, `Class of service`, and `Crew limit`.
-Unsupported/not-present (404/410) responses permit fallback; authentication,
-rate-limit and server failures retain their error. Native parents and issue types
-come from the recorded `gh issue list` board. Field reads are part of that shared
-background refresh, including every Project's declared tracking issues; ready
-reads never query mission fields. Re-ranking becomes visible after the next
-successful board refresh and dispatch reconciliation. Last-good observations
-remain available during a failed refresh, with the board's age/error evidence.
-
-Fair share is a positive per-Project relative weight, separate from the work
-ordering terms. Scores expose it alongside the Project's live crew count and the
-mission's live crew count/limit for #2785 whole-convoy admission. Counts include
-replicated live convoys and count crew roles once per convoy. Pending, Working, Interrupted and Stalled roles count;
-Done, HandedBack and Failed roles release their share even before landing. A live convoy that
-has not published crew state contributes one provisional crew. A batch spanning
-missions contributes to each mission it serves, without duplicating a convoy
-within one mission. Terminal convoys contribute zero. This PR supplies inputs;
-reservation, quota/borrowing and admission enforcement belong to #2785.
+`dispatch ready` shows tier/source, weight, live crews and prospective crews per
+weight (`next/share`, or `fallback` at zero weight); JSON includes the source and
+the numeric inputs in `score`.
+`convoy explain` reports the same current score for every served ticket, including
+per-ticket overrides, or an explicit score-unavailable reason if the board is not
+warm. It does not silently invent a tier from missing tracker evidence.
+`scripts/accept-dispatch-missions` checks a real host's ordering read-only.
 
 ### Companion owner actions
 
-In the flotilla-org organization, define `Value` as a number, `Class of service`
-as a single select with `expedite`, `standard`, `background`, and `Crew limit` as
-a number containing nonnegative integers. These are organization owner actions;
-no organization settings are changed by this PR. Create tracking issues titled
-`Lane: stability` and `Lane: routine`, label them `dispatch:lane` (never `ready`),
-and wire their returned numbers into the flotilla Project charter as above.
-Labels or charter-only attributes work before those owner actions.
+- Create the organization **Weight** number issue field (finite, nonnegative).
+- Create the **Mission** issue type.
 
-Project specs are authored outside this repository by project-map/ops
-`project.yaml` declarations and registered charter Project manifests. The new
-policy inputs are optional; old declarations retain the existing materialized
-policy and need no companion migration. Owners add the shown fields to the
-flotilla charter when selecting lanes. Queue scores are daemon-authored status;
-previous-generation records decode with `score: None` and preserve old FIFO
-semantics until the next successful reconciliation. The stored golden corpus
-is unchanged.
+The existing Priority field is reused. Labels and charter defaults work before
+these owner actions.
 
-On a host running the candidate with configured lanes and ready work, run
-`scripts/accept-dispatch-missions` for a read-only check of the global ordering
-and score breakdown. Change a mission field/label, wait for the next successful
-background refresh and reconciler pass, and rerun to inspect the updated rank.
-The container tests use injected tracker collaborators and in-memory stores;
-this operator check needs a running daemon, without Docker requirements.
+### Stored compatibility and charter authors
 
-Malformed mission attributes, parent cycles, malformed blocker URLs or missing
-tracking sources fail the Project closed. `status.dispatch_queue_error` exposes
-the reason; the last queue and readiness clocks remain stored but unavailable
-until a successful reconciliation clears the error. Live-convoy membership uses
-the current board with frozen issue labels, so mission accounting follows current
-ancestry and charter while retaining the admitted label snapshot.
+Project specs write only `priority` and `weight`. A deserialize-only shim accepts
+and drops `value`, `class_of_service` and `crew_limit` for the roll introducing
+this model; remove it after that generation. The stored-record corpus remains
+unchanged.
+
+The documented out-of-repository charter authors are project-map's
+`flotilla-manifests/**`, transitioning to `robert/fleet-ops@main` (notably
+`projects/flotilla.yaml`), and delegated projects' ops `project.yaml` or Project
+manifests (see [charter delegation](charter-delegation.md)). Existing retired
+attributes decode but lose their old scheduling meaning. Any authored mission
+attributes need companion conversion to Priority/Weight in the same roll.
+Verify the registered declarations and ship their companion conversions in the
+same roll; do not treat successful legacy decoding as preservation of the old
+scheduling policy.
+A retired `crew_limit: 0` hard pause is not preserved: no Weight value is a hard
+pause. Weight zero is the nearest share setting, but can still run fallback work.

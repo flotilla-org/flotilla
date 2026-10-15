@@ -1,5 +1,5 @@
 //! Native issue references and tracker mission-field decoding.
-use flotilla_protocol::{ClassOfService, IssueRef, MissionFields};
+use flotilla_protocol::{IssueRef, MissionFields, Priority};
 use std::collections::BTreeSet;
 
 pub fn issue_ref_from_url(url: &str) -> Result<IssueRef, String> {
@@ -14,25 +14,25 @@ pub fn issue_ref_from_url(url: &str) -> Result<IssueRef, String> {
     })
 }
 
-/// Decode a tracker's class-of-service field value, case-insensitively.
-/// Shared by tracker mission-field decoding and orchestration's dispatch-mission parsing.
-pub fn class(value: &str) -> Result<ClassOfService, String> {
-    match value.to_ascii_lowercase().as_str() {
-        "expedite" => Ok(ClassOfService::Expedite),
-        "standard" => Ok(ClassOfService::Standard),
-        "background" => Ok(ClassOfService::Background),
-        _ => Err(format!("invalid class of service: {value}")),
+/// Priority names are case-insensitive, with surrounding whitespace ignored.
+pub fn priority(value: &str) -> Result<Priority, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "urgent" => Ok(Priority::Urgent),
+        "high" => Ok(Priority::High),
+        "medium" => Ok(Priority::Medium),
+        "low" => Ok(Priority::Low),
+        _ => Err(format!("invalid priority: {value}")),
     }
 }
 
-/// Preserve missing fields for per-attribute fallback. Invalid/duplicate known
-/// fields are errors; unrelated organization fields are deliberately ignored.
+/// Missing/null fields fall back; invalid or duplicate known fields fail closed.
+/// Retired mission fields and unrelated organization fields are ignored.
 pub fn parse_mission_fields(values: &[serde_json::Value]) -> Result<MissionFields, String> {
     let mut fields = MissionFields::default();
     let mut seen = BTreeSet::new();
     for value in values {
         let name = value["issue_field_name"].as_str().ok_or("issue field lacks name")?;
-        if !matches!(name, "Value" | "Class of service" | "Crew limit") {
+        if !matches!(name, "Priority" | "Weight") {
             continue;
         }
         if !seen.insert(name) {
@@ -42,22 +42,13 @@ pub fn parse_mission_fields(values: &[serde_json::Value]) -> Result<MissionField
             continue;
         }
         match name {
-            "Value" => fields.value = Some(value["value"].as_f64().ok_or("mission Value must be numeric")?.try_into()?),
-            "Crew limit" => {
-                fields.crew_limit = Some(
-                    value["value"]
-                        .as_f64()
-                        .filter(|v| *v >= 0.0 && *v <= f64::from(u32::MAX) && v.fract() == 0.0)
-                        .map(|v| v as u32)
-                        .ok_or("mission Crew limit must be a nonnegative u32")?,
-                )
-            }
+            "Weight" => fields.weight = Some(value["value"].as_f64().ok_or("Weight must be numeric")?.try_into()?),
             _ => {
-                fields.class_of_service = Some(class(
+                fields.priority = Some(priority(
                     value["single_select_option"]["name"]
                         .as_str()
                         .or_else(|| value["value"].as_str())
-                        .ok_or("mission class lacks option name")?,
+                        .ok_or("Priority lacks option name")?,
                 )?)
             }
         }

@@ -99,11 +99,11 @@ mod tests {
     // Glue: authored policy passes through the charter parser into typed inputs.
     #[test]
     fn parses_dispatch_policy_with_lanes_and_fractional_value() {
-        let declaration = parse_project_declaration("name: widgets\ndispatch_policy:\n  project_share: 2\n  missions:\n    - name: routine\n      attributes: {value: 3.5, crew_limit: 0}\n  lanes:\n    - mission: routine\n      labels: [bug]\nmembers:\n  - alias: widgets\n    url: https://github.com/org/widgets\n    roles: [code]\n").expect("charter policy");
+        let declaration = parse_project_declaration("name: widgets\ndispatch_policy:\n  project_share: 2\n  missions:\n    - name: routine\n      attributes: {weight: 3.5, priority: high}\n  lanes:\n    - mission: routine\n      labels: [bug]\nmembers:\n  - alias: widgets\n    url: https://github.com/org/widgets\n    roles: [code]\n").expect("charter policy");
         let policy = declaration.dispatch_policy.expect("policy");
         assert_eq!(policy.project_share, 2);
-        assert_eq!(f64::from(policy.missions[0].attributes.value), 3.5);
-        assert_eq!(policy.missions[0].attributes.crew_limit, Some(0));
+        assert_eq!(f64::from(policy.missions[0].attributes.weight), 3.5);
+        assert_eq!(policy.missions[0].attributes.priority, flotilla_protocol::Priority::High);
         assert_eq!(policy.lanes[0].labels, std::collections::BTreeSet::from(["bug".into()]));
         assert_eq!(policy.routine_lane, "routine");
     }

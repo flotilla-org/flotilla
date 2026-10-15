@@ -6006,7 +6006,60 @@ impl InProcessDaemon {
 
     pub async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String> {
         let namespace = requested_namespace.map(ToOwned::to_owned).unwrap_or(self.provisioning_namespace().await);
-        self.read_projections().explain_convoy(&namespace, name).await
+        let mut explanation = self.read_projections().explain_convoy(&namespace, name).await?;
+        match self.convoy_dispatch_scores(&namespace, &explanation.convoy).await {
+            Ok(scores) => explanation.dispatch_scores = scores,
+            Err(error) => explanation.dispatch_score_error = Some(error),
+        }
+        Ok(explanation)
+    }
+
+    async fn convoy_dispatch_scores(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<BTreeMap<String, flotilla_protocol::DispatchScore>, String> {
+        use crate::dispatch_missions::{issue_from_convoy, MissionBoard, MissionOccupancy};
+        let convoy = self
+            .resource_backend
+            .query_declared::<ResourceConvoy>(namespace, &flotilla_store::StoreQuery::names([name.to_string()], true))
+            .await
+            .map_err(|e| e.to_string())?;
+        let convoy = &convoy.items.first().ok_or("convoy disappeared")?.object;
+        let Some(project_name) = &convoy.spec.project_ref else {
+            return Ok(BTreeMap::new());
+        };
+        let projects = self
+            .resource_backend
+            .query_declared::<Project>(namespace, &flotilla_store::StoreQuery::names([project_name.clone()], true))
+            .await
+            .map_err(|e| e.to_string())?;
+        let project = &projects.items.first().ok_or("convoy project unavailable")?.object;
+        let Some(policy) = &project.spec.dispatch_policy else {
+            return Ok(BTreeMap::new());
+        };
+        // This reads the shared immutable board snapshot, scheduling background
+        // warming when cold/stale; it never waits for HTTP. Explanation rebuilds
+        // one project's mission graph and reads only its live convoy subset.
+        let inputs = self.collect_dispatch_board_inputs(std::slice::from_ref(project)).await?;
+        let (_, snapshots) = inputs.get(project_name).ok_or("project board unavailable")?.as_ref().map_err(Clone::clone)?;
+        let board = MissionBoard::new(&snapshots.iter().map(|(_, board)| board.as_ref().clone()).collect::<Vec<_>>())?;
+        let convoys = self
+            .resource_backend
+            .query_declared::<ResourceConvoy>(namespace, &crate::dispatch_missions::live_project_convoys_query([project_name.clone()]))
+            .await
+            .map_err(|e| e.to_string())?;
+        let occupancy = MissionOccupancy::collect(&board, policy, convoys.items.iter().map(|source| &source.object))?;
+        convoy
+            .spec
+            .issues
+            .iter()
+            .map(|served| {
+                let mut score = board.score(&issue_from_convoy(served), policy)?;
+                occupancy.apply(&mut score);
+                Ok((format!("{}/{}#{}", served.reference.source.service, served.reference.source.scope, served.reference.id), score))
+            })
+            .collect()
     }
 }
 

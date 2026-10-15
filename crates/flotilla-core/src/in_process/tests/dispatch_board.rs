@@ -35,7 +35,21 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
         projects
             .create(
                 &test_meta(name),
-                &ProjectSpec::builder().display_name(name.to_string()).issue_source_bindings(vec![binding.clone()]).build(),
+                &ProjectSpec::builder()
+                    .display_name(name.to_string())
+                    .issue_source_bindings(vec![binding.clone()])
+                    .dispatch_policy(
+                        flotilla_resources::DispatchPolicy::builder()
+                            .missions(vec![flotilla_resources::DispatchMission::builder()
+                                .name("routine".into())
+                                .attributes(flotilla_protocol::MissionAttributes {
+                                    priority: flotilla_protocol::Priority::Low,
+                                    weight: 2.0.try_into().expect("weight"),
+                                })
+                                .build()])
+                            .build(),
+                    )
+                    .build(),
             )
             .await
             .expect("project");
@@ -151,4 +165,39 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
         let overlapping = &inputs[&format!("overlap-{id}")].as_ref().expect("overlap scope").1[0].1;
         assert!(Arc::ptr_eq(shared, overlapping));
     }
+    // #3313: convoy explain uses the shared warm board and live accounting,
+    // exposes a ticket override, and never waits on a remote observation.
+    backend
+        .using::<ResourceConvoy>("flotilla")
+        .create(
+            &test_meta("explained"),
+            &ConvoySpec::builder()
+                .workflow_ref("workflow".into())
+                .project_ref("large".into())
+                .issues(vec![flotilla_resources::ConvoyIssue {
+                    reference: flotilla_protocol::IssueRef { source: source.clone(), id: "0".into() },
+                    repository_ref: None,
+                    snapshot: flotilla_resources::IssueSnapshot {
+                        title: "Urgent".into(),
+                        body: None,
+                        state: flotilla_protocol::IssueState::Open,
+                        labels: vec!["priority:urgent".into()],
+                        as_of: now,
+                    },
+                }])
+                .build(),
+        )
+        .await
+        .expect("explained convoy");
+    let explanation = tokio::time::timeout(Duration::from_secs(1), daemon.explain_convoy_internal(Some("flotilla"), "explained"))
+        .await
+        .expect("explain stays local")
+        .expect("explanation");
+    assert_eq!(explanation.dispatch_score_error, None);
+    let score = &explanation.dispatch_scores["https://github.com/org/large#0"];
+    assert_eq!(score.attributes.priority, flotilla_protocol::Priority::Urgent);
+    assert_eq!(score.attribute_sources["priority"], "ticket_label");
+    assert_eq!(f64::from(score.attributes.weight), 2.0);
+    assert_eq!(score.mission_active_crews, 1);
+    assert_eq!(score.project_active_crews, 401);
 }

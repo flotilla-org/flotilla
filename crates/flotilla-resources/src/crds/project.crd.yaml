@@ -121,14 +121,14 @@ spec:
                           attributes:
                             type: object
                             properties:
-                              value: {type: number}
-                              class_of_service:
+                              priority:
                                 type: string
-                                enum: [expedite, standard, background]
-                              crew_limit:
-                                type: integer
-                                nullable: true
+                                enum: [urgent, high, medium, low]
+                                default: medium
+                              weight:
+                                type: number
                                 minimum: 0
+                                default: 1
                     stale_after_seconds:
                       type: integer
                       minimum: 1
