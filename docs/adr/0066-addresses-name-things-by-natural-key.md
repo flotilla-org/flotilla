@@ -1,6 +1,6 @@
 # 66. Addresses name things by natural key, in one typed-segment grammar
 
-**Status:** Proposed (owner grilling, 2026-10-15; #3350)
+**Status:** Proposed (owner grilling, 2026-10-15 and 2026-10-16; #3350)
 **Date:** 2026-10-15
 **Amends:**
 - [ADR 0047](0047-stored-data-stays-decodable-across-one-generation.md): a stored-data shim retires only after an explicit re-encode step has run on every host.
@@ -81,7 +81,7 @@ project:flotilla/convoy:demo                                a convoy
 forge:github/repo:flotilla-org%2Fflotilla                   a repository
 forge:github/repo:flotilla-org%2Fflotilla/cr:42             a change request
 forge:github/repo:flotilla-org%2Fflotilla/issue:7           an issue
-forge:github/repo:flotilla-org%2Fflotilla/commit:4f1c…      a commit
+forge:github/repo:flotilla-org%2Fflotilla/commit:<sha>      a commit (the full 40-character SHA)
 ```
 
 - **A reference is an address plus a revision.** This replaces `MessageReference` and its two spellings of a CR.
@@ -93,7 +93,7 @@ forge:github/repo:flotilla-org%2Fflotilla/commit:4f1c…      a commit
 
 ### 5. Storage: interned canonical text
 
-- **Interned canonical text.** In Rust an address is a typed value. It is stored as its canonical print through the storage derive's `#[store(intern)]`, as one integer column into the `strings` table. Equality is integer equality, and a prefix query is a range scan on the intern table's unique index.
+- **Interned canonical text.** In Rust an address is a typed value. It is stored as its canonical print through the storage derive's `#[store(intern)]`, as one integer column into the `strings` table. Equality is integer equality, and a prefix query is a range scan on the intern table's unique index. That index must use byte-wise (`BINARY`) collation, which the segment-prefix range query in §4 depends on.
 - **Address or `Ref`.** A field means "the thing named this", which may not exist or may be outside flotilla, holds an Address. A field means "this stored record, which must exist" holds a `Ref` foreign key.
 - **The canonical printer is part of the stored shape.** Interned rows are keyed by the canonical print, so any change to it is a stored-shape change. That includes a new escape rule or a normalisation fix like #3351. Before the cut-over it needs the re-encode step (§6); after it, an explicit migration step.
 - **Unused intern entries are cleaned up later.** That is part of archiving: a reference-count or distinct query over the live set, then removing unreferenced intern rows.
@@ -125,15 +125,21 @@ For those kinds a shim never actually becomes removable, and the roll-time live 
 3. **The ADR 0064 model stores addresses natively.** The cut-over importer converts old records once, and normalisation happens there. The combined engine and storage stack (#3319, #3320) uses addresses from the moment the crate lands.
 4. **Receivers move to ADR 0064 inbox addresses as part of the primitives inbox work.** The code still uses ADR 0055's `project/convoy/vessel/role`, `principal:` and `system:` strings.
 
-## Open for review in this ADR
+### 8. Artifacts, work and usage (owner rulings, 2026-10-16)
 
-- **How an artifact is addressed.** An artifact's key is (convoy, producer, kind, subject), and publishing to the same key replaces its body. There are two candidates:
-  - **(a) Under its producing role:** `project:P/convoy:C/role:reviewer/artifact:review-round/of:<subject>`. The subject's meaning is declared by the artifact kind; a review round's subject is a commit. This is the leaning.
-  - **(b) Under its convoy, with producer and kind as segments.**
-
-  Both questions hang on what produces artifacts. Image-build logs today have no convoy and are named outside the artifact scheme (`crates/flotilla-daemon/src/image_build.rs`).
-- **Work.** A work item has no record; it is a key inside its convoy's status. Its candidate address is `project:P/convoy:C/work:W`.
-- **Usage.** Usage (provider, account) is a host-level fact, not an object owned by a project. It may need its own root kind.
+- **An artifact address names the slot, and the file's digest is its revision.**
+  - The blob store already names every file by its SHA-256 (`crates/flotilla-daemon/src/blob_store.rs`), so files are immutable.
+  - The artifact record is a named **slot** pointing at the current file. Publishing to the same slot stores the new file and moves the pointer. Files no longer referenced are swept (`reap_expired`, `crates/flotilla-daemon/src/artifact.rs`).
+  - Code finds artifacts by slot ("the coder's brief", "the convoy's decision ledger", "the reviewer's review round for this head"), so the slot is what an address names. This is the same pattern as a branch name pointing at a commit, or a container tag pointing at an image digest.
+  - A slot sits under the role that produces it: `project:P/convoy:C/role:reviewer/artifact:review-round/of:<subject>`. Each artifact kind declares what its subject means; a review round's subject is a commit.
+  - A reference that pins an exact version adds the digest as its revision.
+  - Image-build logs, which today have no convoy and no role and are named outside the artifact scheme (`crates/flotilla-daemon/src/image_build.rs`), need an owning role or root when they move to this scheme.
+- **There is no `work` kind.**
+  - `ConvoyStatus.work` is the convoy's per-vessel progress record, and `crew_work` holds per-role progress. Neither is a thing of its own.
+  - A condition on a crew's progress addresses the role: `project:P/convoy:C/role:coder .phase == Done`. This replaces `work/<convoy>/<vessel> .crew.<role>.phase == Done`.
+- **Usage is a small root kind: `usage:<provider>/account:<account>`.**
+  - It is a host- or account-level fact, not owned by a project or forge.
+  - Its expected main user is a scheduler checking capacity before a vessel is deployed. Wait conditions on it, which the condition machinery already supports, are a secondary use.
 
 ## Consequences
 
