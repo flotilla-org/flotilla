@@ -59,6 +59,30 @@ before trusting candidate executables. Sync the installer and validator together
 keep the existing validator rollback rule: validate old releases without requiring
 payloads introduced by newer generations.
 
+### Rolling out archive-link support (#3190)
+
+Before building/promoting a candidate that preserves terminfo aliases, sync in
+this order (pause release publication while replacing each tool/module pair):
+
+1. Fleet consumers: sync `generation_validation.py` beside every bootstrap
+   `fleet-install` (or its `FLEET_GENERATION_VALIDATOR` override). Installed
+   generations carrying an older validator need that override for the first
+   link-bearing roll. Do not change signed generation payloads in place.
+2. Comte: sync `generation_validation.py` and `lab-darwin-sign` together into
+   `~/.local/libexec`.
+3. Raclette guest 106: sync `generation_validation.py`, `lab-fleet-promote`,
+   and `lab-fleet-finalize-darwin` together into `/usr/local/sbin`.
+4. Resume candidate builds with the updated `build-candidate.sh`, then signing,
+   finalization and fleet installation. Clear temporary validator overrides once
+   every consumer runs a generation containing the new validator.
+
+All four doors resolve symlinks and tar hard links inside the bundle namespace
+before checking manifests. File aliases materialize as regular bytes; directory
+aliases are created only after file writes finish. Absolute/escaping links,
+cycles, missing targets, duplicate paths and special members refuse before any
+extraction. Ordinary archives from previous generations remain valid. Rolling tools back
+after publishing link-bearing archives makes those archives refuse again.
+
 Neither helper contains credentials; the three host tools continue to read
 their existing token files at runtime.
 

@@ -203,7 +203,11 @@ def inspect_archive(archive_bytes, root, description):
     with archive:
         members = {}
         total = 0
-        for member in archive.getmembers():
+        try:
+            checked = validation.checked_archive_members(archive, root)
+        except validation.ValidationError as error:
+            raise FinalizationError(str(error)) from error
+        for member in checked:
             if member.isdir():
                 directory_name = member.name.rstrip("/")
                 if directory_name == root:
