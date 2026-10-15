@@ -26,7 +26,9 @@ impl<T: Serialize + DeserializeOwned> Freezable for T {}
 
 impl<T: Freezable> Frozen<T> {
     /// Freezes a value. Fails only when `T` has no canonical CBOR form within the ADR 0063 default
-    /// limits (1 MiB, depth 64), such as a map with non-text keys.
+    /// limits (1 MiB, depth 64), such as a map with non-text keys. The ceiling is checked here, at
+    /// freeze time, not at compile time: a `#[store(frozen)]` field holds documents up to 1 MiB
+    /// (workflow snapshots are 16–100 KB, WORKLOAD.md).
     pub fn new(value: T) -> Result<Frozen<T>, flotilla_cbor::Error> {
         let bytes = flotilla_cbor::to_vec(&value, &flotilla_cbor::DEFAULT_LIMITS)?;
         Ok(Frozen { hash: Hash::of(&bytes), value: Arc::new(value), bytes: bytes.into() })

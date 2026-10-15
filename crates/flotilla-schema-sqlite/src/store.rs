@@ -535,6 +535,9 @@ impl Ctx<'_> {
             Change::Insert(row) | Change::Update(row) => Some(*row),
             Change::Delete(_) => None,
         });
+        // Objects first: the root and child rows reference them through immediate foreign keys.
+        // A stale write therefore inserts its objects before the version check refuses it; the
+        // savepoint rolls them back, and the cost is only paid by writes that lose a race.
         self.put_objects(changed.chain(root_changed.then(|| &new.tables[0][0])), &new.objects)?;
         // The root row next: a stale version is refused before any child row changes.
         let updated = if root_changed {

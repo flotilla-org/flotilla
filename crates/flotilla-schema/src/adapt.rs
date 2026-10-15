@@ -219,6 +219,7 @@ pub struct AsOptionalFrozen;
 impl<T: Freezable> Adapter<Option<Frozen<T>>> for AsOptionalFrozen {
     const TABLES: usize = 0;
 
+    // Always nullable: `None` is a stored NULL, whatever the enclosing field's requirement.
     fn layout(layout: &mut Layout, name: &str, _required: bool) {
         layout.column(name, ColumnType::Frozen, false);
     }
