@@ -114,6 +114,38 @@ class ArchiveLinkTests(unittest.TestCase):
                         members = validation.checked_archive_members(archive, signer.OUTPUT_ROOT)
                         self.assertTrue(any(getattr(member, 'bundle_directory_target', None) for member in members))
 
+    # A regular member under a directory alias must never be reinterpreted as
+    # an implicit directory and silently lose its payload (PR #3293 review).
+    def test_file_under_alias_refuses_implicit_directory_target(self):
+        root = 'fleet-candidate-darwin-aarch64'
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode='w:gz') as archive:
+            alias = tarfile.TarInfo(f'{root}/alias')
+            alias.type, alias.linkname = tarfile.SYMTYPE, 'x'
+            archive.addfile(alias)
+            for name in ('alias/new', 'x/new/child'):
+                member = tarfile.TarInfo(f'{root}/{name}')
+                member.size = 7
+                archive.addfile(member, io.BytesIO(b'payload'))
+        with tarfile.open(fileobj=io.BytesIO(output.getvalue())) as archive:
+            with self.assertRaisesRegex(validation.ValidationError, 'implicit directory'):
+                validation.checked_archive_members(archive, root)
+
+    # TarInfo defaults for directory aliases are deterministic just like files:
+    # zero timestamps/ownership and the fixed 0644 default mode.
+    def test_directory_alias_archive_metadata_is_normalized(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = Path(temporary)
+            (stage / 'x').mkdir()
+            (stage / 'x/file').write_bytes(b'payload')
+            (stage / 'alias').symlink_to('x')
+            first = signer.build_archive(stage)
+            self.assertEqual(first, signer.build_archive(stage))
+            with tarfile.open(fileobj=io.BytesIO(first)) as archive:
+                member = archive.getmember(f'{signer.OUTPUT_ROOT}/alias')
+                self.assertEqual((member.mode, member.mtime, member.uid, member.gid,
+                                  member.uname, member.gname), (0o644, 0, 0, 0, '', ''))
+
     # A link chain must be resolved before '..'; lexical normalization alone
     # misses both cycles and escapes through another alias.
     def test_chained_escape_and_duplicate(self):

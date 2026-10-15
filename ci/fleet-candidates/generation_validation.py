@@ -635,6 +635,10 @@ def checked_archive_members(bundle, expected_root):
     if not members:
         raise ValidationError("archive has no bundle directory")
 
+    directories = set()
+    for name in members:
+        directories.update(str(parent) for parent in PurePosixPath(name).parents)
+
     def resolve(parts, active):
         if len(active) > 128:
             raise ValidationError("archive link chain is too deep")
@@ -670,7 +674,7 @@ def checked_archive_members(bundle, expected_root):
         name = "/".join(current)
         if name not in members:
             # Implicit directories are permitted, but dangling links are not.
-            if not any(key.startswith(name + "/") for key in members):
+            if name not in directories:
                 raise ValidationError(f"archive link target is missing: {name}")
         return name
 
@@ -678,6 +682,8 @@ def checked_archive_members(bundle, expected_root):
     for name, member in members.items():
         resolved = resolve(PurePosixPath(name).parts, set())
         target = members.get(resolved)
+        if target is None and member.isfile():
+            raise ValidationError(f"archive file resolves to an implicit directory: {name}")
         view = copy.copy(target or member)
         view.name = name
         if target is None:

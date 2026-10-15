@@ -80,7 +80,8 @@ All four doors resolve symlinks and tar hard links inside the bundle namespace
 before checking manifests. File aliases materialize as regular bytes; directory
 aliases are created only after file writes finish. Absolute/escaping links,
 cycles, missing targets, duplicate paths and special members refuse before any
-extraction. Ordinary archives from previous generations remain valid.
+extraction. Ordinary archives from previous generations remain valid. Rolling tools back
+after publishing link-bearing archives makes those archives refuse again.
 
 Neither helper contains credentials; the three host tools continue to read
 their existing token files at runtime.
