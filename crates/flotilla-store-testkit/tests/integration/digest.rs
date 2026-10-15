@@ -6,7 +6,10 @@ use flotilla_store_sqlite::SqliteBackend;
 
 // Shared contract: cached digests equal authoritative key/version sets after
 // create/update/delete/duplicate relay interleavings, without reading bodies.
-#[hegel::test]
+// Each case runs real memory and SQLite backend operations. Hegel counts
+// that execution time toward TooSlow, so host contention can trip its 30s
+// generation health check (#3166). Keep all cases and correctness assertions.
+#[hegel::test(suppress_health_check = [hegel::HealthCheck::TooSlow])]
 fn cached_digest_tracks_committed_versions(tc: hegel::TestCase) {
     let count = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(20));
     let updates = (0..count).map(|_| tc.draw(hegel::generators::booleans())).collect::<Vec<_>>();
