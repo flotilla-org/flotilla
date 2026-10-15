@@ -25,9 +25,16 @@ fn check_socket_path(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and does not mutate process state.
+    unsafe { libc::geteuid() }
+}
+
 fn alias_path(state_dir: &std::path::Path, uid: u32) -> std::path::PathBuf {
     let digest = Sha256::digest(state_dir.as_os_str().as_encoded_bytes());
     let name: String = digest[..16].iter().map(|byte| format!("{byte:02x}")).collect();
+    // Deliberately ignore TMPDIR: it can be as long as the state directory.
+    // This fixed short prefix makes the pathname bound independent of both.
     std::path::Path::new("/tmp").join(format!("flt-e-{uid}-{name}"))
 }
 
@@ -38,17 +45,22 @@ fn alias_path(state_dir: &std::path::Path, uid: u32) -> std::path::PathBuf {
 async fn socket_root(state_dir: &DaemonHostPath) -> Result<std::path::PathBuf, String> {
     use std::os::unix::fs::MetadataExt;
 
-    tokio::fs::create_dir_all(state_dir.as_path()).await.map_err(|error| error.to_string())?;
-    let target = tokio::fs::canonicalize(state_dir.as_path()).await.map_err(|error| error.to_string())?;
-    // SAFETY: geteuid has no preconditions and does not mutate process state.
-    let uid = unsafe { libc::geteuid() };
+    tokio::fs::create_dir_all(state_dir.as_path())
+        .await
+        .map_err(|error| format!("create environment socket state directory {state_dir}: {error}"))?;
+    let target = tokio::fs::canonicalize(state_dir.as_path())
+        .await
+        .map_err(|error| format!("canonicalize environment socket state directory {state_dir}: {error}"))?;
+    let uid = effective_uid();
     let alias = alias_path(&target, uid);
     match tokio::fs::symlink(&target, &alias).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(format!("create environment socket alias {}: {error}", alias.display())),
     }
-    let metadata = tokio::fs::symlink_metadata(&alias).await.map_err(|error| error.to_string())?;
+    let metadata = tokio::fs::symlink_metadata(&alias)
+        .await
+        .map_err(|error| format!("inspect environment socket alias {}: {error}", alias.display()))?;
     if !metadata.file_type().is_symlink() || metadata.uid() != uid || tokio::fs::read_link(&alias).await.ok().as_ref() != Some(&target) {
         return Err(format!(
             "refuse environment socket alias {}: expected a symlink owned by uid {uid} to {}",
@@ -207,6 +219,24 @@ impl EnvironmentSocketService {
 mod tests {
     use super::*;
 
+    // Production aliases survive daemon shutdown. Tests own unique state roots
+    // and retire their aliases even when an assertion unwinds.
+    struct SocketAliasGuard(std::path::PathBuf);
+
+    impl SocketAliasGuard {
+        fn new(state_dir: &DaemonHostPath) -> Self {
+            std::fs::create_dir_all(state_dir.as_path()).expect("test state directory");
+            let target = std::fs::canonicalize(state_dir.as_path()).expect("canonical test state directory");
+            Self(alias_path(&target, effective_uid()))
+        }
+    }
+
+    impl Drop for SocketAliasGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     // #3285: the length guard counts bytes, accepting the last safe pathname
     // and refusing the next byte with the actual path and limit in the error.
     #[hegel::test]
@@ -252,15 +282,13 @@ mod tests {
     async fn socket_alias_refuses_unexpected_target() {
         let state = tempfile::tempdir().expect("state");
         let other = tempfile::tempdir().expect("other state");
-        let target = std::fs::canonicalize(state.path()).expect("canonical state");
-        let uid = unsafe { libc::geteuid() };
-        let alias = alias_path(&target, uid);
-        std::os::unix::fs::symlink(other.path(), &alias).expect("unexpected alias");
+        let cleanup = SocketAliasGuard::new(&DaemonHostPath::new(state.path()));
+        let alias = &cleanup.0;
+        std::os::unix::fs::symlink(other.path(), alias).expect("unexpected alias");
         let error = socket_root(&DaemonHostPath::new(state.path())).await.expect_err("refuse wrong target");
         assert!(error.contains("refuse environment socket alias"));
         assert!(error.contains(&alias.display().to_string()));
-        assert_eq!(std::fs::read_link(&alias).expect("alias retained"), other.path());
-        std::fs::remove_file(alias).expect("cleanup alias");
+        assert_eq!(std::fs::read_link(alias).expect("alias retained"), other.path());
     }
 
     // #3285: state paths beyond Linux's 108-byte limit must still bind.
@@ -268,6 +296,7 @@ mod tests {
     async fn long_state_directory_still_binds() {
         let directory = tempfile::tempdir().expect("state root");
         let root = DaemonHostPath::new(directory.path().join("x".repeat(120)));
+        let _cleanup = SocketAliasGuard::new(&root);
         let mut registry = EnvironmentSocketRegistry::new();
         let id = EnvironmentId::new("long-state");
         let path = registry
@@ -291,6 +320,7 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let directory = flotilla_test_support::TestSocketDir::new();
         let root = DaemonHostPath::new(directory.socket_path("env"));
+        let _cleanup = SocketAliasGuard::new(&root);
         let id = EnvironmentId::new("env-convoy-0123456789abcdef0123456789abcdef-work");
         let accept = |listener, _| {
             tokio::spawn(async move {
@@ -327,6 +357,7 @@ mod tests {
     async fn failed_socket_removal_can_rebind_and_retry() {
         let directory = flotilla_test_support::TestSocketDir::new();
         let root = DaemonHostPath::new(directory.socket_path("env"));
+        let _cleanup = SocketAliasGuard::new(&root);
         let id = EnvironmentId::new("retry");
         let accept = |listener, _| {
             tokio::spawn(async move {
