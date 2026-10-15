@@ -95,7 +95,9 @@ impl EnvironmentSocketRegistry {
         Ok(())
     }
 
-    /// Remove all environment sockets.
+    /// Best-effort bulk cleanup for shutdown: abort every accept task even if
+    /// unlink/rmdir fails. Resource teardown uses `remove` to report and retry
+    /// cleanup failures rather than treating them as successful deletion.
     pub async fn remove_all(&mut self) {
         for (id, (handle, path)) in self.sockets.drain() {
             if let Some(handle) = handle {

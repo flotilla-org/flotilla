@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_executor::action_support::empty_repo_identity;
 use flotilla_protocol::{
     CallerCrew, CommandAction, CommandCaller, CrewCommandContext, DaemonEvent, EnvironmentId, Message, PrincipalRef, Request, Response,
     ResponseResult,
@@ -97,6 +98,8 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
                 _ => Err("EnvironmentCommandDenied: command is outside the crew allowlist".into()),
             }
         }
+        // The dispatcher resolves caller_session and reads source_path through
+        // that session's environment runner, never the host filesystem.
         Request::ArtifactPut { .. } => Ok(()),
         Request::ArtifactList { convoy, .. } if convoy.as_ref().is_none_or(|value| value == &crew.convoy) => {
             *convoy = Some(crew.convoy.clone());
@@ -233,7 +236,9 @@ pub(super) async fn serve(
                 DaemonEvent::CommandFinished {
                     command_id,
                     node_id: daemon.node_id().clone(),
-                    repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: String::new() },
+                    // Match normal context-free crew completions, including
+                    // the client's repository-free display convention.
+                    repo_identity: empty_repo_identity(),
                     repo: None,
                     result: flotilla_protocol::CommandValue::Error { message },
                 }

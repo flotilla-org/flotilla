@@ -32,6 +32,11 @@ caller-supplied convoy, vessel or crew ID can extend that placement. Missing or
 ambiguous placement refuses rather than assuming host authority. Placement is
 resolved for each request, so retired sessions cannot preserve access.
 
+A declared TerminalSession is not a calling crew until its `status.crew` is
+populated by launch/adoption. During startup, missing crew status therefore
+produces `EnvironmentIdentityUnavailable`; it does not grant host authority.
+Check that the session's launch/adoption has completed before retrying.
+
 The allowlist includes ordinary crew completion (without force), stalls,
 promises, same-convoy handoffs, crew list/capabilities/message contacts,
 explanation of the caller's convoy, artifact submission and same-convoy artifact
