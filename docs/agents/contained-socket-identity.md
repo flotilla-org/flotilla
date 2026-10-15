@@ -118,3 +118,5 @@ remain refused. Dispatch-board, queue and fleet reads are pinned to the bound
 project. Stall reads filter rows to that project and recompute shared-cause
 counts after filtering. Forced settlement and host administration remain outside
 the contained supervisor interface.
+
+Compatibility removal is tracked in #3279. If both a legacy main-directory mount and a dedicated environment socket mount are present, environment-bound identity wins; the extra legacy mount cannot enable variable-derived identity. The short-lived-peer race also applies between reading mountinfo and statting `/proc/<pid>/root`: disappearing evidence produces `CallerIdentityUnavailable` without a downgrade.

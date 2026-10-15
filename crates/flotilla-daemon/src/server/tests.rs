@@ -6277,6 +6277,17 @@ async fn legacy_mount_caller_keeps_working_until_vessel_ends() {
         .await
         .unwrap_err()
         .starts_with("CallerIdentityMismatch:"));
+    // A mixed mount table is new-style: adding legacy main-directory evidence
+    // must never downgrade mounted environment-socket authority.
+    let mut mixed = caller_mountinfo(&environment, true);
+    mixed.mountinfo.push('\n');
+    mixed.mountinfo.push_str(&caller_mountinfo(&environment, false).mountinfo);
+    mixed.legacy_main_directory = true;
+    assert!(super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&mixed)).await.unwrap().transport_bound);
+    assert!(super::caller::resolve_main_caller(&daemon, evidence.clone(), &forged, Some(&mixed))
+        .await
+        .unwrap_err()
+        .starts_with("CallerIdentityMismatch:"));
     let mut unproven = caller_mountinfo(&environment, false);
     unproven.legacy_main_directory = false;
     assert!(super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&unproven))

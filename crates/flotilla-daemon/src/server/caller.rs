@@ -164,11 +164,11 @@ pub(super) fn peer_mounts(pid: u32, socket_path: Option<&std::path::Path>) -> Re
     Ok(PeerMounts { mountinfo, legacy_main_directory })
 }
 
-fn environment_socket_is_mounted(environment: &flotilla_protocol::EnvironmentId, mounts: &str) -> Result<bool, String> {
+fn environment_socket_is_mounted(environment: Option<&flotilla_protocol::EnvironmentId>, mounts: &str) -> Result<bool, String> {
     if mounts.trim().is_empty() {
         return Err("CallerIdentityUnavailable: empty peer mount table".into());
     }
-    let directory = super::environment_sockets::directory_name(environment);
+    let directory = environment.map(super::environment_sockets::directory_name);
     for line in mounts.lines() {
         let (fields, _) = line.split_once(" - ").ok_or("CallerIdentityUnavailable: malformed peer mount table")?;
         let fields: Vec<_> = fields.split_whitespace().collect();
@@ -177,9 +177,13 @@ fn environment_socket_is_mounted(environment: &flotilla_protocol::EnvironmentId,
         }
         // Docker's immutable bind mount source is the daemon-created dedicated
         // directory. The main socket used the daemon run directory instead.
-        if fields[4] == flotilla_environment::environment::CONTAINED_DAEMON_SOCKET_DIRECTORY
-            && std::path::Path::new(fields[3]).file_name().and_then(|name| name.to_str()) == Some(directory.as_str())
-        {
+        let source = std::path::Path::new(fields[3]).file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        // Without a resolved environment, recognize any dedicated socket source
+        // to prevent mixed old/new mounts from selecting legacy authority.
+        let matches = directory
+            .as_deref()
+            .map_or_else(|| source.len() == 32 && source.bytes().all(|byte| byte.is_ascii_hexdigit()), |directory| source == directory);
+        if fields[4] == flotilla_environment::environment::CONTAINED_DAEMON_SOCKET_DIRECTORY && matches {
             return Ok(true);
         }
     }
@@ -202,8 +206,8 @@ pub(super) async fn resolve_main_caller(
         return Ok(CallerResolution { caller, transport_bound: false });
     };
     let mounts = mounts.ok_or("CallerIdentityUnavailable: peer mount evidence unavailable")?;
-    if mounts.legacy_main_directory {
-        // REMOVE this compatibility branch once no pre-#3270 vessels remain.
+    if mounts.legacy_main_directory && !environment_socket_is_mounted(None, &mounts.mountinfo)? {
+        // REMOVE this compatibility branch once no pre-#3270 vessels remain (#3279).
         // A kernel device/inode comparison proves the peer still mounts this
         // daemon's main run directory, not an environment socket directory.
         // It works before adoption and without a prior immutable-ID observation.
@@ -231,7 +235,7 @@ pub(super) async fn resolve_main_caller(
         return Err("CallerIdentityAmbiguous: container maps to multiple environments".into());
     }
     let environment = flotilla_protocol::EnvironmentId::new(environment.object.metadata.name);
-    if !environment_socket_is_mounted(&environment, &mounts.mountinfo)? {
+    if !environment_socket_is_mounted(Some(&environment), &mounts.mountinfo)? {
         return Err("CallerIdentityMismatch: container has no matching environment socket mount".into());
     }
     let crews = super::environment_connection::environment_crews(daemon, &environment).await?;
