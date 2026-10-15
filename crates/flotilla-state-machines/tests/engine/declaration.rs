@@ -463,6 +463,10 @@ fn expected(initial: usize, edges: &[Drawn], ends: &[(usize, bool)]) -> BTreeSet
         if d.from == 0 {
             errors.insert(DefError::EdgeWithoutSource(name));
         }
+        // Inert: no data changes, and every from-label equals every to-label.
+        if d.changes.is_empty() && d.from != 0 && d.from == d.to && d.from.count_ones() == 1 {
+            errors.insert(DefError::InertEdge(name));
+        }
         for data in &d.changes {
             if !labels_in(d.to).iter().any(|label| Latch::fields(*label).contains(data)) {
                 errors.insert(DefError::UnknownData { edge: name, data });
@@ -512,7 +516,7 @@ fn expected(initial: usize, edges: &[Drawn], ends: &[(usize, bool)]) -> BTreeSet
 
 // validate() reports exactly the violated rules for any declaration. The
 // generator spans every rule: from- and to-sets over all 16 masks (including
-// empty), changed data carried by some labels and by none, gated, ungated
+// empty, and inert self-loops), changed data carried by some labels and by none, gated, ungated
 // with and without a reason, and unchecked edges, missing effects, kinds
 // declared zero, one or two times, and ends repeated or without a reason.
 fn validate_case(tc: hegel::TestCase) {

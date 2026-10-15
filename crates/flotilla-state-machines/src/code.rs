@@ -38,7 +38,7 @@ pub trait Datum: Debug {
     fn as_any(&self) -> &dyn Any;
 }
 
-impl<T: PartialEq + Debug + 'static> Datum for T {
+impl<T: Eq + Debug + 'static> Datum for T {
     fn same(&self, other: &dyn Datum) -> bool {
         other.as_any().downcast_ref::<T>() == Some(self)
     }

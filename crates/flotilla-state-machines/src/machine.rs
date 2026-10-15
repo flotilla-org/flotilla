@@ -66,7 +66,7 @@ pub struct WrongState<L, K> {
     pub edge: Option<K>,
 }
 
-type GateFn<M> = dyn Fn(&mut Handle<'_, M>, &<M as Machine>::Edge) -> Result<(), <M as Machine>::Refusal>;
+type GateFn<M> = dyn Fn(&mut Handle<'_, M>, &<M as Machine>::Edge) -> Option<Result<(), <M as Machine>::Refusal>>;
 type EffectFn<M> = dyn Fn(&mut Handle<'_, M>, <M as Machine>::State, &<M as Machine>::Edge) -> Option<<M as Machine>::State>;
 
 /// What an edge checks before it moves.
@@ -105,7 +105,9 @@ impl<M: Machine, A: EdgeArg<Edge = M::Edge>> EdgeDef<M, A> {
     }
 
     /// The data this edge changes: each datum of the next state that is new
-    /// or holds another value. Changing an undeclared datum is a declaration fault.
+    /// or holds another value. Changing an undeclared datum is a declaration
+    /// fault, so an edge into a label that carries data names the data it
+    /// writes there, even when the label changes too.
     pub fn changes(mut self, data: impl IntoIterator<Item = &'static str>) -> Self {
         self.changes.extend(data);
         self
@@ -114,14 +116,13 @@ impl<M: Machine, A: EdgeArg<Edge = M::Edge>> EdgeDef<M, A> {
     /// `doc` is the sentence shown beside the edge; `gate` enforces it,
     /// reading the current state and the world through the handle.
     pub fn gate(mut self, doc: &'static str, gate: fn(&mut Handle<'_, M>, &A) -> Result<(), M::Refusal>) -> Self {
-        let gate = move |handle: &mut Handle<'_, M>, edge: &M::Edge| match A::project(edge) {
-            Some(arg) => gate(handle, arg),
-            // Unreachable by construction: definitions are looked up by kind.
-            // Debug builds stop on a lookup bug; release builds refuse the write.
-            None => {
-                debug_assert!(A::project(edge).is_some(), "edge {:?} reached the gate declared for {:?}", edge.kind(), A::KIND);
-                Err(WrongState { state: handle.state().label(), edge: Some(edge.kind()) }.into())
-            }
+        // Definitions are looked up by kind, so the projection cannot miss. Debug
+        // builds stop on a lookup bug; release builds report a declaration fault,
+        // as the effect's projection does.
+        let gate = move |handle: &mut Handle<'_, M>, edge: &M::Edge| {
+            let arg = A::project(edge);
+            debug_assert!(arg.is_some(), "edge {:?} reached the gate declared for {:?}", edge.kind(), A::KIND);
+            arg.map(|arg| gate(handle, arg))
         };
         self.check = Some(Check::Gate { doc, gate: Box::new(gate) });
         self
@@ -220,6 +221,8 @@ pub enum DefError {
     EdgeWithoutEffect(&'static str),
     EdgeWithoutTarget(&'static str),
     EdgeWithoutSource(&'static str),
+    /// Neither changes data nor leaves its label: it could never alter the state.
+    InertEdge(&'static str),
     /// A changed datum that no target label carries.
     UnknownData {
         edge: &'static str,
@@ -373,6 +376,13 @@ impl<M: Machine> MachineDef<M> {
             if edge.from.is_empty() {
                 errors.insert(DefError::EdgeWithoutSource(name));
             }
+            if edge.changes.is_empty()
+                && !edge.from.is_empty()
+                && !edge.to.is_empty()
+                && edge.from.iter().all(|from| edge.to.iter().all(|to| from == to))
+            {
+                errors.insert(DefError::InertEdge(name));
+            }
             for data in &edge.changes {
                 if !edge.to.iter().any(|label| M::State::fields(*label).contains(data)) {
                     errors.insert(DefError::UnknownData { edge: name, data });
@@ -473,7 +483,7 @@ impl<M: Machine> MachineDef<M> {
             return Err(StepError::Refused(WrongState { state: label, edge: Some(kind) }.into()));
         }
         match &declared.check {
-            Some(Check::Gate { gate, .. }) => gate(handle, edge).map_err(StepError::Refused)?,
+            Some(Check::Gate { gate, .. }) => gate(handle, edge).ok_or_else(undeclared)?.map_err(StepError::Refused)?,
             Some(Check::Ungated { .. }) => {}
             None => return Err(undeclared()),
         }
