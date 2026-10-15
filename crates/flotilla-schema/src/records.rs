@@ -26,7 +26,10 @@ impl fmt::Display for Position {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RecordRow<R> {
     pub position: Position,
-    /// The owner's version after the write that appended this row.
+    /// The owner's version after the write that appended this row. The store stamps rows it
+    /// appends with that write's sequence, but the value is still encoded first, so it must fit
+    /// a stored INTEGER (at most `i64::MAX`, as every home sequence does); above that the write
+    /// fails with `EncodeError::OutOfRange`.
     pub version: u64,
     pub record: R,
 }
