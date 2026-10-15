@@ -190,14 +190,14 @@ impl Read<'_> {
         self.ctx().snapshot(id)
     }
 
-    /// Up to `limit` logged changes of resource `id` after `after`, in sequence order: the tail
-    /// that follows a snapshot at version `after`.
+    /// Up to `limit` (at most [`MAX_CHANGES_PAGE`]; 0 returns none) logged changes of resource
+    /// `id` after `after`, in sequence order: the tail that follows a snapshot at version `after`.
     pub fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
         self.ctx().changes(id, after, limit)
     }
 
-    /// Up to `limit` logged changes homed at `home` after sequence `after`, in home order; page
-    /// with the last returned `home_seq`.
+    /// Up to `limit` (at most [`MAX_CHANGES_PAGE`]; 0 returns none) logged changes homed at
+    /// `home` after sequence `after`, in home order; page with the last returned `home_seq`.
     pub fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
         self.ctx().changes_since(home, after, limit)
     }
@@ -278,14 +278,14 @@ impl Write<'_> {
         self.ctx().snapshot(id)
     }
 
-    /// Up to `limit` logged changes of resource `id` after `after`, in sequence order: the tail
-    /// that follows a snapshot at version `after`.
+    /// Up to `limit` (at most [`MAX_CHANGES_PAGE`]; 0 returns none) logged changes of resource
+    /// `id` after `after`, in sequence order: the tail that follows a snapshot at version `after`.
     pub fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
         self.ctx().changes(id, after, limit)
     }
 
-    /// Up to `limit` logged changes homed at `home` after sequence `after`, in home order; page
-    /// with the last returned `home_seq`.
+    /// Up to `limit` (at most [`MAX_CHANGES_PAGE`]; 0 returns none) logged changes homed at
+    /// `home` after sequence `after`, in home order; page with the last returned `home_seq`.
     pub fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
         self.ctx().changes_since(home, after, limit)
     }
@@ -315,14 +315,16 @@ impl Write<'_> {
 
     /// Applies a change homed elsewhere, as replication receives it: the kind must be
     /// registered (`UnknownKind`), the home must not be this store's (`OwnHome`), and a change at
-    /// or below the resource's last applied sequence is `Duplicate` and changes nothing, so
-    /// replaying a log is idempotent. Otherwise the ops run through the kind's statements, the
-    /// resource's version becomes `home_seq`, objects are verified against their hashes, the
-    /// change is appended to this store's `change_log` under its own home, and that home's
-    /// `home_sequence` rises to at least `home_seq`.
-    ///
-    /// A deleted resource's last sequence is its delete's log row: trimming that row lets an
-    /// older change of the resource apply again.
+    /// or below the identity's sequence is `Duplicate` and changes nothing, so replaying a log is
+    /// idempotent. The identity's sequence survives a delete and any trimming of `change_log`,
+    /// so a replayed change never resurrects a deleted resource. A change whose `prev_seq` is not
+    /// the identity's sequence follows a change this store has not applied: it is a `Gap`, and
+    /// the caller fetches the missing changes first. Ops that would fail part-way are refused
+    /// before any statement runs (see `check_ops`). Otherwise the ops run through the kind's
+    /// statements, the resource's version and the identity's sequence become `home_seq`,
+    /// objects are verified against their hashes, the change is appended to this store's
+    /// `change_log` under its own home, and that home's `home_sequence` rises to at least
+    /// `home_seq`.
     pub fn apply(&mut self, change: &RowChange) -> Result<Applied, StoreError> {
         self.guarded(|ctx| ctx.apply(change))
     }
@@ -342,6 +344,10 @@ impl Write<'_> {
         Ok(())
     }
 }
+
+/// The most changes one `changes` or `changes_since` call returns, whatever limit it asks for:
+/// a page holds whole entries of up to 16 MiB each, so a caller pages rather than lists.
+pub const MAX_CHANGES_PAGE: u32 = 10_000;
 
 const LOG_APPEND: &str = "INSERT INTO change_log (home, home_seq, resource_id, change) VALUES (?1, ?2, ?3, ?4)";
 
@@ -527,9 +533,8 @@ impl Ctx<'_> {
         let mut statement = self.conn.prepare_cached("INSERT OR IGNORE INTO objects (hash, media, bytes) VALUES (?1, ?2, ?3)")?;
         let mut ops = Vec::new();
         for hash in hashes {
-            let bytes = objects.get(&hash).ok_or(DecodeError::MissingObject { hash })?;
-            statement.execute(params![&hash.0[..], MEDIA_CBOR, bytes])?;
-            let bytes = objects.remove(&hash).expect("present");
+            let bytes = objects.remove(&hash).ok_or(DecodeError::MissingObject { hash })?;
+            statement.execute(params![&hash.0[..], MEDIA_CBOR, &bytes])?;
             ops.push(RowOp::PutObject { hash, media: MEDIA_CBOR as u8, bytes });
         }
         Ok(ops)
@@ -650,26 +655,32 @@ impl Ctx<'_> {
 
     /// Applies a change homed elsewhere: see [`Write::apply`].
     fn apply(&mut self, change: &RowChange) -> Result<Applied, StoreError> {
-        let root = self.sql(change.kind)?.root_version.clone();
+        let (root, root_table) = {
+            let sql = self.sql(change.kind)?;
+            (sql.root_version.clone(), sql.tables[0].name.clone())
+        };
         if change.home == self.runtime.home {
             return Err(StoreError::OwnHome { home: change.home.clone() });
         }
         let sequence = i64::try_from(change.home_seq).map_err(|_| Malformed::Sequence { home_seq: change.home_seq })?;
         let identity = Identity { kind: change.kind, name: change.name.clone(), home: change.home.clone() };
         let id = self.ensure_identity(&identity)?;
-        let stored: Option<i64> = self.conn.prepare_cached(&root)?.query_row([id.0], |row| row.get(0)).optional()?;
-        // A deleted resource has no version; its last logged change still marks how far it got.
-        let logged: Option<i64> =
-            self.conn.prepare_cached("SELECT max(home_seq) FROM change_log WHERE resource_id = ?1")?.query_row([id.0], |row| row.get(0))?;
-        if stored.max(logged).is_some_and(|current| sequence <= current) {
+        // The identity's sequence outlives a delete, so it alone decides duplicates and gaps.
+        let current = self.identity_seq(id)?;
+        if change.home_seq <= current {
             return Ok(Applied::Duplicate(id));
         }
-        self.check_objects(&change.ops)?;
+        if change.prev_seq != current {
+            return Err(StoreError::Gap { id, expected: current, found: change.prev_seq });
+        }
+        let stored: Option<i64> = self.conn.prepare_cached(&root)?.query_row([id.0], |row| row.get(0)).optional()?;
+        self.check_ops(&identity, &root_table, stored.is_some(), &change.ops)?;
         if !self.execute(change.kind, id, &change.ops, sequence, stored)? {
             return Err(StoreError::NotFound { id });
         }
         let home = self.intern(&change.home)?;
         self.conn.prepare_cached(LOG_APPEND)?.execute(params![home, sequence, id.0, change.encode()?])?;
+        self.set_identity_seq(id, sequence)?;
         self.conn
             .prepare_cached(
                 "INSERT INTO home_sequence (home, last) VALUES (?1, ?2) ON CONFLICT (home) DO UPDATE SET last = max(last, excluded.last)",
@@ -678,32 +689,61 @@ impl Ctx<'_> {
         Ok(Applied::Applied(Stamp { id, version: change.home_seq }))
     }
 
-    /// A change carries every object it sets; an unchanged object column of an updated row names
-    /// an object the resource's earlier state brought. Refuses, as `MissingObject`, a change whose
-    /// rows name an object it neither carries nor finds here, before any statement runs.
-    fn check_objects(&mut self, ops: &[RowOp]) -> Result<(), StoreError> {
-        let mut named = BTreeSet::new();
+    /// Refuses, before any statement runs, a change that would fail part-way: a root `Insert`
+    /// for a resource whose root row exists (`Exists`); a row naming an object the change puts
+    /// only later (`Malformed::ObjectOrder`); a row naming an object the change does not carry
+    /// and this store lacks (`MissingObject`). A change carries every object it sets; an
+    /// unchanged object column of an updated row names an object the resource's earlier state
+    /// brought.
+    fn check_ops(&mut self, identity: &Identity, root: &str, exists: bool, ops: &[RowOp]) -> Result<(), StoreError> {
+        let carried: BTreeSet<Hash> = ops
+            .iter()
+            .filter_map(|op| match op {
+                RowOp::PutObject { hash, .. } => Some(*hash),
+                _ => None,
+            })
+            .collect();
         let mut put = BTreeSet::new();
+        let mut statement = self.conn.prepare_cached("SELECT 1 FROM objects WHERE hash = ?1")?;
         for op in ops {
-            match op {
+            let (key, values) = match op {
                 RowOp::PutObject { hash, .. } => {
                     put.insert(*hash);
+                    continue;
                 }
-                RowOp::Insert { key, values, .. } | RowOp::Update { key, values, .. } => {
-                    named.extend(key.iter().chain(values).filter_map(|value| match value {
-                        Value::Object(hash) => Some(*hash),
-                        _ => None,
-                    }));
+                RowOp::Insert { table, key, values } => {
+                    if exists && table == root {
+                        return Err(StoreError::Exists { kind: identity.kind, name: identity.name.clone() });
+                    }
+                    (key, values)
                 }
-                RowOp::Delete { .. } | RowOp::DeleteResource => {}
+                RowOp::Update { key, values, .. } => (key, values),
+                RowOp::Delete { .. } | RowOp::DeleteResource => continue,
+            };
+            for value in key.iter().chain(values) {
+                let Value::Object(hash) = value else { continue };
+                if put.contains(hash) {
+                    continue;
+                }
+                if carried.contains(hash) {
+                    return Err(Malformed::ObjectOrder { hash: *hash }.into());
+                }
+                if statement.query_row([&hash.0[..]], |_| Ok(())).optional()?.is_none() {
+                    return Err(StoreError::MissingObject { hash: *hash });
+                }
             }
         }
-        let mut statement = self.conn.prepare_cached("SELECT 1 FROM objects WHERE hash = ?1")?;
-        for hash in named.difference(&put) {
-            if statement.query_row([&hash.0[..]], |_| Ok(())).optional()?.is_none() {
-                return Err(StoreError::MissingObject { hash: *hash });
-            }
-        }
+        Ok(())
+    }
+
+    /// The home sequence of the identity's last change; 0 when it has none.
+    fn identity_seq(&mut self, id: ResourceId) -> Result<u64, StoreError> {
+        let seq: i64 = self.conn.prepare_cached("SELECT seq FROM resource_identity WHERE id = ?1")?.query_row([id.0], |row| row.get(0))?;
+        u64::try_from(seq).map_err(|_| StoreError::Corrupt { table: "resource_identity".into(), column: "seq".into() })
+    }
+
+    fn set_identity_seq(&mut self, id: ResourceId, seq: i64) -> Result<(), StoreError> {
+        self.conn.prepare_cached("UPDATE resource_identity SET seq = ?1 WHERE id = ?2")?.execute(params![seq, id.0])?;
         Ok(())
     }
 
@@ -716,8 +756,10 @@ impl Ctx<'_> {
         ops: Vec<RowOp>,
     ) -> Result<(), StoreError> {
         let home = self.intern(&identity.home)?;
-        let change = RowChange { kind: identity.kind, name: identity.name, home: identity.home, home_seq: version, ops };
+        let prev_seq = self.identity_seq(id)?;
+        let change = RowChange { kind: identity.kind, name: identity.name, home: identity.home, home_seq: version, prev_seq, ops };
         self.conn.prepare_cached(LOG_APPEND)?.execute(params![home, sequence, id.0, change.encode()?])?;
+        self.set_identity_seq(id, sequence)?;
         Ok(())
     }
 
@@ -827,6 +869,7 @@ impl Ctx<'_> {
     /// Logged changes of one resource after `after`, by `change_log_by_resource`.
     fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
         let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let limit = limit.min(MAX_CHANGES_PAGE);
         let mut statement = self
             .conn
             .prepare_cached("SELECT change FROM change_log WHERE resource_id = ?1 AND home_seq > ?2 ORDER BY home_seq LIMIT ?3")?;
@@ -838,6 +881,7 @@ impl Ctx<'_> {
     fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
         let Some(home) = self.string_id(home)? else { return Ok(Vec::new()) };
         let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let limit = limit.min(MAX_CHANGES_PAGE);
         let mut statement =
             self.conn.prepare_cached("SELECT change FROM change_log WHERE home = ?1 AND home_seq > ?2 ORDER BY home_seq LIMIT ?3")?;
         let rows = statement.query_map(params![home, after, limit], |row| row.get::<_, Vec<u8>>(0))?;

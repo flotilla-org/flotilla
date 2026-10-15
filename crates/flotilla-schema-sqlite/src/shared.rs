@@ -2,9 +2,11 @@
 
 use flotilla_schema::{render_ddl_with, DdlMode, KindRegistry};
 
-/// `strings` interns names and interned columns; `resource_identity` holds every live resource's
-/// (kind, name, home), with homes filtered through `resource_identity_by_home`; `objects` holds
-/// frozen documents by hash (media 1 is ADR 0063 CBOR); `home_sequence.last` is each home's
+/// `strings` interns names and interned columns; `resource_identity` holds every resource's
+/// (kind, name, home), with homes filtered through `resource_identity_by_home`, and its `seq`:
+/// the home sequence of the last change written or applied for it, kept after a delete as a
+/// tombstone, so replaying an older change is a duplicate however much `change_log` is trimmed;
+/// `objects` holds frozen documents by hash (media 1 is ADR 0063 CBOR); `home_sequence.last` is each home's
 /// sequence, which never decreases and does not depend on `change_log` rows, so deleting log
 /// rows never lets a sequence repeat; `change_log` holds every write's row changes per home.
 pub(crate) const SHARED_DDL: &str = "\
@@ -12,6 +14,7 @@ CREATE TABLE IF NOT EXISTS strings (id INTEGER PRIMARY KEY, s TEXT NOT NULL UNIQ
 CREATE TABLE IF NOT EXISTS resource_identity (
   id INTEGER PRIMARY KEY, kind INTEGER NOT NULL,
   name INTEGER NOT NULL REFERENCES strings(id), home INTEGER NOT NULL REFERENCES strings(id),
+  seq INTEGER NOT NULL DEFAULT 0,
   UNIQUE (kind, name, home)) STRICT;
 CREATE INDEX IF NOT EXISTS resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE IF NOT EXISTS objects (hash BLOB PRIMARY KEY, media INTEGER NOT NULL, bytes BLOB NOT NULL) STRICT;

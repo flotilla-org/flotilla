@@ -48,6 +48,10 @@ pub enum StoreError {
     /// A replicated change names an object this store does not hold and the change does not carry.
     #[error("object {hash:?} is not stored here")]
     MissingObject { hash: Hash },
+    /// A change that does not follow the identity's last applied change: `found` is its
+    /// `prev_seq`, `expected` the identity's sequence here.
+    #[error("resource {id} is at sequence {expected}; the change follows {found}")]
+    Gap { id: ResourceId, expected: u64, found: u64 },
     #[error("malformed change: {0}")]
     MalformedChange(#[from] Malformed),
 }
@@ -63,6 +67,9 @@ pub enum Malformed {
     /// Root rows are removed by `DeleteResource` only.
     #[error("root row of table {table} deleted by row")]
     RootDelete { table: String },
+    /// A row names an object the change puts only after it.
+    #[error("object {hash:?} is named before the change puts it")]
+    ObjectOrder { hash: Hash },
     #[error("home sequence {home_seq} cannot be stored")]
     Sequence { home_seq: u64 },
 }

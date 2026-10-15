@@ -286,7 +286,8 @@ fn malformed_changes_are_refused() {
     let short = with(RowOp::Insert { table: root.clone(), key: vec![], values: vec![Value::Null] });
     assert!(matches!(write.apply(&short), Err(StoreError::MalformedChange(Malformed::Shape { .. }))));
     write.apply(&change).expect("the real insert applies");
-    let root_delete = RowChange { home_seq: change.home_seq + 1, ..with(RowOp::Delete { table: root, key: vec![] }) };
+    let root_delete =
+        RowChange { home_seq: change.home_seq + 1, prev_seq: change.home_seq, ..with(RowOp::Delete { table: root, key: vec![] }) };
     assert!(matches!(write.apply(&root_delete), Err(StoreError::MalformedChange(Malformed::RootDelete { .. }))));
 }
 
@@ -350,7 +351,14 @@ fn seed(snapshot: &Snapshot) -> RowChange {
     for (table, rows) in set.tables.iter().zip(&snapshot.rows.tables) {
         ops.extend(rows.iter().map(|row| RowOp::Insert { table: table.name.clone(), key: row.key.clone(), values: row.values.clone() }));
     }
-    RowChange { kind: snapshot.kind, name: snapshot.name.clone(), home: snapshot.home.clone(), home_seq: snapshot.version, ops }
+    RowChange {
+        kind: snapshot.kind,
+        name: snapshot.name.clone(),
+        home: snapshot.home.clone(),
+        home_seq: snapshot.version,
+        prev_seq: 0,
+        ops,
+    }
 }
 
 fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
@@ -399,4 +407,176 @@ fn a_snapshot_plus_its_tail_is_the_newest_snapshot(tc: TestCase) {
     snapshot_plus_tail::<Message>(&tc);
     snapshot_plus_tail::<Convoy>(&tc);
     snapshot_plus_tail::<TerminalSession>(&tc);
+}
+
+/// Every change of `store` homed at `home`, in home order.
+fn log(store: &mut Store, home: &str) -> Vec<RowChange> {
+    store.read().expect("read").changes_since(home, 0, 100).expect("log")
+}
+
+fn message(body: &str) -> Message {
+    Message { body: body.into(), ..Message::sample() }
+}
+
+/// Inserts `name`, then rewrites its body once per entry of `bodies`, in one transaction.
+fn write_history(store: &mut Store, name: &str, bodies: &[&str]) {
+    let mut write = store.write().expect("write");
+    let mut stamp = write.insert(name, &message("first")).expect("insert");
+    for body in bodies {
+        let current = write.load::<Message>(stamp.id).expect("load").expect("present");
+        stamp = write.update(&current, &message(body)).expect("update");
+    }
+    write.commit().expect("commit");
+}
+
+// Behaviour (#3338 review, tombstone): the identity's sequence outlives a delete, so after every
+// log row of a deleted resource is trimmed, replaying its old insert and update is still a
+// `Duplicate` and the resource stays deleted.
+#[test]
+fn trimming_the_log_never_resurrects_a_deleted_resource() {
+    let mut source = store();
+    write_history(&mut source, "m", &["second"]);
+    let mut write = source.write().expect("write");
+    let id = write.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
+    let current = write.load::<Message>(id).expect("load").expect("present");
+    write.delete::<Message>(current.stamp()).expect("delete");
+    write.commit().expect("commit");
+    let changes = log(&mut source, LOCAL);
+
+    let mut target = replica();
+    let mut write = target.write().expect("write");
+    for change in &changes {
+        assert!(matches!(write.apply(change).expect("apply"), Applied::Applied(_)));
+    }
+    write.commit().expect("commit");
+    let conn = target.into_connection();
+    assert_eq!(conn.execute("DELETE FROM change_log", []).expect("trim"), 3);
+    let mut target = Store::open(conn, REPLICA, registry()).expect("reopen");
+    let mut write = target.write().expect("write");
+    for change in &changes {
+        assert!(matches!(write.apply(change).expect("replay"), Applied::Duplicate(_)), "{change:?}");
+    }
+    let id = write.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("identity kept");
+    assert_eq!(write.load_snapshot(id).expect("snapshot"), None);
+}
+
+// Behaviour (#3338 review, gaps): each change names the identity's previous sequence (0 when new,
+// the delete's after a re-insert). `apply` refuses a change that skips one as `Gap`, writing
+// nothing, and accepts the missing changes and then the skipped one in order.
+#[test]
+fn a_skipped_change_is_a_gap() {
+    let mut source = store();
+    write_history(&mut source, "m", &["second", "third"]);
+    let mut write = source.write().expect("write");
+    let id = write.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
+    let current = write.load::<Message>(id).expect("load").expect("present");
+    write.delete::<Message>(current.stamp()).expect("delete");
+    write.insert("m", &message("again")).expect("insert again");
+    write.commit().expect("commit");
+    let changes = log(&mut source, LOCAL);
+    let prev: Vec<u64> = changes.iter().map(|change| change.prev_seq).collect();
+    let seqs: Vec<u64> = changes.iter().map(|change| change.home_seq).collect();
+    assert_eq!(prev, [0, seqs[0], seqs[1], seqs[2], seqs[3]], "each change follows the last; the re-insert follows the delete");
+
+    let mut target = replica();
+    let mut write = target.write().expect("write");
+    assert!(matches!(
+        write.apply(&changes[1]),
+        Err(StoreError::Gap { expected: 0, found, .. }) if found == seqs[0]
+    ));
+    assert_eq!(write.resolve(Message::CODE, "m", LOCAL).expect("resolve"), None, "a refused apply writes nothing");
+    write.apply(&changes[0]).expect("insert");
+    assert!(matches!(write.apply(&changes[2]), Err(StoreError::Gap { expected, found, .. }) if expected == seqs[0] && found == seqs[1]));
+    let id = write.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
+    assert_eq!(write.load::<Message>(id).expect("load").expect("present").value, message("first"), "the gap changed nothing");
+    for change in &changes[1..] {
+        assert!(matches!(write.apply(change).expect("in order"), Applied::Applied(_)));
+    }
+    write.commit().expect("commit");
+    let source_id = source.read().expect("read").resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
+    let expected = source.read().expect("read").load_snapshot(source_id).expect("snapshot");
+    assert_eq!(target.read().expect("read").load_snapshot(id).expect("snapshot"), expected);
+}
+
+// Behaviour (#3338 review, typed refusals before any statement): a row naming an object the change
+// puts only later is `Malformed::ObjectOrder`; a root insert for a resource whose root row exists
+// is `Exists`. Neither writes anything.
+#[test]
+fn misordered_objects_and_duplicate_root_inserts_are_refused() {
+    let mut source = store();
+    let mut write = source.write().expect("write");
+    write.insert("c", &Convoy::sample(0)).expect("insert");
+    write.commit().expect("commit");
+    let insert = first_change(&mut source, LOCAL);
+    let mut ops = insert.ops.clone();
+    let put = ops.remove(0);
+    assert!(matches!(put, RowOp::PutObject { .. }));
+    ops.push(put);
+    let late = RowChange { ops, ..insert.clone() };
+
+    let mut target = replica();
+    let mut write = target.write().expect("write");
+    assert!(matches!(write.apply(&late), Err(StoreError::MalformedChange(Malformed::ObjectOrder { .. }))));
+    assert_eq!(write.resolve(Convoy::CODE, "c", LOCAL).expect("resolve"), None);
+    write.apply(&insert).expect("insert");
+    let again = RowChange { home_seq: insert.home_seq + 1, prev_seq: insert.home_seq, ..insert.clone() };
+    assert!(matches!(write.apply(&again), Err(StoreError::Exists { name, .. }) if name == "c"));
+    let id = write.resolve(Convoy::CODE, "c", LOCAL).expect("resolve").expect("present");
+    assert_eq!(write.load::<Convoy>(id).expect("load").expect("present").version, insert.home_seq);
+}
+
+// Behaviour (#3338 review, caches): a refused `apply` creates an identity only inside its
+// rolled-back savepoint, and no cache keeps it: the rowid it used is taken by the next identity,
+// yet resolving the refused identity finds nothing until it is applied, in the same transaction
+// or a later one, and every id loads its own resource.
+#[test]
+fn a_refused_apply_leaves_no_cached_identity() {
+    let mut source = store();
+    for name in ["a", "b", "c"] {
+        write_history(&mut source, name, &["second"]);
+    }
+    let changes = log(&mut source, LOCAL);
+    let of = |name: &str| changes.iter().filter(|change| change.name == name).cloned().collect::<Vec<_>>();
+    let (a, b, c) = (of("a"), of("b"), of("c"));
+
+    let mut target = replica();
+    let mut write = target.write().expect("write");
+    assert!(matches!(write.apply(&a[1]), Err(StoreError::Gap { .. })));
+    let Applied::Applied(b_stamp) = write.apply(&b[0]).expect("b") else { panic!("b applies") };
+    assert_eq!(b_stamp.id, ResourceId(1), "b reuses the rowid a's refused apply rolled back");
+    assert_eq!(write.resolve(Message::CODE, "a", LOCAL).expect("resolve"), None, "a's rolled-back id is not cached");
+    assert_eq!(write.load::<Message>(b_stamp.id).expect("load").expect("present").name, "b");
+    let Applied::Applied(a_stamp) = write.apply(&a[0]).expect("a") else { panic!("a applies") };
+    assert_ne!(a_stamp.id, b_stamp.id);
+    // A never-seen identity whose first change is not an insert: no gap (0), but nothing to update.
+    let headless = RowChange { prev_seq: 0, ..c[1].clone() };
+    assert!(matches!(write.apply(&headless), Err(StoreError::NotFound { .. })));
+    write.commit().expect("commit");
+
+    let mut write = target.write().expect("write");
+    assert_eq!(write.resolve(Message::CODE, "c", LOCAL).expect("resolve"), None);
+    for change in a[1..].iter().chain(&b[1..]).chain(&c) {
+        assert!(matches!(write.apply(change).expect("apply"), Applied::Applied(_)));
+    }
+    write.commit().expect("commit");
+    for name in ["a", "b", "c"] {
+        let source_id = source.read().expect("read").resolve(Message::CODE, name, LOCAL).expect("resolve").expect("present");
+        let expected = source.read().expect("read").load_snapshot(source_id).expect("snapshot");
+        let mut read = target.read().expect("read");
+        let id = read.resolve(Message::CODE, name, LOCAL).expect("resolve").expect("present");
+        assert_eq!(read.load_snapshot(id).expect("snapshot"), expected, "{name}");
+    }
+}
+
+// Behaviour (MAX_CHANGES_PAGE): a page of limit 0 is empty; a page never exceeds the limit asked.
+#[test]
+fn change_pages_respect_their_limit() {
+    let mut source = store();
+    write_history(&mut source, "m", &["second", "third"]);
+    let mut read = source.read().expect("read");
+    assert_eq!(read.changes_since(LOCAL, 0, 0).expect("page"), []);
+    assert_eq!(read.changes_since(LOCAL, 0, 2).expect("page").len(), 2);
+    let id = read.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
+    assert_eq!(read.changes(id, 0, 0).expect("page"), []);
+    assert_eq!(read.changes(id, 0, u32::MAX).expect("page").len(), 3);
 }

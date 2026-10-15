@@ -53,6 +53,7 @@ fn row_changes_round_trip_through_cbor(tc: TestCase) {
         name: tc.draw(gs::text().max_size(8)),
         home: tc.draw(gs::text().max_size(8)),
         home_seq: tc.draw(gs::integers::<u64>().min_value(0).max_value(i64::MAX as u64)),
+        prev_seq: tc.draw(gs::integers::<u64>().min_value(0).max_value(i64::MAX as u64)),
         ops: (0..tc.draw(gs::integers::<usize>().min_value(0).max_value(6))).map(|_| op(&tc)).collect(),
     };
     let bytes = change.encode().expect("encode");
@@ -71,7 +72,7 @@ fn limits_admit_a_maximal_frozen_document_with_its_rows() {
     let bytes = vec![7u8; 1024 * 1024];
     let mut ops = vec![RowOp::PutObject { hash: Hash::of(&bytes), media: 1, bytes }];
     ops.extend((0..10_000).map(insert));
-    let change = RowChange { kind: KindCode(1), name: "m".into(), home: "h".into(), home_seq: 1, ops };
+    let change = RowChange { kind: KindCode(1), name: "m".into(), home: "h".into(), home_seq: 1, prev_seq: 0, ops };
     let encoded = change.encode().expect("a maximal document fits");
     assert_eq!(RowChange::decode(&encoded).expect("decode"), change);
 
@@ -88,6 +89,7 @@ fn a_hash_of_the_wrong_length_is_refused() {
         name: "m".into(),
         home: "h".into(),
         home_seq: 1,
+        prev_seq: 0,
         ops: vec![RowOp::Insert { table: "t".into(), key: vec![], values: vec![Value::Object(Hash([1; 32]))] }],
     };
     let mut bytes = change.encode().expect("encode");

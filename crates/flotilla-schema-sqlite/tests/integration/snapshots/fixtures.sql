@@ -2,6 +2,7 @@ CREATE TABLE strings (id INTEGER PRIMARY KEY, s TEXT NOT NULL UNIQUE) STRICT;
 CREATE TABLE resource_identity (
   id INTEGER PRIMARY KEY, kind INTEGER NOT NULL,
   name INTEGER NOT NULL REFERENCES strings(id), home INTEGER NOT NULL REFERENCES strings(id),
+  seq INTEGER NOT NULL DEFAULT 0,
   UNIQUE (kind, name, home)) STRICT;
 CREATE INDEX resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE objects (hash BLOB PRIMARY KEY, media INTEGER NOT NULL, bytes BLOB NOT NULL) STRICT;

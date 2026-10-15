@@ -21,6 +21,11 @@ pub const CHANGE_LIMITS: flotilla_cbor::Limits =
     flotilla_cbor::Limits { max_message: 16 * 1024 * 1024, max_depth: 16, max_elements: 1 << 20, max_byte_string: 1024 * 1024 };
 
 /// One write to one resource, as its home executed it, at the home sequence it took.
+///
+/// This is the stored format of `change_log` entries, and ADR 0047's N→N+1 rule applies to it
+/// once a production generation writes it. Entries are CBOR maps with named fields, so a later
+/// generation adds a field with a serde `default` and still decodes this one; the one-letter
+/// field and variant names are therefore stable and never reused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowChange {
     #[serde(rename = "k")]
@@ -32,6 +37,11 @@ pub struct RowChange {
     /// The home sequence the write took; the resource's version after it.
     #[serde(rename = "s")]
     pub home_seq: u64,
+    /// The identity's sequence before this change: 0 for a resource never written before, the
+    /// delete's sequence for one inserted again. A receiver whose sequence for the identity
+    /// differs has missed a change (a gap).
+    #[serde(rename = "p")]
+    pub prev_seq: u64,
     /// In execution order: objects, then the root row, then child deletes deepest table first,
     /// child updates, and child inserts shallowest table first.
     #[serde(rename = "o")]
