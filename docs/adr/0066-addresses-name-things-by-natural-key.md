@@ -59,13 +59,20 @@ An address says what a thing is, for example "CR 42 in this repo on this forge" 
 
 - **A forge is named by its `forge_id`.** GitHub gets a built-in Forge, `github`. Hosts, SSH aliases and URLs are inputs only, resolved through Forge resources. A host that doesn't resolve to a Forge is an error, not a fallback spelling.
 - **Case is decided by forge kind, in the constructor only.** GitHub and Forgejo both look up owner and repo case-insensitively (Forgejo compares `lower_name` after lowercasing, `models/repo/repo.go`), so both lowercase owner and repo.
+  - **Display case is not stored in the address.** The address is an identity, not a display name. A surface that wants the forge's own casing reads it from the observation record or the forge.
+  - **`ForgeKind` is a closed enum.** Adding a forge kind means declaring its case rule in the same change. There is no default, so a case-sensitive forge can't be lowercased by accident.
 - **Numbers are numbers.** `007` and `+7` are refused.
 
 ### 4. One grammar: ADR 0064's typed segments
 
 Every address is a list of `kind:value` segments over a closed kind enum. Receivers and things use the same grammar.
 - **Segments.** Segments are separated by `/`. Each value is percent-encoded on its own, as `ViewAddress` already does (`crates/flotilla-protocol/src/view_address.rs`). Parsing splits on `/` and decodes each value, so nothing is positional and nothing is guessed.
-- **The path shows ownership.** "Everything in this convoy" or "everything under this repo" is a prefix match.
+- **The encoding is canonical: one address has exactly one spelling.**
+  - Only RFC 3986 unreserved characters (`A–Z a–z 0–9 - . _ ~`) are left bare. Every other byte of the UTF-8 value is encoded, including `/`, `:`, `%` and space.
+  - Hex digits are uppercase (`%2F`, never `%2f`).
+  - The parser refuses non-canonical input in stored data. Lenient input is canonicalised first; see below.
+- **The kind enum is closed.** Adding a kind changes the parser. Under ADR 0047 that is fine, but it is a deliberate change, not an extension point.
+- **The path shows ownership.** "Everything in this convoy" or "everything under this repo" is a prefix match **on segment boundaries**. `X` is under `P` when `X = P` or `X` starts with `P/`. A raw string prefix is wrong: `…/convoy:demo` must not match `…/convoy:demo2`. Queries use `= P OR (>= P || '/' AND < P || '0')`, since `0` is the byte after `/`.
 
 ```
 project:flotilla/convoy:demo/role:coder                     a convoy role's inbox (ADR 0064)
@@ -81,11 +88,14 @@ forge:github/repo:flotilla-org%2Fflotilla/commit:4f1c…      a commit
 - **A condition (Leaf)** is an address, a field path, an operator and a literal. Field-path segments and literals use JSON string quoting when they contain anything other than a bare word. The printer always produces the canonical form, so print-then-parse returns exactly what went in.
 - **Templates** (`$cr .checks == passing`) use the same field-path and literal rules.
 - **Input may be lenient, but only in what it resolves.** Short forms (`cr/github/org/repo/42`), PR URLs, hosts and mixed case are accepted when parsing and resolved to the canonical form. Only the canonical form is stored and printed.
+  - **Canonical text parses with no lookups.**
+  - **Lenient input may need Forge resources** to resolve a host or URL. Where they aren't available, for example during offline template validation or CLI completion, the parse is refused with the unresolved host named. The exception is the built-in `github` Forge, which needs no record.
 
 ### 5. Storage: interned canonical text
 
 - **Interned canonical text.** In Rust an address is a typed value. It is stored as its canonical print through the storage derive's `#[store(intern)]`, as one integer column into the `strings` table. Equality is integer equality, and a prefix query is a range scan on the intern table's unique index.
 - **Address or `Ref`.** A field means "the thing named this", which may not exist or may be outside flotilla, holds an Address. A field means "this stored record, which must exist" holds a `Ref` foreign key.
+- **The canonical printer is part of the stored shape.** Interned rows are keyed by the canonical print, so any change to it is a stored-shape change. That includes a new escape rule or a normalisation fix like #3351. Before the cut-over it needs the re-encode step (§6); after it, an explicit migration step.
 - **Unused intern entries are cleaned up later.** That is part of archiving: a reference-count or distinct query over the live set, then removing unreferenced intern rows.
 
 ### 6. Stored-data shims retire through an explicit re-encode step (amends ADR 0047)
@@ -98,12 +108,19 @@ ADR 0047 lets a shim go "once records have been rewritten or reaped", but nothin
 For those kinds a shim never actually becomes removable, and the roll-time live decode blocks its removal.
 
 - **A re-encode step.** A stored-shape change that lands before the ADR 0064 cut-over uses a general step, "re-encode every record". On startup it decodes each stored record through the current shims, writes it back in the current shape, and records a marker in `resource_store_migrations`.
+- **What the step is, and isn't.** It is a storage-level rewrite. It changes how a record is encoded, never its content.
+  - **Stays the same:** the decoded value, the `resourceVersion` and the history.
+  - **No events:** it emits no change event.
+  - **Immutability is untouched:** Message and snapshot immutability are rules about content, which doesn't change.
+  - **Replication is untouched:** each host rewrites everything it stores, its own records and its replica copies alike. Replication digests are computed over (name, `resourceVersion`) (`crates/flotilla-store-sqlite/src/sqlite/digest.rs`), so they don't change, and peers at different stages of the step still agree.
 - **When a shim can go.** It is removable once that step has run on every host since the shim was added.
+  - **The marker is per host,** in that host's own store.
+  - **The pre-roll live-store gate (#2167) enforces it.** The gate refuses a candidate that removes a shim while any host's store lacks the step's marker. Retirement is then checked rather than procedural.
 - **After the cut-over,** ADR 0064's explicit migration steps cover the same need.
 
 ### 7. Rollout
 
-1. **A small crate for the address type**, for example `flotilla-address`. It holds the kinds, segments, encoding, canonical printing, normalisation, `record_name`, and the condition and template grammar. It gets property tests for print-then-parse, and each case in the explainer's round-trip table as a fixed test.
+1. **A small crate for the address type**, for example `flotilla-address`. It holds the kinds, segments, encoding, canonical printing, normalisation, `record_name`, and the condition and template grammar. It gets property tests for print-then-parse, and each case in the appendix below as a fixed test.
 2. **Live code uses it internally; stored shapes stay as they are.** Conversion happens at the read and write boundary. The hand-written conversions and the old types go, and #3351's drift ends, with no stored-data shims.
 3. **The ADR 0064 model stores addresses natively.** The cut-over importer converts old records once, and normalisation happens there. The combined engine and storage stack (#3319, #3320) uses addresses from the moment the crate lands.
 4. **Receivers move to ADR 0064 inbox addresses as part of the primitives inbox work.** The code still uses ADR 0055's `project/convoy/vessel/role`, `principal:` and `system:` strings.
@@ -127,3 +144,24 @@ For those kinds a shim never actually becomes removable, and the roll-time live 
   - The subject becomes a marker on one reference.
 - **Fixtures need changes.** Existing replay fixtures and the golden corpus are unaffected while stored shapes stay as they are (rollout step 2). The importer's fixtures carry the conversion.
 - **Text that people type now has a strict grammar.** That covers workflow templates and CLI conditions. Plain cases such as `convoy/demo .status.phase == Landed` parse as before through the lenient input path.
+
+## Appendix: round-trip failures today
+
+These cases were found by running the current parsers on 2026-10-15. Each one becomes a fixed test in the address crate, and print-then-parse must return exactly the input. They are recorded here because the explainers linked above are not durable.
+
+| Form | Input | Today's result |
+|---|---|---|
+| Leaf literal | `a  b` (two spaces), ` a` (leading space), `a<TAB>b` | `a b`, `a`, `a b` |
+| Leaf literal | `"quoted"`, `'q'` (the quotes are part of the value) | `quoted`, `q` |
+| Leaf literal | empty | parse error |
+| Leaf field path | `.a b`; empty | parse error |
+| Leaf | label path `.labels.good first issue` | can't be written |
+| Convoy address | name `my convoy` | parse error |
+| CR address | service `forge.example/team` | service `forge.example`, scope `team/o/r`, no error |
+| CR address | service `https://forge.example` | service `https:`, scope `/forge.example/o/r`, no error |
+| Artifact address | producer `p/q` | producer `p`, kind `q`, subject shifted, no error |
+| CR address | `cr/s//1` (empty scope); artifact with an empty subject | accepted |
+| CR number | `…/007`, `…/+7` | `…/7` |
+| LeafTemplate (stored) | literal `a  b`; literal `"q"` | decodes as `a b`; `q` |
+| LeafTemplate (stored) | field path without a leading `.` | encodes, then fails to decode |
+| LeafTemplate (stored) | artifact producer or kind containing `.`, `,` or whitespace | can't be written |
