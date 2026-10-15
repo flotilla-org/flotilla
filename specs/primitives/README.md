@@ -151,6 +151,10 @@ Open `viewer.html` directly, choose an ITF file from the printed fast-run direct
 and use Previous/Next or the slider. It draws the states/edges visited in that
 trace per host, including the lagging message replica. It needs no server or CDN.
 
+Admission/placement makes no eventual-placement or eventual-Gone claim. Its
+shared `liveness` runner hook checks temporal lease safety, with no host or
+teardown fairness assumption.
+
 ## Symbolic tier
 
 ```sh

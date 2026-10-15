@@ -46,6 +46,8 @@ impl Placement {
         self.quotas.insert(convoy, quota);
         true
     }
+    /// Reports acceptance only: unknown convoys and invalid changes both return
+    /// false. This prototype exposes no distinction between refusal reasons.
     pub fn readmit(&mut self, convoy: u64, quota: Counts) -> bool {
         let Some(old) = self.quotas.get(&convoy) else {
             return false;

@@ -62,5 +62,7 @@ module admission_placement {
   val safety = convoyCaps and hostCapacity and goneReturnsLease and queuePriority
   val view = (C::convoys, V::vessels)
   // No host availability or teardown fairness is assumed.
+  // No progress/liveness claim is made here. The shared runner's temporal hook
+  // checks lease safety only.
   temporal liveness = always(goneReturnsLease)
 }
