@@ -1,25 +1,74 @@
-//! Stable codes and typed edge dispatch.
+//! State values, stable codes and typed edge dispatch.
 //!
-//! States and edge kinds each carry an explicit code next to their name. A
+//! A machine's state is a value: a label plus the data that label carries, as
+//! in the Quint specs (`Open { promises, quota }`). [`states!`](crate::states)
+//! declares the state enum with named data on each variant and derives the
+//! fieldless label enum with strum's `EnumDiscriminants`. The label is what
+//! listings, indexes and diagrams use; the data is what gates read and edges
+//! change. [`StateValue::data`] names every datum, so the engine can check
+//! that an edge changes only the data its declaration names.
+//!
+//! Labels and edge kinds each carry an explicit code next to their name. A
 //! rename changes the name, never the code, so anything keyed by code (the
 //! storage derive, #3208) survives it. Codes are pinned by tests.
 //!
 //! [`edges!`](crate::edges) declares an edge enum whose variants each wrap
-//! their own argument struct. It derives the fieldless kind enum with strum's
-//! `EnumDiscriminants`, so edge names come from the kind, and it implements
-//! [`EdgeArg`] for every argument struct. [`EdgeDef`](crate::EdgeDef) is typed
-//! on that struct, so each gate receives `&Deliver` with no re-match.
+//! their own argument struct. It derives the fieldless kind enum the same way,
+//! so edge names come from the kind, and it implements [`EdgeArg`] for every
+//! argument struct. [`EdgeDef`](crate::EdgeDef) is typed on that struct, so
+//! each gate receives `&Deliver` with no re-match.
 
-use std::{fmt::Debug, hash::Hash};
+use std::{any::Any, collections::BTreeSet, fmt::Debug, hash::Hash};
 
-/// A fieldless enum whose variants carry explicit, stable codes.
+/// A fieldless enum whose variants carry explicit, stable codes: a state
+/// label or an edge kind.
 pub trait Coded: Copy + Eq + Ord + Hash + Debug + 'static {
     /// Every variant, in declaration order.
     const ALL: &'static [Self];
     /// The stable code; unique within the enum and never reused.
     fn code(self) -> u16;
-    /// The display name: the variant name for states, snake_case for edge kinds.
+    /// The display name: the variant name for labels, snake_case for edge kinds.
     fn name(self) -> &'static str;
+}
+
+/// One named datum of a state value, compared without knowing its type.
+pub trait Datum: Debug {
+    /// Whether `other` is a datum of the same type and value.
+    fn same(&self, other: &dyn Datum) -> bool;
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: PartialEq + Debug + 'static> Datum for T {
+    fn same(&self, other: &dyn Datum) -> bool {
+        other.as_any().downcast_ref::<T>() == Some(self)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// A machine's state: a label and the named data it carries.
+pub trait StateValue: Clone + Debug + PartialEq + 'static {
+    type Label: Coded;
+    fn label(&self) -> Self::Label;
+    /// Every datum this value carries, by name, in declaration order.
+    fn data(&self) -> Vec<(&'static str, &dyn Datum)>;
+    /// The names of the data a label carries, in declaration order.
+    fn fields(label: Self::Label) -> &'static [&'static str];
+}
+
+/// The data a move from `previous` to `next` changes: every datum `next`
+/// carries that `previous` lacks or holds with another value. Data a label
+/// change leaves behind goes with the label (`Realised { identity }` to
+/// `Gone` changes nothing).
+pub fn changed<S: StateValue>(previous: &S, next: &S) -> BTreeSet<&'static str> {
+    let before = previous.data();
+    next.data()
+        .into_iter()
+        .filter(|(name, value)| !before.iter().any(|(old, held)| old == name && held.same(*value)))
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// An edge enum: one variant per edge, each wrapping its argument struct.
@@ -36,36 +85,67 @@ pub trait EdgeArg: Clone + Debug + Sized + 'static {
     fn project(edge: &Self::Edge) -> Option<&Self>;
 }
 
-/// Declares a unit state enum with stable codes.
+/// Declares a state enum, its strum-derived label enum and stable codes.
+///
+/// Each variant may carry named data in braces. The label enum is named after
+/// `=>`, its names are the variant names, and its codes are the literals given
+/// here. The expansion uses strum's derives, so the calling crate depends on
+/// `strum`, and every datum type must be `Clone + Debug + Eq + 'static`.
 ///
 /// ```
 /// flotilla_state_machines::states! {
-///     pub enum Door { Shut = 1, Open = 2 }
+///     pub enum Door => DoorLabel { Shut = 1, Open { by: String } = 2 }
 /// }
-/// use flotilla_state_machines::Coded;
-/// assert_eq!((Door::Open.name(), Door::Open.code()), ("Open", 2));
+/// use flotilla_state_machines::{Coded, StateValue};
+/// let open = Door::Open { by: "ann".into() };
+/// assert_eq!((open.label().name(), open.label().code()), ("Open", 2));
+/// assert_eq!(Door::fields(DoorLabel::Open), ["by"]);
 /// ```
 #[macro_export]
 macro_rules! states {
     (
         $(#[$meta:meta])*
-        $vis:vis enum $name:ident {
-            $( $(#[$vmeta:meta])* $variant:ident = $code:literal ),+ $(,)?
+        $vis:vis enum $name:ident => $label:ident {
+            $(
+                $(#[$vmeta:meta])*
+                $variant:ident $({ $( $(#[$fmeta:meta])* $field:ident : $ty:ty ),* $(,)? })? = $code:literal
+            ),+ $(,)?
         }
     ) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Clone, Debug, PartialEq, Eq, strum::EnumDiscriminants)]
+        #[strum_discriminants(
+            name($label),
+            derive(PartialOrd, Ord, Hash, strum::IntoStaticStr, strum::VariantArray)
+        )]
         $vis enum $name {
-            $( $(#[$vmeta])* $variant ),+
+            $( $(#[$vmeta])* $variant $({ $( $(#[$fmeta])* $field: $ty ),* })? ),+
         }
 
-        impl $crate::Coded for $name {
-            const ALL: &'static [Self] = &[$(Self::$variant),+];
+        impl $crate::Coded for $label {
+            const ALL: &'static [Self] = <Self as strum::VariantArray>::VARIANTS;
             fn code(self) -> u16 {
                 match self { $(Self::$variant => $code),+ }
             }
             fn name(self) -> &'static str {
-                match self { $(Self::$variant => stringify!($variant)),+ }
+                self.into()
+            }
+        }
+
+        impl $crate::StateValue for $name {
+            type Label = $label;
+            fn label(&self) -> $label {
+                self.into()
+            }
+            fn data(&self) -> Vec<(&'static str, &dyn $crate::Datum)> {
+                match self {
+                    $( Self::$variant { $($($field),*)? } => vec![$($( (stringify!($field), $field as &dyn $crate::Datum) ),*)?], )+
+                }
+            }
+            fn fields(label: $label) -> &'static [&'static str] {
+                match label {
+                    $( $label::$variant => &[$($(stringify!($field)),*)?], )+
+                }
             }
         }
     };
