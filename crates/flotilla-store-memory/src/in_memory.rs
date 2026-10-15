@@ -1,3 +1,5 @@
+#[path = "message_query.rs"]
+mod message_query;
 use crate::{convert_read, ReadObserver, ReadOperation, ResourceKind, SerializedResource};
 use crate::{watch, DigestQuery, MessageQuery, PartitionDigest, ResourcePosition};
 use crate::{DecodedList, DecodedObject, DecodedReadObject};
@@ -121,7 +123,7 @@ struct ReplicaState {
 #[derive(Debug, Default)]
 struct ReplicaPartition {
     queries: crate::QueryIndex,
-    messages: crate::message_query::MessageIndex,
+    messages: self::message_query::MessageIndex,
     objects: HashMap<String, Value>,
     digest: flotilla_resources::digest::DigestIndex,
     // Retained for deleted names as a tombstone so an older relayed write
@@ -133,7 +135,7 @@ struct ReplicaPartition {
 #[derive(Debug)]
 struct ResourceStore {
     queries: crate::QueryIndex,
-    messages: crate::message_query::MessageIndex,
+    messages: self::message_query::MessageIndex,
     objects: HashMap<String, Value>,
     digest: flotilla_resources::digest::DigestIndex,
     tombstones: HashMap<String, ResourceTombstone>,

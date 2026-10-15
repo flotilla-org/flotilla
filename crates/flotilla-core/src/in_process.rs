@@ -5566,9 +5566,9 @@ impl InProcessDaemon {
             None
         };
         let holder = if receiver.starts_with("topic:") {
-            flotilla_store::resolve_topic_receiver(&self.resource_backend, namespace, receiver, &spec.sender).await
+            flotilla_messaging::resolve_topic_receiver(&self.resource_backend, namespace, receiver, &spec.sender).await
         } else {
-            flotilla_store::resolve_message_receiver(&self.resource_backend, namespace, receiver).await
+            flotilla_messaging::resolve_message_receiver(&self.resource_backend, namespace, receiver).await
         }
         .map_err(|error| error.to_string())?;
         if let Some(holder) = holder {
@@ -5800,7 +5800,7 @@ impl InProcessDaemon {
         execute_local_remote_step_batch(self.node_id.clone(), request, progress_sink, cancel, &resolver).await
     }
 
-    pub async fn message_inbox(&self, namespace: &str) -> flotilla_store::MessageInbox {
+    pub async fn message_inbox(&self, namespace: &str) -> flotilla_messaging::MessageInbox {
         self.crew_ops.message_inbox(namespace).await
     }
 
@@ -5812,8 +5812,8 @@ impl InProcessDaemon {
         namespace: &str,
         document: serde_json::Value,
     ) -> Result<flotilla_store::DynamicResourceObject, ResourceError> {
+        use flotilla_messaging::MessageAdmission;
         use flotilla_resources::MessageSpec;
-        use flotilla_store::MessageAdmission;
         if document.get("kind").and_then(serde_json::Value::as_str) != Some("Message") {
             return apply_resource_document(&self.resource_backend, namespace, document).await;
         }

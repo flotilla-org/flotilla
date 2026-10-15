@@ -10,6 +10,7 @@ aws-lc-provider = ["flotilla-tls/aws-lc-provider"]
 skip-no-sandbox-tests = ["flotilla-executor/skip-no-sandbox-tests", "flotilla-store/skip-no-sandbox-tests", "flotilla-cloud-agent/skip-no-sandbox-tests", "flotilla-ai-utility/skip-no-sandbox-tests"]
 
 [dependencies]
+flotilla-messaging = { path = "../flotilla-messaging" }
 flotilla-executor = { path = "../flotilla-executor" }
 flotilla-capability-contract = { path = "../flotilla-capability-contract" }
 flotilla-config = { path = "../flotilla-config" }

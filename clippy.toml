@@ -59,6 +59,7 @@ absolute-paths-allowed-crates = [
     "flotilla_replay_testkit",
     "flotilla_replication",
     "flotilla_resources",
+    "flotilla_messaging",
     "flotilla_store",
     "flotilla_store_sqlite",
     "flotilla_store_memory",

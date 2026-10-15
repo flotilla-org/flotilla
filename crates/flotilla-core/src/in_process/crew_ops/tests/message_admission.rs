@@ -162,10 +162,10 @@ async fn follow_up_reference_uses_target_namespace() {
 // the producer. The acknowledgement must restore speculative workflow activation.
 #[tokio::test]
 async fn remote_suppression_restores_workflow_before_replication() {
+    use flotilla_messaging::MessageInbox;
     use flotilla_resources::{
         Message, MessageExpectation, MessageReference, MessageRelation, MessageSpec, MessageStatusPatch, ResolvedMessageReceiver,
     };
-    use flotilla_store::MessageInbox;
 
     use crate::leaf_engine::{CrewTurnIntent, ResourceIntentPublisher};
     // Boundary stand-in for the ordinary cross-host resource mutation endpoint.
@@ -181,8 +181,8 @@ async fn remote_suppression_restores_workflow_before_replication() {
                 .await
                 .unwrap();
             let record = match admission {
-                flotilla_store::MessageAdmission::Accepted(record) => record,
-                flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
+                flotilla_messaging::MessageAdmission::Accepted(record) => record,
+                flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
             Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
         }
@@ -248,10 +248,10 @@ async fn remote_suppression_restores_workflow_before_replication() {
 // replication. Suppression must preserve settled workflow state in both cases.
 #[tokio::test]
 async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() {
+    use flotilla_messaging::MessageInbox;
     use flotilla_resources::{
         Message, MessageExpectation, MessageReference, MessageRelation, MessageSpec, MessageStatusPatch, ResolvedMessageReceiver,
     };
-    use flotilla_store::MessageInbox;
 
     use crate::leaf_engine::{CrewTurnIntent, ResourceIntentPublisher};
     struct ReceiverPublisher(MessageInbox);
@@ -266,8 +266,8 @@ async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() 
                 .await
                 .unwrap();
             let record = match admission {
-                flotilla_store::MessageAdmission::Accepted(record) => record,
-                flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
+                flotilla_messaging::MessageAdmission::Accepted(record) => record,
+                flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
             Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
         }
@@ -408,7 +408,7 @@ async fn turn_publication_errors_restore_the_owned_activation() {
                 .relation(flotilla_resources::MessageRelation::System)
                 .body("concurrent intent".into())
                 .build();
-            flotilla_store::MessageInbox::new(self.backend.clone(), namespace)
+            flotilla_messaging::MessageInbox::new(self.backend.clone(), namespace)
                 .accept(&InputMeta::builder().name(name).build(), &spec, Utc::now())
                 .await
                 .map_err(|error| error.to_string())?;
@@ -531,7 +531,7 @@ async fn replica_withdraw_preserves_receiver_submission_on_race() {
         .relation(flotilla_resources::MessageRelation::Supervisor)
         .body("retain this brief".into())
         .build();
-    flotilla_store::MessageInbox::new(receiver.clone(), "flotilla")
+    flotilla_messaging::MessageInbox::new(receiver.clone(), "flotilla")
         .accept(&InputMeta::builder().name("racing-message".into()).build(), &spec, Utc::now())
         .await
         .expect("receiver admission");
@@ -605,8 +605,8 @@ async fn fresh_idle_admission_keeps_completion_and_delivery_evidence_receiver_ow
 // workflow state even after terminal audit retention has removed its body.
 #[tokio::test]
 async fn turn_admission_replays_compacted_message_without_reopening_work() {
+    use flotilla_messaging::MessageInbox;
     use flotilla_resources::{Message, MessagePhase, MessageRelation, MessageSpec};
-    use flotilla_store::MessageInbox;
 
     use crate::leaf_engine::CrewTurnIntent;
     let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Done).await;

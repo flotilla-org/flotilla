@@ -946,7 +946,7 @@ mod framing_tests {
     // receipt identity even if that convoy appears later; only a fresh pass sees it.
     #[tokio::test]
     async fn topic_receipt_requires_convoy_in_snapshot() {
-        let backend = crate::ResourceBackend::new(crate::test_store::memory_backend());
+        let backend = crate::ResourceBackend::new(flotilla_store_testkit::memory_backend());
         let mut intent = messages().remove(0);
         intent.receiver = "topic:project/supervision".into();
         let message = backend
@@ -1013,7 +1013,7 @@ mod framing_tests {
     // A FIFO batch retains one plain header per message and no receipt identifiers.
     #[tokio::test]
     async fn multi_message_batch_snapshot() {
-        let backend = crate::ResourceBackend::new(crate::test_store::memory_backend());
+        let backend = crate::ResourceBackend::new(flotilla_store_testkit::memory_backend());
         let stored = backend.using::<Message>("project");
         let mut members = Vec::new();
         for (index, spec) in messages().iter().enumerate() {

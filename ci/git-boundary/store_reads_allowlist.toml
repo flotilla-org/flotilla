@@ -43,7 +43,7 @@ reason = """Replication snapshot handoff: the origin and local lists run only wh
 (first sync or a resnapshot after the origin log cannot continue)."""
 
 [[allow]]
-path = "crates/flotilla-store/src/message_retention.rs"
+path = "crates/flotilla-messaging/src/message_retention.rs"
 function = "compact_audit"
 reason = """Deliberate O(batches x Convoys) audit compaction outside inbox locks (see the comment there): \
 rescanning per batch keeps follow-up protection fresh without another watch lifecycle."""

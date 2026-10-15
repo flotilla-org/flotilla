@@ -31,6 +31,28 @@ def graph(*packages):
 
 
 class BuildGraphContract(unittest.TestCase):
+    def test_messaging_reads_store_in_c_free_base(self):
+        # Messaging is below capabilities, with resource-only receiver resolution.
+        self.assertIn("flotilla-messaging", C_FREE_BASE)
+        self.assertNotIn("flotilla-messaging", CAPABILITY_CRATES)
+        self.assertEqual(violations(graph(
+            package("flotilla-messaging", normal=("flotilla-store",)),
+            package("flotilla-store", normal=("flotilla-resources",)),
+            package("flotilla-resources"),
+            package("flotilla-executor", normal=("flotilla-messaging",)),
+        )), [])
+
+    def test_messaging_refuses_upper_layers(self):
+        # Finite generator covers every forbidden layer, direct/transitive and normal/build edges.
+        for target in ("flotilla-core", "flotilla-daemon", "flotilla-controllers", "flotilla-aggregator",
+                       "flotilla-projections", "flotilla-credentials", *CAPABILITY_CRATES):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertIn(f"flotilla-messaging: must not depend on {target}, directly or transitively",
+                            violations(graph(package("flotilla-messaging", **{kind: (middle,)}),
+                                             package("adapter", normal=(target,)), package(target))))
+
     def test_capability_reads_store_and_lower_crates(self):
         # ADR 0060 stream 3: executor may read resources, while core composes it.
         self.assertIn("flotilla-executor", CAPABILITY_CRATES)

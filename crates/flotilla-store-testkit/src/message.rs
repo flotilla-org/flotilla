@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
+use flotilla_messaging::MessageInbox;
 use flotilla_resources::{
     legacy_message_spec, Convoy, InputMeta, ResourceError, ResourceObject, TerminalCrewMessage, TerminalSession, CONVOY_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{MessageInbox, TypedResolver};
+use flotilla_store::TypedResolver;
 
 #[async_trait::async_trait]
 pub trait LegacyMessageFixture {

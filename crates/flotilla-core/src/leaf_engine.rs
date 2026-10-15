@@ -134,8 +134,8 @@ struct LeafSubscriptionTableInner {
     clock: Arc<dyn flotilla_resources::Clock>,
     backend: ResourceBackend,
     watch_views: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<wake::LeafViews>>>>,
-    message_inboxes: Arc<Mutex<HashMap<String, flotilla_store::MessageInbox>>>,
-    charter_brief_renderer: Arc<dyn flotilla_store::CharterBriefRenderer>,
+    message_inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>,
+    charter_brief_renderer: Arc<dyn flotilla_messaging::CharterBriefRenderer>,
     event_sink: Arc<dyn EventSink>,
     rows: Mutex<HashMap<uuid::Uuid, LeafSubscriptionRow>>,
     last_firings: Mutex<HashMap<(uuid::Uuid, Leaf), LeafFiringRecord>>,
@@ -171,12 +171,12 @@ impl LeafSubscriptionTable {
         self
     }
 
-    pub fn with_charter_brief_renderer(mut self, renderer: Arc<dyn flotilla_store::CharterBriefRenderer>) -> Self {
+    pub fn with_charter_brief_renderer(mut self, renderer: Arc<dyn flotilla_messaging::CharterBriefRenderer>) -> Self {
         Arc::get_mut(&mut self.inner).expect("configure rendering before sharing subscriptions").charter_brief_renderer = renderer;
         self
     }
 
-    pub fn with_message_inboxes(mut self, inboxes: Arc<Mutex<HashMap<String, flotilla_store::MessageInbox>>>) -> Self {
+    pub fn with_message_inboxes(mut self, inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>) -> Self {
         Arc::get_mut(&mut self.inner).expect("configure inboxes before sharing subscriptions").message_inboxes = inboxes;
         self
     }
@@ -219,7 +219,7 @@ impl LeafSubscriptionTable {
                 backend,
                 watch_views: Default::default(),
                 message_inboxes: Default::default(),
-                charter_brief_renderer: Arc::new(flotilla_store::CharterProseRenderer),
+                charter_brief_renderer: Arc::new(flotilla_messaging::CharterProseRenderer),
                 event_sink,
                 rows: Mutex::new(HashMap::new()),
                 last_firings: Mutex::new(HashMap::new()),

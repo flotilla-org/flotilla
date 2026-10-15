@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+flotilla-messaging = { path = "../flotilla-messaging" }
 flotilla-config = { path = "../flotilla-config" }
 flotilla-environment = { path = "../flotilla-environment" }
 flotilla-vcs = { path = "../flotilla-vcs" }

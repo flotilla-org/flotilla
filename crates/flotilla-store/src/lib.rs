@@ -3,7 +3,7 @@
 #![allow(clippy::double_must_use)]
 
 use flotilla_resources::*;
-use flotilla_resources::{error, field_ownership, host, labels, message, resource, retention};
+use flotilla_resources::{error, field_ownership, host, labels, resource, retention};
 
 mod artifact;
 pub use artifact::*;
@@ -23,14 +23,8 @@ mod event;
 pub use event::*;
 mod image_build;
 pub use image_build::*;
-mod message_conditions;
-mod message_delivery;
-pub use message_delivery::*;
-mod message_inbox;
-pub use message_inbox::*;
 pub mod message_query;
 pub use message_query::*;
-mod message_retention;
 mod owner_gc;
 pub use owner_gc::*;
 mod placement_policy;
@@ -52,8 +46,6 @@ mod review_bundle;
 pub use review_bundle::*;
 mod role_cascade;
 pub use role_cascade::*;
-mod role_routing;
-pub use role_routing::*;
 mod status_patch;
 pub use status_patch::*;
 mod view;

@@ -53,7 +53,7 @@ async fn binding(daemon: &InProcessDaemon, crew: &CallerCrew) -> Result<String, 
         {
             continue;
         }
-        let holder = flotilla_store::resolve_message_receiver(&backend, &crew.namespace, &address).await.map_err(|e| e.to_string())?;
+        let holder = flotilla_messaging::resolve_message_receiver(&backend, &crew.namespace, &address).await.map_err(|e| e.to_string())?;
         if holder.is_some_and(|holder| holder.object.metadata.name == *terminal) {
             return Ok(project);
         }

@@ -262,9 +262,9 @@ impl ReconcilerWake {
             .lock()
             .await
             .entry(namespace.to_string())
-            .or_insert_with(|| flotilla_store::MessageInbox::new(backend.clone(), namespace))
+            .or_insert_with(|| flotilla_messaging::MessageInbox::new(backend.clone(), namespace))
             .clone();
-        let receivers = flotilla_store::MessageReceiverSnapshot::load_from_shared_observations(
+        let receivers = flotilla_messaging::MessageReceiverSnapshot::load_from_shared_observations(
             &read_backend,
             namespace,
             available_convoys.clone(),
@@ -273,7 +273,7 @@ impl ReconcilerWake {
         )
         .await
         .map_err(|error| error.to_string())?;
-        flotilla_store::reconcile_charter_notifications_with_receivers(
+        flotilla_messaging::reconcile_charter_notifications_with_receivers(
             &inbox,
             self.subscriptions.inner.charter_brief_renderer.as_ref(),
             now,

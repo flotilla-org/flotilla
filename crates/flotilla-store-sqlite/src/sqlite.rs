@@ -1,3 +1,6 @@
+#[path = "message_query.rs"]
+mod message_query;
+use self::message_query::MessageQuerySql;
 use crate::load_metrics::StoreLoadMetrics;
 use crate::Store;
 #[cfg(test)]

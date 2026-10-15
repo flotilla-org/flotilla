@@ -33,7 +33,8 @@ pub(super) async fn supervision_policy(
             .and_then(stalled_source_actor)
             .map(|(vessel, role)| crew_role_address(project, &convoy.metadata.name, vessel, role))
             .unwrap_or_else(|| format!("{project}/{}", convoy.spec.role));
-        let path = flotilla_store::supervision_path(read_backend, namespace, project, &sender).await.map_err(|error| error.to_string())?;
+        let path =
+            flotilla_messaging::supervision_path(read_backend, namespace, project, &sender).await.map_err(|error| error.to_string())?;
         if !path.is_empty() {
             // Explicit convoy supervision remains first; Project and fleet
             // routing comes from subscriptions, not role-name guesses.
@@ -122,7 +123,7 @@ pub(super) async fn resolve_target(
         SupervisionTarget::Address { address } if address.starts_with("principal:") => {
             Some((convoy.metadata.name.clone(), String::new(), address.clone(), StallRung::Operator))
         }
-        SupervisionTarget::Address { address } => flotilla_store::resolve_message_receiver(read_backend, namespace, address)
+        SupervisionTarget::Address { address } => flotilla_messaging::resolve_message_receiver(read_backend, namespace, address)
             .await
             .map_err(|error| error.to_string())?
             .map(|holder| {
@@ -215,7 +216,7 @@ impl super::LeafSubscriptionTable {
             // A declared crew state is not a receiver binding. Turn admission
             // can queue an unbound role, so check the binding before calling it.
             if !receiver.starts_with("principal:") {
-                match flotilla_store::resolve_message_receiver(backend, namespace, &receiver).await {
+                match flotilla_messaging::resolve_message_receiver(backend, namespace, &receiver).await {
                     Ok(Some(_)) => {}
                     Ok(None) => {
                         return Ok(EscalationAdmission::Refused(Box::new(CommandValue::CrewEscalationRefused {

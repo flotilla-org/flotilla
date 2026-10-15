@@ -21,8 +21,8 @@ use crate::in_process::{Vessel, WorkCredentialReconciler};
 
 #[hegel::test]
 fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
+    use flotilla_messaging::MessageInbox;
     use flotilla_resources::{Message, MessageReference, MessageRelation, MessageSpec, VesselSpec};
-    use flotilla_store::MessageInbox;
     use hegel::generators as gs;
 
     use crate::leaf_engine::ResourceIntentPublisher;
@@ -53,8 +53,8 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
                 .await
                 .map_err(|error| error.to_string())?;
             let record = match admission {
-                flotilla_store::MessageAdmission::Accepted(record) => record,
-                flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
+                flotilla_messaging::MessageAdmission::Accepted(record) => record,
+                flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
             Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
         }
@@ -191,9 +191,9 @@ async fn legacy_pending_brief_is_adopted_once_before_withdrawal() {
 // Every governor ruling is a Message reply to the exact crew's open escalation.
 #[hegel::test]
 fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
+    use flotilla_messaging::MessageInbox;
     use flotilla_protocol::CrewSupervisionAction;
     use flotilla_resources::{Message, MessageExpectation, MessageReference, MessageRelation, MessageSpec, StallRung, StallSupervisor};
-    use flotilla_store::MessageInbox;
     use hegel::generators as gs;
     let escalation_visible = tc.draw(gs::booleans());
     // All three rulings reply to the source escalation. Escalate additionally
@@ -326,8 +326,8 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
 // Message delivery never applies Fail/Escalate workflow transitions itself.
 #[tokio::test]
 async fn supervisor_decision_survives_authority_disappearing_after_publication() {
+    use flotilla_messaging::MessageInbox;
     use flotilla_resources::{Message, MessageSpec};
-    use flotilla_store::MessageInbox;
 
     use crate::leaf_engine::ResourceIntentPublisher;
     // Boundary stand-in: the receiver admits intent, then a concurrent authority
@@ -465,7 +465,7 @@ async fn remote_session_hold_retries_through_existing_mutation_router() {
         async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<ResourceRef, String> {
             let spec: flotilla_resources::MessageSpec = serde_json::from_value(document["spec"].clone()).expect("Message intent");
             let name = document["metadata"]["name"].as_str().expect("Message name");
-            flotilla_store::MessageInbox::new(self.source.clone(), namespace)
+            flotilla_messaging::MessageInbox::new(self.source.clone(), namespace)
                 .accept(&InputMeta::builder().name(name.into()).build(), &spec, Utc::now())
                 .await
                 .map_err(|error| error.to_string())?;
@@ -806,13 +806,13 @@ impl TurnDeliveryActuator for Delivery {
             .body(request.brief.clone())
             .build();
         let name = flotilla_resources::message_record_name(receiver, &request.sender, &request.source);
-        let admission = flotilla_store::MessageInbox::new(self.backend.clone(), &request.namespace)
+        let admission = flotilla_messaging::MessageInbox::new(self.backend.clone(), &request.namespace)
             .accept(&InputMeta::builder().name(name).build(), &intent, Utc::now())
             .await
             .map_err(|error| error.to_string())?;
         let record = match admission {
-            flotilla_store::MessageAdmission::Accepted(record) => record,
-            flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
+            flotilla_messaging::MessageAdmission::Accepted(record) => record,
+            flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
         };
         if request.convoy == "crew" && request.vessel == "work" && request.role == "deputy" {
             apply_resource_status_patch(

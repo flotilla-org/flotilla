@@ -13,7 +13,7 @@ C_FREE_BASE = frozenset({
     "flotilla-protocol", "flotilla-transport", "flotilla-paths",
     "flotilla-daemon-api", "flotilla-relay-protocol",
     "flotilla-resources", "flotilla-client", "flotilla-store", "flotilla-store-memory",
-    "flotilla-config",
+    "flotilla-config", "flotilla-messaging",
 })
 # Shrink this explicit exemption list with the ADR 0060 step 3 store split.
 # Manifest uses TLS; TUI no longer reaches core or store, but still reaches TLS
@@ -91,6 +91,10 @@ def violations(metadata):
         for target in (*CAPABILITY_FORBIDDEN, *sorted(CAPABILITY_CRATES - {capability})):
             if target in packages and reaches(capability, target):
                 errors.append(f"{capability}: must not depend on {target}, directly or transitively")
+    # Messaging remains below crew capabilities; receiver resolution reads resources.
+    for target in (*CAPABILITY_FORBIDDEN, "flotilla-projections", *sorted(CAPABILITY_CRATES)):
+        if "flotilla-messaging" in packages and target in packages and reaches("flotilla-messaging", target):
+            errors.append(f"flotilla-messaging: must not depend on {target}, directly or transitively")
     # ADR 0060 step 4: credentials depends on the capability contract crate, not on core.
     if "flotilla-credentials" in packages and "flotilla-core" in packages:
         dev_core = any(d["kind"] == "dev" and d["name"] == "flotilla-core" for d in packages["flotilla-credentials"]["dependencies"])

@@ -192,7 +192,7 @@ async fn captured_scrollback_delivery_and_bounded_hold() {
             )
             .await;
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let inbox = flotilla_store::MessageInbox::new(backend, NAMESPACE);
+        let inbox = flotilla_messaging::MessageInbox::new(backend, NAMESPACE);
         inbox
             .accept(
                 &empty_meta("turn"),
@@ -262,7 +262,7 @@ async fn held_turn_is_revalidated_at_actual_input_boundary() {
         .update_status("subject", &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() })
         .await
         .unwrap();
-    let inbox = flotilla_store::MessageInbox::new(backend.clone(), NAMESPACE);
+    let inbox = flotilla_messaging::MessageInbox::new(backend.clone(), NAMESPACE);
     inbox
         .accept(
             &empty_meta("turn"),
@@ -302,8 +302,8 @@ async fn held_turn_is_revalidated_at_actual_input_boundary() {
 // Once its task is gone, polling the durable intent never types it again.
 #[tokio::test(start_paused = true)]
 async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_never_types() {
+    use flotilla_messaging::{MessageBatch, MessageTransport, MessageTransportOutcome};
     use flotilla_resources::MessageSubmission;
-    use flotilla_store::{MessageBatch, MessageTransport, MessageTransportOutcome};
     const ID: &str = "message-crew";
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-transport-test\"\n").expect("daemon config");
@@ -1091,8 +1091,8 @@ async fn message_batch_owns_its_task_until_the_receiver_releases_it() {
 // the recorded receiver settles a held submission, without a Working hook.
 #[tokio::test]
 async fn codex_idle_hook_confirms_held_submission() {
+    use flotilla_messaging::MessageTransport;
     use flotilla_resources::MessageSubmission;
-    use flotilla_store::MessageTransport;
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"codex-hook-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(temp.path()));

@@ -7,12 +7,13 @@ use std::{
 
 use flotilla_agent::adapter::CAPABILITIES_HEADING;
 use flotilla_capability_contract::{credential_card, CredentialCapability, SessionCapabilitySource};
+use flotilla_messaging::MessageInbox;
 use flotilla_resources::{
     message_record_name, vessel_placement_pin, Convoy, Environment, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, ImageBuild,
     ImageBuildPhase, InputMeta, Message, MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef,
     TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, CREDENTIAL_REFS_ANNOTATION,
 };
-use flotilla_store::{MessageInbox, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::warn;

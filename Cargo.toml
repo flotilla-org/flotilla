@@ -45,6 +45,7 @@ members = [
     "crates/flotilla-replication",
     "crates/flotilla-replay-testkit",
     "crates/flotilla-resources",
+    "crates/flotilla-messaging",
     "crates/flotilla-store",
     "crates/flotilla-store-memory",
     "crates/flotilla-store-sqlite",

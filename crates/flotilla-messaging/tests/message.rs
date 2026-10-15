@@ -1,4 +1,5 @@
 use chrono::{TimeZone, Utc};
+use flotilla_messaging::*;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
     InputMeta, Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec, MessageStatus,
@@ -164,7 +165,7 @@ fn relative_role_addresses_are_qualified_once(tc: hegel::TestCase) {
 // revision, another sender/receiver, or no subject is independent.
 #[hegel::test]
 fn subject_supersession_follows_identity_and_expectation(tc: hegel::TestCase) {
-    use flotilla_store::{MessageAdmission, MessageInbox};
+    use flotilla_messaging::{MessageAdmission, MessageInbox};
     let delivered = tc.draw(gs::booleans());
     let open = tc.draw(gs::booleans());
     let same_revision = tc.draw(gs::booleans());
@@ -237,7 +238,7 @@ fn subject_supersession_follows_identity_and_expectation(tc: hegel::TestCase) {
 // predecessor. Retries with the same ID are idempotent; an ID cannot change body.
 #[tokio::test]
 async fn explicit_supersession_and_creation_retries_are_scoped_and_idempotent() {
-    use flotilla_store::{MessageAdmission, MessageInbox};
+    use flotilla_messaging::{MessageAdmission, MessageInbox};
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let resolver = backend.using::<Message>("flotilla");
     let inbox = MessageInbox::new(backend, "flotilla");
@@ -264,7 +265,7 @@ async fn explicit_supersession_and_creation_retries_are_scoped_and_idempotent() 
 // the inbox serializes the check and supersession for all cloned producers.
 #[tokio::test]
 async fn concurrent_same_subject_admissions_leave_one_pending_message() {
-    use flotilla_store::MessageInbox;
+    use flotilla_messaging::MessageInbox;
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let resolver = backend.using::<Message>("flotilla");
     let inbox = MessageInbox::new(backend, "flotilla");
@@ -320,9 +321,9 @@ fn holder_spec(convoy: &str) -> flotilla_resources::TerminalSessionSpec {
 async fn addresses_resolve_current_holders_after_replication() {
     use std::collections::BTreeMap;
 
+    use flotilla_messaging::resolve_message_receiver;
     use flotilla_protocol::NodeId;
     use flotilla_resources::{Convoy, ConvoySpec, ResourceProvenance, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
-    use flotilla_store::resolve_message_receiver;
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let remote = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("remote"));
     assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/coder").await.expect("resolve absent").is_none());
@@ -421,7 +422,7 @@ async fn addresses_resolve_current_holders_after_replication() {
 // initialise status and supersede the older pending subject exactly once.
 #[tokio::test]
 async fn retry_repairs_partial_admission_without_reviving_older_intent() {
-    use flotilla_store::{MessageAdmission, MessageInbox};
+    use flotilla_messaging::{MessageAdmission, MessageInbox};
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let messages = backend.using::<Message>("flotilla");
     let inbox = MessageInbox::new(backend.clone(), "flotilla");
@@ -446,8 +447,8 @@ async fn retry_repairs_partial_admission_without_reviving_older_intent() {
 // Explicit sender context qualifies both partial roles before persisting intent.
 #[tokio::test]
 async fn contextual_admission_qualifies_both_roles() {
+    use flotilla_messaging::{MessageAdmission, MessageInbox};
     use flotilla_resources::MessageAddressContext;
-    use flotilla_store::{MessageAdmission, MessageInbox};
     let inbox = MessageInbox::new(ResourceBackend::new(InMemoryBackend::default()), "flotilla");
     let mut intent = spec(None, MessageExpectation::None);
     intent.sender = "reviewer".into();
@@ -472,7 +473,8 @@ async fn contextual_admission_qualifies_both_roles() {
 // including after the predecessor's expectation closes.
 #[tokio::test]
 async fn replay_of_suppressed_partial_admission_returns_canonical_predecessor() {
-    use flotilla_store::{apply_status_patch, MessageAdmission, MessageInbox};
+    use flotilla_messaging::{MessageAdmission, MessageInbox};
+    use flotilla_store::apply_status_patch;
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let inbox = MessageInbox::new(backend.clone(), "flotilla");
     let messages = backend.using::<Message>("flotilla");
@@ -528,8 +530,8 @@ async fn replay_of_suppressed_partial_admission_returns_canonical_predecessor() 
 async fn four_part_addresses_select_the_role_within_a_shared_vessel() {
     use std::collections::BTreeMap;
 
+    use flotilla_messaging::resolve_message_receiver;
     use flotilla_resources::{Convoy, ConvoySpec, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
-    use flotilla_store::resolve_message_receiver;
     let backend = ResourceBackend::new(InMemoryBackend::default());
     backend
         .using::<Convoy>("flotilla")
@@ -569,8 +571,8 @@ async fn four_part_addresses_select_the_role_within_a_shared_vessel() {
 // including an empty batch; unresolved roles wait without submitting input.
 #[tokio::test]
 async fn delivery_receiver_reads_are_bounded() {
+    use flotilla_messaging::MessageInbox;
     use flotilla_resources::{Convoy, ConvoySpec};
-    use flotilla_store::MessageInbox;
     use flotilla_store_testkit::ReadCountsBackendExt;
     let mut counts = Vec::new();
     for n in [0, 10, 200] {
@@ -590,7 +592,7 @@ async fn delivery_receiver_reads_are_bounded() {
         let transport = FakeMessageTransport {
             submissions: Default::default(),
             observations: Default::default(),
-            outcome: flotilla_store::MessageTransportOutcome::NotSubmitted { reason: "unused".into() },
+            outcome: flotilla_messaging::MessageTransportOutcome::NotSubmitted { reason: "unused".into() },
             accepted: Default::default(),
             working: Default::default(),
         };
@@ -612,8 +614,8 @@ async fn delivery_receiver_reads_are_bounded() {
 // Repeated pure resolutions, including non-agent and invalid addresses, do no reads.
 #[hegel::test]
 fn receiver_snapshot_is_pure_and_refreshes(tc: hegel::TestCase) {
+    use flotilla_messaging::MessageReceiverSnapshot;
     use flotilla_resources::{Convoy, ConvoySpec, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
-    use flotilla_store::MessageReceiverSnapshot;
     use flotilla_store_testkit::ReadCountsBackendExt;
     // Empty through many lookups; every case pins missing, invalid, system and principal addresses.
     let repetitions = tc.draw(gs::integers::<usize>().min_value(0).max_value(20));
@@ -660,34 +662,34 @@ fn receiver_snapshot_is_pure_and_refreshes(tc: hegel::TestCase) {
 struct FakeMessageTransport {
     submissions: std::sync::Mutex<Vec<String>>,
     observations: std::sync::atomic::AtomicUsize,
-    outcome: flotilla_store::MessageTransportOutcome,
+    outcome: flotilla_messaging::MessageTransportOutcome,
     accepted: std::sync::atomic::AtomicBool,
     working: std::sync::atomic::AtomicBool,
 }
 #[async_trait::async_trait]
-impl flotilla_store::MessageTransport for FakeMessageTransport {
+impl flotilla_messaging::MessageTransport for FakeMessageTransport {
     async fn observe(
         &self,
         _: &flotilla_resources::ResourceObject<flotilla_resources::TerminalSession>,
         _: Option<&flotilla_resources::MessageSubmission>,
-    ) -> Result<flotilla_store::MessageObservation, String> {
+    ) -> Result<flotilla_messaging::MessageObservation, String> {
         self.observations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(flotilla_store::MessageObservation {
+        Ok(flotilla_messaging::MessageObservation {
             ready: true,
             working: self.working.load(std::sync::atomic::Ordering::SeqCst),
             evidence: self.accepted.load(std::sync::atomic::Ordering::SeqCst).then(|| "later hook receipt".into()),
             ..Default::default()
         })
     }
-    async fn submit(&self, batch: &flotilla_store::MessageBatch) -> flotilla_store::MessageTransportOutcome {
+    async fn submit(&self, batch: &flotilla_messaging::MessageBatch) -> flotilla_messaging::MessageTransportOutcome {
         self.submissions.lock().expect("submissions").push(batch.text.clone());
         self.outcome.clone()
     }
-    async fn poll(&self, _: &flotilla_store::MessageBatch) -> flotilla_store::MessageTransportOutcome {
+    async fn poll(&self, _: &flotilla_messaging::MessageBatch) -> flotilla_messaging::MessageTransportOutcome {
         self.outcome.clone()
     }
 }
-async fn delivery_inbox() -> (ResourceBackend, flotilla_store::MessageInbox) {
+async fn delivery_inbox() -> (ResourceBackend, flotilla_messaging::MessageInbox) {
     use flotilla_resources::*;
     use flotilla_store::*;
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -745,13 +747,13 @@ async fn delivery_batches_fifo_and_held_batches_resolve_without_retyping() {
     let transport = FakeMessageTransport {
         submissions: Default::default(),
         observations: Default::default(),
-        outcome: flotilla_store::MessageTransportOutcome::Unconfirmed { reason: "acceptance not yet observed".into() },
+        outcome: flotilla_messaging::MessageTransportOutcome::Unconfirmed { reason: "acceptance not yet observed".into() },
         accepted: Default::default(),
         working: Default::default(),
     };
     inbox.reconcile_delivery(&transport, at(20)).await.expect("submit");
     // Reconstruct the inbox as on restart: the durable submission still forbids retyping.
-    let restarted = flotilla_store::MessageInbox::new(backend.clone(), "flotilla");
+    let restarted = flotilla_messaging::MessageInbox::new(backend.clone(), "flotilla");
     restarted.reconcile_delivery(&transport, at(21)).await.expect("held observation");
     assert_eq!(transport.submissions.lock().expect("submissions").len(), 1);
     let text = transport.submissions.lock().expect("submissions")[0].clone();
@@ -784,7 +786,7 @@ async fn genuinely_unsent_batches_back_off_and_stop_after_three_attempts() {
     let transport = FakeMessageTransport {
         submissions: Default::default(),
         observations: Default::default(),
-        outcome: flotilla_store::MessageTransportOutcome::NotSubmitted { reason: "pool unavailable before typing".into() },
+        outcome: flotilla_messaging::MessageTransportOutcome::NotSubmitted { reason: "pool unavailable before typing".into() },
         accepted: Default::default(),
         working: Default::default(),
     };
@@ -827,8 +829,8 @@ async fn genuinely_unsent_batches_back_off_and_stop_after_three_attempts() {
 // or a true admitted Leaf closes them, while unknown outcome evidence waits.
 #[tokio::test]
 async fn delivered_expectations_settle_from_reply_and_outcome_evidence() {
+    use flotilla_messaging::MessageTransportOutcome;
     use flotilla_resources::{Convoy, ConvoyPhase, ConvoyStatus};
-    use flotilla_store::MessageTransportOutcome;
     let (backend, inbox) = delivery_inbox().await;
     for (name, expectation) in [
         ("reply-request", MessageExpectation::Reply),
@@ -871,7 +873,7 @@ async fn working_flicker_does_not_establish_delivery() {
     let transport = FakeMessageTransport {
         submissions: Default::default(),
         observations: Default::default(),
-        outcome: flotilla_store::MessageTransportOutcome::Pending,
+        outcome: flotilla_messaging::MessageTransportOutcome::Pending,
         accepted: Default::default(),
         working: Default::default(),
     };
@@ -903,7 +905,7 @@ async fn working_flicker_does_not_establish_delivery() {
 async fn same_subject_successor_waits_for_uncertain_predecessor_acceptance() {
     use std::sync::atomic::Ordering;
 
-    use flotilla_store::{MessageAdmission, MessageTransportOutcome};
+    use flotilla_messaging::{MessageAdmission, MessageTransportOutcome};
     for expectation in [MessageExpectation::None, MessageExpectation::Reply] {
         let (backend, inbox) = delivery_inbox().await;
         let original = spec(
@@ -963,7 +965,7 @@ async fn same_subject_successor_waits_for_uncertain_predecessor_acceptance() {
 // superseded predecessor never becomes a second terminal input after restart.
 #[tokio::test]
 async fn delivery_repairs_interrupted_admission_before_transport() {
-    use flotilla_store::{MessageInbox, MessageTransportOutcome};
+    use flotilla_messaging::{MessageInbox, MessageTransportOutcome};
     let (backend, inbox) = delivery_inbox().await;
     let messages = backend.using::<Message>("flotilla");
     for message in messages.list().await.expect("list Message fixtures").items {
@@ -1087,7 +1089,7 @@ async fn older_admissions_without_sequence_keep_creation_order() {
     let transport = FakeMessageTransport {
         submissions: Default::default(),
         observations: Default::default(),
-        outcome: flotilla_store::MessageTransportOutcome::Unconfirmed { reason: "uncertain input".into() },
+        outcome: flotilla_messaging::MessageTransportOutcome::Unconfirmed { reason: "uncertain input".into() },
         accepted: Default::default(),
         working: Default::default(),
     };
@@ -1109,31 +1111,31 @@ struct HangingMessageTransport {
     inner: FakeMessageTransport,
 }
 #[async_trait::async_trait]
-impl flotilla_store::MessageTransport for HangingMessageTransport {
+impl flotilla_messaging::MessageTransport for HangingMessageTransport {
     async fn observe(
         &self,
         holder: &flotilla_resources::ResourceObject<flotilla_resources::TerminalSession>,
         submission: Option<&flotilla_resources::MessageSubmission>,
-    ) -> Result<flotilla_store::MessageObservation, String> {
+    ) -> Result<flotilla_messaging::MessageObservation, String> {
         if self.stage == "observe" {
             return std::future::pending().await;
         }
-        flotilla_store::MessageTransport::observe(&self.inner, holder, submission).await
+        flotilla_messaging::MessageTransport::observe(&self.inner, holder, submission).await
     }
-    async fn submit(&self, batch: &flotilla_store::MessageBatch) -> flotilla_store::MessageTransportOutcome {
-        let outcome = flotilla_store::MessageTransport::submit(&self.inner, batch).await;
+    async fn submit(&self, batch: &flotilla_messaging::MessageBatch) -> flotilla_messaging::MessageTransportOutcome {
+        let outcome = flotilla_messaging::MessageTransport::submit(&self.inner, batch).await;
         if self.stage == "submit" {
             return std::future::pending().await;
         }
         outcome
     }
-    async fn poll(&self, batch: &flotilla_store::MessageBatch) -> flotilla_store::MessageTransportOutcome {
+    async fn poll(&self, batch: &flotilla_messaging::MessageBatch) -> flotilla_messaging::MessageTransportOutcome {
         if self.stage == "poll" {
             return std::future::pending().await;
         }
-        flotilla_store::MessageTransport::poll(&self.inner, batch).await
+        flotilla_messaging::MessageTransport::poll(&self.inner, batch).await
     }
-    async fn release(&self, _: &flotilla_store::MessageBatch) {
+    async fn release(&self, _: &flotilla_messaging::MessageBatch) {
         if self.stage == "release" {
             std::future::pending::<()>().await;
         }
@@ -1141,7 +1143,7 @@ impl flotilla_store::MessageTransport for HangingMessageTransport {
 }
 #[tokio::test(start_paused = true)]
 async fn transport_timeouts_release_admission_without_retyping_uncertain_input() {
-    use flotilla_store::MessageTransportOutcome;
+    use flotilla_messaging::MessageTransportOutcome;
     for stage in ["observe", "submit", "poll", "release"] {
         let (backend, inbox) = delivery_inbox().await;
         let transport = HangingMessageTransport {
@@ -1228,7 +1230,8 @@ async fn partial_receipt_recovery_keeps_terminal_members_closed() {
 // aliases the replacement ID to the original or treats it as a subject repeat.
 #[tokio::test]
 async fn explicit_supersession_replaces_open_expectations() {
-    use flotilla_store::{apply_status_patch, MessageAdmission, MessageInbox};
+    use flotilla_messaging::{MessageAdmission, MessageInbox};
+    use flotilla_store::apply_status_patch;
     for expectation in [MessageExpectation::Reply, MessageExpectation::None] {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let inbox = MessageInbox::new(backend.clone(), "flotilla");
@@ -1269,7 +1272,7 @@ async fn operator_failure_releases_a_held_inbox_without_fabricating_receipt() {
     let transport = FakeMessageTransport {
         submissions: Default::default(),
         observations: Default::default(),
-        outcome: flotilla_store::MessageTransportOutcome::Unconfirmed { reason: "possible input".into() },
+        outcome: flotilla_messaging::MessageTransportOutcome::Unconfirmed { reason: "possible input".into() },
         accepted: Default::default(),
         working: Default::default(),
     };
@@ -1292,8 +1295,8 @@ async fn operator_failure_releases_a_held_inbox_without_fabricating_receipt() {
 
 #[tokio::test]
 async fn system_addresses_are_distinct_and_correlated_replies_are_storable() {
+    use flotilla_messaging::MessageInbox;
     use flotilla_resources::{qualify_message_address, MessageAddressContext};
-    use flotilla_store::MessageInbox;
     let context = MessageAddressContext { project: "flotilla".into(), convoy: "convoy".into(), vessel: "work".into() };
     assert_eq!(qualify_message_address("system:checks", &context).expect("system address"), "system:checks");
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -1314,8 +1317,8 @@ async fn system_addresses_are_distinct_and_correlated_replies_are_storable() {
 // held over I/O without depending on an implementation mutex accessor.
 #[tokio::test]
 async fn transport_callbacks_can_admit_intent_without_waiting_for_delivery() {
+    use flotilla_messaging::{MessageBatch, MessageInbox, MessageObservation, MessageTransport, MessageTransportOutcome};
     use flotilla_resources::{MessageSubmission, ResourceObject, TerminalSession};
-    use flotilla_store::{MessageBatch, MessageInbox, MessageObservation, MessageTransport, MessageTransportOutcome};
     struct AdmittingTransport {
         inbox: MessageInbox,
         calls: std::sync::atomic::AtomicUsize,
@@ -1362,8 +1365,8 @@ async fn transport_callbacks_can_admit_intent_without_waiting_for_delivery() {
 // authorized by the recorded holder incarnation, not address-string equality.
 #[tokio::test]
 async fn project_role_expectations_accept_replies_from_the_recorded_qualified_crew() {
+    use flotilla_messaging::{MessageInbox, MessageTransportOutcome};
     use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus};
-    use flotilla_store::{MessageInbox, MessageTransportOutcome};
     let (backend, _) = delivery_inbox().await;
     let inbox = MessageInbox::new(backend.clone(), "flotilla");
     let ensures = backend.using::<ConvoyEnsure>("flotilla");
@@ -1423,8 +1426,8 @@ async fn project_role_expectations_accept_replies_from_the_recorded_qualified_cr
 // Working acknowledges the original batch without waiting for screen debounce.
 #[tokio::test]
 async fn changed_output_requires_fresh_working_to_resolve_message_hold() {
+    use flotilla_messaging::{MessageBatch, MessageObservation, MessageTransport, MessageTransportOutcome};
     use flotilla_resources::{MessageSubmission, ResourceObject, TerminalSession};
-    use flotilla_store::{MessageBatch, MessageObservation, MessageTransport, MessageTransportOutcome};
     struct ScreenTransport {
         changed: std::sync::atomic::AtomicBool,
         working: std::sync::atomic::AtomicBool,
@@ -1480,7 +1483,7 @@ async fn closed_batch_recovery_clears_only_its_existing_delivery_gate() {
     let transport = FakeMessageTransport {
         submissions: Default::default(),
         observations: Default::default(),
-        outcome: flotilla_store::MessageTransportOutcome::Unconfirmed { reason: "held input".into() },
+        outcome: flotilla_messaging::MessageTransportOutcome::Unconfirmed { reason: "held input".into() },
         accepted: Default::default(),
         working: Default::default(),
     };
@@ -1505,7 +1508,7 @@ async fn closed_batch_recovery_clears_only_its_existing_delivery_gate() {
         .await
         .expect("durable closure before crash");
     }
-    flotilla_store::MessageInbox::new(backend, "flotilla")
+    flotilla_messaging::MessageInbox::new(backend, "flotilla")
         .reconcile_delivery(&transport, at(322))
         .await
         .expect("restart repairs gate cleanup");
@@ -1557,8 +1560,9 @@ async fn migration_guard_accepts_resolved_legacy_launches() {
 // and preserve exact producer replay after age-based body compaction.
 #[tokio::test]
 async fn indexed_message_history_and_retention_contract() {
+    use flotilla_messaging::MessageInbox;
     use flotilla_resources::MessageSubmission;
-    use flotilla_store::{MessageInbox, MessageQuery};
+    use flotilla_store::MessageQuery;
     for backend in [
         ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
         ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")),
@@ -1603,10 +1607,10 @@ async fn indexed_message_history_and_retention_contract() {
         assert!(compacted.spec.body_digest.is_some());
         assert_eq!(compacted.status.unwrap().phase, MessagePhase::Expired);
         let replay = inbox.accept(&InputMeta::builder().name("history-1".into()).build(), &intent, at(90000)).await.unwrap();
-        assert!(matches!(replay, flotilla_store::MessageAdmission::Accepted(_)));
+        assert!(matches!(replay, flotilla_messaging::MessageAdmission::Accepted(_)));
         let suppressed = inbox.accept(&InputMeta::builder().name("history-2".into()).build(), &intent, at(90000)).await.unwrap();
         assert!(
-            matches!(suppressed, flotilla_store::MessageAdmission::Suppressed { predecessor } if predecessor.metadata.name == "history-1")
+            matches!(suppressed, flotilla_messaging::MessageAdmission::Suppressed { predecessor } if predecessor.metadata.name == "history-1")
         );
         assert!(!resolver.get("history-0").await.unwrap().spec.body.is_empty());
         assert_eq!(inbox.compact_audit(at(90000)).await.unwrap(), 0, "compaction is idempotent");
@@ -1628,8 +1632,8 @@ async fn indexed_message_history_and_retention_contract() {
 // unresolved transport evidence is retained with its body for explicit recovery.
 #[tokio::test]
 async fn audit_compaction_keeps_receipts_and_uncertain_submissions() {
+    use flotilla_messaging::MessageInbox;
     use flotilla_resources::MessageSubmission;
-    use flotilla_store::MessageInbox;
     let (backend, _) = delivery_inbox().await;
     let inbox = MessageInbox::new(backend.clone(), "flotilla").with_audit_retention_days(1);
     let messages = backend.using::<Message>("flotilla");
@@ -1771,7 +1775,7 @@ fn message_indexes_follow_authority_and_replica_lifecycles(tc: hegel::TestCase) 
 // number of holder observations made by a receiver reconciliation pass.
 #[tokio::test]
 async fn active_delivery_work_is_independent_of_audit_history() {
-    use flotilla_store::MessageTransportOutcome;
+    use flotilla_messaging::MessageTransportOutcome;
     for historical in [0, 256] {
         let (backend, inbox) = delivery_inbox().await;
         let messages = backend.using::<Message>("flotilla");
@@ -2205,7 +2209,6 @@ async fn unknown_project_contact_query_reports_configuration_error() {
 #[hegel::test]
 fn held_turn_release_checks_revision_and_condition(tc: hegel::TestCase) {
     use flotilla_resources::*;
-    use flotilla_store::*;
     let change = tc.draw(gs::integers::<u8>().min_value(0).max_value(6));
     let legacy = tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) == 1;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -2344,8 +2347,8 @@ fn held_turn_release_checks_revision_and_condition(tc: hegel::TestCase) {
 // repeated overdue passes preserve one gate and never claim input receipt.
 #[tokio::test]
 async fn pending_submission_surfaces_at_hold_boundary() {
+    use flotilla_messaging::MessageTransportOutcome;
     use flotilla_resources::Demand;
-    use flotilla_store::MessageTransportOutcome;
     let (backend, inbox) = delivery_inbox().await;
     let transport = FakeMessageTransport {
         submissions: Default::default(),
@@ -2384,7 +2387,6 @@ fn delivery_guard_admission_compatibility() {
 #[tokio::test]
 async fn missing_condition_receipt_exhausts_bounded_retries_without_input() {
     use flotilla_resources::*;
-    use flotilla_store::*;
     struct GuardedTransport {
         inbox: MessageInbox,
         inner: FakeMessageTransport,
@@ -2450,10 +2452,10 @@ async fn missing_condition_receipt_exhausts_bounded_retries_without_input() {
 // convoys, messages, terminals and ensures cannot increase decoding or calls.
 #[tokio::test]
 async fn addressed_receiver_reads_ignore_unrelated_holders() {
+    use flotilla_messaging::{resolve_message_receiver, MessageReceiverSnapshot};
     use flotilla_resources::{
         Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoySpec, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
     };
-    use flotilla_store::{resolve_message_receiver, MessageReceiverSnapshot};
     use flotilla_store_testkit::{assert_flat_reads, ReadCountsBackendExt, ReadSnapshot};
     use std::collections::BTreeMap;
     // Exact per-kind (calls, decoded objects) for Convoy, TerminalSession, ConvoyEnsure, Message.
@@ -2581,5 +2583,58 @@ async fn addressed_receiver_reads_ignore_unrelated_holders() {
     }
     for sqlite in [false, true] {
         assert_flat_reads([0, 48], |unrelated| resolve_reads(sqlite, unrelated)).await;
+    }
+}
+
+// Message pushdown queries classify every persisted phase using the model's
+// terminal rule. Deletion must remove stale inbox and audit index entries.
+#[tokio::test]
+async fn message_query_phase_classification_matches_model() {
+    use flotilla_store::MessageQuery;
+    for backend in
+        [ResourceBackend::new(InMemoryBackend::default()), ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite backend"))]
+    {
+        let messages = backend.using::<Message>("flotilla");
+        // Explicit finite generator spans absent status and every phase. Each
+        // record starts fresh because terminal message statuses are immutable.
+        for phase in std::iter::once(None).chain(MessagePhase::ALL.into_iter().map(Some)) {
+            let object = messages
+                .create(&InputMeta::builder().name("phase".into()).build(), &spec(None, MessageExpectation::None))
+                .await
+                .expect("create message");
+            if let Some(phase) = phase {
+                let status = MessageStatus::builder()
+                    .phase(phase)
+                    .since(at(20))
+                    .reason("phase scenario".into())
+                    .maybe_resolved_receiver(phase.has_delivery_evidence().then(|| {
+                        ResolvedMessageReceiver::builder()
+                            .crew_id("crew".into())
+                            .session("terminal".into())
+                            .delivered_at(at(20))
+                            .evidence("receipt".into())
+                            .build()
+                    }))
+                    .build();
+                messages.update_status("phase", &object.metadata.resource_version, &status).await.expect("set valid message phase");
+            }
+            let terminal = phase.is_some_and(MessagePhase::is_terminal);
+            for receiver in [None, Some(object.spec.receiver.clone())] {
+                assert_eq!(messages.query(&MessageQuery::Active { receiver }).await.expect("query inbox").len(), usize::from(!terminal));
+            }
+            assert!(messages
+                .query(&MessageQuery::Active { receiver: Some("missing/role".into()) })
+                .await
+                .expect("query absent receiver")
+                .is_empty());
+            assert!(messages.query(&MessageQuery::AuditBefore { before: at(20) }).await.expect("query exact cutoff").is_empty());
+            assert_eq!(
+                messages.query(&MessageQuery::AuditBefore { before: at(21) }).await.expect("query old audit").len(),
+                usize::from(terminal)
+            );
+            messages.delete("phase").await.expect("delete phase record");
+            assert!(messages.query(&MessageQuery::active()).await.expect("deleted inbox entry").is_empty());
+            assert!(messages.query(&MessageQuery::AuditBefore { before: at(21) }).await.expect("deleted audit entry").is_empty());
+        }
     }
 }
