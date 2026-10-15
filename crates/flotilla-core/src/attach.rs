@@ -26,17 +26,56 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     terminal_session_attach_target_with_stale_status, Convoy as ResourceConvoy, ConvoyPhase as ResourceConvoyPhase,
-    Environment as ResourceEnvironment, Project, ResourceProvenance, TerminalSession as ResourceTerminalSession, CONVOY_LABEL, ROLE_LABEL,
-    VESSEL_LABEL, VESSEL_REF_LABEL,
+    Environment as ResourceEnvironment, Host as ResourceHost, Project, ReadResourceObject, ResourceProvenance,
+    TerminalSession as ResourceTerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use flotilla_store::{ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
 
-use super::{canonical_placement_host_ref, convoy_address, discover_repo_for_environment, LiveConvoyRecord, RoleAddress};
+use super::{convoy_address, discover_repo_for_environment, LiveConvoyRecord, RoleAddress};
 use crate::aggregator_projection::AggregatorProjectionState;
 use flotilla_discovery::{registry::ProviderRegistry, DiscoveryRuntime};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_terminal::TerminalSessionLiveness;
+
+type HostSnapshot = Result<Vec<ReadResourceObject<ResourceHost>>, String>;
+
+/// One lazy Host snapshot per attach request (including failed loads). Namespace
+/// keys keep resource namespaces isolated; dropping the request releases all data.
+#[derive(Default)]
+struct AttachReadContext {
+    hosts: tokio::sync::Mutex<HashMap<String, HostSnapshot>>,
+}
+
+impl AttachReadContext {
+    async fn canonical_host(
+        &self,
+        backend: &ResourceBackend,
+        namespace: &str,
+        host_ref: &str,
+    ) -> Result<Option<flotilla_protocol::PlacementTargetHost>, String> {
+        self.canonical_host_with_load(namespace, host_ref, async {
+            backend.including_replicas::<ResourceHost>(namespace).list().await.map(|hosts| hosts.items).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    async fn canonical_host_with_load(
+        &self,
+        namespace: &str,
+        host_ref: &str,
+        load: impl std::future::Future<Output = HostSnapshot>,
+    ) -> Result<Option<flotilla_protocol::PlacementTargetHost>, String> {
+        let mut snapshots = self.hosts.lock().await;
+        if !snapshots.contains_key(namespace) {
+            snapshots.insert(namespace.to_string(), load.await);
+        }
+        match snapshots.get(namespace).expect("Host snapshot initialized") {
+            Ok(hosts) => crate::host_resolution::canonical_placement_host_ref_from_sources(hosts, host_ref),
+            Err(error) => Err(error.clone()),
+        }
+    }
+}
 
 pub(super) struct AttachResolver<'a> {
     pub(super) resource_backend: &'a ResourceBackend,
@@ -215,9 +254,10 @@ impl<'a> AttachResolver<'a> {
             let mut reachable = false;
             for (session, provenance) in sessions {
                 reachable = match provenance {
-                    ResourceProvenance::Local => {
-                        self.attach_plan_for_session(&session.metadata.name, session, AttachMode::Default).await.is_ok()
-                    }
+                    ResourceProvenance::Local => self
+                        .attach_plan_for_session(&observations.reads, &session.metadata.name, session, AttachMode::Default)
+                        .await
+                        .is_ok(),
                     ResourceProvenance::Replica { origin_root, .. } => {
                         self.host_registry.live_routed_host_name(origin_root).await.is_some()
                     }
@@ -520,6 +560,7 @@ impl<'a> AttachResolver<'a> {
     /// with the host that actually owns the session (the binding host).
     async fn attach_plan_for_session(
         &self,
+        reads: &AttachReadContext,
         reference: &str,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
         seat: AttachMode,
@@ -546,7 +587,7 @@ impl<'a> AttachResolver<'a> {
             )
         {
             let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
-            let attach_args = self.terminal_pool_attach_args(session, &environment, &cwd, seat).await?;
+            let attach_args = self.terminal_pool_attach_args(reads, session, &environment, &cwd, seat).await?;
             let plan = ResolvedAttachPlan::command(vec![
                 Arg::Literal("ssh".to_string()),
                 Arg::Literal("-tt".to_string()),
@@ -561,13 +602,13 @@ impl<'a> AttachResolver<'a> {
             // has no flotillad to receive a recursive attach command.
             return Ok((plan, self.host_name.clone()));
         }
-        let target_host = self.target_host_for_resource_ref(&namespace, host_ref).await?;
+        let target_host = self.target_host_with_reads(reads, &namespace, host_ref).await?;
         if target_host != *self.host_name {
             let plan = self.recursive_attach_plan_for_remote(&target_host, reference, seat).await?;
             return Ok((plan, target_host));
         }
 
-        let plan = self.local_attach_plan_for_session(session, &environment, seat).await?;
+        let plan = self.local_attach_plan_for_session(reads, session, &environment, seat).await?;
         Ok((plan, self.host_name.clone()))
     }
 
@@ -613,12 +654,13 @@ impl<'a> AttachResolver<'a> {
 
     async fn local_attach_plan_for_session(
         &self,
+        reads: &AttachReadContext,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
         environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
         seat: AttachMode,
     ) -> Result<ResolvedAttachPlan, String> {
         let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
-        let attach_args = self.terminal_pool_attach_args(session, environment, &cwd, seat).await?;
+        let attach_args = self.terminal_pool_attach_args(reads, session, environment, &cwd, seat).await?;
         if environment.spec.docker.is_some() {
             let environment_id = EnvironmentId::new(session.spec.env_ref.clone());
             let container_name = environment.status.as_ref().and_then(|status| status.docker_container_id.as_deref());
@@ -645,12 +687,13 @@ impl<'a> AttachResolver<'a> {
 
     async fn terminal_pool_attach_args(
         &self,
+        reads: &AttachReadContext,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
         environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
         cwd: &ExecutionEnvironmentPath,
         seat: AttachMode,
     ) -> Result<Vec<Arg>, String> {
-        let registry = self.registry_for_resource_environment(environment, cwd.as_path()).await?;
+        let registry = self.registry_for_resource_environment(reads, environment, cwd.as_path()).await?;
         let pool = registry
             .terminal_pools
             .get(&session.spec.pool)
@@ -674,8 +717,13 @@ impl<'a> AttachResolver<'a> {
         pool.attach_args_for_mode(attach_target.session_id, attach_target.launch_command, cwd, &Vec::new(), seat)
     }
 
+    #[cfg(test)]
     pub(super) async fn target_host_for_resource_ref(&self, namespace: &str, host_ref: &str) -> Result<HostName, String> {
-        let canonical_ref = match canonical_placement_host_ref(self.resource_backend, namespace, host_ref).await {
+        self.target_host_with_reads(&AttachReadContext::default(), namespace, host_ref).await
+    }
+
+    async fn target_host_with_reads(&self, reads: &AttachReadContext, namespace: &str, host_ref: &str) -> Result<HostName, String> {
+        let canonical_ref = match reads.canonical_host(self.resource_backend, namespace, host_ref).await {
             Ok(Some(target_host)) => target_host.reference,
             Ok(None) => return Err(format!("references unknown host `{host_ref}`")),
             Err(error) => return Err(error),
@@ -685,12 +733,13 @@ impl<'a> AttachResolver<'a> {
 
     async fn registry_for_resource_environment(
         &self,
+        reads: &AttachReadContext,
         environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
         cwd: &Path,
     ) -> Result<Arc<ProviderRegistry>, String> {
         let environment_id = if let Some(host_direct) = environment.spec.host_direct.as_ref() {
             let canonical_ref =
-                match canonical_placement_host_ref(self.resource_backend, &environment.metadata.namespace, &host_direct.host_ref).await {
+                match reads.canonical_host(self.resource_backend, &environment.metadata.namespace, &host_direct.host_ref).await {
                     Ok(Some(target_host)) => target_host.reference,
                     Ok(None) => return Err(format!("references unknown host `{}`", host_direct.host_ref)),
                     Err(error) => return Err(error),
@@ -947,13 +996,14 @@ impl AttachTarget {
     async fn resolve(
         &self,
         resolver: &AttachResolver<'_>,
+        reads: &AttachReadContext,
         reference: &str,
         transient: bool,
         seat: AttachMode,
     ) -> Result<ResolvedAttach, String> {
         match self {
             Self::Local(session) => {
-                let (plan, host) = resolver.attach_plan_for_session(reference, session, seat).await?;
+                let (plan, host) = resolver.attach_plan_for_session(reads, reference, session, seat).await?;
                 let labels = &session.metadata.labels;
                 let binding = AttachBinding::builder()
                     .host(host)
@@ -1012,6 +1062,7 @@ struct AttachCandidate {
 }
 
 struct AttachCandidateIndex {
+    reads: AttachReadContext,
     convoys: Vec<flotilla_resources::ReadResourceObject<ResourceConvoy>>,
     sessions: Vec<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>,
     candidates: Vec<AttachCandidate>,
@@ -1043,7 +1094,7 @@ impl AttachCandidateIndex {
                 exact.entry(reference.clone()).or_default().push(index);
             }
         }
-        Self { candidates, exact, convoys, sessions }
+        Self { reads: AttachReadContext::default(), candidates, exact, convoys, sessions }
     }
 
     async fn resolve(
@@ -1075,8 +1126,11 @@ impl AttachCandidateIndex {
                 None => Err(AttachIndexError::NoMatch(format!("no attach target matching '{reference}'"))),
             },
             [index] => {
-                let mut resolved =
-                    self.candidates[*index].target.resolve(resolver, reference, transient, seat).await.map_err(AttachIndexError::Other)?;
+                let mut resolved = self.candidates[*index]
+                    .target
+                    .resolve(resolver, &self.reads, reference, transient, seat)
+                    .await
+                    .map_err(AttachIndexError::Other)?;
                 if let Some(binding) = resolved.binding.as_mut() {
                     if let Some(name) = binding.convoy.as_ref() {
                         let observed = self.convoys.iter().find(|source| source.object.metadata.name == *name);
@@ -1189,9 +1243,9 @@ mod tests {
                 .authority(flotilla_protocol::LifecycleAuthority::Observed)
                 .build();
             let target = AttachTarget::Checkout(Box::new(row.clone()));
-            assert!(target.resolve(&resolver, &row.path, false, AttachMode::Default).await.is_err());
+            assert!(target.resolve(&resolver, &AttachReadContext::default(), &row.path, false, AttachMode::Default).await.is_err());
             for mode in [AttachMode::Default, AttachMode::PreferTake, AttachMode::Strict, AttachMode::Take] {
-                let result = target.resolve(&resolver, &row.path, true, mode).await;
+                let result = target.resolve(&resolver, &AttachReadContext::default(), &row.path, true, mode).await;
                 // The fixture's local passthrough pool supports watch/default
                 // seats only; remote routing defers seat checks to the owner.
                 if host == daemon.host_name && matches!(mode, AttachMode::Strict | AttachMode::Take) {
@@ -1246,6 +1300,53 @@ mod tests {
                 (second_address == "coder@project").then_some("coder@project")
             );
         }
+    }
+
+    // A failed catalog load is stable within one request: later lookups return
+    // the same error without running their loader. A new request retries.
+    #[tokio::test]
+    async fn host_snapshot_caches_load_errors_until_the_next_request() {
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let load = || async {
+            loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err("Host catalog unavailable".to_string())
+        };
+        let reads = AttachReadContext::default();
+        for reference in ["first-host", "second-host"] {
+            let error = reads.canonical_host_with_load("flotilla", reference, load()).await.expect_err("load fails");
+            assert_eq!(error, "Host catalog unavailable");
+        }
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let fresh = AttachReadContext::default();
+        assert_eq!(
+            fresh.canonical_host_with_load("flotilla", "first-host", load()).await.expect_err("new request retries"),
+            "Host catalog unavailable"
+        );
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    // A request shares even an empty snapshot across concurrent lookups, isolates
+    // namespaces, and releases the snapshot so the next request sees new Hosts.
+    #[tokio::test]
+    async fn host_snapshot_is_request_scoped_and_namespace_isolated() {
+        let (_daemon, backend, _temp) = attach_fixture().await;
+        let backend = backend.with_read_counts();
+        let reads = AttachReadContext::default();
+        let (first, second) =
+            tokio::join!(reads.canonical_host(&backend, "empty", "new-host"), reads.canonical_host(&backend, "empty", "new-host"),);
+        assert!(first.expect("first lookup").is_none());
+        assert!(second.expect("second lookup").is_none());
+        backend
+            .using::<ResourceHost>("empty")
+            .create(&test_meta("new-host"), &HostSpec { display_name: "new".into(), ..Default::default() })
+            .await
+            .expect("new host");
+        assert!(reads.canonical_host(&backend, "empty", "new-host").await.expect("cached absence").is_none());
+        assert!(reads.canonical_host(&backend, "other", "new-host").await.expect("other namespace").is_none());
+        let fresh = AttachReadContext::default();
+        let host = fresh.canonical_host(&backend, "empty", "new-host").await.expect("fresh lookup").expect("new host visible");
+        assert_eq!(host.reference.as_str(), "new-host");
+        assert_eq!(backend.read_snapshot().calls_by_kind().get("Host"), Some(&6));
     }
 
     #[test]
@@ -1508,9 +1609,9 @@ mod tests {
             assert_eq!(reads.calls_by_kind().get("Convoy"), Some(&convoy_calls));
             assert_eq!(reads.objects_by_kind().get("Convoy"), Some(&1));
             assert_eq!(reads.calls_by_kind().get("TerminalSession"), Some(&1));
-            // Host placement lookups list the Host catalog per hop: flat in
-            // unrelated convoys and messages, but not the target. Tighten this
-            // bound when #3078 reads the catalog once per request.
+            // #3078: reachability checks and final planning share one Host
+            // catalog snapshot for this request. The store counts its local
+            // and replica source lists separately.
             reads.assert_within(
                 &ReadBudget::new()
                     .objects("Convoy", ReadOperation::Query, 1, 1)
@@ -1518,7 +1619,7 @@ mod tests {
                     .objects("TerminalSession", ReadOperation::Query, 1, 1)
                     .objects("TerminalSession", ReadOperation::Get, 1, 1)
                     .objects("Environment", ReadOperation::Get, 2, 2)
-                    .calls("Host", ReadOperation::List, 8),
+                    .calls("Host", ReadOperation::List, 2),
                 reference,
             );
             let observed = request_observations.read_snapshot();
