@@ -96,8 +96,11 @@ async fn context_scope(daemon: &InProcessDaemon, crew: &CallerCrew, project: &st
         let TerminalSessionSource::Agent { context: placed, .. } = session.object.spec.source else {
             return Err("EnvironmentIdentityMismatch: target is not crew".into());
         };
-        if context.convoy.as_ref().is_some_and(|name| name != &placed.convoy) {
-            return Err("EnvironmentIdentityMismatch: conflicting target convoy".into());
+        if context.convoy.as_ref().is_some_and(|name| name != &placed.convoy)
+            || context.vessel_ref.as_ref().is_some_and(|name| name != &placed.vessel_ref)
+            || context.role.as_ref().is_some_and(|role| role != &session.object.spec.role)
+        {
+            return Err("EnvironmentIdentityMismatch: conflicting target crew".into());
         }
         context.convoy = Some(placed.convoy);
         context.vessel_ref = Some(placed.vessel_ref);
@@ -130,7 +133,28 @@ pub(super) async fn authorize(daemon: &InProcessDaemon, request: &mut Request, c
     if command.node_id.is_some() || command.provisioning_target.is_some() || command.context_repo.is_some() {
         return Err("EnvironmentCommandDenied: explicit routing is forbidden".into());
     }
-    let project = binding(daemon, crew).await?;
+    // Reject unsupported actions before doing any authority-store work. Never
+    // expose binding lookup errors (including record existence) to a denied caller.
+    if !matches!(
+        &command.action,
+        CommandAction::CrewSupervise { .. }
+            | CommandAction::CrewFail { .. }
+            | CommandAction::QueryCrewList { .. }
+            | CommandAction::QueryCrewCapabilities { .. }
+            | CommandAction::QueryMessageContacts { .. }
+            | CommandAction::ConvoyAbandon { .. }
+            | CommandAction::ConvoyResume { .. }
+            | CommandAction::QueryExplainConvoy { .. }
+            | CommandAction::ConvoyStart { .. }
+            | CommandAction::QueryExplainProject { .. }
+            | CommandAction::QueryDispatchBoard { .. }
+            | CommandAction::QueryDispatchQueue { .. }
+            | CommandAction::QueryFleetList { .. }
+            | CommandAction::QueryCrewStalls { .. }
+    ) {
+        return Err("EnvironmentCommandDenied: command is outside supervisor authority".into());
+    }
+    let project = binding(daemon, crew).await.map_err(|_| "EnvironmentCommandDenied: no current supervisor binding".to_string())?;
     match &mut command.action {
         CommandAction::CrewSupervise { namespace, convoy, actor_crew_id, .. } => {
             convoy_scope(daemon, crew, &project, namespace, convoy).await?;

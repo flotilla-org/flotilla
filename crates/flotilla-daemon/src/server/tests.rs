@@ -5874,6 +5874,27 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
         force: false,
     });
     assert!(super::environment_supervision::authorize(&daemon, &mut forged, &crew).await.is_err());
+    // An unsupported action and an absent role binding return a uniform denial,
+    // without exposing authority record lookup errors. Conflicting selectors
+    // cannot silently change the crew selected by a valid crew ID.
+    let mut absent = crew.clone();
+    absent.convoy = "missing-convoy".into();
+    for action in [CommandAction::QueryCrewStalls { full: false }, CommandAction::QueryExplainProject { name: "project-a".into() }] {
+        let error = super::environment_supervision::authorize(&daemon, &mut request(action), &absent).await.unwrap_err();
+        assert_eq!(error, "EnvironmentCommandDenied: no current supervisor binding");
+    }
+    for context in [
+        CrewCommandContext { crew_id: Some(crew.crew_id.clone()), role: Some("forged-role".into()), ..Default::default() },
+        CrewCommandContext { crew_id: Some(crew.crew_id.clone()), vessel_ref: Some("foreign-vessel".into()), ..Default::default() },
+    ] {
+        assert!(super::environment_supervision::authorize(
+            &daemon,
+            &mut request(CommandAction::CrewFail { context, message: "failed".into(), force: false }),
+            &crew
+        )
+        .await
+        .is_err());
+    }
     // A valid own-project convoy cannot hide a foreign vessel or namespace.
     for context in [
         CrewCommandContext { convoy: Some("target".into()), vessel_ref: Some("foreign-vessel".into()), ..Default::default() },

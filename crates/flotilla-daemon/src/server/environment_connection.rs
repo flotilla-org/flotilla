@@ -86,6 +86,8 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
                 | CommandAction::QueryCrewList { context }
                 | CommandAction::QueryMessageContacts { context } => authorize_context(context, crew),
                 CommandAction::CrewHandoff { context, target, .. } => {
+                    // Short forms are qualified using the caller's convoy by handoff_with_carries,
+                    // which independently rejects a resolved foreign convoy.
                     let parts = target.split('/').collect::<Vec<_>>();
                     if parts.len() > 2 && !(parts.len() == 4 && parts[0] == crew.namespace && parts[1] == crew.convoy) {
                         return Err("EnvironmentIdentityMismatch: handoff names another convoy".into());
@@ -101,7 +103,9 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
             }
         }
         // The dispatcher resolves caller_session and reads source_path through
-        // that session's environment runner, never the host filesystem.
+        // that session's environment runner, never the host filesystem. Subject is
+        // descriptive (e.g. a commit), not ownership: prepare_put stamps both
+        // spec.convoy and owner reference from the caller for every artifact kind.
         Request::ArtifactPut { .. } => Ok(()),
         Request::ArtifactList { convoy, .. } if convoy.as_ref().is_none_or(|value| value == &crew.convoy) => {
             *convoy = Some(crew.convoy.clone());
@@ -347,6 +351,21 @@ mod tests {
             },
         ] {
             assert!(authorize(&mut request, &placed).is_err());
+        }
+        // One/two-segment handoff forms stay within the caller's convoy after
+        // the core handler qualifies the address.
+        for target in ["reviewer", "work/reviewer"] {
+            let mut request = Request::Execute {
+                command: flotilla_protocol::Command::builder()
+                    .action(CommandAction::CrewHandoff {
+                        context: CrewCommandContext::default(),
+                        target: target.into(),
+                        message: "handoff".into(),
+                        carries: Vec::new(),
+                    })
+                    .build(),
+            };
+            assert!(authorize(&mut request, &placed).is_ok());
         }
         let mut request = Request::ArtifactList { convoy: None, kind: None, subject: None };
         authorize(&mut request, &placed).expect("own artifact list");

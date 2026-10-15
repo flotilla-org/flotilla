@@ -493,6 +493,14 @@ mod tests {
             let error = service.prepare_put(&caller, invalid, &retention).await.expect_err("reject invalid artifact input");
             assert!(error.contains(expected), "unexpected validation error: {error}");
         }
+        // A subject may describe a foreign convoy, commit or review; it never
+        // selects artifact ownership or overwrites that convoy's envelope.
+        let foreign_subject = service.put(&caller, input("other-convoy", BTreeMap::new(), b"evidence"), &retention).await.unwrap();
+        assert_eq!(foreign_subject.spec.convoy, "demo");
+        assert_eq!(foreign_subject.spec.subject, "other-convoy");
+        assert_eq!(foreign_subject.metadata.owner_references[0].name, "demo");
+        assert!(service.list(Some("other-convoy"), None, None).await.unwrap().is_empty());
+        backend.using::<Artifact>(namespace).delete(&foreign_subject.metadata.name).await.unwrap();
         let first = service
             .put(&caller, input("head-1", BTreeMap::from([("disposition".into(), serde_json::json!("approve"))]), b"one"), &retention)
             .await

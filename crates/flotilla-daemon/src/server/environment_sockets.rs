@@ -138,8 +138,7 @@ impl EnvironmentSocketService {
 
     pub(crate) async fn prepare(&self, id: EnvironmentId) -> Result<DaemonHostPath, String> {
         tokio::fs::create_dir_all(self.directory.as_path()).await.map_err(|error| error.to_string())?;
-        let accept = self.accept.clone();
-        self.registry.lock().await.add(id, &self.directory, move |listener, id| accept(listener, id)).await
+        self.registry.lock().await.add(id, &self.directory, &*self.accept).await
     }
 
     pub(crate) async fn remove(&self, id: &EnvironmentId) -> Result<(), String> {
