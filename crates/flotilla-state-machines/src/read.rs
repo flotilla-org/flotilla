@@ -1,6 +1,6 @@
 //! The recording handle and typed reads.
 //!
-//! Gates, chosen targets and judgements see the world only through a
+//! Gates, effects and judgements see the world only through a
 //! [`Handle`]. A typed read `handle.read(&reference)` records the reference
 //! and the version it saw, or an absence, before it returns. A gate's reads
 //! become its edge event's inputs, and a judgement's reads become its
@@ -147,11 +147,11 @@ pub struct Judged<T> {
     pub reads: Vec<InputRead>,
 }
 
-/// The only way a gate, a chosen target or a judgement sees anything beyond
-/// its edge argument. Every read through it is recorded.
+/// The only way a gate, an effect or a judgement sees anything beyond its
+/// edge argument and the current state. Every read through it is recorded.
 pub struct Handle<'a, M: Machine> {
     spec: &'a M::Spec,
-    state: M::State,
+    state: &'a M::State,
     world: &'a M::World,
     now: Time,
     reads: Vec<InputRead>,
@@ -159,8 +159,8 @@ pub struct Handle<'a, M: Machine> {
 }
 
 impl<'a, M: Machine> Handle<'a, M> {
-    /// A handle on one resource, given its spec and state, at `now`.
-    pub fn new(spec: &'a M::Spec, state: M::State, world: &'a M::World, now: Time) -> Self {
+    /// A handle on one resource, given its spec and current state, at `now`.
+    pub fn new(spec: &'a M::Spec, state: &'a M::State, world: &'a M::World, now: Time) -> Self {
         Handle { spec, state, world, now, reads: Vec::new(), valid_until: None }
     }
 
@@ -169,8 +169,9 @@ impl<'a, M: Machine> Handle<'a, M> {
         self.spec
     }
 
-    /// The resource's current state.
-    pub fn state(&self) -> M::State {
+    /// The resource's current state: what gates check and effects change.
+    /// It is the resource's own, so reading it records nothing.
+    pub fn state(&self) -> &'a M::State {
         self.state
     }
 
@@ -186,8 +187,16 @@ impl<'a, M: Machine> Handle<'a, M> {
     {
         let world: &'a M::World = self.world;
         let found = world.lookup(reference);
-        self.reads.push(InputRead { kind: K::NAME, name: reference.name.clone(), version: found.map(|(version, _)| version) });
+        self.record(InputRead { kind: K::NAME, name: reference.name.clone(), version: found.map(|(version, _)| version) });
         found.map(|(_, value)| value)
+    }
+
+    /// Records `read` once: a gate and an effect reading the same value at
+    /// the same version relied on one input.
+    fn record(&mut self, read: InputRead) {
+        if !self.reads.contains(&read) {
+            self.reads.push(read);
+        }
     }
 
     /// Declares that the value being computed may change at `moment` by time
@@ -196,7 +205,7 @@ impl<'a, M: Machine> Handle<'a, M> {
         self.valid_until = Some(self.valid_until.map_or(moment, |current| current.min(moment)));
     }
 
-    /// The reads recorded so far, in order.
+    /// The distinct reads recorded so far, in order.
     pub fn reads(&self) -> &[InputRead] {
         &self.reads
     }

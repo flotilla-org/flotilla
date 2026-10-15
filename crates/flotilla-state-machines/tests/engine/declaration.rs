@@ -1,11 +1,12 @@
-//! The declaration core: typed edge dispatch, stable codes, validation,
-//! the diagram, and the pure step's fixed order (ADR 0064, #3209).
+//! The declaration core: state values with derived labels, typed edge
+//! dispatch, stable codes, validation, the diagram, and the pure step's
+//! fixed order (ADR 0064, #3209).
 
 use std::collections::BTreeSet;
 
 use flotilla_state_machines::{
-    edges, states, Coded, DefError, Edge, EdgeDef, EdgeKind, Ended, Handle, InputRead, Machine, MachineDef, Ref, Source, StepError, Table,
-    Time, Version, WrongState,
+    changed, edges, states, Coded, DefError, Diagram, Edge, EdgeArg, EdgeDef, EdgeKind, Ended, Fault, Handle, InputRead, Machine,
+    MachineDef, Ref, Source, StateValue, StepError, Table, Time, Version, WrongState,
 };
 use hegel::generators as gs;
 
@@ -15,14 +16,30 @@ fn fire(name: &str) -> LatchEdge {
     Fire { signal: Ref::new(name) }.into()
 }
 
+fn armed(shots: u32) -> Latch {
+    Latch::Armed { shots }
+}
+
 // Codes are stable identities: a rename must never change them. This pins them.
 #[test]
 fn codes_and_names_are_pinned() {
-    let states: Vec<_> = Latch::ALL.iter().map(|s| (s.name(), s.code())).collect();
-    assert_eq!(states, [("Armed", 1), ("Fired", 2), ("Spent", 3), ("Withdrawn", 4)]);
+    let labels: Vec<_> = LatchLabel::ALL.iter().map(|s| (s.name(), s.code())).collect();
+    assert_eq!(labels, [("Armed", 1), ("Fired", 2), ("Spent", 3), ("Withdrawn", 4)]);
     let edges: Vec<_> = LatchEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    assert_eq!(edges, [("fire", 10), ("withdraw", 11), ("re_arm", 12)]);
+    assert_eq!(edges, [("fire", 10), ("withdraw", 11), ("re_arm", 12), ("load", 13)]);
     assert_eq!(fire("s").kind(), LatchEdgeKind::Fire);
+}
+
+// A state is a label plus its named data: the label is derived from the
+// value, and each label names the data it carries in declaration order.
+#[test]
+fn a_state_value_names_its_label_and_data() {
+    let fired = Latch::Fired { shots: 2, by: "bell".into() };
+    assert_eq!(fired.label(), LatchLabel::Fired);
+    let data: Vec<_> = fired.data().into_iter().map(|(name, value)| (name, format!("{value:?}"))).collect();
+    assert_eq!(data, [("shots", "2".to_string()), ("by", "\"bell\"".to_string())]);
+    let fields: Vec<_> = LatchLabel::ALL.iter().map(|label| Latch::fields(*label)).collect();
+    assert_eq!(fields, [&["shots"][..], &["shots", "by"], &["shots"], &["reason"]]);
 }
 
 #[test]
@@ -30,21 +47,23 @@ fn the_latch_declaration_validates() {
     assert_eq!(LatchMachine::definition().validate(), Ok(()));
 }
 
-// The diagram is drawn from the same declaration the engine enforces.
+// The diagram is drawn from the same declaration the engine enforces: each
+// transition names its edge and the data it changes. The label view leaves
+// out the edge that changes only data.
 #[test]
-fn mermaid_renders_every_edge_and_end() {
-    let diagram = LatchMachine::definition().mermaid();
-    assert_eq!(
-        diagram,
-        "---\ntitle: Latch\n---\nstateDiagram-v2\n  direction LR\n  [*] --> Armed\n\
-         \x20 Armed --> Fired: fire (chosen)\n  Armed --> Spent: fire (chosen)\n\
-         \x20 Armed --> Withdrawn: withdraw\n  Fired --> Withdrawn: withdraw\n  Fired --> Armed: re_arm\n\
-         \x20 Spent --> [*]\n  note right of Spent: the latch fired for good\n\
-         \x20 Withdrawn --> [*]\n  note right of Withdrawn: the latch was withdrawn\n"
-    );
+fn mermaid_renders_every_edge_its_data_and_each_end() {
+    let head = "---\ntitle: Latch\n---\nstateDiagram-v2\n  direction LR\n  [*] --> Armed\n";
+    let moves = "  Armed --> Fired: fire [shots, by]\n  Armed --> Spent: fire [shots, by]\n\
+                 \x20 Armed --> Withdrawn: withdraw [reason]\n  Fired --> Withdrawn: withdraw [reason]\n\
+                 \x20 Fired --> Armed: re_arm\n";
+    let ends = "  Spent --> [*]\n  note right of Spent: the latch fired for good\n\
+                \x20 Withdrawn --> [*]\n  note right of Withdrawn: the latch was withdrawn\n";
+    let definition = LatchMachine::definition();
+    assert_eq!(definition.mermaid(Diagram::Full), format!("{head}  Armed --> Armed: load [shots]\n{moves}{ends}"));
+    assert_eq!(definition.mermaid(Diagram::Labels), format!("{head}{moves}{ends}"));
 }
 
-fn step(spec: bool, state: Latch, world: &Table<Signal>, edge: &LatchEdge) -> (Result<Latch, StepError<LatchMachine>>, Vec<InputRead>) {
+fn step(spec: bool, state: &Latch, world: &Table<Signal>, edge: &LatchEdge) -> (Result<Latch, StepError<LatchMachine>>, Vec<InputRead>) {
     let def = LatchMachine::definition();
     let mut handle = Handle::<LatchMachine>::new(&spec, state, world, Time::ZERO);
     let result = def.step(&mut handle, edge);
@@ -52,25 +71,36 @@ fn step(spec: bool, state: Latch, world: &Table<Signal>, edge: &LatchEdge) -> (R
 }
 
 // Ends are checked first and refuse with the end's reason, before the
-// from-state or the gate is consulted.
+// from-label or the gate is consulted.
 #[test]
 fn an_end_refuses_with_its_reason_before_anything_else() {
     let world = Table::new();
-    for (state, reason) in [(Latch::Spent, "the latch fired for good"), (Latch::Withdrawn, "the latch was withdrawn")] {
-        for edge in [fire("s"), Withdraw { reason: String::new() }.into(), ReArm.into()] {
-            let (result, reads) = step(false, state, &world, &edge);
+    let ends =
+        [(Latch::Spent { shots: 1 }, "the latch fired for good"), (Latch::Withdrawn { reason: "gone".into() }, "the latch was withdrawn")];
+    for (state, reason) in ends {
+        for edge in [fire("s"), Withdraw { reason: String::new() }.into(), ReArm.into(), Load { shots: 1 }.into()] {
+            let (result, reads) = step(false, &state, &world, &edge);
             assert_eq!(result, Err(StepError::Refused(LatchRefusal::Ended(reason))));
             assert!(reads.is_empty(), "an end refusal reads nothing");
         }
     }
 }
 
-// The from-state is checked before the gate, so a gate never runs (or reads)
-// for an edge that does not leave the current state.
+// The from-label is checked before the gate, so a gate never runs (or reads)
+// for an edge that does not leave the current label.
 #[test]
 fn a_wrong_state_refuses_before_the_gate_reads() {
-    let (result, reads) = step(false, Latch::Fired, &Table::new(), &fire("s"));
+    let (result, reads) = step(false, &Latch::Fired { shots: 1, by: "bell".into() }, &Table::new(), &fire("s"));
     assert_eq!(result, Err(StepError::Refused(LatchRefusal::WrongState)));
+    assert!(reads.is_empty());
+}
+
+// Gates read the current state's data: an armed latch with no shots refuses
+// to fire, before it reads the signal.
+#[test]
+fn a_gate_reads_the_current_state() {
+    let (result, reads) = step(false, &armed(0), &Table::new(), &fire("bell"));
+    assert_eq!(result, Err(StepError::Refused(LatchRefusal::NoShots)));
     assert!(reads.is_empty());
 }
 
@@ -79,63 +109,159 @@ fn a_wrong_state_refuses_before_the_gate_reads() {
 #[test]
 fn gate_reads_are_recorded_with_versions_and_absences() {
     let mut world = Table::<Signal>::new();
-    let (result, reads) = step(false, Latch::Armed, &world, &fire("bell"));
+    let (result, reads) = step(false, &armed(1), &world, &fire("bell"));
     assert_eq!(result, Err(StepError::Refused(LatchRefusal::NoSignal)));
     assert_eq!(reads, [InputRead { kind: "signal", name: "bell".into(), version: None }]);
 
     world.put(&Ref::new("other"), true);
     let version = world.put(&Ref::new("bell"), true);
     assert_eq!(version, Version(2));
-    let (result, reads) = step(false, Latch::Armed, &world, &fire("bell"));
-    assert_eq!(result, Ok(Latch::Fired));
+    let (result, reads) = step(false, &armed(1), &world, &fire("bell"));
+    assert_eq!(result, Ok(Latch::Fired { shots: 0, by: "bell".into() }));
     assert_eq!(reads, [InputRead { kind: "signal", name: "bell".into(), version: Some(Version(2)) }]);
 }
 
-// A chosen target is picked within the declared set.
+// The effect produces the next state from the current value: the target
+// label is the effect's choice within the declared set, and data carries
+// over or changes as the effect writes it.
 #[test]
-fn a_chosen_target_follows_the_pick() {
+fn the_effect_produces_the_next_state() {
     let mut world = Table::<Signal>::new();
     world.put(&Ref::new("bell"), true);
-    assert_eq!(step(true, Latch::Armed, &world, &fire("bell")).0, Ok(Latch::Spent));
-    assert_eq!(step(false, Latch::Armed, &world, &fire("bell")).0, Ok(Latch::Fired));
+    assert_eq!(step(true, &armed(3), &world, &fire("bell")).0, Ok(Latch::Spent { shots: 2 }));
+    assert_eq!(step(false, &armed(3), &world, &fire("bell")).0, Ok(Latch::Fired { shots: 2, by: "bell".into() }));
+    assert_eq!(step(false, &armed(3), &world, &Load { shots: 2 }.into()).0, Ok(armed(5)));
+    assert_eq!(step(false, &Latch::Fired { shots: 2, by: "bell".into() }, &world, &ReArm.into()).0, Ok(armed(2)));
 }
 
-// A pick outside `may_reach` is a declaration fault, never a silent move.
+// An ungated edge runs no gate and reads nothing: its declaration states why.
 #[test]
-fn a_pick_outside_may_reach_is_refused() {
-    struct Rogue;
-    impl Machine for Rogue {
-        const NAME: &'static str = "Rogue";
-        type Spec = ();
-        type State = Latch;
-        type Edge = LatchEdge;
-        type Refusal = LatchRefusal;
-        type World = Table<Signal>;
-        fn definition() -> MachineDef<Self> {
-            MachineDef::new(Latch::Armed).edge(
+fn an_ungated_edge_states_its_reason_and_reads_nothing() {
+    let definition = LatchMachine::definition();
+    let re_arm = definition.find(LatchEdgeKind::ReArm).expect("declared");
+    assert_eq!((re_arm.gate_doc(), re_arm.ungated_reason()), (None, Some("re-arming a fired latch needs no evidence")));
+    let (result, reads) = step(false, &Latch::Fired { shots: 0, by: "bell".into() }, &Table::new(), &ReArm.into());
+    assert_eq!(result, Ok(armed(0)));
+    assert!(reads.is_empty());
+}
+
+// A machine whose effects break their declarations, for the fault tests: its
+// `fire` may reach only Fired yet spends the latch, and its `load` declares
+// no data yet changes the shots.
+struct Rogue;
+
+impl Machine for Rogue {
+    const NAME: &'static str = "Rogue";
+    type Request = ();
+    type Spec = ();
+    type State = Latch;
+    type Edge = LatchEdge;
+    type Refusal = LatchRefusal;
+    type World = Table<Signal>;
+    fn definition() -> MachineDef<Self> {
+        MachineDef::new(LatchLabel::Armed)
+            .edge(
                 EdgeDef::<Self, Fire>::new()
-                    .from([Latch::Armed])
-                    .to_chosen([Latch::Fired], |_, _| Latch::Spent)
-                    .gate("always", |_, _| Ok(())),
+                    .from([LatchLabel::Armed])
+                    .to([LatchLabel::Fired])
+                    .changes(["shots"])
+                    .ungated("a test fixture")
+                    .effect(|_, _, _| Latch::Spent { shots: 0 }),
             )
-        }
+            .edge(
+                EdgeDef::<Self, Load>::new()
+                    .from([LatchLabel::Armed])
+                    .to([LatchLabel::Armed])
+                    .ungated("a test fixture")
+                    .effect(|_, state, load| Latch::Armed { shots: shots(&state) + load.shots }),
+            )
     }
+    fn admit(_: ()) -> Result<((), Latch), LatchRefusal> {
+        Ok(((), armed(0)))
+    }
+}
+
+// A next state outside the declared targets is a declaration fault, never a
+// silent move.
+#[test]
+fn a_target_outside_the_declaration_is_a_fault() {
     let world = Table::new();
-    let mut handle = Handle::<Rogue>::new(&(), Latch::Armed, &world, Time::ZERO);
+    let state = armed(1);
+    let mut handle = Handle::<Rogue>::new(&(), &state, &world, Time::ZERO);
     assert_eq!(
         Rogue::definition().step(&mut handle, &fire("s")),
-        Err(StepError::Undeclared { edge: LatchEdgeKind::Fire, target: Some(Latch::Spent) })
+        Err(StepError::Fault(Fault::Target { edge: LatchEdgeKind::Fire, target: LatchLabel::Spent }))
     );
 }
 
+// Changing data the edge does not declare is a declaration fault, so a
+// declaration's list of changed data is exactly what the engine allows. An
+// effect that leaves the data as it was changes nothing.
+#[test]
+fn changing_undeclared_data_is_a_fault() {
+    let world = Table::new();
+    let state = armed(1);
+    let definition = Rogue::definition();
+    let mut handle = Handle::<Rogue>::new(&(), &state, &world, Time::ZERO);
+    assert_eq!(
+        definition.step(&mut handle, &Load { shots: 2 }.into()),
+        Err(StepError::Fault(Fault::Changes { edge: LatchEdgeKind::Load, data: vec!["shots"] }))
+    );
+    let mut handle = Handle::<Rogue>::new(&(), &state, &world, Time::ZERO);
+    assert_eq!(definition.step(&mut handle, &Load { shots: 0 }.into()), Ok(armed(1)));
+}
+
+// What a move changes: each datum the next state carries that the previous
+// one lacks or holds with another value. Data left behind by a label change
+// goes with the label.
+#[test]
+fn changed_names_new_and_altered_data_only() {
+    let fired = Latch::Fired { shots: 2, by: "bell".into() };
+    assert_eq!(changed(&armed(2), &fired), BTreeSet::from(["by"]));
+    assert_eq!(changed(&armed(3), &fired), BTreeSet::from(["shots", "by"]));
+    assert_eq!(changed(&fired, &armed(2)), BTreeSet::new());
+    assert_eq!(changed(&fired, &Latch::Withdrawn { reason: "r".into() }), BTreeSet::from(["reason"]));
+}
+
+fn draw_latch(tc: &hegel::TestCase) -> Latch {
+    let shots = tc.draw(gs::integers::<u32>().min_value(0).max_value(2));
+    let word = |tc: &hegel::TestCase| ["", "bell", "horn"][tc.draw(gs::integers::<usize>().min_value(0).max_value(2))].to_string();
+    match tc.draw(gs::integers::<u8>().min_value(0).max_value(3)) {
+        0 => Latch::Armed { shots },
+        1 => Latch::Fired { shots, by: word(tc) },
+        2 => Latch::Spent { shots },
+        _ => Latch::Withdrawn { reason: word(tc) },
+    }
+}
+
+// For any two state values: nothing changes when a value moves to itself;
+// what changes is always data the next label carries; and every datum the
+// next value carries either changed or is held equal by the previous value.
+// The generator covers every label, with colliding and distinct shots and
+// words, so equal data across different labels is drawn.
+#[hegel::test(test_cases = 300)]
+fn changed_is_exactly_the_data_that_differs(tc: hegel::TestCase) {
+    let (previous, next) = (draw_latch(&tc), draw_latch(&tc));
+    assert!(changed(&next, &next).is_empty());
+    let changes = changed(&previous, &next);
+    let fields: BTreeSet<_> = Latch::fields(next.label()).iter().copied().collect();
+    assert!(changes.is_subset(&fields), "{previous:?} -> {next:?}: {changes:?}");
+    for (name, value) in next.data() {
+        let held = previous.data().into_iter().any(|(old, datum)| old == name && datum.same(value));
+        assert_eq!(changes.contains(name), !held, "{previous:?} -> {next:?}: {name}");
+    }
+}
+
 // Judgements share the handle: the earliest declared moment wins, and the
-// reads are the dependency set.
+// reads are the dependency set, each distinct read recorded once.
 #[test]
 fn a_judgement_reports_value_validity_and_reads() {
     let mut world = Table::<Signal>::new();
     world.put(&Ref::new("bell"), false);
-    let mut handle = Handle::<LatchMachine>::new(&false, Latch::Armed, &world, Time::from_micros(5));
+    let state = armed(0);
+    let mut handle = Handle::<LatchMachine>::new(&false, &state, &world, Time::from_micros(5));
     let raised = handle.read(&Ref::new("bell")).copied();
+    handle.read(&Ref::<Signal>::new("bell"));
     handle.until(Time::from_micros(30));
     handle.until(Time::from_micros(20));
     handle.until(Time::from_micros(40));
@@ -159,35 +285,44 @@ fn table_versions_rise_across_removal() {
     assert_eq!(table.lookup(&bell), Some((Version(2), &true)));
 }
 
-// A word shared by a state and an edge is rejected, ignoring case and underscores.
+// A word shared by a label and an edge is rejected, ignoring case and underscores.
 #[test]
-fn validate_rejects_a_state_and_edge_sharing_a_word() {
+fn validate_rejects_a_label_and_edge_sharing_a_word() {
     states! {
-        pub enum Clash { Armed = 1, ReArm = 2 }
+        pub enum Clash => ClashLabel { Armed = 1, ReArm = 2, Loaded = 3 }
     }
-    impl From<Ended<Clash>> for LatchRefusal {
-        fn from(_: Ended<Clash>) -> Self {
+    impl From<Ended<ClashLabel>> for LatchRefusal {
+        fn from(_: Ended<ClashLabel>) -> Self {
             LatchRefusal::WrongState
         }
     }
-    impl From<WrongState<Clash, LatchEdgeKind>> for LatchRefusal {
-        fn from(_: WrongState<Clash, LatchEdgeKind>) -> Self {
+    impl From<WrongState<ClashLabel, LatchEdgeKind>> for LatchRefusal {
+        fn from(_: WrongState<ClashLabel, LatchEdgeKind>) -> Self {
             LatchRefusal::WrongState
         }
     }
     struct Clashing;
     impl Machine for Clashing {
         const NAME: &'static str = "Clashing";
+        type Request = ();
         type Spec = ();
         type State = Clash;
         type Edge = LatchEdge;
         type Refusal = LatchRefusal;
         type World = Table<Signal>;
         fn definition() -> MachineDef<Self> {
-            MachineDef::new(Clash::Armed)
-                .edge(EdgeDef::<Self, Fire>::new().from([Clash::Armed]).to(Clash::ReArm).gate("g", |_, _| Ok(())))
-                .edge(EdgeDef::<Self, Withdraw>::new().from([Clash::Armed]).to(Clash::ReArm).gate("g", |_, _| Ok(())))
-                .edge(EdgeDef::<Self, ReArm>::new().from([Clash::ReArm]).to(Clash::Armed).gate("g", |_, _| Ok(())))
+            fn edge<A: EdgeArg<Edge = LatchEdge>>(from: ClashLabel, to: ClashLabel) -> EdgeDef<Clashing, A> {
+                EdgeDef::new().from([from]).to([to]).ungated("a test fixture").effect(|_, _, _| Clash::ReArm)
+            }
+            use ClashLabel::{Armed, Loaded};
+            MachineDef::new(Armed)
+                .edge(edge::<Fire>(Armed, ClashLabel::ReArm))
+                .edge(edge::<Withdraw>(Armed, ClashLabel::ReArm))
+                .edge(edge::<ReArm>(ClashLabel::ReArm, Loaded))
+                .edge(edge::<Load>(Loaded, Armed))
+        }
+        fn admit(_: ()) -> Result<((), Clash), LatchRefusal> {
+            Ok(((), Clash::Armed))
         }
     }
     assert_eq!(Clashing::definition().validate(), Err(vec![DefError::NameClash("re_arm")]));
@@ -197,7 +332,7 @@ fn validate_rejects_a_state_and_edge_sharing_a_word() {
 #[test]
 fn validate_rejects_duplicate_codes() {
     states! {
-        pub enum Twin { One = 1, Two = 1 }
+        pub enum Twin => TwinLabel { One = 1, Two = 1 }
     }
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Go;
@@ -208,28 +343,34 @@ fn validate_rejects_duplicate_codes() {
     }
     #[derive(Clone, Debug, PartialEq)]
     pub struct Never;
-    impl From<Ended<Twin>> for Never {
-        fn from(_: Ended<Twin>) -> Self {
+    impl From<Ended<TwinLabel>> for Never {
+        fn from(_: Ended<TwinLabel>) -> Self {
             Never
         }
     }
-    impl From<WrongState<Twin, TwinEdgeKind>> for Never {
-        fn from(_: WrongState<Twin, TwinEdgeKind>) -> Self {
+    impl From<WrongState<TwinLabel, TwinEdgeKind>> for Never {
+        fn from(_: WrongState<TwinLabel, TwinEdgeKind>) -> Self {
             Never
         }
     }
     struct Twins;
     impl Machine for Twins {
         const NAME: &'static str = "Twins";
+        type Request = ();
         type Spec = ();
         type State = Twin;
         type Edge = TwinEdge;
         type Refusal = Never;
         type World = ();
         fn definition() -> MachineDef<Self> {
-            MachineDef::new(Twin::One)
-                .edge(EdgeDef::<Self, Go>::new().from([Twin::One]).to(Twin::Two).gate("g", |_, _| Ok(())))
-                .edge(EdgeDef::<Self, Back>::new().from([Twin::Two]).to(Twin::One).gate("g", |_, _| Ok(())))
+            MachineDef::new(TwinLabel::One)
+                .edge(EdgeDef::<Self, Go>::new().from([TwinLabel::One]).to([TwinLabel::Two]).ungated("fixture").effect(|_, _, _| Twin::Two))
+                .edge(
+                    EdgeDef::<Self, Back>::new().from([TwinLabel::Two]).to([TwinLabel::One]).ungated("fixture").effect(|_, _, _| Twin::One),
+                )
+        }
+        fn admit(_: ()) -> Result<((), Twin), Never> {
+            Ok(((), Twin::One))
         }
     }
     assert_eq!(Twins::definition().validate(), Err(vec![DefError::DuplicateStateCode(1), DefError::DuplicateEdgeCode(7)]));
@@ -237,44 +378,58 @@ fn validate_rejects_duplicate_codes() {
 
 // ---- validate() as a property over generated declarations ----
 
-/// One generated edge declaration: which kind, the from-set as a bit mask
-/// over the four states, the target (none, fixed, or a chosen bit mask) and
-/// whether it is gated.
+/// How a generated edge is checked.
+#[derive(Clone, Copy, Debug)]
+enum Checked {
+    Gated,
+    Ungated { reasoned: bool },
+    Unchecked,
+}
+
+/// One generated edge declaration: which kind, the from- and to-sets as bit
+/// masks over the four labels, the data it declares changing, how it is
+/// checked and whether it has an effect.
 #[derive(Clone, Debug)]
 struct Drawn {
     kind: usize,
     from: u8,
-    target: Option<Result<usize, u8>>,
-    gated: bool,
+    to: u8,
+    changes: Vec<&'static str>,
+    check: Checked,
+    effect: bool,
 }
 
-fn states_in(mask: u8) -> Vec<Latch> {
-    Latch::ALL.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, s)| *s).collect()
+/// Data names to declare: each label's data, and one no label carries.
+const DATA: [&str; 4] = ["shots", "by", "reason", "bogus"];
+
+fn labels_in(mask: u8) -> Vec<LatchLabel> {
+    LatchLabel::ALL.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, s)| *s).collect()
 }
 
 fn build(initial: usize, edges: &[Drawn], ends: &[(usize, bool)]) -> MachineDef<LatchMachine> {
-    fn add<A: flotilla_state_machines::EdgeArg<Edge = LatchEdge>>(def: MachineDef<LatchMachine>, d: &Drawn) -> MachineDef<LatchMachine> {
-        let mut e = EdgeDef::<LatchMachine, A>::new().from(states_in(d.from));
-        e = match d.target {
-            None => e,
-            Some(Ok(t)) => e.to(Latch::ALL[t]),
-            Some(Err(mask)) => e.to_chosen(states_in(mask), |h, _| h.state()),
+    fn add<A: EdgeArg<Edge = LatchEdge>>(def: MachineDef<LatchMachine>, d: &Drawn) -> MachineDef<LatchMachine> {
+        let mut e = EdgeDef::<LatchMachine, A>::new().from(labels_in(d.from)).to(labels_in(d.to)).changes(d.changes.iter().copied());
+        e = match d.check {
+            Checked::Gated => e.gate("drawn", |_, _| Ok(())),
+            Checked::Ungated { reasoned } => e.ungated(if reasoned { "drawn" } else { " " }),
+            Checked::Unchecked => e,
         };
-        if d.gated {
-            e = e.gate("drawn", |_, _| Ok(()));
+        if d.effect {
+            e = e.effect(|_, state, _| state);
         }
         def.edge(e)
     }
-    let mut def = MachineDef::new(Latch::ALL[initial]);
+    let mut def = MachineDef::new(LatchLabel::ALL[initial]);
     for d in edges {
         def = match d.kind {
             0 => add::<Fire>(def, d),
             1 => add::<Withdraw>(def, d),
-            _ => add::<ReArm>(def, d),
+            2 => add::<ReArm>(def, d),
+            _ => add::<Load>(def, d),
         };
     }
     for (state, reasoned) in ends {
-        def = def.end(Latch::ALL[*state], if *reasoned { "done" } else { " " });
+        def = def.end(LatchLabel::ALL[*state], if *reasoned { "done" } else { " " });
     }
     def
 }
@@ -284,31 +439,38 @@ fn build(initial: usize, edges: &[Drawn], ends: &[(usize, bool)]) -> MachineDef<
 fn expected(initial: usize, edges: &[Drawn], ends: &[(usize, bool)]) -> BTreeSet<DefError> {
     let kinds = LatchEdgeKind::ALL;
     let mut errors = BTreeSet::new();
-    let targets = |d: &Drawn| -> Vec<usize> {
-        match d.target {
-            None => vec![],
-            Some(Ok(t)) => vec![t],
-            Some(Err(mask)) => (0..4).filter(|i| mask & (1 << i) != 0).collect(),
-        }
-    };
     let end_states: BTreeSet<usize> = ends.iter().map(|(s, _)| *s).collect();
     for (i, d) in edges.iter().enumerate() {
         let name = kinds[d.kind].name();
         if edges[..i].iter().any(|e| e.kind == d.kind) {
             errors.insert(DefError::DuplicateEdge(name));
         }
-        if !d.gated {
-            errors.insert(DefError::UngatedEdge(name));
+        match d.check {
+            Checked::Unchecked => {
+                errors.insert(DefError::UngatedEdge(name));
+            }
+            Checked::Ungated { reasoned: false } => {
+                errors.insert(DefError::UngatedWithoutReason(name));
+            }
+            _ => {}
         }
-        if d.target.is_none() {
+        if !d.effect {
+            errors.insert(DefError::EdgeWithoutEffect(name));
+        }
+        if d.to == 0 {
             errors.insert(DefError::EdgeWithoutTarget(name));
         }
         if d.from == 0 {
             errors.insert(DefError::EdgeWithoutSource(name));
         }
+        for data in &d.changes {
+            if !labels_in(d.to).iter().any(|label| Latch::fields(*label).contains(data)) {
+                errors.insert(DefError::UnknownData { edge: name, data });
+            }
+        }
         for s in &end_states {
             if d.from & (1 << s) != 0 {
-                errors.insert(DefError::EdgeLeavesEnd { edge: name, end: Latch::ALL[*s].name() });
+                errors.insert(DefError::EdgeLeavesEnd { edge: name, end: LatchLabel::ALL[*s].name() });
             }
         }
     }
@@ -319,10 +481,10 @@ fn expected(initial: usize, edges: &[Drawn], ends: &[(usize, bool)]) -> BTreeSet
     }
     for (i, (s, reasoned)) in ends.iter().enumerate() {
         if ends[..i].iter().any(|(t, _)| t == s) {
-            errors.insert(DefError::DuplicateEnd(Latch::ALL[*s].name()));
+            errors.insert(DefError::DuplicateEnd(LatchLabel::ALL[*s].name()));
         }
         if !reasoned {
-            errors.insert(DefError::EndWithoutReason(Latch::ALL[*s].name()));
+            errors.insert(DefError::EndWithoutReason(LatchLabel::ALL[*s].name()));
         }
     }
     let mut reached = BTreeSet::from([initial]);
@@ -330,7 +492,7 @@ fn expected(initial: usize, edges: &[Drawn], ends: &[(usize, bool)]) -> BTreeSet
         let before = reached.len();
         for d in edges {
             if reached.iter().any(|s| d.from & (1 << s) != 0) {
-                reached.extend(targets(d));
+                reached.extend((0..4).filter(|t| d.to & (1 << t) != 0));
             }
         }
         if reached.len() == before {
@@ -339,33 +501,37 @@ fn expected(initial: usize, edges: &[Drawn], ends: &[(usize, bool)]) -> BTreeSet
     }
     for s in 0..4 {
         if !reached.contains(&s) {
-            errors.insert(DefError::UnreachableState(Latch::ALL[s].name()));
+            errors.insert(DefError::UnreachableState(LatchLabel::ALL[s].name()));
         }
         if !end_states.contains(&s) && !edges.iter().any(|d| d.from & (1 << s) != 0) {
-            errors.insert(DefError::DeadState(Latch::ALL[s].name()));
+            errors.insert(DefError::DeadState(LatchLabel::ALL[s].name()));
         }
     }
     errors
 }
 
 // validate() reports exactly the violated rules for any declaration. The
-// generator spans every rule: from-sets and chosen sets over all 16 masks
-// (including empty), missing targets and gates, kinds declared zero, one or
-// two times, and ends repeated or without a reason.
+// generator spans every rule: from- and to-sets over all 16 masks (including
+// empty), changed data carried by some labels and by none, gated, ungated
+// with and without a reason, and unchecked edges, missing effects, kinds
+// declared zero, one or two times, and ends repeated or without a reason.
 fn validate_case(tc: hegel::TestCase) {
     let initial = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
-    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(5));
+    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
     let edges: Vec<Drawn> = (0..count)
         .map(|_| {
-            let kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+            let kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
             let from = tc.draw(gs::integers::<u8>().min_value(0).max_value(15));
-            let target = match tc.draw(gs::integers::<u8>().min_value(0).max_value(5)) {
-                0 => None,
-                1 => Some(Err(tc.draw(gs::integers::<u8>().min_value(0).max_value(15)))),
-                _ => Some(Ok(tc.draw(gs::integers::<usize>().min_value(0).max_value(3)))),
+            let to = tc.draw(gs::integers::<u8>().min_value(0).max_value(15));
+            let changes = DATA.iter().copied().filter(|_| tc.draw(gs::integers::<u8>().min_value(0).max_value(3)) == 0).collect();
+            let check = match tc.draw(gs::integers::<u8>().min_value(0).max_value(7)) {
+                0 => Checked::Unchecked,
+                1 => Checked::Ungated { reasoned: false },
+                2 => Checked::Ungated { reasoned: true },
+                _ => Checked::Gated,
             };
-            let gated = tc.draw(gs::integers::<u8>().min_value(0).max_value(4)) > 0;
-            Drawn { kind, from, target, gated }
+            let effect = tc.draw(gs::integers::<u8>().min_value(0).max_value(5)) > 0;
+            Drawn { kind, from, to, changes, check, effect }
         })
         .collect();
     let end_count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
