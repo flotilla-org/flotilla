@@ -81,8 +81,10 @@ impl<K: Kind> fmt::Debug for Ref<K> {
 pub struct Version(pub u64);
 
 impl Version {
+    /// The following version. Saturates: a single writer issuing 2^64
+    /// versions to one value is not a case to wrap or panic over.
     pub fn next(self) -> Version {
-        Version(self.0 + 1)
+        Version(self.0.saturating_add(1))
     }
 }
 

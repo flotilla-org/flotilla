@@ -145,14 +145,18 @@ fn a_judgement_reports_value_validity_and_reads() {
     assert_eq!(judged.reads, [InputRead { kind: "signal", name: "bell".into(), version: Some(Version(1)) }]);
 }
 
+// A table's versions only rise: a value removed and written again is newer
+// than anything read before, so a recorded read can never be confused with it.
 #[test]
-fn table_lookup_and_remove() {
+fn table_versions_rise_across_removal() {
     let mut table = Table::<Signal>::new();
     let bell = Ref::new("bell");
     table.put(&bell, true);
     assert_eq!(table.lookup(&bell), Some((Version(1), &true)));
     assert_eq!(table.remove(&bell), Some(true));
     assert_eq!(table.lookup(&bell), None);
+    table.put(&bell, true);
+    assert_eq!(table.lookup(&bell), Some((Version(2), &true)));
 }
 
 // A word shared by a state and an edge is rejected, ignoring case and underscores.
