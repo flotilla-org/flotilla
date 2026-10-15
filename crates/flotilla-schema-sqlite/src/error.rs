@@ -73,6 +73,10 @@ pub enum Malformed {
     /// A `PutObject` of a media other than ADR 0063 CBOR, the only media today.
     #[error("object media {media} is not CBOR")]
     Media { media: u8 },
+    /// A home sequence this store already logged for another resource of that home: a home
+    /// numbers each change once, so the sender reused it.
+    #[error("home sequence {home_seq} of {home} is already logged")]
+    ReusedSequence { home: String, home_seq: u64 },
     /// Above `i64::MAX`, or 0, which no write takes (sequences start at 1).
     #[error("home sequence {home_seq} cannot be stored")]
     Sequence { home_seq: u64 },

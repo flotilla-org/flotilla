@@ -598,6 +598,29 @@ fn objects_of_another_media_are_refused() {
     assert_eq!(write.resolve(Convoy::CODE, "c", LOCAL).expect("resolve"), None);
 }
 
+// Behaviour: a home numbers each change once. A change for another resource that reuses a
+// sequence already logged for this home passes the per-identity checks, so it is refused as
+// `ReusedSequence` before any write, not as a raw constraint error from the log append.
+#[test]
+fn a_reused_home_sequence_is_refused() {
+    let mut source = store();
+    let mut write = source.write().expect("write");
+    write.insert("a", &message("a")).expect("insert");
+    write.commit().expect("commit");
+    let change = first_change(&mut source, LOCAL);
+    let mut target = replica();
+    let mut write = target.write().expect("write");
+    assert!(matches!(write.apply(&change), Ok(Applied::Applied(_))));
+    let reused = RowChange { name: "b".into(), ..change.clone() };
+    let refused = write.apply(&reused);
+    assert!(
+        matches!(&refused, Err(StoreError::MalformedChange(Malformed::ReusedSequence { home_seq, .. })) if *home_seq == change.home_seq),
+        "{refused:?}"
+    );
+    assert_eq!(write.resolve(Message::CODE, "b", LOCAL).expect("resolve"), None);
+    write.commit().expect("commit");
+}
+
 // Behaviour (MAX_CHANGES_PAGE_BYTES): a page stops before the entry that would take it past the
 // byte budget, yet always holds one entry, so paging with a budget below every entry still walks
 // the whole log, one entry per page.

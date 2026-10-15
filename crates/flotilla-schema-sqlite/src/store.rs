@@ -363,6 +363,7 @@ pub const MAX_CHANGES_PAGE: u32 = 10_000;
 pub const MAX_CHANGES_PAGE_BYTES: usize = 32 * 1024 * 1024;
 
 const LOG_APPEND: &str = "INSERT INTO change_log (home, home_seq, resource_id, change) VALUES (?1, ?2, ?3, ?4)";
+const LOG_TAKEN: &str = "SELECT 1 FROM change_log WHERE home = ?1 AND home_seq = ?2";
 
 /// What `apply` did with a change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -690,6 +691,13 @@ impl Ctx<'_> {
         }
         if change.prev_seq != current {
             return Err(StoreError::Gap { expected: current, found: change.prev_seq });
+        }
+        // Duplicates and gaps are per identity, but a home numbers each change once: a sequence
+        // already logged for another resource is the sender's error, refused before any write.
+        if let Some(home) = self.string_id(&change.home)? {
+            if self.conn.prepare_cached(LOG_TAKEN)?.query_row(params![home, sequence], |_| Ok(())).optional()?.is_some() {
+                return Err(Malformed::ReusedSequence { home: change.home.clone(), home_seq: change.home_seq }.into());
+            }
         }
         let id = match known {
             Some(id) => id,
