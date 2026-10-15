@@ -54,15 +54,21 @@ impl AttachReadContext {
         namespace: &str,
         host_ref: &str,
     ) -> Result<Option<flotilla_protocol::PlacementTargetHost>, String> {
+        self.canonical_host_with_load(namespace, host_ref, async {
+            backend.including_replicas::<ResourceHost>(namespace).list().await.map(|hosts| hosts.items).map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    async fn canonical_host_with_load(
+        &self,
+        namespace: &str,
+        host_ref: &str,
+        load: impl std::future::Future<Output = HostSnapshot>,
+    ) -> Result<Option<flotilla_protocol::PlacementTargetHost>, String> {
         let mut snapshots = self.hosts.lock().await;
         if !snapshots.contains_key(namespace) {
-            let hosts = backend
-                .including_replicas::<ResourceHost>(namespace)
-                .list()
-                .await
-                .map(|hosts| hosts.items)
-                .map_err(|error| error.to_string());
-            snapshots.insert(namespace.to_string(), hosts);
+            snapshots.insert(namespace.to_string(), load.await);
         }
         match snapshots.get(namespace).expect("Host snapshot initialized") {
             Ok(hosts) => crate::host_resolution::canonical_placement_host_ref_from_sources(hosts, host_ref),
@@ -1294,6 +1300,29 @@ mod tests {
                 (second_address == "coder@project").then_some("coder@project")
             );
         }
+    }
+
+    // A failed catalog load is stable within one request: later lookups return
+    // the same error without running their loader. A new request retries.
+    #[tokio::test]
+    async fn host_snapshot_caches_load_errors_until_the_next_request() {
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let load = || async {
+            loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err("Host catalog unavailable".to_string())
+        };
+        let reads = AttachReadContext::default();
+        for reference in ["first-host", "second-host"] {
+            let error = reads.canonical_host_with_load("flotilla", reference, load()).await.expect_err("load fails");
+            assert_eq!(error, "Host catalog unavailable");
+        }
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let fresh = AttachReadContext::default();
+        assert_eq!(
+            fresh.canonical_host_with_load("flotilla", "first-host", load()).await.expect_err("new request retries"),
+            "Host catalog unavailable"
+        );
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     // A request shares even an empty snapshot across concurrent lookups, isolates
