@@ -36,14 +36,19 @@ impl AvailableSpaceProbe for SystemAvailableSpaceProbe {
         #[cfg(not(unix))]
         {
             let disks = Disks::new_with_refreshed_list();
-            disks
-                .list()
-                .iter()
-                .filter(|disk| path.starts_with(disk.mount_point()))
-                .max_by_key(|disk| disk.mount_point().components().count())
-                .map(|disk| disk.available_space())
+            mount_available_space(path, disks.list().iter().map(|disk| (disk.mount_point(), disk.available_space())))
         }
     }
+}
+
+/// Select the deepest mount containing the path, taking the last match for ties.
+#[cfg(any(not(unix), test))]
+fn mount_available_space<'a>(path: &Path, mounts: impl IntoIterator<Item = (&'a Path, u64)>) -> Option<u64> {
+    mounts
+        .into_iter()
+        .filter(|(mount, _)| path.starts_with(mount))
+        .max_by_key(|(mount, _)| mount.components().count())
+        .map(|(_, available)| available)
 }
 
 /// Inspect only the requested filesystem, never enumerate other mounted
@@ -68,6 +73,40 @@ pub fn system_available_space_probe() -> Arc<dyn AvailableSpaceProbe> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Issue #3133: the deepest component-prefix mount supplies the available bytes;
+    // absent matches return None. Generate depths, ordering and the full byte range.
+    #[hegel::test]
+    fn mount_selection_uses_deepest_prefix(tc: hegel::TestCase) {
+        let depth = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(8));
+        let bytes = tc.draw(hegel::generators::integers::<u64>());
+        let reverse = tc.draw(hegel::generators::booleans());
+        let mut deepest = std::path::PathBuf::from("volume");
+        let mut mounts = vec![(deepest.clone(), bytes.wrapping_add(1))];
+        for _ in 0..depth {
+            deepest.push("nested");
+            mounts.push((deepest.clone(), bytes));
+        }
+        // All shallower mounts deliberately report different bytes.
+        for (mount, available) in &mut mounts {
+            if mount != &deepest {
+                *available = bytes.wrapping_add(1);
+            }
+        }
+        if reverse {
+            mounts.reverse();
+        }
+        let select = |path: &Path| mount_available_space(path, mounts.iter().map(|(mount, bytes)| (mount.as_path(), *bytes)));
+        assert_eq!(select(&deepest.join("checkout")), Some(bytes));
+        assert_eq!(select(&deepest), Some(bytes), "an exact mount is a prefix");
+        assert_eq!(select(Path::new("volume-other/checkout")), None, "string prefixes are not path prefixes");
+        assert_eq!(mount_available_space(Path::new("volume/checkout"), []), None);
+        for available in [0, u64::MAX, bytes] {
+            assert_eq!(mount_available_space(Path::new("volume/checkout"), [(Path::new("volume"), available)]), Some(available));
+        }
+        // Equal-depth duplicate mounts retain the existing last-match behavior.
+        assert_eq!(mount_available_space(&deepest, [(deepest.as_path(), bytes.wrapping_add(1)), (deepest.as_path(), bytes)]), Some(bytes));
+    }
 
     // Generate nonexistent path depths through 8; only that path and its
     // ancestors may be inspected, never unrelated protected/removable volumes.
