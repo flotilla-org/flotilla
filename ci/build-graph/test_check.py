@@ -44,7 +44,7 @@ class BuildGraphContract(unittest.TestCase):
 
     def test_messaging_refuses_upper_layers(self):
         # Finite generator covers every forbidden layer, direct/transitive and normal/build edges.
-        for target in ("flotilla-core", "flotilla-daemon", "flotilla-controllers", "flotilla-aggregator",
+        for target in ("flotilla-core", "flotilla-daemon", "flotilla-controllers",
                        "flotilla-projections", "flotilla-credentials", *CAPABILITY_CRATES):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):

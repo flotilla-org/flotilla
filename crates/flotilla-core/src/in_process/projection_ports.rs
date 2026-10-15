@@ -125,6 +125,9 @@ impl flotilla_projections::read_projections::MessageReceiverLoader for MessageRe
 }
 pub(super) struct MessageReceiverEvidence(pub flotilla_messaging::MessageReceiverSnapshot);
 impl flotilla_projections::read_projections::MessageReceiverRead for MessageReceiverEvidence {
+    fn terminals(&self) -> &[flotilla_resources::ReadResourceObject<flotilla_resources::TerminalSession>] {
+        self.0.terminals()
+    }
     fn may_address_convoy(&self, address: &str, project: &str, convoy: &str) -> bool {
         self.0.may_address_convoy(address, project, convoy)
     }

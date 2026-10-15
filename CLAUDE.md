@@ -220,7 +220,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-projections/src/projections_actions.rs` | Query conversion, enrichment and resource watch handlers over host ports |
 | `crates/flotilla-projections/src/host_registry.rs` | Host read models joined with the injected peer overlay |
 | `crates/flotilla-projections/src/dispatch_board.rs` | Shared tracker observation cache and dispatch-board assembly over stores and issue resolvers |
-| `crates/flotilla-core/src/in_process/projection_ports.rs` | Composition adapters for aggregator resolvers, environment reads and leaf subscription evidence |
+| `crates/flotilla-core/src/in_process/projection_ports.rs` | Composition adapters for aggregator resolvers, environment reads, immutable message receiver evidence and leaf subscription evidence |
 | `crates/flotilla-daemon/src/peer/host_overlay.rs` | Plane-A peer identities, configured peers, per-node connectivity and overlay policy |
 | `crates/flotilla-credentials/src/lib.rs` | Runtime-facing credential/material operations and agent-environment composition |
 | `crates/flotilla-messaging/src/` | Message inbox and receiver snapshots, transport delivery, audit retention, conditions and charter notification routing |

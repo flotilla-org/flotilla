@@ -72,13 +72,15 @@ pub trait LeafSubscriptionRead: Send + Sync {
     async fn diagnostics(&self) -> Vec<(LeafSubscriptionRow, Vec<LeafFiringRecord>)>;
 }
 
-/// Projects resource and fleet state supplied by the daemon and FleetService.
-/// Host refresh stays with the daemon; FleetService gathers local and replica rows.
+/// Immutable receiver evidence gathered from one request snapshot.
 pub trait MessageReceiverRead: Send + Sync {
+    fn terminals(&self) -> &[ReadResourceObject<ResourceTerminalSession>];
     fn may_address_convoy(&self, address: &str, project: &str, convoy: &str) -> bool;
     fn resolve(&self, address: &str) -> Result<Option<ReadResourceObject<ResourceTerminalSession>>, String>;
 }
 
+/// Resolve receiver evidence through the messaging resolver at the composition boundary.
+/// The supplied backend is the request snapshot: implementations must read only from it.
 #[async_trait]
 pub trait MessageReceiverLoader: Send + Sync {
     async fn load(
@@ -90,6 +92,8 @@ pub trait MessageReceiverLoader: Send + Sync {
     ) -> Result<Box<dyn MessageReceiverRead>, String>;
 }
 
+/// Projects resource and fleet state supplied by the daemon and FleetService.
+/// Host refresh stays with the daemon; FleetService gathers local and replica rows.
 pub struct ReadProjections<'a> {
     pub backend: &'a ResourceBackend,
     pub message_receivers: &'a dyn MessageReceiverLoader,
@@ -2073,8 +2077,7 @@ pub async fn convoy_receiver_evidence(
         let defaults = project_ops::read_definition_catalog::<CrewDefaults>(backend, namespace).await?;
         snapshot.insert_definitions(defaults)?;
     }
-    let receivers =
-        loader.load(&snapshot.finish(), namespace, convoys.to_vec(), terminals.items).await.map_err(|error| error.to_string())?;
+    let receivers = loader.load(&snapshot.finish(), namespace, convoys.to_vec(), terminals.items).await?;
     Ok((receivers, project, aliases))
 }
 
@@ -2083,7 +2086,7 @@ pub async fn convoy_receiver_evidence(
 pub async fn message_views(
     backend: &flotilla_store::ResourceBackend,
     namespace: &str,
-    receivers: &Box<dyn MessageReceiverRead>,
+    receivers: &dyn MessageReceiverRead,
     convoy: Option<&flotilla_resources::ResourceObject<ResourceConvoy>>,
     aliases: &BTreeSet<String>,
 ) -> Result<Vec<flotilla_protocol::query::CrewMessageView>, String> {
@@ -2132,7 +2135,7 @@ pub async fn message_views(
     let mut views = Vec::new();
     for source in records {
         let message = source.object;
-        let holder = receivers.resolve(&message.spec.receiver).map_err(|error| error.to_string())?;
+        let holder = receivers.resolve(&message.spec.receiver)?;
         let current_receiver = holder.and_then(|holder| {
             let terminal = holder.object;
             let convoy = terminal.metadata.labels.get(flotilla_resources::CONVOY_LABEL)?;

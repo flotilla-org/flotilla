@@ -6258,8 +6258,9 @@ impl projections_actions::ProjectionsActionPort for InProcessDaemon {
     async fn message_contacts_internal(
         &self,
         context: &flotilla_protocol::CrewCommandContext,
-    ) -> Result<flotilla_store::CrewAddressBook, String> {
-        self.crew_ops.message_contacts_internal(context).await
+    ) -> Result<(String, serde_json::Value), String> {
+        let book = self.crew_ops.message_contacts_internal(context).await?;
+        Ok((book.render(), serde_json::to_value(book).map_err(|error| error.to_string())?))
     }
     async fn crew_list_internal(
         &self,
