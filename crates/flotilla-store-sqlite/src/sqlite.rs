@@ -2657,6 +2657,7 @@ impl SqliteBackend {
         merge: Option<MergeMetadata>,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
         resource_kind.validate_spec(meta, spec)?;
+        let initial_status = resource_kind.initial_status(meta)?;
         let key = Self::store_key(resource_kind, namespace);
         let namespace = namespace.to_string();
         let meta = meta.clone();
@@ -2697,7 +2698,7 @@ impl SqliteBackend {
                     merge,
                 },
                 spec: Self::clone_through_serde(&spec)?,
-                status: None,
+                status: initial_status,
             };
             let encoded = Self::encode_object(resource_kind, &object)?;
             let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;

@@ -645,3 +645,68 @@ async fn replica_snapshot_quarantine_pruning_is_bucket_scoped(#[case] adapter: &
     backend.store().replace_replicas_raw(kind, &origin, "flotilla", &empty, at, None).await.unwrap();
     assert!(backend.store().diagnostics().await.unwrap().unwrap().replica_quarantines.is_empty());
 }
+
+// Admission metadata must seed status atomically across adapters: the create
+// response, first Added event and stored object all carry the same decision.
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[case("http")]
+#[tokio::test]
+async fn admission_placement_is_published_with_convoy(#[case] adapter: &str) {
+    use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
+    use flotilla_resources::convoy::ADMISSION_PLACEMENT_ANNOTATION;
+    let (backend, _fixture) = backend(adapter).await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let decision = PlacementDecision {
+        policy_name: "admitted".into(),
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("home"), display_name: "Home".into() },
+        minimal_alternatives: vec!["other-policy".into()],
+        escalation_reason: Some("admission evidence".into()),
+        refused_candidates: Vec::new(),
+        viable_not_selected: Vec::new(),
+        allocation: None,
+    };
+    let spec = flotilla_store_testkit::fixtures::valid_convoy_spec();
+    // An old-style create remains statusless; malformed admission data is
+    // refused without publishing a partial resource or consuming a version.
+    let bare_meta = InputMeta::builder().name("bare".into()).build();
+    let bare = convoys.create(&bare_meta, &spec).await.expect("legacy create");
+    assert!(bare.status.is_none());
+    let malformed = InputMeta::builder()
+        .name("invalid".into())
+        .annotations(BTreeMap::from([(ADMISSION_PLACEMENT_ANNOTATION.into(), "null".into())]))
+        .build();
+    assert!(matches!(convoys.create(&malformed, &spec).await, Err(ResourceError::Invalid { .. })));
+    assert!(matches!(convoys.get("invalid").await, Err(ResourceError::NotFound { .. })));
+    assert_eq!(convoys.current_position().await.expect("position").resource_version, bare.metadata.resource_version);
+
+    let meta = InputMeta::builder()
+        .name("admitted".into())
+        .annotations(BTreeMap::from([(ADMISSION_PLACEMENT_ANNOTATION.into(), serde_json::to_string(&decision).unwrap())]))
+        .build();
+    let created = convoys.create(&meta, &spec).await.expect("admitted create");
+    let mut watch = convoys.watch(WatchStart::FromVersion(bare.metadata.resource_version)).await.expect("watch replay");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), watch.next())
+        .await
+        .expect("Added deadline")
+        .expect("Added event")
+        .expect("watch success");
+    let WatchEvent::Added(added) = event else { panic!("expected Added") };
+    assert_eq!(serde_json::to_value(&added).unwrap(), serde_json::to_value(&created).unwrap());
+    assert_eq!(created.status.as_ref().and_then(|status| status.placement_decision.as_ref()), Some(&decision));
+    assert_eq!(
+        serde_json::to_value(convoys.get("admitted").await.expect("stored convoy")).unwrap(),
+        serde_json::to_value(&created).unwrap()
+    );
+    assert!(matches!(convoys.create(&meta, &spec).await, Err(ResourceError::Conflict { .. })));
+
+    // Later metadata/spec writes must preserve runtime state and never rerun
+    // creation initialization, even if the admission annotation is changed.
+    let mut changed_meta = InputMeta::from(&created.metadata);
+    let mut changed_decision = decision;
+    changed_decision.policy_name = "later".into();
+    changed_meta.annotations.insert(ADMISSION_PLACEMENT_ANNOTATION.into(), serde_json::to_string(&changed_decision).unwrap());
+    let updated = convoys.update(&changed_meta, &created.metadata.resource_version, &spec).await.expect("metadata update");
+    assert_eq!(updated.status, created.status);
+}

@@ -12,7 +12,7 @@ use crate::{
 };
 
 macro_rules! define_resource {
-    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr, queryable = $fields:expr) => {
+    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr $(, initial_status = $initializer:path)?, queryable = $fields:expr) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
 
@@ -25,6 +25,10 @@ macro_rules! define_resource {
             const API_PATHS: $crate::resource::ApiPaths =
                 $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
             const REPLICATION_CLASS: $crate::ReplicationClass = $replication;
+
+            $(fn initial_status(meta: &$crate::InputMeta) -> Result<Option<Self::Status>, $crate::ResourceError> {
+                $initializer(meta)
+            })?
         }
     };
     ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr, validate_spec_update = $validator:path, queryable = $fields:expr) => {
@@ -202,6 +206,13 @@ pub trait Resource: Send + Sync + 'static {
     {
         let _ = meta;
         Self::validate_spec_with_siblings(spec, &siblings.iter().map(|object| object.spec.clone()).collect::<Vec<_>>())
+    }
+
+    /// Derive creation-time status from admission metadata before publishing Added.
+    /// Backends commit this with the spec under the same lock or transaction, and
+    /// validate it as the first status write. Updates never rerun initialization.
+    fn initial_status(_meta: &InputMeta) -> Result<Option<Self::Status>, ResourceError> {
+        Ok(None)
     }
 
     fn validate_spec(_meta: &InputMeta, _spec: &Self::Spec) -> Result<(), ResourceError> {
