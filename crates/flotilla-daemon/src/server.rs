@@ -3,6 +3,7 @@ mod caller;
 mod client_connection;
 mod environment_connection;
 pub mod environment_sockets;
+mod environment_supervision;
 mod peer_connection;
 pub mod peer_runtime;
 pub mod remote_commands;

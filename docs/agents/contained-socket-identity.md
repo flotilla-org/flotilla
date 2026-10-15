@@ -63,3 +63,19 @@ ended. Host-direct environments remain outside this isolation contract.
 Neither change requires a resource schema migration or new out-of-repository
 manifest inputs. The stored-record golden corpus must continue to decode
 unchanged.
+
+## Project supervisors
+
+A live project role holder whose resolved role definition subscribes to
+`supervision` can also supervise and fail crew, start/abandon/resume convoys, and
+read project dispatch, fleet, convoy and crew state. The binding is resolved
+from current ConvoyEnsure or adopted-role records and the current terminal
+holder; calling a role `governor` or `bosun` does not grant authority. Removing
+the holder or subscription removes this permission on the next request.
+
+Every target must belong to that same project and namespace. Foreign projects,
+namespaces, vessel references, forged supervisor IDs and explicit routing
+remain refused. Dispatch-board, queue and fleet reads are pinned to the bound
+project. Stall reads filter rows to that project and recompute shared-cause
+counts after filtering. Forced settlement and host administration remain outside
+the contained supervisor interface.

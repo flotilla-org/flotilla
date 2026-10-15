@@ -1,5 +1,5 @@
 //! Framed crew transport. No HTTP, peer traffic, global subscriptions or
-//! administrative requests cross this interface.
+//! unscoped administrative requests cross this interface.
 use std::{collections::BTreeMap, sync::Arc};
 
 use flotilla_core::in_process::InProcessDaemon;
@@ -187,11 +187,11 @@ pub(super) async fn serve(
         let identity = async {
             let crews = environment_crews(&daemon, &environment).await?;
             let crew = select_crew(crews, role.as_deref())?;
-            authorize(&mut request, &crew)?;
-            Ok::<_, String>(crew)
+            let scope = super::environment_supervision::authorize(&daemon, &mut request, &crew).await?;
+            Ok::<_, String>((crew, scope))
         }
         .await;
-        let crew = match identity {
+        let (crew, scope) = match identity {
             Ok(crew) => crew,
             Err(error) => {
                 if session.write(Message::error_response(id, error)).await.is_err() {
@@ -200,6 +200,7 @@ pub(super) async fn serve(
                 continue;
             }
         };
+        let caller_namespace = crew.namespace.clone();
         let caller =
             CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&crew.namespace), process: None, crew: Some(crew) };
         let mut events = daemon.subscribe();
@@ -212,7 +213,10 @@ pub(super) async fn serve(
             caller,
         )
         .with_placed_terminal_hooks();
-        let response = dispatcher.dispatch(id, request).await;
+        let mut response = dispatcher.dispatch(id, request).await;
+        if let Some(project) = &scope {
+            super::environment_supervision::scope_response(&mut response, &caller_namespace, project);
+        }
         let command_id = match &response {
             Message::Response { response, .. } => match response.as_ref() {
                 ResponseResult::Ok { response } => match response.as_ref() {
@@ -233,7 +237,7 @@ pub(super) async fn serve(
                 _ = shutdown.changed() => return,
             };
             let lost = completion.is_err();
-            let event = completion.unwrap_or_else(|message| {
+            let mut event = completion.unwrap_or_else(|message| {
                 tracing::warn!(%environment, %command_id, %message, "environment command completion unavailable");
                 DaemonEvent::CommandFinished {
                     command_id,
@@ -245,6 +249,9 @@ pub(super) async fn serve(
                     result: flotilla_protocol::CommandValue::Error { message },
                 }
             });
+            if let Some(project) = &scope {
+                super::environment_supervision::scope_completion(&mut event, &caller_namespace, project);
+            }
             if session.write(Message::Event { event: Box::new(event) }).await.is_err() || lost {
                 return;
             }
