@@ -19,7 +19,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 reqwest = { workspace = true, features = ["json"] }
-urlencoding = "2"
+urlencoding.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
