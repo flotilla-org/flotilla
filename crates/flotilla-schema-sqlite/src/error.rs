@@ -52,6 +52,14 @@ pub enum StoreError {
     /// `prev_seq`, `expected` the identity's sequence here.
     #[error("resource is at sequence {expected}; the change follows {found}")]
     Gap { expected: u64, found: u64 },
+    /// A listing asked for no rows; every listing takes a positive limit.
+    #[error("a page limit must be at least 1")]
+    ZeroLimit,
+    #[error("kind code {kind} declares no index {index}")]
+    UnknownIndex { kind: KindCode, index: String },
+    /// A cursor from another query: a different kind, index or `eq` arguments.
+    #[error("cursor does not belong to this query of index {index}")]
+    CursorMismatch { index: String },
     #[error("malformed change: {0}")]
     MalformedChange(#[from] Malformed),
 }

@@ -1,7 +1,8 @@
 // Behaviour (#3320 compile-fail): each refused shape fails to compile. Refusals made by the derive
 // and by the field bounds (`Column`, `Flat`, `Intern`, `KeyColumn`) name the closed attribute list;
 // indirect recursion (through `flatten` or through tables) is refused by the compiler as a cycle,
-// without a message of ours. The expected stderr
+// without a message of ours, and an index predicate naming a variant the enum lacks is the
+// compiler's unknown-variant error. The expected stderr
 // files are reviewed snapshots for the pinned toolchain; `TRYBUILD=overwrite` rewrites them.
 #[test]
 fn refused_shapes_fail_to_compile() {
@@ -20,6 +21,7 @@ fn refusal_snapshots_name_the_closed_list() {
         if path.extension().is_none_or(|extension| extension != "stderr")
             || path.ends_with("indirect_recursion.stderr")
             || path.ends_with("indirect_recursion_child.stderr")
+            || path.ends_with("index_unknown_variant.stderr")
         {
             continue;
         }
@@ -27,5 +29,5 @@ fn refusal_snapshots_name_the_closed_list() {
         assert!(stderr.contains(&list), "{} does not name the attribute list", path.display());
         checked += 1;
     }
-    assert_eq!(checked, 16);
+    assert_eq!(checked, 17);
 }

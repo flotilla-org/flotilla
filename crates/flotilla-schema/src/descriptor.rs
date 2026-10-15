@@ -126,15 +126,87 @@ pub enum ColumnType {
     Frozen,
 }
 
-/// A declared index. Layer 5 fills in the predicate vocabulary; the descriptor only carries
-/// what the renderer needs.
+/// A declared index on a kind's root table: `eq` columns compared for equality, then `order`
+/// columns the query pages through, under a partial-index predicate. Every query the backend
+/// generates for it orders by `order..., id`, so the row id is the index's last key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index {
+    /// The declared name; the schema object is [`Index::object_name`], `<table>_<name>`.
     pub name: String,
     pub table: String,
-    pub columns: Vec<String>,
-    /// A rendered partial-index predicate.
-    pub predicate: Option<String>,
+    pub eq: Vec<String>,
+    pub order: Vec<String>,
+    /// Conjoined; empty for a full index.
+    pub predicate: Vec<Condition>,
+}
+
+/// One term of a partial-index predicate. Kept structured so the DDL and every query render the
+/// same text: SQLite uses a partial index only when the query's WHERE repeats its terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Condition {
+    /// A code column holds one of `codes` (taken from the enum, never restated).
+    In { column: String, codes: Vec<i64> },
+    /// A nullable column is present.
+    NotNull { column: String },
+}
+
+impl Condition {
+    pub fn column(&self) -> &str {
+        match self {
+            Condition::In { column, .. } | Condition::NotNull { column } => column,
+        }
+    }
+
+    pub fn sql(&self) -> String {
+        match self {
+            Condition::In { column, codes } => {
+                let codes: Vec<String> = codes.iter().map(i64::to_string).collect();
+                format!("{} IN ({})", quote_ident(column), codes.join(", "))
+            }
+            Condition::NotNull { column } => format!("{} IS NOT NULL", quote_ident(column)),
+        }
+    }
+}
+
+impl Index {
+    /// The schema object's name: indexes share the schema namespace with tables.
+    pub fn object_name(&self) -> String {
+        format!("{}_{}", self.table, self.name)
+    }
+
+    /// The index key: `eq` columns, then `order` columns.
+    pub fn columns(&self) -> impl Iterator<Item = &str> {
+        self.eq.iter().chain(&self.order).map(String::as_str)
+    }
+
+    /// The predicate's terms joined by `AND`; `None` for a full index.
+    pub fn predicate_sql(&self) -> Option<String> {
+        if self.predicate.is_empty() {
+            None
+        } else {
+            Some(self.predicate.iter().map(Condition::sql).collect::<Vec<_>>().join(" AND "))
+        }
+    }
+}
+
+/// Why a declared index cannot be rendered or queried.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IndexProblem {
+    #[error("it is not on the kind's root table {0}")]
+    Table(String),
+    #[error("it names no eq or order column")]
+    NoColumns,
+    #[error("column {0} is not a column of the root table")]
+    UnknownColumn(String),
+    #[error("column {0} is named twice")]
+    RepeatedColumn(String),
+    /// Keyset paging compares order columns; a null compares as unknown and would drop rows.
+    #[error("order column {0} is nullable and the predicate does not require it")]
+    NullableOrder(String),
+    #[error("column {0} is not a code column holding every listed code")]
+    Codes(String),
+    #[error("column {0} is not nullable, so `is_some` would be always true")]
+    NotNullable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -148,23 +220,30 @@ pub enum DescriptorError {
     DuplicateColumn { kind: String, table: String, column: String },
     #[error("kind {kind}: table {table} uses the reserved column name {column}")]
     ReservedColumn { kind: String, table: String, column: String },
+    #[error("kind {kind}: index {index}: {problem}")]
+    Index { kind: String, index: String, problem: IndexProblem },
 }
 
 impl TableSet {
     /// Refuses descriptors that would render invalid or ambiguous DDL: table or index names declared
     /// twice or taken by a shared table, column names declared twice in one table (key columns included), and
     /// data or key columns named like the backend's own columns: `id` and `version` on the root, `owner` on
-    /// children (a child row may well have a `version` field, such as a gate input's observed version).
+    /// children (a child row may well have a `version` field, such as a gate input's observed version),
+    /// and indexes that are not on the root table, name unknown or repeated columns, page through a
+    /// nullable column the predicate does not require, or whose predicate cannot hold as written.
     pub fn validate(&self) -> Result<(), DescriptorError> {
         let kind = || self.kind.clone();
         let mut names = BTreeSet::new();
         for name in self.object_names() {
-            if SHARED_NAMES.contains(&name) {
-                return Err(DescriptorError::ReservedName { kind: kind(), name: name.to_owned() });
+            if SHARED_NAMES.contains(&name.as_str()) {
+                return Err(DescriptorError::ReservedName { kind: kind(), name });
             }
-            if !names.insert(name) {
-                return Err(DescriptorError::DuplicateName { kind: kind(), name: name.to_owned() });
+            if !names.insert(name.clone()) {
+                return Err(DescriptorError::DuplicateName { kind: kind(), name });
             }
+        }
+        for index in &self.indexes {
+            self.validate_index(index).map_err(|problem| DescriptorError::Index { kind: kind(), index: index.name.clone(), problem })?;
         }
         for table in &self.tables {
             let mut columns = BTreeSet::new();
@@ -181,8 +260,46 @@ impl TableSet {
         Ok(())
     }
 
+    fn validate_index(&self, index: &Index) -> Result<(), IndexProblem> {
+        let root = &self.tables[0];
+        if index.table != root.name {
+            return Err(IndexProblem::Table(root.name.clone()));
+        }
+        if index.eq.is_empty() && index.order.is_empty() {
+            return Err(IndexProblem::NoColumns);
+        }
+        let column =
+            |name: &str| root.columns.iter().find(|column| column.name == name).ok_or_else(|| IndexProblem::UnknownColumn(name.to_owned()));
+        let mut seen = BTreeSet::new();
+        for name in index.columns() {
+            column(name)?;
+            if !seen.insert(name) {
+                return Err(IndexProblem::RepeatedColumn(name.to_owned()));
+            }
+        }
+        let required =
+            |name: &str| index.predicate.iter().any(|condition| matches!(condition, Condition::NotNull { column } if column == name));
+        for name in &index.order {
+            if column(name)?.nullable && !required(name) {
+                return Err(IndexProblem::NullableOrder(name.clone()));
+            }
+        }
+        for condition in &index.predicate {
+            let def = column(condition.column())?;
+            match condition {
+                Condition::In { column, codes } => match &def.ty {
+                    ColumnType::Code(allowed) if !codes.is_empty() && codes.iter().all(|code| allowed.contains(code)) => {}
+                    _ => return Err(IndexProblem::Codes(column.clone())),
+                },
+                Condition::NotNull { column } if !def.nullable => return Err(IndexProblem::NotNullable(column.clone())),
+                Condition::NotNull { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
     /// The names this kind takes in the backend's schema namespace: its tables, then its indexes.
-    pub fn object_names(&self) -> impl Iterator<Item = &str> {
-        self.tables.iter().map(|table| table.name.as_str()).chain(self.indexes.iter().map(|index| index.name.as_str()))
+    pub fn object_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.tables.iter().map(|table| table.name.clone()).chain(self.indexes.iter().map(Index::object_name))
     }
 }

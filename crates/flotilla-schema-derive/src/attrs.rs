@@ -19,15 +19,10 @@ pub(crate) fn refuse_at(span: proc_macro2::Span, what: impl std::fmt::Display) -
     syn::Error::new(span, format!("{what}; {SUPPORTED}"))
 }
 
-/// A shape on the list that a later layer of the derive implements.
-pub(crate) fn not_yet(tokens: impl ToTokens, what: impl std::fmt::Display) -> syn::Error {
-    syn::Error::new_spanned(tokens, format!("{what} is not supported yet"))
-}
-
 pub(crate) struct TypeAttrs {
     pub kind: Option<LitStr>,
     pub code: Option<(u32, Span)>,
-    /// `index(...)` bodies, kept unparsed until indexes are implemented.
+    /// `index(...)` bodies, parsed against the kind's fields by `index::Indexes`.
     pub indexes: Vec<TokenStream>,
 }
 

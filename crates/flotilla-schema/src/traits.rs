@@ -51,13 +51,14 @@ pub trait Column: Columns {}
 )]
 pub trait Flat: Columns {}
 
-/// A single non-null column that can key a child table: a `BTreeMap` key or a `BTreeSet` value.
+/// A single non-null column that can key a child table (a `BTreeMap` key or a `BTreeSet` value) or
+/// an index (an `eq` or `order` field, inside `Option` when optional).
 /// Scalars, code enums, references and newtypes of these; not options, data enums or structs,
 /// whose values span several columns or none.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` cannot key a child table: the storage derive supports only the attributes child, records, history, frozen, \
+    message = "`{Self}` cannot key a child table or an index: the storage derive supports only the attributes child, records, history, frozen, \
                intern, flatten, state and code (fields and variants) and kind, code and index (types)",
-    label = "map keys and set values are single-column types: scalars, code enums, references and their newtypes"
+    label = "map keys, set values and index columns are single-column types: scalars, code enums, references and their newtypes"
 )]
 pub trait KeyColumn: Column {}
 

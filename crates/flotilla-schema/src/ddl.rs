@@ -1,4 +1,4 @@
-//! Deterministic DDL rendering: tables in pre-order, then indexes sorted by name.
+//! Deterministic DDL rendering: tables in pre-order, then indexes sorted by object name.
 //!
 //! Identifiers come from Rust field names (never serde names) and are always quoted, so a field
 //! named like an SQL keyword still renders valid DDL.
@@ -35,11 +35,12 @@ pub fn render_ddl_with(set: &TableSet, mode: DdlMode) -> String {
         render_table(&mut out, set, table, exists);
     }
     let mut indexes: Vec<_> = set.indexes.iter().collect();
-    indexes.sort_by(|left, right| left.name.cmp(&right.name));
+    indexes.sort_by_key(|index| index.object_name());
     for index in indexes {
-        let columns: Vec<String> = index.columns.iter().map(|c| quote_ident(c)).collect();
-        let _ = write!(out, "CREATE INDEX {exists}{} ON {} ({})", quote_ident(&index.name), quote_ident(&index.table), columns.join(", "));
-        if let Some(predicate) = &index.predicate {
+        let columns: Vec<String> = index.columns().map(quote_ident).collect();
+        let name = quote_ident(&index.object_name());
+        let _ = write!(out, "CREATE INDEX {exists}{name} ON {} ({})", quote_ident(&index.table), columns.join(", "));
+        if let Some(predicate) = index.predicate_sql() {
             let _ = write!(out, " WHERE {predicate}");
         }
         out.push_str(";\n");
@@ -115,7 +116,7 @@ fn column(column: &ColumnDef) -> String {
 mod tests {
     use super::{render_ddl, render_ddl_with, DdlMode};
     use crate::{
-        descriptor::{ColumnType, DescriptorError, Index, TableRole},
+        descriptor::{ColumnType, Condition, DescriptorError, Index, IndexProblem, TableRole},
         layout::Layout,
         value::KindCode,
     };
@@ -135,12 +136,13 @@ mod tests {
             });
         });
         layout.index(Index {
-            name: "convoy_open".into(),
+            name: "open".into(),
             table: "convoy".into(),
-            columns: vec!["phase".into()],
-            predicate: Some("\"done\" = 0".into()),
+            eq: vec!["name".into()],
+            order: vec![],
+            predicate: vec![Condition::In { column: "phase".into(), codes: vec![1, 2] }, Condition::NotNull { column: "phase".into() }],
         });
-        layout.index(Index { name: "convoy_by_name".into(), table: "convoy".into(), columns: vec!["name".into()], predicate: None });
+        layout.index(Index { name: "by_name".into(), table: "convoy".into(), eq: vec![], order: vec!["name".into()], predicate: vec![] });
         layout
     }
 
@@ -173,7 +175,7 @@ CREATE TABLE "convoy_deliverables_evidence" (
   FOREIGN KEY ("owner", "deliverables_pos") REFERENCES "convoy_deliverables" ("owner", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "convoy_by_name" ON "convoy" ("name");
-CREATE INDEX "convoy_open" ON "convoy" ("phase") WHERE "done" = 0;
+CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "phase" IS NOT NULL;
 "#;
         let set = convoy().finish();
         set.validate().expect("valid descriptor");
@@ -242,13 +244,58 @@ CREATE INDEX "convoy_open" ON "convoy" ("phase") WHERE "done" = 0;
         });
         assert!(matches!(layout.finish().validate(), Err(DescriptorError::DuplicateName { name, .. }) if name == "a_b_c"));
 
+        // Indexes share the namespace as `<table>_<name>`.
         let mut layout = Layout::root("Edge", KindCode(1));
-        layout.index(Index { name: "edge".into(), table: "edge".into(), columns: vec![], predicate: None });
-        assert!(matches!(layout.finish().validate(), Err(DescriptorError::DuplicateName { name, .. }) if name == "edge"));
+        layout.table("items", TableRole::Child, |layout| layout.key(|layout| layout.column("pos", ColumnType::Integer, true)));
+        layout.index(Index { name: "items".into(), table: "edge".into(), eq: vec![], order: vec![], predicate: vec![] });
+        assert!(matches!(layout.finish().validate(), Err(DescriptorError::DuplicateName { name, .. }) if name == "edge_items"));
 
         assert!(matches!(
             Layout::root("Objects", KindCode(1)).finish().validate(),
             Err(DescriptorError::ReservedName { name, .. }) if name == "objects"
         ));
+    }
+
+    // Behaviour (DESIGN indexes): an index is refused unless it is on the root table, names
+    // existing columns once each, pages only through columns that cannot be null under its
+    // predicate, and its predicate can hold (listed codes of a code column, `is_some` of a
+    // nullable column).
+    #[test]
+    fn validate_refuses_malformed_indexes() {
+        let problem = |index: Index| {
+            let mut layout = Layout::root("Note", KindCode(1));
+            layout.column("phase", ColumnType::Code(vec![1, 2]), true);
+            layout.column("due", ColumnType::Timestamp, false);
+            layout.column("seq", ColumnType::Integer, true);
+            layout.index(index);
+            match layout.finish().validate() {
+                Ok(()) => None,
+                Err(DescriptorError::Index { problem, .. }) => Some(problem),
+                Err(other) => panic!("unexpected {other}"),
+            }
+        };
+        let index = |eq: &[&str], order: &[&str], predicate: Vec<Condition>| Index {
+            name: "i".into(),
+            table: "note".into(),
+            eq: eq.iter().map(|c| (*c).to_owned()).collect(),
+            order: order.iter().map(|c| (*c).to_owned()).collect(),
+            predicate,
+        };
+        let present = || Condition::NotNull { column: "due".into() };
+        assert_eq!(problem(index(&["phase"], &["seq"], vec![])), None);
+        assert_eq!(problem(index(&[], &["due"], vec![present()])), None);
+        assert_eq!(problem(Index { table: "other".into(), ..index(&["seq"], &[], vec![]) }), Some(IndexProblem::Table("note".into())));
+        assert_eq!(problem(index(&[], &[], vec![])), Some(IndexProblem::NoColumns));
+        assert_eq!(problem(index(&["nope"], &[], vec![])), Some(IndexProblem::UnknownColumn("nope".into())));
+        assert_eq!(problem(index(&["seq"], &["seq"], vec![])), Some(IndexProblem::RepeatedColumn("seq".into())));
+        assert_eq!(problem(index(&[], &["due"], vec![])), Some(IndexProblem::NullableOrder("due".into())));
+        let codes = |codes: Vec<i64>| vec![Condition::In { column: "phase".into(), codes }];
+        assert_eq!(problem(index(&["seq"], &[], codes(vec![2]))), None);
+        assert_eq!(problem(index(&["seq"], &[], codes(vec![3]))), Some(IndexProblem::Codes("phase".into())));
+        assert_eq!(problem(index(&["seq"], &[], codes(vec![]))), Some(IndexProblem::Codes("phase".into())));
+        let in_seq = vec![Condition::In { column: "seq".into(), codes: vec![1] }];
+        assert_eq!(problem(index(&["phase"], &[], in_seq)), Some(IndexProblem::Codes("seq".into())));
+        let seq_present = vec![Condition::NotNull { column: "seq".into() }];
+        assert_eq!(problem(index(&["phase"], &[], seq_present)), Some(IndexProblem::NotNullable("seq".into())));
     }
 }

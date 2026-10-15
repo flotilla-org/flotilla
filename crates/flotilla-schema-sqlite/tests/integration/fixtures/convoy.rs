@@ -27,8 +27,9 @@ pub struct Project {
     pub title: String,
 }
 
+/// The #3208 §4.1 index: a project's open convoys.
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Convoy", code = 5)]
+#[store(kind = "Convoy", code = 5, index(name = "open_by_project", eq(project), when(state in [Open], project is_some)))]
 pub struct Convoy {
     pub project: Option<Ref<Project>>,
     #[store(intern)]

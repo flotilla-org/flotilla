@@ -16,6 +16,7 @@
 mod attrs;
 mod enums;
 mod fields;
+mod index;
 mod shape;
 mod structs;
 
@@ -129,11 +130,79 @@ mod tests {
         }
     }
 
-    // Shapes on the list that a later layer implements are refused plainly, not as outside the list.
+    // Behaviour (DESIGN indexes): `eq` and `order` name top-level single-column fields, `when`
+    // allows only `<state field> in [..]` and `<optional field> is_some`, and an optional order
+    // field must be required by `is_some`. Everything else is refused naming the list.
     #[test]
-    fn listed_shapes_not_yet_implemented_say_so() {
-        let message = error(quote! { #[store(kind = "A", code = 1, index(name = "x", eq(a)))] struct A { a: String } });
-        assert!(message.contains("is not supported yet") && !message.contains(SUPPORTED), "{message}");
+    fn index_refusals_name_the_closed_list() {
+        let kind = |index: proc_macro2::TokenStream| {
+            quote! {
+                #[store(kind = "A", code = 1, #index)]
+                struct A {
+                    a: Ref<B>,
+                    b: Option<u64>,
+                    #[store(intern)] c: String,
+                    #[store(state)] s: State<Phase>,
+                    d: Leaf,
+                    #[store(child)] e: Vec<String>,
+                    #[store(flatten)] f: Option<Leaf>,
+                }
+            }
+        };
+        let cases = [
+            quote!(index(eq(a))),
+            quote!(index(name = "x")),
+            quote!(index(name = "Bad", eq(a))),
+            quote!(index(name = "x", eq(nope))),
+            quote!(index(name = "x", eq(e))),
+            quote!(index(name = "x", eq(f))),
+            quote!(index(name = "x", eq(s))),
+            quote!(index(name = "x", eq(a), order(a))),
+            quote!(index(name = "x", order(b))),
+            quote!(index(name = "x", eq(a), when(a in [P]))),
+            quote!(index(name = "x", eq(a), when(s in []))),
+            quote!(index(name = "x", eq(a), when(s in [P, P]))),
+            quote!(index(name = "x", eq(a), when(a is_some))),
+            quote!(index(name = "x", eq(a), when(b is_none))),
+            quote!(index(name = "x", eq(a), when(f is_some))),
+            quote!(index(name = "x", eq(a), unique)),
+            quote!(index(name = "x", eq(a), eq(c))),
+            quote!(index(name = "x", eq(a)), index(name = "x", eq(c))),
+        ];
+        for case in cases {
+            let message = error(kind(case.clone()));
+            assert!(message.contains(SUPPORTED), "{case} was refused without naming the list: {message}");
+        }
+        assert!(error(quote! { #[store(index(name = "x", eq(a)))] struct A { a: String } }).contains("belongs on a kind"));
+        assert!(error(quote! { #[store(index(name = "x", eq(a)))] enum A { #[store(code = 1)] B } }).contains("belongs on a kind"));
+    }
+
+    // Glue: an index adds its descriptor entry to `table_set` with codes read through `CodeEnum`,
+    // and a constructor whose arguments are the `eq` fields' types, inside `Option` when optional.
+    #[test]
+    fn indexes_expand_to_descriptors_and_constructors() {
+        let expanded = expanded(quote! {
+            #[store(kind = "Message", code = 1,
+                index(name = "open_by_inbox", eq(inbox), order(seq), when(state in [Pending, Awaiting])),
+                index(name = "by_reply", eq(reply, sender), when(reply is_some)))]
+            struct Message {
+                inbox: Ref<Inbox>,
+                seq: u64,
+                reply: Option<Ref<Message>>,
+                #[store(intern)] sender: Name,
+                #[store(state)] state: State<MessageState>,
+            }
+        });
+        for expected in [
+            "< MessageState as :: flotilla_schema :: CodeEnum > :: code (& < MessageState > :: Pending)",
+            "pub fn open_by_inbox (inbox : & Ref < Inbox >) -> :: flotilla_schema :: IndexQuery < Self >",
+            "pub fn by_reply (reply : & Ref < Message > , sender : & Name)",
+            ":: flotilla_schema :: interned_value :: < Name > (sender)",
+            "Ref < Inbox > : :: flotilla_schema :: KeyColumn + :: flotilla_schema :: Element",
+            ":: flotilla_schema :: Condition :: NotNull { column : :: std :: string :: String :: from (\"reply\") }",
+        ] {
+            assert!(expanded.contains(expected), "missing {expected}");
+        }
     }
 
     // Glue: each table and frozen attribute selects its adapter and bounds the element, key or

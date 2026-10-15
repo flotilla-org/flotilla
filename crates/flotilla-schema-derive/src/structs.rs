@@ -13,21 +13,21 @@ use syn::{
 };
 
 use crate::{
-    attrs::{self, not_yet, refuse, TypeAttrs},
+    attrs::{self, refuse, TypeAttrs},
     fields::{columns_element, schema, Field, Generics},
+    index::Indexes,
     shape::{self, FieldShape},
 };
 
 pub(crate) fn expand(input: &DeriveInput, fields: &FieldsNamed, type_attrs: TypeAttrs) -> syn::Result<TokenStream> {
     let fields = fields.named.iter().map(|field| Field::parse(field, &input.ident, None)).collect::<syn::Result<Vec<_>>>()?;
-    if let Some(index) = type_attrs.indexes.first() {
-        return Err(not_yet(index, "`index`"));
-    }
     match (&type_attrs.kind, type_attrs.code) {
         (Some(kind), Some((code, _))) => {
             check_kind_name(kind)?;
-            Ok(kind_impls(input, &fields, kind, code))
+            let indexes = Indexes::parse(&type_attrs.indexes, &fields)?;
+            Ok(kind_impls(input, &fields, kind, code, &indexes))
         }
+        (None, _) if !type_attrs.indexes.is_empty() => Err(refuse(&type_attrs.indexes[0], "`index` belongs on a kind")),
         (Some(kind), None) => Err(syn::Error::new_spanned(kind, "a kind needs a stable `code = N`")),
         (None, Some((_, span))) => Err(syn::Error::new(span, "`code` on a struct needs `kind = \"Name\"`")),
         (None, None) => Ok(part_impls(input, &fields)),
@@ -90,14 +90,17 @@ fn element_impl(input: &DeriveInput, fields: &[Field<'_>]) -> TokenStream {
 /// The `Kind` impl's bounds are only those of fields that mention a type parameter: a concrete
 /// field such as `in_reply_to: Option<Ref<Message>>` needs `Message: Kind`, and proving it must not
 /// lead back through `Message`'s own field bounds. Concrete fields are still checked through the
-/// `Element` supertrait.
-fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u32) -> TokenStream {
+/// `Element` supertrait. Declared indexes join the descriptor after the root's layout, and each
+/// gets a query constructor.
+fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u32, indexes: &Indexes<'_, '_>) -> TokenStream {
     let schema = schema();
     let ident = &input.ident;
     let element = element_impl(input, fields);
     let params: Vec<_> = input.generics.type_params().map(|param| param.ident.to_string()).collect();
     let generic = fields.iter().filter(|field| mentions(field.ty, &params)).map(Field::bound);
     let Generics { impl_generics, ty_generics, where_clause } = Generics::new(&input.generics, generic);
+    let index_layout = indexes.layout();
+    let constructors = indexes.constructors(input);
     quote! {
         #element
 
@@ -109,9 +112,12 @@ fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u3
             fn table_set() -> #schema::TableSet {
                 let mut layout = #schema::Layout::root(Self::KIND, Self::CODE);
                 <Self as #schema::Element>::layout_row(&mut layout);
+                #index_layout
                 layout.finish()
             }
         }
+
+        #constructors
     }
 }
 

@@ -1,0 +1,14 @@
+error[E0599]: no variant, associated function, or constant named `Opened` found for enum `Phase` in the current scope
+  --> tests/ui/index_unknown_variant.rs:13:84
+   |
+ 4 | enum Phase {
+   | ---------- variant, associated function, or constant `Opened` not found for this enum
+...
+13 | #[store(kind = "Ticket", code = 1, index(name = "open", order(seq), when(phase in [Opened])))]
+   |                                                                                    ^^^^^^ variant, associated function, or constant not found in `Phase`
+   |
+help: there is a variant with a similar name
+   |
+13 - #[store(kind = "Ticket", code = 1, index(name = "open", order(seq), when(phase in [Opened])))]
+13 + #[store(kind = "Ticket", code = 1, index(name = "open", order(seq), when(phase in [Open])))]
+   |

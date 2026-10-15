@@ -22,7 +22,7 @@ use rusqlite::Connection;
 pub use self::{
     convoy::{Convoy, Project},
     message::{AgentSession, Inbox, Message},
-    terminal::TerminalSession,
+    terminal::{TerminalSession, Vessel},
 };
 
 pub const LOCAL: &str = "local";
@@ -48,6 +48,7 @@ pub fn registry() -> KindRegistry {
     registry.register::<Project>().expect("fixture kinds register");
     registry.register::<Convoy>().expect("fixture kinds register");
     registry.register::<TerminalSession>().expect("fixture kinds register");
+    registry.register::<Vessel>().expect("fixture kinds register");
     registry
 }
 
