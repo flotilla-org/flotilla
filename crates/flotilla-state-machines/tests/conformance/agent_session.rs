@@ -6,13 +6,8 @@
 //!   (an observed absence is a `false` observation).
 //! - `End{reason, observed}`: the session's end is observed with `reason` iff `observed`.
 //!
-//! State mapping: `Live { channel }` is `Live(channel)`, with the same
-//! constructor names, and `Ended { reason }` is the spec's bare `Ended`.
-//!
-//! One difference remains: Rust keeps the reason a session ended for, and the
-//! spec's `Ended` carries no data, so the encoding drops the reason. Storing
-//! it in the spec (`Ended(EndReason)`) is proposed in the spec-proposal commit
-//! at the top of the stack, which would make this mapping one to one.
+//! State mapping, one to one: `Live { channel }` is `Live(channel)` and
+//! `Ended { reason }` is `Ended(reason)`, with the same constructor names.
 
 use flotilla_state_machines::{
     machines::agent_session::{
@@ -88,8 +83,13 @@ impl Conformance for SessionConformance {
                     Channel::Attached => "Attached",
                 }),
             ),
-            // The spec's `Ended` carries no reason (see the module doc).
-            AgentSessionState::Ended { .. } => bare("Ended"),
+            AgentSessionState::Ended { reason } => variant(
+                "Ended",
+                bare(match reason {
+                    EndReason::Completed => "Completed",
+                    EndReason::Lost => "Lost",
+                }),
+            ),
         }
     }
 
@@ -99,8 +99,8 @@ impl Conformance for SessionConformance {
 }
 
 // Every reachable session state is reached in Rust by the spec's path, and
-// every probe agrees: the same move to the same state value (a session ends
-// only on an observed end), or the same refusal with nothing recorded.
+// every probe agrees: the same move to the same state value (an ended session
+// carries the reason it ended for), or the same refusal with nothing recorded.
 #[test]
 #[ignore = "export graphs with specs/primitives/check.sh"]
 fn agent_session_follows_the_full_graph() {

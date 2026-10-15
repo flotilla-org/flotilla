@@ -25,24 +25,11 @@
 //! probe is refused (not admitted, or no cap), so the vessel stays Waiting.
 //!
 //! State mapping: Waiting is the ledger's `Vessel::Waiting(request)`; Leased is
-//! the ledger's `Vessel::Leased(Lease { request, host })` with the lifecycle
-//! state value; Gone is the lifecycle's Gone with the lease `release` returned.
-//! The spec's `Placement = {request, host, available, waiting}` is the lease's
-//! `request` and `host` with the `available` and `waiting` of the
-//! [`Ledger::evidence`] the placement read.
-//!
-//! Two differences from a single resource remain, both kept by the composite:
-//! - the ledger forgets a released vessel, so the composite keeps the returned
-//!   lease to show `Gone(placement)`;
-//! - a [`Lease`] is `{request, host}`, while the spec's placement also carries
-//!   the evidence its priority rule read (`admission_placement.qnt`'s
-//!   `queuePriority` invariant reads it). Rust does not keep that evidence on
-//!   the lease, so the composite keeps the ledger's evidence at place time and
-//!   encodes `available` and `waiting` from it (`waiting` is the other
-//!   requests waiting, as the probe's evidence and the ledger both present
-//!   it). Moving that evidence out of the placement (`Placement = {request,
-//!   host}`, with a separate `placedOn` record) is proposed in the
-//!   spec-proposal commit at the top of the stack.
+//! the ledger's `Vessel::Leased(Lease { request, host })` (the spec's
+//! `Placement = {request, host}`) with the lifecycle state value; Gone is the
+//! lifecycle's Gone with the lease `release` returned. That lease is the one
+//! remaining difference from a single resource: the ledger forgets a released
+//! vessel, so the composite keeps the returned lease to show `Gone(placement)`.
 
 use flotilla_state_machines::{
     machines::{
@@ -56,7 +43,7 @@ use serde_json::{json, Value};
 
 use crate::{
     graph::{self, refusal, tick, Conformance, Report, Step},
-    itf::{boolean, int, map_of, number, pairs, payload, set, set_of, tag, variant},
+    itf::{boolean, int, map_of, number, pairs, payload, set, tag, variant},
     lifecycle::encode_state,
 };
 
@@ -100,14 +87,8 @@ fn request_value(r: &Request) -> Value {
     json!({ "convoy": int(convoy), "class": int(r.class.0.into()), "shape": units_value(&r.shape), "priority": int(r.priority.0.into()) })
 }
 
-/// The spec's `Placement`: the lease, and the evidence its placement read.
-fn placement_value(lease: &Lease, read: &Evidence) -> Value {
-    json!({
-        "request": request_value(&lease.request),
-        "host": int(lease.host.0.into()),
-        "available": units_value(&read.available),
-        "waiting": set_of(read.waiting.iter().map(request_value)),
-    })
+fn placement_value(lease: &Lease) -> Value {
+    json!({ "request": request_value(&lease.request), "host": int(lease.host.0.into()) })
 }
 
 fn refusal_name(r: PlacementRefusal) -> &'static str {
@@ -152,8 +133,6 @@ struct Composed {
     id: VesselId,
     ledger: Ledger,
     lifecycle: Option<Home<V>>,
-    /// The evidence the ledger presented to the granted placement.
-    read: Option<Evidence>,
     /// The lease the ledger returned when the lifecycle reached Gone.
     released: Option<Lease>,
 }
@@ -178,10 +157,8 @@ impl Composed {
                 Ok(_) => panic!("evidence without a ledger cannot place"),
             };
         };
-        let read = ledger.evidence(&self.id, evidence.host).expect("a waiting vessel and a known host");
         match ledger.place(&self.id, evidence.host) {
             Ok(lease) => {
-                self.read = Some(read);
                 let mut home = Home::new("home").expect("valid declaration");
                 home.create(NAME, lease.request.clone()).expect("created");
                 self.ledger = ledger;
@@ -217,7 +194,7 @@ impl Conformance for VesselConformance {
         let id = VesselId::new(NAME);
         let mut ledger = Ledger::new();
         ledger.request(id.clone(), request_of(payload(state))).expect("a new vessel");
-        Composed { id, ledger, lifecycle: None, read: None, released: None }
+        Composed { id, ledger, lifecycle: None, released: None }
     }
 
     fn apply(v: &mut Composed, event: &Value) -> Step {
@@ -257,14 +234,14 @@ impl Conformance for VesselConformance {
     }
 
     fn encode(v: &Composed) -> Value {
-        match (v.ledger.vessel(&v.id), v.lifecycle_state(), &v.read, &v.released) {
-            (Some(Vessel::Waiting(request)), None, None, None) => variant("Waiting", request_value(request)),
-            (Some(Vessel::Leased(lease)), Some(lifecycle), Some(read), None) => {
-                variant("Leased", json!({ "placement": placement_value(lease, read), "lifecycle": encode_state(lifecycle) }))
+        match (v.ledger.vessel(&v.id), v.lifecycle_state(), &v.released) {
+            (Some(Vessel::Waiting(request)), None, None) => variant("Waiting", request_value(request)),
+            (Some(Vessel::Leased(lease)), Some(lifecycle), None) => {
+                variant("Leased", json!({ "placement": placement_value(lease), "lifecycle": encode_state(lifecycle) }))
             }
-            (None, Some(LifecycleState::Gone), Some(read), Some(lease)) => variant("Gone", placement_value(lease, read)),
-            (vessel, lifecycle, read, released) => {
-                panic!("an inconsistent composite: ledger {vessel:?}, lifecycle {lifecycle:?}, read {read:?}, released {released:?}")
+            (None, Some(LifecycleState::Gone), Some(lease)) => variant("Gone", placement_value(lease)),
+            (vessel, lifecycle, released) => {
+                panic!("an inconsistent composite: ledger {vessel:?}, lifecycle {lifecycle:?}, released {released:?}")
             }
         }
     }
@@ -279,9 +256,8 @@ impl Conformance for VesselConformance {
 // Every reachable vessel state is reached in Rust by the spec's path, and
 // every probe agrees: placement refuses in the spec's order (admission, the
 // cap, the fit, a higher-priority waiting request that fits), a lease holds
-// the request on one host with the evidence its placement read, the
-// lifecycle half moves or refuses as composed, and a Gone vessel shows the
-// lease the ledger released.
+// the request on one host, the lifecycle half moves or refuses as composed,
+// and a Gone vessel shows the lease the ledger released.
 #[test]
 #[ignore = "export graphs with specs/primitives/check.sh"]
 fn vessel_follows_the_full_graph() {

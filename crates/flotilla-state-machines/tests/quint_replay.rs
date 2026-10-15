@@ -24,38 +24,19 @@
 //!
 //! Model integers name resources (`1` is the resource named "1"), model ticks
 //! are [`UNIT`] microseconds, and opaque strings map to themselves. The
-//! remaining differences, each as small as the engine allows. The specs are
-//! compared as they stand; where a difference is a spec shape that differs
-//! from what the engine stores, the spec change that would remove it is
-//! proposed in the spec-proposal commit at the top of the stack.
+//! remaining differences, each as small as the engine allows:
 //!
-//! - **Convoy `request`.** The spec's `Work = { request, promises }` carries
-//!   the whole `ConvoyRequest`, and `Readmit` rewrites `request.quota`. Rust
-//!   keeps the immutable [`convoy::ConvoySpec`] and the quota in force in its
-//!   state, so the rendering builds `request` from [`Resource::spec`] and
-//!   [`ConvoyState::quota`]. This is exact. Proposed: `Work = { spec,
-//!   promises, quota }`.
-//! - **AgentSession `Ended`.** The spec's `Ended` has no data; Rust's
-//!   `Ended { reason }` keeps the end's reason, which renders as `Ended`.
-//!   Proposed: `Ended(EndReason)`.
 //! - **Message envelope without a deadline.** The model's envelope keeps a
 //!   `deadline` integer even when `hasDeadline` is false; Rust's
 //!   `deadline: Option<Time>` has none. Both sides compare it as 0 then.
 //! - **Message drop `receiver`.** The model's drop keeps the receiver's
 //!   session only; Rust keeps the whole [`message::Receiver`]. The rendering
 //!   keeps its session (0 for none), and Awaiting compares session and host.
-//! - **Message drop `watermark`, `bound` and `receipt`.** The spec's drop
-//!   records `watermark: appliedThrough` and `bound: o.bound or receiver != 0`
-//!   on every drop, though only an expiry's rule reads them. Rust records the
-//!   applied watermark only for an expiry that a bound consumer constrained.
-//!   So `reason`, `envelope`, `receiver`, `at` and `receipt` compare exactly;
-//!   for an `Expired` drop Rust's `bound` is "a watermark is recorded" and the
-//!   watermarks compare when bound; on every other drop both fields are
-//!   evidence the rule never consulted and are left out of the model's value,
-//!   while any watermark Rust records is rendered and so would differ. The
-//!   spec's `receipt` is false on every drop it can reach (an undeliverable
-//!   drop is refused with a receipt), and Rust has no field. Proposed: record
-//!   `watermark` and `bound` only for an expiry.
+//! - **Message drop `bound` and `receipt`.** Rust stores the applied
+//!   watermark only for an expiry that a bound consumer constrained, which is
+//!   exactly the spec's `bound`, so `bound` renders as "a watermark is
+//!   recorded". The spec's `receipt` is false on every drop it can reach (an
+//!   undeliverable drop is refused with a receipt), and Rust has no field.
 //! - **Ensure `history`.** The model's history lists the fulfiller each
 //!   failure named; Rust's history is the Ensure's attempt records, and the
 //!   replay records that fulfiller as each failure's cause detail. Rust never
@@ -64,16 +45,11 @@
 //! - **Vessels.** A vessel is a placement at the [`Ledger`] plus a lifecycle
 //!   resource. The ledger forgets a vessel when it returns the lease, so the
 //!   harness keeps each returned lease to render the model's `Gone(placement)`.
-//! - **Placement `available` and `waiting`.** The spec's `Placement =
-//!   { request, host, available, waiting }` keeps the evidence its priority
-//!   rule read; a Rust [`Lease`] holds only its request and host. Per the
-//!   owner's ruling the harness keeps what each placement read
-//!   ([`Ledger::evidence`] at place time), renders `available` and `waiting`
-//!   from it for the `Leased` and `Gone` values, and checks the
+//! - **`placedOn`.** A lease holds only its request and host. Per the owner's
+//!   ruling the harness keeps what each placement read ([`Ledger::evidence`] at
+//!   place time), compares it with the scenario's `placedOn`, and checks the
 //!   `queuePriority` rule over it. The model's waiting set includes the placed
 //!   request itself; the ledger's excludes it, so the harness adds it back.
-//!   Proposed: `Placement = { request, host }`, with the evidence in a
-//!   scenario variable `placedOn`.
 //!
 //! To also cover what the model refuses, each reached state is probed: an
 //! ended resource must refuse every edge and record and stay unchanged, and
@@ -470,8 +446,7 @@ fn lifecycle_end_refuses<K: LifecycleKind>(
 // ---------------------------------------------------------------------------
 // AgentSession (spec `machines/agent_session.qnt`)
 
-/// The spec's `Live(Channel) | Ended`. Rust's `Ended` keeps its reason;
-/// the spec's has none (see the module doc).
+/// The spec's `Live(Channel) | Ended(EndReason)`.
 fn session_value(state: &AgentSessionState) -> Value {
     match state {
         AgentSessionState::Live { channel } => variant(
@@ -481,7 +456,14 @@ fn session_value(state: &AgentSessionState) -> Value {
                 Channel::Attached => "Attached",
             }),
         ),
-        AgentSessionState::Ended { .. } => constant("Ended"),
+        AgentSessionState::Ended { reason } => variant("Ended", constant(end_reason_name(*reason))),
+    }
+}
+
+fn end_reason_name(reason: EndReason) -> &'static str {
+    match reason {
+        EndReason::Completed => "Completed",
+        EndReason::Lost => "Lost",
     }
 }
 
@@ -639,19 +621,21 @@ fn quota_value(quota: &Quota) -> Value {
     map_of(quota.iter().map(|(class, count)| (int(class.0.into()), int((*count).into()))))
 }
 
-/// The request the model admitted, from the state it admitted.
+/// The request the model admitted, from the state it admitted: its spec,
+/// and the quota in force at admission.
 fn convoy_request(state: &Value) -> ConvoyRequest {
-    let request = &convoy_work(state)["request"];
+    let work = convoy_work(state);
+    let spec = &work["spec"];
     ConvoyRequest {
-        project: text(&request["project"]).into(),
-        promises: pairs(&request["promises"])
+        project: text(&spec["project"]).into(),
+        promises: pairs(&spec["promises"])
             .iter()
             .map(|pair| {
                 (PromiseId(small(&pair[0])), Promise { kind: text(&pair[1]["kind"]).into(), target: text(&pair[1]["target"]).into() })
             })
             .collect(),
-        quota: quota(&request["quota"]),
-        priority: Priority(small(&request["priority"])),
+        quota: quota(&work["quota"]),
+        priority: Priority(small(&spec["priority"])),
     }
 }
 
@@ -664,22 +648,21 @@ fn promise_name(state: PromiseState) -> &'static str {
 }
 
 /// The spec's `Open(Work) | Delivered(Work) | Abandoned({ work, reason })`,
-/// where `Work = { request, promises }`: the request is the resource's spec
-/// with the quota in force from its state (see the module doc), and the
-/// promises' resolutions are the state's.
+/// where `Work = { spec, promises, quota }`: the resource's spec, and each
+/// promise's resolution and the quota in force from its state.
 fn convoy_value(resource: &Resource<Convoy>) -> Value {
     let spec = resource.spec();
     let work = |promises: &convoy::Resolution, quota: &Quota| {
         json!({
-            "request": {
+            "spec": {
                 "project": spec.project,
                 "promises": map_of(spec.promises.iter().map(|(id, promise)| {
                     (int(id.0.into()), json!({ "kind": promise.kind, "target": promise.target }))
                 })),
-                "quota": quota_value(quota),
                 "priority": int(spec.priority.0.into()),
             },
             "promises": map_of(promises.iter().map(|(id, state)| (int(id.0.into()), constant(promise_name(*state))))),
+            "quota": quota_value(quota),
         })
     };
     match resource.state() {
@@ -816,29 +799,25 @@ fn request_value(request: &placement::Request) -> Value {
     })
 }
 
-/// The spec's `Placement = { request, host, available, waiting }`: the lease's
-/// request and host, and the available capacity and waiting requests from the
-/// evidence the placement read. The model's waiting set includes the placed
-/// request itself; the ledger's excludes it, so it is added back.
-fn placement_value(lease: &Lease, evidence: &Evidence) -> Value {
-    let mut waiting: BTreeSet<&placement::Request> = evidence.waiting.iter().collect();
-    waiting.insert(&lease.request);
-    json!({
-        "request": request_value(&lease.request),
-        "host": int(lease.host.0.into()),
-        "available": units_value(&evidence.available),
-        "waiting": set_of(waiting.into_iter().map(request_value)),
-    })
+/// The spec's `Placement = { request, host }`: a lease, one-to-one.
+fn lease_value(lease: &Lease) -> Value {
+    json!({ "request": request_value(&lease.request), "host": int(lease.host.0.into()) })
+}
+
+/// What a placement read: the request placed and the ledger's evidence.
+struct Placed {
+    request: placement::Request,
+    evidence: Evidence,
 }
 
 /// The scenario's world: convoys, the ledger, vessel lifecycles, and what
-/// the harness keeps beyond them (the evidence each placement read, and the
-/// leases the ledger returned and forgot).
+/// the harness keeps beyond them (each placement's evidence, and the leases
+/// the ledger returned and forgot).
 struct Fleet {
     convoys: Home<Convoy>,
     ledger: Ledger,
     vessels: Home<Lifecycle<VesselKind>>,
-    placed: BTreeMap<i64, Evidence>,
+    placed: BTreeMap<i64, Placed>,
     returned: BTreeMap<i64, Lease>,
 }
 
@@ -867,34 +846,51 @@ impl Fleet {
     }
 
     /// The spec's `Waiting(Request) | Leased({ placement, lifecycle }) | Gone(Placement)`,
-    /// from the ledger, the vessel's lifecycle resource, a returned lease and
-    /// the evidence its placement read.
+    /// from the ledger, the vessel's lifecycle resource and a returned lease.
     fn vessel_value(&self, id: i64, step: &Step) -> Option<Value> {
         let name = id.to_string();
         let life = self.vessels.get(&name).map(Resource::state);
-        let evidence = || self.placed.get(&id).unwrap_or_else(|| panic!("{step}: vessel {id} placed without evidence"));
         match (self.ledger.vessel(&VesselId::new(name)), self.returned.get(&id), life) {
             (None, None, None) => None,
             (Some(placement::Vessel::Waiting(request)), None, None) => Some(variant("Waiting", request_value(request))),
             (Some(placement::Vessel::Leased(lease)), None, Some(life)) if !life.gone() => {
-                Some(variant("Leased", json!({ "placement": placement_value(lease, evidence()), "lifecycle": lifecycle_value(life) })))
+                Some(variant("Leased", json!({ "placement": lease_value(lease), "lifecycle": lifecycle_value(life) })))
             }
-            (None, Some(lease), Some(LifecycleState::Gone)) => Some(variant("Gone", placement_value(lease, evidence()))),
+            (None, Some(lease), Some(LifecycleState::Gone)) => Some(variant("Gone", lease_value(lease))),
             (held, returned, life) => {
                 panic!("{step}: vessel {id} is inconsistent: ledger {held:?}, returned {returned:?}, lifecycle {life:?}")
             }
         }
     }
 
-    /// Convoys and vessels, with the evidence each placement read, equal the
-    /// model's, and every live lease keeps `queuePriority` over that evidence.
+    /// The scenario's `placedOn`: each placement's available capacity and the
+    /// waiting requests, which in the model include the placed one.
+    fn placed_value(&self) -> Value {
+        map_of(self.placed.iter().map(|(id, placed)| {
+            let mut waiting: BTreeSet<&placement::Request> = placed.evidence.waiting.iter().collect();
+            waiting.insert(&placed.request);
+            let value = json!({
+                "available": units_value(&placed.evidence.available),
+                "waiting": set_of(waiting.into_iter().map(request_value)),
+            });
+            (int(*id), value)
+        }))
+    }
+
+    /// Convoys, vessels and the recorded placement evidence equal the model's,
+    /// and every live lease keeps `queuePriority` over the evidence it read.
     fn check(&self, state: &Value, step: &Step) {
         check_convoys(&self.convoys, state, step);
         let model = store(state, "::vessels");
         same(&slots(model, |id| self.vessel_value(id, step)), model, step, "vessel");
+        same(&self.placed_value(), &state["placedOn"], step, "placedOn");
         for (vessel, lease) in self.ledger.leases() {
-            let evidence = self.placed.get(&id_of(&vessel.0)).unwrap_or_else(|| panic!("{step}: {vessel:?} leased without evidence"));
-            let jumped = evidence.waiting.iter().find(|w| w.priority > lease.request.priority && placement::fits(w, &evidence.available));
+            let placed = self.placed.get(&id_of(&vessel.0)).unwrap_or_else(|| panic!("{step}: {vessel:?} leased without evidence"));
+            let jumped = placed
+                .evidence
+                .waiting
+                .iter()
+                .find(|w| w.priority > lease.request.priority && placement::fits(w, &placed.evidence.available));
             assert!(jumped.is_none(), "{step}: {vessel:?} was placed ahead of {jumped:?}");
         }
     }
@@ -978,7 +974,11 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
                 let host = Host(small(step.pick("host")));
                 let evidence = fleet.ledger.evidence(&vessel, host).unwrap_or_else(|error| panic!("{step}: evidence: {error:?}"));
                 ledger_ok(fleet.ledger.place(&vessel, host).map(|_| ()), tally);
-                fleet.placed.insert(id, evidence);
+                let request = match fleet.ledger.vessel(&vessel) {
+                    Some(placement::Vessel::Leased(lease)) => lease.request.clone(),
+                    other => panic!("{step}: placed vessel {id} is {other:?}"),
+                };
+                fleet.placed.insert(id, Placed { request, evidence });
                 create(&mut fleet.vessels, &name, (), &step, tally);
             }
             "realise" => lifecycle_step(&mut fleet.vessels, &name, "realise", true, true, "vessel", now, &step, tally),
@@ -1289,35 +1289,10 @@ fn without_unset_deadline(v: &Value) -> Value {
     }
 }
 
-/// The model's drop record with the evidence its rule never consulted taken
-/// out: `watermark` and `bound` unless it is an expiry, and `watermark` for an
-/// expiry no consumer bound (see the module doc).
-fn without_unread_drop_evidence(v: &Value) -> Value {
-    match v {
-        Value::Object(fields) => {
-            let mut fields: serde_json::Map<String, Value> =
-                fields.iter().map(|(k, v)| (k.clone(), without_unread_drop_evidence(v))).collect();
-            if let (Some(reason), Some(bound)) = (fields.get("reason"), fields.get("bound")) {
-                let expired = tag(reason) == "Expired";
-                if !(expired && boolean(bound)) {
-                    fields.remove("watermark");
-                }
-                if !expired {
-                    fields.remove("bound");
-                }
-            }
-            Value::Object(fields)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(without_unread_drop_evidence).collect()),
-        other => other.clone(),
-    }
-}
-
 /// The spec's `Pending(Envelope) | Awaiting({ envelope, receiver }) |
 /// Settled(Envelope) | Dropped(Drop)`: the spec's envelope and the state's
-/// data. A drop's `receipt` is false; an expiry's `bound` is whether it
-/// recorded a watermark, and a recorded watermark is always rendered, so one
-/// on any other drop differs from the model (see the module doc).
+/// data. A drop's `bound` is whether it recorded a watermark, and its
+/// `receipt` is false (see the module doc).
 fn message_value(resource: &Resource<Message>) -> Value {
     let envelope = envelope_value(resource.spec());
     match resource.state() {
@@ -1327,22 +1302,18 @@ fn message_value(resource: &Resource<Message>) -> Value {
             json!({ "envelope": envelope, "receiver": { "session": int(session_number(receiver)), "host": receiver.host } }),
         ),
         MessageState::Settled => variant("Settled", envelope),
-        MessageState::Dropped { reason, receiver, at, watermark } => {
-            let mut drop = json!({
+        MessageState::Dropped { reason, receiver, at, watermark } => variant(
+            "Dropped",
+            json!({
                 "reason": constant(reason_name(reason)),
                 "envelope": envelope,
                 "receiver": int(receiver.as_ref().map_or(0, session_number)),
                 "at": int(ticks(*at)),
+                "watermark": int(watermark.map_or(0, ticks)),
+                "bound": watermark.is_some(),
                 "receipt": false,
-            });
-            if *reason == DropReason::Expired {
-                drop["bound"] = json!(watermark.is_some());
-            }
-            if let Some(watermark) = watermark {
-                drop["watermark"] = int(ticks(*watermark));
-            }
-            variant("Dropped", drop)
-        }
+            }),
+        ),
     }
 }
 
@@ -1510,7 +1481,7 @@ impl<'a> MessageReplay<'a> {
     /// The message's value equals the model's. As an audit of the history,
     /// each accepted edge left one event and at most one was a delivery.
     fn check(&self, step: &Step) {
-        let model = without_unread_drop_evidence(&without_unset_deadline(store(step.after, "::messages")));
+        let model = without_unset_deadline(store(step.after, "::messages"));
         check_store(&self.home, &model, message_value, step, "message");
         let rust = self.home.get(ONE).expect("message");
         assert_eq!(rust.events().len(), self.edges, "{step}: one edge event per accepted edge");
@@ -1600,9 +1571,8 @@ type Scenario = fn(&Trace, &mut Tally);
 /// the model took is accepted by Rust and each world step applies nothing;
 /// after every step every Rust store, rendered from its resources' state
 /// values (with spec and attempts where the model's state carries them),
-/// equals the model's store (with the harness's placement evidence as the
-/// model's placement `available` and `waiting`), every live lease keeps
-/// `queuePriority` over that evidence; ended resources refuse
+/// equals the model's store, and the harness's placement evidence equals the
+/// scenario's `placedOn` and keeps `queuePriority`; ended resources refuse
 /// every edge and record and change nothing; every edge the Rust gates would
 /// accept from a reached state keeps the scenario's safety properties; and
 /// the scenarios' negative picks are refused. Every scenario must supply traces.

@@ -30,24 +30,12 @@
 //! - `receiver` the session number, or 0 with none;
 //! - `at` the drop's time in model ticks;
 //! - `watermark` and `bound` from `watermark: Option<Time>`: `Some(w)` is
-//!   `watermark: w, bound: true`, and `None` is `watermark: 0, bound: false`;
+//!   `watermark: w, bound: true`, and `None` is `watermark: 0, bound: false`.
+//!   Both describe an expiry with a consumer bound, the only drop that reads
+//!   the watermark;
 //! - `receipt` always false: the spec records the receipt only for an
 //!   undeliverable drop, and that drop is accepted only without one, so no
 //!   reachable drop record has it true and Rust stores nothing for it.
-//!
-//! One difference remains, in `watermark` and `bound`. The spec records
-//! `watermark: appliedThrough` and `bound: o.bound or receiver != 0` on every
-//! drop, while Rust records the watermark only where a rule read it: an
-//! expiry with a consumer bound (or a receiver), whose prefix check compares
-//! it with the deadline. So `reason`, `envelope`, `receiver`, `at` and
-//! `receipt` are compared exactly, and `watermark` and `bound` exactly for an
-//! `Expired` drop (`Some(w)` iff `bound`, and then `watermark == w`). For any
-//! other reason, and for an unbound expiry's watermark, those fields are
-//! evidence the rule never consulted: [`Conformance::compared`] presents them
-//! as Rust's `None` does (`watermark: 0, bound: false`). Recording them only
-//! for an expiry (`watermark: if (Expired and bound) appliedThrough else 0`,
-//! `bound: Expired and bound`) is proposed in the spec-proposal commit at the
-//! top of the stack, which would make the comparison one to one.
 //!
 //! One encoding choice remains: the harness envelope carries `deadline: 1`
 //! even when `hasDeadline` is false, while a Rust deadline is an `Option`, so a
@@ -288,20 +276,6 @@ impl Conformance for MessageConformance {
         }
     }
 
-    /// A drop record with the watermark and binding only an expiry with a
-    /// consumer bound consulted; see the module doc.
-    fn compared(state: &Value) -> Value {
-        let mut state = state.clone();
-        if tag(&state) == "Dropped" {
-            let record = &mut state["value"];
-            if !(tag(&record["reason"]) == "Expired" && boolean(&record["bound"])) {
-                record["watermark"] = int(0);
-                record["bound"] = Value::Bool(false);
-            }
-        }
-        state
-    }
-
     fn version(home: &Home<Message>) -> u64 {
         home.get(NAME).expect("exists").version().0
     }
@@ -309,8 +283,7 @@ impl Conformance for MessageConformance {
 
 // Every reachable message state is reached in Rust by the spec's path, and
 // every probe agrees: the same move to the same state value (a drop records
-// the watermark and binding an expiry relied on, and the spec's watermark and
-// binding on any other drop are not compared), or the same refusal with
+// the watermark and binding an expiry relied on), or the same refusal with
 // nothing recorded. The harness only offers evidence a home could observe
 // (no met expectation for a message expecting nothing), so no probe may be
 // unrealisable.

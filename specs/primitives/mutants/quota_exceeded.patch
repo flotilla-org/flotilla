@@ -8,4 +8,4 @@
 +            else if (false) Refused(QuotaExceeded)
              else if (not(fits(r, o.available))) Refused(DoesNotFit)
              else if (o.waiting.exists(w => w.priority > r.priority and fits(w, o.available))) Refused(HigherPriorityWaiting)
-             else Moved(Leased({ placement: { request: r, host: o.host, available: o.available, waiting: o.waiting }, lifecycle: L::Requested }))
+             else Moved(Leased({ placement: { request: r, host: o.host }, lifecycle: L::Requested }))

@@ -6,6 +6,8 @@ module message {
   type Delivery = { envelope: Envelope, receiver: Receiver }
   type DropReason = Undeliverable | Expired | Superseded | Withdrawn | ConsumerUnreachable
   pure val dropReasons = Set(Undeliverable, Expired, Superseded, Withdrawn, ConsumerUnreachable)
+  // A drop records the evidence its reason's rule consulted: the applied
+  // watermark and the binding only for an expiry, the receipt only for undeliverable.
   type Drop = { reason: DropReason, envelope: Envelope, receiver: int, at: int, watermark: int, bound: bool, receipt: bool }
   type State = Pending(Envelope) | Awaiting(Delivery) | Settled(Envelope) | Dropped(Drop)
   type Receipt = { observed: bool, receiverMatches: bool, transportMatches: bool, receiver: Receiver }
@@ -60,7 +62,8 @@ module message {
             match refusal {
               | Refused(r) => Refused(r)
               | Moved(_) => Moved(Dropped({ reason: o.reason, envelope: env, receiver: receiver(s),
-                  at: o.now, watermark: o.appliedThrough, bound: bound, receipt: if (o.reason == Undeliverable) o.receipt else false }))
+                  at: o.now, watermark: if (o.reason == Expired and bound) o.appliedThrough else 0,
+                  bound: o.reason == Expired and bound, receipt: if (o.reason == Undeliverable) o.receipt else false }))
             }
       }
   }

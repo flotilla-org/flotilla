@@ -20,9 +20,11 @@ viewer.html   local, standalone ITF viewer
 ## Reading the design
 
 Each resource-kind module owns a store `id -> Absent | Present(State)`.
-Its states, events and refusals are sum types. State data belongs to its variant:
-`Awaiting` carries its receiver; `Dropped` its reason and expiry evidence;
-`Abandoned` its reason; an AgentSession is `Live(channel) | Ended`.
+Its states, events and refusals are sum types. A state is a value: its label
+plus the data that label carries, exactly what the Rust engine stores and
+compares. `Awaiting` carries its receiver; `Dropped` its reason and the evidence
+its rule consulted; `Abandoned` its reason; an AgentSession is
+`Live(channel) | Ended(reason)`.
 A pure `step(state, event)` uses `match` and returns `Moved(state) | Refused(reason)`.
 Every gate reads typed local evidence on the event inside `step`. Admission
 validates a typed request before creating a slot. Named actions look up a slot,
@@ -38,7 +40,9 @@ The step blocks contain no assignment lists or machine rules. Imported variants 
 `match` patterns (constructors in expressions remain qualified).
 
 Convoy admission accepts `{project, promises, quota, priority}`. The promise map
-is nonempty and preserves opaque kind/target data. Resolution is a map from
+is nonempty and preserves opaque kind/target data. Admission fixes the project,
+the promise definitions and the priority; the quota in force is work state, which
+readmission raises, so no admitted copy of it can go stale. Resolution is a map from
 promise id to `Pending | Kept | Retracted`; a settled promise cannot be kept or
 retracted again (`PromiseSettled`), and `Kept` is final. Terminal variants retain
 the work record so delivery and finality remain state properties. A continuing
@@ -55,9 +59,10 @@ is currently capped. No borrowing or spend accounting is modeled.
 
 The Vessel module composes the shared lifecycle's pure rules and owns placement
 state; it does not duplicate a lifecycle store. Placement evidence carries the
-observed caps, live counts, available capacity and waiting requests. Allocation
-records retain the placement snapshot, allowing the priority invariant to be a
-property of state rather than a scenario flag. Ensure carries its binding,
+observed caps, live counts, available capacity and waiting requests. A lease
+holds only its request and host. The scenario keeps what each placement's
+priority rule read (available capacity and waiting requests), so the priority
+invariant checks the evidence the rule used. Ensure carries its binding,
 recorded fulfillers and attempt window on the relevant variants.
 
 A gate's booleans represent **versioned local evidence**, not remote queries or
@@ -149,8 +154,8 @@ decodes sum values from `{tag,value}`. Race drops replay the chosen reason and
 check it against the stored reason. It drives the engine's `Home::apply` and,
 after every step, compares every machine's state value with the model's store. It
 also drives the placement ledger and compares every vessel's lifecycle and lease
-with the model. It keeps the evidence each placement read, to compare with the
-model's placement snapshot and to check the priority rule. Accepted operations come from guarded machine actions, and graph
+with the model, and it keeps the evidence each placement read to compare with
+`placedOn` and check the priority rule. Accepted operations come from guarded machine actions, and graph
 conformance covers refused inputs. World changes supply replica observations
 rather than impersonating a production transport. Ended AgentSessions
 deliberately retain no channel in the Quint state. Both checks are `#[ignore]`d

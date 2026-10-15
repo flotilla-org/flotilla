@@ -12,18 +12,12 @@
 //! - `Abandon{authorised, reason}` and `Readmit{quota, authorised}`: those
 //!   edges, their authority reading `authorised`.
 //!
-//! State mapping: the spec's `Work = {request, promises}` is
-//! `{ request, promises: state.promises() }`, so `Open { promises, quota }` is
-//! `Open(work)`, `Delivered { .. }` is `Delivered(work)` and
-//! `Abandoned { reason, .. }` is `Abandoned({work, reason})`.
-//!
-//! The spec's `request: ConvoyRequest {project, promises, quota, priority}`
-//! is the immutable [`ConvoySpec`] (project, promises, priority) joined with
-//! `state.quota()`, the quota in force: the spec's `Readmit` rewrites
-//! `request.quota`, and Rust keeps that quota as work state beside the
-//! request that never changes. The join is exact, so no difference remains;
-//! storing the quota beside the spec in the spec too (`Work = {spec, promises,
-//! quota}`) is proposed in the spec-proposal commit at the top of the stack.
+//! State mapping, one to one: the spec's `Work = {spec, promises, quota}` is
+//! `{ spec: Resource::spec(), promises: state.promises(), quota: state.quota() }`,
+//! so `Open { promises, quota }` is `Open(work)`, `Delivered { .. }` is
+//! `Delivered(work)` and `Abandoned { reason, .. }` is `Abandoned({work, reason})`.
+//! The immutable [`ConvoySpec`] (project, promises, priority) is the spec's
+//! `ConvoySpec` field for field.
 
 use flotilla_state_machines::{
     machines::convoy::{
@@ -67,10 +61,9 @@ fn quota_value(quota: &Quota) -> Value {
     map_of(quota.iter().map(|(class, count)| (int(class.0.into()), int((*count).into()))))
 }
 
-/// The spec's `ConvoyRequest`: the immutable spec with the quota in force.
-fn request_value(spec: &ConvoySpec, quota: &Quota) -> Value {
+fn spec_value(spec: &ConvoySpec) -> Value {
     let promises = spec.promises.iter().map(|(p, promise)| (int(p.0.into()), json!({ "kind": promise.kind, "target": promise.target })));
-    json!({ "project": spec.project, "promises": map_of(promises), "quota": quota_value(quota), "priority": int(spec.priority.0.into()) })
+    json!({ "project": spec.project, "promises": map_of(promises), "priority": int(spec.priority.0.into()) })
 }
 
 fn refusal_of(refusal: ConvoyRefusal) -> Value {
@@ -97,7 +90,7 @@ fn outcome<T>(result: Result<T, WriteError<Convoy>>) -> Step {
     }
 }
 
-/// The spec's `Work`: the request with the quota in force, and the state's resolution.
+/// The spec's `Work`: the immutable spec, and the state's resolution and quota in force.
 fn work(spec: &ConvoySpec, state: &ConvoyState) -> Value {
     let resolved = state.promises().iter().map(|(p, resolution)| {
         let name = match resolution {
@@ -107,7 +100,15 @@ fn work(spec: &ConvoySpec, state: &ConvoyState) -> Value {
         };
         (int(p.0.into()), bare(name))
     });
-    json!({ "request": request_value(spec, state.quota()), "promises": map_of(resolved) })
+    json!({ "spec": spec_value(spec), "promises": map_of(resolved), "quota": quota_value(state.quota()) })
+}
+
+/// The request that admitted an initial `Open(work)`: its spec, with the
+/// quota in force as the admitted quota.
+fn admitted_request(work: &Value) -> ConvoyRequest {
+    let spec = &work["spec"];
+    let request = json!({ "project": spec["project"], "promises": spec["promises"], "quota": work["quota"], "priority": spec["priority"] });
+    request_of(&request)
 }
 
 struct ConvoyConformance;
@@ -120,7 +121,7 @@ impl Conformance for ConvoyConformance {
 
     fn create(state: &Value) -> Home<Convoy> {
         let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, request_of(&payload(state)["request"])).expect("admitted");
+        home.create(NAME, admitted_request(payload(state))).expect("admitted");
         home
     }
 

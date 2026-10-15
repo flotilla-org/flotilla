@@ -2,7 +2,7 @@
 module vessel {
   import lifecycle(IDS = Set()) as L from "./lifecycle"
   type Request = { convoy: int, class: int, shape: int -> int, priority: int }
-  type Placement = { request: Request, host: int, available: int -> int, waiting: Set[Request] }
+  type Placement = { request: Request, host: int }
   type State = Waiting(Request) | Leased({ placement: Placement, lifecycle: L::State }) | Gone(Placement)
   type Evidence = { host: int, available: int -> int, waiting: Set[Request], live: int, cap: int, admitted: bool }
   type Event = Place(Evidence) | Realise({ present: bool, matches: bool }) | Release({ complete: bool }) | Vanish({ absent: bool })
@@ -15,7 +15,7 @@ module vessel {
             else if (o.live >= o.cap) Refused(QuotaExceeded)
             else if (not(fits(r, o.available))) Refused(DoesNotFit)
             else if (o.waiting.exists(w => w.priority > r.priority and fits(w, o.available))) Refused(HigherPriorityWaiting)
-            else Moved(Leased({ placement: { request: r, host: o.host, available: o.available, waiting: o.waiting }, lifecycle: L::Requested }))
+            else Moved(Leased({ placement: { request: r, host: o.host }, lifecycle: L::Requested }))
         | _ => Refused(WrongState)
       }
     | Leased(v) => val result = match e {
