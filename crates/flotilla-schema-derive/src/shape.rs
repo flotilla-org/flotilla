@@ -30,21 +30,6 @@ pub(crate) enum FieldShape {
     History,
 }
 
-impl FieldShape {
-    pub(crate) fn describe(self) -> &'static str {
-        match self {
-            FieldShape::Column => "an unattributed column",
-            FieldShape::Intern { .. } => "`#[store(intern)]`",
-            FieldShape::Flatten { .. } => "`#[store(flatten)]`",
-            FieldShape::State => "`#[store(state)]`",
-            FieldShape::Frozen { .. } => "`#[store(frozen)]`",
-            FieldShape::Child(_) => "`#[store(child)]`",
-            FieldShape::Records => "`#[store(records)]`",
-            FieldShape::History => "`#[store(history)]`",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Collection {
     Vec,
@@ -130,6 +115,14 @@ fn head(ty: &Type) -> Option<(String, Vec<&Type>)> {
 /// The first type argument of the last path segment: `T` of `Option<T>` or `State<T>`.
 pub(crate) fn first_arg(ty: &Type) -> Option<&Type> {
     head(ty).and_then(|(_, args)| args.first().copied())
+}
+
+/// `K` and `V` of `BTreeMap<K, V>`.
+pub(crate) fn map_args(ty: &Type) -> Option<(&Type, &Type)> {
+    match head(ty)?.1.as_slice() {
+        [key, value] => Some((key, value)),
+        _ => None,
+    }
 }
 
 /// For `Option<X<..>>`, the name `X`.

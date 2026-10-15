@@ -16,7 +16,7 @@ slab = "0.4"
 digest = { version = "0.10", features = ["mac", "oid", "std"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
 memchr = { version = "2" }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["alloc", "derive"] }
 serde_core = { version = "1", features = ["alloc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = { workspace = true, features = ["oid"] }

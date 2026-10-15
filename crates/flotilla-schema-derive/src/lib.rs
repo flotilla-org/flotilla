@@ -9,9 +9,9 @@
 //! selects, and `structs` and `enums` generate the trait implementations.
 //!
 //! Indirect recursion (`A` holds `B`, which holds `A`) is not visible to a derive; the compiler
-//! refuses it: by value it is an infinitely sized type (E0072), and any indirection that a stored
-//! field could carry would cycle through the `TABLES` constants (E0391). `Ref<K>` names a kind
-//! without containing it, so references are not recursion.
+//! refuses it: by value it is an infinitely sized type (E0072), and through tables (`A` holds a
+//! `Vec<B>` whose rows hold a `Vec<A>`) proving that the rows are elements overflows (E0275).
+//! `Ref<K>` names a kind without containing it, so references are not recursion.
 
 mod attrs;
 mod enums;
@@ -115,6 +115,10 @@ mod tests {
             quote! { #[store(kind = "A", code = 1)] enum A { #[store(code = 1)] B } },
             quote! { enum A { #[store(code = 1)] B { #[store(state)] a: String } } },
             quote! { enum A { #[store(code = 1)] B { a: Option<A> } } },
+            quote! { struct A { #[store(child)] a: Option<Vec<String>> } },
+            quote! { struct A { #[store(child)] a: Vec<Self> } },
+            quote! { struct A { #[store(records)] a: Records<A> } },
+            quote! { struct A { #[store(frozen)] a: Option<Option<Frozen<Doc>>> } },
             quote! { struct A(#[store(intern)] String); },
             quote! { struct A(Vec<String>); },
             quote! { struct A(Option<Box<A>>); },
@@ -125,22 +129,45 @@ mod tests {
         }
     }
 
-    // Shapes on the list that later layers implement are refused plainly, not as outside the list.
+    // Shapes on the list that a later layer implements are refused plainly, not as outside the list.
     #[test]
     fn listed_shapes_not_yet_implemented_say_so() {
-        let cases = [
-            quote! { struct A { #[store(frozen)] a: Option<Frozen<Doc>> } },
-            quote! { struct A { #[store(child)] a: BTreeMap<String, String> } },
-            quote! { struct A { #[store(records)] a: Records<Event> } },
-            quote! { struct A { #[store(history)] a: Records<Event> } },
-            quote! { #[store(kind = "A", code = 1, index(name = "x", eq(a)))] struct A { a: String } },
-            quote! { enum A { #[store(code = 1)] B { #[store(child)] a: Vec<String> } } },
-            quote! { enum A { #[store(code = 1)] B { #[store(frozen)] a: Frozen<Doc> } } },
-        ];
-        for case in cases {
-            let message = error(case.clone());
-            assert!(message.contains("is not supported yet") && !message.contains(SUPPORTED), "{case}: {message}");
+        let message = error(quote! { #[store(kind = "A", code = 1, index(name = "x", eq(a)))] struct A { a: String } });
+        assert!(message.contains("is not supported yet") && !message.contains(SUPPORTED), "{message}");
+    }
+
+    // Glue: each table and frozen attribute selects its adapter and bounds the element, key or
+    // content type by the trait it needs; a part holding a table is a row only, never `Flat`.
+    #[test]
+    fn tables_and_frozen_select_adapters_and_bounds() {
+        let part = expanded(quote! {
+            struct Part<I> {
+                #[store(child)] a: Vec<Item>,
+                #[store(child)] b: BTreeMap<String, Value>,
+                #[store(child)] c: BTreeSet<Tag>,
+                #[store(records)] d: Records<Event<I>>,
+                #[store(history)] e: Records<Attempt>,
+                #[store(frozen)] f: Frozen<Doc>,
+                #[store(frozen)] g: Option<Frozen<Plan>>,
+            }
+        });
+        for expected in [
+            "Item : :: flotilla_schema :: Element",
+            "String : :: flotilla_schema :: KeyColumn + :: core :: cmp :: Ord , Value : :: flotilla_schema :: Element",
+            "Tag : :: flotilla_schema :: KeyColumn",
+            "Event < I > : :: flotilla_schema :: Element",
+            "Doc : :: flotilla_schema :: Freezable",
+            "Plan : :: flotilla_schema :: Freezable",
+            "adapt :: AsChild as :: flotilla_schema :: adapt :: Adapter < BTreeSet < Tag > >",
+            "adapt :: AsRecords as :: flotilla_schema :: adapt :: Adapter < Records < Event < I > > >",
+            "adapt :: AsHistory as :: flotilla_schema :: adapt :: Adapter < Records < Attempt > >",
+            "adapt :: AsOptionalFrozen as :: flotilla_schema :: adapt :: Adapter < Option < Frozen < Plan > > >",
+        ] {
+            assert!(part.contains(expected), "missing {expected}");
         }
+        assert!(!part.contains("Flat for"), "a part with tables cannot be flattened");
+        let flat = expanded(quote! { struct Leaf { #[store(frozen)] f: Frozen<Doc> } });
+        assert!(flat.contains(":: flotilla_schema :: Flat for Leaf"), "a frozen hash is a column, so the part stays flat");
     }
 
     #[test]

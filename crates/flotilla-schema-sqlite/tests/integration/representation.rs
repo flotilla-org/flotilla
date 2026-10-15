@@ -1,9 +1,9 @@
 use chrono::DateTime;
-use flotilla_schema::{EncodeError, Identity, Kind, KindCode, Ref};
+use flotilla_schema::{EncodeError, Identity, Kind, KindCode, Ref, Timestamp};
 use flotilla_schema_sqlite::StoreError;
 
 use crate::fixtures::{
-    message::{DropReason, MessageEdge},
+    message::{DropReason, MessageEdge, MessageEdgeEvent},
     store, Inbox, Message, LOCAL,
 };
 
@@ -78,7 +78,7 @@ fn references_to_missing_targets_create_their_identity() {
 }
 
 // Behaviour (#3320 interning): equal interned strings share one `strings` row, whichever field,
-// variant or resource holds them.
+// variant, table or resource holds them.
 #[test]
 fn equal_interned_strings_share_one_row() {
     let mut store = store();
@@ -89,19 +89,31 @@ fn equal_interned_strings_share_one_row() {
             authority: Identity { kind: KindCode(9), name: "x".into(), home: LOCAL.into() },
         },
     };
+    let event = MessageEdgeEvent { edge, at: Timestamp(1), writer: "carol".into(), inputs: Vec::new() };
     for name in ["a", "b"] {
-        write.insert(name, &Message { sender: "carol".into(), last_edge: Some(edge.clone()), ..Message::sample() }).expect("insert");
+        let message = Message { sender: "carol".into(), edges: vec![event.clone()].into(), ..Message::sample() };
+        write.insert(name, &message).expect("insert");
     }
     write.commit().expect("commit");
     let conn = store.into_connection();
     let rows: i64 = conn.query_row("SELECT count(*) FROM strings WHERE s = 'carol'", [], |row| row.get(0)).expect("count");
     assert_eq!(rows, 1);
     let distinct: i64 = conn
-        .query_row("SELECT count(DISTINCT sender) + count(DISTINCT last_edge_drop_reason_withdrawn_by) FROM message", [], |row| row.get(0))
+        .query_row(
+            "SELECT count(DISTINCT m.sender) + count(DISTINCT e.edge_drop_reason_withdrawn_by) + count(DISTINCT e.writer) \
+             FROM message m JOIN message_edges e ON e.owner = m.id",
+            [],
+            |row| row.get(0),
+        )
         .expect("count");
-    assert_eq!(distinct, 2, "both columns of both rows name the one row");
+    assert_eq!(distinct, 3, "every column of every row names the one row");
     let same: i64 = conn
-        .query_row("SELECT count(*) FROM message WHERE sender = last_edge_drop_reason_withdrawn_by", [], |row| row.get(0))
+        .query_row(
+            "SELECT count(*) FROM message m JOIN message_edges e ON e.owner = m.id \
+             WHERE m.sender = e.edge_drop_reason_withdrawn_by AND m.sender = e.writer",
+            [],
+            |row| row.get(0),
+        )
         .expect("count");
     assert_eq!(same, 2);
 }

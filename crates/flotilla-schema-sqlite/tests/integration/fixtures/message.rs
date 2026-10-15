@@ -1,28 +1,29 @@
 //! The Message-shaped fixture, transcribed (not imported) from
 //! `flotilla_resources::message::MessageSpec`, `flotilla_protocol::{Leaf, MessageReference}` and
 //! the #3108 prototype's Message machine (`MessageState`, `MessageEdge`, `DropReason`,
-//! `Settlement`, `Cause`, `Transport`).
+//! `Settlement`, `Transport`) and attempts (`attempt.rs`).
 //!
 //! Modelling decisions the storage list forces:
 //! - The prototype's `ObjRef` becomes `Ref<K>` where the target kind is known (`Settlement::Answered`,
 //!   `DropReason::Superseded`, the deliver receipt) and `Identity` where it is not (an authority, an
-//!   observed condition, a reference's repository).
+//!   observed condition, a reference's repository, a gate input).
 //! - `receiver` on the spec is the prototype's `inbox: Ref<Inbox>`; the deliver edge keeps the
 //!   receiving session's name, interned through the `AgentName` newtype.
-//! - `references: Vec<MessageReference>` waits for `child` (layer 3); `subject` exercises the
-//!   seven-variant reference enum as an optional column now.
-//! - Edges arrive as `records` in layer 3; until then `last_edge: Option<MessageEdge>` carries the
-//!   edge shapes, including `Drop { reason: DropReason::Undeliverable { cause } }`, a data enum
-//!   nested in a data enum.
+//! - `references` is a child table of the seven-variant reference enum; `subject` keeps one
+//!   reference as an optional column, as the spec does.
+//! - Edge events are `records`: each row is the edge (`Drop { reason: Undeliverable { cause } }`
+//!   nests a data enum in a data enum), when and by whom it was written, and a child table of the
+//!   gate's inputs. Attempts are `history`.
 //!
 //! Serde attributes are the resource types' own; storage ignores them (codes are explicit).
 
 use chrono::{DateTime, Utc};
-use flotilla_schema::{Identity, KindCode, Ref, State, Stored, Timestamp};
+use flotilla_schema::{Identity, Records, Ref, State, Stored, Timestamp};
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
-use super::{floor, text, time};
+pub use super::attempt::{Attempt, Cause};
+use super::{code_enum, evolve_records, floor, identity, list, name, reference, seq, text, time, timestamp, Fixture, Pick, SHAPES};
 
 /// A minimal target kind for `Message::inbox`.
 #[derive(Debug, Clone, PartialEq, Stored)]
@@ -47,6 +48,8 @@ pub struct Message {
     pub relation: MessageRelation,
     pub body: String,
     pub body_digest: Option<String>,
+    #[store(child)]
+    pub references: Vec<MessageReference>,
     pub subject: Option<MessageReference>,
     pub expectation: MessageExpectation,
     pub in_reply_to: Option<Ref<Message>>,
@@ -59,7 +62,28 @@ pub struct Message {
     pub ordinal: u16,
     #[store(state)]
     pub state: State<MessageState>,
-    pub last_edge: Option<MessageEdge>,
+    #[store(records)]
+    pub edges: Records<MessageEdgeEvent>,
+    #[store(history)]
+    pub attempts: Records<Attempt<String>>,
+}
+
+/// One edge event: the edge, when and by whom it was written, and what its gate relied on.
+#[derive(Debug, Clone, PartialEq, Stored)]
+pub struct MessageEdgeEvent {
+    pub edge: MessageEdge,
+    pub at: Timestamp,
+    #[store(intern)]
+    pub writer: String,
+    #[store(child)]
+    pub inputs: Vec<GateInput>,
+}
+
+/// A resource the gate observed, at the version it observed.
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+pub struct GateInput {
+    pub observed: Identity,
+    pub version: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Stored)]
@@ -261,91 +285,14 @@ pub enum DropReason {
     Superseded { by: Ref<Message> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Stored)]
-pub struct Cause {
-    pub category: CauseCategory,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
-pub enum CauseCategory {
-    #[store(code = 1)]
-    Transient,
-    #[store(code = 2)]
-    Refused,
-    #[store(code = 3)]
-    Misconfigured,
-    #[store(code = 4)]
-    MissingCapability,
-    #[store(code = 5)]
-    External,
-}
-
-/// How a generator chooses each enum variant and option: drawn by Hegel, or fixed by a covering
-/// index so that the indexes `0..COVERING` reach every variant of every enum, nested ones included.
-#[derive(Debug, Clone, Copy)]
-pub enum Pick {
-    Draw,
-    Cover(usize),
-}
-
 /// Structural shapes: indexes `0..SHAPES` reach, while their enclosing variants are active, every
 /// `LeafAddress` under `Outcome` and under a present `delivery_condition` (0..7), every
 /// `MessageReference` (0..7), every edge (`shape % 3`) with every `Settlement` and `DropReason`
-/// (`shape / 3`), and every unit variant and absent option (7 and above).
-const SHAPES: usize = 16;
-
-/// Five rounds of the shapes. Code enums take the covering index itself, so across the rounds
-/// every code reaches every position, including `CauseCategory`, which only an `Undeliverable`
-/// drop (one shape) holds.
+/// (`shape / 3`), and every unit variant and absent option (7 and above). Collections take every
+/// size up to their maximum in turn, and their elements shifted shapes, so the reference and edge
+/// tables also hold every variant. Five rounds let code enums take every code at every position,
+/// including `CauseCategory`, which only an `Undeliverable` drop or a failed attempt holds.
 pub const COVERING: usize = SHAPES * 5;
-
-impl Pick {
-    /// The variant index in `0..count`; `cover` maps a structural shape to it.
-    fn variant(self, tc: &TestCase, count: usize, cover: impl FnOnce(usize) -> usize) -> usize {
-        match self {
-            Pick::Draw => tc.draw(gs::integers::<usize>().min_value(0).max_value(count - 1)),
-            Pick::Cover(index) => cover(index % SHAPES) % count,
-        }
-    }
-
-    /// Whether an option is present; shapes below `until` are present.
-    fn some(self, tc: &TestCase, until: usize) -> bool {
-        match self {
-            Pick::Draw => tc.draw(gs::booleans()),
-            Pick::Cover(index) => index % SHAPES < until,
-        }
-    }
-}
-
-fn seq(tc: &TestCase) -> u64 {
-    tc.draw(gs::integers::<u64>().min_value(0).max_value(i64::MAX as u64))
-}
-
-/// Interned values collide often, so equal strings share `strings` rows.
-fn name(tc: &TestCase) -> String {
-    tc.draw(gs::sampled_from(vec!["alice".to_owned(), "bob".to_owned(), String::new(), "ünïcødé".to_owned()]))
-}
-
-fn home(tc: &TestCase) -> String {
-    tc.draw(gs::sampled_from(vec![super::LOCAL.to_owned(), "elsewhere".to_owned()]))
-}
-
-/// References to targets that mostly do not exist: writing one creates its identity row.
-fn reference<K>(tc: &TestCase) -> Ref<K> {
-    Ref::new(name(tc), home(tc))
-}
-
-fn identity(tc: &TestCase) -> Identity {
-    Identity { kind: KindCode(tc.draw(gs::integers::<u32>())), name: name(tc), home: home(tc) }
-}
-
-fn code_enum<E: Copy>(tc: &TestCase, pick: Pick, all: &[E]) -> E {
-    match pick {
-        Pick::Draw => all[tc.draw(gs::integers::<usize>().min_value(0).max_value(all.len() - 1))],
-        Pick::Cover(index) => all[index % all.len()],
-    }
-}
 
 impl Leaf {
     pub fn generate(tc: &TestCase, pick: Pick) -> Leaf {
@@ -388,8 +335,7 @@ impl MessageReference {
 }
 
 impl MessageEdge {
-    fn generate(tc: &TestCase, pick: Pick) -> MessageEdge {
-        use CauseCategory::*;
+    pub fn generate(tc: &TestCase, pick: Pick) -> MessageEdge {
         match pick.variant(tc, 3, |index| index) {
             0 => MessageEdge::Deliver {
                 receiver: AgentName(name(tc)),
@@ -404,12 +350,7 @@ impl MessageEdge {
             },
             _ => MessageEdge::Drop {
                 reason: match pick.variant(tc, 5, |index| index / 3) {
-                    0 => DropReason::Undeliverable {
-                        cause: Cause {
-                            category: code_enum(tc, pick, &[Transient, Refused, Misconfigured, MissingCapability, External]),
-                            detail: text(tc),
-                        },
-                    },
+                    0 => DropReason::Undeliverable { cause: Cause::generate(tc, pick) },
                     1 => DropReason::Expired,
                     2 => DropReason::Withdrawn { by: name(tc), authority: identity(tc) },
                     3 => DropReason::ConsumerUnreachable { by: name(tc), authority: identity(tc) },
@@ -434,6 +375,7 @@ impl Message {
             relation: code_enum(tc, pick, &[Supervisor, Peer, Dependency, Dependee, System]),
             body: text(tc),
             body_digest: pick.some(tc, 8).then(|| text(tc)),
+            references: list(tc, pick, 3, |pick| MessageReference::generate(tc, pick)),
             subject: pick.some(tc, 7).then(|| MessageReference::generate(tc, pick)),
             expectation: match pick.variant(tc, 3, |index| if index < 7 { 2 } else { index }) {
                 0 => MessageExpectation::None,
@@ -448,7 +390,8 @@ impl Message {
             accepted_seq: seq(tc),
             ordinal: tc.draw(gs::integers::<u16>()),
             state: State::new(code_enum(tc, pick, &[Pending, Awaiting, Settled, Dropped]), Timestamp(tc.draw(gs::integers::<i64>()))),
-            last_edge: pick.some(tc, SHAPES - 1).then(|| MessageEdge::generate(tc, pick)),
+            edges: list(tc, pick, 3, |pick| MessageEdgeEvent::generate(tc, pick)).into(),
+            attempts: list(tc, pick, 2, |pick| Attempt::generate(tc, pick, text(tc))).into(),
         }
     }
 
@@ -460,6 +403,7 @@ impl Message {
             relation: MessageRelation::Peer,
             body: "b".into(),
             body_digest: None,
+            references: Vec::new(),
             subject: None,
             expectation: MessageExpectation::None,
             in_reply_to: None,
@@ -470,12 +414,43 @@ impl Message {
             accepted_seq: 0,
             ordinal: 0,
             state: State::new(MessageState::Pending, Timestamp(0)),
-            last_edge: None,
+            edges: Records::new(),
+            attempts: Records::new(),
+        }
+    }
+}
+
+impl Fixture for Message {
+    const COVERING: usize = COVERING;
+
+    fn generate(tc: &TestCase, pick: Pick) -> Message {
+        Message::generate(tc, pick)
+    }
+
+    /// The spec drawn afresh (references and all), edge events replaced in place or appended,
+    /// attempts appended.
+    fn evolve(&self, tc: &TestCase, pick: Pick) -> Message {
+        let spec = Message::generate(tc, pick);
+        let replace = |_: &MessageEdgeEvent, pick: Pick| MessageEdgeEvent::generate(tc, pick);
+        Message {
+            edges: evolve_records(tc, pick, &self.edges, Some(&replace), |pick| MessageEdgeEvent::generate(tc, pick)),
+            attempts: evolve_records(tc, pick, &self.attempts, None, |pick| Attempt::generate(tc, pick, text(tc))),
+            ..spec
         }
     }
 
-    /// The value a load returns: times floored to microseconds.
-    pub fn stored(&self) -> Message {
+    fn stored(&self) -> Message {
         Message { deadline: self.deadline.map(floor), ..self.clone() }
+    }
+}
+
+impl MessageEdgeEvent {
+    pub fn generate(tc: &TestCase, pick: Pick) -> MessageEdgeEvent {
+        MessageEdgeEvent {
+            edge: MessageEdge::generate(tc, pick),
+            at: timestamp(tc),
+            writer: name(tc),
+            inputs: list(tc, pick, 2, |_| GateInput { observed: identity(tc), version: seq(tc) }),
+        }
     }
 }

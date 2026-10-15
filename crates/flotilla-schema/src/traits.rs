@@ -51,6 +51,16 @@ pub trait Column: Columns {}
 )]
 pub trait Flat: Columns {}
 
+/// A single non-null column that can key a child table: a `BTreeMap` key or a `BTreeSet` value.
+/// Scalars, code enums, references and newtypes of these; not options, data enums or structs,
+/// whose values span several columns or none.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot key a child table: the storage derive supports only the attributes child, records, history, frozen, \
+               intern, flatten, state and code (fields and variants) and kind, code and index (types)",
+    label = "map keys and set values are single-column types: scalars, code enums, references and their newtypes"
+)]
+pub trait KeyColumn: Column {}
+
 /// A unit enum with a stable code on every variant: the target of `#[store(state)]` and of index
 /// predicates. Codes come from `#[store(code = N)]`, never from serde names or declaration order.
 pub trait CodeEnum: Column {
@@ -148,6 +158,8 @@ macro_rules! scalar {
         }
 
         impl Column for $ty {}
+
+        impl KeyColumn for $ty {}
 
         impl Element for $ty {
             const TABLES: usize = 0;
@@ -313,7 +325,7 @@ mod tests {
         let flat = SUPPORTED_ATTRIBUTES.split_whitespace().collect::<Vec<_>>().join(" ");
         let normalise = |source: &str| source.replace("\\\n", "").split_whitespace().collect::<Vec<_>>().join(" ");
         let traits = normalise(include_str!("traits.rs"));
-        assert_eq!(traits.matches(&flat[flat.find("child").expect("list")..]).count(), 5, "every diagnostic names the list");
+        assert_eq!(traits.matches(&flat[flat.find("child").expect("list")..]).count(), 6, "every diagnostic names the list");
         assert!(normalise(include_str!("../../flotilla-schema-derive/src/attrs.rs")).contains(&flat));
     }
 }

@@ -87,7 +87,8 @@ impl Layout {
     }
 
     /// Declares columns that hold only while `column = value`. The controlling column must already
-    /// be declared in the enclosing scope.
+    /// be declared in the enclosing scope. Nested tables declared inside are not guarded by a
+    /// CHECK: the codec writes them no rows while the guard does not hold, and refuses rows there.
     pub fn guard(&mut self, column: &str, value: i64, f: impl FnOnce(&mut Layout)) {
         let frame = self.frames.last_mut().expect("layout has a current table");
         frame.guards.push(Guard { column: column.to_owned(), value, required: Vec::new(), scope: Vec::new() });
@@ -99,7 +100,14 @@ impl Layout {
         f(self);
         let frame = self.frames.last_mut().expect("layout has a current table");
         let guard = frame.guards.pop().expect("guard opened above");
-        self.set.tables[frame.table].guards[slot] = guard;
+        // A guard with no columns of its own (a variant holding only tables) would render an
+        // always-true CHECK; nothing nested can have opened inside it, as a nested guard's
+        // controlling column belongs to this scope.
+        if guard.scope.is_empty() {
+            self.set.tables[frame.table].guards.remove(slot);
+        } else {
+            self.set.tables[frame.table].guards[slot] = guard;
+        }
     }
 
     /// Declares a nested table storing `field` of the current table; `f` declares its own key and
@@ -205,7 +213,7 @@ mod tests {
     // Behaviour (DESIGN guards): a required column inside a guard is nullable and required by that
     // guard's CHECK; a nested guard's controlling column is in the outer scope, while the nested
     // guard's own columns are covered only by its own CHECK, which follows the outer one. Outside guards
-    // required means NOT NULL.
+    // required means NOT NULL. A guard without columns emits no CHECK.
     #[test]
     fn nested_guards_emit_one_check_each() {
         let mut layout = Layout::root("Edge", KindCode(1));
@@ -240,7 +248,6 @@ mod tests {
                  ELSE \"event_drop_reason\" IS NULL AND \"event_drop_at\" IS NULL END",
                 "CASE WHEN \"event_drop_reason\" = 2 THEN \"event_drop_reason_undeliverable_cause\" IS NOT NULL \
                  ELSE \"event_drop_reason_undeliverable_cause\" IS NULL AND \"event_drop_reason_undeliverable_note\" IS NULL END",
-                "CASE WHEN \"event\" = 2 THEN 1 ELSE 1 END",
             ]
         );
     }
@@ -273,6 +280,6 @@ mod tests {
         assert_eq!(evidence.own_key, 1);
         assert_eq!(evidence.parent_key().len(), 1);
         assert_eq!(evidence.columns[0].name, "value");
-        assert_eq!(set.tables[0].guards[0].check(), "CASE WHEN \"state\" = 1 THEN 1 ELSE 1 END");
+        assert!(set.tables[0].guards.is_empty(), "a guard holding only a table emits no CHECK");
     }
 }

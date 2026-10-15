@@ -9,8 +9,8 @@ use quote::{format_ident, quote};
 use syn::{ext::IdentExt, Field as SynField, Ident, LitStr, Type};
 
 use crate::{
-    attrs::{self, not_yet},
-    shape::{self, FieldShape},
+    attrs,
+    shape::{self, Collection, FieldShape},
 };
 
 pub(crate) struct Field<'a> {
@@ -29,9 +29,6 @@ impl<'a> Field<'a> {
     pub(crate) fn parse(field: &'a SynField, owner: &Ident, variant: Option<&str>) -> syn::Result<Field<'a>> {
         let ident = field.ident.as_ref().expect("named field");
         let shape = shape::classify(attrs::field_attr(&field.attrs)?, &field.ty, owner)?;
-        if matches!(shape, FieldShape::Frozen { .. } | FieldShape::Child(_) | FieldShape::Records | FieldShape::History) {
-            return Err(not_yet(&field.ty, shape.describe()));
-        }
         let plain = ident.unraw().to_string();
         let name = match variant {
             Some(variant) => format!("{variant}_{plain}"),
@@ -51,7 +48,12 @@ impl<'a> Field<'a> {
             FieldShape::Intern { optional: false } => quote!(#schema::adapt::AsInterned),
             FieldShape::Intern { optional: true } => quote!(#schema::adapt::AsOptionalInterned),
             FieldShape::Flatten { optional: true } => quote!(#schema::adapt::AsOptionalFlat),
-            _ => quote!(#schema::adapt::AsColumns),
+            FieldShape::Frozen { optional: false } => quote!(#schema::adapt::AsFrozen),
+            FieldShape::Frozen { optional: true } => quote!(#schema::adapt::AsOptionalFrozen),
+            FieldShape::Child(_) => quote!(#schema::adapt::AsChild),
+            FieldShape::Records => quote!(#schema::adapt::AsRecords),
+            FieldShape::History => quote!(#schema::adapt::AsHistory),
+            FieldShape::Column | FieldShape::Flatten { optional: false } | FieldShape::State => quote!(#schema::adapt::AsColumns),
         }
     }
 
@@ -82,8 +84,33 @@ impl<'a> Field<'a> {
                 let inner = inner();
                 quote!(#inner: #schema::CodeEnum)
             }
-            _ => quote!(#ty: #schema::Column),
+            FieldShape::Frozen { optional: false } => {
+                let inner = inner();
+                quote!(#inner: #schema::Freezable)
+            }
+            FieldShape::Frozen { optional: true } => {
+                let inner = shape::first_arg(inner()).unwrap_or(ty);
+                quote!(#inner: #schema::Freezable)
+            }
+            FieldShape::Child(Collection::Vec) | FieldShape::Records | FieldShape::History => {
+                let inner = inner();
+                quote!(#inner: #schema::Element)
+            }
+            FieldShape::Child(Collection::Set) => {
+                let inner = inner();
+                quote!(#inner: #schema::KeyColumn + ::core::cmp::Ord)
+            }
+            FieldShape::Child(Collection::Map) => {
+                let (key, value) = shape::map_args(ty).unwrap_or((ty, ty));
+                quote!(#key: #schema::KeyColumn + ::core::cmp::Ord, #value: #schema::Element)
+            }
+            FieldShape::Column => quote!(#ty: #schema::Column),
         }
+    }
+
+    /// Whether the field is stored in a table of its own rather than in columns of the row.
+    pub(crate) fn is_table(&self) -> bool {
+        matches!(self.shape, FieldShape::Child(_) | FieldShape::Records | FieldShape::History)
     }
 
     pub(crate) fn tables(&self) -> TokenStream {

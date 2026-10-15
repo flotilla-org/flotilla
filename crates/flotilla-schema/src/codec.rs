@@ -49,6 +49,18 @@ pub enum DecodeError {
     Exhausted { column: String },
     #[error("object {hash:?} is missing from the snapshot")]
     MissingObject { hash: Hash },
+    /// Stored object bytes that do not hash to the key naming them.
+    #[error("object {expected:?} holds bytes hashing to {found:?}")]
+    ObjectHash { expected: Hash, found: Hash },
+    /// Object bytes that are not canonical CBOR of the frozen field's type.
+    #[error("object {hash:?} does not decode: {kind}")]
+    Object { hash: Hash, kind: flotilla_cbor::ErrorKind },
+    /// A list or records row whose position is not the next dense index.
+    #[error("column {column}: expected position {expected}, found {found}")]
+    Position { column: String, expected: usize, found: i64 },
+    /// Rows of a table whose owning variant or value is absent.
+    #[error("table {table}: rows stored under an absent value")]
+    AbsentRows { table: usize },
     #[error("table {table}: rows or values were left unconsumed")]
     Unconsumed { table: usize },
     #[error("expected {expected} tables, found {found}")]
@@ -69,6 +81,7 @@ impl DecodeError {
             DecodeError::Code { column, code } => DecodeError::Code { column: join(field, &column), code },
             DecodeError::Exhausted { column } => DecodeError::Exhausted { column: join(field, &column) },
             DecodeError::RefKind { column, expected, found } => DecodeError::RefKind { column: join(field, &column), expected, found },
+            DecodeError::Position { column, expected, found } => DecodeError::Position { column: join(field, &column), expected, found },
             other => other,
         }
     }
@@ -127,8 +140,8 @@ impl Encoder {
     }
 
     /// Appends a frozen object's hash and records its bytes once.
-    pub fn put_object(&mut self, hash: Hash, bytes: Vec<u8>) {
-        self.rows.objects.entry(hash).or_insert(bytes);
+    pub fn put_object(&mut self, hash: Hash, bytes: &[u8]) {
+        self.rows.objects.entry(hash).or_insert_with(|| bytes.to_vec());
         self.put(Value::Object(hash));
     }
 
@@ -252,8 +265,7 @@ impl Decoder {
     pub fn row<R>(&mut self, f: impl FnOnce(&mut Decoder) -> Result<R, DecodeError>) -> Result<Option<R>, DecodeError> {
         let table = *self.scopes.last().expect("rows are read inside a table");
         let parent = self.frames.last().expect("a nested row has a parent row");
-        let belongs = self.tables[table].front().is_some_and(|row| row.key.len() > parent.key.len() && row.key.starts_with(&parent.key));
-        if !belongs {
+        if !self.front_belongs(table) {
             return Ok(None);
         }
         let parent_len = parent.key.len();
@@ -268,6 +280,23 @@ impl Decoder {
             return Err(DecodeError::Unconsumed { table: frame.table });
         }
         Ok(Some(value))
+    }
+
+    /// Refuses any row of the current table under the current parent: the dual of writing an
+    /// absent value's table with no rows.
+    pub fn no_rows(&self) -> Result<(), DecodeError> {
+        let table = *self.scopes.last().expect("rows are read inside a table");
+        if self.front_belongs(table) {
+            return Err(DecodeError::AbsentRows { table });
+        }
+        Ok(())
+    }
+
+    /// Whether the table's first unread row is the current row's child: its key extends the
+    /// current row's key.
+    fn front_belongs(&self, table: usize) -> bool {
+        let parent = self.frames.last().expect("a nested row has a parent row");
+        self.tables[table].front().is_some_and(|row| row.key.len() > parent.key.len() && row.key.starts_with(&parent.key))
     }
 
     /// Values taken inside `f` come from the current row's own key.
@@ -439,8 +468,8 @@ mod tests {
             fn layout_row(_layout: &mut Layout) {}
             fn encode_row(&self, e: &mut Encoder) -> Result<(), EncodeError> {
                 let bytes = b"frozen".to_vec();
-                e.put_object(Hash::of(&bytes), bytes.clone());
-                e.put_object(Hash::of(&bytes), bytes);
+                e.put_object(Hash::of(&bytes), &bytes);
+                e.put_object(Hash::of(&bytes), &bytes);
                 Ok(())
             }
             fn decode_row(d: &mut Decoder) -> Result<Self, DecodeError> {

@@ -2596,6 +2596,7 @@ dependencies = [
  "flotilla-build-features",
  "flotilla-build-features-base",
  "flotilla-build-features-types",
+ "flotilla-cbor",
  "flotilla-schema-derive",
  "hegeltest",
  "serde",

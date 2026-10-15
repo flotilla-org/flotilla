@@ -1,0 +1,99 @@
+error[E0277]: `Pair` cannot key a child table: the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+  --> tests/ui/map_multi_column_key.rs:12:10
+   |
+12 | #[derive(Stored)]
+   |          ^^^^^^ map keys and set values are single-column types: scalars, code enums, references and their newtypes
+   |
+help: the trait `KeyColumn` is not implemented for `Pair`
+  --> tests/ui/map_multi_column_key.rs:7:1
+   |
+ 7 | struct Pair {
+   | ^^^^^^^^^^^
+   = help: the following other types implement trait `KeyColumn`:
+             Identity
+             String
+             Vec<u8>
+             bool
+             chrono::datetime::DateTime<chrono::offset::utc::Utc>
+             flotilla_schema::Ref<K>
+             flotilla_schema::Timestamp
+             i16
+           and $N others
+   = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Pair` cannot key a child table: the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+  --> tests/ui/map_multi_column_key.rs:14:8
+   |
+14 | struct Ticket {
+   |        ^^^^^^ map keys and set values are single-column types: scalars, code enums, references and their newtypes
+   |
+help: the trait `KeyColumn` is not implemented for `Pair`
+  --> tests/ui/map_multi_column_key.rs:7:1
+   |
+ 7 | struct Pair {
+   | ^^^^^^^^^^^
+   = help: the following other types implement trait `KeyColumn`:
+             Identity
+             String
+             Vec<u8>
+             bool
+             chrono::datetime::DateTime<chrono::offset::utc::Utc>
+             flotilla_schema::Ref<K>
+             flotilla_schema::Timestamp
+             i16
+           and $N others
+note: required for `Ticket` to implement `flotilla_schema::Element`
+  --> tests/ui/map_multi_column_key.rs:14:8
+   |
+12 | #[derive(Stored)]
+   |          ------ type parameter would need to implement `flotilla_schema::Element`
+13 | #[store(kind = "Ticket", code = 1)]
+14 | struct Ticket {
+   |        ^^^^^^
+   = help: consider manually implementing `flotilla_schema::Element` to avoid undesired bounds caused by "imperfect derives"
+   = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
+note: required by a bound in `Kind`
+  --> src/traits.rs
+   |
+   | pub trait Kind: Element {
+   |                 ^^^^^^^ required by this bound in `Kind`
+
+error[E0277]: `Pair` cannot key a child table: the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+  --> tests/ui/map_multi_column_key.rs:12:10
+   |
+12 | #[derive(Stored)]
+   |          ^^^^^^ map keys and set values are single-column types: scalars, code enums, references and their newtypes
+   |
+help: the trait `KeyColumn` is not implemented for `Pair`
+  --> tests/ui/map_multi_column_key.rs:7:1
+   |
+ 7 | struct Pair {
+   | ^^^^^^^^^^^
+   = help: the following other types implement trait `KeyColumn`:
+             Identity
+             String
+             Vec<u8>
+             bool
+             chrono::datetime::DateTime<chrono::offset::utc::Utc>
+             flotilla_schema::Ref<K>
+             flotilla_schema::Timestamp
+             i16
+           and $N others
+note: required for `Ticket` to implement `flotilla_schema::Element`
+  --> tests/ui/map_multi_column_key.rs:14:8
+   |
+12 | #[derive(Stored)]
+   |          ------ type parameter would need to implement `flotilla_schema::Element`
+13 | #[store(kind = "Ticket", code = 1)]
+14 | struct Ticket {
+   |        ^^^^^^
+   = help: consider manually implementing `flotilla_schema::Element` to avoid undesired bounds caused by "imperfect derives"
+   = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
+note: required by a bound in `KIND`
+  --> src/traits.rs
+   |
+   | pub trait Kind: Element {
+   |                 ^^^^^^^ required by this bound in `Kind::KIND`
+   |     const KIND: &'static str;
+   |           ---- required by a bound in this associated constant
+   = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)

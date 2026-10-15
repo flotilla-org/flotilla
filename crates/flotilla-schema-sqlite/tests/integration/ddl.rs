@@ -38,7 +38,36 @@ fn every_table_is_strict_and_foreign_keys_hold() {
     let tables: Vec<(String, bool)> =
         statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).expect("query").collect::<Result<_, _>>().expect("rows");
     let names: Vec<&str> = tables.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, ["agent_session", "change_log", "home_sequence", "inbox", "message", "objects", "resource_identity", "strings"]);
+    assert_eq!(
+        names,
+        [
+            "agent_session",
+            "change_log",
+            "convoy",
+            "convoy_deliverables",
+            "convoy_deliverables_evidence",
+            "convoy_deliverables_evidence_metadata",
+            "convoy_inputs",
+            "convoy_inputs_list_items",
+            "convoy_repositories",
+            "home_sequence",
+            "inbox",
+            "message",
+            "message_attempts",
+            "message_edges",
+            "message_edges_inputs",
+            "message_references",
+            "objects",
+            "project",
+            "resource_identity",
+            "strings",
+            "terminal_session",
+            "terminal_session_attempts",
+            "terminal_session_env",
+            "terminal_session_events",
+            "terminal_session_labels",
+        ]
+    );
     for (name, strict) in &tables {
         assert!(strict, "{name} is not STRICT");
     }

@@ -1,0 +1,5 @@
+error: a `Frozen` field needs a storage attribute; the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+ --> tests/ui/unattributed_frozen.rs:6:12
+  |
+6 |     field: flotilla_schema::Frozen<String>,
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -8,8 +8,11 @@ use crate::{ddl::quote_ident, value::KindCode};
 pub const SHARED_NAMES: &[&str] =
     &["strings", "resource_identity", "resource_identity_by_home", "objects", "home_sequence", "change_log", "change_log_by_resource"];
 
-/// Column names the backend adds to every kind table: `id` and `version` on the root, `owner` on children.
-pub const RESERVED_COLUMNS: &[&str] = &["id", "version", "owner"];
+/// Column names the backend adds to a kind's root table.
+pub const RESERVED_ROOT_COLUMNS: &[&str] = &["id", "version"];
+
+/// Column names the backend adds to a kind's child tables.
+pub const RESERVED_CHILD_COLUMNS: &[&str] = &["owner"];
 
 /// One kind's storage. Tables are numbered in pre-order of declaration, root first; the
 /// encoder and decoder address tables by that index.
@@ -150,7 +153,8 @@ pub enum DescriptorError {
 impl TableSet {
     /// Refuses descriptors that would render invalid or ambiguous DDL: table or index names declared
     /// twice or taken by a shared table, column names declared twice in one table (key columns included), and
-    /// data or key columns named like the backend's own `id`, `version` and `owner` columns.
+    /// data or key columns named like the backend's own columns: `id` and `version` on the root, `owner` on
+    /// children (a child row may well have a `version` field, such as a gate input's observed version).
     pub fn validate(&self) -> Result<(), DescriptorError> {
         let kind = || self.kind.clone();
         let mut names = BTreeSet::new();
@@ -165,7 +169,8 @@ impl TableSet {
         for table in &self.tables {
             let mut columns = BTreeSet::new();
             for column in table.key.iter().chain(&table.columns) {
-                if RESERVED_COLUMNS.contains(&column.name.as_str()) {
+                let reserved = if table.parent.is_none() { RESERVED_ROOT_COLUMNS } else { RESERVED_CHILD_COLUMNS };
+                if reserved.contains(&column.name.as_str()) {
                     return Err(DescriptorError::ReservedColumn { kind: kind(), table: table.name.clone(), column: column.name.clone() });
                 }
                 if !columns.insert(column.name.as_str()) {

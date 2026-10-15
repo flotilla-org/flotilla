@@ -13,7 +13,7 @@ use crate::{
     codec::{DecodeError, Decoder, EncodeError, Encoder},
     descriptor::ColumnType,
     layout::Layout,
-    traits::{Column, Columns, Element, Kind},
+    traits::{Column, Columns, Element, KeyColumn, Kind},
     value::{Identity, Value},
 };
 
@@ -116,6 +116,8 @@ impl<K: Kind> Columns for Ref<K> {
 }
 
 impl<K: Kind> Column for Ref<K> {}
+
+impl<K: Kind> KeyColumn for Ref<K> {}
 
 impl<K: Kind> Element for Ref<K> {
     const TABLES: usize = 0;
