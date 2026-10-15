@@ -1779,6 +1779,34 @@ impl Store for InMemoryBackend {
     ) -> Result<(), ResourceError> {
         InMemoryBackend::apply_replica_raw(self, resource_kind, origin_root, namespace, kind, object, synced_at).await
     }
+    async fn list_replica_deletions_raw(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+    ) -> Result<Vec<crate::replica::ReplicaDeletion>, ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.list_replica_deletions_raw(resource_kind, namespace).await;
+        }
+        let key = Self::store_key(resource_kind, namespace);
+        let state = self.replicas.lock().await;
+        let mut deleted = Vec::new();
+        for ((origin_root, store_key), partition) in &state.partitions {
+            if store_key != &key {
+                continue;
+            }
+            for (name, last_synced_at) in &partition.synced_at_by_name {
+                if !partition.objects.contains_key(name) {
+                    deleted.push(crate::replica::ReplicaDeletion {
+                        origin_root: origin_root.clone(),
+                        name: name.clone(),
+                        last_synced_at: *last_synced_at,
+                    });
+                }
+            }
+        }
+        deleted.sort_by(|left, right| left.origin_root.cmp(&right.origin_root).then_with(|| left.name.cmp(&right.name)));
+        Ok(deleted)
+    }
     async fn apply_replica_tombstone_raw(
         &self,
         resource_kind: ResourceKind,

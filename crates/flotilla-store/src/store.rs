@@ -591,6 +591,18 @@ pub trait Store: std::fmt::Debug + Send + Sync {
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
         Err(self.unsupported_operation("replicas"))
     }
+    /// Retained replica deletion fences for a relay's initial snapshot.
+    /// Ordinary list/query APIs continue to return only live objects. This
+    /// initial catch-up result contains one metadata fence per deleted
+    /// origin/name pair in the partition, with no fixed count bound. Live
+    /// delivery uses deltas.
+    async fn list_replica_deletions_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+    ) -> Result<Vec<crate::replica::ReplicaDeletion>, ResourceError> {
+        Err(self.unsupported_operation("replica deletions"))
+    }
     async fn watch_replica_sources_raw(
         &self,
         _resource_kind: ResourceKind,

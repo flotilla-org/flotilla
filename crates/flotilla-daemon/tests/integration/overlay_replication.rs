@@ -406,6 +406,23 @@ async fn lost_authority_record_tombstone_converges_through_two_peers() {
     assert_eq!(deleted.object.value["metadata"]["resourceVersion"], "2", "the tombstone must advance beyond the recovered replica cursor");
 
     let kiwi_feta = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect authority to first peer");
+    // Force the formerly racy ordering: the relay applies the deletion before
+    // the next peer subscribes, so convergence must use its retained fence.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !feta
+            .resource_backend()
+            .including_replicas::<TerminalSession>("flotilla")
+            .list()
+            .await
+            .expect("list first peer replicas")
+            .items
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("authority tombstone did not reach first peer");
     let feta_gouda = spawn_in_memory_request_topology(Arc::clone(&feta), Arc::clone(&gouda)).await.expect("connect relay to second peer");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -423,7 +440,7 @@ async fn lost_authority_record_tombstone_converges_through_two_peers() {
             if converged {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
