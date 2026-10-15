@@ -34,6 +34,8 @@ pub mod attempt;
 mod code;
 mod home;
 mod machine;
+pub mod machines;
+pub mod placement;
 mod read;
 mod record;
 mod time;
