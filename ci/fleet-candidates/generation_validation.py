@@ -2,6 +2,7 @@
 """Canonical validation for fleet candidates and promoted generations."""
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -806,6 +807,83 @@ def disarm_confirmation(path, token):
         pass
 
 
+def memory_pressure_critical(platform, read_text=lambda path: Path(path).read_text(), run=subprocess.run):
+    """Read native pressure without load-generating pressure probes."""
+    if platform.startswith("darwin"):
+        # The sysctl translates internal levels into dispatch flags: 1/2/4.
+        # https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_memorystatus_notify.c
+        result = run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+                     capture_output=True, text=True, timeout=5, check=True)
+        level = int(result.stdout.strip())
+        if level not in (1, 2, 4):
+            raise ValidationError(f"unknown memory pressure level: {level}")
+        return level == 4
+    values = dict(re.findall(r"^(\w+):\s+(\d+) kB$", read_text("/proc/meminfo"), re.MULTILINE))
+    total, available = int(values["MemTotal"]), int(values["MemAvailable"])
+    if total <= 0 or available < 0:
+        raise ValidationError("invalid memory availability")
+    # Reclaimable cache is included in MemAvailable. Refuse at <= 5% headroom;
+    # swap occupancy alone does not distinguish current pressure from history.
+    return available * 100 <= total * 5
+
+
+def host_preflight(state_dir, floor, platform, pressure=None):
+    path = Path(state_dir)
+    while not path.exists():
+        parent = path.parent
+        if parent == path:
+            raise ValidationError(f"cannot find state volume for {state_dir}")
+        path = parent
+    free = shutil.disk_usage(path).free
+    if free < floor:
+        raise ValidationError(f"state volume {path}: {free} bytes available, below free-space floor {floor}; "
+                              "free disk space before retrying fleet-install")
+    try:
+        critical = pressure() if pressure else memory_pressure_critical(platform)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        raise ValidationError(f"cannot determine memory pressure: {error}; retry fleet-install after resolving the probe") from error
+    if critical:
+        raise ValidationError("critical memory pressure; relieve memory pressure before retrying fleet-install")
+
+
+def daemon_health(cli, socket, timeout):
+    # Bound each CLI invocation as well as the outer confirmation loop.
+    # The child inherits FLOTILLA_CONTAINED_HOST_DAEMON=1 from the shell's
+    # probe_daemon_health invocation, preventing client-side daemon spawning.
+    try:
+        result = subprocess.run([cli, "--socket", socket, "fleet", "check"],
+                                stdout=subprocess.DEVNULL, timeout=max(0.1, min(5, timeout)), check=False)
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        print("daemon health probe timed out", file=sys.stderr)
+        return False
+
+
+def startup_pending(path, since):
+    """Only this attempt's structured pending warnings can extend its deadline.
+
+    Read a bounded tail on each poll: the log rotates and an incomplete last
+    line can become valid next time. A chatty daemon can push a warning beyond
+    this window before it is observed; missing evidence retains the normal timeout.
+    """
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 1024 * 1024))
+            lines = stream.read().decode("utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return False
+    for line in lines:
+        try:
+            row = json.loads(line)
+            timestamp = datetime.datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")).timestamp()
+            if timestamp >= since and row["fields"].get("message") == "daemon startup phase remains pending":
+                return True
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -896,9 +974,26 @@ def main():
     helper = sub.add_parser("disarm-confirmation")
     helper.add_argument("path")
     helper.add_argument("token")
+    helper = sub.add_parser("daemon-health")
+    helper.add_argument("cli")
+    helper.add_argument("socket")
+    helper.add_argument("timeout", type=float)
+    helper = sub.add_parser("host-preflight")
+    helper.add_argument("state_dir")
+    helper.add_argument("floor", type=int)
+    helper.add_argument("platform")
+    helper = sub.add_parser("startup-pending")
+    helper.add_argument("path")
+    helper.add_argument("since", type=float)
     args = parser.parse_args()
     try:
-        if args.command == "release-lock":
+        if args.command == "daemon-health":
+            return 0 if daemon_health(args.cli, args.socket, args.timeout) else 1
+        elif args.command == "host-preflight":
+            host_preflight(args.state_dir, args.floor, args.platform)
+        elif args.command == "startup-pending":
+            return 0 if startup_pending(args.path, args.since) else 1
+        elif args.command == "release-lock":
             release_install_lock(args.path, args.owner)
         elif args.command == "begin-install":
             begin_daemon_install(args.socket, args.marker)
@@ -969,4 +1064,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

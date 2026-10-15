@@ -30,6 +30,49 @@ Use the file picker’s “Go to Folder” to enter the hidden `.local` path. Re
 the daemon after changing grants. Old generation-specific grants may be removed
 once the fixed-path installation has been accepted.
 
+## Host refusal and startup confirmation
+
+Before downloading or stopping a daemon, installation and explicit rollback
+refuse when the filesystem containing the daemon state directory has less than
+5 GiB available, or memory pressure is critical. The state directory follows
+`XDG_STATE_HOME` (default `~/.local/state/flotilla`); a missing directory uses
+its nearest existing ancestor. The check runs again before activation, so
+staging and canary work cannot consume the headroom unnoticed. Automatic
+recovery remains available after a failed activation.
+
+Override the floor with `--min-free-bytes N` (default `5368709120`) or
+`FLEET_INSTALL_MIN_FREE_BYTES`. On macOS, the read-only
+`kern.memorystatus_vm_pressure_level` sysctl supplies memory pressure (normal=1, warning=2, critical=4); critical
+refuses. On Linux, `MemAvailable` at or below 5% of `MemTotal` refuses.
+This Linux check reads host memory from `/proc/meminfo`; it does not inspect
+cgroup `memory.current` or `memory.max`. Running the installer inside a
+memory-limited container therefore does not establish cgroup memory headroom.
+Linux kernels without `MemAvailable` cannot pass admission; changing the disk
+floor does not bypass the memory check. Missing or malformed pressure
+observations refuse with a diagnostic. Relieve the reported pressure or free
+space, then retry the installer.
+
+Normal health confirmation waits 90 seconds, allowing the daemon's first
+60-second pending-phase warning to arrive. A structured
+`daemon startup phase remains pending` warning written since this activation
+extends confirmation up to `--max-wait-seconds N` (default `600`), also settable
+as `FLEET_INSTALL_MAX_WAIT_SECONDS`. Historical warnings cannot extend a new
+attempt, including when a caller supplies no timestamp (the wait captures the
+current time). A clock-probe failure is reported and refuses confirmation.
+Only the last 1 MiB is polled; a warning pushed outside that window before it is
+observed cannot extend the ordinary deadline. A zero maximum allows one
+immediate health probe with no retries or startup extension. The maximum caps
+the entire health wait even if warnings continue or the health CLI hangs; each probe also has a five-second cap. A permanently
+pending startup eventually fails confirmation and follows the existing rollback
+path. Recovery gets a separate bounded health wait and ignores candidate logs.
+`FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS` still overrides the ordinary window;
+setting it below 60 seconds can expire before the first pending warning.
+Flags precede `--skip-canary`, `--canary`, or the operation, for example:
+
+```sh
+scripts/fleet-install --min-free-bytes 8589934592 --max-wait-seconds 900 latest
+```
+
 ## Probe audit and configuration
 
 | Probe | Locations and policy |
