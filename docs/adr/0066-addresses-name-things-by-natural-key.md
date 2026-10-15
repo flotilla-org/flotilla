@@ -1,0 +1,129 @@
+# 66. Addresses name things by natural key, in one typed-segment grammar
+
+**Status:** Proposed (owner grilling, 2026-10-15; #3350)
+**Date:** 2026-10-15
+**Amends:**
+- [ADR 0047](0047-stored-data-stays-decodable-across-one-generation.md): a stored-data shim retires only after an explicit re-encode step has run on every host.
+- [ADR 0064](0064-primitives-model-resources-records-gated-machines-inboxes.md): its typed-segment inbox addresses become the grammar for every address, receivers and things alike.
+
+**Relates to:**
+- [ADR 0055](0055-agent-messages-are-durable-receiver-homed-records.md): messages name their subject and references;
+- [ADR 0063](0063-cbor-is-the-stack-binary-format.md): addresses are not opaque documents;
+- #3320, the storage derive stack, where the 79-column Message table exposed this;
+- #3351 (CR record-name case drift) and #3352 (stall nudges that never settle).
+
+## Context
+
+Flotilla has no single way to name an object. There are 14 overlapping types and string dialects:
+- `LeafAddress`;
+- two `Subject` types;
+- `IssueRef` and `IssueSource`;
+- `MessageReference`;
+- `ResourceRef`;
+- the CR, issue, artifact and usage record-name helpers;
+- `LeafTemplate` and `SubjectVariable`;
+- message address strings and `RoleAddress`;
+- `ChangeRequestRef` and the core `IssueRef`;
+- the manifest's `EntityRef`;
+- the untyped `Submission.reference`.
+
+Code converts between them by hand at more than 40 sites ([explainer](https://claude.ai/artifact/KayuzRBw8YUvfeCxRxJAMu), §3–4).
+
+The consequences are concrete:
+- **One GitHub PR has five spellings.** Some keep the original case and some lowercase it. The service is sometimes a host and sometimes a forge id. Record names are computed from different spellings (#3351).
+- **One CR has two spellings inside `MessageReference`:** `ChangeRequest{head}` when its head is known, `ControlRecord{ResourceRef}` when it isn't.
+- **The text forms lose information when re-read.**
+  - Leaf literals lose spaces and quotes.
+  - A label with spaces can't be written.
+  - A service or producer containing `/` silently re-parses as different fields.
+  - `LeafTemplate`'s text *is* its serde form, so the loss is in stored templates and frozen convoy snapshots.
+- **Addresses spread into sparse columns.** Each variant of `MessageReference` and `LeafAddress` contributes its own columns, and they make up 60 of Message's 79.
+
+## Decision
+
+### 1. An address names a thing by its natural key
+
+An address says what a thing is, for example "CR 42 in this repo on this forge" or "the reviewer's review round for this head". It does so whether or not flotilla holds a record of it. It covers flotilla's own objects (project, convoy, role, artifact) and outside objects (repo, change request, issue, comment, commit).
+
+`ResourceRef` stays separate. It means "this particular stored record": its host, namespace and API version. The only join between the two is `record_name(&Address)`:
+- one CR can have several observation records;
+- an artifact's record name is a one-way hash of its key.
+
+### 2. The namespace comes from context
+
+- **Outside objects have no namespace.** A forge object is the same from any namespace.
+- **Flotilla's own objects are relative.** An address is relative to the namespace of whatever holds it.
+- **No stored reference crosses namespaces.** A qualified form, `<namespace>:<address>`, exists only for surfaces and the CLI. If cross-island references arrive, the qualified form enters stored data then, and addresses stored before then keep meaning "my own namespace".
+
+### 3. Normalisation happens once, when an address is built
+
+- **A forge is named by its `forge_id`.** GitHub gets a built-in Forge, `github`. Hosts, SSH aliases and URLs are inputs only, resolved through Forge resources. A host that doesn't resolve to a Forge is an error, not a fallback spelling.
+- **Case is decided by forge kind, in the constructor only.** GitHub and Forgejo both look up owner and repo case-insensitively (Forgejo compares `lower_name` after lowercasing, `models/repo/repo.go`), so both lowercase owner and repo.
+- **Numbers are numbers.** `007` and `+7` are refused.
+
+### 4. One grammar: ADR 0064's typed segments
+
+Every address is a list of `kind:value` segments over a closed kind enum. Receivers and things use the same grammar.
+- **Segments.** Segments are separated by `/`. Each value is percent-encoded on its own, as `ViewAddress` already does (`crates/flotilla-protocol/src/view_address.rs`). Parsing splits on `/` and decodes each value, so nothing is positional and nothing is guessed.
+- **The path shows ownership.** "Everything in this convoy" or "everything under this repo" is a prefix match.
+
+```
+project:flotilla/convoy:demo/role:coder                     a convoy role's inbox (ADR 0064)
+project:flotilla/role:gui-approver                          a standing role's inbox (ADR 0064)
+project:flotilla/convoy:demo                                a convoy
+forge:github/repo:flotilla-org%2Fflotilla                   a repository
+forge:github/repo:flotilla-org%2Fflotilla/cr:42             a change request
+forge:github/repo:flotilla-org%2Fflotilla/issue:7           an issue
+forge:github/repo:flotilla-org%2Fflotilla/commit:4f1c…      a commit
+```
+
+- **A reference is an address plus a revision.** This replaces `MessageReference` and its two spellings of a CR.
+- **A condition (Leaf)** is an address, a field path, an operator and a literal. Field-path segments and literals use JSON string quoting when they contain anything other than a bare word. The printer always produces the canonical form, so print-then-parse returns exactly what went in.
+- **Templates** (`$cr .checks == passing`) use the same field-path and literal rules.
+- **Input may be lenient, but only in what it resolves.** Short forms (`cr/github/org/repo/42`), PR URLs, hosts and mixed case are accepted when parsing and resolved to the canonical form. Only the canonical form is stored and printed.
+
+### 5. Storage: interned canonical text
+
+- **Interned canonical text.** In Rust an address is a typed value. It is stored as its canonical print through the storage derive's `#[store(intern)]`, as one integer column into the `strings` table. Equality is integer equality, and a prefix query is a range scan on the intern table's unique index.
+- **Address or `Ref`.** A field means "the thing named this", which may not exist or may be outside flotilla, holds an Address. A field means "this stored record, which must exist" holds a `Ref` foreign key.
+- **Unused intern entries are cleaned up later.** That is part of archiving: a reference-count or distinct query over the live set, then removing unreferenced intern rows.
+
+### 6. Stored-data shims retire through an explicit re-encode step (amends ADR 0047)
+
+ADR 0047 lets a shim go "once records have been rewritten or reaped", but nothing rewrites records:
+- Messages are immutable and kept forever.
+- Artifact keys can't change.
+- Frozen workflow snapshots are written once.
+
+For those kinds a shim never actually becomes removable, and the roll-time live decode blocks its removal.
+
+- **A re-encode step.** A stored-shape change that lands before the ADR 0064 cut-over uses a general step, "re-encode every record". On startup it decodes each stored record through the current shims, writes it back in the current shape, and records a marker in `resource_store_migrations`.
+- **When a shim can go.** It is removable once that step has run on every host since the shim was added.
+- **After the cut-over,** ADR 0064's explicit migration steps cover the same need.
+
+### 7. Rollout
+
+1. **A small crate for the address type**, for example `flotilla-address`. It holds the kinds, segments, encoding, canonical printing, normalisation, `record_name`, and the condition and template grammar. It gets property tests for print-then-parse, and each case in the explainer's round-trip table as a fixed test.
+2. **Live code uses it internally; stored shapes stay as they are.** Conversion happens at the read and write boundary. The hand-written conversions and the old types go, and #3351's drift ends, with no stored-data shims.
+3. **The ADR 0064 model stores addresses natively.** The cut-over importer converts old records once, and normalisation happens there. The combined engine and storage stack (#3319, #3320) uses addresses from the moment the crate lands.
+4. **Receivers move to ADR 0064 inbox addresses as part of the primitives inbox work.** The code still uses ADR 0055's `project/convoy/vessel/role`, `principal:` and `system:` strings.
+
+## Open for review in this ADR
+
+- **How an artifact is addressed.** An artifact's key is (convoy, producer, kind, subject), and publishing to the same key replaces its body. There are two candidates:
+  - **(a) Under its producing role:** `project:P/convoy:C/role:reviewer/artifact:review-round/of:<subject>`. The subject's meaning is declared by the artifact kind; a review round's subject is a commit. This is the leaning.
+  - **(b) Under its convoy, with producer and kind as segments.**
+
+  Both questions hang on what produces artifacts. Image-build logs today have no convoy and are named outside the artifact scheme (`crates/flotilla-daemon/src/image_build.rs`).
+- **Work.** A work item has no record; it is a key inside its convoy's status. Its candidate address is `project:P/convoy:C/work:W`.
+- **Usage.** Usage (provider, account) is a host-level fact, not an object owned by a project. It may need its own root kind.
+
+## Consequences
+
+- **One type replaces the 14,** and `record_name` replaces four helpers.
+- **The Message table loses its sparse address columns.**
+  - Its conditions are one text column each. They stay on the message, because they are fixed when it is sent and judged on the receiver's host (#3350 investigation: deriving them would read a convoy replica that can lag or be deleted).
+  - A reference becomes an interned address plus a revision.
+  - The subject becomes a marker on one reference.
+- **Fixtures need changes.** Existing replay fixtures and the golden corpus are unaffected while stored shapes stay as they are (rollout step 2). The importer's fixtures carry the conversion.
+- **Text that people type now has a strict grammar.** That covers workflow templates and CLI conditions. Plain cases such as `convoy/demo .status.phase == Landed` parse as before through the lenient input path.
