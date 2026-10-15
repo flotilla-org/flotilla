@@ -29,6 +29,7 @@ pub struct HostQueryDetails {
 }
 
 /// Plane-A peer state supplied by the host; projections only join it to read models.
+/// Locks preserve synchronous event application until Plane-A retires; do not build new peer features on this port.
 pub trait PeerOverlay: Send + Sync {
     fn node_connectivity(&self) -> &RwLock<HashMap<NodeId, PeerConnectionState>>;
     fn configured_peers(&self) -> &RwLock<HashMap<NodeId, String>>;

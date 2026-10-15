@@ -1,5 +1,9 @@
 # Daemon credential and aggregator extraction (#2748)
 
+Historical crate name: `flotilla-aggregator` is now `flotilla-projections` (#3296).
+When rerunning the commands below against the current tree, use the new crate name;
+the recorded layout and measurements describe the original revision.
+
 Measured on 2026-10-09 in the same contained crew vessel, from `60a4fae589`
 (the merged #2747 build-graph change), before any delivery rebase.
 Rust was `1.99.0 (b940084d7 2026-09-28)`, `CARGO_INCREMENTAL=0`,
