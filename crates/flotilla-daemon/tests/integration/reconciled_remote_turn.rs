@@ -18,6 +18,7 @@ use flotilla_daemon::runtime::spawn_pending_supervisor_turn_task;
 use flotilla_daemon::runtime::spawn_pending_supervisor_turn_task_with_watches;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
 use flotilla_discovery_testkit::fake_discovery;
+use flotilla_messaging::{MessageBatch, MessageObservation, MessageTransport, MessageTransportOutcome};
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
@@ -27,9 +28,7 @@ use flotilla_resources::{
     TerminalSessionSource, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowSnapshot,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
-use flotilla_store::{
-    controller::Reconciler, MessageBatch, MessageObservation, MessageTransport, MessageTransportOutcome, ResourceBackend,
-};
+use flotilla_store::{controller::Reconciler, ResourceBackend};
 use futures::StreamExt;
 use tokio_util::task::AbortOnDropHandle;
 

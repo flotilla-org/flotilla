@@ -74,7 +74,7 @@ pub(super) struct CrewService {
     #[builder(default)]
     pub(super) capability_cards: crate::crew_capabilities::CapabilityCardTracker,
     #[builder(default)]
-    message_inboxes: Arc<Mutex<HashMap<String, flotilla_store::MessageInbox>>>,
+    message_inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>,
     #[builder(default)]
     resource_intent_publisher: std::sync::RwLock<Option<Weak<dyn crate::leaf_engine::ResourceIntentPublisher>>>,
     leaf_subscriptions: LeafSubscriptionTable,
@@ -521,14 +521,14 @@ impl CrewService {
         reconciler.ledger_delivery_environment(namespace, environment_ref).await
     }
 
-    pub(super) async fn message_inbox(&self, namespace: &str) -> flotilla_store::MessageInbox {
+    pub(super) async fn message_inbox(&self, namespace: &str) -> flotilla_messaging::MessageInbox {
         self.message_inboxes
             .lock()
             .await
             .entry(namespace.to_string())
             .or_insert_with(|| {
                 let (change_request, issue) = self.message_observation_staleness();
-                flotilla_store::MessageInbox::new(self.resource_backend.clone(), namespace)
+                flotilla_messaging::MessageInbox::new(self.resource_backend.clone(), namespace)
                     .with_observation_staleness(change_request, issue)
                     .with_audit_retention_days(self.config.load_daemon_config().unwrap_or_default().message_audit_retention_days)
             })
@@ -782,7 +782,7 @@ impl CrewService {
     pub(super) async fn message_contacts_internal(
         &self,
         requested: &CrewCommandContext,
-    ) -> Result<flotilla_store::CrewAddressBook, String> {
+    ) -> Result<flotilla_messaging::CrewAddressBook, String> {
         let context = self.resolve_crew_context(requested).await?;
         let convoy = self
             .resource_backend
@@ -792,7 +792,7 @@ impl CrewService {
             .map_err(|error| error.to_string())?;
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
         let address = format!("{project}/{}/{}/{}", context.convoy, context.vessel, context.caller_role);
-        flotilla_store::crew_address_book(&self.resource_backend, &context.namespace, &address).await.map_err(|error| error.to_string())
+        flotilla_messaging::crew_address_book(&self.resource_backend, &context.namespace, &address).await.map_err(|error| error.to_string())
     }
 
     pub(super) async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {
@@ -2193,7 +2193,7 @@ impl CrewService {
             {
                 return Err(format!("crew target `{receiver}` has failed work and cannot receive a handoff"));
             }
-            let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, &context.namespace, &receiver)
+            let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &context.namespace, &receiver)
                 .await
                 .map_err(|error| error.to_string())?;
             if holder.as_ref().is_some_and(|holder| {
@@ -2411,7 +2411,7 @@ impl CrewService {
                         handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, task, &render_options)?;
                     if let Some(project) = convoy.spec.project_ref.as_deref() {
                         let address = format!("{project}/{}/{}/{target}", context.convoy, context.vessel);
-                        let book = flotilla_store::crew_address_book(&self.resource_backend, &context.namespace, &address)
+                        let book = flotilla_messaging::crew_address_book(&self.resource_backend, &context.namespace, &address)
                             .await
                             .map_err(|error| error.to_string())?;
                         brief.content.push('\n');
@@ -2946,7 +2946,7 @@ impl CrewService {
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
-        let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
+        let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
             .await
             .map_err(|error| error.to_string())?;
         let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
@@ -2963,7 +2963,7 @@ impl CrewService {
                 .lock()
                 .await
                 .entry(request.namespace.clone())
-                .or_insert_with(|| flotilla_store::MessageInbox::new(self.resource_backend.clone(), &request.namespace))
+                .or_insert_with(|| flotilla_messaging::MessageInbox::new(self.resource_backend.clone(), &request.namespace))
                 .clone();
             let existing = self.resource_backend.using::<flotilla_resources::Message>(&request.namespace).get(&name).await.is_ok();
             let admission = inbox
@@ -2971,8 +2971,8 @@ impl CrewService {
                 .await
                 .map_err(|error| error.to_string())?;
             let object = match admission {
-                flotilla_store::MessageAdmission::Accepted(object) => object,
-                flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
+                flotilla_messaging::MessageAdmission::Accepted(object) => object,
+                flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
             (ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, object.metadata.name), !existing)
         };
@@ -2999,7 +2999,7 @@ impl CrewService {
         use flotilla_resources::MessageSpec;
         let managed_request;
         let request = if let Some(receiver) = &request.receiver {
-            let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
+            let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
                 .await
                 .map_err(|error| error.to_string())?;
             if holder.as_ref().is_none_or(|holder| {
@@ -3055,7 +3055,7 @@ impl CrewService {
             &sender,
             &crate::leaf_engine::turn_message_producer_key(&request.source, &request.subject_revision),
         );
-        let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, &request.namespace, &receiver)
+        let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, &receiver)
             .await
             .map_err(|error| error.to_string())?;
         // This is the observed admission rung, not a transport or session receipt.
@@ -3166,7 +3166,7 @@ impl CrewService {
                     .await
                     .entry(request.namespace.clone())
                     .or_insert_with(|| {
-                        flotilla_store::MessageInbox::new(self.resource_backend.clone(), &request.namespace).with_observation_staleness(
+                        flotilla_messaging::MessageInbox::new(self.resource_backend.clone(), &request.namespace).with_observation_staleness(
                             self.leaf_subscriptions.change_request_stale_after(),
                             self.leaf_subscriptions.issue_stale_after(),
                         )
@@ -3177,8 +3177,8 @@ impl CrewService {
                     .await
                     .map_err(|error| error.to_string())?;
                 let record = match admission {
-                    flotilla_store::MessageAdmission::Accepted(record) => record,
-                    flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
+                    flotilla_messaging::MessageAdmission::Accepted(record) => record,
+                    flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
                 };
                 ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name)
             };
@@ -3255,9 +3255,10 @@ impl CrewService {
                     })
                 })
                 .collect::<Vec<_>>();
-        let receiver_snapshot = flotilla_store::MessageReceiverSnapshot::load_for_addresses(&self.resource_backend, namespace, &addresses)
-            .await
-            .map_err(|error| error.to_string())?;
+        let receiver_snapshot =
+            flotilla_messaging::MessageReceiverSnapshot::load_for_addresses(&self.resource_backend, namespace, &addresses)
+                .await
+                .map_err(|error| error.to_string())?;
         for source in candidates {
             if matches!(source.provenance, ResourceProvenance::Local) {
                 continue;
@@ -3500,7 +3501,7 @@ impl CrewService {
         if let Some(publisher) = publisher {
             return publisher.publish(namespace, serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":namespace}, "spec":intent})).await;
         }
-        let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, namespace, &intent.receiver)
+        let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, namespace, &intent.receiver)
             .await
             .map_err(|error| error.to_string())?;
         if holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
@@ -3511,15 +3512,15 @@ impl CrewService {
             .lock()
             .await
             .entry(namespace.into())
-            .or_insert_with(|| flotilla_store::MessageInbox::new(self.resource_backend.clone(), namespace))
+            .or_insert_with(|| flotilla_messaging::MessageInbox::new(self.resource_backend.clone(), namespace))
             .clone();
         let admission = inbox
             .accept(&InputMeta::builder().name(name.into()).build(), intent, self.clock.now())
             .await
             .map_err(|error| error.to_string())?;
         let record = match admission {
-            flotilla_store::MessageAdmission::Accepted(record) => record,
-            flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
+            flotilla_messaging::MessageAdmission::Accepted(record) => record,
+            flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
         };
         Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
     }

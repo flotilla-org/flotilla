@@ -209,7 +209,7 @@ pub(super) async fn deliver_guarded_and_confirm(
     adapter: Option<&dyn AgentAdapter>,
     session: &str,
     text: &str,
-    inbox: &flotilla_store::MessageInbox,
+    inbox: &flotilla_messaging::MessageInbox,
     members: &[String],
 ) -> Result<TerminalDeliveryOutcome, String> {
     let deadline =

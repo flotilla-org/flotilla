@@ -119,7 +119,7 @@ use tokio::sync::Notify;
 
 // Boundary stand-in for the ordinary receiver-home ResourceApply router.
 struct ReceiverIntentPublisher {
-    inbox: flotilla_store::MessageInbox,
+    inbox: flotilla_messaging::MessageInbox,
 }
 #[async_trait]
 impl flotilla_core::leaf_engine::ResourceIntentPublisher for ReceiverIntentPublisher {
@@ -131,8 +131,8 @@ impl flotilla_core::leaf_engine::ResourceIntentPublisher for ReceiverIntentPubli
         let meta = InputMeta::builder().name(document["metadata"]["name"].as_str().ok_or("missing name")?.into()).build();
         let admission = self.inbox.accept(&meta, &spec, chrono::Utc::now()).await.map_err(|error| error.to_string())?;
         let record = match admission {
-            flotilla_store::MessageAdmission::Accepted(record) => record,
-            flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
+            flotilla_messaging::MessageAdmission::Accepted(record) => record,
+            flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
         };
         Ok(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
     }
@@ -8467,7 +8467,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
         InProcessDaemon::new(vec![], test_config_store(terminal_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
             .await;
     let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> =
-        Arc::new(ReceiverIntentPublisher { inbox: flotilla_store::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
+        Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     let snapshot = WorkflowSnapshot {
         cascade: None,
@@ -8656,7 +8656,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         InProcessDaemon::new(vec![], test_config_store(terminal_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
             .await;
     let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> =
-        Arc::new(ReceiverIntentPublisher { inbox: flotilla_store::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
+        Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
     let created = convoys

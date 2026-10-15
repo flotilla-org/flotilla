@@ -2006,7 +2006,7 @@ async fn convoy_receiver_evidence(
     namespace: &str,
     convoys: &[ReadResourceObject<ResourceConvoy>],
     convoy: &ResourceObject<ResourceConvoy>,
-) -> Result<(flotilla_store::MessageReceiverSnapshot, Option<ResourceObject<Project>>, BTreeSet<String>), String> {
+) -> Result<(flotilla_messaging::MessageReceiverSnapshot, Option<ResourceObject<Project>>, BTreeSet<String>), String> {
     use flotilla_resources::{ConvoyEnsure, CrewDefaults, FleetDesignation, FLEET_DESIGNATION_NAME, ROLE_ADDRESS_ANNOTATION};
     let project_name = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
     let target = StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone())]), true, true);
@@ -2089,10 +2089,14 @@ async fn convoy_receiver_evidence(
         let defaults = project_ops::read_definition_catalog::<CrewDefaults>(backend, namespace).await?;
         snapshot.insert_definitions(defaults)?;
     }
-    let receivers =
-        flotilla_store::MessageReceiverSnapshot::load_from_observations(&snapshot.finish(), namespace, convoys.to_vec(), terminals.items)
-            .await
-            .map_err(|error| error.to_string())?;
+    let receivers = flotilla_messaging::MessageReceiverSnapshot::load_from_observations(
+        &snapshot.finish(),
+        namespace,
+        convoys.to_vec(),
+        terminals.items,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     Ok((receivers, project, aliases))
 }
 
@@ -2103,7 +2107,7 @@ pub(super) async fn crew_message_views(
     backend: &flotilla_store::ResourceBackend,
     namespace: &str,
 ) -> Result<Vec<flotilla_protocol::query::CrewMessageView>, String> {
-    let receivers = flotilla_store::MessageReceiverSnapshot::load(backend, namespace).await.map_err(|error| error.to_string())?;
+    let receivers = flotilla_messaging::MessageReceiverSnapshot::load(backend, namespace).await.map_err(|error| error.to_string())?;
     message_views(backend, namespace, &receivers, None, &BTreeSet::new()).await
 }
 
@@ -2112,7 +2116,7 @@ pub(super) async fn crew_message_views(
 async fn message_views(
     backend: &flotilla_store::ResourceBackend,
     namespace: &str,
-    receivers: &flotilla_store::MessageReceiverSnapshot,
+    receivers: &flotilla_messaging::MessageReceiverSnapshot,
     convoy: Option<&flotilla_resources::ResourceObject<ResourceConvoy>>,
     aliases: &BTreeSet<String>,
 ) -> Result<Vec<flotilla_protocol::query::CrewMessageView>, String> {
@@ -3772,8 +3776,8 @@ mod tests {
     // reasons survive reads, and delivery identity comes only from evidence.
     #[tokio::test]
     async fn message_views_preserve_waiting_reasons_and_delivery_identity() {
+        use flotilla_messaging::MessageInbox;
         use flotilla_resources::{Message, MessageRelation, MessageSpec, MessageStatusPatch, ResolvedMessageReceiver};
-        use flotilla_store::MessageInbox;
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let inbox = MessageInbox::new(backend.clone(), "flotilla");
         let intent = MessageSpec::builder()

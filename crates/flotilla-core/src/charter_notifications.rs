@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use flotilla_agent::adapter::{
     append_convoy_work_context, build_convoy_crew_brief_with_options, CrewAssignment, CrewBriefMember, CrewBriefTemplateResolver,
 };
+use flotilla_messaging::{CharterBriefInput, CharterBriefRenderer, CharterProseRenderer};
 use flotilla_resources::{CrewSource, ResourceError, TerminalSessionSource, VESSEL_LABEL};
-use flotilla_store::{CharterBriefInput, CharterBriefRenderer, CharterProseRenderer, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use flotilla_config::ConfigStore;
 
@@ -79,7 +80,7 @@ impl CharterBriefRenderer for LiveCharterBriefRenderer {
         let scopes = requirement.map(|requirement| &requirement.credential_scopes).unwrap_or(&empty_scopes);
         append_convoy_work_context(&mut brief.content, convoy, &repositories, scopes);
         let address = format!("{}/{}/{}/{}", input.project.metadata.name, convoy.metadata.name, vessel, input.role);
-        let book = flotilla_store::crew_address_book(&self.backend, &context.namespace, &address).await?;
+        let book = flotilla_messaging::crew_address_book(&self.backend, &context.namespace, &address).await?;
         brief.content.push('\n');
         brief.content.push_str(&book.render());
         Ok(brief.content)
@@ -91,11 +92,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::Utc;
+    use flotilla_messaging::{reconcile_charter_notifications_with_renderer, MessageInbox};
     use flotilla_resources::{
         Convoy, ConvoySpec, ConvoyStatus, CrewSpec, InputMeta, Message, Project, ProjectSpec, RoleDefinition, Selector, TerminalBrief,
         TerminalCrewContext, TerminalSession, TerminalSessionSpec, VesselRequirement, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL,
     };
-    use flotilla_store::{reconcile_charter_notifications_with_renderer, MessageInbox};
 
     use super::*;
 

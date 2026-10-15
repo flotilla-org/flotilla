@@ -424,8 +424,8 @@ async fn current_position_reads_only_collection_metadata() {
 #[tokio::test]
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "requires socket bind")]
 async fn message_admission_accepts_opaque_and_large_kubernetes_versions() {
+    use flotilla_messaging::{MessageAdmission, MessageInbox};
     use flotilla_resources::{InputMeta, MessageExpectation, MessageRelation, MessageSpec};
-    use flotilla_store::{MessageAdmission, MessageInbox};
     for version in ["opaque-create-token", "184467440737095516160000"] {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind Kubernetes stand-in");
         let address = listener.local_addr().expect("server address");

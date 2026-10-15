@@ -77,7 +77,8 @@ impl flotilla_store::controller::Reconciler for MessageController {
                     .any(|delivery| delivery.message_batch.as_deref() == Some(batch))
             });
             if tracked {
-                flotilla_store::MessageTransport::release_closed(&TerminalControllerRuntime { state: Arc::clone(&self.state) }, &[]).await;
+                flotilla_messaging::MessageTransport::release_closed(&TerminalControllerRuntime { state: Arc::clone(&self.state) }, &[])
+                    .await;
             }
             return Ok(None);
         }
@@ -138,12 +139,12 @@ impl flotilla_store::controller::Reconciler for MessageController {
 }
 
 #[async_trait]
-impl flotilla_store::MessageTransport for TerminalControllerRuntime {
+impl flotilla_messaging::MessageTransport for TerminalControllerRuntime {
     async fn observe(
         &self,
         holder: &ResourceObject<TerminalSession>,
         submission: Option<&flotilla_resources::MessageSubmission>,
-    ) -> Result<flotilla_store::MessageObservation, String> {
+    ) -> Result<flotilla_messaging::MessageObservation, String> {
         let status = holder.status.as_ref().ok_or("holder status is absent")?;
         let session = status.session_id.as_deref().ok_or("holder session is absent")?;
         let now = Utc::now();
@@ -192,7 +193,7 @@ impl flotilla_store::MessageTransport for TerminalControllerRuntime {
         });
         let other_delivery = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").contains_key(session);
         let evidence = if other_delivery { None } else { evidence };
-        Ok(flotilla_store::MessageObservation {
+        Ok(flotilla_messaging::MessageObservation {
             ready: same_receiver && !other_delivery && attention.is_some_and(|attention| attention.state == TerminalAttentionState::Idle),
             working: same_receiver
                 && !other_delivery
@@ -258,25 +259,29 @@ impl flotilla_store::MessageTransport for TerminalControllerRuntime {
             }
         }
     }
-    async fn submit(&self, batch: &flotilla_store::MessageBatch) -> flotilla_store::MessageTransportOutcome {
+    async fn submit(&self, batch: &flotilla_messaging::MessageBatch) -> flotilla_messaging::MessageTransportOutcome {
         match self.adapter_for_spec(&batch.holder.spec) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                return flotilla_store::MessageTransportOutcome::NotSubmitted { reason: "agent acceptance observations unavailable".into() }
+                return flotilla_messaging::MessageTransportOutcome::NotSubmitted {
+                    reason: "agent acceptance observations unavailable".into(),
+                }
             }
-            Err(reason) => return flotilla_store::MessageTransportOutcome::NotSubmitted { reason },
+            Err(reason) => return flotilla_messaging::MessageTransportOutcome::NotSubmitted { reason },
         }
         let pool = match self.pool_for_spec(&batch.holder.spec) {
             Ok(pool) => pool,
-            Err(reason) => return flotilla_store::MessageTransportOutcome::NotSubmitted { reason },
+            Err(reason) => return flotilla_messaging::MessageTransportOutcome::NotSubmitted { reason },
         };
         let adapter = match self.adapter_for_spec(&batch.holder.spec) {
             Ok(adapter) => adapter,
-            Err(reason) => return flotilla_store::MessageTransportOutcome::NotSubmitted { reason },
+            Err(reason) => return flotilla_messaging::MessageTransportOutcome::NotSubmitted { reason },
         };
         let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
         if deliveries.contains_key(&batch.submission.session) {
-            return flotilla_store::MessageTransportOutcome::NotSubmitted { reason: "another terminal turn reserved the transport".into() };
+            return flotilla_messaging::MessageTransportOutcome::NotSubmitted {
+                reason: "another terminal turn reserved the transport".into(),
+            };
         }
         let session = batch.submission.session.clone();
         let text = batch.text.clone();
@@ -291,9 +296,9 @@ impl flotilla_store::MessageTransport for TerminalControllerRuntime {
             batch.submission.session.clone(),
             PendingTerminalDelivery { message_batch: Some(batch.submission.batch_id.clone()), message: batch.text.clone(), task },
         );
-        flotilla_store::MessageTransportOutcome::Pending
+        flotilla_messaging::MessageTransportOutcome::Pending
     }
-    async fn release(&self, batch: &flotilla_store::MessageBatch) {
+    async fn release(&self, batch: &flotilla_messaging::MessageBatch) {
         let delivery = {
             let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
             if deliveries
@@ -310,7 +315,7 @@ impl flotilla_store::MessageTransport for TerminalControllerRuntime {
         }
     }
 
-    async fn poll(&self, batch: &flotilla_store::MessageBatch) -> flotilla_store::MessageTransportOutcome {
+    async fn poll(&self, batch: &flotilla_messaging::MessageBatch) -> flotilla_messaging::MessageTransportOutcome {
         let delivery = {
             let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
             match deliveries.get(&batch.submission.session) {
@@ -319,7 +324,7 @@ impl flotilla_store::MessageTransport for TerminalControllerRuntime {
                         && delivery.message == batch.text
                         && !delivery.task.is_finished() =>
                 {
-                    return flotilla_store::MessageTransportOutcome::Pending
+                    return flotilla_messaging::MessageTransportOutcome::Pending
                 }
                 Some(delivery)
                     if delivery.message_batch.as_deref() == Some(batch.submission.batch_id.as_str()) && delivery.message == batch.text =>
@@ -331,15 +336,15 @@ impl flotilla_store::MessageTransport for TerminalControllerRuntime {
         };
         match delivery {
             Some(delivery) => message_transport_outcome(delivery.task.await.unwrap_or_else(|error| Err(error.to_string()))),
-            None => flotilla_store::MessageTransportOutcome::Unconfirmed {
+            None => flotilla_messaging::MessageTransportOutcome::Unconfirmed {
                 reason: "submission task unavailable; observing acceptance without resubmission".into(),
             },
         }
     }
 }
 
-pub(super) fn message_transport_outcome(result: Result<TerminalDeliveryOutcome, String>) -> flotilla_store::MessageTransportOutcome {
-    use flotilla_store::MessageTransportOutcome as Outcome;
+pub(super) fn message_transport_outcome(result: Result<TerminalDeliveryOutcome, String>) -> flotilla_messaging::MessageTransportOutcome {
+    use flotilla_messaging::MessageTransportOutcome as Outcome;
     match result {
         Ok(TerminalDeliveryOutcome::Pending) => Outcome::Pending,
         Ok(TerminalDeliveryOutcome::Confirmed) => Outcome::Accepted { evidence: "holder remained Working after cleat submission".into() },

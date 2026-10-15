@@ -99,7 +99,7 @@ impl MessageInbox {
                 // Status is written only after predecessor cleanup. A missing
                 // status is an unfinished admission, so replay must repair it.
                 if let Some(reference) = existing.status.as_ref().and_then(|status| status.canonical_predecessor.as_ref()) {
-                    if reference.namespace != self.messages.namespace {
+                    if reference.namespace != self.namespace {
                         return Err(ResourceError::invalid("canonical predecessor is outside the receiver inbox"));
                     }
                     let predecessor = self.messages.get(&reference.name).await?;
@@ -142,7 +142,7 @@ impl MessageInbox {
                         predecessor: flotilla_protocol::ResourceRef::new(
                             "flotilla.work/v1",
                             "Message",
-                            &self.messages.namespace,
+                            &self.namespace,
                             &predecessor.metadata.name,
                         ),
                         at: now,

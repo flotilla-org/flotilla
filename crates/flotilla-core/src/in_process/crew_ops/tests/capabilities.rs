@@ -177,29 +177,29 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     // after its turn boundary only the latest card is submitted, once.
     struct Transport {
         working: AtomicBool,
-        submitted: Mutex<Vec<flotilla_store::MessageBatch>>,
+        submitted: Mutex<Vec<flotilla_messaging::MessageBatch>>,
     }
     #[async_trait]
-    impl flotilla_store::MessageTransport for Transport {
+    impl flotilla_messaging::MessageTransport for Transport {
         async fn observe(
             &self,
             _: &ResourceObject<ResourceTerminalSession>,
             _: Option<&flotilla_resources::MessageSubmission>,
-        ) -> Result<flotilla_store::MessageObservation, String> {
+        ) -> Result<flotilla_messaging::MessageObservation, String> {
             let working = self.working.load(Ordering::SeqCst);
-            Ok(flotilla_store::MessageObservation {
+            Ok(flotilla_messaging::MessageObservation {
                 ready: !working,
                 working,
                 evidence: Some("terminal boundary".into()),
                 ..Default::default()
             })
         }
-        async fn submit(&self, batch: &flotilla_store::MessageBatch) -> flotilla_store::MessageTransportOutcome {
+        async fn submit(&self, batch: &flotilla_messaging::MessageBatch) -> flotilla_messaging::MessageTransportOutcome {
             self.submitted.lock().await.push(batch.clone());
-            flotilla_store::MessageTransportOutcome::Accepted { evidence: "accepted".into() }
+            flotilla_messaging::MessageTransportOutcome::Accepted { evidence: "accepted".into() }
         }
-        async fn poll(&self, _: &flotilla_store::MessageBatch) -> flotilla_store::MessageTransportOutcome {
-            flotilla_store::MessageTransportOutcome::Accepted { evidence: "accepted".into() }
+        async fn poll(&self, _: &flotilla_messaging::MessageBatch) -> flotilla_messaging::MessageTransportOutcome {
+            flotilla_messaging::MessageTransportOutcome::Accepted { evidence: "accepted".into() }
         }
     }
     let session = sessions.get("session").await.expect("session");
@@ -223,7 +223,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
         .await
         .expect("running holder");
     let transport = Transport { working: AtomicBool::new(true), submitted: Mutex::new(Vec::new()) };
-    let inbox = flotilla_store::MessageInbox::new(backend, "flotilla");
+    let inbox = flotilla_messaging::MessageInbox::new(backend, "flotilla");
     inbox.reconcile_delivery(&transport, Utc::now()).await.expect("busy holder");
     assert!(transport.submitted.lock().await.is_empty());
     transport.working.store(false, Ordering::SeqCst);

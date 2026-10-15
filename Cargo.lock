@@ -1655,6 +1655,7 @@ dependencies = [
  "flotilla-environment",
  "flotilla-issue-tracker",
  "flotilla-manifest",
+ "flotilla-messaging",
  "flotilla-orchestration-testkit",
  "flotilla-paths",
  "flotilla-protocol",
@@ -1723,6 +1724,7 @@ dependencies = [
  "flotilla-forge-github",
  "flotilla-issue-tracker",
  "flotilla-manifest",
+ "flotilla-messaging",
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
@@ -1866,6 +1868,7 @@ dependencies = [
  "flotilla-executor",
  "flotilla-issue-tracker",
  "flotilla-load-driver",
+ "flotilla-messaging",
  "flotilla-orchestration-testkit",
  "flotilla-paths",
  "flotilla-protocol",
@@ -2284,6 +2287,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-messaging"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bon",
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-protocol",
+ "flotilla-resources",
+ "flotilla-store",
+ "flotilla-store-memory",
+ "flotilla-store-sqlite",
+ "flotilla-store-testkit",
+ "futures",
+ "hegeltest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "flotilla-orchestration-testkit"
 version = "0.1.0"
 dependencies = [
@@ -2694,6 +2728,7 @@ dependencies = [
  "bon",
  "chrono",
  "flotilla-build-features-logging",
+ "flotilla-messaging",
  "flotilla-protocol",
  "flotilla-resources",
  "flotilla-review-bundle-object-store",

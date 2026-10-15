@@ -1479,7 +1479,7 @@ async fn leaf_engine_steady_state_reconcile_reads_no_store() {
 // when the crew repeats its report and the judge restarts between passes.
 async fn stall_message_scenario(repeat_report: bool, restart: bool) {
     use flotilla_resources::{Message, MessageSpec, StallReason};
-    struct InboxDelivery(flotilla_store::MessageInbox);
+    struct InboxDelivery(flotilla_messaging::MessageInbox);
     // Boundary stand-in for turn delivery; persist through the real Message inbox.
     #[async_trait]
     impl TurnDeliveryActuator for InboxDelivery {
@@ -1502,8 +1502,8 @@ async fn stall_message_scenario(repeat_report: bool, restart: bool) {
             let admission =
                 self.0.accept(&InputMeta::builder().name(name).build(), &spec, Utc::now()).await.map_err(|error| error.to_string())?;
             let object = match admission {
-                flotilla_store::MessageAdmission::Accepted(object) => object,
-                flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
+                flotilla_messaging::MessageAdmission::Accepted(object) => object,
+                flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
             Ok(CrewTurnAdmission {
                 new_turn: true,
@@ -1516,7 +1516,7 @@ async fn stall_message_scenario(repeat_report: bool, restart: bool) {
         }
     }
     let (backend, _, _) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
-    let delivery = Arc::new(InboxDelivery(flotilla_store::MessageInbox::new(backend.clone(), "flotilla")));
+    let delivery = Arc::new(InboxDelivery(flotilla_messaging::MessageInbox::new(backend.clone(), "flotilla")));
     let convoys = backend.using::<Convoy>("flotilla");
     let now = Utc::now();
     let stale_objects: HashMap<_, _> =

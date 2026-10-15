@@ -10,6 +10,7 @@ default = []
 skip-no-sandbox-tests = []
 
 [dependencies]
+flotilla-messaging = { path = "../flotilla-messaging" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-store-http = { path = "../flotilla-store-http" }
 flotilla-store-memory = { path = "../flotilla-store-memory" }

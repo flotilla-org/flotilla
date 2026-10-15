@@ -159,6 +159,20 @@ pub enum MessagePhase {
 }
 
 impl MessagePhase {
+    /// Every persisted phase, in lifecycle order, for derived backend predicates.
+    pub const ALL: [Self; 10] = [
+        Self::Accepted,
+        Self::WaitingOnReferences,
+        Self::Deliverable,
+        Self::Delivered,
+        Self::Satisfied,
+        Self::Answered,
+        Self::OutcomeMet,
+        Self::Expired,
+        Self::Superseded,
+        Self::DeadLettered,
+    ];
+
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Satisfied | Self::Answered | Self::OutcomeMet | Self::Expired | Self::Superseded | Self::DeadLettered)
     }
