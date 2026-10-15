@@ -1,3 +1,6 @@
+> The decided successor specs and ITF replay gate are at [specs/primitives](../../specs/primitives/README.md).
+> This directory retains the historical exploration until the real engine layer deletes it (#3220).
+
 # Prototype: Quint specs for the interacting machines (flotilla#3214, part of #3108)
 
 Model-checked specifications of the four places in the primitives model where **ordering across hosts**

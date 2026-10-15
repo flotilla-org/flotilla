@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<title>Flotilla machine trace</title>
+<style>
+body{font:16px system-ui;margin:2rem;background:#f5f6f8;color:#18222d}input[type=range]{width:60vw}main{display:flex;gap:1rem;flex-wrap:wrap}article{background:white;padding:1rem;border:1px solid #ccd3dc;border-radius:8px}svg{display:block}circle{fill:#eef1f5;stroke:#617084;stroke-width:2}.active{fill:#bee4cf;stroke:#187544;stroke-width:3}text{font:13px system-ui;text-anchor:middle}line{stroke:#8490a0;stroke-width:2}pre{white-space:pre-wrap}button{padding:.4rem}
+</style>
+<h1>Machine trace</h1>
+<p>Open a generated ITF trace. Each host shows the states visited by its machines; the current state is green. Everything stays in this page.</p>
+<input id="file" type="file" accept=".json"><p role="alert" id="error"></p>
+<p><button id="back" disabled>Previous</button> <input id="position" type="range" value="0" min="0" max="0" aria-label="Trace step" disabled> <button id="forward" disabled>Next</button> <output id="step"></output></p>
+<pre id="event"></pre><main id="hosts"></main>
+<details><summary>Current ITF state</summary><pre id="raw"></pre></details>
+<script>
+'use strict';
+let trace = [], machines = [];
+const $ = id => document.getElementById(id);
+const integer = x => x && typeof x === 'object' && '#bigint' in x ? x['#bigint'] : x;
+const pairs = x => x && x['#map'] || [];
+function node(tag, attributes, text) {
+  const n = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for(const [k,v] of Object.entries(attributes)) n.setAttribute(k,v);
+  if(text !== undefined) n.textContent = text;
+  return n;
+}
+function addMachine(host, name, stateAt) {
+  const values = trace.map(stateAt), names = [...new Set(values)];
+  machines.push({host,name,values,names});
+}
+function load(data) {
+  if(!Array.isArray(data.states) || !data.states.length) throw Error('Expected a nonempty ITF states array.');
+  trace = data.states; machines = [];
+  const first = trace[0];
+  if(typeof first['mbt::actionTaken'] !== 'string') throw Error('Expected a Quint --mbt trace.');
+  const stores = {convoys:'Convoy',ensures:'Ensure',messages:'Message',sessions:'AgentSession',resources:'Shared lifecycle',vessels:'Vessel'};
+  for(const [field,value] of Object.entries(first)) {
+    const kind=field.split('::').at(-1), title=stores[kind];
+    if(!title || !value || !Array.isArray(value['#map'])) continue;
+    for(const [key] of pairs(value)) {
+      const id=integer(key);
+      addMachine(kind==='sessions'?'Consumer host':'Home',title+' '+id,s=>{
+        const slot=pairs(s[field]).find(([k])=>integer(k)===id)[1];
+        if(slot.tag==='Absent') return 'Absent';
+        if(slot.tag!=='Present') throw Error('Unknown store slot');
+        const state=slot.value, data=state.value;
+        if(state.tag==='Live') return 'Live / '+data.tag;
+        if(state.tag==='Awaiting') return 'Awaiting / '+integer(data.receiver.session);
+        if(state.tag==='Dropped') return 'Dropped / '+data.reason.tag;
+        if(state.tag==='Abandoned') return 'Abandoned / '+data.reason;
+        if(state.tag==='Leased') return data.lifecycle.tag+' / host '+integer(data.placement.host);
+        return state.tag;
+      });
+    }
+  }
+  if(!machines.length) throw Error('No typed machine store in trace.');
+  if(first.homeStream) addMachine('Consumer host','Message replica',s=>{const stream=s.homeStream, applied=Number(integer(stream.applied));return applied ? stream.rows[applied-1].kind : 'Pending';});
+  $('position').max=trace.length-1; $('position').value=0; $('position').disabled=false;
+  $('back').disabled=false; $('forward').disabled=false; render();
+}
+function render() {
+  const index=Number($('position').value), state=trace[index];
+  $('step').textContent=`Step ${index} of ${trace.length-1}`;
+  $('event').textContent=JSON.stringify({action:state['mbt::actionTaken'],picks:state['mbt::nondetPicks'],clock:integer(state.now),consumer:integer(state.bound),alive:state.alive,stream:state.stream||state.source},null,2);
+  $('raw').textContent=JSON.stringify(state,null,2); $('hosts').replaceChildren();
+  for(const machine of machines) {
+    const card=document.createElement('article'), title=document.createElement('h2');
+    title.textContent=machine.host+' · '+machine.name; card.append(title);
+    const width=Math.max(320,machine.names.length*150), svg=node('svg',{width,height:150,viewBox:`0 0 ${width} 150`,role:'img','aria-label':title.textContent});
+    const markerId='arrow-'+machines.indexOf(machine);
+    const defs=node('defs',{}), marker=node('marker',{id:markerId,viewBox:'0 0 8 8',refX:7,refY:4,markerWidth:6,markerHeight:6,orient:'auto-start-reverse'});
+    marker.append(node('path',{d:'M0 0 L8 4 L0 8 z',fill:'#8490a0'}));defs.append(marker);svg.append(defs);
+    const x=name=>70+machine.names.indexOf(name)*150;
+    const transitions=new Set();
+    for(let i=1;i<machine.values.length;i++) if(machine.values[i]!==machine.values[i-1]) {
+      const key=JSON.stringify([machine.values[i-1],machine.values[i]]);
+      if(!transitions.has(key)) { const direction=Math.sign(x(machine.values[i])-x(machine.values[i-1])); svg.append(node('line',{x1:x(machine.values[i-1])+direction*27,y1:65,x2:x(machine.values[i])-direction*27,y2:65,'marker-end':`url(#${markerId})`})); svg.append(node('text',{x:(x(machine.values[i-1])+x(machine.values[i]))/2,y:direction>0?30:95},trace[i]['mbt::actionTaken'])); transitions.add(key); }
+    }
+    for(const name of machine.names) {
+      svg.append(node('circle',{cx:x(name),cy:65,r:25,class:name===machine.values[index]?'active':''}));
+      svg.append(node('text',{x:x(name),y:112},name));
+    }
+    card.append(svg); $('hosts').append(card);
+  }
+  $('back').disabled=index===0; $('forward').disabled=index===trace.length-1;
+}
+$('file').onchange=async event=>{try{$('error').textContent='';load(JSON.parse(await event.target.files[0].text()));}catch(error){$('error').textContent=error.message;}};
+$('position').oninput=render;
+$('back').onclick=()=>{$('position').value=Number($('position').value)-1;render();};
+$('forward').onclick=()=>{$('position').value=Number($('position').value)+1;render();};
+</script>
+</html>

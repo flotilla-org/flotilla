@@ -1,0 +1,11 @@
+--- a/machines/vessel.qnt
++++ b/machines/vessel.qnt
+@@ -14,7 +14,7 @@
+         | Place(o) => if (not(o.admitted)) Refused(NotAdmitted)
+             else if (o.live >= o.cap) Refused(QuotaExceeded)
+             else if (not(fits(r, o.available))) Refused(DoesNotFit)
+-            else if (o.waiting.exists(w => w.priority > r.priority and fits(w, o.available))) Refused(HigherPriorityWaiting)
++            else if (false) Refused(HigherPriorityWaiting)
+             else Moved(Leased({ placement: { request: r, host: o.host, available: o.available, waiting: o.waiting }, lifecycle: L::Requested }))
+         | _ => Refused(WrongState)
+       }
