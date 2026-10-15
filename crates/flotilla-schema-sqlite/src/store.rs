@@ -12,13 +12,14 @@ use std::{
 };
 
 use flotilla_schema::{
-    ColumnType, DdlMode, DecodeError, Decoder, Encoder, Hash, Identity, Kind, KindCode, KindRegistry, Row, Rows, TableRole, Value,
+    ColumnType, DdlMode, DecodeError, Decoder, Encoder, Hash, Identity, Kind, KindCode, KindRegistry, Row, RowChange, RowOp, Rows,
+    TableRole, Value,
 };
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{
     cache::TwoGen,
-    error::StoreError,
+    error::{Malformed, StoreError},
     shared::{schema_ddl, MEDIA_CBOR},
     sql::{KindSql, TableSql},
 };
@@ -188,6 +189,23 @@ impl Read<'_> {
     pub fn load_snapshot(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
         self.ctx().snapshot(id)
     }
+
+    /// Up to `limit` logged changes of resource `id` after `after`, in sequence order: the tail
+    /// that follows a snapshot at version `after`.
+    pub fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
+        self.ctx().changes(id, after, limit)
+    }
+
+    /// Up to `limit` logged changes homed at `home` after sequence `after`, in home order; page
+    /// with the last returned `home_seq`.
+    pub fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
+        self.ctx().changes_since(home, after, limit)
+    }
+
+    /// The highest sequence of `home` this store has taken or applied; 0 when none.
+    pub fn last_sequence(&mut self, home: &str) -> Result<u64, StoreError> {
+        self.ctx().last_sequence(home)
+    }
 }
 
 /// Ids this transaction created or read, served before the committed caches. The journal
@@ -260,10 +278,27 @@ impl Write<'_> {
         self.ctx().snapshot(id)
     }
 
+    /// Up to `limit` logged changes of resource `id` after `after`, in sequence order: the tail
+    /// that follows a snapshot at version `after`.
+    pub fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
+        self.ctx().changes(id, after, limit)
+    }
+
+    /// Up to `limit` logged changes homed at `home` after sequence `after`, in home order; page
+    /// with the last returned `home_seq`.
+    pub fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
+        self.ctx().changes_since(home, after, limit)
+    }
+
+    /// The highest sequence of `home` this store has taken or applied; 0 when none.
+    pub fn last_sequence(&mut self, home: &str) -> Result<u64, StoreError> {
+        self.ctx().last_sequence(home)
+    }
+
     /// Inserts a resource homed here. Its version is the next local home sequence.
     pub fn insert<K: Kind>(&mut self, name: &str, value: &K) -> Result<Stamp, StoreError> {
         let rows = Encoder::encode(value)?;
-        self.guarded(|ctx| ctx.insert::<K>(name, &rows))
+        self.guarded(|ctx| ctx.insert::<K>(name, rows))
     }
 
     /// Writes only the rows that differ between `current.value` and `next`, refusing if the
@@ -276,6 +311,20 @@ impl Write<'_> {
 
     pub fn delete<K: Kind>(&mut self, current: Stamp) -> Result<(), StoreError> {
         self.guarded(|ctx| ctx.delete::<K>(current))
+    }
+
+    /// Applies a change homed elsewhere, as replication receives it: the kind must be
+    /// registered (`UnknownKind`), the home must not be this store's (`OwnHome`), and a change at
+    /// or below the resource's last applied sequence is `Duplicate` and changes nothing, so
+    /// replaying a log is idempotent. Otherwise the ops run through the kind's statements, the
+    /// resource's version becomes `home_seq`, objects are verified against their hashes, the
+    /// change is appended to this store's `change_log` under its own home, and that home's
+    /// `home_sequence` rises to at least `home_seq`.
+    ///
+    /// A deleted resource's last sequence is its delete's log row: trimming that row lets an
+    /// older change of the resource apply again.
+    pub fn apply(&mut self, change: &RowChange) -> Result<Applied, StoreError> {
+        self.guarded(|ctx| ctx.apply(change))
     }
 
     pub fn commit(self) -> Result<(), StoreError> {
@@ -294,10 +343,22 @@ impl Write<'_> {
     }
 }
 
+const LOG_APPEND: &str = "INSERT INTO change_log (home, home_seq, resource_id, change) VALUES (?1, ?2, ?3, ?4)";
+
+/// What `apply` did with a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// The change's rows were written; the resource is at the change's sequence.
+    Applied(Stamp),
+    /// The resource was already at or past the change's sequence; nothing was written.
+    Duplicate(ResourceId),
+}
+
 /// One table's change within an update.
 enum Change<'r> {
     Insert(&'r Row),
-    Update(&'r Row),
+    /// The row before, and after.
+    Update(&'r Row, &'r Row),
     Delete(&'r Row),
 }
 
@@ -458,33 +519,32 @@ impl Ctx<'_> {
         values.iter().map(|value| self.param(value)).collect()
     }
 
-    /// Stores the objects the given rows name; equal content shares one row.
-    fn put_objects<'r>(&mut self, rows: impl IntoIterator<Item = &'r Row>, objects: &BTreeMap<Hash, Vec<u8>>) -> Result<(), StoreError> {
+    /// Stores the given objects, which `objects` holds; equal content shares one row. Returns a
+    /// `PutObject` for every one of them, stored now or before, moving its bytes out of
+    /// `objects`: a change carries every object it sets, so it applies on its own to a receiver
+    /// holding the resource's earlier state.
+    fn put_objects(&mut self, hashes: BTreeSet<Hash>, objects: &mut BTreeMap<Hash, Vec<u8>>) -> Result<Vec<RowOp>, StoreError> {
         let mut statement = self.conn.prepare_cached("INSERT OR IGNORE INTO objects (hash, media, bytes) VALUES (?1, ?2, ?3)")?;
-        let mut seen = BTreeSet::new();
-        for row in rows {
-            for value in row.key.iter().chain(&row.values) {
-                if let Value::Object(hash) = value {
-                    if seen.insert(*hash) {
-                        let bytes = objects.get(hash).ok_or(DecodeError::MissingObject { hash: *hash })?;
-                        statement.execute(params![&hash.0[..], MEDIA_CBOR, bytes])?;
-                    }
-                }
-            }
+        let mut ops = Vec::new();
+        for hash in hashes {
+            let bytes = objects.get(&hash).ok_or(DecodeError::MissingObject { hash })?;
+            statement.execute(params![&hash.0[..], MEDIA_CBOR, bytes])?;
+            let bytes = objects.remove(&hash).expect("present");
+            ops.push(RowOp::PutObject { hash, media: MEDIA_CBOR as u8, bytes });
         }
-        Ok(())
+        Ok(ops)
     }
 
-    fn insert_row(&mut self, code: KindCode, table: usize, owner: ResourceId, row: &Row) -> Result<(), StoreError> {
+    fn insert_row(&mut self, code: KindCode, table: usize, owner: ResourceId, key: &[Value], values: &[Value]) -> Result<(), StoreError> {
         let mut params = vec![SqlValue::Integer(owner.0)];
-        params.extend(self.params(&row.key)?);
-        params.extend(self.params(&row.values)?);
+        params.extend(self.params(key)?);
+        params.extend(self.params(values)?);
         let sql = &self.sql(code)?.tables[table].insert;
         self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
         Ok(())
     }
 
-    fn insert<K: Kind>(&mut self, name: &str, rows: &Rows) -> Result<Stamp, StoreError> {
+    fn insert<K: Kind>(&mut self, name: &str, mut rows: Rows) -> Result<Stamp, StoreError> {
         self.sql(K::CODE)?;
         let identity = Identity { kind: K::CODE, name: name.to_owned(), home: self.runtime.home.clone() };
         let id = self.ensure_identity(&identity)?;
@@ -493,31 +553,32 @@ impl Ctx<'_> {
             return Err(StoreError::Exists { kind: K::CODE, name: name.to_owned() });
         }
         let (sequence, version) = self.next_sequence()?;
-        self.put_objects(rows.tables.iter().flatten(), &rows.objects)?;
-        let mut params = vec![SqlValue::Integer(id.0), SqlValue::Integer(sequence)];
-        params.extend(self.params(&rows.tables[0][0].values)?);
-        let sql = &self.sql(K::CODE)?.tables[0].insert;
-        self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
+        // Objects before any row naming them: their foreign keys are checked per statement.
+        let hashes = rows.tables.iter().flatten().flat_map(|row| set_objects(None, row)).collect();
+        let mut ops = self.put_objects(hashes, &mut rows.objects)?;
+        let objects = ops.len();
         // Pre-order puts every parent table before its children.
-        for (table, table_rows) in rows.tables.iter().enumerate().skip(1) {
-            for row in table_rows {
-                self.insert_row(K::CODE, table, id, row)?;
-            }
+        for (table, table_rows) in rows.tables.into_iter().enumerate() {
+            let name = &self.sql(K::CODE)?.tables[table].name;
+            ops.extend(table_rows.into_iter().map(|row| RowOp::Insert { table: name.clone(), key: row.key, values: row.values }));
         }
+        self.execute(K::CODE, id, &ops[objects..], sequence, None)?;
+        self.append_log(identity, id, (sequence, version), ops)?;
         Ok(Stamp { id, version })
     }
 
     fn update<K: Kind>(&mut self, current: Stamp, mut old: Rows, mut new: Rows) -> Result<Stamp, StoreError> {
-        self.owned::<K>(current.id)?;
+        let identity = self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
         // The encoder already emits each table in key order (positions ascend, maps are
         // ordered, nested rows follow their parent); the diff's merge relies on that order,
         // so it is restored here rather than trusted.
         old.sort();
         new.sort();
+        let Rows { tables: new, objects: mut new_objects } = new;
         let sql = self.sql(K::CODE)?;
-        let changes = diff(&sql.tables, &old, &new)?;
-        let root_changed = old.tables[0][0].values != new.tables[0][0].values;
+        let changes = diff(&sql.tables, &old.tables, &new)?;
+        let root_changed = old.tables[0][0].values != new[0][0].values;
         if !root_changed && changes.iter().all(Vec::is_empty) {
             // A no-op still answers whether the caller's version is current.
             let stored: Option<i64> =
@@ -529,74 +590,268 @@ impl Ctx<'_> {
             };
         }
         let (sequence, version) = self.next_sequence()?;
-        // Objects before any row naming them: their foreign keys are checked per statement. A
-        // refused write rolls them back with its savepoint.
+        // Objects before any row naming them. A refused write rolls them back with its savepoint.
+        // Only objects this change sets: an unchanged object column names an object the
+        // receiver already holds, from a snapshot or the change that set it.
         let changed = changes.iter().flatten().filter_map(|change| match change {
-            Change::Insert(row) | Change::Update(row) => Some(*row),
+            Change::Insert(row) => Some((None, *row)),
+            Change::Update(before, after) => Some((Some(*before), *after)),
             Change::Delete(_) => None,
         });
+        let root = root_changed.then(|| (Some(&old.tables[0][0]), &new[0][0]));
+        let hashes = changed.chain(root).flat_map(|(before, after)| set_objects(before, after)).collect();
         // Objects first: the root and child rows reference them through immediate foreign keys.
         // A stale write therefore inserts its objects before the version check refuses it; the
         // savepoint rolls them back, and the cost is only paid by writes that lose a race.
-        self.put_objects(changed.chain(root_changed.then(|| &new.tables[0][0])), &new.objects)?;
-        // The root row next: a stale version is refused before any child row changes.
-        let updated = if root_changed {
-            let mut params = vec![SqlValue::Integer(sequence)];
-            params.extend(self.params(&new.tables[0][0].values)?);
-            params.extend([SqlValue::Integer(current.id.0), SqlValue::Integer(expected)]);
-            let sql = &self.sql(K::CODE)?.tables[0].update;
-            self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?
-        } else {
-            let sql = &self.sql(K::CODE)?.root_update_version;
-            self.conn.prepare_cached(sql)?.execute(params![sequence, current.id.0, expected])?
+        let mut ops = self.put_objects(hashes, &mut new_objects)?;
+        let objects = ops.len();
+        let tables = &self.sql(K::CODE)?.tables;
+        let op = |table: usize, change: &Change<'_>| {
+            let table = tables[table].name.clone();
+            match change {
+                Change::Insert(row) => RowOp::Insert { table, key: row.key.clone(), values: row.values.clone() },
+                Change::Update(_, row) => RowOp::Update { table, key: row.key.clone(), values: row.values.clone() },
+                Change::Delete(row) => RowOp::Delete { table, key: row.key.clone() },
+            }
         };
-        if updated == 0 {
+        // The root row first: a stale version is refused before any child row changes.
+        if root_changed {
+            ops.push(RowOp::Update { table: tables[0].name.clone(), key: Vec::new(), values: new[0][0].values.clone() });
+        }
+        // Deletes deepest table first, so no child outlives its parent row; then updates; then
+        // inserts shallowest table first, so every parent row exists before its children.
+        for (table, changes) in changes.iter().enumerate().rev() {
+            ops.extend(changes.iter().filter(|change| matches!(change, Change::Delete(_))).map(|change| op(table, change)));
+        }
+        for inserts in [false, true] {
+            for (table, changes) in changes.iter().enumerate() {
+                let wanted = |change: &&Change<'_>| matches!((change, inserts), (Change::Update(..), false) | (Change::Insert(_), true));
+                ops.extend(changes.iter().filter(wanted).map(|change| op(table, change)));
+            }
+        }
+        if !self.execute(K::CODE, current.id, &ops[objects..], sequence, Some(expected))? {
             return Err(self.stale::<K>(current));
         }
-        // Deletes deepest table first, so no child outlives its parent row.
-        for (table, changes) in changes.iter().enumerate().rev() {
-            for change in changes {
-                if let Change::Delete(row) = change {
-                    let mut params = vec![SqlValue::Integer(current.id.0)];
-                    params.extend(self.params(&row.key)?);
-                    let sql = &self.sql(K::CODE)?.tables[table].delete;
-                    self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
-                }
-            }
-        }
-        for (table, changes) in changes.iter().enumerate() {
-            for change in changes {
-                if let Change::Update(row) = change {
-                    let mut params = self.params(&row.values)?;
-                    params.push(SqlValue::Integer(current.id.0));
-                    params.extend(self.params(&row.key)?);
-                    let sql = &self.sql(K::CODE)?.tables[table].update;
-                    self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
-                }
-            }
-        }
-        // Inserts shallowest table first, so every parent row exists before its children.
-        for (table, changes) in changes.iter().enumerate() {
-            for change in changes {
-                if let Change::Insert(row) = change {
-                    self.insert_row(K::CODE, table, current.id, row)?;
-                }
-            }
-        }
+        self.append_log(identity, current.id, (sequence, version), ops)?;
         Ok(Stamp { id: current.id, version })
     }
 
     fn delete<K: Kind>(&mut self, current: Stamp) -> Result<(), StoreError> {
-        self.owned::<K>(current.id)?;
+        let identity = self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
-        self.next_sequence()?;
-        let sql = &self.sql(K::CODE)?.root_delete;
-        // Child rows go with the root row through their cascading foreign keys.
-        let deleted = self.conn.prepare_cached(sql)?.execute(params![current.id.0, expected])?;
-        if deleted == 0 {
+        let (sequence, version) = self.next_sequence()?;
+        let ops = vec![RowOp::DeleteResource];
+        if !self.execute(K::CODE, current.id, &ops, sequence, Some(expected))? {
             return Err(self.stale::<K>(current));
         }
+        self.append_log(identity, current.id, (sequence, version), ops)?;
         Ok(())
+    }
+
+    /// Applies a change homed elsewhere: see [`Write::apply`].
+    fn apply(&mut self, change: &RowChange) -> Result<Applied, StoreError> {
+        let root = self.sql(change.kind)?.root_version.clone();
+        if change.home == self.runtime.home {
+            return Err(StoreError::OwnHome { home: change.home.clone() });
+        }
+        let sequence = i64::try_from(change.home_seq).map_err(|_| Malformed::Sequence { home_seq: change.home_seq })?;
+        let identity = Identity { kind: change.kind, name: change.name.clone(), home: change.home.clone() };
+        let id = self.ensure_identity(&identity)?;
+        let stored: Option<i64> = self.conn.prepare_cached(&root)?.query_row([id.0], |row| row.get(0)).optional()?;
+        // A deleted resource has no version; its last logged change still marks how far it got.
+        let logged: Option<i64> =
+            self.conn.prepare_cached("SELECT max(home_seq) FROM change_log WHERE resource_id = ?1")?.query_row([id.0], |row| row.get(0))?;
+        if stored.max(logged).is_some_and(|current| sequence <= current) {
+            return Ok(Applied::Duplicate(id));
+        }
+        self.check_objects(&change.ops)?;
+        if !self.execute(change.kind, id, &change.ops, sequence, stored)? {
+            return Err(StoreError::NotFound { id });
+        }
+        let home = self.intern(&change.home)?;
+        self.conn.prepare_cached(LOG_APPEND)?.execute(params![home, sequence, id.0, change.encode()?])?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO home_sequence (home, last) VALUES (?1, ?2) ON CONFLICT (home) DO UPDATE SET last = max(last, excluded.last)",
+            )?
+            .execute(params![home, sequence])?;
+        Ok(Applied::Applied(Stamp { id, version: change.home_seq }))
+    }
+
+    /// A change carries every object it sets; an unchanged object column of an updated row names
+    /// an object the resource's earlier state brought. Refuses, as `MissingObject`, a change whose
+    /// rows name an object it neither carries nor finds here, before any statement runs.
+    fn check_objects(&mut self, ops: &[RowOp]) -> Result<(), StoreError> {
+        let mut named = BTreeSet::new();
+        let mut put = BTreeSet::new();
+        for op in ops {
+            match op {
+                RowOp::PutObject { hash, .. } => {
+                    put.insert(*hash);
+                }
+                RowOp::Insert { key, values, .. } | RowOp::Update { key, values, .. } => {
+                    named.extend(key.iter().chain(values).filter_map(|value| match value {
+                        Value::Object(hash) => Some(*hash),
+                        _ => None,
+                    }));
+                }
+                RowOp::Delete { .. } | RowOp::DeleteResource => {}
+            }
+        }
+        let mut statement = self.conn.prepare_cached("SELECT 1 FROM objects WHERE hash = ?1")?;
+        for hash in named.difference(&put) {
+            if statement.query_row([&hash.0[..]], |_| Ok(())).optional()?.is_none() {
+                return Err(StoreError::MissingObject { hash: *hash });
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends a local write's change under this home, at the sequence the write took.
+    fn append_log(
+        &mut self,
+        identity: Identity,
+        id: ResourceId,
+        (sequence, version): (i64, u64),
+        ops: Vec<RowOp>,
+    ) -> Result<(), StoreError> {
+        let home = self.intern(&identity.home)?;
+        let change = RowChange { kind: identity.kind, name: identity.name, home: identity.home, home_seq: version, ops };
+        self.conn.prepare_cached(LOG_APPEND)?.execute(params![home, sequence, id.0, change.encode()?])?;
+        Ok(())
+    }
+
+    /// The index of a change's table within its kind, refusing a key or values that do not
+    /// match its columns. `values` is `None` for a delete.
+    fn table_of(&self, code: KindCode, name: &str, key: &[Value], values: Option<&[Value]>) -> Result<usize, StoreError> {
+        let tables = &self.sql(code)?.tables;
+        let index = tables.iter().position(|table| table.name == name).ok_or_else(|| Malformed::UnknownTable { table: name.to_owned() })?;
+        let table = &tables[index];
+        let data = table.columns.len() - table.key_len;
+        if key.len() != table.key_len || values.is_some_and(|values| values.len() != data) {
+            return Err(Malformed::Shape { table: name.to_owned() }.into());
+        }
+        Ok(index)
+    }
+
+    /// Executes row ops for resource `id` through the kind's statements, as a write at
+    /// `sequence`. `expected` is the root row's version before the write (`None` when it has
+    /// none). Every write moves the root to `sequence`: by the root op, or by a version update
+    /// when the ops name only child rows. Returns `false` when the root row is not at
+    /// `expected`, so the caller can tell a conflict from a missing resource.
+    fn execute(&mut self, code: KindCode, id: ResourceId, ops: &[RowOp], sequence: i64, expected: Option<i64>) -> Result<bool, StoreError> {
+        // Every op's shape first, so a malformed change is refused as such rather than by the
+        // first statement it reaches.
+        let mut names_root = false;
+        for op in ops {
+            match op {
+                RowOp::Insert { table, key, values } | RowOp::Update { table, key, values } => {
+                    names_root |= self.table_of(code, table, key, Some(values))? == 0;
+                }
+                RowOp::Delete { table, key } => {
+                    if self.table_of(code, table, key, None)? == 0 {
+                        return Err(Malformed::RootDelete { table: table.clone() }.into());
+                    }
+                }
+                RowOp::DeleteResource => names_root = true,
+                RowOp::PutObject { .. } => {}
+            }
+        }
+        if !names_root {
+            let Some(expected) = expected else { return Ok(false) };
+            let sql = &self.sql(code)?.root_update_version;
+            if self.conn.prepare_cached(sql)?.execute(params![sequence, id.0, expected])? == 0 {
+                return Ok(false);
+            }
+        }
+        for op in ops {
+            match op {
+                RowOp::PutObject { hash, media, bytes } => {
+                    if Hash::of(bytes) != *hash {
+                        return Err(StoreError::TamperedObject { hash: *hash });
+                    }
+                    self.conn
+                        .prepare_cached("INSERT OR IGNORE INTO objects (hash, media, bytes) VALUES (?1, ?2, ?3)")?
+                        .execute(params![&hash.0[..], media, bytes])?;
+                }
+                RowOp::Insert { table, key, values } => match self.table_of(code, table, key, Some(values))? {
+                    0 => {
+                        let mut params = vec![SqlValue::Integer(id.0), SqlValue::Integer(sequence)];
+                        params.extend(self.params(values)?);
+                        let sql = &self.sql(code)?.tables[0].insert;
+                        self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
+                    }
+                    index => self.insert_row(code, index, id, key, values)?,
+                },
+                RowOp::Update { table, key, values } => {
+                    let index = self.table_of(code, table, key, Some(values))?;
+                    if self.sql(code)?.tables[index].update.is_empty() {
+                        return Err(Malformed::Shape { table: table.clone() }.into());
+                    }
+                    let mut params = Vec::new();
+                    if index == 0 {
+                        let Some(expected) = expected else { return Ok(false) };
+                        params.push(SqlValue::Integer(sequence));
+                        params.extend(self.params(values)?);
+                        params.extend([SqlValue::Integer(id.0), SqlValue::Integer(expected)]);
+                    } else {
+                        params.extend(self.params(values)?);
+                        params.push(SqlValue::Integer(id.0));
+                        params.extend(self.params(key)?);
+                    }
+                    let sql = &self.sql(code)?.tables[index].update;
+                    if self.conn.prepare_cached(sql)?.execute(params_from_iter(params))? == 0 && index == 0 {
+                        return Ok(false);
+                    }
+                }
+                RowOp::Delete { table, key } => {
+                    let index = self.table_of(code, table, key, None)?;
+                    let mut params = vec![SqlValue::Integer(id.0)];
+                    params.extend(self.params(key)?);
+                    let sql = &self.sql(code)?.tables[index].delete;
+                    self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
+                }
+                RowOp::DeleteResource => {
+                    let Some(expected) = expected else { return Ok(false) };
+                    // Child rows go with the root row through their cascading foreign keys.
+                    let sql = &self.sql(code)?.root_delete;
+                    if self.conn.prepare_cached(sql)?.execute(params![id.0, expected])? == 0 {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Logged changes of one resource after `after`, by `change_log_by_resource`.
+    fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT change FROM change_log WHERE resource_id = ?1 AND home_seq > ?2 ORDER BY home_seq LIMIT ?3")?;
+        let rows = statement.query_map(params![id.0, after, limit], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|bytes| Ok(RowChange::decode(&bytes?)?)).collect()
+    }
+
+    /// Logged changes homed at `home` after `after`, in home order, by the primary key.
+    fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
+        let Some(home) = self.string_id(home)? else { return Ok(Vec::new()) };
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let mut statement =
+            self.conn.prepare_cached("SELECT change FROM change_log WHERE home = ?1 AND home_seq > ?2 ORDER BY home_seq LIMIT ?3")?;
+        let rows = statement.query_map(params![home, after, limit], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|bytes| Ok(RowChange::decode(&bytes?)?)).collect()
+    }
+
+    /// The highest sequence taken (this home) or applied (another home) for `home`; 0 when none.
+    fn last_sequence(&mut self, home: &str) -> Result<u64, StoreError> {
+        let Some(home) = self.string_id(home)? else { return Ok(0) };
+        let last: Option<i64> =
+            self.conn.prepare_cached("SELECT last FROM home_sequence WHERE home = ?1")?.query_row([home], |row| row.get(0)).optional()?;
+        last.map_or(Ok(0), |last| {
+            u64::try_from(last).map_err(|_| StoreError::Corrupt { table: "home_sequence".into(), column: "last".into() })
+        })
     }
 
     /// Why a version-checked root write matched no row. Identity rows outlive their resource,
@@ -701,6 +956,18 @@ impl Ctx<'_> {
     }
 }
 
+/// The objects a row write sets: every object of an inserted row (`before` is `None`), and the
+/// object columns of an updated row whose value differs from `before`.
+fn set_objects<'r>(before: Option<&'r Row>, after: &'r Row) -> impl Iterator<Item = Hash> + 'r {
+    let all = before.is_none().then(|| after.key.iter()).into_iter().flatten();
+    let changed =
+        after.values.iter().enumerate().filter(move |(n, value)| before.is_none_or(|before| before.values.get(*n) != Some(*value)));
+    all.chain(changed.map(|(_, value)| value)).filter_map(|value| match value {
+        Value::Object(hash) => Some(*hash),
+        _ => None,
+    })
+}
+
 /// A caller's version as stored. One that cannot be stored cannot be current either.
 fn expected_version(current: Stamp) -> Result<i64, StoreError> {
     i64::try_from(current.version).map_err(|_| StoreError::Conflict { id: current.id, expected: current.version })
@@ -709,14 +976,14 @@ fn expected_version(current: Stamp) -> Result<i64, StoreError> {
 /// Per-table row changes between two sorted encodings of one resource, enforcing each table's
 /// role. A removed `records` or `history` row is allowed only when its parent row is removed too
 /// (the rows go with it); otherwise it is `AppendOnly` or `Immutable`.
-fn diff<'r>(tables: &[TableSql], old: &'r Rows, new: &'r Rows) -> Result<Vec<Vec<Change<'r>>>, StoreError> {
+fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Result<Vec<Vec<Change<'r>>>, StoreError> {
     let mut changes: Vec<Vec<Change<'r>>> = (0..tables.len()).map(|_| Vec::new()).collect();
     let mut removed: Vec<BTreeSet<&'r [Value]>> = (0..tables.len()).map(|_| BTreeSet::new()).collect();
     for (index, table) in tables.iter().enumerate().skip(1) {
         let parent = table.parent.expect("child tables have a parent");
         let parent_key_len = tables[parent].key_len;
-        let mut old_rows = old.tables[index].iter().peekable();
-        let mut new_rows = new.tables[index].iter().peekable();
+        let mut old_rows = old[index].iter().peekable();
+        let mut new_rows = new[index].iter().peekable();
         loop {
             let order = match (old_rows.peek(), new_rows.peek()) {
                 (None, None) => break,
@@ -743,7 +1010,7 @@ fn diff<'r>(tables: &[TableSql], old: &'r Rows, new: &'r Rows) -> Result<Vec<Vec
                         if table.role == TableRole::History {
                             return Err(StoreError::Immutable { table: table.name.clone() });
                         }
-                        changes[index].push(Change::Update(after));
+                        changes[index].push(Change::Update(before, after));
                     }
                 }
             }
@@ -786,7 +1053,7 @@ mod tests {
             for change in changes {
                 let (kind, row) = match change {
                     Change::Insert(row) => ("insert", row),
-                    Change::Update(row) => ("update", row),
+                    Change::Update(_, row) => ("update", row),
                     Change::Delete(row) => ("delete", row),
                 };
                 out.push((table, kind, row.key.clone()));
@@ -802,7 +1069,7 @@ mod tests {
         let sql = tables(TableRole::Child, TableRole::Child);
         let old = rows(vec![row(&[0], "a"), row(&[1], "b"), row(&[2], "c")], vec![]);
         let new = rows(vec![row(&[0], "a"), row(&[1], "B"), row(&[3], "d")], vec![]);
-        let changes = diff(&sql.tables, &old, &new).expect("diff");
+        let changes = diff(&sql.tables, &old.tables, &new.tables).expect("diff");
         assert_eq!(
             summary(&changes),
             [(1, "update", vec![Value::Int(1)]), (1, "delete", vec![Value::Int(2)]), (1, "insert", vec![Value::Int(3)])]
@@ -815,22 +1082,27 @@ mod tests {
     fn records_and_history_rules() {
         let records = tables(TableRole::Records, TableRole::Child);
         let (old, new) = (rows(vec![row(&[0], "a")], vec![]), rows(vec![row(&[0], "A"), row(&[1], "b")], vec![]));
-        assert_eq!(summary(&diff(&records.tables, &old, &new).expect("replace and append")).len(), 2);
+        assert_eq!(summary(&diff(&records.tables, &old.tables, &new.tables).expect("replace and append")).len(), 2);
         assert!(matches!(
-            diff(&records.tables, &rows(vec![row(&[0], "a")], vec![]), &rows(vec![], vec![])),
+            diff(&records.tables, &rows(vec![row(&[0], "a")], vec![]).tables, &rows(vec![], vec![]).tables),
             Err(StoreError::AppendOnly { .. })
         ));
 
         let history = tables(TableRole::History, TableRole::Child);
         assert!(matches!(
-            diff(&history.tables, &rows(vec![row(&[0], "a")], vec![]), &rows(vec![row(&[0], "A")], vec![])),
+            diff(&history.tables, &rows(vec![row(&[0], "a")], vec![]).tables, &rows(vec![row(&[0], "A")], vec![]).tables),
             Err(StoreError::Immutable { .. })
         ));
         assert!(matches!(
-            diff(&history.tables, &rows(vec![row(&[0], "a")], vec![]), &rows(vec![], vec![])),
+            diff(&history.tables, &rows(vec![row(&[0], "a")], vec![]).tables, &rows(vec![], vec![]).tables),
             Err(StoreError::Immutable { .. })
         ));
-        assert!(diff(&history.tables, &rows(vec![row(&[0], "a")], vec![]), &rows(vec![row(&[0], "a"), row(&[1], "b")], vec![])).is_ok());
+        assert!(diff(
+            &history.tables,
+            &rows(vec![row(&[0], "a")], vec![]).tables,
+            &rows(vec![row(&[0], "a"), row(&[1], "b")], vec![]).tables
+        )
+        .is_ok());
     }
 
     // Behaviour: records nested in a removed child row go with their parent.
@@ -839,10 +1111,10 @@ mod tests {
         let sql = tables(TableRole::Child, TableRole::Records);
         let old = rows(vec![row(&[0], "a")], vec![row(&[0, 0], "n")]);
         let empty = rows(vec![], vec![]);
-        let changes = diff(&sql.tables, &old, &empty).expect("cascade allowed");
+        let changes = diff(&sql.tables, &old.tables, &empty.tables).expect("cascade allowed");
         assert_eq!(summary(&changes), [(1, "delete", vec![Value::Int(0)]), (2, "delete", vec![Value::Int(0), Value::Int(0)])]);
         assert!(matches!(
-            diff(&sql.tables, &old, &rows(vec![row(&[0], "a")], vec![])),
+            diff(&sql.tables, &old.tables, &rows(vec![row(&[0], "a")], vec![]).tables),
             Err(StoreError::AppendOnly { table }) if table == "k_items_notes"
         ));
     }

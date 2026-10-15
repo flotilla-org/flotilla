@@ -112,7 +112,7 @@ fn update<K: Kind>(store: &mut Store, current: &Loaded<K>, next: &K) {
 }
 
 // Behaviour (#3320 production shape): an update writes only the rows that changed, plus the root
-// row's version and the home sequence. Appending one record is one insert; replacing one record
+// row's version, the home sequence and one change-log row. Appending one record is one insert; replacing one record
 // with one new gate input is one update and one insert; changing one of three repositories is
 // one update; an unchanged collection writes nothing.
 #[test]
@@ -134,7 +134,7 @@ fn updates_write_only_changed_rows() {
     let mut appended = message.clone();
     appended.edges.push(event("alice"));
     let (mut store, written) = rows_written(store, |store| update(store, &current, &appended));
-    assert_eq!(written, 3, "one record row, the root version and the home sequence");
+    assert_eq!(written, 4, "one record row, the root version, the home sequence and the change log");
 
     let current = load(&mut store, &current);
     let mut replaced = appended.clone();
@@ -143,11 +143,11 @@ fn updates_write_only_changed_rows() {
     with_input.inputs.push(GateInput { observed: Identity { kind: Message::CODE, name: "m".into(), home: LOCAL.into() }, version: 1 });
     replaced.edges.replace(1, with_input);
     let (store, written) = rows_written(store, |store| update(store, &current, &replaced));
-    assert_eq!(written, 4, "the record row, its new gate input, the root version and the home sequence");
+    assert_eq!(written, 5, "the record row, its new gate input, the root version, the home sequence and the change log");
 
     let changed = Convoy { repositories: vec![repository("a"), repository("B"), repository("c")], ..convoy.clone() };
     let (mut store, written) = rows_written(store, |store| update(store, &convoy_current, &changed));
-    assert_eq!(written, 3, "one repository row, the root version and the home sequence");
+    assert_eq!(written, 4, "one repository row, the root version, the home sequence and the change log");
 
     let convoy_current = load(&mut store, &convoy_current);
     let (_, written) = rows_written(store, |store| update(store, &convoy_current, &changed));

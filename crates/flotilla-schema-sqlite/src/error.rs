@@ -1,4 +1,4 @@
-use flotilla_schema::{DecodeError, EncodeError, KindCode, RegistryError};
+use flotilla_schema::{ChangeError, DecodeError, EncodeError, Hash, KindCode, RegistryError};
 
 use crate::store::ResourceId;
 
@@ -35,4 +35,34 @@ pub enum StoreError {
     /// A stored value the descriptor does not allow, such as a malformed hash or a dangling id.
     #[error("table {table}, column {column}: stored value does not match the schema")]
     Corrupt { table: String, column: String },
+    /// A change-log entry that could not be encoded within its limits, or a stored one that does
+    /// not decode.
+    #[error(transparent)]
+    Change(#[from] ChangeError),
+    /// `apply` writes only resources homed elsewhere; this home's changes come from its own writes.
+    #[error("change homed at {home} is this store's own home")]
+    OwnHome { home: String },
+    /// A replicated object whose bytes do not hash to its name.
+    #[error("object {hash:?} does not match its bytes")]
+    TamperedObject { hash: Hash },
+    /// A replicated change names an object this store does not hold and the change does not carry.
+    #[error("object {hash:?} is not stored here")]
+    MissingObject { hash: Hash },
+    #[error("malformed change: {0}")]
+    MalformedChange(#[from] Malformed),
+}
+
+/// Why `apply` refused a change's shape.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Malformed {
+    #[error("table {table} is not a table of this kind")]
+    UnknownTable { table: String },
+    /// A key or value count that does not match the table's columns, or a root key that is not empty.
+    #[error("row of table {table} does not match its columns")]
+    Shape { table: String },
+    /// Root rows are removed by `DeleteResource` only.
+    #[error("root row of table {table} deleted by row")]
+    RootDelete { table: String },
+    #[error("home sequence {home_seq} cannot be stored")]
+    Sequence { home_seq: u64 },
 }
