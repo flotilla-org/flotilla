@@ -229,7 +229,7 @@ impl<M: Machine> Home<M> {
 
     /// Appends a receipt. Refused on an ended resource, with the end's reason.
     pub fn record_receipt(&mut self, name: &str, receipt: Receipt) -> Result<Position, WriteError<M>> {
-        let resource = self.writable(name, |_, _| true)?;
+        let resource = self.writable(name, any_label)?;
         resource.version = resource.version.next();
         Ok(resource.receipts.append(resource.version, receipt).position)
     }
@@ -257,4 +257,9 @@ impl<M: Machine> Home<M> {
         let resource = self.get(name).ok_or_else(|| WriteError::Unknown(name.to_string()))?;
         Ok(resource.judge(world, now, judgement))
     }
+}
+
+/// Receipts are accepted under every label but an end.
+fn any_label<M: Machine>(_: &MachineDef<M>, _: Label<M>) -> bool {
+    true
 }
