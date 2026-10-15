@@ -6217,6 +6217,33 @@ async fn host_direct_caller_keeps_crew_completion_and_stall() {
         process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).build()),
         crew: None,
     };
+    // A stale container observation on a host-direct record cannot establish
+    // container authority, even when its ID and dedicated mount name match.
+    let environments = daemon.resource_backend().using::<flotilla_resources::Environment>("flotilla");
+    let current = environments.get("host-direct-fixture").await.unwrap();
+    environments
+        .update_status(
+            "host-direct-fixture",
+            &current.metadata.resource_version,
+            &flotilla_resources::EnvironmentStatus {
+                runtime_observation: Some(flotilla_protocol::EnvironmentRuntimeObservation {
+                    container_id: Some("stale-container".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut contained = evidence.clone();
+    contained.process.as_mut().unwrap().container = Some("stale-container".into());
+    let mounts = caller_mountinfo(&EnvironmentId::new("host-direct-fixture"), true);
+    for claims in [Default::default(), placed_caller_claims()] {
+        assert_eq!(
+            super::caller::resolve_main_caller(&daemon, contained.clone(), &claims, Some(&mounts)).await.unwrap_err(),
+            "CallerIdentityUnavailable: container has no placed environment"
+        );
+    }
     let resolution = super::caller::resolve_main_caller(&daemon, evidence, &placed_caller_claims(), None).await.unwrap();
     assert!(!resolution.transport_bound);
     assert_eq!(resolution.caller.crew.as_ref().unwrap().crew_id, "placed-crew");
