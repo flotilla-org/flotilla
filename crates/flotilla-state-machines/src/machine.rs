@@ -98,7 +98,11 @@ impl<M: Machine, A: EdgeArg<Edge = M::Edge>> EdgeDef<M, A> {
     /// The target is chosen within `may_reach` by `pick`, which reads through
     /// the handle like a gate.
     pub fn to_chosen(mut self, may_reach: impl IntoIterator<Item = M::State>, pick: fn(&mut Handle<'_, M>, &A) -> M::State) -> Self {
-        let pick = move |handle: &mut Handle<'_, M>, edge: &M::Edge| A::project(edge).map(|arg| pick(handle, arg));
+        let pick = move |handle: &mut Handle<'_, M>, edge: &M::Edge| {
+            let arg = A::project(edge);
+            debug_assert!(arg.is_some(), "edge {:?} reached the target declared for {:?}", edge.kind(), A::KIND);
+            arg.map(|arg| pick(handle, arg))
+        };
         self.target = Some(Target::Chosen { may_reach: may_reach.into_iter().collect(), pick: Box::new(pick) });
         self
     }
@@ -108,7 +112,11 @@ impl<M: Machine, A: EdgeArg<Edge = M::Edge>> EdgeDef<M, A> {
         let gate = move |handle: &mut Handle<'_, M>, edge: &M::Edge| match A::project(edge) {
             Some(arg) => gate(handle, arg),
             // Unreachable by construction: definitions are looked up by kind.
-            None => Err(WrongState { state: handle.state(), edge: Some(edge.kind()) }.into()),
+            // Debug builds stop on a lookup bug; release builds refuse the write.
+            None => {
+                debug_assert!(A::project(edge).is_some(), "edge {:?} reached the gate declared for {:?}", edge.kind(), A::KIND);
+                Err(WrongState { state: handle.state(), edge: Some(edge.kind()) }.into())
+            }
         };
         self.gate = Some((doc, Box::new(gate)));
         self
@@ -231,7 +239,9 @@ impl<M: Machine> MachineDef<M> {
         MachineDef { initial, edges: Vec::new(), ends: Vec::new(), by_kind: BTreeMap::new() }
     }
 
-    /// Adds an edge, typed on its argument struct.
+    /// Adds an edge, typed on its argument struct. A second declaration of the
+    /// same kind is a [`DefError::DuplicateEdge`]; [`Self::step`] assumes a
+    /// definition that validates, which is why a home refuses one that does not.
     pub fn edge<A: EdgeArg<Edge = M::Edge>>(mut self, edge: EdgeDef<M, A>) -> Self {
         self.by_kind.entry(A::KIND).or_insert(self.edges.len());
         self.edges.push(DeclaredEdge { kind: A::KIND, from: edge.from, target: edge.target, gate: edge.gate });
@@ -360,7 +370,7 @@ impl<M: Machine> MachineDef<M> {
         out
     }
 
-    /// One pure step, in the engine's fixed order: the end check (refusing
+    /// One pure step, for a definition that [validates](Self::validate), in the engine's fixed order: the end check (refusing
     /// with the end's reason), the from-state, the gate, then the target.
     /// Reads go through `handle`; on success they are the step's inputs.
     pub fn step(&self, handle: &mut Handle<'_, M>, edge: &M::Edge) -> Result<M::State, StepError<M>> {
