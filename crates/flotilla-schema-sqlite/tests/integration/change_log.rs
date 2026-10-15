@@ -127,7 +127,8 @@ fn string_id(store: Store, string: &str) -> (Store, i64) {
 // relays the same log and the same home sequence. Replaying again is idempotent: every change is
 // a `Duplicate` and nothing moves. Writes span all three fixture kinds, two names each, with
 // inserts, generated edges (events, records and history appended, fields set), spec edits,
-// deletes and re-inserts, over several transactions. Every records and history row a change inserts carries the change's sequence.
+// deletes and re-inserts, over several transactions. Every records and history row a change
+// inserts carries the change's sequence.
 #[hegel::test]
 fn the_change_log_replays_into_another_store(tc: TestCase) {
     let mut source = store();
@@ -222,8 +223,9 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
 // Behaviour (DESIGN change log, self-contained changes): a change carries a `PutObject` for every
 // object it sets (any object of an inserted row, a changed object column of an updated row), even
 // one an earlier write already stored; an update leaving a frozen column alone carries none. So a
-// resource's changes apply into a store that never saw another resource's writes. A change whose rows name an object it neither carries nor finds is refused
-// with `MissingObject`, not a foreign-key failure, and writes nothing.
+// resource's changes apply into a store that never saw another resource's writes. A change whose
+// rows name an object it neither carries nor finds is refused with `MissingObject`, not a
+// foreign-key failure, and writes nothing.
 #[test]
 fn every_change_carries_the_objects_its_rows_name() {
     let mut source = store();

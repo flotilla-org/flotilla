@@ -246,6 +246,37 @@ fn edges_are_owner_checked_and_optimistic() {
     assert!(matches!(write.apply_edge(far, edge()), Err(StoreError::NotHome { home, .. }) if home == "remote"));
 }
 
+// Behaviour (ruling 1, both version branches): every edge appends its event, so the root row is
+// touched either by a declared root field (whose statement also moves the version) or, for an
+// edge that sets no root field, by the version move alone. Each branch moves the version to the
+// write's sequence, logs a root `Set` only when it set a root field, and refuses a stale stamp.
+#[test]
+fn edges_move_the_version_with_and_without_a_root_field() {
+    let mut store = store();
+    let mut write = store.write().expect("write");
+    let inserted = write.insert("c", &Convoy::sample(0)).expect("insert");
+    write.commit().expect("commit");
+    let with_root = || {
+        Edge::new(Convoy::EDGES, &event(ConvoyEdge::Deliver))
+            .and_then(|edge| edge.set(Convoy::STATE, &State::new(ConvoyState::Delivered, Timestamp(3))))
+            .expect("edge")
+    };
+    let without_root = || Edge::new(Convoy::EDGES, &event(ConvoyEdge::Submit { deliverable: 0 })).expect("edge");
+    let mut current = inserted;
+    for (root_set, edge) in [(true, with_root as fn() -> Edge<Convoy>), (false, without_root)] {
+        let mut write = store.write().expect("write");
+        let moved = write.apply_edge(current, edge()).expect("edge");
+        assert!(moved.version > current.version);
+        assert!(matches!(write.apply_edge(current, edge()), Err(StoreError::Conflict { .. })), "stale stamp, root set {root_set}");
+        write.commit().expect("commit");
+        assert_eq!(snapshot(&mut store, moved.id).version, moved.version);
+        let change = store.read().expect("read").changes(moved.id, current.version, 10).expect("log").remove(0);
+        let logged_root_set = change.ops.iter().any(|op| matches!(op, RowOp::Set { table, .. } if table == "convoy"));
+        assert_eq!(logged_root_set, root_set);
+        current = moved;
+    }
+}
+
 // Behaviour (DESIGN change log, self-contained changes): an edge that sets a frozen field carries
 // the object as a `PutObject`, even one the store already holds, so its change applies to a
 // replica holding only the resource's earlier state; an edge setting it to `None` carries none.
