@@ -415,7 +415,10 @@ fn message(trace: &Value, inbox: bool) {
                 "drop" => {
                     let model = state_at(after, "::messages", 1).expect("dropped");
                     assert_eq!(tag(model), "Dropped");
-                    let reason = match tag(&payload(model)["reason"]) {
+                    let model_reason = &payload(model)["reason"];
+                    let selected_reason = if inbox { model_reason } else { pick(after, "reason") };
+                    assert_eq!(selected_reason, model_reason, "drop records the chosen argument");
+                    let reason = match tag(selected_reason) {
                         "Expired" => DropReason::Expired,
                         "Undeliverable" => DropReason::Undeliverable { cause: cause() },
                         "Superseded" => {

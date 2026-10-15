@@ -24,6 +24,8 @@ module message_race {
   action connect: bool = all { source' = S::link(source, true), now' = now }
   action tick: bool = all { source' = source, now' = C::tick(now, 2) }
   action step = {
+    // Share the typed drop rule instead of expanding it once per reason in SMT.
+    nondet reason = M::dropReasons.oneOf()
     any {
       all {
         M::deliver(1, { observed: S::seen(source, "receipt", 1), receiverMatches: true, transportMatches: true, receiver: { session: 1, host: "consumer" } }),
@@ -35,11 +37,7 @@ module message_race {
         source' = source,
         now' = now,
       },
-      all { M::drop(1, { ...dropEvidence, reason: M::Expired }), source' = source, now' = now },
-      all { M::drop(1, { ...dropEvidence, reason: M::Undeliverable }), source' = source, now' = now },
-      all { M::drop(1, { ...dropEvidence, reason: M::Superseded }), source' = source, now' = now },
-      all { M::drop(1, { ...dropEvidence, reason: M::Withdrawn }), source' = source, now' = now },
-      all { M::drop(1, { ...dropEvidence, reason: M::ConsumerUnreachable }), source' = source, now' = now },
+      all { M::drop(1, { ...dropEvidence, reason: reason }), source' = source, now' = now },
       all { publish, M::unchanged },
       all { applySource, M::unchanged },
       all { disconnect, M::unchanged },

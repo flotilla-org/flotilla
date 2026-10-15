@@ -5,6 +5,7 @@ module message {
   type Receiver = { session: int, host: str }
   type Delivery = { envelope: Envelope, receiver: Receiver }
   type DropReason = Undeliverable | Expired | Superseded | Withdrawn | ConsumerUnreachable
+  pure val dropReasons = Set(Undeliverable, Expired, Superseded, Withdrawn, ConsumerUnreachable)
   type Drop = { reason: DropReason, envelope: Envelope, receiver: int, at: int, watermark: int, bound: bool, receipt: bool }
   type State = Pending(Envelope) | Awaiting(Delivery) | Settled(Envelope) | Dropped(Drop)
   type Receipt = { observed: bool, receiverMatches: bool, transportMatches: bool, receiver: Receiver }
