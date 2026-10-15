@@ -155,6 +155,13 @@ Admission/placement makes no eventual-placement or eventual-Gone claim. Its
 shared `liveness` runner hook checks temporal lease safety, with no host or
 teardown fairness assumption.
 
+Admission/placement is completely finite at its stated two-convoy, two-host,
+three-vessel bounds. The fast tier exhausts all 3,764 states with a view containing
+both complete stores. A depth-10 SMT check at those same bounds adds no safety
+coverage; the symbolic tier expands the stream bounds instead. Admission keeps
+its depth-1 assignment guard, exhaustive safety, temporal lease safety, mutants
+and Rust replay checks.
+
 ## Symbolic tier
 
 ```sh
@@ -165,7 +172,7 @@ SYMBOLIC_DEPTH=6 specs/primitives/symbolic.sh
 
 Apalache checks Convoy's `inductive` invariant by initial inclusion and one-step
 preservation. This proves that invariant for **every depth**, at the stated
-finite promise bound. For inbox, race and admission/placement it checks `safety` with six stream rows where streams apply,
+finite promise bound. For inbox and race it checks `safety` with six stream rows,
 at the chosen depth (default 10); these are bounded SMT results, not induction or
 unbounded liveness proofs. The baseline TLC and Rust checks remain necessary:
 SMT does not replace trace replay. Logs go under `build/`.
