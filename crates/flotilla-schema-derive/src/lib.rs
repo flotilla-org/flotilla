@@ -132,7 +132,9 @@ mod tests {
 
     // Behaviour (DESIGN indexes): `eq` and `order` name top-level single-column fields, `when`
     // allows only `<state field> in [..]` and `<optional field> is_some`, and an optional order
-    // field must be required by `is_some`. Everything else is refused naming the list.
+    // field must be required by `is_some`, and `order` refuses interned and reference fields
+    // (local ids, ordered differently in every store) while `eq` accepts them. Everything else is
+    // refused naming the list.
     #[test]
     fn index_refusals_name_the_closed_list() {
         let kind = |index: proc_macro2::TokenStream| {
@@ -146,6 +148,9 @@ mod tests {
                     d: Leaf,
                     #[store(child)] e: Vec<String>,
                     #[store(flatten)] f: Option<Leaf>,
+                    g: Identity,
+                    h: Option<::flotilla_schema::Ref<B>>,
+                    #[store(intern)] i: Option<Name>,
                 }
             }
         };
@@ -167,12 +172,19 @@ mod tests {
             quote!(index(name = "x", eq(a), when(f is_some))),
             quote!(index(name = "x", eq(a), unique)),
             quote!(index(name = "x", eq(a), eq(c))),
+            quote!(index(name = "x", order(a))),
+            quote!(index(name = "x", order(c))),
+            quote!(index(name = "x", order(g))),
+            quote!(index(name = "x", order(h), when(h is_some))),
+            quote!(index(name = "x", order(i), when(i is_some))),
             quote!(index(name = "x", eq(a)), index(name = "x", eq(c))),
         ];
         for case in cases {
             let message = error(kind(case.clone()));
             assert!(message.contains(SUPPORTED), "{case} was refused without naming the list: {message}");
         }
+        assert!(expand(&syn::parse2(kind(quote!(index(name = "x", eq(a, c, g), order(b), when(b is_some))))).expect("parse")).is_ok());
+        assert!(error(kind(quote!(index(name = "x", order(c))))).contains("cannot order an index"));
         assert!(error(quote! { #[store(index(name = "x", eq(a)))] struct A { a: String } }).contains("belongs on a kind"));
         assert!(error(quote! { #[store(index(name = "x", eq(a)))] enum A { #[store(code = 1)] B } }).contains("belongs on a kind"));
     }

@@ -143,12 +143,15 @@ impl IndexSql {
     }
 }
 
-/// A literal at or below every value a STRICT column of this type holds.
+/// A literal at or below every value a STRICT column of this type holds. Exhaustive, so a new
+/// column type (a REAL, say) must choose its own lower bound.
 fn lowest(ty: &ColumnType) -> &'static str {
     match ty {
         ColumnType::Text => "''",
         ColumnType::Blob | ColumnType::Frozen => "x''",
-        _ => "-9223372036854775808",
+        ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp | ColumnType::Code(_) | ColumnType::Interned | ColumnType::Ref => {
+            "-9223372036854775808"
+        }
     }
 }
 

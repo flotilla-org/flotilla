@@ -253,3 +253,39 @@ fn limits_are_required_and_capped() {
     assert_eq!(scan.ids.len(), MAX_PAGE as usize);
     assert_eq!(read.scan::<Message>(LOCAL, scan.next, u32::MAX).expect("rest").ids.len(), 1);
 }
+
+// Behaviour (DESIGN queries): rows sharing one order value are ordered by id, and a page boundary
+// inside such a run neither repeats nor skips a row: the cursor resumes after `(order, id)`.
+#[test]
+fn page_boundaries_inside_a_run_of_equal_order_values() {
+    let mut store = store();
+    // accepted_seq: 1, then six rows at 5, then 9; inserted out of order so ids and order values
+    // do not agree.
+    let seqs = [5, 9, 5, 1, 5, 5, 5, 5];
+    let mut ids = Vec::new();
+    let mut write = store.write().expect("write");
+    for (n, seq) in seqs.iter().enumerate() {
+        ids.push((*seq, write.insert(&format!("m{n}"), &Message { accepted_seq: *seq, ..Message::sample() }).expect("insert").id));
+    }
+    write.commit().expect("commit");
+    ids.sort();
+    let want: Vec<ResourceId> = ids.into_iter().map(|(_, id)| id).collect();
+    let query = Message::open_by_inbox(&Ref::new("inbox", LOCAL));
+    for limit in 1..=4 {
+        let mut read = store.read().expect("read");
+        let first = read.page(&query, None, limit).expect("page");
+        let mut got = first.ids;
+        let mut after = first.next;
+        let mut boundaries = Vec::new();
+        while let Some(cursor) = after {
+            assert!(got.len() <= want.len(), "limit {limit}: paging repeats rows");
+            boundaries.push(got.len());
+            let page = read.page(&query, Some(&cursor), limit).expect("page");
+            got.extend(page.ids);
+            after = page.next;
+        }
+        assert_eq!(got, want, "limit {limit}");
+        // With limits 1..=4 some boundary always falls between two rows at seq 5 (positions 1..=6).
+        assert!(boundaries.iter().any(|at| (2..=6).contains(at)), "limit {limit} splits the run");
+    }
+}

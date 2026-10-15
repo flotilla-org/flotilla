@@ -142,7 +142,7 @@ mod tests {
             order: vec![],
             predicate: vec![Condition::In { column: "phase".into(), codes: vec![1, 2] }, Condition::NotNull { column: "phase".into() }],
         });
-        layout.index(Index { name: "by_name".into(), table: "convoy".into(), eq: vec![], order: vec!["name".into()], predicate: vec![] });
+        layout.index(Index { name: "by_name".into(), table: "convoy".into(), eq: vec!["name".into()], order: vec![], predicate: vec![] });
         layout
     }
 
@@ -259,7 +259,7 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
     // Behaviour (DESIGN indexes): an index is refused unless it is on the root table, names
     // existing columns once each, pages only through columns that cannot be null under its
     // predicate, and its predicate can hold (listed codes of a code column, `is_some` of a
-    // nullable column).
+    // nullable column). Interned and reference columns may be compared but never order an index.
     #[test]
     fn validate_refuses_malformed_indexes() {
         let problem = |index: Index| {
@@ -267,6 +267,8 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
             layout.column("phase", ColumnType::Code(vec![1, 2]), true);
             layout.column("due", ColumnType::Timestamp, false);
             layout.column("seq", ColumnType::Integer, true);
+            layout.column("owner", ColumnType::Ref, true);
+            layout.column("label", ColumnType::Interned, true);
             layout.index(index);
             match layout.finish().validate() {
                 Ok(()) => None,
@@ -289,6 +291,10 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
         assert_eq!(problem(index(&["nope"], &[], vec![])), Some(IndexProblem::UnknownColumn("nope".into())));
         assert_eq!(problem(index(&["seq"], &["seq"], vec![])), Some(IndexProblem::RepeatedColumn("seq".into())));
         assert_eq!(problem(index(&[], &["due"], vec![])), Some(IndexProblem::NullableOrder("due".into())));
+        for surrogate in ["owner", "label"] {
+            assert_eq!(problem(index(&[], &[surrogate], vec![])), Some(IndexProblem::SurrogateOrder(surrogate.into())));
+            assert_eq!(problem(index(&[surrogate], &[], vec![])), None, "{surrogate} may still be an eq column");
+        }
         let codes = |codes: Vec<i64>| vec![Condition::In { column: "phase".into(), codes }];
         assert_eq!(problem(index(&["seq"], &[], codes(vec![2]))), None);
         assert_eq!(problem(index(&["seq"], &[], codes(vec![3]))), Some(IndexProblem::Codes("phase".into())));

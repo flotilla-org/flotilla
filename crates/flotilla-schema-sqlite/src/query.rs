@@ -69,13 +69,14 @@ impl Ctx<'_> {
     pub(crate) fn page<K: Kind>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
         let limit = page_limit(limit)?;
         let eq = query.eq()?;
-        let index = self
+        // Only the order width is taken here: argument lookups need `self` mutably, and the
+        // statement text is borrowed from the per-kind SQL just before it runs.
+        let order = self
             .sql(K::CODE)?
             .indexes
             .get(query.index())
-            .ok_or_else(|| StoreError::UnknownIndex { kind: K::CODE, index: query.index().to_owned() })?;
-        let statement = if after.is_some() { index.after.clone() } else { index.first.clone() };
-        let order = index.order;
+            .ok_or_else(|| StoreError::UnknownIndex { kind: K::CODE, index: query.index().to_owned() })?
+            .order;
         if let Some(cursor) = after {
             if cursor.kind != K::CODE || cursor.index != query.index() || cursor.eq != eq {
                 return Err(StoreError::CursorMismatch { index: query.index().to_owned() });
@@ -94,9 +95,11 @@ impl Ctx<'_> {
         }
         // One row beyond the limit tells whether another page follows.
         params.push(SqlValue::Integer(limit + 1));
+        let index = &self.sql(K::CODE)?.indexes[query.index()];
+        let statement = if after.is_some() { &index.after } else { &index.first };
         let mut rows: Vec<(ResourceId, Vec<SqlValue>)> = self
             .conn
-            .prepare_cached(&statement)?
+            .prepare_cached(statement)?
             .query_map(params_from_iter(params), |row| {
                 let id = ResourceId(row.get(0)?);
                 let values = (1..=order).map(|n| row.get::<_, SqlValue>(n)).collect::<Result<_, _>>()?;
@@ -116,12 +119,12 @@ impl Ctx<'_> {
 
     pub(crate) fn scan<K: Kind>(&mut self, home: &str, after: Option<ResourceId>, limit: u32) -> Result<Page<ResourceId>, StoreError> {
         let limit = page_limit(limit)?;
-        let statement = self.sql(K::CODE)?.scan.clone();
+        self.sql(K::CODE)?;
         let Some(home) = self.string_id(home)? else { return Ok(Page::empty()) };
         let after = after.map_or(i64::MIN, |id| id.0);
         let mut ids: Vec<ResourceId> = self
             .conn
-            .prepare_cached(&statement)?
+            .prepare_cached(&self.sql(K::CODE)?.scan)?
             .query_map(params![home, K::CODE.0, after, limit + 1], |row| row.get(0).map(ResourceId))?
             .collect::<Result<_, _>>()?;
         let more = ids.len() as i64 > limit;

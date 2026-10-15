@@ -6,14 +6,16 @@
 //! ```
 //!
 //! `eq` and `order` name top-level single-column fields: unattributed fields whose type (inside
-//! `Option`) is a `KeyColumn`, or `intern` fields. `when` conjoins `<state field> in [Variant, ...]`,
+//! `Option`) is a `KeyColumn`, or `intern` fields. `order` refuses `intern` fields and references
+//! (`Ref`, `Identity`): their columns hold local surrogate ids, whose order is insertion order in one
+//! store and differs between stores, so it is no order a caller could mean. `when` conjoins `<state field> in [Variant, ...]`,
 //! whose codes come from the enum's `CodeEnum::code`, and `<optional field> is_some`. An optional
 //! `order` field must be required by `is_some`, so keyset paging never compares a null.
 
 use std::collections::BTreeSet;
 
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, quote_spanned};
 use syn::{
     bracketed,
     ext::IdentExt,
@@ -80,17 +82,24 @@ impl<'f, 'a> Indexes<'f, 'a> {
             let order = order.iter().map(|column| &column.field.name);
             let predicate = index.when.iter().map(|condition| match condition {
                 Condition::In { field, variants } => {
+                    // `check` resolved this field and refused it unless it is a `State<E>` field.
                     let field = find(self.fields, field).expect("checked");
                     let column = &field.name;
                     let code_enum = shape::first_arg(field.ty).expect("checked State<E>");
+                    // Each code expression carries its variant's span, so a variant the enum
+                    // lacks is reported at the attribute that names it.
+                    let codes = variants
+                        .iter()
+                        .map(|variant| quote_spanned!(variant.span()=> <#code_enum as #schema::CodeEnum>::code(&<#code_enum>::#variant)));
                     quote! {
                         #schema::Condition::In {
                             column: ::std::string::String::from(#column),
-                            codes: ::std::vec![#(<#code_enum as #schema::CodeEnum>::code(&<#code_enum>::#variants)),*],
+                            codes: ::std::vec![#(#codes),*],
                         }
                     }
                 }
                 Condition::IsSome { field } => {
+                    // `check` resolved this field as an optional single column.
                     let column = &find(self.fields, field).expect("checked").name;
                     quote!(#schema::Condition::NotNull { column: ::std::string::String::from(#column) })
                 }
@@ -280,6 +289,19 @@ fn check<'f, 'a>(index: &IndexAttr, fields: &'f [Field<'a>]) -> syn::Result<Key<
     }
     let eq = index.eq.iter().map(|ident| column(fields, ident)).collect::<syn::Result<Vec<_>>>()?;
     let order = index.order.iter().map(|ident| column(fields, ident)).collect::<syn::Result<Vec<_>>>()?;
+    // Spans point at the name inside `order(...)`, where the fix is made.
+    for (ident, column) in index.order.iter().zip(&order) {
+        let reference = shape::head_name(column.inner).is_some_and(|name| name == "Ref" || name == "Identity");
+        if column.interned || reference {
+            return Err(refuse(
+                ident,
+                format_args!(
+                    "`{ident}` cannot order an index: interned strings and references are stored as local ids, \
+                     whose order differs between stores; use it in `eq`"
+                ),
+            ));
+        }
+    }
     let mut seen = BTreeSet::new();
     for ident in index.eq.iter().chain(&index.order) {
         if !seen.insert(ident.unraw().to_string()) {

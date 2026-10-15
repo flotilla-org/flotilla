@@ -203,6 +203,10 @@ pub enum IndexProblem {
     /// Keyset paging compares order columns; a null compares as unknown and would drop rows.
     #[error("order column {0} is nullable and the predicate does not require it")]
     NullableOrder(String),
+    /// Interned strings and references are stored as local ids: ordering by them is insertion
+    /// order in one store, different in every other.
+    #[error("order column {0} holds local ids (interned or reference) and cannot order an index")]
+    SurrogateOrder(String),
     #[error("column {0} is not a code column holding every listed code")]
     Codes(String),
     #[error("column {0} is not nullable, so `is_some` would be always true")]
@@ -280,7 +284,11 @@ impl TableSet {
         let required =
             |name: &str| index.predicate.iter().any(|condition| matches!(condition, Condition::NotNull { column } if column == name));
         for name in &index.order {
-            if column(name)?.nullable && !required(name) {
+            let def = column(name)?;
+            if matches!(def.ty, ColumnType::Interned | ColumnType::Ref) {
+                return Err(IndexProblem::SurrogateOrder(name.clone()));
+            }
+            if def.nullable && !required(name) {
                 return Err(IndexProblem::NullableOrder(name.clone()));
             }
         }

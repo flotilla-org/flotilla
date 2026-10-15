@@ -29,5 +29,5 @@ fn refusal_snapshots_name_the_closed_list() {
         assert!(stderr.contains(&list), "{} does not name the attribute list", path.display());
         checked += 1;
     }
-    assert_eq!(checked, 17);
+    assert_eq!(checked, 18);
 }
