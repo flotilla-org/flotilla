@@ -54,7 +54,19 @@ jobs:
           test "$(git -C orchestration rev-parse FETCH_HEAD)" = "$FLEET_ORCHESTRATION_SHA"
           git -C orchestration checkout --detach FETCH_HEAD
 
+      - name: Fetch pinned dependency inputs
+        id: dependency-inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          source orchestration/ci/fleet-candidates/build-candidate.sh
+          fetch_exact https://github.com/flotilla-org/flotilla.git "$FLEET_FLOTILLA_SHA" "$PWD/sources/flotilla"
+          fetch_exact https://github.com/flotilla-org/cleat.git "$FLEET_CLEAT_SHA" "$PWD/sources/cleat"
+          key="$(python3 orchestration/ci/fleet-candidates/dependency_cache.py key sources)"
+          echo "key=$key" >>"$GITHUB_OUTPUT"
+
       - name: Restore dependency and compiler caches
+        id: dependency-cache
         uses: https://code.forgejo.org/actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c
         with:
           path: |
@@ -63,9 +75,9 @@ jobs:
             sources/flotilla/target
             sources/cleat/target
             sources/cleat/.tools/ghostty-src/.zig-cache
-          key: fleet-linux-v1-${{ inputs.flotilla_sha }}-${{ inputs.cleat_sha }}
+          key: ${{ steps.dependency-inputs.outputs.key }}
           restore-keys: |
-            fleet-linux-v1-
+            fleet-linux-v2-
 
       - name: Build and verify the coordinated candidate
         env:
@@ -110,8 +122,18 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: Prune workspace artifacts before caching
+        if: success() && steps.dependency-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source orchestration/ci/fleet-candidates/setup-linux-toolchain.sh
+          # Match build-candidate.sh: Cleat also builds with the Flotilla pin.
+          export RUSTUP_TOOLCHAIN="$(read_rust_pin "$PWD/sources/flotilla/rust-toolchain.toml")"
+          python3 orchestration/ci/fleet-candidates/dependency_cache.py prune sources
+
       - name: Save dependency and compiler caches
-        if: always()
+        if: success() && steps.dependency-cache.outputs.cache-hit != 'true'
         uses: https://code.forgejo.org/actions/cache/save@6f8efc29b200d32929f49075959781ed54ec270c
         with:
           path: |
@@ -120,7 +142,7 @@ jobs:
             sources/flotilla/target
             sources/cleat/target
             sources/cleat/.tools/ghostty-src/.zig-cache
-          key: fleet-linux-v1-${{ inputs.flotilla_sha }}-${{ inputs.cleat_sha }}
+          key: ${{ steps.dependency-inputs.outputs.key }}
 
   darwin:
     name: Darwin arm64 candidate

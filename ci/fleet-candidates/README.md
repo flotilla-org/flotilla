@@ -395,3 +395,41 @@ for bootstrap synchronization on the first payload crossing, SSH/Docker
 requirements, retained failure logs, and the explicit emergency skip flag.
 The canary replaces the operator's manual fresh-crew post-roll launch check;
 real-host acceptance is performed after merge.
+
+### Linux dependency cache
+
+The `fleet-linux-v2-` key hashes both selected source trees' `Cargo.lock` and
+`rust-toolchain.toml` files plus Cleat's `tools/ghostty-toolchain.toml` (Zig and
+Ghostty pins). Cleat's Rust pin is a conservative extra input: the coordinated
+build and cache pruning both override it with the selected Flotilla Rust pin.
+This avoids downloading Cleat's potentially different compiler just to prune.
+Sources are fetched before restore; source commit IDs and skill
+revisions do not enter the key. Missing inputs refuse the build rather than
+silently producing a partial key. The v2 restore prefix can seed a changed
+lockfile or pin from the last dependency cache, but only an exact hit skips save.
+
+After a successful candidate build, validation and upload, a cache miss cleans
+all workspace packages in both Cargo profiles and removes incremental output
+before saving. Candidate commands use only the native debug and release profiles;
+adding custom profiles or explicit cross targets requires extending pruning and
+its tests. Cargo metadata supplies workspace membership and Cargo owns the
+artifact names; registry/git dependencies and toolchains remain cached. Failed
+or cancelled runs never save a partial cache. Darwin currently has no cache.
+
+Host-side evidence: `python3 -m unittest discover -s ci/fleet-candidates -p
+test_dependency_cache.py` varies each lock/pin independently, preserves the key
+across a source-only edit, refuses missing inputs, and builds a small offline
+workspace to verify pruning retains compiled external dependencies. The existing
+`test-workflow.sh` runs these tests too.
+
+On the next two lab candidate runs, use different source commits with unchanged
+lockfiles and pins. Observe the same computed key, successful candidate validation
+and upload on both, and an exact restore hit with pruning/save skipped on the
+second. If v2 is cold, the first run should miss, prune workspace artifacts and
+incremental output, and save once; if warm, both should skip save. Inspect the
+first saved archive for retained dependency artifacts/toolchains and absent
+workspace artifacts/incrementals. Then change one lockfile: expect a new key,
+optional prefix restore, pruning and one save; repeat those dependency inputs to
+confirm the new exact hit skips save. Compare save duration and archive size to
+the old source-keyed cache. These action-service observations require lab runs;
+the host tests do not claim to verify remote cache-hit reporting.

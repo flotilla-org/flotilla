@@ -169,5 +169,7 @@ if read_protocol_version "$fake_flotilla" >/dev/null 2>&1; then
 fi
 rm -f "$fake_flotilla"
 
+python3 -m unittest discover -s "$repo_root/ci/fleet-candidates" -p test_dependency_cache.py
+
 echo 'fleet candidate workflow contract passed'
 "$repo_root/ci/fleet-candidates/test-generation-validation.sh"
