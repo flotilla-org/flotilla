@@ -12,7 +12,7 @@
 
 use std::{collections::BTreeMap, fmt, marker::PhantomData};
 
-use crate::{Machine, Time};
+use crate::{Attempt, Machine, Receipt, Resource, Row, Time};
 
 /// Something a gate or judgement can read: a resource kind, or a family of
 /// records such as one session's receipts, each named by a [`Ref`].
@@ -128,6 +128,11 @@ impl<K: Kind> Source<K> for Table<K> {
     }
 }
 
+/// The [`InputRead::kind`] of a read of the resource's own attempts.
+pub const OWN_ATTEMPTS: &str = "attempts";
+/// The [`InputRead::kind`] of a read of the resource's own receipts.
+pub const OWN_RECEIPTS: &str = "receipts";
+
 /// One recorded read: what was read and the version seen, or `None` when the
 /// read found nothing. A gate relying on an absence relied on an input too.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -150,6 +155,7 @@ pub struct Judged<T> {
 /// The only way a gate, an effect or a judgement sees anything beyond its
 /// edge argument and the current state. Every read through it is recorded.
 pub struct Handle<'a, M: Machine> {
+    own: Option<&'a Resource<M>>,
     spec: &'a M::Spec,
     state: &'a M::State,
     world: &'a M::World,
@@ -159,9 +165,21 @@ pub struct Handle<'a, M: Machine> {
 }
 
 impl<'a, M: Machine> Handle<'a, M> {
-    /// A handle on one resource, given its spec and current state, at `now`.
+    /// A handle for a pure step or judgement over a spec and state alone,
+    /// with no records: own-record reads see empty logs, and record them
+    /// under the empty name with version 0, which is exactly what they saw.
     pub fn new(spec: &'a M::Spec, state: &'a M::State, world: &'a M::World, now: Time) -> Self {
-        Handle { spec, state, world, now, reads: Vec::new(), valid_until: None }
+        Handle { own: None, spec, state, world, now, reads: Vec::new(), valid_until: None }
+    }
+
+    /// A handle on a resource and its records, at `now`.
+    pub fn on(resource: &'a Resource<M>, world: &'a M::World, now: Time) -> Self {
+        Handle { own: Some(resource), spec: resource.spec(), state: resource.state(), world, now, reads: Vec::new(), valid_until: None }
+    }
+
+    /// The resource's own name, or empty for a pure handle. Fixed, so unrecorded.
+    pub fn name(&self) -> &'a str {
+        self.own.map_or("", |own| own.name())
     }
 
     /// The resource's own spec. It never changes, so reading it records nothing.
@@ -197,6 +215,26 @@ impl<'a, M: Machine> Handle<'a, M> {
         if !self.reads.contains(&read) {
             self.reads.push(read);
         }
+    }
+
+    fn own_read(&mut self, kind: &'static str, length: usize) {
+        let name = self.name().to_string();
+        self.record(InputRead { kind, name, version: Some(Version(length as u64)) });
+    }
+
+    /// The resource's own attempts, every window. Recorded with the log's
+    /// length as its version.
+    pub fn attempts(&mut self) -> &'a [Row<Attempt>] {
+        let rows = self.own.map_or(&[][..], |own| own.attempts().rows());
+        self.own_read(OWN_ATTEMPTS, rows.len());
+        rows
+    }
+
+    /// The resource's own receipts. Recorded like [`Handle::attempts`].
+    pub fn receipts(&mut self) -> &'a [Row<Receipt>] {
+        let rows = self.own.map_or(&[][..], |own| own.receipts().rows());
+        self.own_read(OWN_RECEIPTS, rows.len());
+        rows
     }
 
     /// Declares that the value being computed may change at `moment` by time
