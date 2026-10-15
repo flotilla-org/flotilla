@@ -120,3 +120,5 @@ counts after filtering. Forced settlement and host administration remain outside
 the contained supervisor interface.
 
 Compatibility removal is tracked in #3279. If both a legacy main-directory mount and a dedicated environment socket mount are present, environment-bound identity wins; the extra legacy mount cannot enable variable-derived identity. The short-lived-peer race also applies between reading mountinfo and statting `/proc/<pid>/root`: disappearing evidence produces `CallerIdentityUnavailable` without a downgrade.
+
+Peer credentials capture a PID at accept, while later `/proc` evidence reads use that PID rather than a pinned kernel process handle. A peer that exits and has its PID reused leaves a narrow pre-existing evidence race; the mechanism does not guarantee process-instance pinning. Missing or disappearing evidence still refuses.
