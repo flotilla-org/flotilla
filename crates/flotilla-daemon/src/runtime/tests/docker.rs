@@ -10,7 +10,14 @@ async fn local_profile_does_not_advertise_docker_without_interior_cleat() {
     fs::write(config_base.join("daemon.toml"), "machine_id = \"local-profile-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    let daemon = InProcessDaemon::new(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        config,
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let mut registry = ProviderRegistry::new();
     registry.environment_providers.insert(
         "docker",
@@ -38,7 +45,14 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
     let config = Arc::new(ConfigStore::with_base(config_base));
     let cleat_state = config.state_dir().join("contained-cleat/contained-work");
     let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None), prepared_auth: Mutex::new(None) });
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
@@ -139,7 +153,14 @@ async fn docker_provisioning_fails_loudly_without_interior_cleat_assets() {
     fs::write(config_base.join("daemon.toml"), "machine_id = \"missing-cleat-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None), prepared_auth: Mutex::new(None) });
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
@@ -199,7 +220,14 @@ async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_r
         fs::write(&delivered_auth, "test credential").expect("delivered credential");
         let config = Arc::new(ConfigStore::with_base(config_base));
         let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::clone(&config),
+            discovery,
+            flotilla_protocol::HostName::new("dinghy"),
+            std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+        )
+        .await;
         daemon
             .resource_backend()
             .definitions::<CredentialSpec>(NAMESPACE)
@@ -315,7 +343,14 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
         let skill_sources = write_test_skill_sources(temp.path());
         let config = Arc::new(ConfigStore::with_base(config_base));
         let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::clone(&config),
+            discovery,
+            flotilla_protocol::HostName::new("dinghy"),
+            std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+        )
+        .await;
         let backend = daemon.resource_backend();
         backend
             .definitions::<Project>(NAMESPACE)
@@ -447,7 +482,14 @@ async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
     fs::write(config_base.join("daemon.toml"), "machine_id = \"material-restart-teardown-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let destroyed = Arc::new(AtomicBool::new(false));
     let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
         id: EnvironmentId::new("contained-restarted"),
@@ -528,6 +570,7 @@ async fn docker_orphan_cleanup_without_persisted_status_reaps_backing() {
         Arc::clone(&config),
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
         flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let destroyed = Arc::new(AtomicBool::new(false));
@@ -585,7 +628,14 @@ async fn docker_provisioning_reports_unavailable_flotilla_cli() {
     fs::write(config_base.join("daemon.toml"), "machine_id = \"cli-unavailable-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let state = Arc::new(ControllerRuntimeState::new(
         daemon,
         config,
@@ -632,7 +682,14 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
     fs::write(config_base.join("daemon.toml"), "machine_id = \"cli-collision-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None), prepared_auth: Mutex::new(None) });
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
@@ -708,7 +765,14 @@ async fn provisioned_environment_discovers_and_registers_interior_agent_adapters
     let config = Arc::new(ConfigStore::with_base(config_base));
     let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
     discovery.host_detectors = Arc::new(flotilla_discovery::detectors::default_host_detectors());
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let state = ControllerRuntimeState::new(
         Arc::clone(&daemon),
         config,
@@ -784,6 +848,7 @@ async fn fresh_contained_admission_resolves_legacy_literal_and_refuses_literal_t
             config.clone(),
             fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
             flotilla_protocol::HostName::new("udder"),
+            std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
         )
         .await;
         let backend = daemon.resource_backend();
@@ -979,6 +1044,7 @@ async fn legacy_baseline_admission_recovers_old_records_and_preserves_frozen_pro
         config.clone(),
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
         flotilla_protocol::HostName::new("udder"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let backend = daemon.resource_backend();
@@ -1092,7 +1158,14 @@ async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing()
     let config = Arc::new(ConfigStore::with_base(config_base));
     let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
     discovery.host_detectors = Arc::new(flotilla_discovery::detectors::default_host_detectors());
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let destroyed = Arc::new(AtomicBool::new(false));
     let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
         id: EnvironmentId::new("contained-rejected"),

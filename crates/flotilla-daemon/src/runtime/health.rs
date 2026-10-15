@@ -11,8 +11,10 @@ use std::{
 };
 
 use chrono::Utc;
-use flotilla_aggregator::IssuePollingHealth;
-use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_projections::aggregator_projection::AggregatorProjectionState;
+use flotilla_projections::IssuePollingHealth;
+
 use flotilla_credentials::CredentialStore;
 use flotilla_protocol::{BlobSyncStatus, HostSummary, NodeId, Rows};
 use flotilla_resources::Resource;
@@ -453,7 +455,7 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
             heartbeat_at: daemon.clock().now(),
             ready,
             resource_store: resource_store.map(Box::new),
-            daemon_rss_bytes: flotilla_core::host_summary::daemon_rss_bytes(),
+            daemon_rss_bytes: flotilla_projections::host_summary::daemon_rss_bytes(),
             daemon_generation: health.generation.clone(),
             protocol_fingerprint: Some(flotilla_protocol::PROTOCOL_FINGERPRINT.to_string()),
             daemon_version: Some(health.version.clone()),

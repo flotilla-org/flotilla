@@ -1,4 +1,5 @@
 //! Crew outcomes, lifecycle teardown, and serialized crew message delivery.
+use flotilla_resources::{credential_refresh_alert_for_vessel, LANDING_EVIDENCE_TTL};
 
 use flotilla_resources::ResumeIntent;
 use std::{
@@ -39,20 +40,18 @@ use tracing::debug;
 use tracing::warn;
 
 use super::{
-    checkout_path,
-    checkout_providers::CheckoutProviders,
-    convoy_admission::convoy_address,
-    read_projections::{credential_refresh_alert_for_vessel, LeafSubscriptionRead},
-    BriefArtifactWriter, WorkCredentialReconciler,
+    checkout_path, checkout_providers::CheckoutProviders, convoy_admission::convoy_address, BriefArtifactWriter, WorkCredentialReconciler,
 };
 use flotilla_agent::adapter::{CrewAssignment, CrewBriefTemplateResolver};
 
 use crate::{
-    checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL},
-    fleet::crew_attention,
+    checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id_for_checkout},
     leaf_engine::{EscalationAdmission, LeafSubscriptionTable, TurnDeliveryActuator},
-    resource_explain::explain_unmet_expectation,
 };
+use flotilla_resources::crew_attention;
+
+use flotilla_resources::explain_unmet_expectation;
+
 use flotilla_config::ConfigStore;
 
 /// An authorized supervision decision; escalation carries its admitted recipient.
@@ -499,12 +498,12 @@ impl CrewService {
         self.leaf_subscriptions.set_turn_delivery_actuator(actuator).await;
     }
 
-    pub(super) fn subscription_diagnostics(&self) -> &dyn LeafSubscriptionRead {
+    pub(super) fn subscription_diagnostics(&self) -> &LeafSubscriptionTable {
         &self.leaf_subscriptions
     }
 
     #[cfg(test)]
-    pub(super) async fn subscription_rows(&self) -> Vec<crate::leaf_engine::LeafSubscriptionRow> {
+    pub(super) async fn subscription_rows(&self) -> Vec<flotilla_resources::LeafSubscriptionRow> {
         self.leaf_subscriptions.rows().await
     }
 

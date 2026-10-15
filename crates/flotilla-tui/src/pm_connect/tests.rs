@@ -1071,6 +1071,7 @@ async fn connector_real_daemon_stays_subscribed() {
         fake_discovery(false),
         HostName::new("local"),
         ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let baseline = daemon.aggregator_projection_state().await.subscribed_queries();
@@ -1105,6 +1106,7 @@ async fn reconnect_loop_bounds_real_unsupported_watch_errors() {
         fake_discovery(false),
         HostName::new("local"),
         ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let attempts = AtomicUsize::new(0);
@@ -1156,6 +1158,7 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let mut state = ConnectorState::default();

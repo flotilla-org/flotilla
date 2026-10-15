@@ -54,8 +54,12 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use super::{empty_repo_identity, read_projections};
-use crate::in_process::attach::ResolvedAttach;
+use crate::read_projections;
+use flotilla_protocol::RepoIdentity;
+fn empty_repo_identity() -> RepoIdentity {
+    RepoIdentity { authority: String::new(), path: String::new() }
+}
+use crate::ports::ResolvedAttach;
 use crate::resource_explain::resource_read_envelope;
 use crate::resource_explain::resource_record;
 use crate::resource_explain::run_resource_watch_command;
@@ -67,7 +71,17 @@ use flotilla_issue_tracker::IssueProvider;
 /// registration and crew queries use directly supplied collaborators instead of
 /// requiring the host port to expose its state.
 #[async_trait]
-pub(super) trait ProjectionsActionPort: Send + Sync {
+pub trait ProjectionsActionPort: Send + Sync {
+    async fn image_build_report(&self, namespace: &str, name: &str) -> Result<flotilla_protocol::image_check::ImageBuildReport, String>;
+    async fn crew_capabilities_internal(&self, context: &flotilla_protocol::CrewCommandContext) -> Result<String, String>;
+    async fn message_contacts_internal(
+        &self,
+        context: &flotilla_protocol::CrewCommandContext,
+    ) -> Result<(String, serde_json::Value), String>;
+    async fn crew_list_internal(
+        &self,
+        context: &flotilla_protocol::CrewCommandContext,
+    ) -> Result<flotilla_protocol::CrewListResponse, String>;
     async fn attach_project_context(&self, selector: Option<&RepoSelector>) -> Result<Option<String>, String>;
     async fn scoped_fleet_list(
         &self,
@@ -101,20 +115,19 @@ pub(super) trait ProjectionsActionPort: Send + Sync {
     async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<DispatchBoardResponse, String>;
 }
 
-pub(super) struct ProjectionsActions<'a> {
-    pub(super) port: &'a dyn ProjectionsActionPort,
-    pub(super) crew: &'a super::crew_ops::CrewService,
-    pub(super) resource_backend: &'a ResourceBackend,
-    pub(super) observed_resource_backend: &'a ResourceBackend,
-    pub(super) event_sink: &'a Arc<dyn EventSink>,
-    pub(super) node_id: &'a NodeId,
-    pub(super) clock: &'a Arc<dyn Clock>,
-    pub(super) config: &'a Arc<ConfigStore>,
-    pub(super) active_commands: &'a Arc<Mutex<HashMap<u64, CancellationToken>>>,
+pub struct ProjectionsActions<'a> {
+    pub port: &'a dyn ProjectionsActionPort,
+    pub resource_backend: &'a ResourceBackend,
+    pub observed_resource_backend: &'a ResourceBackend,
+    pub event_sink: &'a Arc<dyn EventSink>,
+    pub node_id: &'a NodeId,
+    pub clock: &'a Arc<dyn Clock>,
+    pub config: &'a Arc<ConfigStore>,
+    pub active_commands: &'a Arc<Mutex<HashMap<u64, CancellationToken>>>,
 }
 
 impl ProjectionsActions<'_> {
-    pub(super) async fn execute_action_resource_watch(&self, id: u64, command: &Command, command_node_id: &NodeId) -> Result<u64, String> {
+    pub async fn execute_action_resource_watch(&self, id: u64, command: &Command, command_node_id: &NodeId) -> Result<u64, String> {
         let command_node_id = command_node_id.clone();
         if let CommandAction::ResourceWatch { namespace, kind, name, include_replicas, replica_sources, cursor } = command.action.clone() {
             let repo_identity = empty_repo_identity();
@@ -172,7 +185,7 @@ impl ProjectionsActions<'_> {
 }
 
 impl ProjectionsActions<'_> {
-    pub(super) async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+    pub async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
         use CommandAction;
         match &command.action {
             CommandAction::QueryResolveRepository { repo } => {
@@ -229,7 +242,7 @@ impl ProjectionsActions<'_> {
             },
             CommandAction::QueryImageBuild { name } => {
                 let namespace = self.port.provisioning_namespace().await;
-                match super::image_check::image_build_report(self.resource_backend, &namespace, name).await {
+                match self.port.image_build_report(&namespace, name).await {
                     Ok(report) => Ok(CommandValue::ImageBuild(Box::new(report))),
                     Err(message) => Ok(CommandValue::Error { message }),
                 }
@@ -246,18 +259,15 @@ impl ProjectionsActions<'_> {
                     Err(message) => Ok(CommandValue::Error { message }),
                 }
             }
-            CommandAction::QueryCrewCapabilities { context } => match self.crew.crew_capabilities_internal(context).await {
+            CommandAction::QueryCrewCapabilities { context } => match self.port.crew_capabilities_internal(context).await {
                 Ok(card) => Ok(CommandValue::CrewCapabilities { card }),
                 Err(message) => Ok(CommandValue::Error { message }),
             },
-            CommandAction::QueryMessageContacts { context } => match self.crew.message_contacts_internal(context).await {
-                Ok(book) => Ok(CommandValue::MessageContacts {
-                    text: book.render(),
-                    book: serde_json::to_value(book).map_err(|error| error.to_string())?,
-                }),
+            CommandAction::QueryMessageContacts { context } => match self.port.message_contacts_internal(context).await {
+                Ok((text, book)) => Ok(CommandValue::MessageContacts { text, book }),
                 Err(message) => Ok(CommandValue::Error { message }),
             },
-            CommandAction::QueryCrewList { context } => match self.crew.crew_list_internal(context).await {
+            CommandAction::QueryCrewList { context } => match self.port.crew_list_internal(context).await {
                 Ok(v) => Ok(CommandValue::CrewList(Box::new(v))),
                 Err(message) => Ok(CommandValue::Error { message }),
             },

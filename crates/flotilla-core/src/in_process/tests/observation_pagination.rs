@@ -91,6 +91,7 @@ async fn source_pagination_fairness_survives_provider_rediscovery() {
         fake_discovery_with_runner(false, runner.clone()),
         HostName::new("test-host"),
         backend,
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon

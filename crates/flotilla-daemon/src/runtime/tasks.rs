@@ -1,5 +1,6 @@
 //! Background task ownership, supervision, retention, and watch loops.
 
+use flotilla_daemon_api::daemon::DaemonHandle;
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -11,7 +12,9 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_controllers::reconcilers::checkout::runtime::sweep_host_empty_convoy_directories;
 use flotilla_controllers::reconcilers::VesselPlacementProjector;
-use flotilla_core::{aggregator_projection::AggregatorProjectionState, demand_lifecycle::DemandLifecycle, in_process::InProcessDaemon};
+use flotilla_core::{demand_lifecycle::DemandLifecycle, in_process::InProcessDaemon};
+use flotilla_projections::aggregator_projection::AggregatorProjectionState;
+
 use flotilla_credentials::CredentialStore;
 use flotilla_discovery::registry::{command_provider_registry, ProviderRegistry};
 use flotilla_environment::environment::EnvironmentKind;
@@ -899,7 +902,24 @@ pub(super) fn spawn_aggregator_task(
             let namespace = namespace.clone();
             let state = state.clone();
             let issue_polling = issue_polling.clone();
-            async move { flotilla_aggregator::run(daemon, &namespace, state, issue_polling).await }
+            async move {
+                flotilla_projections::run(
+                    flotilla_projections::AggregatorContext {
+                        durable: daemon.resource_backend(),
+                        observed: daemon.observed_resource_backend(),
+                        host_name: daemon.host_name().clone(),
+                        event_sink: daemon.event_sink(),
+                        events: daemon.subscribe(),
+                        attach: daemon.clone(),
+                        change_requests: daemon.clone(),
+                        issues: daemon.clone(),
+                    },
+                    &namespace,
+                    state,
+                    issue_polling,
+                )
+                .await
+            }
         })
         .await;
     })

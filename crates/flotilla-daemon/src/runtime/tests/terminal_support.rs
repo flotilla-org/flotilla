@@ -257,6 +257,7 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool) {
         fake_discovery(false),
         HostName::new("message-sender"),
         ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let topology = spawn_in_memory_request_topology_stateful(sender.clone(), daemon.clone())
@@ -450,9 +451,15 @@ pub(super) async fn daemon_with_transient_terminal_pool(
     pool: Arc<TransientTerminalPool>,
 ) -> Arc<InProcessDaemon> {
     let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(pool as Arc<dyn TerminalPool>));
-    let daemon =
-        InProcessDaemon::new_with_resource_backend(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy"), backend)
-            .await;
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        config,
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        backend,
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .replace_local_environment_bag_for_test(
             EnvironmentBag::new()

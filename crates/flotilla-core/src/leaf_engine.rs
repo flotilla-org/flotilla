@@ -1,4 +1,5 @@
 use flotilla_daemon_api::event_sink::EventSink;
+use flotilla_resources::{EpisodeKeyFields, LeafFiringRecord, LeafSubscriptionRow, LeafWatcher};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{
@@ -12,7 +13,7 @@ use chrono::{DateTime, Utc};
 use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_protocol::Leaf;
 use flotilla_provider_runtime::ObservationError;
-use flotilla_resources::{Convoy, HoldAct, LeafMaker, TerminalAttentionSource, TerminalAttentionState, TurnDeliveryRule, TurnDeliveryRung};
+use flotilla_resources::{Convoy, HoldAct, TerminalAttentionSource, TerminalAttentionState, TurnDeliveryRung};
 use flotilla_store::{controller::SecondaryWatch, ResourceBackend};
 use tokio::{
     sync::{broadcast, Mutex},
@@ -33,22 +34,6 @@ impl IssueObservationSource for UnavailableIssues {
     async fn observe(&self, _subject: &IssueRef) -> Result<flotilla_resources::IssueStatus, String> {
         Err("issue observation source unavailable".into())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LeafWatcher {
-    WaitCaller { connection_id: uuid::Uuid },
-    ReconcilerWake { convoy: String },
-    TurnDelivery { convoy: String, source: String, rule: Box<TurnDeliveryRule> },
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EpisodeKeyFields {
-    pub source: Option<String>,
-    pub convoy: Option<String>,
-    pub vessel: Option<String>,
-    pub role: Option<String>,
-    pub subject_revision: Option<String>,
 }
 
 /// In-process workflow activation context. Only the resulting Message resource
@@ -104,25 +89,6 @@ pub trait ResourceIntentPublisher: Send + Sync {
 pub trait TurnDeliveryActuator: Send + Sync {
     async fn deliver(&self, request: &CrewTurnIntent) -> Result<CrewTurnAdmission, String>;
     async fn hold(&self, request: &CrewTurnIntent, act: &HoldAct, reason: &str) -> Result<(), String>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeafSubscriptionRow {
-    pub id: uuid::Uuid,
-    pub namespace: String,
-    pub leaves: Vec<Leaf>,
-    pub watcher: LeafWatcher,
-    pub maker: LeafMaker,
-    pub freshness_demand: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub episode_key: EpisodeKeyFields,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeafFiringRecord {
-    pub leaf: Leaf,
-    pub value: String,
-    pub fired_at: DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -325,7 +291,7 @@ mod turn_delivery;
 mod wake;
 
 pub(crate) use stalls::{crew_role_address, supervision_message_source};
-pub(crate) use turn_delivery::{durable_message_evidence, queued_turn_evidence, queued_turn_session, turn_message_producer_key};
+pub(crate) use turn_delivery::{durable_message_evidence, turn_message_producer_key};
 
 #[cfg(test)]
 mod tests;

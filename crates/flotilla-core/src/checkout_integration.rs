@@ -4,7 +4,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use chrono::Utc;
@@ -20,8 +19,6 @@ use flotilla_vcs::vcs::RepositoryRead;
 use flotilla_vcs::vcs::Vcs;
 use flotilla_vcs::vcs::VcsCheck;
 
-/// Maximum age of checkout evidence used to settle or tear down a convoy.
-pub const LANDING_EVIDENCE_TTL: Duration = Duration::from_secs(30);
 const CONVOY_ASSOCIATION_UNAVAILABLE: &str = "no change request exists for the checkout ref, but convoy association was not available";
 
 pub fn checkout_observation_lacks_convoy_association(status: &CheckoutIntegrationStatus) -> bool {

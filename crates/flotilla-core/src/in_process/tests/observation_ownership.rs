@@ -81,6 +81,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
             ),
             HostName::new(name),
             ResourceBackend::new(InMemoryBackend::default()),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         temps.push(temp);

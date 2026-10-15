@@ -181,6 +181,7 @@ async fn bound_admission_prioritizes_typed_limit_over_misleading_diagnostic() {
         fake_discovery_with_runner(false, runner.clone()),
         HostName::new("test-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon.set_provisioning_namespace("flotilla".into()).await;
@@ -223,6 +224,7 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
         fake_discovery_with_runner(false, runner.clone()),
         HostName::new("test-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon
@@ -379,6 +381,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         fake_discovery_with_runner(false, runner.clone()),
         HostName::new("test-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon

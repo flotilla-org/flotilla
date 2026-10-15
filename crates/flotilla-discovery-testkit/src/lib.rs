@@ -1379,3 +1379,6 @@ mod tests {
         assert!(provider.list_changed_since(&source, "1970-01-01T00:00:00Z", 1).await.expect("paged changes").has_more);
     }
 }
+
+mod peer_overlay;
+pub use peer_overlay::HostPeerOverlay;

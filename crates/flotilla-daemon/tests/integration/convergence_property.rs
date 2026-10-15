@@ -123,6 +123,7 @@ impl Node {
             fake_discovery(false),
             self.host.clone(),
             self.backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         assert_eq!(self.daemon.node_id(), &self.root, "restart changed the durable node identity");
@@ -160,6 +161,7 @@ impl Harness {
                 fake_discovery(false),
                 host.clone(),
                 backend.clone(),
+                std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
             )
             .await;
             let root = daemon.node_id().clone();

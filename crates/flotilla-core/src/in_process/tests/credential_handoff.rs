@@ -28,6 +28,7 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         fake_discovery(false),
         HostName::new("test-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let repository = RepositoryKey("github.com-flotilla-org-flotilla".to_string());
@@ -265,6 +266,7 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
         fake_discovery(false),
         HostName::new("test-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let agent = |role: &str| {

@@ -89,8 +89,14 @@ fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
         let mut discovery = fake_discovery(false);
         discovery.factories.vcs =
             vec![Box::new(CountingVcsFactory { inner: FakeVcsFactory::new(FakeVcsState::builder(path).build()), probes: probes.clone() })];
-        let daemon =
-            InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), discovery, HostName::new("test")).await;
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            discovery,
+            HostName::new("test"),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
         let backend = if durable { &daemon.resource_backend } else { &daemon.observed_resource_backend };
         let repository = RepositorySpec::remote("https://github.com/example/lifetime").expect("repository");
         let key = repository.key();
@@ -156,7 +162,14 @@ async fn generic_checkout_executes_without_presentation_roots() {
     let state = FakeVcsState::builder(path).checkout("main").path(path).is_main(true).build().build();
     let mut discovery = fake_discovery(false);
     discovery.factories.vcs = vec![Box::new(FakeVcsFactory::new(state.clone()))];
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), discovery, HostName::new("test")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::new("test"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let spec = RepositorySpec::remote("https://github.com/acme/commands").expect("repository");
     let key = spec.key();
     daemon
@@ -252,7 +265,14 @@ async fn project_issue_binding_keeps_conditional_lease_after_checkout_removal() 
         parse_first_dotted_version,
     )));
     discovery.factories.issue_trackers = vec![Box::new(GitHubIssueProviderFactory)];
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), discovery, HostName::new("test")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::new("test"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let spec = RepositorySpec::remote("https://github.com/acme/issues").expect("repository");
     let key = spec.key();
     daemon
@@ -317,7 +337,14 @@ async fn checkout_provider_watch_follows_namespace_changes() {
     let path = Path::new("/checkouts/namespace");
     let mut discovery = fake_discovery(false);
     discovery.factories.vcs = vec![Box::new(FakeVcsFactory::new(FakeVcsState::builder(path).build()))];
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), discovery, HostName::new("test")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::new("test"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let spec = RepositorySpec::remote("https://github.com/example/namespace").expect("repository");
     let key = spec.key();
     for namespace in ["flotilla", "other"] {
@@ -381,7 +408,14 @@ async fn project_issue_binding_uses_source_forge_instead_of_mirror_transport() {
     std::fs::write(temp.path().join("lab-forgejo-source-token"), "test-token\n").expect("credential");
     let mut discovery = fake_discovery(false);
     discovery.factories.issue_trackers = vec![Box::new(ForgejoIssueProviderFactory)];
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(config_dir)), discovery, HostName::new("test")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(config_dir)),
+        discovery,
+        HostName::new("test"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let forge = ForgeSpec::builder()
         .forge_id("source-forge".into())
         .kind(ForgeKind::Forgejo)

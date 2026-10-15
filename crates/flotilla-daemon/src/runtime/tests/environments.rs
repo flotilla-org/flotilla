@@ -12,6 +12,7 @@ async fn standing_backing_inspection_accepts_durable_pre_provisioning_failure() 
         Arc::clone(&config),
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
         HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
@@ -57,6 +58,7 @@ async fn standing_backing_inspection_accepts_local_absence_only_after_startup_ob
         Arc::clone(&config),
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
         HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
@@ -136,6 +138,7 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
         Arc::clone(&config),
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
         HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let convoy = daemon
@@ -235,6 +238,7 @@ async fn fresh_daemon_readopts_running_environment_from_shared_store_and_backing
             fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
             flotilla_protocol::HostName::new("udder"),
             backend.clone(),
+            std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
         )
         .await;
         let env_id = EnvironmentId::new("env-governor-govern");
@@ -268,6 +272,7 @@ async fn fresh_daemon_readopts_running_environment_from_shared_store_and_backing
             fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
             flotilla_protocol::HostName::new("udder"),
             backend,
+            std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
         )
         .await;
         assert!(restarted.environment_registry_for_environment(&env_id).is_none(), "fresh daemon starts without ephemeral registration");
@@ -317,6 +322,7 @@ async fn environment_readoption_marks_missing_container_lost() {
         Arc::clone(&config),
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
         flotilla_protocol::HostName::new("udder"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let env_id = EnvironmentId::new("env-dead");
@@ -354,6 +360,7 @@ async fn transient_environment_liveness_error_remains_ready_for_retry() {
         Arc::clone(&config),
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
         flotilla_protocol::HostName::new("udder"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let env_id = EnvironmentId::new("env-transient");
@@ -389,6 +396,7 @@ async fn failed_environment_readoption_does_not_block_a_live_sibling() {
         Arc::clone(&config),
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
         flotilla_protocol::HostName::new("udder"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let bad_id = EnvironmentId::new("env-bad");

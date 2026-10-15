@@ -9,10 +9,10 @@ use flotilla_resources::{Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, Conv
 use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
-use crate::in_process::convoy_admission::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 use crate::in_process::crew_ops::{convoy_message_address, convoy_sender_address};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 
 // #2597: failed reads retain the resource identity and emit scoped debug diagnostics;
 // successful reads never emit fallback diagnostics. Glue: exhaust the three read outcomes.
@@ -132,6 +132,7 @@ async fn resource_message_mutations_use_durable_inbox_admission() {
         fake_discovery(false),
         HostName::new("test-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let mut document = serde_json::json!({
@@ -163,6 +164,7 @@ async fn new_message_mutations_route_to_the_absent_receivers_home() {
         fake_discovery(false),
         HostName::new("sender"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let remote = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("receiver"));
@@ -202,6 +204,7 @@ async fn message_admission_qualifies_and_exposes_canonical_suppression() {
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let mut document = serde_json::json!({
@@ -245,6 +248,7 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let document =
@@ -357,6 +361,7 @@ async fn message_send_reads_ignore_unrelated_history() {
             fake_discovery(false),
             HostName::new("local"),
             backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let convoys = backend.using::<ResourceConvoy>("flotilla");

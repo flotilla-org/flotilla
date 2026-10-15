@@ -198,9 +198,15 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
         .apply(WatchEvent::Added(remote.clone()), chrono::Utc::now())
         .await
         .expect("replica");
-    let daemon =
-        InProcessDaemon::new_with_resource_backend(vec![], config.clone(), fake_discovery(false), HostName::new("local"), backend.clone())
-            .await;
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        config.clone(),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let runtime = DaemonRuntime::start_with_options(
         daemon.clone(),
         config,

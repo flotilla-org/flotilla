@@ -32,6 +32,7 @@ async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selectio
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     create_docker_placement(&backend, "docker-kiwi", "kiwi", BTreeSet::new()).await;

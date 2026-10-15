@@ -111,9 +111,15 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         )
         .await
         .expect("create project");
-    let daemon =
-        InProcessDaemon::new_with_resource_backend(vec![], Arc::clone(&config), fake_discovery(false), HostName::new("local"), backend)
-            .await;
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend,
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let observed = daemon.observed_resource_backend();
     let options = RuntimeOptions {
         namespace: "flotilla".into(),
@@ -323,6 +329,7 @@ async fn runtime_start_republishes_durable_adopted_checkouts_before_query_bootst
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let options = RuntimeOptions::builder()
@@ -407,7 +414,15 @@ async fn project_issue_subscription_materializes_window_and_ephemeral_search() {
     let discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_issue_tracker(Arc::clone(&provider) as Arc<dyn flotilla_issue_tracker::IssueProvider>),
     );
-    let daemon = InProcessDaemon::new_with_resource_backend(vec![], Arc::clone(&config), discovery, HostName::new("local"), backend).await;
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        discovery,
+        HostName::new("local"),
+        backend,
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let options = RuntimeOptions {
         namespace: "flotilla".into(),
         heartbeat_interval: Duration::from_secs(300),
@@ -487,6 +502,7 @@ async fn aggregator_emits_result_set_events() {
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
 
@@ -569,6 +585,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(pool.clone())),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let mut rx = daemon.subscribe();
@@ -957,6 +974,7 @@ async fn subscribe_queries_replays_result_set_after_seq() {
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
 
@@ -1121,6 +1139,7 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let options = RuntimeOptions::builder()

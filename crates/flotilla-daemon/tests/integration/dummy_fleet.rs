@@ -53,8 +53,15 @@ impl DummyDaemon {
         let mut discovery = fake_discovery(false);
         let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet configured");
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let daemon =
-            InProcessDaemon::new_with_resource_backend(vec![], Arc::clone(&config), discovery, HostName::new("dummy-load"), backend).await;
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            vec![],
+            Arc::clone(&config),
+            discovery,
+            HostName::new("dummy-load"),
+            backend,
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
         attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");
         let options = RuntimeOptions {
             namespace: NAMESPACE.into(),

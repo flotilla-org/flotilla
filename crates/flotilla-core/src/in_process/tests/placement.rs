@@ -37,6 +37,7 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
         fake_discovery(false),
         HostName::new("kiwi"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     backend
@@ -532,6 +533,7 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
         fake_discovery(false),
         HostName::new("local"),
         ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let local_host = daemon.local_host_id().expect("local host id").to_string();
@@ -566,6 +568,7 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
         fake_discovery(false),
         HostName::new("local"),
         ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let host = daemon.local_host_id().expect("local host id").to_string();

@@ -315,6 +315,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         fake_discovery(false),
         HostName::new("test-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon.set_work_credential_reconciler(probe.clone()).await;

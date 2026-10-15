@@ -137,7 +137,14 @@ async fn repeated_reclaim_refusal_with_changing_reason_raises_demand() {
     fs::create_dir_all(&config_base).expect("config directory");
     fs::write(config_base.join("daemon.toml"), "machine_id = \"reclaim-refusal-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
-    let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        git_process_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
     let convoy = convoys
         .create(
@@ -190,7 +197,14 @@ async fn landed_convoy_reclaim_accepts_sanctioned_checkout_absence() {
     fs::create_dir_all(&config_base).expect("config directory");
     fs::write(config_base.join("daemon.toml"), "machine_id = \"landed-reclaim-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
-    let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        git_process_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
     let created = convoys
         .create(&InputMeta::builder().name("raced".to_string()).build(), &ConvoySpec::builder().workflow_ref("wf-a".to_string()).build())
@@ -246,7 +260,14 @@ async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout
     fs::create_dir_all(&config_base).expect("config directory");
     fs::write(config_base.join("daemon.toml"), "machine_id = \"checkout-authority-collected-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
-    let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        git_process_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);

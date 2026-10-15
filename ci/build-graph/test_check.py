@@ -67,12 +67,12 @@ class BuildGraphContract(unittest.TestCase):
         # Explicit finite generator spans direct/transitive normal/build edges.
         # A second capability proves that ports cannot be replaced by crate edges.
         for target in ("flotilla-core", "flotilla-daemon", "flotilla-controllers",
-                       "flotilla-aggregator", "flotilla-credentials", "flotilla-provisioning"):
+                       "flotilla-projections", "flotilla-credentials", "flotilla-provisioning"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
                     with self.subTest(target=target, kind=kind, middle=middle):
                         with patch("check.CAPABILITY_CRATES",
-                                   frozenset({"flotilla-executor", "flotilla-provisioning"})):
+                                   CAPABILITY_CRATES | {"flotilla-provisioning"}):
                             self.assertIn(
                                 f"flotilla-executor: must not depend on {target}, directly or transitively",
                                 violations(graph(
@@ -80,6 +80,29 @@ class BuildGraphContract(unittest.TestCase):
                                     package("adapter", normal=(target,)), package(target),
                                 )),
                             )
+
+    def test_projections_reads_lower_crates_and_refuses_capability_edges(self):
+        # #3296: projections is a capability below core, with no path back to
+        # composition or another capability. Cover direct and transitive edges,
+        # normal and build dependencies, and the permitted store-only graph.
+        self.assertIn("flotilla-projections", CAPABILITY_CRATES)
+        self.assertEqual(violations(graph(
+            package("flotilla-core", normal=("flotilla-projections",)),
+            package("flotilla-projections", normal=("flotilla-store",)),
+            package("flotilla-store", normal=("flotilla-resources",)),
+            package("flotilla-resources"),
+        )), [])
+        for target in ("flotilla-core", "flotilla-daemon", "flotilla-executor", "flotilla-credentials"):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertIn(
+                            f"flotilla-projections: must not depend on {target}, directly or transitively",
+                            violations(graph(
+                                package("flotilla-projections", **{kind: (middle,)}),
+                                package("adapter", normal=(target,)), package(target),
+                            )),
+                        )
 
     def test_components_refuse_capability_reachbacks(self):
         # A lower component cannot gain an upward dependency on the executor.
@@ -92,7 +115,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_provider_runtime_is_native_and_independent(self):
         # ADR 0060: runtime is native, but cannot reach composition or store crates.
         self.assertEqual(layer("flotilla-provider-runtime"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -111,7 +134,7 @@ class BuildGraphContract(unittest.TestCase):
         # ADR 0060 step 4: host-local configuration is a C-free base crate that
         # discovery and components may read, but it cannot reach upward.
         self.assertEqual(layer("flotilla-config"), "base")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -130,7 +153,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_discovery_api_is_native_and_independent(self):
         # ADR 0060: discovery API is native, but cannot reach composition or store crates.
         self.assertEqual(layer("flotilla-discovery-api"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -148,7 +171,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_vcs_is_native_and_independent(self):
         # ADR 0060: VCS is native, but cannot reach composition or store crates.
         self.assertEqual(layer("flotilla-vcs"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -166,7 +189,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_charter_is_native_and_independent(self):
         # ADR 0060: Charter reads through VCS, so it is native, but cannot reach composition or store crates.
         self.assertEqual(layer("flotilla-charter"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -184,7 +207,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_environment_is_native_and_independent(self):
         # ADR 0060: environment is native, but cannot reach composition or store crates.
         self.assertEqual(layer("flotilla-environment"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -202,7 +225,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_terminal_is_native_and_independent(self):
         # ADR 0060: terminal component is native, but cannot reach composition or store crates.
         self.assertEqual(layer("flotilla-terminal"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -220,7 +243,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_cloud_agent_is_native_and_independent(self):
         # Issue #3037 / ADR 0060: cloud-agent is native and cannot reach composition or storage.
         self.assertEqual(layer("flotilla-cloud-agent"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -238,7 +261,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_ai_utility_is_native_and_independent(self):
         # Issue #3038 / ADR 0060: ai-utility is native and cannot reach composition or storage.
         self.assertEqual(layer("flotilla-ai-utility"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -256,7 +279,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_forge_github_is_native_and_independent(self):
         # Issue #3039 / ADR 0060: forge-github is native and cannot reach composition or storage.
         self.assertEqual(layer("flotilla-forge-github"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -274,7 +297,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_forgejo_is_native_and_independent(self):
         # Issue #3040 / ADR 0060: forge-forgejo is native and cannot reach composition or storage.
         self.assertEqual(layer("flotilla-forge-forgejo"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -292,7 +315,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_change_request_is_native_and_independent(self):
         # Issue #2749 / ADR 0060: change-request is native and cannot reach composition or storage.
         self.assertEqual(layer("flotilla-change-request"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -310,7 +333,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_issue_tracker_is_native_and_independent(self):
         # Issue #2749 / ADR 0060: issue-tracker is native and cannot reach composition or storage.
         self.assertEqual(layer("flotilla-issue-tracker"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -328,7 +351,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_agent_is_native_and_independent(self):
         # Issue #2749 / ADR 0060: agent harness adapters build on vcs and terminal, never composition or storage.
         self.assertEqual(layer("flotilla-agent"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -347,7 +370,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_discovery_is_native_and_independent(self):
         # Issue #2749 / ADR 0060: discovery assembles the provider type crates, never composition or storage.
         self.assertEqual(layer("flotilla-discovery"), "native")
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-projections", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):
@@ -388,7 +411,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_replication_is_native_and_independent(self):
         # ADR 0060: replication reaches stores only through dyn Store, not daemon or HTTP crates.
         self.assertEqual(layer("flotilla-replication"), "native")
-        for target in ("flotilla-core", "flotilla-daemon", "flotilla-daemon-api", "flotilla-aggregator",
+        for target in ("flotilla-core", "flotilla-daemon", "flotilla-daemon-api", "flotilla-projections",
                        "flotilla-credentials", "flotilla-controllers", "flotilla-store-http"):
             for kind in ("normal", "build"):
                 for middle in (target, "adapter"):

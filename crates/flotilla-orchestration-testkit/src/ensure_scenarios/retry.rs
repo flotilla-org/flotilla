@@ -517,6 +517,7 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
         HostName::local(),
         backend.clone(),
         clock.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     restarted_daemon

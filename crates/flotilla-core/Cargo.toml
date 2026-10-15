@@ -11,6 +11,7 @@ skip-no-sandbox-tests = ["flotilla-executor/skip-no-sandbox-tests", "flotilla-st
 
 [dependencies]
 flotilla-messaging = { path = "../flotilla-messaging" }
+flotilla-projections = { path = "../flotilla-projections" }
 flotilla-executor = { path = "../flotilla-executor" }
 flotilla-capability-contract = { path = "../flotilla-capability-contract" }
 flotilla-config = { path = "../flotilla-config" }

@@ -275,7 +275,14 @@ async fn empty_daemon_named(host_name: &str) -> Arc<InProcessDaemon> {
 async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Option<u64>) -> Arc<InProcessDaemon> {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store_with_floor(tmp.keep(), free_space_floor_gib);
-    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host_name)).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        fake_discovery(false),
+        HostName::new(host_name),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .install_convoy_ensure_reconciler(Arc::new(
             EnsureReconciler::builder().resource_backend(daemon.resource_backend()).clock(Arc::new(SystemClock)).build(),
@@ -3766,7 +3773,14 @@ async fn remote_issue_query_returns_results() {
     let follower_discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_issue_tracker(Arc::clone(&mock_service) as Arc<dyn IssueProvider>),
     );
-    let follower = InProcessDaemon::new(vec![], follower_config, follower_discovery, HostName::new("follower")).await;
+    let follower = InProcessDaemon::new(
+        vec![],
+        follower_config,
+        follower_discovery,
+        HostName::new("follower"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let repository = RepositorySpec::remote("https://github.com/owner/repo").expect("repository");
     let key = repository.key();
     follower
@@ -4311,7 +4325,14 @@ async fn repository_identity_operations_scenario(alias: bool, observed: bool) {
         discovery.factories.vcs = vec![Box::new(FakeVcsFactory::new(
             FakeVcsState::builder(path).branch("main", true).checkout("main").is_main(true).path(path).build().build(),
         ))];
-        InProcessDaemon::new(Vec::new(), test_config_store_with_floor(tmp.keep(), None), discovery, HostName::new("leader")).await
+        InProcessDaemon::new(
+            Vec::new(),
+            test_config_store_with_floor(tmp.keep(), None),
+            discovery,
+            HostName::new("leader"),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await
     } else {
         empty_daemon_named("leader").await
     };

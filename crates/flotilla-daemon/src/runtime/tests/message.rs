@@ -21,6 +21,7 @@ async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_ho
         Arc::clone(&config),
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
         HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([

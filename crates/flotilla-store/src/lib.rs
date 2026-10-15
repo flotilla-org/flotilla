@@ -75,3 +75,7 @@ use flotilla_resources::digest;
 
 mod serialized_watch;
 pub use serialized_watch::*;
+
+mod projection_helpers;
+
+pub use projection_helpers::{read_definition_catalog, RequestSnapshot};

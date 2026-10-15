@@ -584,7 +584,14 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
     fs::set_permissions(&central, fs::Permissions::from_mode(0o600)).expect("protect central auth");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None), prepared_auth: Mutex::new(None) });
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
@@ -679,7 +686,14 @@ async fn codex_credential_and_agent_material_conflict_before_container_creation(
     fs::set_permissions(&central, fs::Permissions::from_mode(0o600)).expect("protect central auth");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .resource_backend()
         .definitions::<CredentialSpec>(NAMESPACE)
@@ -761,7 +775,14 @@ async fn an_unprovisioned_central_codex_credential_fails_before_registry_preflig
     let skill_sources = write_test_skill_sources(temp.path());
     let config = Arc::new(ConfigStore::with_base(config_base));
     let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .resource_backend()
         .definitions::<CredentialSpec>(NAMESPACE)

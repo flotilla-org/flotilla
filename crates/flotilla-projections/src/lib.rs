@@ -8,33 +8,56 @@
 
 use std::sync::Arc;
 
-use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
-use flotilla_daemon_api::daemon::DaemonHandle;
+use crate::aggregator_projection::AggregatorProjectionState;
+use flotilla_daemon_api::event_sink::EventSink;
+use flotilla_protocol::{DaemonEvent, HostName};
 use flotilla_resources::{Checkout, Convoy, Demand, Environment, Project, Regard, Repository, ResourceError};
+use flotilla_store::ResourceBackend;
 use futures::future::BoxFuture;
+use tokio::sync::broadcast;
 
 mod aggregator;
 mod issue_materializer;
 
 use aggregator::{Aggregator, AggregatorResolvers};
-pub use issue_materializer::IssuePollingHealth;
+pub use aggregator::{AttachCapabilityResolver, ConvoyChangeRequestResolver};
+pub use issue_materializer::{IssueMaterializationResolver, IssuePollingHealth};
+pub mod aggregator_projection;
+pub mod awareness_projection;
+pub mod convoy_branch_refresh;
+pub mod dispatch_board;
+mod dispatch_ready;
+pub mod fleet;
+pub mod fleet_health;
+pub mod host_registry;
+pub mod host_summary;
+pub mod ports;
+mod project_repositories;
+pub mod projections_actions;
+pub mod query_registry;
+pub mod read_projections;
+pub mod resource_explain;
+pub mod salience;
+mod scoped_store;
+mod standing_roles;
+pub mod terminal_health;
 
 /// Run one aggregator lifetime, including its provider resolvers and watch sources.
 /// Dropping the future releases its watches and materialization tasks; the runtime
 /// remains responsible for restart policy and reporting a returned store error.
 pub fn run(
-    daemon: Arc<InProcessDaemon>,
+    context: AggregatorContext,
     namespace: &str,
     state: AggregatorProjectionState,
     issue_polling: IssuePollingHealth,
 ) -> BoxFuture<'_, Result<(), ResourceError>> {
     Box::pin(async move {
-        let durable = daemon.resource_backend();
-        let observed = daemon.observed_resource_backend();
-        let aggregator = Aggregator::with_events(state, daemon.host_name().clone(), daemon.event_sink(), daemon.subscribe())
-            .with_attach_resolver(Arc::clone(&daemon))
-            .with_change_request_resolver(Arc::clone(&daemon))
-            .with_issue_resolver(Arc::clone(&daemon))
+        let durable = context.durable;
+        let observed = context.observed;
+        let aggregator = Aggregator::with_events(state, context.host_name, context.event_sink, context.events)
+            .with_attach_resolver_arc(context.attach)
+            .with_change_request_resolver_arc(context.change_requests)
+            .with_issue_resolver_arc(context.issues)
             .with_issue_polling_health(issue_polling);
         aggregator
             .run(
@@ -60,4 +83,16 @@ pub fn run(
             )
             .await
     })
+}
+
+/// Runtime inputs for one supervised projection lifetime.
+pub struct AggregatorContext {
+    pub durable: ResourceBackend,
+    pub observed: ResourceBackend,
+    pub host_name: HostName,
+    pub event_sink: Arc<dyn EventSink>,
+    pub events: broadcast::Receiver<DaemonEvent>,
+    pub attach: Arc<dyn AttachCapabilityResolver>,
+    pub change_requests: Arc<dyn ConvoyChangeRequestResolver>,
+    pub issues: Arc<dyn IssueMaterializationResolver>,
 }

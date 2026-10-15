@@ -212,6 +212,7 @@ async fn standing_ensure_fixture_for(
         HostName::new(host),
         backend.clone(),
         clock.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon.install_convoy_ensure_reconciler(factory.create(daemon.resource_backend(), daemon.clock_for_scenarios())).await;

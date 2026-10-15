@@ -53,6 +53,7 @@ async fn start_daemon_with_backend(
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let options = RuntimeOptions {
@@ -78,6 +79,7 @@ async fn start_sqlite_daemon(
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let options = RuntimeOptions {

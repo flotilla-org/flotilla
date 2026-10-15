@@ -764,6 +764,7 @@ mod tests {
             Arc::new(ConfigStore::with_base(leader_temp.path())),
             fake_discovery(false),
             HostName::new(if target == 2 { "kiwi" } else { "feta" }),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let follower = InProcessDaemon::new(
@@ -771,6 +772,7 @@ mod tests {
             Arc::new(ConfigStore::with_base(follower_temp.path())),
             fake_discovery(false),
             HostName::new("feta"),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("router");

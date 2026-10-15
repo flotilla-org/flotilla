@@ -99,7 +99,14 @@ async fn contained_terminal_session_never_falls_back_from_the_requested_interior
     fs::write(config_base.join("daemon.toml"), "machine_id = \"interior-pool-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        flotilla_protocol::HostName::new("dinghy"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let env_id = EnvironmentId::new("contained-work");
     let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
         id: env_id.clone(),

@@ -1413,6 +1413,7 @@ mod tests {
             Arc::new(ConfigStore::with_base(config.path())),
             fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
             HostName::new("laptop"),
+            std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
         )
         .await;
         let backend = daemon.resource_backend();
@@ -1769,6 +1770,7 @@ mod tests {
             Arc::new(ConfigStore::with_base(config_dir)),
             fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
             HostName::local(),
+            std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
         )
         .await;
         let backend = daemon.resource_backend();
@@ -2434,6 +2436,7 @@ mod registered_charter_tests {
             fake_discovery(false),
             HostName::new("fleet-home"),
             fleet_backend.clone(),
+            std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
         )
         .await;
         let host = InProcessDaemon::new_with_resource_backend(
@@ -2442,6 +2445,7 @@ mod registered_charter_tests {
             fake_discovery(false),
             HostName::new("target-host"),
             host_backend.clone(),
+            std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
         )
         .await;
         let host_ref = host.local_host_summary().await.environment_id.host_id().expect("host ID").to_string();

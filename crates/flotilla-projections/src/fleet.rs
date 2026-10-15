@@ -5,31 +5,29 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     result_set::{ConvoyRow, ResultSet, Rows},
-    CanonicalHostId, CredentialAttention, CredentialAttentionSeverity, CrewAttention, FleetListRow, FleetObservationAgreement,
-    FleetStaleness, HostName, NodeId, PeerConnectionState,
+    CanonicalHostId, CredentialAttention, CredentialAttentionSeverity, FleetListRow, FleetObservationAgreement, FleetStaleness, HostName,
+    NodeId, PeerConnectionState,
 };
+use flotilla_resources::canonical_placement_host_ref_from_sources;
 use flotilla_resources::{
-    Checkout as ResourceCheckout, Convoy as ResourceConvoy, Environment as ResourceEnvironment, Host as ResourceHost,
-    HostStatus as ResourceHostStatus, ReadResourceObject, ResourceProvenance, TerminalAttentionState,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionStatus, CONVOY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    crew_attention, Checkout as ResourceCheckout, Convoy as ResourceConvoy, Environment as ResourceEnvironment, Host as ResourceHost,
+    HostStatus as ResourceHostStatus, ReadResourceObject, ResourceProvenance, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use tokio::sync::RwLock;
 use tracing::debug;
 
-use crate::{
-    aggregator_projection::AggregatorProjectionState, host_registry::HostRegistry,
-    host_resolution::canonical_placement_host_ref_from_sources,
-};
+use crate::aggregator_projection::AggregatorProjectionState;
+use crate::host_registry::HostRegistry;
 
-pub(crate) const FLEET_REPLICA_FRESH_SECS: i64 = 90;
+pub const FLEET_REPLICA_FRESH_SECS: i64 = 90;
 
-pub(crate) fn replica_sync_is_fresh(last_sync: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+pub fn replica_sync_is_fresh(last_sync: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     now.signed_duration_since(last_sync).num_seconds() <= FLEET_REPLICA_FRESH_SECS
 }
 
-pub(crate) async fn is_host_self_report(source: &ReadResourceObject<ResourceHost>, host_registry: &HostRegistry) -> bool {
+pub async fn is_host_self_report(source: &ReadResourceObject<ResourceHost>, host_registry: &HostRegistry) -> bool {
     let ResourceProvenance::Replica { origin_root, .. } = &source.provenance else { return false };
     host_registry
         .environment_id_for_node(origin_root)
@@ -38,13 +36,13 @@ pub(crate) async fn is_host_self_report(source: &ReadResourceObject<ResourceHost
         .is_some_and(|host_id| host_id == source.object.metadata.name)
 }
 
-pub(crate) struct ReplicatedHostReport {
-    pub(crate) host_id: String,
-    pub(crate) last_synced_at: DateTime<Utc>,
-    pub(crate) status: Option<ResourceHostStatus>,
+pub struct ReplicatedHostReport {
+    pub host_id: String,
+    pub last_synced_at: DateTime<Utc>,
+    pub status: Option<ResourceHostStatus>,
 }
 
-pub(crate) async fn replicated_host_reports(
+pub async fn replicated_host_reports(
     sources: &[ReadResourceObject<ResourceHost>],
     host_registry: &HostRegistry,
     configured_by_node: &HashMap<NodeId, HostName>,
@@ -76,7 +74,7 @@ pub(crate) async fn replicated_host_reports(
     }
     reports
 }
-pub(crate) struct FleetService {
+pub struct FleetService {
     aggregator_projection_state: AggregatorProjectionState,
     host_name: HostName,
     canonical_local_host_id: Option<CanonicalHostId>,
@@ -84,7 +82,7 @@ pub(crate) struct FleetService {
 }
 
 impl FleetService {
-    pub(crate) fn new(
+    pub fn new(
         aggregator_projection_state: AggregatorProjectionState,
         host_name: HostName,
         canonical_local_host_id: Option<CanonicalHostId>,
@@ -92,19 +90,19 @@ impl FleetService {
         Self { aggregator_projection_state, host_name, canonical_local_host_id, resource_replication_failures: RwLock::new(HashMap::new()) }
     }
 
-    pub(crate) async fn replication_failures(&self) -> HashMap<NodeId, BTreeMap<String, String>> {
+    pub async fn replication_failures(&self) -> HashMap<NodeId, BTreeMap<String, String>> {
         self.resource_replication_failures.read().await.clone()
     }
 
-    pub(crate) async fn begin_peer_resource_replication(&self, peer: &NodeId) {
+    pub async fn begin_peer_resource_replication(&self, peer: &NodeId) {
         self.resource_replication_failures.write().await.remove(peer);
     }
 
-    pub(crate) async fn report_resource_replication_failure(&self, peer: &NodeId, kind: &str, message: &str) {
+    pub async fn report_resource_replication_failure(&self, peer: &NodeId, kind: &str, message: &str) {
         self.resource_replication_failures.write().await.entry(peer.clone()).or_default().insert(kind.to_string(), message.to_string());
     }
 
-    pub(crate) async fn report_resource_replication_healthy(&self, peer: &NodeId, kind: &str) {
+    pub async fn report_resource_replication_healthy(&self, peer: &NodeId, kind: &str) {
         let mut failures = self.resource_replication_failures.write().await;
         let Some(peer_failures) = failures.get_mut(peer) else { return };
         peer_failures.remove(kind);
@@ -123,7 +121,7 @@ impl FleetService {
 
     /// Project an explicit request inventory. Selection and storage reads belong
     /// to the caller; the same row/provenance logic serves scoped and full views.
-    pub(crate) async fn rows_with_backend(
+    pub async fn rows_with_backend(
         &self,
         backend: &ResourceBackend,
         namespace: &str,
@@ -306,7 +304,7 @@ impl FleetService {
     }
 }
 
-pub(crate) fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
+pub fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
     match phase {
         Some(ResourceTerminalSessionPhase::Starting) | None => "starting".to_string(),
         Some(ResourceTerminalSessionPhase::Running) => "running".to_string(),
@@ -316,24 +314,7 @@ pub(crate) fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) 
     }
 }
 
-pub(crate) fn crew_attention(status: Option<&TerminalSessionStatus>, now: DateTime<Utc>) -> Option<CrewAttention> {
-    let status = status.filter(|status| status.phase == ResourceTerminalSessionPhase::Running)?;
-    if status.degraded.as_ref().is_some_and(|condition| condition.is_delivery()) {
-        return Some(CrewAttention::DeliveryUnconfirmed);
-    }
-    let attention = status.attention.as_ref()?;
-    if attention.is_stale_at(now) {
-        return Some(CrewAttention::Unobservable);
-    }
-    Some(match attention.state {
-        TerminalAttentionState::Working => CrewAttention::Working,
-        TerminalAttentionState::NeedsInput => CrewAttention::NeedsInput,
-        TerminalAttentionState::Idle => CrewAttention::Idle,
-        TerminalAttentionState::Unobservable => CrewAttention::Unobservable,
-    })
-}
-
-pub(crate) fn accumulate_fleet_health_counts(counts: &mut HashMap<HostName, (usize, HashSet<String>)>, rows: &[FleetListRow]) {
+pub fn accumulate_fleet_health_counts(counts: &mut HashMap<HostName, (usize, HashSet<String>)>, rows: &[FleetListRow]) {
     for row in rows {
         let (crew_count, convoys) = counts.entry(row.host.clone()).or_default();
         if row.crew != "-" {
@@ -347,7 +328,7 @@ pub(crate) fn accumulate_fleet_health_counts(counts: &mut HashMap<HostName, (usi
 
 /// One attention entry per expired or near-expiry credential scope on a host,
 /// derived from the `credential_expiry` capability its heartbeat publishes.
-pub(crate) fn host_credential_attention(
+pub fn host_credential_attention(
     status: &ResourceHostStatus,
     now: DateTime<Utc>,
     warning_window: chrono::Duration,
@@ -380,7 +361,7 @@ pub(crate) fn host_credential_attention(
     attention
 }
 
-pub(crate) fn fleet_observation_agreement(
+pub fn fleet_observation_agreement(
     link: &PeerConnectionState,
     heartbeat_at: Option<DateTime<Utc>>,
     heartbeat_fresh: bool,
@@ -407,7 +388,7 @@ pub(crate) fn fleet_observation_agreement(
     }
 }
 
-pub(crate) fn format_resource_replication_failures(failures: &[ResourceReplicationFailure]) -> Option<String> {
+pub fn format_resource_replication_failures(failures: &[ResourceReplicationFailure]) -> Option<String> {
     if failures.is_empty() {
         return None;
     }
@@ -417,7 +398,7 @@ pub(crate) fn format_resource_replication_failures(failures: &[ResourceReplicati
     ))
 }
 
-pub(crate) fn join_replica_errors(first: Option<&str>, second: Option<&str>) -> Option<String> {
+pub fn join_replica_errors(first: Option<&str>, second: Option<&str>) -> Option<String> {
     match (first, second) {
         (Some(first), Some(second)) => Some(format!("{first}; {second}")),
         (Some(message), None) | (None, Some(message)) => Some(message.to_string()),
@@ -426,9 +407,9 @@ pub(crate) fn join_replica_errors(first: Option<&str>, second: Option<&str>) -> 
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ResourceReplicationFailure {
-    pub(crate) kind: String,
-    pub(crate) message: String,
+pub struct ResourceReplicationFailure {
+    pub kind: String,
+    pub message: String,
 }
 
 fn convoy_state_label(row: &ConvoyRow) -> String {
@@ -487,8 +468,8 @@ fn resource_environment_host_ref(environment: &flotilla_resources::ResourceObjec
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{ConvoyPhase, ResourceRef};
-    use flotilla_resources::{TerminalAttention, TerminalAttentionSource};
+    use flotilla_protocol::{ConvoyPhase, CrewAttention, ResourceRef};
+    use flotilla_resources::{TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSessionStatus};
 
     use super::*;
 

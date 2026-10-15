@@ -302,7 +302,7 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
                 .subscription_rows()
                 .await
                 .iter()
-                .any(|row| matches!(&row.watcher, crate::leaf_engine::LeafWatcher::ReconcilerWake { convoy } if convoy == "landed-claim"))
+                .any(|row| matches!(&row.watcher, flotilla_resources::LeafWatcher::ReconcilerWake { convoy } if convoy == "landed-claim"))
             {
                 break;
             }
@@ -564,6 +564,7 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
         fake_discovery(false),
         HostName::new("replica"),
         replica.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let (sender, _receiver) = flotilla_store::controller::WorkQueueSender::channel();

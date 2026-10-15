@@ -1,3 +1,4 @@
+use flotilla_resources::parse_role_address;
 use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
@@ -15,7 +16,7 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{create_identity_convoy, placement_policy, test_meta};
-use crate::in_process::convoy_admission::{allocate_convoy_generation, convoy_record_name, parse_role_address, RoleAddress};
+use crate::in_process::convoy_admission::{allocate_convoy_generation, convoy_record_name, RoleAddress};
 use crate::in_process::{placement_target_host, resolve_local_convoy_name, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 
@@ -149,6 +150,7 @@ async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() 
         fake_discovery(false),
         HostName::new("udder"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let host_id = daemon.local_host_id().expect("host id").to_string();
@@ -237,6 +239,7 @@ async fn fulfilment_list_joins_host_facts_and_fleet_health_shows_local_kinds() {
         fake_discovery(false),
         HostName::new("local-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let host_id = daemon.local_host_id().expect("local host ID").to_string();
@@ -311,6 +314,7 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
         fake_discovery(false),
         HostName::new("local-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let host_id = daemon.local_host_id().expect("local host identity").to_string();
@@ -395,6 +399,7 @@ async fn resource_host_routing_refuses_unresolved_host_ref() {
         fake_discovery(false),
         HostName::new("local-host"),
         ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
 
@@ -417,6 +422,7 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
         fake_discovery(false),
         HostName::new("local-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let host_id = daemon.local_host_id().expect("local host identity").to_string();
