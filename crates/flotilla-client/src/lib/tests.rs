@@ -100,5 +100,93 @@ fn query_cursors_use_known_sequences() {
     let query = QueryId::Convoys { scope: None };
     let subscriptions = Arc::new(std::sync::RwLock::new(HashSet::from([query.clone()])));
     let sequences = Arc::new(std::sync::RwLock::new(HashMap::from([(StreamKey::Query { query: query.clone() }, 3)])));
-    assert_eq!(encode_query_cursors(&subscriptions, &sequences), vec![QueryCursor { query, since: Some(3) }]);
+    // #3244: selected recovery preserves the known cursor and does not invent
+    // interest for a query this client has not subscribed to.
+    assert_eq!(query_cursor(&subscriptions, &sequences, &query), Some(QueryCursor { query, since: Some(3) }));
+    assert_eq!(query_cursor(&subscriptions, &sequences, &QueryId::Independents { scope: None }), None);
+}
+
+// #3244: the socket reader repairs only the gapped query and keeps sibling
+// delta delivery alive. This peer stands in for the daemon message boundary.
+#[tokio::test]
+async fn socket_gap_recovery_requests_one_query_and_keeps_sibling_deltas() {
+    use flotilla_protocol::result_set::{QueryChanges, ResultDelta, ResultSet, Rows};
+
+    let (client, server) = flotilla_transport::message::message_session_pair();
+    let daemon = SocketDaemon::from_session(client).expect("socket client");
+    let mut events = daemon.subscribe();
+    let convoy = QueryId::Convoys { scope: None };
+    let sibling = QueryId::StandingRoles { scope: None };
+    let cursors = vec![QueryCursor { query: convoy.clone(), since: None }, QueryCursor { query: sibling, since: None }];
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (done_tx, done_rx) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let Some(Message::Request { id, request: Request::SubscribeQueries { queries } }) = server.read().await.expect("read setup") else {
+            panic!("subscription setup");
+        };
+        assert_eq!(queries.len(), 2);
+        let set = |seq, rows| DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows, state: Default::default() }));
+        server
+            .write(Message::ok_response(
+                id,
+                Response::SubscribeQueries(vec![
+                    set(3, Rows::Convoys { scope: None, rows: vec![] }),
+                    set(5, Rows::StandingRoles { scope: None, rows: vec![] }),
+                ]),
+            ))
+            .await
+            .expect("seed cursors");
+        ready_rx.await.expect("subscription seeded");
+        server
+            .write(Message::Event {
+                event: Box::new(DaemonEvent::ResultDelta(Box::new(ResultDelta {
+                    seq: 9,
+                    changes: QueryChanges::Convoys { scope: None, changed: vec![], removed: vec![] },
+                    state: None,
+                }))),
+            })
+            .await
+            .expect("send gap");
+        let Some(Message::Request { id, request: Request::RecoverQueries { queries } }) = server.read().await.expect("read recovery")
+        else {
+            panic!("targeted recovery request");
+        };
+        assert_eq!(queries, vec![QueryCursor { query: QueryId::Convoys { scope: None }, since: Some(3) }]);
+        server
+            .write(Message::ok_response(id, Response::RecoverQueries(vec![set(9, Rows::Convoys { scope: None, rows: vec![] })])))
+            .await
+            .expect("recover snapshot");
+        server
+            .write(Message::Event {
+                event: Box::new(DaemonEvent::ResultDelta(Box::new(ResultDelta {
+                    seq: 6,
+                    changes: QueryChanges::StandingRoles { scope: None, changed: vec![], removed: vec![] },
+                    state: None,
+                }))),
+            })
+            .await
+            .expect("sibling delta");
+        done_rx.await.expect("events consumed before peer disconnects");
+    });
+    daemon.subscribe_queries(uuid::Uuid::nil(), &cursors).await.expect("subscribe");
+    ready_tx.send(()).expect("ready");
+    let mut recovered = false;
+    let mut sibling_delta = false;
+    for _ in 0..2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv()).await.expect("event timeout").expect("event");
+        match event {
+            DaemonEvent::ResultSet(set) => {
+                assert_eq!(set.seq, 9);
+                recovered = true;
+            }
+            DaemonEvent::ResultDelta(delta) => {
+                assert_eq!(delta.seq, 6);
+                sibling_delta = true;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert!(recovered && sibling_delta);
+    done_tx.send(()).expect("done");
+    peer.await.expect("peer");
 }

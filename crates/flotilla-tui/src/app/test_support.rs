@@ -130,6 +130,11 @@ impl DaemonHandle for StubDaemon {
         self.subscribe_result.lock().expect("subscribe result lock").clone()
     }
 
+    async fn recover_queries(&self, _queries: &[flotilla_protocol::QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+        // This UI-action stub has no materialized query state or recovery stream.
+        Err("query recovery is not modeled by the UI-action stub".into())
+    }
+
     async fn get_status(&self) -> Result<StatusResponse, String> {
         Ok(StatusResponse { repos: vec![] })
     }

@@ -97,6 +97,20 @@ fn decode<T: Resource>(value: &Value) -> Result<ResourceObject<T>, String> {
 }
 
 impl Records {
+    pub(super) fn clear_scope(&mut self, namespace: &str, kind: &str) {
+        // The ordered key puts this scope in one contiguous range. Recovery
+        // need not inspect records held by unrelated kinds or namespaces.
+        let keys: Vec<_> = self
+            .objects
+            .range((kind.to_owned(), namespace.to_owned(), String::new(), String::new())..)
+            .take_while(|((plural, ns, _, _), _)| plural == kind && ns == namespace)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            self.objects.remove(&key);
+        }
+    }
+
     pub(super) fn apply(&mut self, envelope: &ResourceReadEnvelope) -> Result<(), String> {
         if !KINDS.contains(&envelope.plural.as_str()) {
             return Err(format!("unexpected subject catalog resource {}", envelope.plural));
