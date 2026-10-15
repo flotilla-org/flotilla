@@ -358,6 +358,14 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      # The Quint pin decides which Apalache jar `quint compile` fetches;
+      # check.sh's preflight expects apalache-dist-0.62.1, so bump both together.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.npm
+            ~/.quint
+          key: quint-0.33.0-apalache-0.62.1
       # Quick tier of the typed machine specs (#3280): assignment coverage,
       # exhaustive TLC safety, generated trace replay against the prototype,
       # and mutants. The first compile bootstraps Quint's lazily fetched

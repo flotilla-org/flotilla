@@ -21,8 +21,8 @@ check() {
 
 core_diff=$'--- a/crates/flotilla-core/src/x.rs\n+++ b/crates/flotilla-core/src/x.rs\n+fn helper() {}\n'
 
-check "push to main runs both" push false "docs/x.md" "" "windows=true macos=true quint=true "
-check "ci:full label runs both" pull_request true "docs/x.md" "" "windows=true macos=true quint=true "
+check "push to main runs every job" push false "docs/x.md" "" "windows=true macos=true quint=true "
+check "ci:full label runs every job" pull_request true "docs/x.md" "" "windows=true macos=true quint=true "
 check "docs-only PR runs neither" pull_request false "docs/x.md" "" "windows=false macos=false quint=false "
 check "plain core change runs neither" pull_request false "crates/flotilla-core/src/x.rs" "$core_diff" "windows=false macos=false quint=false "
 check "client change runs Windows" pull_request false "crates/flotilla-client/src/lib.rs" "" "windows=true macos=false quint=false "
@@ -33,12 +33,12 @@ check "connector tests run Windows" pull_request false "crates/flotilla-tui/src/
 check "transport change runs both" merge_group false "crates/flotilla-transport/src/message.rs" "" "windows=true macos=true quint=false "
 check "caller change runs macOS" pull_request false "crates/flotilla-daemon/src/server/caller.rs" "" "windows=false macos=true quint=false "
 # The compiler pin and its assertion are shared platform-job inputs.
-check "compiler pin runs both" pull_request false "rust-toolchain.toml" "" "windows=true macos=true quint=true "
+check "compiler pin runs every job" pull_request false "rust-toolchain.toml" "" "windows=true macos=true quint=true "
 check "selector changes run both" pull_request false "ci/platform-tests/selectors.txt" "" "windows=true macos=true quint=false "
 check "local Rust action changes run both" pull_request false "ci/toolchain/action/action.yml" "" "windows=true macos=true quint=false "
 check "compiler assertion runs both" pull_request false "ci/toolchain/assert.sh" "" "windows=true macos=true quint=false "
 check "lockfile runs both" pull_request false "Cargo.lock" "" "windows=true macos=true quint=false "
-check "workflow change runs both" pull_request false ".github/workflows/ci.yml" "" "windows=true macos=true quint=true "
+check "workflow change runs every job" pull_request false ".github/workflows/ci.yml" "" "windows=true macos=true quint=true "
 check "core cfg(unix) runs Windows" pull_request false "crates/flotilla-core/src/x.rs" \
   $'--- a/crates/flotilla-core/src/x.rs\n+++ b/crates/flotilla-core/src/x.rs\n+#[cfg(unix)]\n+fn helper() {}\n' "windows=true macos=false quint=false "
 check "core std::os::unix runs Windows" pull_request false "crates/flotilla-core/src/x.rs" \
@@ -50,7 +50,7 @@ check "macOS target_os runs macOS" pull_request false "crates/flotilla-core/src/
 check "diff header alone is not content" pull_request false "crates/flotilla-core/src/cfg_unix.rs" \
   $'--- a/crates/flotilla-core/src/cfg(unix).rs\n+++ b/crates/flotilla-core/src/cfg(unix).rs\n+fn x() {}\n' "windows=false macos=false quint=false "
 
-check "unknown event runs both" workflow_dispatch false "" "" "windows=true macos=true quint=true "
+check "unknown event runs every job" workflow_dispatch false "" "" "windows=true macos=true quint=true "
 check "manifest sink runs Windows" pull_request false "crates/flotilla-manifest/src/sink.rs" "" "windows=true macos=false quint=false "
 check "crate manifest runs both" pull_request false "crates/flotilla-core/Cargo.toml" "" "windows=true macos=true quint=false "
 check "core libc call runs Windows" pull_request false "crates/flotilla-core/src/x.rs" \
