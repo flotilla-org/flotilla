@@ -117,8 +117,15 @@ impl EnvironmentSocketRegistry {
         }
         let directory_name = directory_name(&id);
         let directory = socket_root(state_dir).await?.join(directory_name);
-        tokio::fs::DirBuilder::new().recursive(true).mode(0o700).create(&directory).await.map_err(|error| error.to_string())?;
-        tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await.map_err(|error| error.to_string())?;
+        tokio::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)
+            .await
+            .map_err(|error| format!("create environment socket directory {}: {error}", directory.display()))?;
+        tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|error| format!("protect environment socket directory {}: {error}", directory.display()))?;
         let socket_path = DaemonHostPath::new(directory.join("flotilla.sock"));
         check_socket_path(socket_path.as_path())?;
 
