@@ -436,6 +436,27 @@ mod tests {
         per_iteration(started.elapsed(), iterations)
     }
 
+    // Measurement only (#3197): actual local resource_objects writes through
+    // update_status_raw, including projection/digest triggers and one transaction
+    // per write. Run in release with --ignored --nocapture --test-threads=1.
+    #[tokio::test]
+    #[ignore = "measurement; prints timings and does not gate"]
+    async fn measure_local_status_write_cost() {
+        const ITERATIONS: u32 = 500;
+        let mut fixture = Fixture::open(Backing::File).await;
+        fixture.status_write().await;
+        for round in 1..=3 {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                fixture.status_write().await;
+            }
+            println!(
+                "local update_status_raw round {round}, one transaction per write: {:.4} ms",
+                per_iteration(started.elapsed(), ITERATIONS)
+            );
+        }
+    }
+
     // Measurement only (#3154): compares the replica upsert compiled per call,
     // as `Connection::execute` did, with the cached statement, on a writer that
     // carries the daemon's TEMP triggers. Run with
