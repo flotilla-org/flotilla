@@ -118,6 +118,7 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, adm
         discovery,
         HostName::new(format!("load-{index}")),
         ResourceBackend::new(store.clone()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");

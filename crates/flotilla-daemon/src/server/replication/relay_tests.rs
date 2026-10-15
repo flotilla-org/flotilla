@@ -118,7 +118,15 @@ async fn governor_relay_contract(storage: TestBackend) {
             }
             TestBackend::InMemory => ResourceBackend::new(InMemoryBackend::default()),
         };
-        let daemon = InProcessDaemon::new_with_resource_backend(vec![], config, fake_discovery(false), HostName::new(host), backend).await;
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            vec![],
+            config,
+            fake_discovery(false),
+            HostName::new(host),
+            backend,
+            std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+        )
+        .await;
         let path = sockets.socket_path(&format!("{host}.sock"));
         let listener = UnixListener::bind(&path).expect("bind resource API");
         let backend = daemon.resource_backend();
@@ -255,8 +263,14 @@ async fn observed_checkout_http_relay_keeps_ephemeral_origin_and_deletes() {
         let config_path = temp.path().join(host);
         std::fs::create_dir_all(&config_path).expect("config directory");
         std::fs::write(config_path.join("daemon.toml"), format!("machine_id = \"{host}\"\n")).expect("machine identity");
-        let daemon =
-            InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_path)), fake_discovery(false), HostName::new(host)).await;
+        let daemon = InProcessDaemon::new(
+            vec![],
+            Arc::new(ConfigStore::with_base(config_path)),
+            fake_discovery(false),
+            HostName::new(host),
+            std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+        )
+        .await;
         let path = sockets.socket_path(&format!("{host}.sock"));
         let listener = UnixListener::bind(&path).expect("bind resource API");
         let server_daemon = Arc::clone(&daemon);

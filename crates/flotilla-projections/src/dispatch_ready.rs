@@ -6,7 +6,7 @@ type ReadyRows = HashMap<DispatchReadyKey, DispatchQueueRow>;
 type ReadySet = (u64, ReadyRows, ResultSetState);
 
 #[derive(Debug, Default)]
-pub(crate) struct DispatchReadyProjection {
+pub struct DispatchReadyProjection {
     rows: ReadyRows,
     errors: Vec<(QueryScope, String)>,
     /// Materialized views and the sequence each last published.

@@ -115,6 +115,7 @@ fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
                 fake_discovery(false),
                 HostName::new("noop-contract"),
                 backend.clone(),
+                std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
             )
             .await;
             // Keep contract resources outside the daemon's background provisioning namespace.
@@ -247,6 +248,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         fake_discovery(false),
         HostName::local(),
         home.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let placement_config = tempfile::tempdir().expect("placement config dir");
@@ -257,6 +259,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         fake_discovery(false),
         HostName::local(),
         placement.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let convoys = home.clone().using::<ResourceConvoy>("flotilla");

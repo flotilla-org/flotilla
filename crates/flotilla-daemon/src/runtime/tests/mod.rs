@@ -27,7 +27,6 @@ use flotilla_controllers::reconcilers::{
     CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler, TerminalDeliveryFailure, TerminalDeliveryOutcome,
     TerminalDeliveryReadiness, TerminalLiveness, TerminalRuntime, TerminalSessionReconciler, VesselReconciler,
 };
-use flotilla_core::aggregator_projection::AggregatorProjectionState;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::StandingConvoyBackingInspector;
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE;
@@ -59,6 +58,7 @@ use flotilla_environment::environment::ProvisionedMount;
 use flotilla_environment::environment::ProvisionedMountMode;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_protocol::ChangeRequest as ProviderChangeRequest;
 use flotilla_protocol::{
     CanonicalHostId, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, HostSummary, ImageId,

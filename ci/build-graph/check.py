@@ -23,15 +23,15 @@ RESOURCE_EXEMPTIONS = frozenset({
 })
 # Composition, daemon and transport crates the replication engine must not reach.
 REPLICATION_FORBIDDEN = (
-    "flotilla-core", "flotilla-daemon", "flotilla-daemon-api", "flotilla-aggregator",
+    "flotilla-core", "flotilla-daemon", "flotilla-daemon-api", "flotilla-projections",
     "flotilla-credentials", "flotilla-controllers", "flotilla-store-http",
 )
 # ADR 0060 step 4: capabilities read resources through the store and receive
 # higher orchestration through ports. Register each new capability here.
-CAPABILITY_CRATES = frozenset({"flotilla-executor"})
+CAPABILITY_CRATES = frozenset({"flotilla-executor", "flotilla-projections"})
 CAPABILITY_FORBIDDEN = (
     "flotilla-core", "flotilla-daemon", "flotilla-controllers",
-    "flotilla-aggregator", "flotilla-credentials",
+    "flotilla-credentials",
 )
 # Known C packages and compiler drivers catch new anchors that reach them.
 # This is a metadata deny list, not build-script analysis: crates invoking a
@@ -83,7 +83,7 @@ def violations(metadata):
     if "flotilla-client" in packages and "flotilla-core" in packages and reaches("flotilla-client", "flotilla-core"):
         errors.append("flotilla-client: must not depend on flotilla-core, directly or transitively")
     for component in ("flotilla-config", "flotilla-provider-runtime", "flotilla-discovery-api", "flotilla-vcs", "flotilla-environment", "flotilla-terminal", "flotilla-cloud-agent", "flotilla-ai-utility", "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-change-request", "flotilla-issue-tracker", "flotilla-agent", "flotilla-discovery", "flotilla-dummy-fleet", "flotilla-charter"):
-        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+        for target in ("flotilla-core", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store", *sorted(CAPABILITY_CRATES)):
             if component in packages and target in packages and reaches(component, target):
                 errors.append(f"{component}: must not depend on {target}, directly or transitively")

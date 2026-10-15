@@ -67,6 +67,7 @@ async fn fixture(layers: Vec<ImageLayerSpec>, image: Option<ImageSelection>) -> 
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     create_docker_placement(&backend, "crew-policy", "host-a", BTreeSet::new()).await;

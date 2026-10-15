@@ -80,6 +80,7 @@ async fn tui_shows_convoys_from_daemon() {
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
 
@@ -157,6 +158,7 @@ async fn generated_table_action_completes_work() {
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
 

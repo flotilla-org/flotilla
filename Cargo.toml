@@ -4,7 +4,7 @@ debug = "line-tables-only"
 [workspace]
 members = [
     "crates/flotilla-agent",
-    "crates/flotilla-aggregator",
+    "crates/flotilla-projections",
     "crates/flotilla-build-features",
     "crates/flotilla-capability-contract",
     "crates/flotilla-cbor",
@@ -105,6 +105,7 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-prov
 
 # New external crates also belong in clippy.toml's absolute-paths-allowed-crates.
 [dependencies]
+flotilla-projections = { path = "crates/flotilla-projections" }
 flotilla-config = { path = "crates/flotilla-config" }
 flotilla-environment = { path = "crates/flotilla-environment" }
 flotilla-vcs = { path = "crates/flotilla-vcs" }

@@ -91,6 +91,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
             fake_discovery(false),
             HostName::local(),
             home.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await,
     );
@@ -103,6 +104,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
             fake_discovery(false),
             HostName::local(),
             placement.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await,
     );

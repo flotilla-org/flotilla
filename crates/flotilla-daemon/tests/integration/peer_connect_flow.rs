@@ -86,7 +86,14 @@ async fn peer_connect_triggers_local_state_send() {
     let _host_b = HostName::new("host-b");
     let node_b = test_node_id("host-b");
 
-    let daemon = InProcessDaemon::new(vec![repo_path.clone()], config, fake_discovery(false), host_a.clone()).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo_path.clone()],
+        config,
+        fake_discovery(false),
+        host_a.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let node_a = daemon.node_id().clone();
 
     let sent = Arc::new(StdMutex::new(Vec::new()));
@@ -124,7 +131,14 @@ async fn peer_reconnect_resends_local_state() {
     let _host_b = HostName::new("host-b");
     let node_b = test_node_id("host-b");
 
-    let daemon = InProcessDaemon::new(vec![repo_path.clone()], config, fake_discovery(false), host_a.clone()).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo_path.clone()],
+        config,
+        fake_discovery(false),
+        host_a.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let node_a = daemon.node_id().clone();
 
     let sent = Arc::new(StdMutex::new(Vec::new()));

@@ -312,6 +312,7 @@ mod tests {
             config.clone(),
             fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_issue_tracker(issues.clone())),
             HostName::new("test"),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let backend = daemon.resource_backend();

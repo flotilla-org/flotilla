@@ -368,6 +368,7 @@ async fn http_replication_resnapshots_after_quarantined_history() {
         fake_discovery(false),
         HostName::new("holder"),
         holder_backend.clone(),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
 
@@ -448,6 +449,7 @@ async fn http_replicator_relists_after_an_origin_generation_change() {
         fake_discovery(false),
         HostName::new("holder"),
         holder_backend.clone(),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
 
@@ -606,6 +608,7 @@ async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
         fake_discovery(false),
         HostName::new("holder"),
         holder_backend.clone(),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let socket_path = PathBuf::from(format!("/tmp/flotilla-replicator-relist-{}.sock", uuid::Uuid::new_v4()));
@@ -791,7 +794,14 @@ async fn spawn_test_client_handler(
 async fn empty_daemon_named(host_name: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host_name)).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        fake_discovery(false),
+        HostName::new(host_name),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     (tmp, daemon)
 }
 
@@ -983,7 +993,14 @@ async fn write_message_writes_json_line() {
 async fn dispatch_add_list_remove_repo_round_trip() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        git_process_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     let repo_path = tmp.path().join("repo-a");
     init_git_repo_with_remote(&repo_path, "git@github.com:owner/repo-a.git");
 
@@ -2795,7 +2812,14 @@ async fn remote_command_remote_step_events_remap_to_client_command_id_and_global
     let repo = tmp.path().join("repo");
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        git_process_discovery(false),
+        HostName::new("local"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -2899,7 +2923,14 @@ async fn remote_checkout_failure_with_empty_response_still_stops_local_workspace
     init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
     let discovery = git_process_discovery(false);
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::new("local")).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        discovery,
+        HostName::new("local"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -3138,7 +3169,14 @@ async fn cancel_active_remote_segment_routes_remote_step_cancel_and_finishes_com
     let repo = tmp.path().join("repo");
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        git_process_discovery(false),
+        HostName::new("local"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -3297,7 +3335,14 @@ async fn cancel_disconnect_of_active_remote_segment_finishes_pending_command() {
     let repo = tmp.path().join("repo");
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        git_process_discovery(false),
+        HostName::new("local"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -3479,7 +3524,14 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
     let repo = tmp.path().join("repo");
     init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        git_process_discovery(false),
+        HostName::new("local"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     daemon.add_repo(&repo).await.expect("adopt repo resources");
     // Refresh reports physical checkout paths (#2574); macOS tempdirs sit behind /var -> /private/var.
     let physical_repo = std::fs::canonicalize(&repo).expect("canonical repo path");
@@ -3588,7 +3640,14 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
     init_git_repo_with_remote(&requester_repo, "git@github.com:owner/repo.git");
 
     let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![remote_repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
+    let daemon = InProcessDaemon::new(
+        vec![remote_repo.clone()],
+        config,
+        git_process_discovery(false),
+        HostName::new("local"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     daemon.add_repo(&remote_repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -5347,7 +5406,14 @@ async fn remote_command_mutations_route_remote_step_requests() {
     let repo = tmp.path().join("repo");
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        git_process_discovery(false),
+        HostName::new("local"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -5435,7 +5501,14 @@ async fn remote_checkout_completion_is_headless() {
     init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
     let discovery = git_process_discovery(false);
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::new("local")).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        discovery,
+        HostName::new("local"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));

@@ -86,6 +86,7 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
         HostName::new("local"),
         backend.clone(),
         clock.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     restarted.install_convoy_ensure_reconciler(factory.create(restarted.resource_backend(), restarted.clock_for_scenarios())).await;
@@ -601,6 +602,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         fake_discovery(false),
         HostName::new("root-b"),
         target.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon.install_convoy_ensure_reconciler(factory.create(daemon.resource_backend(), daemon.clock_for_scenarios())).await;
@@ -875,6 +877,7 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
         fake_discovery(false),
         HostName::new("driver"),
         driver_backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     driver.install_convoy_ensure_reconciler(factory.create(driver.resource_backend(), driver.clock_for_scenarios())).await;

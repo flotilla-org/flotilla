@@ -11,8 +11,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
-use chrono::Utc;
 use flotilla_protocol::{DispatchBoardRepository, IssueSource};
 use futures::FutureExt;
 use tokio::{sync::Mutex, time::Instant};
@@ -24,7 +22,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 // ForgeReads owns the 300s load deadline and publishes its timeout/last-good
 // result. This outer watchdog must allow that completion, rather than racing
 // the inner deadline and discarding its result. It also bounds bare providers.
-const REFRESH_TIMEOUT: Duration = crate::forge_observation::LOAD_TIMEOUT.saturating_add(Duration::from_secs(30));
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(300).saturating_add(Duration::from_secs(30));
 
 #[derive(Default)]
 struct Entry {
@@ -38,21 +36,18 @@ struct Entry {
 type SharedEntry = Arc<Mutex<Entry>>;
 
 #[derive(Clone, Default)]
-pub(super) struct DispatchBoardCache {
+pub struct DispatchBoardCache {
     entries: Arc<Mutex<BTreeMap<IssueSource, SharedEntry>>>,
-    #[cfg(test)]
-    pub(in crate::in_process) reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DispatchBoardCache {
     /// Only a complete source inventory may retire entries. An old refresh owns
     /// its retired entry, so its completion cannot overwrite a re-added source.
-    pub(super) async fn retain_sources(&self, sources: &BTreeSet<IssueSource>) {
+    pub async fn retain_sources(&self, sources: &BTreeSet<IssueSource>) {
         self.entries.lock().await.retain(|source, _| sources.contains(source));
     }
 
-    #[cfg(test)]
-    pub(super) async fn read<F, Fut>(&self, source: &IssueSource, load: F) -> Result<DispatchBoardRepository, String>
+    pub async fn read<F, Fut>(&self, source: &IssueSource, load: F) -> Result<DispatchBoardRepository, String>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<DispatchBoardRepository, String>> + Send,
@@ -64,13 +59,11 @@ impl DispatchBoardCache {
         })
     }
 
-    pub(super) async fn read_snapshot<F, Fut>(&self, source: &IssueSource, load: F) -> Result<(u64, Arc<DispatchBoardRepository>), String>
+    pub async fn read_snapshot<F, Fut>(&self, source: &IssueSource, load: F) -> Result<(u64, Arc<DispatchBoardRepository>), String>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<DispatchBoardRepository, String>> + Send,
     {
-        #[cfg(test)]
-        self.reads.fetch_add(1, Ordering::Relaxed);
         let entry = self.entries.lock().await.entry(source.clone()).or_default().clone();
         let mut entry_state = entry.lock().await;
         let state = &mut *entry_state;
@@ -119,8 +112,135 @@ impl DispatchBoardCache {
     }
 }
 
+use chrono::Utc;
+use flotilla_resources::{IssueSourceResolution, Project, Repository, ResourceObject};
+use flotilla_store::ResourceBackend;
+pub type DispatchBoardInputs = BTreeMap<
+    String,
+    Result<(Vec<flotilla_resources::ResolvedIssueSourceBinding>, Vec<(u64, Arc<flotilla_protocol::DispatchBoardRepository>)>), String>,
+>;
+
+pub struct DispatchBoard<'a> {
+    pub backend: &'a ResourceBackend,
+    pub cache: &'a DispatchBoardCache,
+    pub resolver: std::sync::Weak<dyn crate::IssueMaterializationResolver>,
+    pub namespace: String,
+}
+impl DispatchBoard<'_> {
+    pub async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<flotilla_protocol::DispatchBoardResponse, String> {
+        let readiness =
+            crate::read_projections::ReadProjections::dispatch_queue(self.backend, &self.namespace, project_filter, Utc::now()).await?;
+        let repositories = self.dispatch_board_repositories_internal(project_filter).await?;
+        Ok(flotilla_protocol::DispatchBoardResponse { readiness, repositories })
+    }
+    pub async fn dispatch_board_repositories_internal(
+        &self,
+        project_filter: Option<&str>,
+    ) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String> {
+        let namespace = self.namespace.clone();
+        let projects = self.backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let projects =
+            projects.into_iter().filter(|project| project_filter.is_none_or(|name| name == project.metadata.name)).collect::<Vec<_>>();
+        let snapshot = self.collect_dispatch_board_inputs(&projects).await?;
+        if project_filter.is_none() && snapshot.values().all(Result::is_ok) {
+            let sources = snapshot
+                .values()
+                .filter_map(|input| input.as_ref().ok())
+                .flat_map(|(bindings, _)| bindings.iter().map(|binding| binding.source.clone()))
+                .collect();
+            self.cache.retain_sources(&sources).await;
+        }
+        let mut repositories = BTreeMap::new();
+        let mut errors = Vec::new();
+        for input in snapshot.into_values() {
+            match input {
+                Ok((_, boards)) => {
+                    for (_, board) in boards {
+                        repositories.insert(board.source.clone(), board);
+                    }
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+        if errors.is_empty() {
+            Ok(repositories
+                .into_values()
+                .map(|board| {
+                    let mut board = (*board).clone();
+                    board.age_seconds = Utc::now().signed_duration_since(board.observed_at).num_seconds().max(0) as u64;
+                    board
+                })
+                .collect())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+    pub async fn collect_dispatch_board_inputs(&self, projects: &[ResourceObject<Project>]) -> Result<DispatchBoardInputs, String> {
+        let namespace = self.namespace.clone();
+        let inventory = self.backend.including_replicas::<Repository>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let inventory = inventory.items.into_iter().map(|record| (record.object.metadata.name.clone(), Ok(record.object))).collect();
+        let mut bindings_by_project = BTreeMap::new();
+        let mut sources = std::collections::BTreeSet::new();
+        let mut mission_issues = std::collections::BTreeSet::new();
+        for project in projects {
+            if let Some(policy) = &project.spec.dispatch_policy {
+                mission_issues.extend(policy.missions.iter().filter_map(|mission| mission.issue.clone()));
+            }
+            let bindings = match flotilla_resources::resolve_project_issue_sources_from_inventory(&inventory, &project.spec) {
+                IssueSourceResolution::Available { bindings } => {
+                    sources.extend(bindings.iter().map(|binding| binding.source.clone()));
+                    Ok(bindings)
+                }
+                IssueSourceResolution::Unavailable(error) => Err(format!("project {}: {error:?}", project.metadata.name)),
+            };
+            bindings_by_project.insert(project.metadata.name.clone(), bindings);
+        }
+        let mut repositories = BTreeMap::new();
+        for source in sources {
+            let resolver = self.resolver.clone();
+            let tracker_source = source.clone();
+            let mission_issues = mission_issues.clone();
+            let result = self
+                .cache
+                .read_snapshot(&source, move || async move {
+                    let resolver = resolver.upgrade().ok_or("daemon stopped")?;
+                    let provider = resolver.issue_provider_for(&tracker_source).await?;
+                    let mut board = provider.dispatch_board(&tracker_source).await?;
+                    for issue in &mut board.issues {
+                        let reference = flotilla_protocol::IssueRef { source: tracker_source.clone(), id: issue.id.clone() };
+                        if mission_issues.iter().any(|mission| {
+                            mission.id == reference.id
+                                && mission.source.scope.eq_ignore_ascii_case(&reference.source.scope)
+                                && matches!(mission.source.service.trim_end_matches('/'), "github" | "github.com" | "https://github.com")
+                        }) || issue.issue_type.as_ref().is_some_and(|kind| kind.eq_ignore_ascii_case("map"))
+                            || issue
+                                .labels
+                                .iter()
+                                .any(|label| label.rsplit(':').next().is_some_and(|kind| kind.eq_ignore_ascii_case("map")))
+                        {
+                            issue.mission_fields = provider.mission_fields(&reference).await?;
+                        }
+                    }
+                    Ok(board)
+                })
+                .await;
+            repositories.insert(source, result);
+        }
+        Ok(bindings_by_project
+            .into_iter()
+            .map(|(name, bindings)| {
+                let input = bindings.and_then(|bindings| {
+                    let boards = bindings.iter().map(|binding| repositories[&binding.source].clone()).collect::<Result<Vec<_>, _>>()?;
+                    Ok((bindings, boards))
+                });
+                (name, input)
+            })
+            .collect())
+    }
+}
+
 #[cfg(test)]
-pub(super) mod tests {
+pub mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use flotilla_protocol::{DispatchBoardIssue, DispatchBoardPullRequest, IssueState};
@@ -148,7 +268,7 @@ pub(super) mod tests {
         IssueSource { service: "https://github.com".into(), scope: scope.into() }
     }
 
-    pub(in crate::in_process) fn board(source: &IssueSource, count: usize) -> DispatchBoardRepository {
+    pub fn board(source: &IssueSource, count: usize) -> DispatchBoardRepository {
         DispatchBoardRepository {
             source: source.clone(),
             observed_at: Utc::now(),
@@ -179,75 +299,6 @@ pub(super) mod tests {
                 })
                 .collect(),
         }
-    }
-
-    // The real board watchdog allows ForgeReads to finish its earlier deadline
-    // and expose the last-good board with the observation error, rather than
-    // racing both 300s deadlines and replacing it with a tracker timeout.
-    #[tokio::test(start_paused = true)]
-    async fn layered_deadlines_preserve_observation_timeout_and_recover() {
-        use crate::forge_observation::ForgeReads;
-        use flotilla_resources::Clock;
-        use flotilla_store::ResourceBackend;
-        use flotilla_store_memory::InMemoryBackend;
-        use flotilla_store_testkit::VirtualClock;
-        let cache = DispatchBoardCache::default();
-        let source = source("org/shared");
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("owner"));
-        let clock = Arc::new(VirtualClock::new(Utc::now()));
-        let mut reads = ForgeReads::new(backend, "flotilla".into()).with_clock(clock.clone());
-        reads.allow_stale = true;
-        let snapshot = board(&source, 1);
-        reads.read(&source, flotilla_resources::ForgeReadRequest::Board, || async { Ok(snapshot.clone()) }).await.unwrap();
-        clock.advance(chrono::Duration::seconds(60));
-        let slow_reads = reads.clone();
-        let slow_source = source.clone();
-        let (entered, started) = tokio::sync::oneshot::channel();
-        cache
-            .read(&source, move || async move {
-                // Model request/resource-store setup before the load timer.
-                // Equal layered deadlines cannot tolerate this small overhead.
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let result = slow_reads
-                    .read(&slow_source, flotilla_resources::ForgeReadRequest::Board, || async {
-                        entered.send(()).unwrap();
-                        std::future::pending::<Result<DispatchBoardRepository, String>>().await
-                    })
-                    .await;
-                let mut board = result?;
-                board.refresh_error = slow_reads
-                    .status(&flotilla_resources::forge_read_name(&slow_source, &flotilla_resources::ForgeReadRequest::Board))
-                    .await?
-                    .and_then(|status| status.error);
-                Ok(board)
-            })
-            .await
-            .expect_err("cold cache");
-        started.await.unwrap();
-        tokio::time::advance(crate::forge_observation::LOAD_TIMEOUT - Duration::from_secs(1)).await;
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(Duration::from_secs(1)).await;
-        settled(&cache, &source).await;
-        let cached = cache.read(&source, || async { panic!("cached timeout") }).await.unwrap();
-        assert_eq!(cached.issues, snapshot.issues);
-        assert_eq!(cached.refresh_error.as_deref(), Some("forge observation timed out"));
-        clock.advance(chrono::Duration::seconds(60));
-        tokio::time::advance(REFRESH_INTERVAL).await;
-        let recovered = snapshot.clone();
-        let refresh_source = source.clone();
-        cache
-            .read(&source, move || async move {
-                reads.read(&refresh_source, flotilla_resources::ForgeReadRequest::Board, || async { Ok(recovered) }).await
-            })
-            .await
-            .unwrap();
-        settled(&cache, &source).await;
-        let cached = cache.read(&source, || async { panic!("cached recovery") }).await.unwrap();
-        assert!(cached.refresh_error.is_none());
-        assert_eq!(cached.issues, snapshot.issues);
-        assert!(clock.now() > snapshot.observed_at);
     }
 
     // #2842: hundreds of issues must not multiply tracker work. A slow forge

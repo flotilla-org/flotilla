@@ -140,6 +140,7 @@ mod tests {
             fake_discovery(false),
             HostName::new("owner"),
             ResourceBackend::new(counted.clone()),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let backend = daemon.resource_backend();

@@ -25,13 +25,10 @@ use flotilla_protocol::{
 use flotilla_resources::{
     normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyRepositorySpec,
     DeclarationRefusedCondition, Demand, DemandKind, DemandSpec, Forge, InputMeta, ObjectEvent, Project, ProjectRepositoryRole,
-    ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, ReadResourceList, ReadResourceObject, Repository, RepositoryIdentity,
-    RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, WorkflowTemplate, WorkflowTemplateSpec,
-    WriterIdentity, MANAGED_BY_LABEL,
+    ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceError,
+    ResourceObject, WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
 };
-use flotilla_store::{
-    apply_status_patch as apply_resource_status_patch, ensure_repository, EventRecorder, ResourceBackend, StoreQuery, ViewSnapshot,
-};
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, ensure_repository, EventRecorder, ResourceBackend};
 use tracing::{debug, warn};
 
 use super::{
@@ -40,37 +37,6 @@ use super::{
 use crate::repository_inspection::{
     LocalCheckoutInspection, OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector,
 };
-
-/// Request-local evidence builder. Definition catalogs preserve their merged
-/// semantics while ordinary inventories retain each source's provenance.
-pub(super) struct RequestSnapshot<'a> {
-    namespace: &'a str,
-    snapshot: ViewSnapshot,
-}
-impl<'a> RequestSnapshot<'a> {
-    pub(super) fn new(backend: &ResourceBackend, namespace: &'a str) -> Result<Self, String> {
-        Ok(Self { namespace, snapshot: ViewSnapshot::new(Some(backend.local_root().map_err(|error| error.to_string())?)) })
-    }
-    pub(super) fn insert<T: Resource>(&mut self, inventory: ReadResourceList<T>) -> Result<(), String> {
-        self.snapshot.insert(self.namespace, inventory).map_err(|error| error.to_string())
-    }
-    pub(super) fn insert_definitions<T: Resource>(&mut self, objects: Vec<ResourceObject<T>>) -> Result<(), String> {
-        self.insert(ReadResourceList {
-            items: objects.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect(),
-        })
-    }
-    pub(super) async fn copy<T: Resource>(&mut self, backend: &ResourceBackend) -> Result<(), String> {
-        self.insert(
-            backend
-                .query_declared::<T>(self.namespace, &StoreQuery { include_replicas: true, ..Default::default() })
-                .await
-                .map_err(|error| error.to_string())?,
-        )
-    }
-    pub(super) fn finish(self) -> ResourceBackend {
-        ResourceBackend::new(self.snapshot)
-    }
-}
 
 /// A refresh refusal preserves file identity independently of its display text.
 struct OperationalEntryRefusal {
@@ -1548,25 +1514,6 @@ fn repository_catalog_query(target: &str) -> flotilla_store::StoreQuery {
         ]),
         ..Default::default()
     }
-}
-
-pub(super) async fn read_definition_catalog<T: flotilla_resources::Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-) -> Result<Vec<flotilla_resources::ResourceObject<T>>, String> {
-    backend
-        .query_declared::<T>(
-            namespace,
-            &flotilla_store::StoreQuery {
-                include_replicas: true,
-                suppress_self_origin: false,
-                merged_definitions: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .map(|listed| listed.items.into_iter().map(|item| item.object).collect())
-        .map_err(|error| error.to_string())
 }
 
 pub(super) async fn repository_transport_url_with_backend(

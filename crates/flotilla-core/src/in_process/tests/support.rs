@@ -28,7 +28,7 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use crate::in_process::dispatch_board::tests::board;
+use crate::in_process::dispatch_board_tests::tests::board;
 use crate::in_process::input_meta_from_resource;
 use crate::in_process::InProcessDaemon;
 use crate::in_process::WorkCredentialReconciler;
@@ -131,6 +131,7 @@ pub(super) async fn resume_staging_fixture_with_clock(
         HostName::new("test-host"),
         backend.clone(),
         clock,
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -571,6 +572,7 @@ pub(super) async fn stall_test_daemon() -> (Arc<InProcessDaemon>, ResourceBacken
         fake_discovery(false),
         HostName::new("test-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let (sender, mut receiver) = flotilla_store::controller::WorkQueueSender::channel();

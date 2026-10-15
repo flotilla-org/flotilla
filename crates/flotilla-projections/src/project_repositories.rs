@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use flotilla_protocol::{ProjectRepositoriesRow, QueryChanges, QueryScope, ResourceRef, ResultDelta, ResultSet, ResultSetState, Rows};
 
 #[derive(Debug, Default)]
-pub(crate) struct ProjectRepositoryProjection {
+pub struct ProjectRepositoryProjection {
     rows: HashMap<ResourceRef, ProjectRepositoriesRow>,
     /// Materialized views and the sequence each last published.
     sets: HashMap<Option<QueryScope>, (u64, HashMap<ResourceRef, ProjectRepositoriesRow>)>,

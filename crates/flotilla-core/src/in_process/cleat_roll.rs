@@ -259,6 +259,7 @@ mod tests {
             fake_discovery(false),
             HostName::new("host"),
             backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let local_bag = EnvironmentBag::new()
@@ -490,6 +491,7 @@ mod tests {
             fake_discovery_with_runner(false, runner),
             HostName::new("host"),
             ResourceBackend::new(InMemoryBackend::default()),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let bag = EnvironmentBag::new()

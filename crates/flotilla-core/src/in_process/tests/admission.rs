@@ -100,6 +100,7 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         discovery,
         HostName::new("test-host"),
         backend,
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon.set_provisioning_namespace("flotilla".to_string()).await;
@@ -268,6 +269,7 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
         discovery,
         HostName::local(),
         ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon.set_repository_inspector(Arc::new(ConcurrentCreateRepositoryInspector)).await;
@@ -408,6 +410,7 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
         discovery,
         HostName::local(),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let repository = RepositorySpec::remote("https://github.com/acme/archive").expect("repository spec").key();
@@ -493,6 +496,7 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
         fake_discovery(false),
         HostName::new("test-host"),
         backend,
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon.set_provisioning_namespace("flotilla".to_string()).await;

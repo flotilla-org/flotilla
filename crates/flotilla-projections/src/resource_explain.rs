@@ -4,10 +4,10 @@ use std::{sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
-    CommandValue, DaemonEvent, EvidenceFreshness, ExplainedCondition, ExplainedUnmetExpectation, NodeId, RepoIdentity, ResourceCursor,
-    ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StepStatus,
+    CommandValue, DaemonEvent, EvidenceFreshness, ExplainedCondition, NodeId, RepoIdentity, ResourceCursor, ResourceReadEnvelope,
+    ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StepStatus,
 };
-use flotilla_resources::{ConditionValue, IntegrationCondition, ResourceError, ResourceProvenance, UnmetSettlementExpectation, WatchStart};
+use flotilla_resources::{ConditionValue, IntegrationCondition, ResourceError, ResourceProvenance, WatchStart};
 use flotilla_store::{
     watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources,
     ResourceBackend,
@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use flotilla_daemon_api::event_sink::EventSink;
 
 #[derive(bon::Builder)]
-pub(crate) struct ResourceWatchCommandContext {
+pub struct ResourceWatchCommandContext {
     backend: ResourceBackend,
     namespace: String,
     kind: String,
@@ -33,7 +33,7 @@ pub(crate) struct ResourceWatchCommandContext {
     token: CancellationToken,
 }
 
-pub(crate) async fn run_resource_watch_command(context: ResourceWatchCommandContext) -> CommandValue {
+pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) -> CommandValue {
     let resuming = context.cursor.is_some();
     let start = match context.cursor.as_ref().map(ResourceCursor::position).transpose() {
         Ok(position) => position.map(|(resource_version, generation)| match generation {
@@ -164,7 +164,7 @@ fn send_resource_watch_event(
     });
 }
 
-pub(crate) fn resource_read_envelope(
+pub fn resource_read_envelope(
     resource_kind: String,
     plural: String,
     namespace: String,
@@ -174,7 +174,7 @@ pub(crate) fn resource_read_envelope(
     ResourceReadEnvelope { api_version: "flotilla.work/v1".to_string(), resource_kind, plural, namespace, cursor, records }
 }
 
-pub(crate) fn resource_record(record_type: ResourceRecordType, object: serde_json::Value, local_node_id: &NodeId) -> ResourceReadRecord {
+pub fn resource_record(record_type: ResourceRecordType, object: serde_json::Value, local_node_id: &NodeId) -> ResourceReadRecord {
     let annotations = object.get("metadata").and_then(|metadata| metadata.get("annotations"));
     let origin_root = annotations.and_then(|annotations| annotations.get("flotilla.work/origin-root")).and_then(|value| value.as_str());
     let last_synced_at =
@@ -188,7 +188,7 @@ pub(crate) fn resource_record(record_type: ResourceRecordType, object: serde_jso
     ResourceReadRecord { record_type, provenance, object: Some(object) }
 }
 
-pub(crate) fn explained_provenance(provenance: &ResourceProvenance, local_node_id: &NodeId) -> ResourceRecordProvenance {
+pub fn explained_provenance(provenance: &ResourceProvenance, local_node_id: &NodeId) -> ResourceRecordProvenance {
     match provenance {
         ResourceProvenance::Local => ResourceRecordProvenance::Local { node_id: local_node_id.clone() },
         ResourceProvenance::Replica { origin_root, last_synced_at } => {
@@ -197,7 +197,7 @@ pub(crate) fn explained_provenance(provenance: &ResourceProvenance, local_node_i
     }
 }
 
-pub(crate) fn observed_freshness(observed_at: Option<DateTime<Utc>>, now: DateTime<Utc>, ttl: Duration) -> EvidenceFreshness {
+pub fn observed_freshness(observed_at: Option<DateTime<Utc>>, now: DateTime<Utc>, ttl: Duration) -> EvidenceFreshness {
     match observed_at.and_then(|observed_at| now.signed_duration_since(observed_at).to_std().ok()) {
         Some(age) if age < ttl => EvidenceFreshness::Fresh,
         Some(_) => EvidenceFreshness::Stale,
@@ -205,7 +205,7 @@ pub(crate) fn observed_freshness(observed_at: Option<DateTime<Utc>>, now: DateTi
     }
 }
 
-pub(crate) fn explain_condition(condition: &IntegrationCondition, now: DateTime<Utc>, ttl: Duration) -> ExplainedCondition {
+pub fn explain_condition(condition: &IntegrationCondition, now: DateTime<Utc>, ttl: Duration) -> ExplainedCondition {
     let observed_at = condition.observed_at.as_deref().and_then(|value| DateTime::parse_from_rfc3339(value).ok()).map(|at| at.to_utc());
     ExplainedCondition {
         value: match condition.value {
@@ -217,95 +217,6 @@ pub(crate) fn explain_condition(condition: &IntegrationCondition, now: DateTime<
         observed_at: condition.observed_at.clone(),
         freshness: observed_freshness(observed_at, now, ttl),
         details: condition.details.clone(),
-    }
-}
-
-pub(crate) fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> ExplainedUnmetExpectation {
-    match expectation {
-        UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, field_path, value, .. } => ExplainedUnmetExpectation {
-            reason: "completion_condition_unsatisfied".to_string(),
-            detail: format!("{field_path} is {}", value.unwrap_or_else(|| "unavailable".to_string())),
-            subject,
-        },
-        UnmetSettlementExpectation::ChangeRequestNotReady { record, detail } => ExplainedUnmetExpectation {
-            reason: "change_request_not_ready".to_string(),
-            subject: format!("change_request/{record}"),
-            detail,
-        },
-        UnmetSettlementExpectation::SubjectDiscoveryPending { convoy, error } => ExplainedUnmetExpectation {
-            reason: "subject_discovery_pending".to_string(),
-            subject: format!("convoy/{convoy}"),
-            detail: error.as_ref().map_or_else(
-                || "The convoy's branch search has not completed".to_string(),
-                |error| format!("The convoy's branch search failed: {error}"),
-            ),
-        },
-        UnmetSettlementExpectation::InvalidExpectedCheckouts { message } => {
-            ExplainedUnmetExpectation { reason: "invalid_expected_checkouts".to_string(), subject: "convoy".to_string(), detail: message }
-        }
-        UnmetSettlementExpectation::ExitEntryAwaitingBinding { disposition, subject } => ExplainedUnmetExpectation {
-            reason: "missing_binding".to_string(),
-            subject: format!("exit/{disposition}"),
-            detail: format!("entry awaits a bound change request for {subject}"),
-        },
-        UnmetSettlementExpectation::MissingCheckout { checkout } => ExplainedUnmetExpectation {
-            reason: "missing_record".to_string(),
-            subject: format!("checkout/{checkout}"),
-            detail: "expected checkout has no federated record".to_string(),
-        },
-        UnmetSettlementExpectation::MissingCheckoutStatus { checkout } => ExplainedUnmetExpectation {
-            reason: "missing_status".to_string(),
-            subject: format!("checkout/{checkout}"),
-            detail: "observed checkout has no status".to_string(),
-        },
-        UnmetSettlementExpectation::CheckoutConditionFalse { checkout, condition } => ExplainedUnmetExpectation {
-            reason: "false_condition".to_string(),
-            subject: format!("checkout/{checkout}.{condition}"),
-            detail: format!("{condition} is false"),
-        },
-        UnmetSettlementExpectation::CheckoutConditionUnknown { checkout, condition } => ExplainedUnmetExpectation {
-            reason: "unknown_condition".to_string(),
-            subject: format!("checkout/{checkout}.{condition}"),
-            detail: format!("{condition} is unknown"),
-        },
-        UnmetSettlementExpectation::StaleCheckoutEvidence { checkout, condition, observed_at } => ExplainedUnmetExpectation {
-            reason: "stale_evidence".to_string(),
-            subject: format!("checkout/{checkout}.{condition}"),
-            detail: observed_at.map_or_else(|| "evidence has no observation time".to_string(), |at| format!("observed at {at}")),
-        },
-        UnmetSettlementExpectation::MissingChangeRequest { record } => ExplainedUnmetExpectation {
-            reason: "missing_record".to_string(),
-            subject: format!("change_request/{record}"),
-            detail: "expected change request has no federated observation".to_string(),
-        },
-        UnmetSettlementExpectation::StaleChangeRequest { record, observed_at } => ExplainedUnmetExpectation {
-            reason: "stale_evidence".to_string(),
-            subject: format!("change_request/{record}.state"),
-            detail: observed_at.map_or_else(|| "state has no observation time".to_string(), |at| format!("observed at {at}")),
-        },
-        UnmetSettlementExpectation::ChangeRequestConditionFalse { record, value } => ExplainedUnmetExpectation {
-            reason: "false_condition".to_string(),
-            subject: format!("change_request/{record}.state"),
-            detail: value.map_or_else(|| "state is unknown".to_string(), |value| format!("state is {value}")),
-        },
-        UnmetSettlementExpectation::InvalidCondition { subject, message } => {
-            ExplainedUnmetExpectation { reason: "invalid_condition".to_string(), subject, detail: message }
-        }
-        UnmetSettlementExpectation::MissingObservedRef { reference } => ExplainedUnmetExpectation {
-            reason: "missing_observation".to_string(),
-            subject: format!("remote_ref/{reference}"),
-            detail: "the claimed ref has not been observed through Git transport".to_string(),
-        },
-        UnmetSettlementExpectation::StaleObservedRef { reference, observed_at } => ExplainedUnmetExpectation {
-            reason: "stale_evidence".to_string(),
-            subject: format!("remote_ref/{reference}"),
-            detail: format!("observed at {observed_at}"),
-        },
-        UnmetSettlementExpectation::ObservedDigestMismatch { reference, claimed, observed } => ExplainedUnmetExpectation {
-            reason: "digest_mismatch".to_string(),
-            subject: format!("remote_ref/{reference}"),
-            detail: format!("claim names {claimed}, observed {observed}"),
-        },
     }
 }
 

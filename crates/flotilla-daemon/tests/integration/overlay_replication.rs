@@ -35,7 +35,15 @@ async fn sqlite_daemon(path: std::path::PathBuf, machine_id: &str, host: &str) -
 }
 
 async fn daemon_with_backend(path: std::path::PathBuf, machine_id: &str, host: &str, backend: ResourceBackend) -> Arc<InProcessDaemon> {
-    InProcessDaemon::new_with_resource_backend(vec![], config(path, machine_id), fake_discovery(false), HostName::new(host), backend).await
+    InProcessDaemon::new_with_resource_backend(
+        vec![],
+        config(path, machine_id),
+        fake_discovery(false),
+        HostName::new(host),
+        backend,
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await
 }
 
 #[tokio::test]

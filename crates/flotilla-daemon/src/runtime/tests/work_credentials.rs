@@ -14,6 +14,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         Arc::clone(&config),
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
         HostName::new("test-host"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let backend = daemon.resource_backend();

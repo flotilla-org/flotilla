@@ -67,6 +67,7 @@ fn host_provider_summary_survives_root_membership_changes(tc: hegel::TestCase) {
             fake_discovery_with_provider_set(providers),
             HostName::new("observer"),
             backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let environment = daemon.local_host_identity().environment_id;
@@ -142,6 +143,7 @@ fn resource_host_descriptions_survive_transport_changes(tc: hegel::TestCase) {
                 fake_discovery(false),
                 HostName::new("observer"),
                 backend.clone(),
+                std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
             )
         };
         let daemon = make_daemon().await;
@@ -320,6 +322,7 @@ async fn event_publication_preserves_context_free_command_order() {
         fake_discovery(false),
         HostName::new("test-host"),
         ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let mut first = daemon.subscribe();
@@ -353,6 +356,7 @@ async fn event_publication_preserves_spawned_watch_order() {
         fake_discovery(false),
         HostName::new("test-host"),
         ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let mut events = daemon.subscribe();

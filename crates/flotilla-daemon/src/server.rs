@@ -406,7 +406,14 @@ impl DaemonServer {
         let resource_backend = phase("open_resource_backend", build_embedded_resource_backend(&config)).await?;
         let daemon = phase(
             "initialize_in_process_daemon",
-            InProcessDaemon::new_with_resource_backend(repo_paths, Arc::clone(&config), discovery, host_name.clone(), resource_backend),
+            InProcessDaemon::new_with_resource_backend(
+                repo_paths,
+                Arc::clone(&config),
+                discovery,
+                host_name.clone(),
+                resource_backend,
+                std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+            ),
         )
         .await;
         let peer_manager = build_peer_manager(&daemon, &config, &socket_path)?;

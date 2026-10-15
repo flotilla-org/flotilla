@@ -11,3 +11,6 @@ pub use manager::{
 pub(crate) use ssh_transport::{peer_resource_socket_path, reverse_peer_resource_socket_path};
 pub use ssh_transport::{SshTransport, SshTransportPaths};
 pub use transport::{PeerConnectionStatus, PeerSender, PeerTransport};
+
+mod host_overlay;
+pub use host_overlay::HostPeerOverlay;

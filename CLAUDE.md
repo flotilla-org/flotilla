@@ -165,11 +165,10 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-cbor` | The ADR 0063 CBOR profile over `cbor2`: deterministic writers, safe readers, limits, framing and the conformance corpus; no flotilla dependencies, so sibling repos use it through Git |
 | `flotilla-capability-contract` | Session capability contract: `CredentialCapability`, `SessionCapabilitySource`, endpoint and credential-card helpers; no flotilla dependencies |
 | `flotilla-credentials` | Host-local credential minting/delivery, agent homes and skills, private vessel configuration composition |
-| `flotilla-aggregator` | Durable/observed resource query projection and demand-backed issue materialization |
-| `flotilla-resources` | Resource kinds, lifecycle authority, pure helpers, and typed list/watch shapes; no storage dependencies |
+| `flotilla-projections` | Surface read models, host/fleet views, dispatch board, query actions, durable/observed aggregation and demand-backed issue materialization; reads host inputs through ports |
+| `flotilla-resources` | Resource kinds, lifecycle authority, typed list/watch shapes and shared pure helpers, including convoy-address selection, terminal delivery/attention evidence, unmet-expectation explanations and landing-evidence freshness; no storage dependencies |
 | `flotilla-messaging` | Resource-backed inbox admission, delivery, retention, conditions and receiver/role routing |
-| `flotilla-store` | Object-safe `Store`, typed resolvers, replica/watch machinery, store queries, and the generic controller runtime |
-| `flotilla-store-memory` | In-memory storage and observed replicas; no native persistence dependencies |
+| `flotilla-store` | Object-safe `Store`, typed resolvers, replica/watch machinery, store queries, generic request snapshots and merged definition-catalog reads, and the generic controller runtime || `flotilla-store-memory` | In-memory storage and observed replicas; no native persistence dependencies |
 | `flotilla-store-sqlite` | SQLite persistence, schema, transactions and decode quarantine |
 | `flotilla-store-http` | Kubernetes-isomorphic HTTP storage client |
 | `flotilla-store-testkit` | Shared backend contracts, fixtures and per-request read counters |
@@ -215,8 +214,14 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-protocol/src/snapshot.rs` | `RepoInfo`, provider errors and labels |
 | `crates/flotilla-daemon/src/server.rs` | Daemon server with peer networking |
 | `crates/flotilla-daemon/src/server/` | Server submodules: client/peer connections, request dispatch, remote commands |
-| `crates/flotilla-aggregator/src/lib.rs` | Runtime-facing aggregator future; owns daemon collaborator and watch-source wiring |
-| `crates/flotilla-aggregator/src/aggregator.rs` | Watches durable and observed resources and maintains query result sets |
+| `crates/flotilla-projections/src/lib.rs` | Aggregator runtime context and public resolver ports; wires store watch sources |
+| `crates/flotilla-projections/src/aggregator.rs` | Watches durable and observed resources and maintains query result sets |
+| `crates/flotilla-projections/src/read_projections.rs` | Store-backed explanation, host/fleet, project and crew-stall views; environment and leaf-evidence ports |
+| `crates/flotilla-projections/src/projections_actions.rs` | Query conversion, enrichment and resource watch handlers over host ports |
+| `crates/flotilla-projections/src/host_registry.rs` | Host read models joined with the injected peer overlay |
+| `crates/flotilla-projections/src/dispatch_board.rs` | Shared tracker observation cache and dispatch-board assembly over stores and issue resolvers |
+| `crates/flotilla-core/src/in_process/projection_ports.rs` | Composition adapters for aggregator resolvers, environment reads, immutable message receiver evidence and leaf subscription evidence |
+| `crates/flotilla-daemon/src/peer/host_overlay.rs` | Plane-A peer identities, configured peers, per-node connectivity and overlay policy |
 | `crates/flotilla-credentials/src/lib.rs` | Runtime-facing credential/material operations and agent-environment composition |
 | `crates/flotilla-messaging/src/` | Message inbox and receiver snapshots, transport delivery, audit retention, conditions and charter notification routing |
 | `crates/flotilla-store/src/load_metrics.rs` | Load metrics: store queue, controller loop and replication counters and latency histograms that load drivers sample (#3206) |

@@ -27,8 +27,14 @@ async fn checkout_vcs_discovery_is_cached_per_checkout() {
         Box::new(FakeVcsFactory::new(FakeVcsState::builder(&first_path).build())),
         Box::new(FakeVcsFactory::new(FakeVcsState::builder(&second_path).build())),
     ];
-    let daemon =
-        InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), discovery, HostName::new("local-host")).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::new("local-host"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
 
     // #1770: only observed Checkout lifetimes retain discovered providers.
     for (name, path) in [("first", &first_path), ("second", &second_path)] {
@@ -81,6 +87,7 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
         fake_discovery(false),
         HostName::new("test-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon.set_provisioning_namespace("flotilla".to_string()).await;

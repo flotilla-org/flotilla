@@ -9,6 +9,7 @@ license.workspace = true
 default = []
 
 [dependencies]
+uuid = { workspace = true, features = ["v4"] }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
 serde = { workspace = true, features = ["derive"] }

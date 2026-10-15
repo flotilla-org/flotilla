@@ -23,8 +23,8 @@ use tokio::sync::{broadcast, OnceCell};
 use super::durable_message_evidence;
 use super::sources::{change_request_sources, freshest_change_requests};
 use super::stalls::{is_active_change_request_probe, is_merged_settlement_probe};
-use super::turn_delivery::{queued_turn_evidence, queued_turn_session};
 use super::{EpisodeKeyFields, LeafSubscriptionRow, LeafSubscriptionTable, LeafWatcher, UnableEvidenceKey};
+use flotilla_resources::{queued_turn_evidence, queued_turn_session};
 
 #[derive(Clone)]
 pub(super) struct ReconcilerWake {

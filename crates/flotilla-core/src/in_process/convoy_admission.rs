@@ -340,7 +340,7 @@ impl ConvoyAdmission {
         repository_keys: &[RepositoryKey],
         branch: &str,
         binding: Option<&flotilla_resources::BoundChangeRequest>,
-    ) -> crate::convoy_branch_refresh::ConvoyBranchRefresh {
+    ) -> flotilla_projections::convoy_branch_refresh::ConvoyBranchRefresh {
         let namespace = self.provisioning_namespace().await;
         let mut keys = repository_keys.to_vec();
         if let Some(binding) = binding {
@@ -349,7 +349,7 @@ impl ConvoyAdmission {
         let reads = match self.change_request_read_inventory(&namespace, &keys, binding.map_or("", |binding| binding.id.as_str())).await {
             Ok(reads) => reads,
             Err(error) => {
-                return crate::convoy_branch_refresh::ConvoyBranchRefresh {
+                return flotilla_projections::convoy_branch_refresh::ConvoyBranchRefresh {
                     primary: Err(error.clone()),
                     repositories: repository_keys.iter().cloned().map(|key| (key, Err(error.clone()))).collect(),
                 }
@@ -409,7 +409,7 @@ impl ConvoyAdmission {
             let error = failures.iter().find(|error| matches!(error, ObservationError::RateLimited { .. })).or_else(|| failures.first());
             error.map_or(Ok(None), |error| Err(error.to_string()))
         };
-        crate::convoy_branch_refresh::ConvoyBranchRefresh { primary, repositories: results }
+        flotilla_projections::convoy_branch_refresh::ConvoyBranchRefresh { primary, repositories: results }
     }
 
     #[cfg(test)]
@@ -453,7 +453,7 @@ impl ConvoyAdmission {
             .query_declared::<ResourceChangeRequest>(namespace, &StoreQuery::names(names, true))
             .await
             .map_err(|error| error.to_string())?;
-        let mut snapshot = project_ops::RequestSnapshot::new(&self.backend, namespace)?;
+        let mut snapshot = flotilla_store::RequestSnapshot::new(&self.backend, namespace)?;
         snapshot.insert::<Repository>(repositories)?;
         snapshot.insert::<ResourceChangeRequest>(observations)?;
         Ok(snapshot.finish())
@@ -524,7 +524,7 @@ impl ConvoyAdmission {
     ) -> Result<Option<flotilla_protocol::qualified_path::HostId>, String> {
         let (namespace, intent) = normalize_convoy_start_intent(namespace, intent)?;
         let reads = if intent.placement_policy.is_some() {
-            let mut snapshot = project_ops::RequestSnapshot::new(&self.backend, &namespace)?;
+            let mut snapshot = flotilla_store::RequestSnapshot::new(&self.backend, &namespace)?;
             // Every candidate participates in routing, including pin refusals.
             snapshot.copy::<FulfilmentKind>(&self.backend).await?;
             snapshot.copy::<PlacementPolicy>(&self.backend).await?;
@@ -776,8 +776,8 @@ impl ConvoyAdmission {
             return Ok(None);
         }
         let Some(project) = spec.project_ref.as_deref() else { return Ok(None) };
-        let projects = project_ops::read_definition_catalog::<Project>(reads, namespace).await?;
-        let defaults = project_ops::read_definition_catalog::<CrewDefaults>(reads, namespace).await?;
+        let projects = flotilla_store::read_definition_catalog::<Project>(reads, namespace).await?;
+        let defaults = flotilla_store::read_definition_catalog::<CrewDefaults>(reads, namespace).await?;
         let fleet = reads
             .definitions::<FleetDesignation>(namespace)
             .list_names([FLEET_DESIGNATION_NAME.into()])
@@ -798,7 +798,7 @@ impl ConvoyAdmission {
         {
             return Ok(ResourceBackend::new(flotilla_store::ViewSnapshot::default()));
         }
-        let mut snapshot = project_ops::RequestSnapshot::new(&self.backend, namespace)?;
+        let mut snapshot = flotilla_store::RequestSnapshot::new(&self.backend, namespace)?;
         let names = spec
             .repositories
             .iter()
@@ -812,9 +812,9 @@ impl ConvoyAdmission {
         )?;
         if spec.project_ref.is_some() {
             // Every graph/default layer participates in cascade/topic refusal.
-            snapshot.insert_definitions::<Project>(project_ops::read_definition_catalog::<Project>(&self.backend, namespace).await?)?;
+            snapshot.insert_definitions::<Project>(flotilla_store::read_definition_catalog::<Project>(&self.backend, namespace).await?)?;
             snapshot.insert_definitions::<CrewDefaults>(
-                project_ops::read_definition_catalog::<CrewDefaults>(&self.backend, namespace).await?,
+                flotilla_store::read_definition_catalog::<CrewDefaults>(&self.backend, namespace).await?,
             )?;
             snapshot.insert_definitions::<FleetDesignation>(
                 self.backend
@@ -903,14 +903,14 @@ impl ConvoyAdmission {
             )
             .await
             .map_err(|error| error.to_string())?;
-        let mut snapshot = project_ops::RequestSnapshot::new(&self.backend, namespace)?;
+        let mut snapshot = flotilla_store::RequestSnapshot::new(&self.backend, namespace)?;
         snapshot.insert::<Repository>(repositories)?;
         snapshot.insert::<Environment>(environments)?;
         snapshot.insert::<ResourceCheckout>(checkouts)?;
         if let Some(project) = spec.project_ref.as_deref() {
             // Every graph/default layer participates in topic and cascade refusals.
-            let projects = project_ops::read_definition_catalog::<Project>(read_source, namespace).await?;
-            let defaults = project_ops::read_definition_catalog::<CrewDefaults>(read_source, namespace).await?;
+            let projects = flotilla_store::read_definition_catalog::<Project>(read_source, namespace).await?;
+            let defaults = flotilla_store::read_definition_catalog::<CrewDefaults>(read_source, namespace).await?;
             let fleet = read_source
                 .definitions::<FleetDesignation>(namespace)
                 .list_names([FLEET_DESIGNATION_NAME.into()])
@@ -962,7 +962,7 @@ impl ConvoyAdmission {
             snapshot.insert::<ResourceTerminalSession>(terminals)?;
             snapshot.insert::<ConvoyEnsure>(ensures)?;
         }
-        let mut observed_snapshot = project_ops::RequestSnapshot::new(&self.observed_backend, namespace)?;
+        let mut observed_snapshot = flotilla_store::RequestSnapshot::new(&self.observed_backend, namespace)?;
         observed_snapshot.insert::<ResourceCheckout>(observed)?;
         Ok((snapshot.finish(), observed_snapshot.finish()))
     }
@@ -1578,8 +1578,8 @@ pub(super) async fn installation_image_defaults(
     project_ref: Option<&str>,
 ) -> Result<Option<flotilla_resources::ImageSelection>, String> {
     use flotilla_resources::{CrewDefaults, FleetDesignation, FLEET_DESIGNATION_NAME};
-    let defaults = project_ops::read_definition_catalog::<CrewDefaults>(backend, namespace).await?;
-    let projects = project_ops::read_definition_catalog::<Project>(backend, namespace).await?;
+    let defaults = flotilla_store::read_definition_catalog::<CrewDefaults>(backend, namespace).await?;
+    let projects = flotilla_store::read_definition_catalog::<Project>(backend, namespace).await?;
     if let Some(project) = project_ref.and_then(|name| projects.iter().find(|project| project.metadata.name == name)) {
         let fleet = backend
             .definitions::<FleetDesignation>(namespace)
@@ -1772,7 +1772,7 @@ impl AdmissionReadContext<'_> {
         let project_ref = required_admission_value(&intent.project_ref, "project")?;
         // All graph declarations participate in ancestor/cycle validation. Load
         // once and reuse the exact merged catalog for every decision in this request.
-        let projects = project_ops::read_definition_catalog::<Project>(backend, namespace).await?;
+        let projects = flotilla_store::read_definition_catalog::<Project>(backend, namespace).await?;
         let project = projects
             .iter()
             .find(|project| project.metadata.name == project_ref)
@@ -1782,7 +1782,7 @@ impl AdmissionReadContext<'_> {
             .list_names([FLEET_DESIGNATION_NAME.into()])
             .await
             .map_err(|error| error.to_string())?;
-        let defaults = project_ops::read_definition_catalog::<CrewDefaults>(backend, namespace).await?;
+        let defaults = flotilla_store::read_definition_catalog::<CrewDefaults>(backend, namespace).await?;
         let hierarchy = flotilla_resources::ProjectHierarchy::from_declared(
             projects.iter().map(|project| (project.metadata.name.clone(), project.spec.parent.clone())).collect(),
             fleet.first().map(|designation| designation.spec.project.clone()),
@@ -1916,12 +1916,12 @@ impl AdmissionReadContext<'_> {
             backend.definitions::<CrewImageBaseline>(namespace).list_names(baseline_names).await.map_err(|error| error.to_string())?;
         // Composed images resolve against every layer definition, and their
         // placement cost reads the per-identity builds.
-        let image_layers = project_ops::read_definition_catalog::<ImageLayer>(backend, namespace).await?;
+        let image_layers = flotilla_store::read_definition_catalog::<ImageLayer>(backend, namespace).await?;
         let builds = backend
             .query_declared::<ImageBuild>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
             .await
             .map_err(|error| error.to_string())?;
-        let mut snapshot = project_ops::RequestSnapshot::new(backend, namespace)?;
+        let mut snapshot = flotilla_store::RequestSnapshot::new(backend, namespace)?;
         snapshot.insert_definitions::<Project>(projects)?;
         snapshot.insert_definitions::<FleetDesignation>(fleet)?;
         snapshot.insert_definitions::<CrewDefaults>(defaults)?;
@@ -3635,10 +3635,6 @@ pub(super) fn convoy_address(role: &str, project: Option<&str>) -> String {
     project.map_or_else(|| role.to_string(), |project| format!("{role}@{project}"))
 }
 
-pub(super) fn convoy_disambiguation_address(role: &str, project: Option<&str>) -> String {
-    format!("{role}@{}", project.unwrap_or_default())
-}
-
 /// The stable human-facing address of a convoy role, independent of any one
 /// generation's resource record name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -3860,69 +3856,6 @@ fn allocate_convoy_generation_from_inventory(
     let generation =
         maximum.checked_add(1).ok_or_else(|| format!("convoy {} exhausted its generation counter", convoy_address(role, project)))?;
     Ok(generation)
-}
-
-pub(super) fn parse_role_address(value: &str) -> Result<(&str, Option<&str>), String> {
-    match value.split_once('@') {
-        Some((role, project)) if !role.is_empty() && !project.contains('@') => Ok((role, Some(project))),
-        Some(_) => Err(format!("invalid convoy address `{value}`: expected role@project")),
-        None if value.is_empty() => Err("convoy role cannot be empty".to_string()),
-        None => Ok((value, None)),
-    }
-}
-
-pub(super) struct ConvoyAddressIdentity<'a> {
-    pub(super) record_name: &'a str,
-    pub(super) role: Option<&'a str>,
-    pub(super) project: Option<&'a str>,
-    pub(super) terminal: bool,
-}
-
-pub(super) fn resolve_convoy_candidate_indices(identities: &[ConvoyAddressIdentity<'_>], address: &str) -> Result<Vec<usize>, String> {
-    let exact = identities
-        .iter()
-        .enumerate()
-        .filter_map(|(index, identity)| (identity.record_name == address).then_some(index))
-        .collect::<Vec<_>>();
-    if !exact.is_empty() {
-        return Ok(exact);
-    }
-
-    let (role, project) = parse_role_address(address)?;
-    let matching = identities
-        .iter()
-        .enumerate()
-        .filter_map(|(index, identity)| {
-            (identity.role == Some(role) && project.is_none_or(|project| identity.project.unwrap_or_default() == project)).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let (live, terminal): (Vec<_>, Vec<_>) = matching.into_iter().partition(|index| !identities[*index].terminal);
-    let candidates = if live.is_empty() { terminal } else { live };
-    let record_names = candidates.iter().map(|index| identities[*index].record_name).collect::<BTreeSet<_>>();
-    if record_names.len() <= 1 {
-        return Ok(candidates);
-    }
-
-    let address_options = candidates
-        .iter()
-        .filter_map(|index| identities[*index].role.map(|role| convoy_disambiguation_address(role, identities[*index].project)))
-        .collect::<BTreeSet<_>>();
-    if candidates.iter().all(|index| identities[*index].terminal) && address_options.len() == 1 {
-        return Err(format!(
-            "convoy address `{address}` matches multiple terminal records; use an exact record name: {}",
-            record_names.into_iter().collect::<Vec<_>>().join(", ")
-        ));
-    }
-    if address_options.len() > 1 {
-        return Err(format!(
-            "convoy role `{role}` is ambiguous; use one of: {}",
-            address_options.into_iter().collect::<Vec<_>>().join(", ")
-        ));
-    }
-    Err(format!(
-        "convoy address `{address}` matches multiple records; use an exact record name: {}",
-        record_names.into_iter().collect::<Vec<_>>().join(", ")
-    ))
 }
 
 #[derive(Clone, Copy)]
@@ -5590,7 +5523,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let mut evidence = project_ops::RequestSnapshot::new(&counted, "flotilla").unwrap();
+            let mut evidence = flotilla_store::RequestSnapshot::new(&counted, "flotilla").unwrap();
             evidence.copy::<ResourceHost>(&counted).await.unwrap();
             evidence.copy::<PlacementPolicy>(&counted).await.unwrap();
             let admission = PreparedConvoyAdmission::builder()
@@ -5731,8 +5664,14 @@ mod tests {
     async fn retired_project_workflow_admits_current_turn_rules() {
         let temp = tempfile::tempdir().expect("config");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"retired-workflow-test\"\n").expect("machine identity");
-        let daemon =
-            InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), fake_discovery(false), HostName::local()).await;
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            fake_discovery(false),
+            HostName::local(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
         let templates = daemon.resource_backend().definitions::<WorkflowTemplate>("flotilla");
         let current = flotilla_resources::single_agent_workflow_spec();
         templates.create(&InputMeta::builder().name("single-agent".into()).build(), &current).await.expect("current workflow");
@@ -5812,6 +5751,7 @@ mod tests {
             discovery,
             HostName::new("test-host"),
             backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let defaults = CrewDefaultsSpec {
@@ -5886,6 +5826,7 @@ mod tests {
             fake_discovery(false),
             HostName::new("cascade"),
             backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let projects = backend.definitions::<Project>("flotilla");
@@ -6013,6 +5954,7 @@ mod tests {
             fake_discovery(false),
             HostName::new("test-host"),
             ResourceBackend::new(InMemoryBackend::default()),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let mut project = ProjectSpec::builder().display_name("Example".to_string()).default_workflow_ref("work".to_string()).build();
@@ -6041,6 +5983,7 @@ mod tests {
             fake_discovery(false),
             HostName::new("test-host"),
             ResourceBackend::new(InMemoryBackend::default()),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let project = ProjectSpec::builder().display_name("Example".into()).default_workflow_ref("work".into()).build();
@@ -6074,6 +6017,7 @@ mod tests {
             fake_discovery(false),
             HostName::new("test-host"),
             backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let hosts = backend.using::<ResourceHost>("flotilla");

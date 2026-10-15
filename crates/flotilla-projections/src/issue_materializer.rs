@@ -10,9 +10,9 @@ use std::{
     time::Duration,
 };
 
+use crate::aggregator_projection::AggregatorProjectionState;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
 use flotilla_forge_github::github::{core_rate_limit_reset, rate_limit_reset};
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_protocol::{
@@ -43,20 +43,9 @@ fn is_github_source(source: &IssueSource) -> bool {
 }
 
 #[async_trait]
-pub(crate) trait IssueMaterializationResolver: Send + Sync {
+pub trait IssueMaterializationResolver: Send + Sync {
     async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<ResolvedIssueSourceBinding>, String>;
     async fn issue_provider_for(&self, source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String>;
-}
-
-#[async_trait]
-impl IssueMaterializationResolver for InProcessDaemon {
-    async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<ResolvedIssueSourceBinding>, String> {
-        self.resolve_issue_source_bindings(scope).await
-    }
-
-    async fn issue_provider_for(&self, source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
-        self.issue_provider_for_source(source).await
-    }
 }
 
 enum MaterializationIntent {
@@ -87,7 +76,7 @@ impl ActiveMaterialization {
     }
 }
 
-pub(crate) struct IssueMaterializer {
+pub struct IssueMaterializer {
     state: AggregatorProjectionState,
     resolver: Arc<dyn IssueMaterializationResolver>,
     event_sink: Arc<dyn EventSink>,
@@ -425,14 +414,11 @@ impl SharedIssueRefresh {
 }
 
 impl IssueMaterializer {
-    pub(crate) fn new<R>(state: AggregatorProjectionState, resolver: Arc<R>, event_sink: Arc<dyn EventSink>) -> Self
-    where
-        R: IssueMaterializationResolver + 'static,
-    {
+    pub fn new(state: AggregatorProjectionState, resolver: Arc<dyn IssueMaterializationResolver>, event_sink: Arc<dyn EventSink>) -> Self {
         Self { state, resolver, event_sink, active: HashMap::new(), shared_refresh: Arc::new(SharedIssueRefresh::default()) }
     }
 
-    pub(crate) fn with_polling_health(mut self, health: IssuePollingHealth) -> Self {
+    pub fn with_polling_health(mut self, health: IssuePollingHealth) -> Self {
         self.shared_refresh = Arc::new(SharedIssueRefresh { sources: StdMutex::new(HashMap::new()), health });
         self
     }
@@ -440,7 +426,7 @@ impl IssueMaterializer {
     /// Reconcile complete demand, including each query's materialization
     /// generation. A generation change replaces the task even when a watch
     /// receiver coalesced the intervening stop/start edges.
-    pub(crate) fn reconcile(&mut self, demanded: HashMap<QueryId, u64>) {
+    pub fn reconcile(&mut self, demanded: HashMap<QueryId, u64>) {
         let stale = self
             .active
             .iter()
@@ -476,7 +462,7 @@ impl IssueMaterializer {
         }
     }
 
-    pub(crate) fn fetch_more(&self, query: &QueryId, generation: u64) {
+    pub fn fetch_more(&self, query: &QueryId, generation: u64) {
         if let Some(active) = self.active.get(query).filter(|active| active.generation == generation) {
             if let Err(error) = active.intents.try_send(MaterializationIntent::FetchMore) {
                 tracing::warn!(%query, %error, "could not enqueue fetch-more intent");
@@ -484,7 +470,7 @@ impl IssueMaterializer {
         }
     }
 
-    pub(crate) fn refilter_active_queries(&self) {
+    pub fn refilter_active_queries(&self) {
         for (query, active) in &self.active {
             if let Err(error) = active.intents.try_send(MaterializationIntent::Refilter) {
                 tracing::warn!(%query, %error, "could not enqueue issue refilter intent");

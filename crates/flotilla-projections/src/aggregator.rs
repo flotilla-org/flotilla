@@ -8,15 +8,14 @@ use std::{
     sync::Arc,
 };
 
-use async_trait::async_trait;
-use flotilla_charter::ops_entry::{ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION};
-use flotilla_core::{
+use crate::{
     aggregator_projection::AggregatorProjectionState,
     convoy_branch_refresh::ConvoyBranchRefresh,
-    in_process::InProcessDaemon,
     salience::{AttentionFact, DemandFact, RegardFact, SalienceFacts},
     terminal_health,
 };
+use async_trait::async_trait;
+use flotilla_charter::ops_entry::{ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION};
 #[cfg(test)]
 use flotilla_daemon_api::event_sink::BroadcastEventSink;
 use flotilla_protocol::{
@@ -118,7 +117,7 @@ const LOCAL_SOURCE_PRECEDENCE: [LocalSource; 2] = [LocalSource::Durable, LocalSo
 const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
 
 #[async_trait]
-pub(crate) trait AttachCapabilityResolver: Send + Sync {
+pub trait AttachCapabilityResolver: Send + Sync {
     async fn resolvable_attach_targets(&self, targets: &[(String, HostName)]) -> Result<Vec<bool>, String>;
 
     async fn origin_host_names(&self, origins: &HashSet<flotilla_protocol::NodeId>) -> HashMap<flotilla_protocol::NodeId, HostName> {
@@ -148,7 +147,7 @@ async fn bounded_refresh(
 }
 
 #[async_trait]
-pub(crate) trait ConvoyChangeRequestResolver: Send + Sync {
+pub trait ConvoyChangeRequestResolver: Send + Sync {
     async fn refresh_branch(
         &self,
         repositories: &[RepositoryKey],
@@ -164,39 +163,6 @@ pub(crate) trait ConvoyChangeRequestResolver: Send + Sync {
         _resolution: ConvoyBranchRefresh,
     ) -> Result<(), String> {
         Ok(())
-    }
-}
-
-#[async_trait]
-impl ConvoyChangeRequestResolver for InProcessDaemon {
-    async fn refresh_branch(
-        &self,
-        repositories: &[RepositoryKey],
-        branch: &str,
-        binding: Option<&flotilla_resources::BoundChangeRequest>,
-    ) -> ConvoyBranchRefresh {
-        self.refresh_convoy_branch(repositories, branch, binding).await
-    }
-
-    async fn discover_branch_subjects(
-        &self,
-        namespace: &str,
-        convoy: &str,
-        branch: &str,
-        resolution: ConvoyBranchRefresh,
-    ) -> Result<(), String> {
-        self.discover_convoy_branch_subjects_with_resolution(namespace, convoy, branch, Some(&resolution)).await
-    }
-}
-
-#[async_trait]
-impl AttachCapabilityResolver for InProcessDaemon {
-    async fn resolvable_attach_targets(&self, targets: &[(String, HostName)]) -> Result<Vec<bool>, String> {
-        self.resolvable_attach_targets_internal(targets).await
-    }
-
-    async fn origin_host_names(&self, origins: &HashSet<flotilla_protocol::NodeId>) -> HashMap<flotilla_protocol::NodeId, HostName> {
-        self.origin_host_names_internal(origins).await
     }
 }
 
@@ -370,7 +336,20 @@ impl Aggregator {
         }
     }
 
-    pub(crate) fn with_attach_resolver<R>(mut self, resolver: Arc<R>) -> Self
+    pub fn with_attach_resolver_arc(mut self, resolver: Arc<dyn AttachCapabilityResolver>) -> Self {
+        self.attach_resolver = Some(resolver);
+        self
+    }
+    pub fn with_change_request_resolver_arc(mut self, resolver: Arc<dyn ConvoyChangeRequestResolver>) -> Self {
+        self.change_request_resolver = Some(resolver);
+        self
+    }
+    pub fn with_issue_resolver_arc(mut self, resolver: Arc<dyn IssueMaterializationResolver>) -> Self {
+        self.issue_materializer = Some(IssueMaterializer::new(self.state.clone(), resolver, self.event_sink.clone()));
+        self
+    }
+    #[cfg(test)]
+    pub fn with_attach_resolver<R>(mut self, resolver: Arc<R>) -> Self
     where
         R: AttachCapabilityResolver + 'static,
     {
@@ -378,7 +357,8 @@ impl Aggregator {
         self
     }
 
-    pub(crate) fn with_change_request_resolver<R>(mut self, resolver: Arc<R>) -> Self
+    #[cfg(test)]
+    pub fn with_change_request_resolver<R>(mut self, resolver: Arc<R>) -> Self
     where
         R: ConvoyChangeRequestResolver + 'static,
     {
@@ -386,15 +366,7 @@ impl Aggregator {
         self
     }
 
-    pub(crate) fn with_issue_resolver<R>(mut self, resolver: Arc<R>) -> Self
-    where
-        R: IssueMaterializationResolver + 'static,
-    {
-        self.issue_materializer = Some(IssueMaterializer::new(self.state.clone(), resolver, self.event_sink.clone()));
-        self
-    }
-
-    pub(crate) fn with_issue_polling_health(mut self, health: IssuePollingHealth) -> Self {
+    pub fn with_issue_polling_health(mut self, health: IssuePollingHealth) -> Self {
         let materializer = self.issue_materializer.take().expect("issue resolver must be configured before polling health");
         self.issue_materializer = Some(materializer.with_polling_health(health));
         self

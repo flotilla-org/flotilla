@@ -1074,6 +1074,7 @@ dependencies = [
  "flotilla-environment",
  "flotilla-manifest",
  "flotilla-paths",
+ "flotilla-projections",
  "flotilla-protocol",
  "flotilla-provider-runtime",
  "flotilla-resources",
@@ -1126,47 +1127,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml_edit 0.22.27",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "flotilla-aggregator"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bon",
- "chrono",
- "flotilla-build-features",
- "flotilla-build-features-async",
- "flotilla-build-features-base",
- "flotilla-build-features-hmac",
- "flotilla-build-features-http",
- "flotilla-build-features-os",
- "flotilla-build-features-signing",
- "flotilla-build-features-sqlite",
- "flotilla-build-features-tracing",
- "flotilla-build-features-types",
- "flotilla-charter",
- "flotilla-core",
- "flotilla-daemon-api",
- "flotilla-forge-github",
- "flotilla-issue-tracker",
- "flotilla-protocol",
- "flotilla-protocol-testkit",
- "flotilla-provider-runtime",
- "flotilla-resources",
- "flotilla-store",
- "flotilla-store-memory",
- "flotilla-store-sqlite",
- "flotilla-store-testkit",
- "flotilla-tls",
- "futures",
- "hegeltest",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -1726,6 +1686,7 @@ dependencies = [
  "flotilla-manifest",
  "flotilla-messaging",
  "flotilla-paths",
+ "flotilla-projections",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
  "flotilla-provider-runtime",
@@ -1835,7 +1796,6 @@ dependencies = [
  "bytes",
  "chrono",
  "flotilla-agent",
- "flotilla-aggregator",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -1871,6 +1831,7 @@ dependencies = [
  "flotilla-messaging",
  "flotilla-orchestration-testkit",
  "flotilla-paths",
+ "flotilla-projections",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
  "flotilla-provider-runtime",
@@ -2019,6 +1980,7 @@ dependencies = [
  "flotilla-environment",
  "flotilla-issue-tracker",
  "flotilla-paths",
+ "flotilla-projections",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
  "flotilla-provider-runtime",
@@ -2359,6 +2321,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-projections"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bon",
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-http",
+ "flotilla-build-features-os",
+ "flotilla-build-features-signing",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-change-request",
+ "flotilla-charter",
+ "flotilla-config",
+ "flotilla-daemon-api",
+ "flotilla-forge-github",
+ "flotilla-issue-tracker",
+ "flotilla-manifest",
+ "flotilla-protocol",
+ "flotilla-protocol-testkit",
+ "flotilla-provider-runtime",
+ "flotilla-resources",
+ "flotilla-store",
+ "flotilla-store-memory",
+ "flotilla-store-sqlite",
+ "flotilla-store-testkit",
+ "flotilla-tls",
+ "futures",
+ "hegeltest",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "flotilla-protocol"
 version = "0.1.0"
 dependencies = [
@@ -2543,6 +2550,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

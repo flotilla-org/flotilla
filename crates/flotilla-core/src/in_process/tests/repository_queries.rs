@@ -36,6 +36,7 @@ async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon
@@ -169,6 +170,7 @@ async fn cli_lists_include_active_provider_sessions() {
         fake_discovery(false),
         HostName::new("local"),
         ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let mut registry = ProviderRegistry::new();

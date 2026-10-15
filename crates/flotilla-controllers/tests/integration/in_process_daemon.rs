@@ -819,7 +819,14 @@ async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) 
     let repo = fixture.join("repo");
     init_git_repo(&repo);
     let config = test_config_store(temp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        git_process_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     (temp, repo, daemon)
 }
 
@@ -828,7 +835,14 @@ async fn daemon_for_plain_dir() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
     let repo = physical_tempdir_path(&temp).join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config = test_config_store(temp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     (temp, repo, daemon)
 }
 
@@ -837,7 +851,14 @@ async fn daemon_for_plain_dir_with_discovery(discovery: DiscoveryRuntime) -> (te
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config = test_config_store(temp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     (temp, repo, daemon)
 }
@@ -863,8 +884,14 @@ async fn host_capability_provider_is_constructed_once_for_multiple_tracked_repos
         .ai_utilities
         .push(Box::new(SlowAiUtilityFactory { utility: Arc::new(SlowAiUtility::new()), probes: Some(Arc::clone(&probes)) }));
 
-    let daemon =
-        InProcessDaemon::new(vec![repo_a, repo_b], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo_a, repo_b],
+        test_config_store(temp.path().join("config")),
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
 
     assert_eq!(daemon.tracked_repo_paths().await.len(), 2);
     assert_eq!(probes.load(Ordering::SeqCst), 1, "host provider construction must not scale with repository count");
@@ -895,7 +922,14 @@ async fn demanded_host_issue_provider_keeps_its_lifetime_without_a_checkout() {
     let temp = tempfile::tempdir().expect("tempdir");
     let mut discovery = fake_discovery(false);
     discovery.factories.issue_trackers = vec![Box::new(FreshIssueFactory)];
-    let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let source = IssueSource { service: "fake".into(), scope: "owner/repo".into() };
     let first = daemon.issue_provider_for_source(&source).await.expect("first provider");
     let second = daemon.issue_provider_for_source(&source).await.expect("retained provider");
@@ -918,7 +952,14 @@ async fn fetch_issue_by_ref_does_not_require_a_tracked_checkout() {
     let discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_issue_tracker(provider.clone() as Arc<dyn flotilla_issue_tracker::IssueProvider>),
     );
-    let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
 
     let fetched = daemon.fetch_issue_by_ref(&reference).await.expect("source-addressed fetch should succeed");
 
@@ -930,8 +971,14 @@ async fn fetch_issue_by_ref_does_not_require_a_tracked_checkout() {
 #[tokio::test]
 async fn resource_list_and_get_queries_return_wire_json() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .resource_backend()
         .using::<ResourceConvoy>("flotilla")
@@ -1036,8 +1083,14 @@ async fn resource_list_and_get_queries_return_wire_json() {
 #[tokio::test]
 async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let vessels = backend.clone().using::<flotilla_resources::Vessel>("flotilla");
@@ -1175,8 +1228,14 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
 #[tokio::test]
 async fn convoy_explain_reports_observed_digest_anchor_and_mismatch() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let checkouts = backend.clone().using::<ResourceCheckout>("flotilla");
@@ -1269,8 +1328,14 @@ async fn convoy_explain_reports_observed_digest_anchor_and_mismatch() {
 #[tokio::test]
 async fn resource_list_and_get_queries_return_local_non_replicated_resources() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .resource_backend()
         .using::<WorkflowTemplate>("flotilla")
@@ -1320,8 +1385,14 @@ async fn resource_list_and_get_queries_return_local_non_replicated_resources() {
 #[tokio::test]
 async fn operator_can_remove_a_wrong_repository_remote_without_deleting_the_record() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let stable = "https://github.com/flotilla-org/flotilla";
     let wrong = "https://github.com/wrong/flotilla";
     let spec = RepositorySpec::remote(stable).expect("repository").with_declared_remotes([wrong, stable]).expect("remote declaration");
@@ -1356,12 +1427,22 @@ async fn operator_can_remove_a_wrong_repository_remote_without_deleting_the_reco
 async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
     let authority_temp = tempfile::tempdir().expect("authority tempdir");
     let replica_temp = tempfile::tempdir().expect("replica tempdir");
-    let authority =
-        InProcessDaemon::new(vec![], test_config_store(authority_temp.path().join("config")), fake_discovery(false), HostName::new("feta"))
-            .await;
-    let replica =
-        InProcessDaemon::new(vec![], test_config_store(replica_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
-            .await;
+    let authority = InProcessDaemon::new(
+        vec![],
+        test_config_store(authority_temp.path().join("config")),
+        fake_discovery(false),
+        HostName::new("feta"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let replica = InProcessDaemon::new(
+        vec![],
+        test_config_store(replica_temp.path().join("config")),
+        fake_discovery(false),
+        HostName::new("kiwi"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let origin = authority.node_id().clone();
     let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
     convoys
@@ -1462,8 +1543,14 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
 #[tokio::test]
 async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let authority_node = test_node("retired-authority");
     let origin = authority_node.node_id.clone();
     daemon.set_configured_peers(vec![authority_node.clone()]).await;
@@ -1544,6 +1631,7 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
         test_config_store(authority_temp.path().join("config")),
         fake_discovery(false),
         HostName::new("authority"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let peer_one_temp = tempfile::tempdir().expect("create first peer tempdir");
@@ -1552,6 +1640,7 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
         test_config_store(peer_one_temp.path().join("config")),
         fake_discovery(false),
         HostName::new("peer-one"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let peer_two_temp = tempfile::tempdir().expect("create second peer tempdir");
@@ -1560,6 +1649,7 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
         test_config_store(peer_two_temp.path().join("config")),
         fake_discovery(false),
         HostName::new("peer-two"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let origin = authority.node_id().clone();
@@ -1682,8 +1772,14 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
 #[tokio::test]
 async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let mut events = daemon.subscribe();
     let name = flotilla_resources::usage_record_name("codex", "ada@example.com");
     let create_id = daemon
@@ -1754,8 +1850,14 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
 #[tokio::test]
 async fn manifest_resolution_command_persists_a_root_spec_token() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let roots = daemon.resource_backend().using::<flotilla_resources::ManifestRoot>("flotilla");
     roots
         .create(
@@ -1809,8 +1911,14 @@ async fn manifest_resolution_command_persists_a_root_spec_token() {
 #[tokio::test]
 async fn resource_watch_streams_current_update_and_resumed_delete_without_loss() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
     let created = convoys
         .create(
@@ -2047,8 +2155,14 @@ async fn create_test_convoy_project(backend: &flotilla_store::ResourceBackend, i
 #[tokio::test]
 async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
     let temp = tempfile::TempDir::new().expect("tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let backend = daemon.resource_backend();
     let repository = RepositorySpec::remote("https://forgejo.lab/fork-issues/zellij")
         .expect("fork repository")
@@ -2261,6 +2375,7 @@ async fn exercise_existing_pr_admission(continuing: bool) {
         test_config_store(temp.path().join("config")),
         fake_discovery_with_runner(false, runner),
         HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon
@@ -3465,8 +3580,14 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"local-host\"\n").expect("write daemon config");
-    let daemon =
-        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_base)), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(config_base)),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let local_host_ref = daemon.local_host_id().expect("local host id").to_string();
     let backend = daemon.resource_backend();
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
@@ -3630,7 +3751,14 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
 async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config_store(temp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let backend = daemon.resource_backend();
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     backend
@@ -3776,8 +3904,14 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
 #[tokio::test]
 async fn convoy_start_accepts_project_list_identifier() {
     let temp = tempfile::TempDir::new().expect("tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let backend = daemon.resource_backend();
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     backend
@@ -3889,8 +4023,14 @@ async fn convoy_start_accepts_project_list_identifier() {
 #[tokio::test]
 async fn convoy_start_freezes_dispatch_promises_and_refuses_unresolvable_ones() {
     let temp = tempfile::TempDir::new().expect("tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let backend = daemon.resource_backend();
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     backend
@@ -4012,8 +4152,14 @@ async fn convoy_start_freezes_dispatch_promises_and_refuses_unresolvable_ones() 
 #[tokio::test]
 async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
     let temp = tempfile::TempDir::new().expect("tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let mut events = daemon.subscribe();
 
     let command_id = daemon
@@ -4948,8 +5094,14 @@ async fn convoy_delete_reaps_a_landed_pre_identity_record_and_its_terminal_sessi
 #[tokio::test]
 async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let backend = daemon.resource_backend();
     let repo_ref = RepositoryKey("repo-a".to_string());
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -5057,8 +5209,14 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
 #[tokio::test]
 async fn landed_convoy_teardown_accepts_merged_produced_subject_when_checkout_status_is_missing() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let backend = daemon.resource_backend();
     let repo_ref = RepositoryKey("repo-a".to_string());
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -5488,7 +5646,14 @@ async fn daemon_for_plain_dir_with_local_environment_id(local_environment_id: &s
         flotilla_core::host_identity::resolve_local_environment_state_dir(&config_dir, Some("test-machine"), &*discovery.runner).await;
     std::fs::create_dir_all(&machine_state_dir).expect("create machine-scoped state dir");
     std::fs::write(machine_state_dir.join("environment-id"), format!("{local_environment_id}\n")).expect("seed environment id");
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     (temp, repo, daemon)
 }
 
@@ -5619,7 +5784,14 @@ hostname = "buildbox.example"
         Box::new(flotilla_discovery_api::detectors::EnvVarDetector::new("TERM")),
         Box::new(flotilla_discovery_api::detectors::EnvVarDetector::new("COLORTERM")),
     ]);
-    let daemon = InProcessDaemon::new(vec![repo], Arc::new(ConfigStore::with_base(config_dir)), discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo],
+        Arc::new(ConfigStore::with_base(config_dir)),
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
 
     let remote_env_id = EnvironmentId::new("buildbox-env-id");
     let managed_ids = daemon.managed_environment_ids_for_test();
@@ -5738,6 +5910,7 @@ display_name = "Build Box"
         Arc::new(ConfigStore::with_base(config_dir)),
         static_ssh_test_discovery(ssh_runner),
         HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
 
@@ -5846,6 +6019,7 @@ hostname = "brokenbox.example"
         Arc::new(ConfigStore::with_base(config_dir)),
         static_ssh_test_discovery(ssh_runner),
         HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
 
@@ -5906,6 +6080,7 @@ hostname = "buildbox.example"
             vec![Box::new(EnvVarEchoHostDetector { env_var: "LOCAL_ONLY_SECRET", assertion_key: "LOCAL_ONLY_SECRET" })],
         ),
         HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
 
@@ -6035,7 +6210,14 @@ hostname = "buildbox.example"
 
     let mut discovery = fake_discovery(false);
     discovery.runner = ssh_runner;
-    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_dir)), discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(config_dir)),
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
 
     let result = daemon
         .discover_repo_for_environment_for_test(&repo, &EnvironmentId::new("static-ssh-6275696c64626f78"))
@@ -6074,6 +6256,7 @@ hostname = "hangbox.example"
             Arc::new(ConfigStore::with_base(config_dir)),
             static_ssh_test_discovery(Arc::new(HangingSshRunner { delay: Duration::from_secs(6) })),
             HostName::local(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         ),
     )
     .await
@@ -6189,6 +6372,7 @@ hostname = "builddash.example"
         Arc::new(ConfigStore::with_base(config_dir)),
         static_ssh_test_discovery(ssh_runner),
         HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
 
@@ -6223,7 +6407,14 @@ async fn daemon_for_fake_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
     discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
 
     let config = test_config_store(temp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        config,
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".into()))).await;
     daemon.add_repo(&repo).await.expect("adopt test checkout into resources");
     let identity = daemon.tracked_repo_identity_for_path(&repo).await.expect("identity");
@@ -6288,7 +6479,14 @@ async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathB
     discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
 
     let config = test_config_store(temp.path().join("config"));
-    let daemon = InProcessDaemon::new(Vec::new(), config, discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        config,
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     daemon.add_repo(&repo_a).await.expect("observe first checkout");
     daemon.add_repo(&repo_b).await.expect("observe second checkout");
@@ -6475,8 +6673,14 @@ async fn daemon_uses_persisted_local_environment_id() {
 
     drop(daemon);
 
-    let restarted =
-        InProcessDaemon::new(vec![repo], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let restarted = InProcessDaemon::new(
+        vec![repo],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     assert_eq!(restarted.local_environment_id().as_str(), "test-local-environment-id");
 }
 
@@ -6492,6 +6696,7 @@ async fn daemon_restart_preserves_standing_convoy_and_terminal_session() {
         fake_discovery(false),
         HostName::local(),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
 
@@ -6551,9 +6756,15 @@ async fn daemon_restart_preserves_standing_convoy_and_terminal_session() {
     drop(backend);
 
     let restarted_backend = ResourceBackend::new(SqliteBackend::open(&database_path).expect("reopen resource store"));
-    let _restarted =
-        InProcessDaemon::new_with_resource_backend(Vec::new(), config, fake_discovery(false), HostName::local(), restarted_backend.clone())
-            .await;
+    let _restarted = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        config,
+        fake_discovery(false),
+        HostName::local(),
+        restarted_backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
 
     let convoy =
         restarted_backend.clone().using::<ResourceConvoy>("flotilla").get("standing-convoy").await.expect("standing convoy after restart");
@@ -6572,8 +6783,14 @@ async fn daemon_uses_config_machine_id_for_local_node_identity_storage() {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"override-machine\"\n").expect("write daemon config");
 
-    let daemon =
-        InProcessDaemon::new(vec![repo], Arc::new(ConfigStore::with_base(&config_dir)), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo],
+        Arc::new(ConfigStore::with_base(&config_dir)),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
 
     assert!(
         config_dir.join("identity/override-machine/node.key").exists(),
@@ -6595,8 +6812,14 @@ async fn daemon_uses_persisted_fingerprint_backed_node_id() {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
 
     let discovery = fake_discovery(false);
-    let daemon =
-        InProcessDaemon::new(vec![repo.clone()], test_config_store(config_dir.clone()), discovery, HostName::new("display-host")).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        test_config_store(config_dir.clone()),
+        discovery,
+        HostName::new("display-host"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
 
     let first_node_id = daemon.node_id().clone();
     assert_eq!(first_node_id.as_str().len(), 32, "node id should be a 16-byte hex fingerprint");
@@ -6609,6 +6832,7 @@ async fn daemon_uses_persisted_fingerprint_backed_node_id() {
         test_config_store(config_dir.clone()),
         fake_discovery(false),
         HostName::new("renamed-display-host"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
 
@@ -6621,8 +6845,14 @@ async fn daemon_uses_persisted_fingerprint_backed_node_id() {
 #[tokio::test]
 async fn adopted_checkout_reconciliation_repairs_partial_durable_creation() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let durable = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
     let spec = ResourceCheckoutSpec::Observed(
@@ -6660,8 +6890,14 @@ async fn adopted_checkout_reconciliation_repairs_partial_durable_creation() {
 #[tokio::test]
 async fn adopted_checkout_reconciliation_isolates_an_observed_name_collision() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let durable = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
     let checkout_spec = |path: &str| {
@@ -6711,7 +6947,14 @@ async fn tracking_does_not_materialize_when_project_name_is_occupied() {
     let mut discovery = fake_vcs_discovery(state);
     discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
 
-    let daemon = InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
 
     let tracked = RepositorySpec::remote("https://github.com/owner/repo").expect("tracked repository spec");
@@ -6776,7 +7019,14 @@ async fn repository_identity_change_does_not_materialize_project_when_superseded
     let mut discovery = fake_vcs_discovery(state);
     discovery.repo_detectors.push(Box::new(MutableRemoteHostDetector { owner: "owner", repo: Arc::clone(&discovered_repo) }));
 
-    let daemon = InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     install_test_repository_inspector(&daemon, Arc::clone(&discovered_repo)).await;
     daemon.add_repo(&repo).await.expect("add repository with old identity");
 
@@ -6841,9 +7091,14 @@ async fn discovery_resolves_origin_forge_and_binds_both_forgejo_sources() {
     let repo = fixture.join("repo");
     init_git_repo_with_remote(&repo, "git@forgejo.lab.flotilla.work:lab/flotilla.git");
     std::fs::write(temp.path().join("lab-forgejo-coder-token"), "test-token\n").expect("write test token");
-    let daemon =
-        InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), git_process_discovery(false), HostName::local())
-            .await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        git_process_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .resource_backend()
         .definitions::<Forge>("flotilla")
@@ -6928,6 +7183,7 @@ async fn forge_alias_observations_from_two_hosts_record_canonical_live_remote_ad
             fake_discovery(false),
             HostName::local(),
             backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         daemon
@@ -6959,8 +7215,14 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("ghostty-ops");
     std::fs::create_dir_all(&repo).expect("create repository path");
-    let daemon =
-        InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .set_repository_inspector(Arc::new(ForgeAliasInspector {
             path: repo.clone(),
@@ -7215,8 +7477,14 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("ghostty-ops");
     std::fs::create_dir_all(&repo).expect("create repository path");
-    let daemon =
-        InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .set_repository_inspector(Arc::new(ForgeAliasInspector {
             path: repo.clone(),
@@ -7293,8 +7561,14 @@ async fn forge_identity_sweep_merges_records_whose_bookkeeping_annotations_diffe
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("katzensteg-ops");
     std::fs::create_dir_all(&repo).expect("create repository path");
-    let daemon =
-        InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .set_repository_inspector(Arc::new(ForgeAliasInspector {
             path: repo.clone(),
@@ -7372,6 +7646,7 @@ async fn forge_identity_sweep_includes_replica_only_legacy_repository() {
         fake_discovery(false),
         HostName::local(),
         target.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon
@@ -7399,7 +7674,14 @@ async fn associated_checkout_remote_move_updates_repository_in_place() {
     let remote = Arc::new(std::sync::RwLock::new("old-repo".to_string()));
     let mut discovery = fake_vcs_discovery(state);
     discovery.repo_detectors.push(Box::new(MutableRemoteHostDetector { owner: "owner", repo: Arc::clone(&remote) }));
-    let daemon = InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     install_test_repository_inspector(&daemon, Arc::clone(&remote)).await;
     daemon.add_repo(&repo).await.expect("track old remote");
 
@@ -7447,7 +7729,14 @@ async fn associated_path_replaced_by_unrelated_repository_mints_new_identity() {
     let remote = Arc::new(std::sync::RwLock::new("ghostty".to_string()));
     let mut discovery = fake_vcs_discovery(state);
     discovery.repo_detectors.push(Box::new(MutableRemoteHostDetector { owner: "fork-issues", repo: Arc::clone(&remote) }));
-    let daemon = InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .set_repository_inspector(Arc::new(TestRepositoryInspector {
             host_ref: daemon.local_host_id().expect("local Host").to_string(),
@@ -7615,7 +7904,14 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     init_git_repo(&repo);
 
     let config = test_config_store(temp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("new-repo".to_string()))).await;
     let mut rx = daemon.subscribe();
 
@@ -7694,7 +7990,14 @@ async fn remove_repo_persistence_failure_leaves_repo_tracked() {
 
     let config_dir = temp.path().join("config");
     let config = test_config_store(config_dir.clone());
-    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     daemon.add_repo(&repo).await.expect("track repo");
 
@@ -7714,7 +8017,14 @@ async fn remove_repo_command_cleans_up_an_untracked_observation_root() {
     let unavailable = temp.path().join("unavailable-repo");
     let config = test_config_store(temp.path().join("config"));
     config.add_observation_root(&ExecutionEnvironmentPath::new(&unavailable)).expect("persist observation root");
-    let daemon = InProcessDaemon::new(vec![], Arc::clone(&config), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let mut rx = daemon.subscribe();
 
     let command_id = daemon
@@ -7778,7 +8088,14 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
     let _ = init_git_repo_with_local_bare_remote(&local_repo, &remote);
     let identity = test_repo_identity();
     let config = test_config_store(temp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![], config, local_bare_remote_discovery(), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        local_bare_remote_discovery(),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
 
     daemon
@@ -7803,7 +8120,14 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
 async fn refresh_unobserved_checkout_refuses_without_started_event() {
     let config_tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(config_tmp.path().to_path_buf());
-    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let mut rx = daemon.subscribe();
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
 
@@ -7830,7 +8154,14 @@ async fn refresh_unobserved_checkout_refuses_without_started_event() {
 async fn stop_observing_missing_checkout_refuses_without_started_event() {
     let config_tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(config_tmp.path().to_path_buf());
-    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let mut rx = daemon.subscribe();
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
 
@@ -7862,7 +8193,14 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
     std::fs::create_dir_all(&repo_b).unwrap();
 
     let config = test_config_store(temp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo_a.clone(), repo_b.clone()], config, fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo_a.clone(), repo_b.clone()],
+        config,
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .set_repository_inspector(Arc::new(TestRepositoryInspector {
             host_ref: daemon.local_host_id().expect("local Host").to_string(),
@@ -7904,7 +8242,14 @@ async fn symlinked_untrack_removes_unavailable_observation_root() {
     let physical = std::fs::canonicalize(&alias).expect("physical root");
     let config = test_config_store(temp.path().join("config"));
     config.add_observation_root(&ExecutionEnvironmentPath::new(&physical)).expect("observation root");
-    let daemon = InProcessDaemon::new(vec![], Arc::clone(&config), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     daemon
         .execute(Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Path(alias) }).build())
         .await
@@ -7927,8 +8272,14 @@ async fn symlinked_remove_repo_retires_tracked_and_persisted_roots() {
     // Seed a previous-generation file that already contains both spellings.
     let legacy_roots = toml::to_string(&BTreeMap::from([("paths", vec![repo.clone(), physical.clone()])])).expect("legacy roots");
     std::fs::write(config.base_path().as_path().join("observation-roots.toml"), legacy_roots).expect("persist legacy aliases");
-    let daemon =
-        InProcessDaemon::new(vec![repo.clone(), physical], Arc::clone(&config), git_process_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone(), physical],
+        Arc::clone(&config),
+        git_process_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     // Legacy persisted spellings produce one physical root, and removal retires both.
     assert_eq!(daemon.tracked_repo_paths().await.len(), 1);
     daemon.remove_repo(&repo).await.expect("remove alias checkout");
@@ -8063,11 +8414,25 @@ async fn missing_issue_provider_names_the_missing_capability_on_every_host() {
     let config = test_config_store(config_tmp.path().to_path_buf());
     let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
 
-    let leader = InProcessDaemon::new(vec![], config.clone(), fake_discovery(false), HostName::local()).await;
+    let leader = InProcessDaemon::new(
+        vec![],
+        config.clone(),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let leader_error = leader.issue_provider_for_source(&source).await.err().expect("leader should have no provider in test environment");
     assert_eq!(leader_error, "no issue provider available for https://github.com flotilla-org/flotilla");
 
-    let follower = InProcessDaemon::new(vec![], config, fake_discovery(true), HostName::local()).await;
+    let follower = InProcessDaemon::new(
+        vec![],
+        config,
+        fake_discovery(true),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let follower_error = follower.issue_provider_for_source(&source).await.err().expect("follower should have no issue provider");
     assert_eq!(follower_error, "no issue provider available for https://github.com flotilla-org/flotilla");
 }
@@ -8076,7 +8441,14 @@ async fn missing_issue_provider_names_the_missing_capability_on_every_host() {
 async fn add_virtual_repo_is_idempotent() {
     let config_tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(config_tmp.path().to_path_buf());
-    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
     let identity = RepoIdentity { authority: "github.com".into(), path: "owner/remote-only".into() };
@@ -8120,8 +8492,14 @@ async fn add_repo_uses_manager_backed_local_environment_for_repo_identity() {
     let repo = physical_tempdir_path(&temp).join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config = test_config_store(temp.path().join("config"));
-    let daemon =
-        InProcessDaemon::new(vec![], config, fake_discovery_with_provider_set(FakeDiscoveryProviders::new()), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("manager-backed-repo".to_string()))).await;
 
     daemon
@@ -8160,7 +8538,14 @@ async fn add_repo_uses_manager_backed_local_environment_for_provider_discovery()
     Arc::get_mut(&mut discovery.host_detectors)
         .expect("unshared detectors")
         .push(Box::new(FixedEnvVarHostDetector { key: "ENABLE_MANAGER_TERMINALS", value: "1" }));
-    let daemon = InProcessDaemon::new(vec![], config, discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        config,
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("provider-discovery".to_string()))).await;
 
     daemon.add_repo(&repo).await.expect("add repo");
@@ -8352,7 +8737,14 @@ hostname = "buildbox.example"
 
     let mut discovery = fake_discovery(false);
     discovery.runner = ssh_runner;
-    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_dir)), discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(config_dir)),
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
 
     let result = daemon
         .discover_repo_for_environment_for_test(&repo, &EnvironmentId::new("static-ssh-6275696c64626f78"))
@@ -8431,7 +8823,14 @@ hostname = "buildbox.example"
         .factories
         .terminal_pools
         .push(Box::new(EnvGatedTerminalPoolFactory { required_env_var: "ENABLE_REMOTE_TERMINALS", pool: terminal_pool }));
-    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_dir)), discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(config_dir)),
+        discovery,
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
 
     let result = daemon
         .discover_repo_for_environment_for_test(&repo, &EnvironmentId::new("static-ssh-6275696c64626f78"))
@@ -8460,12 +8859,22 @@ async fn cancel_nonexistent_command_returns_error() {
 async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     let authority_temp = tempfile::tempdir().expect("authority tempdir");
     let terminal_temp = tempfile::tempdir().expect("terminal tempdir");
-    let authority =
-        InProcessDaemon::new(vec![], test_config_store(authority_temp.path().join("config")), fake_discovery(false), HostName::new("feta"))
-            .await;
-    let terminal_host =
-        InProcessDaemon::new(vec![], test_config_store(terminal_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
-            .await;
+    let authority = InProcessDaemon::new(
+        vec![],
+        test_config_store(authority_temp.path().join("config")),
+        fake_discovery(false),
+        HostName::new("feta"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let terminal_host = InProcessDaemon::new(
+        vec![],
+        test_config_store(terminal_temp.path().join("config")),
+        fake_discovery(false),
+        HostName::new("kiwi"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> =
         Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
@@ -8649,12 +9058,22 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
 async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     let authority_temp = tempfile::tempdir().expect("authority tempdir");
     let terminal_temp = tempfile::tempdir().expect("terminal tempdir");
-    let authority =
-        InProcessDaemon::new(vec![], test_config_store(authority_temp.path().join("config")), fake_discovery(false), HostName::new("feta"))
-            .await;
-    let terminal_host =
-        InProcessDaemon::new(vec![], test_config_store(terminal_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
-            .await;
+    let authority = InProcessDaemon::new(
+        vec![],
+        test_config_store(authority_temp.path().join("config")),
+        fake_discovery(false),
+        HostName::new("feta"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let terminal_host = InProcessDaemon::new(
+        vec![],
+        test_config_store(terminal_temp.path().join("config")),
+        fake_discovery(false),
+        HostName::new("kiwi"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> =
         Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
@@ -9456,7 +9875,14 @@ fn repository_operations_without_tracked_roots(tc: hegel::TestCase) {
             )])
             .await;
         let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_change_request(provider.clone()));
-        let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+        let daemon = InProcessDaemon::new(
+            vec![],
+            test_config_store(temp.path().join("config")),
+            discovery,
+            HostName::local(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
         let spec = RepositorySpec::remote("https://github.com/owner/identity-repo").expect("Repository");
         let key = spec.key();
         daemon
@@ -9555,6 +9981,7 @@ async fn repository_github_execution_uses_forge_identity_without_checkout() {
         test_config_store(temp.path().join("config")),
         fake_discovery_with_runner(false, runner.clone()),
         HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon
@@ -9607,6 +10034,7 @@ async fn repository_forge_refusals_without_tracked_roots() {
         test_config_store(temp.path().join("config")),
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_change_request(provider)),
         HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let spec = RepositorySpec::remote("https://github.com/owner/refusals").expect("Repository");
@@ -9645,6 +10073,7 @@ async fn startup_observation_publishes_repository_context_without_project_mintin
         test_config_store(temp.path().join("config")),
         git_process_discovery(false),
         HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let response = daemon.get_repo_providers_internal(&RepoSelector::Path(path.join("src"))).await.expect("startup cwd context");
@@ -9676,8 +10105,14 @@ async fn startup_observation_publishes_repository_context_without_project_mintin
 async fn checkoutless_refresh_honors_failure_policy() {
     use flotilla_resources::{ForgeKind, ForgeSpec};
     let temp = tempfile::tempdir().expect("config");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let forge = ForgeSpec::builder()
         .forge_id("unavailable".into())
         .kind(ForgeKind::Github)
@@ -9804,6 +10239,7 @@ async fn startup_forgejo_case(
         fake_discovery_with_runner(false, Arc::new(StartupForgeRunner)),
         HostName::local(),
         backend,
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     (temp, repo, daemon)
@@ -9901,8 +10337,14 @@ async fn startup_forgejo_discovery_error_preserves_other_repositories() {
 #[tokio::test]
 async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_observation() {
     let temp = tempfile::tempdir().expect("config");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let backend = daemon.resource_backend();
     backend
         .using::<ResourceConvoy>("document-namespace")

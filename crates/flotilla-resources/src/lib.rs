@@ -307,3 +307,15 @@ pub use actuation::Actuation;
 #[doc(hidden)]
 pub mod project_hierarchy;
 pub use project_hierarchy::ProjectHierarchy;
+
+mod leaf_diagnostics;
+pub use leaf_diagnostics::*;
+
+mod read_evidence;
+pub use read_evidence::*;
+
+mod convoy_address;
+pub use convoy_address::*;
+
+mod host_projection;
+pub use host_projection::canonical_placement_host_ref_from_sources;

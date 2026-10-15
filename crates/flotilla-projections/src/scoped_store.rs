@@ -10,7 +10,7 @@ use flotilla_protocol::{
     ResultSetCondition, ResultSetState, Rows, UNKNOWN_REPOSITORY_LABEL,
 };
 
-pub(crate) trait ScopedStoreRow: Clone + PartialEq {
+pub trait ScopedStoreRow: Clone + PartialEq {
     fn resource(&self) -> &ResourceRef;
     fn repository_key(&self) -> Option<&RepositoryKey>;
     fn apply_repository_label(&mut self, labels: &HashMap<RepositoryKey, String>);
@@ -93,7 +93,7 @@ impl ScopedStoreRow for IndependentRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MaterializedSet<R> {
+pub struct MaterializedSet<R> {
     seq: u64,
     rows: HashMap<ResourceRef, R>,
     state: ResultSetState,
@@ -122,8 +122,8 @@ impl<R: ScopedStoreRow> MaterializedSet<R> {
 /// All warm facts for one store-backed query family and their finite,
 /// referent-backed Project views.
 #[derive(Debug, bon::Builder)]
-#[builder(builder_type(vis = "pub(crate)"))]
-pub(crate) struct ScopedStoreProjection<R> {
+#[builder(builder_type(vis = "pub"))]
+pub struct ScopedStoreProjection<R> {
     known_repositories: HashSet<RepositoryKey>,
     repository_labels: HashMap<RepositoryKey, String>,
     projects: HashMap<QueryScope, Vec<RepositoryKey>>,
@@ -280,8 +280,8 @@ impl<R: ScopedStoreRow> ScopedStoreProjection<R> {
     }
 }
 
-pub(crate) type ScopedCheckoutProjection = ScopedStoreProjection<CheckoutRow>;
-pub(crate) type ScopedIndependentProjection = ScopedStoreProjection<IndependentRow>;
+pub type ScopedCheckoutProjection = ScopedStoreProjection<CheckoutRow>;
+pub type ScopedIndependentProjection = ScopedStoreProjection<IndependentRow>;
 
 fn group_rows<R: ScopedStoreRow>(rows: Vec<R>) -> HashMap<Option<RepositoryKey>, HashMap<ResourceRef, R>> {
     let mut grouped: HashMap<Option<RepositoryKey>, HashMap<ResourceRef, R>> = HashMap::new();

@@ -84,6 +84,7 @@ async fn start_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigSto
         fake_discovery_on_host_os(false, "linux"),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let options = RuntimeOptions {
@@ -266,9 +267,15 @@ async fn replicated_remote_declaration_resolution_preserves_existing_mirror_proj
         .await
         .expect("seed retired mirror Project residue");
 
-    let daemon =
-        InProcessDaemon::new_with_resource_backend(vec![], Arc::clone(&config), fake_discovery(false), HostName::new("feta"), feta.clone())
-            .await;
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("feta"),
+        feta.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: mirror_spec, host_ref: "feta".to_string() })).await;
     let checkout_path = tmp.path().join("mirror-checkout");
     std::fs::create_dir(&checkout_path).expect("mirror checkout dir");
@@ -301,9 +308,15 @@ async fn independently_observed_same_repository_remains_resolvable_after_replica
         .await
         .expect("replicate kiwi observation to feta");
 
-    let daemon =
-        InProcessDaemon::new_with_resource_backend(vec![], Arc::clone(&config), fake_discovery(false), HostName::new("feta"), feta.clone())
-            .await;
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("feta"),
+        feta.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "feta".to_string() })).await;
     let checkout_path = tmp.path().join("canonical-checkout");
     std::fs::create_dir(&checkout_path).expect("canonical checkout dir");
@@ -481,6 +494,7 @@ async fn selected_detached_ops_checkout_loads_without_rederiving_identity() {
             git_process_discovery(false),
             HostName::new("local"),
             backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await,
     );
@@ -1184,6 +1198,7 @@ async fn tracked_repo_labels_materialized_project_without_overwriting_user_field
         git_process_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
@@ -1238,6 +1253,7 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
         git_process_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
 
@@ -1323,6 +1339,7 @@ async fn tracked_repo_labels_matching_unlabelled_project_once() {
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec.clone(), host_ref: "host-01".to_string() })).await;
@@ -1678,6 +1695,7 @@ async fn daemon_start_and_restart_do_not_backfill_projects() {
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let repository_spec = RepositorySpec::remote("https://github.com/org/backfilled.git").expect("repository spec");
@@ -1715,6 +1733,7 @@ async fn daemon_restart_does_not_create_project_while_preserving_applied_project
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let local_spec = RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec");
@@ -1782,6 +1801,7 @@ async fn daemon_start_skips_a_tracked_repo_that_cannot_be_backfilled() {
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon.set_repository_inspector(Arc::new(FailingInspector)).await;
@@ -1913,6 +1933,7 @@ async fn project_checkout_set_with_store_history(tmp: &tempfile::TempDir, with_h
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let options = RuntimeOptions {

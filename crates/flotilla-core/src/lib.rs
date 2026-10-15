@@ -3,27 +3,18 @@
 #![allow(clippy::double_must_use)]
 
 pub mod admission;
-pub mod aggregator_projection;
-pub mod awareness_projection;
 pub mod change_request_observer;
 mod charter_notifications;
 pub mod checkout_integration;
 pub mod cleat_roll;
 pub mod command_target;
 pub mod convert;
-pub mod convoy_branch_refresh;
 pub mod convoy_ensure;
 pub mod crew_capabilities;
 pub mod decision_log;
 pub mod demand_lifecycle;
 pub mod dispatch_missions;
-mod dispatch_ready;
-pub(crate) mod fleet;
-pub mod fleet_health;
 pub mod host_identity;
-pub(crate) mod host_registry;
-pub mod host_resolution;
-pub mod host_summary;
 pub mod image_build;
 pub mod in_process;
 pub mod issue_observer;
@@ -31,18 +22,11 @@ pub mod leaf_engine;
 pub mod model;
 pub(crate) mod observed_resources;
 pub mod placement_policy;
-mod project_repositories;
-pub mod query_registry;
 pub mod regard_lifecycle;
 pub(crate) mod repo_state;
 pub(crate) mod repository_addressing;
 pub mod repository_inspection;
 pub mod resolve;
-mod resource_explain;
-pub mod salience;
-mod scoped_store;
-mod standing_roles;
-pub mod terminal_health;
 
 // Re-export shared infrastructure and host types for convenience.
 pub use flotilla_protocol::HostName;

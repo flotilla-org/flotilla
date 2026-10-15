@@ -1,22 +1,26 @@
 [package]
-name = "flotilla-aggregator"
+name = "flotilla-projections"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
 
 [features]
 default = []
-aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-tls/aws-lc-provider"]
-skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-store/skip-no-sandbox-tests"]
+aws-lc-provider = ["flotilla-tls/aws-lc-provider"]
+skip-no-sandbox-tests = ["flotilla-store/skip-no-sandbox-tests"]
 
 [dependencies]
+flotilla-change-request = { path = "../flotilla-change-request" }
+sysinfo = "0.38.4"
+flotilla-config = { path = "../flotilla-config" }
+flotilla-manifest = { path = "../flotilla-manifest" }
+serde = { workspace = true }
 flotilla-forge-github = { path = "../flotilla-forge-github" }
 flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-tls = { path = "../flotilla-tls" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
-flotilla-core = { path = "../flotilla-core" }
 flotilla-charter = { path = "../flotilla-charter" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }

@@ -33,9 +33,9 @@ use flotilla_store::{ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
 
 use super::{convoy_address, discover_repo_for_environment, LiveConvoyRecord, RoleAddress};
-use crate::aggregator_projection::AggregatorProjectionState;
 use flotilla_discovery::{registry::ProviderRegistry, DiscoveryRuntime};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_terminal::TerminalSessionLiveness;
 
 type HostSnapshot = Result<Vec<ReadResourceObject<ResourceHost>>, String>;
@@ -71,7 +71,7 @@ impl AttachReadContext {
             snapshots.insert(namespace.to_string(), load.await);
         }
         match snapshots.get(namespace).expect("Host snapshot initialized") {
-            Ok(hosts) => crate::host_resolution::canonical_placement_host_ref_from_sources(hosts, host_ref),
+            Ok(hosts) => flotilla_resources::canonical_placement_host_ref_from_sources(hosts, host_ref),
             Err(error) => Err(error.clone()),
         }
     }
@@ -82,7 +82,7 @@ pub(super) struct AttachResolver<'a> {
     pub(super) observed_resource_backend: &'a ResourceBackend,
     pub(super) aggregator_projection_state: &'a AggregatorProjectionState,
     pub(super) config: &'a ConfigStore,
-    pub(super) host_registry: &'a crate::host_registry::HostRegistry,
+    pub(super) host_registry: &'a flotilla_projections::host_registry::HostRegistry,
     pub(super) environment_manager: &'a EnvironmentManager,
     pub(super) discovery: &'a DiscoveryRuntime,
     pub(super) local_environment_id: &'a EnvironmentId,
@@ -488,7 +488,7 @@ impl<'a> AttachResolver<'a> {
                 .maybe_convoy_ref((!independent).then_some(convoy))
                 .vessel(if independent { "-".to_string() } else { session.spec.env_ref.clone() })
                 .crew(if independent { "-".to_string() } else { crew })
-                .crew_state(crate::fleet::session_status_label(session.status.as_ref().map(|status| status.phase)))
+                .crew_state(flotilla_projections::fleet::session_status_label(session.status.as_ref().map(|status| status.phase)))
                 .host(host.clone())
                 .namespace(session.metadata.namespace.clone())
                 .session(session.metadata.name.clone())
@@ -785,14 +785,7 @@ impl<'a> AttachResolver<'a> {
     }
 }
 
-/// An attach resolution: the plan the CLI should execute, plus the
-/// structured binding it stamps onto its enclosing PM pane (#708).
-#[derive(Debug, Clone)]
-pub struct ResolvedAttach {
-    pub plan: ResolvedAttachPlan,
-    pub binding: Option<AttachBinding>,
-}
-
+use flotilla_projections::ports::ResolvedAttach;
 fn attach_convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
     match phase {
         ResourceConvoyPhase::Pending => ConvoyPhase::Pending,
@@ -1219,6 +1212,7 @@ mod tests {
             fake_discovery(false),
             HostName::new("local"),
             backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         (daemon, backend, temp)

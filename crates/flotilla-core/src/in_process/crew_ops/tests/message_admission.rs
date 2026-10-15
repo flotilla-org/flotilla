@@ -363,6 +363,7 @@ async fn unknown_controller_sender_has_a_creatable_system_reply() {
         fake_discovery(false),
         HostName::new("host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let reply = serde_json::json!({

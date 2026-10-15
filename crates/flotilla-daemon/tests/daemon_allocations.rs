@@ -94,6 +94,7 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
         fake_discovery(false),
         HostName::new("memory-scenario"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     eprintln!("N={n} owner=daemon live={}", counters().0);
@@ -101,8 +102,24 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
     let state = daemon.aggregator_projection_state().await;
     let aggregate_daemon = daemon.clone();
     let aggregate_state = state.clone();
-    let aggregator =
-        tokio::spawn(async move { flotilla_aggregator::run(aggregate_daemon, "flotilla", aggregate_state, Default::default()).await });
+    let aggregator = tokio::spawn(async move {
+        flotilla_projections::run(
+            flotilla_projections::AggregatorContext {
+                durable: aggregate_daemon.resource_backend(),
+                observed: aggregate_daemon.observed_resource_backend(),
+                host_name: aggregate_daemon.host_name().clone(),
+                event_sink: aggregate_daemon.event_sink(),
+                events: aggregate_daemon.subscribe(),
+                attach: aggregate_daemon.clone(),
+                change_requests: aggregate_daemon.clone(),
+                issues: aggregate_daemon.clone(),
+            },
+            "flotilla",
+            aggregate_state,
+            Default::default(),
+        )
+        .await
+    });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         // Its bootstrap ResultSet is emitted after all watched kinds are
         // installed, including an empty convoy inventory. No timing warmup.

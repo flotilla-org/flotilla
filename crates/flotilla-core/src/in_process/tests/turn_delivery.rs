@@ -154,6 +154,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             fake_discovery(false),
             HostName::new("test-host"),
             backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         let credentials = Arc::new(RecordingWorkCredentials {

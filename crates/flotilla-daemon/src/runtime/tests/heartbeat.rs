@@ -612,6 +612,7 @@ async fn host_status_commits_at_most_once_per_heartbeat_interval_on_sqlite() {
         flotilla_protocol::HostName::new("test-host"),
         backend,
         clock.clone(),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
     let host_id = daemon.local_host_id().expect("local host id").to_string();

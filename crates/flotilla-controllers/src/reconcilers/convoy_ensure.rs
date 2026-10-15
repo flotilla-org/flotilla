@@ -1,5 +1,6 @@
 //! Standing-convoy reconciliation and its complete transaction guard.
 
+use flotilla_resources::canonical_placement_host_ref_from_sources;
 use flotilla_store::ResolvedCascadeStoreExt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -15,7 +16,6 @@ use flotilla_charter::ops_entry::{
 };
 use flotilla_core::{
     convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler, StandingConvoyBackingInspector},
-    host_resolution::canonical_placement_host_ref_from_sources,
     in_process::PreparedConvoyAdmission,
 };
 use flotilla_protocol::{PlacementTargetHost, PrincipalRef, ResourceRef};

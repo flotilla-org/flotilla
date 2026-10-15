@@ -89,7 +89,7 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         Some(SubCommand::Logs(LogsArgs { host, since, level, target })) => run_logs(&cli, host.as_deref(), since, level, target).await,
         Some(SubCommand::Fleet { command: None }) => run_fleet_health(&cli, format).await,
         Some(SubCommand::Fleet { command: Some(FleetSubCommand::Check) }) => {
-            flotilla_core::fleet_health::check(query_installer_health(&cli).await).map_err(|error| color_eyre::eyre::eyre!(error))
+            flotilla_projections::fleet_health::check(query_installer_health(&cli).await).map_err(|error| color_eyre::eyre::eyre!(error))
         }
         Some(SubCommand::Fleet { command: Some(FleetSubCommand::Spread) }) => {
             let result = query_installer_health(&cli).await;
@@ -97,7 +97,7 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
                 Err(error) | Ok(CommandValue::Error { message: error }) => eprintln!("fleet status: {error}"),
                 _ => {}
             }
-            print!("{}", flotilla_core::fleet_health::spread(result));
+            print!("{}", flotilla_projections::fleet_health::spread(result));
             Ok(())
         }
         Some(SubCommand::Fleet { command: Some(FleetSubCommand::Prune { fleet_root, keep_others, dry_run }) }) => {

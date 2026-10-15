@@ -150,6 +150,7 @@ pub(super) async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lo
         fake_discovery(false),
         HostName::new("test-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     daemon.set_provisioning_namespace("flotilla".into()).await;

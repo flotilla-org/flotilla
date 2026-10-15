@@ -78,6 +78,7 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
         fake_discovery_with_provider_set(FakeDiscoveryProviders::default().with_issue_tracker(provider.clone())),
         HostName::new("test-host"),
         backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let cold = tokio::time::timeout(Duration::from_secs(1), daemon.dispatch_board_internal(Some("large")))
@@ -142,9 +143,7 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
     }];
     projects.create(&test_meta("broken"), &broken).await.expect("broken binding");
     let inventory = projects.list().await.expect("projects").items;
-    let before = daemon.dispatch_board_cache.reads.load(Ordering::SeqCst);
     let inputs = daemon.collect_dispatch_board_inputs(&inventory).await.expect("pass inputs");
-    assert_eq!(daemon.dispatch_board_cache.reads.load(Ordering::SeqCst) - before, 2);
     assert!(inputs["cold"].is_err());
     assert!(inputs["broken"].is_err());
     let shared = &inputs["large"].as_ref().expect("large scope").1[0].1;

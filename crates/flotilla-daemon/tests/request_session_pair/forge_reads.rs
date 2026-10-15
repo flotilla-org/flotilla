@@ -28,6 +28,7 @@ async fn assert_nonowner_issue_demand_returns_owner_value(heartbeat_only: bool) 
         test_config_store(temp.path().join("config")),
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_issue_tracker(provider.clone())),
         HostName::new("forge-owner"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let requester = empty_daemon_named("forge-requester").await;

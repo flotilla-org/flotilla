@@ -6,8 +6,7 @@ use flotilla_protocol::{Leaf, LeafAddress};
 use flotilla_resources::{
     evaluate_leaf, expected_change_request_leaves, external_patches, select_convoy_children, Artifact, ArtifactLeafSubject, ChangeRequest,
     Checkout, Convoy, ConvoyAttention, ConvoyPhase, HoldAct, Issue, ObservedChecks, ResourceObject, StatusPatch, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::stalls::{is_active_change_request_probe, is_conflict_probe, is_merged_settlement_probe};
@@ -537,17 +536,6 @@ pub(super) fn compose_subject_turn_brief(
     )
 }
 
-pub(crate) fn queued_turn_session<'a>(
-    sessions: &'a BTreeMap<String, ResourceObject<TerminalSession>>,
-    vessel: &str,
-    role: &str,
-) -> Option<&'a ResourceObject<TerminalSession>> {
-    sessions.values().find(|session| {
-        session.metadata.labels.get(VESSEL_LABEL).is_some_and(|label| label == vessel)
-            && session.metadata.labels.get(ROLE_LABEL).is_some_and(|label| label == role)
-    })
-}
-
 pub(crate) fn durable_message_evidence(message: &ResourceObject<flotilla_resources::Message>) -> (bool, String) {
     match &message.status {
         Some(status) if status.phase.has_delivery_evidence() => (true, String::new()),
@@ -555,32 +543,5 @@ pub(crate) fn durable_message_evidence(message: &ResourceObject<flotilla_resourc
             (false, format!("message {:?}: {}", status.phase, status.reason.as_deref().unwrap_or("waiting for receiver evidence")))
         }
         None => (false, "message Accepted: waiting for receiver resolution".into()),
-    }
-}
-
-pub(crate) fn queued_turn_evidence(session: Option<&ResourceObject<TerminalSession>>, message_id: &str) -> (bool, String) {
-    let Some(session) = session else { return (false, "terminal session unavailable".into()) };
-    let status = session.status.as_ref();
-    if status.and_then(|status| status.delivered_message_id.as_deref()) == Some(message_id) {
-        return (true, String::new());
-    }
-    if let TerminalSessionSource::Agent { message: Some(message), .. } = &session.spec.source {
-        if message.delivered_through(status.and_then(|status| status.delivered_message_id.as_deref()), message_id) {
-            return (true, String::new());
-        }
-        if message.next_after(status.and_then(|status| status.delivered_message_id.as_deref())).is_some_and(|next| next.id != message_id) {
-            return (false, "waiting behind an earlier terminal message".into());
-        }
-    }
-    if let Some(condition) = status.and_then(|status| status.degraded.as_ref()) {
-        return (false, format!("{}: {}", condition.reason, condition.message));
-    }
-    match status {
-        Some(status) if status.phase == TerminalSessionPhase::Running => match &status.attention {
-            Some(attention) => (false, format!("attention {:?}; waiting for turn readiness or submission evidence", attention.state)),
-            None => (false, "waiting for startup readiness or submission evidence".into()),
-        },
-        Some(status) => (false, format!("terminal {:?}; waiting for startup readiness", status.phase)),
-        None => (false, "waiting for terminal startup".into()),
     }
 }
