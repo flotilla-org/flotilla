@@ -391,7 +391,8 @@ fn declared_artifact_completion_accepts_a_new_kind_and_rebinds_to_current_head()
         literal: "approved".to_string(),
     })];
     workflow.turn_delivery["actionable-review"].on =
-        "$artifact(coder,toy-explainer,change-request-head).summary.disposition == approved".parse().expect("head-bound artifact leaf");
+        flotilla_resources::parse_leaf_template("$artifact(coder,toy-explainer,change-request-head).summary.disposition == approved")
+            .expect("head-bound artifact leaf");
     flotilla_resources::validate(&workflow).expect("new artifact kind needs no core admission change");
     let status = ConvoyStatus {
         workflow_snapshot: Some(WorkflowSnapshot {

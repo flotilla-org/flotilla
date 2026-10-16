@@ -3,9 +3,9 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
 
 use crate::{
-    artifact_record_name, change_request_record_name, evaluate_leaf, issue_record_name, usage_record_name, Artifact, ArtifactLeafSubject,
-    ChangeRequest, ChangeRequestLeafSubject, Convoy, ConvoyLeafSubject, Issue, IssueLeafSubject, LeafSubject, MessageInbox, Resource,
-    ResourceError, ResourceObject, ThreeValue, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WorkLeafSubject,
+    artifact_record_name, change_request_record_name, evaluate_leaf, issue_record_name, template_leaf, usage_record_name, Artifact,
+    ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Convoy, ConvoyLeafSubject, Issue, IssueLeafSubject, LeafSubject,
+    MessageInbox, Resource, ResourceError, ResourceObject, ThreeValue, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WorkLeafSubject,
 };
 
 impl MessageInbox {
@@ -235,12 +235,7 @@ impl MessageInbox {
                 }
                 _ => continue,
             };
-            return Ok(Some(Leaf {
-                address,
-                field_path: rule.on.field_path.clone(),
-                operator: rule.on.operator,
-                literal: rule.on.literal.clone(),
-            }));
+            return Ok(Some(template_leaf(&rule.on, address)));
         }
         Ok(None)
     }

@@ -363,16 +363,31 @@ fn stock_landing_workflows_validate_with_checks_review_conflicting_and_merged_tu
         }
         if name == "implement-review" {
             assert_eq!(spec.turn_delivery.len(), 6);
-            assert_eq!(spec.turn_delivery["reviewer-checks-settled"].on.to_string(), "$cr.checks != pending");
-            assert_eq!(spec.turn_delivery["reviewer-actionable-review"].on.to_string(), "$cr.review.actionable-at-head == true");
+            assert_eq!(
+                flotilla_resources::legacy_template_text(&spec.turn_delivery["reviewer-checks-settled"].on).expect("stored form"),
+                "$cr.checks != pending"
+            );
+            assert_eq!(
+                flotilla_resources::legacy_template_text(&spec.turn_delivery["reviewer-actionable-review"].on).expect("stored form"),
+                "$cr.review.actionable-at-head == true"
+            );
         } else {
             assert_eq!(spec.turn_delivery.len(), 4);
         }
         // #2596: stock delivery wakes the crew for either settled checks outcome.
-        assert_eq!(spec.turn_delivery["checks-settled"].on.to_string(), "$cr.checks != pending");
-        assert_eq!(spec.turn_delivery["conflicting"].on.to_string(), "$cr.mergeable == conflicting");
+        assert_eq!(
+            flotilla_resources::legacy_template_text(&spec.turn_delivery["checks-settled"].on).expect("stored form"),
+            "$cr.checks != pending"
+        );
+        assert_eq!(
+            flotilla_resources::legacy_template_text(&spec.turn_delivery["conflicting"].on).expect("stored form"),
+            "$cr.mergeable == conflicting"
+        );
         // #2701: admission must accept the stock merged settlement wake too.
-        assert_eq!(spec.turn_delivery["merged-unclaimed"].on.to_string(), "$cr.state == merged");
+        assert_eq!(
+            flotilla_resources::legacy_template_text(&spec.turn_delivery["merged-unclaimed"].on).expect("stored form"),
+            "$cr.state == merged"
+        );
     }
 }
 
@@ -380,7 +395,8 @@ fn stock_landing_workflows_validate_with_checks_review_conflicting_and_merged_tu
 fn turn_delivery_can_subscribe_to_an_artifact_leaf() {
     let mut workflow = single_agent_workflow_spec();
     workflow.turn_delivery["actionable-review"].on =
-        "$artifact(reviewer,review-round,convoy).summary.disposition == approve".parse().expect("parse artifact leaf");
+        flotilla_resources::parse_leaf_template("$artifact(reviewer,review-round,convoy).summary.disposition == approve")
+            .expect("parse artifact leaf");
     validate(&workflow).expect("artifact turn delivery is admitted");
     let snapshot = flotilla_resources::WorkflowSnapshot {
         cascade: None,

@@ -568,8 +568,8 @@ fn evaluate_exit_with_disposition(
         // A checkout with landed evidence predates a bound change-request
         // record. The default merged entry remains its concrete exit.
         for entry in entries {
-            if entry.template.field_path == ".state"
-                && entry.template.operator == flotilla_protocol::LeafOperator::Equal
+            if entry.template.path.segments() == ["state"]
+                && entry.template.operator == flotilla_address::Operator::Equal
                 && entry.template.literal == "merged"
             {
                 disposition = Some(entry.disposition);

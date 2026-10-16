@@ -287,11 +287,11 @@ impl LeafSubscriptionTable {
             }
             LeafAddress::Artifact { convoy: artifact_convoy, producer, kind, subject } => {
                 if matches!(
-                    &rule.on.subject,
-                    flotilla_resources::SubjectVariable::Artifact {
+                    flotilla_resources::SubjectVariable::of(&rule.on),
+                    Ok(flotilla_resources::SubjectVariable::Artifact {
                         about: flotilla_resources::ArtifactSubjectBinding::ChangeRequestHead,
                         ..
-                    }
+                    })
                 ) {
                     let checkout_sources =
                         self.inner.backend.including_replicas::<Checkout>(&namespace).list().await.map_err(|error| error.to_string())?;
