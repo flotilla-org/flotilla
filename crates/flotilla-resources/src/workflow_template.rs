@@ -216,11 +216,35 @@ impl SubjectVariable {
 /// [`Template::resolve`] accepts, including the stored `$cr.state == merged`,
 /// with a known subject and a lossless stored form.
 pub fn parse_leaf_template(input: &str) -> Result<Template, String> {
-    let template = Template::resolve(input).map_err(|error| {
+    let mut template = Template::resolve(input).map_err(|error| {
         format!("invalid leaf template `{input}`: {error}; expected `$cr.<path>`, `$issue.<path>`, or `$artifact(<producer>,<kind>,<about>).<path>` followed by an operator and literal")
     })?;
+    if let Some(literal) = old_parser_literal(input) {
+        template.literal = literal;
+    }
     legacy_template_text(&template)?;
     Ok(template)
+}
+
+/// The literal the pre-ADR 0066 parser read from stored text in its own form
+/// (`$cr.state == <literal>`, path joined to the variable): the remaining
+/// words joined by single spaces, with one layer of surrounding `"` or `'`
+/// removed and nothing unescaped. Stored and hand-authored templates keep
+/// decoding to the value they always had, such as `"a  b"` reading `a b`.
+fn old_parser_literal(input: &str) -> Option<String> {
+    let mut words = input.split_whitespace();
+    let subject_path = words.next()?;
+    if !subject_path.starts_with('$') || !subject_path.contains('.') {
+        return None;
+    }
+    words.next()?;
+    let literal = words.collect::<Vec<_>>().join(" ");
+    let unquoted = literal
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| literal.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')))
+        .unwrap_or(&literal);
+    Some(unquoted.to_string())
 }
 
 /// The stored text of a leaf template: `$cr<path> <op> <literal>`, with the
@@ -1883,6 +1907,18 @@ mod legacy_template_tests {
 
     // ADR 0047 / #2169: every template text in the golden stored corpus, and
     // every stock template, decodes and re-encodes to the same bytes.
+    // Review of #3361: the old parser read a quoted literal with inner runs of
+    // whitespace as single-spaced; such hand-authored text keeps decoding to
+    // that value and re-encodes in the stored form.
+    #[test]
+    fn old_quoted_literals_decode_as_the_old_parser_read_them() {
+        let template = parse_leaf_template("$cr.state == \"a  b\"").expect("decodes");
+        assert_eq!(template.literal, "a b");
+        assert_eq!(super::legacy_template_text(&template).as_deref(), Ok("$cr.state == a b"));
+        let backslash = parse_leaf_template(r#"$cr.state == "a\b""#).expect("decodes");
+        assert_eq!(backslash.literal, r"a\b", "nothing is unescaped");
+    }
+
     #[test]
     fn stored_corpus_and_stock_templates_reencode_byte_identically() {
         let mut texts = vec![
@@ -2026,7 +2062,10 @@ mod legacy_template_tests {
             assert!(serde_json::to_value(&exit).is_err(), "exit with `{template}` must not encode");
             assert!(parse_leaf_template(&template.to_string()).is_err(), "`{template}` must not be admitted");
         }
-        for text in ["$cr. == merged", "$cr.state ==", "$cr.state == \"a  b\"", "$cr.state == ' merged'", "$cr .state == \"a  b\""] {
+        // `$cr.state == "a  b"` in the old form decodes as the old parser read
+        // it (see `old_quoted_literals_decode_as_the_old_parser_read_them`);
+        // the canonical form keeps the double space and has no stored form.
+        for text in ["$cr. == merged", "$cr.state ==", "$cr.state == ' merged'", "$cr .state == \"a  b\""] {
             assert!(parse_leaf_template(text).is_err(), "`{text}` must not be admitted");
             assert!(serde_json::from_value::<TurnDeliveryRule>(stored_rule(text)).is_err(), "`{text}` must not decode");
         }
