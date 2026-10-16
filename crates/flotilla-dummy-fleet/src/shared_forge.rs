@@ -52,6 +52,8 @@ impl SharedForge {
         // evidence: forgejo_head_filter_capability.yaml). Check the head ref
         // anyway, so a forge that ignored the filter cannot hand back another
         // branch's pull request.
+        // One page suffices: a branch has at most one pull request here,
+        // because a coder reuses the one it finds instead of opening another.
         if let Some(pull) = existing.as_array().into_iter().flatten().find(|pull| pull["head"]["ref"].as_str() == Some(branch)) {
             return web_url(pull);
         }
