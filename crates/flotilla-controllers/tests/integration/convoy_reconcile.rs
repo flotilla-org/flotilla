@@ -1,4 +1,7 @@
+use flotilla_protocol::{IssueSource, Relationship, Subject, SubjectKind};
+use flotilla_resources::convoy::reconcile::{evaluate_landing_settlement_with_disposition, reconcile_internal, LifecycleConditions};
 use flotilla_resources::ResumeIntent;
+use flotilla_resources::{ConvoySpec, DeclaredSubject, ExitDeclaration, ResourceObject};
 use flotilla_store_memory::InMemoryBackend;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -1466,18 +1469,18 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
     let now = timestamp(40);
     let observed_at = now - chrono::Duration::seconds(age);
     let subjects = (1..=count)
-        .map(|number| flotilla_resources::DeclaredSubject {
-            subject: flotilla_protocol::Subject {
-                kind: flotilla_protocol::SubjectKind::ChangeRequest,
-                source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+        .map(|number| DeclaredSubject {
+            subject: Subject {
+                kind: SubjectKind::ChangeRequest,
+                source: IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
                 id: number.to_string(),
             },
-            relationship: flotilla_protocol::Relationship::Produces,
+            relationship: Relationship::Produces,
             issue: None,
             change_request: None,
         })
         .collect();
-    let spec = flotilla_resources::ConvoySpec::builder().workflow_ref("interactive".to_string()).subjects(subjects).build();
+    let spec = ConvoySpec::builder().workflow_ref("interactive".to_string()).subjects(subjects).build();
     let mut status = bootstrapped_convoy_status();
     status.phase = ConvoyPhase::Landing;
     status.observed_workflow_ref = Some("interactive".to_string());
@@ -1486,14 +1489,14 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
     }
     mark_crew_done(&mut status, "implement", "coder");
     mark_crew_done(&mut status, "review", "reviewer");
-    status.workflow_snapshot.as_mut().expect("snapshot").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+    status.workflow_snapshot.as_mut().expect("snapshot").exit = Some(ExitDeclaration::standard_table());
     let convoy = convoy_object("many-merged", spec, Some(status));
     let mut records: BTreeMap<_, _> = (1..=count)
         .map(|number| {
             let name = cr_name("github.com", "flotilla-org/flotilla", number as u64);
             (
                 name.clone(),
-                flotilla_resources::ResourceObject::<ChangeRequest> {
+                ResourceObject::<ChangeRequest> {
                     metadata: common::object_meta(&name, "flotilla", "1"),
                     spec: ChangeRequestSpec::builder()
                         .service("github.com".to_string())
@@ -1522,7 +1525,7 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
     assert!(evaluation.satisfied, "old merged observations must settle: {:?}", evaluation.unmet);
     assert!(evaluation.unmet.is_empty(), "explain must not report merged observations as stale");
     // The satisfied exit must drive the real lifecycle transition to Landed.
-    let settlement = flotilla_resources::convoy::reconcile::evaluate_landing_settlement_with_disposition(
+    let settlement = evaluate_landing_settlement_with_disposition(
         &convoy,
         &BTreeMap::new(),
         &BTreeMap::new(),
@@ -1532,12 +1535,12 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
         Duration::from_secs(180),
         now,
     );
-    let outcome = flotilla_resources::convoy::reconcile::reconcile_internal(
+    let outcome = reconcile_internal(
         &convoy,
         None,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        flotilla_resources::convoy::reconcile::LifecycleConditions {
+        LifecycleConditions {
             exit_disposition: settlement.disposition,
             reclaim_eligible: false,
             settlement_evidence: Some(settlement.evaluation),
@@ -1549,7 +1552,7 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
     assert_eq!(landed.phase, ConvoyPhase::Landed);
     // An unmatched exit explains a false condition, never stale Merged evidence.
     let mut closed_only = convoy.clone();
-    if let Some(flotilla_resources::ExitDeclaration::Table(entries)) =
+    if let Some(ExitDeclaration::Table(entries)) =
         &mut closed_only.status.as_mut().expect("status").workflow_snapshot.as_mut().expect("snapshot").exit
     {
         entries.retain(|disposition, _| disposition == "closed-unmerged");
