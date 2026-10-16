@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{quote_ident, Edge, Hash, Identity, Kind, Records, Ref, State, Table, Timestamp};
+use flotilla_schema::{quote_ident, Edge, EdgeEvent, Hash, Identity, Kind, Records, Ref, State, Table, Timestamp};
 use flotilla_schema_sqlite::{Loaded, Stamp, Store, StoreError};
 use hegel::TestCase;
 use rusqlite::Connection;
@@ -10,17 +10,25 @@ use rusqlite::Connection;
 use crate::fixtures::{
     attempt::{Attempt, Outcome},
     convoy::{workflow, ConvoyRepository, Deliverable, DeliverableState, Evidence, InputValue, PromiseKind, PromiseSource},
-    message::{GateInput, MessageEdge, MessageEdgeEvent, MessageState, Settlement},
-    registry, store, Convoy, Fixture, Message, Pick, TerminalSession, LOCAL,
+    message::{MessageEdge, MessageEdgeEvent, MessageState, Settlement},
+    registry, store, Convoy, Fixture, GateRead, Message, Payload, Pick, TerminalSession, LOCAL,
 };
 
+/// A settle edge's event, from a sample message's `Pending` to `Awaiting`.
 fn event(writer: &str) -> MessageEdgeEvent {
-    MessageEdgeEvent {
-        edge: MessageEdge::Settle { by: Settlement::Answered { reply: Ref::new("r", LOCAL) } },
-        at: Timestamp(1),
+    let args = MessageEdge::Settle { by: Settlement::Answered { reply: Ref::new("r", LOCAL) } };
+    EdgeEvent {
+        edge: args.name(),
+        from: MessageState::Pending,
+        to: MessageState::Awaiting,
         writer: writer.into(),
-        inputs: Vec::new(),
+        at: Timestamp(1),
+        payload: Payload { args, reads: Vec::new() },
     }
+}
+
+fn read() -> GateRead {
+    GateRead { observed: Identity { kind: Message::CODE, name: "m".into(), home: LOCAL.into() }, version: 1 }
 }
 
 fn attempt(target: &str) -> Attempt<String> {
@@ -89,7 +97,7 @@ fn refused(result: Result<Stamp, StoreError>) -> String {
 // Behaviour (#3320 ruling 1): a spec edit (`update`) refuses what only an edge writes, naming the
 // table or column: a changed state column (`state`, `state_since`; a deliverable's state is part
 // of its records row), and any append to, change of or removal from a history table (edge events,
-// their gate inputs, attempts) or a records table (deliverables, evidence under a kept
+// their documents' gate reads, attempts) or a records table (deliverables, evidence under a kept
 // deliverable). A refused write changes nothing and the transaction stays usable: a spec edit and
 // an edge then commit, the edge's rows stamped with its version.
 #[test]
@@ -110,9 +118,8 @@ fn spec_edits_refuse_what_only_edges_write() {
     assert_eq!(refused(write.update(&current, &edges(&|rows| drop(rows.pop())))), "message_edges");
     assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].1 = event("carol")))), "message_edges");
     assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].0 += 1))), "message_edges", "the stamp is part of the row");
-    let input = GateInput { observed: Identity { kind: Message::CODE, name: "m".into(), home: LOCAL.into() }, version: 1 };
-    let with_input = edges(&|rows| rows[0].1.inputs.push(input.clone()));
-    assert_eq!(refused(write.update(&current, &with_input)), "message_edges", "gate inputs are part of the edge row");
+    let with_read = edges(&|rows| rows[0].1.payload.reads.push(read()));
+    assert_eq!(refused(write.update(&current, &with_read)), "message_edges", "gate reads are part of the edge row");
     let more_attempts = Message { attempts: with_rows(&message.attempts, |rows| rows.push((0, attempt("b")))), ..message.clone() };
     assert_eq!(refused(write.update(&current, &more_attempts)), "message_attempts");
     let fewer_attempts = Message { attempts: Records::new(), ..message.clone() };
@@ -138,9 +145,8 @@ fn spec_edits_refuse_what_only_edges_write() {
     let edited = Message { body: "edited".into(), ..message.clone() };
     let stamp = write.update(&current, &edited).expect("spec edit");
     let awaiting = State::new(MessageState::Awaiting, Timestamp(8));
-    let edge = Edge::new(Message::EDGES, &event("dave"))
+    let edge = Edge::new(Message::STATE, &awaiting, Message::EDGES, &event("dave"))
         .and_then(|edge| edge.append(Message::ATTEMPTS, &attempt("b")))
-        .and_then(|edge| edge.set(Message::STATE, &awaiting))
         .expect("edge");
     let stamp = write.apply_edge(stamp, edge).expect("edge");
     write.commit().expect("commit");
@@ -183,8 +189,8 @@ fn apply_edge<K: Kind>(store: &mut Store, current: Stamp, edge: Edge<K>) {
 
 // Behaviour (#3320 production shape): a write touches only its rows, plus the home sequence, the
 // identity's sequence and one change-log row. An edge appending its event and moving the state is
-// two row writes (the event insert, and the state update that also moves the version); a gate
-// input is one more; an edge that sets no root field still moves the root's version. A spec edit
+// two row writes (the event insert, and the state update that also moves the version), with or
+// without gate reads, which are inside the event's document. A spec edit
 // changing one of three repositories is one update and the root version; an unchanged value
 // writes nothing.
 #[test]
@@ -203,22 +209,17 @@ fn writes_touch_only_their_rows() {
     let convoy_current = insert(&mut store, "c", &convoy);
 
     let moved = State::new(MessageState::Awaiting, Timestamp(5));
-    let edge = Edge::new(Message::EDGES, &event("alice")).and_then(|edge| edge.set(Message::STATE, &moved)).expect("edge");
+    let edge = Edge::new(Message::STATE, &moved, Message::EDGES, &event("alice")).expect("edge");
     let (mut store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
     assert_eq!(written, 5, "the event row, the state with the version, the home and identity sequences and the change log");
 
     let current = load(&mut store, &current);
     // "alice" is already interned, so no `strings` row is written.
-    let mut with_input = event("alice");
-    with_input.inputs.push(GateInput { observed: Identity { kind: Message::CODE, name: "m".into(), home: LOCAL.into() }, version: 1 });
-    let edge = Edge::new(Message::EDGES, &with_input).and_then(|edge| edge.set(Message::STATE, &moved)).expect("edge");
-    let (mut store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
-    assert_eq!(written, 6, "the event row, its gate input, the state with the version, the sequences and the change log");
-
-    let current = load(&mut store, &current);
-    let edge = Edge::new(Message::EDGES, &event("alice")).expect("edge");
+    let mut with_reads = event("alice");
+    with_reads.payload.reads = vec![read(), read()];
+    let edge = Edge::new(Message::STATE, &moved, Message::EDGES, &with_reads).expect("edge");
     let (store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
-    assert_eq!(written, 5, "the event row, the root version, the sequences and the change log");
+    assert_eq!(written, 5, "gate reads add no rows: they are in the event's document");
 
     let changed = Convoy { repositories: vec![repository("a"), repository("B"), repository("c")], ..convoy.clone() };
     let (mut store, written) = rows_written(store, |store| update(store, &convoy_current, &changed));

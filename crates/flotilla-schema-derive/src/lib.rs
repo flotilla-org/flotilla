@@ -75,6 +75,7 @@ mod tests {
             quote! { struct A { #[store(code = 1)] a: String } },
             quote! { struct A { #[store(child, intern)] a: Vec<String> } },
             quote! { struct A { #[store(intern(x))] a: String } },
+            quote! { struct A { #[store(cbor, frozen)] a: String } },
             quote! { #[store(child)] struct A { a: String } },
             quote! { #[store(rename = "x")] struct A { a: String } },
             quote! { struct A { #[store(child)] a: String } },
@@ -188,8 +189,9 @@ mod tests {
         }
         assert!(expand(&syn::parse2(kind(quote!(index(name = "x", eq(a, c, g), order(b), when(b is_some))))).expect("parse")).is_ok());
         assert!(error(kind(quote!(index(name = "x", order(c))))).contains("cannot order an index"));
-        assert!(error(quote! { #[store(index(name = "x", eq(a)))] struct A { a: String } }).contains("belongs on a kind"));
-        assert!(error(quote! { #[store(index(name = "x", eq(a)))] enum A { #[store(code = 1)] B } }).contains("belongs on a kind"));
+        assert!(error(quote! { #[store(index(name = "x", eq(a)))] struct A(String); }).contains("belongs on a kind or a part struct"));
+        assert!(error(quote! { #[store(index(name = "x", eq(a)))] enum A { #[store(code = 1)] B } })
+            .contains("belongs on a kind or a part struct"));
     }
 
     // Glue: an index adds its descriptor entry to `table_set` with codes read through `CodeEnum`,
@@ -339,9 +341,10 @@ mod tests {
     }
 
     // Behaviour (#3320 ruling 1): every field of a struct gets an edge handle named by the field in
-    // upper case, with the field's visibility: a `ColumnOf` for a column-shaped field (its adapter
-    // encodes it), a `HistoryOf` or `RecordsOf` for a table of records, and none for a spec
-    // collection. Column-shaped fields of a row are declared as its fields, state ones marked.
+    // upper case, with the field's visibility: a `StateOf` for the state field, a `ColumnOf` for
+    // another column-shaped field (its adapter encodes it; a `cbor` field's is `AsCbor`), a
+    // `HistoryOf` or `RecordsOf` for a table of records, and none for a spec collection.
+    // Column-shaped fields of a row are declared as its fields, state ones marked.
     #[test]
     fn fields_expand_to_edge_handles() {
         let kind = expanded(quote! {
@@ -353,10 +356,14 @@ mod tests {
                 #[store(child)] refs: Vec<Reference>,
                 pub(crate) body: T,
                 r#type: u8,
+                #[store(cbor)] args: Args,
             }
         });
         for expected in [
-            "const STATE : :: flotilla_schema :: ColumnOf < Self , State < Phase > > = :: flotilla_schema :: ColumnOf :: new (\"state\"",
+            "const STATE : :: flotilla_schema :: StateOf < Self , State < Phase > > = :: flotilla_schema :: StateOf :: new (:: flotilla_schema :: ColumnOf :: new (\"state\"",
+            "const ARGS : :: flotilla_schema :: ColumnOf < Self , Args >",
+            "adapt :: AsCbor as :: flotilla_schema :: adapt :: Adapter < Args >",
+            "Args : :: flotilla_schema :: Cbor",
             "pub const EDGES : :: flotilla_schema :: HistoryOf < Self , Event < T > > = :: flotilla_schema :: HistoryOf :: new (\"edges\")",
             "const NOTES : :: flotilla_schema :: RecordsOf < Self , Note >",
             "pub (crate) const BODY : :: flotilla_schema :: ColumnOf < Self , T >",
@@ -385,6 +392,21 @@ mod tests {
             assert!(message.contains(SUPPORTED) && message.contains("edge handle"), "{case}: {message}");
         }
         assert!(expanded(quote! { struct Part { kind: Kind, code: u32 } }).contains("const KIND"));
+    }
+
+    // Behaviour (#3320 ruling of 2026-10-15): a part struct may declare indexes, laid out on the
+    // table holding its rows (named when the layout reaches it), with no query constructor; a part
+    // with indexes is never flattened, so it gets no `Flat`.
+    #[test]
+    fn part_indexes_go_on_the_table_holding_the_rows() {
+        let part = expanded(quote! {
+            #[store(index(name = "by_time", order(at)))]
+            struct Event { at: Timestamp, edge: Edge }
+        });
+        assert!(part.contains("table : :: std :: string :: String :: from (layout . table_name ())"), "{part}");
+        assert!(!part.contains("IndexQuery"), "no constructor");
+        assert!(!part.contains("Flat for Event"));
+        assert!(error(quote! { #[store(index(name = "x", order(nope)))] struct A { a: u8 } }).contains("not a field of this struct"));
     }
 
     // Behaviour: a newtype wrapping String is internable; other newtypes are not.

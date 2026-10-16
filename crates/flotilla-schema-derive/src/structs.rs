@@ -3,7 +3,8 @@
 //! A kind (`#[store(kind = "Name", code = N)]`) is the root row of its own tables and implements
 //! `Element` and `Kind`. A part implements `Element` (it can be a collection's row) and, having no
 //! table fields, `Columns` and `Flat` (it can be flattened into another row). A part's table fields
-//! nest under its collection's table. A single-field tuple struct is a transparent column.
+//! nest under its collection's table, and its declared indexes are on that table. A single-field
+//! tuple struct is a transparent column.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -29,12 +30,12 @@ pub(crate) fn expand(input: &DeriveInput, fields: &FieldsNamed, type_attrs: Type
             let kind = kind_impls(input, &fields, kind, code, &indexes);
             Ok(quote!(#kind #handles))
         }
-        (None, _) if !type_attrs.indexes.is_empty() => Err(refuse(&type_attrs.indexes[0], "`index` belongs on a kind")),
         (Some(kind), None) => Err(syn::Error::new_spanned(kind, "a kind needs a stable `code = N`")),
         (None, Some((_, span))) => Err(syn::Error::new(span, "`code` on a struct needs `kind = \"Name\"`")),
         (None, None) => {
+            let indexes = Indexes::parse(&type_attrs.indexes, &fields)?;
             let handles = handles(input, &fields, false)?;
-            let part = part_impls(input, &fields);
+            let part = part_impls(input, &fields, &indexes);
             Ok(quote!(#part #handles))
         }
     }
@@ -98,7 +99,8 @@ fn bounds<'a>(input: &'a DeriveInput, fields: &[Field<'_>]) -> Generics<'a> {
 }
 
 /// The `Element` impl both shapes share: the row's columns are the fields' columns, unprefixed.
-fn element_impl(input: &DeriveInput, fields: &[Field<'_>]) -> TokenStream {
+/// `indexes` declares a part's indexes on the table holding its rows; a kind's go in `table_set`.
+fn element_impl(input: &DeriveInput, fields: &[Field<'_>], indexes: TokenStream) -> TokenStream {
     let schema = schema();
     let ident = &input.ident;
     let Generics { impl_generics, ty_generics, where_clause } = bounds(input, fields);
@@ -118,6 +120,7 @@ fn element_impl(input: &DeriveInput, fields: &[Field<'_>]) -> TokenStream {
 
             fn layout_row(layout: &mut #schema::Layout) {
                 #(#layout)*
+                #indexes
             }
 
             fn encode_row(&self, e: &mut #schema::Encoder) -> ::core::result::Result<(), #schema::EncodeError> {
@@ -141,7 +144,7 @@ fn element_impl(input: &DeriveInput, fields: &[Field<'_>]) -> TokenStream {
 fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u32, indexes: &Indexes<'_, '_>) -> TokenStream {
     let schema = schema();
     let ident = &input.ident;
-    let element = element_impl(input, fields);
+    let element = element_impl(input, fields, TokenStream::new());
     let params: Vec<_> = input.generics.type_params().map(|param| param.ident.to_string()).collect();
     let generic = fields.iter().filter(|field| mentions(field.ty, &params)).map(Field::bound);
     let Generics { impl_generics, ty_generics, where_clause } = Generics::new(&input.generics, generic);
@@ -183,14 +186,14 @@ fn mentions(ty: &Type, params: &[String]) -> bool {
     finder.found
 }
 
-/// A part is a collection's row (`Element`). Without table fields it is also `Columns` and `Flat`,
-/// so it can be flattened into another row; a part holding tables is only ever a row, so the
-/// missing `Flat` reports `flatten` of it at the bound.
-fn part_impls(input: &DeriveInput, fields: &[Field<'_>]) -> TokenStream {
+/// A part is a collection's row (`Element`). Without table fields or indexes it is also `Columns`
+/// and `Flat`, so it can be flattened into another row; a part holding tables or declaring indexes
+/// is only ever a row, so the missing `Flat` reports `flatten` of it at the bound.
+fn part_impls(input: &DeriveInput, fields: &[Field<'_>], indexes: &Indexes<'_, '_>) -> TokenStream {
     let schema = schema();
     let ident = &input.ident;
-    let element = element_impl(input, fields);
-    if fields.iter().any(Field::is_table) {
+    let element = element_impl(input, fields, indexes.layout());
+    if fields.iter().any(Field::is_table) || !indexes.is_empty() {
         return element;
     }
     let Generics { impl_generics, ty_generics, where_clause } = bounds(input, fields);
@@ -261,7 +264,7 @@ pub(crate) fn newtype(input: &DeriveInput, fields: &FieldsUnnamed, type_attrs: T
         return Err(refuse(kind, "a kind is a struct with named fields"));
     }
     if let Some(index) = type_attrs.indexes.first() {
-        return Err(refuse(index, "`index` belongs on a kind"));
+        return Err(refuse(index, "`index` belongs on a kind or a part struct"));
     }
     if let Some((_, span)) = type_attrs.code {
         return Err(syn::Error::new(span, "`code` on a struct needs `kind = \"Name\"`"));

@@ -1,15 +1,18 @@
 //! Edge writes: the event-driven write path (#3320 ruling 1).
 //!
-//! A state-machine edge is one write that appends its event to a `history` table, sets only the
-//! fields it declares (a state and its `_since`, other root columns, or fields of one existing
-//! `records` row) and may append declared `records` or `history` rows. [`Edge`] describes such a
-//! write without a backend: it encodes each named field through the field's own adapter into
+//! A machine's state is a value, its label plus its data (#3319 ruling of 2026-10-15), and every
+//! edge writes it: a state-machine edge is one write that sets the kind's `#[store(state)]` field
+//! to the new state value, appends its [`EdgeEvent`] to the kind's edge log (a `history` table),
+//! and may set other fields it declares (root columns, or fields of one existing `records` row)
+//! and append declared `records` or `history` rows. [`Edge`] describes such a write without a
+//! backend: it encodes each named field through the field's own adapter into
 //! logical values, and each appended row through its `Element` codec. A backend resolves the
 //! tables, takes the next positions and stamps every appended row with the write's sequence.
 //!
 //! The derive generates the typed handles an edge names: for each field of a struct deriving
 //! `Stored` (a kind or a part), an associated const named by the field in upper case:
-//! `Message::STATE: ColumnOf<Message, State<MessageState>>` for a column-shaped field,
+//! `Message::STATE: StateOf<Message, State<MessageState>>` for a `state` field,
+//! `Message::SUBJECT: ColumnOf<Message, Option<MessageReference>>` for another column-shaped field,
 //! `Message::EDGES: HistoryOf<Message, MessageEdgeEvent>` for a `history` field and
 //! `Convoy::DELIVERABLES: RecordsOf<Convoy, Deliverable>` for a `records` field. Spec collections
 //! (`child`) have no handle: they change only by a spec edit.
@@ -23,8 +26,10 @@ use std::{collections::BTreeMap, fmt, marker::PhantomData};
 use crate::{
     codec::{EncodeError, Encoder},
     descriptor::TableRole,
+    history::{EdgeEvent, Labelled},
+    inline::Cbor,
     records::Position,
-    traits::Element,
+    traits::{CodeEnum, Element},
     value::{Hash, Rows, Value},
 };
 
@@ -47,6 +52,53 @@ impl<O, F> ColumnOf<O, F> {
 
     pub fn name(&self) -> &'static str {
         self.name
+    }
+}
+
+/// The `#[store(state)]` field of rows of `O`, holding the state value `S`: what [`Edge::new`]
+/// writes on every edge, and [`Edge::set_in`] on a `records` row.
+pub struct StateOf<O, S>(ColumnOf<O, S>);
+
+impl<O, S> StateOf<O, S> {
+    #[doc(hidden)]
+    pub const fn new(column: ColumnOf<O, S>) -> StateOf<O, S> {
+        StateOf(column)
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.0.name
+    }
+}
+
+impl<O, S> Clone for StateOf<O, S> {
+    fn clone(&self) -> StateOf<O, S> {
+        *self
+    }
+}
+
+impl<O, S> Copy for StateOf<O, S> {}
+
+impl<O, S> fmt::Debug for StateOf<O, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "StateOf({})", self.0.name)
+    }
+}
+
+/// A column-shaped field `F` of rows of `O` an edge may set inside a `records` row: a
+/// [`ColumnOf`] or a [`StateOf`].
+pub trait FieldOf<O, F>: Copy {
+    fn column(self) -> ColumnOf<O, F>;
+}
+
+impl<O, F> FieldOf<O, F> for ColumnOf<O, F> {
+    fn column(self) -> ColumnOf<O, F> {
+        self
+    }
+}
+
+impl<O, F> FieldOf<O, F> for StateOf<O, F> {
+    fn column(self) -> ColumnOf<O, F> {
+        self.0
     }
 }
 
@@ -170,12 +222,17 @@ pub enum EdgeError {
     /// One write sets a field once.
     #[error("field {field} is set twice on one row")]
     Repeated { field: String },
+    /// The event's `to` label is not the label of the state the edge writes.
+    #[error("the event enters label {to}, but the state written to {field} has label {state}")]
+    Label { field: String, to: i64, state: i64 },
 }
 
 /// One edge write to a resource of kind `K`, built from typed handles; see the module docs.
 ///
 /// ```text
-/// let edge = Edge::new(Message::EDGES, &event)?.set(Message::STATE, &State::new(MessageState::Awaiting, now))?;
+/// let next = State::new(MessageState::Awaiting, now);
+/// let event = EdgeEvent { edge: MessageEdgeName::Deliver, from: Pending, to: Awaiting, writer, at: now, payload };
+/// let edge = Edge::new(Message::STATE, &next, Message::EDGES, &event)?.set(Message::SUBJECT, &subject)?;
 /// write.apply_edge(current, edge)?;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,13 +242,24 @@ pub struct Edge<K> {
 }
 
 impl<K> Edge<K> {
-    /// An edge whose event `row` is appended to the kind's `history` field `events`.
-    pub fn new<E: Element>(events: HistoryOf<K, E>, row: &E) -> Result<Edge<K>, EdgeError> {
+    /// An edge that moves the kind's `state` to the value `next` and appends `event` to the kind's
+    /// edge log `log`. The event's `to` must be `next`'s label; its `from` is the writer's, which
+    /// read the current state for the optimistic stamp the edge is applied under.
+    pub fn new<S: Labelled, E: CodeEnum, P: Cbor>(
+        state: StateOf<K, S>,
+        next: &S,
+        log: HistoryOf<K, EdgeEvent<S::Label, E, P>>,
+        event: &EdgeEvent<S::Label, E, P>,
+    ) -> Result<Edge<K>, EdgeError> {
+        let (to, label) = (event.to.code(), next.label().code());
+        if to != label {
+            return Err(EdgeError::Label { field: state.name().to_owned(), to, state: label });
+        }
         let edge = Edge { parts: EdgeParts { sets: Vec::new(), appends: Vec::new(), objects: BTreeMap::new() }, kind: PhantomData };
-        edge.appended(RowPath::Root, events, row)
+        edge.appended(RowPath::Root, log, event)?.setting(RowPath::Root, state.0, next)
     }
 
-    /// Sets the kind's column-shaped `field` to `value`.
+    /// Sets the kind's column-shaped `field` (not its state, which [`Edge::new`] sets) to `value`.
     pub fn set<F>(self, field: ColumnOf<K, F>, value: &F) -> Result<Edge<K>, EdgeError> {
         self.setting(RowPath::Root, field, value)
     }
@@ -206,10 +274,10 @@ impl<K> Edge<K> {
         self,
         records: RecordsOf<K, P>,
         position: Position,
-        field: ColumnOf<P, F>,
+        field: impl FieldOf<P, F>,
         value: &F,
     ) -> Result<Edge<K>, EdgeError> {
-        self.setting(RowPath::Record { table: records.name, position }, field, value)
+        self.setting(RowPath::Record { table: records.name, position }, field.column(), value)
     }
 
     /// Appends `row` to `table` of the existing row at `position` of the kind's `records` field

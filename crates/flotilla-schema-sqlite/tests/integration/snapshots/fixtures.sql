@@ -350,79 +350,13 @@ CREATE TABLE "message_edges" (
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
   "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3)),
-  "edge_deliver_receiver" INTEGER REFERENCES "strings" ("id"),
-  "edge_deliver_receipt" INTEGER REFERENCES "resource_identity" ("id"),
-  "edge_deliver_transport" INTEGER CHECK ("edge_deliver_transport" IN (1, 2, 3)),
-  "edge_settle_by" INTEGER CHECK ("edge_settle_by" IN (1, 2)),
-  "edge_settle_by_answered_reply" INTEGER REFERENCES "resource_identity" ("id"),
-  "edge_settle_by_outcome_observed_observation" INTEGER REFERENCES "resource_identity" ("id"),
-  "edge_drop_reason" INTEGER CHECK ("edge_drop_reason" IN (1, 2, 3, 4, 5)),
-  "edge_drop_reason_undeliverable_cause_category" INTEGER CHECK ("edge_drop_reason_undeliverable_cause_category" IN (1, 2, 3, 4, 5)),
-  "edge_drop_reason_undeliverable_cause_detail" TEXT,
-  "edge_drop_reason_withdrawn_by" INTEGER REFERENCES "strings" ("id"),
-  "edge_drop_reason_withdrawn_authority" INTEGER REFERENCES "resource_identity" ("id"),
-  "edge_drop_reason_consumer_unreachable_by" INTEGER REFERENCES "strings" ("id"),
-  "edge_drop_reason_consumer_unreachable_authority" INTEGER REFERENCES "resource_identity" ("id"),
-  "edge_drop_reason_superseded_by" INTEGER REFERENCES "resource_identity" ("id"),
-  "at" INTEGER NOT NULL,
+  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2, 3, 4)),
+  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2, 3, 4)),
   "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "at" INTEGER NOT NULL,
+  "payload" BLOB NOT NULL,
   PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "message" ("id") ON DELETE CASCADE,
-  CHECK (CASE WHEN "edge" = 1
-      THEN "edge_deliver_receiver" IS NOT NULL
-      AND "edge_deliver_receipt" IS NOT NULL
-      AND "edge_deliver_transport" IS NOT NULL
-      ELSE "edge_deliver_receiver" IS NULL
-      AND "edge_deliver_receipt" IS NULL
-      AND "edge_deliver_transport" IS NULL
-      END),
-  CHECK (CASE WHEN "edge" = 2
-      THEN "edge_settle_by" IS NOT NULL
-      ELSE "edge_settle_by" IS NULL
-      END),
-  CHECK (CASE WHEN "edge_settle_by" = 1
-      THEN "edge_settle_by_answered_reply" IS NOT NULL
-      ELSE "edge_settle_by_answered_reply" IS NULL
-      END),
-  CHECK (CASE WHEN "edge_settle_by" = 2
-      THEN "edge_settle_by_outcome_observed_observation" IS NOT NULL
-      ELSE "edge_settle_by_outcome_observed_observation" IS NULL
-      END),
-  CHECK (CASE WHEN "edge" = 3
-      THEN "edge_drop_reason" IS NOT NULL
-      ELSE "edge_drop_reason" IS NULL
-      END),
-  CHECK (CASE WHEN "edge_drop_reason" = 1
-      THEN "edge_drop_reason_undeliverable_cause_category" IS NOT NULL
-      AND "edge_drop_reason_undeliverable_cause_detail" IS NOT NULL
-      ELSE "edge_drop_reason_undeliverable_cause_category" IS NULL
-      AND "edge_drop_reason_undeliverable_cause_detail" IS NULL
-      END),
-  CHECK (CASE WHEN "edge_drop_reason" = 3
-      THEN "edge_drop_reason_withdrawn_by" IS NOT NULL
-      AND "edge_drop_reason_withdrawn_authority" IS NOT NULL
-      ELSE "edge_drop_reason_withdrawn_by" IS NULL
-      AND "edge_drop_reason_withdrawn_authority" IS NULL
-      END),
-  CHECK (CASE WHEN "edge_drop_reason" = 4
-      THEN "edge_drop_reason_consumer_unreachable_by" IS NOT NULL
-      AND "edge_drop_reason_consumer_unreachable_authority" IS NOT NULL
-      ELSE "edge_drop_reason_consumer_unreachable_by" IS NULL
-      AND "edge_drop_reason_consumer_unreachable_authority" IS NULL
-      END),
-  CHECK (CASE WHEN "edge_drop_reason" = 5
-      THEN "edge_drop_reason_superseded_by" IS NOT NULL
-      ELSE "edge_drop_reason_superseded_by" IS NULL
-      END)
-) STRICT, WITHOUT ROWID;
-CREATE TABLE "message_edges_inputs" (
-  "owner" INTEGER NOT NULL,
-  "edges_pos" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "observed" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
-  "version" INTEGER NOT NULL,
-  PRIMARY KEY ("owner", "edges_pos", "pos"),
-  FOREIGN KEY ("owner", "edges_pos") REFERENCES "message_edges" ("owner", "pos") ON DELETE CASCADE
+  FOREIGN KEY ("owner") REFERENCES "message" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "message_attempts" (
   "owner" INTEGER NOT NULL,
@@ -448,6 +382,8 @@ CREATE TABLE "message_attempts" (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "message_by_reply" ON "message" ("in_reply_to") WHERE "in_reply_to" IS NOT NULL;
 CREATE INDEX "message_deadline" ON "message" ("deadline") WHERE "state" IN (1, 2) AND "deadline" IS NOT NULL;
+CREATE INDEX "message_edges_by_edge" ON "message_edges" ("edge", "at");
+CREATE INDEX "message_edges_by_time" ON "message_edges" ("at");
 CREATE INDEX "message_open_by_inbox" ON "message" ("inbox", "accepted_seq") WHERE "state" IN (1, 2);
 CREATE TABLE "inbox" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
@@ -579,37 +515,16 @@ CREATE TABLE "convoy_edges" (
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
   "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3, 4, 5)),
-  "edge_abandon_by" INTEGER REFERENCES "strings" ("id"),
-  "edge_abandon_reason" TEXT,
-  "edge_promise_deliverable" INTEGER,
-  "edge_submit_deliverable" INTEGER,
-  "edge_retract_deliverable" INTEGER,
-  "edge_retract_reason" TEXT,
-  "at" INTEGER NOT NULL,
+  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2, 3)),
+  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2, 3)),
   "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "at" INTEGER NOT NULL,
+  "payload" BLOB NOT NULL,
   PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE,
-  CHECK (CASE WHEN "edge" = 2
-      THEN "edge_abandon_by" IS NOT NULL
-      AND "edge_abandon_reason" IS NOT NULL
-      ELSE "edge_abandon_by" IS NULL
-      AND "edge_abandon_reason" IS NULL
-      END),
-  CHECK (CASE WHEN "edge" = 3
-      THEN "edge_promise_deliverable" IS NOT NULL
-      ELSE "edge_promise_deliverable" IS NULL
-      END),
-  CHECK (CASE WHEN "edge" = 4
-      THEN "edge_submit_deliverable" IS NOT NULL
-      ELSE "edge_submit_deliverable" IS NULL
-      END),
-  CHECK (CASE WHEN "edge" = 5
-      THEN "edge_retract_deliverable" IS NOT NULL
-      AND "edge_retract_reason" IS NOT NULL
-      ELSE "edge_retract_deliverable" IS NULL
-      AND "edge_retract_reason" IS NULL
-      END)
+  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
+CREATE INDEX "convoy_edges_by_edge" ON "convoy_edges" ("edge", "at");
+CREATE INDEX "convoy_edges_by_time" ON "convoy_edges" ("at");
 CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN (1) AND "project" IS NOT NULL;
 CREATE TABLE "terminal_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
@@ -664,27 +579,13 @@ CREATE TABLE "terminal_session_events" (
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
   "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3, 4)),
-  "edge_realise_identity_session_id" TEXT,
-  "edge_realise_identity_pid" INTEGER,
-  "edge_realise_identity_endpoint" TEXT,
-  "edge_give_up_cause_category" INTEGER CHECK ("edge_give_up_cause_category" IN (1, 2, 3, 4, 5)),
-  "edge_give_up_cause_detail" TEXT,
-  "at" INTEGER NOT NULL,
+  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2, 3, 4)),
+  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2, 3, 4)),
   "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "at" INTEGER NOT NULL,
+  "payload" BLOB NOT NULL,
   PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "terminal_session" ("id") ON DELETE CASCADE,
-  CHECK (CASE WHEN "edge" = 1
-      THEN "edge_realise_identity_session_id" IS NOT NULL
-      ELSE "edge_realise_identity_session_id" IS NULL
-      AND "edge_realise_identity_pid" IS NULL
-      AND "edge_realise_identity_endpoint" IS NULL
-      END),
-  CHECK (CASE WHEN "edge" = 4
-      THEN "edge_give_up_cause_category" IS NOT NULL
-      AND "edge_give_up_cause_detail" IS NOT NULL
-      ELSE "edge_give_up_cause_category" IS NULL
-      AND "edge_give_up_cause_detail" IS NULL
-      END)
+  FOREIGN KEY ("owner") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE "terminal_session_attempts" (
   "owner" INTEGER NOT NULL,
@@ -709,6 +610,8 @@ CREATE TABLE "terminal_session_attempts" (
       END)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "terminal_session_by_vessel" ON "terminal_session" ("vessel", "ordinal");
+CREATE INDEX "terminal_session_events_by_edge" ON "terminal_session_events" ("edge", "at");
+CREATE INDEX "terminal_session_events_by_time" ON "terminal_session_events" ("at");
 CREATE INDEX "terminal_session_live_by_pool" ON "terminal_session" ("pool") WHERE "lifecycle" IN (1, 2);
 CREATE TABLE "vessel" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),

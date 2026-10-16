@@ -165,6 +165,11 @@ impl Layout {
         }
     }
 
+    /// The name of the table being declared: where generated code places a declared index.
+    pub fn table_name(&self) -> &str {
+        &self.set.tables[self.frames.last().expect("layout has a current table").table].name
+    }
+
     pub fn index(&mut self, index: Index) {
         self.set.indexes.push(index);
     }

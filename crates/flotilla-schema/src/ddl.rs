@@ -89,7 +89,7 @@ fn column(column: &ColumnDef) -> String {
     let name = quote_ident(&column.name);
     let sql_type = match column.ty {
         ColumnType::Text => "TEXT",
-        ColumnType::Blob | ColumnType::Frozen => "BLOB",
+        ColumnType::Blob | ColumnType::Frozen | ColumnType::Cbor => "BLOB",
         _ => "INTEGER",
     };
     let mut out = format!("{name} {sql_type}");
@@ -107,7 +107,7 @@ fn column(column: &ColumnDef) -> String {
             let codes: Vec<String> = codes.iter().map(i64::to_string).collect();
             let _ = write!(out, " CHECK ({name} IN ({}))", codes.join(", "));
         }
-        ColumnType::Integer | ColumnType::Text | ColumnType::Blob | ColumnType::Timestamp => {}
+        ColumnType::Integer | ColumnType::Text | ColumnType::Blob | ColumnType::Cbor | ColumnType::Timestamp => {}
     }
     out
 }
@@ -283,8 +283,8 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
         ));
     }
 
-    // Behaviour (DESIGN indexes): an index is refused unless it is on the root table, names
-    // existing columns once each, pages only through columns that cannot be null under its
+    // Behaviour (DESIGN indexes): an index is refused unless it is on one of the kind's tables
+    // (the root, or a nested table such as an edge log), names existing columns of that table once each, pages only through columns that cannot be null under its
     // predicate, and its predicate can hold (listed codes of a code column, `is_some` of a
     // nullable column). Interned and reference columns may be compared but never order an index.
     #[test]
@@ -296,6 +296,11 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
             layout.column("seq", ColumnType::Integer, true);
             layout.column("owner", ColumnType::Ref, true);
             layout.column("label", ColumnType::Interned, true);
+            layout.table("events", TableRole::History, |layout| {
+                layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
+                layout.column(RECORD_VERSION, ColumnType::Integer, true);
+                layout.column("at", ColumnType::Timestamp, true);
+            });
             layout.index(index);
             match layout.finish().validate() {
                 Ok(()) => None,
@@ -313,7 +318,10 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
         let present = || Condition::NotNull { column: "due".into() };
         assert_eq!(problem(index(&["phase"], &["seq"], vec![])), None);
         assert_eq!(problem(index(&[], &["due"], vec![present()])), None);
-        assert_eq!(problem(Index { table: "other".into(), ..index(&["seq"], &[], vec![]) }), Some(IndexProblem::Table("note".into())));
+        assert_eq!(problem(Index { table: "other".into(), ..index(&["seq"], &[], vec![]) }), Some(IndexProblem::Table("other".into())));
+        let events = |eq: &[&str], order: &[&str]| Index { table: "note_events".into(), ..index(eq, order, vec![]) };
+        assert_eq!(problem(events(&[], &["at"])), None, "a nested table's own columns");
+        assert_eq!(problem(events(&["seq"], &[])), Some(IndexProblem::UnknownColumn("seq".into())), "not the root's");
         assert_eq!(problem(index(&[], &[], vec![])), Some(IndexProblem::NoColumns));
         assert_eq!(problem(index(&["nope"], &[], vec![])), Some(IndexProblem::UnknownColumn("nope".into())));
         assert_eq!(problem(index(&["seq"], &["seq"], vec![])), Some(IndexProblem::RepeatedColumn("seq".into())));

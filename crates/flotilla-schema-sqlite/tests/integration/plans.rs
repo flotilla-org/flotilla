@@ -6,9 +6,10 @@
 //! foreign-key enforcement; every foreign key the runtime can trigger points at a primary key or
 //! at a child table whose primary key starts with the referencing columns.
 
+use flotilla_schema::quote_ident;
 use rusqlite::{types::Value as SqlValue, Connection};
 
-use crate::fixtures::store;
+use crate::fixtures::{registry, store};
 
 /// The detail column of each plan row.
 fn plan(conn: &Connection, sql: &str) -> Vec<String> {
@@ -80,7 +81,7 @@ fn the_enumeration_covers_every_kind_and_index() {
         "string_id",
         "log_by_home",
         "message select",
-        "message_edges_inputs delete",
+        "message_edges select",
         "message_edges insert",
         "convoy_deliverables_evidence_metadata insert",
         "terminal_session_labels select",
@@ -108,5 +109,54 @@ fn the_enumeration_covers_every_kind_and_index() {
     assert!(
         !labels.iter().any(|label| label.starts_with("message_references ") && label.ends_with(" last position")),
         "spec collections take no positions from edges"
+    );
+}
+
+// Behaviour (#3320 ruling of 2026-10-15): an edge log's indexes serve the reads history answers.
+// Events of one edge in a time range, and every event in a time range across resources, each
+// search their own index in its order: no scan and no temporary sort. (One resource's log in order
+// is its primary key, which loading already searches.) The reads have no query API yet, so the
+// statements are rendered here from the descriptor.
+#[test]
+fn edge_log_indexes_serve_history_reads() {
+    let (conn, _) = statements();
+    let mut planned = Vec::new();
+    for set in registry().iter() {
+        for index in set.indexes.iter().filter(|index| index.table != set.tables[0].name) {
+            let table = set.tables.iter().find(|table| table.name == index.table).expect("the index's table");
+            let key: Vec<String> =
+                ["owner"].into_iter().chain(table.key.iter().map(|column| column.name.as_str())).map(quote_ident).collect();
+            let order: Vec<String> = index.order.iter().map(|column| quote_ident(column)).collect();
+            let mut terms: Vec<String> = index.eq.iter().map(|column| format!("{} = ?", quote_ident(column))).collect();
+            terms.push(format!("{} >= ? AND {} < ?", order[0], order[0]));
+            let sql = format!(
+                "SELECT {} FROM {} WHERE {} ORDER BY {}, {} LIMIT ?",
+                key.join(", "),
+                quote_ident(&table.name),
+                terms.join(" AND "),
+                order.join(", "),
+                key.join(", ")
+            );
+            let rows = plan(&conn, &sql);
+            let own = format!("USING COVERING INDEX {} (", index.object_name());
+            assert!(
+                rows.iter().any(|row| row.starts_with("SEARCH") && row.contains(&own))
+                    && !rows.iter().any(|row| row.contains("SCAN") || row.contains("TEMP B-TREE")),
+                "{sql}: {rows:?}"
+            );
+            planned.push(index.object_name());
+        }
+    }
+    planned.sort();
+    assert_eq!(
+        planned,
+        [
+            "convoy_edges_by_edge",
+            "convoy_edges_by_time",
+            "message_edges_by_edge",
+            "message_edges_by_time",
+            "terminal_session_events_by_edge",
+            "terminal_session_events_by_time",
+        ]
     );
 }

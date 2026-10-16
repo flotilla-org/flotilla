@@ -5,7 +5,9 @@ use std::{
     ops::Range,
 };
 
-use flotilla_schema::{Edge, Frozen, Kind, Position, Records, Row, RowChange, RowOp, State, TableRole, Timestamp, Value};
+use flotilla_schema::{
+    Edge, EdgeError, EdgeEvent, Frozen, Kind, Position, Records, Row, RowChange, RowOp, State, TableRole, Timestamp, Value,
+};
 use flotilla_schema_sqlite::{Applied, ResourceId, Snapshot, Stamp, Store, StoreError};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
@@ -14,7 +16,7 @@ use crate::fixtures::{
     convoy::{
         ConvoyEdge, ConvoyEdgeEvent, ConvoyState, Deliverable, DeliverableState, Evidence, PlacementSnapshot, PromiseKind, PromiseSource,
     },
-    registry, store, Convoy, Fixture, Message, Pick, TerminalSession, LOCAL,
+    registry, store, Convoy, Fixture, Message, Payload, Pick, TerminalSession, LOCAL,
 };
 
 fn snapshot(store: &mut Store, id: ResourceId) -> Snapshot {
@@ -112,9 +114,11 @@ fn touches_only_declared_rows<K: Fixture>(tc: &TestCase) {
                 }
             }
         }
-        // One statement per appended row and per set field; the root's version moves with its
-        // first field, or by itself; then the home and identity sequences and the change log.
-        let statements = inserted.len() + set_rows.values().map(Vec::len).sum::<usize>() + usize::from(!root_set) + 3;
+        // One statement per appended row and per set field, the root's version moving with its
+        // first field (every edge sets the state); then the home and identity sequences and the
+        // change log.
+        assert!(root_set, "every edge writes the state value");
+        let statements = inserted.len() + set_rows.values().map(Vec::len).sum::<usize>() + 3;
         assert_eq!(written, statements as u64, "rows written by {change:?}");
         stamp = next;
     }
@@ -124,8 +128,8 @@ fn touches_only_declared_rows<K: Fixture>(tc: &TestCase) {
 // (event, declared appends and the rows nested in them) is new, holds the logged values and, in a
 // records or history table, the edge's version; every other row that changed is one a logged `Set`
 // names, and only within that field's columns, which hold the logged values; no row disappears.
-// SQLite counts one row write per op, plus the root version when no root field is set, plus the
-// home sequence, identity sequence and change-log rows.
+// SQLite counts one row write per op, plus the home sequence, identity sequence and change-log
+// rows; the root's version moves with the state every edge writes.
 #[hegel::test(test_cases = 60)]
 fn an_edge_touches_exactly_its_declared_rows(tc: TestCase) {
     touches_only_declared_rows::<Message>(&tc);
@@ -148,8 +152,21 @@ fn deliverable() -> Deliverable {
     }
 }
 
-fn event(edge: ConvoyEdge) -> ConvoyEdgeEvent {
-    ConvoyEdgeEvent { edge, at: Timestamp(6), writer: "alice".into() }
+fn event(args: ConvoyEdge, from: ConvoyState, to: ConvoyState) -> ConvoyEdgeEvent {
+    EdgeEvent { edge: args.name(), from, to, writer: "alice".into(), at: Timestamp(6), payload: Payload { args, reads: Vec::new() } }
+}
+
+/// A deliverable edge on a sample convoy: it writes the convoy's state unchanged.
+fn staying_open(args: ConvoyEdge) -> Result<Edge<Convoy>, EdgeError> {
+    let open = Convoy::sample(0).state;
+    Edge::new(Convoy::STATE, &open, Convoy::EDGES, &event(args, ConvoyState::Open, ConvoyState::Open))
+}
+
+/// The deliver edge on an open convoy.
+fn deliver() -> Edge<Convoy> {
+    let delivered = State::new(ConvoyState::Delivered, Timestamp(8));
+    Edge::new(Convoy::STATE, &delivered, Convoy::EDGES, &event(ConvoyEdge::Deliver, ConvoyState::Open, ConvoyState::Delivered))
+        .expect("edge")
 }
 
 fn load(store: &mut Store, id: ResourceId) -> Convoy {
@@ -173,18 +190,18 @@ fn deliverables_move_and_take_evidence_through_edges() {
     deliverables.append(0, deliverable());
     let inserted = write.insert("c", &Convoy { deliverables, ..Convoy::sample(0) }).expect("insert");
 
-    let submit = Edge::new(Convoy::EDGES, &event(ConvoyEdge::Submit { deliverable: 0 }))
+    let submit = staying_open(ConvoyEdge::Submit { deliverable: 0 })
         .and_then(|edge| edge.append_in(Convoy::DELIVERABLES, Position(0), Deliverable::EVIDENCE, &evidence("e1")))
         .expect("edge");
     let submitted = write.apply_edge(inserted, submit).expect("submit");
     let retracted_state = State::new(DeliverableState::Retracted, Timestamp(7));
-    let retract = Edge::new(Convoy::EDGES, &event(ConvoyEdge::Retract { deliverable: 1, reason: "dropped".into() }))
+    let retract = staying_open(ConvoyEdge::Retract { deliverable: 1, reason: "dropped".into() })
         .and_then(|edge| edge.set_in(Convoy::DELIVERABLES, Position(1), Deliverable::STATE, &retracted_state))
         .expect("edge");
     let retracted = write.apply_edge(submitted, retract).expect("retract");
 
     let missing = |position| {
-        Edge::new(Convoy::EDGES, &event(ConvoyEdge::Submit { deliverable: position }))
+        staying_open(ConvoyEdge::Submit { deliverable: position })
             .and_then(|edge| edge.append_in(Convoy::DELIVERABLES, Position(position), Deliverable::EVIDENCE, &evidence("e9")))
             .expect("edge")
     };
@@ -193,20 +210,22 @@ fn deliverables_move_and_take_evidence_through_edges() {
         matches!(&refused, Err(StoreError::NoRecord { table, key }) if table == "convoy_deliverables" && key == &[Value::Int(2)]),
         "{refused:?}"
     );
-    let retract_missing = Edge::new(Convoy::EDGES, &event(ConvoyEdge::Retract { deliverable: 5, reason: String::new() }))
+    let retract_missing = staying_open(ConvoyEdge::Retract { deliverable: 5, reason: String::new() })
         .and_then(|edge| edge.set_in(Convoy::DELIVERABLES, Position(5), Deliverable::STATE, &retracted_state))
         .expect("edge");
     let refused = write.apply_edge(retracted, retract_missing);
     assert!(matches!(&refused, Err(StoreError::NoRecord { table, .. }) if table == "convoy_deliverables"), "{refused:?}");
-    let delivered = Edge::new(Convoy::EDGES, &event(ConvoyEdge::Deliver))
-        .and_then(|edge| edge.set(Convoy::STATE, &State::new(ConvoyState::Delivered, Timestamp(8))))
-        .expect("edge");
-    let last = write.apply_edge(retracted, delivered).expect("a refused edge leaves the transaction usable");
+    let last = write.apply_edge(retracted, deliver()).expect("a refused edge leaves the transaction usable");
     write.commit().expect("commit");
 
     let convoy = load(&mut store, inserted.id);
-    let versions: Vec<u64> = convoy.edges.iter().map(|row| row.version).collect();
-    assert_eq!(versions, [submitted.version, retracted.version, last.version], "one event per edge, in order");
+    let versions: Vec<(u64, ConvoyState)> = convoy.edges.iter().map(|row| (row.version, row.record.to)).collect();
+    assert_eq!(
+        versions,
+        [(submitted.version, ConvoyState::Open), (retracted.version, ConvoyState::Open), (last.version, ConvoyState::Delivered)],
+        "one event per edge, in order"
+    );
+    assert_eq!(convoy.edges.last().map(|row| &row.record.payload.args), Some(&ConvoyEdge::Deliver), "the document round-trips");
     let evidence_rows: Vec<(u32, u64, &str)> = convoy.deliverables.rows()[0]
         .record
         .evidence
@@ -229,7 +248,7 @@ fn edges_are_owner_checked_and_optimistic() {
     let mut store = store();
     let mut write = store.write().expect("write");
     let stamp = write.insert("c", &Convoy::sample(0)).expect("insert");
-    let edge = || Edge::new(Convoy::EDGES, &event(ConvoyEdge::Deliver)).expect("edge");
+    let edge = deliver;
     let moved = write.apply_edge(stamp, edge()).expect("edge");
     assert!(matches!(write.apply_edge(stamp, edge()), Err(StoreError::Conflict { .. })));
     write.delete::<Convoy>(moved).expect("delete");
@@ -247,7 +266,7 @@ fn edges_are_owner_checked_and_optimistic() {
     // append under a records row that does not exist): retrying callers re-read on `Conflict`.
     let current = write.insert("stale", &Convoy::sample(0)).expect("insert");
     let both_wrong = || {
-        Edge::new(Convoy::EDGES, &event(ConvoyEdge::Submit { deliverable: 9 }))
+        staying_open(ConvoyEdge::Submit { deliverable: 9 })
             .and_then(|edge| edge.append_in(Convoy::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence("e")))
             .expect("edge")
     };
@@ -256,33 +275,28 @@ fn edges_are_owner_checked_and_optimistic() {
     assert!(matches!(write.apply_edge(far, edge()), Err(StoreError::NotHome { home, .. }) if home == "remote"));
 }
 
-// Behaviour (ruling 1, both version branches): every edge appends its event, so the root row is
-// touched either by a declared root field (whose statement also moves the version) or, for an
-// edge that sets no root field, by the version move alone. Each branch moves the version to the
-// write's sequence, logs a root `Set` only when it set a root field, and refuses a stale stamp.
+// Behaviour (ruling 1, #3319's state value): every edge writes the state value, so its root `Set`
+// moves the version to the write's sequence under the optimistic check, whether the label changes
+// (deliver) or not (a deliverable edge, writing the state unchanged); a stale stamp is refused.
 #[test]
-fn edges_move_the_version_with_and_without_a_root_field() {
+fn every_edge_writes_the_state_and_moves_the_version() {
     let mut store = store();
     let mut write = store.write().expect("write");
     let inserted = write.insert("c", &Convoy::sample(0)).expect("insert");
     write.commit().expect("commit");
-    let with_root = || {
-        Edge::new(Convoy::EDGES, &event(ConvoyEdge::Deliver))
-            .and_then(|edge| edge.set(Convoy::STATE, &State::new(ConvoyState::Delivered, Timestamp(3))))
-            .expect("edge")
-    };
-    let without_root = || Edge::new(Convoy::EDGES, &event(ConvoyEdge::Submit { deliverable: 0 })).expect("edge");
+    let unchanged = || staying_open(ConvoyEdge::Promise { deliverable: 0 }).expect("edge");
     let mut current = inserted;
-    for (root_set, edge) in [(true, with_root as fn() -> Edge<Convoy>), (false, without_root)] {
+    for (label, edge) in [(ConvoyState::Open, unchanged as fn() -> Edge<Convoy>), (ConvoyState::Delivered, deliver)] {
         let mut write = store.write().expect("write");
         let moved = write.apply_edge(current, edge()).expect("edge");
         assert!(moved.version > current.version);
-        assert!(matches!(write.apply_edge(current, edge()), Err(StoreError::Conflict { .. })), "stale stamp, root set {root_set}");
+        assert!(matches!(write.apply_edge(current, edge()), Err(StoreError::Conflict { .. })), "stale stamp, {label:?}");
         write.commit().expect("commit");
         assert_eq!(snapshot(&mut store, moved.id).version, moved.version);
         let change = store.read().expect("read").changes(moved.id, current.version, 10).expect("log").remove(0);
-        let logged_root_set = change.ops.iter().any(|op| matches!(op, RowOp::Set { table, .. } if table == "convoy"));
-        assert_eq!(logged_root_set, root_set);
+        let state_set = change.ops.iter().any(|op| matches!(op, RowOp::Set { table, field, .. } if table == "convoy" && field == "state"));
+        assert!(state_set, "{label:?}");
+        assert_eq!(load(&mut store, moved.id).state.value, label);
         current = moved;
     }
 }
@@ -296,12 +310,12 @@ fn edges_carry_the_objects_they_set() {
     let mut write = source.write().expect("write");
     write.insert("a", &Convoy { placement_snapshot: Some(placement()), ..Convoy::sample(0) }).expect("insert a");
     let b = write.insert("b", &Convoy::sample(0)).expect("insert b");
-    let placed = Edge::new(Convoy::EDGES, &event(ConvoyEdge::Deliver))
+    let placed = staying_open(ConvoyEdge::Promise { deliverable: 0 })
         .and_then(|edge| edge.set(Convoy::PLACEMENT_SNAPSHOT, &Some(placement())))
         .expect("edge");
     let b = write.apply_edge(b, placed).expect("edge");
     let cleared =
-        Edge::new(Convoy::EDGES, &event(ConvoyEdge::Deliver)).and_then(|edge| edge.set(Convoy::PLACEMENT_SNAPSHOT, &None)).expect("edge");
+        staying_open(ConvoyEdge::Promise { deliverable: 0 }).and_then(|edge| edge.set(Convoy::PLACEMENT_SNAPSHOT, &None)).expect("edge");
     let b = write.apply_edge(b, cleared).expect("edge");
     write.commit().expect("commit");
     let changes = source.read().expect("read").changes(b.id, 0, 10).expect("log");

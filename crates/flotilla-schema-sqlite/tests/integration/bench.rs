@@ -5,26 +5,27 @@
 //! ```
 //!
 //! A temp-file database in WAL mode with `synchronous = NORMAL` holds pre-created messages. Each
-//! event is one edge through `Write::apply_edge`: it appends an edge history row with one gate
-//! input and moves the message's state (`state`, `state_since` and the version, by the state
-//! field's own statement). That is the edge row, the gate-input row, the root row and the
-//! `change_log` row (plus the `home_sequence` counter and the identity's sequence), WORKLOAD.md's
-//! ~4 row writes per event. Events are committed in batches of 1, 10, 100 and 1000 per transaction.
+//! event is one edge through `Write::apply_edge`: it moves the message's state (`state`,
+//! `state_since` and the version, by the state field's own statement) and appends an edge history
+//! row, whose document holds the edge's arguments and one gate read. That is the edge row, the
+//! root row and the `change_log` row (plus the `home_sequence` counter and the identity's
+//! sequence): one row fewer than WORKLOAD.md's ~4 row writes per event, which counted the gate
+//! read as a row. Events are committed in batches of 1, 10, 100 and 1000 per transaction.
 
 use std::{env, fs, path::PathBuf, process, time::Instant};
 
-use flotilla_schema::{Edge, Identity, Kind, Ref, State, Timestamp};
+use flotilla_schema::{Edge, EdgeEvent, Identity, Kind, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{Stamp, Store};
 use rusqlite::Connection;
 
 use crate::fixtures::{
-    message::{AgentName, GateInput, MessageEdge, MessageEdgeEvent, MessageState, Transport},
-    registry, AgentSession, Message, LOCAL,
+    message::{AgentName, MessageEdge, MessageState, Transport},
+    registry, AgentSession, GateRead, Message, Payload, LOCAL,
 };
 
 const MESSAGES: usize = 10_000;
 const INBOXES: usize = 100;
-const ROWS_PER_EVENT: f64 = 4.0;
+const ROWS_PER_EVENT: f64 = 3.0;
 
 struct Database(PathBuf);
 
@@ -67,23 +68,27 @@ fn seed(store: &mut Store) -> Vec<(Stamp, MessageState)> {
     stamps
 }
 
-/// One delivery event: its edge row with one gate input, and the state it moves the message to.
+/// One delivery event: the state it moves the message to, and its edge row with one gate read.
 fn event(state: MessageState, n: usize) -> (Edge<Message>, MessageState) {
-    let event = MessageEdgeEvent {
-        edge: MessageEdge::Deliver {
-            receiver: AgentName("crew".into()),
-            receipt: Ref::new(format!("session-{}", n % 50), LOCAL),
-            transport: Transport::Turn,
-        },
-        at: Timestamp(n as i64),
-        writer: LOCAL.into(),
-        inputs: vec![GateInput {
-            observed: Identity { kind: AgentSession::CODE, name: format!("session-{}", n % 50), home: LOCAL.into() },
-            version: n as u64,
-        }],
+    let args = MessageEdge::Deliver {
+        receiver: AgentName("crew".into()),
+        receipt: Ref::new(format!("session-{}", n % 50), LOCAL),
+        transport: Transport::Turn,
+    };
+    let read = GateRead {
+        observed: Identity { kind: AgentSession::CODE, name: format!("session-{}", n % 50), home: LOCAL.into() },
+        version: n as u64,
     };
     let next = if state == MessageState::Pending { MessageState::Awaiting } else { MessageState::Pending };
-    let edge = Edge::new(Message::EDGES, &event).and_then(|edge| edge.set(Message::STATE, &State::new(next, Timestamp(n as i64))));
+    let event = EdgeEvent {
+        edge: args.name(),
+        from: state,
+        to: next,
+        writer: LOCAL.into(),
+        at: Timestamp(n as i64),
+        payload: Payload { args, reads: vec![read] },
+    };
+    let edge = Edge::new(Message::STATE, &State::new(next, Timestamp(n as i64)), Message::EDGES, &event);
     (edge.expect("edge"), next)
 }
 
@@ -134,7 +139,7 @@ fn run(batch: usize, events: usize) -> String {
 #[ignore = "load benchmark: run in release with --ignored --nocapture"]
 fn bench_message_events() {
     let mut lines = vec![
-        format!("{MESSAGES} messages over {INBOXES} inboxes; each event, one apply_edge: edge history row + gate input + state move + change_log"),
+        format!("{MESSAGES} messages over {INBOXES} inboxes; each event, one apply_edge: state move + edge history row (one gate read in its document) + change_log"),
         "| batch | events | events/s |    rows/s | txn p50 ms | txn p99 ms | commit p50 ms | commit p99 ms |".to_owned(),
         "|---:|---:|---:|---:|---:|---:|---:|---:|".to_owned(),
     ];

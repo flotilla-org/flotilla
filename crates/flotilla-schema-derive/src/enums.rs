@@ -35,7 +35,7 @@ pub(crate) fn expand(input: &DeriveInput, data: &DataEnum, type_attrs: TypeAttrs
         return Err(refuse_at(span, "an enum takes `code = N` on each variant, not on the type"));
     }
     if let Some(index) = type_attrs.indexes.first() {
-        return Err(refuse(index, "`index` belongs on a kind"));
+        return Err(refuse(index, "`index` belongs on a kind or a part struct"));
     }
     if data.variants.is_empty() {
         return Err(refuse(&input.ident, "an enum without variants has no values to store"));

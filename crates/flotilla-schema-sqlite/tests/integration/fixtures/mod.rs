@@ -16,10 +16,11 @@ pub mod terminal;
 use std::fmt::Debug;
 
 use chrono::{DateTime, Utc};
-use flotilla_schema::{Edge, Identity, Kind, KindCode, KindRegistry, Position, Records, Ref, Timestamp};
+use flotilla_schema::{Edge, EdgeEvent, Identity, Kind, KindCode, KindRegistry, Position, Records, Ref, Timestamp};
 use flotilla_schema_sqlite::Store;
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 
 pub use self::{
     convoy::{Convoy, Project},
@@ -28,6 +29,31 @@ pub use self::{
 };
 
 pub const LOCAL: &str = "local";
+
+/// An edge event's inline document (#3320 ruling of 2026-10-15): the edge's arguments and the
+/// resources its gate read, never expanded into columns or tables.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Payload<A> {
+    pub args: A,
+    pub reads: Vec<GateRead>,
+}
+
+/// A resource a gate read, at the version it read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateRead {
+    pub observed: Identity,
+    pub version: u64,
+}
+
+/// `args` with up to two drawn gate reads.
+pub fn payload<A>(tc: &TestCase, pick: Pick, args: A) -> Payload<A> {
+    Payload { args, reads: list(tc, pick, 2, |_| GateRead { observed: identity(tc), version: seq(tc) }) }
+}
+
+/// An edge event from `from` to `to`, with a drawn writer and time.
+pub fn event<L, E, A>(tc: &TestCase, edge: E, from: L, to: L, payload: Payload<A>) -> EdgeEvent<L, E, Payload<A>> {
+    EdgeEvent { edge, from, to, writer: name(tc), at: timestamp(tc), payload }
+}
 
 /// A generated fixture kind.
 pub trait Fixture: Kind + Clone + PartialEq + Debug {

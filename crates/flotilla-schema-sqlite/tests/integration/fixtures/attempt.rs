@@ -5,16 +5,18 @@
 
 use flotilla_schema::{Column, Stored, Timestamp};
 use hegel::TestCase;
+use serde::{Deserialize, Serialize};
 
 use super::{code_enum, text, timestamp, Pick};
 
-#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+/// Stored as columns under an attempt's outcome, and inside edge documents (serde).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]
 pub struct Cause {
     pub category: CauseCategory,
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Stored)]
 pub enum CauseCategory {
     #[store(code = 1)]
     Transient,

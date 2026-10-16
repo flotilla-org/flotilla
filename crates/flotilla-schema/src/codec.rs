@@ -20,6 +20,9 @@ pub enum EncodeError {
     /// Generated code addressed a table the layout did not declare.
     #[error("table index {index} is outside the layout's {tables} tables")]
     Table { index: usize, tables: usize },
+    /// A `cbor` field with no canonical CBOR form within the ADR 0063 default limits.
+    #[error("column {column}: no canonical CBOR form: {kind}")]
+    Cbor { column: String, kind: flotilla_cbor::ErrorKind },
 }
 
 impl EncodeError {
@@ -27,6 +30,7 @@ impl EncodeError {
     pub fn at(self, field: &str) -> EncodeError {
         match self {
             EncodeError::OutOfRange { column, value } => EncodeError::OutOfRange { column: join(field, &column), value },
+            EncodeError::Cbor { column, kind } => EncodeError::Cbor { column: join(field, &column), kind },
             other => other,
         }
     }
@@ -55,6 +59,9 @@ pub enum DecodeError {
     /// Object bytes that are not canonical CBOR of the frozen field's type.
     #[error("object {hash:?} does not decode: {kind}")]
     Object { hash: Hash, kind: flotilla_cbor::ErrorKind },
+    /// A `cbor` column whose bytes are not canonical CBOR of the field's type.
+    #[error("column {column}: CBOR does not decode: {kind}")]
+    Cbor { column: String, kind: flotilla_cbor::ErrorKind },
     /// A list or records row whose position is not the next dense index.
     #[error("column {column}: expected position {expected}, found {found}")]
     Position { column: String, expected: usize, found: i64 },
@@ -82,6 +89,7 @@ impl DecodeError {
             DecodeError::Exhausted { column } => DecodeError::Exhausted { column: join(field, &column) },
             DecodeError::RefKind { column, expected, found } => DecodeError::RefKind { column: join(field, &column), expected, found },
             DecodeError::Position { column, expected, found } => DecodeError::Position { column: join(field, &column), expected, found },
+            DecodeError::Cbor { column, kind } => DecodeError::Cbor { column: join(field, &column), kind },
             other => other,
         }
     }

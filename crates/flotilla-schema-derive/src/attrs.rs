@@ -6,8 +6,8 @@ use syn::{parenthesized, Attribute, LitInt, LitStr};
 
 /// The closed attribute list, named by every refusal. `flotilla-schema` repeats this text in its
 /// trait diagnostics and a test there keeps the two equal.
-pub(crate) const SUPPORTED: &str = "the storage derive supports only the attributes child, records, history, frozen, intern, flatten, \
-                                    state and code (fields and variants) and kind, code and index (types)";
+pub(crate) const SUPPORTED: &str = "the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
+                                    flatten, state and code (fields and variants) and kind, code and index (types)";
 
 /// A refusal: names what was refused and the closed list.
 pub(crate) fn refuse(tokens: impl ToTokens, what: impl std::fmt::Display) -> syn::Error {
@@ -32,6 +32,7 @@ pub(crate) enum FieldAttr {
     Records,
     History,
     Frozen,
+    Cbor,
     Intern,
     Flatten,
     State,
@@ -44,6 +45,7 @@ impl FieldAttr {
             FieldAttr::Records => "records",
             FieldAttr::History => "history",
             FieldAttr::Frozen => "frozen",
+            FieldAttr::Cbor => "cbor",
             FieldAttr::Intern => "intern",
             FieldAttr::Flatten => "flatten",
             FieldAttr::State => "state",
@@ -56,6 +58,7 @@ impl FieldAttr {
             FieldAttr::Records,
             FieldAttr::History,
             FieldAttr::Frozen,
+            FieldAttr::Cbor,
             FieldAttr::Intern,
             FieldAttr::Flatten,
             FieldAttr::State,
