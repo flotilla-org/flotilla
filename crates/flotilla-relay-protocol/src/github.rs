@@ -3,7 +3,9 @@ use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::Sha256;
 
-use crate::{Hint, Source, Subject, SubjectKind};
+use flotilla_address::Kind;
+
+use crate::{hint_subject, hint_subject::github_subject, Hint, Source};
 
 /// GitHub's documented maximum webhook payload size. Larger deliveries are never sent.
 pub const MAX_PAYLOAD_BYTES: usize = 25 * 1024 * 1024;
@@ -41,7 +43,7 @@ pub fn signature(secret: &str, payload: &[u8]) -> String {
 }
 
 /// Reduces a verified delivery to hints. Irrelevant events, and check events without a pull
-/// request, produce none. Subjects are normalized per [`crate::subject`]'s rule.
+/// request, produce none. Subjects are addresses, normalized per [`crate::hint_subject`].
 pub fn hints(event: &str, delivery_id: &str, payload: &[u8]) -> Result<Vec<Hint>, serde_json::Error> {
     if !EVENTS.contains(&event) {
         return Ok(Vec::new());
@@ -50,9 +52,9 @@ pub fn hints(event: &str, delivery_id: &str, payload: &[u8]) -> Result<Vec<Hint>
     let Some(owner) = value.pointer("/repository/owner/login").and_then(Value::as_str) else { return Ok(Vec::new()) };
     let Some(repo) = value.pointer("/repository/name").and_then(Value::as_str) else { return Ok(Vec::new()) };
     let number_at = |pointer: &str| value.pointer(pointer).and_then(Value::as_u64);
-    let (kind, mut numbers): (SubjectKind, Vec<u64>) = match event {
+    let (kind, mut numbers): (Kind, Vec<u64>) = match event {
         "pull_request" | "pull_request_review" | "pull_request_review_comment" | "pull_request_review_thread" => {
-            (SubjectKind::ChangeRequest, number_at("/pull_request/number").into_iter().collect())
+            (Kind::ChangeRequest, number_at("/pull_request/number").into_iter().collect())
         }
         "check_run" | "check_suite" => {
             let pull_requests = if event == "check_run" { "/check_run/pull_requests" } else { "/check_suite/pull_requests" };
@@ -63,26 +65,24 @@ pub fn hints(event: &str, delivery_id: &str, payload: &[u8]) -> Result<Vec<Hint>
                 .flatten()
                 .filter_map(|pr| pr.get("number").and_then(Value::as_u64))
                 .collect();
-            (SubjectKind::ChangeRequest, numbers)
+            (Kind::ChangeRequest, numbers)
         }
         // A comment on a pull request arrives as an issue comment whose issue carries a
         // `pull_request` link; it is review feedback on the change request.
         "issue_comment" if value.pointer("/issue/pull_request").is_some_and(|link| !link.is_null()) => {
-            (SubjectKind::ChangeRequest, number_at("/issue/number").into_iter().collect())
+            (Kind::ChangeRequest, number_at("/issue/number").into_iter().collect())
         }
-        "issues" | "issue_comment" => (SubjectKind::Issue, number_at("/issue/number").into_iter().collect()),
+        "issues" | "issue_comment" => (Kind::Issue, number_at("/issue/number").into_iter().collect()),
         _ => unreachable!("EVENTS lists every handled event"),
     };
     numbers.sort_unstable();
     numbers.dedup();
+    // An owner or repository GitHub would never send cannot form an address;
+    // such a delivery reduces to no hint rather than a malformed subject.
     Ok(numbers
         .into_iter()
-        .map(|number| Hint {
-            source: Source::Github.as_str().into(),
-            subject: Subject::github(kind, owner, repo, number).to_string(),
-            kind: event.into(),
-            delivery_id: delivery_id.into(),
-        })
+        .filter_map(|number| github_subject(kind, owner, repo, number).ok().as_ref().and_then(hint_subject))
+        .map(|subject| Hint { source: Source::Github.as_str().into(), subject, kind: event.into(), delivery_id: delivery_id.into() })
         .collect())
 }
 

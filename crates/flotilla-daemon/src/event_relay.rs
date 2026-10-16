@@ -3,9 +3,10 @@
 use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use flotilla_address::Address;
 use flotilla_config::RelayConfig;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_relay_protocol::{ConsumerFrame, StreamFrame, Subject};
+use flotilla_relay_protocol::{parse_hint_subject, ConsumerFrame, StreamFrame};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{
@@ -27,7 +28,7 @@ trait RelayConnector: Send + Sync {
 
 #[async_trait]
 trait RefreshTarget: Send + Sync {
-    async fn hint(&self, subject: &Subject) -> Result<(), String>;
+    async fn hint(&self, subject: &Address) -> Result<(), String>;
     async fn resync(&self) -> Result<(), String>;
     fn healthy(&self, healthy: bool);
 }
@@ -38,7 +39,7 @@ struct DaemonRefreshTarget {
 
 #[async_trait]
 impl RefreshTarget for DaemonRefreshTarget {
-    async fn hint(&self, subject: &Subject) -> Result<(), String> {
+    async fn hint(&self, subject: &Address) -> Result<(), String> {
         self.daemon.refresh_change_request_hint(subject).await
     }
 
@@ -152,7 +153,7 @@ impl RelayClient {
                 if delivery.cursor <= *cursor {
                     return Ok(());
                 }
-                if let Ok(subject) = delivery.hint.subject.parse::<Subject>() {
+                if let Ok(subject) = parse_hint_subject(&delivery.hint.subject) {
                     if let Err(error) = self.target.hint(&subject).await {
                         warn!(%error, subject = %subject, "relay hint refresh failed; polling will retry");
                     }
@@ -343,22 +344,26 @@ mod tests {
     // remains separate from these lifecycle scenarios.
     use std::{collections::HashSet, sync::Mutex};
 
-    use flotilla_relay_protocol::{Delivery, Hint, SubjectKind};
+    use flotilla_relay_protocol::{Delivery, Hint};
+
+    fn github_cr(number: u64) -> Address {
+        Address::change_request(&flotilla_address::Forge::github(), "flotilla-org/flotilla", number).expect("change request")
+    }
 
     use super::*;
 
     #[derive(Default)]
     struct MemoryTarget {
-        owned: HashSet<Subject>,
-        failing: HashSet<Subject>,
-        refreshed: Mutex<Vec<Subject>>,
+        owned: HashSet<Address>,
+        failing: HashSet<Address>,
+        refreshed: Mutex<Vec<Address>>,
         resyncs: Mutex<usize>,
         health: Mutex<Vec<bool>>,
     }
 
     #[async_trait]
     impl RefreshTarget for MemoryTarget {
-        async fn hint(&self, subject: &Subject) -> Result<(), String> {
+        async fn hint(&self, subject: &Address) -> Result<(), String> {
             if self.failing.contains(subject) {
                 return Err("forge unavailable".into());
             }
@@ -430,7 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn owned_hint_is_normalized_and_acted_on_once() {
-        let subject = Subject::github(SubjectKind::ChangeRequest, "flotilla-org", "flotilla", 2051);
+        let subject = github_cr(2051);
         let target = Arc::new(MemoryTarget { owned: HashSet::from([subject.clone()]), ..Default::default() });
         let acks = Arc::new(Mutex::new(Vec::new()));
         let relay = Arc::new(MemoryRelay {
@@ -480,8 +485,8 @@ mod tests {
 
     #[tokio::test]
     async fn failing_refresh_does_not_block_later_hints() {
-        let failing = Subject::github(SubjectKind::ChangeRequest, "flotilla-org", "flotilla", 1);
-        let healthy = Subject::github(SubjectKind::ChangeRequest, "flotilla-org", "flotilla", 2);
+        let failing = github_cr(1);
+        let healthy = github_cr(2);
         let target =
             Arc::new(MemoryTarget { owned: HashSet::from([healthy.clone()]), failing: HashSet::from([failing]), ..Default::default() });
         let acks = Arc::new(Mutex::new(Vec::new()));

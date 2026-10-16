@@ -482,7 +482,7 @@ impl CrewService {
         self.leaf_subscriptions.watch_change_request_convoy_demands(namespace).await;
     }
 
-    pub(super) async fn refresh_change_request_hint(&self, hint: &flotilla_relay_protocol::Subject) -> Result<(), String> {
+    pub(super) async fn refresh_change_request_hint(&self, hint: &flotilla_address::Address) -> Result<(), String> {
         self.leaf_subscriptions.refresh_change_request_hint(hint).await
     }
 

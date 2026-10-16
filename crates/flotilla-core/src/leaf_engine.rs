@@ -247,7 +247,7 @@ impl LeafSubscriptionTable {
         self.inner.change_requests.refresh_once(subject).await
     }
 
-    pub async fn refresh_change_request_hint(&self, hint: &flotilla_relay_protocol::Subject) -> Result<(), String> {
+    pub async fn refresh_change_request_hint(&self, hint: &flotilla_address::Address) -> Result<(), String> {
         self.inner.change_requests.refresh_hint(hint).await?;
         self.inner.issues.refresh_hint(hint).await
     }

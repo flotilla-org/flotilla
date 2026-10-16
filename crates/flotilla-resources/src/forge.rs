@@ -43,6 +43,14 @@ impl Resource for Forge {
         {
             return Err(ResourceError::invalid("Forge forge_id must be a lowercase DNS label"));
         }
+        // ADR 0066 §3: `forge:github` names public GitHub with no record. A
+        // declared `github` may only extend it (for example with SSH aliases);
+        // any other forge under that id would let one address mean two forges.
+        if spec.forge_id == flotilla_address::GITHUB_FORGE_ID
+            && (spec.kind != ForgeKind::Github || spec.https_url.trim_end_matches('/') != "https://github.com")
+        {
+            return Err(ResourceError::invalid("Forge forge_id `github` is reserved for public GitHub (kind github, https://github.com)"));
+        }
         if spec.hosts.is_empty() || spec.hosts.iter().any(|host| host.trim().is_empty() || host.contains('/')) {
             return Err(ResourceError::invalid("Forge hosts must be non-empty hostnames or SSH aliases"));
         }
@@ -136,5 +144,34 @@ impl ForgeSpec {
             return Err(format!("forge repository URL requires owner and name: {remote}"));
         }
         Ok(Some((owner.to_string(), repo_name.to_string())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(forge_id: &str, kind: ForgeKind, https_url: &str) -> ForgeSpec {
+        ForgeSpec::builder()
+            .forge_id(forge_id.into())
+            .kind(kind)
+            .hosts(BTreeSet::from(["github-alias".to_string()]))
+            .https_url(https_url.into())
+            .git_ssh_host("github-alias".into())
+            .build()
+    }
+
+    fn meta(name: &str) -> InputMeta {
+        InputMeta::builder().name(name.into()).build()
+    }
+
+    // ADR 0066 §3: `forge:github` is public GitHub. A declared `github` may
+    // extend it with aliases but never name another forge.
+    #[test]
+    fn the_github_forge_id_is_reserved_for_public_github() {
+        assert!(Forge::validate_spec(&meta("github"), &spec("github", ForgeKind::Github, "https://github.com")).is_ok());
+        assert!(Forge::validate_spec(&meta("github"), &spec("github", ForgeKind::Forgejo, "https://github.com")).is_err());
+        assert!(Forge::validate_spec(&meta("github"), &spec("github", ForgeKind::Github, "https://ghe.example")).is_err());
+        assert!(Forge::validate_spec(&meta("ghe"), &spec("ghe", ForgeKind::Github, "https://ghe.example")).is_ok());
     }
 }

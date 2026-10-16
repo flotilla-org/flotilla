@@ -2,9 +2,12 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_address::{Address, Kind};
 use flotilla_protocol::LeafAddress;
-use flotilla_relay_protocol::{Subject, SubjectKind};
-use flotilla_resources::{issue_record_name, InputMeta, Issue, IssueSpec, IssueStatus, ResourceProvenance};
+use flotilla_resources::{
+    address::{canonical_stored_spelling, stored_spelling_names},
+    issue_record_name, InputMeta, Issue, IssueSpec, IssueStatus, ResourceProvenance,
+};
 use flotilla_store::ResourceBackend;
 use tokio::{
     sync::{Mutex, Notify},
@@ -26,12 +29,12 @@ impl IssueRef {
     }
 
     pub(crate) fn record_name(&self) -> String {
-        let (service, scope) = Subject::normalize_scope(&self.service, &self.scope);
+        let (service, scope) = canonical_stored_spelling(&self.service, &self.scope);
         issue_record_name(&service, &scope, self.number)
     }
 
     fn normalized(mut self) -> Self {
-        (self.service, self.scope) = Subject::normalize_scope(&self.service, &self.scope);
+        (self.service, self.scope) = canonical_stored_spelling(&self.service, &self.scope);
         self
     }
 }
@@ -191,8 +194,8 @@ impl IssueRefresher {
 
     /// Match a relay address across all namespaces with live demand. The wire
     /// subject has no namespace, while one daemon can serve several.
-    pub async fn refresh_hint(&self, hint: &Subject) -> Result<(), String> {
-        if hint.kind != SubjectKind::Issue {
+    pub async fn refresh_hint(&self, hint: &Address) -> Result<(), String> {
+        if hint.kind() != Kind::Issue {
             return Ok(());
         }
         let subjects = self
@@ -201,7 +204,7 @@ impl IssueRefresher {
             .lock()
             .await
             .keys()
-            .filter(|subject| subject.service == hint.service && subject.scope == hint.scope && subject.number == hint.number)
+            .filter(|subject| stored_spelling_names(hint, &subject.service, &subject.scope, subject.number, &[]))
             .cloned()
             .collect::<Vec<_>>();
         let mut first_error = None;
@@ -500,7 +503,7 @@ mod tests {
             Arc::new(CountingSource(calls.clone())),
             IssueRefreshCadence::default(),
         );
-        let hint: Subject = "issue/github.com/flotilla-org/flotilla/2052".parse().expect("hint");
+        let hint = flotilla_relay_protocol::parse_hint_subject("issue/github.com/flotilla-org/flotilla/2052").expect("hint");
         refresher.refresh_hint(&hint).await.expect("no demand");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let demand = uuid::Uuid::new_v4();
@@ -553,7 +556,7 @@ mod tests {
             IssueRefresher::new(backend.clone(), "reader".into(), Arc::new(CountingSource(calls.clone())), IssueRefreshCadence::default());
         let demand = uuid::Uuid::new_v4();
         refresher.demand(demand, subject, None).await.expect("demand");
-        let hint: Subject = "issue/github.com/flotilla-org/flotilla/2052".parse().expect("hint");
+        let hint = flotilla_relay_protocol::parse_hint_subject("issue/github.com/flotilla-org/flotilla/2052").expect("hint");
         refresher.refresh_hint(&hint).await.expect("foreign hint");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         refresher.release(demand).await;

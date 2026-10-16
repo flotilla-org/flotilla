@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+flotilla-address = { path = "../flotilla-address" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hmac = "0.12"

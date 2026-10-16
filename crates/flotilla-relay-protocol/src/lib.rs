@@ -5,11 +5,11 @@
 //! Installs are provisioned through the operator-authenticated [`admin`] API.
 pub mod admin;
 pub mod github;
-mod subject;
+mod hint_subject;
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::subject::{Subject, SubjectKind, SubjectParseError};
+pub use crate::hint_subject::{hint_subject, parse_hint_subject};
 
 /// A reduced producer event: "something about `subject` changed". Never carries forge content.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -5,10 +5,10 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use flotilla_address::{Address, Kind};
 use flotilla_change_request::observation::{ChangeRequestObservationSource, ChangeRequestRef};
 use flotilla_protocol::{IssueSource, ReferenceContext, Relationship, Subject as ConvoySubject, SubjectKind as ConvoySubjectKind};
 use flotilla_provider_runtime::ObservationError;
-use flotilla_relay_protocol::{Subject, SubjectKind};
 use flotilla_resources::{
     convoy_subject_rows, merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestSpec,
     ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy, InputMeta, ObservedChangeRequestState, ObservedChecks, ResourceError,
@@ -370,8 +370,8 @@ impl ChangeRequestRefresher {
 
     /// Match a relay address across all namespaces with live demand. The wire
     /// subject has no namespace, while one daemon can serve several.
-    pub async fn refresh_hint(&self, hint: &Subject) -> Result<(), String> {
-        if hint.kind != SubjectKind::ChangeRequest {
+    pub async fn refresh_hint(&self, hint: &Address) -> Result<(), String> {
+        if hint.kind() != Kind::ChangeRequest {
             return Ok(());
         }
         let subjects = self
@@ -382,9 +382,7 @@ impl ChangeRequestRefresher {
             .iter()
             .filter(|(subject, refresh)| {
                 !refresh.demands.is_empty()
-                    && subject.service == hint.service
-                    && subject.scope == hint.scope
-                    && subject.number == hint.number
+                    && flotilla_resources::address::stored_spelling_names(hint, &subject.service, &subject.scope, subject.number, &[])
             })
             .map(|(subject, _)| subject.clone())
             .collect::<Vec<_>>();
@@ -1453,7 +1451,7 @@ mod tests {
         }
         wait_for_calls(&calls, 2).await;
         let before = calls.load(Ordering::SeqCst);
-        let hint = Subject::new(SubjectKind::ChangeRequest, "github.com", "flotilla-org/flotilla", 2051);
+        let hint = flotilla_relay_protocol::parse_hint_subject("cr/github.com/flotilla-org/flotilla/2051").expect("hint");
         refresher.refresh_hint(&hint).await.expect("hint");
         assert_eq!(calls.load(Ordering::SeqCst), before + 2, "both namespaces refresh once");
 
