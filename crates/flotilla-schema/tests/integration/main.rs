@@ -1,4 +1,5 @@
 // Keep integration coverage in one executable to avoid linking the crate graph per module.
+mod change;
 mod codec;
 mod compile_fail;
 mod tables;

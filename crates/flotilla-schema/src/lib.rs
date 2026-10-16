@@ -40,6 +40,7 @@
 
 #[doc(hidden)]
 pub mod adapt;
+mod change;
 mod codec;
 mod ddl;
 mod descriptor;
@@ -53,6 +54,7 @@ mod time;
 mod traits;
 mod value;
 
+pub use change::{ChangeError, RowChange, RowOp, CHANGE_LIMITS};
 pub use codec::{DecodeError, Decoder, EncodeError, Encoder};
 pub use ddl::{quote_ident, render_ddl, render_ddl_with, DdlMode};
 pub use descriptor::{

@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 /// The stable numeric code of a resource kind. Codes never change once a kind is stored.
@@ -16,9 +16,24 @@ impl fmt::Display for KindCode {
     }
 }
 
-/// SHA-256 of an object's canonical bytes; the key of the `objects` table.
+/// SHA-256 of an object's canonical bytes; the key of the `objects` table. Serde writes it as
+/// a 32-byte byte string.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hash(pub [u8; 32]);
+
+impl Serialize for Hash {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Hash {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Hash, D::Error> {
+        let bytes = byte_string::deserialize(deserializer)?;
+        let len = bytes.len();
+        bytes.try_into().map(Hash).map_err(|_| de::Error::invalid_length(len, &"32 bytes"))
+    }
+}
 
 impl Hash {
     pub fn of(bytes: &[u8]) -> Hash {
@@ -46,16 +61,55 @@ pub struct Identity {
 }
 
 /// One logical column value. `Str`, `Ref` and `Object` are resolved to local ids only by a backend.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Serde (used by change-log entries only) names variants with one letter, writes blobs as byte
+/// strings and references as `[kind, name, home]`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Value {
+    #[serde(rename = "n")]
     Null,
+    #[serde(rename = "i")]
     Int(i64),
+    #[serde(rename = "t")]
     Text(String),
+    #[serde(rename = "b", with = "byte_string")]
     Blob(Vec<u8>),
     /// An interned string.
+    #[serde(rename = "s")]
     Str(String),
+    #[serde(rename = "r", with = "identity_tuple")]
     Ref(Identity),
+    #[serde(rename = "o")]
     Object(Hash),
+}
+
+/// Bytes as a CBOR byte string rather than serde's default array of integers.
+pub(crate) mod byte_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        flotilla_cbor::Bytes::deserialize(deserializer).map(|bytes| bytes.0)
+    }
+}
+
+/// A reference as a three-element array; the field names would outweigh the values.
+mod identity_tuple {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{Identity, KindCode};
+
+    pub fn serialize<S: Serializer>(identity: &Identity, serializer: S) -> Result<S::Ok, S::Error> {
+        (identity.kind, &identity.name, &identity.home).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Identity, D::Error> {
+        let (kind, name, home) = <(KindCode, String, String)>::deserialize(deserializer)?;
+        Ok(Identity { kind, name, home })
+    }
 }
 
 impl Value {
