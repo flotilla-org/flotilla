@@ -1,44 +1,79 @@
-//! Append-only record lists: the value type of `#[store(records)]` and `#[store(history)]` fields.
+//! Append-only records: the value type of `#[store(records)]` and `#[store(history)]` fields, and
+//! of the state-machine engine's per-resource logs.
+//!
+//! A record has no identity, watch or lifecycle of its own (ADR 0064). Positions are dense and
+//! never reused, and nothing removes or rewrites a row through this type. Each row carries the
+//! owner's version at the write that appended it, which orders rows across an owner's tables.
+//! Storage stamps that version: every row a write appends is stored with the write's sequence,
+//! whatever the in-memory value holds, so a loaded row always carries the stored stamp.
 
-use std::{ops::Index, slice};
+use std::{fmt, slice};
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 
-/// An append-only list. A row's position is its index: dense, assigned by [`Records::push`] and
-/// never reused, so a stored row keeps its key for the life of its owner. There is no remove,
-/// insert or `get_mut`; a `records` row may be replaced in place through [`Records::replace`], which
-/// the store refuses for `history` fields when the owner is written.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A row's place in its owner's table, starting at zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Records<T> {
-    rows: Vec<T>,
+pub struct Position(pub u32);
+
+impl fmt::Display for Position {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
-impl<T> Records<T> {
-    pub fn new() -> Records<T> {
+/// One appended row.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RecordRow<R> {
+    pub position: Position,
+    /// The owner's version after the write that appended this row. The store stamps rows it
+    /// appends with that write's sequence, but the value is still encoded first, so it must fit
+    /// a stored INTEGER (at most `i64::MAX`, as every home sequence does); above that the write
+    /// fails with `EncodeError::OutOfRange`.
+    pub version: u64,
+    pub record: R,
+}
+
+/// An owner's append-only rows of `R`.
+///
+/// Serde sees a sequence of rows (`position`, `version`, `record`): a view for logs and tests, not
+/// storage, which goes through the derive. Deserializing refuses positions that are not dense.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct Records<R> {
+    rows: Vec<RecordRow<R>>,
+}
+
+impl<R> Records<R> {
+    pub fn new() -> Records<R> {
         Records { rows: Vec::new() }
     }
 
-    /// Appends a row and returns its position.
-    pub fn push(&mut self, row: T) -> usize {
-        self.rows.push(row);
-        self.rows.len() - 1
-    }
-
-    /// Replaces the row at `pos`, returning the previous one.
+    /// Appends `record` at the next position, stamped with `version`, and returns the new row.
     ///
     /// # Panics
     ///
-    /// When `pos` is not a position of this list, like slice indexing.
-    pub fn replace(&mut self, pos: usize, row: T) -> T {
-        std::mem::replace(&mut self.rows[pos], row)
+    /// When every `u32` position is taken: positions would repeat past it, and `u32::MAX` rows on
+    /// one resource is far beyond any archive window.
+    pub fn append(&mut self, version: u64, record: R) -> &RecordRow<R> {
+        let position = Position(u32::try_from(self.rows.len()).expect("a record table holds at most u32::MAX + 1 rows"));
+        self.rows.push(RecordRow { position, version, record });
+        &self.rows[self.rows.len() - 1]
     }
 
-    pub fn get(&self, pos: usize) -> Option<&T> {
-        self.rows.get(pos)
+    pub fn rows(&self) -> &[RecordRow<R>] {
+        &self.rows
     }
 
-    pub fn last(&self) -> Option<&T> {
+    pub fn iter(&self) -> slice::Iter<'_, RecordRow<R>> {
+        self.rows.iter()
+    }
+
+    pub fn get(&self, position: Position) -> Option<&RecordRow<R>> {
+        self.rows.get(position.0 as usize)
+    }
+
+    pub fn last(&self) -> Option<&RecordRow<R>> {
         self.rows.last()
     }
 
@@ -49,67 +84,56 @@ impl<T> Records<T> {
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
-
-    pub fn iter(&self) -> slice::Iter<'_, T> {
-        self.rows.iter()
-    }
-
-    pub fn as_slice(&self) -> &[T] {
-        &self.rows
-    }
 }
 
-impl<T> Default for Records<T> {
-    fn default() -> Records<T> {
+impl<R> Default for Records<R> {
+    fn default() -> Records<R> {
         Records::new()
     }
 }
 
-impl<T> From<Vec<T>> for Records<T> {
-    /// Positions follow the vector's order.
-    fn from(rows: Vec<T>) -> Records<T> {
-        Records { rows }
-    }
-}
+impl<'a, R> IntoIterator for &'a Records<R> {
+    type Item = &'a RecordRow<R>;
+    type IntoIter = slice::Iter<'a, RecordRow<R>>;
 
-impl<T> FromIterator<T> for Records<T> {
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Records<T> {
-        Records { rows: iter.into_iter().collect() }
-    }
-}
-
-impl<T> Index<usize> for Records<T> {
-    type Output = T;
-
-    fn index(&self, pos: usize) -> &T {
-        &self.rows[pos]
-    }
-}
-
-impl<'a, T> IntoIterator for &'a Records<T> {
-    type Item = &'a T;
-    type IntoIter = slice::Iter<'a, T>;
-
-    fn into_iter(self) -> slice::Iter<'a, T> {
+    fn into_iter(self) -> slice::Iter<'a, RecordRow<R>> {
         self.rows.iter()
+    }
+}
+
+impl<'de, R: Deserialize<'de>> Deserialize<'de> for Records<R> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Records<R>, D::Error> {
+        let rows = Vec::<RecordRow<R>>::deserialize(deserializer)?;
+        for (expected, row) in rows.iter().enumerate() {
+            if row.position.0 as usize != expected {
+                return Err(de::Error::custom(format_args!("record at position {} where {expected} was expected", row.position)));
+            }
+        }
+        Ok(Records { rows })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Records;
+    use super::{Position, RecordRow, Records};
 
-    // Behaviour (DESIGN Records): positions are dense indexes assigned by push; replace keeps the
-    // position; serde sees a plain list.
+    // Behaviour (#3320 ruling 3): append assigns the next dense position and keeps the version it
+    // is given; serde is a sequence of rows and refuses positions that are not dense.
     #[test]
-    fn positions_are_dense_and_serde_is_transparent() {
+    fn positions_are_dense_and_rows_keep_their_version() {
         let mut records = Records::new();
-        assert_eq!(records.push("a"), 0);
-        assert_eq!(records.push("b"), 1);
-        assert_eq!(records.replace(0, "A"), "a");
-        assert_eq!((records.len(), records.get(0), records.last()), (2, Some(&"A"), Some(&"b")));
-        assert_eq!(serde_json::to_string(&records).expect("json"), r#"["A","b"]"#);
-        let back: Records<String> = serde_json::from_str(r#"["x"]"#).expect("json");
-        assert_eq!(back.as_slice(), ["x".to_owned()]);
+        assert_eq!(records.append(7, "a").position, Position(0));
+        assert_eq!(records.append(9, "b"), &RecordRow { position: Position(1), version: 9, record: "b" });
+        assert_eq!(
+            (records.len(), records.get(Position(0)).map(|row| row.version), records.last().map(|row| row.record)),
+            (2, Some(7), Some("b"))
+        );
+        assert_eq!(records.get(Position(2)), None);
+        let json = serde_json::to_string(&records).expect("json");
+        assert_eq!(json, r#"[{"position":0,"version":7,"record":"a"},{"position":1,"version":9,"record":"b"}]"#);
+        let back: Records<String> = serde_json::from_str(&json).expect("json");
+        assert_eq!(back.iter().map(|row| (row.version, row.record.as_str())).collect::<Vec<_>>(), [(7, "a"), (9, "b")]);
+        let gap = r#"[{"position":1,"version":7,"record":"a"}]"#;
+        assert!(serde_json::from_str::<Records<String>>(gap).is_err());
     }
 }

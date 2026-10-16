@@ -1,5 +1,0 @@
-error: a stored type cannot contain itself; the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
- --> tests/ui/direct_recursion_child.rs:7:19
-  |
-7 |     children: Vec<Self>,
-  |                   ^^^^

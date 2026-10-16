@@ -1,5 +1,0 @@
-error: variant `Closed` needs a stable `#[store(code = N)]`; the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
- --> tests/ui/missing_code.rs:7:5
-  |
-7 |     Closed,
-  |     ^^^^^^

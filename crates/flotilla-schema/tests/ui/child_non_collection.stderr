@@ -1,5 +1,0 @@
-error: `child` needs a Vec, BTreeMap or BTreeSet field; the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
- --> tests/ui/child_non_collection.rs:7:11
-  |
-7 |     note: String,
-  |           ^^^^^^

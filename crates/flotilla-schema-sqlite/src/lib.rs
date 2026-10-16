@@ -33,5 +33,5 @@ mod store;
 
 pub use error::{Malformed, StoreError};
 pub use query::{Cursor, Page, MAX_PAGE};
-pub use shared::{schema_ddl, MEDIA_CBOR};
+pub use shared::schema_ddl;
 pub use store::{Applied, Loaded, Read, ResourceId, Snapshot, Stamp, Store, StoreOptions, Write, MAX_CHANGES_PAGE_BYTES};

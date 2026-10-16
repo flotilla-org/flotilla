@@ -1,5 +1,0 @@
-error: a `State` field needs a storage attribute; the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
-  --> tests/ui/unattributed_state.rs:12:12
-   |
-12 |     phase: State<Phase>,
-   |            ^^^^^^^^^^^^

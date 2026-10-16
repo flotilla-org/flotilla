@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     codec::{DecodeError, Decoder, EncodeError, Encoder},
-    descriptor::{ColumnType, TableRole},
+    descriptor::{ColumnType, TableRole, RECORD_VERSION},
     frozen::{Freezable, Frozen},
     layout::Layout,
     records::Records,
@@ -351,7 +351,8 @@ impl<K: KeyColumn + Ord> Adapter<BTreeSet<K>> for AsChild {
     }
 }
 
-/// `#[store(records)]`: rows keyed by `pos`, appended and replaceable, never removed.
+/// `#[store(records)]`: rows keyed by `pos`, appended and never removed. Until edges (#3320 layer
+/// 7), the store refuses any change to an existing row through a whole-value write.
 #[doc(hidden)]
 pub struct AsRecords;
 
@@ -365,11 +366,15 @@ macro_rules! records_adapter {
             const TABLES: usize = 1 + T::TABLES;
 
             fn layout(layout: &mut Layout, name: &str, _required: bool) {
-                layout_list::<T>(layout, name, $role);
+                layout.table(name, $role, |layout| {
+                    layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
+                    layout.column(RECORD_VERSION, ColumnType::Integer, true);
+                    T::layout_row(layout);
+                });
             }
 
             fn encode(value: &Records<T>, e: &mut Encoder) -> Result<(), EncodeError> {
-                encode_list(value, e)
+                encode_records(value, e)
             }
 
             fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError> {
@@ -377,7 +382,7 @@ macro_rules! records_adapter {
             }
 
             fn decode(d: &mut Decoder) -> Result<Option<Records<T>>, DecodeError> {
-                decode_list(d).map(|rows| Some(Records::from(rows)))
+                decode_records(d).map(Some)
             }
 
             fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {
@@ -398,9 +403,9 @@ fn layout_list<T: Element>(layout: &mut Layout, name: &str, role: TableRole) {
 }
 
 /// Rows keyed by their index.
-fn encode_list<'a, T: Element + 'a>(rows: impl IntoIterator<Item = &'a T>, e: &mut Encoder) -> Result<(), EncodeError> {
+fn encode_list<T: Element>(rows: &[T], e: &mut Encoder) -> Result<(), EncodeError> {
     e.table(T::TABLES, |e| {
-        for (pos, row) in rows.into_iter().enumerate() {
+        for (pos, row) in rows.iter().enumerate() {
             e.row(|e| {
                 e.key(|e| {
                     // A list long enough to overflow i64 cannot be in memory.
@@ -414,25 +419,64 @@ fn encode_list<'a, T: Element + 'a>(rows: impl IntoIterator<Item = &'a T>, e: &m
     })
 }
 
+/// Rows keyed by their position, each with its version stamp before the record's columns.
+fn encode_records<T: Element>(records: &Records<T>, e: &mut Encoder) -> Result<(), EncodeError> {
+    e.table(T::TABLES, |e| {
+        for row in records {
+            e.row(|e| {
+                e.key(|e| {
+                    e.put(Value::Int(i64::from(row.position.0)));
+                    Ok(())
+                })?;
+                row.version.encode(e).map_err(|error| error.at(RECORD_VERSION))?;
+                row.record.encode_row(e)
+            })?;
+        }
+        Ok(())
+    })
+}
+
 /// Rows in position order, refusing a gap or a negative position: positions are dense indexes.
 fn decode_list<T: Element>(d: &mut Decoder) -> Result<Vec<T>, DecodeError> {
     d.table(T::TABLES, |d| {
         let mut rows = Vec::new();
-        loop {
+        while let Some(row) = d.row(|d| {
             let expected = rows.len();
-            let row = d.row(|d| {
-                match d.key(Decoder::take)? {
-                    Value::Int(found) if usize::try_from(found).is_ok_and(|found| found == expected) => {}
-                    Value::Int(found) => return Err(DecodeError::Position { column: "pos".to_owned(), expected, found }),
-                    other => return Err(DecodeError::unexpected("integer", &other).at("pos")),
-                }
-                T::decode_row(d)
-            })?;
-            match row {
-                Some(row) => rows.push(row),
-                None => return Ok(rows),
+            match d.key(Decoder::take)? {
+                Value::Int(found) if usize::try_from(found).is_ok_and(|found| found == expected) => {}
+                Value::Int(found) => return Err(DecodeError::Position { column: "pos".to_owned(), expected, found }),
+                other => return Err(DecodeError::unexpected("integer", &other).at("pos")),
             }
+            T::decode_row(d)
+        })? {
+            rows.push(row);
         }
+        Ok(rows)
+    })
+}
+
+/// Records in position order with their stored version stamps. A position outside `u32` is
+/// `OutOfRange` (before the density check, so it is reported as such wherever it is stored); a gap
+/// is `Position`.
+fn decode_records<T: Element>(d: &mut Decoder) -> Result<Records<T>, DecodeError> {
+    d.table(T::TABLES, |d| {
+        let mut records = Records::new();
+        while let Some((version, record)) = d.row(|d| {
+            let expected = records.len();
+            match d.key(Decoder::take)? {
+                Value::Int(found) if u32::try_from(found).is_err() => {
+                    return Err(DecodeError::OutOfRange { column: "pos".to_owned(), value: found })
+                }
+                Value::Int(found) if usize::try_from(found).is_ok_and(|found| found == expected) => {}
+                Value::Int(found) => return Err(DecodeError::Position { column: "pos".to_owned(), expected, found }),
+                other => return Err(DecodeError::unexpected("integer", &other).at("pos")),
+            }
+            let version = u64::decode(d).map_err(|error| error.at(RECORD_VERSION))?.ok_or_else(|| DecodeError::missing(RECORD_VERSION))?;
+            Ok((version, T::decode_row(d)?))
+        })? {
+            records.append(version, record);
+        }
+        Ok(records)
     })
 }
 

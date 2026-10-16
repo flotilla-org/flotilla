@@ -36,7 +36,7 @@ fn values(tc: &TestCase) -> Vec<Value> {
 fn op(tc: &TestCase) -> RowOp {
     let table = || tc.draw(gs::text().max_size(6));
     match tc.draw(gs::integers::<u8>().min_value(0).max_value(4)) {
-        0 => RowOp::PutObject { hash: hash(tc), media: tc.draw(gs::integers::<u8>()), bytes: tc.draw(gs::binary().max_size(16)) },
+        0 => RowOp::PutObject { hash: hash(tc), bytes: tc.draw(gs::binary().max_size(16)) },
         1 => RowOp::Insert { table: table(), key: values(tc), values: values(tc) },
         2 => RowOp::Update { table: table(), key: values(tc), values: values(tc) },
         3 => RowOp::Delete { table: table(), key: values(tc) },
@@ -70,14 +70,14 @@ fn insert(n: i64) -> RowOp {
 #[test]
 fn limits_admit_a_maximal_frozen_document_with_its_rows() {
     let bytes = vec![7u8; 1024 * 1024];
-    let mut ops = vec![RowOp::PutObject { hash: Hash::of(&bytes), media: 1, bytes }];
+    let mut ops = vec![RowOp::PutObject { hash: Hash::of(&bytes), bytes }];
     ops.extend((0..10_000).map(insert));
     let change = RowChange { kind: KindCode(1), name: "m".into(), home: "h".into(), home_seq: 1, prev_seq: 0, ops };
     let encoded = change.encode().expect("a maximal document fits");
     assert_eq!(RowChange::decode(&encoded).expect("decode"), change);
 
     let bytes = vec![7u8; 1024 * 1024 + 1];
-    let over = RowChange { ops: vec![RowOp::PutObject { hash: Hash::of(&bytes), media: 1, bytes }], ..change };
+    let over = RowChange { ops: vec![RowOp::PutObject { hash: Hash::of(&bytes), bytes }], ..change };
     assert_eq!(over.encode().expect_err("over the byte-string bound").kind(), ErrorKind::ByteStringLimit);
 }
 
@@ -98,4 +98,17 @@ fn a_hash_of_the_wrong_length_is_refused() {
     bytes[at + 1] = 0x1f;
     bytes.remove(at + 2);
     assert!(RowChange::decode(&bytes).is_err());
+}
+
+// Behaviour (#3320 ruling 5): an object travels as its hash and its bytes only, which are always
+// ADR 0063 canonical CBOR, so the stored entry has no media field: the op encodes as exactly
+// `{"p": {"b": bytes, "h": hash}}` (canonical key order) and decodes back.
+#[test]
+fn objects_travel_without_a_media_code() {
+    let op = RowOp::PutObject { hash: Hash([1; 32]), bytes: vec![2, 3] };
+    let encoded = flotilla_cbor::to_vec(&op, &flotilla_schema::CHANGE_LIMITS).expect("encode");
+    let mut expected = vec![0xa1, 0x61, b'p', 0xa2, 0x61, b'b', 0x42, 2, 3, 0x61, b'h', 0x58, 0x20];
+    expected.extend([1; 32]);
+    assert_eq!(encoded, expected);
+    assert_eq!(flotilla_cbor::from_slice::<RowOp>(&encoded, &flotilla_schema::CHANGE_LIMITS).expect("decode"), op);
 }

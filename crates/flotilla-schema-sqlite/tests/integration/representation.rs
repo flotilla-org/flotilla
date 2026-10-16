@@ -1,5 +1,5 @@
 use chrono::DateTime;
-use flotilla_schema::{EncodeError, Identity, Kind, KindCode, Ref, Timestamp};
+use flotilla_schema::{EncodeError, Identity, Kind, KindCode, Records, Ref, Timestamp};
 use flotilla_schema_sqlite::StoreError;
 
 use crate::fixtures::{
@@ -91,7 +91,9 @@ fn equal_interned_strings_share_one_row() {
     };
     let event = MessageEdgeEvent { edge, at: Timestamp(1), writer: "carol".into(), inputs: Vec::new() };
     for name in ["a", "b"] {
-        let message = Message { sender: "carol".into(), edges: vec![event.clone()].into(), ..Message::sample() };
+        let mut edges = Records::new();
+        edges.append(0, event.clone());
+        let message = Message { sender: "carol".into(), edges, ..Message::sample() };
         write.insert(name, &message).expect("insert");
     }
     write.commit().expect("commit");

@@ -1,6 +1,8 @@
 //! The Convoy-shaped fixture, transcribed from the #3208 §4.1 sketch (itself written from
 //! `flotilla_resources::convoy`): frozen workflow and placement snapshots, a repositories child,
-//! an inputs map of a data enum, and deliverables as `records` whose evidence is `records` too.
+//! an inputs map of a data enum, and deliverables as `records` whose evidence is `records` too:
+//! rows that change only through a declared edge (#3320 ruling 2), so a whole-value write only
+//! appends deliverables, and evidence to new or kept deliverables.
 //!
 //! Modelling decisions the storage list forces:
 //! - The workflow snapshot is a serde document with nested maps and lists, stored once per
@@ -17,7 +19,7 @@ use flotilla_schema::{Frozen, Records, Ref, State, Stored, Timestamp};
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
-use super::{code_enum, evolve_records, key, list, name, reference, text, timestamp, Fixture, Pick, SHAPES};
+use super::{code_enum, evolve_records, key, list, name, records, reference, stamp, text, timestamp, Fixture, Pick, SHAPES};
 use crate::fixtures::AgentSession;
 
 /// A minimal target kind for `Convoy::project`.
@@ -232,7 +234,7 @@ impl Evidence {
 
 impl Deliverable {
     fn generate(tc: &TestCase, pick: Pick) -> Deliverable {
-        Deliverable { evidence: list(tc, pick, 2, |pick| Evidence::generate(tc, pick)).into(), ..Deliverable::spec(tc, pick) }
+        Deliverable { evidence: records(tc, pick, 2, |pick| Evidence::generate(tc, pick)), ..Deliverable::spec(tc, pick) }
     }
 
     /// The deliverable's own fields, with no evidence.
@@ -253,13 +255,17 @@ impl Deliverable {
         }
     }
 
-    /// Replaced in place: fields drawn afresh, evidence kept append-only (records in records).
+    /// Kept: its own fields unchanged, evidence appended (records in records).
     fn evolve(&self, tc: &TestCase, pick: Pick) -> Deliverable {
-        let replace = |_: &Evidence, pick: Pick| Evidence::generate(tc, pick);
         Deliverable {
-            evidence: evolve_records(tc, pick, &self.evidence, Some(&replace), |pick| Evidence::generate(tc, pick)),
-            ..Deliverable::spec(tc, pick)
+            evidence: evolve_records(tc, pick, &self.evidence, |evidence, _| evidence.clone(), |pick| Evidence::generate(tc, pick)),
+            ..self.clone()
         }
+    }
+
+    fn stamped(&self, before: Option<&Deliverable>, version: u64) -> Deliverable {
+        let evidence = stamp(&self.evidence, before.map(|before| &before.evidence), version, |evidence, _| evidence.clone());
+        Deliverable { evidence, ..self.clone() }
     }
 }
 
@@ -287,20 +293,32 @@ impl Fixture for Convoy {
                 workspace_slug: text(tc),
             }),
             inputs: map(tc, pick, 3, |pick| InputValue::generate(tc, pick)),
-            deliverables: list(tc, pick, 2, |pick| Deliverable::generate(tc, pick)).into(),
+            deliverables: records(tc, pick, 2, |pick| Deliverable::generate(tc, pick)),
             state: State::new(code_enum(tc, pick, &[Open, Delivered, Abandoned]), timestamp(tc)),
         }
     }
 
-    /// Spec and child tables drawn afresh; deliverables replaced in place (their evidence evolving
-    /// append-only) or appended.
+    /// Spec and child tables drawn afresh; deliverables kept (their evidence appended to) or
+    /// appended.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> Convoy {
         let spec = Convoy::generate(tc, pick);
-        let replace = |deliverable: &Deliverable, pick: Pick| deliverable.evolve(tc, pick);
         Convoy {
-            deliverables: evolve_records(tc, pick, &self.deliverables, Some(&replace), |pick| Deliverable::generate(tc, pick)),
+            deliverables: evolve_records(
+                tc,
+                pick,
+                &self.deliverables,
+                |deliverable, pick| deliverable.evolve(tc, pick),
+                |pick| Deliverable::generate(tc, pick),
+            ),
             ..spec
         }
+    }
+
+    fn stamped(&self, before: Option<&Convoy>, version: u64) -> Convoy {
+        let deliverables = stamp(&self.deliverables, before.map(|before| &before.deliverables), version, |deliverable, before| {
+            deliverable.stamped(before, version)
+        });
+        Convoy { deliverables, ..self.clone() }
     }
 }
 

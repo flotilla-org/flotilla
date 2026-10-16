@@ -5,7 +5,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use flotilla_schema::{Hash, Kind, KindCode, RowChange, RowOp, Value};
+use flotilla_schema::{Hash, Kind, KindCode, RowChange, RowOp, TableRole, Value};
 use flotilla_schema_sqlite::{Applied, Malformed, ResourceId, Snapshot, Stamp, Store, StoreError, StoreOptions, Write};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
@@ -63,6 +63,15 @@ fn step<K: Fixture>(tc: &TestCase, write: &mut Write<'_>, live: &mut Option<Stam
     };
     assert_eq!((change.kind, change.name.as_str(), change.home.as_str()), (K::CODE, name, LOCAL));
     assert!(change.home_seq > *last);
+    // Every records or history row the write appended is stamped with its sequence.
+    let set = K::table_set();
+    for op in &change.ops {
+        let RowOp::Insert { table, values, .. } = op else { continue };
+        let role = set.tables.iter().find(|candidate| &candidate.name == table).expect("a table of the kind").role;
+        if matches!(role, TableRole::Records | TableRole::History) {
+            assert_eq!(values[0], Value::Int(i64::try_from(change.home_seq).expect("stored")), "{table} row stamped");
+        }
+    }
     *last = change.home_seq;
 }
 
@@ -107,8 +116,8 @@ fn string_id(store: Store, string: &str) -> (Store, i64) {
 // objects) although the two databases number strings and identities differently. The target
 // relays the same log and the same home sequence. Replaying again is idempotent: every change is
 // a `Duplicate` and nothing moves. Writes span all three fixture kinds, two names each, with
-// inserts, allowed updates (records replaced and appended, history appended), deletes and
-// re-inserts, over several transactions.
+// inserts, allowed updates (records and history appended), deletes and re-inserts, over several
+// transactions. Every records and history row a change inserts carries the change's sequence.
 #[hegel::test]
 fn the_change_log_replays_into_another_store(tc: TestCase) {
     let mut source = store();
@@ -234,7 +243,7 @@ fn every_change_carries_the_objects_its_rows_name() {
         [1, 1, 0, 0, 1],
         "two inserts, a root update keeping the snapshot, a child update, a root update replacing it"
     );
-    let RowOp::PutObject { hash, media: 1, bytes } = &changes[1].ops[0] else { panic!("object first: {:?}", changes[1]) };
+    let RowOp::PutObject { hash, bytes } = &changes[1].ops[0] else { panic!("object first: {:?}", changes[1]) };
     assert_eq!(Hash::of(bytes), *hash);
 
     let mut target = replica();
@@ -347,7 +356,7 @@ fn sequences_never_repeat_after_log_rows_are_deleted() {
 fn seed(snapshot: &Snapshot) -> RowChange {
     let set = registry().get(snapshot.kind).expect("registered").clone();
     let mut ops: Vec<RowOp> =
-        snapshot.rows.objects.iter().map(|(hash, bytes)| RowOp::PutObject { hash: *hash, media: 1, bytes: bytes.clone() }).collect();
+        snapshot.rows.objects.iter().map(|(hash, bytes)| RowOp::PutObject { hash: *hash, bytes: bytes.clone() }).collect();
     for (table, rows) in set.tables.iter().zip(&snapshot.rows.tables) {
         ops.extend(rows.iter().map(|row| RowOp::Insert { table: table.name.clone(), key: row.key.clone(), values: row.values.clone() }));
     }
@@ -580,23 +589,6 @@ fn change_pages_respect_their_limit() {
     let id = read.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
     assert!(matches!(read.changes(id, 0, 0), Err(StoreError::ZeroLimit)));
     assert_eq!(read.changes(id, 0, u32::MAX).expect("page").len(), 3);
-}
-
-// Behaviour (#3338 review): ADR 0063 CBOR is the only object media; `apply` refuses a
-// `PutObject` of any other media before any statement runs, writing nothing.
-#[test]
-fn objects_of_another_media_are_refused() {
-    let mut source = store();
-    let mut write = source.write().expect("write");
-    write.insert("c", &Convoy::sample(0)).expect("insert");
-    write.commit().expect("commit");
-    let mut change = first_change(&mut source, LOCAL);
-    let Some(RowOp::PutObject { media, .. }) = change.ops.first_mut() else { panic!("object first: {change:?}") };
-    *media = 2;
-    let mut target = replica();
-    let mut write = target.write().expect("write");
-    assert!(matches!(write.apply(&change), Err(StoreError::MalformedChange(Malformed::Media { media: 2 }))));
-    assert_eq!(write.resolve(Convoy::CODE, "c", LOCAL).expect("resolve"), None);
 }
 
 // Behaviour: a home numbers each change once. A change for another resource that reuses a

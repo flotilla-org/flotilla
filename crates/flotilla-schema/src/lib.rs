@@ -59,14 +59,14 @@ pub use change::{ChangeError, RowChange, RowOp, CHANGE_LIMITS};
 pub use codec::{DecodeError, Decoder, EncodeError, Encoder};
 pub use ddl::{quote_ident, render_ddl, render_ddl_with, DdlMode};
 pub use descriptor::{
-    ColumnDef, ColumnType, Condition, DescriptorError, Guard, Index, IndexProblem, Table, TableRole, TableSet, RESERVED_CHILD_COLUMNS,
-    RESERVED_ROOT_COLUMNS, SHARED_NAMES,
+    ColumnDef, ColumnType, Condition, DescriptorError, Guard, Index, IndexProblem, Table, TableRole, TableSet, RECORD_VERSION,
+    RESERVED_CHILD_COLUMNS, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES,
 };
 pub use flotilla_schema_derive::Stored;
 pub use frozen::{Freezable, Frozen};
 pub use layout::{snake_case, Layout};
 pub use query::{interned_value, key_value, IndexQuery};
-pub use records::Records;
+pub use records::{Position, RecordRow, Records};
 pub use reference::Ref;
 pub use registry::{KindRegistry, RegistryError};
 pub use state::State;

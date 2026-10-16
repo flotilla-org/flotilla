@@ -26,8 +26,9 @@ pub enum StoreError {
     Conflict { id: ResourceId, expected: u64 },
     #[error("a {kind} resource named {name} already exists here")]
     Exists { kind: KindCode, name: String },
-    /// A `records` row may be replaced but never removed.
-    #[error("table {table}: records rows cannot be removed")]
+    /// A `records` row is never removed, and changes only through a declared edge: a
+    /// whole-value write may append rows but not change or remove an existing one.
+    #[error("table {table}: records rows are appended only through a whole-value write")]
     AppendOnly { table: String },
     /// A `history` row is never changed or removed.
     #[error("table {table}: history rows are immutable")]
@@ -78,9 +79,6 @@ pub enum Malformed {
     /// A row names an object the change puts only after it.
     #[error("object {hash:?} is named before the change puts it")]
     ObjectOrder { hash: Hash },
-    /// A `PutObject` of a media other than ADR 0063 CBOR, the only media today.
-    #[error("object media {media} is not CBOR")]
-    Media { media: u8 },
     /// A home sequence this store already logged for another resource of that home: a home
     /// numbers each change once, so the sender reused it.
     #[error("home sequence {home_seq} of {home} is already logged")]

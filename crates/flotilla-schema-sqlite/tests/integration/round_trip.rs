@@ -3,9 +3,10 @@ use hegel::TestCase;
 
 use crate::fixtures::{store, Convoy, Fixture, Message, Pick, TerminalSession, LOCAL};
 
-/// Inserts `first`, checks that the snapshot and `load` decode to it, updates to `second` and
-/// checks the result again.
-fn insert_then_update<K: Fixture>(store: &mut Store, name: &str, first: &K, second: &K) {
+/// Inserts `first`, checks that the snapshot and `load` decode to it with every record stamped by
+/// the insert, updates the loaded value to `evolve(loaded)` and checks the result again: rows
+/// the update appended carry its version, earlier rows keep theirs.
+fn insert_then_update<K: Fixture>(store: &mut Store, name: &str, first: &K, evolve: impl FnOnce(&K) -> K) {
     let mut write = store.write().expect("write");
     let inserted = write.insert(name, first).expect("insert");
     write.commit().expect("commit");
@@ -14,15 +15,17 @@ fn insert_then_update<K: Fixture>(store: &mut Store, name: &str, first: &K, seco
     let snapshot = read.load_snapshot(inserted.id).expect("load").expect("present");
     assert_eq!((snapshot.kind, snapshot.name.as_str(), snapshot.home.as_str()), (K::CODE, name, LOCAL));
     assert_eq!(snapshot.version, inserted.version);
-    assert_eq!(snapshot.decode::<K>().expect("decode"), first.stored());
+    let expected = first.stamped(None, inserted.version).stored();
+    assert_eq!(snapshot.decode::<K>().expect("decode"), expected);
     let loaded = read.load::<K>(inserted.id).expect("load").expect("present");
-    assert_eq!(loaded.value, first.stored());
+    assert_eq!(loaded.value, expected);
     drop(read);
 
+    let second = evolve(&loaded.value);
     let mut write = store.write().expect("write");
-    let updated = write.update(&loaded, second).expect("an evolved value is an allowed update");
+    let updated = write.update(&loaded, &second).expect("an evolved value is an allowed update");
     write.commit().expect("commit");
-    if second.stored() == first.stored() {
+    if second.stored() == loaded.value {
         assert_eq!(updated, inserted, "an update with no row changes is a no-op");
     } else {
         assert!(updated.version > inserted.version);
@@ -31,15 +34,14 @@ fn insert_then_update<K: Fixture>(store: &mut Store, name: &str, first: &K, seco
     let mut read = store.read().expect("read");
     let snapshot = read.load_snapshot(inserted.id).expect("load").expect("present");
     assert_eq!(snapshot.version, updated.version);
-    assert_eq!(snapshot.decode::<K>().expect("decode"), second.stored());
+    assert_eq!(snapshot.decode::<K>().expect("decode"), second.stamped(Some(&loaded.value), updated.version).stored());
 }
 
-/// Drawn values: insert, then an allowed update (spec and child tables drawn afresh, records
-/// replaced in place and appended, history appended).
+/// Drawn values: insert, then an allowed update (spec and child tables drawn afresh, records and
+/// history appended).
 fn drawn<K: Fixture>(tc: &TestCase) {
     let first = K::generate(tc, Pick::Draw);
-    let second = first.evolve(tc, Pick::Draw);
-    insert_then_update(&mut store(), "r", &first, &second);
+    insert_then_update(&mut store(), "r", &first, |loaded| loaded.evolve(tc, Pick::Draw));
 }
 
 /// Covering values: each index's value, updated to the next index's shapes, so every enum also
@@ -48,15 +50,14 @@ fn covering<K: Fixture>(tc: &TestCase) {
     let mut store = store();
     for index in 0..K::COVERING {
         let first = K::generate(tc, Pick::Cover(index));
-        let second = first.evolve(tc, Pick::Cover((index + 1) % K::COVERING));
-        insert_then_update(&mut store, &format!("r{index}"), &first, &second);
+        insert_then_update(&mut store, &format!("r{index}"), &first, |loaded| loaded.evolve(tc, Pick::Cover((index + 1) % K::COVERING)));
     }
 }
 
 // Behaviour (#3320 round trip): insert, then load_snapshot and decode, gives back the value with
-// times truncated to microseconds; the same holds after a generated update with spec child
-// changes, records appends and in-place replaces, and history appends. `load` agrees with the
-// snapshot, and an update that changes rows takes a later version.
+// times truncated to microseconds and each record stamped with the version that appended it; the
+// same holds after a generated update with spec child changes and records and history appends.
+// `load` agrees with the snapshot, and an update that changes rows takes a later version.
 #[hegel::test]
 fn message_round_trips_through_insert_and_update(tc: TestCase) {
     drawn::<Message>(&tc);
