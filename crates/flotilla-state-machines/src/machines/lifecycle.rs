@@ -7,14 +7,21 @@
 //! are spent. [`Lifecycle<K>`] is that machine, with each kind's opaque
 //! request as its spec; the state carries the realised identity and the cause
 //! given up with.
+//!
+//! Storage: the engine provides the storable state ([`LifecycleState`]) and
+//! history ([`LifecycleEvent`] and `Attempt`); a lifecycle kind's stored row
+//! (its request's columns, `#[store(state)] State<LifecycleState>`, the edge
+//! log and the attempts) is declared by whoever owns its request, with a
+//! kind code of its own.
 
 use std::marker::PhantomData;
 
+use flotilla_schema::EdgeEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attempt, edges, states, AttemptPolicy, Cause, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Version,
-    WrongState,
+    attempt, edges, states, AttemptPolicy, Cause, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table,
+    Version, WrongState,
 };
 
 /// One kind sharing the lifecycle: its name, request and retry policy.
@@ -45,9 +52,13 @@ states! {
         Realised { identity: String } = 2,
         Gone = 3,
         /// The attempts were spent, the last failing with `cause`.
-        GaveUp { cause: Cause } = 4,
+        GaveUp { #[store(flatten)] cause: Cause } = 4,
     }
 }
+
+/// One edge event of any lifecycle kind: `EdgeEventOf<Lifecycle<K>>` for
+/// every `K`, since the kinds share the labels, edges and arguments.
+pub type LifecycleEvent = EdgeEvent<LifecycleLabel, LifecycleEdgeKind, EdgePayload<LifecycleEdge>>;
 
 impl LifecycleState {
     /// Spec `live`: Requested or Realised.

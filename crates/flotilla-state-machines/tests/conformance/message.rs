@@ -23,7 +23,7 @@
 //! State mapping: the envelope is the immutable [`MessageSpec`] (expectation,
 //! and the deadline as `hasDeadline` and `deadline`); `Pending` and `Settled`
 //! carry it, `Awaiting { receiver }` is `Awaiting({envelope, receiver})` with
-//! session `s<n>` as `n`, and `Dropped { reason, receiver, at, watermark }` is
+//! session `s<n>` as `n`, and `Dropped { reason, dropped_receiver, at, watermark }` is
 //! the spec's whole drop record:
 //! - `reason` by constructor (the evidence references a reason carries in
 //!   Rust are the gate's inputs, not state the spec has);
@@ -253,7 +253,7 @@ impl Conformance for MessageConformance {
                 let receiver = json!({ "session": int(session_number(receiver)), "host": receiver.host });
                 variant("Awaiting", json!({ "envelope": envelope, "receiver": receiver }))
             }
-            MessageState::Dropped { reason, receiver, at, watermark } => {
+            MessageState::Dropped { reason, dropped_receiver: receiver, at, watermark } => {
                 let reason = match reason {
                     DropReason::Undeliverable => "Undeliverable",
                     DropReason::Expired => "Expired",

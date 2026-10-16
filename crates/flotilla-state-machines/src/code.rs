@@ -94,13 +94,21 @@ pub trait EdgeArg: Clone + Debug + Sized + 'static {
 /// Each variant may carry named data in braces. The label enum is named after
 /// `=>`, its names are the variant names, and its codes are the literals given
 /// here: the label derives `flotilla_schema::Stored` as a code enum with
-/// those codes. The expansion uses strum's and the schema crate's derives, so
-/// the calling crate depends on `strum` and `flotilla-schema`, and every datum
-/// type must be `Clone + Debug + Eq + 'static`.
+/// those codes. The state enum derives `Stored` too, as a label-plus-data
+/// state (`#[store(labels = Label)]`, #3373 ruling 1), so a stored kind holds
+/// it under `#[store(state)]`: one label column, `<field>_since`, and each
+/// datum once, shared by name across the labels that carry it. Each datum
+/// takes its storage form in the input: no attribute (its own columns),
+/// `#[store(child)]` (a `BTreeMap` or `BTreeSet`, spelled out, changed row by
+/// row), `#[store(intern)]` or `#[store(flatten)]`; a datum has one type and
+/// form in every label carrying it. The expansion uses strum's and the schema
+/// crate's derives, so the calling crate depends on `strum` and
+/// `flotilla-schema`, and every datum type must be `Clone + Debug + Eq +
+/// 'static` and storable in its form.
 ///
 /// ```
 /// flotilla_state_machines::states! {
-///     pub enum Door => DoorLabel { Shut = 1, Open { by: String } = 2 }
+///     pub enum Door => DoorLabel { Shut = 1, Open { #[store(intern)] by: String } = 2 }
 /// }
 /// use flotilla_schema::CodeEnum;
 /// use flotilla_state_machines::{Coded, StateValue};
@@ -120,15 +128,17 @@ macro_rules! states {
         }
     ) => {
         $(#[$meta])*
-        #[derive(Clone, Debug, PartialEq, Eq, strum::EnumDiscriminants)]
+        #[derive(Clone, Debug, PartialEq, Eq, strum::EnumDiscriminants, ::flotilla_schema::Stored)]
         #[strum_discriminants(
             name($label),
             derive(PartialOrd, Ord, Hash, strum::IntoStaticStr, strum::VariantArray, ::flotilla_schema::Stored)
         )]
+        #[store(labels = $label)]
         $vis enum $name {
             $(
                 $(#[$vmeta])*
                 #[strum_discriminants(store(code = $code))]
+                #[store(code = $code)]
                 $variant $({ $( $(#[$fmeta])* $field: $ty ),* })?
             ),+
         }

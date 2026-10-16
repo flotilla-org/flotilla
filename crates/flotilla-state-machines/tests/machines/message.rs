@@ -96,8 +96,8 @@ fn the_diagram_is_pinned() {
                    \x20 Pending --> Awaiting: deliver [receiver]\n\
                    \x20 Pending --> Settled: settle\n\
                    \x20 Awaiting --> Settled: settle\n\
-                   \x20 Pending --> Dropped: drop [reason, receiver, at, watermark]\n\
-                   \x20 Awaiting --> Dropped: drop [reason, receiver, at, watermark]\n\
+                   \x20 Pending --> Dropped: drop [reason, dropped_receiver, at, watermark]\n\
+                   \x20 Awaiting --> Dropped: drop [reason, dropped_receiver, at, watermark]\n\
                    \x20 Settled --> [*]\n  note right of Settled: the message was settled\n\
                    \x20 Dropped --> [*]\n  note right of Dropped: the message was dropped\n";
     let definition = Message::definition();
@@ -206,7 +206,10 @@ fn supersession_must_name_this_message() {
     assert_eq!(home.apply("m", superseded(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
     world.supersession.put(&by, Supersedes { older: "m".into() });
     home.apply("m", superseded(), &world, t(1)).expect("dropped");
-    assert_eq!(*state(&home), MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: None, at: t(1), watermark: None });
+    assert_eq!(
+        *state(&home),
+        MessageState::Dropped { reason: DropReason::Superseded { by }, dropped_receiver: None, at: t(1), watermark: None }
+    );
 }
 
 // Withdrawn and ConsumerUnreachable are deliberate drops that need authority,
@@ -229,7 +232,10 @@ fn deliberate_drops_need_authority() {
         assert_eq!(home.apply("m", reason("absent"), &world, t(2)).err(), refused(MessageRefusal::Unauthorised));
         home.apply("m", reason("yes"), &world, t(2)).expect("dropped");
         let receiver = delivered.then(|| session("s1"));
-        assert_eq!(*state(&home), MessageState::Dropped { reason: reason("yes").reason, receiver, at: t(2), watermark: None });
+        assert_eq!(
+            *state(&home),
+            MessageState::Dropped { reason: reason("yes").reason, dropped_receiver: receiver, at: t(2), watermark: None }
+        );
     }
 }
 
@@ -251,7 +257,7 @@ fn expiry_needs_a_passed_deadline_and_no_expected_evidence() {
     assert_eq!(outcome.apply("m", drop(DropReason::Expired), &world, t(6)).err(), refused(MessageRefusal::ExpectationMet));
     world.condition.put(&condition(), false);
     outcome.apply("m", drop(DropReason::Expired), &world, t(6)).expect("expired");
-    assert_eq!(*state(&outcome), MessageState::Dropped { reason: DropReason::Expired, receiver: None, at: t(6), watermark: None });
+    assert_eq!(*state(&outcome), MessageState::Dropped { reason: DropReason::Expired, dropped_receiver: None, at: t(6), watermark: None });
     let reads = &outcome.get("m").expect("exists").events().last().expect("dropped").record.payload.reads;
     assert!(reads.iter().all(|read| read.kind != <AppliedThrough as Kind>::NAME), "{reads:?}");
 }
@@ -270,7 +276,10 @@ fn expiry_with_a_consumer_waits_for_the_watermark_and_records_it() {
     let kinds: Vec<_> = event.payload.reads.iter().map(|read| (read.kind.as_ref(), read.name.as_str())).collect();
     assert!(kinds.contains(&(<Binding as Kind>::NAME, INBOX)), "{kinds:?}");
     assert!(kinds.contains(&(<AppliedThrough as Kind>::NAME, INBOX)), "{kinds:?}");
-    assert_eq!(*state(&home), MessageState::Dropped { reason: DropReason::Expired, receiver: None, at: t(7), watermark: Some(t(6)) });
+    assert_eq!(
+        *state(&home),
+        MessageState::Dropped { reason: DropReason::Expired, dropped_receiver: None, at: t(7), watermark: Some(t(6)) }
+    );
 
     // A receiver counts as a consumer even with the inbox unbound.
     let (mut delivered, mut world) = awaiting(Some(5));
@@ -278,7 +287,8 @@ fn expiry_with_a_consumer_waits_for_the_watermark_and_records_it() {
     assert_eq!(delivered.apply("m", drop(DropReason::Expired), &world, t(7)).err(), refused(MessageRefusal::PrefixBeforeDeadline));
     world.applied_through.put(&Ref::new(INBOX), t(9));
     delivered.apply("m", drop(DropReason::Expired), &world, t(10)).expect("expired");
-    let expired = MessageState::Dropped { reason: DropReason::Expired, receiver: Some(session("s1")), at: t(10), watermark: Some(t(9)) };
+    let expired =
+        MessageState::Dropped { reason: DropReason::Expired, dropped_receiver: Some(session("s1")), at: t(10), watermark: Some(t(9)) };
     assert_eq!(*state(&delivered), expired);
 }
 
@@ -301,7 +311,10 @@ fn undeliverable_needs_no_receipt_and_an_unbound_inbox_or_a_failure() {
     assert_eq!(pending.apply("m", drop(DropReason::Undeliverable), &world, t(20)).err(), refused(MessageRefusal::MissingEvidence));
     world.delivery_failure.put(&Ref::new("m"), ());
     pending.apply("m", drop(DropReason::Undeliverable), &world, t(20)).expect("dropped");
-    assert_eq!(*state(&pending), MessageState::Dropped { reason: DropReason::Undeliverable, receiver: None, at: t(20), watermark: None });
+    assert_eq!(
+        *state(&pending),
+        MessageState::Dropped { reason: DropReason::Undeliverable, dropped_receiver: None, at: t(20), watermark: None }
+    );
 }
 
 // The time rules' boundaries, as named cases: expiry needs `now` strictly past

@@ -3,7 +3,7 @@ use std::{env, fs, path::Path};
 use flotilla_schema::{render_view, DdlMode};
 use flotilla_schema_sqlite::{schema_ddl, Store};
 
-use crate::fixtures::{registry, store, Message, LOCAL};
+use crate::fixtures::{message, registry, store, MessageRow, LOCAL};
 
 // Behaviour (#3320 DDL snapshot): the fixtures' DDL is deterministic and checked in. Any diff
 // fails; `UPDATE_DDL_SNAPSHOT=1` rewrites the snapshot for review.
@@ -43,10 +43,10 @@ fn fixture_schema_view_matches_the_snapshot() {
 fn every_table_is_strict_and_foreign_keys_hold() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let message = Message { body_digest: Some("d".into()), interrupting: true, accepted_seq: 3, ordinal: 4, ..Message::sample() };
+    let message = MessageRow { deadline: Some(flotilla_schema::Timestamp(3)), unbound_after: 4, ..message::sample() };
     let stamp = write.insert("m", &message).expect("insert");
-    let current = write.load::<Message>(stamp.id).expect("load").expect("present");
-    write.update(&current, &Message { body: "c".into(), ..message }).expect("update");
+    let current = write.load::<MessageRow>(stamp.id).expect("load").expect("present");
+    write.update(&current, &MessageRow { inbox: "c".into(), ..message }).expect("update");
     write.commit().expect("commit");
 
     let conn = store.into_connection();
@@ -60,23 +60,33 @@ fn every_table_is_strict_and_foreign_keys_hold() {
         names,
         [
             "agent_session",
+            "agent_session_edges",
+            "agent_session_receipts",
             "change_log",
             "convoy",
-            "convoy_deliverables",
-            "convoy_deliverables_evidence",
-            "convoy_deliverables_evidence_metadata",
             "convoy_edges",
-            "convoy_inputs",
-            "convoy_inputs_list_items",
-            "convoy_repositories",
+            "convoy_promises",
+            "convoy_quota",
+            "convoy_resolution",
+            "dossier",
+            "dossier_deliverables",
+            "dossier_deliverables_evidence",
+            "dossier_deliverables_evidence_metadata",
+            "dossier_edges",
+            "dossier_inputs",
+            "dossier_inputs_list_items",
+            "ensure",
+            "ensure_attempts",
+            "ensure_created",
+            "ensure_edges",
+            "ensure_recorded",
             "home_sequence",
-            "inbox",
             "message",
-            "message_attempts",
             "message_edges",
-            "message_references",
             "objects",
-            "project",
+            "referral",
+            "referral_edges",
+            "referral_references",
             "resource_identity",
             "strings",
             "terminal_session",
@@ -105,10 +115,10 @@ fn every_table_is_strict_and_foreign_keys_hold() {
 fn reopening_keeps_tables_and_rows() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let message = Message { body: "kept".into(), ..Message::sample() };
+    let message = MessageRow { inbox: "kept".into(), ..message::sample() };
     let stamp = write.insert("m", &message).expect("insert");
     write.commit().expect("commit");
     let mut store = Store::open(store.into_connection(), LOCAL, registry()).expect("reopen");
     let mut read = store.read().expect("read");
-    assert_eq!(read.load::<Message>(stamp.id).expect("load").expect("present").value, message);
+    assert_eq!(read.load::<MessageRow>(stamp.id).expect("load").expect("present").value, message);
 }

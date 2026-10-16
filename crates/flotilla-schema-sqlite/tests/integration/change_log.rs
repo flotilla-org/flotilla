@@ -11,8 +11,9 @@ use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
 use crate::fixtures::{
-    convoy::{workflow, ConvoyRepository},
-    registry, store, Convoy, Fixture, Message, Pick, TerminalSession, Ticket, LOCAL,
+    message as messages, registry, store,
+    synthetic::{workflow, InputValue},
+    AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow as Message, Pick, Referral, TerminalSession, Ticket, LOCAL,
 };
 
 const REPLICA: &str = "replica";
@@ -28,22 +29,19 @@ fn logged(write: &mut Write<'_>, before: u64) -> RowChange {
     changes.remove(0)
 }
 
-/// One generated write to slot `live` of kind `K`: insert when absent, else an edge, a spec edit
-/// (possibly changing no row) or a delete. Checks that the write logged exactly one change at
-/// its version naming the resource, or nothing when it changed no row.
+/// One generated write to slot `live` of kind `K`: insert when absent, else an edge (when one
+/// applies), a spec edit (possibly changing no row) or a delete. Checks that the write logged
+/// exactly one change at its version naming the resource, or nothing when it changed no row.
 fn step<K: Fixture>(tc: &TestCase, write: &mut Write<'_>, live: &mut Option<Stamp>, name: &str, last: &mut u64) {
-    let change = match *live {
-        None => {
-            let stamp = write.insert(name, &K::generate(tc, Pick::Draw)).expect("insert");
-            *live = Some(stamp);
-            let change = logged(write, *last);
-            assert!(matches!(&change.ops[..], [.., RowOp::Insert { .. }]));
-            assert_eq!(change.home_seq, stamp.version);
-            change
-        }
+    let edge = match *live {
         Some(stamp) if tc.draw(gs::booleans()) => {
             let current = write.load::<K>(stamp.id).expect("load").expect("present");
-            let (edge, _) = current.value.edge(tc, Pick::Draw);
+            current.value.edge(tc, Pick::Draw).map(|(edge, _)| (stamp, edge))
+        }
+        _ => None,
+    };
+    let change = match (*live, edge) {
+        (_, Some((stamp, edge))) => {
             let next = write.apply_edge(stamp, edge).expect("edge");
             *live = Some(next);
             let change = logged(write, *last);
@@ -51,7 +49,15 @@ fn step<K: Fixture>(tc: &TestCase, write: &mut Write<'_>, live: &mut Option<Stam
             assert!(change.ops.iter().any(|op| matches!(op, RowOp::Insert { .. })), "an edge appends its event");
             change
         }
-        Some(stamp) if tc.draw(gs::booleans()) => {
+        (None, None) => {
+            let stamp = write.insert(name, &K::generate(tc, Pick::Draw)).expect("insert");
+            *live = Some(stamp);
+            let change = logged(write, *last);
+            assert!(matches!(&change.ops[..], [.., RowOp::Insert { .. }]));
+            assert_eq!(change.home_seq, stamp.version);
+            change
+        }
+        (Some(stamp), None) if tc.draw(gs::booleans()) => {
             let current = write.load::<K>(stamp.id).expect("load").expect("present");
             let next = write.update(&current, &current.value.evolve(tc, Pick::Draw)).expect("update");
             *live = Some(next);
@@ -63,7 +69,7 @@ fn step<K: Fixture>(tc: &TestCase, write: &mut Write<'_>, live: &mut Option<Stam
             assert_eq!(change.home_seq, next.version);
             change
         }
-        Some(stamp) => {
+        (Some(stamp), None) => {
             write.delete::<K>(stamp).expect("delete");
             *live = None;
             let change = logged(write, *last);
@@ -87,10 +93,19 @@ fn step<K: Fixture>(tc: &TestCase, write: &mut Write<'_>, live: &mut Option<Stam
 
 /// Every slot's resource: kind code and name.
 fn slots() -> Vec<(KindCode, String)> {
-    [Message::CODE, Convoy::CODE, TerminalSession::CODE, Ticket::CODE]
-        .into_iter()
-        .flat_map(|code| (0..2).map(move |n| (code, format!("r{n}"))))
-        .collect()
+    [
+        Message::CODE,
+        AgentSessionRow::CODE,
+        ConvoyRow::CODE,
+        EnsureRow::CODE,
+        TerminalSession::CODE,
+        Ticket::CODE,
+        Referral::CODE,
+        Dossier::CODE,
+    ]
+    .into_iter()
+    .flat_map(|code| (0..2).map(move |n| (code, format!("r{n}"))))
+    .collect()
 }
 
 fn snapshot(store: &mut Store, code: KindCode, name: &str) -> Option<(ResourceId, Option<Snapshot>)> {
@@ -128,8 +143,8 @@ fn string_id(store: Store, string: &str) -> (Store, i64) {
 // with a different home reproduces every resource: equal snapshots (version, name, home, rows,
 // objects) although the two databases number strings and identities differently. The target
 // relays the same log and the same home sequence. Replaying again is idempotent: every change is
-// a `Duplicate` and nothing moves. Writes span the three fixture kinds and the synthetic `Ticket`
-// (whose transitions edit state data row by row), two names each, with
+// a `Duplicate` and nothing moves. Writes span every fixture kind, the engine kinds (whose
+// transitions edit state data row by row) and the synthetic ones, two names each, with
 // inserts, generated edges (events, records and history appended, fields set), spec edits,
 // deletes and re-inserts, over several transactions. Every records and history row a change
 // inserts carries the change's sequence.
@@ -143,11 +158,16 @@ fn the_change_log_replays_into_another_store(tc: TestCase) {
     for _ in 0..steps {
         let slot = tc.draw(gs::integers::<usize>().min_value(0).max_value(slots().len() - 1));
         let (code, name) = &slots()[slot];
+        let (live, last) = (&mut live[slot], &mut last);
         match *code {
-            Message::CODE => step::<Message>(&tc, &mut write, &mut live[slot], name, &mut last),
-            Convoy::CODE => step::<Convoy>(&tc, &mut write, &mut live[slot], name, &mut last),
-            Ticket::CODE => step::<Ticket>(&tc, &mut write, &mut live[slot], name, &mut last),
-            _ => step::<TerminalSession>(&tc, &mut write, &mut live[slot], name, &mut last),
+            Message::CODE => step::<Message>(&tc, &mut write, live, name, last),
+            AgentSessionRow::CODE => step::<AgentSessionRow>(&tc, &mut write, live, name, last),
+            ConvoyRow::CODE => step::<ConvoyRow>(&tc, &mut write, live, name, last),
+            EnsureRow::CODE => step::<EnsureRow>(&tc, &mut write, live, name, last),
+            Ticket::CODE => step::<Ticket>(&tc, &mut write, live, name, last),
+            Referral::CODE => step::<Referral>(&tc, &mut write, live, name, last),
+            Dossier::CODE => step::<Dossier>(&tc, &mut write, live, name, last),
+            _ => step::<TerminalSession>(&tc, &mut write, live, name, last),
         }
         if tc.draw(gs::booleans()) {
             write.commit().expect("commit");
@@ -159,7 +179,7 @@ fn the_change_log_replays_into_another_store(tc: TestCase) {
     // The target interns its own strings and identities first, so its local ids differ.
     let mut target = replica();
     let mut write = target.write().expect("write");
-    write.insert("pre", &Message::sample()).expect("pre-existing local resource");
+    write.insert("pre", &messages::sample()).expect("pre-existing local resource");
     write.commit().expect("commit");
 
     let results = replay(&mut source, &mut target);
@@ -199,9 +219,9 @@ fn first_change(store: &mut Store, home: &str) -> RowChange {
 fn apply_writes_other_homes_and_generated_writes_do_not() {
     let mut remote = Store::open(Connection::open_in_memory().expect("db"), "remote", registry()).expect("open remote");
     let mut write = remote.write().expect("write");
-    let stamp = write.insert("far", &Message::sample()).expect("insert");
+    let stamp = write.insert("far", &messages::sample()).expect("insert");
     let current = write.load::<Message>(stamp.id).expect("load").expect("present");
-    write.update(&current, &Message { body: "edited".into(), ..Message::sample() }).expect("update");
+    write.update(&current, &Message { inbox: "edited".into(), ..messages::sample() }).expect("update");
     write.commit().expect("commit");
     let changes = remote.read().expect("read").changes_since("remote", 0, 10).expect("log");
 
@@ -212,8 +232,8 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
     }
     let id = write.resolve(Message::CODE, "far", "remote").expect("resolve").expect("present");
     let current = write.load::<Message>(id).expect("load").expect("present");
-    assert_eq!((current.version, current.value.body.as_str()), (changes[1].home_seq, "edited"));
-    let next = Message { body: "local edit".into(), ..current.value.clone() };
+    assert_eq!((current.version, current.value.inbox.as_str()), (changes[1].home_seq, "edited"));
+    let next = Message { inbox: "local edit".into(), ..current.value.clone() };
     assert!(matches!(write.update(&current, &next), Err(StoreError::NotHome { .. })));
     assert!(matches!(write.delete::<Message>(current.stamp()), Err(StoreError::NotHome { .. })));
 
@@ -235,23 +255,16 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
 fn every_change_carries_the_objects_its_rows_name() {
     let mut source = store();
     let mut write = source.write().expect("write");
-    write.insert("a", &Convoy::sample(0)).expect("insert a");
-    let b = write.insert("b", &Convoy::sample(0)).expect("insert b");
-    let current = write.load::<Convoy>(b.id).expect("load").expect("present");
-    let root = Convoy { instruction: Some("go".into()), ..Convoy::sample(0) };
+    write.insert("a", &Dossier::sample(0)).expect("insert a");
+    let b = write.insert("b", &Dossier::sample(0)).expect("insert b");
+    let current = write.load::<Dossier>(b.id).expect("load").expect("present");
+    let root = Dossier { instruction: Some("go".into()), ..Dossier::sample(0) };
     let b = write.update(&current, &root).expect("root update");
-    let current = write.load::<Convoy>(b.id).expect("load").expect("present");
-    let repository = ConvoyRepository {
-        url: "u".into(),
-        repo_key: "k".into(),
-        source_ref: "s".into(),
-        target_ref: "t".into(),
-        workspace_slug: "w".into(),
-    };
-    let child = Convoy { repositories: vec![repository], ..root };
+    let current = write.load::<Dossier>(b.id).expect("load").expect("present");
+    let child = Dossier { inputs: [("k".to_owned(), InputValue::Text { value: "v".into() })].into(), ..root };
     let b = write.update(&current, &child).expect("child update");
-    let current = write.load::<Convoy>(b.id).expect("load").expect("present");
-    write.update(&current, &Convoy { workflow_snapshot: workflow(1), ..child }).expect("frozen column update");
+    let current = write.load::<Dossier>(b.id).expect("load").expect("present");
+    write.update(&current, &Dossier { workflow: workflow(1), ..child }).expect("frozen column update");
     write.commit().expect("commit");
     let changes = source.read().expect("read").changes_since(LOCAL, 0, 10).expect("log");
     let puts = |change: &RowChange| change.ops.iter().filter(|op| matches!(op, RowOp::PutObject { .. })).count();
@@ -267,11 +280,11 @@ fn every_change_carries_the_objects_its_rows_name() {
     let mut write = target.write().expect("write");
     let stripped = RowChange { ops: changes[1].ops[1..].to_vec(), ..changes[1].clone() };
     assert!(matches!(write.apply(&stripped), Err(StoreError::MissingObject { hash: missing }) if missing == *hash));
-    assert_eq!(write.resolve(Convoy::CODE, "b", LOCAL).expect("resolve"), None, "a refused apply writes nothing");
+    assert_eq!(write.resolve(Dossier::CODE, "b", LOCAL).expect("resolve"), None, "a refused apply writes nothing");
     for change in &changes[1..] {
         assert!(matches!(write.apply(change).expect("b's changes apply without a's"), Applied::Applied(_)));
     }
-    let id = write.resolve(Convoy::CODE, "b", LOCAL).expect("resolve").expect("present");
+    let id = write.resolve(Dossier::CODE, "b", LOCAL).expect("resolve").expect("present");
     let newest = source.read().expect("read").load_snapshot(b.id).expect("snapshot");
     assert_eq!(write.load_snapshot(id).expect("snapshot"), newest);
 }
@@ -282,7 +295,7 @@ fn every_change_carries_the_objects_its_rows_name() {
 fn a_tampered_object_is_refused() {
     let mut source = store();
     let mut write = source.write().expect("write");
-    write.insert("c", &Convoy::sample(1)).expect("insert");
+    write.insert("c", &Dossier::sample(1)).expect("insert");
     write.commit().expect("commit");
     let mut change = first_change(&mut source, LOCAL);
     let Some(RowOp::PutObject { bytes, .. }) = change.ops.first_mut() else { panic!("object first: {change:?}") };
@@ -291,7 +304,7 @@ fn a_tampered_object_is_refused() {
     let mut target = replica();
     let mut write = target.write().expect("write");
     assert!(matches!(write.apply(&change), Err(StoreError::TamperedObject { .. })));
-    assert_eq!(write.resolve(Convoy::CODE, "c", LOCAL).expect("resolve"), None);
+    assert_eq!(write.resolve(Dossier::CODE, "c", LOCAL).expect("resolve"), None);
 }
 
 // Behaviour: `apply` refuses ops that do not fit the kind: an unknown table, a row whose values
@@ -300,7 +313,7 @@ fn a_tampered_object_is_refused() {
 fn malformed_changes_are_refused() {
     let mut source = store();
     let mut write = source.write().expect("write");
-    write.insert("m", &Message::sample()).expect("insert");
+    write.insert("m", &messages::sample()).expect("insert");
     write.commit().expect("commit");
     let change = first_change(&mut source, LOCAL);
     let root = Message::table_set().tables[0].name.clone();
@@ -347,7 +360,7 @@ fn sequences_never_repeat_after_log_rows_are_deleted() {
     let db = TempDb::new();
     let mut store = db.open();
     let mut write = store.write().expect("write");
-    let versions: Vec<u64> = (0..4).map(|n| write.insert(&format!("m{n}"), &Message::sample()).expect("insert").version).collect();
+    let versions: Vec<u64> = (0..4).map(|n| write.insert(&format!("m{n}"), &messages::sample()).expect("insert").version).collect();
     write.commit().expect("commit");
     let conn = store.into_connection();
     conn.execute(
@@ -359,7 +372,7 @@ fn sequences_never_repeat_after_log_rows_are_deleted() {
 
     let mut store = db.open();
     let mut write = store.write().expect("write");
-    let next = write.insert("m9", &Message::sample()).expect("insert after reopen");
+    let next = write.insert("m9", &messages::sample()).expect("insert after reopen");
     assert!(next.version > versions[3], "{} after {}", next.version, versions[3]);
     assert_eq!(
         write.changes_since(LOCAL, 0, 10).expect("log").iter().map(|change| change.home_seq).collect::<Vec<_>>(),
@@ -402,10 +415,10 @@ fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
         if n < updates {
             let mut write = source.write().expect("write");
             let current = write.load::<K>(stamp.id).expect("load").expect("present");
-            stamp = if tc.draw(gs::booleans()) {
-                write.apply_edge(stamp, current.value.edge(tc, Pick::Draw).0).expect("edge")
-            } else {
-                write.update(&current, &current.value.evolve(tc, Pick::Draw)).expect("update")
+            let edge = if tc.draw(gs::booleans()) { current.value.edge(tc, Pick::Draw) } else { None };
+            stamp = match edge {
+                Some((edge, _)) => write.apply_edge(stamp, edge).expect("edge"),
+                None => write.update(&current, &current.value.evolve(tc, Pick::Draw)).expect("update"),
             };
             write.commit().expect("commit");
         }
@@ -435,9 +448,13 @@ fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
 #[hegel::test]
 fn a_snapshot_plus_its_tail_is_the_newest_snapshot(tc: TestCase) {
     snapshot_plus_tail::<Message>(&tc);
-    snapshot_plus_tail::<Convoy>(&tc);
+    snapshot_plus_tail::<AgentSessionRow>(&tc);
+    snapshot_plus_tail::<ConvoyRow>(&tc);
+    snapshot_plus_tail::<EnsureRow>(&tc);
     snapshot_plus_tail::<TerminalSession>(&tc);
     snapshot_plus_tail::<Ticket>(&tc);
+    snapshot_plus_tail::<Referral>(&tc);
+    snapshot_plus_tail::<Dossier>(&tc);
 }
 
 /// Every change of `store` homed at `home`, in home order.
@@ -445,11 +462,11 @@ fn log(store: &mut Store, home: &str) -> Vec<RowChange> {
     store.read().expect("read").changes_since(home, 0, 100).expect("log")
 }
 
-fn message(body: &str) -> Message {
-    Message { body: body.into(), ..Message::sample() }
+fn message(inbox: &str) -> Message {
+    Message { inbox: inbox.into(), ..messages::sample() }
 }
 
-/// Inserts `name`, then rewrites its body once per entry of `bodies`, in one transaction.
+/// Inserts `name`, then rewrites its inbox once per entry of `bodies`, in one transaction.
 fn write_history(store: &mut Store, name: &str, bodies: &[&str]) {
     let mut write = store.write().expect("write");
     let mut stamp = write.insert(name, &message("first")).expect("insert");
@@ -536,7 +553,7 @@ fn a_skipped_change_is_a_gap() {
 fn misordered_objects_and_duplicate_root_inserts_are_refused() {
     let mut source = store();
     let mut write = source.write().expect("write");
-    write.insert("c", &Convoy::sample(0)).expect("insert");
+    write.insert("c", &Dossier::sample(0)).expect("insert");
     write.commit().expect("commit");
     let insert = first_change(&mut source, LOCAL);
     let mut ops = insert.ops.clone();
@@ -548,12 +565,12 @@ fn misordered_objects_and_duplicate_root_inserts_are_refused() {
     let mut target = replica();
     let mut write = target.write().expect("write");
     assert!(matches!(write.apply(&late), Err(StoreError::MalformedChange(Malformed::ObjectOrder { .. }))));
-    assert_eq!(write.resolve(Convoy::CODE, "c", LOCAL).expect("resolve"), None);
+    assert_eq!(write.resolve(Dossier::CODE, "c", LOCAL).expect("resolve"), None);
     write.apply(&insert).expect("insert");
     let again = RowChange { home_seq: insert.home_seq + 1, prev_seq: insert.home_seq, ..insert.clone() };
     assert!(matches!(write.apply(&again), Err(StoreError::Exists { name, .. }) if name == "c"));
-    let id = write.resolve(Convoy::CODE, "c", LOCAL).expect("resolve").expect("present");
-    assert_eq!(write.load::<Convoy>(id).expect("load").expect("present").version, insert.home_seq);
+    let id = write.resolve(Dossier::CODE, "c", LOCAL).expect("resolve").expect("present");
+    assert_eq!(write.load::<Dossier>(id).expect("load").expect("present").version, insert.home_seq);
 }
 
 // Behaviour (#3338 review, caches): a refused `apply` creates an identity only inside its

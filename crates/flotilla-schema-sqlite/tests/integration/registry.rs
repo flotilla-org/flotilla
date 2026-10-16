@@ -1,6 +1,6 @@
 use flotilla_schema::{Kind, KindRegistry, RegistryError, Stored};
 
-use crate::fixtures::Message;
+use crate::fixtures::MessageRow as Message;
 
 #[derive(Debug, Clone, PartialEq, Stored)]
 #[store(kind = "Convoy", code = 1)]

@@ -13,7 +13,7 @@
 //!   edges, their authority reading `authorised`.
 //!
 //! State mapping, one to one: the spec's `Work = {spec, promises, quota}` is
-//! `{ spec: Resource::spec(), promises: state.promises(), quota: state.quota() }`,
+//! `{ spec: Resource::spec(), promises: state.resolution(), quota: state.quota() }`,
 //! so `Open { promises, quota }` is `Open(work)`, `Delivered { .. }` is
 //! `Delivered(work)` and `Abandoned { reason, .. }` is `Abandoned({work, reason})`.
 //! The immutable [`ConvoySpec`] (project, promises, priority) is the spec's
@@ -92,7 +92,7 @@ fn outcome<T>(result: Result<T, WriteError<Convoy>>) -> Step {
 
 /// The spec's `Work`: the immutable spec, and the state's resolution and quota in force.
 fn work(spec: &ConvoySpec, state: &ConvoyState) -> Value {
-    let resolved = state.promises().iter().map(|(p, resolution)| {
+    let resolved = state.resolution().iter().map(|(p, resolution)| {
         let name = match resolution {
             PromiseState::Pending => "Pending",
             PromiseState::Kept => "Kept",

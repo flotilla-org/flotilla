@@ -5,7 +5,9 @@ use flotilla_schema_sqlite::Write;
 use hegel::TestCase;
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, ErrorCode};
 
-use crate::fixtures::{registry, store, Convoy, Fixture, Message, Pick, TerminalSession, Ticket};
+use crate::fixtures::{
+    registry, store, AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession, Ticket,
+};
 
 /// A stored value of the column's type that satisfies its own column constraint and foreign key,
 /// so a refusal can only come from a guard CHECK.
@@ -65,6 +67,18 @@ fn insert_covering<K: Fixture>(write: &mut Write<'_>, tc: &TestCase) {
     }
 }
 
+/// The covering values of every fixture kind.
+fn insert_all(write: &mut Write<'_>, tc: &TestCase) {
+    insert_covering::<MessageRow>(write, tc);
+    insert_covering::<AgentSessionRow>(write, tc);
+    insert_covering::<ConvoyRow>(write, tc);
+    insert_covering::<EnsureRow>(write, tc);
+    insert_covering::<TerminalSession>(write, tc);
+    insert_covering::<Ticket>(write, tc);
+    insert_covering::<Referral>(write, tc);
+    insert_covering::<Dossier>(write, tc);
+}
+
 // Behaviour (#3320 CHECK constraints, #3373 ruling 1): for every guard every fixture kind declares,
 // in every table (every data enum variant with columns and every present `Option<flatten>`,
 // nested, flattened and in child tables, and every label of a label-plus-data state), a raw SQL
@@ -77,10 +91,7 @@ fn insert_covering<K: Fixture>(write: &mut Write<'_>, tc: &TestCase) {
 fn raw_writes_breaking_a_variant_rule_are_refused(tc: TestCase) {
     let mut store = store();
     let mut write = store.write().expect("write");
-    insert_covering::<Message>(&mut write, &tc);
-    insert_covering::<Convoy>(&mut write, &tc);
-    insert_covering::<TerminalSession>(&mut write, &tc);
-    insert_covering::<Ticket>(&mut write, &tc);
+    insert_all(&mut write, &tc);
     write.commit().expect("commit");
     let conn = store.into_connection();
     let mut guards = 0;
@@ -150,10 +161,7 @@ fn check_table(conn: &Connection, table: &Table) {
 fn record_stamps_are_never_null(tc: TestCase) {
     let mut store = store();
     let mut write = store.write().expect("write");
-    insert_covering::<Message>(&mut write, &tc);
-    insert_covering::<Convoy>(&mut write, &tc);
-    insert_covering::<TerminalSession>(&mut write, &tc);
-    insert_covering::<Ticket>(&mut write, &tc);
+    insert_all(&mut write, &tc);
     write.commit().expect("commit");
     let conn = store.into_connection();
     let mut checked = 0;
@@ -170,5 +178,9 @@ fn record_stamps_are_never_null(tc: TestCase) {
             checked += 1;
         }
     }
-    assert_eq!(checked, 8, "edges, attempts, deliverables, evidence, convoy edges, events, attempts and ticket edges");
+    assert_eq!(
+        checked, 13,
+        "every engine kind's edges, the session's receipts, the Ensure's and the terminal session's attempts, the ticket's and \
+         referral's edges, and the dossier's deliverables, evidence and edges"
+    );
 }

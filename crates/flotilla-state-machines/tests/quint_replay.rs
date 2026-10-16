@@ -680,10 +680,10 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
         })
     };
     match resource.state() {
-        ConvoyState::Open { promises, quota } => variant("Open", work(promises, quota)),
-        ConvoyState::Delivered { promises, quota } => variant("Delivered", work(promises, quota)),
-        ConvoyState::Abandoned { promises, quota, reason } => {
-            variant("Abandoned", json!({ "work": work(promises, quota), "reason": reason }))
+        ConvoyState::Open { resolution, quota } => variant("Open", work(resolution, quota)),
+        ConvoyState::Delivered { resolution, quota } => variant("Delivered", work(resolution, quota)),
+        ConvoyState::Abandoned { resolution, quota, reason } => {
+            variant("Abandoned", json!({ "work": work(resolution, quota), "reason": reason }))
         }
     }
 }
@@ -1065,7 +1065,7 @@ fn ensure_value(resource: &Resource<Ensure>) -> Value {
         "recorded": fulfiller_set(state.recorded()),
         "created": fulfiller_set(state.created()),
         "history": Value::Array(history.collect()),
-        "window": int(i64::try_from(state.window()).expect("window")),
+        "window": int(i64::from(state.window())),
     });
     match state {
         EnsureState::Unfulfilled { .. } => variant("Unfulfilled", work),
@@ -1316,7 +1316,7 @@ fn message_value(resource: &Resource<Message>) -> Value {
             json!({ "envelope": envelope, "receiver": { "session": int(session_number(receiver)), "host": receiver.host } }),
         ),
         MessageState::Settled => variant("Settled", envelope),
-        MessageState::Dropped { reason, receiver, at, watermark } => variant(
+        MessageState::Dropped { reason, dropped_receiver: receiver, at, watermark } => variant(
             "Dropped",
             json!({
                 "reason": constant(reason_name(reason)),

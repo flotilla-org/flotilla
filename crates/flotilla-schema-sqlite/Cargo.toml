@@ -12,6 +12,8 @@ thiserror = "2"
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# The engine's machine declarations are the integration tests' stored kinds (#3319); dev-only.
+flotilla-state-machines = { path = "../flotilla-state-machines" }
 hegeltest = { workspace = true }
 serde = { workspace = true }
 

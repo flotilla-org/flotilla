@@ -5,22 +5,33 @@
 //! listing shows whether it completed or was lost. The session's name is its
 //! identity. Receipts are recorded on the session and refused once it has
 //! ended. "Running" is a judgement, not a state.
+//!
+//! The stored kind is [`AgentSessionRow`] (code 3): the state, the edge log,
+//! and the receipts, which never change once appended, as `history`.
 
+use flotilla_schema::{Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Version, WrongState};
+use crate::{
+    edges, states, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Receipt, Ref, Resource, RowParts, Source,
+    Table, Version, WrongState,
+};
 
 /// Whether a channel to a Live session is attached (spec `Channel`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
 pub enum Channel {
+    #[store(code = 1)]
     Detached,
+    #[store(code = 2)]
     Attached,
 }
 
 /// How a session ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub enum EndReason {
+    #[store(code = 1)]
     Completed,
+    #[store(code = 2)]
     Lost,
 }
 
@@ -213,5 +224,46 @@ fn gate_end(h: &mut Handle<'_, AgentSession>, edge: &End) -> Result<(), AgentSes
         Ok(())
     } else {
         Err(AgentSessionRefusal::MissingEvidence)
+    }
+}
+
+/// The stored AgentSession (kind code 3): the state, the edge log and the
+/// receipts. The session's name is its identity, so it has no spec columns.
+#[derive(Clone, Debug, PartialEq, Stored)]
+#[store(kind = "AgentSession", code = 3)]
+pub struct AgentSessionRow {
+    #[store(state)]
+    pub state: State<AgentSessionState>,
+    #[store(history)]
+    pub edges: Records<EdgeEventOf<AgentSession>>,
+    #[store(history)]
+    pub receipts: Records<Receipt>,
+}
+
+impl MachineRow for AgentSessionRow {
+    type Machine = AgentSession;
+    const STATE_FIELD: flotilla_schema::StateOf<Self, State<AgentSessionState>> = AgentSessionRow::STATE;
+    const EDGE_LOG: flotilla_schema::HistoryOf<Self, EdgeEventOf<AgentSession>> = AgentSessionRow::EDGES;
+
+    fn of(resource: &Resource<AgentSession>, since: Timestamp) -> AgentSessionRow {
+        AgentSessionRow {
+            state: State::new(resource.state().clone(), since),
+            edges: resource.events().clone(),
+            receipts: resource.receipts().clone(),
+        }
+    }
+
+    fn state(&self) -> &State<AgentSessionState> {
+        &self.state
+    }
+
+    fn parts(&self) -> RowParts<AgentSession> {
+        RowParts {
+            spec: (),
+            state: self.state.value.clone(),
+            events: self.edges.clone(),
+            attempts: Records::new(),
+            receipts: self.receipts.clone(),
+        }
     }
 }

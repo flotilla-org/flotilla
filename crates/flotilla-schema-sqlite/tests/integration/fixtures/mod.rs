@@ -1,17 +1,32 @@
-//! Fixture kinds, transcribed from the real resource types rather than imported, plus the
-//! synthetic machine-state kind `Ticket` (#3373 ruling 4), and helpers.
+//! Fixture kinds and helpers.
+//!
+//! The stored kinds are the engine's machine declarations (#3319, #3373 ruling 4): Message,
+//! AgentSession, Convoy and Ensure from `flotilla_state_machines::machines`, and `TerminalSession`,
+//! a lifecycle kind whose row is declared here, beside its request (`terminal`). Their edges are
+//! real transitions: each fixture's [`Fixture::edge`] builds a home holding the stored row, a world
+//! that makes a drawn edge pass its gate, applies the edge through the engine, and turns the result
+//! into the stored edge ([`engine::drive`]). Every stored transition is one the engine's rules
+//! allow. The rows' spec fields, states and history are generated freely: history is never read to
+//! decide, and a stored row need not be one the engine could have reached.
+//!
+//! The synthetic kinds cover the derive features no engine kind uses yet: the label-plus-data
+//! `Ticket` (`ticket`), and `Referral` and `Dossier` (`synthetic`, whose module doc lists each
+//! feature with its expected first real user).
 //!
 //! Each fixture generates values in two modes ([`Pick`]): drawn by Hegel, or fixed by a covering
 //! index, so that a fixture's covering indexes `0..COVERING` reach every enum variant, nested ones
-//! included, and both empty and non-empty collections. [`Fixture::evolve`] generates a spec edit:
-//! spec fields and child tables change freely, while states and `records` and `history` rows stay
-//! as they are. [`Fixture::edge`] generates an edge, the only write that moves those. Generated
-//! rows carry arbitrary version stamps; [`Fixture::stamped`] gives the stamps the store writes
-//! instead.
+//! included, every label, and both empty and non-empty collections. [`Fixture::evolve`] generates
+//! a spec edit: spec fields and child tables change freely, while states and `records` and
+//! `history` rows stay as they are. [`Fixture::edge`] generates an edge, the only write that moves
+//! those. Generated rows carry arbitrary version stamps; [`Fixture::stamped`] gives the stamps the
+//! store writes instead.
 
-pub mod attempt;
+pub mod agent_session;
 pub mod convoy;
+pub mod engine;
+pub mod ensure;
 pub mod message;
+pub mod synthetic;
 pub mod terminal;
 pub mod ticket;
 
@@ -20,21 +35,21 @@ use std::fmt::Debug;
 use chrono::{DateTime, Utc};
 use flotilla_schema::{Edge, EdgeEvent, Identity, Kind, KindCode, KindRegistry, Position, Records, Ref, Timestamp};
 use flotilla_schema_sqlite::Store;
+pub use flotilla_state_machines::machines::{agent_session::AgentSessionRow, convoy::ConvoyRow, ensure::EnsureRow, message::MessageRow};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 pub use self::{
-    convoy::{Convoy, Project},
-    message::{AgentSession, Inbox, Message},
+    synthetic::{Dossier, Referral},
     terminal::{TerminalSession, Vessel},
     ticket::Ticket,
 };
 
 pub const LOCAL: &str = "local";
 
-/// An edge event's inline document (#3320 ruling of 2026-10-15): the edge's arguments and the
-/// resources its gate read, never expanded into columns or tables.
+/// A synthetic kind's edge document: the edge's arguments and the resources its gate read, never
+/// expanded into columns or tables. (The engine kinds' documents are `EdgePayload`.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Payload<A> {
     pub args: A,
@@ -60,14 +75,16 @@ pub fn event<L, E, A>(tc: &TestCase, edge: E, from: L, to: L, payload: Payload<A
 
 /// A generated fixture kind.
 pub trait Fixture: Kind + Clone + PartialEq + Debug {
-    /// Covering indexes `0..COVERING` reach every variant and both empty and non-empty collections.
+    /// Covering indexes `0..COVERING` reach every variant, every label and both empty and
+    /// non-empty collections.
     const COVERING: usize;
     fn generate(tc: &TestCase, pick: Pick) -> Self;
     /// A spec edit of `self`: spec fields drawn afresh by `pick`, states and records kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> Self;
     /// An edge on `self` drawn by `pick`, and the value it leads to (appended rows with arbitrary
-    /// stamps; see [`Fixture::stamped`]).
-    fn edge(&self, tc: &TestCase, pick: Pick) -> (Edge<Self>, Self);
+    /// stamps; see [`Fixture::stamped`]). `None` when no edge applies: an engine kind in an end
+    /// state, or one whose stored data no gate accepts.
+    fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<Self>, Self)>;
     /// The value a load returns: times floored to microseconds.
     fn stored(&self) -> Self {
         self.clone()
@@ -79,14 +96,15 @@ pub trait Fixture: Kind + Clone + PartialEq + Debug {
 
 pub fn registry() -> KindRegistry {
     let mut registry = KindRegistry::new();
-    registry.register::<Message>().expect("fixture kinds register");
-    registry.register::<Inbox>().expect("fixture kinds register");
-    registry.register::<AgentSession>().expect("fixture kinds register");
-    registry.register::<Project>().expect("fixture kinds register");
-    registry.register::<Convoy>().expect("fixture kinds register");
+    registry.register::<MessageRow>().expect("fixture kinds register");
+    registry.register::<AgentSessionRow>().expect("fixture kinds register");
+    registry.register::<ConvoyRow>().expect("fixture kinds register");
     registry.register::<TerminalSession>().expect("fixture kinds register");
     registry.register::<Vessel>().expect("fixture kinds register");
     registry.register::<Ticket>().expect("fixture kinds register");
+    registry.register::<EnsureRow>().expect("fixture kinds register");
+    registry.register::<Referral>().expect("fixture kinds register");
+    registry.register::<Dossier>().expect("fixture kinds register");
     registry
 }
 
@@ -111,6 +129,15 @@ impl Pick {
         match self {
             Pick::Draw => tc.draw(gs::integers::<usize>().min_value(0).max_value(count - 1)),
             Pick::Cover(index) => cover(index % SHAPES) % count,
+        }
+    }
+
+    /// A choice in `0..radix`: the covering index's digit at `place` (the product of the radixes
+    /// of the digits below it), so independent choices of one value take every combination.
+    pub fn digit(self, tc: &TestCase, radix: usize, place: usize) -> usize {
+        match self {
+            Pick::Draw => tc.draw(gs::integers::<usize>().min_value(0).max_value(radix - 1)),
+            Pick::Cover(index) => (index / place) % radix,
         }
     }
 
@@ -192,6 +219,11 @@ pub fn stamp<T>(records: &Records<T>, before: Option<&Records<T>>, version: u64,
         stamped.append(previous.map_or(version, |_| row.version), inner(&row.record, previous.map(|previous| &previous.record)));
     }
     stamped
+}
+
+/// `records` as written at `version`, its rows holding no records of their own.
+pub fn stamp_flat<T: Clone>(records: &Records<T>, before: Option<&Records<T>>, version: u64) -> Records<T> {
+    stamp(records, before, version, |record, _| record.clone())
 }
 
 pub fn code_enum<E: Copy>(tc: &TestCase, pick: Pick, all: &[E]) -> E {

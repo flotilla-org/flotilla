@@ -6,3 +6,4 @@ mod ensure;
 mod lifecycle;
 mod message;
 mod placement;
+mod stored;

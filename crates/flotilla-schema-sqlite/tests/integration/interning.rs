@@ -1,9 +1,9 @@
 use flotilla_schema::Kind;
 
-use crate::fixtures::{store, Message, LOCAL};
+use crate::fixtures::{message, store, MessageRow, Referral, LOCAL};
 
-fn message() -> Message {
-    Message::sample()
+fn message() -> MessageRow {
+    message::sample()
 }
 
 // Behaviour (DESIGN interning): ids created in a transaction that rolls back are never served
@@ -23,10 +23,10 @@ fn ids_from_a_rolled_back_transaction_are_evicted() {
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
-    assert_eq!(read.resolve(Message::CODE, "first", LOCAL).expect("resolve"), Some(first.id));
-    assert_eq!(read.resolve(Message::CODE, "second", LOCAL).expect("resolve"), Some(second.id));
-    assert_eq!(read.load::<Message>(first.id).expect("load").expect("present").name, "first");
-    assert_eq!(read.load::<Message>(second.id).expect("load").expect("present").name, "second");
+    assert_eq!(read.resolve(MessageRow::CODE, "first", LOCAL).expect("resolve"), Some(first.id));
+    assert_eq!(read.resolve(MessageRow::CODE, "second", LOCAL).expect("resolve"), Some(second.id));
+    assert_eq!(read.load::<MessageRow>(first.id).expect("load").expect("present").name, "first");
+    assert_eq!(read.load::<MessageRow>(second.id).expect("load").expect("present").name, "second");
 }
 
 // Behaviour: a write refused inside a transaction rewinds the ids it created with its savepoint,
@@ -35,10 +35,10 @@ fn ids_from_a_rolled_back_transaction_are_evicted() {
 fn ids_from_a_refused_write_are_evicted() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let refused = Message { accepted_seq: u64::MAX, ..message() };
+    let refused = Referral { seq: u64::MAX, ..Referral::sample() };
     assert!(write.insert("first", &refused).is_err());
-    let first = write.insert("first", &message()).expect("insert");
+    let first = write.insert("first", &Referral::sample()).expect("insert");
     write.commit().expect("commit");
     let mut read = store.read().expect("read");
-    assert_eq!(read.load::<Message>(first.id).expect("load").expect("present").name, "first");
+    assert_eq!(read.load::<Referral>(first.id).expect("load").expect("present").name, "first");
 }
