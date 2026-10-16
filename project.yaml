@@ -1,4 +1,8 @@
 name: flotilla
+# The workflow and image match the Project as registered by hand before this declaration was read.
+default_workflow: single-agent-contained
+image:
+  layers: [rust]
 members:
   - alias: flotilla
     url: https://github.com/flotilla-org/flotilla
