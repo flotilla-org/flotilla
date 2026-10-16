@@ -15,10 +15,14 @@ home = Path(os.environ['CLAUDE_CONFIG_DIR'])
 
 def version(tool):
     # A runnable toolchain is the contract; images may place it anywhere on PATH.
+    # Failures report why, so the baseline refusal can name the cause.
     try:
-        return subprocess.run([tool, '--version'], capture_output=True, text=True).stdout.strip()
-    except OSError:
-        return ''
+        result = subprocess.run([tool, '--version'], capture_output=True, text=True)
+    except OSError as error:
+        return f'not runnable: {error}'
+    if result.returncode != 0:
+        return f'exit {result.returncode}: {result.stderr.strip()}'
+    return result.stdout.strip()
 
 
 print(json.dumps({

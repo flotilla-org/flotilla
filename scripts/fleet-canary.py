@@ -104,7 +104,7 @@ def verify_baseline(report):
     for tool in ('cargo', 'rustc'):
         version = report['toolchain'].get(tool)
         if not isinstance(version, str) or not version.startswith(tool + ' '):
-            raise CanaryFailure(f'baseline {tool} toolchain missing or not runnable')
+            raise CanaryFailure(f'baseline {tool} toolchain missing or not runnable: {version!r}')
     expected_identity = 'flotilla-crew[bot] <309902803+flotilla-crew[bot]@users.noreply.github.com>'
     # git var reflects the identity Git will actually use, including injected
     # GIT_AUTHOR_* / GIT_COMMITTER_* overrides. The timestamp is not policy.

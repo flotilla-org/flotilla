@@ -476,7 +476,11 @@ class Contract(unittest.TestCase):
     def test_real_stub_reports_missing_identity(self):
         self.run_real_stub(missing_identity=True)
 
-    def run_real_stub(self, missing_identity=False):
+    # A toolchain that exits non-zero is refused with its stderr, even if stdout looks like a version.
+    def test_real_stub_reports_broken_toolchain(self):
+        self.run_real_stub(broken_toolchain=True)
+
+    def run_real_stub(self, missing_identity=False, broken_toolchain=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             home = root / 'crew-home'
@@ -493,6 +497,9 @@ class Contract(unittest.TestCase):
                 stand_in = bin_dir / tool
                 stand_in.write_text(f'#!/bin/bash\necho "{tool} 1.99.0 (stand-in)"\n')
                 stand_in.chmod(0o755)
+            if broken_toolchain:
+                (bin_dir / 'cargo').write_text('#!/bin/bash\necho "cargo 1.99.0 (stand-in)"\n'
+                                               'echo "error: no default toolchain configured" >&2\nexit 1\n')
             subprocess.check_call(['git', '-C', str(root), 'init', '-q'])
             completion = root / 'completion'
             # HOME excludes user global config; NOSYSTEM excludes system config.
@@ -526,6 +533,11 @@ class Contract(unittest.TestCase):
                     with self.assertRaisesRegex(canary.CanaryFailure, 'baseline git identity GIT_AUTHOR_IDENT'):
                         canary.verify_baseline(report)
                     self.assertFalse(completion.exists(), 'invalid identity must not claim completion')
+                    return
+                if broken_toolchain:
+                    self.assertEqual(report['toolchain']['cargo'], 'exit 1: error: no default toolchain configured')
+                    with self.assertRaisesRegex(canary.CanaryFailure, 'baseline cargo toolchain .*no default toolchain'):
+                        canary.verify_baseline(report)
                     return
                 canary.verify_baseline(report)
                 self.assertFalse(completion.exists(), 'completion must wait for Running/baseline checks')
@@ -563,7 +575,10 @@ class Contract(unittest.TestCase):
     # must fail; valid environment values may include unrelated Cleat-owned coordinates.
     def test_each_baseline_requirement_is_enforced(self):
         canary.verify_baseline(REPORT)
-        for report in (None, {}, {'environment': {}, 'git': {}, 'skills': None}):
+        without_toolchain = copy.deepcopy(REPORT)
+        del without_toolchain['toolchain']
+        for report in (None, {}, {'environment': {}, 'git': {}, 'skills': None}, without_toolchain,
+                       {**REPORT, 'toolchain': ['cargo', 'rustc']}):
             with self.subTest(report=report), self.assertRaisesRegex(canary.CanaryFailure, 'stub agent report'):
                 canary.verify_baseline(report)
         for tool in ('cargo', 'rustc'):
