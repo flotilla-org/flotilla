@@ -369,7 +369,14 @@ impl<'a> Cursor<'a> {
             return self.quoted(bare);
         }
         let rest = self.rest();
-        let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')).unwrap_or(rest.len());
+        // Lenient input accepts the old grammar's segments: any run of
+        // characters that do not end a segment, such as `kind:bug`. The
+        // printer quotes them, so the canonical form stays strict.
+        let ends_word = |c: char| match self.mode {
+            Mode::Strict => !(c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            Mode::Lenient => c.is_whitespace() || matches!(c, '.' | ',' | '(' | ')' | '"'),
+        };
+        let end = rest.find(ends_word).unwrap_or(rest.len());
         if end == 0 {
             return Err(self.syntax(expected));
         }

@@ -464,6 +464,17 @@ mod normalisation {
         assert_eq!(unquoted.literal, "changes pushed");
     }
 
+    // Stored templates and conditions written by the old parsers may hold
+    // path segments with any non-whitespace character; they still decode,
+    // and print quoted.
+    #[test]
+    fn lenient_paths_accept_old_segments() {
+        let template = Template::resolve("$issue.labels.kind:bug == true").expect("template");
+        assert_eq!(template.path.segments(), ["labels", "kind:bug"]);
+        assert_eq!(template.to_string(), r#"$issue .labels."kind:bug" == true"#);
+        assert!("$issue .labels.kind:bug == true".parse::<Template>().is_err(), "strict input quotes it");
+    }
+
     #[test]
     fn lenient_templates_accept_the_old_text() {
         let template = Template::resolve("$cr.state == merged").expect("template");
