@@ -1,0 +1,29 @@
+[package]
+name = "flotilla-schema-sqlite"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "The rusqlite runtime for flotilla-schema: shared tables, generated statements, interning and identities"
+
+[dependencies]
+flotilla-schema = { path = "../flotilla-schema" }
+rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
+thiserror = "2"
+
+[dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+hegeltest = { workspace = true }
+
+[lints]
+workspace = true
+
+# Keep native library features stable across build and test commands. The anchors of
+# flotilla-store-sqlite, less async: this crate does not reach tokio.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-sqlite = { path = "../flotilla-build-features-sqlite" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

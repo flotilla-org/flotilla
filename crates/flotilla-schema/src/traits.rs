@@ -1,0 +1,311 @@
+//! The traits generated code implements and relies on, and their primitive implementations.
+//!
+//! Primitive implementations come from `macro_rules!` rather than blanket impls, so derived types
+//! implement these traits without coherence conflicts.
+
+use chrono::{DateTime, Utc};
+
+use crate::{
+    codec::{DecodeError, Decoder, EncodeError, Encoder},
+    descriptor::{ColumnType, TableSet},
+    layout::Layout,
+    time::Timestamp,
+    value::{KindCode, Value},
+};
+
+/// The closed attribute list, named by every refusal. The derive refuses with the same text.
+pub const SUPPORTED_ATTRIBUTES: &str = "the storage derive supports only the attributes child, records, history, frozen, intern, flatten, \
+                                        state and code (fields and variants) and kind, code and index (types)";
+
+/// Anything that lays out as zero or more columns of the current row, plus nested tables.
+#[doc(hidden)]
+pub trait Columns: Sized {
+    /// Tables the layout declares, in pre-order; the codec cursor skips this many.
+    const TABLES: usize;
+    /// Declares the columns under `name` (a joined prefix; empty for a scalar element).
+    fn layout(layout: &mut Layout, name: &str, required: bool);
+    fn encode(&self, e: &mut Encoder) -> Result<(), EncodeError>;
+    /// Writes the columns of an absent value: all nulls and zero-row nested tables.
+    fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError>;
+    /// `None` when the value is absent (its columns are null).
+    fn decode(d: &mut Decoder) -> Result<Option<Self>, DecodeError>;
+    /// Consumes an absent value's columns and tables, refusing any that are present. The dual of
+    /// [`Columns::encode_absent`], for inactive variants and absent flattened structs.
+    fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError>;
+}
+
+/// A type usable as a field with no attribute.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a storage column: the storage derive supports only the attributes child, records, history, frozen, intern, \
+               flatten, state and code (fields and variants) and kind, code and index (types)",
+    label = "needs a column type or one of the storage attributes",
+    note = "column types are integers, bool, String, Vec<u8>, Timestamp, DateTime<Utc>, Option of a column, and enums and newtypes deriving Stored"
+)]
+pub trait Column: Columns {}
+
+/// A struct usable under `#[store(flatten)]`: it derives `Stored` and has no table fields.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, intern, \
+               flatten, state and code (fields and variants) and kind, code and index (types)",
+    label = "flatten needs a struct deriving Stored with no table fields"
+)]
+pub trait Flat: Columns {}
+
+/// A unit enum with a stable code on every variant.
+pub trait CodeEnum: Column + Copy {
+    const CODES: &'static [i64];
+    fn code(self) -> i64;
+}
+
+/// A `#[store(intern)]` target: stored as an id in `strings`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be interned: the storage derive supports only the attributes child, records, history, frozen, intern, \
+               flatten, state and code (fields and variants) and kind, code and index (types)",
+    label = "intern needs String or a newtype of String"
+)]
+pub trait Intern {
+    fn as_str(&self) -> &str;
+    fn from_string(value: String) -> Self;
+}
+
+/// A table row: a struct deriving `Stored`, or a primitive/enum element of a collection.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a storage row: the storage derive supports only the attributes child, records, history, frozen, intern, \
+               flatten, state and code (fields and variants) and kind, code and index (types)",
+    label = "collection elements are structs, enums or newtypes deriving Stored, or column primitives"
+)]
+pub trait Element: Sized {
+    /// Tables nested under one row, in pre-order (the row's own table excluded).
+    const TABLES: usize;
+    fn layout_row(layout: &mut Layout);
+    fn encode_row(&self, e: &mut Encoder) -> Result<(), EncodeError>;
+    fn decode_row(d: &mut Decoder) -> Result<Self, DecodeError>;
+}
+
+/// A resource kind: a struct with `#[store(kind = "...", code = N)]`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a stored kind: a kind is a struct deriving Stored with #[store(kind = \"Name\", code = N)]",
+    label = "not a stored kind"
+)]
+pub trait Kind: Element {
+    const KIND: &'static str;
+    const CODE: KindCode;
+    fn table_set() -> TableSet;
+}
+
+impl Intern for String {
+    fn as_str(&self) -> &str {
+        self
+    }
+
+    fn from_string(value: String) -> Self {
+        value
+    }
+}
+
+/// Implements `Columns`, `Column` and `Element` for a single-column primitive.
+/// `$encode` maps `&Self` to `Result<Value, EncodeError>`; `$decode` maps a non-null `Value` to
+/// `Result<Self, DecodeError>`.
+macro_rules! scalar {
+    ($ty:ty, $column:expr, |$this:ident| $encode:expr, |$value:ident| $decode:expr) => {
+        impl Columns for $ty {
+            const TABLES: usize = 0;
+
+            fn layout(layout: &mut Layout, name: &str, required: bool) {
+                layout.column(name, $column, required);
+            }
+
+            fn encode(&self, e: &mut Encoder) -> Result<(), EncodeError> {
+                let $this = self;
+                let value: Result<Value, EncodeError> = $encode;
+                e.put(value?);
+                Ok(())
+            }
+
+            fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError> {
+                e.put(Value::Null);
+                Ok(())
+            }
+
+            fn decode(d: &mut Decoder) -> Result<Option<Self>, DecodeError> {
+                match d.take()? {
+                    Value::Null => Ok(None),
+                    $value => {
+                        let decoded: Result<Self, DecodeError> = $decode;
+                        decoded.map(Some)
+                    }
+                }
+            }
+
+            fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {
+                match d.take()? {
+                    Value::Null => Ok(()),
+                    other => Err(DecodeError::unexpected("null", &other)),
+                }
+            }
+        }
+
+        impl Column for $ty {}
+
+        impl Element for $ty {
+            const TABLES: usize = 0;
+
+            fn layout_row(layout: &mut Layout) {
+                <Self as Columns>::layout(layout, "", true);
+            }
+
+            fn encode_row(&self, e: &mut Encoder) -> Result<(), EncodeError> {
+                <Self as Columns>::encode(self, e)
+            }
+
+            fn decode_row(d: &mut Decoder) -> Result<Self, DecodeError> {
+                <Self as Columns>::decode(d)?.ok_or_else(|| DecodeError::missing(""))
+            }
+        }
+    };
+}
+
+/// Integers narrower than i64 are range-checked on decode, never truncated.
+macro_rules! integer {
+    ($($ty:ty),*) => {$(
+        scalar!($ty, ColumnType::Integer, |this| Ok(Value::Int(i64::from(*this))), |value| match value {
+            Value::Int(stored) => <$ty>::try_from(stored).map_err(|_| DecodeError::OutOfRange { column: String::new(), value: stored }),
+            other => Err(DecodeError::unexpected("integer", &other)),
+        });
+    )*};
+}
+
+integer!(i8, i16, i32, i64, u8, u16, u32);
+
+scalar!(
+    u64,
+    ColumnType::Integer,
+    |this| i64::try_from(*this).map(Value::Int).map_err(|_| EncodeError::OutOfRange { column: String::new(), value: *this }),
+    |value| match value {
+        Value::Int(stored) => u64::try_from(stored).map_err(|_| DecodeError::OutOfRange { column: String::new(), value: stored }),
+        other => Err(DecodeError::unexpected("integer", &other)),
+    }
+);
+
+scalar!(bool, ColumnType::Bool, |this| Ok(Value::Int(i64::from(*this))), |value| match value {
+    Value::Int(0) => Ok(false),
+    Value::Int(1) => Ok(true),
+    Value::Int(stored) => Err(DecodeError::OutOfRange { column: String::new(), value: stored }),
+    other => Err(DecodeError::unexpected("boolean", &other)),
+});
+
+scalar!(String, ColumnType::Text, |this| Ok(Value::Text(this.clone())), |value| match value {
+    Value::Text(text) => Ok(text),
+    other => Err(DecodeError::unexpected("text", &other)),
+});
+
+scalar!(Vec<u8>, ColumnType::Blob, |this| Ok(Value::Blob(this.clone())), |value| match value {
+    Value::Blob(bytes) => Ok(bytes),
+    other => Err(DecodeError::unexpected("blob", &other)),
+});
+
+scalar!(Timestamp, ColumnType::Timestamp, |this| Ok(Value::Int(this.micros())), |value| match value {
+    Value::Int(micros) => Ok(Timestamp(micros)),
+    other => Err(DecodeError::unexpected("integer", &other)),
+});
+
+// Stored as microseconds, floored: a load returns the truncated time.
+scalar!(DateTime<Utc>, ColumnType::Timestamp, |this| Ok(Value::Int(Timestamp::from_datetime(this).micros())), |value| match value {
+    Value::Int(micros) => Timestamp(micros).to_datetime().ok_or(DecodeError::OutOfRange { column: String::new(), value: micros }),
+    other => Err(DecodeError::unexpected("integer", &other)),
+});
+
+/// An optional column is the inner type's columns, nullable.
+impl<T: Column> Columns for Option<T> {
+    const TABLES: usize = T::TABLES;
+
+    fn layout(layout: &mut Layout, name: &str, _required: bool) {
+        T::layout(layout, name, false);
+    }
+
+    fn encode(&self, e: &mut Encoder) -> Result<(), EncodeError> {
+        match self {
+            Some(value) => value.encode(e),
+            None => T::encode_absent(e),
+        }
+    }
+
+    fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError> {
+        T::encode_absent(e)
+    }
+
+    fn decode(d: &mut Decoder) -> Result<Option<Self>, DecodeError> {
+        T::decode(d).map(Some)
+    }
+
+    fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {
+        T::decode_absent(d)
+    }
+}
+
+impl<T: Column> Column for Option<T> {}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Utc};
+
+    use super::{Columns, Element, SUPPORTED_ATTRIBUTES};
+    use crate::{
+        codec::{DecodeError, Decoder, EncodeError, Encoder},
+        layout::Layout,
+        value::{KindCode, Row, Rows, Value},
+    };
+
+    fn rows(values: Vec<Value>) -> Rows {
+        Rows { tables: vec![vec![Row { key: Vec::new(), values }]], objects: Default::default() }
+    }
+
+    // Behaviour (#3320): a u64 above i64::MAX is refused with a typed error, never wrapped; a
+    // negative stored value is refused on decode.
+    #[test]
+    fn u64_is_checked_both_ways() {
+        assert_eq!(Encoder::encode(&u64::MAX), Err(EncodeError::OutOfRange { column: String::new(), value: u64::MAX }));
+        let max = i64::MAX as u64;
+        let encoded = Encoder::encode(&max).expect("i64::MAX fits");
+        assert_eq!(Decoder::decode::<u64>(encoded), Ok(max));
+        assert_eq!(Decoder::decode::<u64>(rows(vec![Value::Int(-1)])), Err(DecodeError::OutOfRange { column: String::new(), value: -1 }));
+    }
+
+    #[test]
+    fn narrow_integers_and_bools_refuse_out_of_range_values() {
+        assert!(matches!(Decoder::decode::<u8>(rows(vec![Value::Int(256)])), Err(DecodeError::OutOfRange { value: 256, .. })));
+        assert!(matches!(Decoder::decode::<bool>(rows(vec![Value::Int(2)])), Err(DecodeError::OutOfRange { value: 2, .. })));
+        assert!(matches!(Decoder::decode::<String>(rows(vec![Value::Int(2)])), Err(DecodeError::Type { expected: "text", .. })));
+        assert_eq!(Decoder::decode::<String>(rows(vec![Value::Null])), Err(DecodeError::missing("")));
+    }
+
+    #[test]
+    fn datetimes_store_floored_microseconds() {
+        let time = DateTime::<Utc>::from_timestamp(-1, 999_999_999).expect("in range");
+        let encoded = Encoder::encode(&time).expect("encode");
+        assert_eq!(encoded.tables[0][0].values, [Value::Int(-1)]);
+        assert_eq!(Decoder::decode::<DateTime<Utc>>(encoded), Ok(DateTime::<Utc>::from_timestamp(-1, 999_999_000).expect("in range")));
+    }
+
+    #[test]
+    fn options_are_nullable_columns() {
+        let mut layout = Layout::root("K", KindCode(1));
+        <Option<String> as Columns>::layout(&mut layout, "note", true);
+        String::layout_row(&mut layout);
+        let set = layout.finish();
+        assert!(set.tables[0].columns[0].nullable);
+        assert_eq!(set.tables[0].columns[1].name, "value");
+        assert!(!set.tables[0].columns[1].nullable);
+    }
+
+    // The diagnostic attributes must name the same closed list as the derive's refusals; both
+    // spell it out because attribute arguments cannot reference a constant.
+    #[test]
+    fn diagnostics_and_derive_name_the_same_list() {
+        let flat = SUPPORTED_ATTRIBUTES.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalise = |source: &str| source.replace("\\\n", "").split_whitespace().collect::<Vec<_>>().join(" ");
+        let traits = normalise(include_str!("traits.rs"));
+        assert_eq!(traits.matches(&flat[flat.find("child").expect("list")..]).count(), 5, "every diagnostic names the list");
+        assert!(normalise(include_str!("../../flotilla-schema-derive/src/attrs.rs")).contains(&flat));
+    }
+}

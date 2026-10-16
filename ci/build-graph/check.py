@@ -13,7 +13,7 @@ C_FREE_BASE = frozenset({
     "flotilla-address", "flotilla-protocol", "flotilla-transport", "flotilla-paths",
     "flotilla-daemon-api", "flotilla-relay-protocol",
     "flotilla-resources", "flotilla-client", "flotilla-store", "flotilla-store-memory",
-    "flotilla-config", "flotilla-messaging",
+    "flotilla-config", "flotilla-messaging", "flotilla-schema", "flotilla-schema-derive",
 })
 # Shrink this explicit exemption list with the ADR 0060 step 3 store split.
 # Manifest uses TLS; TUI no longer reaches core or store, but still reaches TLS
@@ -33,6 +33,10 @@ CAPABILITY_FORBIDDEN = (
     "flotilla-core", "flotilla-daemon", "flotilla-controllers",
     "flotilla-credentials",
 )
+# #3320: the storage derive stack, lowest first. Each may depend in production only on
+# flotilla-cbor, the schema crates below it and the build-feature anchors.
+SCHEMA_CRATES = ("flotilla-schema-derive", "flotilla-schema", "flotilla-schema-sqlite")
+SCHEMA_ALLOWED = ("flotilla-cbor",)
 # Known C packages and compiler drivers catch new anchors that reach them.
 # This is a metadata deny list, not build-script analysis: crates invoking a
 # compiler without these drivers need an explicit entry when introduced.
@@ -104,6 +108,22 @@ def violations(metadata):
     for target in REPLICATION_FORBIDDEN:
         if "flotilla-replication" in packages and target in packages and reaches("flotilla-replication", target):
             errors.append(f"flotilla-replication: must not depend on {target}, directly or transitively")
+    # The schema crates stay a self-contained stack: anything they reach, directly or through an
+    # allowed crate, must itself be allowed. Upward schema edges are refused the same way.
+    for position, schema in enumerate(SCHEMA_CRATES):
+        if schema not in packages:
+            continue
+        allowed = {*SCHEMA_ALLOWED, *SCHEMA_CRATES[:position]}
+        pending, reached = list(production[schema]), set()
+        while pending:
+            node = pending.pop()
+            if node not in reached:
+                reached.add(node)
+                pending.extend(production[node])
+        for target in sorted(reached - {schema}):
+            if target not in allowed and not target.startswith("flotilla-build-features"):
+                errors.append(f"{schema}: must not depend on {target}, directly or transitively; schema crates depend only "
+                              "on flotilla-cbor, lower schema crates and flotilla-build-features anchors")
     for name, package in sorted(packages.items()):
         # A dev-only testkit may depend on the library it tests, closing a
         # Cargo dev cycle without introducing an upward production edge.

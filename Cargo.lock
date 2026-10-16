@@ -2589,6 +2589,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-schema"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-base",
+ "flotilla-build-features-types",
+ "flotilla-schema-derive",
+ "hegeltest",
+ "sha2",
+ "smallvec",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "flotilla-schema-derive"
+version = "0.1.0"
+dependencies = [
+ "flotilla-build-features",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "flotilla-schema-sqlite"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-os",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-schema",
+ "hegeltest",
+ "rusqlite",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "flotilla-store"
 version = "0.1.0"
 dependencies = [
