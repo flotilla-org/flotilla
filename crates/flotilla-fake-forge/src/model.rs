@@ -4,7 +4,7 @@
 //! sequence of changes.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
@@ -343,7 +343,7 @@ struct Inner {
     forges: BTreeMap<String, Forge>,
     next_id: u64,
     last_time: Option<DateTime<Utc>>,
-    refusals: Vec<Refusal>,
+    refusals: VecDeque<Refusal>,
     refusal_count: u64,
 }
 
@@ -361,7 +361,7 @@ impl FakeForge {
         Self {
             public_url: public_url.into().trim_end_matches('/').to_string(),
             clock,
-            inner: Mutex::new(Inner { forges: BTreeMap::new(), next_id: 1, last_time: None, refusals: Vec::new(), refusal_count: 0 }),
+            inner: Mutex::new(Inner { forges: BTreeMap::new(), next_id: 1, last_time: None, refusals: VecDeque::new(), refusal_count: 0 }),
         }
     }
 
@@ -407,8 +407,7 @@ impl FakeForge {
     /// repository goes through here, so a repository exists from its first
     /// reference.
     pub fn ensure_repository(&self, repo: &RepoRef) -> Result<Repository, ForgeError> {
-        let mut inner = self.lock();
-        Ok(inner.repository(repo)?.clone())
+        Ok(self.lock().repository(repo)?.clone())
     }
 
     /// Seed a repository with its default branch, before any reference.
@@ -428,10 +427,8 @@ impl FakeForge {
         if new.head == new.base {
             return Err(ForgeError::Invalid(format!("head and base are both `{}`", new.head)));
         }
-        let now = self.tick();
-        let mut inner = self.lock();
-        let login = inner.forge(&repo.forge)?.settings.login.clone();
-        let id = inner.next_id();
+        let (mut inner, now) = self.change();
+        let login = inner.login(&repo.forge)?;
         let repository = inner.repository(repo)?;
         if let Some(existing) = repository.items.values().find(|item| {
             item.state == ItemState::Open
@@ -448,6 +445,7 @@ impl FakeForge {
             )));
         }
         let number = next_number(repository);
+        let id = inner.next_id();
         let head_sha = commit_sha(&[&repo.to_string(), &number.to_string(), &new.head]);
         let item = Item {
             id,
@@ -477,7 +475,7 @@ impl FakeForge {
                 requested_reviewers: Vec::new(),
             }),
         };
-        repository.items.insert(number, item.clone());
+        inner.repository(repo)?.items.insert(number, item.clone());
         Ok(item)
     }
 
@@ -485,22 +483,12 @@ impl FakeForge {
         if new.title.trim().is_empty() {
             return Err(ForgeError::Invalid("an issue needs a title".into()));
         }
-        let now = self.tick();
-        let mut inner = self.lock();
-        let login = inner.forge(&repo.forge)?.settings.login.clone();
-        let id = inner.next_id();
-        let mut label_ids = Vec::new();
-        for _ in &new.labels {
-            label_ids.push(inner.next_id());
-        }
-        let repository = inner.repository(repo)?;
-        for (label, id) in new.labels.iter().zip(label_ids) {
-            if repository.label_id(label).is_none() {
-                repository.labels.push(Label { id, name: label.clone(), color: label_color(label) });
-            }
-        }
-        let number = next_number(repository);
+        let (mut inner, now) = self.change();
+        let login = inner.login(&repo.forge)?;
         let labels = unique(new.labels);
+        inner.ensure_labels(repo, &labels)?;
+        let number = next_number(inner.repository(repo)?);
+        let id = inner.next_id();
         let item = Item {
             id,
             number,
@@ -516,110 +504,78 @@ impl FakeForge {
             closed_at: None,
             pull: None,
         };
-        repository.items.insert(number, item.clone());
+        inner.repository(repo)?.items.insert(number, item.clone());
         Ok(item)
     }
 
     pub fn item(&self, repo: &RepoRef, number: u64) -> Result<Item, ForgeError> {
-        let mut inner = self.lock();
-        inner.repository(repo)?.items.get(&number).cloned().ok_or_else(|| not_found(repo, number))
+        Ok(self.lock().item(repo, number)?.clone())
     }
 
     pub fn pull(&self, repo: &RepoRef, number: u64) -> Result<Item, ForgeError> {
-        let item = self.item(repo, number)?;
-        if item.is_pull() {
-            Ok(item)
-        } else {
-            Err(ForgeError::NotFound(format!("{repo}#{number} is an issue, not a pull request")))
-        }
+        Ok(self.lock().pull(repo, number)?.clone())
     }
 
     /// Edit an issue or pull request. Reopening a merged pull is refused.
     pub fn edit(&self, repo: &RepoRef, number: u64, edit: ItemEdit) -> Result<Item, ForgeError> {
-        let now = self.tick();
-        self.with_item(repo, number, |item| {
-            if let Some(title) = edit.title {
-                if title.trim().is_empty() {
-                    return Err(ForgeError::Invalid("title cannot be empty".into()));
-                }
-                item.title = title;
-            }
-            if let Some(body) = edit.body {
-                item.body = body;
-            }
-            if let Some(state) = edit.state {
-                if state == ItemState::Open && item.merged() {
-                    return Err(ForgeError::NotAllowed(format!("{repo}#{number} is merged and cannot be reopened")));
-                }
-                if state != item.state {
-                    item.state = state;
-                    item.closed_at = (state == ItemState::Closed).then_some(now);
-                }
-            }
-            item.updated_at = now;
-            Ok(item.clone())
-        })
+        let (mut inner, now) = self.change();
+        edit_item(inner.item(repo, number)?, repo, edit, now)
+    }
+
+    /// Edit a pull request: as [`FakeForge::edit`], but an issue number is
+    /// not found, checked under the same lock as the edit.
+    pub fn edit_pull(&self, repo: &RepoRef, number: u64, edit: ItemEdit) -> Result<Item, ForgeError> {
+        let (mut inner, now) = self.change();
+        edit_item(inner.pull(repo, number)?, repo, edit, now)
     }
 
     /// Merge an open pull request. A closed or merged one is refused, as
     /// Forgejo answers 405.
     pub fn merge(&self, repo: &RepoRef, number: u64, style: &str, merged_by: Option<String>) -> Result<Item, ForgeError> {
-        let now = self.tick();
-        let login = self.settings(&repo.forge).ok_or_else(|| ForgeError::UnknownForge(repo.forge.clone()))?.login;
-        self.with_pull(repo, number, |item| {
-            if item.state != ItemState::Open {
-                return Err(ForgeError::NotAllowed(format!("{repo}#{number} is not open")));
-            }
-            let pull = item.pull.as_mut().expect("with_pull yields pulls");
-            if pull.draft {
-                return Err(ForgeError::NotAllowed(format!("{repo}#{number} is a draft")));
-            }
-            pull.merged_at = Some(now);
-            pull.merged_by = Some(merged_by.unwrap_or(login));
-            pull.merge_style = Some(style.to_string());
-            pull.merge_commit_sha = Some(commit_sha(&[&repo.to_string(), &number.to_string(), "merge", style]));
-            item.state = ItemState::Closed;
-            item.closed_at = Some(now);
-            item.updated_at = now;
-            Ok(item.clone())
-        })
+        let (mut inner, now) = self.change();
+        let merged_by = match merged_by {
+            Some(user) => user,
+            None => inner.login(&repo.forge)?,
+        };
+        merge_item(inner.pull(repo, number)?, repo, style, merged_by, now)
     }
 
     pub fn add_review(&self, repo: &RepoRef, number: u64, review: NewReview) -> Result<Review, ForgeError> {
-        let now = self.tick();
-        let id = self.lock().next_id();
-        self.with_pull(repo, number, |item| {
-            let pull = item.pull.as_mut().expect("with_pull yields pulls");
-            let review = Review {
-                id,
-                user: review.user,
-                state: review.state,
-                body: review.body,
-                commit_id: pull.head_sha.clone(),
-                stale: false,
-                dismissed: false,
-                submitted_at: now,
-            };
-            pull.reviews.push(review.clone());
-            item.updated_at = now;
-            Ok(review)
-        })
+        let (mut inner, now) = self.change();
+        inner.pull(repo, number)?;
+        let id = inner.next_id();
+        let item = inner.pull(repo, number)?;
+        let pull = item.pull.as_mut().expect("pull() yields pulls");
+        let review = Review {
+            id,
+            user: review.user,
+            state: review.state,
+            body: review.body,
+            commit_id: pull.head_sha.clone(),
+            stale: false,
+            dismissed: false,
+            submitted_at: now,
+        };
+        pull.reviews.push(review.clone());
+        item.updated_at = now;
+        Ok(review)
     }
 
     pub fn dismiss_review(&self, repo: &RepoRef, number: u64, review_id: u64) -> Result<Review, ForgeError> {
-        let now = self.tick();
-        self.with_pull(repo, number, |item| {
-            let pull = item.pull.as_mut().expect("with_pull yields pulls");
-            let review = pull
-                .reviews
-                .iter_mut()
-                .find(|review| review.id == review_id)
-                .ok_or_else(|| ForgeError::NotFound(format!("{repo}#{number} has no review {review_id}")))?;
-            review.dismissed = true;
-            let review = review.clone();
-            item.updated_at = now;
-            Ok(review)
-        })
+        let (mut inner, now) = self.change();
+        let item = inner.pull(repo, number)?;
+        let review = item
+            .pull
+            .as_mut()
+            .expect("pull() yields pulls")
+            .reviews
+            .iter_mut()
+            .find(|review| review.id == review_id)
+            .ok_or_else(|| ForgeError::NotFound(format!("{repo}#{number} has no review {review_id}")))?;
+        review.dismissed = true;
+        let review = review.clone();
+        item.updated_at = now;
+        Ok(review)
     }
 
     /// One page of a pull request's reviews, oldest first.
@@ -629,57 +585,34 @@ impl FakeForge {
     }
 
     pub fn set_checks(&self, repo: &RepoRef, number: u64, checks: CheckState) -> Result<Item, ForgeError> {
-        let now = self.tick();
-        self.with_pull(repo, number, |item| {
-            item.pull.as_mut().expect("with_pull yields pulls").checks = Some(checks);
-            item.updated_at = now;
-            Ok(item.clone())
-        })
+        self.change_pull(repo, number, |pull| pull.checks = Some(checks))
     }
 
     /// Record a new head commit. Earlier reviews become stale, as Forgejo
     /// marks reviews of an outdated commit.
     pub fn push_head(&self, repo: &RepoRef, number: u64) -> Result<Item, ForgeError> {
-        let now = self.tick();
-        self.with_pull(repo, number, |item| {
-            let pull = item.pull.as_mut().expect("with_pull yields pulls");
+        self.change_pull(repo, number, |pull| {
             pull.head_sha = commit_sha(&[&pull.head_sha, "push"]);
             pull.checks = None;
             for review in &mut pull.reviews {
                 review.stale = true;
             }
-            item.updated_at = now;
-            Ok(item.clone())
         })
     }
 
     pub fn delete_head(&self, repo: &RepoRef, number: u64) -> Result<Item, ForgeError> {
-        let now = self.tick();
-        self.with_pull(repo, number, |item| {
-            item.pull.as_mut().expect("with_pull yields pulls").head_deleted = true;
-            item.updated_at = now;
-            Ok(item.clone())
-        })
+        self.change_pull(repo, number, |pull| pull.head_deleted = true)
     }
 
     pub fn set_draft(&self, repo: &RepoRef, number: u64, draft: bool) -> Result<Item, ForgeError> {
-        let now = self.tick();
-        self.with_pull(repo, number, |item| {
-            item.pull.as_mut().expect("with_pull yields pulls").draft = draft;
-            item.updated_at = now;
-            Ok(item.clone())
-        })
+        self.change_pull(repo, number, |pull| pull.draft = draft)
     }
 
     pub fn request_review(&self, repo: &RepoRef, number: u64, login: &str) -> Result<Item, ForgeError> {
-        let now = self.tick();
-        self.with_pull(repo, number, |item| {
-            let pull = item.pull.as_mut().expect("with_pull yields pulls");
+        self.change_pull(repo, number, |pull| {
             if !pull.requested_reviewers.iter().any(|existing| existing.eq_ignore_ascii_case(login)) {
                 pull.requested_reviewers.push(login.to_string());
             }
-            item.updated_at = now;
-            Ok(item.clone())
         })
     }
 
@@ -687,31 +620,23 @@ impl FakeForge {
         if body.trim().is_empty() {
             return Err(ForgeError::Invalid("a comment needs a body".into()));
         }
-        let now = self.tick();
-        let id = self.lock().next_id();
-        self.with_item(repo, number, |item| {
-            let comment = Comment { id, user: user.to_string(), body: body.to_string(), created_at: now };
-            item.comments.push(comment.clone());
-            item.updated_at = now;
-            Ok(comment)
-        })
+        let (mut inner, now) = self.change();
+        inner.item(repo, number)?;
+        let id = inner.next_id();
+        let item = inner.item(repo, number)?;
+        let comment = Comment { id, user: user.to_string(), body: body.to_string(), created_at: now };
+        item.comments.push(comment.clone());
+        item.updated_at = now;
+        Ok(comment)
     }
 
     pub fn set_labels(&self, repo: &RepoRef, number: u64, labels: Vec<String>) -> Result<Item, ForgeError> {
-        let now = self.tick();
-        let mut inner = self.lock();
-        let mut ids = Vec::new();
-        for _ in &labels {
-            ids.push(inner.next_id());
-        }
-        let repository = inner.repository(repo)?;
-        for (label, id) in labels.iter().zip(ids) {
-            if repository.label_id(label).is_none() {
-                repository.labels.push(Label { id, name: label.clone(), color: label_color(label) });
-            }
-        }
-        let item = repository.items.get_mut(&number).ok_or_else(|| not_found(repo, number))?;
-        item.labels = unique(labels);
+        let (mut inner, now) = self.change();
+        inner.item(repo, number)?;
+        let labels = unique(labels);
+        inner.ensure_labels(repo, &labels)?;
+        let item = inner.item(repo, number)?;
+        item.labels = labels;
         item.updated_at = now;
         Ok(item.clone())
     }
@@ -771,78 +696,83 @@ impl FakeForge {
         forges
     }
 
-    /// Merge every open, non-draft pull request opened at least `after` ago.
-    /// Returns the merged pull requests.
+    /// Merge every open, non-draft pull request opened at least `after` ago,
+    /// in one critical section, so no admin change interleaves between
+    /// choosing a pull request and merging it. Returns the merged pull requests.
     pub fn merge_due(&self, after: Duration) -> Vec<(RepoRef, u64)> {
-        let now = self.clock.now();
         let after = chrono::Duration::from_std(after).unwrap_or(chrono::Duration::MAX);
-        let mut due = Vec::new();
-        for (forge, state) in &self.lock().forges {
-            for repository in state.repositories.values() {
-                for item in repository.items.values() {
+        let (mut inner, now) = self.change();
+        let mut merged = Vec::new();
+        for (forge, state) in &mut inner.forges {
+            for repository in state.repositories.values_mut() {
+                let repo = RepoRef::new(forge, &repository.owner, &repository.name);
+                for item in repository.items.values_mut() {
                     let ready = item.state == ItemState::Open && item.pull.as_ref().is_some_and(|pull| !pull.draft);
-                    if ready && now.signed_duration_since(item.created_at) >= after {
-                        due.push((RepoRef::new(forge, &repository.owner, &repository.name), item.number));
+                    if ready
+                        && now.signed_duration_since(item.created_at) >= after
+                        && merge_item(item, &repo, "merge", state.settings.login.clone(), now).is_ok()
+                    {
+                        merged.push((repo.clone(), item.number));
                     }
                 }
             }
         }
-        due.into_iter().filter(|(repo, number)| self.merge(repo, *number, "merge", None).is_ok()).collect()
+        merged
     }
 
     pub fn record_refusal(&self, refusal: Refusal) {
         let mut inner = self.lock();
         inner.refusal_count += 1;
         if inner.refusals.len() == REFUSALS_KEPT {
-            inner.refusals.remove(0);
+            inner.refusals.pop_front();
         }
-        inner.refusals.push(refusal);
+        inner.refusals.push_back(refusal);
     }
 
     /// The most recent refusals, oldest first, and the total ever refused.
     pub fn refusals(&self) -> (Vec<Refusal>, u64) {
         let inner = self.lock();
-        (inner.refusals.clone(), inner.refusal_count)
+        (inner.refusals.iter().cloned().collect(), inner.refusal_count)
     }
 
-    /// A strictly increasing timestamp, so `recentupdate` order is total.
-    fn tick(&self) -> DateTime<Utc> {
-        let now = self.clock.now();
+    /// Lock for one change, with its timestamp taken under the same lock, so
+    /// `updated_at` order is the order changes were made.
+    fn change(&self) -> (MutexGuard<'_, Inner>, DateTime<Utc>) {
         let mut inner = self.lock();
-        let next = match inner.last_time {
-            Some(last) if now <= last => last + chrono::Duration::milliseconds(1),
-            _ => now,
-        };
-        inner.last_time = Some(next);
-        next
+        let now = inner.tick(self.clock.now());
+        (inner, now)
     }
 
-    fn with_item<T>(&self, repo: &RepoRef, number: u64, change: impl FnOnce(&mut Item) -> Result<T, ForgeError>) -> Result<T, ForgeError> {
-        let mut inner = self.lock();
-        let item = inner.repository(repo)?.items.get_mut(&number).ok_or_else(|| not_found(repo, number))?;
-        change(item)
-    }
-
-    fn with_pull<T>(&self, repo: &RepoRef, number: u64, change: impl FnOnce(&mut Item) -> Result<T, ForgeError>) -> Result<T, ForgeError> {
-        self.with_item(repo, number, |item| {
-            if item.is_pull() {
-                change(item)
-            } else {
-                Err(ForgeError::NotFound(format!("{repo}#{number} is an issue, not a pull request")))
-            }
-        })
+    /// Change one pull request's facts and mark it updated.
+    fn change_pull(&self, repo: &RepoRef, number: u64, change: impl FnOnce(&mut PullFacts)) -> Result<Item, ForgeError> {
+        let (mut inner, now) = self.change();
+        let item = inner.pull(repo, number)?;
+        change(item.pull.as_mut().expect("pull() yields pulls"));
+        item.updated_at = now;
+        Ok(item.clone())
     }
 }
 
 impl Inner {
+    /// A strictly increasing timestamp, so `recentupdate` order is total.
+    fn tick(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
+        let next = match self.last_time {
+            Some(last) if now <= last => last + chrono::Duration::milliseconds(1),
+            _ => now,
+        };
+        self.last_time = Some(next);
+        next
+    }
+
     fn next_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         id
     }
 
-    fn forge(&mut self, forge: &str) -> Result<&mut Forge, ForgeError> {
-        self.forges.get_mut(forge).ok_or_else(|| ForgeError::UnknownForge(forge.to_string()))
+    /// The login that owns the forge's token.
+    fn login(&self, forge: &str) -> Result<String, ForgeError> {
+        self.forges.get(forge).map(|forge| forge.settings.login.clone()).ok_or_else(|| ForgeError::UnknownForge(forge.to_string()))
     }
 
     fn repository(&mut self, repo: &RepoRef) -> Result<&mut Repository, ForgeError> {
@@ -853,7 +783,7 @@ impl Inner {
         let forge = self.forges.get_mut(&repo.forge).ok_or_else(|| ForgeError::UnknownForge(repo.forge.clone()))?;
         let key = repo.key();
         if !forge.repositories.contains_key(&key) {
-            tracing::info!(repository = %repo, "fake forge created repository on first reference");
+            tracing::info!(repository = %repo, "fake forge created repository");
             forge.repositories.insert(
                 key.clone(),
                 Repository {
@@ -869,6 +799,70 @@ impl Inner {
         }
         Ok(self.forges.get_mut(&repo.forge).and_then(|forge| forge.repositories.get_mut(&key)).expect("present above"))
     }
+
+    fn item(&mut self, repo: &RepoRef, number: u64) -> Result<&mut Item, ForgeError> {
+        self.repository(repo)?.items.get_mut(&number).ok_or_else(|| not_found(repo, number))
+    }
+
+    fn pull(&mut self, repo: &RepoRef, number: u64) -> Result<&mut Item, ForgeError> {
+        let item = self.item(repo, number)?;
+        if item.is_pull() {
+            Ok(item)
+        } else {
+            Err(ForgeError::NotFound(format!("{repo}#{number} is an issue, not a pull request")))
+        }
+    }
+
+    /// Give the repository each label it does not have yet.
+    fn ensure_labels(&mut self, repo: &RepoRef, labels: &[String]) -> Result<(), ForgeError> {
+        for label in labels {
+            if self.repository(repo)?.label_id(label).is_none() {
+                let id = self.next_id();
+                self.repository(repo)?.labels.push(Label { id, name: label.clone(), color: label_color(label) });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn edit_item(item: &mut Item, repo: &RepoRef, edit: ItemEdit, now: DateTime<Utc>) -> Result<Item, ForgeError> {
+    if edit.title.as_ref().is_some_and(|title| title.trim().is_empty()) {
+        return Err(ForgeError::Invalid("title cannot be empty".into()));
+    }
+    if edit.state == Some(ItemState::Open) && item.merged() {
+        return Err(ForgeError::NotAllowed(format!("{repo}#{} is merged and cannot be reopened", item.number)));
+    }
+    if let Some(title) = edit.title {
+        item.title = title;
+    }
+    if let Some(body) = edit.body {
+        item.body = body;
+    }
+    if let Some(state) = edit.state.filter(|state| *state != item.state) {
+        item.state = state;
+        item.closed_at = (state == ItemState::Closed).then_some(now);
+    }
+    item.updated_at = now;
+    Ok(item.clone())
+}
+
+fn merge_item(item: &mut Item, repo: &RepoRef, style: &str, merged_by: String, now: DateTime<Utc>) -> Result<Item, ForgeError> {
+    let number = item.number;
+    if item.state != ItemState::Open {
+        return Err(ForgeError::NotAllowed(format!("{repo}#{number} is not open")));
+    }
+    let pull = item.pull.as_mut().expect("merge_item merges pulls");
+    if pull.draft {
+        return Err(ForgeError::NotAllowed(format!("{repo}#{number} is a draft")));
+    }
+    pull.merged_at = Some(now);
+    pull.merged_by = Some(merged_by);
+    pull.merge_style = Some(style.to_string());
+    pull.merge_commit_sha = Some(commit_sha(&[&repo.to_string(), &number.to_string(), "merge", style]));
+    item.state = ItemState::Closed;
+    item.closed_at = Some(now);
+    item.updated_at = now;
+    Ok(item.clone())
 }
 
 fn next_number(repository: &Repository) -> u64 {

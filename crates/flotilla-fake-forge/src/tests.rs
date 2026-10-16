@@ -189,6 +189,12 @@ async fn requests_outside_the_provider_shapes_are_refused() {
         ("repeated parameter", Request::get(&format!("{PULLS}?state=open&state=all&limit=10&page=1")), StatusCode::BAD_REQUEST),
         ("query on item read", Request::get(&format!("{PULLS}/1?fields=all")), StatusCode::BAD_REQUEST),
         ("non-numeric item", Request::get(&format!("{PULLS}/first")), StatusCode::NOT_FOUND),
+        ("signed item number", Request::get(&format!("{PULLS}/+1")), StatusCode::NOT_FOUND),
+        (
+            "unknown route without a token",
+            Request::get("/github/api/v1/repos/flotilla-org/flotilla/branches").token(None),
+            StatusCode::UNAUTHORIZED,
+        ),
         ("no token", Request::get(&format!("{PULLS}/1")).token(None), StatusCode::UNAUTHORIZED),
         ("wrong token", Request::get(&format!("{PULLS}/1")).token(Some("guess")), StatusCode::UNAUTHORIZED),
         ("another forge's token", Request::get(&format!("{PULLS}/1")).token(Some(LAB_TOKEN)), StatusCode::UNAUTHORIZED),
@@ -527,4 +533,20 @@ fn model_filters_select_by_state() {
         .list_issues(&repo(), &IssueFilter { state: StateFilter::All, labels: vec![], query: None, since: None }, 1, 10)
         .expect("issues");
     assert_eq!(issues.total, 0, "pull requests are not issues");
+}
+
+// Behaviour: a refused creation changes nothing, not even the id sequence, so
+// ids stay dense and comparable across implementations. The ids an item gets
+// are allocated under the same lock as the change, after validation.
+#[test]
+fn refused_creations_consume_no_ids() {
+    let forge = forge();
+    let first = forge.create_pull(&repo(), new_pull("feature")).expect("pull");
+    assert!(forge.create_pull(&repo(), new_pull("feature")).is_err(), "duplicate head and base");
+    assert!(forge.create_pull(&repo(), NewPull { title: " ".into(), ..new_pull("other") }).is_err(), "empty title");
+    assert!(forge.add_review(&repo(), 99, NewReview { user: "a".into(), state: ReviewState::Approved, body: String::new() }).is_err());
+    assert!(forge.add_comment(&repo(), 99, "a", "missing item").is_err());
+    let next = forge.create_issue(&repo(), new_issue("next", &[])).expect("issue");
+    assert_eq!(next.id, first.id + 1);
+    assert_eq!(next.number, first.number + 1);
 }

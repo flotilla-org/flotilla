@@ -142,10 +142,13 @@ impl Call<'_> {
             .forge
             .settings(forge_name)
             .ok_or_else(|| Failure::refuse(StatusCode::NOT_FOUND, format!("no forge is mounted at `/{forge_name}`")))?;
+        // Authenticate before answering an unknown route, so only a token
+        // holder learns which routes exist. Forge names are not secret: the
+        // rehearsal's Forge records publish them.
+        self.authenticate(&settings.token)?;
         if let Route::Unknown(rest) = route {
             return Err(Failure::refuse(StatusCode::NOT_FOUND, format!("unsupported Forgejo API route `{rest}`")));
         }
-        self.authenticate(&settings.token)?;
         let query = Query::parse(self.query)?;
         match (self.method.clone(), route) {
             (Method::GET, Route::User) => {
@@ -181,8 +184,7 @@ impl Call<'_> {
                         return Err(Failure::refuse(StatusCode::UNPROCESSABLE_ENTITY, format!("state `{other}` is not open or closed")))
                     }
                 };
-                self.forge.pull(&repo, number)?;
-                let item = self.forge.edit(&repo, number, ItemEdit { title: body.title, body: body.body, state })?;
+                let item = self.forge.edit_pull(&repo, number, ItemEdit { title: body.title, body: body.body, state })?;
                 // Forgejo answers a pull request edit with 201 Created.
                 Ok(json_response(StatusCode::CREATED, &render::pull(&self.urls(&repo)?.as_urls(), &item)))
             }
@@ -376,7 +378,9 @@ impl OwnedUrls {
 
 fn parse_number(value: &str) -> Result<u64, Failure> {
     match value.parse::<u64>() {
-        Ok(number) if number > 0 && !value.starts_with('0') => Ok(number),
+        // Canonical decimal only: `+5` and `05` parse as numbers but are not
+        // how Forgejo or flotilla spell an item number.
+        Ok(number) if number > 0 && !value.starts_with('0') && value.bytes().all(|byte| byte.is_ascii_digit()) => Ok(number),
         _ => Err(Failure::refuse(StatusCode::NOT_FOUND, format!("`{value}` is not an item number"))),
     }
 }
