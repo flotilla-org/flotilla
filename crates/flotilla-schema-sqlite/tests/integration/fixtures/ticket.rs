@@ -1,9 +1,10 @@
 //! The synthetic machine-state fixture (#3373 ruling 4): `Ticket`, whose state is a label-plus-data
-//! enum (`#[store(labels = TicketLabel)]`). Clearly synthetic: no engine kind is a ticket, and the
-//! next layer's engine kinds do not replace it. It covers every datum form (a plain datum shared by
-//! two labels, a plain datum of one label, `child` set and map data, `intern` data optional and
-//! required, `flatten` data optional and required), a label carrying no data, and an index
-//! predicate on the state.
+//! enum (`#[store(labels = TicketLabel)]`). Clearly synthetic: no engine kind is a ticket. The
+//! engine kinds use every datum form too, but no engine label lacks a collection another label
+//! carries, so the ticket keeps the rows a label change deletes covered. It covers every datum form
+//! (a plain datum shared by two labels, a plain datum of one label, `child` set and map data,
+//! `intern` data optional and required, `flatten` data optional and required), a label carrying no
+//! data, and an index predicate on the state.
 //!
 //! Its edges are transitions (`Edge::transition`): the next state keeps, grows, shrinks and changes
 //! the previous one's collections, or moves to another label.
@@ -241,10 +242,10 @@ impl Fixture for Ticket {
         Ticket { queue: name(tc), title: text(tc), ..self.clone() }
     }
 
-    fn edge(&self, tc: &TestCase, pick: Pick) -> (Edge<Ticket>, Ticket) {
+    fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<Ticket>, Ticket)> {
         let value = next_value(tc, pick, &self.state.value);
         let (edge, state, event) = transition(tc, pick, &self.state, value);
-        (edge, Ticket { state, edges: appended(tc, &self.edges, event), ..self.clone() })
+        Some((edge, Ticket { state, edges: appended(tc, &self.edges, event), ..self.clone() }))
     }
 
     fn stamped(&self, before: Option<&Ticket>, version: u64) -> Ticket {

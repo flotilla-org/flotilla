@@ -1,29 +1,31 @@
-//! The lifecycle-shaped fixture (TerminalSession), transcribed from the #3208 §4.3 sketch: the
-//! shared lifecycle edge is generic over each kind's identity type, and TerminalSession supplies
-//! `TerminalIdentity`.
-//!
-//! Modelling decisions the storage list forces:
-//! - The edge log is an [`EdgeEvent`] header plus one document, whose `LifecycleEdge<I>` arguments
-//!   carry the identity (`Realise { identity }`): the same generic shape serves Vessel,
-//!   Environment and the others without a column per identity field.
-//! - The realised identity on the resource is a flattened `Option<TerminalIdentity>` with a
-//!   presence flag, rather than columns read from the latest edge.
-//! - An agent source's brief is frozen inside a data enum variant: a hash column guarded by the
-//!   variant's CHECK.
-//! - Labels are a set: a child table whose key is the value itself.
+//! `TerminalSession`: a lifecycle kind (`flotilla_state_machines::machines::lifecycle`) with a
+//! concrete request, declared here because a lifecycle kind's stored row belongs to whoever owns
+//! its request (#3319). The engine supplies the storable state (`LifecycleState`) and history
+//! (`LifecycleEvent`, `Attempt`); the request's columns are this test kind's own, transcribed from
+//! the #3208 §4.3 sketch:
+//! - `vessel` is a reference to the `Vessel` kind (a target kind of the test registry), so a
+//!   lifecycle row also exercises references to kinds and their identity rows;
+//! - an agent source's brief is frozen inside a data enum variant: a hash column guarded by the
+//!   variant's CHECK;
+//! - labels are a set: a child table whose key is the value itself.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Edge, EdgeEvent, Frozen, Records, Ref, State, Stored};
+use flotilla_schema::{Edge, Frozen, HistoryOf, Records, Ref, State, StateOf, Stored, Timestamp};
+use flotilla_state_machines::{
+    machines::lifecycle::{
+        Absence, GiveUp, Lifecycle, LifecycleEdge, LifecycleEvent, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld,
+        Observed, Realisation, Realise, Release, Teardown, Vanish,
+    },
+    Attempt, EdgeEventOf, MachineRow, Resource, RowParts,
+};
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    appended,
-    attempt::{Attempt, Cause},
-    code_enum,
-    convoy::map,
-    event, key, list, name, payload, records, reference, stamp, text, timestamp, Fixture, Payload, Pick, SHAPES,
+    engine::{self, Candidate},
+    ensure::{attempt, cause},
+    key, list, name, records, reference, stamp_flat, text, timestamp, Fixture, Pick,
 };
 
 /// A minimal target kind for `TerminalSession::vessel`.
@@ -33,6 +35,27 @@ pub struct Vessel {
     pub name: String,
 }
 
+/// The test lifecycle kind: its name, request and the default retry policy.
+pub struct Terminal;
+
+impl LifecycleKind for Terminal {
+    const NAME: &'static str = "TerminalSession";
+    type Request = TerminalRequest;
+}
+
+/// What a caller asks for: the session's request, its immutable spec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalRequest {
+    pub vessel: Ref<Vessel>,
+    pub role: String,
+    pub ordinal: u16,
+    pub pool: String,
+    pub cwd: String,
+    pub source: TerminalSource,
+    pub env: BTreeMap<String, String>,
+    pub labels: BTreeSet<String>,
+}
+
 /// A vessel's sessions in ordinal order (the #3208 §4.3 `(vessel_id, role, ordinal)` key, without
 /// uniqueness), and a pool's live sessions: an interned `eq` column under a lifecycle predicate.
 #[derive(Debug, Clone, PartialEq, Stored)]
@@ -40,7 +63,7 @@ pub struct Vessel {
     kind = "TerminalSession",
     code = 6,
     index(name = "by_vessel", eq(vessel), order(ordinal)),
-    index(name = "live_by_pool", eq(pool), when(lifecycle in [Requested, Realised]))
+    index(name = "live_by_pool", eq(pool), when(state in [Requested, Realised]))
 )]
 pub struct TerminalSession {
     pub vessel: Ref<Vessel>,
@@ -55,14 +78,12 @@ pub struct TerminalSession {
     pub env: BTreeMap<String, String>,
     #[store(child)]
     pub labels: BTreeSet<String>,
-    #[store(flatten)]
-    pub realised: Option<TerminalIdentity>,
-    #[store(history)]
-    pub events: Records<LifecycleEvent<TerminalIdentity>>,
-    #[store(history)]
-    pub attempts: Records<Attempt<TerminalAction>>,
     #[store(state)]
-    pub lifecycle: State<LifecycleState>,
+    pub state: State<LifecycleState>,
+    #[store(history)]
+    pub events: Records<LifecycleEvent>,
+    #[store(history)]
+    pub attempts: Records<Attempt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Stored)]
@@ -84,178 +105,166 @@ pub struct Brief {
     pub skills: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]
-pub struct TerminalIdentity {
-    pub session_id: String,
-    pub pid: Option<i64>,
-    pub endpoint: Option<String>,
-}
-
-/// One lifecycle edge event; generic over the identity a `Realise` edge carries.
-pub type LifecycleEvent<I> = EdgeEvent<LifecycleState, LifecycleEdgeName, Payload<LifecycleEdge<I>>>;
-
-/// The edge column of a lifecycle's edge log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
-pub enum LifecycleEdgeName {
-    #[store(code = 1)]
-    Realise,
-    #[store(code = 2)]
-    Vanish,
-    #[store(code = 3)]
-    Release,
-    #[store(code = 4)]
-    GiveUp,
-}
-
-/// The lifecycle edges' arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LifecycleEdge<I> {
-    Realise { identity: I },
-    Vanish,
-    Release,
-    GiveUp { cause: Cause },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
-pub enum LifecycleState {
-    #[store(code = 1)]
-    Requested,
-    #[store(code = 2)]
-    Realised,
-    #[store(code = 3)]
-    Gone,
-    #[store(code = 4)]
-    GaveUp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
-pub enum TerminalAction {
-    #[store(code = 1)]
-    Spawn,
-    #[store(code = 2)]
-    Attach,
-    #[store(code = 3)]
-    Kill,
-}
-
-impl TerminalIdentity {
-    fn generate(tc: &TestCase, pick: Pick) -> TerminalIdentity {
-        TerminalIdentity {
-            session_id: text(tc),
-            pid: pick.some(tc, 8).then(|| tc.draw(gs::integers::<i64>())),
-            endpoint: pick.some(tc, 4).then(|| text(tc)),
+impl TerminalSession {
+    pub fn request(&self) -> TerminalRequest {
+        TerminalRequest {
+            vessel: self.vessel.clone(),
+            role: self.role.clone(),
+            ordinal: self.ordinal,
+            pool: self.pool.clone(),
+            cwd: self.cwd.clone(),
+            source: self.source.clone(),
+            env: self.env.clone(),
+            labels: self.labels.clone(),
         }
     }
 }
 
-impl<I> LifecycleEdge<I> {
-    /// Every edge in turn when covering; `identity` draws the kind's own identity.
-    pub fn generate(tc: &TestCase, pick: Pick, identity: impl FnOnce() -> I) -> LifecycleEdge<I> {
-        match pick.variant(tc, 4, |index| index) {
-            0 => LifecycleEdge::Realise { identity: identity() },
-            1 => LifecycleEdge::Vanish,
-            2 => LifecycleEdge::Release,
-            _ => LifecycleEdge::GiveUp { cause: Cause::generate(tc, pick) },
+impl MachineRow for TerminalSession {
+    type Machine = Lifecycle<Terminal>;
+    const STATE_FIELD: StateOf<Self, State<LifecycleState>> = TerminalSession::STATE;
+    const EDGE_LOG: HistoryOf<Self, EdgeEventOf<Lifecycle<Terminal>>> = TerminalSession::EVENTS;
+
+    fn of(resource: &Resource<Lifecycle<Terminal>>, since: Timestamp) -> TerminalSession {
+        let TerminalRequest { vessel, role, ordinal, pool, cwd, source, env, labels } = resource.spec().clone();
+        TerminalSession {
+            vessel,
+            role,
+            ordinal,
+            pool,
+            cwd,
+            source,
+            env,
+            labels,
+            state: State::new(resource.state().clone(), since),
+            events: resource.events().clone(),
+            attempts: resource.attempts().clone(),
         }
     }
 
-    pub fn name(&self) -> LifecycleEdgeName {
-        match self {
-            LifecycleEdge::Realise { .. } => LifecycleEdgeName::Realise,
-            LifecycleEdge::Vanish => LifecycleEdgeName::Vanish,
-            LifecycleEdge::Release => LifecycleEdgeName::Release,
-            LifecycleEdge::GiveUp { .. } => LifecycleEdgeName::GiveUp,
+    fn state(&self) -> &State<LifecycleState> {
+        &self.state
+    }
+
+    fn parts(&self) -> RowParts<Lifecycle<Terminal>> {
+        RowParts {
+            spec: self.request(),
+            state: self.state.value.clone(),
+            events: self.events.clone(),
+            attempts: self.attempts.clone(),
+            receipts: Records::new(),
         }
     }
 }
 
-fn args(tc: &TestCase, pick: Pick) -> LifecycleEdge<TerminalIdentity> {
-    LifecycleEdge::generate(tc, pick, || TerminalIdentity::generate(tc, pick))
+/// Covering indexes: the label is digit 0 (base 4), the source digit 2 (base 2).
+pub const COVERING: usize = 48;
+
+pub fn state_value(tc: &TestCase, pick: Pick) -> LifecycleState {
+    match pick.digit(tc, 4, 1) {
+        0 => LifecycleState::Requested,
+        1 => LifecycleState::Realised { identity: text(tc) },
+        2 => LifecycleState::Gone,
+        _ => LifecycleState::GaveUp { cause: cause(tc, pick) },
+    }
 }
 
-/// An event of any edge between any labels.
-fn edge_event(tc: &TestCase, pick: Pick) -> LifecycleEvent<TerminalIdentity> {
-    use LifecycleState::*;
-    let (args, labels) = (args(tc, pick), [Requested, Realised, Gone, GaveUp]);
-    event(tc, args.name(), code_enum(tc, pick, &labels), code_enum(tc, pick.nth(1), &labels), payload(tc, pick, args))
+fn edges(tc: &TestCase, pick: Pick) -> Vec<LifecycleEdge> {
+    vec![
+        Realise { identity: text(tc), observed: flotilla_state_machines::Ref::new(name(tc)) }.into(),
+        Release { teardown: flotilla_state_machines::Ref::new(name(tc)) }.into(),
+        Vanish { observed: flotilla_state_machines::Ref::new(name(tc)) }.into(),
+        GiveUp { cause: cause(tc, pick) }.into(),
+    ]
 }
 
-fn attempt(tc: &TestCase, pick: Pick) -> Attempt<TerminalAction> {
-    use TerminalAction::*;
-    Attempt::generate(tc, pick, code_enum(tc, pick, &[Spawn, Attach, Kill]))
+/// Drawn keys collide (and so dedupe); covering keys are distinct.
+pub fn map<V>(tc: &TestCase, pick: Pick, max: usize, mut value: impl FnMut(Pick) -> V) -> BTreeMap<String, V> {
+    (0..pick.count(tc, max))
+        .map(|n| {
+            let key = match pick {
+                Pick::Draw => key(tc),
+                Pick::Cover(_) => format!("k{n}"),
+            };
+            (key, value(pick.nth(n)))
+        })
+        .collect()
 }
 
-/// Every variant and option in each round of [`SHAPES`]; five rounds give every code enum every
-/// code.
-pub const COVERING: usize = SHAPES * 5;
+pub fn generate(tc: &TestCase, pick: Pick) -> TerminalSession {
+    let source = match pick.digit(tc, 2, 4) {
+        0 => TerminalSource::Tool { command: text(tc) },
+        _ => TerminalSource::Agent {
+            selector: name(tc),
+            brief: Frozen::new(Brief { text: name(tc), skills: list(tc, pick, 2, |_| name(tc)) }).expect("freeze"),
+        },
+    };
+    TerminalSession {
+        vessel: reference(tc),
+        role: name(tc),
+        ordinal: tc.draw(gs::integers::<u16>()),
+        pool: name(tc),
+        cwd: text(tc),
+        source,
+        env: map(tc, pick, 3, |_| text(tc)),
+        labels: list(tc, pick, 3, |_| key(tc)).into_iter().collect(),
+        state: State::new(state_value(tc, pick), timestamp(tc)),
+        events: records(tc, pick, 3, |pick| engine::event::<Lifecycle<Terminal>>(tc, pick, &edges(tc, pick))),
+        attempts: records(tc, pick.nth(1), 3, |pick| attempt(tc, pick)),
+    }
+}
+
+fn boxed(world: MemoryLifecycleWorld) -> Box<dyn LifecycleWorld> {
+    Box::new(world)
+}
+
+/// Every edge a live session may take: realising under an observed identity, releasing once torn
+/// down, vanishing when observed absent, and giving up with its last attempt's cause.
+pub fn candidates(tc: &TestCase, row: &TerminalSession) -> Vec<Candidate<Lifecycle<Terminal>>> {
+    let now = timestamp(tc);
+    let mut candidates = Vec::new();
+    let (identity, observed) = (text(tc), flotilla_state_machines::Ref::<Realisation>::new(name(tc)));
+    let mut world = MemoryLifecycleWorld::default();
+    world.realisations.put(&observed, Observed { identity: identity.clone() });
+    candidates.push((Realise { identity, observed }.into(), boxed(world), now));
+    let teardown = flotilla_state_machines::Ref::<Teardown>::new(name(tc));
+    let mut world = MemoryLifecycleWorld::default();
+    world.teardowns.put(&teardown, true);
+    candidates.push((Release { teardown }.into(), boxed(world), now));
+    let absent = flotilla_state_machines::Ref::<Absence>::new(name(tc));
+    let mut world = MemoryLifecycleWorld::default();
+    world.absences.put(&absent, true);
+    candidates.push((Vanish { observed: absent }.into(), boxed(world), now));
+    let last = row.attempts.last().and_then(|row| match &row.record.outcome {
+        flotilla_state_machines::Outcome::Failed { cause, .. } => Some(cause.clone()),
+        flotilla_state_machines::Outcome::Succeeded => None,
+    });
+    if let Some(cause) = last {
+        candidates.push((GiveUp { cause }.into(), boxed(MemoryLifecycleWorld::default()), now));
+    }
+    candidates
+}
 
 impl Fixture for TerminalSession {
     const COVERING: usize = COVERING;
 
     fn generate(tc: &TestCase, pick: Pick) -> TerminalSession {
-        use LifecycleState::*;
-        let source = match pick.variant(tc, 2, |index| index) {
-            0 => TerminalSource::Tool { command: text(tc) },
-            _ => TerminalSource::Agent {
-                selector: name(tc),
-                brief: Frozen::new(Brief { text: name(tc), skills: list(tc, pick, 2, |_| name(tc)) }).expect("freeze"),
-            },
-        };
-        TerminalSession {
-            vessel: reference(tc),
-            role: name(tc),
-            ordinal: tc.draw(gs::integers::<u16>()),
-            pool: name(tc),
-            cwd: text(tc),
-            source,
-            env: map(tc, pick, 3, |_| text(tc)),
-            labels: list(tc, pick, 3, |_| key(tc)).into_iter().collect(),
-            realised: pick.some(tc, 7).then(|| TerminalIdentity::generate(tc, pick.nth(1))),
-            events: records(tc, pick, 3, |pick| edge_event(tc, pick)),
-            attempts: records(tc, pick, 2, |pick| attempt(tc, pick)),
-            lifecycle: State::new(code_enum(tc, pick, &[Requested, Realised, Gone, GaveUp]), timestamp(tc)),
-        }
+        generate(tc, pick)
     }
 
-    /// Spec, env and labels drawn afresh; the lifecycle, the realised identity, events and
-    /// attempts kept.
+    /// The request drawn afresh; the state, events and attempts kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> TerminalSession {
-        TerminalSession {
-            realised: self.realised.clone(),
-            events: self.events.clone(),
-            attempts: self.attempts.clone(),
-            lifecycle: self.lifecycle,
-            ..TerminalSession::generate(tc, pick)
-        }
+        TerminalSession { state: self.state.clone(), events: self.events.clone(), attempts: self.attempts.clone(), ..generate(tc, pick) }
     }
 
-    /// The lifecycle moved and a lifecycle event appended; a `Realise` sets the realised identity
-    /// (a flattened optional struct), and sometimes an attempt is appended.
-    fn edge(&self, tc: &TestCase, pick: Pick) -> (Edge<TerminalSession>, TerminalSession) {
-        use LifecycleState::*;
-        let args = args(tc, pick);
-        let lifecycle = State::new(code_enum(tc, pick.nth(1), &[Requested, Realised, Gone, GaveUp]), timestamp(tc));
-        let event = event(tc, args.name(), self.lifecycle.value, lifecycle.value, payload(tc, pick, args));
-        let mut edge = Edge::new(TerminalSession::LIFECYCLE, &lifecycle, TerminalSession::EVENTS, &event).expect("edge");
-        let mut next = TerminalSession { lifecycle, ..self.clone() };
-        if let LifecycleEdge::Realise { identity } = &event.payload.args {
-            let realised = Some(identity.clone());
-            edge = edge.set(TerminalSession::REALISED, &realised).expect("realised");
-            next.realised = realised;
-        }
-        if pick.nth(2).some(tc, 8) {
-            let attempt = attempt(tc, pick);
-            edge = edge.append(TerminalSession::ATTEMPTS, &attempt).expect("attempt");
-            next.attempts = appended(tc, &self.attempts, attempt);
-        }
-        next.events = appended(tc, &self.events, event);
-        (edge, next)
+    fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<TerminalSession>, TerminalSession)> {
+        engine::drive(tc, pick, self, candidates(tc, self))
     }
 
     fn stamped(&self, before: Option<&TerminalSession>, version: u64) -> TerminalSession {
         TerminalSession {
-            events: stamp(&self.events, before.map(|before| &before.events), version, |event, _| event.clone()),
-            attempts: stamp(&self.attempts, before.map(|before| &before.attempts), version, |attempt, _| attempt.clone()),
+            events: stamp_flat(&self.events, before.map(|before| &before.events), version),
+            attempts: stamp_flat(&self.attempts, before.map(|before| &before.attempts), version),
             ..self.clone()
         }
     }

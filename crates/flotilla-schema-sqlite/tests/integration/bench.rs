@@ -4,24 +4,28 @@
 //! cargo test -p flotilla-schema-sqlite --release --locked --test integration bench -- --ignored --nocapture
 //! ```
 //!
-//! A temp-file database in WAL mode with `synchronous = NORMAL` holds pre-created messages. Each
-//! event is one edge through `Write::apply_edge`: it moves the message's state (`state`,
-//! `state_since` and the version, by the state field's own statement) and appends an edge history
-//! row, whose document holds the edge's arguments and one gate read. That is the edge row, the
-//! root row and the `change_log` row (plus the `home_sequence` counter and the identity's
-//! sequence): one row fewer than WORKLOAD.md's ~4 row writes per event, which counted the gate
-//! read as a row. Events are committed in batches of 1, 10, 100 and 1000 per transaction.
+//! A temp-file database in WAL mode with `synchronous = NORMAL` holds pre-created messages, each
+//! Pending and expecting a reply. Each event is one engine edge through `Write::apply_edge`: the
+//! engine's `deliver` (Pending to Awaiting, with its receiver) and then its `settle` (Awaiting to
+//! Settled, on the reply), each computed by the engine's home before the timed loop. An edge moves
+//! the message's state (the label, its `since` and the label's data, with the version, in the state
+//! field's one statement) and appends an edge history row, whose document holds the edge's
+//! arguments and the gate's one read. That is the edge row, the root row and the `change_log` row
+//! (plus the `home_sequence` counter and the identity's sequence): one row fewer than WORKLOAD.md's
+//! ~4 row writes per event, which counted the gate read as a row. Events are committed in batches of
+//! 1, 10, 100 and 1000 per transaction.
 
 use std::{env, fs, path::PathBuf, process, time::Instant};
 
-use flotilla_schema::{Edge, EdgeEvent, Identity, Kind, Ref, State, Timestamp};
+use flotilla_schema::{Edge, Timestamp};
 use flotilla_schema_sqlite::{Stamp, Store};
+use flotilla_state_machines::{
+    machines::message::{Deliver, MemoryMessageWorld, Message, MessageWorld, Receiver, Settle, Settlement},
+    Home, MachineRow, Ref, Transport, Version,
+};
 use rusqlite::Connection;
 
-use crate::fixtures::{
-    message::{AgentName, MessageEdge, MessageState, Transport},
-    registry, AgentSession, GateRead, Message, Payload, LOCAL,
-};
+use crate::fixtures::{engine::NAME, message, registry, MessageRow, LOCAL};
 
 const MESSAGES: usize = 10_000;
 const INBOXES: usize = 100;
@@ -49,47 +53,43 @@ fn open(batch: usize) -> (Database, Store) {
     (database, Store::open(conn, LOCAL, registry()).expect("store"))
 }
 
-/// The messages, each with its current stamp and state.
-fn seed(store: &mut Store) -> Vec<(Stamp, MessageState)> {
+fn value(n: usize) -> MessageRow {
+    MessageRow { inbox: format!("inbox-{}", n % INBOXES), ..message::sample() }
+}
+
+/// The messages' stamps.
+fn seed(store: &mut Store) -> Vec<Stamp> {
     let mut stamps = Vec::with_capacity(MESSAGES);
     for chunk in 0..MESSAGES / 1_000 {
         let mut write = store.write().expect("write");
         for n in chunk * 1_000..(chunk + 1) * 1_000 {
-            let value = Message {
-                inbox: Ref::new(format!("inbox-{}", n % INBOXES), LOCAL),
-                body: format!("message body {n}: please review the change and reply with findings"),
-                accepted_seq: n as u64,
-                ..Message::sample()
-            };
-            stamps.push((write.insert(&format!("message-{n}"), &value).expect("insert"), value.state.value));
+            stamps.push(write.insert(&format!("message-{n}"), &value(n)).expect("insert"));
         }
         write.commit().expect("commit");
     }
     stamps
 }
 
-/// One delivery event: the state it moves the message to, and its edge row with one gate read.
-fn event(state: MessageState, n: usize) -> (Edge<Message>, MessageState) {
-    let args = MessageEdge::Deliver {
-        receiver: AgentName("crew".into()),
-        receipt: Ref::new(format!("session-{}", n % 50), LOCAL),
-        transport: Transport::Turn,
-    };
-    let read = GateRead {
-        observed: Identity { kind: AgentSession::CODE, name: format!("session-{}", n % 50), home: LOCAL.into() },
-        version: n as u64,
-    };
-    let next = if state == MessageState::Pending { MessageState::Awaiting } else { MessageState::Pending };
-    let event = EdgeEvent {
-        edge: args.name(),
-        from: state,
-        to: next,
-        writer: LOCAL.into(),
-        at: Timestamp(n as i64),
-        payload: Payload { args, reads: vec![read] },
-    };
-    let edge = Edge::new(Message::STATE, &State::new(next, Timestamp(n as i64)), Message::EDGES, &event);
-    (edge.expect("edge"), next)
+/// Message `n`'s two events, as the engine applies them: its delivery to a session (the gate
+/// reads the session's receipt) and its settlement on the reply (the gate reads the reply).
+fn events(n: usize) -> [Edge<MessageRow>; 2] {
+    let session = format!("session-{}", n % 50);
+    let mut world = MemoryMessageWorld::default();
+    world.receipts.put(&Ref::new(NAME), [(session.clone(), Transport::Turn)].into());
+    world.reply.put(&Ref::new(NAME), ());
+    let world: Box<dyn MessageWorld> = Box::new(world);
+    let mut home = Home::<Message>::new(LOCAL).expect("valid");
+    let row = value(n);
+    home.restore(NAME, Version(1), row.parts()).unwrap_or_else(|_| panic!("an empty home"));
+    let at = Timestamp(n as i64);
+    let deliver = Deliver { receiver: Receiver { session, host: "consumer".into() }, transport: Transport::Turn };
+    let event = home.apply(NAME, deliver, &*world, at).unwrap_or_else(|_| panic!("delivered")).clone();
+    let (first, state) = row.edge(&event, home.get(NAME).expect("present").state().clone()).expect("edge");
+    let delivered = MessageRow { state, ..row };
+    let event =
+        home.apply(NAME, Settle { by: Settlement::Answered }, &*world, at.saturating_add(1)).unwrap_or_else(|_| panic!("settled")).clone();
+    let (second, _) = delivered.edge(&event, home.get(NAME).expect("present").state().clone()).expect("edge");
+    [first, second]
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -99,6 +99,8 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 fn run(batch: usize, events: usize) -> String {
     let (_database, mut store) = open(batch);
     let mut messages = seed(&mut store);
+    assert!(events <= 2 * MESSAGES, "each message takes two events");
+    let mut pending: Vec<std::vec::IntoIter<Edge<MessageRow>>> = (0..MESSAGES).map(|n| Vec::from(self::events(n)).into_iter()).collect();
     let mut transactions = Vec::new();
     let mut commits = Vec::new();
     let start = Instant::now();
@@ -107,10 +109,9 @@ fn run(batch: usize, events: usize) -> String {
         let began = Instant::now();
         let mut write = store.write().expect("write");
         for _ in 0..batch {
-            let (stamp, state) = &mut messages[n % MESSAGES];
-            let (edge, next) = event(*state, n);
+            let edge = pending[n % MESSAGES].next().expect("an event left");
+            let stamp = &mut messages[n % MESSAGES];
             *stamp = write.apply_edge(*stamp, edge).expect("edge");
-            *state = next;
             n += 1;
         }
         let committing = Instant::now();
@@ -139,7 +140,7 @@ fn run(batch: usize, events: usize) -> String {
 #[ignore = "load benchmark: run in release with --ignored --nocapture"]
 fn bench_message_events() {
     let mut lines = vec![
-        format!("{MESSAGES} messages over {INBOXES} inboxes; each event, one apply_edge: state move + edge history row (one gate read in its document) + change_log"),
+        format!("{MESSAGES} messages over {INBOXES} inboxes; each event, one engine edge through apply_edge: state move + edge history row (one gate read in its document) + change_log"),
         "| batch | events | events/s |    rows/s | txn p50 ms | txn p99 ms | commit p50 ms | commit p99 ms |".to_owned(),
         "|---:|---:|---:|---:|---:|---:|---:|---:|".to_owned(),
     ];

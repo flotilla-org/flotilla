@@ -83,27 +83,39 @@ fn the_enumeration_covers_every_kind_and_index() {
         "message select",
         "message_edges select",
         "message_edges insert",
-        "convoy_deliverables_evidence_metadata insert",
-        "terminal_session_labels select",
         "message update version",
         "message set state",
-        "message set subject",
+        "message set receiver",
+        "message set state state",
+        "message label state",
         "message_edges last position",
-        "convoy_deliverables set state",
-        "convoy_deliverables last position",
-        "convoy_deliverables_evidence last position",
+        "agent_session_receipts insert",
+        "convoy_resolution update",
+        "convoy_quota insert",
+        "convoy_quota delete",
+        "convoy label state",
+        "ensure_recorded insert",
+        "ensure set bound",
+        "ensure_attempts last position",
+        "terminal_session_labels select",
+        "dossier_deliverables_evidence_metadata insert",
+        "dossier_deliverables set state",
+        "dossier_deliverables last position",
+        "dossier_deliverables_evidence last position",
+        "referral set subject",
         "index message_open_by_inbox first",
         "index message_open_by_inbox after",
-        "index message_by_reply after",
         "index message_deadline first",
         "index convoy_open_by_project first",
+        "index ensure_by_inbox after",
         "index terminal_session_by_vessel after",
         "index terminal_session_live_by_pool first",
+        "index referral_by_reply after",
+        "index referral_by_session first",
         "vessel scan",
         "ticket set state state",
         "ticket set reason",
         "ticket label state",
-        "convoy label state",
         "ticket_assignees insert",
         "ticket_notes update",
         "ticket_notes delete",
@@ -111,12 +123,16 @@ fn the_enumeration_covers_every_kind_and_index() {
     ] {
         assert!(labels.contains(&expected), "missing {expected}");
     }
-    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 7);
-    assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 8);
+    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 9);
+    assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 9);
     assert!(!labels.iter().any(|label| label.starts_with("message_edges set ")), "history rows are never set");
     assert!(
-        !labels.iter().any(|label| label.starts_with("message_references ") && label.ends_with(" last position")),
+        !labels.iter().any(|label| label.starts_with("convoy_promises ") && label.ends_with(" last position")),
         "spec collections take no positions from edges"
+    );
+    assert!(
+        !labels.iter().any(|label| label.starts_with("ensure_recorded ") && label.ends_with(" update")),
+        "a set's rows are inserted and deleted, never updated"
     );
 }
 
@@ -159,10 +175,18 @@ fn edge_log_indexes_serve_history_reads() {
     assert_eq!(
         planned,
         [
+            "agent_session_edges_by_edge",
+            "agent_session_edges_by_time",
             "convoy_edges_by_edge",
             "convoy_edges_by_time",
+            "dossier_edges_by_edge",
+            "dossier_edges_by_time",
+            "ensure_edges_by_edge",
+            "ensure_edges_by_time",
             "message_edges_by_edge",
             "message_edges_by_time",
+            "referral_edges_by_edge",
+            "referral_edges_by_time",
             "terminal_session_events_by_edge",
             "terminal_session_events_by_time",
             "ticket_edges_by_edge",

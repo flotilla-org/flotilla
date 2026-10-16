@@ -3,12 +3,13 @@ use flotilla_schema::{EdgeEvent, EncodeError, Kind, Records, Ref, Timestamp};
 use flotilla_schema_sqlite::StoreError;
 
 use crate::fixtures::{
-    message::{AgentName, MessageEdge, MessageEdgeEvent, MessageReference, MessageState, Settlement},
-    store, Inbox, Message, Payload, LOCAL,
+    agent_session, store,
+    synthetic::{AgentName, Phase, Reference, ReferralEdge, ReferralEvent},
+    AgentSessionRow, Payload, Referral, LOCAL,
 };
 
-fn message(accepted_seq: u64) -> Message {
-    Message { interrupting: true, accepted_seq, ordinal: u16::MAX, ..Message::sample() }
+fn referral(seq: u64) -> Referral {
+    Referral { seq, ordinal: u16::MAX, ..Referral::sample() }
 }
 
 // Behaviour (#3320 representation): a u64 above i64::MAX is refused with a typed error naming
@@ -18,14 +19,14 @@ fn u64_above_i64_max_is_refused() {
     let mut store = store();
     let mut write = store.write().expect("write");
     assert!(matches!(
-        write.insert("max", &message(u64::MAX)),
-        Err(StoreError::Encode(EncodeError::OutOfRange { column, value })) if column == "accepted_seq" && value == u64::MAX
+        write.insert("max", &referral(u64::MAX)),
+        Err(StoreError::Encode(EncodeError::OutOfRange { column, value })) if column == "seq" && value == u64::MAX
     ));
-    assert!(matches!(write.insert("over", &message(i64::MAX as u64 + 1)), Err(StoreError::Encode(EncodeError::OutOfRange { .. }))));
-    let stamp = write.insert("edge", &message(i64::MAX as u64)).expect("i64::MAX fits");
+    assert!(matches!(write.insert("over", &referral(i64::MAX as u64 + 1)), Err(StoreError::Encode(EncodeError::OutOfRange { .. }))));
+    let stamp = write.insert("edge", &referral(i64::MAX as u64)).expect("i64::MAX fits");
     write.commit().expect("commit");
     let mut read = store.read().expect("read");
-    assert_eq!(read.load::<Message>(stamp.id).expect("load").expect("present").value.accepted_seq, i64::MAX as u64);
+    assert_eq!(read.load::<Referral>(stamp.id).expect("load").expect("present").value.seq, i64::MAX as u64);
 }
 
 // Behaviour (#3320 representation): timestamps are stored as INTEGER microseconds, floored, so a
@@ -36,45 +37,46 @@ fn timestamps_truncate_to_microseconds() {
     let mut write = store.write().expect("write");
     let after = DateTime::from_timestamp(1_700_000_000, 123_456_789).expect("in range");
     let before = DateTime::from_timestamp(-1, 999_999_999).expect("in range");
-    let late = write.insert("late", &Message { deadline: Some(after), ..message(1) }).expect("insert");
-    let early = write.insert("early", &Message { deadline: Some(before), ..message(1) }).expect("insert");
+    let late = write.insert("late", &Referral { sent_at: Some(after), ..referral(1) }).expect("insert");
+    let early = write.insert("early", &Referral { sent_at: Some(before), ..referral(1) }).expect("insert");
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
-    let late = read.load::<Message>(late.id).expect("load").expect("present").value.deadline;
+    let late = read.load::<Referral>(late.id).expect("load").expect("present").value.sent_at;
     assert_eq!(late, Some(DateTime::from_timestamp(1_700_000_000, 123_456_000).expect("in range")));
-    let early = read.load::<Message>(early.id).expect("load").expect("present").value.deadline;
+    let early = read.load::<Referral>(early.id).expect("load").expect("present").value.sent_at;
     assert_eq!(early, Some(DateTime::from_timestamp(-1, 999_999_000).expect("in range")));
     drop(read);
 
     let conn = store.into_connection();
-    let stored: i64 = conn.query_row("SELECT deadline FROM message ORDER BY id LIMIT 1", [], |row| row.get(0)).expect("raw");
+    let stored: i64 = conn.query_row("SELECT sent_at FROM referral ORDER BY id LIMIT 1", [], |row| row.get(0)).expect("raw");
     assert_eq!(stored, 1_700_000_000_123_456);
 }
 
 // Behaviour (#3320 references): a reference may precede its target. Writing it creates the
-// target's identity row, and inserting the target later takes that same identity.
+// target's identity row, and inserting the target later (here an engine kind, the session)
+// takes that same identity.
 #[test]
 fn references_to_missing_targets_create_their_identity() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let message = Message { inbox: Ref::new("later", LOCAL), in_reply_to: Some(Ref::new("gone", "elsewhere")), ..Message::sample() };
-    let stamp = write.insert("m", &message).expect("insert");
-    let inbox = write.resolve(Inbox::CODE, "later", LOCAL).expect("resolve").expect("identity created by the reference");
-    let reply = write.resolve(Message::CODE, "gone", "elsewhere").expect("resolve").expect("identity created by the reference");
-    assert_eq!(write.load::<Message>(reply).expect("load"), None, "an identity is not a resource");
-    let target = write.insert("later", &Inbox { role: "r".into() }).expect("target inserted after the reference");
-    assert_eq!(target.id, inbox);
+    let value = Referral { session: Ref::new("later", LOCAL), in_reply_to: Some(Ref::new("gone", "elsewhere")), ..Referral::sample() };
+    let stamp = write.insert("m", &value).expect("insert");
+    let session = write.resolve(AgentSessionRow::CODE, "later", LOCAL).expect("resolve").expect("identity created by the reference");
+    let reply = write.resolve(Referral::CODE, "gone", "elsewhere").expect("resolve").expect("identity created by the reference");
+    assert_eq!(write.load::<Referral>(reply).expect("load"), None, "an identity is not a resource");
+    let target = write.insert("later", &agent_session::sample()).expect("target inserted after the reference");
+    assert_eq!(target.id, session);
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
-    assert_eq!(read.load::<Message>(stamp.id).expect("load").expect("present").value, message);
+    assert_eq!(read.load::<Referral>(stamp.id).expect("load").expect("present").value, value);
     drop(read);
     let conn = store.into_connection();
     let stored: (i64, i64) = conn
-        .query_row("SELECT inbox, in_reply_to FROM message WHERE id = ?1", [stamp.id.0], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_row("SELECT session, in_reply_to FROM referral WHERE id = ?1", [stamp.id.0], |row| Ok((row.get(0)?, row.get(1)?)))
         .expect("raw");
-    assert_eq!(stored, (inbox.0, reply.0));
+    assert_eq!(stored, (session.0, reply.0));
 }
 
 // Behaviour (#3320 interning): equal interned strings share one `strings` row, whichever field,
@@ -83,21 +85,20 @@ fn references_to_missing_targets_create_their_identity() {
 fn equal_interned_strings_share_one_row() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let args = MessageEdge::Settle { by: Settlement::Answered { reply: Ref::new("r", LOCAL) } };
-    let event: MessageEdgeEvent = EdgeEvent {
-        edge: args.name(),
-        from: MessageState::Pending,
-        to: MessageState::Settled,
+    let event: ReferralEvent = EdgeEvent {
+        edge: ReferralEdge::Send,
+        from: Phase::Draft,
+        to: Phase::Sent,
         writer: "carol".into(),
         at: Timestamp(1),
-        payload: Payload { args, reads: Vec::new() },
+        payload: Payload { args: String::new(), reads: Vec::new() },
     };
-    let reference = MessageReference::ChangeRequest { service: "carol".into(), scope: "s".into(), number: 1, revision: "r".into() };
+    let reference = Reference::ChangeRequest { service: "carol".into(), scope: "s".into(), number: 1, revision: "r".into() };
     for name in ["a", "b"] {
         let mut edges = Records::new();
         edges.append(0, event.clone());
-        let message = Message { sender: AgentName("carol".into()), references: vec![reference.clone()], edges, ..Message::sample() };
-        write.insert(name, &message).expect("insert");
+        let value = Referral { sender: AgentName("carol".into()), references: vec![reference.clone()], edges, ..Referral::sample() };
+        write.insert(name, &value).expect("insert");
     }
     write.commit().expect("commit");
     let conn = store.into_connection();
@@ -106,7 +107,7 @@ fn equal_interned_strings_share_one_row() {
     let distinct: i64 = conn
         .query_row(
             "SELECT count(DISTINCT m.sender) + count(DISTINCT r.change_request_service) + count(DISTINCT e.writer) \
-             FROM message m JOIN message_edges e ON e.owner = m.id JOIN message_references r ON r.owner = m.id",
+             FROM referral m JOIN referral_edges e ON e.owner = m.id JOIN referral_references r ON r.owner = m.id",
             [],
             |row| row.get(0),
         )
@@ -114,7 +115,7 @@ fn equal_interned_strings_share_one_row() {
     assert_eq!(distinct, 3, "every column of every row names the one row");
     let same: i64 = conn
         .query_row(
-            "SELECT count(*) FROM message m JOIN message_edges e ON e.owner = m.id JOIN message_references r ON r.owner = m.id \
+            "SELECT count(*) FROM referral m JOIN referral_edges e ON e.owner = m.id JOIN referral_references r ON r.owner = m.id \
              WHERE m.sender = r.change_request_service AND m.sender = e.writer",
             [],
             |row| row.get(0),

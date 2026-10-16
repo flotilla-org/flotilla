@@ -31,10 +31,13 @@
 //! caller. The engine never reads a clock, link age or any other liveness
 //! signal.
 //!
-//! State labels and edge kinds are `flotilla_schema` code enums, and records
-//! and events are the schema crate's types, so the storage derive stores them
-//! as they are. Nothing here touches a backend, replication or a wire
-//! encoding. The only workspace crate this one reaches is `flotilla-schema`,
+//! State labels and edge kinds are `flotilla_schema` code enums, state enums
+//! are the schema crate's label-plus-data states, and records and events are
+//! the schema crate's types, so the storage derive stores them as they are.
+//! Each machine declares its stored kind beside it ([`MachineRow`]): Message,
+//! AgentSession, Convoy and Ensure here, and a lifecycle kind's row wherever
+//! its request is declared. Nothing here touches a backend, replication or a
+//! wire encoding. The only workspace crate this one reaches is `flotilla-schema`,
 //! and no production crate depends on this one yet (`ci/build-graph/check.py`).
 
 pub mod attempt;
@@ -45,12 +48,14 @@ pub mod machines;
 pub mod placement;
 mod read;
 mod record;
+mod stored;
 
 pub use attempt::{Attempt, AttemptPolicy, Cause, CauseCategory, Outcome, Retry, Schedule};
 pub use code::{changed, Coded, Datum, Edge, EdgeArg, StateValue};
-pub use home::{Home, Resource, WriteError};
+pub use home::{Home, Resource, RowParts, WriteError};
 pub use machine::{
     Check, DeclaredEdge, DefError, Diagram, EdgeDef, EdgeKind, EndDef, Ended, Fault, Label, Machine, MachineDef, StepError, WrongState,
 };
 pub use read::{Handle, InputRead, Judged, Kind, Ref, Source, Table, Version, OWN_ATTEMPTS, OWN_RECEIPTS};
 pub use record::{EdgeEventOf, EdgePayload, Receipt, Transport};
+pub use stored::{MachineRow, StoredState};

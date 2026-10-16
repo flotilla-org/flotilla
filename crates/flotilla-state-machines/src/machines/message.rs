@@ -14,21 +14,35 @@
 //!
 //! The spec's envelope is the immutable [`MessageSpec`]; the rest of its
 //! state is the state's data: Awaiting's one receiver, and Dropped's reason,
-//! receiver, time and the watermark an expiry relied on.
+//! receiver (`dropped_receiver`), time and the watermark an expiry relied on.
+//!
+//! The stored kind is [`MessageRow`] (code 1): the envelope as columns, the
+//! state, and the edge log. A message records no attempts or receipts; the
+//! consumer's receipts are its session's.
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Transport, Version, WrongState};
+use crate::{
+    edges, states, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts, Source, Table,
+    Transport, Version, WrongState,
+};
 
 /// What would settle the message. `Nothing` settles on delivery.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub enum Expectation {
+    #[store(code = 1)]
     Nothing,
+    #[store(code = 2)]
     Reply,
-    Outcome { condition: Ref<Condition> },
+    #[store(code = 3)]
+    Outcome {
+        /// An address: plain interned text until `flotilla-address` is adopted.
+        #[store(intern)]
+        condition: Ref<Condition>,
+    },
 }
 
 /// The message as sent: the spec's envelope. Immutable.
@@ -42,10 +56,13 @@ pub struct MessageSpec {
     pub unbound_after: i64,
 }
 
-/// The consumer session a receipt came from, and its host.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// The consumer session a receipt came from, and its host. Stored flattened;
+/// both are addresses, plain interned text until `flotilla-address` is adopted.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub struct Receiver {
+    #[store(intern)]
     pub session: String,
+    #[store(intern)]
     pub host: String,
 }
 
@@ -71,37 +88,56 @@ pub struct Settle {
     pub by: Settlement,
 }
 
-/// Why a message dropped, with what the reason's gate reads.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Why a message dropped, with what the reason's gate reads. Stored as a data
+/// enum under the Dropped label; its references are plain interned text until
+/// `flotilla-address` is adopted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 pub enum DropReason {
     /// No receipt was confirmed within policy; never proof that no turn happened.
+    #[store(code = 1)]
     Undeliverable,
+    #[store(code = 2)]
     Expired,
     /// A newer message replaces this one.
+    #[store(code = 3)]
     Superseded {
+        #[store(intern)]
         by: Ref<Supersession>,
     },
     /// The sender cancelled without a replacement.
+    #[store(code = 4)]
     Withdrawn {
+        #[store(intern)]
         by: String,
+        #[store(intern)]
         authority: Ref<Authority>,
     },
     /// A deliberate drop of a message whose consumer stays silent.
+    #[store(code = 5)]
     ConsumerUnreachable {
+        #[store(intern)]
         by: String,
+        #[store(intern)]
         authority: Ref<Authority>,
     },
 }
 
 states! {
-    /// The spec's `State`. `at` is the drop's time; `watermark` is the
-    /// consumer stream's applied watermark that an expiry with a consumer
-    /// bound relied on, and `None` for every other drop.
+    /// The spec's `State`. `dropped_receiver` is the receiver a drop kept, if
+    /// any (a datum has one type in every label, and Awaiting's receiver is
+    /// required); `at` is the drop's time; `watermark` is the consumer
+    /// stream's applied watermark that an expiry with a consumer bound relied
+    /// on, and `None` for every other drop.
     pub enum MessageState => MessageLabel {
         Pending = 1,
-        Awaiting { receiver: Receiver } = 2,
+        Awaiting { #[store(flatten)] receiver: Receiver } = 2,
         Settled = 3,
-        Dropped { reason: DropReason, receiver: Option<Receiver>, at: Timestamp, watermark: Option<Timestamp> } = 4,
+        Dropped {
+            reason: DropReason,
+            #[store(flatten)] dropped_receiver: Option<Receiver>,
+            at: Timestamp,
+            watermark: Option<Timestamp>,
+        } = 4,
     }
 }
 
@@ -110,7 +146,7 @@ impl MessageState {
     pub fn receiver(&self) -> Option<&Receiver> {
         match self {
             MessageState::Awaiting { receiver } => Some(receiver),
-            MessageState::Dropped { receiver, .. } => receiver.as_ref(),
+            MessageState::Dropped { dropped_receiver, .. } => dropped_receiver.as_ref(),
             MessageState::Pending | MessageState::Settled => None,
         }
     }
@@ -330,7 +366,7 @@ impl Machine for Message {
                 EdgeDef::<Self, DropMessage>::new()
                     .from([Pending, Awaiting])
                     .to([Dropped])
-                    .changes(["reason", "receiver", "at", "watermark"])
+                    .changes(["reason", "dropped_receiver", "at", "watermark"])
                     .gate("the drop reason's evidence holds", gate_drop)
                     .effect(drop_message),
             )
@@ -484,5 +520,72 @@ fn drop_message(h: &mut Handle<'_, Message>, state: MessageState, drop: &DropMes
         DropReason::Expired if consumer_bound(h) => applied_through(h).copied(),
         _ => None,
     };
-    MessageState::Dropped { reason: drop.reason.clone(), receiver: state.receiver().cloned(), at: h.now(), watermark }
+    MessageState::Dropped { reason: drop.reason.clone(), dropped_receiver: state.receiver().cloned(), at: h.now(), watermark }
+}
+
+/// The stored Message (kind code 1): the envelope's fields as columns, the
+/// state, and the edge log. Indexed for an inbox's open messages and for
+/// open messages by deadline, the expiry sweep's read.
+#[derive(Clone, Debug, PartialEq, Stored)]
+#[store(
+    kind = "Message",
+    code = 1,
+    index(name = "open_by_inbox", eq(inbox), when(state in [Pending, Awaiting])),
+    index(name = "deadline", order(deadline), when(state in [Pending, Awaiting], deadline is_some))
+)]
+pub struct MessageRow {
+    /// An address: plain interned text until `flotilla-address` is adopted.
+    #[store(intern)]
+    pub inbox: String,
+    pub expectation: Expectation,
+    pub deadline: Option<Timestamp>,
+    pub unbound_after: i64,
+    #[store(state)]
+    pub state: State<MessageState>,
+    #[store(history)]
+    pub edges: Records<EdgeEventOf<Message>>,
+}
+
+impl MessageRow {
+    /// The immutable envelope.
+    pub fn spec(&self) -> MessageSpec {
+        MessageSpec {
+            inbox: self.inbox.clone(),
+            expectation: self.expectation.clone(),
+            deadline: self.deadline,
+            unbound_after: self.unbound_after,
+        }
+    }
+}
+
+impl MachineRow for MessageRow {
+    type Machine = Message;
+    const STATE_FIELD: flotilla_schema::StateOf<Self, State<MessageState>> = MessageRow::STATE;
+    const EDGE_LOG: flotilla_schema::HistoryOf<Self, EdgeEventOf<Message>> = MessageRow::EDGES;
+
+    fn of(resource: &Resource<Message>, since: Timestamp) -> MessageRow {
+        let spec = resource.spec().clone();
+        MessageRow {
+            inbox: spec.inbox,
+            expectation: spec.expectation,
+            deadline: spec.deadline,
+            unbound_after: spec.unbound_after,
+            state: State::new(resource.state().clone(), since),
+            edges: resource.events().clone(),
+        }
+    }
+
+    fn state(&self) -> &State<MessageState> {
+        &self.state
+    }
+
+    fn parts(&self) -> RowParts<Message> {
+        RowParts {
+            spec: self.spec(),
+            state: self.state.value.clone(),
+            events: self.edges.clone(),
+            attempts: Records::new(),
+            receipts: Records::new(),
+        }
+    }
 }

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{CodeEnum, Timestamp};
+use flotilla_schema::{CodeEnum, Decoder, Encoder, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
         Abandon, Authority, Convoy, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoyState, Deliver, Keep,
@@ -10,7 +10,7 @@ use flotilla_state_machines::{
         PromiseState::{self, Kept, Pending, Retracted},
         Quota, Readmit, Retract, VesselClass,
     },
-    Coded, Diagram, Home, Kind, Machine, Ref, StateValue, WriteError,
+    Coded, Diagram, EdgeEventOf, Home, Kind, Machine, Ref, StateValue, WriteError,
 };
 
 const YES: &str = "yes";
@@ -82,8 +82,11 @@ fn the_declaration_is_valid() {
 #[test]
 fn codes_are_pinned() {
     let labels: Vec<_> = ConvoyLabel::ALL.iter().map(|s| (s.name(), s.code(), ConvoyState::fields(*s))).collect();
-    let expected: [(&str, i64, &[&str]); 3] =
-        [("Open", 1, &["promises", "quota"]), ("Delivered", 2, &["promises", "quota"]), ("Abandoned", 3, &["promises", "quota", "reason"])];
+    let expected: [(&str, i64, &[&str]); 3] = [
+        ("Open", 1, &["resolution", "quota"]),
+        ("Delivered", 2, &["resolution", "quota"]),
+        ("Abandoned", 3, &["resolution", "quota", "reason"]),
+    ];
     assert_eq!(labels, expected);
     let edges: Vec<_> = ConvoyEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
     assert_eq!(edges, [("keep", 1), ("retract", 2), ("deliver", 3), ("abandon", 4), ("readmit", 5)]);
@@ -106,8 +109,8 @@ stateDiagram-v2
   Abandoned --> [*]
   note right of Abandoned: the convoy was abandoned
 ";
-    let full = "  Open --> Open: keep [promises]
-  Open --> Open: retract [promises]
+    let full = "  Open --> Open: keep [resolution]
+  Open --> Open: retract [resolution]
   Open --> Delivered: deliver
   Open --> Abandoned: abandon [reason]
   Open --> Open: readmit [quota]
@@ -127,7 +130,7 @@ fn admission_requires_a_promise() {
     let mut home: Home<Convoy> = Home::new("home").expect("valid");
     assert_eq!(home.create("empty", request(&[], &[(0, 1)])).err(), refused(ConvoyRefusal::NoPromises));
     let admitted = home.create("c", request(&[0, 1], &[(0, 1)])).expect("admitted");
-    assert_eq!(admitted.state(), &ConvoyState::Open { promises: promises(&[(0, Pending), (1, Pending)]), quota: quota(&[(0, 1)]) });
+    assert_eq!(admitted.state(), &ConvoyState::Open { resolution: promises(&[(0, Pending), (1, Pending)]), quota: quota(&[(0, 1)]) });
     assert_eq!((admitted.spec().promises.len(), admitted.spec().priority), (2, Priority(1)));
 }
 
@@ -140,11 +143,11 @@ fn keep_settles_a_pending_promise_once() {
     let w = world();
     assert_eq!(home.apply("c", Keep { promise: PromiseId(9) }, &w, at()).err(), refused(ConvoyRefusal::UnknownPromise));
     home.apply("c", Keep { promise: PromiseId(0) }, &w, at()).expect("kept");
-    assert_eq!(state(&home), &ConvoyState::Open { promises: promises(&[(0, Kept), (1, Pending)]), quota: quota(&[]) });
+    assert_eq!(state(&home), &ConvoyState::Open { resolution: promises(&[(0, Kept), (1, Pending)]), quota: quota(&[]) });
     assert_eq!(home.apply("c", Keep { promise: PromiseId(0) }, &w, at()).err(), refused(ConvoyRefusal::PromiseSettled));
     home.apply("c", retract(1, YES), &w, at()).expect("retracted");
     assert_eq!(home.apply("c", Keep { promise: PromiseId(1) }, &w, at()).err(), refused(ConvoyRefusal::PromiseSettled));
-    assert_eq!(state(&home), &ConvoyState::Open { promises: promises(&[(0, Kept), (1, Retracted)]), quota: quota(&[]) });
+    assert_eq!(state(&home), &ConvoyState::Open { resolution: promises(&[(0, Kept), (1, Retracted)]), quota: quota(&[]) });
 }
 
 // A data-only edge keeps its label: keep moves Open to Open, and its event
@@ -155,7 +158,7 @@ fn keep_changes_only_the_promises() {
     let event = home.apply("c", Keep { promise: PromiseId(0) }, &world(), at()).expect("kept");
     assert_eq!((event.from, event.to), (ConvoyLabel::Open, ConvoyLabel::Open));
     assert_eq!(state(&home).quota(), &quota(&[(0, 2)]));
-    assert_eq!(state(&home).promises(), &promises(&[(0, Kept)]));
+    assert_eq!(state(&home).resolution(), &promises(&[(0, Kept)]));
 }
 
 // AcceptRetraction checks authority first: an unauthorised or absent
@@ -185,7 +188,7 @@ fn deliver_waits_for_every_promise() {
     home.apply("c", retract(0, YES), &w, at()).expect("retracted");
     home.apply("c", Keep { promise: PromiseId(2) }, &w, at()).expect("kept");
     home.apply("c", Deliver, &w, at()).expect("delivered");
-    let delivered = ConvoyState::Delivered { promises: promises(&[(0, Retracted), (1, Kept), (2, Kept)]), quota: quota(&[(0, 1)]) };
+    let delivered = ConvoyState::Delivered { resolution: promises(&[(0, Retracted), (1, Kept), (2, Kept)]), quota: quota(&[(0, 1)]) };
     assert_eq!(state(&home), &delivered);
     let not_open = refused(ConvoyRefusal::NotOpen);
     assert_eq!(home.apply("c", Deliver, &w, at()).err(), not_open);
@@ -208,7 +211,7 @@ fn abandon_is_an_authorised_decision_with_a_reason() {
     assert_eq!(state(&home).reason(), None);
     home.apply("c", abandon("no longer wanted", YES), &w, at()).expect("abandoned");
     let abandoned = ConvoyState::Abandoned {
-        promises: promises(&[(0, Pending), (1, Kept)]),
+        resolution: promises(&[(0, Pending), (1, Kept)]),
         quota: quota(&[(0, 1)]),
         reason: "no longer wanted".into(),
     };
@@ -230,7 +233,7 @@ fn readmission_only_raises_the_quota() {
     home.apply("c", readmit(&[(0, 1), (1, 1)], YES), &w, at()).expect("unchanged quota is no decrease");
     home.apply("c", Keep { promise: PromiseId(0) }, &w, at()).expect("kept");
     home.apply("c", readmit(&[(0, 3), (1, 1)], YES), &w, at()).expect("raised");
-    assert_eq!(state(&home), &ConvoyState::Open { promises: promises(&[(0, Kept)]), quota: quota(&[(0, 3), (1, 1)]) });
+    assert_eq!(state(&home), &ConvoyState::Open { resolution: promises(&[(0, Kept)]), quota: quota(&[(0, 3), (1, 1)]) });
     // Above the admitted quota but below the readmitted one.
     assert_eq!(home.apply("c", readmit(&[(0, 2), (1, 1)], YES), &w, at()).err(), refused(ConvoyRefusal::QuotaNotIncrease));
 }
@@ -243,4 +246,25 @@ fn an_authorised_edge_records_its_authority_read() {
     let w = world();
     let event = home.apply("c", retract(0, YES), &w, at()).expect("retracted");
     assert!(event.payload.reads.iter().any(|read| read.kind == <Authority as Kind>::NAME && read.name == YES));
+}
+
+// Every convoy edge's event is storable as it is: the schema codec's CBOR profile takes text map
+// keys only, so a readmission's quota (keyed by vessel class) travels as a list of pairs, and each
+// event decodes to the one the home appended.
+#[test]
+fn convoy_edge_events_round_trip_through_the_schema_codec() {
+    let mut home = Home::<Convoy>::new("home").expect("valid");
+    home.create("c", request(&[0, 1], &[(0, 1), (3, 2)])).expect("admitted");
+    let world = world();
+    home.apply("c", readmit(&[(0, 2), (3, 2)], YES), &world, Timestamp(1)).expect("readmitted");
+    home.apply("c", Keep { promise: PromiseId(0) }, &world, Timestamp(2)).expect("kept");
+    home.apply("c", Retract { promise: PromiseId(1), by: "lead".into(), authority: Ref::new(YES) }, &world, Timestamp(3))
+        .expect("retracted");
+    home.apply("c", Deliver, &world, Timestamp(4)).expect("delivered");
+    let events = home.get("c").expect("exists").events();
+    assert_eq!(events.len(), 4);
+    for row in events {
+        let rows = Encoder::encode(&row.record).expect("encodes");
+        assert_eq!(Decoder::decode::<EdgeEventOf<Convoy>>(rows).expect("decodes"), row.record);
+    }
 }

@@ -8,27 +8,54 @@
 //! (`recorded`, `created`, `window`, and `bound` while Fulfilled); its
 //! `history` is the Ensure's attempt records, and its `Fail` is
 //! [`Home::record_attempt`](crate::Home::record_attempt), not an edge.
+//!
+//! The stored kind is [`EnsureRow`] (code 9, the next code after the schema
+//! stack's test kinds): the spec's inbox and flattened policy, the state
+//! (with the recorded and created fulfillers as child tables of state data,
+//! which `record` and `create` grow a row at a time), the edge log and the
+//! attempts.
 
 use std::collections::BTreeSet;
 
+use flotilla_schema::{Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attempt, edges, states, AttemptPolicy, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Version, WrongState,
+    attempt, edges, states, Attempt, AttemptPolicy, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref,
+    Resource, RowParts, Source, Table, Version, WrongState,
 };
 
-/// Fulfiller references, in name order.
+/// Fulfiller references, in name order. Fulfiller names are addresses: plain
+/// interned text until `flotilla-address` is adopted.
 pub type Fulfillers = BTreeSet<Ref<Fulfiller>>;
 
 states! {
     /// The spec's `State`: each label carries its `Work`, and Fulfilled its
     /// `bound` fulfiller. `window` is how many attempts came before the
-    /// current attempt window.
+    /// current attempt window. The storage derive reads the written type, so
+    /// [`Fulfillers`] is spelled out.
     pub enum EnsureState => EnsureLabel {
-        Unfulfilled { recorded: Fulfillers, created: Fulfillers, window: usize } = 1,
-        Fulfilled { recorded: Fulfillers, created: Fulfillers, window: usize, bound: Ref<Fulfiller> } = 2,
-        Held { recorded: Fulfillers, created: Fulfillers, window: usize } = 3,
-        Retired { recorded: Fulfillers, created: Fulfillers, window: usize } = 4,
+        Unfulfilled {
+            #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,
+            #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
+            window: u32,
+        } = 1,
+        Fulfilled {
+            #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,
+            #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
+            window: u32,
+            #[store(intern)] bound: Ref<Fulfiller>,
+        } = 2,
+        Held {
+            #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,
+            #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
+            window: u32,
+        } = 3,
+        Retired {
+            #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,
+            #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
+            window: u32,
+        } = 4,
     }
 }
 
@@ -54,7 +81,7 @@ impl EnsureState {
     }
 
     /// How many attempts came before the current window (spec `window`).
-    pub fn window(&self) -> usize {
+    pub fn window(&self) -> u32 {
         match self {
             EnsureState::Unfulfilled { window, .. }
             | EnsureState::Fulfilled { window, .. }
@@ -72,7 +99,7 @@ impl EnsureState {
     }
 
     /// The spec's `Work`, whatever the label.
-    fn work(self) -> (Fulfillers, Fulfillers, usize) {
+    fn work(self) -> (Fulfillers, Fulfillers, u32) {
         match self {
             EnsureState::Unfulfilled { recorded, created, window }
             | EnsureState::Fulfilled { recorded, created, window, .. }
@@ -85,7 +112,8 @@ impl EnsureState {
 /// What an Ensure keeps bound, and how its attempts are judged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnsureSpec {
-    /// The inbox whose [`Drain`] a bind waits on.
+    /// The inbox whose [`Drain`] a bind waits on. An address: plain interned
+    /// text until `flotilla-address` is adopted.
     pub inbox: String,
     pub policy: AttemptPolicy,
 }
@@ -413,7 +441,7 @@ fn gate_unbind(h: &mut Handle<'_, Ensure>, edge: &Unbind) -> Result<(), EnsureRe
 // judgement over the attempts after the state's window.
 fn gate_give_up(h: &mut Handle<'_, Ensure>, _: &GiveUp) -> Result<(), EnsureRefusal> {
     let policy = h.spec().policy;
-    let window = h.state().window();
+    let window = h.state().window() as usize;
     if attempt::retry(h, &policy, window).exhausted() {
         Ok(())
     } else {
@@ -434,7 +462,9 @@ fn gate_resume(h: &mut Handle<'_, Ensure>, edge: &Resume) -> Result<(), EnsureRe
 // new window, and stays in the history.
 fn resume(h: &mut Handle<'_, Ensure>, state: EnsureState, _: &Resume) -> EnsureState {
     let (recorded, created, _) = state.work();
-    EnsureState::Unfulfilled { recorded, created, window: h.attempts().len() }
+    // Positions are `u32`, so the attempt count fits.
+    let window = u32::try_from(h.attempts().len()).unwrap_or(u32::MAX);
+    EnsureState::Unfulfilled { recorded, created, window }
 }
 
 // Spec: `o.authorised`, then `o.teardownComplete`.
@@ -446,4 +476,60 @@ fn gate_retire(h: &mut Handle<'_, Ensure>, edge: &Retire) -> Result<(), EnsureRe
         return Err(EnsureRefusal::MissingEvidence);
     }
     Ok(())
+}
+
+/// The stored Ensure (kind code 9): the spec's inbox and flattened policy,
+/// the state, the edge log and the attempts. Indexed by inbox, the read a
+/// binding change makes.
+#[derive(Clone, Debug, PartialEq, Stored)]
+#[store(kind = "Ensure", code = 9, index(name = "by_inbox", eq(inbox)))]
+pub struct EnsureRow {
+    /// An address: plain interned text until `flotilla-address` is adopted.
+    #[store(intern)]
+    pub inbox: String,
+    #[store(flatten)]
+    pub policy: AttemptPolicy,
+    #[store(state)]
+    pub state: State<EnsureState>,
+    #[store(history)]
+    pub edges: Records<EdgeEventOf<Ensure>>,
+    #[store(history)]
+    pub attempts: Records<Attempt>,
+}
+
+impl EnsureRow {
+    pub fn spec(&self) -> EnsureSpec {
+        EnsureSpec { inbox: self.inbox.clone(), policy: self.policy }
+    }
+}
+
+impl MachineRow for EnsureRow {
+    type Machine = Ensure;
+    const STATE_FIELD: flotilla_schema::StateOf<Self, State<EnsureState>> = EnsureRow::STATE;
+    const EDGE_LOG: flotilla_schema::HistoryOf<Self, EdgeEventOf<Ensure>> = EnsureRow::EDGES;
+
+    fn of(resource: &Resource<Ensure>, since: Timestamp) -> EnsureRow {
+        let spec = resource.spec().clone();
+        EnsureRow {
+            inbox: spec.inbox,
+            policy: spec.policy,
+            state: State::new(resource.state().clone(), since),
+            edges: resource.events().clone(),
+            attempts: resource.attempts().clone(),
+        }
+    }
+
+    fn state(&self) -> &State<EnsureState> {
+        &self.state
+    }
+
+    fn parts(&self) -> RowParts<Ensure> {
+        RowParts {
+            spec: self.spec(),
+            state: self.state.value.clone(),
+            events: self.edges.clone(),
+            attempts: self.attempts.clone(),
+            receipts: Records::new(),
+        }
+    }
 }

@@ -98,7 +98,7 @@ fn work(e: &Resource<Ensure>) -> Value {
         })
         .collect();
     let state = e.state();
-    let window = i64::try_from(state.window()).expect("model window");
+    let window = i64::from(state.window());
     json!({ "recorded": ids(state.recorded()), "created": ids(state.created()), "history": history, "window": int(window) })
 }
 

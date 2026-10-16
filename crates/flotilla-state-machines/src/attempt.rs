@@ -8,23 +8,31 @@
 //! Older attempts stay in the history. A listing and a `give up` gate call
 //! the same [`retry`], so they cannot disagree.
 
-use flotilla_schema::{RecordRow, Timestamp};
+use flotilla_schema::{RecordRow, Stored, Timestamp};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{Handle, Machine};
 
-/// What kind of failure, shared across kinds; the detail is per kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// What kind of failure, shared across kinds; the detail is per kind. Stored
+/// by code, so a rename keeps every stored category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub enum CauseCategory {
+    #[store(code = 1)]
     Transient,
+    #[store(code = 2)]
     Refused,
+    #[store(code = 3)]
     Misconfigured,
+    #[store(code = 4)]
     MissingCapability,
+    #[store(code = 5)]
     External,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Stored flattened: an attempt's failure and a lifecycle's `GaveUp` carry
+/// its category and detail as two columns.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub struct Cause {
     pub category: CauseCategory,
     pub detail: String,
@@ -36,14 +44,21 @@ impl Cause {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub enum Outcome {
+    #[store(code = 1)]
     Succeeded,
-    Failed { cause: Cause, retryable: bool },
+    #[store(code = 2)]
+    Failed {
+        #[store(flatten)]
+        cause: Cause,
+        retryable: bool,
+    },
 }
 
-/// One try at the resource's work, and how it ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One try at the resource's work, and how it ended: a row of the resource's
+/// `history` table of attempts.
+#[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub struct Attempt {
     pub at: Timestamp,
     pub outcome: Outcome,
@@ -59,8 +74,9 @@ impl Attempt {
     }
 }
 
-/// How many consecutive failures a window allows, and the backoff between them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How many consecutive failures a window allows, and the backoff between
+/// them. Stored flattened in Ensure's spec.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Stored)]
 pub struct AttemptPolicy {
     /// Consecutive failures after which the window is exhausted; at least 1.
     pub max_failures: u32,

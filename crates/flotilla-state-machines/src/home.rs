@@ -92,6 +92,16 @@ where
     }
 }
 
+/// What a stored row holds of one resource, apart from its name and version:
+/// see [`Home::restore`] and [`MachineRow::parts`](crate::MachineRow::parts).
+pub struct RowParts<M: Machine> {
+    pub spec: M::Spec,
+    pub state: M::State,
+    pub events: Records<EdgeEventOf<M>>,
+    pub attempts: Records<Attempt>,
+    pub receipts: Records<Receipt>,
+}
+
 /// Why a write did not happen.
 pub enum WriteError<M: Machine> {
     /// No resource of that name at this home.
@@ -197,6 +207,21 @@ impl<M: Machine> Home<M> {
             state,
             version: Version(1),
         };
+        Ok(self.resources.entry(name).or_insert(resource))
+    }
+
+    /// Places a resource read from storage at this home, as stored: its spec,
+    /// state and records, at `version`. Nothing is checked against the
+    /// declaration: the row holds what earlier writes left. The storage port
+    /// (a later layer) is its caller; tests use it to apply an edge to a
+    /// stored row.
+    pub fn restore(&mut self, name: impl Into<String>, version: Version, parts: RowParts<M>) -> Result<&Resource<M>, WriteError<M>> {
+        let name = name.into();
+        if self.resources.contains_key(&name) {
+            return Err(WriteError::Exists(name));
+        }
+        let RowParts { spec, state, events, attempts, receipts } = parts;
+        let resource = Resource { name: name.clone(), spec, state, version, events, attempts, receipts };
         Ok(self.resources.entry(name).or_insert(resource))
     }
 

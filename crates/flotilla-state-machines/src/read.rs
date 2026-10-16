@@ -12,7 +12,10 @@
 
 use std::{borrow::Cow, collections::BTreeMap, fmt, marker::PhantomData};
 
-use flotilla_schema::{RecordRow, Timestamp};
+use flotilla_schema::{
+    adapt::{Adapter, AsInterned},
+    Column, Columns, DecodeError, Decoder, Element, EncodeError, Encoder, Intern, KeyColumn, Layout, RecordRow, Timestamp,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{Attempt, Machine, Receipt, Resource};
@@ -89,6 +92,63 @@ impl<K: Kind> Serialize for Ref<K> {
 impl<'de, K: Kind> Deserialize<'de> for Ref<K> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         String::deserialize(deserializer).map(Ref::new)
+    }
+}
+
+/// Stored as its name, interned: the reference is plain interned text until a later layer
+/// adopts `flotilla-address`. The kind is the type's, so no column holds it. A reference is a
+/// key column too, so a set of references (Ensure's fulfillers) is a child table of names.
+impl<K: Kind> Intern for Ref<K> {
+    fn as_str(&self) -> &str {
+        &self.name
+    }
+
+    fn from_string(value: String) -> Self {
+        Ref::new(value)
+    }
+}
+
+impl<K: Kind> Columns for Ref<K> {
+    const TABLES: usize = 0;
+
+    fn layout(layout: &mut Layout, name: &str, required: bool) {
+        <AsInterned as Adapter<Ref<K>>>::layout(layout, name, required);
+    }
+
+    fn encode(&self, e: &mut Encoder) -> Result<(), EncodeError> {
+        <AsInterned as Adapter<Ref<K>>>::encode(self, e)
+    }
+
+    fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError> {
+        <AsInterned as Adapter<Ref<K>>>::encode_absent(e)
+    }
+
+    fn decode(d: &mut Decoder) -> Result<Option<Self>, DecodeError> {
+        <AsInterned as Adapter<Ref<K>>>::decode(d)
+    }
+
+    fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {
+        <AsInterned as Adapter<Ref<K>>>::decode_absent(d)
+    }
+}
+
+impl<K: Kind> Column for Ref<K> {}
+
+impl<K: Kind> KeyColumn for Ref<K> {}
+
+impl<K: Kind> Element for Ref<K> {
+    const TABLES: usize = 0;
+
+    fn layout_row(layout: &mut Layout) {
+        <Self as Columns>::layout(layout, "", true);
+    }
+
+    fn encode_row(&self, e: &mut Encoder) -> Result<(), EncodeError> {
+        <Self as Columns>::encode(self, e)
+    }
+
+    fn decode_row(d: &mut Decoder) -> Result<Self, DecodeError> {
+        <Self as Columns>::decode(d)?.ok_or_else(|| DecodeError::missing(""))
     }
 }
 

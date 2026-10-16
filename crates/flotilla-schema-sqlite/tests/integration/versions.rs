@@ -3,10 +3,10 @@ use hegel::{generators as gs, TestCase};
 
 use chrono::{DateTime, Duration};
 
-use crate::fixtures::{floor, store, Message};
+use crate::fixtures::{floor, message as messages, store, MessageRow as Message, Referral};
 
-fn message(body: &str) -> Message {
-    Message { body: body.into(), accepted_seq: 1, ..Message::sample() }
+fn message(inbox: &str) -> Message {
+    Message { inbox: inbox.into(), unbound_after: 1, ..messages::sample() }
 }
 
 // Behaviour (ADR 0064, #3320 sequencing): every write takes the home's next sequence, so the
@@ -59,16 +59,16 @@ fn versions_strictly_increase_across_writes(tc: TestCase) {
 fn update_without_row_changes_is_a_no_op() {
     let mut store = store();
     let time = DateTime::from_timestamp(1_700_000_000, 123_456_000).expect("in range");
-    let value = Message { deadline: Some(time), ..message("same") };
+    let value = Referral { sent_at: Some(time), ..Referral::sample() };
     let mut write = store.write().expect("write");
     let stamp = write.insert("m", &value).expect("insert");
-    let current = write.load::<Message>(stamp.id).expect("load").expect("present");
+    let current = write.load::<Referral>(stamp.id).expect("load").expect("present");
     assert_eq!(write.update(&current, &value).expect("no-op"), stamp);
-    let finer = Message { deadline: Some(time + Duration::nanoseconds(999)), ..value.clone() };
-    assert_eq!(floor(finer.deadline.expect("set")), time);
+    let finer = Referral { sent_at: Some(time + Duration::nanoseconds(999)), ..value.clone() };
+    assert_eq!(floor(finer.sent_at.expect("set")), time);
     assert_eq!(write.update(&current, &finer).expect("no-op below resolution"), stamp);
     // The next real write takes the very next sequence: the no-ops consumed none.
-    let next = write.update(&current, &message("changed")).expect("update");
+    let next = write.update(&current, &Referral { seq: 9, ..value.clone() }).expect("update");
     assert_eq!(next.version, stamp.version + 1);
     write.commit().expect("commit");
 }
@@ -128,8 +128,8 @@ fn a_refused_write_does_not_spoil_its_batch() {
 
     let mut read = store.read().expect("read");
     let a = read.load::<Message>(first.id).expect("load a").expect("a present");
-    assert_eq!((a.value.body.as_str(), a.version), ("second", moved.version));
-    assert_eq!(read.load::<Message>(other.id).expect("load b").expect("b present").value.body, "other");
+    assert_eq!((a.value.inbox.as_str(), a.version), ("second", moved.version));
+    assert_eq!(read.load::<Message>(other.id).expect("load b").expect("b present").value.inbox, "other");
 }
 
 // Behaviour: identity rows outlive their resource, so a write to a deleted resource is

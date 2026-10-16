@@ -12,10 +12,10 @@ use hegel::{generators as gs, TestCase};
 use rusqlite::{Connection, ErrorCode};
 
 use crate::fixtures::{
-    convoy::{ConvoyEdge, ConvoyEdgeEvent, ConvoyState, Deliverable, Evidence},
     registry, store,
+    synthetic::{Deliverable, DossierEdge, DossierEvent, DossierState, Evidence},
     ticket::{next_value, state_value, transition, Hold, Signature, Ticket, TicketEdgeName, TicketLabel, TicketState},
-    Convoy, Fixture, Payload, Pick, LOCAL,
+    Dossier, Fixture, Payload, Pick, LOCAL,
 };
 
 fn snapshot(store: &mut Store, id: ResourceId) -> Snapshot {
@@ -104,7 +104,7 @@ fn a_transition_logs_exactly_the_rows_and_columns_that_differ(tc: TestCase) {
     for _ in 0..tc.draw(gs::integers::<usize>().min_value(1).max_value(5)) {
         let current = store.read().expect("read").load::<Ticket>(stamp.id).expect("load").expect("present");
         let before = snapshot(&mut store, stamp.id);
-        let (edge, _) = current.value.edge(&tc, Pick::Draw);
+        let (edge, _) = current.value.edge(&tc, Pick::Draw).expect("a ticket always has an edge");
         let (next_store, next, change, written) = apply_counted(store, stamp, edge);
         store = next_store;
         let after = snapshot(&mut store, stamp.id);
@@ -202,7 +202,7 @@ fn transitions_round_trip_and_replay(tc: TestCase) {
             stamp = write.update(&current, &next).expect("a spec edit keeps the state");
             model = next;
         } else {
-            let (edge, next) = current.value.edge(&tc, Pick::Draw);
+            let (edge, next) = current.value.edge(&tc, Pick::Draw).expect("a ticket always has an edge");
             stamp = write.apply_edge(stamp, edge).expect("edge");
             model = next.stamped(Some(&current.value), stamp.version);
         }
@@ -222,7 +222,7 @@ fn transitions_round_trip_and_replay(tc: TestCase) {
     assert_eq!(replayed, snapshot(&mut source, stamp.id));
 }
 
-fn convoy_event(args: ConvoyEdge, from: ConvoyState, to: ConvoyState) -> ConvoyEdgeEvent {
+fn dossier_event(args: DossierEdge, from: DossierState, to: DossierState) -> DossierEvent {
     EdgeEvent { edge: args.name(), from, to, writer: "w".into(), at: Timestamp(6), payload: Payload { args, reads: Vec::new() } }
 }
 
@@ -263,24 +263,28 @@ fn edge_refusals_come_in_a_fixed_order() {
     );
 
     // An edge built whole, leaving the wrong label and appending under a missing deliverable.
-    let convoy = write.insert("c", &Convoy::sample(0)).expect("insert");
-    let delivered = State::new(ConvoyState::Delivered, Timestamp(6));
+    let dossier = write.insert("c", &Dossier::sample(0)).expect("insert");
+    let delivered = State::new(DossierState::Delivered, Timestamp(6));
     let both = Edge::new(
-        Convoy::STATE,
+        Dossier::STATE,
         &delivered,
-        Convoy::EDGES,
-        &convoy_event(ConvoyEdge::Deliver, ConvoyState::Delivered, ConvoyState::Delivered),
+        Dossier::EDGES,
+        &dossier_event(DossierEdge::Deliver, DossierState::Delivered, DossierState::Delivered),
     )
-    .and_then(|edge| edge.append_in(Convoy::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence()))
+    .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence()))
     .expect("edge");
-    let refused = write.apply_edge(convoy, both.clone());
+    let refused = write.apply_edge(dossier, both.clone());
     assert!(matches!(&refused, Err(StoreError::WrongFrom { from: 2, stored: 1, .. })), "the label before the records row: {refused:?}");
-    let missing =
-        Edge::new(Convoy::STATE, &delivered, Convoy::EDGES, &convoy_event(ConvoyEdge::Deliver, ConvoyState::Open, ConvoyState::Delivered))
-            .and_then(|edge| edge.append_in(Convoy::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence()))
-            .expect("edge");
-    assert!(matches!(write.apply_edge(convoy, missing), Err(StoreError::NoRecord { .. })), "then the records row");
-    let stale = Stamp { version: convoy.version - 1, ..convoy };
+    let missing = Edge::new(
+        Dossier::STATE,
+        &delivered,
+        Dossier::EDGES,
+        &dossier_event(DossierEdge::Deliver, DossierState::Open, DossierState::Delivered),
+    )
+    .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence()))
+    .expect("edge");
+    assert!(matches!(write.apply_edge(dossier, missing), Err(StoreError::NoRecord { .. })), "then the records row");
+    let stale = Stamp { version: dossier.version - 1, ..dossier };
     assert!(matches!(write.apply_edge(stale, both), Err(StoreError::Conflict { .. })), "a stale stamp before the label");
     write.commit().expect("commit");
 

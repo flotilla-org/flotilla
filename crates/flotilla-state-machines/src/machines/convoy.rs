@@ -1,20 +1,30 @@
 //! Convoy: admitted work that ends when every promise is settled (spec
 //! `machines/convoy.qnt`, ADR 0064 "A convoy ends when its work is delivered").
 //!
-//! The spec's work record is the state: each promise's resolution and the
-//! quota in force travel with every label, and an abandoned convoy also
-//! carries its reason. The request's project, promises and priority never
+//! The spec's work record is the state: each promise's resolution (the
+//! spec's `promises`, named `resolution` here so it does not clash with the
+//! spec's promise definitions in storage) and the quota in force travel with
+//! every label, and an abandoned convoy also carries its reason. The request's project, promises and priority never
 //! change, so they are the spec. Promise kinds and targets are opaque data;
 //! no promise kind is named here.
 //!
 //! The identifiers placement shares with the convoy ([`ConvoyId`],
 //! [`VesselClass`], [`Priority`] and [`Quota`]) are defined here once.
+//!
+//! The stored kind is [`ConvoyRow`] (code 5): the spec's project and priority
+//! as columns and its promise definitions as a child table, the state (with
+//! the resolution and quota as child tables of state data, which `keep`,
+//! `retract` and `readmit` change a row at a time), and the edge log.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use flotilla_schema::{Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Version, WrongState};
+use crate::{
+    edges, states, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts, Source, Table,
+    Version, WrongState,
+};
 
 /// A convoy: the convoy resource's name at its home.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -31,25 +41,28 @@ impl ConvoyId {
 }
 
 /// A promise's key within one convoy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub struct PromiseId(pub u32);
 
 /// An abstract vessel class that quota counts are granted for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub struct VesselClass(pub u32);
 
 /// A convoy's priority; its vessels' placement requests carry it. Higher
 /// places first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
 pub struct Priority(pub u32);
 
 /// Per-class caps on live vessels. Admission grants a cap, never a reservation.
 pub type Quota = BTreeMap<VesselClass, u32>;
 
-/// What the convoy promises: opaque kind and target data.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What the convoy promises: opaque kind and target data. Both are plain
+/// interned text until `flotilla-address` is adopted.
+#[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub struct Promise {
+    #[store(intern)]
     pub kind: String,
+    #[store(intern)]
     pub target: String,
 }
 
@@ -72,10 +85,13 @@ pub struct ConvoySpec {
 }
 
 /// One promise's resolution. `Kept` and `Retracted` are final.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
 pub enum PromiseState {
+    #[store(code = 1)]
     Pending,
+    #[store(code = 2)]
     Kept,
+    #[store(code = 3)]
     Retracted,
 }
 
@@ -83,21 +99,33 @@ pub enum PromiseState {
 pub type Resolution = BTreeMap<PromiseId, PromiseState>;
 
 states! {
-    /// The spec's `State`, with its `Work` (less the immutable request) on every label.
+    /// The spec's `State`, with its `Work` (less the immutable request) on
+    /// every label. The storage derive reads the written type, so the
+    /// [`Resolution`] and [`Quota`] maps are spelled out.
     pub enum ConvoyState => ConvoyLabel {
-        Open { promises: Resolution, quota: Quota } = 1,
-        Delivered { promises: Resolution, quota: Quota } = 2,
-        Abandoned { promises: Resolution, quota: Quota, reason: String } = 3,
+        Open {
+            #[store(child)] resolution: BTreeMap<PromiseId, PromiseState>,
+            #[store(child)] quota: BTreeMap<VesselClass, u32>,
+        } = 1,
+        Delivered {
+            #[store(child)] resolution: BTreeMap<PromiseId, PromiseState>,
+            #[store(child)] quota: BTreeMap<VesselClass, u32>,
+        } = 2,
+        Abandoned {
+            #[store(child)] resolution: BTreeMap<PromiseId, PromiseState>,
+            #[store(child)] quota: BTreeMap<VesselClass, u32>,
+            reason: String,
+        } = 3,
     }
 }
 
 impl ConvoyState {
-    /// Each promise's resolution.
-    pub fn promises(&self) -> &Resolution {
+    /// Each promise's resolution (the spec's `promises`).
+    pub fn resolution(&self) -> &Resolution {
         match self {
-            ConvoyState::Open { promises, .. } | ConvoyState::Delivered { promises, .. } | ConvoyState::Abandoned { promises, .. } => {
-                promises
-            }
+            ConvoyState::Open { resolution, .. }
+            | ConvoyState::Delivered { resolution, .. }
+            | ConvoyState::Abandoned { resolution, .. } => resolution,
         }
     }
 
@@ -118,7 +146,7 @@ impl ConvoyState {
 
     /// The promises still pending.
     pub fn outstanding(&self) -> BTreeSet<PromiseId> {
-        self.promises().iter().filter(|(_, state)| **state == PromiseState::Pending).map(|(id, _)| *id).collect()
+        self.resolution().iter().filter(|(_, state)| **state == PromiseState::Pending).map(|(id, _)| *id).collect()
     }
 }
 
@@ -152,9 +180,31 @@ pub struct Abandon {
 /// Readmission of the same convoy with a raised quota.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Readmit {
+    #[serde(with = "pairs")]
     pub quota: Quota,
     pub by: String,
     pub authority: Ref<Authority>,
+}
+
+/// A map in an edge's document as a list of `(key, value)` pairs: the stored CBOR profile
+/// (ADR 0063) takes text map keys only, and a quota is keyed by vessel class.
+mod pairs {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(map: &BTreeMap<K, V>, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(map)
+    }
+
+    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Vec::<(K, V)>::deserialize(deserializer).map(|pairs| pairs.into_iter().collect())
+    }
 }
 
 edges! {
@@ -237,7 +287,7 @@ impl Machine for Convoy {
                 EdgeDef::<Self, Keep>::new()
                     .from([Open])
                     .to([Open])
-                    .changes(["promises"])
+                    .changes(["resolution"])
                     .gate("the promise is known and still pending", gate_keep)
                     .effect(|_, state, keep| settle(state, keep.promise, PromiseState::Kept)),
             )
@@ -245,7 +295,7 @@ impl Machine for Convoy {
                 EdgeDef::<Self, Retract>::new()
                     .from([Open])
                     .to([Open])
-                    .changes(["promises"])
+                    .changes(["resolution"])
                     .gate("an authorised retraction of a known, pending promise", gate_retract)
                     .effect(|_, state, retract| settle(state, retract.promise, PromiseState::Retracted)),
             )
@@ -276,8 +326,8 @@ impl Machine for Convoy {
         if request.promises.is_empty() {
             return Err(ConvoyRefusal::NoPromises);
         }
-        let promises = request.promises.keys().map(|id| (*id, PromiseState::Pending)).collect();
-        let state = ConvoyState::Open { promises, quota: request.quota };
+        let resolution = request.promises.keys().map(|id| (*id, PromiseState::Pending)).collect();
+        let state = ConvoyState::Open { resolution, quota: request.quota };
         Ok((ConvoySpec { project: request.project, promises: request.promises, priority: request.priority }, state))
     }
 }
@@ -288,7 +338,7 @@ fn authorised(h: &mut Handle<'_, Convoy>, authority: &Ref<Authority>) -> bool {
 
 /// Spec order: unknown, then settled.
 fn pending(h: &Handle<'_, Convoy>, promise: PromiseId) -> Result<(), ConvoyRefusal> {
-    match h.state().promises().get(&promise) {
+    match h.state().resolution().get(&promise) {
         None => Err(ConvoyRefusal::UnknownPromise),
         Some(PromiseState::Pending) => Ok(()),
         Some(_) => Err(ConvoyRefusal::PromiseSettled),
@@ -350,9 +400,9 @@ fn gate_readmit(h: &mut Handle<'_, Convoy>, readmit: &Readmit) -> Result<(), Con
 
 fn settle(state: ConvoyState, promise: PromiseId, to: PromiseState) -> ConvoyState {
     match state {
-        ConvoyState::Open { mut promises, quota } => {
-            promises.insert(promise, to);
-            ConvoyState::Open { promises, quota }
+        ConvoyState::Open { mut resolution, quota } => {
+            resolution.insert(promise, to);
+            ConvoyState::Open { resolution, quota }
         }
         other => other,
     }
@@ -360,21 +410,77 @@ fn settle(state: ConvoyState, promise: PromiseId, to: PromiseState) -> ConvoySta
 
 fn deliver(_: &mut Handle<'_, Convoy>, state: ConvoyState, _: &Deliver) -> ConvoyState {
     match state {
-        ConvoyState::Open { promises, quota } => ConvoyState::Delivered { promises, quota },
+        ConvoyState::Open { resolution, quota } => ConvoyState::Delivered { resolution, quota },
         other => other,
     }
 }
 
 fn abandon(_: &mut Handle<'_, Convoy>, state: ConvoyState, abandon: &Abandon) -> ConvoyState {
     match state {
-        ConvoyState::Open { promises, quota } => ConvoyState::Abandoned { promises, quota, reason: abandon.reason.clone() },
+        ConvoyState::Open { resolution, quota } => ConvoyState::Abandoned { resolution, quota, reason: abandon.reason.clone() },
         other => other,
     }
 }
 
 fn readmit(_: &mut Handle<'_, Convoy>, state: ConvoyState, readmit: &Readmit) -> ConvoyState {
     match state {
-        ConvoyState::Open { promises, .. } => ConvoyState::Open { promises, quota: readmit.quota.clone() },
+        ConvoyState::Open { resolution, .. } => ConvoyState::Open { resolution, quota: readmit.quota.clone() },
         other => other,
+    }
+}
+
+/// The stored Convoy (kind code 5): the spec's project and priority as
+/// columns and its promise definitions as a child table, the state, and the
+/// edge log. Indexed for a project's open convoys.
+#[derive(Clone, Debug, PartialEq, Stored)]
+#[store(kind = "Convoy", code = 5, index(name = "open_by_project", eq(project), when(state in [Open])))]
+pub struct ConvoyRow {
+    /// An address: plain interned text until `flotilla-address` is adopted.
+    #[store(intern)]
+    pub project: String,
+    #[store(child)]
+    pub promises: BTreeMap<PromiseId, Promise>,
+    pub priority: Priority,
+    #[store(state)]
+    pub state: State<ConvoyState>,
+    #[store(history)]
+    pub edges: Records<EdgeEventOf<Convoy>>,
+}
+
+impl ConvoyRow {
+    /// The part of the request that never changes.
+    pub fn spec(&self) -> ConvoySpec {
+        ConvoySpec { project: self.project.clone(), promises: self.promises.clone(), priority: self.priority }
+    }
+}
+
+impl MachineRow for ConvoyRow {
+    type Machine = Convoy;
+    const STATE_FIELD: flotilla_schema::StateOf<Self, State<ConvoyState>> = ConvoyRow::STATE;
+    const EDGE_LOG: flotilla_schema::HistoryOf<Self, EdgeEventOf<Convoy>> = ConvoyRow::EDGES;
+
+    fn of(resource: &Resource<Convoy>, since: Timestamp) -> ConvoyRow {
+        let spec = resource.spec().clone();
+        ConvoyRow {
+            project: spec.project,
+            promises: spec.promises,
+            priority: spec.priority,
+            state: State::new(resource.state().clone(), since),
+            edges: resource.events().clone(),
+        }
+    }
+
+    fn state(&self) -> &State<ConvoyState> {
+        &self.state
+    }
+
+    fn parts(&self) -> RowParts<Convoy> {
+        RowParts {
+            spec: self.spec(),
+            state: self.state.value.clone(),
+            events: self.edges.clone(),
+            attempts: Records::new(),
+            receipts: Records::new(),
+        }
     }
 }
