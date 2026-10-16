@@ -111,6 +111,11 @@ impl Config {
             if token == admin_token {
                 return Err(StartupError::new(format!("forge `{name}` shares the admin token; give the admin API its own token")));
             }
+            // A token identifies its forge: two forges sharing one would let
+            // a client authenticate to either.
+            if let Some((other, _)) = forges.iter().find(|(_, settings): &(&String, &ForgeSettings)| settings.token == token) {
+                return Err(StartupError::new(format!("forges `{other}` and `{name}` share a token; give each forge its own")));
+            }
             let login = forge.login.unwrap_or_else(|| DEFAULT_LOGIN.to_string());
             if login.trim().is_empty() {
                 return Err(StartupError::new(format!("forge `{name}` has an empty `login`")));

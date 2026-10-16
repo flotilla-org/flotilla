@@ -79,6 +79,7 @@ fn config_mistakes_are_refused_with_clear_errors() {
         ("zero auto-merge", valid.replace("= 120", "= 0"), "at least 1"),
         ("shared listener", valid.replace("0.0.0.0:3444", "0.0.0.0:3443"), "its own listener"),
         ("forge shares admin token", valid.replace("tokens/github", "admin-token"), "shares the admin token"),
+        ("forges share a token", valid.replace("tokens/lab", "tokens/github"), "share a token"),
         ("bad listen address", valid.replace("0.0.0.0:3443\"\nadmin", "localhost\"\nadmin"), "listen"),
     ];
     for (case, text, expected) in cases {

@@ -105,7 +105,7 @@ store.
 ## Admin API
 
 Rehearsal drivers use the admin API on `admin_listen` to move work along.
-Every request needs `Authorization: Bearer <admin token>`. Bodies are JSON,
+Every request needs `Authorization: Bearer <admin token>`, with exactly that scheme spelling; `bearer` or `token` is refused, as strictly as the Forgejo API. Bodies are JSON,
 and unknown fields are refused. Unknown routes, wrong methods, bodies sent to
 routes that take none, and query parameters are refused. Refusals are logged
 and counted alongside the Forgejo API's.
