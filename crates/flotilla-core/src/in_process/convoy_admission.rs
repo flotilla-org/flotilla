@@ -6426,7 +6426,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let rule = flotilla_resources::TurnDeliveryRule::builder()
-            .on("$cr.mergeable == conflicting".parse().expect("leaf"))
+            .on(flotilla_resources::parse_leaf_template("$cr.mergeable == conflicting").expect("leaf"))
             .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("verify".to_string()).role("verify".to_string()).build())
             .brief("Verify the result".to_string())
             .hold(HoldAct::State)

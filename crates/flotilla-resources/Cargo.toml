@@ -10,6 +10,7 @@ default = []
 
 [dependencies]
 uuid = { workspace = true, features = ["v4"] }
+flotilla-address = { path = "../flotilla-address" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
 serde = { workspace = true, features = ["derive"] }

@@ -377,7 +377,7 @@ async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires()
             supervision: None,
             exit: Some(ExitDeclaration::Table(indexmap::IndexMap::from([(
                 "shipped".to_string(),
-                "$cr.state == merged".parse().expect("custom leaf template"),
+                flotilla_resources::parse_leaf_template("$cr.state == merged").expect("custom leaf template"),
             )]))),
             turn_delivery: Default::default(),
             vessels: Vec::new(),

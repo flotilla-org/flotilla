@@ -10,7 +10,7 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use crate::{
     resource::define_resource,
     status_patch::StatusPatch,
-    workflow_template::{ExitDeclaration, SubjectVariable, TurnDeliveryRule, VesselRequirement},
+    workflow_template::{parse_leaf_template, template_leaf, ExitDeclaration, SubjectVariable, TurnDeliveryRule, VesselRequirement},
     InputMeta, ReadResourceObject, ReplicationClass, RepositoryKey, Resource, ResourceError, ResourceObject, ResourceProvenance,
     SettlementClaimEvidence, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
 };
@@ -582,7 +582,7 @@ pub fn expected_change_request_leaves(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstantiatedExitEntry {
     pub disposition: String,
-    pub template: crate::LeafTemplate,
+    pub template: flotilla_address::Template,
     pub leaves: Vec<Leaf>,
 }
 
@@ -610,23 +610,27 @@ pub fn instantiate_turn_delivery(
         return Ok(Vec::new());
     };
     let change_requests = bound_change_request_addresses(convoy, checkouts)?;
-    let issues = if snapshot.turn_delivery.values().any(|rule| rule.on.subject == SubjectVariable::Issue) {
+    let rules = snapshot
+        .turn_delivery
+        .iter()
+        .map(|(source, rule)| Ok((source, rule, SubjectVariable::of(&rule.on)?)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let issues = if rules.iter().any(|(_, _, subject)| *subject == SubjectVariable::Issue) {
         convoy.spec.issues.iter().map(|issue| issue_address_with_forges(&issue.reference, forges)).collect::<Result<Vec<_>, _>>()?
     } else {
         Vec::new()
     };
-    let mut rows: Vec<_> = snapshot
-        .turn_delivery
-        .iter()
-        .flat_map(|(source, rule)| {
-            let subjects = match &rule.on.subject {
+    let mut rows: Vec<_> = rules
+        .into_iter()
+        .flat_map(|(source, rule, subject)| {
+            let subjects = match subject {
                 SubjectVariable::ChangeRequest => change_requests.clone(),
                 SubjectVariable::Issue => issues.clone(),
                 SubjectVariable::Artifact { producer, kind, about } => match about {
                     crate::ArtifactSubjectBinding::Convoy => vec![LeafAddress::Artifact {
                         convoy: convoy.metadata.name.clone(),
-                        producer: producer.clone(),
-                        kind: kind.clone(),
+                        producer,
+                        kind,
                         subject: convoy.metadata.name.clone(),
                     }],
                     crate::ArtifactSubjectBinding::ChangeRequestHead => change_requests
@@ -647,12 +651,7 @@ pub fn instantiate_turn_delivery(
             };
             subjects.into_iter().map(move |address| InstantiatedTurnDelivery {
                 source: source.clone(),
-                leaf: Leaf {
-                    address,
-                    field_path: rule.on.field_path.clone(),
-                    operator: rule.on.operator,
-                    literal: rule.on.literal.clone(),
-                },
+                leaf: template_leaf(&rule.on, address),
                 rule: rule.clone(),
             })
         })
@@ -673,7 +672,7 @@ pub fn instantiate_turn_delivery(
                 continue;
             };
             let rule = TurnDeliveryRule::builder()
-                .on("$cr.state == closed".parse().expect("valid rejection leaf"))
+                .on(parse_leaf_template("$cr.state == closed").expect("valid rejection leaf"))
                 .to(crate::TurnDeliveryTarget::builder().vessel(promise.vessel.clone()).role(promise.role.clone()).build())
                 .brief(format!("Promise `{}` submission `{}` was rejected: PR closed without merging. Inspect your open promises and resubmit or propose retraction with a reason.", promise.id, submission.reference))
                 .hold(crate::HoldAct::State).build();
@@ -748,22 +747,16 @@ pub fn instantiate_exit(
     let ExitDeclaration::Table(entries) = declaration else {
         unreachable!("claim declaration returned above");
     };
-    if entries.iter().any(|(_, template)| template.subject == SubjectVariable::Issue) {
-        return Err("issue exit leaves are not admitted".to_string());
+    for template in entries.values() {
+        if SubjectVariable::of(template)? == SubjectVariable::Issue {
+            return Err("issue exit leaves are not admitted".to_string());
+        }
     }
     Ok(InstantiatedExit::Table(
         entries
             .into_iter()
             .map(|(disposition, template)| {
-                let leaves = subjects
-                    .iter()
-                    .map(|address| Leaf {
-                        address: address.clone(),
-                        field_path: template.field_path.clone(),
-                        operator: template.operator,
-                        literal: template.literal.clone(),
-                    })
-                    .collect();
+                let leaves = subjects.iter().map(|address| template_leaf(&template, address.clone())).collect();
                 InstantiatedExitEntry { disposition, template, leaves }
             })
             .collect(),

@@ -1,10 +1,7 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-    str::FromStr,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_protocol::{LeafKind, LeafOperator};
+use flotilla_address::{FieldPath, Operator, Template, Variable};
+use flotilla_protocol::{Leaf, LeafAddress, LeafKind, LeafOperator};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -104,7 +101,8 @@ pub struct StallNudgePolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct TurnDeliveryRule {
-    pub on: LeafTemplate,
+    #[serde(with = "legacy_template")]
+    pub on: Template,
     pub to: TurnDeliveryTarget,
     pub brief: String,
     pub hold: HoldAct,
@@ -129,14 +127,14 @@ pub enum HoldAct {
 #[serde(untagged)]
 pub enum ExitDeclaration {
     Claim(ClaimExit),
-    Table(IndexMap<String, LeafTemplate>),
+    Table(#[serde(with = "legacy_template::table")] IndexMap<String, Template>),
 }
 
 impl ExitDeclaration {
     pub fn standard_table() -> Self {
         Self::Table(IndexMap::from([
-            ("merged".to_string(), "$cr.state == merged".parse().expect("valid standard merged exit")),
-            ("closed-unmerged".to_string(), "$cr.state == closed".parse().expect("valid standard closed exit")),
+            ("merged".to_string(), parse_leaf_template("$cr.state == merged").expect("valid standard merged exit")),
+            ("closed-unmerged".to_string(), parse_leaf_template("$cr.state == closed").expect("valid standard closed exit")),
         ]))
     }
 }
@@ -167,14 +165,9 @@ impl<'de> Deserialize<'de> for ClaimExit {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeafTemplate {
-    pub subject: SubjectVariable,
-    pub field_path: String,
-    pub operator: LeafOperator,
-    pub literal: String,
-}
-
+/// The typed reading of a leaf template's subject [`Variable`]: `$cr`,
+/// `$issue` or `$artifact(<producer>,<kind>,<about>)`. The address grammar
+/// parses and prints the variable; this names what it binds to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubjectVariable {
     ChangeRequest,
@@ -182,101 +175,160 @@ pub enum SubjectVariable {
     Artifact { producer: String, kind: String, about: ArtifactSubjectBinding },
 }
 
-impl FromStr for LeafTemplate {
-    type Err = String;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let mut parts = input.split_whitespace();
-        let subject_path = parts.next().ok_or_else(|| leaf_template_syntax_error(input))?;
-        let operator = parts.next().ok_or_else(|| leaf_template_syntax_error(input))?.parse()?;
-        let literal = parts.collect::<Vec<_>>().join(" ");
-        if literal.is_empty() {
-            return Err(leaf_template_syntax_error(input));
-        }
-        let (subject, field_path) = subject_path
-            .split_once('.')
-            .map(|(subject, path)| (subject, format!(".{path}")))
-            .ok_or_else(|| leaf_template_syntax_error(input))?;
-        let subject = match subject {
-            "$cr" => SubjectVariable::ChangeRequest,
-            "$issue" => SubjectVariable::Issue,
-            artifact if artifact.starts_with("$artifact(") && artifact.ends_with(')') => {
-                let values = artifact.trim_start_matches("$artifact(").trim_end_matches(')').split(',').collect::<Vec<_>>();
-                let [producer, kind, about] = values.as_slice() else {
-                    return Err("artifact leaf subject requires producer, kind, and about".to_string());
-                };
+impl SubjectVariable {
+    pub fn from_variable(variable: &Variable) -> Result<Self, String> {
+        match (variable.name(), variable.arguments()) {
+            ("cr", []) => Ok(Self::ChangeRequest),
+            ("issue", []) => Ok(Self::Issue),
+            ("artifact", [producer, kind, about]) => {
                 if producer.is_empty() || kind.is_empty() {
                     return Err("artifact leaf producer and kind must be nonempty".to_string());
                 }
-                let about = match *about {
-                    "convoy" => ArtifactSubjectBinding::Convoy,
-                    "change-request-head" => ArtifactSubjectBinding::ChangeRequestHead,
-                    _ => return Err(format!("unknown artifact subject binding `{about}`")),
-                };
-                SubjectVariable::Artifact { producer: (*producer).to_string(), kind: (*kind).to_string(), about }
+                let about = ArtifactSubjectBinding::from_variable_argument(about)
+                    .ok_or_else(|| format!("unknown artifact subject binding `{about}`"))?;
+                Ok(Self::Artifact { producer: producer.clone(), kind: kind.clone(), about })
             }
-            unknown => return Err(format!("unknown leaf subject variable `{unknown}`; admitted variables: $cr, $issue, $artifact(...)")),
-        };
-        if field_path == "." {
-            return Err(leaf_template_syntax_error(input));
-        }
-        let literal = literal
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-            .or_else(|| literal.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')))
-            .unwrap_or(&literal)
-            .to_string();
-        Ok(Self { subject, field_path, operator, literal })
-    }
-}
-
-fn leaf_template_syntax_error(input: &str) -> String {
-    format!("invalid leaf template `{input}`; expected `$cr.<path>`, `$issue.<path>`, or `$artifact(<producer>,<kind>,<about>).<path>` followed by an operator and literal")
-}
-
-impl fmt::Display for LeafTemplate {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let subject = match &self.subject {
-            SubjectVariable::ChangeRequest => "$cr",
-            SubjectVariable::Issue => "$issue",
-            SubjectVariable::Artifact { .. } => return write!(f, "{}{} {} {}", self.subject, self.field_path, self.operator, self.literal),
-        };
-        write!(f, "{subject}{} {} {}", self.field_path, self.operator, self.literal)
-    }
-}
-
-impl fmt::Display for SubjectVariable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ChangeRequest => f.write_str("$cr"),
-            Self::Issue => f.write_str("$issue"),
-            Self::Artifact { producer, kind, about } => write!(
-                f,
-                "$artifact({producer},{kind},{})",
-                match about {
-                    ArtifactSubjectBinding::Convoy => "convoy",
-                    ArtifactSubjectBinding::ChangeRequestHead => "change-request-head",
-                }
-            ),
+            ("artifact", _) => Err("artifact leaf subject requires producer, kind, and about".to_string()),
+            _ => Err(format!("unknown leaf subject variable `{variable}`; admitted variables: $cr, $issue, $artifact(...)")),
         }
     }
-}
 
-impl Serialize for LeafTemplate {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
+    /// The subject of `template`. Templates decoded from storage or admitted
+    /// through [`parse_leaf_template`] always have one; a template built
+    /// field by field may not.
+    pub fn of(template: &Template) -> Result<Self, String> {
+        Self::from_variable(&template.subject)
+    }
+
+    pub fn variable(&self) -> Variable {
+        let (name, arguments) = match self {
+            Self::ChangeRequest => ("cr", Vec::new()),
+            Self::Issue => ("issue", Vec::new()),
+            Self::Artifact { producer, kind, about } => {
+                ("artifact", vec![producer.clone(), kind.clone(), about.variable_argument().to_string()])
+            }
+        };
+        Variable::new(name, arguments).expect("subject variable names are lowercase words")
     }
 }
 
-impl<'de> Deserialize<'de> for LeafTemplate {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?.parse().map_err(serde::de::Error::custom)
+/// Parses a leaf template as workflow templates admit it: any spelling
+/// [`Template::resolve`] accepts, including the stored `$cr.state == merged`,
+/// with a known subject and a lossless stored form.
+pub fn parse_leaf_template(input: &str) -> Result<Template, String> {
+    let template = Template::resolve(input).map_err(|error| {
+        format!("invalid leaf template `{input}`: {error}; expected `$cr.<path>`, `$issue.<path>`, or `$artifact(<producer>,<kind>,<about>).<path>` followed by an operator and literal")
+    })?;
+    legacy_template_text(&template)?;
+    Ok(template)
+}
+
+/// The stored text of a leaf template: `$cr<path> <op> <literal>`, with the
+/// path written `.a.b` and the literal raw, as before ADR 0066. This legacy
+/// form stays the stored shape of workflow templates and frozen convoy
+/// workflow snapshots until the ADR 0064 cut-over importer rewrites it.
+///
+/// A template the form cannot hold losslessly (a path segment that is not a
+/// bare word, an empty path, a quoted or whitespace-padded literal, an
+/// argument that is not a bare word) is refused: the text must read back as
+/// the same template.
+pub fn legacy_template_text(template: &Template) -> Result<String, String> {
+    let subject = SubjectVariable::of(template)?;
+    let subject = match &subject {
+        SubjectVariable::ChangeRequest => "$cr".to_string(),
+        SubjectVariable::Issue => "$issue".to_string(),
+        SubjectVariable::Artifact { producer, kind, about } => format!("$artifact({producer},{kind},{})", about.variable_argument()),
+    };
+    let text = format!("{subject}{} {} {}", legacy_field_path(&template.path), template.operator, template.literal);
+    if Template::resolve(&text).as_ref() != Ok(template) {
+        return Err(format!(
+            "leaf template `{template}` has no lossless stored form; field names and artifact arguments must be bare words, the path nonempty, and the literal unquoted with single spaces"
+        ));
+    }
+    Ok(text)
+}
+
+/// A template's field path as [`Leaf`] carries it: `.review.actionable-at-head`.
+pub fn legacy_field_path(path: &FieldPath) -> String {
+    path.segments().iter().map(|segment| format!(".{segment}")).collect()
+}
+
+/// The protocol operator a template operator becomes in a [`Leaf`]. Converted
+/// here rather than in `flotilla-protocol` so the wire crate does not depend
+/// on the address crate.
+pub fn leaf_operator(operator: Operator) -> LeafOperator {
+    match operator {
+        Operator::Equal => LeafOperator::Equal,
+        Operator::NotEqual => LeafOperator::NotEqual,
+        Operator::LessThan => LeafOperator::LessThan,
+        Operator::LessThanOrEqual => LeafOperator::LessThanOrEqual,
+        Operator::GreaterThan => LeafOperator::GreaterThan,
+        Operator::GreaterThanOrEqual => LeafOperator::GreaterThanOrEqual,
+    }
+}
+
+/// The leaf `template` becomes once its subject is bound to `address`.
+pub fn template_leaf(template: &Template, address: LeafAddress) -> Leaf {
+    Leaf {
+        address,
+        field_path: legacy_field_path(&template.path),
+        operator: leaf_operator(template.operator),
+        literal: template.literal.clone(),
+    }
+}
+
+/// Template text for diagnostics: the stored form where there is one.
+fn template_text(template: &Template) -> String {
+    legacy_template_text(template).unwrap_or_else(|_| template.to_string())
+}
+
+/// Serde for a stored leaf template: see [`legacy_template_text`].
+mod legacy_template {
+    use flotilla_address::Template;
+    use serde::{de::Error as _, ser::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(template: &Template, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&super::legacy_template_text(template).map_err(S::Error::custom)?)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Template, D::Error> {
+        super::parse_leaf_template(&String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+
+    struct Stored<'a>(&'a Template);
+
+    impl Serialize for Stored<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serialize(self.0, serializer)
+        }
+    }
+
+    struct Decoded(Template);
+
+    impl<'de> Deserialize<'de> for Decoded {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserialize(deserializer).map(Self)
+        }
+    }
+
+    /// An exit table: disposition to stored leaf template.
+    pub mod table {
+        use flotilla_address::Template;
+        use indexmap::IndexMap;
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        use super::{Decoded, Stored};
+
+        pub fn serialize<S: Serializer>(table: &IndexMap<String, Template>, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_map(table.iter().map(|(disposition, template)| (disposition, Stored(template))))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<IndexMap<String, Template>, D::Error> {
+            Ok(IndexMap::<String, Decoded>::deserialize(deserializer)?
+                .into_iter()
+                .map(|(disposition, template)| (disposition, template.0))
+                .collect())
+        }
     }
 }
 
@@ -598,6 +650,20 @@ pub enum ArtifactSubjectBinding {
     ChangeRequestHead,
 }
 
+impl ArtifactSubjectBinding {
+    /// The `about` argument of a `$artifact(<producer>,<kind>,<about>)` subject.
+    pub fn variable_argument(self) -> &'static str {
+        match self {
+            Self::Convoy => "convoy",
+            Self::ChangeRequestHead => "change-request-head",
+        }
+    }
+
+    fn from_variable_argument(argument: &str) -> Option<Self> {
+        [Self::Convoy, Self::ChangeRequestHead].into_iter().find(|binding| binding.variable_argument() == argument)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum CrewSource {
@@ -742,7 +808,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
         (
             "checks-settled".to_string(),
             TurnDeliveryRule::builder()
-                .on("$cr.checks != pending".parse().expect("valid stock checks leaf"))
+                .on(parse_leaf_template("$cr.checks != pending").expect("valid stock checks leaf"))
                 .to(target())
                 .brief("Inspect checks and reviews at the bound head. Fix failures caused by this PR and continue shepherding; inspect your open promises after checks pass, review findings are handled, and the PR is mergeable. Submit the PR against its promise and continue until every promise is kept or retracted.".to_string())
                 .hold(HoldAct::State)
@@ -751,7 +817,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
         (
             "merged-unclaimed".to_string(),
             TurnDeliveryRule::builder()
-                .on("$cr.state == merged".parse().expect("valid stock merged leaf"))
+                .on(parse_leaf_template("$cr.state == merged").expect("valid stock merged leaf"))
                 .to(target())
                 .brief("The PR merged. Inspect your open promises, continue any remaining work, and submit your decision ledger. Run `flotilla crew complete` once every promise is kept or retracted.".to_string())
                 .hold(HoldAct::State)
@@ -760,7 +826,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
         (
             "actionable-review".to_string(),
             TurnDeliveryRule::builder()
-                .on("$cr.review.actionable-at-head == true".parse().expect("valid stock review leaf"))
+                .on(parse_leaf_template("$cr.review.actionable-at-head == true").expect("valid stock review leaf"))
                 .to(target())
                 .brief(
                     "Address the actionable review at the bound head, push the durable fix, and file a fresh settlement claim."
@@ -772,7 +838,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
         (
             "conflicting".to_string(),
             TurnDeliveryRule::builder()
-                .on("$cr.mergeable == conflicting".parse().expect("valid stock mergeability leaf"))
+                .on(parse_leaf_template("$cr.mergeable == conflicting").expect("valid stock mergeability leaf"))
                 .to(target())
                 .brief(
                     "Rebase onto the current base branch and resolve conflicts additively, keeping both sides' intent. Regenerate generated files rather than hand-merging them. Re-run the repository's pinned CI gates, push the same branch, process any review, and file a fresh settlement claim; the previous claim is superseded."
@@ -964,26 +1030,25 @@ fn validate_turn_delivery(
     errors: &mut Vec<ValidationError>,
 ) {
     for (source, rule) in &spec.turn_delivery {
-        let admitted = (rule.on.subject == SubjectVariable::ChangeRequest
-            && matches!(rule.on.field_path.as_str(), ".state" | ".checks" | ".review.actionable-at-head" | ".mergeable")
-            || rule.on.subject == SubjectVariable::Issue
-                && (matches!(rule.on.field_path.as_str(), ".state" | ".updated-at") || rule.on.field_path.starts_with(".labels."))
-            || matches!(rule.on.subject, SubjectVariable::Artifact { .. })
-                && (rule.on.field_path == ".exists" || rule.on.field_path.starts_with(".summary.")))
-            && (rule.on.field_path == ".updated-at" || matches!(rule.on.operator, LeafOperator::Equal | LeafOperator::NotEqual));
+        let subject = SubjectVariable::of(&rule.on);
+        let field_path = legacy_field_path(&rule.on.path);
+        let admitted = (subject == Ok(SubjectVariable::ChangeRequest)
+            && matches!(field_path.as_str(), ".state" | ".checks" | ".review.actionable-at-head" | ".mergeable")
+            || subject == Ok(SubjectVariable::Issue)
+                && (matches!(field_path.as_str(), ".state" | ".updated-at") || field_path.starts_with(".labels."))
+            || matches!(subject, Ok(SubjectVariable::Artifact { .. })) && (field_path == ".exists" || field_path.starts_with(".summary.")))
+            && (field_path == ".updated-at" || matches!(rule.on.operator, Operator::Equal | Operator::NotEqual));
+        let template = template_text(&rule.on);
         if !admitted {
-            push_error(errors, ValidationError::InvalidTurnDeliveryLeaf { source: source.clone(), template: rule.on.to_string() });
+            push_error(errors, ValidationError::InvalidTurnDeliveryLeaf { source: source.clone(), template });
         } else {
-            let kind = match &rule.on.subject {
-                SubjectVariable::ChangeRequest => LeafKind::ChangeRequest,
-                SubjectVariable::Issue => LeafKind::Issue,
-                SubjectVariable::Artifact { .. } => LeafKind::Artifact,
+            let kind = match subject {
+                Ok(SubjectVariable::ChangeRequest) => LeafKind::ChangeRequest,
+                Ok(SubjectVariable::Issue) => LeafKind::Issue,
+                _ => LeafKind::Artifact,
             };
-            if let Err(reason) = validate_leaf_literal(kind, &rule.on.field_path, &rule.on.literal) {
-                push_error(
-                    errors,
-                    ValidationError::InvalidTurnDeliveryLiteral { source: source.clone(), template: rule.on.to_string(), reason },
-                );
+            if let Err(reason) = legacy_template_text(&rule.on).and_then(|_| validate_leaf_literal(kind, &field_path, &rule.on.literal)) {
+                push_error(errors, ValidationError::InvalidTurnDeliveryLiteral { source: source.clone(), template, reason });
             }
         }
         if rule.brief.trim().is_empty() {
@@ -1015,12 +1080,12 @@ fn validate_exit(spec: &WorkflowTemplateSpec, errors: &mut Vec<ValidationError>)
         push_error(errors, ValidationError::EmptyExitTable);
     }
     for (disposition, template) in entries {
-        let is_world_terminal = template.subject == SubjectVariable::ChangeRequest
-            && template.field_path == ".state"
-            && template.operator == LeafOperator::Equal
+        let is_world_terminal = SubjectVariable::of(template) == Ok(SubjectVariable::ChangeRequest)
+            && template.path.segments() == ["state"]
+            && template.operator == Operator::Equal
             && matches!(template.literal.as_str(), "merged" | "closed");
         if !is_world_terminal {
-            push_error(errors, ValidationError::InvalidExitLeaf { disposition: disposition.clone(), template: template.to_string() });
+            push_error(errors, ValidationError::InvalidExitLeaf { disposition: disposition.clone(), template: template_text(template) });
         }
     }
 }
@@ -1773,5 +1838,238 @@ mod promise_template_tests {
         workflow.roles = workflow.vessels[0].crew.clone();
         workflow.vessels[0].crew[0].promises[0].owner = "coder".into();
         assert!(validate(&workflow).is_err(), "authored roles are validated even beside vessel hints");
+    }
+}
+
+/// Stored leaf templates keep their pre-ADR 0066 text, byte for byte, while
+/// live code holds the address crate's `Template`.
+#[cfg(test)]
+mod legacy_template_tests {
+    use flotilla_address::{FieldPath, Operator, Template, Variable};
+    use hegel::generators as gs;
+    use indexmap::IndexMap;
+
+    use super::{parse_leaf_template, ExitDeclaration, SubjectVariable, TurnDeliveryRule};
+
+    fn stored_rule(on: &str) -> serde_json::Value {
+        serde_json::json!({"on": on, "to": {"vessel": "work", "role": "coder"}, "brief": "b", "hold": {"kind": "state"}})
+    }
+
+    /// Decodes `text` as a turn-delivery rule's `on` and as an exit-table
+    /// entry, re-encodes both, and returns the decoded template with the two
+    /// re-encoded texts.
+    fn decode_and_reencode(text: &str) -> Result<(Template, String, String), String> {
+        let rule: TurnDeliveryRule = serde_json::from_value(stored_rule(text)).map_err(|error| error.to_string())?;
+        let exit: ExitDeclaration = serde_json::from_value(serde_json::json!({"done": text})).map_err(|error| error.to_string())?;
+        let ExitDeclaration::Table(table) = &exit else { panic!("an object decodes as a table") };
+        assert_eq!(table["done"], rule.on, "both stored positions decode alike");
+        let rule_text = serde_json::to_value(&rule).expect("encode rule")["on"].as_str().expect("text").to_string();
+        let exit_text = serde_json::to_value(&exit).expect("encode exit")["done"].as_str().expect("text").to_string();
+        Ok((rule.on, rule_text, exit_text))
+    }
+
+    fn template(subject: SubjectVariable, path: &[&str], operator: Operator, literal: &str) -> Template {
+        Template {
+            subject: subject.variable(),
+            path: FieldPath::new(path.iter().map(|segment| segment.to_string()).collect()),
+            operator,
+            literal: literal.to_string(),
+        }
+    }
+
+    // ADR 0047 / #2169: every template text in the golden stored corpus, and
+    // every stock template, decodes and re-encodes to the same bytes.
+    #[test]
+    fn stored_corpus_and_stock_templates_reencode_byte_identically() {
+        let mut texts = vec![
+            "$cr.mergeable == conflicting",
+            "$cr.review.actionable-at-head == true",
+            "$cr.state == closed",
+            "$cr.state == merged",
+            "$cr.checks != pending",
+            "$artifact(coder,decision-ledger,convoy).summary.x == y",
+        ];
+        let stock = super::builtin_workflow_templates()
+            .into_iter()
+            .flat_map(|(_, spec)| {
+                let exit = serde_json::to_value(&spec.exit).expect("exit");
+                let rules = serde_json::to_value(&spec.turn_delivery).expect("rules");
+                let mut stored = exit.as_object().into_iter().flat_map(|table| table.values().cloned()).collect::<Vec<_>>();
+                stored.extend(rules.as_object().into_iter().flat_map(|rules| rules.values().map(|rule| rule["on"].clone())));
+                stored
+            })
+            .map(|text| text.as_str().expect("stored text").to_string())
+            .collect::<Vec<_>>();
+        assert!(!stock.is_empty());
+        texts.extend(stock.iter().map(String::as_str));
+        for text in texts {
+            let (_, rule_text, exit_text) = decode_and_reencode(text).unwrap_or_else(|error| panic!("{text}: {error}"));
+            assert_eq!((rule_text.as_str(), exit_text.as_str()), (text, text));
+        }
+    }
+
+    const SEGMENT: &str = "[A-Za-z0-9_-]{1,8}";
+
+    /// A literal the old parser kept as written: one to three words joined
+    /// by single spaces, over characters seen in literals (timestamps,
+    /// versions, quotes and operators inside a word), never opening with a
+    /// quote, which the old parser would have stripped.
+    fn literal(tc: &hegel::TestCase) -> String {
+        let words = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+        (0..words)
+            .map(|index| {
+                let first = if index == 0 { "[A-Za-z0-9_.:/+@$=<>!-]" } else { "[A-Za-z0-9_.:/+@$=<>!'\"-]" };
+                tc.draw(gs::from_regex(&format!("{first}[A-Za-z0-9_.:/+@$=<>!,()'\"-]{{0,6}}")).fullmatch(true))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Every subject variable, with bare-word artifact producers and kinds and
+    /// both artifact bindings.
+    fn subject(tc: &hegel::TestCase) -> SubjectVariable {
+        match tc.draw(gs::integers::<u8>().min_value(0).max_value(2)) {
+            0 => SubjectVariable::ChangeRequest,
+            1 => SubjectVariable::Issue,
+            _ => SubjectVariable::Artifact {
+                producer: tc.draw(gs::from_regex(SEGMENT).fullmatch(true)),
+                kind: tc.draw(gs::from_regex(SEGMENT).fullmatch(true)),
+                about: if tc.draw(gs::booleans()) {
+                    super::ArtifactSubjectBinding::Convoy
+                } else {
+                    super::ArtifactSubjectBinding::ChangeRequestHead
+                },
+            },
+        }
+    }
+
+    // Behaviour: text the old printer wrote (`$cr.a.b <op> <literal>`, the
+    // literal raw) decodes to the template it named and re-encodes to the
+    // same bytes. The generator spans every subject, one to three bare path
+    // segments, every operator and multiword literals.
+    #[hegel::test(test_cases = 300)]
+    fn old_printer_text_reencodes_byte_identically(tc: hegel::TestCase) {
+        let subject = subject(&tc);
+        let segments = (0..tc.draw(gs::integers::<usize>().min_value(1).max_value(3)))
+            .map(|_| tc.draw(gs::from_regex(SEGMENT).fullmatch(true)))
+            .collect::<Vec<String>>();
+        let operator = Operator::ALL[tc.draw(gs::integers::<usize>().min_value(0).max_value(5))];
+        let literal = literal(&tc);
+        let old_subject = match &subject {
+            SubjectVariable::ChangeRequest => "$cr".to_string(),
+            SubjectVariable::Issue => "$issue".to_string(),
+            SubjectVariable::Artifact { producer, kind, about } => format!("$artifact({producer},{kind},{})", about.variable_argument()),
+        };
+        let text = format!("{old_subject}.{} {operator} {literal}", segments.join("."));
+
+        let (decoded, rule_text, exit_text) = decode_and_reencode(&text).unwrap_or_else(|error| panic!("{text}: {error}"));
+        let segments = segments.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(decoded, template(subject, &segments, operator, &literal));
+        assert_eq!((rule_text, exit_text), (text.clone(), text));
+    }
+
+    // Behaviour: the other spellings the old parser accepted (runs of
+    // whitespace between tokens, a single- or double-quoted literal) decode
+    // to the same template as the printed form and re-encode to it.
+    #[hegel::test(test_cases = 200)]
+    fn old_parser_spellings_decode_to_the_printed_form(tc: hegel::TestCase) {
+        let literal = tc.draw(gs::from_regex("[a-z0-9-]{1,6}( [a-z0-9-]{1,6}){0,2}").fullmatch(true));
+        let printed = format!("$cr.state == {literal}");
+        let gap = |tc: &hegel::TestCase| tc.draw(gs::from_regex("[ \t]{1,3}").fullmatch(true));
+        let quoted = match tc.draw(gs::integers::<u8>().min_value(0).max_value(2)) {
+            0 => literal.split(' ').collect::<Vec<_>>().join(&gap(&tc)),
+            1 => format!("'{literal}'"),
+            _ => format!("\"{literal}\""),
+        };
+        let spelled = format!("{}$cr.state{}=={}{quoted}{}", gap(&tc).trim_start_matches('\t'), gap(&tc), gap(&tc), gap(&tc));
+
+        let (decoded, rule_text, _) = decode_and_reencode(&spelled).unwrap_or_else(|error| panic!("{spelled:?}: {error}"));
+        assert_eq!(decoded, parse_leaf_template(&printed).expect("printed form"));
+        assert_eq!(rule_text, printed);
+    }
+
+    // Behaviour: a template the legacy text cannot hold losslessly is refused
+    // when encoded and when admitted, rather than written as different text.
+    #[test]
+    fn templates_without_a_lossless_stored_form_are_refused() {
+        let artifact = |producer: &str| SubjectVariable::Artifact {
+            producer: producer.to_string(),
+            kind: "review".to_string(),
+            about: super::ArtifactSubjectBinding::Convoy,
+        };
+        let unstorable = [
+            template(SubjectVariable::Issue, &["labels", "good first issue"], Operator::Equal, "true"),
+            template(SubjectVariable::Issue, &["labels", "kind.bug"], Operator::Equal, "true"),
+            template(SubjectVariable::ChangeRequest, &["state", ""], Operator::Equal, "merged"),
+            template(SubjectVariable::ChangeRequest, &[], Operator::Equal, "merged"),
+            template(SubjectVariable::ChangeRequest, &["state"], Operator::Equal, ""),
+            template(SubjectVariable::ChangeRequest, &["state"], Operator::Equal, "a  b"),
+            template(SubjectVariable::ChangeRequest, &["state"], Operator::Equal, " merged"),
+            template(SubjectVariable::ChangeRequest, &["state"], Operator::Equal, "\"merged\""),
+            template(SubjectVariable::ChangeRequest, &["state"], Operator::Equal, "'merged'"),
+            template(artifact("p.q"), &["exists"], Operator::Equal, "true"),
+            template(artifact("p,q"), &["exists"], Operator::Equal, "true"),
+        ];
+        for template in unstorable {
+            let rule = TurnDeliveryRule::builder()
+                .on(template.clone())
+                .to(super::TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
+                .brief("b".into())
+                .hold(super::HoldAct::State)
+                .build();
+            assert!(serde_json::to_value(&rule).is_err(), "rule with `{template}` must not encode");
+            let exit = ExitDeclaration::Table(IndexMap::from([("done".to_string(), template.clone())]));
+            assert!(serde_json::to_value(&exit).is_err(), "exit with `{template}` must not encode");
+            assert!(parse_leaf_template(&template.to_string()).is_err(), "`{template}` must not be admitted");
+        }
+        for text in ["$cr. == merged", "$cr.state ==", "$cr.state == \"a  b\"", "$cr.state == ' merged'", "$cr .state == \"a  b\""] {
+            assert!(parse_leaf_template(text).is_err(), "`{text}` must not be admitted");
+            assert!(serde_json::from_value::<TurnDeliveryRule>(stored_rule(text)).is_err(), "`{text}` must not decode");
+        }
+    }
+
+    // Behaviour: only `$cr`, `$issue` and `$artifact(<producer>,<kind>,<about>)`
+    // with a known binding are subjects; anything else is refused when
+    // decoded, admitted or encoded.
+    #[test]
+    fn unknown_subject_variables_are_refused() {
+        for (text, reason) in [
+            ("$pr.state == merged", "unknown leaf subject variable `$pr`"),
+            ("$cr(x).state == merged", "unknown leaf subject variable `$cr(x)`"),
+            ("$issue(1).state == closed", "unknown leaf subject variable `$issue(1)`"),
+            ("$artifact(coder,ledger).exists == true", "artifact leaf subject requires producer, kind, and about"),
+            ("$artifact(coder,ledger,head).exists == true", "unknown artifact subject binding `head`"),
+            ("$artifact(coder,\"\",convoy).exists == true", "artifact leaf producer and kind must be nonempty"),
+        ] {
+            let refused = parse_leaf_template(text).expect_err(text);
+            assert!(refused.contains(reason), "{text}: {refused}");
+            let decoded = serde_json::from_value::<TurnDeliveryRule>(stored_rule(text)).expect_err(text).to_string();
+            assert!(decoded.contains(reason), "{text}: {decoded}");
+        }
+        let unknown = Template {
+            subject: Variable::new("pr", Vec::new()).expect("variable"),
+            path: FieldPath::new(vec!["state".into()]),
+            operator: Operator::Equal,
+            literal: "merged".into(),
+        };
+        let exit = ExitDeclaration::Table(IndexMap::from([("done".to_string(), unknown)]));
+        assert!(serde_json::to_value(&exit).is_err());
+        assert!(super::validate(&super::WorkflowTemplateSpec::builder().exit(exit).build()).is_err());
+    }
+
+    // Behaviour: a subject variable reads back from the variable it prints.
+    #[test]
+    fn subject_variables_round_trip_through_variables() {
+        for subject in [
+            SubjectVariable::ChangeRequest,
+            SubjectVariable::Issue,
+            SubjectVariable::Artifact {
+                producer: "coder".into(),
+                kind: "decision-ledger".into(),
+                about: super::ArtifactSubjectBinding::ChangeRequestHead,
+            },
+        ] {
+            assert_eq!(SubjectVariable::from_variable(&subject.variable()), Ok(subject));
+        }
     }
 }

@@ -273,7 +273,7 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
     let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
     snapshot.exit = Some(flotilla_resources::ExitDeclaration::Table(indexmap::IndexMap::from([(
         "shipped".into(),
-        "$cr.state == merged".parse().expect("leaf template"),
+        flotilla_resources::parse_leaf_template("$cr.state == merged").expect("leaf template"),
     )])));
     convoys
         .update_status(
@@ -411,7 +411,7 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
                     supervision: None,
                     exit: Some(flotilla_resources::ExitDeclaration::Table(indexmap::IndexMap::from([(
                         "shipped".into(),
-                        "$cr.state == merged".parse().expect("leaf template"),
+                        flotilla_resources::parse_leaf_template("$cr.state == merged").expect("leaf template"),
                     )]))),
                     turn_delivery: Default::default(),
                     vessels: Vec::new(),

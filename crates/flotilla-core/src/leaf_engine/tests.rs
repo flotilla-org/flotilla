@@ -1132,7 +1132,7 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
         wake.sync_rows("flotilla", &HashMap::from([("checks-wake".into(), updated)])).await.expect("inactive subscriptions");
         assert!(
             !table.rows().await.iter().any(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { rule, .. }
-            if matches!(rule.on.field_path.as_str(), ".checks" | ".review.actionable-at-head"))),
+            if matches!(flotilla_resources::legacy_field_path(&rule.on.path).as_str(), ".checks" | ".review.actionable-at-head"))),
             "{phase:?}"
         );
     }
@@ -1142,7 +1142,7 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
         status.crew_work.get_mut("work").expect("work").get_mut(role).expect("crew").phase = phase;
         let updated = convoys.update_status("checks-wake", &current.metadata.resource_version, &status).await.expect("active crew");
         wake.sync_rows("flotilla", &HashMap::from([("checks-wake".into(), updated)])).await.expect("active subscriptions");
-        assert!(table.rows().await.iter().any(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { rule, .. } if rule.to.role == role && rule.on.field_path == ".checks")), "{phase:?}");
+        assert!(table.rows().await.iter().any(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { rule, .. } if rule.to.role == role && flotilla_resources::legacy_field_path(&rule.on.path) == ".checks")), "{phase:?}");
     }
     let objects = HashMap::from([("checks-wake".into(), convoys.get("checks-wake").await.expect("convoy"))]);
     // Drive each evaluation deterministically, using the same evaluator and
@@ -1158,7 +1158,7 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
         .into_iter()
         .find(|row| {
             matches!(&row.watcher,
-                LeafWatcher::TurnDelivery { rule, .. } if rule.to.role == role && rule.on.field_path == ".checks"
+                LeafWatcher::TurnDelivery { rule, .. } if rule.to.role == role && flotilla_resources::legacy_field_path(&rule.on.path) == ".checks"
             )
         })
         .expect("active checks-settled subscription");
@@ -1300,7 +1300,7 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
         .into_iter()
         .find(|row| {
             matches!(&row.watcher,
-                LeafWatcher::TurnDelivery { rule, .. } if rule.to.role == role && rule.on.field_path == ".review.actionable-at-head"
+                LeafWatcher::TurnDelivery { rule, .. } if rule.to.role == role && flotilla_resources::legacy_field_path(&rule.on.path) == ".review.actionable-at-head"
             )
         })
         .expect("active review subscription");
@@ -1348,7 +1348,7 @@ async fn assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates
     let actuator = Arc::new(RecordingTurnDelivery::default());
     table.set_turn_delivery_actuator(actuator.clone()).await;
     let rule = TurnDeliveryRule::builder()
-        .on(condition.parse().expect("wake leaf"))
+        .on(flotilla_resources::parse_leaf_template(condition).expect("wake leaf"))
         .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".to_string()).role("coder".to_string()).build())
         .brief(brief.to_string())
         .hold(HoldAct::State)

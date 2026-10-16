@@ -2260,7 +2260,7 @@ fn held_turn_release_checks_revision_and_condition(tc: hegel::TestCase) {
             let convoys = backend.using::<Convoy>("flotilla");
             let convoy = convoys.get("convoy").await.unwrap();
             let rule = TurnDeliveryRule::builder()
-                .on("$cr.checks == fail".parse().unwrap())
+                .on(flotilla_resources::parse_leaf_template("$cr.checks == fail").unwrap())
                 .to(TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
                 .brief("checks settled".into())
                 .hold(HoldAct::State)

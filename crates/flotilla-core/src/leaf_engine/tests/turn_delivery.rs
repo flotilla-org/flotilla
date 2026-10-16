@@ -322,9 +322,12 @@ fn delivery_failures_are_durable_and_log_once() {
                 }
                 convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.expect("tracing scenario");
                 let rule = TurnDeliveryRule::builder()
-                    .on(if kind == 2 || kind == 3 { "$issue.state == closed" } else { "$cr.checks == fail" }
-                        .parse()
-                        .expect("tracing scenario"))
+                    .on(flotilla_resources::parse_leaf_template(if kind == 2 || kind == 3 {
+                        "$issue.state == closed"
+                    } else {
+                        "$cr.checks == fail"
+                    })
+                    .expect("tracing scenario"))
                     .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
                     .brief("continue".into())
                     .hold(HoldAct::State)
@@ -531,7 +534,7 @@ async fn issue_turn_delivery_fires_once_for_changed_issue() {
     let actuator = Arc::new(RecordingTurnDelivery::default());
     table.set_turn_delivery_actuator(actuator.clone()).await;
     let rule = TurnDeliveryRule::builder()
-        .on("$issue.state == closed".parse().expect("issue rule"))
+        .on(flotilla_resources::parse_leaf_template("$issue.state == closed").expect("issue rule"))
         .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
         .brief("Respond to the issue change.".into())
         .hold(HoldAct::State)

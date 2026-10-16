@@ -450,7 +450,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
                     turn_delivery: indexmap::IndexMap::from([(
                         "conflicting".to_string(),
                         flotilla_resources::TurnDeliveryRule::builder()
-                            .on("$cr.mergeable == conflicting".parse().expect("conflict leaf"))
+                            .on(flotilla_resources::parse_leaf_template("$cr.mergeable == conflicting").expect("conflict leaf"))
                             .to(flotilla_resources::TurnDeliveryTarget::builder()
                                 .vessel("work".to_string())
                                 .role("coder".to_string())
