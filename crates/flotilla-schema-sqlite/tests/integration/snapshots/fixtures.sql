@@ -627,24 +627,44 @@ CREATE TABLE "ticket" (
   "state_since" INTEGER NOT NULL,
   "priority" INTEGER,
   "owner" INTEGER REFERENCES "strings" ("id"),
+  "hold_present" INTEGER CHECK ("hold_present" IN (0, 1)),
+  "hold_by" TEXT,
+  "hold_until" INTEGER,
   "reason" TEXT,
   "closed_by" INTEGER REFERENCES "strings" ("id"),
+  "signature_who" INTEGER REFERENCES "strings" ("id"),
+  "signature_at" INTEGER,
+  CHECK (CASE WHEN "hold_present" = 1
+      THEN "hold_by" IS NOT NULL
+      AND "hold_until" IS NOT NULL
+      ELSE "hold_by" IS NULL
+      AND "hold_until" IS NULL
+      END),
   CHECK (CASE WHEN "state" = 1
       THEN "priority" IS NULL
       AND "owner" IS NULL
+      AND "hold_present" IS NULL
       AND "reason" IS NULL
       AND "closed_by" IS NULL
+      AND "signature_who" IS NULL
+      AND "signature_at" IS NULL
       END),
   CHECK (CASE WHEN "state" = 2
       THEN "priority" IS NOT NULL
+      AND "hold_present" IS NOT NULL
       AND "reason" IS NULL
       AND "closed_by" IS NULL
+      AND "signature_who" IS NULL
+      AND "signature_at" IS NULL
       END),
   CHECK (CASE WHEN "state" = 3
       THEN "priority" IS NOT NULL
       AND "reason" IS NOT NULL
       AND "closed_by" IS NOT NULL
+      AND "signature_who" IS NOT NULL
+      AND "signature_at" IS NOT NULL
       AND "owner" IS NULL
+      AND "hold_present" IS NULL
       END)
 ) STRICT;
 CREATE TABLE "ticket_assignees" (

@@ -15,8 +15,9 @@
 //! group or table per datum, shared by name across the variants that carry it, and one CHECK per
 //! label requiring the label's own data and nulling the data it lacks. A datum is unattributed (its
 //! columns), `child` (a `BTreeMap` or `BTreeSet`: a table keyed by owner plus map key or set value,
-//! changed row by row) or `intern`; it has the same type and attribute in every variant carrying
-//! it. A datum's table holds rows only while the label carries it, and decoding refuses rows
+//! changed row by row), `intern`, or `flatten` (a struct without table fields as columns
+//! `<datum>_<field>`, or an `Option` of one with its `<datum>_present` flag, which is null under a
+//! label lacking the datum); it has the same type and attribute in every variant carrying it. A datum's table holds rows only while the label carries it, and decoding refuses rows
 //! otherwise.
 
 use std::collections::BTreeMap;
@@ -432,12 +433,15 @@ fn datums<'v, 'a>(variants: &'v [Variant<'a>]) -> syn::Result<Vec<Datum<'v, 'a>>
         for field in variant.fields.iter().flatten() {
             let name = field.name.value();
             match field.shape {
-                FieldShape::Column | FieldShape::Intern { .. } | FieldShape::Child(Collection::Map | Collection::Set) => {}
+                FieldShape::Column
+                | FieldShape::Intern { .. }
+                | FieldShape::Flatten { .. }
+                | FieldShape::Child(Collection::Map | Collection::Set) => {}
                 _ => {
                     return Err(refuse(
                         field.ident,
                         format_args!(
-                            "state datum `{name}` takes no attribute (its columns), `child` (a BTreeMap or BTreeSet, changed row by row) or `intern`"
+                            "state datum `{name}` takes no attribute (its columns), `child` (a BTreeMap or BTreeSet, changed row by row), `intern` or `flatten` (a struct without table fields, or an Option of one)"
                         ),
                     ));
                 }

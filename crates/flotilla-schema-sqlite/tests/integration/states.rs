@@ -14,7 +14,7 @@ use rusqlite::{Connection, ErrorCode};
 use crate::fixtures::{
     convoy::{ConvoyEdge, ConvoyEdgeEvent, ConvoyState, Deliverable, Evidence},
     registry, store,
-    ticket::{next_value, state_value, transition, Ticket, TicketEdgeName, TicketLabel, TicketState},
+    ticket::{next_value, state_value, transition, Hold, Signature, Ticket, TicketEdgeName, TicketLabel, TicketState},
     Convoy, Fixture, Payload, Pick, LOCAL,
 };
 
@@ -57,11 +57,19 @@ fn open(assignees: &[&str], priority: u8) -> TicketState {
         notes: BTreeMap::new(),
         priority,
         owner: None,
+        hold: None,
     }
 }
 
 fn closed() -> TicketState {
-    TicketState::Closed { assignees: BTreeSet::new(), notes: BTreeMap::new(), priority: 0, reason: "done".into(), closed_by: "ann".into() }
+    TicketState::Closed {
+        assignees: BTreeSet::new(),
+        notes: BTreeMap::new(),
+        priority: 0,
+        reason: "done".into(),
+        closed_by: "ann".into(),
+        signature: Signature { who: "ann".into(), at: Timestamp(2) },
+    }
 }
 
 fn event(from: TicketLabel, to: TicketLabel, at: i64) -> EdgeEvent<TicketLabel, TicketEdgeName, Payload<String>> {
@@ -366,15 +374,72 @@ fn a_label_and_its_data_change_in_one_statement() {
     let conn = store.into_connection();
     let by = |id: ResourceId| format!("WHERE {} = {}", quote_ident("id"), id.0);
     let closed_by: i64 = conn.query_row("SELECT min(id) FROM strings", [], |row| row.get(0)).expect("a string");
-    assert!(refused_by_check(&conn, &format!("UPDATE ticket SET state = 3, closed_by = {closed_by} {}", by(stamp.id))), "no reason");
+    let signed = format!("signature_who = {closed_by}, signature_at = 4");
+    let closing = format!("state = 3, closed_by = {closed_by}, hold_present = NULL");
+    assert!(refused_by_check(&conn, &format!("UPDATE ticket SET {closing}, {signed} {}", by(stamp.id))), "no reason");
+    assert!(refused_by_check(&conn, &format!("UPDATE ticket SET {closing}, reason = 'r' {}", by(stamp.id))), "no signature");
     assert!(refused_by_check(&conn, &format!("UPDATE ticket SET reason = 'r' {}", by(stamp.id))), "Open lacks a reason");
-    let together = format!("UPDATE ticket SET state = 3, reason = 'r', closed_by = {closed_by} {}", by(stamp.id));
+    assert!(refused_by_check(&conn, &format!("UPDATE ticket SET {signed} {}", by(stamp.id))), "Open lacks a signature");
+    assert!(refused_by_check(&conn, &format!("UPDATE ticket SET hold_present = 1 {}", by(stamp.id))), "a present hold needs its columns");
+    assert!(refused_by_check(&conn, &format!("UPDATE ticket SET hold_present = NULL {}", by(stamp.id))), "Open carries a hold flag");
+    let together = format!("UPDATE ticket SET {closing}, reason = 'r', {signed} {}", by(stamp.id));
     assert_eq!(conn.execute(&together, []).expect("one statement"), 1);
 
     conn.execute(&format!("INSERT INTO ticket_assignees (owner, value) VALUES ({}, 'x')", draft.id.0), []).expect("no table CHECK");
     let mut store = Store::open(conn, LOCAL, registry()).expect("reopen");
     let refused = store.read().expect("read").load::<Ticket>(draft.id);
     assert!(matches!(refused, Err(StoreError::Decode(flotilla_schema::DecodeError::AbsentRows { .. }))), "{refused:?}");
+}
+
+// Behaviour (coordinator addition, flattened data): a flattened datum is one field of the state:
+// an optional one's flag and columns move together when it appears, changes or goes (its flag 0
+// for `None` under a label carrying it, null under one lacking it), and a required one is written
+// whole when its label is entered. Each logged `Set` names the datum alone.
+#[test]
+fn a_flattened_datum_moves_as_one_field() {
+    let mut store = store();
+    let mut write = store.write().expect("write");
+    let mut stamp = write.insert("t", &ticket(open(&["a"], 1))).expect("insert");
+    let mut state = State::new(open(&["a"], 1), Timestamp(1));
+    let held = TicketState::Open {
+        assignees: ["a".to_owned()].into(),
+        notes: BTreeMap::new(),
+        priority: 1,
+        owner: None,
+        hold: Some(Hold { by: "bo".into(), until: Timestamp(7) }),
+    };
+    for (next, at, expected) in [
+        (held, 3, vec![("hold", vec![Value::Int(1), Value::Text("bo".into()), Value::Int(7)])]),
+        (open(&["a"], 1), 4, vec![("hold", vec![Value::Int(0), Value::Null, Value::Null])]),
+        (
+            closed(),
+            5,
+            vec![
+                ("state", vec![Value::Int(3), Value::Int(5)]),
+                ("priority", vec![Value::Int(0)]),
+                ("hold", vec![Value::Null, Value::Null, Value::Null]),
+                ("reason", vec![Value::Text("done".into())]),
+                ("closed_by", vec![Value::Str("ann".into())]),
+                ("signature", vec![Value::Str("ann".into()), Value::Int(2)]),
+            ],
+        ),
+    ] {
+        let built = edge(&state, next, at);
+        let moved = write.apply_edge(stamp, built).expect("edge");
+        let change = write.changes(stamp.id, stamp.version, 10).expect("log").remove(0);
+        let sets: Vec<(&str, Vec<Value>)> = change
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                RowOp::Set { field, values, .. } => Some((field.as_str(), values.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sets, expected);
+        stamp = moved;
+        state = write.load::<Ticket>(stamp.id).expect("load").expect("present").value.state;
+    }
+    write.commit().expect("commit");
 }
 
 // Behaviour (#3373 ruling 1, indexes): an index predicate on a label-plus-data state takes its

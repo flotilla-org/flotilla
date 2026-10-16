@@ -2,14 +2,15 @@
 //! enum (`#[store(labels = TicketLabel)]`). Clearly synthetic: no engine kind is a ticket, and the
 //! next layer's engine kinds do not replace it. It covers every datum form (a plain datum shared by
 //! two labels, a plain datum of one label, `child` set and map data, `intern` data optional and
-//! required), a label carrying no data, and an index predicate on the state.
+//! required, `flatten` data optional and required), a label carrying no data, and an index
+//! predicate on the state.
 //!
 //! Its edges are transitions (`Edge::transition`): the next state keeps, grows, shrinks and changes
 //! the previous one's collections, or moves to another label.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Edge, EdgeEvent, Labelled, Records, State, Stored};
+use flotilla_schema::{Edge, EdgeEvent, Labelled, Records, State, Stored, Timestamp};
 use hegel::{generators as gs, TestCase};
 
 use super::{appended, code_enum, key, list, name, payload, records, stamp, text, timestamp, Fixture, Payload, Pick, SHAPES};
@@ -22,6 +23,21 @@ pub enum TicketLabel {
     Open,
     #[store(code = 3)]
     Closed,
+}
+
+/// A hold on an open ticket: an optional flattened datum, behind its `hold_present` flag.
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+pub struct Hold {
+    pub by: String,
+    pub until: Timestamp,
+}
+
+/// Who closed a ticket, and when: a required flattened datum, one interned column among its own.
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+pub struct Signature {
+    #[store(intern)]
+    pub who: String,
+    pub at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
@@ -38,6 +54,8 @@ pub enum TicketState {
         priority: u8,
         #[store(intern)]
         owner: Option<String>,
+        #[store(flatten)]
+        hold: Option<Hold>,
     },
     #[store(code = 3)]
     Closed {
@@ -49,6 +67,8 @@ pub enum TicketState {
         reason: String,
         #[store(intern)]
         closed_by: String,
+        #[store(flatten)]
+        signature: Signature,
     },
 }
 
@@ -86,16 +106,40 @@ fn priority(tc: &TestCase) -> u8 {
     tc.draw(gs::integers::<u8>().min_value(0).max_value(1))
 }
 
+/// Times from two values, so a redrawn hold or signature often equals the previous one.
+fn small_time(tc: &TestCase) -> Timestamp {
+    Timestamp(tc.draw(gs::integers::<i64>().min_value(0).max_value(1)))
+}
+
+fn hold(tc: &TestCase) -> Hold {
+    Hold { by: name(tc), until: small_time(tc) }
+}
+
+fn signature(tc: &TestCase) -> Signature {
+    Signature { who: name(tc), at: small_time(tc) }
+}
+
 /// A state of the picked label, its data drawn afresh.
 pub fn state_value(tc: &TestCase, pick: Pick) -> TicketState {
     let assignees = || list(tc, pick, 3, |_| key(tc)).into_iter().collect();
     let notes = || list(tc, pick.nth(1), 3, |_| (key(tc), note(tc))).into_iter().collect();
     match pick.variant(tc, 3, |index| index) {
         0 => TicketState::Draft,
-        1 => {
-            TicketState::Open { assignees: assignees(), notes: notes(), priority: priority(tc), owner: pick.some(tc, 8).then(|| name(tc)) }
-        }
-        _ => TicketState::Closed { assignees: assignees(), notes: notes(), priority: priority(tc), reason: text(tc), closed_by: name(tc) },
+        1 => TicketState::Open {
+            assignees: assignees(),
+            notes: notes(),
+            priority: priority(tc),
+            owner: pick.some(tc, 8).then(|| name(tc)),
+            hold: pick.nth(2).some(tc, 8).then(|| hold(tc)),
+        },
+        _ => TicketState::Closed {
+            assignees: assignees(),
+            notes: notes(),
+            priority: priority(tc),
+            reason: text(tc),
+            closed_by: name(tc),
+            signature: signature(tc),
+        },
     }
 }
 
@@ -137,14 +181,16 @@ pub fn next_value(tc: &TestCase, pick: Pick, previous: &TicketState) -> TicketSt
     let kept = if tc.draw(gs::booleans()) { kept } else { priority(tc) };
     match fresh {
         TicketState::Draft => TicketState::Draft,
-        TicketState::Open { owner, .. } => {
-            let owner = match previous {
-                TicketState::Open { owner: held, .. } if tc.draw(gs::booleans()) => held.clone(),
-                _ => owner,
+        TicketState::Open { owner, hold, .. } => {
+            let (owner, hold) = match previous {
+                TicketState::Open { owner: held, hold: kept_hold, .. } if tc.draw(gs::booleans()) => (held.clone(), kept_hold.clone()),
+                _ => (owner, hold),
             };
-            TicketState::Open { assignees, notes, priority: kept, owner }
+            TicketState::Open { assignees, notes, priority: kept, owner, hold }
         }
-        TicketState::Closed { reason, closed_by, .. } => TicketState::Closed { assignees, notes, priority: kept, reason, closed_by },
+        TicketState::Closed { reason, closed_by, signature, .. } => {
+            TicketState::Closed { assignees, notes, priority: kept, reason, closed_by, signature }
+        }
     }
 }
 

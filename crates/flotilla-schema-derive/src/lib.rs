@@ -137,12 +137,15 @@ mod tests {
     // Behaviour (#3373 ruling 1): a label-plus-data state is refused, naming the closed list, when
     // a datum appears with different types or attributes in two variants, when a variant has no
     // code (or two share one), when a datum takes a storage form other than plain, `child` (a map
-    // or set) or `intern`, and when `labels` is put anywhere but on an enum.
+    // or set), `intern` or `flatten`, and when `labels` is put anywhere but on an enum. A flattened
+    // datum and its `Option` are different types, so they cannot share a name.
     #[test]
     fn label_state_refusals_name_the_closed_list() {
         let cases = [
             quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { a: String }, #[store(code = 2)] C { a: u32 } } },
             quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { a: String }, #[store(code = 2)] C { #[store(intern)] a: String } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(flatten)] a: P }, #[store(code = 2)] C { #[store(flatten)] a: Option<P> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(flatten)] a: P }, #[store(code = 2)] C { a: P } } },
             quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(child)] a: BTreeSet<String> }, #[store(code = 2)] C { #[store(child)] a: BTreeMap<String, String> } } },
             quote! { #[store(labels = L)] enum A { #[store(code = 1)] B, C } },
             quote! { #[store(labels = L)] enum A { B { a: String }, #[store(code = 2)] C } },
@@ -150,7 +153,6 @@ mod tests {
             quote! { #[store(labels = L)] enum A { #[store(code = 1)] B(String) } },
             quote! { #[store(labels = L)] enum A {} },
             quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(frozen)] a: Frozen<Doc> } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(flatten)] a: Part } } },
             quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(cbor)] a: Doc } } },
             quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(child)] a: Vec<String> } } },
             quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(records)] a: Records<String> } } },
@@ -185,7 +187,12 @@ mod tests {
             enum TicketState {
                 #[store(code = 3)] Closed { #[store(child)] assignees: BTreeSet<String>, reason: String },
                 #[store(code = 1)] Draft,
-                #[store(code = 2)] Open { #[store(child)] assignees: BTreeSet<String>, #[store(intern)] owner: Option<String> },
+                #[store(code = 2)] Open {
+                    #[store(child)] assignees: BTreeSet<String>,
+                    #[store(intern)] owner: Option<String>,
+                    #[store(flatten)] hold: Option<Hold>,
+                    #[store(flatten)] signature: Signature,
+                },
             }
         });
         for expected in [
@@ -194,17 +201,21 @@ mod tests {
             "Self :: Draft => & < TicketLabel > :: Draft",
             ":: flotilla_schema :: StateData for TicketState",
             "const CODES : & 'static [i64] = & [1i64 , 2i64 , 3i64]",
-            "const DATA : & 'static [& 'static str] = & [\"assignees\" , \"reason\" , \"owner\"]",
+            "const DATA : & 'static [& 'static str] = & [\"assignees\" , \"reason\" , \"owner\" , \"hold\" , \"signature\"]",
             "layout . datum (\"assignees\" , label",
             "layout . label_guard (label , 3i64 , & datums , & [0usize , 1usize])",
             "layout . label_guard (label , 1i64 , & datums , & [])",
-            "layout . label_guard (label , 2i64 , & datums , & [0usize , 2usize])",
+            "layout . label_guard (label , 2i64 , & datums , & [0usize , 2usize , 3usize , 4usize])",
             "< TicketLabel as :: flotilla_schema :: CodeEnum > :: code (& < TicketLabel > :: Open) , 2i64",
             "delta . table (\"assignees\"",
             "delta . column (\"owner\"",
             "adapt :: AsOptionalInterned as :: flotilla_schema :: adapt :: Adapter < Option < String > >",
             "Self :: Closed { assignees : __store_assignees , .. } | Self :: Open { assignees : __store_assignees , .. }",
             "if [3i64] . contains (& code)",
+            "adapt :: AsOptionalFlat as :: flotilla_schema :: adapt :: Adapter < Option < Hold > >",
+            "Hold : :: flotilla_schema :: Flat",
+            "Signature : :: flotilla_schema :: Flat",
+            "delta . column (\"signature\"",
         ] {
             assert!(state.contains(expected), "missing {expected}");
         }
