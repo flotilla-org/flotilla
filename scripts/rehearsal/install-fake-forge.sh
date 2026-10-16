@@ -64,16 +64,18 @@ while (($#)); do
   esac
 done
 
-if [[ -n $stage ]]; then
-  mkdir -p "$stage"
-  prefix=$(cd "$stage" && pwd)
-else
+if [[ -z $stage ]]; then
   [[ $EUID -eq 0 ]] || die "run as root (or use --stage DIR to only write the files)"
   [[ -n $binary && -x $binary ]] || die "--binary must name the executable flotilla-fake-forge"
   for tool in systemctl curl useradd; do command -v "$tool" >/dev/null || die "$tool is required"; done
 fi
 command -v openssl >/dev/null || die "openssl is required"
+# Every value below lands in TOML, JSON, a certificate or a URL, so each is
+# checked against the characters its kind of name allows.
 [[ -n $host ]] || die "--host is required: the name rehearsal hosts use to reach the fake"
+[[ $host =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "--host '$host' must be a DNS name or IPv4 address"
+[[ -z $ip || $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || $ip =~ ^[0-9A-Fa-f:]+$ ]] || die "--ip '$ip' must be an IPv4 or IPv6 address"
+[[ $bind =~ ^[0-9.]+$ || $bind =~ ^\[[0-9A-Fa-f:]+\]$ ]] || die "--bind '$bind' must be an IPv4 address or a bracketed IPv6 address"
 ((${#forges[@]})) || die "at least one --forge MOUNT=FORGE_ID=HOST[,HOST...] is required"
 [[ -z $seed || -r $seed ]] || die "seed file $seed is not readable"
 [[ -z $auto_merge || $auto_merge =~ ^[1-9][0-9]*$ ]] || die "--auto-merge-after takes a positive number of seconds"
@@ -88,7 +90,7 @@ for entry in "${forges[@]}"; do
   [[ $mount =~ ^[A-Za-z0-9_-]+$ ]] || die "mount '$mount' must be letters, digits, '-' or '_'"
   [[ $forge_id =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "forge id '$forge_id' must be a lowercase DNS label"
   [[ $forge_id != github ]] || die "forge id 'github' is reserved for public GitHub (ADR 0066); use another, such as github-rehearsal"
-  [[ -n $hosts && $hosts != *[[:space:]/]* ]] || die "--forge $entry needs comma-separated host names"
+  [[ $hosts =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]] || die "--forge $entry needs comma-separated host names"
   [[ -z ${forge_ids[$mount]:-} ]] || die "mount '$mount' is given twice"
   for other in "${mounts[@]}"; do [[ ${forge_ids[$other]} != "$forge_id" ]] || die "forge id '$forge_id' is given twice"; done
   forge_ids[$mount]=$forge_id
@@ -96,6 +98,11 @@ for entry in "${forges[@]}"; do
   mounts+=("$mount")
 done
 
+# Everything is valid: only now create anything.
+if [[ -n $stage ]]; then
+  mkdir -p "$stage"
+  prefix=$(cd "$stage" && pwd)
+fi
 user=flotilla-fake-forge
 public_url="https://$host:$port"
 install -d -m 0755 "$prefix" "$prefix/apply"
@@ -105,7 +112,10 @@ if [[ -z $stage ]]; then
   install -m 0755 "$binary" /usr/local/bin/flotilla-fake-forge
 fi
 # Files the service reads belong to its group; in --stage mode, to the caller.
-readable() { [[ -n $stage ]] || chgrp "$user" "$@"; chmod 0640 "$@"; }
+readable() {
+  if [[ -z $stage ]]; then chgrp "$user" "$@"; fi
+  chmod 0640 "$@"
+}
 
 # The rehearsal-only CA is kept across re-runs, so hosts that already trust it keep working.
 if [[ ! -s $prefix/ca/ca.pem ]]; then
@@ -116,7 +126,7 @@ if [[ ! -s $prefix/ca/ca.pem ]]; then
 fi
 san="DNS:$host"
 if [[ $host =~ ^[0-9.]+$ ]]; then san="IP:$host"; fi
-[[ -n $ip && $ip != "$host" ]] && san+=",IP:$ip"
+if [[ -n $ip && $ip != "$host" ]]; then san+=",IP:$ip"; fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$host" \
@@ -130,7 +140,7 @@ readable "$prefix/server-key.pem"
 install -m 0644 "$prefix/ca/ca.pem" "$prefix/rehearsal-ca.pem"
 
 new_token() { [[ -s $1 ]] || (umask 077; openssl rand -hex 32 >"$1"); readable "$1"; }
-[[ -n $stage ]] || chgrp "$user" "$prefix/tokens"
+if [[ -z $stage ]]; then chgrp "$user" "$prefix/tokens"; fi
 chmod 0750 "$prefix/tokens"
 new_token "$prefix/admin-token"
 
@@ -210,6 +220,8 @@ Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info
 NoNewPrivileges=true
+# The service only reads its config, certificate, tokens and seed, and keeps
+# its state in memory, so the whole file system can be read-only to it.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
@@ -258,6 +270,10 @@ echo "== 2. On every rehearsal host: install the forge tokens for the daemon use
 for mount in "${mounts[@]}"; do
   echo "  $prefix/tokens/$mount  ->  $client_tokens/${forge_ids[$mount]}  (mode 0600, owned by the daemon user)"
 done
+# With one forge the dummy-crew stanza is complete; with several, the
+# operator picks one.
+shared_mount="<MOUNT>" shared_forge_id="<FORGE_ID>"
+if ((${#mounts[@]} == 1)); then shared_mount=${mounts[0]} shared_forge_id=${forge_ids[${mounts[0]}]}; fi
 cat <<EOF
 
 == 3. On every rehearsal host: add to daemon.toml, then restart flotillad ==
@@ -266,8 +282,8 @@ $(cat "$prefix/apply/daemon.toml")
   For dummy crews to open their change requests on the fake, so numbers are
   unique across the fleet, also add (naming one mount and its forge id):
 [dummy_fleet.shared_forge]
-service_url = "$public_url/<MOUNT>"
-token_path = "$client_tokens/<FORGE_ID>"
+service_url = "$public_url/$shared_mount"
+token_path = "$client_tokens/$shared_forge_id"
 
 == 4. Once, on any rehearsal host: apply the records (they replicate) ==
 EOF

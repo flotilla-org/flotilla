@@ -128,6 +128,12 @@ fn the_printed_records_are_valid_and_point_at_the_fake() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("flotilla resource apply -f forge-github-rehearsal.json"), "{stdout}");
     assert!(stdout.contains("[dummy_fleet.shared_forge]"), "{stdout}");
+    assert!(stdout.contains("token_path = \"/etc/flotilla-rehearsal/tokens/<FORGE_ID>\""), "several forges leave the choice: {stdout}");
+    // With one forge the dummy-crew stanza is filled in.
+    let single = tempfile::tempdir().expect("stage dir");
+    let output = stage(single.path(), &["--forge", "lab=lab=forgejo.lab.flotilla.work"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("service_url = \"https://localhost:0/lab\"\ntoken_path = \"/etc/flotilla-rehearsal/tokens/lab\""), "{stdout}");
 }
 
 // Behaviour: re-running keeps the CA, the forge tokens and the admin token,
@@ -155,15 +161,29 @@ fn the_script_refuses_broken_input() {
         ("repeated forge id", vec!["--forge", "a=one=x.example", "--forge", "b=one=y.example"], "given twice"),
         ("no hosts", vec!["--forge", "a=one="], "host names"),
         ("no forge", vec![], "at least one --forge"),
+        ("quote in a forge host", vec!["--forge", "a=one=x.example\""], "host names"),
+        ("bad ip", vec!["--forge", "a=one=x.example", "--ip", "10.0.0.1; rm"], "--ip"),
     ] {
         let dir = tempfile::tempdir().expect("stage dir");
         let staged = dir.path().join("fake");
         let output = stage(&staged, &args);
         assert!(!output.status.success(), "{case}");
         assert!(String::from_utf8_lossy(&output.stderr).contains(expected), "{case}: {}", String::from_utf8_lossy(&output.stderr));
-        assert!(!staged.join("config.toml").exists(), "{case}: nothing installed");
+        assert!(!staged.exists(), "{case}: nothing is written, not even the stage directory");
     }
-    let mut command = Command::new("bash");
-    let output = command.arg(script()).args(["--stage", "/tmp/unused", "--forge", "a=one=x.example"]).output().expect("run");
+    let dir = tempfile::tempdir().expect("stage dir");
+    let staged = dir.path().join("fake");
+    let output = Command::new("bash")
+        .arg(script())
+        .args(["--stage", staged.to_str().expect("UTF-8"), "--forge", "a=one=x.example"])
+        .output()
+        .expect("run");
     assert!(String::from_utf8_lossy(&output.stderr).contains("--host is required"));
+    let output = Command::new("bash")
+        .arg(script())
+        .args(["--stage", staged.to_str().expect("UTF-8"), "--host", "bad\"host", "--forge", "a=one=x.example"])
+        .output()
+        .expect("run");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must be a DNS name"));
+    assert!(!staged.exists());
 }

@@ -87,8 +87,9 @@ impl Seed {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GeneratedSeed {
     pub seed: Seed,
-    /// One line per record that names no forge repository, or a forge with no
-    /// mount: these projects reach no forge in the rehearsal.
+    /// One line per repository (once, however many replicas name it) whose
+    /// record names no forge repository, or a forge with no mount: these
+    /// projects reach no forge in the rehearsal.
     pub skipped: Vec<String>,
 }
 
@@ -96,15 +97,25 @@ pub struct GeneratedSeed {
 /// repositories` prints them on each rehearsal host (an envelope with
 /// `records[].object`), or as a plain array of Repository objects.
 ///
-/// `mounts` maps a forge's service URL, as Repository records name it in
-/// `spec.forge.service_url`, to the mount it has on the fake. Records are
-/// merged across inputs: a repository appears once per mount, compared
+/// `mounts` pairs a forge's service URL, as Repository records name it in
+/// `spec.forge.service_url`, with the mount it has on the fake. Service URLs
+/// compare without case or a trailing `/`; a service or a mount given twice is
+/// refused rather than one mapping silently winning. Records are merged
+/// across inputs: a repository appears once per mount, compared
 /// case-insensitively as Forgejo compares names, with the first default
-/// branch a record reports.
-pub fn seed_from_repository_records(inputs: &[serde_json::Value], mounts: &BTreeMap<String, String>) -> Result<GeneratedSeed, String> {
-    let mounts: BTreeMap<String, &String> = mounts.iter().map(|(service, mount)| (normalize_service(service), mount)).collect();
+/// branch a record reports. A listing that seeds nothing is refused.
+pub fn seed_from_repository_records(inputs: &[serde_json::Value], mounts: &[(String, String)]) -> Result<GeneratedSeed, String> {
+    let mut by_service: BTreeMap<String, &String> = BTreeMap::new();
+    for (service, mount) in mounts {
+        if by_service.insert(normalize_service(service), mount).is_some() {
+            return Err(format!("forge {service} is mapped twice"));
+        }
+        if mounts.iter().filter(|(_, other)| other == mount).count() > 1 {
+            return Err(format!("mount `{mount}` is given to more than one forge"));
+        }
+    }
     let mut repositories: BTreeMap<(String, String), SeedRepository> = BTreeMap::new();
-    let mut skipped = Vec::new();
+    let mut skipped = std::collections::BTreeSet::new();
     for input in inputs {
         let objects: Vec<&serde_json::Value> = match input {
             serde_json::Value::Array(objects) => objects.iter().collect(),
@@ -115,21 +126,23 @@ pub fn seed_from_repository_records(inputs: &[serde_json::Value], mounts: &BTree
             _ => return Err("input is neither a resource list envelope with `records` nor an array of Repository objects".into()),
         };
         for object in objects {
-            if object.get("kind").and_then(serde_json::Value::as_str).is_some_and(|kind| kind != "Repository") {
-                return Err(format!("input holds a {} record; expected Repository records", object["kind"]));
+            match object.get("kind").and_then(serde_json::Value::as_str) {
+                Some("Repository") => {}
+                Some(kind) => return Err(format!("input holds a {kind} record; expected Repository records")),
+                None => return Err("input holds a record without a kind; expected Repository records".into()),
             }
             let name = object["metadata"]["name"].as_str().unwrap_or("(unnamed)");
             let forge = &object["spec"]["forge"];
             let (Some(service), Some(full_name)) = (forge["service_url"].as_str(), forge["repository"].as_str()) else {
-                skipped.push(format!("Repository {name}: names no forge repository"));
+                skipped.insert(format!("Repository {name}: names no forge repository"));
                 continue;
             };
-            let Some(mount) = mounts.get(&normalize_service(service)) else {
-                skipped.push(format!("Repository {name}: forge {service} has no mount (add --forge {service}=<mount>)"));
+            let Some(mount) = by_service.get(&normalize_service(service)) else {
+                skipped.insert(format!("{service}/{full_name}: forge {service} has no mount (add --forge {service}=<mount>)"));
                 continue;
             };
             let Some((owner, repo)) = full_name.split_once('/').filter(|(owner, repo)| !owner.is_empty() && !repo.is_empty()) else {
-                skipped.push(format!("Repository {name}: forge repository `{full_name}` is not owner/name"));
+                skipped.insert(format!("Repository {name}: forge repository `{full_name}` is not owner/name"));
                 continue;
             };
             let branch = object["status"]["default_branch"].as_str().filter(|branch| !branch.trim().is_empty());
@@ -143,6 +156,9 @@ pub fn seed_from_repository_records(inputs: &[serde_json::Value], mounts: &BTree
             }
         }
     }
+    if repositories.is_empty() {
+        return Err(format!("no repository maps to a mounted forge ({} skipped)", skipped.len()));
+    }
     let mut seed = Seed::default();
     for ((mount, _), mut repository) in repositories {
         if repository.default_branch.is_empty() {
@@ -150,7 +166,7 @@ pub fn seed_from_repository_records(inputs: &[serde_json::Value], mounts: &BTree
         }
         seed.forges.entry(mount).or_default().repositories.push(repository);
     }
-    Ok(GeneratedSeed { seed, skipped })
+    Ok(GeneratedSeed { seed, skipped: skipped.into_iter().collect() })
 }
 
 fn normalize_service(service: &str) -> String {

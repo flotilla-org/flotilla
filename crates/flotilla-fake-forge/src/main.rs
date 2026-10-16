@@ -2,7 +2,7 @@
 //! service for a rehearsal fleet. `flotilla-fake-forge seed` generates its
 //! seed from the copied stores' Repository records. See the crate README.
 
-use std::{collections::BTreeMap, path::PathBuf, process::ExitCode};
+use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
@@ -51,8 +51,7 @@ fn write_seed(repositories: &[PathBuf], forges: Vec<(String, String)>, output: O
         let text = std::fs::read_to_string(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         inputs.push(serde_json::from_str(&text).map_err(|error| format!("{} is not JSON: {error}", path.display()))?);
     }
-    let mounts: BTreeMap<String, String> = forges.into_iter().collect();
-    let generated = flotilla_fake_forge::seed::seed_from_repository_records(&inputs, &mounts)?;
+    let generated = flotilla_fake_forge::seed::seed_from_repository_records(&inputs, &forges)?;
     for line in &generated.skipped {
         eprintln!("skipped {line}");
     }

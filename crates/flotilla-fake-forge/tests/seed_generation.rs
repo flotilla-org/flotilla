@@ -11,8 +11,8 @@ fn binary() -> PathBuf {
     std::env::var_os("CARGO_BIN_EXE_flotilla-fake-forge").map(PathBuf::from).expect("Cargo names the binary for integration tests")
 }
 
-fn mounts() -> BTreeMap<String, String> {
-    [("https://github.com".to_string(), "github".to_string())].into()
+fn mounts() -> Vec<(String, String)> {
+    vec![("https://github.com".to_string(), "github".to_string())]
 }
 
 fn corpus() -> PathBuf {
@@ -64,8 +64,13 @@ fn the_stored_corpus_seeds_each_github_repository_once() {
             .find_map(|record| record["status"]["default_branch"].as_str());
         assert_eq!(repository.default_branch, reported.unwrap_or("main"));
     }
-    let unmapped = objects.iter().filter(|record| record["spec"]["forge"]["service_url"] != "https://github.com").count();
-    assert_eq!(generated.skipped.len(), unmapped);
+    // Skipped repositories are reported once each, however many replicas name them.
+    let unmapped: std::collections::BTreeSet<String> = objects
+        .iter()
+        .filter(|record| record["spec"]["forge"]["service_url"] != "https://github.com")
+        .map(|record| format!("{}/{}", record["spec"]["forge"]["service_url"], record["spec"]["forge"]["repository"]))
+        .collect();
+    assert_eq!(generated.skipped.len(), unmapped.len());
 }
 
 // Behaviour: merging is by mount and case-insensitive name, as Forgejo
@@ -101,9 +106,9 @@ fn generated_listings_seed_each_mapped_repository_once(tc: hegel::TestCase) {
         }
     };
     let inputs = [wrap(&records[..split]), wrap(&records[split..])];
-    let mounts: BTreeMap<String, String> =
-        [("https://github.com".into(), "github".into()), ("https://forgejo.lab.example".into(), "lab".into())].into();
-    let generated = seed_from_repository_records(&inputs, &mounts).expect("seed");
+    let mounts =
+        vec![("https://github.com".to_string(), "github".to_string()), ("https://forgejo.lab.example".to_string(), "lab".to_string())];
+    let generated = seed_from_repository_records(&inputs, &mounts);
 
     let mount_of = |service: &str| match service {
         "https://github.com" => Some("github"),
@@ -120,6 +125,11 @@ fn generated_listings_seed_each_mapped_repository_once(tc: hegel::TestCase) {
             *entry = branch.unwrap_or_default();
         }
     }
+    if expected.is_empty() {
+        assert!(generated.is_err(), "a listing that seeds nothing is refused");
+        return;
+    }
+    let generated = generated.expect("seed");
     let actual: BTreeMap<(String, String), String> = generated
         .seed
         .forges
@@ -138,8 +148,12 @@ fn generated_listings_seed_each_mapped_repository_once(tc: hegel::TestCase) {
     assert_eq!(actual, expected);
     let seeded_count: usize = generated.seed.forges.values().map(|forge| forge.repositories.len()).sum();
     assert_eq!(seeded_count, actual.len(), "no repository twice under one mount");
-    let unmapped = records.iter().filter(|record| record["spec"]["forge"]["service_url"] == "https://other.example").count();
-    assert_eq!(generated.skipped.len(), unmapped);
+    let unmapped: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter(|record| record["spec"]["forge"]["service_url"] == "https://other.example")
+        .map(|record| record["spec"]["forge"]["repository"].as_str().expect("name"))
+        .collect();
+    assert_eq!(generated.skipped.len(), unmapped.len(), "each skipped repository is reported once");
 }
 
 // Behaviour: input that is not a listing of Repository records is refused
@@ -150,6 +164,17 @@ fn other_inputs_are_refused() {
     assert!(seed_from_repository_records(&[json!("text")], &mounts()).is_err());
     let convoy = json!([{"kind": "Convoy", "metadata": {"name": "c"}, "spec": {}}]);
     assert!(seed_from_repository_records(&[convoy], &mounts()).expect_err("not repositories").contains("Convoy"));
+    let kindless = json!([{"metadata": {"name": "r"}, "spec": {"forge": {"service_url": "https://github.com", "repository": "a/b"}}}]);
+    assert!(seed_from_repository_records(&[kindless], &mounts()).expect_err("no kind").contains("without a kind"));
+    let listing = json!([repository("https://github.com", "a/b", None)]);
+    let unmapped = json!([repository("https://elsewhere.example", "a/b", None)]);
+    assert!(seed_from_repository_records(&[unmapped], &mounts()).expect_err("nothing seeded").contains("no repository"));
+    // A forge mapped twice, even in another spelling, or a mount given to two
+    // forges, is refused rather than one mapping silently winning.
+    let twice = vec![("https://GitHub.com/".to_string(), "a".to_string()), ("https://github.com".to_string(), "b".to_string())];
+    assert!(seed_from_repository_records(std::slice::from_ref(&listing), &twice).expect_err("mapped twice").contains("mapped twice"));
+    let shared = vec![("https://github.com".to_string(), "a".to_string()), ("https://lab.example".to_string(), "a".to_string())];
+    assert!(seed_from_repository_records(&[listing], &shared).expect_err("mount shared").contains("more than one forge"));
 }
 
 // Behaviour (glue): the `seed` subcommand writes the seed the service loads,
@@ -168,7 +193,7 @@ fn the_seed_command_writes_a_loadable_seed() {
         .output()
         .expect("run seed");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("skipped Repository repo-a/b"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("skipped https://elsewhere.example/a/b"));
     let seed = Seed::load(&output_path).expect("the service loads it");
     assert_eq!(seed.forges["github"].repositories.len(), 1);
     let refused = Command::new(binary())
