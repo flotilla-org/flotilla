@@ -14,6 +14,7 @@ C_FREE_BASE = frozenset({
     "flotilla-daemon-api", "flotilla-relay-protocol",
     "flotilla-resources", "flotilla-client", "flotilla-store", "flotilla-store-memory",
     "flotilla-config", "flotilla-messaging", "flotilla-schema", "flotilla-schema-derive",
+    "flotilla-state-machines",
 })
 # Shrink this explicit exemption list with the ADR 0060 step 3 store split.
 # Manifest uses TLS; TUI no longer reaches core or store, but still reaches TLS
@@ -37,6 +38,11 @@ CAPABILITY_FORBIDDEN = (
 # flotilla-cbor, the schema crates below it and the build-feature anchors.
 SCHEMA_CRATES = ("flotilla-schema-derive", "flotilla-schema", "flotilla-schema-sqlite")
 SCHEMA_ALLOWED = ("flotilla-cbor",)
+# ADR 0064: the state-machine engine is storage-free and self-contained. It
+# reaches no other workspace crate, and no production crate depends on it until
+# the stack that adds the composition-root switch names its dependents here.
+STATE_MACHINES = "flotilla-state-machines"
+STATE_MACHINE_DEPENDENTS = frozenset()
 # Known C packages and compiler drivers catch new anchors that reach them.
 # This is a metadata deny list, not build-script analysis: crates invoking a
 # compiler without these drivers need an explicit entry when introduced.
@@ -124,6 +130,12 @@ def violations(metadata):
             if target not in allowed and not target.startswith("flotilla-build-features"):
                 errors.append(f"{schema}: must not depend on {target}, directly or transitively; schema crates depend only "
                               "on flotilla-cbor, lower schema crates and flotilla-build-features anchors")
+    if STATE_MACHINES in packages:
+        for target in sorted(production[STATE_MACHINES]):
+            errors.append(f"{STATE_MACHINES}: must not depend on workspace crate {target}")
+        for name in sorted(packages):
+            if name != STATE_MACHINES and STATE_MACHINES in production[name] and name not in STATE_MACHINE_DEPENDENTS:
+                errors.append(f"{name}: production dependency on {STATE_MACHINES} before the composition-root switch")
     for name, package in sorted(packages.items()):
         # A dev-only testkit may depend on the library it tests, closing a
         # Cargo dev cycle without introducing an upward production edge.
