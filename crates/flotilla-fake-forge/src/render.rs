@@ -88,9 +88,11 @@ pub(crate) fn repository(service_url: &str, repository: &Repository) -> Value {
     })
 }
 
-fn branch(urls: &Urls<'_>, reference: &str, sha: &str) -> Value {
+/// A pull request end. `label` stays the branch name after the branch is
+/// deleted, while `ref` becomes the pull ref, as recorded on Forgejo.
+fn branch(urls: &Urls<'_>, label: &str, reference: &str, sha: &str) -> Value {
     json!({
-        "label": reference,
+        "label": label,
         "ref": reference,
         "sha": sha,
         "repo_id": urls.repository.id,
@@ -132,8 +134,8 @@ pub(crate) fn pull(urls: &Urls<'_>, item: &Item) -> Value {
         "merge_commit_sha": pull.merge_commit_sha,
         "merged_by": pull.merged_by.as_deref().map(user),
         "allow_maintainer_edit": false,
-        "base": branch(urls, &pull.base_branch, &base_sha),
-        "head": branch(urls, &pull.head_ref(item.number), &pull.head_sha),
+        "base": branch(urls, &pull.base_branch, &pull.base_branch, &base_sha),
+        "head": branch(urls, &pull.head_branch, &pull.head_ref(item.number), &pull.head_sha),
         "merge_base": base_sha,
         "due_date": null,
         "created_at": time(item.created_at),

@@ -179,6 +179,10 @@ impl super::IssueProvider for ForgejoIssueProvider {
 
 #[cfg(test)]
 mod tests {
+    use flotilla_fake_forge::{
+        recorded::{ManualClock, RecordedWorld},
+        Clock, FakeForge, ForgeSettings, InProcessClient, ItemEdit, ItemState, NewIssue,
+    };
     use flotilla_forge_forgejo::ForgejoAuth;
     use std::path::PathBuf;
     use std::{
@@ -299,6 +303,176 @@ mod tests {
         assert_provider_contract(&provider, &contract_source(), "9", "2026-01-01T00:00:00Z").await;
 
         session.finish();
+    }
+
+    const FAKE_URL: &str = "https://fake-forge.test:3443";
+    const FAKE_TOKEN: &str = "fake-forge-token";
+
+    /// The real provider, configured as a rehearsal Forge record points it at
+    /// the fake's `lab` mount, reaching it through the in-process HTTP seam.
+    fn fake_provider(fake: &Arc<FakeForge>) -> (ForgejoIssueProvider, IssueSource) {
+        let provider = ForgejoIssueProvider::new(
+            Arc::new(InProcessClient::new(Arc::clone(fake))),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new(
+                fake.service_url("lab"),
+                None,
+                ForgejoAuth { token: FAKE_TOKEN.into(), token_path: PathBuf::from("fake-forge-token") },
+            ),
+        );
+        let source = IssueSource { service: fake.service_url("lab"), scope: RecordedWorld::ZellijIssues.repo_slug().into() };
+        assert!(provider.supports(&source), "a fake-backed Forge record's source belongs to the provider");
+        (provider, source)
+    }
+
+    fn assert_no_refusals(fake: &FakeForge) {
+        let (refusals, count) = fake.refusals();
+        assert_eq!(count, 0, "the fake refused provider requests: {refusals:?}");
+    }
+
+    fn ids(issues: &[Issue]) -> Vec<&str> {
+        issues.iter().map(|issue| issue.reference.id.as_str()).collect()
+    }
+
+    // Behaviour (#3374): the shared issue-provider contract that runs on the
+    // recording above also holds against the fake seeded to the recorded world.
+    #[tokio::test]
+    async fn fake_forge_satisfies_provider_contract() {
+        let fake = RecordedWorld::ZellijIssues.seed(FAKE_URL, "lab", FAKE_TOKEN);
+        let (provider, source) = fake_provider(&fake);
+        assert_provider_contract(&provider, &source, "9", "2026-01-01T00:00:00Z").await;
+        assert_no_refusals(&fake);
+    }
+
+    // Behaviour (#3374): against the recorded world, the provider reads the
+    // same issues the recording shows (open 9 then 8, newest update first,
+    // with their titles, labels and update times), fetches one by number,
+    // partitions changes since a time into open updates and closed numbers,
+    // and narrows queries by label and by text search.
+    #[tokio::test]
+    async fn fake_forge_answers_issue_queries_over_the_recorded_world() {
+        let fake = RecordedWorld::ZellijIssues.seed(FAKE_URL, "lab", FAKE_TOKEN);
+        let (provider, source) = fake_provider(&fake);
+        let page = provider.query(&source, &IssueQuery::default(), 1, 30).await.expect("query");
+        assert_eq!(ids(&page.items), ["9", "8"]);
+        assert!(!page.has_more);
+        let titles: Vec<_> =
+            page.items.iter().map(|issue| (issue.title.as_str(), issue.labels.clone(), issue.as_of.to_rfc3339())).collect();
+        assert_eq!(
+            titles,
+            [
+                ("Wire Forgejo issue provider into convoy startup", vec!["ready".to_string()], "2026-07-24T12:00:00+00:00".to_string()),
+                ("List Forgejo issues by label", vec!["provider".to_string()], "2026-07-24T11:00:00+00:00".to_string()),
+            ]
+        );
+        let fetched = provider.fetch_by_id(&IssueRef { source: source.clone(), id: "7".into() }).await.expect("fetch closed issue");
+        assert_eq!((fetched.title.as_str(), fetched.state), ("Closed synthetic Forgejo issue", IssueState::Closed));
+        assert!(provider.fetch_by_id(&IssueRef { source: source.clone(), id: "99".into() }).await.expect_err("missing").contains("404"));
+
+        let changes = provider.list_changed_since(&source, "2026-01-01T00:00:00Z", 30).await.expect("changes");
+        assert_eq!(ids(&changes.updated), ["9", "8"]);
+        assert_eq!(changes.closed, [IssueRef { source: source.clone(), id: "7".into() }]);
+        let later = provider.list_changed_since(&source, "2026-07-24T10:30:00Z", 30).await.expect("later changes");
+        assert_eq!((ids(&later.updated), later.closed.len()), (vec!["9", "8"], 0));
+
+        for (label, search, expected) in [
+            (Some("ready"), None, vec!["9"]),
+            (Some("provider"), None, vec!["8"]),
+            (Some("absent"), None, vec![]),
+            (None, Some("by label"), vec!["8"]),
+            (None, Some("CONVOY"), vec!["9"]),
+            (Some("ready"), Some("by label"), vec![]),
+        ] {
+            let query =
+                IssueQuery { label: label.map(str::to_string), search: search.map(str::to_string), match_fields: Default::default() };
+            let page = provider.query(&source, &query, 1, 30).await.expect("filtered query");
+            assert_eq!(ids(&page.items), expected, "label {label:?}, search {search:?}");
+        }
+        assert_no_refusals(&fake);
+    }
+
+    // Finding (#3374): `IssueQuery.match_fields` sends each project-declared
+    // field name as a query parameter. Forgejo silently ignores parameters it
+    // does not know, so the provider's match fields filter nothing there; the
+    // fake refuses the unrecorded shape instead, which makes the latent
+    // behaviour visible. This pins the refusal; the provider is unchanged.
+    #[tokio::test]
+    async fn fake_forge_refuses_match_field_parameters() {
+        let fake = RecordedWorld::ZellijIssues.seed(FAKE_URL, "lab", FAKE_TOKEN);
+        let (provider, source) = fake_provider(&fake);
+        let query = IssueQuery { match_fields: [("priority".to_string(), vec!["high".to_string()])].into(), ..IssueQuery::default() };
+        let error = provider.query(&source, &query, 1, 30).await.expect_err("unrecorded parameter");
+        assert!(error.contains("400"), "{error}");
+        let (refusals, count) = fake.refusals();
+        assert_eq!(count, 1);
+        assert!(refusals[0].reason.contains("`priority`"), "{refusals:?}");
+    }
+
+    const LABELS: [&str; 3] = ["ready", "provider", "bug"];
+
+    // Behaviour (#3374): paging through a filtered query with the provider
+    // against the fake yields exactly the open issues carrying the label,
+    // most recently updated first, each page full until the last, with
+    // `has_more` (from the `Link` next relation) false only on the last page.
+    // The generator draws 0..=12 issues, each with any subset of three labels,
+    // open or closed, some edited later so update order differs from number
+    // order; a label filter or none; and a page size of 1..=5, so listings fit
+    // one page, fill pages exactly, and spill over.
+    #[hegel::test]
+    fn fake_forge_paged_label_queries_agree_with_the_forge(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(12));
+        let issues: Vec<(usize, bool, bool)> = (0..count)
+            .map(|_| (tc.draw(gs::integers::<usize>().min_value(0).max_value(7)), tc.draw(gs::booleans()), tc.draw(gs::booleans())))
+            .collect();
+        let label = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let label = LABELS.get(label).copied();
+        let page_size = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let clock = Arc::new(ManualClock::new("2026-07-24T00:00:00Z".parse().expect("time")));
+            let fake = Arc::new(FakeForge::new(FAKE_URL, clock.clone()));
+            fake.add_forge("lab", ForgeSettings { token: FAKE_TOKEN.into(), login: "flotilla-bot".into() }).expect("forge");
+            let repo = RecordedWorld::ZellijIssues.repository("lab");
+            // Whole minutes apart, so second-precision update times are exact.
+            let tick = || clock.set(clock.now() + chrono::Duration::minutes(1));
+            let mut numbers = Vec::new();
+            for (index, (mask, _, _)) in issues.iter().enumerate() {
+                tick();
+                let labels =
+                    LABELS.iter().enumerate().filter(|(bit, _)| mask & (1 << bit) != 0).map(|(_, name)| name.to_string()).collect();
+                let new = NewIssue { title: format!("Issue {index}"), labels, ..NewIssue::default() };
+                numbers.push(fake.create_issue(&repo, new).expect("issue").number);
+            }
+            for (number, (_, closed, edited)) in numbers.iter().zip(&issues) {
+                if *edited || *closed {
+                    tick();
+                    let state = closed.then_some(ItemState::Closed);
+                    fake.edit(&repo, *number, ItemEdit { body: Some("edited".into()), state, ..ItemEdit::default() }).expect("edit");
+                }
+            }
+            let mut expected: Vec<_> = numbers
+                .iter()
+                .map(|number| fake.item(&repo, *number).expect("issue"))
+                .filter(|item| item.state == ItemState::Open && label.is_none_or(|label| item.labels.iter().any(|name| name == label)))
+                .collect();
+            expected.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
+
+            let (provider, source) = fake_provider(&fake);
+            let query = IssueQuery { label: label.map(str::to_string), ..IssueQuery::default() };
+            let mut seen: Vec<(String, Vec<String>, DateTime<Utc>)> = Vec::new();
+            for page_number in 1..=20 {
+                let page = provider.query(&source, &query, page_number, page_size).await.expect("page");
+                seen.extend(page.items.iter().map(|issue| (issue.reference.id.clone(), issue.labels.clone(), issue.as_of)));
+                if !page.has_more {
+                    break;
+                }
+                assert_eq!(page.items.len(), page_size, "a page with more after it is full");
+            }
+            let expected: Vec<_> = expected.into_iter().map(|item| (item.number.to_string(), item.labels, item.updated_at)).collect();
+            assert_eq!(seen, expected);
+            assert_no_refusals(&fake);
+        });
     }
 
     #[tokio::test]
