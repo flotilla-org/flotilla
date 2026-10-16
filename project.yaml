@@ -1,6 +1,7 @@
 name: flotilla
-# The workflow and image match the Project as registered by hand before this declaration was read.
-default_workflow: single-agent-contained
+# The workflow and image match the hand-registered Project's effective settings. Its retired
+# single-agent-contained alias resolves to single-agent (current_builtin_workflow_name).
+default_workflow: single-agent
 image:
   layers: [rust]
 members:
