@@ -22,20 +22,40 @@ pub(crate) const DEFAULT_REVIEW_BOT_LOGIN: &str = "claude";
 ///
 /// Its identity is the change request's [`Address`], so every spelling of
 /// one change request (host or forge id, any repository case) is one
-/// observation subject with one record.
+/// observation subject with one record. Its fields are private because it
+/// keys maps: [`ChangeRequestKey::new`] is the only way to make one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChangeRequestKey {
-    pub namespace: String,
+    namespace: String,
     address: Address,
 }
 
 impl ChangeRequestKey {
     /// The key for a change-request address; any other address is refused.
+    ///
+    /// It checks the whole shape the accessors read (a forge, a repository,
+    /// a number, a record name and a stored `(service, scope)`), so the
+    /// accessors below cannot panic. The address grammar already puts a
+    /// change request under a repository under a forge; this check states it
+    /// here.
     pub fn new(namespace: impl Into<String>, address: Address) -> Result<Self, String> {
         if address.kind() != AddressKind::ChangeRequest {
             return Err(format!("{address} is not a change request"));
         }
+        if address.get(AddressKind::Forge).is_none()
+            || address.parent().is_none()
+            || address.get(AddressKind::Repo).is_none()
+            || address.number().is_none()
+            || record_name(&address).is_none()
+            || stored_service_scope(&address).is_none()
+        {
+            return Err(format!("{address} is not a change request under a forge repository"));
+        }
         Ok(Self { namespace: namespace.into(), address })
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 
     pub fn address(&self) -> &Address {
@@ -44,31 +64,31 @@ impl ChangeRequestKey {
 
     /// The repository the change request belongs to.
     pub fn repository(&self) -> Address {
-        self.address.parent().expect("a change request is under a repository")
+        self.address.parent().expect("ChangeRequestKey::new checked the repository")
     }
 
     /// The forge id: `github` for public GitHub.
     pub fn forge_id(&self) -> &str {
-        self.address.get(AddressKind::Forge).expect("a change request is under a forge")
+        self.address.get(AddressKind::Forge).expect("ChangeRequestKey::new checked the forge")
     }
 
     /// The repository's `owner/repo`, in its forge's case.
     pub fn repository_path(&self) -> &str {
-        self.address.get(AddressKind::Repo).expect("a change request is under a repository")
+        self.address.get(AddressKind::Repo).expect("ChangeRequestKey::new checked the repository")
     }
 
     pub fn number(&self) -> u64 {
-        self.address.number().expect("a change request has a number")
+        self.address.number().expect("ChangeRequestKey::new checked the number")
     }
 
     /// The name of the record that observes this change request.
     pub fn record_name(&self) -> String {
-        record_name(&self.address).expect("a change request has a record name")
+        record_name(&self.address).expect("ChangeRequestKey::new checked the record name")
     }
 
     /// The `(service, scope)` its record spec stores.
     pub fn stored_service_scope(&self) -> (String, String) {
-        stored_service_scope(&self.address).expect("a change request is under a repository")
+        stored_service_scope(&self.address).expect("ChangeRequestKey::new checked the stored spelling")
     }
 }
 

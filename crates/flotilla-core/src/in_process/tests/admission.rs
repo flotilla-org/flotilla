@@ -640,3 +640,32 @@ fn standalone_issue_source_lookup_round_trips_installation_identity() {
         crate::issue_observer::IssueKey::new("flotilla", stored_issue_address("lab", "Team/Repo", 12, &[]).expect("address")).expect("key");
     assert!(issue_source_for_subject(&orphaned, &[]).expect_err("missing Forge").contains("no Forge declaration"));
 }
+
+// The issue source of a declared non-GitHub Forge is its declared HTTPS root,
+// not a URL guessed from its forge id or host; public GitHub needs no Forge.
+#[test]
+fn issue_source_is_the_declared_forge_https_root() {
+    use flotilla_resources::address::stored_issue_address;
+
+    let lab = flotilla_resources::ForgeSpec::builder()
+        .forge_id("lab".into())
+        .kind(flotilla_resources::ForgeKind::Forgejo)
+        .hosts(BTreeSet::from(["git.lab.example".into()]))
+        .https_url("https://code.lab.example/root".into())
+        .git_ssh_host("git.lab.example".into())
+        .build();
+    let forges = [lab];
+    let subject =
+        crate::issue_observer::IssueKey::new("flotilla", stored_issue_address("lab", "team/repo", 3, &forges).expect("forge-id address"))
+            .expect("key");
+    let source = issue_source_for_subject(&subject, &forges).expect("source");
+    assert_eq!(source.service, "https://code.lab.example/root");
+    assert_eq!(source.scope, "team/repo");
+
+    let github = crate::issue_observer::IssueKey::new(
+        "flotilla",
+        stored_issue_address("github.com", "Flotilla-Org/Flotilla", 3, &[]).expect("github address"),
+    )
+    .expect("key");
+    assert_eq!(issue_source_for_subject(&github, &forges).expect("github source").service, "https://github.com");
+}

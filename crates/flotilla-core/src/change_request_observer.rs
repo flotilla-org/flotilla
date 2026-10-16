@@ -292,7 +292,7 @@ impl ChangeRequestRefresher {
         let lock = self.subject_lock(&subject).await;
         let _guard = lock.lock().await;
         let name = subject.record_name();
-        match self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace).get(&name).await {
+        match self.inner.backend.including_replicas::<ChangeRequest>(subject.namespace()).get(&name).await {
             Ok(_) => {}
             Err(ResourceError::NotFound { .. }) => self.ensure_record(&subject, &name).await?,
             Err(error) => return Err(error.to_string()),
@@ -338,7 +338,7 @@ impl ChangeRequestRefresher {
                 continue;
             }
             self.inner.observation_errors.lock().await.remove(&subject);
-            let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+            let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
             let result = match records.get(&subject.record_name()).await {
                 Ok(record) if retain_change_request(&record) => {
                     self.start_retained(subject.clone()).await;
@@ -452,7 +452,7 @@ impl ChangeRequestRefresher {
         if !retained {
             return Ok(false);
         }
-        let sources = self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace).list().await?;
+        let sources = self.inner.backend.including_replicas::<ChangeRequest>(subject.namespace()).list().await?;
         let selected = select_change_requests(sources.items.iter().map(|source| &source.object));
         let terminal = selected.values().find(|record| spec_names(&record.spec, subject)).is_some_and(|record| {
             record.status.as_ref().is_some_and(|status| {
@@ -468,7 +468,7 @@ impl ChangeRequestRefresher {
     }
 
     async fn collect_local_subject(&self, subject: &ChangeRequestKey) -> Result<(), ResourceError> {
-        let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+        let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
         for record in records.list().await?.items.iter().filter(|record| spec_names(&record.spec, subject)) {
             match records.delete(&record.metadata.name).await {
                 Ok(()) | Err(ResourceError::NotFound { .. }) => {}
@@ -493,17 +493,25 @@ impl ChangeRequestRefresher {
     /// the spec so ordinary forge status refreshes cannot erase it, and it follows
     /// the record's existing observation replication class.
     async fn record_convoy_history(&self, subject: &ChangeRequestKey) -> Result<(), String> {
-        let convoys = self.inner.backend.using::<Convoy>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
-        let forges = self.forges(&subject.namespace).await?;
+        let convoys = self.inner.backend.using::<Convoy>(subject.namespace()).list().await.map_err(|error| error.to_string())?;
+        let forges = self.forges(subject.namespace()).await?;
         let mut history = Vec::new();
         let references = ReferenceContext::default();
         for convoy in convoys.items {
             for row in convoy_subject_rows(&convoy, &references) {
                 // Convoy rows keep the spelling they were admitted with; one
                 // change request matches whatever its spelling.
-                if row.subject.kind != ConvoySubjectKind::ChangeRequest
-                    || row.subject.leaf().ok().and_then(|leaf| leaf_address(&leaf, &forges).ok()).as_ref() != Some(subject.address())
-                {
+                if row.subject.kind != ConvoySubjectKind::ChangeRequest {
+                    continue;
+                }
+                let address = match row.subject.leaf().and_then(|leaf| leaf_address(&leaf, &forges)) {
+                    Ok(address) => address,
+                    Err(error) => {
+                        tracing::debug!(convoy = %convoy.metadata.name, %error, "convoy change request subject has no address; no history recorded");
+                        continue;
+                    }
+                };
+                if &address != subject.address() {
                     continue;
                 }
                 history.push(
@@ -523,7 +531,7 @@ impl ChangeRequestRefresher {
             return Ok(());
         }
         let name = subject.record_name();
-        let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+        let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
         loop {
             let current = match records.get(&name).await {
                 Ok(current) => current,
@@ -533,7 +541,7 @@ impl ChangeRequestRefresher {
                     let observed = self
                         .inner
                         .backend
-                        .including_replicas::<ChangeRequest>(&subject.namespace)
+                        .including_replicas::<ChangeRequest>(subject.namespace())
                         .get(&name)
                         .await
                         .map_err(|error| error.to_string())?
@@ -681,12 +689,12 @@ impl ChangeRequestRefresher {
 
     async fn owns_record(&self, subject: &ChangeRequestKey, allow_takeover: bool, create_missing: bool) -> Result<bool, String> {
         let source = stored_source(subject);
-        if let Some(owner) = crate::forge_observation::source_owner(&self.inner.backend, &subject.namespace, &source).await? {
+        if let Some(owner) = crate::forge_observation::source_owner(&self.inner.backend, subject.namespace(), &source).await? {
             if owner.to_string() != self.inner.authority {
                 return Ok(false);
             }
             let name = subject.record_name();
-            let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+            let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
             if create_missing {
                 self.get_or_create_record(subject, &name).await?;
             }
@@ -714,7 +722,7 @@ impl ChangeRequestRefresher {
             }
         }
         let name = subject.record_name();
-        let records = self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace);
+        let records = self.inner.backend.including_replicas::<ChangeRequest>(subject.namespace());
         // A former owner can still hold its local copy after another host has
         // claimed the subject. Prefer the freshest observation across copies;
         // an exact tie is resolved deterministically by authority name.
@@ -745,7 +753,7 @@ impl ChangeRequestRefresher {
         if Utc::now().signed_duration_since(observed_at) <= takeover_after {
             return Ok(false);
         }
-        let local = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+        let local = self.inner.backend.using::<ChangeRequest>(subject.namespace());
         let mut spec = record.object.spec.clone();
         spec.observing_authority = self.inner.authority.clone();
         if let Ok(existing) = local.get(&name).await {
@@ -795,7 +803,7 @@ impl ChangeRequestRefresher {
             return Ok(());
         }
         self.record_convoy_history(subject).await?;
-        let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+        let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
         let current = records.get(name).await.map_err(|error| error.to_string())?;
         if current.spec.observing_authority != self.inner.authority {
             return Ok(());
@@ -821,19 +829,19 @@ impl ChangeRequestRefresher {
         subject: &ChangeRequestKey,
         name: &str,
     ) -> Result<flotilla_resources::ResourceObject<ChangeRequest>, String> {
-        let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+        let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
         match records.get(name).await {
             Ok(current) => Ok(current),
             Err(ResourceError::NotFound { .. }) => {
                 let source = stored_source(subject);
                 // Without declared ownership, preserve the legacy local authority election.
-                let authority = crate::forge_observation::source_owner(&self.inner.backend, &subject.namespace, &source)
+                let authority = crate::forge_observation::source_owner(&self.inner.backend, subject.namespace(), &source)
                     .await?
                     .map_or_else(|| self.inner.authority.clone(), |owner| owner.to_string());
                 let candidates = self
                     .inner
                     .backend
-                    .including_replicas::<ChangeRequest>(&subject.namespace)
+                    .including_replicas::<ChangeRequest>(subject.namespace())
                     .list()
                     .await
                     .map_err(|error| error.to_string())?;
@@ -869,7 +877,7 @@ fn stored_source(subject: &ChangeRequestKey) -> IssueSource {
 }
 
 fn same_repository(candidate: &ChangeRequestKey, subject: &ChangeRequestKey) -> bool {
-    candidate.namespace == subject.namespace && candidate.repository() == subject.repository()
+    candidate.namespace() == subject.namespace() && candidate.repository() == subject.repository()
 }
 
 /// Whether a record's stored spelling names the subject's change request.
@@ -1486,6 +1494,35 @@ mod tests {
             "hint does not recreate a missing record"
         );
         assert_eq!(calls.load(Ordering::SeqCst), before + 3, "remaining namespace still refreshes");
+    }
+
+    // A hint spells public GitHub by host (`cr/github.com/...`) while a
+    // stored subject may spell it by forge id (`github`) in any repository
+    // case. Both are one address, so the hint refreshes that demand.
+    #[tokio::test(start_paused = true)]
+    async fn host_spelled_relay_hint_matches_a_forge_id_spelled_demand() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
+            backend.clone(),
+            "authority".to_string(),
+            Arc::new(CountingSource(Arc::clone(&calls))),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let address =
+            flotilla_resources::address::stored_change_request_address("github", "Flotilla-Org/Flotilla", 2053, &[]).expect("address");
+        refresher.demand(uuid::Uuid::new_v4(), ChangeRequestKey::new("flotilla", address).expect("key"), None).await.expect("demand");
+        wait_for_calls(&calls, 1).await;
+        let before = calls.load(Ordering::SeqCst);
+
+        let other = flotilla_relay_protocol::parse_hint_subject("cr/github.com/flotilla-org/flotilla/2054").expect("other hint");
+        refresher.refresh_hint(&other).await.expect("other hint");
+        assert_eq!(calls.load(Ordering::SeqCst), before, "another change request's hint refreshes nothing");
+
+        let hint = flotilla_relay_protocol::parse_hint_subject("cr/github.com/flotilla-org/flotilla/2053").expect("hint");
+        refresher.refresh_hint(&hint).await.expect("hint");
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1, "the host-spelled hint names the forge-id-spelled demand");
     }
 
     #[tokio::test(start_paused = true)]

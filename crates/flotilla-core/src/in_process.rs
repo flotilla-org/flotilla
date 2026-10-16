@@ -471,7 +471,7 @@ impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationS
     async fn observe(&self, subject: &crate::issue_observer::IssueKey) -> Result<flotilla_resources::IssueStatus, String> {
         let forges = self
             .backend
-            .definitions::<Forge>(&subject.namespace)
+            .definitions::<Forge>(subject.namespace())
             .list()
             .await
             .map_err(|error| error.to_string())?
@@ -482,7 +482,7 @@ impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationS
             flotilla_protocol::IssueRef { source: issue_source_for_subject(subject, &forges)?, id: subject.number().to_string() };
         let reference = self
             .backend
-            .including_replicas::<ResourceConvoy>(&subject.namespace)
+            .including_replicas::<ResourceConvoy>(subject.namespace())
             .list()
             .await
             .map_err(|error| error.to_string())?
@@ -528,10 +528,13 @@ fn convoy_change_request_credential_refs(
         .into_iter()
         .filter(|bound| {
             bound.kind == flotilla_protocol::SubjectKind::ChangeRequest
-                && bound
-                    .leaf()
-                    .and_then(|leaf| leaf_address(&leaf, forges))
-                    .is_ok_and(|address| address.parent() == Some(requested.repository()))
+                && match bound.leaf().and_then(|leaf| leaf_address(&leaf, forges)) {
+                    Ok(address) => address.parent() == Some(requested.repository()),
+                    Err(error) => {
+                        tracing::debug!(convoy = %convoy.metadata.name, %error, "bound change request subject has no address; no credentials bound");
+                        false
+                    }
+                }
         })
         .filter_map(|bound| bound.id.parse().ok())
         .collect::<BTreeSet<_>>();
@@ -583,7 +586,7 @@ impl ProviderChangeRequestObservationSource {
         fresh: bool,
     ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         let (service, scope) = subject.stored_service_scope();
-        let key = (subject.namespace.clone(), service.clone(), scope.clone());
+        let key = (subject.namespace().to_string(), service.clone(), scope.clone());
         let mut numbers = subjects.iter().map(ChangeRequestKey::number).collect::<BTreeSet<_>>();
         numbers.insert(subject.number());
         let scope_cache = {
@@ -602,7 +605,7 @@ impl ProviderChangeRequestObservationSource {
         }
 
         let repositories =
-            self.backend.including_replicas::<Repository>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
+            self.backend.including_replicas::<Repository>(subject.namespace()).list().await.map_err(|error| error.to_string())?;
         let repository = repositories
             .items
             .into_iter()
@@ -610,8 +613,8 @@ impl ProviderChangeRequestObservationSource {
             .ok_or_else(|| format!("repository {} has no discovered change request provider", subject.repository()))?;
         let mut credential_refs_by_number = BTreeMap::<u64, BTreeSet<String>>::new();
         let convoys =
-            self.backend.including_replicas::<ResourceConvoy>(&subject.namespace).list().await.map_err(|error| error.to_string())?.items;
-        let forges = self.backend.definitions::<Forge>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
+            self.backend.including_replicas::<ResourceConvoy>(subject.namespace()).list().await.map_err(|error| error.to_string())?.items;
+        let forges = self.backend.definitions::<Forge>(subject.namespace()).list().await.map_err(|error| error.to_string())?;
         let forges = forges.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
         let missing_snapshots = convoys
             .iter()
@@ -624,7 +627,7 @@ impl ProviderChangeRequestObservationSource {
         self.warned_missing_snapshot
             .lock()
             .await
-            .retain(|(namespace, name)| namespace != &subject.namespace || missing_snapshots.contains(name.as_str()));
+            .retain(|(namespace, name)| namespace != subject.namespace() || missing_snapshots.contains(name.as_str()));
         for convoy in convoys {
             if convoy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
                 continue;
@@ -649,7 +652,11 @@ impl ProviderChangeRequestObservationSource {
                     for (number, refs) in bound.credentials_by_number {
                         credential_refs_by_number.entry(number).or_default().extend(refs);
                     }
-                } else if self.warned_missing_snapshot.lock().await.insert((subject.namespace.clone(), convoy.object.metadata.name.clone()))
+                } else if self
+                    .warned_missing_snapshot
+                    .lock()
+                    .await
+                    .insert((subject.namespace().to_string(), convoy.object.metadata.name.clone()))
                 {
                     tracing::warn!(convoy = %convoy.object.metadata.name, "bound change request has no frozen workflow for crew credential identity");
                 }
@@ -678,7 +685,7 @@ impl ProviderChangeRequestObservationSource {
         let credentials = if credential_refs_by_number.is_empty() {
             Vec::new()
         } else {
-            match self.backend.including_replicas::<CredentialSpec>(&subject.namespace).list().await {
+            match self.backend.including_replicas::<CredentialSpec>(subject.namespace()).list().await {
                 Ok(credentials) => credentials.items,
                 Err(error) => {
                     tracing::warn!(%error, "could not list crew credential declarations; change request markers remain unverified");
@@ -697,7 +704,7 @@ impl ProviderChangeRequestObservationSource {
         self.warned_missing_identity
             .lock()
             .await
-            .retain(|(namespace, name)| namespace != &subject.namespace || missing_actors.contains(name.as_str()));
+            .retain(|(namespace, name)| namespace != subject.namespace() || missing_actors.contains(name.as_str()));
         for credential in credentials {
             for (number, refs) in &credential_refs_by_number {
                 if refs.contains(&credential.object.metadata.name) {
@@ -708,14 +715,14 @@ impl ProviderChangeRequestObservationSource {
                             .warned_missing_identity
                             .lock()
                             .await
-                            .insert((subject.namespace.clone(), credential.object.metadata.name.clone()))
+                            .insert((subject.namespace().to_string(), credential.object.metadata.name.clone()))
                     {
                         tracing::warn!(credential = %credential.object.metadata.name, "granted GitHub App credential has no actor_login; crew address markers cannot be recognized");
                     }
                 }
             }
         }
-        let provider = self.query_port.discover_repository_change_request(&subject.namespace, &repository.object.spec).await?;
+        let provider = self.query_port.discover_repository_change_request(subject.namespace(), &repository.object.spec).await?;
         let crew_logins = crew_logins.into_iter().map(|(number, logins)| (number, logins.into_iter().collect())).collect();
         let result = provider.observe_bound(&numbers, &crew_logins).await;
         let delay = observation_cache_delay(observation_rate_limit_error(&result).and_then(ObservationError::retry_at), Utc::now());
