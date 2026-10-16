@@ -164,9 +164,6 @@ pub struct CrewCompletionClaim<'a> {
 pub fn evaluate_crew_completion(
     convoy: &ResourceObject<Convoy>,
     claim: CrewCompletionClaim<'_>,
-    // Completion leaves come from the convoy's subjects; checkouts no longer
-    // contribute. Kept for callers until they stop loading them.
-    _checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     artifacts: &BTreeMap<String, ResourceObject<Artifact>>,
     forges: &[ForgeSpec],

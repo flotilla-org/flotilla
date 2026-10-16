@@ -556,17 +556,55 @@ pub fn active_change_request_subjects(convoy: &ResourceObject<Convoy>) -> Result
     Ok(subjects)
 }
 
+/// An active change-request subject whose address does not resolve, such as
+/// a host-spelled subject whose Forge is undeclared or removed. It cannot be
+/// observed (ADR 0066 §3), so it contributes no leaf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedChangeRequestSubject {
+    pub subject: Subject,
+    pub error: String,
+}
+
+/// The world-terminal leaves of a convoy's active change-request subjects,
+/// with the subjects that were skipped because they have no address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChangeRequestLeafSet {
+    pub leaves: Vec<Leaf>,
+    pub unresolved: Vec<UnresolvedChangeRequestSubject>,
+}
+
 /// The world-terminal leaves of every active change-request subject, each
 /// written once in the stored spelling however its subjects are spelled.
-pub fn expected_change_request_leaves(convoy: &crate::ResourceObject<Convoy>, forges: &[crate::ForgeSpec]) -> Result<Vec<Leaf>, String> {
+///
+/// A subject whose address does not resolve is skipped and reported in
+/// [`ChangeRequestLeafSet::unresolved`], so one stale spelling does not hide
+/// the convoy's other subjects. When subjects exist but none resolves, this
+/// is an error rather than an empty set: an empty set means "no change
+/// request", which settlement and optional completion treat differently.
+pub fn change_request_leaf_set(
+    convoy: &crate::ResourceObject<Convoy>,
+    forges: &[crate::ForgeSpec],
+) -> Result<ChangeRequestLeafSet, String> {
     let mut addresses = Vec::new();
+    let mut unresolved = Vec::new();
     for subject in active_change_request_subjects(convoy)? {
-        let address = crate::address::leaf_for(&crate::address::subject_address(&subject, forges)?)?;
+        let address = match crate::address::subject_address(&subject, forges).and_then(|address| crate::address::leaf_for(&address)) {
+            Ok(address) => address,
+            Err(error) => {
+                unresolved.push(UnresolvedChangeRequestSubject { subject, error });
+                continue;
+            }
+        };
         if !addresses.contains(&address) {
             addresses.push(address);
         }
     }
-    Ok(addresses
+    if addresses.is_empty() {
+        if let Some(first) = unresolved.first() {
+            return Err(first.error.clone());
+        }
+    }
+    let leaves = addresses
         .into_iter()
         .flat_map(|address| {
             ["merged", "closed"].map(|literal| Leaf {
@@ -576,7 +614,26 @@ pub fn expected_change_request_leaves(convoy: &crate::ResourceObject<Convoy>, fo
                 literal: literal.to_string(),
             })
         })
-        .collect())
+        .collect();
+    Ok(ChangeRequestLeafSet { leaves, unresolved })
+}
+
+/// The leaves of [`change_request_leaf_set`], logging each skipped subject.
+/// Debug, not warn: settlement, exit and turn delivery re-derive this on
+/// every pass, and convoy explain shows the subject as unobserved.
+pub fn expected_change_request_leaves(convoy: &crate::ResourceObject<Convoy>, forges: &[crate::ForgeSpec]) -> Result<Vec<Leaf>, String> {
+    let set = change_request_leaf_set(convoy, forges)?;
+    for skipped in &set.unresolved {
+        tracing::debug!(
+            convoy = %convoy.metadata.name,
+            service = %skipped.subject.source.service,
+            scope = %skipped.subject.source.scope,
+            id = %skipped.subject.id,
+            error = %skipped.error,
+            "change request subject has no address; its settlement leaves are skipped"
+        );
+    }
+    Ok(set.leaves)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3239,6 +3296,56 @@ mod subject_tests {
             let subject = inferred.parse(&url).expect("parse forge PR");
             assert_eq!(subject.url(&inferred), Some(url));
         }
+    }
+
+    // A host-spelled subject whose Forge is undeclared (or was removed) has no
+    // address and cannot be observed (ADR 0066 §3). It must not hide the
+    // convoy's other subjects: its leaves are skipped and it is reported. A
+    // convoy whose subjects all fail to resolve is an error, not "no change
+    // request", so optional completion and discovery do not treat it as absent.
+    #[test]
+    fn unresolvable_change_request_subject_is_skipped_and_reported() {
+        let request = |service: &str, scope: &str, id: &str| Subject {
+            kind: flotilla_protocol::SubjectKind::ChangeRequest,
+            source: flotilla_protocol::IssueSource { service: service.into(), scope: scope.into() },
+            id: id.into(),
+        };
+        let resolvable = request("github.com", "flotilla-org/flotilla", "2372");
+        let undeclared = request("forgejo.lab.example", "team/repo", "3");
+        let convoy_with = |subjects: &[&Subject]| {
+            let mut status = ConvoyStatus::default();
+            for subject in subjects {
+                status.discover_subject((*subject).clone(), Relationship::Produces, SubjectDiscoverySource::Claim, Utc::now());
+            }
+            ResourceObject::<Convoy> {
+                metadata: crate::ObjectMeta {
+                    name: "mixed".into(),
+                    namespace: "default".into(),
+                    resource_version: "1".into(),
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    owner_references: Vec::new(),
+                    finalizers: Vec::new(),
+                    deletion_timestamp: None,
+                    creation_timestamp: Utc::now(),
+                    merge: None,
+                },
+                spec: ConvoySpec::builder().workflow_ref("interactive".to_string()).build(),
+                status: Some(status),
+            }
+        };
+
+        let mixed = convoy_with(&[&undeclared, &resolvable]);
+        let set = change_request_leaf_set(&mixed, &[]).expect("resolvable subject yields leaves");
+        let expected = crate::address::leaf_for(&crate::address::subject_address(&resolvable, &[]).expect("address")).expect("leaf");
+        assert_eq!(set.leaves.len(), 2, "merged and closed for the one resolvable subject");
+        assert!(set.leaves.iter().all(|leaf| leaf.address == expected));
+        assert_eq!(set.unresolved.len(), 1);
+        assert_eq!(set.unresolved[0].subject, undeclared);
+        assert_eq!(expected_change_request_leaves(&mixed, &[]).expect("leaves"), set.leaves);
+
+        let only_undeclared = convoy_with(&[&undeclared]);
+        assert!(change_request_leaf_set(&only_undeclared, &[]).is_err(), "no resolvable subject is not an empty set");
     }
 
     #[test]

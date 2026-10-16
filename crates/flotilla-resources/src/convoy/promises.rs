@@ -869,6 +869,41 @@ mod tests {
     // ADR 0061 with ADR 0066: a discovered submission for a subject recorded
     // in an older spelling is the same submission, so discovery neither
     // resubmits nor adds a second produced subject for it.
+    // `apply` compares a resubmission with the prior one with no Forge list,
+    // because a status patch carries none. A previous-generation submission
+    // spelled by an undeclared-to-`apply` host (`cr/forgejo.lab.example/...`)
+    // has no address there, so it falls back to text equality: the same text
+    // merges metadata, while a forge-id respelling of the same change request
+    // is not recognised and leaves the prior untouched. This is a narrow,
+    // accepted limitation tracked by #3370; the test pins it so a change is
+    // deliberate.
+    #[test]
+    fn apply_matches_a_host_spelled_prior_submission_by_text_only() {
+        let resubmit = |reference: &str, key: &str| PromiseOperation::Submit {
+            id: "feature".into(),
+            kind: PromiseKind::Pr,
+            source: PromiseSource::Crew,
+            submission: Submission {
+                reference: reference.into(),
+                metadata: BTreeMap::from([(key.to_string(), "yes".to_string())]),
+                submitted_at: DateTime::from_timestamp(1, 0).unwrap(),
+                verdict: None,
+            },
+        };
+        let host_spelled = "cr/forgejo.lab.example/team/repo/3";
+        let mut status = ConvoyStatus::default();
+        apply(&mut status, "work", "coder", &resubmit(host_spelled, "first"));
+        assert_eq!(owned(&status, "work", "coder")[0].state, PromiseState::Submitted);
+
+        apply(&mut status, "work", "coder", &resubmit(host_spelled, "same-text"));
+        apply(&mut status, "work", "coder", &resubmit("cr/lab/team/repo/3", "forge-id"));
+        let promise = &owned(&status, "work", "coder")[0];
+        assert_eq!(promise.submissions.len(), 1);
+        let metadata = &promise.submissions[0].metadata;
+        assert!(metadata.contains_key("first") && metadata.contains_key("same-text"), "identical text merges: {metadata:?}");
+        assert!(!metadata.contains_key("forge-id"), "a respelling is not matched without Forges (#3370): {metadata:?}");
+    }
+
     #[test]
     fn discovery_matches_older_spellings_of_one_subject() {
         let mut status = ConvoyStatus::default();

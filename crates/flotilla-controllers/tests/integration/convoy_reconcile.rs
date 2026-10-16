@@ -87,7 +87,6 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
     };
     let convoy = convoy_object("completion", spec, Some(status));
     let record_name = cr_name("github.com", "flotilla-org/flotilla", 42);
-    let checkouts = BTreeMap::new();
     let mut change_requests = BTreeMap::new();
     let ledger = |role: &str| {
         let name = flotilla_resources::address::record_name(
@@ -117,7 +116,6 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
         evaluate_crew_completion(
             &convoy,
             flotilla_resources::CrewCompletionClaim { vessel: "work", role },
-            &checkouts,
             records,
             artifacts,
             &[],
@@ -165,7 +163,6 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
         let unmet = evaluate_crew_completion(
             &unbound,
             flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
-            &checkouts,
             &change_requests,
             &artifacts,
             &[],
@@ -181,7 +178,6 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
     assert!(evaluate_crew_completion(
         &no_checkouts,
         flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
-        &checkouts,
         &change_requests,
         &artifacts,
         &[],
@@ -206,7 +202,6 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
             evaluate_crew_completion(
                 &scanned,
                 flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
-                &checkouts,
                 &change_requests,
                 &artifacts,
                 &[],
@@ -231,7 +226,6 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
     assert!(!evaluate_crew_completion(
         &discovered,
         flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
-        &checkouts,
         &change_requests,
         &artifacts,
         &[],
@@ -252,7 +246,6 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
     assert!(!evaluate_crew_completion(
         &required,
         flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
-        &checkouts,
         &change_requests,
         &artifacts,
         &[],
@@ -311,7 +304,6 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
             evaluate_crew_completion(
                 &discovered,
                 flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
-                &checkouts,
                 &late_records,
                 &artifacts,
                 &[],
@@ -373,7 +365,6 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
                     let unmet = evaluate_crew_completion(
                         &selected,
                         flotilla_resources::CrewCompletionClaim { vessel: "work", role: "reviewer" },
-                        &checkouts,
                         &records,
                         &artifacts,
                         &[],
@@ -486,7 +477,6 @@ fn declared_artifact_completion_accepts_a_new_kind_and_rebinds_to_current_head()
         evaluate_crew_completion(
             &convoy,
             flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
-            &BTreeMap::new(),
             change_requests,
             artifacts,
             &[],

@@ -1218,15 +1218,6 @@ impl CrewService {
         }
         let mut observed_change_requests = None;
         if forced_by.is_none() && !existing_claim_is_admitted {
-            let checkout_sources = self
-                .resource_backend
-                .query_declared::<ResourceCheckout>(
-                    namespace,
-                    &StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone())]), true, true),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            let checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items);
             let requires_change_request = convoy
                 .status
                 .as_ref()
@@ -1291,7 +1282,6 @@ impl CrewService {
             let unmet = evaluate_crew_completion(
                 &convoy,
                 CrewCompletionClaim { vessel: &context.vessel, role: &context.caller_role },
-                &checkouts,
                 &change_requests,
                 &promise_artifacts,
                 &forges,

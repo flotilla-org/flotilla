@@ -535,7 +535,7 @@ mod tests {
             .build()
     }
 
-    /// `value` with each ASCII letter's case flipped where `flips` says so.
+    /// `value` with each ASCII letter's case flipped where the test case draws `true`.
     fn recase(tc: &hegel::TestCase, value: &str) -> String {
         value
             .chars()
