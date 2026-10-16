@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::ConvoyStatus;
+use crate::address::{Address, AddressKind, ForgeDirectory};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -95,6 +96,36 @@ impl Submission {
     pub fn subject(&self) -> &str {
         self.metadata.get("subject").map(String::as_str).unwrap_or(&self.reference)
     }
+
+    /// The change request or issue this submission names.
+    ///
+    /// The stored text is a leaf in any service spelling
+    /// (`cr/<service>/<scope>/<n>`, resolved through `forges` as a leaf is) or
+    /// lenient address input such as a PR URL. Text naming anything else, such
+    /// as a decision-ledger record, names no subject.
+    pub fn subject_address(&self, forges: &[crate::ForgeSpec]) -> Result<Address, String> {
+        let text = self.subject();
+        let address = match text.parse::<flotilla_protocol::LeafAddress>() {
+            Ok(leaf) => crate::address::leaf_address(&leaf, forges)?,
+            Err(_) => flotilla_address::resolve(text, &ForgeDirectory::new(forges))
+                .map_err(|error| format!("submission subject `{text}`: {error}"))?,
+        };
+        match address.kind() {
+            AddressKind::ChangeRequest | AddressKind::Issue => Ok(address),
+            kind => Err(format!("submission subject `{text}` names a {kind}, not a change request or issue")),
+        }
+    }
+
+    /// Whether this submission names the change request or issue `address`.
+    pub fn names(&self, address: &Address, forges: &[crate::ForgeSpec]) -> bool {
+        self.subject_address(forges).is_ok_and(|named| &named == address)
+    }
+
+    /// Whether two submissions name the same subject: the same text, or text
+    /// that resolves to the same address through `forges`.
+    pub fn same_subject(&self, other: &Submission, forges: &[crate::ForgeSpec]) -> bool {
+        self.subject() == other.subject() || self.subject_address(forges).is_ok_and(|address| other.names(&address, forges))
+    }
 }
 
 /// Commands check the persisted effect after an optimistic patch, because a
@@ -115,7 +146,7 @@ pub fn effect_present(status: &ConvoyStatus, vessel: &str, role: &str, operation
             promise.kind == *kind
                 && matches!(promise.state, PromiseState::Submitted | PromiseState::Kept)
                 && promise.submissions.last().is_some_and(|prior| {
-                    prior.subject() == submission.subject()
+                    prior.same_subject(submission, &[])
                         && submission.metadata.iter().all(|(key, value)| prior.metadata.get(key) == Some(value))
                 })
         }
@@ -140,13 +171,13 @@ pub fn needs_observation(status: &ConvoyStatus, kind: PromiseKind) -> bool {
             && status.subjects.iter().any(|subject| {
                 subject.relationship == flotilla_protocol::Relationship::Produces
                     && subject.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
-                    && subject.subject.internal().is_ok_and(|reference| {
+                    && crate::address::subject_address(&subject.subject, &[]).is_ok_and(|address| {
                         !status
                             .promises
                             .values()
                             .flat_map(BTreeMap::values)
                             .flatten()
-                            .any(|p| p.submissions.iter().any(|s| s.subject() == reference))
+                            .any(|p| p.submissions.iter().any(|s| s.names(&address, &[])))
                     })
             }))
 }
@@ -196,7 +227,7 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
             let promise = promises.iter_mut().find(|p| p.id == *id).expect("inserted promise");
             if let PromiseOperation::Submit { submission, .. } = operation {
                 if promise.kind == *kind && matches!(promise.state, PromiseState::Submitted | PromiseState::Kept) {
-                    if let Some(prior) = promise.submissions.last_mut().filter(|prior| prior.subject() == submission.subject()) {
+                    if let Some(prior) = promise.submissions.last_mut().filter(|prior| prior.same_subject(submission, &[])) {
                         prior.metadata.extend(submission.metadata.clone());
                     }
                     return;
@@ -244,16 +275,17 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
         }
     }
     if let PromiseOperation::Submit { kind: PromiseKind::Pr, submission, .. } = operation {
-        if let Ok(address) = submission.subject().parse::<flotilla_protocol::LeafAddress>() {
-            if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
-                if !status.produces(&subject) {
-                    status.discover_subject(
-                        subject,
-                        flotilla_protocol::Relationship::Produces,
-                        super::SubjectDiscoverySource::Claim,
-                        submission.submitted_at,
-                    );
-                }
+        // Status patches apply without a Forge list: a forge-id or public
+        // GitHub spelling resolves, and an existing subject in another
+        // spelling of the same request is not discovered twice.
+        if let Ok(subject) = submission.subject_address(&[]).and_then(|address| crate::address::subject_for(&address)) {
+            if !status.produces_any(|produced| crate::address::same_subject(produced, &subject, &[])) {
+                status.discover_subject(
+                    subject,
+                    flotilla_protocol::Relationship::Produces,
+                    super::SubjectDiscoverySource::Claim,
+                    submission.submitted_at,
+                );
             }
         }
     }
@@ -549,12 +581,14 @@ pub fn discovered_submission(
     vessel: &str,
     role: &str,
     subject: &flotilla_protocol::Subject,
+    forges: &[crate::ForgeSpec],
     now: DateTime<Utc>,
 ) -> Option<PromiseOperation> {
-    let reference = subject.internal().ok()?;
-    if status.promises.values().flat_map(BTreeMap::values).flatten().any(|p| p.submissions.iter().any(|s| s.subject() == reference)) {
+    let address = crate::address::subject_address(subject, forges).ok()?;
+    if status.promises.values().flat_map(BTreeMap::values).flatten().any(|p| p.submissions.iter().any(|s| s.names(&address, forges))) {
         return None;
     }
+    let reference = crate::address::submission_subject_text(&address).ok()?;
     let open =
         owned(status, vessel, role).iter().filter(|p| p.kind == PromiseKind::Pr && p.state == PromiseState::Open).collect::<Vec<_>>();
     let id = match open.as_slice() {
@@ -605,9 +639,11 @@ pub fn next_observation(
     for subject in status.subjects.iter().filter(|s| {
         s.relationship == flotilla_protocol::Relationship::Produces && s.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
     }) {
-        if let Some(mut operation) = discovered_submission(status, vessel, role, &subject.subject, now) {
+        if let Some(mut operation) = discovered_submission(status, vessel, role, &subject.subject, forges, now) {
             if let PromiseOperation::Submit { submission, .. } = &mut operation {
-                if let Ok(name) = subject.subject.leaf().and_then(|leaf| crate::address::leaf_record_name(&leaf, forges)) {
+                if let Some(name) =
+                    crate::address::subject_address(&subject.subject, forges).ok().and_then(|address| crate::address::record_name(&address))
+                {
                     if let Some(commit) = change_requests
                         .get(&name)
                         .and_then(|record| record.status.as_ref())
@@ -680,10 +716,10 @@ fn observed_verdict(
             (true, "artifact", "decision ledger artifact exists")
         }
         PromiseKind::Pr => {
-            let name = match submission.subject().parse::<flotilla_protocol::LeafAddress>() {
-                Ok(leaf @ flotilla_protocol::LeafAddress::ChangeRequest { .. }) => crate::address::leaf_record_name(&leaf, forges),
-                other => Err(format!("parsed as {other:?}")),
-            };
+            let name = submission.subject_address(forges).and_then(|address| match address.kind() {
+                AddressKind::ChangeRequest => crate::address::record_name(&address).ok_or_else(|| format!("{address} names no record")),
+                kind => Err(format!("names a {kind}")),
+            });
             let name = match name {
                 Ok(name) => name,
                 Err(error) => {
@@ -758,6 +794,10 @@ fn discovery_owner(status: &ConvoyStatus) -> Option<(&str, &str)> {
 mod tests {
     use super::*;
     use crate::StatusPatch;
+    fn pr_subject(number: u64) -> flotilla_protocol::Subject {
+        let address = crate::address::stored_change_request_address("github.com", "org/repo", number, &[]).expect("address");
+        crate::address::subject_for(&address).expect("subject")
+    }
     fn submit(id: &str, attempt: i64) -> PromiseOperation {
         PromiseOperation::Submit {
             id: id.into(),
@@ -784,6 +824,104 @@ mod tests {
             },
         }
     }
+    fn submission(reference: &str) -> Submission {
+        Submission {
+            reference: reference.into(),
+            metadata: BTreeMap::new(),
+            submitted_at: DateTime::from_timestamp(1, 0).unwrap(),
+            verdict: None,
+        }
+    }
+
+    // ADR 0066 §3: a submission names its PR whatever text recorded it: the
+    // old host-spelled `cr/` text a previous generation wrote, a pasted PR
+    // URL, or the stored spelling this generation writes. They compare equal
+    // by address; another number in the same repository does not.
+    #[test]
+    fn submissions_compare_by_the_subject_address() {
+        let lab = crate::ForgeSpec::builder()
+            .forge_id("lab".into())
+            .kind(crate::ForgeKind::Forgejo)
+            .hosts(std::collections::BTreeSet::from(["forgejo.lab.example".to_string()]))
+            .https_url("https://forgejo.lab.example".into())
+            .git_ssh_host("forgejo.lab.example".into())
+            .build();
+        let forges = [lab];
+        for spellings in [
+            [
+                "cr/github.com/Flotilla-Org/flotilla/7",
+                "https://github.com/flotilla-org/Flotilla/pull/7",
+                "cr/github.com/flotilla-org/flotilla/7",
+            ],
+            ["cr/forgejo.lab.example/Team/Repo/3", "https://forgejo.lab.example/Team/Repo/pulls/3", "cr/lab/team/repo/3"],
+        ] {
+            let [old, url, current] = spellings.map(submission);
+            let address = old.subject_address(&forges).expect("old text resolves");
+            assert_eq!(url.subject_address(&forges).as_ref(), Ok(&address));
+            assert_eq!(crate::address::submission_subject_text(&address).as_deref(), Ok(current.subject()));
+            assert!(old.same_subject(&url, &forges) && url.same_subject(&current, &forges), "{spellings:?}");
+        }
+        let other = submission("https://github.com/flotilla-org/flotilla/pull/8");
+        assert!(!other.same_subject(&submission("cr/github.com/flotilla-org/flotilla/7"), &[]));
+        assert!(submission("decision-ledger-record").subject_address(&[]).is_err(), "a ledger record names no PR");
+    }
+
+    // ADR 0061 with ADR 0066: a discovered submission for a subject recorded
+    // in an older spelling is the same submission, so discovery neither
+    // resubmits nor adds a second produced subject for it.
+    // `apply` compares a resubmission with the prior one with no Forge list,
+    // because a status patch carries none. A previous-generation submission
+    // spelled by an undeclared-to-`apply` host (`cr/forgejo.lab.example/...`)
+    // has no address there, so it falls back to text equality: the same text
+    // merges metadata, while a forge-id respelling of the same change request
+    // is not recognised and leaves the prior untouched. This is a narrow,
+    // accepted limitation tracked by #3370; the test pins it so a change is
+    // deliberate.
+    #[test]
+    fn apply_matches_a_host_spelled_prior_submission_by_text_only() {
+        let resubmit = |reference: &str, key: &str| PromiseOperation::Submit {
+            id: "feature".into(),
+            kind: PromiseKind::Pr,
+            source: PromiseSource::Crew,
+            submission: Submission {
+                reference: reference.into(),
+                metadata: BTreeMap::from([(key.to_string(), "yes".to_string())]),
+                submitted_at: DateTime::from_timestamp(1, 0).unwrap(),
+                verdict: None,
+            },
+        };
+        let host_spelled = "cr/forgejo.lab.example/team/repo/3";
+        let mut status = ConvoyStatus::default();
+        apply(&mut status, "work", "coder", &resubmit(host_spelled, "first"));
+        assert_eq!(owned(&status, "work", "coder")[0].state, PromiseState::Submitted);
+
+        apply(&mut status, "work", "coder", &resubmit(host_spelled, "same-text"));
+        apply(&mut status, "work", "coder", &resubmit("cr/lab/team/repo/3", "forge-id"));
+        let promise = &owned(&status, "work", "coder")[0];
+        assert_eq!(promise.submissions.len(), 1);
+        let metadata = &promise.submissions[0].metadata;
+        assert!(metadata.contains_key("first") && metadata.contains_key("same-text"), "identical text merges: {metadata:?}");
+        assert!(!metadata.contains_key("forge-id"), "a respelling is not matched without Forges (#3370): {metadata:?}");
+    }
+
+    #[test]
+    fn discovery_matches_older_spellings_of_one_subject() {
+        let mut status = ConvoyStatus::default();
+        let old = flotilla_protocol::Subject {
+            kind: flotilla_protocol::SubjectKind::ChangeRequest,
+            source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "Org/repo".into() },
+            id: "1".into(),
+        };
+        status.discover_subject(old, flotilla_protocol::Relationship::Produces, super::super::SubjectDiscoverySource::Branch, Utc::now());
+        let operation =
+            discovered_submission(&status, "work", "coder", &status.subjects[0].subject.clone(), &[], Utc::now()).expect("submission");
+        apply(&mut status, "work", "coder", &operation);
+        assert_eq!(status.subjects.len(), 1, "one subject per change request");
+        let old = status.subjects[0].subject.clone();
+        assert!(discovered_submission(&status, "work", "coder", &old, &[], Utc::now()).is_none());
+        assert!(discovered_submission(&status, "work", "coder", &pr_subject(1), &[], Utc::now()).is_none());
+    }
+
     // ADR 0047: historical custom PR checks retain their discovery attribution
     // even when they do not map to the stock deliverer/readiness rule.
     #[test]
@@ -897,12 +1035,7 @@ mod tests {
     fn terminal_history_has_no_observation_patch() {
         let mut status = ConvoyStatus { phase: super::super::ConvoyPhase::Landed, ..Default::default() };
         status.discover_subject(
-            flotilla_protocol::Subject::from_leaf(&flotilla_protocol::LeafAddress::ChangeRequest {
-                service: "github.com".into(),
-                scope: "org/repo".into(),
-                number: 1,
-            })
-            .unwrap(),
+            pr_subject(1),
             flotilla_protocol::Relationship::Produces,
             super::super::SubjectDiscoverySource::Claim,
             Utc::now(),
@@ -953,8 +1086,8 @@ mod tests {
                 &PromiseOperation::Declare { id: id.into(), kind: PromiseKind::Pr, source: PromiseSource::Crew },
             );
         }
-        let subject = flotilla_protocol::Subject::from_leaf(&"cr/github.com/org/repo/1".parse().unwrap()).unwrap();
-        let operation = discovered_submission(&status, "work", "coder", &subject, Utc::now()).unwrap();
+        let subject = pr_subject(1);
+        let operation = discovered_submission(&status, "work", "coder", &subject, &[], Utc::now()).unwrap();
         apply(&mut status, "work", "coder", &operation);
         assert_eq!(pending(&status, "work", "coder").len(), 3);
         assert!(owned(&status, "work", "coder").iter().filter(|p| p.id == "a" || p.id == "b").all(|p| p.state == PromiseState::Open));

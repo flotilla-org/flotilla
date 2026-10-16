@@ -593,7 +593,8 @@ async fn issue_turn_delivery_fires_once_for_changed_issue() {
         )
         .await
         .expect("claim");
-    let leaf = flotilla_resources::issue_address(&reference)
+    let leaf = flotilla_resources::address::issue_reference_address(&reference, &[])
+        .and_then(|address| flotilla_resources::address::leaf_for(&address))
         .map(|address| Leaf { address, field_path: ".state".into(), operator: LeafOperator::Equal, literal: "closed".into() })
         .expect("issue address");
     let subscription_id = uuid::Uuid::new_v4();

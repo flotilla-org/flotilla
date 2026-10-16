@@ -18,17 +18,19 @@ use flotilla_protocol::{
     CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
 };
 use flotilla_resources::{
-    address::{artifact_slot_record_name, leaf_address, leaf_record_name, record_name},
-    change_request_address_with_forges, evaluate_crew_completion, expected_change_request_leaves,
-    external_patches as convoy_external_patches, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
-    CheckoutIntegrationStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewCompletionClaim,
-    CrewCompletionPending, CrewCompletionRefusalCause, CrewMessageSender, CrewSource, CrewWorkPhase, Demand as ResourceDemand, Forge,
-    HoldAct, InputMeta, IntegrationCondition, LifecycleAuthority, ObservedChangeRequestState, Project, Repository, RepositoryKey, Resource,
-    ResourceError, ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
-    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WorkCompletionAuthority,
-    CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_REF_LABEL,
+    address::{
+        artifact_slot_record_name, leaf_address, leaf_record_name, record_name, remote_change_request_address, repository_address,
+        subject_address, submission_subject_text, AddressKind,
+    },
+    evaluate_crew_completion, expected_change_request_leaves, external_patches as convoy_external_patches,
+    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus, Clock, ConditionValue,
+    Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewCompletionClaim, CrewCompletionPending, CrewCompletionRefusalCause,
+    CrewMessageSender, CrewSource, CrewWorkPhase, Demand as ResourceDemand, Forge, HoldAct, InputMeta, IntegrationCondition,
+    LifecycleAuthority, ObservedChangeRequestState, Project, Repository, RepositoryKey, Resource, ResourceError, ResourceObject,
+    ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
+    TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WorkCompletionAuthority, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{CrewMessageDelivery, TerminalCrewMessage};
@@ -245,25 +247,19 @@ fn convoy_names_query(name: Option<&str>, include_replicas: bool) -> StoreQuery 
 
 fn crew_change_request_query(
     convoy: &ResourceObject<ResourceConvoy>,
-    checkouts: &BTreeMap<String, ResourceObject<ResourceCheckout>>,
     forges: &[flotilla_resources::ForgeSpec],
 ) -> Result<StoreQuery, String> {
     let mut names = BTreeSet::new();
-    let mut add = |address: LeafAddress| {
-        if matches!(address, LeafAddress::ChangeRequest { .. }) {
-            names.extend(leaf_record_name(&address, forges).ok());
+    // Every active change-request subject has a leaf here.
+    for leaf in expected_change_request_leaves(convoy, forges)? {
+        if matches!(leaf.address, LeafAddress::ChangeRequest { .. }) {
+            names.extend(leaf_record_name(&leaf.address, forges).ok());
         }
-    };
-    for leaf in expected_change_request_leaves(convoy, checkouts)? {
-        add(leaf.address);
-    }
-    for subject in flotilla_resources::active_change_request_subjects(convoy)? {
-        add(subject.leaf()?);
     }
     if let Some(status) = &convoy.status {
         for submission in status.promises.values().flat_map(|crew| crew.values()).flatten().flat_map(|promise| &promise.submissions) {
-            if let Ok(address) = submission.subject().parse::<LeafAddress>() {
-                add(address);
+            if let Some(address) = submission.subject_address(forges).ok().filter(|address| address.kind() == AddressKind::ChangeRequest) {
+                names.extend(record_name(&address));
             }
         }
     }
@@ -987,9 +983,10 @@ impl CrewService {
                     return Err("submission reference must not be empty".into());
                 }
                 let mut metadata = metadata;
+                let mut forges = Vec::new();
                 if kind == PromiseKind::Pr {
                     // URL parsing needs every declared forge endpoint; read this catalogue once.
-                    let forges = self
+                    forges = self
                         .resource_backend
                         .definitions::<Forge>(namespace)
                         .list()
@@ -1002,16 +999,18 @@ impl CrewService {
                     let [subject] = subjects.as_slice() else {
                         return Err("PR reference must name one change request in the convoy's repositories".into());
                     };
-                    metadata.insert("subject".into(), subject.internal()?);
+                    metadata.insert("subject".into(), submission_subject_text(&subject_address(subject, &forges)?)?);
                 }
+                let submission = Submission { reference, metadata, submitted_at: self.clock.now(), verdict: None };
+                let reference = &submission.reference;
+                // Earlier submissions may spell the same subject differently.
                 let id = match promise {
                     Some(id) => id,
                     None => {
-                        let canonical = metadata.get("subject").unwrap_or(&reference);
                         if let Some(existing) = promises.iter().find(|p| {
                             p.kind == kind
                                 && p.state != PromiseState::Retracted
-                                && p.submissions.last().is_some_and(|s| s.subject() == canonical)
+                                && p.submissions.last().is_some_and(|s| s.same_subject(&submission, &forges))
                         }) {
                             existing.id.clone()
                         } else {
@@ -1025,19 +1024,14 @@ impl CrewService {
                     }
                 };
                 if let Some(p) = promises.iter().find(|p| p.id == id) {
-                    let same = p.submissions.last().is_some_and(|s| s.subject() == metadata.get("subject").unwrap_or(&reference));
+                    let same = p.submissions.last().is_some_and(|s| s.same_subject(&submission, &forges));
                     if p.kind != kind
                         || (p.state != PromiseState::Open && !(same && matches!(p.state, PromiseState::Submitted | PromiseState::Kept)))
                     {
                         return Err(format!("promise `{id}` does not accept this submission"));
                     }
                 }
-                PromiseOperation::Submit {
-                    id,
-                    kind,
-                    source: PromiseSource::Crew,
-                    submission: Submission { reference, metadata, submitted_at: self.clock.now(), verdict: None },
-                }
+                PromiseOperation::Submit { id, kind, source: PromiseSource::Crew, submission }
             }
             Request::Retract { id, reason } => {
                 if reason.trim().is_empty() {
@@ -1158,6 +1152,7 @@ impl CrewService {
                     &context.vessel,
                     &context.caller_role,
                     subject,
+                    &forges,
                     self.clock.now(),
                 )
             }) {
@@ -1223,15 +1218,6 @@ impl CrewService {
         }
         let mut observed_change_requests = None;
         if forced_by.is_none() && !existing_claim_is_admitted {
-            let checkout_sources = self
-                .resource_backend
-                .query_declared::<ResourceCheckout>(
-                    namespace,
-                    &StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone())]), true, true),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            let checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items);
             let requires_change_request = convoy
                 .status
                 .as_ref()
@@ -1255,7 +1241,7 @@ impl CrewService {
             if requires_change_request {
                 // One subject per change request, whatever its leaves' spellings.
                 let mut subjects = BTreeMap::new();
-                for leaf in expected_change_request_leaves(&convoy, &checkouts)? {
+                for leaf in expected_change_request_leaves(&convoy, &forges)? {
                     let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else { continue };
                     let cause = || CrewCompletionRefusalCause::MissingChangeRequestObservation {
                         service: service.clone(),
@@ -1285,7 +1271,7 @@ impl CrewService {
             }
             let change_request_sources = self
                 .resource_backend
-                .query_declared::<ResourceChangeRequest>(namespace, &crew_change_request_query(&convoy, &checkouts, &forges)?)
+                .query_declared::<ResourceChangeRequest>(namespace, &crew_change_request_query(&convoy, &forges)?)
                 .await
                 .map_err(|error| error.to_string())?;
             let change_requests =
@@ -1296,7 +1282,6 @@ impl CrewService {
             let unmet = evaluate_crew_completion(
                 &convoy,
                 CrewCompletionClaim { vessel: &context.vessel, role: &context.caller_role },
-                &checkouts,
                 &change_requests,
                 &promise_artifacts,
                 &forges,
@@ -1359,7 +1344,7 @@ impl CrewService {
             None => {
                 let records = self
                     .resource_backend
-                    .query_declared::<ResourceChangeRequest>(namespace, &crew_change_request_query(&convoy, &BTreeMap::new(), &forges)?)
+                    .query_declared::<ResourceChangeRequest>(namespace, &crew_change_request_query(&convoy, &forges)?)
                     .await
                     .map_err(|error| error.to_string())?;
                 flotilla_resources::select_change_requests(records.items.iter().map(|source| &source.object))
@@ -1883,7 +1868,7 @@ impl CrewService {
                 .iter()
                 .filter_map(|checkout| associated_change_request_name_without_checkout_status(convoy, checkout, &forges).transpose())
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut query = crew_change_request_query(convoy, &BTreeMap::new(), &forges)?;
+            let mut query = crew_change_request_query(convoy, &forges)?;
             query.field_values.entry("metadata.name".into()).or_default().extend(names);
             query.fields.insert("status.state.value".into(), "merged".into());
             let records = self
@@ -3817,24 +3802,19 @@ fn associated_change_request_name_without_checkout_status(
         return Ok(None);
     };
     if let Some(id) = convoy_change_request_id_for_checkout(convoy, checkout, forges) {
-        return leaf_record_name(&change_request_address_with_forges(&repository.url, &id, forges)?, forges).map(Some);
+        let number = id.parse::<u64>().map_err(|_| format!("change request id `{id}` is not a numeric forge number"))?;
+        let address = remote_change_request_address(&repository.url, number, forges)?;
+        return record_name(&address).ok_or_else(|| format!("{address} names no record")).map(Some);
     }
 
     // A produced subject can retain PR identity after checkout status is gone.
     // Require exactly one current PR for the repository if nothing singles one out.
-    let LeafAddress::ChangeRequest { service, scope, .. } = change_request_address_with_forges(&repository.url, "1", forges)? else {
-        unreachable!("change_request_address always returns a change-request address")
-    };
-    let names = expected_change_request_leaves(convoy, &BTreeMap::new())?
+    let repository = repository_address(&repository.url, forges)?;
+    let names = expected_change_request_leaves(convoy, forges)?
         .into_iter()
-        .filter_map(|leaf| match leaf.address {
-            LeafAddress::ChangeRequest { service: candidate_service, scope: candidate_scope, number }
-                if candidate_service == service && candidate_scope == scope =>
-            {
-                leaf_record_name(&LeafAddress::ChangeRequest { service: service.clone(), scope: scope.clone(), number }, forges).ok()
-            }
-            _ => None,
-        })
+        .filter_map(|leaf| leaf_address(&leaf.address, forges).ok())
+        .filter(|address| address.kind() == AddressKind::ChangeRequest && address.parent().as_ref() == Some(&repository))
+        .filter_map(|address| record_name(&address))
         .collect::<BTreeSet<_>>();
     if names.len() == 1 {
         Ok(names.into_iter().next())

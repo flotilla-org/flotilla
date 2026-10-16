@@ -10,9 +10,11 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
 use flotilla_resources::{
-    actor_obligation, instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest,
-    Checkout, CheckoutSpec, ControllerRetry, Convoy, ConvoyPhase, Forge, InstantiatedExit, LeafMaker, ResourceError, ResourceObject,
-    RetryCeiling, StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WorkPhase,
+    actor_obligation,
+    address::{leaf_for, subject_address},
+    instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest, Checkout,
+    CheckoutSpec, ControllerRetry, Convoy, ConvoyPhase, Forge, InstantiatedExit, LeafMaker, ResourceError, ResourceObject, RetryCeiling,
+    StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WorkPhase,
 };
 use flotilla_store::{
     controller::{SecondaryWatch, WorkQueueSender},
@@ -308,7 +310,11 @@ impl ReconcilerWake {
             if !conflicts.is_empty() {
                 let details = conflicts
                     .iter()
-                    .map(|subject| subject.internal().unwrap_or_else(|_| subject.id.clone()))
+                    .map(|subject| {
+                        subject_address(subject, &forges)
+                            .and_then(|address| leaf_for(&address))
+                            .map_or_else(|_| subject.id.clone(), |leaf| leaf.to_string())
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 let created_at = convoy.metadata.creation_timestamp;
@@ -463,8 +469,8 @@ impl ReconcilerWake {
                         });
                     }
                 }
-                for delivery in instantiate_turn_delivery(convoy, &checkouts, &observed_change_requests, &forges)? {
-                    let eligible = is_active_change_request_probe(status, &delivery.rule, &delivery.leaf);
+                for delivery in instantiate_turn_delivery(convoy, &observed_change_requests, &forges)? {
+                    let eligible = is_active_change_request_probe(status, &delivery.rule, &delivery.leaf, &forges);
                     let changed = self
                         .subscriptions
                         .inner
@@ -498,7 +504,7 @@ impl ReconcilerWake {
                 }
                 continue;
             }
-            let exit = match instantiate_exit(convoy, &checkouts) {
+            let exit = match instantiate_exit(convoy, &forges) {
                 Ok(exit) => exit,
                 Err(error) => {
                     tracing::warn!(convoy = %convoy.metadata.name, %error, "derive reconciler leaf subscriptions failed");
@@ -522,7 +528,7 @@ impl ReconcilerWake {
                 }
             }
             let status = convoy.status.as_ref().expect("parked convoy has status");
-            for delivery in instantiate_turn_delivery(convoy, &checkouts, &observed_change_requests, &forges)? {
+            for delivery in instantiate_turn_delivery(convoy, &observed_change_requests, &forges)? {
                 // A merged PR cannot reopen a crew that already claimed settlement.
                 if is_merged_settlement_probe(&delivery.leaf) {
                     continue;

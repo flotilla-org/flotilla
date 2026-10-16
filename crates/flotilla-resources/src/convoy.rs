@@ -146,12 +146,8 @@ pub fn convoy_reference_context<'a>(
                     (forge_ref.clone(), format!("{owner}/{repo_name}"))
                 }
                 _ => {
-                    let LeafAddress::ChangeRequest { service, scope, .. } =
-                        change_request_address_with_forges(&repository.url, "1", forges).ok()?
-                    else {
-                        return None;
-                    };
-                    (service, scope)
+                    let source = crate::address::subject_source_for_remote(&repository.url, forges).ok()?;
+                    (source.service, source.scope)
                 }
             };
             let canonical = crate::canonicalize_repo_url(&repository.url).ok()?;
@@ -286,14 +282,11 @@ impl ConvoySpec {
     pub fn declared_subjects(&self) -> Result<Vec<DeclaredSubject>, String> {
         let mut subjects = self.subjects.clone();
         for issue in &self.issues {
-            let mut canonical = issue.reference.clone();
-            canonical.id = "1".to_string();
-            let LeafAddress::Issue { service, scope, .. } = issue_address(&canonical)? else {
-                unreachable!("issue_address always returns an issue address")
-            };
+            // Opaque tracker ids stay as recorded; only forge issues have
+            // an address.
             let subject = Subject {
                 kind: flotilla_protocol::SubjectKind::Issue,
-                source: flotilla_protocol::IssueSource { service, scope },
+                source: crate::address::issue_subject_source(&issue.reference.source),
                 id: issue.reference.id.clone(),
             };
             if !subjects.iter().any(|entry| entry.subject == subject && entry.relationship == Relationship::WorksOn) {
@@ -311,8 +304,9 @@ impl ConvoySpec {
                 .iter()
                 .find(|repo| repo.repo_ref == bound.repository_ref)
                 .ok_or_else(|| format!("bound change request repository {} is absent from convoy", bound.repository_ref))?;
-            let subject =
-                Subject::from_leaf(&change_request_address(&repository.url, &bound.id)?).expect("change request address is a subject");
+            // The spec serializer derives this subject with no Forge list at
+            // hand; the subject keeps the spelling earlier records used.
+            let subject = crate::address::remote_change_request_subject(&repository.url, &bound.id, &[])?;
             let relationship =
                 if self.continuation.as_ref() == Some(&bound.repository_ref) { Relationship::Produces } else { Relationship::Adopts };
             if !subjects.iter().any(|entry| entry.subject == subject && entry.relationship == relationship) {
@@ -421,7 +415,7 @@ pub fn observed_change_request_subjects(
         .into_iter()
         .filter(|entry| entry.relationship == Relationship::Adopts)
         .map(|entry| entry.subject)
-        .collect::<BTreeSet<_>>();
+        .collect::<Vec<_>>();
     let mut subjects = Vec::new();
     for name in expected {
         let Some(checkout) = checkouts.get(&name) else { continue };
@@ -434,21 +428,22 @@ pub fn observed_change_request_subjects(
             .iter()
             .find(|repository| repository.repo_ref == *checkout.spec.repo_ref())
             .ok_or_else(|| format!("checkout {name} repository {} is absent from convoy", checkout.spec.repo_ref()))?;
-        let address = change_request_address_with_forges(&repository.url, &observed.id, forges)?;
-        if let Some(subject) = Subject::from_leaf(&address) {
-            let terminal = observed.state != crate::ChangeRequestState::Open;
-            let merged_during_checkout = checkout
-                .status
-                .as_ref()
-                .and_then(|status| status.integration.landed_evidence.as_ref())
-                .filter(|evidence| evidence.change_request_id == observed.id)
-                .and_then(|evidence| evidence.merged_at.as_deref())
-                .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-                .is_some_and(|at| at >= checkout.metadata.creation_timestamp);
-            let already_produced = convoy.status.as_ref().is_some_and(|status| status.produces(&subject));
-            if (!terminal || merged_during_checkout || already_produced) && !adopted.contains(&subject) && !subjects.contains(&subject) {
-                subjects.push(subject);
-            }
+        let subject = crate::address::remote_change_request_subject(&repository.url, &observed.id, forges)?;
+        let terminal = observed.state != crate::ChangeRequestState::Open;
+        let merged_during_checkout = checkout
+            .status
+            .as_ref()
+            .and_then(|status| status.integration.landed_evidence.as_ref())
+            .filter(|evidence| evidence.change_request_id == observed.id)
+            .and_then(|evidence| evidence.merged_at.as_deref())
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| at >= checkout.metadata.creation_timestamp);
+        // A subject recorded in another spelling of the same request is the
+        // same subject: compare addresses, not spellings.
+        let same = |other: &Subject| crate::address::same_subject(other, &subject, forges);
+        let already_produced = convoy.status.as_ref().is_some_and(|status| status.produces_any(same));
+        if (!terminal || merged_during_checkout || already_produced) && !adopted.iter().any(same) && !subjects.iter().any(same) {
+            subjects.push(subject);
         }
     }
     Ok(subjects)
@@ -561,14 +556,55 @@ pub fn active_change_request_subjects(convoy: &ResourceObject<Convoy>) -> Result
     Ok(subjects)
 }
 
-pub fn expected_change_request_leaves(
+/// An active change-request subject whose address does not resolve, such as
+/// a host-spelled subject whose Forge is undeclared or removed. It cannot be
+/// observed (ADR 0066 §3), so it contributes no leaf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedChangeRequestSubject {
+    pub subject: Subject,
+    pub error: String,
+}
+
+/// The world-terminal leaves of a convoy's active change-request subjects,
+/// with the subjects that were skipped because they have no address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChangeRequestLeafSet {
+    pub leaves: Vec<Leaf>,
+    pub unresolved: Vec<UnresolvedChangeRequestSubject>,
+}
+
+/// The world-terminal leaves of every active change-request subject, each
+/// written once in the stored spelling however its subjects are spelled.
+///
+/// A subject whose address does not resolve is skipped and reported in
+/// [`ChangeRequestLeafSet::unresolved`], so one stale spelling does not hide
+/// the convoy's other subjects. When subjects exist but none resolves, this
+/// is an error rather than an empty set: an empty set means "no change
+/// request", which settlement and optional completion treat differently.
+pub fn change_request_leaf_set(
     convoy: &crate::ResourceObject<Convoy>,
-    _checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
-) -> Result<Vec<Leaf>, String> {
-    Ok(active_change_request_subjects(convoy)?
-        .into_iter()
-        .map(|subject| subject.leaf())
-        .collect::<Result<Vec<_>, _>>()?
+    forges: &[crate::ForgeSpec],
+) -> Result<ChangeRequestLeafSet, String> {
+    let mut addresses = Vec::new();
+    let mut unresolved = Vec::new();
+    for subject in active_change_request_subjects(convoy)? {
+        let address = match crate::address::subject_address(&subject, forges).and_then(|address| crate::address::leaf_for(&address)) {
+            Ok(address) => address,
+            Err(error) => {
+                unresolved.push(UnresolvedChangeRequestSubject { subject, error });
+                continue;
+            }
+        };
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    if addresses.is_empty() {
+        if let Some(first) = unresolved.first() {
+            return Err(first.error.clone());
+        }
+    }
+    let leaves = addresses
         .into_iter()
         .flat_map(|address| {
             ["merged", "closed"].map(|literal| Leaf {
@@ -578,7 +614,26 @@ pub fn expected_change_request_leaves(
                 literal: literal.to_string(),
             })
         })
-        .collect())
+        .collect();
+    Ok(ChangeRequestLeafSet { leaves, unresolved })
+}
+
+/// The leaves of [`change_request_leaf_set`], logging each skipped subject.
+/// Debug, not warn: settlement, exit and turn delivery re-derive this on
+/// every pass, and convoy explain shows the subject as unobserved.
+pub fn expected_change_request_leaves(convoy: &crate::ResourceObject<Convoy>, forges: &[crate::ForgeSpec]) -> Result<Vec<Leaf>, String> {
+    let set = change_request_leaf_set(convoy, forges)?;
+    for skipped in &set.unresolved {
+        tracing::debug!(
+            convoy = %convoy.metadata.name,
+            service = %skipped.subject.source.service,
+            scope = %skipped.subject.source.scope,
+            id = %skipped.subject.id,
+            error = %skipped.error,
+            "change request subject has no address; its settlement leaves are skipped"
+        );
+    }
+    Ok(set.leaves)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -604,21 +659,27 @@ pub struct InstantiatedTurnDelivery {
 
 pub fn instantiate_turn_delivery(
     convoy: &crate::ResourceObject<Convoy>,
-    checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
     observed_change_requests: &BTreeMap<String, crate::ResourceObject<crate::ChangeRequest>>,
     forges: &[crate::ForgeSpec],
 ) -> Result<Vec<InstantiatedTurnDelivery>, String> {
     let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else {
         return Ok(Vec::new());
     };
-    let change_requests = bound_change_request_addresses(convoy, checkouts)?;
+    let change_requests = bound_change_request_addresses(convoy, forges)?;
     let rules = snapshot
         .turn_delivery
         .iter()
         .map(|(source, rule)| Ok((source, rule, SubjectVariable::of(&rule.on)?)))
         .collect::<Result<Vec<_>, String>>()?;
     let issues = if rules.iter().any(|(_, _, subject)| *subject == SubjectVariable::Issue) {
-        convoy.spec.issues.iter().map(|issue| issue_address_with_forges(&issue.reference, forges)).collect::<Result<Vec<_>, _>>()?
+        convoy
+            .spec
+            .issues
+            .iter()
+            .map(|issue| {
+                crate::address::issue_reference_address(&issue.reference, forges).and_then(|address| crate::address::leaf_for(&address))
+            })
+            .collect::<Result<Vec<_>, _>>()?
     } else {
         Vec::new()
     };
@@ -668,8 +729,11 @@ pub fn instantiate_turn_delivery(
             let Some(submission) = promise.submissions.last() else {
                 continue;
             };
-            let reference = submission.metadata.get("subject").unwrap_or(&submission.reference);
-            let Ok(address) = reference.parse::<LeafAddress>() else {
+            let Ok(address) = submission
+                .subject_address(forges)
+                .and_then(|address| crate::address::leaf_for(&address))
+                .inspect_err(|error| tracing::debug!(promise = %promise.id, %error, "promise submission names no watchable subject"))
+            else {
                 continue;
             };
             let rule = TurnDeliveryRule::builder()
@@ -687,58 +751,13 @@ pub fn instantiate_turn_delivery(
     Ok(rows)
 }
 
-pub fn issue_address(reference: &IssueRef) -> Result<LeafAddress, String> {
-    issue_address_with_forges(reference, &[])
-}
-
-/// The relay service is a declared forge name when one owns the issue source.
-/// Without a declaration, encode the source path in the service component so
-/// installations sharing a host cannot claim the same subject.
-pub fn issue_address_with_forges(reference: &IssueRef, forges: &[crate::ForgeSpec]) -> Result<LeafAddress, String> {
-    let source = crate::normalize_issue_source(&reference.source);
-    let service_url = source.service.trim_end_matches('/');
-    let matches = forges.iter().filter(|forge| forge.owns_issue_service(service_url)).collect::<Vec<_>>();
-    let (service, scope) = match matches.as_slice() {
-        [forge] => {
-            let scope = if forge.kind == crate::ForgeKind::Github { source.scope.to_ascii_lowercase() } else { source.scope.clone() };
-            (forge.forge_id.clone(), scope)
-        }
-        [] => {
-            let (scheme, location) = service_url.split_once("://").map_or(("https", service_url), |(scheme, rest)| (scheme, rest));
-            let location = location.to_ascii_lowercase().replace('%', "%25").replace('/', "%2f");
-            let service = if scheme != "https" {
-                format!("{scheme}%3a%2f%2f{location}")
-            } else if !location.contains(['.', ':']) && !location.contains("%2f") {
-                format!("host%3a{location}")
-            } else {
-                location
-            };
-            (service, source.scope.clone())
-        }
-        _ => return Err(format!("issue source {service_url} matches multiple Forge definitions")),
-    };
-    // Public GitHub needs no Forge record, so its leaf takes the stored
-    // spelling of its address: `github.com` and a lowercase repository.
-    let (service, scope) = match crate::address::stored_repository_address(&service, &scope, &[]) {
-        Ok(address) if address.get(crate::address::AddressKind::Forge) == Some(crate::address::GITHUB_FORGE_ID) => {
-            crate::address::stored_service_scope(&address).expect("a repository address is under a forge")
-        }
-        _ => (service, scope),
-    };
-    let number = reference.id.parse::<u64>().map_err(|_| format!("issue id `{}` is not a numeric forge number", reference.id))?;
-    Ok(LeafAddress::Issue { service, scope, number })
-}
-
 /// Instantiate the convoy's pinned exit declaration over every bound subject.
 ///
 /// A table entry is an implicit universal over its subject role. With no bound
 /// subjects, a declared table collapses to the same claim exit as `exit: claim`.
 /// An absent declaration stays absent, leaving the convoy standing until an
 /// operator explicitly reaps it.
-pub fn instantiate_exit(
-    convoy: &crate::ResourceObject<Convoy>,
-    checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
-) -> Result<InstantiatedExit, String> {
+pub fn instantiate_exit(convoy: &crate::ResourceObject<Convoy>, forges: &[crate::ForgeSpec]) -> Result<InstantiatedExit, String> {
     let Some(declaration) =
         convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).and_then(|snapshot| snapshot.exit.clone())
     else {
@@ -748,7 +767,7 @@ pub fn instantiate_exit(
         return Ok(InstantiatedExit::Claim);
     }
 
-    let subjects = bound_change_request_addresses(convoy, checkouts)?;
+    let subjects = bound_change_request_addresses(convoy, forges)?;
     if subjects.is_empty() && expected_checkout_refs(convoy)?.is_empty() {
         return Ok(InstantiatedExit::Claim);
     }
@@ -771,46 +790,14 @@ pub fn instantiate_exit(
     ))
 }
 
-fn bound_change_request_addresses(
-    convoy: &crate::ResourceObject<Convoy>,
-    checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
-) -> Result<Vec<LeafAddress>, String> {
-    let leaves = expected_change_request_leaves(convoy, checkouts)?;
+fn bound_change_request_addresses(convoy: &crate::ResourceObject<Convoy>, forges: &[crate::ForgeSpec]) -> Result<Vec<LeafAddress>, String> {
+    let leaves = expected_change_request_leaves(convoy, forges)?;
     Ok(leaves.into_iter().map(|leaf| leaf.address).fold(Vec::new(), |mut addresses, address| {
         if !addresses.contains(&address) {
             addresses.push(address);
         }
         addresses
     }))
-}
-
-pub fn change_request_address(repository_url: &str, id: &str) -> Result<LeafAddress, String> {
-    let canonical = crate::canonicalize_repo_url(repository_url)?;
-    let without_scheme = canonical
-        .split_once("://")
-        .map(|(_, value)| value)
-        .ok_or_else(|| format!("canonical repository remote has no scheme: {canonical}"))?;
-    let (service, scope) =
-        without_scheme.split_once('/').ok_or_else(|| format!("canonical repository remote has no repository path: {canonical}"))?;
-    let number = id.parse::<u64>().map_err(|_| format!("change request id `{id}` is not a numeric forge number"))?;
-    Ok(LeafAddress::ChangeRequest { service: service.to_string(), scope: scope.to_string(), number })
-}
-
-pub fn change_request_address_with_forges(repository_url: &str, id: &str, forges: &[crate::ForgeSpec]) -> Result<LeafAddress, String> {
-    let mut matches = Vec::new();
-    for forge in forges {
-        if let Some(path) = forge.repository_path(repository_url)? {
-            matches.push((forge, path));
-        }
-    }
-    match matches.as_slice() {
-        [(forge, (owner, repo))] => {
-            let number = id.parse::<u64>().map_err(|_| format!("change request id `{id}` is not a numeric forge number"))?;
-            Ok(LeafAddress::ChangeRequest { service: forge.forge_id.clone(), scope: format!("{owner}/{repo}"), number })
-        }
-        [] => change_request_address(repository_url, id),
-        _ => Err(format!("repository {repository_url} matches multiple Forge definitions")),
-    }
 }
 
 pub fn pinned_workflow_ref(convoy: &crate::ResourceObject<Convoy>) -> &str {
@@ -898,6 +885,12 @@ impl ConvoyStatus {
 
     pub fn produces(&self, subject: &Subject) -> bool {
         self.subjects.iter().any(|entry| &entry.subject == subject && entry.relationship == Relationship::Produces)
+    }
+
+    /// Whether any produced subject matches `matches`, for callers that
+    /// compare subjects by address rather than spelling.
+    pub fn produces_any(&self, matches: impl Fn(&Subject) -> bool) -> bool {
+        self.subjects.iter().any(|entry| entry.relationship == Relationship::Produces && matches(&entry.subject))
     }
 
     pub fn discover_subject(&mut self, subject: Subject, relationship: Relationship, source: SubjectDiscoverySource, at: DateTime<Utc>) {
@@ -3305,6 +3298,56 @@ mod subject_tests {
         }
     }
 
+    // A host-spelled subject whose Forge is undeclared (or was removed) has no
+    // address and cannot be observed (ADR 0066 §3). It must not hide the
+    // convoy's other subjects: its leaves are skipped and it is reported. A
+    // convoy whose subjects all fail to resolve is an error, not "no change
+    // request", so optional completion and discovery do not treat it as absent.
+    #[test]
+    fn unresolvable_change_request_subject_is_skipped_and_reported() {
+        let request = |service: &str, scope: &str, id: &str| Subject {
+            kind: flotilla_protocol::SubjectKind::ChangeRequest,
+            source: flotilla_protocol::IssueSource { service: service.into(), scope: scope.into() },
+            id: id.into(),
+        };
+        let resolvable = request("github.com", "flotilla-org/flotilla", "2372");
+        let undeclared = request("forgejo.lab.example", "team/repo", "3");
+        let convoy_with = |subjects: &[&Subject]| {
+            let mut status = ConvoyStatus::default();
+            for subject in subjects {
+                status.discover_subject((*subject).clone(), Relationship::Produces, SubjectDiscoverySource::Claim, Utc::now());
+            }
+            ResourceObject::<Convoy> {
+                metadata: crate::ObjectMeta {
+                    name: "mixed".into(),
+                    namespace: "default".into(),
+                    resource_version: "1".into(),
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    owner_references: Vec::new(),
+                    finalizers: Vec::new(),
+                    deletion_timestamp: None,
+                    creation_timestamp: Utc::now(),
+                    merge: None,
+                },
+                spec: ConvoySpec::builder().workflow_ref("interactive".to_string()).build(),
+                status: Some(status),
+            }
+        };
+
+        let mixed = convoy_with(&[&undeclared, &resolvable]);
+        let set = change_request_leaf_set(&mixed, &[]).expect("resolvable subject yields leaves");
+        let expected = crate::address::leaf_for(&crate::address::subject_address(&resolvable, &[]).expect("address")).expect("leaf");
+        assert_eq!(set.leaves.len(), 2, "merged and closed for the one resolvable subject");
+        assert!(set.leaves.iter().all(|leaf| leaf.address == expected));
+        assert_eq!(set.unresolved.len(), 1);
+        assert_eq!(set.unresolved[0].subject, undeclared);
+        assert_eq!(expected_change_request_leaves(&mixed, &[]).expect("leaves"), set.leaves);
+
+        let only_undeclared = convoy_with(&[&undeclared]);
+        assert!(change_request_leaf_set(&only_undeclared, &[]).is_err(), "no resolvable subject is not an empty set");
+    }
+
     #[test]
     fn settlement_uses_every_active_change_request_subject() {
         let request = |scope: &str, id: &str| Subject {
@@ -3337,14 +3380,12 @@ mod subject_tests {
             spec: ConvoySpec::builder().workflow_ref("interactive".to_string()).build(),
             status: Some(status),
         };
-        let addresses = expected_change_request_leaves(&convoy, &BTreeMap::new())
-            .expect("subject leaves")
-            .into_iter()
-            .map(|leaf| leaf.address)
-            .collect::<Vec<_>>();
+        let addresses =
+            expected_change_request_leaves(&convoy, &[]).expect("subject leaves").into_iter().map(|leaf| leaf.address).collect::<Vec<_>>();
         assert_eq!(addresses.len(), 6);
         for subject in [&first, &followup, &other_repo] {
-            assert!(addresses.contains(&subject.leaf().expect("subject address")));
+            let address = crate::address::subject_address(subject, &[]).expect("subject address");
+            assert!(addresses.contains(&crate::address::leaf_for(&address).expect("subject leaf")));
         }
         assert!(subject_relationship_conflicts(&convoy).is_empty(), "plural production is normal");
         let mut adopted = convoy.clone();
@@ -3384,7 +3425,7 @@ mod subject_tests {
             )]),
         );
         assert!(
-            expected_change_request_leaves(&unlinked, &BTreeMap::new()).expect("subject leaves").is_empty(),
+            expected_change_request_leaves(&unlinked, &[]).expect("subject leaves").is_empty(),
             "a claim message alone cannot bypass the persisted subject set"
         );
     }

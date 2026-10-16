@@ -164,7 +164,6 @@ pub struct CrewCompletionClaim<'a> {
 pub fn evaluate_crew_completion(
     convoy: &ResourceObject<Convoy>,
     claim: CrewCompletionClaim<'_>,
-    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     artifacts: &BTreeMap<String, ResourceObject<Artifact>>,
     forges: &[ForgeSpec],
@@ -186,7 +185,7 @@ pub fn evaluate_crew_completion(
     if !crew.promise_exclusions.contains(&pr) && (crew.deliverer || crew.promises.iter().any(|promise| promise.kind == pr)) {
         if let Some(condition) = pr.readiness_condition() {
             if let Some(expectation) =
-                evaluate_declared_completion_condition(convoy, &condition, checkouts, change_requests, artifacts, forges, stale_after, now)?
+                evaluate_declared_completion_condition(convoy, &condition, change_requests, artifacts, forges, stale_after, now)?
             {
                 unmet.push(expectation);
             }
@@ -195,16 +194,8 @@ pub fn evaluate_crew_completion(
     for expectation in &crew.completion_conditions {
         match expectation {
             crate::CrewCompletionExpectation::Condition(condition) => {
-                let result = evaluate_declared_completion_condition(
-                    convoy,
-                    condition,
-                    checkouts,
-                    change_requests,
-                    artifacts,
-                    forges,
-                    stale_after,
-                    now,
-                )?;
+                let result =
+                    evaluate_declared_completion_condition(convoy, condition, change_requests, artifacts, forges, stale_after, now)?;
                 if let Some(expectation) = result {
                     unmet.push(expectation);
                 }
@@ -221,14 +212,13 @@ pub fn evaluate_crew_completion(
 fn evaluate_declared_completion_condition(
     convoy: &ResourceObject<Convoy>,
     condition: &CompletionCondition,
-    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     artifacts: &BTreeMap<String, ResourceObject<Artifact>>,
     forges: &[ForgeSpec],
     stale_after: std::time::Duration,
     now: DateTime<Utc>,
 ) -> Result<Option<UnmetSettlementExpectation>, String> {
-    let change_request_leaves = || expected_change_request_leaves(convoy, checkouts);
+    let change_request_leaves = || expected_change_request_leaves(convoy, forges);
     let evaluate = |leaf: Leaf, subject: Option<&dyn crate::LeafSubject>| -> Result<Option<UnmetSettlementExpectation>, String> {
         let result = crate::evaluate_leaf(&leaf, subject, None)?;
         Ok((result.result != ThreeValue::True).then(|| UnmetSettlementExpectation::CompletionConditionUnsatisfied {
@@ -496,7 +486,7 @@ fn evaluate_exit_with_disposition(
                     .is_some_and(|exit| matches!(exit, ExitDeclaration::Table(_)))
                 // A known subject lets the exit table decide settlement. Old
                 // scan failures remain diagnostic, including stored pre-fix state.
-                && expected_change_request_leaves(convoy, checkouts).is_ok_and(|leaves| leaves.is_empty())
+                && expected_change_request_leaves(convoy, forges).is_ok_and(|leaves| leaves.is_empty())
         });
     if discovery_pending {
         return LandingSettlement {
@@ -511,7 +501,7 @@ fn evaluate_exit_with_disposition(
             disposition: None,
         };
     }
-    let exit = match instantiate_exit(convoy, checkouts) {
+    let exit = match instantiate_exit(convoy, forges) {
         Ok(exit) => exit,
         Err(message) => {
             return LandingSettlement {
@@ -787,7 +777,7 @@ pub fn reconcile(
     template: Option<&ResourceObject<WorkflowTemplate>>,
     now: DateTime<Utc>,
 ) -> ReconcileOutcome {
-    let exit_disposition = matches!(instantiate_exit(convoy, &BTreeMap::new()), Ok(InstantiatedExit::Claim)).then(|| "claim".to_string());
+    let exit_disposition = matches!(instantiate_exit(convoy, &[]), Ok(InstantiatedExit::Claim)).then(|| "claim".to_string());
     let outcome = reconcile_internal(
         convoy,
         template,

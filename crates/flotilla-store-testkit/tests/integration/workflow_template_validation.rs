@@ -1,11 +1,24 @@
 use flotilla_protocol::{IssueRef, IssueSource};
 use flotilla_resources::{
-    admit_leaf, implement_review_workflow_spec, interactive_single_workflow_spec, issue_address, issue_address_with_forges,
-    single_agent_shepherd_workflow_spec, single_agent_workflow_spec, validate, ExitDeclaration, InterpolationField, InterpolationLocation,
-    RepositoryKey, ValidationError, WorkflowTemplateSpec,
+    address::{issue_reference_address, issue_subject_source, leaf_for},
+    admit_leaf, implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_shepherd_workflow_spec,
+    single_agent_workflow_spec, validate, ExitDeclaration, InterpolationField, InterpolationLocation, RepositoryKey, ValidationError,
+    WorkflowTemplateSpec,
 };
 use flotilla_store_testkit::fixtures::{valid_workflow_template_spec, valid_workflow_template_yaml};
 use serde::Deserialize;
+
+/// The leaf text of the subject a convoy derives from a carried issue; the
+/// subject spelling is kept (see `issue_subject_source`).
+fn issue_subject_text(reference: &IssueRef) -> String {
+    let source = issue_subject_source(&reference.source);
+    format!("issue/{}/{}/{}", source.service, source.scope, reference.id)
+}
+
+/// The leaf an issue reference is watched through.
+fn issue_leaf(reference: &IssueRef, forges: &[flotilla_resources::ForgeSpec]) -> Result<flotilla_protocol::LeafAddress, String> {
+    leaf_for(&issue_reference_address(reference, forges)?)
+}
 
 #[derive(Debug, Deserialize)]
 struct WorkflowTemplateDocument {
@@ -262,7 +275,7 @@ vessels:
         .any(|error| matches!(error, ValidationError::InvalidExitLeaf { .. })));
 
     let github = IssueRef { source: IssueSource { service: "https://GitHub.com".into(), scope: "Owner/Repo".into() }, id: "12".into() };
-    assert_eq!(issue_address(&github).expect("github address").to_string(), "issue/github.com/owner/repo/12");
+    assert_eq!(issue_subject_text(&github), "issue/github.com/owner/repo/12");
     assert_eq!(
         flotilla_resources::address::record_name(
             &flotilla_resources::address::stored_issue_address("GitHub.com", "Owner/Repo", 12, &[]).expect("issue address")
@@ -275,7 +288,7 @@ vessels:
     );
     let forgejo =
         IssueRef { source: IssueSource { service: "https://forgejo.example/lab".into(), scope: "Team/Repo".into() }, id: "12".into() };
-    assert_eq!(issue_address(&forgejo).expect("forgejo address").to_string(), "issue/forgejo.example%2flab/Team/Repo/12");
+    assert_eq!(issue_subject_text(&forgejo), "issue/forgejo.example%2flab/Team/Repo/12");
     // ADR 0066 §3: a host no Forge declares is not an address, so it names
     // no issue record.
     assert!(flotilla_resources::address::stored_issue_address("forgejo.example", "Team/Repo", 12, &[]).is_err());
@@ -293,8 +306,8 @@ fn issue_subjects_distinguish_installations_on_one_host() {
     };
     let lab = source("lab");
     let stage = source("stage");
-    let fallback_lab = issue_address(&lab).expect("lab");
-    let fallback_stage = issue_address(&stage).expect("stage");
+    let fallback_lab = issue_subject_text(&lab);
+    let fallback_stage = issue_subject_text(&stage);
     assert_eq!(fallback_lab.to_string(), "issue/forgejo.example%2flab/Team/Repo/12");
     assert_eq!(fallback_stage.to_string(), "issue/forgejo.example%2fstage/Team/Repo/12");
     assert_ne!(fallback_lab, fallback_stage);
@@ -309,18 +322,17 @@ fn issue_subjects_distinguish_installations_on_one_host() {
             .build()
     };
     let forges = [forge("lab", "lab"), forge("stage", "stage")];
-    let lab_address = issue_address_with_forges(&lab, &forges).expect("declared lab");
-    let stage_address = issue_address_with_forges(&stage, &forges).expect("declared stage");
-    assert_eq!(lab_address.to_string(), "issue/lab/Team/Repo/12");
-    assert_eq!(stage_address.to_string(), "issue/stage/Team/Repo/12");
+    let lab_address = issue_leaf(&lab, &forges).expect("declared lab");
+    let stage_address = issue_leaf(&stage, &forges).expect("declared stage");
+    assert_eq!(lab_address.to_string(), "issue/lab/team/repo/12");
+    assert_eq!(stage_address.to_string(), "issue/stage/team/repo/12");
     let lab_alias =
         IssueRef { source: IssueSource { service: "https://lab.example/lab".into(), scope: "Team/Repo".into() }, id: "12".into() };
-    assert_eq!(issue_address_with_forges(&lab_alias, &forges).expect("declared lab alias"), lab_address);
+    assert_eq!(issue_leaf(&lab_alias, &forges).expect("declared lab alias"), lab_address);
+    // An installation path is matched case-insensitively, as the encoded
+    // spelling that path once fell back to already named the lab record.
     let distinct_case = source("Lab");
-    assert_eq!(
-        issue_address_with_forges(&distinct_case, &forges).expect("distinct case").to_string(),
-        "issue/forgejo.example%2flab/Team/Repo/12"
-    );
+    assert_eq!(issue_leaf(&distinct_case, &forges).expect("distinct case"), lab_address);
     assert_ne!(lab_address, stage_address);
     // Each installation's encoded fallback spelling reaches the record its
     // Forge id names, and the two installations keep distinct records.
@@ -339,14 +351,14 @@ fn undeclared_issue_subjects_keep_non_https_schemes_distinct() {
         source: IssueSource { service: format!("{scheme}://tracker.example/root"), scope: "Team/Repo".into() },
         id: "12".into(),
     };
-    assert_eq!(issue_address(&reference("https")).expect("https").to_string(), "issue/tracker.example%2froot/Team/Repo/12");
-    assert_eq!(issue_address(&reference("http")).expect("http").to_string(), "issue/http%3a%2f%2ftracker.example%2froot/Team/Repo/12");
+    assert_eq!(issue_subject_text(&reference("https")), "issue/tracker.example%2froot/Team/Repo/12");
+    assert_eq!(issue_subject_text(&reference("http")), "issue/http%3a%2f%2ftracker.example%2froot/Team/Repo/12");
 }
 
 #[test]
 fn undeclared_single_label_host_has_a_distinct_service_spelling() {
     let reference = IssueRef { source: IssueSource { service: "https://forgejo".into(), scope: "Team/Repo".into() }, id: "12".into() };
-    assert_eq!(issue_address(&reference).expect("single-label host").to_string(), "issue/host%3aforgejo/Team/Repo/12");
+    assert_eq!(issue_subject_text(&reference), "issue/host%3aforgejo/Team/Repo/12");
 }
 
 #[test]
@@ -429,8 +441,7 @@ fn turn_delivery_can_subscribe_to_an_artifact_leaf() {
         flotilla_store_testkit::fixtures::task_provisioning_convoy_spec(),
         Some(flotilla_resources::ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() }),
     );
-    let turns = flotilla_resources::instantiate_turn_delivery(&convoy, &Default::default(), &Default::default(), &[])
-        .expect("instantiate artifact leaf");
+    let turns = flotilla_resources::instantiate_turn_delivery(&convoy, &Default::default(), &[]).expect("instantiate artifact leaf");
     let leaf = &turns.iter().find(|turn| turn.source == "actionable-review").expect("artifact turn").leaf;
     assert!(matches!(&leaf.address, flotilla_protocol::LeafAddress::Artifact { convoy, producer, kind, subject }
         if convoy == "artifact-turn" && producer == "reviewer" && kind == "review-round" && subject == "artifact-turn"));

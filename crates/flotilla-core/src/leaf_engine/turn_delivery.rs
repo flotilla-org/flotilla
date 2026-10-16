@@ -4,10 +4,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
 use flotilla_resources::{
-    address::leaf_record_name, evaluate_leaf, expected_change_request_leaves, external_patches, select_convoy_children, Artifact,
-    ArtifactLeafSubject, ChangeRequest, Checkout, Convoy, ConvoyAttention, ConvoyPhase, HoldAct, Issue, ObservedChecks, ResourceObject,
-    StatusPatch, TerminalSession, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
-    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    address::leaf_record_name, evaluate_leaf, expected_change_request_leaves, external_patches, Artifact, ArtifactLeafSubject,
+    ChangeRequest, Convoy, ConvoyAttention, ConvoyPhase, HoldAct, Issue, ObservedChecks, ResourceObject, StatusPatch, TerminalSession,
+    TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::stalls::{is_active_change_request_probe, is_conflict_probe, is_merged_settlement_probe};
@@ -123,14 +122,14 @@ impl LeafSubscriptionTable {
         }
         let claim = status.crew_work.get(&rule.to.vessel).and_then(|crew| crew.get(&rule.to.role));
         let claim_at = claim.and_then(|claim| claim.finished_at);
-        let active_probe = is_active_change_request_probe(status, rule, leaf);
+        let forges = self.namespace_forges(&namespace).await?;
+        let active_probe = is_active_change_request_probe(status, rule, leaf, &forges);
         // A cached row can fire after its target stalls or settles, before the
         // reconciler removes it. Judge eligibility against the current status.
         if (status.phase == ConvoyPhase::Active || is_merged_settlement_probe(leaf)) && !active_probe {
             return Ok(());
         }
         let active_conflict = active_probe && is_conflict_probe(leaf);
-        let forges = self.namespace_forges(&namespace).await?;
         let (subject_revision, evidence_at, brief, message_subject) = match &leaf.address {
             LeafAddress::ChangeRequest { service, scope, number } => {
                 let record_name = leaf_record_name(&leaf.address, &forges)?;
@@ -295,10 +294,7 @@ impl LeafSubscriptionTable {
                         ..
                     })
                 ) {
-                    let checkout_sources =
-                        self.inner.backend.including_replicas::<Checkout>(&namespace).list().await.map_err(|error| error.to_string())?;
-                    let checkouts = select_convoy_children(&convoy, &checkout_sources.items);
-                    let leaves = expected_change_request_leaves(&convoy, &checkouts)?;
+                    let leaves = expected_change_request_leaves(&convoy, &forges)?;
                     let mut bound_to_current_head = false;
                     for candidate in leaves {
                         if !matches!(candidate.address, LeafAddress::ChangeRequest { .. }) {

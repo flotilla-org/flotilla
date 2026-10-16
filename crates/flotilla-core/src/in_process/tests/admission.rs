@@ -188,7 +188,7 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
     .await
     .expect("claim discovery");
     let with_followup = convoys.get("multi-repo").await.expect("convoy with follow-up");
-    let leaves = flotilla_resources::expected_change_request_leaves(&with_followup, &BTreeMap::new()).expect("subject leaves");
+    let leaves = flotilla_resources::expected_change_request_leaves(&with_followup, &[]).expect("subject leaves");
     assert_eq!(leaves.len(), 6, "all three produced change requests require terminal observations");
     assert!(daemon
         .link_convoy_subject("flotilla", "multi-repo", "wheelhouze/cleat!12", Some(flotilla_protocol::Relationship::Produces))
@@ -210,7 +210,7 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         .await
         .expect("operator resolution");
     let superseded = convoys.get("multi-repo").await.expect("convoy with superseded request");
-    let leaves = flotilla_resources::expected_change_request_leaves(&superseded, &BTreeMap::new()).expect("subject leaves");
+    let leaves = flotilla_resources::expected_change_request_leaves(&superseded, &[]).expect("subject leaves");
     assert_eq!(leaves.len(), 4, "supersedes releases only the replaced change request");
 }
 
@@ -605,7 +605,7 @@ fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
 // back to the same address. A host no Forge declares makes no key (ADR 0066 §3).
 #[test]
 fn standalone_issue_source_lookup_round_trips_installation_identity() {
-    use flotilla_resources::address::{leaf_address, stored_issue_address};
+    use flotilla_resources::address::stored_issue_address;
 
     let lab = flotilla_resources::ForgeSpec::builder()
         .forge_id("lab".into())
@@ -630,8 +630,8 @@ fn standalone_issue_source_lookup_round_trips_installation_identity() {
         let source = issue_source_for_subject(&subject, &forges).expect("source");
         assert_eq!(source.service, expected);
         let reference = flotilla_protocol::IssueRef { source, id: "12".into() };
-        let leaf = flotilla_resources::issue_address_with_forges(&reference, &forges).expect("round trip");
-        assert_eq!(leaf_address(&leaf, &forges).as_ref(), Ok(subject.address()), "{service}");
+        let address = flotilla_resources::address::issue_reference_address(&reference, &forges).expect("round trip");
+        assert_eq!(&address, subject.address(), "{service}");
     }
     for undeclared in ["forgejo.example%2flab", "http%3a%2f%2fforgejo.example%2flab", "host%3aforgejo"] {
         assert!(stored_issue_address(undeclared, "Team/Repo", 12, &[]).is_err(), "{undeclared}");
