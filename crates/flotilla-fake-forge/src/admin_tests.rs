@@ -471,3 +471,15 @@ async fn check_api_view(harness: &Harness, model: &[Expected]) {
         model.iter().enumerate().filter(|(_, item)| !item.pull && item.open && item.ready).map(|(index, _)| index as u64 + 1).collect();
     assert_eq!(ready, expected_ready, "the label filter returns exactly the open `ready` issues");
 }
+
+// Behaviour: token comparison accepts exactly the expected token. The
+// generator draws short tokens over a two-letter alphabet, so equal tokens,
+// prefixes, extensions and single-byte differences all occur.
+#[hegel::test]
+fn tokens_match_only_the_expected_token(tc: hegel::TestCase) {
+    let draw = |tc: &hegel::TestCase| -> String {
+        (0..tc.draw(gs::integers::<usize>().min_value(0).max_value(4))).map(|_| if tc.draw(gs::booleans()) { 'a' } else { 'b' }).collect()
+    };
+    let (presented, expected) = (draw(&tc), draw(&tc));
+    assert_eq!(crate::api::tokens_match(&presented, &expected), presented == expected);
+}

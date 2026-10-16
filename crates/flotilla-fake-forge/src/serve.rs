@@ -125,8 +125,11 @@ pub async fn start(config: &Config, forge: Arc<FakeForge>) -> Result<Running, St
 pub async fn run(path: &Path) -> Result<(), StartupError> {
     let config = Config::load(path)?;
     let forge = build_forge(&config, Arc::new(SystemClock))?;
+    // Watch for signals before listening, so one that arrives during startup
+    // still drains gracefully rather than taking the default action.
+    let shutdown = shutdown_signal()?;
     let running = start(&config, forge).await?;
-    shutdown_signal().await?;
+    shutdown.await;
     tracing::info!("fake forge shutting down");
     running.shutdown().await;
     Ok(())
@@ -189,6 +192,8 @@ async fn accept_loop(
     drop(listener);
     let drained = tokio::time::timeout(DRAIN_TIMEOUT, async { while connections.join_next().await.is_some() {} }).await;
     if drained.is_err() {
+        // Returning drops `connections`, which aborts every connection task
+        // still open, such as a keep-alive client that never finishes.
         tracing::warn!(listener = listener_name, open = connections.len(), "fake forge closed connections that did not finish draining");
     }
 }
@@ -226,21 +231,31 @@ async fn serve_connection(
     }
 }
 
+/// Register for SIGTERM and SIGINT now; the returned future resolves on the
+/// first of them.
 #[cfg(unix)]
-async fn shutdown_signal() -> Result<(), StartupError> {
+fn shutdown_signal() -> Result<impl std::future::Future<Output = ()>, StartupError> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut terminate = signal(SignalKind::terminate()).map_err(|error| StartupError::new(format!("cannot watch SIGTERM: {error}")))?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| StartupError::new(format!("cannot watch SIGINT: {error}")))?;
-    tokio::select! {
-        _ = terminate.recv() => {}
-        _ = interrupt.recv() => {}
-    }
-    Ok(())
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
 }
 
+/// Rehearsal hosts are Linux; elsewhere Ctrl-C stops the service, watched
+/// from the first poll.
 #[cfg(not(unix))]
-async fn shutdown_signal() -> Result<(), StartupError> {
-    tokio::signal::ctrl_c().await.map_err(|error| StartupError::new(format!("cannot watch Ctrl-C: {error}")))
+fn shutdown_signal() -> Result<impl std::future::Future<Output = ()>, StartupError> {
+    Ok(async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "fake forge cannot watch Ctrl-C");
+            std::future::pending::<()>().await;
+        }
+    })
 }
 
 #[cfg(test)]

@@ -63,6 +63,9 @@ async fn serves_both_apis_over_https_and_survives_a_failed_handshake() {
     let mut plain = TcpStream::connect(running.api_addr()).await.expect("connect");
     plain.write_all(b"GET /lab/api/v1/user HTTP/1.1\r\nhost: localhost\r\n\r\n").await.expect("write");
     drop(plain);
+    // A connection that never starts its handshake does not hold up others:
+    // each handshake runs in its own task, bounded by the handshake timeout.
+    let stalled = TcpStream::connect(running.api_addr()).await.expect("connect");
 
     let user = client
         .get(format!("{api}/lab/api/v1/user"))
@@ -74,6 +77,7 @@ async fn serves_both_apis_over_https_and_survives_a_failed_handshake() {
     assert_eq!(user.status(), reqwest::StatusCode::OK);
     let user: serde_json::Value = user.json().await.expect("JSON");
     assert_eq!(user["login"], "lab-bot");
+    drop(stalled);
 
     let issue = client
         .post(format!("{admin}/admin/v1/forges/lab/repos/flotilla-org/flotilla/issues"))

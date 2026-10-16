@@ -22,7 +22,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
-    api::{failure_response, json_response, Failure, Query, MAX_BODY_BYTES, MERGE_STYLES},
+    api::{self, failure_response, json_response, Failure, Query, MAX_BODY_BYTES, MERGE_STYLES},
     model::{CheckState, FakeForge, ItemEdit, ItemState, NewIssue, NewPull, NewReview, RepoRef, ReviewState},
 };
 
@@ -324,7 +324,7 @@ impl Call<'_> {
     fn authenticate(&self) -> Result<(), Failure> {
         let authorization = self.headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok());
         match authorization.and_then(|value| value.strip_prefix("Bearer ")) {
-            Some(presented) if presented == self.admin.token => Ok(()),
+            Some(presented) if api::tokens_match(presented, &self.admin.token) => Ok(()),
             Some(_) => Err(Failure::refuse(StatusCode::UNAUTHORIZED, "admin token is not valid")),
             None => Err(Failure::refuse(StatusCode::UNAUTHORIZED, "admin requests must send `Authorization: Bearer <admin token>`")),
         }

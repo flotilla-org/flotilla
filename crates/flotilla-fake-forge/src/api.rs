@@ -244,7 +244,7 @@ impl Call<'_> {
         }
         let authorization = self.headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok());
         match authorization.and_then(|value| value.strip_prefix("token ")) {
-            Some(presented) if presented == token => Ok(()),
+            Some(presented) if tokens_match(presented, token) => Ok(()),
             Some(_) => Err(Failure::refuse(StatusCode::UNAUTHORIZED, "token is not valid for this forge")),
             None => Err(Failure::refuse(StatusCode::UNAUTHORIZED, "requests must send `Authorization: token <token>`")),
         }
@@ -374,6 +374,14 @@ impl OwnedUrls {
     fn as_urls(&self) -> Urls<'_> {
         Urls { service_url: &self.service_url, repository: &self.repository }
     }
+}
+
+/// Compare a presented token with the expected one in time independent of
+/// where they differ, so response timing does not reveal a token prefix.
+pub(crate) fn tokens_match(presented: &str, expected: &str) -> bool {
+    let (presented, expected) = (presented.as_bytes(), expected.as_bytes());
+    let difference = presented.iter().zip(expected).fold(0_u8, |difference, (left, right)| difference | (left ^ right));
+    presented.len() == expected.len() && difference == 0
 }
 
 fn parse_number(value: &str) -> Result<u64, Failure> {
