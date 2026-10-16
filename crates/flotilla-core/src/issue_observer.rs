@@ -204,7 +204,7 @@ impl IssueRefresher {
             .lock()
             .await
             .keys()
-            .filter(|subject| stored_spelling_names(hint, &subject.service, &subject.scope, subject.number))
+            .filter(|subject| stored_spelling_names(hint, &subject.service, &subject.scope, subject.number, &[]))
             .cloned()
             .collect::<Vec<_>>();
         let mut first_error = None;

@@ -382,7 +382,7 @@ impl ChangeRequestRefresher {
             .iter()
             .filter(|(subject, refresh)| {
                 !refresh.demands.is_empty()
-                    && flotilla_resources::address::stored_spelling_names(hint, &subject.service, &subject.scope, subject.number)
+                    && flotilla_resources::address::stored_spelling_names(hint, &subject.service, &subject.scope, subject.number, &[])
             })
             .map(|(subject, _)| subject.clone())
             .collect::<Vec<_>>();

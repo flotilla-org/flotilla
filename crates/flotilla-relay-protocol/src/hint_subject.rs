@@ -21,7 +21,9 @@ pub fn hint_subject(address: &Address) -> Option<String> {
 }
 
 /// Parses a hint subject to its address. Hints name only public GitHub
-/// change requests and issues; anything else is refused.
+/// change requests and issues; anything else is refused. The canonical
+/// address text is accepted too, so the relay may move to it after a fleet
+/// roll without a consumer change.
 pub fn parse_hint_subject(subject: &str) -> Result<Address, Error> {
     let address = resolve(subject, &BuiltinForges)?;
     match address.kind() {
@@ -63,5 +65,10 @@ mod tests {
         }
         assert!(parse_hint_subject("forge:lab/repo:a%2Fb/cr:1").is_err(), "hints name public GitHub only");
         assert!(parse_hint_subject("convoy:demo").is_err());
+        assert_eq!(
+            parse_hint_subject("forge:github/repo:codertocat%2Fhello-world/cr:2"),
+            parse_hint_subject("cr/github.com/codertocat/hello-world/2"),
+            "canonical text is the same subject"
+        );
     }
 }

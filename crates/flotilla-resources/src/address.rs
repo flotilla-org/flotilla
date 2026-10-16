@@ -55,6 +55,9 @@ impl ForgeLookup for ForgeDirectory<'_> {
     }
 
     fn forge_by_host(&self, host: &str) -> Option<AddressForge> {
+        // Forge admission refuses overlapping claims, so an ambiguous host is
+        // a configuration fault; it resolves to nothing here, while
+        // `repository_address` names it in its error.
         match self.forges.iter().filter(|spec| spec.matches_host(host)).collect::<Vec<_>>().as_slice() {
             [spec] => Self::forge(spec),
             _ => None,
@@ -141,12 +144,20 @@ pub fn stored_service_scope(address: &Address) -> Option<(String, String)> {
 }
 
 /// Whether a stored `(service, scope, number)` names the change request or
-/// issue `address`, comparing addresses rather than spellings.
-pub fn stored_spelling_names(address: &Address, service: &str, scope: &str, number: u64) -> bool {
+/// issue `address`, comparing addresses rather than spellings. A host or URL
+/// spelling resolves only through `forges`; with none, only `github.com`,
+/// `github` and forge-id spellings can match.
+pub fn stored_spelling_names(address: &Address, service: &str, scope: &str, number: u64, forges: &[ForgeSpec]) -> bool {
     address.number() == Some(number)
         && address
             .parent()
-            .is_some_and(|repository| stored_repository_address(service, scope, &[]).is_ok_and(|stored| stored == repository))
+            .is_some_and(|repository| stored_repository_address(service, scope, forges).is_ok_and(|stored| stored == repository))
+}
+
+/// Whether a repository remote URL is the repository `repository` names.
+/// An unresolvable remote names nothing.
+pub fn remote_names_repository(remote: &str, forges: &[ForgeSpec], repository: &Address) -> bool {
+    repository_address(remote, forges).is_ok_and(|address| &address == repository)
 }
 
 /// The canonical stored spelling of a `(service, scope)` pair: the pair
@@ -231,6 +242,55 @@ mod tests {
         assert_eq!(canonical_stored_spelling("github", "Codertocat/Hello-World"), ("github.com".into(), "codertocat/hello-world".into()));
         assert_eq!(canonical_stored_spelling("forgejo.example", "Lab/Repo"), ("forgejo.example".into(), "Lab/Repo".into()));
         assert_eq!(canonical_stored_spelling("lab", "Lab/Repo"), ("lab".into(), "Lab/Repo".into()));
+    }
+
+    // A repository behind a declared `github` Forge, reached through one of
+    // its SSH aliases, is the built-in forge's repository: a relay hint for
+    // it matches (the old spelling comparison never did).
+    #[test]
+    fn a_declared_github_alias_names_the_builtin_repository() {
+        let github = ForgeSpec::builder()
+            .forge_id("github".into())
+            .kind(ForgeKind::Github)
+            .hosts(BTreeSet::from(["github-alias".to_string(), "github.com".to_string()]))
+            .https_url("https://github.com".into())
+            .git_ssh_host("github-alias".into())
+            .build();
+        let hint = flotilla_address::resolve("cr/github.com/org/repo/7", &flotilla_address::BuiltinForges).expect("hint");
+        let repository = hint.parent().expect("repository");
+        assert!(remote_names_repository("git@github-alias:Org/Repo.git", &[github], &repository));
+        assert!(!remote_names_repository("git@github-alias:Org/Repo.git", &[], &repository), "an undeclared alias names nothing");
+        assert!(!remote_names_repository("https://github.com/org/other", &[], &repository));
+    }
+
+    // `decode_service` inverts the spelling `issue_address_with_forges`
+    // writes for an issue source no Forge declared, including path prefixes.
+    #[test]
+    fn decode_service_inverts_the_undeclared_issue_spelling() {
+        let installed = ForgeSpec::builder()
+            .forge_id("lab".into())
+            .kind(ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["forge.example".to_string()]))
+            .https_url("https://forge.example/install".into())
+            .git_ssh_host("forge.example".into())
+            .build();
+        for service_url in ["https://forge.example/install", "http://forge.example/install"] {
+            let reference = flotilla_protocol::IssueRef {
+                source: flotilla_protocol::IssueSource { service: service_url.into(), scope: "Team/Repo".into() },
+                id: "3".into(),
+            };
+            let flotilla_protocol::LeafAddress::Issue { service, scope, .. } =
+                crate::issue_address_with_forges(&reference, &[]).expect("leaf")
+            else {
+                panic!("issue leaf")
+            };
+            let expected = "forge:lab/repo:team%2Frepo";
+            assert_eq!(
+                stored_repository_address(&service, &scope, std::slice::from_ref(&installed)).map(|a| a.to_string()).as_deref(),
+                Ok(expected),
+                "{service}"
+            );
+        }
     }
 
     #[test]

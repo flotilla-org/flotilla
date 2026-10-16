@@ -2813,7 +2813,10 @@ impl InProcessDaemon {
         else {
             return Ok(());
         };
+        // Transitional (#3359): convoy subjects are still the protocol
+        // `Subject`, so the hint goes back through its wire text to match them.
         let subject = flotilla_protocol::ReferenceContext::default().parse(&hint_text)?;
+        let Some(hint_repository) = hint.parent() else { return Ok(()) };
         let namespace = self.provisioning_namespace().await;
         let forges = self
             .resource_backend
@@ -2830,7 +2833,7 @@ impl InProcessDaemon {
                 .spec
                 .repositories
                 .iter()
-                .any(|repository| flotilla_resources::address::repository_address(&repository.url, &forges).ok() == hint.parent());
+                .any(|repository| flotilla_resources::address::remote_names_repository(&repository.url, &forges, &hint_repository));
             if !matches_repository {
                 continue;
             }
