@@ -25,6 +25,8 @@ pub(crate) struct TableSql {
     /// The root's and `records` tables' column-shaped fields, each with the statement an edge
     /// sets it with: the root's also moves the version (`?1`) under the optimistic check.
     pub fields: Vec<FieldSql>,
+    /// Each label-plus-data state's label field and data fields, which one statement sets.
+    pub groups: Vec<GroupSql>,
     /// `records` and `history` tables: the last position under one parent row, by primary-key
     /// range; no row when the parent row does not exist, a null when it has no rows yet.
     /// Parameters: the owner, then the parent's key.
@@ -36,6 +38,23 @@ pub(crate) struct FieldSql {
     pub name: String,
     pub columns: Range<usize>,
     pub update: String,
+    /// The label-plus-data state the field belongs to (its label or a datum): an index into
+    /// [`TableSql::groups`].
+    pub group: Option<usize>,
+}
+
+/// A label-plus-data state's fields (the label field, then its column datums in declaration
+/// order, as indexes into [`TableSql::fields`]) and the one statement that sets any of them.
+///
+/// The per-label CHECK holds after every statement, so a label change and the data it brings or
+/// leaves behind are written together. Each field has a flag parameter, then one parameter per
+/// column; a column whose field's flag is 0 keeps its value (`CASE WHEN ?flag THEN ?value ELSE
+/// "column" END`), so the statement writes exactly the fields an edge names. On the root, `?1` is
+/// the new version and the last two parameters the id and the expected version; on a `records`
+/// row, the last parameters are the owner and the row's key.
+pub(crate) struct GroupSql {
+    pub fields: Vec<usize>,
+    pub update: String,
 }
 
 pub(crate) struct KindSql {
@@ -43,6 +62,9 @@ pub(crate) struct KindSql {
     pub root_update_version: String,
     pub root_delete: String,
     pub root_version: String,
+    /// Per root state field (by its label field's name): the version and the stored label, which
+    /// an edge reads inside its write to check the stamp and the event's `from`.
+    pub labels: BTreeMap<String, String>,
     /// Declared indexes by declared name.
     pub indexes: BTreeMap<String, IndexSql>,
     /// The startup scan: this kind's resources homed at `?1`, by id, through
@@ -92,6 +114,15 @@ impl KindSql {
             root_update_version: format!("UPDATE {root} SET \"version\" = ?1 WHERE \"id\" = ?2 AND \"version\" = ?3"),
             root_delete: format!("DELETE FROM {root} WHERE \"id\" = ?1 AND \"version\" = ?2"),
             root_version: format!("SELECT \"version\" FROM {root} WHERE \"id\" = ?1"),
+            labels: set.tables[0]
+                .fields
+                .iter()
+                .filter(|field| field.is_label())
+                .map(|field| {
+                    let label = quote_ident(&set.tables[0].columns[field.columns.start].name);
+                    (field.name.clone(), format!("SELECT \"version\", {label} FROM {root} WHERE \"id\" = ?1"))
+                })
+                .collect(),
             // Root indexes page resources; an index on a nested table (an edge log's) serves history
             // reads, which have no query API yet.
             indexes: set
@@ -122,6 +153,9 @@ impl KindSql {
             for field in &table.fields {
                 out.push((format!("{} set {}", table.name, field.name), field.update.clone()));
             }
+            for group in &table.groups {
+                out.push((format!("{} set state {}", table.name, table.fields[group.fields[0]].name), group.update.clone()));
+            }
             if !table.last_position.is_empty() {
                 out.push((format!("{} last position", table.name), table.last_position.clone()));
             }
@@ -130,6 +164,9 @@ impl KindSql {
         out.push((format!("{root} update version"), self.root_update_version.clone()));
         out.push((format!("{root} delete"), self.root_delete.clone()));
         out.push((format!("{root} version"), self.root_version.clone()));
+        for (field, sql) in &self.labels {
+            out.push((format!("{root} label {field}"), sql.clone()));
+        }
         for index in self.indexes.values() {
             out.push((format!("index {} first", index.object), index.first.clone()));
             out.push((format!("index {} after", index.object), index.after.clone()));
@@ -232,10 +269,17 @@ impl TableSql {
             )
         };
         let state_columns = table.fields.iter().filter(|field| field.state).flat_map(|field| field.columns.clone()).collect();
-        let fields = match table.role {
-            TableRole::Root | TableRole::Records => table.fields.iter().map(|field| FieldSql::render(table, field)).collect(),
-            TableRole::Child | TableRole::History => Vec::new(),
+        let (mut fields, groups): (Vec<FieldSql>, Vec<GroupSql>) = match table.role {
+            TableRole::Root | TableRole::Records => {
+                (table.fields.iter().map(|field| FieldSql::render(table, field)).collect(), GroupSql::render_all(table))
+            }
+            TableRole::Child | TableRole::History | TableRole::State => (Vec::new(), Vec::new()),
         };
+        for (index, group) in groups.iter().enumerate() {
+            for &field in &group.fields {
+                fields[field].group = Some(index);
+            }
+        }
         let last_position = match (table.role, table.parent) {
             (TableRole::Records | TableRole::History, Some(parent)) => last_position(&set.tables[parent], table),
             _ => String::new(),
@@ -247,6 +291,7 @@ impl TableSql {
             field: table.field.clone(),
             state_columns,
             fields,
+            groups,
             last_position,
             key_len: table.key.len(),
             columns,
@@ -273,7 +318,49 @@ impl FieldSql {
                 table.key.iter().enumerate().map(|(n, key)| format!(" AND {} = ?{}", quote_ident(&key.name), owner + 1 + n)).collect();
             format!("UPDATE {name} SET {} WHERE \"owner\" = ?{owner}{}", set.join(", "), key.concat())
         };
-        FieldSql { name: field.name.clone(), columns: field.columns.clone(), update }
+        FieldSql { name: field.name.clone(), columns: field.columns.clone(), update, group: None }
+    }
+}
+
+impl GroupSql {
+    /// One group per label field that has column datums.
+    fn render_all(table: &Table) -> Vec<GroupSql> {
+        table
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.is_label())
+            .filter_map(|(label, field)| {
+                let datums = table.fields.iter().enumerate().filter(|(_, datum)| datum.datum_of.as_deref() == Some(field.name.as_str()));
+                let mut members = vec![label];
+                members.extend(datums.map(|(index, _)| index));
+                (members.len() > 1).then(|| GroupSql::render(table, members))
+            })
+            .collect()
+    }
+
+    fn render(table: &Table, fields: Vec<usize>) -> GroupSql {
+        let name = quote_ident(&table.name);
+        let root = table.parent.is_none();
+        let mut next = if root { 2 } else { 1 };
+        let mut sets = Vec::new();
+        for &field in &fields {
+            let flag = next;
+            next += 1;
+            for column in &table.columns[table.fields[field].columns.clone()] {
+                let column = quote_ident(&column.name);
+                sets.push(format!("{column} = CASE WHEN ?{flag} THEN ?{next} ELSE {column} END"));
+                next += 1;
+            }
+        }
+        let update = if root {
+            format!("UPDATE {name} SET \"version\" = ?1, {} WHERE \"id\" = ?{next} AND \"version\" = ?{}", sets.join(", "), next + 1)
+        } else {
+            let key: Vec<String> =
+                table.key.iter().enumerate().map(|(n, key)| format!(" AND {} = ?{}", quote_ident(&key.name), next + 1 + n)).collect();
+            format!("UPDATE {name} SET {} WHERE \"owner\" = ?{next}{}", sets.join(", "), key.concat())
+        };
+        GroupSql { fields, update }
     }
 }
 

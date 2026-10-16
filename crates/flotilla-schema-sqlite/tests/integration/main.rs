@@ -14,6 +14,7 @@ mod registry;
 mod renames;
 mod representation;
 mod round_trip;
+mod states;
 mod tables;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;

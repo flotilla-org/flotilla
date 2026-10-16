@@ -24,6 +24,11 @@ pub enum StoreError {
     /// Optimistic concurrency: the resource changed since the caller loaded `expected`.
     #[error("resource {id} is no longer at version {expected}")]
     Conflict { id: ResourceId, expected: u64 },
+    /// An edge whose event leaves label `from` while the stored state `field` holds label
+    /// `stored`, at the version the caller read (#3373 ruling 5). Checked inside the write, after
+    /// the version: a stale stamp is `Conflict` whatever the label.
+    #[error("resource {id}: the edge leaves label {from} of {field}, which holds label {stored}")]
+    WrongFrom { id: ResourceId, field: String, from: i64, stored: i64 },
     #[error("a {kind} resource named {name} already exists here")]
     Exists { kind: KindCode, name: String },
     /// A spec edit (`update`) changed what only an edge writes: a `state` column (`column` is

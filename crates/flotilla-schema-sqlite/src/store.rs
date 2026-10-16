@@ -12,8 +12,8 @@ use std::{
 };
 
 use flotilla_schema::{
-    ColumnType, DdlMode, DecodeError, Decoder, Edge, EdgeParts, Encoder, Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry, Row,
-    RowChange, RowOp, RowPath, Rows, TableRole, Value,
+    ColumnType, DdlMode, DecodeError, Decoder, Edge, EdgeParts, EdgeRow, Encoder, Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry,
+    Row, RowChange, RowEdit, RowOp, RowPath, Rows, TableRole, Value,
 };
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
@@ -363,8 +363,9 @@ impl Write<'_> {
 
     /// The spec edit: writes only the rows that differ between `current.value` and `next`,
     /// refusing if the resource moved past `current.version`. A write with no row changes is a
-    /// no-op. What edges write is refused (`NotThroughEdge`): a changed `state` column, and any
-    /// append to, change of or removal from a `records` or `history` table. Rows nested in a spec
+    /// no-op. What edges write is refused (`NotThroughEdge`): a changed `state` column (a label,
+    /// its `since` or a column datum), and any append to, change of or removal from a `records`,
+    /// `history` or state data table. Rows nested in a spec
     /// child row the edit inserts or removes go with it, and an inserted one is stamped with this
     /// write's version. State and records move only through [`Write::apply_edge`].
     pub fn update<K: Kind>(&mut self, current: &Loaded<K>, next: &K) -> Result<Stamp, StoreError> {
@@ -380,11 +381,18 @@ impl Write<'_> {
     /// Applies one edge to a resource homed here, as one write at the next home sequence: the
     /// event and every declared append go in at their table's next position under their parent
     /// row (read backwards through the primary key), stamped with the write's sequence; the
-    /// declared fields are set by their own statements, so no other column is written; one
-    /// `change_log` entry holds exactly those row operations, with a `PutObject` for every object
-    /// the edge's values name. Refused like `update`: `NotHome`, then `Conflict` or `NotFound`
-    /// when the resource is not at `current.version`. An edge on a `records` row that does not
-    /// exist is `NoRecord`; nothing is written by a refused edge.
+    /// declared fields are set by their own statements (a label-plus-data state's label and data
+    /// by one, so its per-label CHECK holds), and its collection data rows are inserted, updated
+    /// and deleted one at a time, so no other column or row is written; one `change_log` entry
+    /// holds exactly those row operations, with a `PutObject` for every object the edge's values
+    /// name.
+    ///
+    /// Refusals, in order, all inside this write's transaction (#3373 ruling 5): `NotFound`,
+    /// `WrongKind` or `NotHome` for a resource this store may not write; then `Conflict` (or
+    /// `NotFound` once deleted) when the stored version is not `current.version`; then `WrongFrom`
+    /// when the stored label of the edge's state is not the event's `from`; then `NoRecord` for an
+    /// edge on a `records` row that does not exist. Nothing is written by a refused edge, and the
+    /// transaction stays usable.
     pub fn apply_edge<K: Kind>(&mut self, current: Stamp, edge: Edge<K>) -> Result<Stamp, StoreError> {
         let parts = edge.into_parts();
         self.guarded(|ctx| ctx.apply_edge::<K>(current, parts))
@@ -722,15 +730,27 @@ impl Ctx<'_> {
     fn apply_edge<K: Kind>(&mut self, current: Stamp, parts: EdgeParts) -> Result<Stamp, StoreError> {
         let identity = self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
+        let EdgeParts { sets, rows, appends, mut objects, from } = parts;
         // A stale stamp is answered first: the caller re-reads on `Conflict`, which would show
-        // whatever else (such as a missing records row) also makes this edge wrong. The root
-        // update below checks the version again under the write.
-        let stored: Option<i64> =
-            self.conn.prepare_cached(&self.sql(K::CODE)?.root_version)?.query_row([current.id.0], |row| row.get(0)).optional()?;
-        if stored != Some(expected) {
-            return Err(self.stale::<K>(current));
+        // whatever else (a label other than the event's `from`, a missing records row) also makes
+        // this edge wrong. Then the stored label must be the one the event leaves. One read of the
+        // root row by its primary key gives both; the root update below checks the version again
+        // under the write.
+        let select = {
+            let sql = self.sql(K::CODE)?;
+            let table = || sql.tables[0].name.clone();
+            sql.labels.get(from.field).cloned().ok_or_else(|| StoreError::EdgeTarget { table: table(), field: from.field.to_owned() })?
+        };
+        let stored: Option<(i64, i64)> =
+            self.conn.prepare_cached(&select)?.query_row([current.id.0], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+        match stored {
+            Some((version, _)) if version != expected => return Err(self.stale::<K>(current)),
+            None => return Err(self.stale::<K>(current)),
+            Some((_, label)) if label != from.code => {
+                return Err(StoreError::WrongFrom { id: current.id, field: from.field.to_owned(), from: from.code, stored: label });
+            }
+            Some(_) => {}
         }
-        let EdgeParts { sets, appends, mut objects } = parts;
         let (mut root_sets, mut record_sets) = (Vec::new(), Vec::new());
         for set in sets {
             let (table, key) = self.edge_row(K::CODE, set.row)?;
@@ -745,13 +765,27 @@ impl Ctx<'_> {
                 record_sets.push(op);
             }
         }
+        let mut row_ops = Vec::new();
+        for EdgeRow { under, table, edit } in rows {
+            let (parent, parent_key) = self.edge_row(K::CODE, under)?;
+            let index = self.child_table(K::CODE, parent, table, TableRole::State)?;
+            let table = self.sql(K::CODE)?.tables[index].name.clone();
+            let full = |own: Vec<Value>| parent_key.iter().cloned().chain(own).collect();
+            row_ops.push(match edit {
+                RowEdit::Insert { key, values } => RowOp::Insert { table, key: full(key), values },
+                RowEdit::Update { key, values } => RowOp::Update { table, key: full(key), values },
+                RowEdit::Delete { key } => RowOp::Delete { table, key: full(key) },
+            });
+        }
         let (sequence, version) = self.next_sequence()?;
         let hashes = objects.keys().copied().collect();
         let mut ops = self.put_objects(hashes, &mut objects)?;
         let objects = ops.len();
-        // The root's fields first: the first of them is the optimistic version check.
+        // The root's fields first: the first of them is the optimistic version check. Then the
+        // state data rows the edge edits, then its appends.
         ops.extend(root_sets);
         ops.extend(record_sets);
+        ops.extend(row_ops);
         // Positions taken by this edge, per table and parent row, after the first read.
         let mut taken: BTreeMap<(usize, Vec<Value>), i64> = BTreeMap::new();
         for append in appends {
@@ -1003,7 +1037,9 @@ impl Ctx<'_> {
     /// `expected`, later ones find `sequence`), or by a version update when the ops name only
     /// child rows. Returns `false` when the root row is not at `expected`, so the caller can tell
     /// a conflict from a missing resource. A `Set` of a child row that does not exist is
-    /// `NoRecord`.
+    /// `NoRecord`. The contiguous `Set`s of one label-plus-data state of one row run as one
+    /// statement, so the state's per-label CHECK holds after it (a label and the data it brings
+    /// change together).
     fn execute(
         &mut self,
         code: KindCode,
@@ -1038,7 +1074,9 @@ impl Ctx<'_> {
             }
         }
         let moved = Some(sequence);
-        for op in ops {
+        let mut next = 0;
+        while let Some(op) = ops.get(next) {
+            next += 1;
             match op {
                 RowOp::PutObject { hash, bytes } => {
                     if Hash::of(bytes) != *hash {
@@ -1082,18 +1120,68 @@ impl Ctx<'_> {
                 }
                 RowOp::Set { table, key, field, values } => {
                     let (index, field) = self.field_of(code, (table, key, field, values))?;
+                    // A label-plus-data state's fields are set together, by one statement: the
+                    // contiguous `Set`s of one row's state (each field once) form one write.
+                    let mut set: Vec<(usize, &[Value])> = vec![(field, values)];
+                    let group = self.sql(code)?.tables[index].fields[field].group;
+                    if let Some(group) = group {
+                        while let Some(RowOp::Set { table: next_table, key: next_key, field: next_field, values: next_values }) =
+                            ops.get(next)
+                        {
+                            if next_table != table || next_key != key {
+                                break;
+                            }
+                            let (_, member) = self.field_of(code, (next_table, next_key, next_field, next_values))?;
+                            if self.sql(code)?.tables[index].fields[member].group != Some(group)
+                                || set.iter().any(|(set, _)| *set == member)
+                            {
+                                break;
+                            }
+                            set.push((member, next_values));
+                            next += 1;
+                        }
+                    }
                     let mut params = Vec::new();
-                    if index == 0 {
+                    let check = if index == 0 {
                         let Some(expected) = expected else { return Ok(false) };
                         params.push(SqlValue::Integer(sequence));
-                        params.extend(self.params(values)?);
-                        params.extend([SqlValue::Integer(id.0), SqlValue::Integer(expected)]);
+                        Some(expected)
                     } else {
-                        params.extend(self.params(values)?);
-                        params.push(SqlValue::Integer(id.0));
-                        params.extend(self.params(key)?);
+                        None
+                    };
+                    match group {
+                        None => params.extend(self.params(values)?),
+                        Some(group) => {
+                            let members: Vec<(usize, usize)> = {
+                                let table = &self.sql(code)?.tables[index];
+                                table.groups[group].fields.iter().map(|member| (*member, table.fields[*member].columns.len())).collect()
+                            };
+                            for (member, columns) in members {
+                                match set.iter().find(|(set, _)| *set == member) {
+                                    Some((_, values)) => {
+                                        params.push(SqlValue::Integer(1));
+                                        params.extend(self.params(values)?);
+                                    }
+                                    None => {
+                                        params.push(SqlValue::Integer(0));
+                                        params.extend(std::iter::repeat_n(SqlValue::Null, columns));
+                                    }
+                                }
+                            }
+                        }
                     }
-                    let sql = &self.sql(code)?.tables[index].fields[field].update;
+                    match check {
+                        Some(expected) => params.extend([SqlValue::Integer(id.0), SqlValue::Integer(expected)]),
+                        None => {
+                            params.push(SqlValue::Integer(id.0));
+                            params.extend(self.params(key)?);
+                        }
+                    }
+                    let table_sql = &self.sql(code)?.tables[index];
+                    let sql = match group {
+                        None => &table_sql.fields[field].update,
+                        Some(group) => &table_sql.groups[group].update,
+                    };
                     if self.conn.prepare_cached(sql)?.execute(params_from_iter(params))? == 0 {
                         if index == 0 {
                             return Ok(false);
@@ -1302,8 +1390,9 @@ fn changed_state(table: &TableSql, before: &Row, after: &Row) -> Option<String> 
 }
 
 /// Per-table row changes between two sorted encodings of one resource, enforcing a spec edit's
-/// limits: `child` rows change freely, except their `state` columns; `records` and `history` rows,
-/// and the child rows nested in them, change only through an edge (`NotThroughEdge`). The one
+/// limits: `child` rows change freely, except their `state` columns; `records`, `history` and
+/// state data rows, and the child rows nested in them, change only through an edge
+/// (`NotThroughEdge`). The one
 /// exception is a row nested in a spec child row this write inserts or removes, which goes with
 /// that row.
 fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Result<Vec<Vec<Change<'r>>>, StoreError> {
@@ -1317,7 +1406,8 @@ fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Re
     for (index, table) in tables.iter().enumerate().skip(1) {
         let parent = table.parent.expect("child tables have a parent");
         let parent_key_len = tables[parent].key_len;
-        let appended = matches!(table.role, TableRole::Records | TableRole::History);
+        // Rows only an edge writes: appended records and history, and state data, edited row by row.
+        let appended = matches!(table.role, TableRole::Records | TableRole::History | TableRole::State);
         // The records or history row a row of this table belongs to, when it is kept by this write.
         let seal = |sealed: &[BTreeMap<&[Value], usize>], row: &Row| {
             if appended {

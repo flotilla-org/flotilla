@@ -95,12 +95,18 @@ impl Layout {
     /// CHECK: the codec writes them no rows while the guard does not hold, and refuses rows there.
     pub fn guard(&mut self, column: &str, value: i64, f: impl FnOnce(&mut Layout)) {
         let frame = self.frames.last_mut().expect("layout has a current table");
-        frame.guards.push(Guard { column: column.to_owned(), value, required: Vec::new(), scope: Vec::new() });
+        frame.guards.push(Guard { column: column.to_owned(), value, required: Vec::new(), scope: Vec::new(), absent: Vec::new() });
         // The table lists guards in the order they open, so an outer CHECK precedes its nested ones.
         // The slot holds a placeholder until `f` returns and the finished guard replaces it; a
         // layout is only read after `finish`, so the placeholder is never observed.
         let slot = self.set.tables[frame.table].guards.len();
-        self.set.tables[frame.table].guards.push(Guard { column: String::new(), value, required: Vec::new(), scope: Vec::new() });
+        self.set.tables[frame.table].guards.push(Guard {
+            column: String::new(),
+            value,
+            required: Vec::new(),
+            scope: Vec::new(),
+            absent: Vec::new(),
+        });
         f(self);
         let frame = self.frames.last_mut().expect("layout has a current table");
         let guard = frame.guards.pop().expect("guard opened above");
@@ -151,8 +157,13 @@ impl Layout {
 
     /// Declares one column-shaped field of the current row: the columns `f` declares are recorded
     /// as the field `name` when the row is the current table's own (not a struct flattened into a
-    /// field). Generated `layout_row` code wraps each column-shaped field of a struct in this.
+    /// field). Generated `layout_row` code wraps each column-shaped field of a struct in this,
+    /// except a `state` field, whose `State` records its own label and data fields.
     pub fn field(&mut self, name: &str, state: bool, f: impl FnOnce(&mut Layout)) {
+        self.record_field(name, state, None, f);
+    }
+
+    fn record_field(&mut self, name: &str, state: bool, datum_of: Option<&str>, f: impl FnOnce(&mut Layout)) {
         let frame = self.frames.last_mut().expect("layout has a current table");
         let (table, record) = (frame.table, frame.field_depth == 0 && !frame.key_mode);
         frame.field_depth += 1;
@@ -160,9 +171,51 @@ impl Layout {
         f(self);
         self.frames.last_mut().expect("layout has a current table").field_depth -= 1;
         let end = self.set.tables[table].columns.len();
-        if record {
-            self.set.tables[table].fields.push(FieldColumns { name: name.to_owned(), columns: start..end, state });
+        // A datum holding a table declares no columns here, and is not a field of the row.
+        if record && (datum_of.is_none() || end > start) {
+            let datum_of = datum_of.map(str::to_owned);
+            self.set.tables[table].fields.push(FieldColumns { name: name.to_owned(), columns: start..end, state, datum_of });
         }
+    }
+
+    /// Declares one datum of a label-plus-data state whose label column is `label`: the columns
+    /// and tables `f` declares are nullable (a datum is null, or has no rows, under a label that
+    /// lacks it), and the returned [`DatumColumns`] say which columns the datum declares and which
+    /// of them a label carrying it requires, for [`Layout::label_guard`]. A datum with columns is
+    /// recorded as a state field of the row, `datum_of` the label; one holding a table is not a
+    /// field (its rows change one at a time).
+    pub fn datum(&mut self, name: &str, label: &str, f: impl FnOnce(&mut Layout)) -> DatumColumns {
+        let frame = self.frames.last_mut().expect("layout has a current table");
+        // A collecting scope: the columns `f` declares directly land in it, nullable, as they would
+        // in a guard, but it renders no CHECK of its own. A data enum inside the datum opens its own
+        // guards, whose controlling tag is in this scope.
+        frame.guards.push(Guard { column: String::new(), value: 0, required: Vec::new(), scope: Vec::new(), absent: Vec::new() });
+        self.record_field(name, true, Some(label), f);
+        let frame = self.frames.last_mut().expect("layout has a current table");
+        let collected = frame.guards.pop().expect("collecting scope pushed above");
+        DatumColumns { columns: collected.scope, required: collected.required }
+    }
+
+    /// Declares the CHECK of one label of a label-plus-data state: while `label = code`, the
+    /// required columns of every datum in `carried` are non-null and every column of the other
+    /// datums is null. `datums` are the state's datums in declaration order and `carried` holds
+    /// the indexes of those this label carries. A label constraining nothing (it carries every
+    /// datum, none of whose columns it requires) emits no CHECK.
+    pub fn label_guard(&mut self, label: &str, code: i64, datums: &[DatumColumns], carried: &[usize]) {
+        let mut required = Vec::new();
+        let mut absent = Vec::new();
+        for (index, datum) in datums.iter().enumerate() {
+            if carried.contains(&index) {
+                required.extend(datum.required.iter().cloned());
+            } else {
+                absent.extend(datum.columns.iter().cloned());
+            }
+        }
+        if required.is_empty() && absent.is_empty() {
+            return;
+        }
+        let table = self.frames.last().expect("layout has a current table").table;
+        self.set.tables[table].guards.push(Guard { column: label.to_owned(), value: code, required, scope: Vec::new(), absent });
     }
 
     /// The name of the table being declared: where generated code places a declared index.
@@ -178,6 +231,14 @@ impl Layout {
         assert_eq!(self.frames.len(), 1, "every nested table closes before the layout finishes");
         self.set
     }
+}
+
+/// The columns one datum of a label-plus-data state declares directly, and those of them a label
+/// carrying the datum requires; see [`Layout::datum`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatumColumns {
+    pub columns: Vec<String>,
+    pub required: Vec<String>,
 }
 
 /// `TerminalSession` becomes `terminal_session`.

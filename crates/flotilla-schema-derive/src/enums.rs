@@ -8,6 +8,17 @@
 //! CHECK. Unit variants of a data enum have no columns and so no guard. A variant field holding a
 //! collection is a nested table `<table>_<field>_<variant>_<subfield>`, which has rows only while
 //! the variant is active.
+//!
+//! An enum with `#[store(labels = L)]` is a machine's state (#3373 ruling 1): its variants are the
+//! labels of the code enum `L`, code for code, and their fields the state's data. It is stored only
+//! under `#[store(state)]`, as `State<Self>`: one label column, `<field>_since`, then one column
+//! group or table per datum, shared by name across the variants that carry it, and one CHECK per
+//! label requiring the label's own data and nulling the data it lacks. A datum is unattributed (its
+//! columns), `child` (a `BTreeMap` or `BTreeSet`: a table keyed by owner plus map key or set value,
+//! changed row by row), `intern`, or `flatten` (a struct without table fields as columns
+//! `<datum>_<field>`, or an `Option` of one with its `<datum>_present` flag, which is null under a
+//! label lacking the datum); it has the same type and attribute in every variant carrying it. A datum's table holds rows only while the label carries it, and decoding refuses rows
+//! otherwise.
 
 use std::collections::BTreeMap;
 
@@ -18,6 +29,7 @@ use syn::{DataEnum, DeriveInput, Fields, Ident};
 use crate::{
     attrs::{self, refuse, refuse_at, TypeAttrs},
     fields::{columns_element, schema, Field, Generics},
+    shape::{Collection, FieldShape},
 };
 
 struct Variant<'a> {
@@ -40,6 +52,7 @@ pub(crate) fn expand(input: &DeriveInput, data: &DataEnum, type_attrs: TypeAttrs
     if data.variants.is_empty() {
         return Err(refuse(&input.ident, "an enum without variants has no values to store"));
     }
+    let labels = type_attrs.labels.as_ref();
     let mut seen: BTreeMap<i64, &Ident> = BTreeMap::new();
     let mut variants = Vec::new();
     for variant in &data.variants {
@@ -47,6 +60,14 @@ pub(crate) fn expand(input: &DeriveInput, data: &DataEnum, type_attrs: TypeAttrs
         let fields = match &variant.fields {
             Fields::Unnamed(fields) => return Err(refuse(fields, "tuple variants cannot be stored; use named fields")),
             Fields::Unit => None,
+            // A label's data is named by the datum alone: shared by name across the labels.
+            Fields::Named(fields) if labels.is_some() => Some(
+                fields
+                    .named
+                    .iter()
+                    .map(|field| Field::parse(field, &input.ident, None).map(|field| Field { state_datum: true, ..field }))
+                    .collect::<syn::Result<Vec<_>>>()?,
+            ),
             Fields::Named(fields) => {
                 let prefix = snake_case(&variant.ident.to_string());
                 Some(fields.named.iter().map(|field| Field::parse(field, &input.ident, Some(&prefix))).collect::<syn::Result<Vec<_>>>()?)
@@ -59,6 +80,10 @@ pub(crate) fn expand(input: &DeriveInput, data: &DataEnum, type_attrs: TypeAttrs
             return Err(refuse_at(span, format_args!("code {code} is used by both `{previous}` and `{}`", variant.ident)));
         }
         variants.push(Variant { ident: &variant.ident, code, fields });
+    }
+    let codes: Vec<i64> = seen.keys().copied().collect();
+    if let Some(labels) = labels {
+        return labels_enum(input, labels, &variants, &codes);
     }
     // `A { b_c }` and `AB { c }` would both name the column `a_b_c`; refuse here with a span
     // rather than leave it to the descriptor's duplicate-column check at runtime.
@@ -79,7 +104,6 @@ pub(crate) fn expand(input: &DeriveInput, data: &DataEnum, type_attrs: TypeAttrs
             }
         }
     }
-    let codes: Vec<i64> = seen.keys().copied().collect();
     if variants.iter().all(|variant| variant.fields.is_none()) {
         Ok(code_enum(input, &variants, &codes))
     } else {
@@ -149,6 +173,10 @@ fn code_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[i64]) -> To
         let (ident, code) = (variant.ident, variant.code);
         quote!(::core::option::Option::Some(#code) => ::core::option::Option::Some(Self::#ident))
     });
+    let state_arms = variants.iter().map(|variant| {
+        let (ident, code) = (variant.ident, variant.code);
+        quote!(#code => ::core::result::Result::Ok(Self::#ident))
+    });
     quote! {
         #[automatically_derived]
         impl #impl_generics #schema::Columns for #ident #ty_generics #where_clause {
@@ -198,6 +226,52 @@ fn code_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[i64]) -> To
                 match self {
                     #(#arms,)*
                 }
+            }
+        }
+
+        // A code enum is its own label: a state that carries no data.
+        #[automatically_derived]
+        impl #impl_generics #schema::Labelled for #ident #ty_generics #where_clause {
+            type Label = Self;
+
+            fn label(&self) -> &Self {
+                self
+            }
+        }
+
+        #[automatically_derived]
+        impl #impl_generics #schema::StateData for #ident #ty_generics #where_clause {
+            const TABLES: usize = 0;
+            const CODES: &'static [i64] = &[#(#codes),*];
+            const DATA: &'static [&'static str] = &[];
+
+            fn code(&self) -> i64 {
+                <Self as #schema::CodeEnum>::code(self)
+            }
+
+            fn layout_data(_layout: &mut #schema::Layout, _label: &str) {}
+
+            fn encode_data(&self, _e: &mut #schema::Encoder) -> ::core::result::Result<(), #schema::EncodeError> {
+                ::core::result::Result::Ok(())
+            }
+
+            fn encode_absent_data(_e: &mut #schema::Encoder) -> ::core::result::Result<(), #schema::EncodeError> {
+                ::core::result::Result::Ok(())
+            }
+
+            fn decode_data(code: i64, _d: &mut #schema::Decoder) -> ::core::result::Result<Self, #schema::DecodeError> {
+                match code {
+                    #(#state_arms,)*
+                    code => ::core::result::Result::Err(#schema::DecodeError::Code { column: ::std::string::String::new(), code }),
+                }
+            }
+
+            fn decode_absent_data(_d: &mut #schema::Decoder) -> ::core::result::Result<(), #schema::DecodeError> {
+                ::core::result::Result::Ok(())
+            }
+
+            fn delta(_previous: &Self, _next: &Self, _delta: &mut #schema::StateDelta) -> ::core::result::Result<(), #schema::EncodeError> {
+                ::core::result::Result::Ok(())
             }
         }
 
@@ -320,4 +394,242 @@ fn data_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[i64]) -> To
 
         #element
     }
+}
+
+/// One datum of a label-plus-data state: its first declaration, and the labels carrying it.
+struct Datum<'v, 'a> {
+    field: &'v Field<'a>,
+    /// The carrying labels' variants, in declaration order.
+    variants: Vec<&'a Ident>,
+    codes: Vec<i64>,
+    /// Its index among the state's datums.
+    index: usize,
+}
+
+impl Datum<'_, '_> {
+    /// `Option<&Datum>` of `value` (an expression of type `&Self`): `None` under a label lacking it.
+    fn of(&self, value: &TokenStream) -> TokenStream {
+        let (ident, local) = (self.field.ident, &self.field.local);
+        let carriers = self.variants.iter().map(|variant| quote!(Self::#variant { #ident: #local, .. }));
+        quote! {
+            match #value {
+                #(#carriers)|* => ::core::option::Option::Some(#local),
+                #[allow(unreachable_patterns)]
+                _ => ::core::option::Option::None,
+            }
+        }
+    }
+
+    fn is_table(&self) -> bool {
+        self.field.is_table()
+    }
+}
+
+/// The datums of `variants`, in order of first declaration, refusing a datum outside the storage
+/// forms a state datum takes, and one declared with different types or attributes.
+fn datums<'v, 'a>(variants: &'v [Variant<'a>]) -> syn::Result<Vec<Datum<'v, 'a>>> {
+    let mut datums: Vec<Datum<'v, 'a>> = Vec::new();
+    for variant in variants {
+        for field in variant.fields.iter().flatten() {
+            let name = field.name.value();
+            match field.shape {
+                FieldShape::Column
+                | FieldShape::Intern { .. }
+                | FieldShape::Flatten { .. }
+                | FieldShape::Child(Collection::Map | Collection::Set) => {}
+                _ => {
+                    return Err(refuse(
+                        field.ident,
+                        format_args!(
+                            "state datum `{name}` takes no attribute (its columns), `child` (a BTreeMap or BTreeSet, changed row by row), `intern` or `flatten` (a struct without table fields, or an Option of one)"
+                        ),
+                    ));
+                }
+            }
+            let ty = |field: &Field<'_>| {
+                let ty = field.ty;
+                quote!(#ty).to_string()
+            };
+            match datums.iter_mut().find(|datum| datum.field.name.value() == name) {
+                Some(datum) => {
+                    if ty(datum.field) != ty(field) || datum.field.shape != field.shape {
+                        return Err(refuse(
+                            field.ident,
+                            format_args!(
+                                "state datum `{name}` is declared as `{}` in `{}` and as `{}` in `{}`; a datum has one type and attribute in every label carrying it",
+                                ty(datum.field),
+                                datum.variants[0],
+                                ty(field),
+                                variant.ident
+                            ),
+                        ));
+                    }
+                    datum.variants.push(variant.ident);
+                    datum.codes.push(variant.code);
+                }
+                None => {
+                    let index = datums.len();
+                    datums.push(Datum { field, variants: vec![variant.ident], codes: vec![variant.code], index });
+                }
+            }
+        }
+    }
+    Ok(datums)
+}
+
+/// A machine's state enum (`#[store(labels = L)]`): `Labelled` with label `L`, and `StateData`,
+/// which `State<Self>` stores after the label column and `<field>_since`.
+fn labels_enum(input: &DeriveInput, labels: &syn::Path, variants: &[Variant<'_>], codes: &[i64]) -> syn::Result<TokenStream> {
+    let schema = schema();
+    let ident = &input.ident;
+    let datums = datums(variants)?;
+    let generics = Generics::new(&input.generics, datums.iter().map(|datum| datum.field.bound()));
+    let Generics { impl_generics, ty_generics, where_clause } = &generics;
+    let names: Vec<&syn::LitStr> = datums.iter().map(|datum| &datum.field.name).collect();
+    let tables = datums.iter().map(|datum| datum.field.tables());
+    let arms = code_arms(variants);
+    let label_arms = variants.iter().map(|variant| {
+        let variant_ident = variant.ident;
+        match variant.fields {
+            None => quote!(Self::#variant_ident => &<#labels>::#variant_ident),
+            Some(_) => quote!(Self::#variant_ident { .. } => &<#labels>::#variant_ident),
+        }
+    });
+
+    // Each label of `L` is a variant with the same code: the label column stores the variant's
+    // code, and indexes and edge events name `L`'s.
+    let agree = variants.iter().map(|variant| {
+        let (variant_ident, code) = (variant.ident, variant.code);
+        let message = format!("label `{variant_ident}` has another code in the labels enum than `{ident}::{variant_ident}`");
+        quote!(::core::assert_eq!(<#labels as #schema::CodeEnum>::code(&<#labels>::#variant_ident), #code, #message);)
+    });
+    let same_labels = format!("the labels enum of `{ident}` has other labels than its variants");
+    // A column datum spans no table, and a collection datum's rows hold no tables of their own:
+    // edges edit the state's data one row at a time.
+    let shapes = datums.iter().map(|datum| {
+        let via = datum.field.via();
+        if datum.is_table() {
+            let message = format!("state datum `{}`: a collection's elements hold no tables", datum.field.name.value());
+            quote!(const { ::core::assert!(#via::TABLES == 1, #message) };)
+        } else {
+            let message = format!("state datum `{}`: a column datum holds no tables", datum.field.name.value());
+            quote!(const { ::core::assert!(#via::TABLES == 0, #message) };)
+        }
+    });
+    let layout = datums.iter().map(|datum| {
+        let (name, layout) = (&datum.field.name, datum.field.layout(&quote!(""), &quote!(true)));
+        quote!(layout.datum(#name, label, |layout| { #layout }))
+    });
+    let guards = variants.iter().map(|variant| {
+        let code = variant.code;
+        let carried = datums.iter().filter(|datum| datum.codes.contains(&code)).map(|datum| datum.index);
+        quote!(layout.label_guard(label, #code, &datums, &[#(#carried),*]);)
+    });
+
+    let encode = datums.iter().map(|datum| {
+        let of = datum.of(&quote!(self));
+        let (present, absent) = (datum.field.encode(&quote!(value)), datum.field.encode_absent());
+        quote! {
+            match #of {
+                ::core::option::Option::Some(value) => { #present }
+                ::core::option::Option::None => { #absent }
+            }
+        }
+    });
+    let encode_absent = datums.iter().map(|datum| datum.field.encode_absent());
+    let decode = datums.iter().map(|datum| {
+        let (via, name, local, carried) = (datum.field.via(), &datum.field.name, &datum.field.local, &datum.codes);
+        quote! {
+            let #local = if [#(#carried),*].contains(&code) {
+                ::core::option::Option::Some(
+                    #via::decode(d).map_err(|error| error.at(#name))?.ok_or_else(|| #schema::DecodeError::missing(#name))?,
+                )
+            } else {
+                #via::decode_absent(d).map_err(|error| error.at(#name))?;
+                ::core::option::Option::None
+            };
+        }
+    });
+    let construct = variants.iter().map(|variant| {
+        let (variant_ident, code) = (variant.ident, variant.code);
+        match &variant.fields {
+            None => quote!(#code => ::core::result::Result::Ok(Self::#variant_ident)),
+            Some(fields) => {
+                let values = fields.iter().map(|field| {
+                    let (field_ident, local, name) = (field.ident, &field.local, &field.name);
+                    quote!(#field_ident: #local.ok_or_else(|| #schema::DecodeError::missing(#name))?)
+                });
+                quote!(#code => ::core::result::Result::Ok(Self::#variant_ident { #(#values,)* }))
+            }
+        }
+    });
+    let decode_absent = datums.iter().map(|datum| datum.field.decode_absent());
+    let delta = datums.iter().map(|datum| {
+        let (via, name) = (datum.field.via(), &datum.field.name);
+        let (previous, next) = (datum.of(&quote!(previous)), datum.of(&quote!(next)));
+        let method = if datum.is_table() { quote!(table) } else { quote!(column) };
+        quote!(delta.#method(#name, #via::encode, #via::encode_absent, #previous, #next)?;)
+    });
+
+    Ok(quote! {
+        #[automatically_derived]
+        impl #impl_generics #schema::Labelled for #ident #ty_generics #where_clause {
+            type Label = #labels;
+
+            fn label(&self) -> &#labels {
+                match self {
+                    #(#label_arms,)*
+                }
+            }
+        }
+
+        #[automatically_derived]
+        impl #impl_generics #schema::StateData for #ident #ty_generics #where_clause {
+            const TABLES: usize = 0 #(+ #tables)*;
+            const CODES: &'static [i64] = &[#(#codes),*];
+            const DATA: &'static [&'static str] = &[#(#names),*];
+
+            fn code(&self) -> i64 {
+                match self {
+                    #(#arms,)*
+                }
+            }
+
+            fn layout_data(layout: &mut #schema::Layout, label: &str) {
+                #(#shapes)*
+                ::core::assert_eq!(<#labels as #schema::CodeEnum>::CODES, <Self as #schema::StateData>::CODES, #same_labels);
+                #(#agree)*
+                let datums: ::std::vec::Vec<#schema::DatumColumns> = ::std::vec![#(#layout),*];
+                #(#guards)*
+            }
+
+            fn encode_data(&self, e: &mut #schema::Encoder) -> ::core::result::Result<(), #schema::EncodeError> {
+                #(#encode)*
+                ::core::result::Result::Ok(())
+            }
+
+            fn encode_absent_data(e: &mut #schema::Encoder) -> ::core::result::Result<(), #schema::EncodeError> {
+                #(#encode_absent)*
+                ::core::result::Result::Ok(())
+            }
+
+            fn decode_data(code: i64, d: &mut #schema::Decoder) -> ::core::result::Result<Self, #schema::DecodeError> {
+                #(#decode)*
+                match code {
+                    #(#construct,)*
+                    code => ::core::result::Result::Err(#schema::DecodeError::Code { column: ::std::string::String::new(), code }),
+                }
+            }
+
+            fn decode_absent_data(d: &mut #schema::Decoder) -> ::core::result::Result<(), #schema::DecodeError> {
+                #(#decode_absent)*
+                ::core::result::Result::Ok(())
+            }
+
+            fn delta(previous: &Self, next: &Self, delta: &mut #schema::StateDelta) -> ::core::result::Result<(), #schema::EncodeError> {
+                #(#delta)*
+                ::core::result::Result::Ok(())
+            }
+        }
+    })
 }

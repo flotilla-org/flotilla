@@ -316,81 +316,94 @@ impl<T: Element> Adapter<Vec<T>> for AsChild {
     }
 }
 
-impl<K: KeyColumn + Ord, V: Element> Adapter<BTreeMap<K, V>> for AsChild {
-    const TABLES: usize = 1 + V::TABLES;
+/// `#[store(child)]` on a datum of a label-plus-data state (`#[store(labels = L)]`): a map or set
+/// table like [`AsChild`]'s, in the `state` role: its rows change one at a time, through edges.
+#[doc(hidden)]
+pub struct AsStateChild;
 
-    fn layout(layout: &mut Layout, name: &str, _required: bool) {
-        layout.table(name, TableRole::Child, |layout| {
-            layout.key(|layout| K::layout(layout, "key", true));
-            V::layout_row(layout);
-        });
-    }
+/// The map and set tables of `$adapter`, in `$role`.
+macro_rules! keyed_tables {
+    ($adapter:ty, $role:expr) => {
+        impl<K: KeyColumn + Ord, V: Element> Adapter<BTreeMap<K, V>> for $adapter {
+            const TABLES: usize = 1 + V::TABLES;
 
-    fn encode(value: &BTreeMap<K, V>, e: &mut Encoder) -> Result<(), EncodeError> {
-        e.table(V::TABLES, |e| {
-            for (key, row) in value {
-                e.row(|e| {
-                    e.key(|e| key.encode(e).map_err(|error| error.at("key")))?;
-                    row.encode_row(e)
-                })?;
+            fn layout(layout: &mut Layout, name: &str, _required: bool) {
+                layout.table(name, $role, |layout| {
+                    layout.key(|layout| K::layout(layout, "key", true));
+                    V::layout_row(layout);
+                });
             }
-            Ok(())
-        })
-    }
 
-    fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError> {
-        e.table(V::TABLES, |_| Ok(()))
-    }
-
-    fn decode(d: &mut Decoder) -> Result<Option<BTreeMap<K, V>>, DecodeError> {
-        d.table(V::TABLES, |d| {
-            let mut map = BTreeMap::new();
-            while let Some((key, row)) = d.row(|d| Ok((decode_key::<K>(d, "key")?, V::decode_row(d)?)))? {
-                map.insert(key, row);
+            fn encode(value: &BTreeMap<K, V>, e: &mut Encoder) -> Result<(), EncodeError> {
+                e.table(V::TABLES, |e| {
+                    for (key, row) in value {
+                        e.row(|e| {
+                            e.key(|e| key.encode(e).map_err(|error| error.at("key")))?;
+                            row.encode_row(e)
+                        })?;
+                    }
+                    Ok(())
+                })
             }
-            Ok(Some(map))
-        })
-    }
 
-    fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {
-        d.table(V::TABLES, |d| d.no_rows())
-    }
+            fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError> {
+                e.table(V::TABLES, |_| Ok(()))
+            }
+
+            fn decode(d: &mut Decoder) -> Result<Option<BTreeMap<K, V>>, DecodeError> {
+                d.table(V::TABLES, |d| {
+                    let mut map = BTreeMap::new();
+                    while let Some((key, row)) = d.row(|d| Ok((decode_key::<K>(d, "key")?, V::decode_row(d)?)))? {
+                        map.insert(key, row);
+                    }
+                    Ok(Some(map))
+                })
+            }
+
+            fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {
+                d.table(V::TABLES, |d| d.no_rows())
+            }
+        }
+
+        impl<K: KeyColumn + Ord> Adapter<BTreeSet<K>> for $adapter {
+            const TABLES: usize = 1;
+
+            fn layout(layout: &mut Layout, name: &str, _required: bool) {
+                layout.table(name, $role, |layout| layout.key(|layout| K::layout(layout, "value", true)));
+            }
+
+            fn encode(value: &BTreeSet<K>, e: &mut Encoder) -> Result<(), EncodeError> {
+                e.table(0, |e| {
+                    for key in value {
+                        e.row(|e| e.key(|e| key.encode(e).map_err(|error| error.at("value"))))?;
+                    }
+                    Ok(())
+                })
+            }
+
+            fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError> {
+                e.table(0, |_| Ok(()))
+            }
+
+            fn decode(d: &mut Decoder) -> Result<Option<BTreeSet<K>>, DecodeError> {
+                d.table(0, |d| {
+                    let mut set = BTreeSet::new();
+                    while let Some(key) = d.row(|d| decode_key::<K>(d, "value"))? {
+                        set.insert(key);
+                    }
+                    Ok(Some(set))
+                })
+            }
+
+            fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {
+                d.table(0, |d| d.no_rows())
+            }
+        }
+    };
 }
 
-impl<K: KeyColumn + Ord> Adapter<BTreeSet<K>> for AsChild {
-    const TABLES: usize = 1;
-
-    fn layout(layout: &mut Layout, name: &str, _required: bool) {
-        layout.table(name, TableRole::Child, |layout| layout.key(|layout| K::layout(layout, "value", true)));
-    }
-
-    fn encode(value: &BTreeSet<K>, e: &mut Encoder) -> Result<(), EncodeError> {
-        e.table(0, |e| {
-            for key in value {
-                e.row(|e| e.key(|e| key.encode(e).map_err(|error| error.at("value"))))?;
-            }
-            Ok(())
-        })
-    }
-
-    fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError> {
-        e.table(0, |_| Ok(()))
-    }
-
-    fn decode(d: &mut Decoder) -> Result<Option<BTreeSet<K>>, DecodeError> {
-        d.table(0, |d| {
-            let mut set = BTreeSet::new();
-            while let Some(key) = d.row(|d| decode_key::<K>(d, "value"))? {
-                set.insert(key);
-            }
-            Ok(Some(set))
-        })
-    }
-
-    fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {
-        d.table(0, |d| d.no_rows())
-    }
-}
+keyed_tables!(AsChild, TableRole::Child);
+keyed_tables!(AsStateChild, TableRole::State);
 
 /// `#[store(records)]`: rows keyed by `pos`, appended and never removed; appended and changed only
 /// by edges (`Edge`), never by a spec edit.

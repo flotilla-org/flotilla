@@ -23,6 +23,8 @@ pub(crate) struct Field<'a> {
     pub ty: &'a Type,
     pub vis: &'a syn::Visibility,
     pub shape: FieldShape,
+    /// A datum of a label-plus-data state: a `child` datum's table is in the `state` role.
+    pub state_datum: bool,
 }
 
 impl<'a> Field<'a> {
@@ -39,11 +41,11 @@ impl<'a> Field<'a> {
             Some(variant) => format_ident!("__store_{}_{}", variant, plain),
             None => format_ident!("__store_{}", plain),
         };
-        Ok(Field { ident, local, name: LitStr::new(&name, ident.span()), ty: &field.ty, vis: &field.vis, shape })
+        Ok(Field { ident, local, name: LitStr::new(&name, ident.span()), ty: &field.ty, vis: &field.vis, shape, state_datum: false })
     }
 
     /// The adapter type implementing `Adapter<FieldTy>` for this field's attribute.
-    fn adapter(&self) -> TokenStream {
+    pub(crate) fn adapter(&self) -> TokenStream {
         let schema = schema();
         match self.shape {
             FieldShape::Intern { optional: false } => quote!(#schema::adapt::AsInterned),
@@ -52,6 +54,7 @@ impl<'a> Field<'a> {
             FieldShape::Frozen { optional: false } => quote!(#schema::adapt::AsFrozen),
             FieldShape::Frozen { optional: true } => quote!(#schema::adapt::AsOptionalFrozen),
             FieldShape::Cbor => quote!(#schema::adapt::AsCbor),
+            FieldShape::Child(_) if self.state_datum => quote!(#schema::adapt::AsStateChild),
             FieldShape::Child(_) => quote!(#schema::adapt::AsChild),
             FieldShape::Records => quote!(#schema::adapt::AsRecords),
             FieldShape::History => quote!(#schema::adapt::AsHistory),
@@ -60,7 +63,7 @@ impl<'a> Field<'a> {
     }
 
     /// `<Adapter as Adapter<FieldTy>>`, the path every generated call goes through.
-    fn via(&self) -> TokenStream {
+    pub(crate) fn via(&self) -> TokenStream {
         let schema = schema();
         let (adapter, ty) = (self.adapter(), self.ty);
         quote!(<#adapter as #schema::adapt::Adapter<#ty>>)
@@ -84,7 +87,7 @@ impl<'a> Field<'a> {
             }
             FieldShape::State => {
                 let inner = inner();
-                quote!(#inner: #schema::CodeEnum)
+                quote!(#inner: #schema::StateData)
             }
             FieldShape::Frozen { optional: false } => {
                 let inner = inner();
@@ -128,10 +131,11 @@ impl<'a> Field<'a> {
     }
 
     /// Declares the field as one of its row's own fields: column-shaped fields are recorded in the
-    /// table's `fields`, the unit an edge sets; table fields declare their table.
+    /// table's `fields`, the unit an edge sets; table fields declare their table, and a `state`
+    /// field's `State` records its label field and data fields itself.
     pub(crate) fn layout_row_field(&self) -> TokenStream {
         let layout = self.layout(&quote!(""), &quote!(true));
-        if self.is_table() {
+        if self.is_table() || self.shape == FieldShape::State {
             return layout;
         }
         let (name, state) = (&self.name, self.shape == FieldShape::State);
@@ -160,11 +164,19 @@ impl<'a> Field<'a> {
                 let inner = inner();
                 ("history", quote!(#schema::HistoryOf<Self, #inner>), quote!(#schema::HistoryOf::new(#name)))
             }
-            FieldShape::State => (
-                "state",
-                quote!(#schema::StateOf<Self, #ty>),
-                quote!(#schema::StateOf::new(#schema::ColumnOf::new(#name, #via::TABLES, #via::encode))),
-            ),
+            FieldShape::State => {
+                let inner = inner();
+                (
+                    "state",
+                    quote!(#schema::StateOf<Self, #ty>),
+                    quote! {
+                        #schema::StateOf::new(
+                            #schema::ColumnOf::new(#name, #via::TABLES, #via::encode),
+                            <#inner as #schema::StateData>::DATA,
+                        )
+                    },
+                )
+            }
             _ => ("column", quote!(#schema::ColumnOf<Self, #ty>), quote!(#schema::ColumnOf::new(#name, #via::TABLES, #via::encode))),
         };
         let doc = format!("Edge handle of the {doc} field `{}`.", name.value());

@@ -69,18 +69,23 @@ pub use descriptor::{
     ColumnDef, ColumnType, Condition, DescriptorError, FieldColumns, Guard, Index, IndexProblem, Table, TableRole, TableSet,
     RECORD_VERSION, RESERVED_CHILD_COLUMNS, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES,
 };
-pub use edge::{AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeParts, EdgeSet, FieldOf, HistoryOf, RecordsOf, RowPath, StateOf};
+pub use edge::{
+    AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf, RowPath,
+    StateOf,
+};
 pub use flotilla_schema_derive::Stored;
 pub use frozen::{Freezable, Frozen};
 pub use history::{EdgeEvent, Labelled};
 pub use inline::{Cbor, INLINE_LIMITS};
-pub use layout::{snake_case, Layout};
+pub use layout::{snake_case, DatumColumns, Layout};
 pub use query::{interned_value, key_value, IndexQuery};
 pub use records::{Position, RecordRow, Records};
 pub use reference::Ref;
 pub use registry::{KindRegistry, RegistryError};
-pub use state::State;
+#[doc(hidden)]
+pub use state::StateDelta;
+pub use state::{RowEdit, State};
 pub use time::Timestamp;
-pub use traits::{CodeEnum, Column, Columns, Element, Flat, Intern, KeyColumn, Kind, SUPPORTED_ATTRIBUTES};
+pub use traits::{CodeEnum, Column, Columns, Element, Flat, Intern, KeyColumn, Kind, StateData, SUPPORTED_ATTRIBUTES};
 pub use value::{Hash, Identity, KindCode, Row, Rows, Value};
-pub use view::{column_count, enum_columns, render_view, WIDE};
+pub use view::{column_count, enum_columns, render_view, state_data, WIDE};

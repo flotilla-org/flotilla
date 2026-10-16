@@ -1,6 +1,8 @@
 //! A readable view of generated tables, for schema review before a table shape is built on
 //! (CLAUDE.md, "schema review before build"): each table's width, the columns that expanding data
-//! enums adds, its child tables and its indexes, with tables wider than [`WIDE`] called out.
+//! enums adds, its child tables and its indexes, with tables wider than [`WIDE`] called out, and
+//! each label-plus-data state's label, data columns and data tables. A label-plus-data state is
+//! not enum expansion: its data columns are shared by name across its labels.
 
 use std::{collections::BTreeSet, fmt::Write};
 
@@ -23,15 +25,17 @@ pub fn column_count(table: &Table) -> usize {
 /// outermost enums are listed; a nested enum's columns count toward the enum holding it.
 pub fn enum_columns(table: &Table) -> Vec<(&str, usize)> {
     let tag = |name: &str| table.columns.iter().any(|column| column.name == name && matches!(column.ty, ColumnType::Code(_)));
-    // A guard's controlling column is a data enum's tag (a code) or an optional flatten's flag.
-    let tags: BTreeSet<&str> = table.guards.iter().map(|guard| guard.column.as_str()).filter(|column| tag(column)).collect();
+    // A variant guard's controlling column is a data enum's tag (a code) or an optional flatten's
+    // flag. A label guard (a label-plus-data state's) is not enum expansion.
+    let variant = || table.guards.iter().filter(|guard| !guard.is_label());
+    let tags: BTreeSet<&str> = variant().map(|guard| guard.column.as_str()).filter(|column| tag(column)).collect();
     let mut groups = Vec::new();
     let mut nested = BTreeSet::new();
     for &root in &tags {
         let mut members: BTreeSet<&str> = BTreeSet::new();
         let mut frontier = vec![root];
         while let Some(column) = frontier.pop() {
-            for guard in table.guards.iter().filter(|guard| guard.column == column) {
+            for guard in variant().filter(|guard| guard.column == column) {
                 for name in &guard.scope {
                     if members.insert(name.as_str()) {
                         frontier.push(name.as_str());
@@ -46,10 +50,38 @@ pub fn enum_columns(table: &Table) -> Vec<(&str, usize)> {
     groups
 }
 
-/// The view of `sets` as Markdown: a summary table of every table, then the wide tables.
+/// The label-plus-data states of one table: each label field's name, its data columns, and the
+/// state data tables nested under the table. Empty when the table holds no state with data.
+pub fn state_data(set: &TableSet, position: usize) -> Vec<(&str, Vec<&str>, Vec<&str>)> {
+    let table = &set.tables[position];
+    table
+        .fields
+        .iter()
+        .filter(|field| field.is_label())
+        .filter_map(|label| {
+            let data: Vec<&str> = table
+                .fields
+                .iter()
+                .filter(|field| field.datum_of.as_deref() == Some(label.name.as_str()))
+                .flat_map(|field| table.columns[field.columns.clone()].iter().map(|column| column.name.as_str()))
+                .collect();
+            let tables: Vec<&str> = set
+                .tables
+                .iter()
+                .filter(|child| child.parent == Some(position) && child.role == TableRole::State)
+                .map(|child| child.name.as_str())
+                .collect();
+            (!data.is_empty() || !tables.is_empty()).then_some((label.name.as_str(), data, tables))
+        })
+        .collect()
+}
+
+/// The view of `sets` as Markdown: a summary table of every table, then the wide tables, then the
+/// label-plus-data states (when any).
 pub fn render_view<'a>(sets: impl IntoIterator<Item = &'a TableSet>) -> String {
     let mut out = String::from("| Table | Role | Columns | From enum expansion | Child tables | Indexes |\n|---|---|--:|---|---|---|\n");
     let mut wide = Vec::new();
+    let mut states = Vec::new();
     for set in sets {
         for (position, table) in set.tables.iter().enumerate() {
             let count = column_count(table);
@@ -85,6 +117,15 @@ pub fn render_view<'a>(sets: impl IntoIterator<Item = &'a TableSet>) -> String {
             if count > WIDE {
                 wide.push(format!("- `{}`: {count} columns, {expanded} from enum expansion", table.name));
             }
+            for (label, data, tables) in state_data(set, position) {
+                let quoted = |names: &[&str]| list(&names.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>());
+                states.push(format!(
+                    "- `{}`.`{label}`: label `{label}` and `{label}_since`; data columns {}; data tables {}",
+                    table.name,
+                    quoted(&data),
+                    quoted(&tables)
+                ));
+            }
         }
     }
     out.push_str(&format!("\nTables wider than {WIDE} columns:\n"));
@@ -92,6 +133,11 @@ pub fn render_view<'a>(sets: impl IntoIterator<Item = &'a TableSet>) -> String {
         out.push_str("- none\n");
     } else {
         out.push_str(&wide.join("\n"));
+        out.push('\n');
+    }
+    if !states.is_empty() {
+        out.push_str("\nStates with data (one label column, then data shared by name across the labels):\n");
+        out.push_str(&states.join("\n"));
         out.push('\n');
     }
     out
@@ -103,6 +149,7 @@ fn role(role: TableRole) -> &'static str {
         TableRole::Child => "child",
         TableRole::Records => "records",
         TableRole::History => "history",
+        TableRole::State => "state data",
     }
 }
 

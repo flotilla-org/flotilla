@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{state::State, time::Timestamp, traits::CodeEnum, Stored};
+use crate::{time::Timestamp, traits::CodeEnum, Stored};
 
 /// One edge event, stored in the kind's `#[store(history)]` edge log as
 ///
@@ -41,16 +41,15 @@ pub struct EdgeEvent<L, E, P> {
 }
 
 /// A machine's state value: its label (a code enum, for listing, indexing and drawing) plus any
-/// data the state carries.
+/// data the state carries. The derive implements it for every code enum (its own label) and for
+/// every label-plus-data enum (`#[store(labels = L)]`, label `L`); `State<S>` has `S`'s label.
 pub trait Labelled {
     type Label: CodeEnum;
     fn label(&self) -> &Self::Label;
-}
 
-impl<E: CodeEnum> Labelled for State<E> {
-    type Label = E;
-
-    fn label(&self) -> &E {
-        &self.value
+    /// The label's code: what the state's label column stores, and what an edge event's `from`
+    /// and `to` name.
+    fn label_code(&self) -> i64 {
+        self.label().code()
     }
 }

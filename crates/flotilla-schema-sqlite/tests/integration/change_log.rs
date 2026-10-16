@@ -12,7 +12,7 @@ use rusqlite::Connection;
 
 use crate::fixtures::{
     convoy::{workflow, ConvoyRepository},
-    registry, store, Convoy, Fixture, Message, Pick, TerminalSession, LOCAL,
+    registry, store, Convoy, Fixture, Message, Pick, TerminalSession, Ticket, LOCAL,
 };
 
 const REPLICA: &str = "replica";
@@ -87,7 +87,10 @@ fn step<K: Fixture>(tc: &TestCase, write: &mut Write<'_>, live: &mut Option<Stam
 
 /// Every slot's resource: kind code and name.
 fn slots() -> Vec<(KindCode, String)> {
-    [Message::CODE, Convoy::CODE, TerminalSession::CODE].into_iter().flat_map(|code| (0..2).map(move |n| (code, format!("r{n}")))).collect()
+    [Message::CODE, Convoy::CODE, TerminalSession::CODE, Ticket::CODE]
+        .into_iter()
+        .flat_map(|code| (0..2).map(move |n| (code, format!("r{n}"))))
+        .collect()
 }
 
 fn snapshot(store: &mut Store, code: KindCode, name: &str) -> Option<(ResourceId, Option<Snapshot>)> {
@@ -125,7 +128,8 @@ fn string_id(store: Store, string: &str) -> (Store, i64) {
 // with a different home reproduces every resource: equal snapshots (version, name, home, rows,
 // objects) although the two databases number strings and identities differently. The target
 // relays the same log and the same home sequence. Replaying again is idempotent: every change is
-// a `Duplicate` and nothing moves. Writes span all three fixture kinds, two names each, with
+// a `Duplicate` and nothing moves. Writes span the three fixture kinds and the synthetic `Ticket`
+// (whose transitions edit state data row by row), two names each, with
 // inserts, generated edges (events, records and history appended, fields set), spec edits,
 // deletes and re-inserts, over several transactions. Every records and history row a change
 // inserts carries the change's sequence.
@@ -142,6 +146,7 @@ fn the_change_log_replays_into_another_store(tc: TestCase) {
         match *code {
             Message::CODE => step::<Message>(&tc, &mut write, &mut live[slot], name, &mut last),
             Convoy::CODE => step::<Convoy>(&tc, &mut write, &mut live[slot], name, &mut last),
+            Ticket::CODE => step::<Ticket>(&tc, &mut write, &mut live[slot], name, &mut last),
             _ => step::<TerminalSession>(&tc, &mut write, &mut live[slot], name, &mut last),
         }
         if tc.draw(gs::booleans()) {
@@ -432,6 +437,7 @@ fn a_snapshot_plus_its_tail_is_the_newest_snapshot(tc: TestCase) {
     snapshot_plus_tail::<Message>(&tc);
     snapshot_plus_tail::<Convoy>(&tc);
     snapshot_plus_tail::<TerminalSession>(&tc);
+    snapshot_plus_tail::<Ticket>(&tc);
 }
 
 /// Every change of `store` homed at `home`, in home order.

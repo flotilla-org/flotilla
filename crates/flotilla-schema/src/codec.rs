@@ -142,8 +142,15 @@ impl Encoder {
     /// refused (`EncodeError::Table`). Returns one table holding the row (key empty), and the
     /// objects its values name.
     pub fn columns(f: impl FnOnce(&mut Encoder) -> Result<(), EncodeError>) -> Result<Rows, EncodeError> {
+        Encoder::fragment(0, f)
+    }
+
+    /// Like [`Encoder::columns`], for columns followed by `tables` nested tables: table 0 holds
+    /// the row (key empty) and tables `1..=tables` the rows `f` writes into them, keyed relative
+    /// to the row. One state datum's values, for an edge that edits its rows.
+    pub fn fragment(tables: usize, f: impl FnOnce(&mut Encoder) -> Result<(), EncodeError>) -> Result<Rows, EncodeError> {
         let mut encoder =
-            Encoder { rows: Rows::with_tables(1), next: 1, scopes: Vec::new(), frames: vec![EncodeFrame::new(0, Vec::new())] };
+            Encoder { rows: Rows::with_tables(1 + tables), next: 1, scopes: Vec::new(), frames: vec![EncodeFrame::new(0, Vec::new())] };
         f(&mut encoder)?;
         let row = encoder.frames.pop().expect("root frame");
         encoder.rows.tables[0].push(Row { key: row.key, values: row.values });

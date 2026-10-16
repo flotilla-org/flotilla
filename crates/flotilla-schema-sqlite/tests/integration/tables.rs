@@ -217,6 +217,8 @@ fn writes_touch_only_their_rows() {
     // "alice" is already interned, so no `strings` row is written.
     let mut with_reads = event("alice");
     with_reads.payload.reads = vec![read(), read()];
+    // The message is Awaiting now, and an edge leaves the stored label (#3373 ruling 5).
+    with_reads.from = MessageState::Awaiting;
     let edge = Edge::new(Message::STATE, &moved, Message::EDGES, &with_reads).expect("edge");
     let (store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
     assert_eq!(written, 5, "gate reads add no rows: they are in the event's document");
