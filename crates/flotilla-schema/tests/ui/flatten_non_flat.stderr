@@ -1,0 +1,80 @@
+error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+ --> tests/ui/flatten_non_flat.rs:9:10
+  |
+9 | #[derive(Stored)]
+  |          ^^^^^^ flatten needs a struct deriving Stored with no table fields
+  |
+help: the trait `Flat` is not implemented for `Inbox`
+ --> tests/ui/flatten_non_flat.rs:5:1
+  |
+5 | struct Inbox {
+  | ^^^^^^^^^^^^
+  = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+  --> tests/ui/flatten_non_flat.rs:11:8
+   |
+11 | struct Ticket {
+   |        ^^^^^^ flatten needs a struct deriving Stored with no table fields
+   |
+help: the trait `Flat` is not implemented for `Inbox`
+  --> tests/ui/flatten_non_flat.rs:5:1
+   |
+ 5 | struct Inbox {
+   | ^^^^^^^^^^^^
+help: the trait `flotilla_schema::Element` is conditionally implemented for `Ticket`
+  --> tests/ui/flatten_non_flat.rs:9:10
+   |
+ 9 | #[derive(Stored)]
+   |          ^^^^^^ unsatisfied requirement introduced here: `Inbox: Flat`
+note: required for `Ticket` to implement `flotilla_schema::Element`
+  --> tests/ui/flatten_non_flat.rs:11:8
+   |
+ 9 | #[derive(Stored)]
+   |          ------ type parameter would need to implement `flotilla_schema::Element`
+10 | #[store(kind = "Ticket", code = 1)]
+11 | struct Ticket {
+   |        ^^^^^^
+   = help: consider manually implementing `flotilla_schema::Element` to avoid undesired bounds caused by "imperfect derives"
+   = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
+note: required by a bound in `Kind`
+  --> src/traits.rs
+   |
+   | pub trait Kind: Element {
+   |                 ^^^^^^^ required by this bound in `Kind`
+   = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+  --> tests/ui/flatten_non_flat.rs:9:10
+   |
+ 9 | #[derive(Stored)]
+   |          ^^^^^^ flatten needs a struct deriving Stored with no table fields
+   |
+help: the trait `Flat` is not implemented for `Inbox`
+  --> tests/ui/flatten_non_flat.rs:5:1
+   |
+ 5 | struct Inbox {
+   | ^^^^^^^^^^^^
+help: the trait `flotilla_schema::Element` is conditionally implemented for `Ticket`
+  --> tests/ui/flatten_non_flat.rs:9:10
+   |
+ 9 | #[derive(Stored)]
+   |          ^^^^^^ unsatisfied requirement introduced here: `Inbox: Flat`
+note: required for `Ticket` to implement `flotilla_schema::Element`
+  --> tests/ui/flatten_non_flat.rs:11:8
+   |
+ 9 | #[derive(Stored)]
+   |          ------ type parameter would need to implement `flotilla_schema::Element`
+10 | #[store(kind = "Ticket", code = 1)]
+11 | struct Ticket {
+   |        ^^^^^^
+   = help: consider manually implementing `flotilla_schema::Element` to avoid undesired bounds caused by "imperfect derives"
+   = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
+note: required by a bound in `KIND`
+  --> src/traits.rs
+   |
+   | pub trait Kind: Element {
+   |                 ^^^^^^^ required by this bound in `Kind::KIND`
+   |     const KIND: &'static str;
+   |           ---- required by a bound in this associated constant
+   = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)

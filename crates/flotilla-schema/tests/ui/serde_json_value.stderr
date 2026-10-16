@@ -1,0 +1,5 @@
+error: `serde_json` values have no storage shape; the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+ --> tests/ui/serde_json_value.rs:6:12
+  |
+6 |     extra: serde_json::Value,
+  |            ^^^^^^^^^^^^^^^^^

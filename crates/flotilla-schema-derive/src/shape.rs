@@ -15,7 +15,9 @@ use crate::attrs::{refuse, FieldAttr};
 pub(crate) enum FieldShape {
     /// Unattributed: the type's own `Column` implementation.
     Column,
-    Intern,
+    Intern {
+        optional: bool,
+    },
     Flatten {
         optional: bool,
     },
@@ -32,7 +34,7 @@ impl FieldShape {
     pub(crate) fn describe(self) -> &'static str {
         match self {
             FieldShape::Column => "an unattributed column",
-            FieldShape::Intern => "`#[store(intern)]`",
+            FieldShape::Intern { .. } => "`#[store(intern)]`",
             FieldShape::Flatten { .. } => "`#[store(flatten)]`",
             FieldShape::State => "`#[store(state)]`",
             FieldShape::Frozen { .. } => "`#[store(frozen)]`",
@@ -97,7 +99,7 @@ pub(crate) fn classify(attr: Option<FieldAttr>, ty: &Type, owner: &Ident) -> syn
                 return Err(refuse(ty, format_args!("`{}` cannot apply to a `{stored}` field", attr.name())));
             }
             if attr == FieldAttr::Intern {
-                FieldShape::Intern
+                FieldShape::Intern { optional: name == "Option" }
             } else {
                 FieldShape::Flatten { optional: name == "Option" }
             }
@@ -123,6 +125,11 @@ fn head(ty: &Type) -> Option<(String, Vec<&Type>)> {
         }
         _ => None,
     }
+}
+
+/// The first type argument of the last path segment: `T` of `Option<T>` or `State<T>`.
+pub(crate) fn first_arg(ty: &Type) -> Option<&Type> {
+    head(ty).and_then(|(_, args)| args.first().copied())
 }
 
 /// For `Option<X<..>>`, the name `X`.
@@ -180,7 +187,11 @@ impl<'ast> Visit<'ast> for TypeCheck<'_> {
             if segment.ident == "serde_json" {
                 self.fail(refuse(path, "`serde_json` values have no storage shape"));
             }
+            // A reference names its target's kind without containing it, so `Ref<Self>` is not
+            // recursion; its argument is only a marker.
+            if segment.ident != "Ref" {
+                visit::visit_path_arguments(self, &segment.arguments);
+            }
         }
-        visit::visit_path(self, path);
     }
 }

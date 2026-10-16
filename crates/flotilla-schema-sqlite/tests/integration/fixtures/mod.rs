@@ -8,13 +8,15 @@ use flotilla_schema_sqlite::Store;
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
-pub use self::message::Message;
+pub use self::message::{AgentSession, Inbox, Message};
 
 pub const LOCAL: &str = "local";
 
 pub fn registry() -> KindRegistry {
     let mut registry = KindRegistry::new();
     registry.register::<Message>().expect("fixture kinds register");
+    registry.register::<Inbox>().expect("fixture kinds register");
+    registry.register::<AgentSession>().expect("fixture kinds register");
     registry
 }
 

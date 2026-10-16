@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::value::KindCode;
+use crate::{ddl::quote_ident, value::KindCode};
 
 /// Schema object names of the shared tables and their indexes; no kind table or index may take one.
 pub const SHARED_NAMES: &[&str] =
@@ -47,8 +47,48 @@ pub struct Table {
     /// How many trailing `key` columns are this table's own key.
     pub own_key: usize,
     pub columns: Vec<ColumnDef>,
-    /// Table CHECK constraints (guard checks), as SQL expressions.
-    pub checks: Vec<String>,
+    /// Sparse-column guards, in the order they closed; each renders as one table CHECK.
+    pub guards: Vec<Guard>,
+}
+
+/// Columns that hold only while `column = value`: a data enum variant (`column` is the tag) or a
+/// present `Option<flatten>` (`column` is `<field>_present`, `value` 1). Kept structured rather
+/// than as SQL text so tests can derive the rows each CHECK must refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Guard {
+    pub column: String,
+    pub value: i64,
+    /// Columns that must be non-null while the guard holds.
+    pub required: Vec<String>,
+    /// Every column declared directly inside the guard; all null while it does not hold. A nested
+    /// guard's columns are in its own scope only (its controlling column is in this one).
+    pub scope: Vec<String>,
+}
+
+impl Guard {
+    /// `CASE WHEN <cond> THEN <required> IS NOT NULL AND ... ELSE <scope> IS NULL AND ... END`.
+    /// When an enclosing guard does not hold, this guard's controlling column is null, the
+    /// condition is null and the ELSE branch applies.
+    pub fn check(&self) -> String {
+        self.check_with(" ")
+    }
+
+    /// The CHECK with `separator` before `THEN`, `ELSE` and each term, for readable DDL.
+    pub fn check_with(&self, separator: &str) -> String {
+        let and = format!("{separator}AND ");
+        let then = conjunction(self.required.iter().map(|name| format!("{} IS NOT NULL", quote_ident(name))), &and);
+        let otherwise = conjunction(self.scope.iter().map(|name| format!("{} IS NULL", quote_ident(name))), &and);
+        format!("CASE WHEN {} = {}{separator}THEN {then}{separator}ELSE {otherwise}{separator}END", quote_ident(&self.column), self.value)
+    }
+}
+
+fn conjunction(terms: impl Iterator<Item = String>, and: &str) -> String {
+    let terms: Vec<String> = terms.collect();
+    if terms.is_empty() {
+        "1".to_owned()
+    } else {
+        terms.join(and)
+    }
 }
 
 impl Table {

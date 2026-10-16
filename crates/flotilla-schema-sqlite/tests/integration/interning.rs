@@ -3,7 +3,7 @@ use flotilla_schema::Kind;
 use crate::fixtures::{store, Message, LOCAL};
 
 fn message() -> Message {
-    Message { body: "b".into(), body_digest: None, interrupting: false, accepted_seq: 0, deadline: None, ordinal: 0 }
+    Message::sample()
 }
 
 // Behaviour (DESIGN interning): ids created in a transaction that rolls back are never served

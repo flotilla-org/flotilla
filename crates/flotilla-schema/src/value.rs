@@ -2,10 +2,12 @@
 
 use std::{collections::BTreeMap, fmt};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// The stable numeric code of a resource kind. Codes never change once a kind is stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct KindCode(pub u32);
 
 impl fmt::Display for KindCode {
@@ -36,7 +38,7 @@ impl fmt::Debug for Hash {
 
 /// An untyped resource reference. Logical rows carry identities, never a database's local ids,
 /// so rows compare equal across databases.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Identity {
     pub kind: KindCode,
     pub name: String,

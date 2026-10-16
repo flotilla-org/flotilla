@@ -8,11 +8,14 @@ description = "Backend-neutral storage schema: descriptors, DDL rendering, logic
 [dependencies]
 flotilla-schema-derive = { path = "../flotilla-schema-derive" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+serde = { workspace = true }
 sha2 = { workspace = true }
 thiserror = "2"
 
 [dev-dependencies]
 hegeltest = { workspace = true }
+serde_json = { workspace = true }
+trybuild = "1"
 # Test-only feature anchor (docs/measurements/2747-build-graph.md): hegeltest reaches smallvec
 # through parking_lot; select the features the base layer already uses.
 smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }

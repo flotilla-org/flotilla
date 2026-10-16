@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use crate::{
     traits::Element,
-    value::{Hash, Row, Rows, Value},
+    value::{Hash, KindCode, Row, Rows, Value},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -42,6 +42,9 @@ pub enum DecodeError {
     OutOfRange { column: String, value: i64 },
     #[error("column {column}: unknown code {code}")]
     Code { column: String, code: i64 },
+    /// A reference whose stored identity is of another kind than the field's `Ref<K>`.
+    #[error("column {column}: reference to kind {found}, expected kind {expected}")]
+    RefKind { column: String, expected: KindCode, found: KindCode },
     #[error("column {column}: row has fewer values than the layout")]
     Exhausted { column: String },
     #[error("object {hash:?} is missing from the snapshot")]
@@ -65,6 +68,7 @@ impl DecodeError {
             DecodeError::OutOfRange { column, value } => DecodeError::OutOfRange { column: join(field, &column), value },
             DecodeError::Code { column, code } => DecodeError::Code { column: join(field, &column), code },
             DecodeError::Exhausted { column } => DecodeError::Exhausted { column: join(field, &column) },
+            DecodeError::RefKind { column, expected, found } => DecodeError::RefKind { column: join(field, &column), expected, found },
             other => other,
         }
     }
