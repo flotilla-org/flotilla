@@ -560,6 +560,50 @@ async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restart
     }
 }
 
+// A crew's own stall remains actionable across judge ticks even when its
+// workflow declares no claims. Resolving the crew phase removes that obligation.
+#[tokio::test]
+async fn promise_less_crew_stall_survives_judge_ticks() {
+    for resolved in [CrewWorkPhase::Working, CrewWorkPhase::Done, CrewWorkPhase::Failed, CrewWorkPhase::HandedBack] {
+        let (backend, wake, _) = project_supervision_case(&[]).await;
+        wake.subscriptions.inner.rows.lock().await.clear();
+        let now = Utc::now();
+        update_convoy(&backend, "stalled-work", |status| {
+            let member = &mut status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0];
+            member.promises.clear();
+            member.completion_conditions.clear();
+            external_patches::mark_crew_stalled(
+                "stalled-work".into(),
+                "work".into(),
+                "coder".into(),
+                now,
+                flotilla_resources::StallReason::Infra,
+                None,
+                "needs decision".into(),
+            )
+            .apply(status);
+        })
+        .await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        for tick in 0..4 {
+            let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.expect("convoy"))]);
+            wake.sync_rows("flotilla", &objects).await.expect("sync actor rows");
+            wake.judge_stalls_at("flotilla", &objects, now + chrono::Duration::seconds(tick)).await.expect("judge tick");
+            let status = convoys.get("stalled-work").await.expect("convoy").status.expect("status");
+            assert!(status.stalled.is_some(), "crew stall erased at tick {tick}");
+            assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+        }
+        update_convoy(&backend, "stalled-work", |status| {
+            status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = resolved;
+        })
+        .await;
+        let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.expect("convoy"))]);
+        wake.sync_rows("flotilla", &objects).await.expect("sync resolved rows");
+        wake.judge_stalls_at("flotilla", &objects, now + chrono::Duration::seconds(5)).await.expect("judge resolution");
+        assert!(convoys.get("stalled-work").await.expect("convoy").status.expect("status").stalled.is_none(), "resolved {resolved:?}");
+    }
+}
+
 async fn update_convoy(backend: &ResourceBackend, name: &str, update: impl FnOnce(&mut ConvoyStatus)) {
     let convoys = backend.using::<Convoy>("flotilla");
     let current = convoys.get(name).await.expect("get convoy");

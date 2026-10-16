@@ -425,7 +425,9 @@ impl ReconcilerWake {
                                     })
                             })
                         });
-                        if !owes_claim {
+                        // Reporting a stall creates an actor obligation of its own,
+                        // even when this role has no declared settlement claim.
+                        if !owes_claim && work.phase != flotilla_resources::CrewWorkPhase::Stalled {
                             continue;
                         }
                         if status.stalled.as_ref().is_some_and(|stalled| {
