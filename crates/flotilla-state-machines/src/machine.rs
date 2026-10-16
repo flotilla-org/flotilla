@@ -206,6 +206,7 @@ pub struct MachineDef<M: Machine> {
     edges: Vec<DeclaredEdge<M>>,
     ends: Vec<EndDef<Label<M>>>,
     by_kind: BTreeMap<EdgeKind<M>, usize>,
+    attempts_in: Option<Vec<Label<M>>>,
 }
 
 /// A rule a declaration breaks.
@@ -302,7 +303,7 @@ impl<M: Machine> Debug for StepError<M> {
 
 impl<M: Machine> MachineDef<M> {
     pub fn new(initial: Label<M>) -> Self {
-        MachineDef { initial, edges: Vec::new(), ends: Vec::new(), by_kind: BTreeMap::new() }
+        MachineDef { initial, edges: Vec::new(), ends: Vec::new(), by_kind: BTreeMap::new(), attempts_in: None }
     }
 
     /// Adds an edge, typed on its argument struct. A second declaration of the
@@ -324,6 +325,18 @@ impl<M: Machine> MachineDef<M> {
     pub fn end(mut self, state: Label<M>, reason: &'static str) -> Self {
         self.ends.push(EndDef { state, reason });
         self
+    }
+
+    /// Attempts may be recorded only under these labels. Without this
+    /// declaration they may be recorded under any label but an end.
+    pub fn attempts_in(mut self, labels: impl IntoIterator<Item = Label<M>>) -> Self {
+        self.attempts_in = Some(labels.into_iter().collect());
+        self
+    }
+
+    /// Whether an attempt may be recorded under `label` (ends aside).
+    pub fn accepts_attempts(&self, label: Label<M>) -> bool {
+        self.attempts_in.as_ref().is_none_or(|labels| labels.contains(&label))
     }
 
     pub fn initial(&self) -> Label<M> {
