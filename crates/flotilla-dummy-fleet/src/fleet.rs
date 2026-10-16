@@ -15,7 +15,9 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{commands::CommandValue, Command, CommandAction, DaemonEvent};
 use tokio::sync::{broadcast::error::RecvError, oneshot};
 
-use crate::{forge::DummyForge, terminal::DummySessions, vcs::DummyCheckouts};
+use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
+
+use crate::{forge::DummyForge, shared_forge::SharedForge, terminal::DummySessions, vcs::DummyCheckouts};
 
 /// How a dummy crew reaches its daemon: the same commands a real crew sends
 /// through `flotilla crew …`, without a socket or a process.
@@ -36,6 +38,8 @@ pub trait CrewCommandPort: Send + Sync {
 pub struct DummyFleet {
     pub(crate) config: DummyFleetConfig,
     pub(crate) forge: DummyForge,
+    /// Where coders open change requests instead of `forge`, when configured.
+    pub(crate) shared_forge: Option<Arc<SharedForge>>,
     pub(crate) sessions: DummySessions,
     pub(crate) checkouts: DummyCheckouts,
     port: OnceLock<Arc<dyn CrewCommandPort>>,
@@ -43,9 +47,22 @@ pub struct DummyFleet {
 }
 
 impl DummyFleet {
+    /// A fleet whose shared forge, if configured, is reached over HTTPS.
     pub fn new(config: DummyFleetConfig) -> Arc<Self> {
+        let http = config.shared_forge.is_some().then(|| Arc::new(ReqwestHttpClient::new()) as Arc<dyn HttpClient>);
+        Self::build(config, http)
+    }
+
+    /// A fleet whose shared forge, if configured, is reached through `http`.
+    pub fn with_http(config: DummyFleetConfig, http: Arc<dyn HttpClient>) -> Arc<Self> {
+        Self::build(config, Some(http))
+    }
+
+    fn build(config: DummyFleetConfig, http: Option<Arc<dyn HttpClient>>) -> Arc<Self> {
+        let shared_forge = config.shared_forge.clone().zip(http).map(|(shared, http)| Arc::new(SharedForge::new(shared, http)));
         Arc::new(Self {
             forge: DummyForge::new(&config),
+            shared_forge,
             sessions: DummySessions::default(),
             checkouts: DummyCheckouts::default(),
             config,

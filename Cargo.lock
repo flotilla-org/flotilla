@@ -2030,6 +2030,8 @@ dependencies = [
  "flotilla-discovery",
  "flotilla-discovery-api",
  "flotilla-environment",
+ "flotilla-fake-forge",
+ "flotilla-forge-forgejo",
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-provider-runtime",
@@ -2037,6 +2039,9 @@ dependencies = [
  "flotilla-terminal",
  "flotilla-vcs",
  "hegeltest",
+ "reqwest 0.13.2",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
