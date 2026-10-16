@@ -43,10 +43,14 @@ pub struct Forge {
 }
 
 impl Forge {
-    /// A forge with a validated `forge_id` (a lowercase DNS label).
+    /// A forge with a validated `forge_id` (a lowercase DNS label). The
+    /// built-in id `github` is public GitHub, so it takes only that kind.
     pub fn new(id: impl Into<String>, kind: ForgeKind) -> Result<Self, Error> {
         let id = id.into();
         validate_forge_id(&id)?;
+        if id == GITHUB_FORGE_ID && kind != ForgeKind::Github {
+            return Err(Error::InvalidValue { kind: crate::Kind::Forge, value: id, reason: "the `github` forge id is public GitHub" });
+        }
         Ok(Self { id, kind })
     }
 

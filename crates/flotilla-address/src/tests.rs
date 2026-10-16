@@ -369,6 +369,12 @@ mod normalisation {
     }
 
     #[test]
+    fn the_github_forge_id_is_only_public_github() {
+        assert!(Forge::new("github", ForgeKind::Forgejo).is_err());
+        assert_eq!(Forge::new("github", ForgeKind::Github), Ok(Forge::github()));
+    }
+
+    #[test]
     fn forge_ids_are_lowercase_dns_labels() {
         for id in ["Lab", "-lab", "lab-", "", "l.ab", "l_ab"] {
             assert!(Forge::new(id, ForgeKind::Forgejo).is_err(), "{id}");

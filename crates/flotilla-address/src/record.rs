@@ -20,7 +20,10 @@ const GITHUB_RECORD_SERVICE: &str = "github.com";
 ///
 /// These are the names records already carry, so this is a read and write
 /// boundary, not a stored-shape change. A convoy's Project does not take part
-/// in an artifact's name; artifact addresses with no convoy have none.
+/// in an artifact's name, so `project:P/convoy:C/role:R/artifact:…` and
+/// `convoy:C/role:R/artifact:…` share one record. An artifact of a standing
+/// role (no convoy) has no record name yet: artifact records are keyed by
+/// convoy today.
 pub fn record_name(address: &Address) -> Option<String> {
     match address.kind() {
         Kind::ChangeRequest => Some(forge_record_name("cr", address)),
@@ -86,6 +89,14 @@ mod tests {
             .and_then(|role| role.artifact("decision-ledger", "demo"))
             .expect("artifact");
         assert_eq!(record_name(&artifact), Some(legacy_artifact_name()));
+        let in_project = Address::project("flotilla")
+            .and_then(|project| project.child(Kind::Convoy, "demo"))
+            .and_then(|convoy| convoy.child(Kind::Role, "coder"))
+            .and_then(|role| role.artifact("decision-ledger", "demo"))
+            .expect("artifact");
+        assert_eq!(record_name(&in_project), Some(legacy_artifact_name()), "the project does not change the record");
+        let standing = Address::project("flotilla").and_then(|p| p.child(Kind::Role, "gui")).and_then(|r| r.artifact("k", "s")).expect("a");
+        assert_eq!(record_name(&standing), None, "standing-role artifacts have no record yet");
         let usage = Address::usage("Claude", " Team@Example.com ").expect("usage");
         assert_eq!(record_name(&usage), Some(legacy_usage_name("claude", "team@example.com")));
     }
