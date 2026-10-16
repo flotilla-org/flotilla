@@ -208,7 +208,7 @@ impl DummyDaemon {
     }
 
     /// A crew stall a supervisor can act on: the crew's work and the convoy's
-    /// stall condition, which the leaf engine raises after the crew stalls.
+    /// stall condition, both published by the crew and maintained by the leaf engine.
     async fn wait_for_stall(&self, name: &str) -> ResourceObject<Convoy> {
         self.wait_for(name, "a supervisable stall", |convoy| {
             convoy.status.as_ref().is_some_and(|status| {
@@ -286,7 +286,7 @@ fn supervise(convoy: &ResourceObject<Convoy>, operation: CrewSupervisionAction) 
 async fn a_failing_crew_proposes_failure_and_its_supervisor_fails_the_convoy() {
     let fleet = DummyDaemon::start(&format!("{SCENARIO_AGENT}fail_rate = 1.0\n"), "").await;
     fleet.dispatch("failing", CrewMix::Coder).await;
-    // The stall is published before the script records its failure. Wait for
+    // The crew publishes its stall before the script records its failure. Wait for
     // accounting before supervision can tear down the crew session.
     fleet.wait_for("failing", "failure accounting", |_| fleet.fleet.snapshot().crews_failed > 0).await;
     assert_eq!(fleet.fleet.snapshot().crews_failed, 1);
@@ -300,6 +300,9 @@ async fn a_failing_crew_proposes_failure_and_its_supervisor_fails_the_convoy() {
 async fn a_stalled_crew_resumes_on_supervision_and_lands() {
     let fleet = DummyDaemon::start(&format!("{SCENARIO_AGENT}stall_rate = 1.0\n"), "").await;
     fleet.dispatch("stalled", CrewMix::Coder).await;
+    // The crew publishes its stall before recording accounting; wait for both
+    // before supervision resumes the script.
+    fleet.wait_for("stalled", "stall accounting", |_| fleet.fleet.snapshot().crews_stalled > 0).await;
     let convoy = fleet.wait_for_stall("stalled").await;
     assert_eq!(fleet.fleet.snapshot().crews_stalled, 1);
     let resumed = fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Resume)).await;

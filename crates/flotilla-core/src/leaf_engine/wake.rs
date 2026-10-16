@@ -13,8 +13,8 @@ use flotilla_resources::{
     actor_obligation,
     address::{leaf_for, subject_address},
     instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest, Checkout,
-    CheckoutSpec, ControllerRetry, Convoy, ConvoyPhase, Forge, InstantiatedExit, LeafMaker, ResourceError, ResourceObject, RetryCeiling,
-    StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WorkPhase,
+    CheckoutSpec, ControllerRetry, Convoy, ConvoyPhase, CrewWorkPhase, Forge, InstantiatedExit, LeafMaker, ResourceError, ResourceObject,
+    RetryCeiling, StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WorkPhase,
 };
 use flotilla_store::{
     controller::{SecondaryWatch, WorkQueueSender},
@@ -425,7 +425,9 @@ impl ReconcilerWake {
                                     })
                             })
                         });
-                        if !owes_claim {
+                        // Reporting a stall creates an actor obligation of its own,
+                        // even when this role has no declared settlement claim.
+                        if !owes_claim && work.phase != CrewWorkPhase::Stalled {
                             continue;
                         }
                         if status.stalled.as_ref().is_some_and(|stalled| {
@@ -441,12 +443,7 @@ impl ReconcilerWake {
                             .work
                             .get(vessel)
                             .is_some_and(|work| matches!(work.phase, WorkPhase::Launching | WorkPhase::Running | WorkPhase::Stalled))
-                            || matches!(
-                                work.phase,
-                                flotilla_resources::CrewWorkPhase::Done
-                                    | flotilla_resources::CrewWorkPhase::Failed
-                                    | flotilla_resources::CrewWorkPhase::HandedBack
-                            )
+                            || matches!(work.phase, CrewWorkPhase::Done | CrewWorkPhase::Failed | CrewWorkPhase::HandedBack)
                         {
                             continue;
                         }
