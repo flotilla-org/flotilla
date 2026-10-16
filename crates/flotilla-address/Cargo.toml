@@ -28,6 +28,7 @@ generic-array = { version = "0.14", default-features = false, features = ["more_
 zeroize = { version = "1", features = ["derive"] }
 memchr = { version = "2" }
 serde_core = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["alloc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 
 # sha2's Apple Silicon cpufeatures path reaches libc without default/std.
