@@ -24,7 +24,6 @@ CREW_EMAIL = '309902803+flotilla-crew[bot]@users.noreply.github.com'
 # Live crews receive identity and Git settings through environment injection;
 # user.name/user.email are empty in the repository config.
 REPORT = {'environment': {
-    'RUSTUP_HOME': '/usr/local/rustup',
     'GIT_AUTHOR_NAME': CREW_NAME, 'GIT_AUTHOR_EMAIL': CREW_EMAIL,
     'GIT_COMMITTER_NAME': CREW_NAME, 'GIT_COMMITTER_EMAIL': CREW_EMAIL,
     'GIT_CONFIG_COUNT': '3', 'GIT_CONFIG_KEY_0': 'push.default', 'GIT_CONFIG_VALUE_0': 'current',
@@ -33,7 +32,8 @@ REPORT = {'environment': {
     'git': {'user.name': '', 'user.email': '', 'push.default': 'current',
             'GIT_AUTHOR_IDENT': f'{CREW_NAME} <{CREW_EMAIL}> 1791345600 +0000',
             'GIT_COMMITTER_IDENT': f'{CREW_NAME} <{CREW_EMAIL}> 1791345601 +0000'},
-    'skills': ['testing/SKILL.md']}
+    'skills': ['testing/SKILL.md'],
+    'toolchain': {'cargo': 'cargo 1.99.0 (5f94df478 2026-08-27)', 'rustc': 'rustc 1.99.0 (b940084d7 2026-09-28)'}}
 
 
 class Process:
@@ -476,7 +476,11 @@ class Contract(unittest.TestCase):
     def test_real_stub_reports_missing_identity(self):
         self.run_real_stub(missing_identity=True)
 
-    def run_real_stub(self, missing_identity=False):
+    # A toolchain that exits non-zero is refused with its stderr, even if stdout looks like a version.
+    def test_real_stub_reports_broken_toolchain(self):
+        self.run_real_stub(broken_toolchain=True)
+
+    def run_real_stub(self, missing_identity=False, broken_toolchain=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             home = root / 'crew-home'
@@ -488,11 +492,19 @@ class Contract(unittest.TestCase):
             cli = bin_dir / 'flotilla'
             cli.write_text('#!/bin/bash\nprintf "%s\\n" "$*" > "$CANARY_COMPLETE_LOG"\n')
             cli.chmod(0o755)
+            # Toolchain stand-ins: the stub reports what the image's PATH runs.
+            for tool in ('cargo', 'rustc'):
+                stand_in = bin_dir / tool
+                stand_in.write_text(f'#!/bin/bash\necho "{tool} 1.99.0 (stand-in)"\n')
+                stand_in.chmod(0o755)
+            if broken_toolchain:
+                (bin_dir / 'cargo').write_text('#!/bin/bash\necho "cargo 1.99.0 (stand-in)"\n'
+                                               'echo "error: no default toolchain configured" >&2\nexit 1\n')
             subprocess.check_call(['git', '-C', str(root), 'init', '-q'])
             completion = root / 'completion'
             # HOME excludes user global config; NOSYSTEM excludes system config.
             environment = {'PATH': f'{bin_dir}:/usr/local/bin:/usr/bin:/bin', 'HOME': str(root),
-                           'CLAUDE_CONFIG_DIR': str(home), 'RUSTUP_HOME': '/usr/local/rustup',
+                           'CLAUDE_CONFIG_DIR': str(home),
                            'CANARY_COMPLETE_LOG': str(completion), 'GIT_CONFIG_NOSYSTEM': '1',
                            **REPORT['environment']}
             if missing_identity:
@@ -521,6 +533,11 @@ class Contract(unittest.TestCase):
                     with self.assertRaisesRegex(canary.CanaryFailure, 'baseline git identity GIT_AUTHOR_IDENT'):
                         canary.verify_baseline(report)
                     self.assertFalse(completion.exists(), 'invalid identity must not claim completion')
+                    return
+                if broken_toolchain:
+                    self.assertEqual(report['toolchain']['cargo'], 'exit 1: error: no default toolchain configured')
+                    with self.assertRaisesRegex(canary.CanaryFailure, 'baseline cargo toolchain .*no default toolchain'):
+                        canary.verify_baseline(report)
                     return
                 canary.verify_baseline(report)
                 self.assertFalse(completion.exists(), 'completion must wait for Running/baseline checks')
@@ -558,10 +575,19 @@ class Contract(unittest.TestCase):
     # must fail; valid environment values may include unrelated Cleat-owned coordinates.
     def test_each_baseline_requirement_is_enforced(self):
         canary.verify_baseline(REPORT)
-        for report in (None, {}, {'environment': {}, 'git': {}, 'skills': None}):
+        without_toolchain = copy.deepcopy(REPORT)
+        del without_toolchain['toolchain']
+        for report in (None, {}, {'environment': {}, 'git': {}, 'skills': None}, without_toolchain,
+                       {**REPORT, 'toolchain': ['cargo', 'rustc']}):
             with self.subTest(report=report), self.assertRaisesRegex(canary.CanaryFailure, 'stub agent report'):
                 canary.verify_baseline(report)
-        for key in ('RUSTUP_HOME', 'GH_TOKEN', 'GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'):
+        for tool in ('cargo', 'rustc'):
+            for value in ('', 'error: toolchain not installed'):
+                report = copy.deepcopy(REPORT)
+                report['toolchain'][tool] = value
+                with self.subTest(tool=tool, value=value), self.assertRaisesRegex(canary.CanaryFailure, tool):
+                    canary.verify_baseline(report)
+        for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'):
             report = copy.deepcopy(REPORT)
             report['environment'][key] = 'incorrect'
             with self.subTest(key=key), self.assertRaisesRegex(canary.CanaryFailure, key):
