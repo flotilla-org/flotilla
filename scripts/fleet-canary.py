@@ -96,11 +96,15 @@ def objects(response):
 
 def verify_baseline(report):
     if (not isinstance(report, dict) or not isinstance(report.get('environment'), dict)
-            or not isinstance(report.get('git'), dict) or not isinstance(report.get('skills'), list)):
-        raise CanaryFailure('stub agent report missing environment, git config or skills')
+            or not isinstance(report.get('git'), dict) or not isinstance(report.get('skills'), list)
+            or not isinstance(report.get('toolchain'), dict)):
+        raise CanaryFailure('stub agent report missing environment, git config, skills or toolchain')
     env = report['environment']
-    if env.get('RUSTUP_HOME') != '/usr/local/rustup':
-        raise CanaryFailure('baseline RUSTUP_HOME missing or incorrect')
+    # Composed crew images set no fixed RUSTUP_HOME (#3116); require a runnable toolchain instead.
+    for tool in ('cargo', 'rustc'):
+        version = report['toolchain'].get(tool)
+        if not isinstance(version, str) or not version.startswith(tool + ' '):
+            raise CanaryFailure(f'baseline {tool} toolchain missing or not runnable')
     expected_identity = 'flotilla-crew[bot] <309902803+flotilla-crew[bot]@users.noreply.github.com>'
     # git var reflects the identity Git will actually use, including injected
     # GIT_AUTHOR_* / GIT_COMMITTER_* overrides. The timestamp is not policy.

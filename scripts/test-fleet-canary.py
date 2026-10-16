@@ -24,7 +24,6 @@ CREW_EMAIL = '309902803+flotilla-crew[bot]@users.noreply.github.com'
 # Live crews receive identity and Git settings through environment injection;
 # user.name/user.email are empty in the repository config.
 REPORT = {'environment': {
-    'RUSTUP_HOME': '/usr/local/rustup',
     'GIT_AUTHOR_NAME': CREW_NAME, 'GIT_AUTHOR_EMAIL': CREW_EMAIL,
     'GIT_COMMITTER_NAME': CREW_NAME, 'GIT_COMMITTER_EMAIL': CREW_EMAIL,
     'GIT_CONFIG_COUNT': '3', 'GIT_CONFIG_KEY_0': 'push.default', 'GIT_CONFIG_VALUE_0': 'current',
@@ -33,7 +32,8 @@ REPORT = {'environment': {
     'git': {'user.name': '', 'user.email': '', 'push.default': 'current',
             'GIT_AUTHOR_IDENT': f'{CREW_NAME} <{CREW_EMAIL}> 1791345600 +0000',
             'GIT_COMMITTER_IDENT': f'{CREW_NAME} <{CREW_EMAIL}> 1791345601 +0000'},
-    'skills': ['testing/SKILL.md']}
+    'skills': ['testing/SKILL.md'],
+    'toolchain': {'cargo': 'cargo 1.99.0 (5f94df478 2026-08-27)', 'rustc': 'rustc 1.99.0 (b940084d7 2026-09-28)'}}
 
 
 class Process:
@@ -488,11 +488,16 @@ class Contract(unittest.TestCase):
             cli = bin_dir / 'flotilla'
             cli.write_text('#!/bin/bash\nprintf "%s\\n" "$*" > "$CANARY_COMPLETE_LOG"\n')
             cli.chmod(0o755)
+            # Toolchain stand-ins: the stub reports what the image's PATH runs.
+            for tool in ('cargo', 'rustc'):
+                stand_in = bin_dir / tool
+                stand_in.write_text(f'#!/bin/bash\necho "{tool} 1.99.0 (stand-in)"\n')
+                stand_in.chmod(0o755)
             subprocess.check_call(['git', '-C', str(root), 'init', '-q'])
             completion = root / 'completion'
             # HOME excludes user global config; NOSYSTEM excludes system config.
             environment = {'PATH': f'{bin_dir}:/usr/local/bin:/usr/bin:/bin', 'HOME': str(root),
-                           'CLAUDE_CONFIG_DIR': str(home), 'RUSTUP_HOME': '/usr/local/rustup',
+                           'CLAUDE_CONFIG_DIR': str(home),
                            'CANARY_COMPLETE_LOG': str(completion), 'GIT_CONFIG_NOSYSTEM': '1',
                            **REPORT['environment']}
             if missing_identity:
@@ -561,7 +566,13 @@ class Contract(unittest.TestCase):
         for report in (None, {}, {'environment': {}, 'git': {}, 'skills': None}):
             with self.subTest(report=report), self.assertRaisesRegex(canary.CanaryFailure, 'stub agent report'):
                 canary.verify_baseline(report)
-        for key in ('RUSTUP_HOME', 'GH_TOKEN', 'GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'):
+        for tool in ('cargo', 'rustc'):
+            for value in ('', 'error: toolchain not installed'):
+                report = copy.deepcopy(REPORT)
+                report['toolchain'][tool] = value
+                with self.subTest(tool=tool, value=value), self.assertRaisesRegex(canary.CanaryFailure, tool):
+                    canary.verify_baseline(report)
+        for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'):
             report = copy.deepcopy(REPORT)
             report['environment'][key] = 'incorrect'
             with self.subTest(key=key), self.assertRaisesRegex(canary.CanaryFailure, key):

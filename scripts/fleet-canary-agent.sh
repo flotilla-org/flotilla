@@ -11,6 +11,16 @@ from pathlib import Path
 import subprocess
 
 home = Path(os.environ['CLAUDE_CONFIG_DIR'])
+
+
+def version(tool):
+    # A runnable toolchain is the contract; images may place it anywhere on PATH.
+    try:
+        return subprocess.run([tool, '--version'], capture_output=True, text=True).stdout.strip()
+    except OSError:
+        return ''
+
+
 print(json.dumps({
     'environment': dict(os.environ),
     'git': {key: subprocess.run(['git', 'config', '--get', key], capture_output=True, text=True).stdout.strip()
@@ -19,6 +29,7 @@ print(json.dumps({
                 for key in ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']},
     'skills': sorted(str(path.relative_to(home / 'skills'))
                      for path in (home / 'skills').rglob('SKILL.md')),
+    'toolchain': {tool: version(tool) for tool in ['cargo', 'rustc']},
 }))
 PY
 # The installer observes Running before releasing the completion claim.
