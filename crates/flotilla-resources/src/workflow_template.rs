@@ -277,7 +277,9 @@ pub fn template_leaf(template: &Template, address: LeafAddress) -> Leaf {
     }
 }
 
-/// Template text for diagnostics: the stored form where there is one.
+/// Template text for diagnostics: the stored form where there is one, and
+/// the canonical address-grammar form for a template that has none, so a
+/// message may not match any stored text.
 fn template_text(template: &Template) -> String {
     legacy_template_text(template).unwrap_or_else(|_| template.to_string())
 }
@@ -1039,17 +1041,19 @@ fn validate_turn_delivery(
             || matches!(subject, Ok(SubjectVariable::Artifact { .. })) && (field_path == ".exists" || field_path.starts_with(".summary.")))
             && (field_path == ".updated-at" || matches!(rule.on.operator, Operator::Equal | Operator::NotEqual));
         let template = template_text(&rule.on);
-        if !admitted {
-            push_error(errors, ValidationError::InvalidTurnDeliveryLeaf { source: source.clone(), template });
-        } else {
-            let kind = match subject {
-                Ok(SubjectVariable::ChangeRequest) => LeafKind::ChangeRequest,
-                Ok(SubjectVariable::Issue) => LeafKind::Issue,
-                _ => LeafKind::Artifact,
-            };
-            if let Err(reason) = legacy_template_text(&rule.on).and_then(|_| validate_leaf_literal(kind, &field_path, &rule.on.literal)) {
-                push_error(errors, ValidationError::InvalidTurnDeliveryLiteral { source: source.clone(), template, reason });
+        match subject {
+            Ok(subject) if admitted => {
+                let kind = match subject {
+                    SubjectVariable::ChangeRequest => LeafKind::ChangeRequest,
+                    SubjectVariable::Issue => LeafKind::Issue,
+                    SubjectVariable::Artifact { .. } => LeafKind::Artifact,
+                };
+                if let Err(reason) = legacy_template_text(&rule.on).and_then(|_| validate_leaf_literal(kind, &field_path, &rule.on.literal))
+                {
+                    push_error(errors, ValidationError::InvalidTurnDeliveryLiteral { source: source.clone(), template, reason });
+                }
             }
+            _ => push_error(errors, ValidationError::InvalidTurnDeliveryLeaf { source: source.clone(), template }),
         }
         if rule.brief.trim().is_empty() {
             push_error(errors, ValidationError::EmptyTurnDeliveryBrief { source: source.clone() });
