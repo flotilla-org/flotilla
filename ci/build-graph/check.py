@@ -10,7 +10,7 @@ import sys
 
 # ADR 0060 step 2: these isolated production graphs must remain C-free.
 C_FREE_BASE = frozenset({
-    "flotilla-protocol", "flotilla-transport", "flotilla-paths",
+    "flotilla-address", "flotilla-protocol", "flotilla-transport", "flotilla-paths",
     "flotilla-daemon-api", "flotilla-relay-protocol",
     "flotilla-resources", "flotilla-client", "flotilla-store", "flotilla-store-memory",
     "flotilla-config", "flotilla-messaging",

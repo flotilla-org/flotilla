@@ -1,0 +1,39 @@
+[package]
+name = "flotilla-address"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "ADR 0066 addresses: typed segments, canonical encoding, normalisation, record names and the condition grammar"
+
+# Depends on no other flotilla crate, so the engine and storage stack and
+# sibling projects can adopt it on its own.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+hegeltest = { workspace = true }
+
+[lints]
+workspace = true
+
+# Feature anchors for ci/build-graph/check.py (see
+# docs/measurements/2747-build-graph.md), declared inline rather than through
+# the flotilla-build-features crates so this crate depends on no other flotilla
+# crate. They select features of dependencies already in the graph and add none;
+# `serde_json` appears again here only to select `raw_value` like the base layer.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
+zeroize = { version = "1", features = ["derive"] }
+memchr = { version = "2" }
+serde_core = { version = "1", features = ["alloc"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.build-dependencies]
+proc-macro2 = { version = "1", features = ["default", "proc-macro"] }
+quote = { version = "1", features = ["default", "proc-macro"] }
+syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }
