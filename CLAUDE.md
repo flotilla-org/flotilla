@@ -174,8 +174,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-store-http` | Kubernetes-isomorphic HTTP storage client |
 | `flotilla-store-testkit` | Shared backend contracts, fixtures and per-request read counters |
 | `flotilla-schema-derive` | `#[derive(Stored)]` over the closed `#[store(...)]` attribute list; refuses every other shape (#3320) |
-| `flotilla-schema` | Backend-neutral storage schema: table descriptors, deterministic DDL, logical rows codec, change-log entries (`RowChange`), timestamps and the kind-code registry; re-exports the derive |
-| `flotilla-schema-sqlite` | Rusqlite runtime for derived kinds: shared tables (`strings`, `resource_identity`, `objects`, `home_sequence`, `change_log`), per-kind statements, interning, owner-checked writes, the change log and `apply` of other homes' changes |
+| `flotilla-schema` | Backend-neutral storage schema: table descriptors and declared indexes, deterministic DDL, logical rows codec, typed index queries (`IndexQuery`), change-log entries (`RowChange`), timestamps and the kind-code registry; re-exports the derive |
+| `flotilla-schema-sqlite` | Rusqlite runtime for derived kinds: shared tables (`strings`, `resource_identity`, `objects`, `home_sequence`, `change_log`), per-kind statements, interning, owner-checked writes, the change log and `apply` of other homes' changes, keyset-paged index queries and the startup scan |
 | `flotilla-replication` | Store-to-store replication over `dyn Store`: list/watch/resume, origin filtering, digest scheduling; host ports for stores, identity, health and peer sources |
 | `flotilla-review-bundle-object-store` | Object-store/S3 byte adapter for the review-bundle port |
 | `flotilla-tls` | Shared TLS provider selection and HTTP client construction |

@@ -28,6 +28,51 @@ CREATE TABLE IF NOT EXISTS change_log (
 CREATE INDEX IF NOT EXISTS change_log_by_resource ON change_log (resource_id, home_seq);
 ";
 
+/// Every statement the runtime prepares outside the per-kind statements. `Store::statements` lists
+/// them for the query-plan tests, so a statement added here is covered; `store.rs` prepares no
+/// literal SQL (a unit test there checks).
+pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
+    ("log_append", LOG_APPEND),
+    ("log_taken", LOG_TAKEN),
+    ("string_id", STRING_ID),
+    ("string_insert", STRING_INSERT),
+    ("identity_resolve", IDENTITY_RESOLVE),
+    ("identity_insert", IDENTITY_INSERT),
+    ("identity_of", IDENTITY_OF),
+    ("sequence_next", SEQUENCE_NEXT),
+    ("object_put", OBJECT_PUT),
+    ("identity_seq", IDENTITY_SEQ),
+    ("identity_set_seq", IDENTITY_SET_SEQ),
+    ("sequence_raise", SEQUENCE_RAISE),
+    ("object_exists", OBJECT_EXISTS),
+    ("log_by_resource", LOG_BY_RESOURCE),
+    ("log_by_home", LOG_BY_HOME),
+    ("sequence_last", SEQUENCE_LAST),
+    ("object_bytes", OBJECT_BYTES),
+];
+
+pub(crate) const LOG_APPEND: &str = "INSERT INTO change_log (home, home_seq, resource_id, change) VALUES (?1, ?2, ?3, ?4)";
+pub(crate) const LOG_TAKEN: &str = "SELECT 1 FROM change_log WHERE home = ?1 AND home_seq = ?2";
+pub(crate) const STRING_ID: &str = "SELECT id FROM strings WHERE s = ?1";
+pub(crate) const STRING_INSERT: &str = "INSERT INTO strings (s) VALUES (?1)";
+pub(crate) const IDENTITY_RESOLVE: &str = "SELECT id FROM resource_identity WHERE kind = ?1 AND name = ?2 AND home = ?3";
+pub(crate) const IDENTITY_INSERT: &str = "INSERT INTO resource_identity (kind, name, home) VALUES (?1, ?2, ?3)";
+pub(crate) const IDENTITY_OF: &str =
+    "SELECT i.kind, n.s, h.s FROM resource_identity i JOIN strings n ON n.id = i.name JOIN strings h ON h.id = i.home WHERE i.id = ?1";
+pub(crate) const SEQUENCE_NEXT: &str =
+    "INSERT INTO home_sequence (home, last) VALUES (?1, 1) ON CONFLICT (home) DO UPDATE SET last = last + 1 RETURNING last";
+pub(crate) const OBJECT_PUT: &str = "INSERT OR IGNORE INTO objects (hash, media, bytes) VALUES (?1, ?2, ?3)";
+pub(crate) const IDENTITY_SEQ: &str = "SELECT seq FROM resource_identity WHERE id = ?1";
+pub(crate) const IDENTITY_SET_SEQ: &str = "UPDATE resource_identity SET seq = ?1 WHERE id = ?2";
+pub(crate) const SEQUENCE_RAISE: &str =
+    "INSERT INTO home_sequence (home, last) VALUES (?1, ?2) ON CONFLICT (home) DO UPDATE SET last = max(last, excluded.last)";
+pub(crate) const OBJECT_EXISTS: &str = "SELECT 1 FROM objects WHERE hash = ?1";
+pub(crate) const LOG_BY_RESOURCE: &str =
+    "SELECT change FROM change_log WHERE resource_id = ?1 AND home_seq > ?2 ORDER BY home_seq LIMIT ?3";
+pub(crate) const LOG_BY_HOME: &str = "SELECT change FROM change_log WHERE home = ?1 AND home_seq > ?2 ORDER BY home_seq LIMIT ?3";
+pub(crate) const SEQUENCE_LAST: &str = "SELECT last FROM home_sequence WHERE home = ?1";
+pub(crate) const OBJECT_BYTES: &str = "SELECT bytes FROM objects WHERE hash = ?1";
+
 /// The objects media code for ADR 0063 canonical CBOR.
 pub const MEDIA_CBOR: i64 = 1;
 

@@ -1,7 +1,9 @@
 //! Per-kind statements, rendered once from the descriptor when the store opens. Every statement
 //! addresses rows by primary key: the root by `id`, child rows by `owner` plus their key.
 
-use flotilla_schema::{quote_ident, ColumnDef, ColumnType, TableRole, TableSet};
+use std::collections::BTreeMap;
+
+use flotilla_schema::{quote_ident, ColumnDef, ColumnType, Index, Table, TableRole, TableSet};
 
 pub(crate) struct TableSql {
     pub name: String,
@@ -23,6 +25,25 @@ pub(crate) struct KindSql {
     pub root_update_version: String,
     pub root_delete: String,
     pub root_version: String,
+    /// Declared indexes by declared name.
+    pub indexes: BTreeMap<String, IndexSql>,
+    /// The startup scan: this kind's resources homed at `?1`, by id, through
+    /// `resource_identity_by_home`. Identities without a root row (references to resources not
+    /// stored here, deleted resources) are skipped by the primary-key join.
+    pub scan: String,
+}
+
+/// One index's page queries. Both select `id` then the order columns, filter by the index's own
+/// predicate (rendered as the DDL renders it, so SQLite can use the partial index), bind the `eq`
+/// values as `?1..`, and order by `order..., id`.
+pub(crate) struct IndexSql {
+    /// The schema object name, `<table>_<name>`.
+    pub object: String,
+    pub order: usize,
+    /// The first page: parameters are the eq values, then the limit.
+    pub first: String,
+    /// A later page: eq values, the cursor's order values and id, then the limit.
+    pub after: String,
 }
 
 /// Interned columns read back as their strings through `strings`' primary key.
@@ -53,12 +74,89 @@ impl KindSql {
             root_update_version: format!("UPDATE {root} SET \"version\" = ?1 WHERE \"id\" = ?2 AND \"version\" = ?3"),
             root_delete: format!("DELETE FROM {root} WHERE \"id\" = ?1 AND \"version\" = ?2"),
             root_version: format!("SELECT \"version\" FROM {root} WHERE \"id\" = ?1"),
+            indexes: set.indexes.iter().map(|index| (index.name.clone(), IndexSql::render(&set.tables[0], index))).collect(),
+            scan: format!(
+                "SELECT i.\"id\" FROM \"resource_identity\" AS i CROSS JOIN {root} AS r ON r.\"id\" = i.\"id\" \
+                 WHERE i.\"home\" = ?1 AND i.\"kind\" = ?2 AND i.\"id\" > ?3 ORDER BY i.\"id\" LIMIT ?4"
+            ),
+        }
+    }
+
+    /// Every statement of this kind, labelled, for the query-plan tests.
+    pub(crate) fn statements(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for table in &self.tables {
+            for (what, sql) in [("insert", &table.insert), ("update", &table.update), ("delete", &table.delete), ("select", &table.select)]
+            {
+                if !sql.is_empty() {
+                    out.push((format!("{} {what}", table.name), sql.clone()));
+                }
+            }
+        }
+        let root = &self.tables[0].name;
+        out.push((format!("{root} update version"), self.root_update_version.clone()));
+        out.push((format!("{root} delete"), self.root_delete.clone()));
+        out.push((format!("{root} version"), self.root_version.clone()));
+        for index in self.indexes.values() {
+            out.push((format!("index {} first", index.object), index.first.clone()));
+            out.push((format!("index {} after", index.object), index.after.clone()));
+        }
+        out.push((format!("{root} scan"), self.scan.clone()));
+        out
+    }
+}
+
+impl IndexSql {
+    fn render(root: &Table, index: &Index) -> IndexSql {
+        let table = quote_ident(&root.name);
+        let order: Vec<String> = index.order.iter().map(|name| quote_ident(name)).collect();
+        let mut terms: Vec<String> = index.predicate_sql().into_iter().collect();
+        terms.extend(index.eq.iter().enumerate().map(|(n, name)| format!("{} = ?{}", quote_ident(name), n + 1)));
+        let next = index.eq.len() + 1;
+        let mut first = terms.clone();
+        if index.eq.is_empty() {
+            // With no equality prefix, a bare ORDER BY would walk the index from its start, which
+            // SQLite plans as a SCAN. A lower bound below every value of the column's storage class
+            // makes it a range SEARCH of the same rows.
+            let column = root.columns.iter().find(|column| column.name == index.order[0]).expect("validated index column");
+            first.push(format!("{} >= {}", order[0], lowest(&column.ty)));
+        }
+        let mut after = terms;
+        if order.is_empty() {
+            after.push(format!("\"id\" > ?{next}"));
+        } else {
+            let cursor = placeholders(next, order.len() + 1);
+            after.push(format!("({}, \"id\") > ({cursor})", order.join(", ")));
+        }
+        let limit = |params: usize| {
+            let mut by = order.clone();
+            by.push("\"id\"".to_owned());
+            format!("ORDER BY {} LIMIT ?{params}", by.join(", "))
+        };
+        let select = format!("SELECT \"id\"{} FROM {table} WHERE", prefixed(&order));
+        IndexSql {
+            object: index.object_name(),
+            order: order.len(),
+            first: format!("{select} {} {}", first.join(" AND "), limit(next)),
+            after: format!("{select} {} {}", after.join(" AND "), limit(next + order.len() + 1)),
+        }
+    }
+}
+
+/// A literal at or below every value a STRICT column of this type holds. Exhaustive, so a new
+/// column type (a REAL, say) must choose its own lower bound.
+fn lowest(ty: &ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Text => "''",
+        ColumnType::Blob | ColumnType::Frozen => "x''",
+        ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp | ColumnType::Code(_) | ColumnType::Interned | ColumnType::Ref => {
+            "-9223372036854775808"
         }
     }
 }
 
 impl TableSql {
-    fn render(table: &flotilla_schema::Table) -> TableSql {
+    fn render(table: &Table) -> TableSql {
         let name = quote_ident(&table.name);
         let columns: Vec<ColumnDef> = table.key.iter().chain(&table.columns).cloned().collect();
         let names: Vec<String> = columns.iter().map(|column| quote_ident(&column.name)).collect();

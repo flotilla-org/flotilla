@@ -568,16 +568,17 @@ fn a_refused_apply_leaves_no_cached_identity() {
     }
 }
 
-// Behaviour (MAX_CHANGES_PAGE): a page of limit 0 is empty; a page never exceeds the limit asked.
+// Behaviour (one limit rule for every listing): a limit of 0 is refused; a page never exceeds the
+// limit asked, and a limit above `MAX_PAGE` is lowered to it.
 #[test]
 fn change_pages_respect_their_limit() {
     let mut source = store();
     write_history(&mut source, "m", &["second", "third"]);
     let mut read = source.read().expect("read");
-    assert_eq!(read.changes_since(LOCAL, 0, 0).expect("page"), []);
+    assert!(matches!(read.changes_since(LOCAL, 0, 0), Err(StoreError::ZeroLimit)));
     assert_eq!(read.changes_since(LOCAL, 0, 2).expect("page").len(), 2);
     let id = read.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
-    assert_eq!(read.changes(id, 0, 0).expect("page"), []);
+    assert!(matches!(read.changes(id, 0, 0), Err(StoreError::ZeroLimit)));
     assert_eq!(read.changes(id, 0, u32::MAX).expect("page").len(), 3);
 }
 

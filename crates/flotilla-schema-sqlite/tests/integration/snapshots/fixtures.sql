@@ -444,6 +444,9 @@ CREATE TABLE "message_attempts" (
       AND "outcome_failure_retryable" IS NULL
       END)
 ) STRICT, WITHOUT ROWID;
+CREATE INDEX "message_by_reply" ON "message" ("in_reply_to") WHERE "in_reply_to" IS NOT NULL;
+CREATE INDEX "message_deadline" ON "message" ("deadline") WHERE "state" IN (1, 2) AND "deadline" IS NOT NULL;
+CREATE INDEX "message_open_by_inbox" ON "message" ("inbox", "accepted_seq") WHERE "state" IN (1, 2);
 CREATE TABLE "inbox" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -567,9 +570,11 @@ CREATE TABLE "convoy_deliverables_evidence_metadata" (
   PRIMARY KEY ("owner", "deliverables_pos", "evidence_pos", "key"),
   FOREIGN KEY ("owner", "deliverables_pos", "evidence_pos") REFERENCES "convoy_deliverables_evidence" ("owner", "deliverables_pos", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
+CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN (1) AND "project" IS NOT NULL;
 CREATE TABLE "terminal_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "vessel" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
   "role" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "ordinal" INTEGER NOT NULL,
   "pool" INTEGER NOT NULL REFERENCES "strings" ("id"),
@@ -661,3 +666,10 @@ CREATE TABLE "terminal_session_attempts" (
       AND "outcome_failure_retryable" IS NULL
       END)
 ) STRICT, WITHOUT ROWID;
+CREATE INDEX "terminal_session_by_vessel" ON "terminal_session" ("vessel", "ordinal");
+CREATE INDEX "terminal_session_live_by_pool" ON "terminal_session" ("pool") WHERE "lifecycle" IN (1, 2);
+CREATE TABLE "vessel" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "name" TEXT NOT NULL
+) STRICT;

@@ -47,11 +47,7 @@ impl KindRegistry {
         }
         for existing in self.kinds.values() {
             if let Some(name) = set.object_names().find(|name| existing.object_names().any(|other| other == *name)) {
-                return Err(RegistryError::DuplicateObject {
-                    name: name.to_owned(),
-                    kind: set.kind.clone(),
-                    existing: existing.kind.clone(),
-                });
+                return Err(RegistryError::DuplicateObject { name, kind: set.kind.clone(), existing: existing.kind.clone() });
             }
         }
         self.kinds.insert(set.code, set);

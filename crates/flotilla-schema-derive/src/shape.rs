@@ -117,6 +117,19 @@ pub(crate) fn first_arg(ty: &Type) -> Option<&Type> {
     head(ty).and_then(|(_, args)| args.first().copied())
 }
 
+/// The last path segment's name: `Ref` of `Ref<Inbox>` or `flotilla_schema::Ref<Inbox>`.
+pub(crate) fn head_name(ty: &Type) -> Option<String> {
+    head(ty).map(|(name, _)| name)
+}
+
+/// `T` of `Option<T>`; `None` for any other type.
+pub(crate) fn option_inner(ty: &Type) -> Option<&Type> {
+    match head(ty) {
+        Some((name, args)) if name == "Option" => args.first().copied(),
+        _ => None,
+    }
+}
+
 /// `K` and `V` of `BTreeMap<K, V>`.
 pub(crate) fn map_args(ty: &Type) -> Option<(&Type, &Type)> {
     match head(ty)?.1.as_slice() {

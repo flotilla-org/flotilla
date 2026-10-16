@@ -39,8 +39,16 @@ pub struct AgentSession {
     pub harness: String,
 }
 
+/// Indexes from #3208 §4.2: an inbox's open messages in acceptance order, a message's replies,
+/// and open messages with a deadline in deadline order.
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Message", code = 1)]
+#[store(
+    kind = "Message",
+    code = 1,
+    index(name = "open_by_inbox", eq(inbox), order(accepted_seq), when(state in [Pending, Awaiting])),
+    index(name = "by_reply", eq(in_reply_to), when(in_reply_to is_some)),
+    index(name = "deadline", order(deadline), when(state in [Pending, Awaiting], deadline is_some))
+)]
 pub struct Message {
     #[store(intern)]
     pub sender: String,

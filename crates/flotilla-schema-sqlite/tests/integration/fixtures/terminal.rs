@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Flat, Frozen, Records, State, Stored, Timestamp};
+use flotilla_schema::{Flat, Frozen, Records, Ref, State, Stored, Timestamp};
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
@@ -21,12 +21,27 @@ use super::{
     attempt::{Attempt, Cause},
     code_enum,
     convoy::map,
-    evolve_records, key, list, name, text, timestamp, Fixture, Pick, SHAPES,
+    evolve_records, key, list, name, reference, text, timestamp, Fixture, Pick, SHAPES,
 };
 
+/// A minimal target kind for `TerminalSession::vessel`.
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "TerminalSession", code = 6)]
+#[store(kind = "Vessel", code = 7)]
+pub struct Vessel {
+    pub name: String,
+}
+
+/// A vessel's sessions in ordinal order (the #3208 §4.3 `(vessel_id, role, ordinal)` key, without
+/// uniqueness), and a pool's live sessions: an interned `eq` column under a lifecycle predicate.
+#[derive(Debug, Clone, PartialEq, Stored)]
+#[store(
+    kind = "TerminalSession",
+    code = 6,
+    index(name = "by_vessel", eq(vessel), order(ordinal)),
+    index(name = "live_by_pool", eq(pool), when(lifecycle in [Requested, Realised]))
+)]
 pub struct TerminalSession {
+    pub vessel: Ref<Vessel>,
     #[store(intern)]
     pub role: String,
     pub ordinal: u16,
@@ -172,6 +187,7 @@ impl Fixture for TerminalSession {
             },
         };
         TerminalSession {
+            vessel: reference(tc),
             role: name(tc),
             ordinal: tc.draw(gs::integers::<u16>()),
             pool: name(tc),

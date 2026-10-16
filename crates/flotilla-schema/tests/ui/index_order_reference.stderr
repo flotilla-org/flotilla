@@ -1,0 +1,5 @@
+error: `desk` cannot order an index: interned strings and references are stored as local ids, whose order differs between stores; use it in `eq`; the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+  --> tests/ui/index_order_reference.rs:11:66
+   |
+11 | #[store(kind = "Ticket", code = 1, index(name = "by_desk", order(desk)))]
+   |                                                                  ^^^^
