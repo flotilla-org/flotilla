@@ -22,8 +22,9 @@
 //! append-only `flotilla_schema::Records`, keyed by owner and position, and
 //! an ended resource refuses them. An edge event is a
 //! `flotilla_schema::EdgeEvent` ([`EdgeEventOf`]) whose document is an
-//! [`EdgePayload`]: the edge's arguments and its reads. Edge events are history, for showing and auditing what
-//! happened; nothing that decides reads them. Retry counts, schedules and
+//! [`EdgePayload`]: the edge's arguments and its reads. Edge events are
+//! history, for showing and auditing what happened; nothing that decides
+//! reads them. Retry counts, schedules and
 //! giving up are judgements over attempts ([`attempt::retry`]).
 //!
 //! Time is `flotilla_schema::Timestamp` (microseconds), always supplied by the
