@@ -222,7 +222,10 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         "refused completion must leave the crew session alive"
     );
 
-    let ledger_name = flotilla_resources::artifact_record_name(&crew_record, "coder", "decision-ledger", &crew_record);
+    let ledger_name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::artifact_address(&crew_record, "coder", "decision-ledger", &crew_record).expect("artifact address"),
+    )
+    .expect("record name");
     backend
         .using::<flotilla_resources::Artifact>(NAMESPACE)
         .create(

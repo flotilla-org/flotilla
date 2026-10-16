@@ -7,7 +7,9 @@ use std::{
 
 use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_protocol::LeafAddress;
-use flotilla_resources::{Artifact, ChangeRequest, Convoy, Issue, ReadWatchEvent, Resource, ResourceError, Usage, Vessel};
+use flotilla_resources::{
+    address::leaf_record_name, Artifact, ChangeRequest, Convoy, ForgeSpec, Issue, ReadWatchEvent, Resource, ResourceError, Usage, Vessel,
+};
 use flotilla_store::ResourceBackend;
 use futures::{
     stream::{BoxStream, SelectAll},
@@ -39,42 +41,59 @@ pub(super) struct ObjectAddress {
 pub(super) struct RowDependencies {
     namespace: String,
     pub(super) objects: HashSet<ObjectAddress>,
+    /// The record each leaf reads. A leaf whose subject has no address, such
+    /// as a service spelled by a host no Forge declares, has no entry and
+    /// evaluates against an absent subject.
+    pub(super) names: HashMap<LeafAddress, String>,
     pub(super) change_requests: HashSet<ChangeRequestRef>,
     pub(super) issues: HashSet<IssueRef>,
 }
 
 impl RowDependencies {
-    pub(super) fn derive(row: &LeafSubscriptionRow) -> Self {
+    /// Resolves each leaf's record through its address; `forges` resolve a
+    /// change request or issue spelled by host.
+    pub(super) fn derive(row: &LeafSubscriptionRow, forges: &[ForgeSpec]) -> Self {
         let mut dependencies = Self { namespace: row.namespace.clone(), ..Default::default() };
         for leaf in &row.leaves {
-            let (kind, name) = match &leaf.address {
-                LeafAddress::Convoy { name } => (ObjectKind::Convoy, name.clone()),
-                LeafAddress::Work { convoy, .. } => (ObjectKind::Convoy, convoy.clone()),
-                LeafAddress::Vessel { name } => (ObjectKind::Vessel, name.clone()),
-                LeafAddress::ChangeRequest { service, scope, number } => {
-                    dependencies.change_requests.insert(ChangeRequestRef {
-                        namespace: row.namespace.clone(),
-                        service: service.clone(),
-                        scope: scope.clone(),
-                        number: *number,
-                    });
-                    (ObjectKind::ChangeRequest, flotilla_resources::change_request_record_name(service, scope, *number))
+            let kind = match &leaf.address {
+                LeafAddress::Convoy { name } => {
+                    dependencies.objects.insert(ObjectAddress { kind: ObjectKind::Convoy, name: name.clone() });
+                    continue;
                 }
-                LeafAddress::Issue { service, scope, number } => {
-                    dependencies.issues.insert(IssueRef {
-                        namespace: row.namespace.clone(),
-                        service: service.clone(),
-                        scope: scope.clone(),
-                        number: *number,
-                    });
-                    (ObjectKind::Issue, flotilla_resources::issue_record_name(service, scope, *number))
+                LeafAddress::Work { convoy, .. } => {
+                    dependencies.objects.insert(ObjectAddress { kind: ObjectKind::Convoy, name: convoy.clone() });
+                    continue;
                 }
-                LeafAddress::Usage { provider, account } => (ObjectKind::Usage, flotilla_resources::usage_record_name(provider, account)),
-                LeafAddress::Artifact { convoy, producer, kind, subject } => {
-                    (ObjectKind::Artifact, flotilla_resources::artifact_record_name(convoy, producer, kind, subject))
+                LeafAddress::Vessel { name } => {
+                    dependencies.objects.insert(ObjectAddress { kind: ObjectKind::Vessel, name: name.clone() });
+                    continue;
                 }
+                LeafAddress::ChangeRequest { .. } => {
+                    if let Some(subject) =
+                        ChangeRequestRef::from_address(&row.namespace, &leaf.address).and_then(|subject| subject.normalized(forges).ok())
+                    {
+                        dependencies.change_requests.insert(subject);
+                    }
+                    ObjectKind::ChangeRequest
+                }
+                LeafAddress::Issue { .. } => {
+                    if let Some(subject) =
+                        IssueRef::from_address(&row.namespace, &leaf.address).and_then(|subject| subject.normalized(forges).ok())
+                    {
+                        dependencies.issues.insert(subject);
+                    }
+                    ObjectKind::Issue
+                }
+                LeafAddress::Usage { .. } => ObjectKind::Usage,
+                LeafAddress::Artifact { .. } => ObjectKind::Artifact,
             };
-            dependencies.objects.insert(ObjectAddress { kind, name });
+            match leaf_record_name(&leaf.address, forges) {
+                Ok(name) => {
+                    dependencies.names.insert(leaf.address.clone(), name.clone());
+                    dependencies.objects.insert(ObjectAddress { kind, name });
+                }
+                Err(error) => tracing::debug!(leaf = %leaf.address, %error, "leaf subject has no record"),
+            }
         }
         if let LeafWatcher::TurnDelivery { convoy, .. } = &row.watcher {
             dependencies.objects.insert(ObjectAddress { kind: ObjectKind::Convoy, name: convoy.clone() });
@@ -242,7 +261,7 @@ impl LeafSubscriptionTable {
     ) -> Result<(RowDependencies, watch::Receiver<()>), ResourceError> {
         // Production admission already derived dependencies; tests may arm directly.
         let dependencies =
-            self.inner.routing.lock().await.dependencies.get(&row.id).cloned().unwrap_or_else(|| RowDependencies::derive(row));
+            self.inner.routing.lock().await.dependencies.get(&row.id).cloned().unwrap_or_else(|| RowDependencies::derive(row, &[]));
         tokio::pin!(opening);
         let mut streams = None;
         loop {

@@ -5,8 +5,8 @@ use chrono::{DateTime, Utc};
 use flotilla_address::{Address, Kind};
 use flotilla_protocol::LeafAddress;
 use flotilla_resources::{
-    address::{canonical_stored_spelling, stored_spelling_names},
-    issue_record_name, InputMeta, Issue, IssueSpec, IssueStatus, ResourceProvenance,
+    address::{record_name, stored_issue_address, stored_service_scope, stored_spelling_names},
+    Forge, ForgeSpec, InputMeta, Issue, IssueSpec, IssueStatus, ResourceProvenance,
 };
 use flotilla_store::ResourceBackend;
 use tokio::{
@@ -28,14 +28,25 @@ impl IssueRef {
         Some(Self { namespace: namespace.to_string(), service: service.clone(), scope: scope.clone(), number: *number })
     }
 
-    pub(crate) fn record_name(&self) -> String {
-        let (service, scope) = canonical_stored_spelling(&self.service, &self.scope);
-        issue_record_name(&service, &scope, self.number)
+    /// The issue this subject names. A service spelled by host resolves only
+    /// through the Forge in `forges` that declares it.
+    pub(crate) fn address(&self, forges: &[ForgeSpec]) -> Result<Address, String> {
+        stored_issue_address(&self.service, &self.scope, self.number, forges)
     }
 
-    fn normalized(mut self) -> Self {
-        (self.service, self.scope) = canonical_stored_spelling(&self.service, &self.scope);
-        self
+    /// The name of the record that observes this subject. A normalized
+    /// subject spells its forge by id, so it needs no Forge directory.
+    pub(crate) fn record_name(&self) -> Result<String, String> {
+        let address = self.address(&[])?;
+        record_name(&address).ok_or_else(|| format!("{address} names no record"))
+    }
+
+    /// This subject respelled as its address's stored `(service, scope)`, so
+    /// every spelling of one issue is one subject.
+    pub(crate) fn normalized(mut self, forges: &[ForgeSpec]) -> Result<Self, String> {
+        let address = self.address(forges)?;
+        (self.service, self.scope) = stored_service_scope(&address).expect("an issue address is under a repository");
+        Ok(self)
     }
 }
 
@@ -100,7 +111,18 @@ impl IssueRefresher {
     }
 
     pub async fn observation_error(&self, subject: &IssueRef) -> Option<String> {
-        self.inner.observation_errors.lock().await.get(subject).cloned()
+        let subject = match self.normalized(subject.clone()).await {
+            Ok(subject) => subject,
+            Err(error) => return Some(error),
+        };
+        self.inner.observation_errors.lock().await.get(&subject).cloned()
+    }
+
+    /// A subject respelled through its address with the namespace's Forges,
+    /// so every spelling of one issue is one subject with one record name.
+    async fn normalized(&self, subject: IssueRef) -> Result<IssueRef, String> {
+        let forges = self.inner.backend.definitions::<Forge>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
+        subject.normalized(&forges.into_iter().map(|forge| forge.spec).collect::<Vec<_>>())
     }
 
     /// Refresh a claim-time observation even before Landing has armed its
@@ -110,17 +132,18 @@ impl IssueRefresher {
     }
 
     async fn refresh_once_with_creation(&self, subject: &IssueRef, create_missing: bool) -> Result<(), String> {
-        let subject = &subject.clone().normalized();
+        let subject = &self.normalized(subject.clone()).await?;
+        let name = subject.record_name()?;
         if !self.owns_record(subject, false, create_missing).await? {
             return Ok(());
         }
         let status = self.inner.source.observe(subject).await?;
-        self.publish(subject, &subject.record_name(), status, true, false, create_missing).await
+        self.publish(subject, &name, status, true, false, create_missing).await
     }
 
     pub async fn demand(&self, subscription_id: uuid::Uuid, subject: IssueRef, freshness: Option<DateTime<Utc>>) -> Result<(), String> {
-        let subject = subject.normalized();
-        let name = subject.record_name();
+        let subject = self.normalized(subject).await?;
+        let name = subject.record_name()?;
         match self.inner.backend.including_replicas::<Issue>(&subject.namespace).get(&name).await {
             Ok(_) => {}
             Err(flotilla_resources::ResourceError::NotFound { .. }) => self.ensure_record(&subject, &name).await?,
@@ -165,8 +188,9 @@ impl IssueRefresher {
             }
             self.inner.observation_errors.lock().await.remove(&subject);
             let records = self.inner.backend.using::<Issue>(&subject.namespace);
-            let result = match records.get(&subject.record_name()).await {
-                Ok(record) if record.spec.observing_authority == self.inner.authority => records.delete(&subject.record_name()).await,
+            let Ok(name) = subject.record_name() else { continue };
+            let result = match records.get(&name).await {
+                Ok(record) if record.spec.observing_authority == self.inner.authority => records.delete(&name).await,
                 Ok(_) | Err(flotilla_resources::ResourceError::NotFound { .. }) => Ok(()),
                 Err(error) => Err(error),
             };
@@ -252,7 +276,13 @@ impl IssueRefresher {
     }
 
     async fn refresh_loop(&self, subject: IssueRef) {
-        let record_name = subject.record_name();
+        let record_name = match subject.record_name() {
+            Ok(name) => name,
+            Err(error) => {
+                tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "issue subject has no record");
+                return;
+            }
+        };
         loop {
             match self.owns_record(&subject, true, true).await {
                 Ok(false) => {
@@ -307,13 +337,14 @@ impl IssueRefresher {
             if owner.to_string() != self.inner.authority {
                 return Ok(false);
             }
+            let name = subject.record_name()?;
             if !create_missing {
-                return Ok(self.inner.backend.using::<Issue>(&subject.namespace).get(&subject.record_name()).await.is_ok());
+                return Ok(self.inner.backend.using::<Issue>(&subject.namespace).get(&name).await.is_ok());
             }
-            self.get_or_create_record(subject, &subject.record_name()).await?;
+            self.get_or_create_record(subject, &name).await?;
             return Ok(true);
         }
-        let name = subject.record_name();
+        let name = subject.record_name()?;
         let records = self.inner.backend.including_replicas::<Issue>(&subject.namespace);
         // A former owner can still hold its local copy after another host has
         // claimed the subject. Prefer the freshest observation across copies;
@@ -479,7 +510,7 @@ mod tests {
             .number(subject.number)
             .observing_authority("former".to_string())
             .build();
-        let name = subject.record_name();
+        let name = subject.record_name().expect("record name");
         let created = records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.expect("create issue");
         let old = Utc::now() - chrono::Duration::hours(1);
         records
@@ -528,7 +559,7 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let records = backend.using::<Issue>("flotilla");
         let subject = subject();
-        let name = subject.record_name();
+        let name = subject.record_name().expect("record name");
         let spec = IssueSpec::builder()
             .service(subject.service.clone())
             .scope(subject.scope.clone())

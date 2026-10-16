@@ -311,8 +311,14 @@ mod tests {
     #[test]
     fn checked_in_usage_observer_script_preserves_translation_and_coalescing_rules() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/usage-observer");
-        let expected_codex_name = flotilla_resources::usage_record_name("codex", "Ada@Example.com");
-        let expected_claude_name = flotilla_resources::usage_record_name("claude", "Ada@Example.com");
+        let expected_codex_name = flotilla_resources::address::record_name(
+            &flotilla_resources::address::Address::usage("codex", "Ada@Example.com").expect("usage address"),
+        )
+        .expect("record name");
+        let expected_claude_name = flotilla_resources::address::record_name(
+            &flotilla_resources::address::Address::usage("claude", "Ada@Example.com").expect("usage address"),
+        )
+        .expect("record name");
         let program = r#"
 import copy
 import runpy

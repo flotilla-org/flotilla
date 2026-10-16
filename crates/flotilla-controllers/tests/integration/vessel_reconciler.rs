@@ -16,12 +16,12 @@ use flotilla_controllers::reconcilers::{vessel::WorktreeMetadataResolver, Vessel
 use flotilla_core::in_process::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
-    artifact_record_name, canonicalize_repo_url, clone_key, interactive_single_workflow_spec, Artifact, ArtifactSpec, BoundChangeRequest,
-    Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
-    DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec,
-    ExitDeclaration, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus,
-    InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec,
+    canonicalize_repo_url, clone_key, interactive_single_workflow_spec, Artifact, ArtifactSpec, BoundChangeRequest, Checkout,
+    CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec,
+    ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DockerCheckoutStrategy,
+    DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ExitDeclaration,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta,
+    IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec,
     ResourceError, Selector, Stance, StatusPatch, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase,
     TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus,
     WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION,
@@ -2517,7 +2517,10 @@ async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
         .iter()
         .all(|actuation| !matches!(actuation, Actuation::CreateTerminalSession { .. })));
 
-    let name = artifact_record_name("convoy-artifact", "coder", "brief", "convoy-artifact");
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::artifact_address("convoy-artifact", "coder", "brief", "convoy-artifact").expect("artifact address"),
+    )
+    .expect("record name");
     let digest = "a".repeat(64);
     backend
         .using::<Artifact>(NAMESPACE)

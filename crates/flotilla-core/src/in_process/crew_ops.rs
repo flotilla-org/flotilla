@@ -18,7 +18,8 @@ use flotilla_protocol::{
     CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
 };
 use flotilla_resources::{
-    change_request_address_with_forges, change_request_record_name, evaluate_crew_completion, expected_change_request_leaves,
+    address::{artifact_slot_record_name, leaf_record_name, record_name},
+    change_request_address_with_forges, evaluate_crew_completion, expected_change_request_leaves,
     external_patches as convoy_external_patches, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
     CheckoutIntegrationStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewCompletionClaim,
     CrewCompletionPending, CrewCompletionRefusalCause, CrewMessageSender, CrewSource, CrewWorkPhase, Demand as ResourceDemand, Forge,
@@ -245,11 +246,12 @@ fn convoy_names_query(name: Option<&str>, include_replicas: bool) -> StoreQuery 
 fn crew_change_request_query(
     convoy: &ResourceObject<ResourceConvoy>,
     checkouts: &BTreeMap<String, ResourceObject<ResourceCheckout>>,
+    forges: &[flotilla_resources::ForgeSpec],
 ) -> Result<StoreQuery, String> {
     let mut names = BTreeSet::new();
     let mut add = |address: LeafAddress| {
-        if let LeafAddress::ChangeRequest { service, scope, number } = address {
-            names.insert(change_request_record_name(&service, &scope, number));
+        if matches!(address, LeafAddress::ChangeRequest { .. }) {
+            names.extend(leaf_record_name(&address, forges).ok());
         }
     };
     for leaf in expected_change_request_leaves(convoy, checkouts)? {
@@ -1168,7 +1170,7 @@ impl CrewService {
                 .map_err(|e| e.to_string())?;
             }
         }
-        let ledger_name = flotilla_resources::artifact_record_name(convoy_name, &context.caller_role, "decision-ledger", convoy_name);
+        let ledger_name = artifact_slot_record_name(convoy_name, &context.caller_role, "decision-ledger", convoy_name)?;
         let artifact_sources = self
             .resource_backend
             .query_declared::<flotilla_resources::Artifact>(
@@ -1275,15 +1277,13 @@ impl CrewService {
             }
             let change_request_sources = self
                 .resource_backend
-                .query_declared::<ResourceChangeRequest>(namespace, &crew_change_request_query(&convoy, &checkouts)?)
+                .query_declared::<ResourceChangeRequest>(namespace, &crew_change_request_query(&convoy, &checkouts, &forges)?)
                 .await
                 .map_err(|error| error.to_string())?;
             let change_requests =
                 flotilla_resources::select_change_requests(change_request_sources.items.iter().map(|source| &source.object));
-            let change_requests = change_requests
-                .into_values()
-                .map(|record| (change_request_record_name(&record.spec.service, &record.spec.scope, record.spec.number), record))
-                .collect::<BTreeMap<_, _>>();
+            let change_requests =
+                change_requests.into_values().filter_map(|record| spec_record_name(record, &forges)).collect::<BTreeMap<_, _>>();
             observed_change_requests = Some(change_requests.clone());
             let unmet = evaluate_crew_completion(
                 &convoy,
@@ -1291,6 +1291,7 @@ impl CrewService {
                 &checkouts,
                 &change_requests,
                 &promise_artifacts,
+                &forges,
                 self.leaf_subscriptions.change_request_stale_after(),
                 self.clock.now(),
             )?;
@@ -1350,12 +1351,12 @@ impl CrewService {
             None => {
                 let records = self
                     .resource_backend
-                    .query_declared::<ResourceChangeRequest>(namespace, &crew_change_request_query(&convoy, &BTreeMap::new())?)
+                    .query_declared::<ResourceChangeRequest>(namespace, &crew_change_request_query(&convoy, &BTreeMap::new(), &forges)?)
                     .await
                     .map_err(|error| error.to_string())?;
                 flotilla_resources::select_change_requests(records.items.iter().map(|source| &source.object))
                     .into_values()
-                    .map(|record| (change_request_record_name(&record.spec.service, &record.spec.scope, record.spec.number), record))
+                    .filter_map(|record| spec_record_name(record, &forges))
                     .collect()
             }
         };
@@ -1366,6 +1367,7 @@ impl CrewService {
                     convoy_name,
                     &promise_change_requests,
                     &promise_artifacts,
+                    &forges,
                     self.clock.now(),
                     self.leaf_subscriptions.change_request_stale_after(),
                 )
@@ -1873,7 +1875,7 @@ impl CrewService {
                 .iter()
                 .filter_map(|checkout| associated_change_request_name_without_checkout_status(convoy, checkout, &forges).transpose())
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut query = crew_change_request_query(convoy, &BTreeMap::new())?;
+            let mut query = crew_change_request_query(convoy, &BTreeMap::new(), &forges)?;
             query.field_values.entry("metadata.name".into()).or_default().extend(names);
             query.fields.insert("status.state.value".into(), "merged".into());
             let records = self
@@ -3788,6 +3790,16 @@ fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, int
     }
 }
 
+/// A change-request record keyed by the record name its spec addresses,
+/// resolving a host-spelled service through `forges`.
+fn spec_record_name(
+    record: ResourceObject<ResourceChangeRequest>,
+    forges: &[flotilla_resources::ForgeSpec],
+) -> Option<(String, ResourceObject<ResourceChangeRequest>)> {
+    let name = record.spec.address(forges).ok().and_then(|address| record_name(&address))?;
+    Some((name, record))
+}
+
 fn associated_change_request_name_without_checkout_status(
     convoy: &ResourceObject<ResourceConvoy>,
     checkout: &ResourceObject<ResourceCheckout>,
@@ -3797,11 +3809,7 @@ fn associated_change_request_name_without_checkout_status(
         return Ok(None);
     };
     if let Some(id) = convoy_change_request_id_for_checkout(convoy, checkout, forges) {
-        let LeafAddress::ChangeRequest { service, scope, number } = change_request_address_with_forges(&repository.url, &id, forges)?
-        else {
-            unreachable!("change_request_address always returns a change-request address")
-        };
-        return Ok(Some(change_request_record_name(&service, &scope, number)));
+        return leaf_record_name(&change_request_address_with_forges(&repository.url, &id, forges)?, forges).map(Some);
     }
 
     // A produced subject can retain PR identity after checkout status is gone.
@@ -3815,7 +3823,7 @@ fn associated_change_request_name_without_checkout_status(
             LeafAddress::ChangeRequest { service: candidate_service, scope: candidate_scope, number }
                 if candidate_service == service && candidate_scope == scope =>
             {
-                Some(change_request_record_name(&service, &scope, number))
+                leaf_record_name(&LeafAddress::ChangeRequest { service: service.clone(), scope: scope.clone(), number }, forges).ok()
             }
             _ => None,
         })

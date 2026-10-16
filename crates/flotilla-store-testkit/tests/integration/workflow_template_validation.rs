@@ -1,8 +1,8 @@
 use flotilla_protocol::{IssueRef, IssueSource};
 use flotilla_resources::{
     admit_leaf, implement_review_workflow_spec, interactive_single_workflow_spec, issue_address, issue_address_with_forges,
-    issue_record_name, single_agent_shepherd_workflow_spec, single_agent_workflow_spec, validate, ExitDeclaration, InterpolationField,
-    InterpolationLocation, RepositoryKey, ValidationError, WorkflowTemplateSpec,
+    single_agent_shepherd_workflow_spec, single_agent_workflow_spec, validate, ExitDeclaration, InterpolationField, InterpolationLocation,
+    RepositoryKey, ValidationError, WorkflowTemplateSpec,
 };
 use flotilla_store_testkit::fixtures::{valid_workflow_template_spec, valid_workflow_template_yaml};
 use serde::Deserialize;
@@ -263,11 +263,22 @@ vessels:
 
     let github = IssueRef { source: IssueSource { service: "https://GitHub.com".into(), scope: "Owner/Repo".into() }, id: "12".into() };
     assert_eq!(issue_address(&github).expect("github address").to_string(), "issue/github.com/owner/repo/12");
-    assert_eq!(issue_record_name("GitHub.com", "Owner/Repo", 12), issue_record_name("github.com", "owner/repo", 12));
+    assert_eq!(
+        flotilla_resources::address::record_name(
+            &flotilla_resources::address::stored_issue_address("GitHub.com", "Owner/Repo", 12, &[]).expect("issue address")
+        )
+        .expect("record name"),
+        flotilla_resources::address::record_name(
+            &flotilla_resources::address::stored_issue_address("github.com", "owner/repo", 12, &[]).expect("issue address")
+        )
+        .expect("record name")
+    );
     let forgejo =
         IssueRef { source: IssueSource { service: "https://forgejo.example/lab".into(), scope: "Team/Repo".into() }, id: "12".into() };
     assert_eq!(issue_address(&forgejo).expect("forgejo address").to_string(), "issue/forgejo.example%2flab/Team/Repo/12");
-    assert_ne!(issue_record_name("forgejo.example", "Team/Repo", 12), issue_record_name("forgejo.example", "team/repo", 12));
+    // ADR 0066 §3: a host no Forge declares is not an address, so it names
+    // no issue record.
+    assert!(flotilla_resources::address::stored_issue_address("forgejo.example", "Team/Repo", 12, &[]).is_err());
 }
 
 #[test]
@@ -287,7 +298,6 @@ fn issue_subjects_distinguish_installations_on_one_host() {
     assert_eq!(fallback_lab.to_string(), "issue/forgejo.example%2flab/Team/Repo/12");
     assert_eq!(fallback_stage.to_string(), "issue/forgejo.example%2fstage/Team/Repo/12");
     assert_ne!(fallback_lab, fallback_stage);
-    assert_ne!(issue_record_name("forgejo.example%2flab", "Team/Repo", 12), issue_record_name("forgejo.example%2fstage", "Team/Repo", 12));
 
     let forge = |id: &str, path: &str| {
         ForgeSpec::builder()
@@ -312,7 +322,15 @@ fn issue_subjects_distinguish_installations_on_one_host() {
         "issue/forgejo.example%2flab/Team/Repo/12"
     );
     assert_ne!(lab_address, stage_address);
-    assert_ne!(issue_record_name("lab", "Team/Repo", 12), issue_record_name("stage", "Team/Repo", 12));
+    // Each installation's encoded fallback spelling reaches the record its
+    // Forge id names, and the two installations keep distinct records.
+    let record = |service: &str| {
+        let address = flotilla_resources::address::stored_issue_address(service, "Team/Repo", 12, &forges).expect("issue address");
+        flotilla_resources::address::record_name(&address).expect("record name")
+    };
+    assert_eq!(record("forgejo.example%2flab"), record("lab"));
+    assert_eq!(record("forgejo.example%2fstage"), record("stage"));
+    assert_ne!(record("lab"), record("stage"));
 }
 
 #[test]

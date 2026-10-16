@@ -2162,7 +2162,10 @@ async fn ledger_creation_authority_scenario(steps: Vec<(bool, u64)>) {
     let authority = empty_daemon_named("ledger-authority").await;
     let topology = spawn_in_memory_request_topology(caller.clone(), authority.clone()).await.expect("ledger topology");
     let namespace = "flotilla";
-    let name = flotilla_resources::artifact_record_name("ledger", "coder", "decision-ledger", "ledger");
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::artifact_address("ledger", "coder", "decision-ledger", "ledger").expect("artifact address"),
+    )
+    .expect("record name");
     let spec = flotilla_resources::ArtifactSpec::builder()
         .convoy("ledger".into())
         .producer("coder".into())

@@ -9,9 +9,9 @@ use std::{
 use chrono::Utc;
 use flotilla_protocol::{DaemonEvent, LeafAddress, LeafFire, WaitSubscriptionRequest};
 use flotilla_resources::{
-    admit_leaf, evaluate_leaf, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Convoy, ConvoyLeafSubject, Issue,
-    IssueLeafSubject, LeafMaker, ResourceError, ResourceObject, ThreeValue, Usage, UsageLeafSubject, Vessel, VesselLeafSubject,
-    WorkLeafSubject,
+    admit_leaf, evaluate_leaf, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Convoy, ConvoyLeafSubject, Forge,
+    ForgeSpec, Issue, IssueLeafSubject, LeafMaker, ResourceError, ResourceObject, ThreeValue, Usage, UsageLeafSubject, Vessel,
+    VesselLeafSubject, WorkLeafSubject,
 };
 
 use super::routing::{ObjectAddress, ObjectKind, RowDependencies};
@@ -132,7 +132,7 @@ impl LeafSubscriptionTable {
 
     // One dependency pass supplies both the store index and observation demand.
     pub(super) async fn arm_dependencies(&self, row: &LeafSubscriptionRow) -> Result<(), String> {
-        let dependencies = RowDependencies::derive(row);
+        let dependencies = RowDependencies::derive(row, &self.namespace_forges(&row.namespace).await?);
         for subject in &dependencies.change_requests {
             self.inner.change_requests.demand(row.id, subject.clone(), row.freshness_demand).await?;
         }
@@ -141,6 +141,13 @@ impl LeafSubscriptionTable {
         }
         self.inner.routing.lock().await.dependencies.insert(row.id, dependencies);
         Ok(())
+    }
+
+    /// The namespace's declared Forges, which resolve a leaf's host-spelled
+    /// service to its address.
+    pub(super) async fn namespace_forges(&self, namespace: &str) -> Result<Vec<ForgeSpec>, String> {
+        let forges = self.inner.backend.definitions::<Forge>(namespace).list().await.map_err(|error| error.to_string())?;
+        Ok(forges.into_iter().map(|forge| forge.spec).collect())
     }
 
     pub(super) async fn watch_row(&self, row: LeafSubscriptionRow) -> Result<(), String> {
@@ -153,7 +160,7 @@ impl LeafSubscriptionTable {
     pub(super) async fn watch_row_once(&self, row: LeafSubscriptionRow) -> Result<(), ResourceError> {
         let (dependencies, changes) = self.register_routing(&row).await?;
         let namespace = row.namespace.clone();
-        self.watch_registered_row(row, changes, || self.load_subjects(&namespace, &dependencies.objects)).await
+        self.watch_registered_row(row, &dependencies.names, changes, || self.load_subjects(&namespace, &dependencies.objects)).await
     }
 
     // Internal store-read seam; retry whole addressed reads after transient I/O
@@ -161,6 +168,7 @@ impl LeafSubscriptionTable {
     pub(super) async fn watch_registered_row<F, Fut>(
         &self,
         row: LeafSubscriptionRow,
+        names: &HashMap<LeafAddress, String>,
         mut changes: tokio::sync::watch::Receiver<()>,
         mut load: F,
     ) -> Result<(), ResourceError>
@@ -189,7 +197,7 @@ impl LeafSubscriptionTable {
             };
             #[cfg(test)]
             self.inner.evaluations.fetch_add(1, Ordering::SeqCst);
-            if let Some(fire) = evaluate_row(&current_row, &subjects.borrowed(), staleness).map_err(ResourceError::other)? {
+            if let Some(fire) = evaluate_row(&current_row, &subjects.borrowed(), names, staleness).map_err(ResourceError::other)? {
                 self.fire(row.id, fire).await;
                 if !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }) {
                     return Ok(());
@@ -325,12 +333,16 @@ pub(super) struct LeafSubjects<'a> {
     pub(super) artifacts: &'a HashMap<String, ResourceObject<Artifact>>,
 }
 
+/// Evaluates a row's leaves against loaded subjects; `names` holds the record
+/// each leaf reads (see [`RowDependencies::derive`]).
 pub(super) fn evaluate_row(
     row: &LeafSubscriptionRow,
     subjects: &LeafSubjects<'_>,
+    names: &HashMap<LeafAddress, String>,
     staleness: LeafObservationStaleness,
 ) -> Result<Option<LeafFire>, String> {
     let LeafSubjects { convoys, vessels, change_requests, usages, issues, artifacts } = subjects;
+    let name = |leaf: &flotilla_protocol::Leaf| names.get(&leaf.address);
     let require_all = matches!(row.watcher, LeafWatcher::ReconcilerWake { .. });
     let mut matched = None;
     for leaf in &row.leaves {
@@ -349,28 +361,28 @@ pub(super) fn evaluate_row(
                 });
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
             }
-            LeafAddress::ChangeRequest { service, scope, number } => {
-                let name = flotilla_resources::change_request_record_name(service, scope, *number);
-                let subject = change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject {
+            LeafAddress::ChangeRequest { .. } => {
+                let subject = name(leaf).and_then(|name| change_requests.get(name)).map(|change_request| ChangeRequestLeafSubject {
                     change_request,
                     now: Utc::now(),
                     stale_after: staleness.change_request,
                 });
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
             }
-            LeafAddress::Issue { service, scope, number } => {
-                let name = flotilla_resources::issue_record_name(service, scope, *number);
-                let subject = issues.get(&name).map(|issue| IssueLeafSubject { issue, now: Utc::now(), stale_after: staleness.issue });
+            LeafAddress::Issue { .. } => {
+                let subject = name(leaf).and_then(|name| issues.get(name)).map(|issue| IssueLeafSubject {
+                    issue,
+                    now: Utc::now(),
+                    stale_after: staleness.issue,
+                });
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
             }
-            LeafAddress::Usage { provider, account } => {
-                let name = flotilla_resources::usage_record_name(provider, account);
-                let subject = usages.get(&name).map(UsageLeafSubject);
+            LeafAddress::Usage { .. } => {
+                let subject = name(leaf).and_then(|name| usages.get(name)).map(UsageLeafSubject);
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
             }
-            LeafAddress::Artifact { convoy, producer, kind, subject } => {
-                let name = flotilla_resources::artifact_record_name(convoy, producer, kind, subject);
-                let subject = artifacts.get(&name).map(ArtifactLeafSubject);
+            LeafAddress::Artifact { .. } => {
+                let subject = name(leaf).and_then(|name| artifacts.get(name)).map(ArtifactLeafSubject);
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
             }
         };

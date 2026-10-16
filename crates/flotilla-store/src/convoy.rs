@@ -7,6 +7,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Relationship, Subject};
+use flotilla_resources::address::record_name;
 use flotilla_resources::convoy::reconcile::*;
 use flotilla_resources::*;
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
@@ -306,7 +307,10 @@ impl Reconciler for ConvoyReconciler {
                 let sources = change_requests.list().await?.items;
                 crate::select_change_requests(sources.iter().map(|source| &source.object))
                     .into_values()
-                    .map(|record| (crate::change_request_record_name(&record.spec.service, &record.spec.scope, record.spec.number), record))
+                    .filter_map(|record| {
+                        let name = record.spec.address(&forges).ok().and_then(|address| record_name(&address))?;
+                        Some((name, record))
+                    })
                     .collect()
             }
             _ => BTreeMap::new(),
@@ -323,6 +327,7 @@ impl Reconciler for ConvoyReconciler {
                 &obj.metadata.name,
                 &change_requests,
                 &artifacts,
+                &forges,
                 self.clock.now(),
                 self.change_request_stale_after,
             )
@@ -333,6 +338,7 @@ impl Reconciler for ConvoyReconciler {
                 &vessels,
                 &checkouts,
                 &change_requests,
+                &forges,
                 self.change_request_stale_after,
                 self.landing_evidence_stale_after,
                 self.clock.now(),

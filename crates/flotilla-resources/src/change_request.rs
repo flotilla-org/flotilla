@@ -4,7 +4,10 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{IssueSource, Relationship, Subject, SubjectKind};
 use serde::{Deserialize, Serialize};
 
-use crate::{ApiPaths, ReplicationClass, Resource, ResourceError, ResourceObject, StatusPatch};
+use crate::{
+    address::{record_name, stored_change_request_address, Address},
+    ApiPaths, ForgeSpec, ReplicationClass, Resource, ResourceError, ResourceObject, StatusPatch,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChangeRequest;
@@ -39,6 +42,14 @@ pub struct ChangeRequestSpec {
     #[serde(default)]
     #[builder(default)]
     pub subject_of: Vec<ChangeRequestSubjectHistory>,
+}
+
+impl ChangeRequestSpec {
+    /// The change request this record observes. A host-spelled service
+    /// resolves only through the Forge in `forges` that declares it.
+    pub fn address(&self, forges: &[ForgeSpec]) -> Result<Address, String> {
+        stored_change_request_address(&self.service, &self.scope, self.number, forges)
+    }
 }
 
 /// A convoy link retained after the convoy leaves the resource store.
@@ -86,7 +97,7 @@ pub fn select_change_request_sources<'a, T>(
         (
             record.status.as_ref().map(|status| status.state.observed_at),
             record.spec.observing_authority.clone(),
-            record.metadata.name == change_request_record_name(&record.spec.service, &record.spec.scope, record.spec.number),
+            record.spec.address(&[]).ok().and_then(|address| record_name(&address)).is_some_and(|name| name == record.metadata.name),
             record.metadata.namespace.clone(),
             record.metadata.name.clone(),
             serde_json::to_string(&record.status).expect("ChangeRequest status serializes"),
@@ -227,11 +238,4 @@ impl StatusPatch<ChangeRequestStatus> for ChangeRequestStatusPatch {
             Self::Observed(observation) => *status = observation.clone(),
         }
     }
-}
-
-pub fn change_request_record_name(service: &str, scope: &str, number: u64) -> String {
-    fn hex(value: &str) -> String {
-        value.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-    format!("cr-{}-{}-{number}", hex(service), hex(scope))
 }

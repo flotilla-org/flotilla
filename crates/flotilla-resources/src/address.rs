@@ -8,7 +8,9 @@
 //! spellings into addresses and back. Stored shapes do not change, so the
 //! ADR 0064 cut-over importer can retire this module.
 
-use flotilla_address::{Address, Forge as AddressForge, ForgeKind as AddressForgeKind, ForgeLookup, GITHUB_FORGE_ID, GITHUB_HOSTS};
+pub use flotilla_address::{record_name, Address, Kind as AddressKind};
+use flotilla_address::{Forge as AddressForge, ForgeKind as AddressForgeKind, ForgeLookup, GITHUB_FORGE_ID, GITHUB_HOSTS};
+use flotilla_protocol::LeafAddress;
 
 use crate::{canonicalize_repo_url, ForgeKind, ForgeSpec};
 
@@ -124,6 +126,71 @@ pub fn stored_repository_address(service: &str, scope: &str, forges: &[ForgeSpec
         .or_else(|| GITHUB_HOSTS.contains(&location).then(AddressForge::github))
         .ok_or_else(|| format!("service `{service}` names no declared Forge"))?;
     Address::repository(&forge, scope).map_err(refused)
+}
+
+/// A change request's address from the `(service, scope, number)` its record
+/// spec or leaf spells it with. See [`stored_repository_address`] for which
+/// spellings resolve without `forges`.
+pub fn stored_change_request_address(service: &str, scope: &str, number: u64, forges: &[ForgeSpec]) -> Result<Address, String> {
+    numbered(stored_repository_address(service, scope, forges)?, AddressKind::ChangeRequest, number)
+}
+
+/// A change request in the repository at a remote URL; see
+/// [`repository_address`] for how the remote resolves.
+pub fn remote_change_request_address(remote: &str, number: u64, forges: &[ForgeSpec]) -> Result<Address, String> {
+    numbered(repository_address(remote, forges)?, AddressKind::ChangeRequest, number)
+}
+
+/// An issue's address from the `(service, scope, number)` its record spec or
+/// leaf spells it with.
+pub fn stored_issue_address(service: &str, scope: &str, number: u64, forges: &[ForgeSpec]) -> Result<Address, String> {
+    numbered(stored_repository_address(service, scope, forges)?, AddressKind::Issue, number)
+}
+
+fn numbered(repository: Address, kind: AddressKind, number: u64) -> Result<Address, String> {
+    repository.child(kind, &number.to_string()).map_err(|error| format!("{repository} {kind} {number}: {error}"))
+}
+
+/// The address a leaf's subject names.
+///
+/// A change request or issue leaf resolves its stored `(service, scope)`
+/// through `forges`; a forge id or public GitHub spelling needs none, while a
+/// host or URL spelling resolves only through the Forge that declares it. An
+/// artifact sits under its producing role in its convoy. Vessel and work
+/// leaves have no address yet (ADR 0066 §8 retires `work`).
+pub fn leaf_address(leaf: &LeafAddress, forges: &[ForgeSpec]) -> Result<Address, String> {
+    let refused = |error: flotilla_address::Error| format!("leaf address {leaf:?}: {error}");
+    match leaf {
+        LeafAddress::ChangeRequest { service, scope, number } => stored_change_request_address(service, scope, *number, forges),
+        LeafAddress::Issue { service, scope, number } => stored_issue_address(service, scope, *number, forges),
+        LeafAddress::Usage { provider, account } => Address::usage(provider, account).map_err(refused),
+        LeafAddress::Artifact { convoy, producer, kind, subject } => artifact_address(convoy, producer, kind, subject),
+        LeafAddress::Convoy { name } => Address::convoy(name).map_err(refused),
+        LeafAddress::Vessel { .. } | LeafAddress::Work { .. } => Err(format!("leaf address {leaf:?} has no address")),
+    }
+}
+
+/// An artifact slot: the `kind` artifact about `subject` that `role`
+/// produces in `convoy` (ADR 0066 §8).
+pub fn artifact_address(convoy: &str, role: &str, kind: &str, subject: &str) -> Result<Address, String> {
+    Address::convoy(convoy)
+        .and_then(|convoy| convoy.child(AddressKind::Role, role))
+        .and_then(|role| role.artifact(kind, subject))
+        .map_err(|error| format!("artifact {kind} about {subject} by {convoy}/{role}: {error}"))
+}
+
+/// The record name of an artifact slot: [`artifact_address`] joined to its
+/// record through [`record_name`].
+pub fn artifact_slot_record_name(convoy: &str, role: &str, kind: &str, subject: &str) -> Result<String, String> {
+    let address = artifact_address(convoy, role, kind, subject)?;
+    record_name(&address).ok_or_else(|| format!("{address} names no record"))
+}
+
+/// The name of the record a leaf's subject is read from: [`leaf_address`]
+/// joined to its record through [`record_name`].
+pub fn leaf_record_name(leaf: &LeafAddress, forges: &[ForgeSpec]) -> Result<String, String> {
+    let address = leaf_address(leaf, forges)?;
+    record_name(&address).ok_or_else(|| format!("{address} names no record"))
 }
 
 /// Undoes the service encoding of an undeclared issue source: `host%3a` for a
@@ -300,5 +367,54 @@ mod tests {
             let address = stored_repository_address(service, scope, &forges).expect("address");
             assert_eq!(stored_service_scope(&address), Some((service.to_string(), scope.to_string())));
         }
+    }
+
+    fn change_request(service: &str, scope: &str) -> LeafAddress {
+        LeafAddress::ChangeRequest { service: service.to_string(), scope: scope.to_string(), number: 42 }
+    }
+
+    // #3351 and ADR 0066 §1: every spelling of one change request reaches one
+    // record. Spellings span the built-in forge (host, id, case) and a
+    // declared forge (id, host, encoded URL).
+    #[test]
+    fn every_spelling_of_one_change_request_names_one_record() {
+        let forges = [lab()];
+        let github =
+            ["github.com", "GitHub.com", "github"].map(|service| leaf_record_name(&change_request(service, "Flotilla-Org/Flotilla"), &[]));
+        assert!(
+            github.iter().all(|name| name == &leaf_record_name(&change_request("github.com", "flotilla-org/flotilla"), &[])),
+            "{github:?}"
+        );
+        let declared = ["lab", "forgejo.lab.example", "https%3a%2f%2fforgejo.lab.example"]
+            .map(|service| leaf_record_name(&change_request(service, "Team/Repo"), &forges));
+        assert!(declared.iter().all(|name| name.as_ref().is_ok_and(|name| name.starts_with("cr-6c6162-"))), "{declared:?}");
+        assert!(declared.iter().all(|name| name == &declared[0]), "{declared:?}");
+    }
+
+    // ADR 0066 §3: a host no Forge declares names no record; it is refused
+    // rather than given a host-spelled name.
+    #[test]
+    fn an_undeclared_host_names_no_record() {
+        assert!(leaf_record_name(&change_request("forgejo.lab.example", "team/repo"), &[]).is_err());
+        assert!(leaf_record_name(&LeafAddress::Issue { service: "forge.example".into(), scope: "o/r".into(), number: 1 }, &[]).is_err());
+    }
+
+    // An artifact leaf names its slot under the producing role; vessels and
+    // work have no address in this generation (ADR 0066 §8).
+    #[test]
+    fn artifact_leaves_name_their_slot_and_vessels_have_no_address() {
+        let artifact = LeafAddress::Artifact {
+            convoy: "demo".into(),
+            producer: "coder".into(),
+            kind: "decision-ledger".into(),
+            subject: "demo".into(),
+        };
+        assert_eq!(leaf_record_name(&artifact, &[]), artifact_slot_record_name("demo", "coder", "decision-ledger", "demo"));
+        assert_eq!(
+            leaf_address(&artifact, &[]).map(|address| address.to_string()).as_deref(),
+            Ok("convoy:demo/role:coder/artifact:decision-ledger/of:demo")
+        );
+        assert!(leaf_address(&LeafAddress::Vessel { name: "work".into() }, &[]).is_err());
+        assert!(leaf_address(&LeafAddress::Work { convoy: "demo".into(), work: "work".into() }, &[]).is_err());
     }
 }

@@ -38,14 +38,14 @@ use flotilla_protocol::{
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::resolve_project_issue_sources_from_inventory;
 use flotilla_resources::{
-    bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
-    expected_checkout_refs, repository_display_labels, ChangeRequestStatus, Checkout as ResourceCheckout, Clock, ConditionValue,
-    Convoy as ResourceConvoy, ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, Forge, FulfilmentKind,
-    FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, IssueSourceResolution, IssueSourceUnavailable,
-    ManifestRoot, Project, ReadResourceObject, Repository, RepositoryKey, ResourceObject, ResourceProvenance, SettlementMode,
-    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    address::{leaf_record_name, record_name},
+    bound_change_request_address, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
+    repository_display_labels, ChangeRequestStatus, Checkout as ResourceCheckout, Clock, ConditionValue, Convoy as ResourceConvoy,
+    ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, Forge, FulfilmentKind, FulfilmentRealisation,
+    Host as ResourceHost, HostStatus as ResourceHostStatus, IssueSourceResolution, IssueSourceUnavailable, ManifestRoot, Project,
+    ReadResourceObject, Repository, RepositoryKey, ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{EventRecorder, ProjectHierarchyStoreExt, ResourceBackend, StoreQuery};
 use tracing::warn;
@@ -1371,12 +1371,7 @@ impl ReadProjections<'_> {
                                 expected_change_request_leaves(&convoy, &selected_checkouts)
                                     .map_err(|error| error.to_string())?
                                     .iter()
-                                    .filter_map(|leaf| match &leaf.address {
-                                        flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } => {
-                                            Some(flotilla_resources::change_request_record_name(service, scope, *number))
-                                        }
-                                        _ => None,
-                                    }),
+                                    .filter_map(|leaf| leaf_record_name(&leaf.address, &forges).ok()),
                                 true,
                             )))
                             .collect(),
@@ -1392,12 +1387,7 @@ impl ReadProjections<'_> {
             flotilla_resources::select_change_request_sources(change_request_sources.iter().map(|source| (&source.object, source)));
         let change_request_objects = selected_change_requests
             .values()
-            .map(|(object, _)| {
-                (
-                    flotilla_resources::change_request_record_name(&object.spec.service, &object.spec.scope, object.spec.number),
-                    object.clone(),
-                )
-            })
+            .filter_map(|(object, _)| Some((spec_record_name(&object.spec, &forges)?, object.clone())))
             .collect::<BTreeMap<_, _>>();
         // Match the shared catalog: any linked landed convoy makes a merged
         // request closed, even when the convoy being explained is still live.
@@ -1424,21 +1414,23 @@ impl ReadProjections<'_> {
             .map_err(|error| format!("derive expected change requests: {error}"))?;
         let expected_change_requests = expected_change_request_leaves
             .iter()
-            .filter_map(|leaf| match &leaf.address {
-                flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } => {
-                    Some(flotilla_resources::change_request_record_name(service, scope, *number))
-                }
-                _ => None,
-            })
+            .filter(|leaf| matches!(leaf.address, flotilla_protocol::LeafAddress::ChangeRequest { .. }))
+            .filter_map(|leaf| leaf_record_name(&leaf.address, &forges).ok())
             .collect::<BTreeSet<_>>();
-        let bound_name = bound_change_request_record_name(&convoy).map_err(|error| format!("derive bound change request: {error}"))?;
+        let bound_name = bound_change_request_address(&convoy, &forges)
+            .map_err(|error| format!("derive bound change request: {error}"))?
+            .and_then(|address| record_name(&address));
         let mut observation_errors = BTreeMap::new();
         for leaf in expected_change_request_leaves {
-            if let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = leaf.address {
-                let subject = ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
-                if let Some(error) = self.leaf_subscriptions.change_request_observation_error(&subject).await {
-                    observation_errors.insert(subject.record_name(), error.to_string());
-                }
+            let Some(subject) =
+                ChangeRequestRef::from_address(namespace, &leaf.address).and_then(|subject| subject.normalized(&forges).ok())
+            else {
+                continue;
+            };
+            if let (Some(error), Ok(name)) =
+                (self.leaf_subscriptions.change_request_observation_error(&subject).await, subject.record_name())
+            {
+                observation_errors.insert(name, error.to_string());
             }
         }
         let change_requests = expected_change_requests
@@ -1447,10 +1439,7 @@ impl ReadProjections<'_> {
                 let selected = change_request_objects.get(record_name);
                 let provenance = selected_change_requests
                     .values()
-                    .find(|(object, _)| {
-                        flotilla_resources::change_request_record_name(&object.spec.service, &object.spec.scope, object.spec.number)
-                            == *record_name
-                    })
+                    .find(|(object, _)| spec_record_name(&object.spec, &forges).as_ref() == Some(record_name))
                     .map(|(_, source)| explained_provenance(&source.provenance, self.node_id));
                 let observed_at = selected.and_then(|source| source.status.as_ref()).map(|status| status.state.observed_at);
                 ExplainedChangeRequest {
@@ -1471,6 +1460,7 @@ impl ReadProjections<'_> {
             &selected_vessels,
             &selected_checkouts,
             &change_request_objects,
+            &forges,
             change_request_stale_after,
             LANDING_EVIDENCE_TTL,
             now,
@@ -1858,10 +1848,11 @@ pub fn explained_decision_ledgers(
                     })
                     .collect::<Vec<_>>();
                 if matches!(claim.phase, CrewWorkPhase::Done | CrewWorkPhase::HandedBack) {
-                    let name = flotilla_resources::artifact_record_name(convoy_name, role, "decision-ledger", convoy_name);
+                    let name =
+                        flotilla_resources::address::artifact_slot_record_name(convoy_name, role, "decision-ledger", convoy_name).ok();
                     let artifact = artifacts
                         .iter()
-                        .filter(|source| source.object.metadata.name == name)
+                        .filter(|source| name.as_ref() == Some(&source.object.metadata.name))
                         .min_by_key(|source| !matches!(source.provenance, ResourceProvenance::Local))
                         .filter(|source| {
                             let artifact = &source.object.spec;
@@ -2171,4 +2162,10 @@ pub async fn message_views(
         });
     }
     Ok(views)
+}
+
+/// The record name a change-request record's spec addresses, resolving a
+/// host-spelled service through `forges`.
+fn spec_record_name(spec: &flotilla_resources::ChangeRequestSpec, forges: &[flotilla_resources::ForgeSpec]) -> Option<String> {
+    spec.address(forges).ok().and_then(|address| record_name(&address))
 }

@@ -809,7 +809,8 @@ async fn leaf_targeted_reads_retry_without_losing_wait_identity() {
     let (dependencies, changes) = table.register_routing(&row).await.expect("register");
     let attempts = AtomicUsize::new(0);
     // Store-I/O seam: inject two transient read failures, then use the real store.
-    let mut watching = Box::pin(table.watch_registered_row(row, changes, || {
+    let names = dependencies.names.clone();
+    let mut watching = Box::pin(table.watch_registered_row(row, &names, changes, || {
         let attempt = attempts.fetch_add(1, Ordering::SeqCst);
         let table = &table;
         let dependencies = &dependencies;
@@ -856,10 +857,10 @@ async fn leaf_read_backoff_is_cancelled_by_disconnect() {
     let watching_table = table.clone();
     let reading_attempts = attempts.clone();
     let task = tokio::spawn(async move {
-        let (_, changes) = watching_table.register_routing(&row).await.expect("register");
+        let (dependencies, changes) = watching_table.register_routing(&row).await.expect("register");
         // Store-I/O seam: hold the store in a transient failure state.
         watching_table
-            .watch_registered_row(row, changes, || {
+            .watch_registered_row(row, &dependencies.names, changes, || {
                 reading_attempts.fetch_add(1, Ordering::SeqCst);
                 async { Err(ResourceError::other("store temporarily unavailable")) }
             })

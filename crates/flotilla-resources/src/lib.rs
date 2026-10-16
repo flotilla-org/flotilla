@@ -100,12 +100,11 @@ mod watch;
 #[doc(hidden)]
 pub mod workflow_template;
 
-pub use artifact::{artifact_record_name, Artifact, ArtifactSpec, ArtifactStatus, ArtifactStatusPatch};
+pub use artifact::{Artifact, ArtifactSpec, ArtifactStatus, ArtifactStatusPatch};
 pub use change_request::{
-    change_request_record_name, change_request_subject, merge_change_request_history, retain_change_request, select_change_request_sources,
-    select_change_requests, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus,
-    ChangeRequestStatusPatch, ChangeRequestSubjectHistory, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
-    ObservedReviewDecision,
+    change_request_subject, merge_change_request_history, retain_change_request, select_change_request_sources, select_change_requests,
+    ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, ChangeRequestStatusPatch,
+    ChangeRequestSubjectHistory, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision,
 };
 pub use checkout::{
     latch_evidence_backed_integration, ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout,
@@ -117,7 +116,7 @@ pub use clock::{Clock, SystemClock};
 pub use clone::{Clone, CloneFailurePolicy, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use controller_retry::{ControllerRetry, ControllerRetryDisposition, RetryBackoff, RetryCeiling, PROVISIONING_RETRY_BACKOFF};
 pub use convoy::{
-    active_change_request_subjects, bound_change_request_record_name, change_request_address, change_request_address_with_forges,
+    active_change_request_subjects, bound_change_request_address, change_request_address, change_request_address_with_forges,
     controller_patches, convoy_reference_context, convoy_sanctions_checkout_reclaim, convoy_subject_rows, evaluate_crew_completion,
     evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs, external_patches, instantiate_exit,
     instantiate_turn_delivery, issue_address, issue_address_with_forges, observed_change_request_subjects, pinned_placement_ref,
@@ -168,7 +167,7 @@ pub use host::{
     HEARTBEAT_READY_TTL_SECS, HEARTBEAT_REFRESH_SECS, HELD_CREDENTIALS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
     SLEEP_INHIBITION_CONDITION_TYPE, TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
 };
-pub use issue::{issue_record_name, Issue, IssueSpec, IssueStatus, IssueStatusPatch, ObservedIssueState};
+pub use issue::{Issue, IssueSpec, IssueStatus, IssueStatusPatch, ObservedIssueState};
 pub use labels::{
     label_value, labels_match, LifecycleAuthority, AUTHORITY_LABEL, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL,
     GENERATION_LABEL, MANAGED_BY_LABEL, PROJECT_LABEL, REPO_KEY_LABEL, REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL,
@@ -230,7 +229,7 @@ pub use terminal_session::{
     TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTag, TERMINAL_DELIVERY_EXPIRED_REASON,
     TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON,
 };
-pub use usage::{usage_record_name, Usage, UsagePace, UsageProviderCost, UsageSpec, UsageStatus, UsageStatusPatch, UsageWindow};
+pub use usage::{Usage, UsagePace, UsageProviderCost, UsageSpec, UsageStatus, UsageStatusPatch, UsageWindow};
 pub use vessel::{
     vessel_resource_name, Vessel, VesselImage, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,

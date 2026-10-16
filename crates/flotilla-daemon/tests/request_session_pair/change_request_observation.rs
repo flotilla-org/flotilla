@@ -2,7 +2,6 @@ use flotilla_change_request::observation::{ChangeRequestObservationSource, Chang
 use flotilla_core::change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
-    change_request_record_name,
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
     ChangeRequest, ChangeRequestLeafSubject, ChangeRequestSpec, ChangeRequestStatus, ConvoyStatus, IssueSourceBindingSpec, LeafSubject,
     Observation, ObservedChangeRequestState, ObservedChecks, Project, ProjectSpec,
@@ -109,7 +108,11 @@ async fn remote_change_request_scenario(existing: ExistingRecord, late_watcher: 
     .await;
     let subject =
         ChangeRequestRef { namespace: "flotilla".into(), service: source.service.clone(), scope: source.scope.clone(), number: 330 };
-    let name = change_request_record_name(&source.service, &source.scope, 330);
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address(&source.service, &source.scope, 330, &[])
+            .expect("change request address"),
+    )
+    .expect("record name");
     // Existing misattribution from the live failure: an empty nonowner record.
     if !matches!(existing, ExistingRecord::Missing) {
         requester
@@ -230,7 +233,8 @@ async fn remote_change_request_scenario(existing: ExistingRecord, late_watcher: 
             .into_values()
             .map(|record| (name.clone(), record))
             .collect();
-        let Some(patch) = promises::next_observation(&status, "producer", &records, &BTreeMap::new(), Utc::now(), Duration::from_secs(180))
+        let Some(patch) =
+            promises::next_observation(&status, "producer", &records, &BTreeMap::new(), &[], Utc::now(), Duration::from_secs(180))
         else {
             return false;
         };

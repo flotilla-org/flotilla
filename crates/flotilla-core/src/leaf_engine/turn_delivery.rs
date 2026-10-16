@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
 use flotilla_resources::{
-    evaluate_leaf, expected_change_request_leaves, external_patches, select_convoy_children, Artifact, ArtifactLeafSubject, ChangeRequest,
-    Checkout, Convoy, ConvoyAttention, ConvoyPhase, HoldAct, Issue, ObservedChecks, ResourceObject, StatusPatch, TerminalSession,
-    TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    address::leaf_record_name, evaluate_leaf, expected_change_request_leaves, external_patches, select_convoy_children, Artifact,
+    ArtifactLeafSubject, ChangeRequest, Checkout, Convoy, ConvoyAttention, ConvoyPhase, HoldAct, Issue, ObservedChecks, ResourceObject,
+    StatusPatch, TerminalSession, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::stalls::{is_active_change_request_probe, is_conflict_probe, is_merged_settlement_probe};
@@ -129,9 +130,10 @@ impl LeafSubscriptionTable {
             return Ok(());
         }
         let active_conflict = active_probe && is_conflict_probe(leaf);
+        let forges = self.namespace_forges(&namespace).await?;
         let (subject_revision, evidence_at, brief, message_subject) = match &leaf.address {
             LeafAddress::ChangeRequest { service, scope, number } => {
-                let record_name = flotilla_resources::change_request_record_name(service, scope, *number);
+                let record_name = leaf_record_name(&leaf.address, &forges)?;
                 let record = self
                     .inner
                     .backend
@@ -232,7 +234,7 @@ impl LeafSubscriptionTable {
                 (revision, evidence_at, brief, Some(subject))
             }
             LeafAddress::Issue { service, scope, number } => {
-                let record_name = flotilla_resources::issue_record_name(service, scope, *number);
+                let record_name = leaf_record_name(&leaf.address, &forges)?;
                 let record = self
                     .inner
                     .backend
@@ -299,8 +301,10 @@ impl LeafSubscriptionTable {
                     let leaves = expected_change_request_leaves(&convoy, &checkouts)?;
                     let mut bound_to_current_head = false;
                     for candidate in leaves {
-                        let LeafAddress::ChangeRequest { service, scope, number } = candidate.address else { continue };
-                        let name = flotilla_resources::change_request_record_name(&service, &scope, number);
+                        if !matches!(candidate.address, LeafAddress::ChangeRequest { .. }) {
+                            continue;
+                        }
+                        let Ok(name) = leaf_record_name(&candidate.address, &forges) else { continue };
                         let record = self.inner.backend.including_replicas::<ChangeRequest>(&namespace).get(&name).await;
                         if record.ok().and_then(|record| record.object.status.and_then(|status| status.head_sha.value)).as_deref()
                             == Some(subject.as_str())
@@ -313,7 +317,7 @@ impl LeafSubscriptionTable {
                         return Ok(());
                     }
                 }
-                let name = flotilla_resources::artifact_record_name(artifact_convoy, producer, kind, subject);
+                let name = leaf_record_name(&leaf.address, &[])?;
                 let artifact = self
                     .inner
                     .backend

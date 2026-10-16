@@ -35,6 +35,7 @@ use flotilla_store_memory::InMemoryBackend;
 use futures::StreamExt;
 use tokio::sync::broadcast;
 
+use super::routing::RowDependencies;
 use super::sources::*;
 use super::stalls::*;
 use super::subscriptions::*;
@@ -671,7 +672,10 @@ async fn assert_leaf_subscription_contract(backend: ResourceBackend) {
         freshness_demand: Some(recorded_at - chrono::Duration::seconds(1)),
     };
     let artifact_id = table.subscribe_wait(connection_id, artifact_wait).await.expect("subscribe artifact leaf");
-    let name = flotilla_resources::artifact_record_name("demo", "reviewer", "review-round", "head-X");
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::artifact_address("demo", "reviewer", "review-round", "head-X").expect("artifact address"),
+    )
+    .expect("record name");
     backend
         .using::<Artifact>("flotilla")
         .create(
@@ -749,7 +753,11 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
     );
     convoys.update_status("checks-wake", &created.metadata.resource_version, &status).await.expect("active crew");
     let records = backend.using::<ChangeRequest>("flotilla");
-    let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 2596);
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2596, &[])
+            .expect("change request address"),
+    )
+    .expect("record name");
     records
         .create(
             &InputMeta::builder().name(name.clone()).build(),
@@ -863,6 +871,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
             "checks-wake",
             &BTreeMap::from([(name.clone(), record.clone())]),
             &BTreeMap::new(),
+            &[],
             Utc::now(),
             Duration::from_secs(60),
         )
@@ -898,6 +907,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
         let fire = evaluate_row(
             row,
             &subjects,
+            &RowDependencies::derive(row, &[]).names,
             LeafObservationStaleness { change_request: Duration::from_secs(60), issue: Duration::from_secs(60) },
         )
         .expect("evaluate merged")
@@ -910,6 +920,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
             if let Some(fire) = evaluate_row(
                 competing,
                 &subjects,
+                &RowDependencies::derive(competing, &[]).names,
                 LeafObservationStaleness { change_request: Duration::from_secs(60), issue: Duration::from_secs(60) },
             )
             .expect("competing evaluation")
@@ -949,7 +960,11 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
     if stalled {
         if open_ledger {
             let artifacts = backend.using::<Artifact>("flotilla");
-            let ledger_name = flotilla_resources::artifact_record_name("checks-wake", "coder", "decision-ledger", "checks-wake");
+            let ledger_name = flotilla_resources::address::record_name(
+                &flotilla_resources::address::artifact_address("checks-wake", "coder", "decision-ledger", "checks-wake")
+                    .expect("artifact address"),
+            )
+            .expect("record name");
             let ledger = artifacts
                 .create(
                     &InputMeta::builder().name(ledger_name.clone()).build(),
@@ -972,6 +987,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
                 "checks-wake",
                 &BTreeMap::from([(name.clone(), record.clone())]),
                 &artifacts,
+                &[],
                 Utc::now(),
                 Duration::from_secs(60),
             ) {
@@ -1109,7 +1125,11 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
     );
     convoys.update_status("checks-wake", &created.metadata.resource_version, &status).await.expect("active crew");
     let records = backend.using::<ChangeRequest>("flotilla");
-    let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 2596);
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2596, &[])
+            .expect("change request address"),
+    )
+    .expect("record name");
     records
         .create(
             &InputMeta::builder().name(name.clone()).build(),
@@ -1199,6 +1219,7 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
                     issues: &HashMap::new(),
                     artifacts: &HashMap::new(),
                 },
+                &RowDependencies::derive(&row, &[]).names,
                 LeafObservationStaleness { change_request: Duration::from_secs(60), issue: Duration::from_secs(60) },
             )
             .expect("evaluate checks");
@@ -1400,7 +1421,11 @@ async fn assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates
         )
         .await
         .expect("landing status");
-    let cr_name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1392);
+    let cr_name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1392, &[])
+            .expect("change request address"),
+    )
+    .expect("record name");
     let records = backend.clone().using::<ChangeRequest>("flotilla");
     let record = records
         .create(

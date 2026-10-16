@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::{ApiPaths, ReplicationClass, Resource, ResourceError, StatusPatch};
 
@@ -124,17 +123,4 @@ impl StatusPatch<UsageStatus> for UsageStatusPatch {
             Self::Observed(observation) => *status = observation.clone(),
         }
     }
-}
-
-/// Produce a DNS-safe, fixed-size resource name for a provider/account subject.
-pub fn usage_record_name(provider: &str, account: &str) -> String {
-    let normalized_provider = provider.trim().to_lowercase();
-    let normalized_account = account.trim().to_lowercase();
-    let mut hash = Sha256::new();
-    hash.update(b"usage-account-v2\0");
-    hash.update(normalized_provider.as_bytes());
-    hash.update(b"\0");
-    hash.update(normalized_account.as_bytes());
-    let digest = format!("{:x}", hash.finalize());
-    format!("usage-{}", &digest[..54])
 }

@@ -12,7 +12,6 @@ use flotilla_controllers::reconcilers::{
     checkout::{CheckoutPrepared, CheckoutReconciler},
     CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
-use flotilla_resources::change_request_record_name;
 use flotilla_resources::Actuation;
 use flotilla_resources::ChangeRequest;
 use flotilla_resources::ChangeRequestMergeability;
@@ -149,7 +148,7 @@ impl WorldBuilder for CheckoutWorldBuilder {
                     r#ref: "feature/liveness".to_string(),
                     base_ref: Some("main".to_string()),
                     target_path: "/work/checkout-a".to_string(),
-                    url: "https://example.com/repo-a".to_string(),
+                    url: "https://github.com/example/repo-a".to_string(),
                 }),
             )
             .await
@@ -341,7 +340,8 @@ impl WorldBuilder for ConvoyWorldBuilder {
         let backend = WriteCountingBackend::in_memory();
         let inner = backend.inner();
         let created =
-            common::create_convoy_with_single_task(&inner, NAMESPACE, "convoy-a", "work", "https://example.com/repo-a", "main").await;
+            common::create_convoy_with_single_task(&inner, NAMESPACE, "convoy-a", "work", "https://github.com/example/repo-a", "main")
+                .await;
         let convoys = backend.using::<Convoy>(NAMESPACE);
         let mut status = created.status.expect("convoy fixture status");
         status.phase = ConvoyPhase::Landing;
@@ -372,7 +372,7 @@ impl WorldBuilder for ConvoyWorldBuilder {
                     r#ref: "feature/liveness".to_string(),
                     base_ref: Some("main".to_string()),
                     target_path: "/work/checkout-a".to_string(),
-                    url: "https://example.com/repo-a".to_string(),
+                    url: "https://github.com/example/repo-a".to_string(),
                 }),
             )
             .await
@@ -412,13 +412,17 @@ impl WorldBuilder for ConvoyWorldBuilder {
             .map_err(|error| error.to_string())?;
 
         let change_requests = backend.using::<ChangeRequest>(NAMESPACE);
-        let record_name = change_request_record_name("example.com", "repo-a", CHANGE_REQUEST_NUMBER);
+        let record_name = flotilla_resources::address::record_name(
+            &flotilla_resources::address::stored_change_request_address("github.com", "example/repo-a", CHANGE_REQUEST_NUMBER, &[])
+                .expect("change request address"),
+        )
+        .expect("record name");
         let record = change_requests
             .create(
                 &InputMeta::builder().name(record_name.clone()).build(),
                 &ChangeRequestSpec::builder()
-                    .service("example.com".to_string())
-                    .scope("repo-a".to_string())
+                    .service("github.com".to_string())
+                    .scope("example/repo-a".to_string())
                     .number(CHANGE_REQUEST_NUMBER)
                     .observing_authority("test".to_string())
                     .build(),
@@ -459,7 +463,11 @@ impl ReconcileStep<ConvoyWorld> for ConvoyStep {
 
     async fn reconcile_step(&self, world: &mut ConvoyWorld) -> Result<LivenessStep<Self::Patch, Self::Actuation>, String> {
         let records = world.backend.using::<ChangeRequest>(NAMESPACE);
-        let record_name = change_request_record_name("example.com", "repo-a", CHANGE_REQUEST_NUMBER);
+        let record_name = flotilla_resources::address::record_name(
+            &flotilla_resources::address::stored_change_request_address("github.com", "example/repo-a", CHANGE_REQUEST_NUMBER, &[])
+                .expect("change request address"),
+        )
+        .expect("record name");
         let record = records.get(&record_name).await.map_err(|error| error.to_string())?;
         let stale =
             record.status.as_ref().is_some_and(|status| world.clock.now().signed_duration_since(status.state.observed_at) > LANDING_TTL);

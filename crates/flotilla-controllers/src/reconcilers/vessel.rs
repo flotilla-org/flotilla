@@ -17,14 +17,14 @@ use flotilla_core::in_process::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, PlacementDecision};
 use flotilla_resources::{
-    artifact_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot, repository_workspace_slugs, Artifact,
-    Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy, CrewImageBaseline, CrewSource, CrewWorkPhase,
-    DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource, Environment, EnvironmentMount,
-    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository,
-    RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase,
-    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
+    address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
+    repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,
+    CrewImageBaseline, CrewSource, CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource,
+    Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
+    PlacementPolicySpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance,
+    TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage, VesselPhase,
+    VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
     CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
@@ -1320,7 +1320,8 @@ impl Reconciler for VesselReconciler {
                             );
                             render_options.has_credential_scope = !requirement.credential_scopes.is_empty();
                             let mut brief = if convoy.metadata.annotations.contains_key(BRIEF_ARTIFACTS_ANNOTATION) {
-                                let name = artifact_record_name(&context.convoy, &process.role, "brief", &context.convoy);
+                                let name = artifact_slot_record_name(&context.convoy, &process.role, "brief", &context.convoy)
+                                    .map_err(ResourceError::invalid)?;
                                 let artifact = match self.artifacts.get(&name).await {
                                     Ok(artifact) => artifact.object,
                                     Err(ResourceError::NotFound { .. }) => {

@@ -6,10 +6,10 @@ use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_protocol::{arg::shell_quote, Leaf, LeafAddress, LeafOperator};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
-    actor_obligation, select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewCompletionRefusal,
-    CrewCompletionRefusalCause, LeafMaker, NudgeObligation, ResourceObject, StallEvidenceSource, StallNudge, StallRung, StallSupervisor,
-    StalledCondition, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    actor_obligation, address::leaf_record_name, select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus,
+    CrewCompletionRefusal, CrewCompletionRefusalCause, LeafMaker, NudgeObligation, ResourceObject, StallEvidenceSource, StallNudge,
+    StallRung, StallSupervisor, StalledCondition, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::sources::freshest_change_request_refs;
@@ -244,6 +244,8 @@ impl ReconcilerWake {
         let observation_list = views.change_requests.shared_list().await.map_err(|error| error.to_string())?;
         let progress_observations = freshest_change_request_refs(&observation_list.items);
         let observations = &observation_list.items;
+        let forges =
+            views.forges.definitions().await.map_err(|error| error.to_string())?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
         let checkouts_list = views.checkouts.shared_list().await.map_err(|error| error.to_string())?;
         let checkouts = &checkouts_list.items;
         let vessels_list = views.vessels.shared_list().await.map_err(|error| error.to_string())?;
@@ -765,10 +767,10 @@ impl ReconcilerWake {
                         let mut reason = None;
                         for leaf in &row.leaves {
                             if let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address {
-                                let name = flotilla_resources::change_request_record_name(service, scope, *number);
+                                let name = leaf_record_name(&leaf.address, &forges).ok();
                                 let observation = observations
                                     .iter()
-                                    .filter(|source| source.object.metadata.name == name)
+                                    .filter(|source| name.as_ref() == Some(&source.object.metadata.name))
                                     .filter_map(|source| source.object.status.as_ref())
                                     .max_by_key(|status| status.state.observed_at);
                                 let has_value = observation.is_some_and(|status| match leaf.field_path.as_str() {

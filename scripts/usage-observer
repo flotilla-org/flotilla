@@ -19,7 +19,7 @@ PROVIDERS = ("codex", "claude")
 
 
 def record_name(provider, account):
-    """Keep this byte-for-byte aligned with usage_record_name in usage.rs."""
+    """Keep this byte-for-byte aligned with record_name for usage accounts in crates/flotilla-address/src/record.rs."""
     normalized_provider = provider.strip().lower()
     normalized_account = account.strip().lower()
     digest = hashlib.sha256(b"usage-account-v2\0" + normalized_provider.encode() + b"\0" + normalized_account.encode()).hexdigest()

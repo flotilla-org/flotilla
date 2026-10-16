@@ -3,7 +3,11 @@ use flotilla_store_sqlite::SqliteBackend;
 
 pub(super) async fn publish_merged_change_request(backend: &ResourceBackend, number: u64, authority: &str) {
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>(NAMESPACE);
-    let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", number);
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", number, &[])
+            .expect("change request address"),
+    )
+    .expect("record name");
     let record = match records
         .create(
             &InputMeta::builder().name(name).build(),
@@ -18,7 +22,13 @@ pub(super) async fn publish_merged_change_request(backend: &ResourceBackend, num
     {
         Ok(record) => record,
         Err(ResourceError::Conflict { .. }) => records
-            .get(&flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", number))
+            .get(
+                &flotilla_resources::address::record_name(
+                    &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", number, &[])
+                        .expect("change request address"),
+                )
+                .expect("record name"),
+            )
             .await
             .expect("read concurrently materialized CR observation"),
         Err(error) => panic!("create merged CR observation: {error}"),

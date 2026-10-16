@@ -12,6 +12,7 @@ use super::{
     WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use crate::{
+    address::{artifact_slot_record_name, leaf_record_name},
     checkout::Checkout,
     labels::{LifecycleAuthority, CONVOY_LABEL, VESSEL_LABEL},
     pinned_placement_ref,
@@ -22,7 +23,7 @@ use crate::{
         validate, visit_template_tokens, ArtifactSubjectBinding, CompletionCondition, CrewSource, CrewSpec, ExitDeclaration,
         ValidationError, WorkflowTemplate,
     },
-    Actuation, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, ControllerRetry, InputValue,
+    Actuation, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, ControllerRetry, ForgeSpec, InputValue,
     ObservedChangeRequestState, OwnerReference, PlacementStatus, Resource, ThreeValue, ENSURED_FROM_ANNOTATION, PROVISIONING_RETRY_BACKOFF,
 };
 
@@ -159,12 +160,14 @@ pub struct CrewCompletionClaim<'a> {
     pub role: &'a str,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_crew_completion(
     convoy: &ResourceObject<Convoy>,
     claim: CrewCompletionClaim<'_>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     artifacts: &BTreeMap<String, ResourceObject<Artifact>>,
+    forges: &[ForgeSpec],
     stale_after: std::time::Duration,
     now: DateTime<Utc>,
 ) -> Result<Vec<UnmetSettlementExpectation>, String> {
@@ -183,7 +186,7 @@ pub fn evaluate_crew_completion(
     if !crew.promise_exclusions.contains(&pr) && (crew.deliverer || crew.promises.iter().any(|promise| promise.kind == pr)) {
         if let Some(condition) = pr.readiness_condition() {
             if let Some(expectation) =
-                evaluate_declared_completion_condition(convoy, &condition, checkouts, change_requests, artifacts, stale_after, now)?
+                evaluate_declared_completion_condition(convoy, &condition, checkouts, change_requests, artifacts, forges, stale_after, now)?
             {
                 unmet.push(expectation);
             }
@@ -192,8 +195,16 @@ pub fn evaluate_crew_completion(
     for expectation in &crew.completion_conditions {
         match expectation {
             crate::CrewCompletionExpectation::Condition(condition) => {
-                let result =
-                    evaluate_declared_completion_condition(convoy, condition, checkouts, change_requests, artifacts, stale_after, now)?;
+                let result = evaluate_declared_completion_condition(
+                    convoy,
+                    condition,
+                    checkouts,
+                    change_requests,
+                    artifacts,
+                    forges,
+                    stale_after,
+                    now,
+                )?;
                 if let Some(expectation) = result {
                     unmet.push(expectation);
                 }
@@ -206,12 +217,14 @@ pub fn evaluate_crew_completion(
     Ok(unmet)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_declared_completion_condition(
     convoy: &ResourceObject<Convoy>,
     condition: &CompletionCondition,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     artifacts: &BTreeMap<String, ResourceObject<Artifact>>,
+    forges: &[ForgeSpec],
     stale_after: std::time::Duration,
     now: DateTime<Utc>,
 ) -> Result<Option<UnmetSettlementExpectation>, String> {
@@ -237,10 +250,10 @@ fn evaluate_declared_completion_condition(
                     if leaves.iter().any(|candidate| candidate.address != leaf.address) {
                         return Err("head-bound artifact condition requires exactly one change request".to_string());
                     }
-                    let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
+                    if !matches!(leaf.address, LeafAddress::ChangeRequest { .. }) {
                         return Err("expected change request leaf has another subject".to_string());
-                    };
-                    let name = crate::change_request_record_name(service, scope, *number);
+                    }
+                    let name = leaf_record_name(&leaf.address, forges)?;
                     let head = change_requests.get(&name).and_then(|record| record.status.as_ref()).and_then(|status| {
                         now.signed_duration_since(status.head_sha.observed_at)
                             .to_std()
@@ -259,7 +272,7 @@ fn evaluate_declared_completion_condition(
                     head.clone()
                 }
             };
-            let name = crate::artifact_record_name(&convoy.metadata.name, producer, kind, &subject);
+            let name = artifact_slot_record_name(&convoy.metadata.name, producer, kind, &subject)?;
             let address =
                 LeafAddress::Artifact { convoy: convoy.metadata.name.clone(), producer: producer.clone(), kind: kind.clone(), subject };
             let leaf = Leaf { address, field_path: field_path.clone(), operator: *operator, literal: literal.clone() };
@@ -308,10 +321,11 @@ fn evaluate_declared_completion_condition(
             }
             for expected in leaves {
                 let LeafAddress::ChangeRequest { service, scope, number } = &expected.address else { continue };
-                let name = crate::change_request_record_name(service, scope, *number);
-                let subject =
-                    change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject { change_request, now, stale_after });
-                let cause = match change_requests.get(&name).and_then(|record| record.status.as_ref()) {
+                // A leaf that names no record, such as a host no Forge
+                // declares, has no observation.
+                let record = leaf_record_name(&expected.address, forges).ok().and_then(|name| change_requests.get(&name));
+                let subject = record.map(|change_request| ChangeRequestLeafSubject { change_request, now, stale_after });
+                let cause = match record.and_then(|record| record.status.as_ref()) {
                     None => Some(CrewCompletionRefusalCause::MissingChangeRequestObservation {
                         service: service.clone(),
                         scope: scope.clone(),
@@ -372,11 +386,13 @@ pub struct LandingSettlement {
 /// every branch that held it false. Reconciliation and diagnostics share this
 /// function so an explanation cannot drift from the condition writer. Landed
 /// preserves its recognised terminal outcome after the supporting records expire.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_landing_settlement(
     convoy: &ResourceObject<Convoy>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
+    forges: &[ForgeSpec],
     change_request_stale_after: std::time::Duration,
     landing_evidence_stale_after: std::time::Duration,
     now: DateTime<Utc>,
@@ -386,6 +402,7 @@ pub fn evaluate_landing_settlement(
         vessels,
         checkouts,
         change_requests,
+        forges,
         change_request_stale_after,
         landing_evidence_stale_after,
         now,
@@ -393,11 +410,13 @@ pub fn evaluate_landing_settlement(
     .evaluation
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_landing_settlement_with_disposition(
     convoy: &ResourceObject<Convoy>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
+    forges: &[ForgeSpec],
     change_request_stale_after: std::time::Duration,
     landing_evidence_stale_after: std::time::Duration,
     now: DateTime<Utc>,
@@ -407,6 +426,7 @@ pub fn evaluate_landing_settlement_with_disposition(
         vessels,
         checkouts,
         change_requests,
+        forges,
         change_request_stale_after,
         landing_evidence_stale_after,
         now,
@@ -421,11 +441,13 @@ pub fn evaluate_landing_settlement_with_disposition(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_exit_with_disposition(
     convoy: &ResourceObject<Convoy>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
+    forges: &[ForgeSpec],
     change_request_stale_after: std::time::Duration,
     landing_evidence_stale_after: std::time::Duration,
     now: DateTime<Utc>,
@@ -522,13 +544,14 @@ fn evaluate_exit_with_disposition(
     };
 
     let evaluate_terminal = |leaf: &Leaf| {
-        let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
+        if !matches!(leaf.address, LeafAddress::ChangeRequest { .. }) {
             return Err(UnmetSettlementExpectation::InvalidCondition {
                 subject: convoy.metadata.name.clone(),
                 message: "exit table leaf did not address a change request".to_string(),
             });
-        };
-        let name = crate::change_request_record_name(service, scope, *number);
+        }
+        let name = leaf_record_name(&leaf.address, forges)
+            .map_err(|message| UnmetSettlementExpectation::InvalidCondition { subject: leaf.address.to_string(), message })?;
         let subject = change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject {
             change_request,
             now,
@@ -624,9 +647,7 @@ fn evaluate_exit_with_disposition(
         .into_iter()
         .map(|address| {
             let record = match &address {
-                LeafAddress::ChangeRequest { service, scope, number } => {
-                    change_requests.get(&crate::change_request_record_name(service, scope, *number))
-                }
+                LeafAddress::ChangeRequest { .. } => leaf_record_name(&address, forges).ok().and_then(|name| change_requests.get(&name)),
                 _ => None,
             };
             let observation = record.and_then(|record| record.status.as_ref()).map(|status| &status.state);

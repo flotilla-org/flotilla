@@ -312,7 +312,11 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
     .await
     .expect("exit row armed");
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
-    let record_name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1392);
+    let record_name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1392, &[])
+            .expect("change request address"),
+    )
+    .expect("record name");
     let record = records.get(&record_name).await.expect("demanded observation record");
     let fresh = Utc::now();
     records
@@ -422,7 +426,11 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
         .await
         .expect("landing status");
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
-    let record_name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1391);
+    let record_name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1391, &[])
+            .expect("change request address"),
+    )
+    .expect("record name");
     let record = records
         .create(
             &test_meta(&record_name),

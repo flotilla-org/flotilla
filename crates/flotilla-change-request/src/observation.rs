@@ -12,8 +12,9 @@ use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
-    address::canonical_stored_spelling, change_request_record_name, ChangeRequestReviewObservation, ChangeRequestStatus, Observation,
-    ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision,
+    address::{record_name, stored_change_request_address, stored_service_scope, Address},
+    ChangeRequestReviewObservation, ChangeRequestStatus, ForgeSpec, Observation, ObservedChangeRequestState, ObservedChecks,
+    ObservedMergeability, ObservedReviewDecision,
 };
 
 pub(crate) const DEFAULT_REVIEW_BOT_LOGIN: &str = "claude";
@@ -32,14 +33,25 @@ impl ChangeRequestRef {
         Some(Self { namespace: namespace.to_string(), service: service.clone(), scope: scope.clone(), number: *number })
     }
 
-    pub fn record_name(&self) -> String {
-        let (service, scope) = canonical_stored_spelling(&self.service, &self.scope);
-        change_request_record_name(&service, &scope, self.number)
+    /// The change request this subject names. A service spelled by host
+    /// resolves only through the Forge in `forges` that declares it.
+    pub fn address(&self, forges: &[ForgeSpec]) -> Result<Address, String> {
+        stored_change_request_address(&self.service, &self.scope, self.number, forges)
     }
 
-    pub fn normalized(mut self) -> Self {
-        (self.service, self.scope) = canonical_stored_spelling(&self.service, &self.scope);
-        self
+    /// The name of the record that observes this subject. A normalized
+    /// subject spells its forge by id, so it needs no Forge directory.
+    pub fn record_name(&self) -> Result<String, String> {
+        let address = self.address(&[])?;
+        record_name(&address).ok_or_else(|| format!("{address} names no record"))
+    }
+
+    /// This subject respelled as its address's stored `(service, scope)`, so
+    /// every spelling of one change request is one subject.
+    pub fn normalized(mut self, forges: &[ForgeSpec]) -> Result<Self, String> {
+        let address = self.address(forges)?;
+        (self.service, self.scope) = stored_service_scope(&address).expect("a change request address is under a repository");
+        Ok(self)
     }
 }
 

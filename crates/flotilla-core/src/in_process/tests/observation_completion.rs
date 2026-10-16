@@ -13,9 +13,9 @@ use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::{CrewCommandContext, HostName};
 use flotilla_resources::{
-    change_request_record_name, BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, Repository, RepositorySpec,
-    Selector, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
+    ConvoyStatusPatch, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, Repository, RepositorySpec, Selector,
+    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
@@ -678,7 +678,13 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
     assert_ne!(refused_status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
     let observed = backend
         .using::<ResourceChangeRequest>("flotilla")
-        .get(&change_request_record_name("github.com", "flotilla-org/flotilla", 2200))
+        .get(
+            &flotilla_resources::address::record_name(
+                &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2200, &[])
+                    .expect("change request address"),
+            )
+            .expect("record name"),
+        )
         .await
         .expect("claim-time observation");
     assert_eq!(observed.status.expect("status").mergeable.value, Some(flotilla_resources::ObservedMergeability::Conflicting));

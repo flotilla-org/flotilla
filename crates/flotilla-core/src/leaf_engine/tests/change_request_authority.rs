@@ -11,7 +11,14 @@ async fn usage_leaf_fires_from_the_named_window_in_the_replicated_resource_path(
     let records = backend.using::<Usage>("flotilla");
     let created = records
         .create(
-            &InputMeta::builder().name(flotilla_resources::usage_record_name(provider, account)).build(),
+            &InputMeta::builder()
+                .name(
+                    flotilla_resources::address::record_name(
+                        &flotilla_resources::address::Address::usage(provider, account).expect("usage address"),
+                    )
+                    .expect("record name"),
+                )
+                .build(),
             &flotilla_resources::UsageSpec { provider: provider.to_string(), account: account.to_string() },
         )
         .await
@@ -155,7 +162,11 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
         .expect("replicate checkout evidence");
 
     let remote_records = remote.using::<ChangeRequest>("flotilla");
-    let record_name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1364);
+    let record_name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1364, &[])
+            .expect("change request address"),
+    )
+    .expect("record name");
     let record = remote_records
         .create(
             &InputMeta::builder().name(record_name).build(),
@@ -323,7 +334,11 @@ async fn replica_reading_evaluator_fires_from_authority_change_request_record() 
     let authority = ResourceBackend::new(InMemoryBackend::default());
     let subject =
         LeafAddress::ChangeRequest { service: "github.com".to_string(), scope: "flotilla-org/flotilla".to_string(), number: 1365 };
-    let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1365);
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1365, &[])
+            .expect("change request address"),
+    )
+    .expect("record name");
     let records = authority.using::<ChangeRequest>("flotilla");
     let created = records
         .create(
@@ -396,7 +411,11 @@ async fn replica_reading_evaluator_fires_from_authority_change_request_record() 
 async fn foreign_change_request_authority_does_not_fetch_or_write_status() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let records = backend.using::<ChangeRequest>("flotilla");
-    let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 2049);
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2049, &[])
+            .expect("change request address"),
+    )
+    .expect("record name");
     records
         .create(
             &InputMeta::builder().name(name.clone()).build(),
@@ -474,7 +493,7 @@ async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
     .expect("owner fetches");
     let records = owner.using::<ChangeRequest>("flotilla");
     tokio::time::timeout(Duration::from_secs(2), async {
-        while records.get(&subject.record_name()).await.expect("owner record").status.is_none() {
+        while records.get(&subject.record_name().expect("record name")).await.expect("owner record").status.is_none() {
             tokio::task::yield_now().await;
         }
     })
@@ -495,8 +514,14 @@ async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
     );
     let reader_id = uuid::Uuid::new_v4();
     reader_refresher.demand(reader_id, subject.clone(), None).await.expect("reader demand");
-    let initial_observed_at =
-        records.get(&subject.record_name()).await.expect("owner record").status.expect("owner status").state.observed_at;
+    let initial_observed_at = records
+        .get(&subject.record_name().expect("record name"))
+        .await
+        .expect("owner record")
+        .status
+        .expect("owner status")
+        .state
+        .observed_at;
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_millis(30)).await;
         reader
@@ -507,14 +532,21 @@ async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
     }
     assert_eq!(reader_calls.load(Ordering::SeqCst), 0, "reader must use replicated observation");
     assert!(
-        records.get(&subject.record_name()).await.expect("owner record").status.expect("renewed status").state.observed_at
+        records
+            .get(&subject.record_name().expect("record name"))
+            .await
+            .expect("owner record")
+            .status
+            .expect("renewed status")
+            .state
+            .observed_at
             > initial_observed_at,
         "healthy owner must renew unchanged observations before they become stale"
     );
-    assert!(reader.using::<ChangeRequest>("flotilla").get(&subject.record_name()).await.is_err());
+    assert!(reader.using::<ChangeRequest>("flotilla").get(&subject.record_name().expect("record name")).await.is_err());
     assert!(reader
         .including_replicas::<ChangeRequest>("flotilla")
-        .get(&subject.record_name())
+        .get(&subject.record_name().expect("record name"))
         .await
         .expect("replicated record")
         .object
@@ -528,7 +560,11 @@ async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
 async fn former_owner_evaluates_fresher_takeover_replica() {
     let former_owner = ResourceBackend::new(InMemoryBackend::default());
     let new_owner = ResourceBackend::new(InMemoryBackend::default());
-    let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 2052);
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2052, &[])
+            .expect("change request address"),
+    )
+    .expect("record name");
     let spec = |authority: &str| {
         flotilla_resources::ChangeRequestSpec::builder()
             .service("github.com".to_string())
@@ -675,7 +711,7 @@ async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
         let records = backend.using::<ChangeRequest>("flotilla");
         let created = records
             .create(
-                &InputMeta::builder().name(subject.record_name()).build(),
+                &InputMeta::builder().name(subject.record_name().expect("record name")).build(),
                 &flotilla_resources::ChangeRequestSpec::builder()
                     .service(subject.service.clone())
                     .scope(subject.scope.clone())
@@ -686,7 +722,11 @@ async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
             .await
             .expect("create authority record");
         records
-            .update_status(&subject.record_name(), &created.metadata.resource_version, &status(Utc::now() - chrono::Duration::seconds(age)))
+            .update_status(
+                &subject.record_name().expect("record name"),
+                &created.metadata.resource_version,
+                &status(Utc::now() - chrono::Duration::seconds(age)),
+            )
             .await
             .expect("publish old observation");
     }
@@ -719,7 +759,11 @@ async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
     .expect("former owner reclaims stale takeover");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let reclaimed = former.using::<ChangeRequest>("flotilla").get(&subject.record_name()).await.expect("reclaimed local record");
+            let reclaimed = former
+                .using::<ChangeRequest>("flotilla")
+                .get(&subject.record_name().expect("record name"))
+                .await
+                .expect("reclaimed local record");
             assert_eq!(reclaimed.spec.observing_authority, "former");
             if reclaimed.status.is_some_and(|status| status.state.observed_at > Utc::now() - chrono::Duration::seconds(2)) {
                 break;
@@ -745,7 +789,7 @@ async fn stale_replicated_change_request_is_claimed_by_demanding_host() {
     let records = owner.using::<ChangeRequest>("flotilla");
     let created = records
         .create(
-            &InputMeta::builder().name(subject.record_name()).build(),
+            &InputMeta::builder().name(subject.record_name().expect("record name")).build(),
             &flotilla_resources::ChangeRequestSpec::builder()
                 .service(subject.service.clone())
                 .scope(subject.scope.clone())
@@ -793,7 +837,7 @@ async fn stale_replicated_change_request_is_claimed_by_demanding_host() {
     refresher.demand(id, subject.clone(), None).await.expect("demand stale replica");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0, "one stale threshold must not move a healthy owner's record");
-    assert!(reader.using::<ChangeRequest>("flotilla").get(&subject.record_name()).await.is_err());
+    assert!(reader.using::<ChangeRequest>("flotilla").get(&subject.record_name().expect("record name")).await.is_err());
     let current = records.get(&created.metadata.name).await.expect("owner record");
     let mut very_old_status = old_status;
     let very_old = Utc::now() - chrono::Duration::seconds(10);
@@ -814,7 +858,7 @@ async fn stale_replicated_change_request_is_claimed_by_demanding_host() {
     })
     .await
     .expect("reader should take over and refresh");
-    let claimed = reader.using::<ChangeRequest>("flotilla").get(&subject.record_name()).await.expect("local claim");
+    let claimed = reader.using::<ChangeRequest>("flotilla").get(&subject.record_name().expect("record name")).await.expect("local claim");
     assert_eq!(claimed.spec.observing_authority, "reader");
     assert!(claimed.status.is_some());
     owner
@@ -859,7 +903,10 @@ async fn observed_issue_change_fires_wait_leaf() {
         )
         .await
         .expect("subscribe issue");
-    let name = flotilla_resources::issue_record_name("github.com", "flotilla-org/flotilla", 2052);
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_issue_address("github.com", "flotilla-org/flotilla", 2052, &[]).expect("issue address"),
+    )
+    .expect("record name");
     let records = backend.using::<Issue>("flotilla");
     let created = records.get(&name).await.expect("demand creates record");
     let now = Utc::now();
@@ -887,7 +934,10 @@ async fn observed_issue_change_fires_wait_leaf() {
 async fn issue_leaf_uses_issue_refresher_staleness() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let records = backend.using::<Issue>("flotilla");
-    let name = flotilla_resources::issue_record_name("github.com", "flotilla-org/flotilla", 2052);
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_issue_address("github.com", "flotilla-org/flotilla", 2052, &[]).expect("issue address"),
+    )
+    .expect("record name");
     let created = records
         .create(
             &InputMeta::builder().name(name.clone()).build(),
@@ -964,4 +1014,33 @@ async fn issue_leaf_uses_issue_refresher_staleness() {
         DaemonEvent::LeafFired(_)
     ));
     table.unsubscribe_connection(connection).await;
+}
+
+// #3351: a wait on a change request addressed from a repository URL with
+// capitals reads the record the observer writes. GitHub looks owners and
+// repositories up case-insensitively, so both spellings name one change
+// request and therefore one record (ADR 0066 §3).
+#[tokio::test]
+async fn mixed_case_repository_leaf_reads_the_record_the_observer_writes() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let (event_tx, _) = broadcast::channel(16);
+    let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(true) });
+    let refresher = ChangeRequestRefresher::new(
+        "fleet".to_string(),
+        backend.clone(),
+        "authority".to_string(),
+        source,
+        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+    );
+    let table = LeafSubscriptionTable::new(backend, broadcast_test_sink(event_tx.clone()), refresher);
+    let mut events = event_tx.subscribe();
+    let address = flotilla_resources::change_request_address("https://github.com/Flotilla-Org/Flotilla", "3351").expect("address");
+    let request = WaitSubscriptionRequest {
+        namespace: "flotilla".to_string(),
+        leaves: vec![leaf(address, ".state", "merged")],
+        freshness_demand: None,
+    };
+    let subscription_id = table.subscribe_wait(uuid::Uuid::new_v4(), request).await.expect("subscribe CR wait");
+
+    assert_eq!(receive_fire(&mut events, subscription_id).await.value, "merged");
 }

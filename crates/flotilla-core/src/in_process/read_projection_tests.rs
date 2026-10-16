@@ -834,7 +834,15 @@ mod tests {
         for scope in ["owner/one", "owner/two", "owner/unrelated"] {
             let record = requests
                 .create(
-                    &InputMeta::builder().name(flotilla_resources::change_request_record_name("github.com", scope, 42)).build(),
+                    &InputMeta::builder()
+                        .name(
+                            flotilla_resources::address::record_name(
+                                &flotilla_resources::address::stored_change_request_address("github.com", scope, 42, &[])
+                                    .expect("change request address"),
+                            )
+                            .expect("record name"),
+                        )
+                        .build(),
                     &ChangeRequestSpec::builder()
                         .service("github.com".into())
                         .scope(scope.into())
@@ -1113,7 +1121,11 @@ mod tests {
         for (producer, subject) in [("reviewer", "ledger-artifact"), ("coder", "other-subject"), ("coder", "ledger-artifact")] {
             let explanation = fixture.projections().explain_convoy("flotilla", "ledger-artifact").await.expect("explanation");
             assert!(explanation.decision_ledgers[0].missing, "another crew or subject cannot supply this claim's evidence");
-            let name = flotilla_resources::artifact_record_name("ledger-artifact", producer, "decision-ledger", subject);
+            let name = flotilla_resources::address::record_name(
+                &flotilla_resources::address::artifact_address("ledger-artifact", producer, "decision-ledger", subject)
+                    .expect("artifact address"),
+            )
+            .expect("record name");
             fixture
                 .backend
                 .using::<flotilla_resources::Artifact>("flotilla")
@@ -1156,7 +1168,10 @@ mod tests {
         runtime.block_on(async {
             let backend = ResourceBackend::new(InMemoryBackend::default());
             let at = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).single().expect("timestamp");
-            let name = flotilla_resources::artifact_record_name("claimed", "coder", "decision-ledger", "claimed");
+            let name = flotilla_resources::address::record_name(
+                &flotilla_resources::address::artifact_address("claimed", "coder", "decision-ledger", "claimed").expect("artifact address"),
+            )
+            .expect("record name");
             let mut spec = flotilla_resources::ArtifactSpec::builder()
                 .convoy("claimed".into())
                 .producer("coder".into())
