@@ -115,12 +115,31 @@ pub struct DummyChangeRequestConfig {
 #[serde(deny_unknown_fields)]
 pub struct DummySharedForgeConfig {
     /// Forgejo web root, as the forge's Forge record names it in `https_url`.
+    #[serde(deserialize_with = "deserialize_https_url")]
     pub service_url: String,
     /// Absolute path of the file holding the forge's API token.
+    #[serde(deserialize_with = "deserialize_absolute_path")]
     pub token_path: String,
     /// Branch the change requests target.
     #[serde(default = "default_base_branch")]
     pub base_branch: String,
+}
+
+fn deserialize_https_url<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let url = String::deserialize(deserializer)?;
+    match url.strip_prefix("https://") {
+        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => Ok(url),
+        _ => Err(serde::de::Error::custom(format!("shared forge service_url `{url}` must be an https URL"))),
+    }
+}
+
+fn deserialize_absolute_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let path = String::deserialize(deserializer)?;
+    if std::path::Path::new(&path).is_absolute() {
+        Ok(path)
+    } else {
+        Err(serde::de::Error::custom(format!("shared forge token_path `{path}` must be absolute")))
+    }
 }
 
 fn default_base_branch() -> String {
@@ -164,9 +183,18 @@ mod tests {
             })
         );
         assert_eq!(DummyFleetConfig::default().shared_forge, None);
-        let error = toml::from_str::<DummyFleetConfig>("[shared_forge]\nservice_url = \"x\"\ntoken_path = \"y\"\ntoken = \"z\"\n")
+        let error = toml::from_str::<DummyFleetConfig>("[shared_forge]\nservice_url = \"https://x\"\ntoken_path = \"/y\"\ntoken = \"z\"\n")
             .expect_err("unknown key");
         assert!(error.to_string().contains("unknown field"), "{error}");
+        // Mistakes that would only surface as a crew stall fail at load.
+        for (section, expected) in [
+            ("service_url = \"\"\ntoken_path = \"/t\"\n", "must be an https URL"),
+            ("service_url = \"http://fake/github\"\ntoken_path = \"/t\"\n", "must be an https URL"),
+            ("service_url = \"https://fake/github\"\ntoken_path = \"tokens/github\"\n", "must be absolute"),
+        ] {
+            let error = toml::from_str::<DummyFleetConfig>(&format!("[shared_forge]\n{section}")).expect_err(expected);
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]

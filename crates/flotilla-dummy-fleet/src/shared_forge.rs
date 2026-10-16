@@ -48,7 +48,11 @@ impl SharedForge {
                 None,
             )
             .await?;
-        if let Some(pull) = existing.as_array().and_then(|pulls| pulls.first()) {
+        // Forgejo's `head` filter matches the exact branch (recorded lab
+        // evidence: forgejo_head_filter_capability.yaml). Check the head ref
+        // anyway, so a forge that ignored the filter cannot hand back another
+        // branch's pull request.
+        if let Some(pull) = existing.as_array().into_iter().flatten().find(|pull| pull["head"]["ref"].as_str() == Some(branch)) {
             return web_url(pull);
         }
         let created = forge

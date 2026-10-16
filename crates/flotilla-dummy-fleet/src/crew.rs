@@ -6,8 +6,9 @@
 //! A brief selects its script with a line `dummy-script: <script> [key=value]…`:
 //!
 //! - `coder [review=<role>] [repo=<owner/name>]` promises a change request,
-//!   opens one on the dummy forge (or the configured shared forge) and submits it, optionally asks a peer to
-//!   review it and waits for the reply, then completes.
+//!   opens one on the dummy forge (or on the configured shared forge) and
+//!   submits it, optionally asks a peer to review it and waits for the reply,
+//!   then completes.
 //! - `responder reply=<role>` answers every turn with a handoff to `reply`,
 //!   and completes after answering a turn marked [`LAST_TURN_MARKER`].
 //! - `governor aide=<role> [turns=<n>]` is a long runner: it hands its aide
@@ -313,14 +314,17 @@ impl Crew {
         loop {
             let mut backoff = Duration::from_secs(1);
             let mut last_error = String::new();
-            for _ in 0..COMMAND_ATTEMPTS {
+            for attempt in 1..=COMMAND_ATTEMPTS {
                 match shared.open(repository, branch, title, &body).await {
                     Ok(url) => return Some(url),
                     Err(error) => {
-                        tracing::warn!(crew = %self.identity.subject(), %error, "dummy crew could not open its change request; retrying");
+                        tracing::warn!(crew = %self.identity.subject(), attempt, %error, "dummy crew could not open its change request");
                         last_error = error;
-                        self.idle_for(backoff).await;
-                        backoff *= 2;
+                        // Back off between attempts; after the last, stall at once.
+                        if attempt < COMMAND_ATTEMPTS {
+                            self.idle_for(backoff).await;
+                            backoff *= 2;
+                        }
                     }
                 }
             }
