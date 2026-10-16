@@ -27,9 +27,9 @@ use crate::{
 
 /// Forgejo's default `MAX_RESPONSE_ITEMS`: the largest page it serves.
 pub const MAX_PAGE_SIZE: usize = 50;
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Merge styles Forgejo's `MergePullRequestOption.Do` accepts.
-const MERGE_STYLES: &[&str] = &["merge", "rebase", "rebase-merge", "squash", "fast-forward-only", "manually-merged"];
+pub(crate) const MERGE_STYLES: &[&str] = &["merge", "rebase", "rebase-merge", "squash", "fast-forward-only", "manually-merged"];
 
 /// The Forgejo API for every forge in `forge`.
 pub fn router(forge: Arc<FakeForge>) -> Router {
