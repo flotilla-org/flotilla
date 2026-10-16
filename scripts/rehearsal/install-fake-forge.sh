@@ -233,12 +233,15 @@ UNIT
   systemctl enable flotilla-fake-forge.service >/dev/null
   systemctl restart flotilla-fake-forge.service
   # Ready when every forge answers its token over HTTPS, verified against the CA.
+  # The header comes from a private file, so the token never appears in `ps`.
+  resolve=()
+  if [[ -n $ip && $ip == *:* ]]; then resolve=(--resolve "$host:$port:[$ip]"); elif [[ -n $ip ]]; then resolve=(--resolve "$host:$port:$ip"); fi
   for mount in "${mounts[@]}"; do
+    (umask 077; printf 'Authorization: token %s\n' "$(cat "$prefix/tokens/$mount")" >"$work/auth-$mount")
     ready=""
     for _ in $(seq 1 30); do
-      if curl -fsS --cacert "$prefix/ca/ca.pem" -H "Accept: application/json" \
-        -H "Authorization: token $(cat "$prefix/tokens/$mount")" \
-        ${ip:+--resolve "$host:$port:$ip"} "$public_url/$mount/api/v1/user" >/dev/null 2>&1; then
+      if curl -fsS --cacert "$prefix/ca/ca.pem" -H "Accept: application/json" -H "@$work/auth-$mount" \
+        "${resolve[@]}" "$public_url/$mount/api/v1/user" >/dev/null 2>&1; then
         ready=1
         break
       fi

@@ -178,12 +178,14 @@ fn the_script_refuses_broken_input() {
         .args(["--stage", staged.to_str().expect("UTF-8"), "--forge", "a=one=x.example"])
         .output()
         .expect("run");
+    assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--host is required"));
     let output = Command::new("bash")
         .arg(script())
         .args(["--stage", staged.to_str().expect("UTF-8"), "--host", "bad\"host", "--forge", "a=one=x.example"])
         .output()
         .expect("run");
+    assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("must be a DNS name"));
     assert!(!staged.exists());
 }
