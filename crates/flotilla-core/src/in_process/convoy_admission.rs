@@ -296,6 +296,8 @@ impl ConvoyAdmission {
             return Ok(Some(change_request));
         }
         let repositories = reads.including_replicas::<Repository>(namespace);
+        let forges = reads.definitions::<Forge>(namespace).list().await.map_err(|error| error.to_string())?;
+        let forges = forges.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
         let mut failures = Vec::new();
         for repository_key in repository_keys {
             let repository = match repositories.get(&repository_key.to_string()).await {
@@ -306,14 +308,18 @@ impl ConvoyAdmission {
                 }
             };
             let Some(remote) = repository.object.spec.live_remote() else { continue };
-            let address = match change_request_address(remote, id) {
-                Ok(address) => address,
+            let subject = id
+                .parse::<u64>()
+                .map_err(|_| format!("change request id `{id}` is not a numeric forge number"))
+                .and_then(|number| remote_change_request_address(remote, number, &forges))
+                .and_then(|address| ChangeRequestKey::new(namespace, address));
+            let subject = match subject {
+                Ok(subject) => subject,
                 Err(error) => {
                     failures.push(ObservationError::Failed(error));
                     continue;
                 }
             };
-            let Some(subject) = ChangeRequestRef::from_address(namespace, &address) else { continue };
             match self.change_request_observation_source.observe(&subject).await {
                 Ok(observation) => {
                     let status = match observation.state.value {
@@ -5942,12 +5948,11 @@ mod tests {
             .await;
         let port = Arc::new(FakeQueryPort { backend, tracker, discoveries: AtomicUsize::new(0) });
         let source = ProviderChangeRequestObservationSource::new(port.backend.clone(), port.clone());
-        let subject = ChangeRequestRef {
-            namespace: "flotilla".to_string(),
-            service: "github.com".to_string(),
-            scope: "acme/repo".to_string(),
-            number: 7,
-        };
+        let subject = ChangeRequestKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_change_request_address("github.com", "acme/repo", 7, &[]).expect("address"),
+        )
+        .expect("key");
 
         let status = source.observe(&subject).await.expect("observed change request");
         assert_eq!(status.state.value, Some(ObservedChangeRequestState::Open));

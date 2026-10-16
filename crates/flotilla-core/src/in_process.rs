@@ -3,6 +3,7 @@
 //! `InProcessDaemon` owns repos, runs refresh loops, executes commands,
 //! and broadcasts events — all within the same process.
 
+use flotilla_resources::address::{leaf_address, GITHUB_FORGE_ID};
 use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 #[cfg(test)]
 mod host_registry_tests;
@@ -63,8 +64,8 @@ use convoy_admission::{
     StaticFulfilmentDecider,
 };
 pub use convoy_admission::{PreparedConvoyAdmission, RoleAddress};
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_change_request::observation::ChangeRequestObservationSource;
-use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_change_request::BoundObservations;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_projections::ports::ResolvedAttach;
@@ -86,7 +87,7 @@ use flotilla_protocol::{
 #[cfg(test)]
 use flotilla_resources::CrewMessageSender;
 use flotilla_resources::{
-    active_change_request_subjects, api_version, capped_github_app_permissions, change_request_address, change_request_address_with_forges,
+    active_change_request_subjects, api_version, capped_github_app_permissions, change_request_address_with_forges,
     host_direct_environment_name, normalize_issue_source, observed_change_request_subjects, AllocationDecision, BoundChangeRequest,
     CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
     CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
@@ -451,43 +452,37 @@ impl IssueQueryPort for ProviderIssueQueryPort {
     }
 }
 
+/// The issue source a subject is read from: its forge's declared HTTPS
+/// root, or public GitHub for the built-in `github` forge.
 fn issue_source_for_subject(
-    subject: &crate::issue_observer::IssueRef,
+    subject: &crate::issue_observer::IssueKey,
     forges: &[flotilla_resources::ForgeSpec],
 ) -> Result<flotilla_protocol::IssueSource, String> {
-    let service = if let Some(forge) = forges.iter().find(|forge| forge.forge_id == subject.service) {
-        forge.https_url.clone()
-    } else {
-        if !subject.service.starts_with("host%3a") && !subject.service.contains(['.', ':']) && !subject.service.contains("%2f") {
-            return Err(format!("issue service `{}` has no Forge declaration or host-derived address", subject.service));
-        }
-        let encoded = subject.service.strip_prefix("host%3a").unwrap_or(&subject.service);
-        let location = encoded.replace("%2f", "/").replace("%3a", ":").replace("%25", "%");
-        if location.contains("://") {
-            location
-        } else {
-            format!("https://{location}")
-        }
+    let service = match forges.iter().find(|forge| forge.forge_id == subject.forge_id()) {
+        Some(forge) => forge.https_url.clone(),
+        None if subject.forge_id() == GITHUB_FORGE_ID => "https://github.com".to_string(),
+        None => return Err(format!("issue forge `{}` has no Forge declaration", subject.forge_id())),
     };
-    Ok(flotilla_protocol::IssueSource { service, scope: subject.scope.clone() })
+    Ok(flotilla_protocol::IssueSource { service, scope: subject.repository_path().to_string() })
 }
 
 #[async_trait]
 impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationSource {
-    async fn observe(&self, subject: &crate::issue_observer::IssueRef) -> Result<flotilla_resources::IssueStatus, String> {
+    async fn observe(&self, subject: &crate::issue_observer::IssueKey) -> Result<flotilla_resources::IssueStatus, String> {
         let forges = self
             .backend
-            .definitions::<Forge>(&subject.namespace)
+            .definitions::<Forge>(subject.namespace())
             .list()
             .await
             .map_err(|error| error.to_string())?
             .into_iter()
             .map(|forge| forge.spec)
             .collect::<Vec<_>>();
-        let fallback = flotilla_protocol::IssueRef { source: issue_source_for_subject(subject, &forges)?, id: subject.number.to_string() };
+        let fallback =
+            flotilla_protocol::IssueRef { source: issue_source_for_subject(subject, &forges)?, id: subject.number().to_string() };
         let reference = self
             .backend
-            .including_replicas::<ResourceConvoy>(&subject.namespace)
+            .including_replicas::<ResourceConvoy>(subject.namespace())
             .list()
             .await
             .map_err(|error| error.to_string())?
@@ -496,14 +491,9 @@ impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationS
             .flat_map(|convoy| convoy.object.spec.issues)
             .map(|issue| issue.reference)
             .find(|reference| {
-                flotilla_resources::issue_address_with_forges(reference, &forges).is_ok_and(|address| {
-                    address
-                        == flotilla_protocol::LeafAddress::Issue {
-                            service: subject.service.clone(),
-                            scope: subject.scope.clone(),
-                            number: subject.number,
-                        }
-                })
+                flotilla_resources::issue_address_with_forges(reference, &forges)
+                    .and_then(|leaf| leaf_address(&leaf, &forges))
+                    .is_ok_and(|address| &address == subject.address())
             })
             .unwrap_or(fallback);
         let issue = self.query_port.fetch_issue_by_ref(&reference).await?;
@@ -531,14 +521,20 @@ struct BoundConvoyCredentialRefs {
 
 fn convoy_change_request_credential_refs(
     convoy: &ResourceObject<ResourceConvoy>,
-    requested: &ChangeRequestRef,
+    requested: &ChangeRequestKey,
+    forges: &[flotilla_resources::ForgeSpec],
 ) -> Result<BoundConvoyCredentialRefs, String> {
     let bound_numbers = active_change_request_subjects(convoy)?
         .into_iter()
         .filter(|bound| {
             bound.kind == flotilla_protocol::SubjectKind::ChangeRequest
-                && bound.source.service == requested.service
-                && bound.source.scope == requested.scope
+                && match bound.leaf().and_then(|leaf| leaf_address(&leaf, forges)) {
+                    Ok(address) => address.parent() == Some(requested.repository()),
+                    Err(error) => {
+                        tracing::debug!(convoy = %convoy.metadata.name, %error, "bound change request subject has no address; no credentials bound");
+                        false
+                    }
+                }
         })
         .filter_map(|bound| bound.id.parse().ok())
         .collect::<BTreeSet<_>>();
@@ -585,13 +581,14 @@ impl ProviderChangeRequestObservationSource {
 
     async fn query(
         &self,
-        subjects: &[ChangeRequestRef],
-        subject: &ChangeRequestRef,
+        subjects: &[ChangeRequestKey],
+        subject: &ChangeRequestKey,
         fresh: bool,
     ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
-        let key = (subject.namespace.clone(), subject.service.clone(), subject.scope.clone());
-        let mut numbers = subjects.iter().map(|subject| subject.number).collect::<BTreeSet<_>>();
-        numbers.insert(subject.number);
+        let (service, scope) = subject.stored_service_scope();
+        let key = (subject.namespace().to_string(), service.clone(), scope.clone());
+        let mut numbers = subjects.iter().map(ChangeRequestKey::number).collect::<BTreeSet<_>>();
+        numbers.insert(subject.number());
         let scope_cache = {
             let mut cache = self.cache.lock().await;
             Arc::clone(cache.entry(key).or_insert_with(|| Arc::new(Mutex::new(None))))
@@ -603,20 +600,22 @@ impl ProviderChangeRequestObservationSource {
         // cooldown too. Check before discovery and regardless of the cached batch.
         if let Some(entry) = cache.as_ref().filter(|entry| tokio::time::Instant::now() < entry.expires_at) {
             if let Some(error) = entry.rate_limit_error() {
-                return observation_during_cooldown(&entry.result, subject.number, error);
+                return observation_during_cooldown(&entry.result, subject.number(), error);
             }
         }
 
         let repositories =
-            self.backend.including_replicas::<Repository>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
+            self.backend.including_replicas::<Repository>(subject.namespace()).list().await.map_err(|error| error.to_string())?;
         let repository = repositories
             .items
             .into_iter()
-            .find(|repository| repository_observes_subject(&repository.object.spec, &subject.service, &subject.scope))
-            .ok_or_else(|| format!("repository {}/{} has no discovered change request provider", subject.service, subject.scope))?;
+            .find(|repository| repository_observes_subject(&repository.object.spec, &service, &scope))
+            .ok_or_else(|| format!("repository {} has no discovered change request provider", subject.repository()))?;
         let mut credential_refs_by_number = BTreeMap::<u64, BTreeSet<String>>::new();
         let convoys =
-            self.backend.including_replicas::<ResourceConvoy>(&subject.namespace).list().await.map_err(|error| error.to_string())?.items;
+            self.backend.including_replicas::<ResourceConvoy>(subject.namespace()).list().await.map_err(|error| error.to_string())?.items;
+        let forges = self.backend.definitions::<Forge>(subject.namespace()).list().await.map_err(|error| error.to_string())?;
+        let forges = forges.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
         let missing_snapshots = convoys
             .iter()
             .filter(|convoy| {
@@ -628,7 +627,7 @@ impl ProviderChangeRequestObservationSource {
         self.warned_missing_snapshot
             .lock()
             .await
-            .retain(|(namespace, name)| namespace != &subject.namespace || missing_snapshots.contains(name.as_str()));
+            .retain(|(namespace, name)| namespace != subject.namespace() || missing_snapshots.contains(name.as_str()));
         for convoy in convoys {
             if convoy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
                 continue;
@@ -640,7 +639,7 @@ impl ProviderChangeRequestObservationSource {
                     numbers.insert(number);
                 }
             }
-            let bound = match convoy_change_request_credential_refs(&convoy.object, subject) {
+            let bound = match convoy_change_request_credential_refs(&convoy.object, subject, &forges) {
                 Ok(bound) => bound,
                 Err(error) => {
                     tracing::warn!(convoy = %convoy.object.metadata.name, %error, "could not resolve active change request subjects for crew identity");
@@ -653,7 +652,11 @@ impl ProviderChangeRequestObservationSource {
                     for (number, refs) in bound.credentials_by_number {
                         credential_refs_by_number.entry(number).or_default().extend(refs);
                     }
-                } else if self.warned_missing_snapshot.lock().await.insert((subject.namespace.clone(), convoy.object.metadata.name.clone()))
+                } else if self
+                    .warned_missing_snapshot
+                    .lock()
+                    .await
+                    .insert((subject.namespace().to_string(), convoy.object.metadata.name.clone()))
                 {
                     tracing::warn!(convoy = %convoy.object.metadata.name, "bound change request has no frozen workflow for crew credential identity");
                 }
@@ -667,9 +670,9 @@ impl ProviderChangeRequestObservationSource {
                         .result
                         .as_ref()
                         .map_err(Clone::clone)?
-                        .get(&subject.number)
+                        .get(&subject.number())
                         .cloned()
-                        .unwrap_or_else(|| Err(format!("change request {} was not found", subject.number).into()));
+                        .unwrap_or_else(|| Err(format!("change request {} was not found", subject.number()).into()));
                 }
             }
         }
@@ -682,7 +685,7 @@ impl ProviderChangeRequestObservationSource {
         let credentials = if credential_refs_by_number.is_empty() {
             Vec::new()
         } else {
-            match self.backend.including_replicas::<CredentialSpec>(&subject.namespace).list().await {
+            match self.backend.including_replicas::<CredentialSpec>(subject.namespace()).list().await {
                 Ok(credentials) => credentials.items,
                 Err(error) => {
                     tracing::warn!(%error, "could not list crew credential declarations; change request markers remain unverified");
@@ -701,7 +704,7 @@ impl ProviderChangeRequestObservationSource {
         self.warned_missing_identity
             .lock()
             .await
-            .retain(|(namespace, name)| namespace != &subject.namespace || missing_actors.contains(name.as_str()));
+            .retain(|(namespace, name)| namespace != subject.namespace() || missing_actors.contains(name.as_str()));
         for credential in credentials {
             for (number, refs) in &credential_refs_by_number {
                 if refs.contains(&credential.object.metadata.name) {
@@ -712,25 +715,25 @@ impl ProviderChangeRequestObservationSource {
                             .warned_missing_identity
                             .lock()
                             .await
-                            .insert((subject.namespace.clone(), credential.object.metadata.name.clone()))
+                            .insert((subject.namespace().to_string(), credential.object.metadata.name.clone()))
                     {
                         tracing::warn!(credential = %credential.object.metadata.name, "granted GitHub App credential has no actor_login; crew address markers cannot be recognized");
                     }
                 }
             }
         }
-        let provider = self.query_port.discover_repository_change_request(&subject.namespace, &repository.object.spec).await?;
+        let provider = self.query_port.discover_repository_change_request(subject.namespace(), &repository.object.spec).await?;
         let crew_logins = crew_logins.into_iter().map(|(number, logins)| (number, logins.into_iter().collect())).collect();
         let result = provider.observe_bound(&numbers, &crew_logins).await;
         let delay = observation_cache_delay(observation_rate_limit_error(&result).and_then(ObservationError::retry_at), Utc::now());
         let status = if let Some(error) = observation_rate_limit_error(&result) {
-            observation_during_cooldown(&result, subject.number, error)
+            observation_during_cooldown(&result, subject.number(), error)
         } else {
             result.as_ref().map_err(Clone::clone).and_then(|statuses| {
                 statuses
-                    .get(&subject.number)
+                    .get(&subject.number())
                     .cloned()
-                    .unwrap_or_else(|| Err(format!("change request {} was not found", subject.number).into()))
+                    .unwrap_or_else(|| Err(format!("change request {} was not found", subject.number()).into()))
             })
         };
         *cache = Some(
@@ -747,21 +750,21 @@ impl ProviderChangeRequestObservationSource {
 
 #[async_trait]
 impl ChangeRequestObservationSource for ProviderChangeRequestObservationSource {
-    async fn observe(&self, subject: &ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+    async fn observe(&self, subject: &ChangeRequestKey) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         self.query(std::slice::from_ref(subject), subject, false).await
     }
 
     async fn observe_group(
         &self,
-        subjects: &[ChangeRequestRef],
-        subject: &ChangeRequestRef,
+        subjects: &[ChangeRequestKey],
+        subject: &ChangeRequestKey,
     ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         self.query(subjects, subject, false).await
     }
 
     async fn observe_for_completion(
         &self,
-        subject: &ChangeRequestRef,
+        subject: &ChangeRequestKey,
     ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         self.query(std::slice::from_ref(subject), subject, true).await
     }

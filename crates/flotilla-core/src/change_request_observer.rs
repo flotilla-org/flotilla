@@ -6,10 +6,11 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_address::{Address, Kind};
-use flotilla_change_request::observation::{ChangeRequestObservationSource, ChangeRequestRef};
-use flotilla_protocol::{IssueSource, ReferenceContext, Relationship, Subject as ConvoySubject, SubjectKind as ConvoySubjectKind};
+use flotilla_change_request::observation::{ChangeRequestKey, ChangeRequestObservationSource};
+use flotilla_protocol::{IssueSource, ReferenceContext, Relationship, SubjectKind as ConvoySubjectKind};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
+    address::{leaf_address, stored_spelling_names},
     convoy_subject_rows, merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestSpec,
     ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks,
     ResourceError, ResourceProvenance,
@@ -64,9 +65,9 @@ struct ChangeRequestRefresherInner {
     origin: String,
     source: Arc<dyn ChangeRequestObservationSource>,
     cadence: ChangeRequestRefreshCadence,
-    active: Mutex<HashMap<ChangeRequestRef, ActiveRefresh>>,
-    observation_errors: Mutex<HashMap<ChangeRequestRef, ObservationError>>,
-    subject_locks: Mutex<HashMap<ChangeRequestRef, Weak<Mutex<()>>>>,
+    active: Mutex<HashMap<ChangeRequestKey, ActiveRefresh>>,
+    observation_errors: Mutex<HashMap<ChangeRequestKey, ObservationError>>,
+    subject_locks: Mutex<HashMap<ChangeRequestKey, Weak<Mutex<()>>>>,
     relay_healthy: std::sync::atomic::AtomicBool,
     relay_wake: Notify,
 }
@@ -161,7 +162,7 @@ impl ChangeRequestRefresher {
         }
     }
 
-    async fn reconcile_convoy_demands(&self, namespace: &str, demands: &mut HashMap<ChangeRequestRef, uuid::Uuid>) -> Result<(), String> {
+    async fn reconcile_convoy_demands(&self, namespace: &str, demands: &mut HashMap<ChangeRequestKey, uuid::Uuid>) -> Result<(), String> {
         let convoys = self.inner.backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?;
         let forges = self.forges(namespace).await?;
         let mut wanted = HashSet::new();
@@ -171,19 +172,27 @@ impl ChangeRequestRefresher {
                 continue;
             }
             for row in convoy_subject_rows(&copy.object, &ReferenceContext::default()) {
-                let Some(subject) = row.subject.leaf().ok().and_then(|address| ChangeRequestRef::from_address(namespace, &address)) else {
-                    continue;
-                };
+                let Ok(leaf) = row.subject.leaf() else { continue };
                 // Debug, not warn: this re-runs on every convoy, project and
                 // Forge change, so an undeclared host would repeat each pass.
-                let subject = match subject.clone().normalized(&forges) {
-                    Ok(subject) => subject,
+                let address = match leaf_address(&leaf, &forges) {
+                    Ok(address) => address,
                     Err(error) => {
-                        tracing::debug!(convoy = %copy.object.metadata.name, service = %subject.service, scope = %subject.scope, number = subject.number, %error, "convoy change request subject has no address; not observed");
+                        tracing::debug!(convoy = %copy.object.metadata.name, ?leaf, %error, "convoy subject has no address; not observed");
                         continue;
                     }
                 };
-                let source = IssueSource { service: subject.service.clone(), scope: subject.scope.clone() };
+                if address.kind() != Kind::ChangeRequest {
+                    continue;
+                }
+                let subject = match ChangeRequestKey::new(namespace, address) {
+                    Ok(subject) => subject,
+                    Err(error) => {
+                        tracing::debug!(convoy = %copy.object.metadata.name, %error, "convoy change request subject has no observation key");
+                        continue;
+                    }
+                };
+                let source = stored_source(&subject);
                 let owned = if let Some(owned) = owners.get(&source) {
                     *owned
                 } else {
@@ -214,7 +223,7 @@ impl ChangeRequestRefresher {
         Ok(())
     }
 
-    async fn subject_lock(&self, subject: &ChangeRequestRef) -> Arc<Mutex<()>> {
+    async fn subject_lock(&self, subject: &ChangeRequestKey) -> Arc<Mutex<()>> {
         let mut locks = self.inner.subject_locks.lock().await;
         if let Some(lock) = locks.get(subject).and_then(Weak::upgrade) {
             return lock;
@@ -229,12 +238,8 @@ impl ChangeRequestRefresher {
         self.inner.cadence.stale_after
     }
 
-    pub async fn observation_error(&self, subject: &ChangeRequestRef) -> Option<ObservationError> {
-        let subject = match self.normalized(subject.clone()).await {
-            Ok(subject) => subject,
-            Err(error) => return Some(ObservationError::Failed(error)),
-        };
-        self.inner.observation_errors.lock().await.get(&subject).cloned()
+    pub async fn observation_error(&self, subject: &ChangeRequestKey) -> Option<ObservationError> {
+        self.inner.observation_errors.lock().await.get(subject).cloned()
     }
 
     /// The namespace's declared Forges, which resolve a host-spelled service.
@@ -243,22 +248,14 @@ impl ChangeRequestRefresher {
         Ok(forges.into_iter().map(|forge| forge.spec).collect())
     }
 
-    /// A subject respelled through its address, so every spelling of one
-    /// change request is one subject with one record name.
-    async fn normalized(&self, subject: ChangeRequestRef) -> Result<ChangeRequestRef, String> {
-        let forges = self.forges(&subject.namespace).await?;
-        subject.normalized(&forges)
-    }
-
     /// Refresh a claim-time observation even before Landing has armed its
     /// standing leaf subscriptions.
-    pub async fn refresh_once(&self, subject: &ChangeRequestRef) -> Result<(), ObservationError> {
+    pub async fn refresh_once(&self, subject: &ChangeRequestKey) -> Result<(), ObservationError> {
         self.refresh_once_with_creation(subject, true).await
     }
 
-    async fn refresh_once_with_creation(&self, subject: &ChangeRequestRef, create_missing: bool) -> Result<(), ObservationError> {
-        let subject = &self.normalized(subject.clone()).await.map_err(ObservationError::Failed)?;
-        let record_name = subject.record_name().map_err(ObservationError::Failed)?;
+    async fn refresh_once_with_creation(&self, subject: &ChangeRequestKey, create_missing: bool) -> Result<(), ObservationError> {
+        let record_name = subject.record_name();
         let lock = self.subject_lock(subject).await;
         let _guard = lock.lock().await;
         // Ownership and publication use the resource store's string errors, not
@@ -269,17 +266,8 @@ impl ChangeRequestRefresher {
         let status = if create_missing {
             self.inner.source.observe_for_completion(subject).await
         } else {
-            let group = self
-                .inner
-                .active
-                .lock()
-                .await
-                .keys()
-                .filter(|candidate| {
-                    candidate.namespace == subject.namespace && candidate.service == subject.service && candidate.scope == subject.scope
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+            let group =
+                self.inner.active.lock().await.keys().filter(|candidate| same_repository(candidate, subject)).cloned().collect::<Vec<_>>();
             self.inner.source.observe_group(&group, subject).await
         };
         let status = match status {
@@ -298,14 +286,13 @@ impl ChangeRequestRefresher {
     pub async fn demand(
         &self,
         subscription_id: uuid::Uuid,
-        subject: ChangeRequestRef,
+        subject: ChangeRequestKey,
         freshness: Option<DateTime<Utc>>,
     ) -> Result<(), String> {
-        let subject = self.normalized(subject).await?;
         let lock = self.subject_lock(&subject).await;
         let _guard = lock.lock().await;
-        let name = subject.record_name()?;
-        match self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace).get(&name).await {
+        let name = subject.record_name();
+        match self.inner.backend.including_replicas::<ChangeRequest>(subject.namespace()).get(&name).await {
             Ok(_) => {}
             Err(ResourceError::NotFound { .. }) => self.ensure_record(&subject, &name).await?,
             Err(error) => return Err(error.to_string()),
@@ -351,15 +338,8 @@ impl ChangeRequestRefresher {
                 continue;
             }
             self.inner.observation_errors.lock().await.remove(&subject);
-            let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
-            let name = match subject.record_name() {
-                Ok(name) => name,
-                Err(error) => {
-                    tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "undemanded change request names no record; not collected");
-                    continue;
-                }
-            };
-            let result = match records.get(&name).await {
+            let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
+            let result = match records.get(&subject.record_name()).await {
                 Ok(record) if retain_change_request(&record) => {
                     self.start_retained(subject.clone()).await;
                     continue;
@@ -375,7 +355,7 @@ impl ChangeRequestRefresher {
             };
             if let Err(error) = result {
                 if !matches!(error, ResourceError::NotFound { .. }) {
-                    tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "garbage collect undemanded change request failed");
+                    tracing::warn!(change_request = %subject.address(), %error, "garbage collect undemanded change request failed");
                 }
             }
         }
@@ -383,7 +363,7 @@ impl ChangeRequestRefresher {
 
     /// The relay only acts on live demand, and the same authority check used by
     /// refresh_once is repeated just before the forge read.
-    pub async fn demanded_owned(&self) -> Result<Vec<ChangeRequestRef>, String> {
+    pub async fn demanded_owned(&self) -> Result<Vec<ChangeRequestKey>, String> {
         let subjects = self
             .inner
             .active
@@ -414,10 +394,7 @@ impl ChangeRequestRefresher {
             .lock()
             .await
             .iter()
-            .filter(|(subject, refresh)| {
-                !refresh.demands.is_empty()
-                    && flotilla_resources::address::stored_spelling_names(hint, &subject.service, &subject.scope, subject.number, &[])
-            })
+            .filter(|(subject, refresh)| !refresh.demands.is_empty() && subject.address() == hint)
             .map(|(subject, _)| subject.clone())
             .collect::<Vec<_>>();
         let mut first_error = None;
@@ -456,13 +433,7 @@ impl ChangeRequestRefresher {
             let forges = self.forges(&namespace).await?;
             for record in records.list().await.map_err(|error| error.to_string())?.items {
                 if retain_change_request(&record) {
-                    let subject = ChangeRequestRef {
-                        namespace: namespace.clone(),
-                        service: record.spec.service.clone(),
-                        scope: record.spec.scope.clone(),
-                        number: record.spec.number,
-                    };
-                    match subject.normalized(&forges) {
+                    match record.spec.address(&forges).and_then(|address| ChangeRequestKey::new(namespace.clone(), address)) {
                         Ok(subject) => self.start_retained(subject).await,
                         Err(error) => tracing::warn!(record = %record.metadata.name, %error, "retained change request has no address"),
                     }
@@ -474,25 +445,20 @@ impl ChangeRequestRefresher {
         Ok(())
     }
 
-    async fn collect_retained_if_terminal(&self, subject: &ChangeRequestRef) -> Result<bool, ResourceError> {
+    async fn collect_retained_if_terminal(&self, subject: &ChangeRequestKey) -> Result<bool, ResourceError> {
         let lock = self.subject_lock(subject).await;
         let _guard = lock.lock().await;
         let retained = self.inner.active.lock().await.get(subject).is_some_and(|refresh| refresh.demands.is_empty());
         if !retained {
             return Ok(false);
         }
-        let sources = self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace).list().await?;
+        let sources = self.inner.backend.including_replicas::<ChangeRequest>(subject.namespace()).list().await?;
         let selected = select_change_requests(sources.items.iter().map(|source| &source.object));
-        let terminal = selected
-            .values()
-            .find(|record| {
-                record.spec.service == subject.service && record.spec.scope == subject.scope && record.spec.number == subject.number
+        let terminal = selected.values().find(|record| spec_names(&record.spec, subject)).is_some_and(|record| {
+            record.status.as_ref().is_some_and(|status| {
+                matches!(status.state.value, Some(ObservedChangeRequestState::Merged | ObservedChangeRequestState::Closed))
             })
-            .is_some_and(|record| {
-                record.status.as_ref().is_some_and(|status| {
-                    matches!(status.state.value, Some(ObservedChangeRequestState::Merged | ObservedChangeRequestState::Closed))
-                })
-            });
+        });
         if !terminal {
             return Ok(false);
         }
@@ -501,11 +467,9 @@ impl ChangeRequestRefresher {
         Ok(true)
     }
 
-    async fn collect_local_subject(&self, subject: &ChangeRequestRef) -> Result<(), ResourceError> {
-        let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
-        for record in records.list().await?.items.iter().filter(|record| {
-            record.spec.service == subject.service && record.spec.scope == subject.scope && record.spec.number == subject.number
-        }) {
+    async fn collect_local_subject(&self, subject: &ChangeRequestKey) -> Result<(), ResourceError> {
+        let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
+        for record in records.list().await?.items.iter().filter(|record| spec_names(&record.spec, subject)) {
             match records.delete(&record.metadata.name).await {
                 Ok(()) | Err(ResourceError::NotFound { .. }) => {}
                 Err(error) => return Err(error),
@@ -514,7 +478,7 @@ impl ChangeRequestRefresher {
         Ok(())
     }
 
-    async fn start_retained(&self, subject: ChangeRequestRef) {
+    async fn start_retained(&self, subject: ChangeRequestKey) {
         let mut active = self.inner.active.lock().await;
         if active.contains_key(&subject) {
             return;
@@ -528,18 +492,26 @@ impl ChangeRequestRefresher {
     /// Capture links at admission, before a convoy can disappear. History is in
     /// the spec so ordinary forge status refreshes cannot erase it, and it follows
     /// the record's existing observation replication class.
-    async fn record_convoy_history(&self, subject: &ChangeRequestRef) -> Result<(), String> {
-        let convoys = self.inner.backend.using::<Convoy>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
-        let target = ConvoySubject {
-            kind: ConvoySubjectKind::ChangeRequest,
-            source: IssueSource { service: subject.service.clone(), scope: subject.scope.clone() },
-            id: subject.number.to_string(),
-        };
+    async fn record_convoy_history(&self, subject: &ChangeRequestKey) -> Result<(), String> {
+        let convoys = self.inner.backend.using::<Convoy>(subject.namespace()).list().await.map_err(|error| error.to_string())?;
+        let forges = self.forges(subject.namespace()).await?;
         let mut history = Vec::new();
         let references = ReferenceContext::default();
         for convoy in convoys.items {
             for row in convoy_subject_rows(&convoy, &references) {
-                if row.subject != target {
+                // Convoy rows keep the spelling they were admitted with; one
+                // change request matches whatever its spelling.
+                if row.subject.kind != ConvoySubjectKind::ChangeRequest {
+                    continue;
+                }
+                let address = match row.subject.leaf().and_then(|leaf| leaf_address(&leaf, &forges)) {
+                    Ok(address) => address,
+                    Err(error) => {
+                        tracing::debug!(convoy = %convoy.metadata.name, %error, "convoy change request subject has no address; no history recorded");
+                        continue;
+                    }
+                };
+                if &address != subject.address() {
                     continue;
                 }
                 history.push(
@@ -558,8 +530,8 @@ impl ChangeRequestRefresher {
         if history.is_empty() {
             return Ok(());
         }
-        let name = subject.record_name()?;
-        let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+        let name = subject.record_name();
+        let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
         loop {
             let current = match records.get(&name).await {
                 Ok(current) => current,
@@ -569,7 +541,7 @@ impl ChangeRequestRefresher {
                     let observed = self
                         .inner
                         .backend
-                        .including_replicas::<ChangeRequest>(&subject.namespace)
+                        .including_replicas::<ChangeRequest>(subject.namespace())
                         .get(&name)
                         .await
                         .map_err(|error| error.to_string())?
@@ -625,7 +597,7 @@ impl ChangeRequestRefresher {
         self.inner.active.lock().await.values().map(|refresh| refresh.demands.len()).sum()
     }
 
-    async fn refresh_delay(&self, subject: &ChangeRequestRef, demanded_delay: Duration) -> Duration {
+    async fn refresh_delay(&self, subject: &ChangeRequestKey, demanded_delay: Duration) -> Duration {
         if self.inner.active.lock().await.get(subject).is_some_and(|refresh| refresh.demands.is_empty()) {
             RETAINED_REFRESH_INTERVAL
         } else {
@@ -633,20 +605,14 @@ impl ChangeRequestRefresher {
         }
     }
 
-    async fn refresh_loop(&self, subject: ChangeRequestRef) {
-        let record_name = match subject.record_name() {
-            Ok(name) => name,
-            Err(error) => {
-                tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "change request subject has no record");
-                return;
-            }
-        };
+    async fn refresh_loop(&self, subject: ChangeRequestKey) {
+        let record_name = subject.record_name();
         loop {
             match self.collect_retained_if_terminal(&subject).await {
                 Ok(true) => return,
                 Ok(false) => {}
                 Err(error) => {
-                    tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "collect retained change request failed")
+                    tracing::warn!(change_request = %subject.address(), %error, "collect retained change request failed")
                 }
             }
             match self.owns_record(&subject, true, true).await {
@@ -665,24 +631,15 @@ impl ChangeRequestRefresher {
                 }
                 Ok(true) => {}
             }
-            let group = self
-                .inner
-                .active
-                .lock()
-                .await
-                .keys()
-                .filter(|candidate| {
-                    candidate.namespace == subject.namespace && candidate.service == subject.service && candidate.scope == subject.scope
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+            let group =
+                self.inner.active.lock().await.keys().filter(|candidate| same_repository(candidate, &subject)).cloned().collect::<Vec<_>>();
             match self.inner.source.observe_group(&group, &subject).await {
                 Ok(status) => {
                     let demanded =
                         self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.values().any(Option::is_some));
                     if let Err(error) = self.publish(&subject, &record_name, status.clone(), demanded, true, true).await {
                         self.inner.observation_errors.lock().await.insert(subject.clone(), ObservationError::Failed(error.clone()));
-                        tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "publish change request observation failed");
+                        tracing::warn!(change_request = %subject.address(), %error, "publish change request observation failed");
                     } else {
                         self.inner.observation_errors.lock().await.remove(&subject);
                     }
@@ -690,7 +647,7 @@ impl ChangeRequestRefresher {
                         Ok(true) => return,
                         Ok(false) => {}
                         Err(error) => {
-                            tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "collect retained change request failed")
+                            tracing::warn!(change_request = %subject.address(), %error, "collect retained change request failed")
                         }
                     }
                     let retained = self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.is_empty());
@@ -714,7 +671,7 @@ impl ChangeRequestRefresher {
                 }
                 Err(error) => {
                     self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
-                    tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "change request observation failed");
+                    tracing::warn!(change_request = %subject.address(), %error, "change request observation failed");
                     let retained = self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.is_empty());
                     let ordinary_delay = if retained { RETAINED_REFRESH_INTERVAL } else { self.inner.cadence.checks_pending };
                     let delay = error
@@ -730,14 +687,14 @@ impl ChangeRequestRefresher {
         }
     }
 
-    async fn owns_record(&self, subject: &ChangeRequestRef, allow_takeover: bool, create_missing: bool) -> Result<bool, String> {
-        let source = flotilla_protocol::IssueSource { service: subject.service.clone(), scope: subject.scope.clone() };
-        if let Some(owner) = crate::forge_observation::source_owner(&self.inner.backend, &subject.namespace, &source).await? {
+    async fn owns_record(&self, subject: &ChangeRequestKey, allow_takeover: bool, create_missing: bool) -> Result<bool, String> {
+        let source = stored_source(subject);
+        if let Some(owner) = crate::forge_observation::source_owner(&self.inner.backend, subject.namespace(), &source).await? {
             if owner.to_string() != self.inner.authority {
                 return Ok(false);
             }
-            let name = subject.record_name()?;
-            let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+            let name = subject.record_name();
+            let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
             if create_missing {
                 self.get_or_create_record(subject, &name).await?;
             }
@@ -764,8 +721,8 @@ impl ChangeRequestRefresher {
                 }
             }
         }
-        let name = subject.record_name()?;
-        let records = self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace);
+        let name = subject.record_name();
+        let records = self.inner.backend.including_replicas::<ChangeRequest>(subject.namespace());
         // A former owner can still hold its local copy after another host has
         // claimed the subject. Prefer the freshest observation across copies;
         // an exact tie is resolved deterministically by authority name.
@@ -796,7 +753,7 @@ impl ChangeRequestRefresher {
         if Utc::now().signed_duration_since(observed_at) <= takeover_after {
             return Ok(false);
         }
-        let local = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+        let local = self.inner.backend.using::<ChangeRequest>(subject.namespace());
         let mut spec = record.object.spec.clone();
         spec.observing_authority = self.inner.authority.clone();
         if let Ok(existing) = local.get(&name).await {
@@ -821,7 +778,7 @@ impl ChangeRequestRefresher {
         }
     }
 
-    async fn wait_for_next(&self, subject: &ChangeRequestRef, delay: Duration) -> bool {
+    async fn wait_for_next(&self, subject: &ChangeRequestKey, delay: Duration) -> bool {
         let Some(wake) = self.inner.active.lock().await.get(subject).map(|refresh| Arc::clone(&refresh.wake)) else {
             return false;
         };
@@ -835,7 +792,7 @@ impl ChangeRequestRefresher {
 
     async fn publish(
         &self,
-        subject: &ChangeRequestRef,
+        subject: &ChangeRequestKey,
         name: &str,
         status: ChangeRequestStatus,
         heartbeat: bool,
@@ -846,7 +803,7 @@ impl ChangeRequestRefresher {
             return Ok(());
         }
         self.record_convoy_history(subject).await?;
-        let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+        let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
         let current = records.get(name).await.map_err(|error| error.to_string())?;
         if current.spec.observing_authority != self.inner.authority {
             return Ok(());
@@ -863,44 +820,43 @@ impl ChangeRequestRefresher {
         Ok(())
     }
 
-    async fn ensure_record(&self, subject: &ChangeRequestRef, name: &str) -> Result<(), String> {
+    async fn ensure_record(&self, subject: &ChangeRequestKey, name: &str) -> Result<(), String> {
         self.get_or_create_record(subject, name).await.map(|_| ())
     }
 
     async fn get_or_create_record(
         &self,
-        subject: &ChangeRequestRef,
+        subject: &ChangeRequestKey,
         name: &str,
     ) -> Result<flotilla_resources::ResourceObject<ChangeRequest>, String> {
-        let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+        let records = self.inner.backend.using::<ChangeRequest>(subject.namespace());
         match records.get(name).await {
             Ok(current) => Ok(current),
             Err(ResourceError::NotFound { .. }) => {
-                let source = IssueSource { service: subject.service.clone(), scope: subject.scope.clone() };
+                let source = stored_source(subject);
                 // Without declared ownership, preserve the legacy local authority election.
-                let authority = crate::forge_observation::source_owner(&self.inner.backend, &subject.namespace, &source)
+                let authority = crate::forge_observation::source_owner(&self.inner.backend, subject.namespace(), &source)
                     .await?
                     .map_or_else(|| self.inner.authority.clone(), |owner| owner.to_string());
                 let candidates = self
                     .inner
                     .backend
-                    .including_replicas::<ChangeRequest>(&subject.namespace)
+                    .including_replicas::<ChangeRequest>(subject.namespace())
                     .list()
                     .await
                     .map_err(|error| error.to_string())?;
                 let selected = select_change_requests(candidates.items.iter().map(|source| &source.object));
                 let history = selected
                     .values()
-                    .find(|record| {
-                        record.spec.service == subject.service && record.spec.scope == subject.scope && record.spec.number == subject.number
-                    })
+                    .find(|record| spec_names(&record.spec, subject))
                     .map(|record| record.spec.subject_of.clone())
                     .unwrap_or_default();
+                let (service, scope) = subject.stored_service_scope();
                 let spec = ChangeRequestSpec::builder()
                     .subject_of(history)
-                    .service(subject.service.clone())
-                    .scope(subject.scope.clone())
-                    .number(subject.number)
+                    .service(service)
+                    .scope(scope)
+                    .number(subject.number())
                     .observing_authority(authority)
                     .build();
                 match records.create(&InputMeta::builder().name(name.to_string()).build(), &spec).await {
@@ -912,6 +868,23 @@ impl ChangeRequestRefresher {
             Err(error) => Err(error.to_string()),
         }
     }
+}
+
+/// The stored `(service, scope)` source that declares the subject's owner.
+fn stored_source(subject: &ChangeRequestKey) -> IssueSource {
+    let (service, scope) = subject.stored_service_scope();
+    IssueSource { service, scope }
+}
+
+fn same_repository(candidate: &ChangeRequestKey, subject: &ChangeRequestKey) -> bool {
+    candidate.namespace() == subject.namespace() && candidate.repository() == subject.repository()
+}
+
+/// Whether a record's stored spelling names the subject's change request.
+/// Records are written in `stored_service_scope`'s spelling (`github.com` or
+/// a forge id), which needs no Forge directory to read back.
+fn spec_names(spec: &ChangeRequestSpec, subject: &ChangeRequestKey) -> bool {
+    stored_spelling_names(subject.address(), &spec.service, &spec.scope, spec.number, &[])
 }
 
 fn observed_values_equal(left: &ChangeRequestStatus, right: &ChangeRequestStatus) -> bool {
@@ -943,12 +916,13 @@ mod tests {
     use super::*;
     use crate::testkits::cr_name;
     use flotilla_change_request::observation::parse_gh_observation;
+    use flotilla_protocol::Subject as ConvoySubject;
 
     struct UnavailableSource;
 
     #[async_trait]
     impl ChangeRequestObservationSource for UnavailableSource {
-        async fn observe(&self, _subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
+        async fn observe(&self, _subject: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
             Err("unavailable".into())
         }
     }
@@ -958,7 +932,7 @@ mod tests {
         struct RecoveringSource(Mutex<Result<ChangeRequestStatus, ObservationError>>);
         #[async_trait]
         impl ChangeRequestObservationSource for RecoveringSource {
-            async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
+            async fn observe(&self, _: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
                 self.0.lock().await.clone()
             }
         }
@@ -978,7 +952,11 @@ mod tests {
             source.clone(),
             ChangeRequestRefreshCadence::default(),
         );
-        let subject = ChangeRequestRef { namespace: "ops".into(), service: "github.com".into(), scope: "org/repo".into(), number: 42 };
+        let subject = ChangeRequestKey::new(
+            "ops",
+            flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
+        )
+        .expect("key");
         assert_eq!(refresher.refresh_once(&subject).await.unwrap_err(), error);
         assert_eq!(refresher.observation_error(&subject).await, Some(error.clone()));
         *source.0.lock().await = Ok(parse_gh_observation(
@@ -994,7 +972,7 @@ mod tests {
 
     #[async_trait]
     impl ChangeRequestObservationSource for CountingSource {
-        async fn observe(&self, _subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
+        async fn observe(&self, _subject: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             let observed_at = Utc::now();
             Ok(ChangeRequestStatus {
@@ -1021,12 +999,11 @@ mod tests {
             Arc::new(UnavailableSource),
             ChangeRequestRefreshCadence::default(),
         );
-        let subject = ChangeRequestRef {
-            namespace: "flotilla".to_string(),
-            service: "github.com".to_string(),
-            scope: "flotilla-org/flotilla".to_string(),
-            number: 1366,
-        };
+        let subject = ChangeRequestKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1366, &[]).expect("address"),
+        )
+        .expect("key");
         let (first, second) = tokio::join!(
             refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None),
             refresher.demand(uuid::Uuid::new_v4(), subject, None),
@@ -1046,15 +1023,19 @@ mod tests {
         for via_replica in [false, true] {
             let backend = ResourceBackend::new(InMemoryBackend::default());
             let remote = ResourceBackend::new(InMemoryBackend::default());
-            let subject = ChangeRequestRef { namespace: "ops".into(), service: "github.com".into(), scope: "org/repo".into(), number: 42 };
+            let subject = ChangeRequestKey::new(
+                "ops",
+                flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
+            )
+            .expect("key");
             let remote_records = remote.using::<ChangeRequest>("ops");
             let record = remote_records
                 .create(
-                    &InputMeta::builder().name(subject.record_name().expect("record name")).build(),
+                    &InputMeta::builder().name(subject.record_name()).build(),
                     &ChangeRequestSpec::builder()
-                        .service(subject.service.clone())
-                        .scope(subject.scope.clone())
-                        .number(subject.number)
+                        .service(subject.stored_service_scope().0)
+                        .scope(subject.stored_service_scope().1)
+                        .number(subject.number())
                         .observing_authority("remote".into())
                         .build(),
                 )
@@ -1062,7 +1043,7 @@ mod tests {
                 .expect("remote record");
             let observed = parse_gh_observation(r#"{"state":"OPEN"}"#, Utc::now()).expect("observation");
             remote_records
-                .update_status(&subject.record_name().expect("record name"), &record.metadata.resource_version, &observed)
+                .update_status(&subject.record_name(), &record.metadata.resource_version, &observed)
                 .await
                 .expect("remote observation");
             backend
@@ -1080,7 +1061,7 @@ mod tests {
                         .subjects(vec![DeclaredSubject {
                             subject: Subject {
                                 kind: SubjectKind::ChangeRequest,
-                                source: IssueSource { service: subject.service.clone(), scope: subject.scope.clone() },
+                                source: IssueSource { service: subject.stored_service_scope().0, scope: subject.stored_service_scope().1 },
                                 id: "42".into(),
                             },
                             relationship: Relationship::Produces,
@@ -1101,7 +1082,7 @@ mod tests {
             let demand = uuid::Uuid::new_v4();
             refresher.demand(demand, subject.clone(), None).await.expect("demand");
             let records = backend.using::<ChangeRequest>("ops");
-            let record = records.get(&subject.record_name().expect("record name")).await.expect("local history copy");
+            let record = records.get(&subject.record_name()).await.expect("local history copy");
             assert_eq!(record.spec.observing_authority, "remote");
             assert_eq!(record.spec.subject_of.len(), 1);
             assert_eq!(record.spec.subject_of[0].origin, "kiwi");
@@ -1109,19 +1090,19 @@ mod tests {
             let second = uuid::Uuid::new_v4();
             refresher.demand(second, subject.clone(), None).await.expect("second demand");
             assert_eq!(
-                records.get(&subject.record_name().expect("record name")).await.expect("history unchanged").metadata.resource_version,
+                records.get(&subject.record_name()).await.expect("history unchanged").metadata.resource_version,
                 record.metadata.resource_version
             );
             backend.using::<Convoy>("ops").delete("producer").await.expect("delete producer");
             refresher.release(demand).await;
             if via_replica {
                 refresher.release(second).await;
-                assert!(records.get(&subject.record_name().expect("record name")).await.is_ok());
-                let current = remote_records.get(&subject.record_name().expect("record name")).await.expect("remote current");
+                assert!(records.get(&subject.record_name()).await.is_ok());
+                let current = remote_records.get(&subject.record_name()).await.expect("remote current");
                 let mut terminal = current.status.expect("remote status");
                 terminal.state = Observation::known(ObservedChangeRequestState::Merged, Utc::now() + chrono::Duration::seconds(1));
                 remote_records
-                    .update_status(&subject.record_name().expect("record name"), &current.metadata.resource_version, &terminal)
+                    .update_status(&subject.record_name(), &current.metadata.resource_version, &terminal)
                     .await
                     .expect("remote merge");
                 backend
@@ -1130,14 +1111,14 @@ mod tests {
                     .await
                     .expect("terminal replica");
                 tokio::time::advance(RETAINED_REFRESH_INTERVAL).await;
-                wait_for_request_state(&records, &subject.record_name().expect("record name"), None).await;
+                wait_for_request_state(&records, &subject.record_name(), None).await;
                 assert!(!refresher.inner.active.lock().await.contains_key(&subject));
                 continue;
             }
             let mut terminal = record.status.expect("status");
             terminal.state = Observation::known(ObservedChangeRequestState::Closed, Utc::now());
             records
-                .update_status(&subject.record_name().expect("record name"), &record.metadata.resource_version, &terminal)
+                .update_status(&subject.record_name(), &record.metadata.resource_version, &terminal)
                 .await
                 .expect("terminal observation");
             refresher.release(second).await;
@@ -1149,7 +1130,7 @@ mod tests {
     struct MutableSource(Mutex<ChangeRequestStatus>, AtomicUsize);
     #[async_trait]
     impl ChangeRequestObservationSource for MutableSource {
-        async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
+        async fn observe(&self, _: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
             let status = self.0.lock().await.clone();
             self.1.fetch_add(1, Ordering::SeqCst);
             Ok(status)
@@ -1211,7 +1192,11 @@ mod tests {
             Arc::new(UnavailableSource),
             ChangeRequestRefreshCadence::default(),
         );
-        let subject = ChangeRequestRef { namespace: "ops".into(), service: "github.com".into(), scope: "org/repo".into(), number: 42 };
+        let subject = ChangeRequestKey::new(
+            "ops",
+            flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
+        )
+        .expect("key");
         refresher.start_retained(subject.clone()).await;
         assert!(refresher.collect_local_subject(&subject).await.is_err());
         assert!(refresher.collect_retained_if_terminal(&subject).await.is_err());
@@ -1250,12 +1235,16 @@ mod tests {
                 )
                 .await
                 .expect("convoy");
-            let subject = ChangeRequestRef { namespace: "ops".into(), service: "github.com".into(), scope: "org/repo".into(), number: 42 };
+            let subject = ChangeRequestKey::new(
+                "ops",
+                flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
+            )
+            .expect("key");
             let mut status = ConvoyStatus::default();
             status.discover_subject(
                 ConvoySubject {
                     kind: ConvoySubjectKind::ChangeRequest,
-                    source: IssueSource { service: subject.service.clone(), scope: subject.scope.clone() },
+                    source: IssueSource { service: subject.stored_service_scope().0, scope: subject.stored_service_scope().1 },
                     id: "42".into(),
                 },
                 Relationship::Produces,
@@ -1267,7 +1256,7 @@ mod tests {
             refresher.demand(demand, subject.clone(), None).await.expect("demand");
             refresher.refresh_once(&subject).await.expect("initial observation");
             let records = backend.using::<ChangeRequest>("ops");
-            let record = records.get(&subject.record_name().expect("record name")).await.expect("request");
+            let record = records.get(&subject.record_name()).await.expect("request");
             assert_eq!(record.spec.subject_of.len(), 1);
             assert_eq!(record.spec.subject_of[0].convoy, "producer");
             assert_eq!(record.spec.subject_of[0].origin, "kiwi");
@@ -1275,7 +1264,7 @@ mod tests {
             convoys.delete("producer").await.expect("delete convoy");
             let next_observation = source.1.load(Ordering::SeqCst) + 1;
             refresher.release(demand).await;
-            assert!(records.get(&subject.record_name().expect("record name")).await.is_ok());
+            assert!(records.get(&subject.record_name()).await.is_ok());
             assert_eq!(refresher.active_demands().await, 0);
             wait_for_observation(&source, next_observation).await;
             source.0.lock().await.state = Observation::known(ObservedChangeRequestState::Draft, observed_at);
@@ -1283,19 +1272,19 @@ mod tests {
             refresher.release(uuid::Uuid::new_v4()).await;
             tokio::time::advance(Duration::from_secs(14 * 60)).await;
             assert_eq!(
-                records.get(&subject.record_name().expect("record name")).await.expect("slow poll").status.expect("status").state.value,
+                records.get(&subject.record_name()).await.expect("slow poll").status.expect("status").state.value,
                 Some(ObservedChangeRequestState::Open)
             );
             let resumed = uuid::Uuid::new_v4();
             refresher.demand(resumed, subject.clone(), None).await.expect("reactivate ordinary demand");
-            wait_for_request_state(&records, &subject.record_name().expect("record name"), Some(ObservedChangeRequestState::Draft)).await;
+            wait_for_request_state(&records, &subject.record_name(), Some(ObservedChangeRequestState::Draft)).await;
             assert_eq!(
-                records.get(&subject.record_name().expect("record name")).await.expect("reactivated").status.expect("status").state.value,
+                records.get(&subject.record_name()).await.expect("reactivated").status.expect("status").state.value,
                 Some(ObservedChangeRequestState::Draft)
             );
             refresher.release(resumed).await;
             let observations = SubjectCatalogInput {
-                change_requests: vec![records.get(&subject.record_name().expect("record name")).await.expect("retained")],
+                change_requests: vec![records.get(&subject.record_name()).await.expect("retained")],
                 ..Default::default()
             };
             let catalog = project_catalog(
@@ -1329,10 +1318,10 @@ mod tests {
                 ChangeRequestRefreshCadence::default(),
             );
             recovered.garbage_collect_orphans().await.expect("recover");
-            assert!(records.get(&subject.record_name().expect("record name")).await.is_ok());
+            assert!(records.get(&subject.record_name()).await.is_ok());
             source.0.lock().await.state = Observation::known(terminal, observed_at + chrono::Duration::seconds(1));
-            wait_for_request_state(&records, &subject.record_name().expect("record name"), None).await;
-            assert!(matches!(records.get(&subject.record_name().expect("record name")).await, Err(ResourceError::NotFound { .. })));
+            wait_for_request_state(&records, &subject.record_name(), None).await;
+            assert!(matches!(records.get(&subject.record_name()).await, Err(ResourceError::NotFound { .. })));
             let observations = SubjectCatalogInput { change_requests: records.list().await.expect("list").items, ..Default::default() };
             let catalog = project_catalog(
                 &CatalogInput {
@@ -1359,12 +1348,11 @@ mod tests {
             Arc::new(UnavailableSource),
             ChangeRequestRefreshCadence::default(),
         );
-        let subject = ChangeRequestRef {
-            namespace: "flotilla".to_string(),
-            service: "github.com".to_string(),
-            scope: "flotilla-org/flotilla".to_string(),
-            number: 1366,
-        };
+        let subject = ChangeRequestKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1366, &[]).expect("address"),
+        )
+        .expect("key");
         let first = uuid::Uuid::new_v4();
         let last = uuid::Uuid::new_v4();
         refresher.demand(first, subject.clone(), None).await.expect("first demand");
@@ -1388,12 +1376,11 @@ mod tests {
             Arc::new(UnavailableSource),
             ChangeRequestRefreshCadence::default(),
         );
-        let subject = ChangeRequestRef {
-            namespace: "ops".to_string(),
-            service: "github.com".to_string(),
-            scope: "flotilla-org/flotilla".to_string(),
-            number: 1366,
-        };
+        let subject = ChangeRequestKey::new(
+            "ops",
+            flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1366, &[]).expect("address"),
+        )
+        .expect("key");
         refresher.demand(uuid::Uuid::new_v4(), subject, None).await.expect("non-default namespace demand");
         assert_eq!(backend.local_namespaces::<ChangeRequest>().await.expect("local namespaces"), vec!["ops"]);
 
@@ -1414,16 +1401,15 @@ mod tests {
             Arc::new(CountingSource(Arc::clone(&calls))),
             ChangeRequestRefreshCadence::default(),
         );
-        let subject = ChangeRequestRef {
-            namespace: "flotilla".to_string(),
-            service: "github.com".to_string(),
-            scope: "flotilla-org/flotilla".to_string(),
-            number: 1366,
-        };
+        let subject = ChangeRequestKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1366, &[]).expect("address"),
+        )
+        .expect("key");
         refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.expect("demand");
         wait_for_calls(&calls, 1).await;
         let records = backend.using::<ChangeRequest>("flotilla");
-        let first = records.get(&subject.record_name().expect("record name")).await.expect("first observation");
+        let first = records.get(&subject.record_name()).await.expect("first observation");
 
         const IDENTICAL_POLLS: usize = 4;
         for poll in 0..IDENTICAL_POLLS {
@@ -1431,7 +1417,7 @@ mod tests {
             wait_for_calls(&calls, poll + 2).await;
         }
 
-        let after = records.get(&subject.record_name().expect("record name")).await.expect("observation after identical polls");
+        let after = records.get(&subject.record_name()).await.expect("observation after identical polls");
         assert_eq!(calls.load(Ordering::SeqCst), IDENTICAL_POLLS + 1);
         assert_eq!(after.metadata.resource_version, first.metadata.resource_version, "identical observed values must produce no writes");
         assert_eq!(after.status, first.status, "poll timestamps are not persisted unless an observed value changes");
@@ -1449,12 +1435,11 @@ mod tests {
             ChangeRequestRefreshCadence::default(),
         );
         refresher.set_relay_healthy(true);
-        let subject = ChangeRequestRef {
-            namespace: "flotilla".to_string(),
-            service: "GitHub.com".to_string(),
-            scope: "Flotilla-Org/Flotilla".to_string(),
-            number: 2051,
-        };
+        let subject = ChangeRequestKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_change_request_address("GitHub.com", "Flotilla-Org/Flotilla", 2051, &[]).expect("address"),
+        )
+        .expect("key");
         refresher.demand(uuid::Uuid::new_v4(), subject, None).await.expect("demand");
         wait_for_calls(&calls, 1).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1484,12 +1469,12 @@ mod tests {
             refresher
                 .demand(
                     uuid::Uuid::new_v4(),
-                    ChangeRequestRef {
-                        namespace: namespace.to_string(),
-                        service: "GitHub.com".to_string(),
-                        scope: "Flotilla-Org/Flotilla".to_string(),
-                        number: 2051,
-                    },
+                    ChangeRequestKey::new(
+                        namespace,
+                        flotilla_resources::address::stored_change_request_address("GitHub.com", "Flotilla-Org/Flotilla", 2051, &[])
+                            .expect("address"),
+                    )
+                    .expect("key"),
                     None,
                 )
                 .await
@@ -1511,6 +1496,35 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), before + 3, "remaining namespace still refreshes");
     }
 
+    // A hint spells public GitHub by host (`cr/github.com/...`) while a
+    // stored subject may spell it by forge id (`github`) in any repository
+    // case. Both are one address, so the hint refreshes that demand.
+    #[tokio::test(start_paused = true)]
+    async fn host_spelled_relay_hint_matches_a_forge_id_spelled_demand() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
+            backend.clone(),
+            "authority".to_string(),
+            Arc::new(CountingSource(Arc::clone(&calls))),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let address =
+            flotilla_resources::address::stored_change_request_address("github", "Flotilla-Org/Flotilla", 2053, &[]).expect("address");
+        refresher.demand(uuid::Uuid::new_v4(), ChangeRequestKey::new("flotilla", address).expect("key"), None).await.expect("demand");
+        wait_for_calls(&calls, 1).await;
+        let before = calls.load(Ordering::SeqCst);
+
+        let other = flotilla_relay_protocol::parse_hint_subject("cr/github.com/flotilla-org/flotilla/2054").expect("other hint");
+        refresher.refresh_hint(&other).await.expect("other hint");
+        assert_eq!(calls.load(Ordering::SeqCst), before, "another change request's hint refreshes nothing");
+
+        let hint = flotilla_relay_protocol::parse_hint_subject("cr/github.com/flotilla-org/flotilla/2053").expect("hint");
+        refresher.refresh_hint(&hint).await.expect("hint");
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1, "the host-spelled hint names the forge-id-spelled demand");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn freshness_demand_heartbeats_identical_observations() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -1522,20 +1536,19 @@ mod tests {
             Arc::new(CountingSource(Arc::clone(&calls))),
             ChangeRequestRefreshCadence::default(),
         );
-        let subject = ChangeRequestRef {
-            namespace: "flotilla".to_string(),
-            service: "github.com".to_string(),
-            scope: "flotilla-org/flotilla".to_string(),
-            number: 1699,
-        };
+        let subject = ChangeRequestKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1699, &[]).expect("address"),
+        )
+        .expect("key");
         refresher.demand(uuid::Uuid::new_v4(), subject.clone(), Some(Utc::now())).await.expect("freshness demand");
         wait_for_calls(&calls, 1).await;
         let records = backend.using::<ChangeRequest>("flotilla");
-        let first = records.get(&subject.record_name().expect("record name")).await.expect("first observation");
+        let first = records.get(&subject.record_name()).await.expect("first observation");
 
         tokio::time::advance(Duration::from_secs(10)).await;
         wait_for_calls(&calls, 2).await;
-        let heartbeat = records.get(&subject.record_name().expect("record name")).await.expect("heartbeat observation");
+        let heartbeat = records.get(&subject.record_name()).await.expect("heartbeat observation");
 
         assert_ne!(heartbeat.metadata.resource_version, first.metadata.resource_version);
         assert!(heartbeat.status.expect("heartbeat status").state.observed_at > first.status.expect("first status").state.observed_at);
@@ -1557,12 +1570,11 @@ mod tests {
                 stale_after: Duration::from_secs(180),
             },
         );
-        let subject = ChangeRequestRef {
-            namespace: "flotilla".to_string(),
-            service: "github.com".to_string(),
-            scope: "flotilla-org/flotilla".to_string(),
-            number: 1366,
-        };
+        let subject = ChangeRequestKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1366, &[]).expect("address"),
+        )
+        .expect("key");
         refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.expect("initial demand");
         wait_for_calls(&calls, 1).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1583,12 +1595,11 @@ mod tests {
             Arc::new(UnavailableSource),
             ChangeRequestRefreshCadence::default(),
         );
-        let subject = ChangeRequestRef {
-            namespace: "flotilla".to_string(),
-            service: "github.com".to_string(),
-            scope: "flotilla-org/flotilla".to_string(),
-            number: 1699,
-        };
+        let subject = ChangeRequestKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1699, &[]).expect("address"),
+        )
+        .expect("key");
         let demand = uuid::Uuid::new_v4();
         refresher.demand(demand, subject.clone(), Some(Utc::now())).await.expect("demand");
 

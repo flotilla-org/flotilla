@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_protocol::Leaf;
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{Convoy, HoldAct, TerminalAttentionSource, TerminalAttentionState, TurnDeliveryRung};
@@ -22,7 +22,7 @@ use tokio::{
 
 use crate::{
     change_request_observer::ChangeRequestRefresher,
-    issue_observer::{IssueObservationSource, IssueRef, IssueRefreshCadence, IssueRefresher},
+    issue_observer::{IssueKey, IssueObservationSource, IssueRefreshCadence, IssueRefresher},
 };
 use turn_delivery::UnavailableTurnDeliveryActuator;
 use wake::ReconcilerWake;
@@ -31,7 +31,7 @@ struct UnavailableIssues;
 
 #[async_trait]
 impl IssueObservationSource for UnavailableIssues {
-    async fn observe(&self, _subject: &IssueRef) -> Result<flotilla_resources::IssueStatus, String> {
+    async fn observe(&self, _subject: &IssueKey) -> Result<flotilla_resources::IssueStatus, String> {
         Err("issue observation source unavailable".into())
     }
 }
@@ -235,7 +235,7 @@ impl LeafSubscriptionTable {
         self.inner.issues.stale_after()
     }
 
-    pub async fn change_request_observation_error(&self, subject: &ChangeRequestRef) -> Option<ObservationError> {
+    pub async fn change_request_observation_error(&self, subject: &ChangeRequestKey) -> Option<ObservationError> {
         self.inner.change_requests.observation_error(subject).await
     }
 
@@ -243,7 +243,7 @@ impl LeafSubscriptionTable {
         self.inner.change_requests.watch_convoy_demands(namespace).await;
     }
 
-    pub async fn refresh_change_request_once(&self, subject: &ChangeRequestRef) -> Result<(), ObservationError> {
+    pub async fn refresh_change_request_once(&self, subject: &ChangeRequestKey) -> Result<(), ObservationError> {
         self.inner.change_requests.refresh_once(subject).await
     }
 

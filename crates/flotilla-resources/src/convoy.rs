@@ -717,7 +717,14 @@ pub fn issue_address_with_forges(reference: &IssueRef, forges: &[crate::ForgeSpe
         }
         _ => return Err(format!("issue source {service_url} matches multiple Forge definitions")),
     };
-    let (service, scope) = crate::address::canonical_stored_spelling(&service, &scope);
+    // Public GitHub needs no Forge record, so its leaf takes the stored
+    // spelling of its address: `github.com` and a lowercase repository.
+    let (service, scope) = match crate::address::stored_repository_address(&service, &scope, &[]) {
+        Ok(address) if address.get(crate::address::AddressKind::Forge) == Some(crate::address::GITHUB_FORGE_ID) => {
+            crate::address::stored_service_scope(&address).expect("a repository address is under a forge")
+        }
+        _ => (service, scope),
+    };
     let number = reference.id.parse::<u64>().map_err(|_| format!("issue id `{}` is not a numeric forge number", reference.id))?;
     Ok(LeafAddress::Issue { service, scope, number })
 }

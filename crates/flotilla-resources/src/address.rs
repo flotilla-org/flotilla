@@ -8,8 +8,8 @@
 //! spellings into addresses and back. Stored shapes do not change, so the
 //! ADR 0064 cut-over importer can retire this module.
 
-pub use flotilla_address::{record_name, Address, Kind as AddressKind};
-use flotilla_address::{Forge as AddressForge, ForgeKind as AddressForgeKind, ForgeLookup, GITHUB_FORGE_ID, GITHUB_HOSTS};
+pub use flotilla_address::{record_name, Address, Kind as AddressKind, GITHUB_FORGE_ID};
+use flotilla_address::{Forge as AddressForge, ForgeKind as AddressForgeKind, ForgeLookup, GITHUB_HOSTS};
 use flotilla_protocol::LeafAddress;
 
 use crate::{canonicalize_repo_url, ForgeKind, ForgeSpec};
@@ -227,20 +227,6 @@ pub fn remote_names_repository(remote: &str, forges: &[ForgeSpec], repository: &
     repository_address(remote, forges).is_ok_and(|address| &address == repository)
 }
 
-/// The canonical stored spelling of a `(service, scope)` pair: the pair
-/// read back through its address when the service resolves with no Forge
-/// directory, and unchanged when it does not. Public GitHub, spelled
-/// `github.com` or `github`, becomes `github.com` with a lowercase scope.
-///
-/// Transitional: callers that still key by the stored pair use this until
-/// they hold an [`Address`] (#3359).
-pub fn canonical_stored_spelling(service: &str, scope: &str) -> (String, String) {
-    stored_repository_address(service, scope, &[])
-        .ok()
-        .and_then(|address| stored_service_scope(&address))
-        .unwrap_or_else(|| (service.to_string(), scope.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -301,14 +287,6 @@ mod tests {
         assert!(repository_address("https://forge.example/o/r", &[]).is_err());
         assert!(stored_repository_address("forge.example", "o/r", &[]).is_err());
         assert!(stored_repository_address("host%3aforge", "o/r", &[]).is_err());
-    }
-
-    #[test]
-    fn canonical_stored_spelling_lowercases_public_github_only() {
-        assert_eq!(canonical_stored_spelling("GitHub.com", "A/B"), ("github.com".to_string(), "a/b".to_string()));
-        assert_eq!(canonical_stored_spelling("github", "Codertocat/Hello-World"), ("github.com".into(), "codertocat/hello-world".into()));
-        assert_eq!(canonical_stored_spelling("forgejo.example", "Lab/Repo"), ("forgejo.example".into(), "Lab/Repo".into()));
-        assert_eq!(canonical_stored_spelling("lab", "Lab/Repo"), ("lab".into(), "Lab/Repo".into()));
     }
 
     // A repository behind a declared `github` Forge, reached through one of

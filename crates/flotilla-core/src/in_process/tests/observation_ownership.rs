@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
@@ -125,7 +125,11 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         .await
         .unwrap();
     replicate::<Repository>(&daemons).await;
-    let subject = ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "org/shared".into(), number: 7 };
+    let subject = ChangeRequestKey::new(
+        "flotilla",
+        flotilla_resources::address::stored_change_request_address("github.com", "org/shared", 7, &[]).expect("address"),
+    )
+    .expect("key");
     let refreshers = daemons
         .iter()
         .map(|daemon| {
@@ -183,7 +187,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         let record = daemon
             .resource_backend()
             .including_replicas::<flotilla_resources::ChangeRequest>("flotilla")
-            .get(&subject.record_name().expect("record name"))
+            .get(&subject.record_name())
             .await
             .unwrap();
         assert_eq!(record.object.status.unwrap().title.value.as_deref(), Some("Shared PR"));

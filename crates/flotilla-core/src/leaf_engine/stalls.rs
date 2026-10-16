@@ -2,14 +2,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
 use chrono::{DateTime, Utc};
-use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_protocol::{arg::shell_quote, Leaf, LeafAddress, LeafOperator};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
-    actor_obligation, address::leaf_record_name, select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus,
-    CrewCompletionRefusal, CrewCompletionRefusalCause, LeafMaker, NudgeObligation, ResourceObject, StallEvidenceSource, StallNudge,
-    StallRung, StallSupervisor, StalledCondition, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    actor_obligation,
+    address::{leaf_address, record_name},
+    select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewCompletionRefusal, CrewCompletionRefusalCause,
+    LeafMaker, NudgeObligation, ResourceObject, StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition,
+    SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::sources::freshest_change_request_refs;
@@ -766,8 +768,9 @@ impl ReconcilerWake {
                     LeafMaker::Observed { .. } => {
                         let mut reason = None;
                         for leaf in &row.leaves {
-                            if let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address {
-                                let name = leaf_record_name(&leaf.address, &forges).ok();
+                            if let LeafAddress::ChangeRequest { .. } = &leaf.address {
+                                let address = leaf_address(&leaf.address, &forges);
+                                let name = address.as_ref().ok().and_then(record_name);
                                 let observation = observations
                                     .iter()
                                     .filter(|source| name.as_ref() == Some(&source.object.metadata.name))
@@ -796,13 +799,10 @@ impl ReconcilerWake {
                                                     .expect("duration fits")
                                     });
                                 if !fresh {
-                                    let subject = ChangeRequestRef {
-                                        namespace: namespace.into(),
-                                        service: service.clone(),
-                                        scope: scope.clone(),
-                                        number: *number,
+                                    let refresh_error = match address.and_then(|address| ChangeRequestKey::new(namespace, address)) {
+                                        Ok(subject) => self.subscriptions.change_request_observation_error(&subject).await,
+                                        Err(error) => Some(ObservationError::Failed(error)),
                                     };
-                                    let refresh_error = self.subscriptions.change_request_observation_error(&subject).await;
                                     if refresh_error.as_ref().and_then(ObservationError::retry_at).is_some_and(|retry_at| retry_at > now) {
                                         // A known forge retry deadline keeps the observed
                                         // maker pending; missing evidence is not a crew stall.

@@ -1,4 +1,4 @@
-use flotilla_change_request::observation::{ChangeRequestObservationSource, ChangeRequestRef};
+use flotilla_change_request::observation::{ChangeRequestKey, ChangeRequestObservationSource};
 use flotilla_core::change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
@@ -15,7 +15,7 @@ use super::*;
 struct ForgeObservation(tokio::sync::Mutex<ObservedChangeRequestState>);
 #[async_trait]
 impl ChangeRequestObservationSource for ForgeObservation {
-    async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
+    async fn observe(&self, _: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
         Ok(ChangeRequestStatus {
             state: Observation::known(*self.0.lock().await, Utc::now()),
             checks: Observation::known(ObservedChecks::Pass, Utc::now()),
@@ -32,7 +32,7 @@ impl ChangeRequestObservationSource for ForgeObservation {
 struct ForbiddenForge(std::sync::atomic::AtomicUsize);
 #[async_trait]
 impl ChangeRequestObservationSource for ForbiddenForge {
-    async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
+    async fn observe(&self, _: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(ObservationError::Failed("nonowner contacted forge".into()))
     }
@@ -106,8 +106,12 @@ async fn remote_change_request_scenario(existing: ExistingRecord, late_watcher: 
             == Ok(Some(owner.node_id().clone()))
     })
     .await;
-    let subject =
-        ChangeRequestRef { namespace: "flotilla".into(), service: source.service.clone(), scope: source.scope.clone(), number: 330 };
+    let subject = ChangeRequestKey::new(
+        "flotilla",
+        flotilla_resources::address::stored_change_request_address(&source.service.clone(), &source.scope.clone(), 330, &[])
+            .expect("address"),
+    )
+    .expect("key");
     let name = flotilla_resources::address::record_name(
         &flotilla_resources::address::stored_change_request_address(&source.service, &source.scope, 330, &[])
             .expect("change request address"),

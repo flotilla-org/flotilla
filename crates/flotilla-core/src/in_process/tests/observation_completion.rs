@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_change_request::observation::ChangeRequestObservationSource;
-use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_config::ConfigStore;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
@@ -252,7 +252,13 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
             spec.change_request =
                 Some(BoundChangeRequest { id: id.to_string(), repository_ref: repository_key.clone(), title: format!("PR {id}") });
             backend.using::<ResourceConvoy>("flotilla").create(&test_meta(&format!("convoy-{id}")), &spec).await.expect("convoy");
-            subjects.push(ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: scope.into(), number: id });
+            subjects.push(
+                ChangeRequestKey::new(
+                    "flotilla",
+                    flotilla_resources::address::stored_change_request_address("github.com", scope, id, &[]).expect("address"),
+                )
+                .expect("key"),
+            );
         }
     }
     for subject in &subjects {
@@ -612,12 +618,12 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
             CrewWorkPhase::Done
         );
         for number in [2200, 2201] {
-            let subject = ChangeRequestRef {
-                namespace: "flotilla".into(),
-                service: "github.com".into(),
-                scope: "flotilla-org/flotilla".into(),
-                number,
-            };
+            let subject = ChangeRequestKey::new(
+                "flotilla",
+                flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", number, &[])
+                    .expect("address"),
+            )
+            .expect("key");
             assert!(
                 daemon.crew_ops.subscription_diagnostics().change_request_observation_error(&subject).await.is_none(),
                 "recovery clears subject errors"

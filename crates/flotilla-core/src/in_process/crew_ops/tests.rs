@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_change_request::observation::ChangeRequestObservationSource;
-use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::qualified_path::HostId;
 use flotilla_protocol::{EnvironmentId, HostName};
@@ -37,7 +37,7 @@ struct UnusedForge;
 
 #[async_trait]
 impl ChangeRequestObservationSource for UnusedForge {
-    async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
+    async fn observe(&self, _: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
         panic!("crew delivery must not query the forge")
     }
 }

@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_executor::environment_manager::EnvironmentManager;
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_projections::{
@@ -84,7 +84,7 @@ impl LeafSubscriptionRead for LeafSubscriptionTable {
         LeafSubscriptionTable::change_request_stale_after(self)
     }
 
-    async fn change_request_observation_error(&self, subject: &ChangeRequestRef) -> Option<ObservationError> {
+    async fn change_request_observation_error(&self, subject: &ChangeRequestKey) -> Option<ObservationError> {
         LeafSubscriptionTable::change_request_observation_error(self, subject).await
     }
 

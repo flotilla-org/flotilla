@@ -5,10 +5,11 @@ use std::{
     sync::Weak,
 };
 
-use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_protocol::LeafAddress;
 use flotilla_resources::{
-    address::leaf_record_name, Artifact, ChangeRequest, Convoy, ForgeSpec, Issue, ReadWatchEvent, Resource, ResourceError, Usage, Vessel,
+    address::{leaf_address, record_name},
+    Artifact, ChangeRequest, Convoy, ForgeSpec, Issue, ReadWatchEvent, Resource, ResourceError, Usage, Vessel,
 };
 use flotilla_store::ResourceBackend;
 use futures::{
@@ -19,7 +20,7 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use super::subscriptions::LeafWatchRecovery;
 use super::{LeafSubscriptionRow, LeafSubscriptionTable, LeafSubscriptionTableInner, LeafWatcher};
-use crate::issue_observer::IssueRef;
+use crate::issue_observer::IssueKey;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ObjectKind {
@@ -45,8 +46,8 @@ pub(super) struct RowDependencies {
     /// as a service spelled by a host no Forge declares, has no entry and
     /// evaluates against an absent subject.
     pub(super) names: HashMap<LeafAddress, String>,
-    pub(super) change_requests: HashSet<ChangeRequestRef>,
-    pub(super) issues: HashSet<IssueRef>,
+    pub(super) change_requests: HashSet<ChangeRequestKey>,
+    pub(super) issues: HashSet<IssueKey>,
 }
 
 impl RowDependencies {
@@ -55,6 +56,7 @@ impl RowDependencies {
     pub(super) fn derive(row: &LeafSubscriptionRow, forges: &[ForgeSpec]) -> Self {
         let mut dependencies = Self { namespace: row.namespace.clone(), ..Default::default() };
         for leaf in &row.leaves {
+            let address = leaf_address(&leaf.address, forges);
             let kind = match &leaf.address {
                 LeafAddress::Convoy { name } => {
                     dependencies.objects.insert(ObjectAddress { kind: ObjectKind::Convoy, name: name.clone() });
@@ -69,17 +71,13 @@ impl RowDependencies {
                     continue;
                 }
                 LeafAddress::ChangeRequest { .. } => {
-                    if let Some(subject) =
-                        ChangeRequestRef::from_address(&row.namespace, &leaf.address).and_then(|subject| subject.normalized(forges).ok())
-                    {
+                    if let Some(subject) = address.clone().ok().and_then(|address| ChangeRequestKey::new(&row.namespace, address).ok()) {
                         dependencies.change_requests.insert(subject);
                     }
                     ObjectKind::ChangeRequest
                 }
                 LeafAddress::Issue { .. } => {
-                    if let Some(subject) =
-                        IssueRef::from_address(&row.namespace, &leaf.address).and_then(|subject| subject.normalized(forges).ok())
-                    {
+                    if let Some(subject) = address.clone().ok().and_then(|address| IssueKey::new(&row.namespace, address).ok()) {
                         dependencies.issues.insert(subject);
                     }
                     ObjectKind::Issue
@@ -87,7 +85,7 @@ impl RowDependencies {
                 LeafAddress::Usage { .. } => ObjectKind::Usage,
                 LeafAddress::Artifact { .. } => ObjectKind::Artifact,
             };
-            match leaf_record_name(&leaf.address, forges) {
+            match address.and_then(|address| record_name(&address).ok_or_else(|| format!("{address} names no record"))) {
                 Ok(name) => {
                     dependencies.names.insert(leaf.address.clone(), name.clone());
                     dependencies.objects.insert(ObjectAddress { kind, name });

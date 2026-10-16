@@ -7,69 +7,105 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::LeafAddress;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
-    address::{record_name, stored_change_request_address, stored_service_scope, Address},
-    ChangeRequestReviewObservation, ChangeRequestStatus, ForgeSpec, Observation, ObservedChangeRequestState, ObservedChecks,
-    ObservedMergeability, ObservedReviewDecision,
+    address::{record_name, stored_service_scope, Address, AddressKind, GITHUB_FORGE_ID},
+    ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
+    ObservedReviewDecision,
 };
 
 pub(crate) const DEFAULT_REVIEW_BOT_LOGIN: &str = "claude";
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ChangeRequestRef {
-    pub namespace: String,
-    pub service: String,
-    pub scope: String,
-    pub number: u64,
+/// One change request observed in one namespace: the observers' key.
+///
+/// Its identity is the change request's [`Address`], so every spelling of
+/// one change request (host or forge id, any repository case) is one
+/// observation subject with one record. Its fields are private because it
+/// keys maps: [`ChangeRequestKey::new`] is the only way to make one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ChangeRequestKey {
+    namespace: String,
+    address: Address,
 }
 
-impl ChangeRequestRef {
-    pub fn from_address(namespace: &str, address: &LeafAddress) -> Option<Self> {
-        let LeafAddress::ChangeRequest { service, scope, number } = address else { return None };
-        Some(Self { namespace: namespace.to_string(), service: service.clone(), scope: scope.clone(), number: *number })
+impl ChangeRequestKey {
+    /// The key for a change-request address; any other address is refused.
+    ///
+    /// It checks the whole shape the accessors read (a forge, a repository,
+    /// a number, a record name and a stored `(service, scope)`), so the
+    /// accessors below cannot panic. The address grammar already puts a
+    /// change request under a repository under a forge; this check states it
+    /// here.
+    pub fn new(namespace: impl Into<String>, address: Address) -> Result<Self, String> {
+        if address.kind() != AddressKind::ChangeRequest {
+            return Err(format!("{address} is not a change request"));
+        }
+        if address.get(AddressKind::Forge).is_none()
+            || address.parent().is_none()
+            || address.get(AddressKind::Repo).is_none()
+            || address.number().is_none()
+            || record_name(&address).is_none()
+            || stored_service_scope(&address).is_none()
+        {
+            return Err(format!("{address} is not a change request under a forge repository"));
+        }
+        Ok(Self { namespace: namespace.into(), address })
     }
 
-    /// The change request this subject names. A service spelled by host
-    /// resolves only through the Forge in `forges` that declares it.
-    pub fn address(&self, forges: &[ForgeSpec]) -> Result<Address, String> {
-        stored_change_request_address(&self.service, &self.scope, self.number, forges)
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 
-    /// The name of the record that observes this subject. A normalized
-    /// subject spells its forge by id, so it needs no Forge directory.
-    pub fn record_name(&self) -> Result<String, String> {
-        let address = self.address(&[])?;
-        record_name(&address).ok_or_else(|| format!("{address} names no record"))
+    pub fn address(&self) -> &Address {
+        &self.address
     }
 
-    /// This subject respelled as its address's stored `(service, scope)`, so
-    /// every spelling of one change request is one subject.
-    pub fn normalized(mut self, forges: &[ForgeSpec]) -> Result<Self, String> {
-        let address = self.address(forges)?;
-        (self.service, self.scope) =
-            stored_service_scope(&address).ok_or_else(|| format!("{address} is not a change request under a repository"))?;
-        Ok(self)
+    /// The repository the change request belongs to.
+    pub fn repository(&self) -> Address {
+        self.address.parent().expect("ChangeRequestKey::new checked the repository")
+    }
+
+    /// The forge id: `github` for public GitHub.
+    pub fn forge_id(&self) -> &str {
+        self.address.get(AddressKind::Forge).expect("ChangeRequestKey::new checked the forge")
+    }
+
+    /// The repository's `owner/repo`, in its forge's case.
+    pub fn repository_path(&self) -> &str {
+        self.address.get(AddressKind::Repo).expect("ChangeRequestKey::new checked the repository")
+    }
+
+    pub fn number(&self) -> u64 {
+        self.address.number().expect("ChangeRequestKey::new checked the number")
+    }
+
+    /// The name of the record that observes this change request.
+    pub fn record_name(&self) -> String {
+        record_name(&self.address).expect("ChangeRequestKey::new checked the record name")
+    }
+
+    /// The `(service, scope)` its record spec stores.
+    pub fn stored_service_scope(&self) -> (String, String) {
+        stored_service_scope(&self.address).expect("ChangeRequestKey::new checked the stored spelling")
     }
 }
 
 #[async_trait]
 pub trait ChangeRequestObservationSource: Send + Sync {
-    async fn observe(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError>;
+    async fn observe(&self, subject: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError>;
 
     async fn observe_group(
         &self,
-        subjects: &[ChangeRequestRef],
-        subject: &ChangeRequestRef,
+        subjects: &[ChangeRequestKey],
+        subject: &ChangeRequestKey,
     ) -> Result<ChangeRequestStatus, ObservationError> {
         let _ = subjects;
         self.observe(subject).await
     }
 
-    async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
+    async fn observe_for_completion(&self, subject: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
         self.observe(subject).await
     }
 }
@@ -86,41 +122,37 @@ impl GhChangeRequestObservationSource {
 
 #[async_trait]
 impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
-    async fn observe(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
-        if subject.service != "github.com" {
-            return Err(format!("change request observation service `{}` is not available on this host", subject.service).into());
-        }
-        let number = subject.number.to_string();
+    async fn observe(&self, subject: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
+        let repository = github_repository(subject)?;
+        let number = subject.number().to_string();
         let output = run!(
             self.runner,
             "gh",
-            &["pr", "view", &number, "--repo", &subject.scope, "--json", "state,headRefOid,statusCheckRollup,reviewDecision,mergeable",],
+            &["pr", "view", &number, "--repo", repository, "--json", "state,headRefOid,statusCheckRollup,reviewDecision,mergeable",],
             Path::new("/"),
         )?;
         parse_gh_observation(&output, Utc::now()).map_err(ObservationError::Failed)
     }
 
-    async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
-        if subject.service != "github.com" {
-            return Err(format!("change request observation service `{}` is not available on this host", subject.service).into());
-        }
-        let number = subject.number.to_string();
+    async fn observe_for_completion(&self, subject: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
+        let repository = github_repository(subject)?;
+        let number = subject.number().to_string();
         let output = run!(
             self.runner,
             "gh",
-            &[
-                "pr",
-                "view",
-                &number,
-                "--repo",
-                &subject.scope,
-                "--json",
-                "state,isDraft,headRefOid,statusCheckRollup,reviewDecision,mergeable"
-            ],
+            &["pr", "view", &number, "--repo", repository, "--json", "state,isDraft,headRefOid,statusCheckRollup,reviewDecision,mergeable"],
             Path::new("/"),
         )?;
         parse_gh_observation(&output, Utc::now()).map_err(ObservationError::Failed)
     }
+}
+
+/// `gh` reads only public GitHub, the built-in `github` forge.
+fn github_repository(subject: &ChangeRequestKey) -> Result<&str, ObservationError> {
+    if subject.forge_id() != GITHUB_FORGE_ID {
+        return Err(format!("change request observation forge `{}` is not available on this host", subject.forge_id()).into());
+    }
+    Ok(subject.repository_path())
 }
 
 pub fn parse_gh_observation(json: &str, observed_at: DateTime<Utc>) -> Result<ChangeRequestStatus, String> {
@@ -342,9 +374,32 @@ mod tests {
     use flotilla_resources::{ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision};
 
     use super::{
-        parse_gh_observation, parse_gh_observation_with_crew_identity, parse_gh_observation_with_identity,
-        parse_gh_observation_with_review_bot, DEFAULT_REVIEW_BOT_LOGIN,
+        github_repository, parse_gh_observation, parse_gh_observation_with_crew_identity, parse_gh_observation_with_identity,
+        parse_gh_observation_with_review_bot, ChangeRequestKey, DEFAULT_REVIEW_BOT_LOGIN,
     };
+
+    fn key(service: &str, scope: &str) -> ChangeRequestKey {
+        let address = flotilla_resources::address::stored_change_request_address(service, scope, 42, &[]).expect("address");
+        ChangeRequestKey::new("flotilla", address).expect("key")
+    }
+
+    // #3359: a key's identity is its Address, so every spelling of one change
+    // request is one key, and a key names only a change request.
+    #[test]
+    fn spellings_of_one_change_request_are_one_key() {
+        assert_eq!(key("github.com", "Flotilla-Org/Flotilla"), key("github", "flotilla-org/flotilla"));
+        assert_ne!(key("github.com", "flotilla-org/flotilla"), key("github.com", "flotilla-org/cleat"));
+        let issue = flotilla_resources::address::stored_issue_address("github.com", "flotilla-org/flotilla", 42, &[]).expect("issue");
+        assert!(ChangeRequestKey::new("flotilla", issue).is_err());
+    }
+
+    // `gh` reads only the built-in GitHub forge; another forge is refused
+    // before any command runs.
+    #[test]
+    fn gh_reads_only_the_github_forge() {
+        assert_eq!(github_repository(&key("github.com", "Flotilla-Org/Flotilla")).ok(), Some("flotilla-org/flotilla"));
+        assert!(github_repository(&key("lab", "team/repo")).is_err());
+    }
 
     fn review_actionable(request: serde_json::Value) -> bool {
         parse_gh_observation(&request.to_string(), "2026-09-30T12:00:00Z".parse().expect("time"))

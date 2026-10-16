@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_change_request::observation::ChangeRequestObservationSource;
-use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_change_request::BoundObservations;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_daemon_api::daemon::DaemonHandle;
@@ -158,8 +158,11 @@ async fn distinct_cooldowns_block_all_observation_reads() {
     for seconds in [0, 11, 48] {
         tokio::time::advance(Duration::from_secs(seconds)).await;
         for number in [1, 2, 3, 4, 5] {
-            let subject =
-                ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/repo".into(), number };
+            let subject = ChangeRequestKey::new(
+                "flotilla",
+                flotilla_resources::address::stored_change_request_address("github.com", "team/repo", number, &[]).expect("address"),
+            )
+            .expect("key");
             let expected = if number == 4 { ObservationError::Failed("hard refusal".into()) } else { controlling.clone() };
             assert_eq!(source.observe(&subject).await.expect_err("ordinary read waits"), expected);
             assert_eq!(source.observe_for_completion(&subject).await.expect_err("completion waits"), expected);
@@ -167,7 +170,11 @@ async fn distinct_cooldowns_block_all_observation_reads() {
         }
     }
     tokio::time::advance(Duration::from_secs(1)).await;
-    let subject = ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/repo".into(), number: 1 };
+    let subject = ChangeRequestKey::new(
+        "flotilla",
+        flotilla_resources::address::stored_change_request_address("github.com", "team/repo", 1, &[]).expect("address"),
+    )
+    .expect("key");
     let expired = source.observe_for_completion(&subject).await.expect_err("no repository after cache expires");
     assert!(matches!(expired, ObservationError::Failed(_)), "cache expires at controlling deadline");
 }

@@ -12,13 +12,13 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_change_request::observation::{self, ChangeRequestRef};
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_protocol::{
     CheckoutArchiveOutcome, CheckoutArchiveStatus, CommandValue, CrewCommandContext, CrewListMember, CrewListResponse, CrewProject,
     CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
 };
 use flotilla_resources::{
-    address::{artifact_slot_record_name, leaf_record_name, record_name},
+    address::{artifact_slot_record_name, leaf_address, leaf_record_name, record_name},
     change_request_address_with_forges, evaluate_crew_completion, expected_change_request_leaves,
     external_patches as convoy_external_patches, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
     CheckoutIntegrationStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewCompletionClaim,
@@ -1253,24 +1253,32 @@ impl CrewService {
             let mut refusal_causes = Vec::new();
             let mut observation_waits = Vec::new();
             if requires_change_request {
-                let mut subjects = BTreeSet::new();
+                // One subject per change request, whatever its leaves' spellings.
+                let mut subjects = BTreeMap::new();
                 for leaf in expected_change_request_leaves(&convoy, &checkouts)? {
-                    if let Some(subject) = ChangeRequestRef::from_address(namespace, &leaf.address) {
-                        subjects.insert((subject.service, subject.scope, subject.number));
+                    let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else { continue };
+                    let cause = || CrewCompletionRefusalCause::MissingChangeRequestObservation {
+                        service: service.clone(),
+                        scope: scope.clone(),
+                        number: *number,
+                    };
+                    match leaf_address(&leaf.address, &forges).and_then(|address| ChangeRequestKey::new(namespace, address)) {
+                        Ok(subject) => {
+                            subjects.entry(subject).or_insert_with(cause);
+                        }
+                        Err(error) => {
+                            observation_errors.push(format!("could not observe PR {number}: {error}"));
+                            refusal_causes.push(cause());
+                        }
                     }
                 }
-                for (service, scope, number) in subjects {
-                    let subject = observation::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
+                for (subject, cause) in subjects {
                     if let Err(error) = self.leaf_subscriptions.refresh_change_request_once(&subject).await {
                         if let Some(retry_at) = error.retry_at().filter(|retry_at| *retry_at > Utc::now()) {
-                            observation_waits.push((retry_at, format!("PR {} observation: {error}", subject.number)));
+                            observation_waits.push((retry_at, format!("PR {} observation: {error}", subject.number())));
                         } else {
-                            observation_errors.push(format!("could not observe PR {}: {error}", subject.number));
-                            refusal_causes.push(CrewCompletionRefusalCause::MissingChangeRequestObservation {
-                                service: subject.service.clone(),
-                                scope: subject.scope.clone(),
-                                number: subject.number,
-                            });
+                            observation_errors.push(format!("could not observe PR {}: {error}", subject.number()));
+                            refusal_causes.push(cause);
                         }
                     }
                 }
