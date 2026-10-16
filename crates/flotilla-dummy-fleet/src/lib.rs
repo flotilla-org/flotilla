@@ -11,13 +11,17 @@
 //!   provider-instance label is `dummy`, and marks them as dummy environments;
 //! - inside a dummy environment, discovery finds the dummy terminal pool, the
 //!   dummy agent adapter and the dummy VCS, and no real tools;
-//! - the dummy change-request tracker claims repositories on the dummy forge.
+//! - the dummy change-request tracker claims repositories on the dummy forge;
+//! - with `[dummy_fleet.shared_forge]`, coders instead open change requests on
+//!   a Forgejo forge every rehearsal host shares (#3374), which the ordinary
+//!   Forgejo provider observes.
 
 mod adapter;
 pub mod catalog;
 mod crew;
 mod fleet;
 mod forge;
+mod shared_forge;
 mod terminal;
 mod vcs;
 

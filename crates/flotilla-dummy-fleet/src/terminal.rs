@@ -243,6 +243,8 @@ mod tests {
     // Stands in for the daemon's command boundary: records each crew command,
     // refuses the first completions, and reports handoffs to the test's peer.
     struct RecordingPort {
+        /// Every submitted change-request reference starts with this.
+        reference_prefix: String,
         refusals: std::sync::Mutex<usize>,
         handoff_refusals: std::sync::Mutex<usize>,
         commands: mpsc::UnboundedSender<String>,
@@ -257,7 +259,7 @@ mod tests {
                     ("promise".to_string(), CommandValue::Ok)
                 }
                 CommandAction::CrewPromise { operation: CrewPromiseOperation::Submit { reference, .. }, .. } => {
-                    assert!(reference.starts_with("https://forge.dummy.invalid/dummy/fleet/pulls/"), "{reference}");
+                    assert!(reference.starts_with(&self.reference_prefix), "{reference}");
                     ("submit".to_string(), CommandValue::Ok)
                 }
                 CommandAction::CrewHandoff { target, message, .. } => {
@@ -378,6 +380,7 @@ mod tests {
             let fleet = DummyFleet::new(DummyFleetConfig { agent, ..DummyFleetConfig::default() });
             let (commands, mut recorded) = mpsc::unbounded_channel();
             let port = Arc::new(RecordingPort {
+                reference_prefix: "https://forge.dummy.invalid/dummy/fleet/pulls/".into(),
                 refusals: std::sync::Mutex::new(refusals),
                 handoff_refusals: std::sync::Mutex::new(handoff_refusals),
                 commands,
@@ -454,5 +457,71 @@ mod tests {
             assert!(pool.list_sessions().await.expect("sessions").is_empty());
             assert!(pool.deliver(SESSION, "late").await.is_err(), "a killed session refuses turns");
         });
+    }
+
+    // Behaviour (#3374): with a shared forge configured, a coder opens its
+    // change request there over the Forgejo API and submits that pull
+    // request's URL. When the forge refuses it (a wrong token), the crew
+    // retries, stalls with the reason, and opens the pull request after
+    // guidance once the token is right; the forge holds exactly one.
+    #[tokio::test(start_paused = true)]
+    async fn coders_open_change_requests_on_the_shared_forge() {
+        use std::io::Write;
+
+        use flotilla_config::dummy_fleet::DummySharedForgeConfig;
+        use flotilla_fake_forge::{FakeForge, ForgeSettings, InProcessClient, RepoRef, SystemClock};
+
+        let fake = Arc::new(FakeForge::new("https://fake-forge.test:3443", Arc::new(SystemClock)));
+        fake.add_forge("github", ForgeSettings { token: "right".into(), login: "rehearsal-crew".into() }).expect("forge");
+        let mut token = tempfile::NamedTempFile::new().expect("token file");
+        write!(token, "wrong").expect("write token");
+        let config = DummyFleetConfig {
+            agent: DummyAgentConfig { turn_delay_ms: 1_500, fail_rate: 0.0, stall_rate: 0.0, long_runner_turns: 1 },
+            shared_forge: Some(DummySharedForgeConfig {
+                service_url: fake.service_url("github"),
+                token_path: token.path().to_string_lossy().into_owned(),
+                base_branch: "main".into(),
+            }),
+            ..DummyFleetConfig::default()
+        };
+        let fleet = DummyFleet::with_http(config, Arc::new(InProcessClient::new(Arc::clone(&fake))));
+        let (commands, mut recorded) = mpsc::unbounded_channel();
+        let port = Arc::new(RecordingPort {
+            reference_prefix: "https://fake-forge.test:3443/github/flotilla-org/flotilla/pulls/".into(),
+            refusals: std::sync::Mutex::new(0),
+            handoff_refusals: std::sync::Mutex::new(0),
+            commands,
+            attention: Default::default(),
+        });
+        fleet.attach(Arc::clone(&port) as Arc<dyn CrewCommandPort>).expect("attach");
+        let pool = DummyTerminalPool { fleet: Arc::clone(&fleet) };
+        let script = CrewScript::Coder { reviewer: None, repository: "flotilla-org/flotilla".into() };
+        pool.ensure_session(
+            SESSION,
+            "flotilla-dummy-crew",
+            &ExecutionEnvironmentPath::new("/workspace"),
+            &launch_environment(&script),
+            &[],
+        )
+        .await
+        .expect("launch");
+        async fn next(recorded: &mut mpsc::UnboundedReceiver<String>) -> String {
+            tokio::time::timeout(Duration::from_secs(600), recorded.recv()).await.expect("crew acts").expect("port open")
+        }
+        assert_eq!(next(&mut recorded).await, "promise");
+        assert_eq!(next(&mut recorded).await, "stall:resume", "a refused open stalls after its retries");
+        assert_eq!(fake.refusals().1, 3, "each attempt reached the forge and was refused");
+        let repo = RepoRef::new("github", "flotilla-org", "flotilla");
+        assert!(fake.repository(&repo).expect("repository").items.is_empty());
+
+        std::fs::write(token.path(), "right\n").expect("fix token");
+        pool.deliver(SESSION, "[from the operator (supervisor)]\n\nToken fixed.").await.expect("deliver");
+        assert_eq!(next(&mut recorded).await, "submit");
+        assert_eq!(next(&mut recorded).await, "complete");
+        let pull = fake.pull(&repo, 1).expect("the crew's pull request");
+        assert_eq!((pull.title.as_str(), pull.user.as_str()), ("Dummy work for convoy-a", "rehearsal-crew"));
+        assert_eq!(pull.pull.expect("pull facts").head_branch, "dummy/convoy-a/implement");
+        assert_eq!(fleet.snapshot().change_requests_opened, 1);
+        pool.kill_session(SESSION).await.expect("kill");
     }
 }

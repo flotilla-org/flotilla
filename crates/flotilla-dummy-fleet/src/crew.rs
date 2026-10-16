@@ -6,8 +6,9 @@
 //! A brief selects its script with a line `dummy-script: <script> [key=value]…`:
 //!
 //! - `coder [review=<role>] [repo=<owner/name>]` promises a change request,
-//!   opens one on the dummy forge and submits it, optionally asks a peer to
-//!   review it and waits for the reply, then completes.
+//!   opens one on the dummy forge (or on the configured shared forge) and
+//!   submits it, optionally asks a peer to review it and waits for the reply,
+//!   then completes.
 //! - `responder reply=<role>` answers every turn with a handoff to `reply`,
 //!   and completes after answering a turn marked [`LAST_TURN_MARKER`].
 //! - `governor aide=<role> [turns=<n>]` is a long runner: it hands its aide
@@ -34,6 +35,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     fleet::{Counter, DummyFleet},
+    shared_forge::SharedForge,
     terminal::DummySession,
 };
 
@@ -224,7 +226,11 @@ impl Crew {
         // A crew resumed after a restart may have promised already.
         let _ = self.fleet.execute(CommandAction::CrewPromise { context: self.identity.context(), operation: promise }).await;
         let branch = format!("dummy/{}/{}", self.identity.convoy, self.identity.vessel);
-        let (_, url) = self.fleet.forge.open(repository, &branch, &format!("Dummy work for {}", self.identity.convoy));
+        let title = format!("Dummy work for {}", self.identity.convoy);
+        let url = match self.fleet.shared_forge.clone() {
+            Some(shared) => self.open_on_shared_forge(&shared, repository, &branch, &title).await?,
+            None => self.fleet.forge.open(repository, &branch, &title).1,
+        };
         self.fleet.count(Counter::ChangeRequestsOpened);
         let submit = CrewPromiseOperation::Submit {
             promise: Some(PROMISE_ID.into()),
@@ -292,6 +298,41 @@ impl Crew {
                 reason: StallReason::Infra,
                 proposed_disposition: Some(StallProposedDisposition::Resume),
                 message: format!("dummy crew command kept failing: {last_error}"),
+            };
+            if self.attempt(stall).await.is_some() {
+                self.fleet.count(Counter::CrewsStalled);
+            }
+            self.await_guidance().await?;
+        }
+    }
+
+    /// Open the change request on the shared forge as a real crew would:
+    /// retry a failure a few times, then stall with it and retry after
+    /// guidance. `None` once the session is gone.
+    async fn open_on_shared_forge(&mut self, shared: &SharedForge, repository: &str, branch: &str, title: &str) -> Option<String> {
+        let body = format!("Opened by dummy crew {}.", self.identity.subject());
+        loop {
+            let mut backoff = Duration::from_secs(1);
+            let mut last_error = String::new();
+            for attempt in 1..=COMMAND_ATTEMPTS {
+                match shared.open(repository, branch, title, &body).await {
+                    Ok(url) => return Some(url),
+                    Err(error) => {
+                        tracing::warn!(crew = %self.identity.subject(), attempt, %error, "dummy crew could not open its change request");
+                        last_error = error;
+                        // Back off between attempts; after the last, stall at once.
+                        if attempt < COMMAND_ATTEMPTS {
+                            self.idle_for(backoff).await;
+                            backoff *= 2;
+                        }
+                    }
+                }
+            }
+            let stall = CommandAction::CrewStall {
+                context: self.identity.context(),
+                reason: StallReason::Infra,
+                proposed_disposition: Some(StallProposedDisposition::Resume),
+                message: format!("dummy crew could not open its change request on the shared forge: {last_error}"),
             };
             if self.attempt(stall).await.is_some() {
                 self.fleet.count(Counter::CrewsStalled);

@@ -28,6 +28,12 @@ pub struct DummyFleetConfig {
     pub agent: DummyAgentConfig,
     #[serde(default)]
     pub change_request: DummyChangeRequestConfig,
+    /// A forge shared by every host of a rehearsal fleet (#3374). When set,
+    /// dummy coders open their change requests there over the Forgejo API,
+    /// so change-request numbers are unique across hosts, instead of on this
+    /// daemon's in-process dummy forge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_forge: Option<DummySharedForgeConfig>,
 }
 
 impl Default for DummyFleetConfig {
@@ -38,6 +44,7 @@ impl Default for DummyFleetConfig {
             environment: DummyEnvironmentConfig::default(),
             agent: DummyAgentConfig::default(),
             change_request: DummyChangeRequestConfig::default(),
+            shared_forge: None,
         }
     }
 }
@@ -102,6 +109,43 @@ pub struct DummyChangeRequestConfig {
     pub close_rate: f64,
 }
 
+/// The Forgejo forge, such as the rehearsal's fake forge, that dummy coders
+/// open change requests on.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DummySharedForgeConfig {
+    /// Forgejo web root, as the forge's Forge record names it in `https_url`.
+    #[serde(deserialize_with = "deserialize_https_url")]
+    pub service_url: String,
+    /// Absolute path of the file holding the forge's API token.
+    #[serde(deserialize_with = "deserialize_absolute_path")]
+    pub token_path: String,
+    /// Branch the change requests target.
+    #[serde(default = "default_base_branch")]
+    pub base_branch: String,
+}
+
+fn deserialize_https_url<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let url = String::deserialize(deserializer)?;
+    match url.strip_prefix("https://") {
+        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => Ok(url),
+        _ => Err(serde::de::Error::custom(format!("shared forge service_url `{url}` must be an https URL"))),
+    }
+}
+
+fn deserialize_absolute_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let path = String::deserialize(deserializer)?;
+    if std::path::Path::new(&path).is_absolute() {
+        Ok(path)
+    } else {
+        Err(serde::de::Error::custom(format!("shared forge token_path `{path}` must be absolute")))
+    }
+}
+
+fn default_base_branch() -> String {
+    "main".to_string()
+}
+
 fn deserialize_rate<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
     let rate = f64::deserialize(deserializer)?;
     if !(0.0..=1.0).contains(&rate) {
@@ -119,6 +163,38 @@ mod tests {
         let config: DummyFleetConfig = toml::from_str("").expect("empty dummy fleet section");
         assert_eq!(config, DummyFleetConfig::default());
         assert_eq!(config.forge_service_url, DEFAULT_DUMMY_FORGE_SERVICE_URL);
+    }
+
+    // Behaviour (#3374): a `[dummy_fleet.shared_forge]` section names the
+    // forge dummy coders open change requests on; its base branch defaults to
+    // `main`, and an unknown key is refused rather than ignored.
+    #[test]
+    fn shared_forge_section_names_the_forge_and_token() {
+        let config: DummyFleetConfig = toml::from_str(
+            "[shared_forge]\nservice_url = \"https://fake-forge.rehearsal:3443/github\"\ntoken_path = \"/etc/flotilla/github-token\"\n",
+        )
+        .expect("shared forge section");
+        assert_eq!(
+            config.shared_forge,
+            Some(DummySharedForgeConfig {
+                service_url: "https://fake-forge.rehearsal:3443/github".into(),
+                token_path: "/etc/flotilla/github-token".into(),
+                base_branch: "main".into(),
+            })
+        );
+        assert_eq!(DummyFleetConfig::default().shared_forge, None);
+        let error = toml::from_str::<DummyFleetConfig>("[shared_forge]\nservice_url = \"https://x\"\ntoken_path = \"/y\"\ntoken = \"z\"\n")
+            .expect_err("unknown key");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+        // Mistakes that would only surface as a crew stall fail at load.
+        for (section, expected) in [
+            ("service_url = \"\"\ntoken_path = \"/t\"\n", "must be an https URL"),
+            ("service_url = \"http://fake/github\"\ntoken_path = \"/t\"\n", "must be an https URL"),
+            ("service_url = \"https://fake/github\"\ntoken_path = \"tokens/github\"\n", "must be absolute"),
+        ] {
+            let error = toml::from_str::<DummyFleetConfig>(&format!("[shared_forge]\n{section}")).expect_err(expected);
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # Dummy fleet (#3206): production-shape fake crews, VCS and change requests for
 # load testing, installed by the composition root behind `[dummy_fleet]`.
+# With `[dummy_fleet.shared_forge]` coders open change requests on a shared
+# Forgejo forge, such as the rehearsal fake forge (#3374).
 # The environment provider lives in flotilla-environment with the other adapters.
 [package]
 name = "flotilla-dummy-fleet"
@@ -15,6 +17,7 @@ flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 flotilla-discovery = { path = "../flotilla-discovery" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-environment = { path = "../flotilla-environment" }
+flotilla-forge-forgejo = { path = "../flotilla-forge-forgejo" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
@@ -23,11 +26,15 @@ flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 async-trait.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+reqwest.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+flotilla-fake-forge = { path = "../flotilla-fake-forge" }
 hegeltest = "=0.48.1"
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
