@@ -25,6 +25,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bytes.workspace = true
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
+flotilla-fake-forge = { path = "../flotilla-fake-forge" }
 hegeltest = "=0.48.1"
 http.workspace = true
 tempfile.workspace = true

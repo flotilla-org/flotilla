@@ -10,6 +10,7 @@
 pub mod api;
 mod client;
 pub mod model;
+pub mod recorded;
 mod render;
 
 pub use client::InProcessClient;

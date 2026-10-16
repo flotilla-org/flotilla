@@ -25,6 +25,7 @@ bon.workspace = true
 bytes.workspace = true
 dirs = "6"
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+flotilla-fake-forge = { path = "../flotilla-fake-forge" }
 flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
 hegeltest = "=0.48.1"
 http.workspace = true

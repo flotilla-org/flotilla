@@ -335,6 +335,10 @@ mod tests {
     use flotilla_provider_runtime::ChannelLabel;
 
     use super::*;
+    use flotilla_fake_forge::{
+        recorded::{ManualClock, RecordedWorld, RECORDED_ORIGIN, RECORDED_TOKEN},
+        FakeForge, ForgeSettings, InProcessClient, ItemEdit, ItemState, NewIssue, NewPull, NewReview, RepoRef, ReviewState,
+    };
     use flotilla_forge_forgejo::ForgejoAuth;
     use flotilla_replay_testkit as replay;
     use flotilla_replay_testkit::testing::MockRunner;
@@ -627,39 +631,91 @@ mod tests {
         assert!(urls[1].contains("pulls/7/reviews"));
         assert!(urls[3].contains("pulls/8/reviews"));
     }
-    #[tokio::test]
-    async fn record_replay_lists_forgejo_pull_requests() {
+    fn replay_provider(fixture: &str, repo_slug: &str) -> (replay::Session, ForgejoChangeRequestProvider) {
         let auth = auth();
         let mut masks = Masks::new();
-        masks.add(&auth.token, "<LAB_FORGEJO_TOKEN>");
-        let fixture = fixture_path("forgejo_pulls.yaml");
-        let session = replay::test_session(&fixture, masks);
+        masks.add(&auth.token, RECORDED_TOKEN);
+        let session = replay::test_session(&fixture_path(fixture), masks);
         let provider = ForgejoChangeRequestProvider::new(
             replay::test_http_client(&session),
             Arc::new(MockRunner::new(vec![])),
-            ForgejoIssueProviderConfig::new("https://forgejo.lab.flotilla.work".into(), None, auth),
-            "lab/flotilla".into(),
+            ForgejoIssueProviderConfig::new(RECORDED_ORIGIN.into(), None, auth),
+            repo_slug.into(),
         );
+        (session, provider)
+    }
+
+    const FAKE_URL: &str = "https://fake-forge.test:3443";
+    const FAKE_TOKEN: &str = "fake-forge-token";
+
+    /// The real provider, configured as a rehearsal Forge record points it at
+    /// the fake's `lab` mount, reaching it through the in-process HTTP seam.
+    fn fake_provider(fake: &Arc<FakeForge>, token: &str, repo_slug: &str) -> ForgejoChangeRequestProvider {
+        ForgejoChangeRequestProvider::new(
+            Arc::new(InProcessClient::new(Arc::clone(fake))),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new(
+                fake.service_url("lab"),
+                None,
+                ForgejoAuth { token: token.into(), token_path: PathBuf::from("fake-forge-token") },
+            ),
+            repo_slug.into(),
+        )
+    }
+
+    fn recorded_world_provider(world: RecordedWorld) -> (Arc<FakeForge>, ForgejoChangeRequestProvider) {
+        let fake = world.seed(FAKE_URL, "lab", FAKE_TOKEN);
+        let provider = fake_provider(&fake, FAKE_TOKEN, world.repo_slug());
+        (fake, provider)
+    }
+
+    /// The provider stayed within the fake's contract: nothing was refused.
+    fn assert_no_refusals(fake: &FakeForge) {
+        let (refusals, count) = fake.refusals();
+        assert_eq!(count, 0, "the fake refused provider requests: {refusals:?}");
+    }
+
+    // Contract (recorded world: lab/flotilla has no open pull requests): the
+    // open listing holds only open or draft requests, here none.
+    async fn contract_lists_open_pull_requests(provider: &ForgejoChangeRequestProvider) {
         let requests = provider.list_change_requests(10).await.expect("list pull requests");
         assert!(requests.iter().all(|(_, request)| matches!(request.status, ChangeRequestStatus::Open | ChangeRequestStatus::Draft)));
+        assert!(requests.is_empty(), "the recorded repository has no open pull requests: {requests:?}");
+    }
+
+    #[tokio::test]
+    async fn record_replay_lists_forgejo_pull_requests() {
+        let (session, provider) = replay_provider("forgejo_pulls.yaml", "lab/flotilla");
+        contract_lists_open_pull_requests(&provider).await;
         session.finish();
     }
 
     #[tokio::test]
+    async fn fake_forge_lists_forgejo_pull_requests() {
+        let (fake, provider) = recorded_world_provider(RecordedWorld::LabFlotillaWithoutOpenPulls);
+        contract_lists_open_pull_requests(&provider).await;
+        assert_no_refusals(&fake);
+    }
+
+    // Contract (recorded world: robert/ghostty-ops before any pull request):
+    // a branch lookup scans to the empty page and proves absence.
+    async fn contract_queries_ghostty_governor_pull_request(provider: &ForgejoChangeRequestProvider) {
+        let found = provider.find_change_request_by_branch("governor").await.expect("query Forgejo pull requests");
+        assert!(found.is_none(), "the recorded repository has no pull requests: {found:?}");
+    }
+
+    #[tokio::test]
     async fn record_replay_queries_ghostty_governor_pull_request() {
-        let auth = auth();
-        let mut masks = Masks::new();
-        masks.add(&auth.token, "<LAB_FORGEJO_TOKEN>");
-        let fixture = fixture_path("forgejo_ghostty_governor.yaml");
-        let session = replay::test_session(&fixture, masks);
-        let provider = ForgejoChangeRequestProvider::new(
-            replay::test_http_client(&session),
-            Arc::new(MockRunner::new(vec![])),
-            ForgejoIssueProviderConfig::new("https://forgejo.lab.flotilla.work".into(), None, auth),
-            "robert/ghostty-ops".into(),
-        );
-        provider.find_change_request_by_branch("governor").await.expect("query Forgejo pull requests");
+        let (session, provider) = replay_provider("forgejo_ghostty_governor.yaml", "robert/ghostty-ops");
+        contract_queries_ghostty_governor_pull_request(&provider).await;
         session.finish();
+    }
+
+    #[tokio::test]
+    async fn fake_forge_queries_ghostty_governor_pull_request() {
+        let (fake, provider) = recorded_world_provider(RecordedWorld::GhosttyOpsBeforePulls);
+        contract_queries_ghostty_governor_pull_request(&provider).await;
+        assert_no_refusals(&fake);
     }
 
     // HTTP boundary: an observer reuses only proven absence, then checks again
@@ -784,24 +840,18 @@ mod tests {
         assert_eq!(replacement_http.urls.lock().expect("urls").len(), 1);
     }
 
-    // Live-recorded evidence: lab head filtering supports an exact branch name,
-    // but cannot reproduce lookup by a deleted head's synthetic head.ref.
-    #[tokio::test]
-    async fn record_replay_lab_head_filter_capability() {
-        let auth = auth();
-        let mut masks = Masks::new();
-        masks.add(&auth.token, "<LAB_FORGEJO_TOKEN>");
-        let fixture = fixture_path("forgejo_head_filter_capability.yaml");
-        let session = replay::test_session(&fixture, masks);
-        let provider = ForgejoChangeRequestProvider::new(
-            replay::test_http_client(&session),
-            Arc::new(MockRunner::new(vec![])),
-            ForgejoIssueProviderConfig::new("https://forgejo.lab.flotilla.work".into(), None, auth),
-            "robert/ghostty-ops".into(),
-        );
-        for (head, expected) in
-            [("drop-retired-stance", 1), ("robert:drop-retired-stance", 0), ("refs/pull/1/head", 0), ("flotilla-2585-definitely-absent", 0)]
-        {
+    // Contract (recorded world: robert/ghostty-ops with pull request 1 merged
+    // and its branch deleted, pull request 2 merged from drop-retired-stance):
+    // head filtering supports an exact branch name, but cannot reproduce
+    // lookup by a deleted head's synthetic head.ref, which only an unfiltered
+    // scan finds. A repeated absent lookup reuses the proven absence.
+    async fn contract_lab_head_filter_capability(provider: ForgejoChangeRequestProvider) {
+        for (head, expected) in [
+            ("drop-retired-stance", &["2"][..]),
+            ("robert:drop-retired-stance", &[]),
+            ("refs/pull/1/head", &[]),
+            ("flotilla-2585-definitely-absent", &[]),
+        ] {
             let result = provider
                 .forge
                 .execute(
@@ -813,17 +863,35 @@ mod tests {
                 )
                 .await
                 .expect("head query");
-            assert_eq!(result.as_array().expect("pull list").len(), expected);
+            let numbers: Vec<String> =
+                result.as_array().expect("pull list").iter().filter_map(|pull| pull["number"].as_i64()).map(|n| n.to_string()).collect();
+            assert_eq!(numbers, expected, "head filter {head}");
         }
-        let (_, request) =
+        let (id, request) =
             provider.find_change_request_by_branch("refs/pull/1/head").await.expect("unfiltered lookup").expect("deleted head PR");
+        assert_eq!(id, "1");
         assert_eq!(request.branch, "refs/pull/1/head");
+        assert_eq!(request.status, ChangeRequestStatus::Merged);
         let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider);
         let observer = BranchLookupObserver::default();
         for _ in 0..3 {
             assert!(observer.find("robert/ghostty-ops", &provider, "flotilla-2585-definitely-absent").await.expect("absence").is_none());
         }
+    }
+
+    // Live-recorded evidence for the head-filter contract.
+    #[tokio::test]
+    async fn record_replay_lab_head_filter_capability() {
+        let (session, provider) = replay_provider("forgejo_head_filter_capability.yaml", "robert/ghostty-ops");
+        contract_lab_head_filter_capability(provider).await;
         session.finish();
+    }
+
+    #[tokio::test]
+    async fn fake_forge_lab_head_filter_capability() {
+        let (fake, provider) = recorded_world_provider(RecordedWorld::GhosttyOpsWithMergedPulls);
+        contract_lab_head_filter_capability(provider).await;
+        assert_no_refusals(&fake);
     }
 
     #[test]
@@ -955,5 +1023,262 @@ mod tests {
         );
         let error = provider.list_change_requests(1).await.expect_err("HTTP error");
         assert!(error.contains("401"));
+    }
+
+    const OPERATOR: &str = "operator";
+
+    /// A fresh fake with an empty `lab` forge whose token belongs to
+    /// `flotilla-bot`, and the real provider pointed at `team/repo` on it.
+    fn empty_fake() -> (Arc<FakeForge>, Arc<ManualClock>, ForgejoChangeRequestProvider) {
+        let clock = Arc::new(ManualClock::new("2026-10-16T12:00:00Z".parse().expect("time")));
+        let fake = Arc::new(FakeForge::new(FAKE_URL, clock.clone()));
+        fake.add_forge("lab", ForgeSettings { token: FAKE_TOKEN.into(), login: "flotilla-bot".into() }).expect("lab forge");
+        let provider = fake_provider(&fake, FAKE_TOKEN, "team/repo");
+        (fake, clock, provider)
+    }
+
+    fn team_repo() -> RepoRef {
+        RepoRef::new("lab", "team", "repo")
+    }
+
+    async fn open_through_api(provider: &ForgejoChangeRequestProvider, head: &str, title: &str, body: &str) -> String {
+        let created = provider
+            .forge
+            .execute(
+                &provider.repo_slug,
+                reqwest::Method::POST,
+                "pulls",
+                &[],
+                Some(serde_json::json!({"head": head, "base": "main", "title": title, "body": body})),
+            )
+            .await
+            .expect("open pull request through the fake's API");
+        created["number"].as_u64().expect("created number").to_string()
+    }
+
+    fn request(title: &str, branch: &str, status: ChangeRequestStatus, body: &str) -> ChangeRequest {
+        ChangeRequest {
+            title: title.into(),
+            branch: branch.into(),
+            status,
+            body: Some(body.into()),
+            provider_name: "forgejo".into(),
+            provider_display_name: "Forgejo".into(),
+        }
+    }
+
+    async fn observe(provider: &ForgejoChangeRequestProvider, number: u64) -> ObservedStatus {
+        let mut observed = provider.observe_bound(&[number], &Default::default()).await.expect("observe bound");
+        observed.remove(&number).expect("observed number").expect("observed status")
+    }
+
+    // Behaviour (#3374): a crew's whole change-request lifecycle runs through
+    // the real Forgejo provider against the fake: a pull request opened
+    // through the API takes the next shared number, is listed, found by
+    // branch, read for admission with its base, has its body edited and
+    // issues linked, is observed with author, owner review request, draft
+    // state, head commit and the review decision derived from reviews added
+    // by scenario drivers, and then closed or merged. Merged branch names
+    // follow the recorded head.ref rule: a deleted head reads as its pull ref.
+    // Writes cannot run on read-only recordings, so this runs on the fake only.
+    #[tokio::test]
+    async fn fake_forge_change_request_lifecycle() {
+        let (fake, clock, provider) = empty_fake();
+        let provider = provider.with_operator_login(OPERATOR.into());
+        let repo = team_repo();
+        fake.create_issue(&repo, NewIssue { title: "Tracked work".into(), ..NewIssue::default() }).expect("issue 1");
+
+        let id = open_through_api(&provider, "feature/one", "First change", "Notes").await;
+        assert_eq!(id, "2", "pull requests share the issue number sequence");
+        let first = request("First change", "feature/one", ChangeRequestStatus::Open, "Notes");
+        assert_eq!(provider.list_change_requests(50).await.expect("list"), vec![(id.clone(), first.clone())]);
+        assert_eq!(provider.find_change_request_by_branch("feature/one").await.expect("find"), Some((id.clone(), first.clone())));
+        assert_eq!(provider.find_change_request_by_branch("feature/absent").await.expect("absence"), None);
+        assert_eq!(provider.get_change_request(&id).await.expect("get"), (id.clone(), first.clone()));
+        let admission = provider.get_change_request_for_admission(&id).await.expect("admission");
+        assert_eq!((admission.id.as_str(), admission.base_ref.as_deref()), (id.as_str(), Some("main")));
+        assert_eq!(admission.change_request, first);
+
+        provider.update_body(&id, "Rewritten").await.expect("update body");
+        provider.link_issues(&id, &["1".into(), "1".into()]).await.expect("link issues");
+        provider.link_issues(&id, &["1".into()]).await.expect("link again");
+        assert_eq!(provider.get_change_request(&id).await.expect("get").1.body.as_deref(), Some("Rewritten\n\nFixes #1"));
+        assert_eq!(fake.item(&repo, 2).expect("model").body, "Rewritten\n\nFixes #1");
+
+        // Observation: author, owner review request, head commit and decision.
+        let status = observe(&provider, 2).await;
+        assert_eq!(status.author.value.as_deref(), Some("flotilla-bot"));
+        assert_eq!(status.title.value.as_deref(), Some("First change"));
+        assert_eq!(status.state.value, Some(ObservedChangeRequestState::Open));
+        assert_eq!(status.review_requested_from_owner.value, Some(false));
+        assert_eq!(status.review_decision.value, Some(ObservedReviewDecision::None));
+        assert_eq!(status.head_sha.value, fake.item(&repo, 2).expect("model").pull.map(|pull| pull.head_sha));
+        fake.request_review(&repo, 2, OPERATOR).expect("request review");
+        let approval = fake
+            .add_review(&repo, 2, NewReview { user: "alice".into(), state: ReviewState::Approved, body: String::new() })
+            .expect("approve");
+        let status = observe(&provider, 2).await;
+        assert_eq!(status.review_requested_from_owner.value, Some(true));
+        assert_eq!(status.review_decision.value, Some(ObservedReviewDecision::Approved));
+        let changes = fake
+            .add_review(&repo, 2, NewReview { user: "bob".into(), state: ReviewState::RequestChanges, body: "Please fix".into() })
+            .expect("request changes");
+        assert_eq!(observe(&provider, 2).await.review_decision.value, Some(ObservedReviewDecision::ChangesRequested));
+        // A new head makes both reviews stale: the stale approval stops
+        // counting, the stale change request still blocks.
+        clock.set("2026-10-16T13:00:00Z".parse().expect("time"));
+        let pushed = fake.push_head(&repo, 2).expect("push");
+        let status = observe(&provider, 2).await;
+        assert_eq!(status.review_decision.value, Some(ObservedReviewDecision::ChangesRequested));
+        assert_eq!(status.head_sha.value, pushed.pull.map(|pull| pull.head_sha));
+        fake.dismiss_review(&repo, 2, changes.id).expect("dismiss");
+        assert_ne!(approval.id, changes.id);
+        assert_eq!(observe(&provider, 2).await.review_decision.value, Some(ObservedReviewDecision::None));
+        fake.set_draft(&repo, 2, true).expect("draft");
+        assert_eq!(observe(&provider, 2).await.state.value, Some(ObservedChangeRequestState::Draft));
+        assert_eq!(
+            provider.list_change_requests(50).await.expect("list").first().map(|(_, request)| request.status.clone()),
+            Some(ChangeRequestStatus::Draft)
+        );
+        fake.set_draft(&repo, 2, false).expect("ready");
+        let missing = provider.observe_bound(&[2, 99], &Default::default()).await.expect("observe bound");
+        assert!(missing[&2].is_ok());
+        assert!(missing[&99].as_ref().expect_err("missing pull request").to_string().contains("404"));
+
+        // Merge one request, close the other.
+        let second = open_through_api(&provider, "feature/two", "Second change", "").await;
+        assert_eq!(second, "3");
+        provider.merge_change_request(&second).await.expect("merge");
+        assert_eq!(provider.get_change_request(&second).await.expect("get").1.status, ChangeRequestStatus::Merged);
+        assert_eq!(observe(&provider, 3).await.state.value, Some(ObservedChangeRequestState::Merged));
+        assert!(provider.merge_change_request(&second).await.expect_err("merged twice").contains("405"));
+        provider.close_change_request(&id).await.expect("close");
+        assert_eq!(provider.get_change_request(&id).await.expect("get").1.status, ChangeRequestStatus::Closed);
+        assert!(provider.merge_change_request(&id).await.expect_err("closed is not mergeable").contains("405"));
+        assert_eq!(fake.item(&repo, 2).expect("model").state, ItemState::Closed);
+
+        assert_eq!(provider.list_change_requests(50).await.expect("list"), vec![]);
+        assert_eq!(provider.list_merged_branch_names(50).await.expect("merged"), vec!["feature/two".to_string()]);
+        fake.delete_head(&repo, 3).expect("delete head");
+        assert_eq!(provider.list_merged_branch_names(50).await.expect("merged"), vec!["refs/pull/3/head".to_string()]);
+        assert_eq!(provider.find_change_request_by_branch("feature/two").await.expect("find"), None);
+        let (found, merged) = provider.find_change_request_by_branch("refs/pull/3/head").await.expect("find").expect("pull ref");
+        assert_eq!((found.as_str(), merged.status), ("3", ChangeRequestStatus::Merged));
+        assert_eq!(
+            provider.find_change_request_by_branch("feature/one").await.expect("find").map(|(id, request)| (id, request.status)),
+            Some(("2".into(), ChangeRequestStatus::Closed))
+        );
+        assert_no_refusals(&fake);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Fate {
+        Open,
+        Draft,
+        Closed,
+        Merged,
+        MergedHeadDeleted,
+    }
+
+    const FATES: [Fate; 5] = [Fate::Open, Fate::Draft, Fate::Closed, Fate::Merged, Fate::MergedHeadDeleted];
+
+    // Behaviour (#3374): over any pull-request population, the provider's
+    // listings through the fake agree with the forge's state: open listing is
+    // the open and draft requests newest first, truncated to the limit;
+    // a branch lookup finds the newest request whose head.ref is the branch
+    // (a deleted head reads as its pull ref); merged branch names are the
+    // merged requests among the newest closed ones. The generator draws 0..=60
+    // pull requests, crossing the 50-item page boundary, over six branch names
+    // so branches repeat (an open duplicate is refused by the forge and
+    // skipped), each with every fate, and a limit of 1..=70 on either side of
+    // the page size.
+    #[hegel::test]
+    fn fake_forge_listings_agree_with_generated_pull_populations(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(60));
+        let pulls: Vec<(usize, Fate)> = (0..count)
+            .map(|_| {
+                (
+                    tc.draw(gs::integers::<usize>().min_value(0).max_value(5)),
+                    FATES[tc.draw(gs::integers::<usize>().min_value(0).max_value(4))],
+                )
+            })
+            .collect();
+        let limit = tc.draw(gs::integers::<usize>().min_value(1).max_value(70));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let (fake, _clock, provider) = empty_fake();
+            let repo = team_repo();
+            // Expected state: (number, head.ref, status), oldest first.
+            let mut expected: Vec<(u64, String, ChangeRequestStatus)> = Vec::new();
+            for (branch, fate) in pulls {
+                let head = format!("branch-{branch}");
+                let new =
+                    NewPull { head: head.clone(), base: "main".into(), title: head.clone(), body: String::new(), user: None, draft: false };
+                let Ok(pull) = fake.create_pull(&repo, new) else {
+                    continue;
+                };
+                let number = pull.number;
+                let status = match fate {
+                    Fate::Open => ChangeRequestStatus::Open,
+                    Fate::Draft => {
+                        fake.set_draft(&repo, number, true).expect("draft");
+                        ChangeRequestStatus::Draft
+                    }
+                    Fate::Closed => {
+                        fake.edit(&repo, number, ItemEdit { state: Some(ItemState::Closed), ..ItemEdit::default() }).expect("close");
+                        ChangeRequestStatus::Closed
+                    }
+                    Fate::Merged | Fate::MergedHeadDeleted => {
+                        fake.merge(&repo, number, "squash", None).expect("merge");
+                        ChangeRequestStatus::Merged
+                    }
+                };
+                let head_ref = if matches!(fate, Fate::MergedHeadDeleted) {
+                    fake.delete_head(&repo, number).expect("delete head");
+                    format!("refs/pull/{number}/head")
+                } else {
+                    head
+                };
+                expected.push((number, head_ref, status));
+            }
+            let newest_first: Vec<_> = expected.iter().rev().collect();
+
+            let listed: Vec<(String, String, ChangeRequestStatus)> = provider
+                .list_change_requests(limit)
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|(id, request)| (id, request.branch, request.status))
+                .collect();
+            let open: Vec<_> = newest_first
+                .iter()
+                .filter(|(_, _, status)| matches!(status, ChangeRequestStatus::Open | ChangeRequestStatus::Draft))
+                .take(limit)
+                .map(|(number, head, status)| (number.to_string(), head.clone(), status.clone()))
+                .collect();
+            assert_eq!(listed, open, "open listing");
+
+            for branch in (0..6).map(|branch| format!("branch-{branch}")) {
+                let found =
+                    provider.find_change_request_by_branch(&branch).await.expect("lookup").map(|(id, request)| (id, request.status));
+                let newest = newest_first
+                    .iter()
+                    .find(|(_, head, _)| *head == branch)
+                    .map(|(number, _, status)| (number.to_string(), status.clone()));
+                assert_eq!(found, newest, "lookup of {branch}");
+            }
+
+            let merged = provider.list_merged_branch_names(limit).await.expect("merged branches");
+            let expected_merged: Vec<String> = newest_first
+                .iter()
+                .filter(|(_, _, status)| matches!(status, ChangeRequestStatus::Closed | ChangeRequestStatus::Merged))
+                .take(limit)
+                .filter(|(_, _, status)| *status == ChangeRequestStatus::Merged)
+                .map(|(_, head, _)| head.clone())
+                .collect();
+            assert_eq!(merged, expected_merged, "merged branch names");
+            assert_no_refusals(&fake);
+        });
     }
 }
