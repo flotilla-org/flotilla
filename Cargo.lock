@@ -1454,7 +1454,6 @@ dependencies = [
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-provider-runtime",
- "flotilla-relay-protocol",
  "flotilla-replay-testkit",
  "flotilla-resources",
  "hegeltest",
@@ -1673,6 +1672,7 @@ dependencies = [
  "bytes",
  "chrono",
  "ed25519-dalek",
+ "flotilla-address",
  "flotilla-agent",
  "flotilla-ai-utility",
  "flotilla-build-features",
@@ -1813,6 +1813,7 @@ dependencies = [
  "bon",
  "bytes",
  "chrono",
+ "flotilla-address",
  "flotilla-agent",
  "flotilla-build-features",
  "flotilla-build-features-async",
@@ -2475,6 +2476,7 @@ dependencies = [
 name = "flotilla-relay-protocol"
 version = "0.1.0"
 dependencies = [
+ "flotilla-address",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -2556,7 +2558,6 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-protocol",
- "flotilla-relay-protocol",
  "futures",
  "hegeltest",
  "indexmap",

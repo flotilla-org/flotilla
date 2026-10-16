@@ -4,6 +4,7 @@
 #![allow(clippy::double_must_use)]
 
 #[doc(hidden)]
+pub mod address;
 pub mod artifact;
 #[doc(hidden)]
 pub mod change_request;

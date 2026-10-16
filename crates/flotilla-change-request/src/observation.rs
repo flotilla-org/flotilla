@@ -11,10 +11,9 @@ use flotilla_protocol::LeafAddress;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ObservationError;
-use flotilla_relay_protocol::Subject;
 use flotilla_resources::{
-    change_request_record_name, ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState,
-    ObservedChecks, ObservedMergeability, ObservedReviewDecision,
+    address::canonical_stored_spelling, change_request_record_name, ChangeRequestReviewObservation, ChangeRequestStatus, Observation,
+    ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision,
 };
 
 pub(crate) const DEFAULT_REVIEW_BOT_LOGIN: &str = "claude";
@@ -34,12 +33,12 @@ impl ChangeRequestRef {
     }
 
     pub fn record_name(&self) -> String {
-        let (service, scope) = Subject::normalize_scope(&self.service, &self.scope);
+        let (service, scope) = canonical_stored_spelling(&self.service, &self.scope);
         change_request_record_name(&service, &scope, self.number)
     }
 
     pub fn normalized(mut self) -> Self {
-        (self.service, self.scope) = Subject::normalize_scope(&self.service, &self.scope);
+        (self.service, self.scope) = canonical_stored_spelling(&self.service, &self.scope);
         self
     }
 }

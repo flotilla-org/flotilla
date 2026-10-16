@@ -2807,12 +2807,13 @@ impl InProcessDaemon {
         self.crew_ops.change_request_stale_after()
     }
 
-    pub async fn refresh_change_request_hint(&self, hint: &flotilla_relay_protocol::Subject) -> Result<(), String> {
+    pub async fn refresh_change_request_hint(&self, hint: &flotilla_address::Address) -> Result<(), String> {
         self.crew_ops.refresh_change_request_hint(hint).await?;
-        if hint.kind != flotilla_relay_protocol::SubjectKind::ChangeRequest {
+        let Some(hint_text) = flotilla_relay_protocol::hint_subject(hint).filter(|_| hint.kind() == flotilla_address::Kind::ChangeRequest)
+        else {
             return Ok(());
-        }
-        let subject = flotilla_protocol::ReferenceContext::default().parse(&hint.to_string())?;
+        };
+        let subject = flotilla_protocol::ReferenceContext::default().parse(&hint_text)?;
         let namespace = self.provisioning_namespace().await;
         let forges = self
             .resource_backend
@@ -2825,12 +2826,11 @@ impl InProcessDaemon {
             .collect::<Vec<_>>();
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
         for convoy in convoys.list().await.map_err(|error| error.to_string())?.items {
-            let matches_repository = convoy.spec.repositories.iter().any(|repository| {
-                change_request_address_with_forges(&repository.url, "1", &forges).ok().is_some_and(|address| {
-                    matches!(address, flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. }
-                        if service == subject.source.service && scope == subject.source.scope)
-                })
-            });
+            let matches_repository = convoy
+                .spec
+                .repositories
+                .iter()
+                .any(|repository| flotilla_resources::address::repository_address(&repository.url, &forges).ok() == hint.parent());
             if !matches_repository {
                 continue;
             }

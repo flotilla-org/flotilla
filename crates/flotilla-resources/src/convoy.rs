@@ -716,7 +716,7 @@ pub fn issue_address_with_forges(reference: &IssueRef, forges: &[crate::ForgeSpe
         }
         _ => return Err(format!("issue source {service_url} matches multiple Forge definitions")),
     };
-    let (service, scope) = flotilla_relay_protocol::Subject::normalize_scope(&service, &scope);
+    let (service, scope) = crate::address::canonical_stored_spelling(&service, &scope);
     let number = reference.id.parse::<u64>().map_err(|_| format!("issue id `{}` is not a numeric forge number", reference.id))?;
     Ok(LeafAddress::Issue { service, scope, number })
 }

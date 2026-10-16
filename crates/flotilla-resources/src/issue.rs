@@ -67,7 +67,7 @@ pub fn issue_record_name(service: &str, scope: &str, number: u64) -> String {
     fn hex(value: &str) -> String {
         value.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
     }
-    let (service, scope) = flotilla_relay_protocol::Subject::normalize_scope(service, scope);
+    let (service, scope) = crate::address::canonical_stored_spelling(service, scope);
     format!("issue-{}-{}-{number}", hex(&service), hex(&scope))
 }
 
