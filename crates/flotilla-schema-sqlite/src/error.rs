@@ -1,4 +1,4 @@
-use flotilla_schema::{ChangeError, DecodeError, EncodeError, Hash, KindCode, RegistryError};
+use flotilla_schema::{ChangeError, DecodeError, EncodeError, Hash, KindCode, RegistryError, Value};
 
 use crate::store::ResourceId;
 
@@ -26,13 +26,22 @@ pub enum StoreError {
     Conflict { id: ResourceId, expected: u64 },
     #[error("a {kind} resource named {name} already exists here")]
     Exists { kind: KindCode, name: String },
-    /// A `records` row is never removed, and changes only through a declared edge: a
-    /// whole-value write may append rows but not change or remove an existing one.
-    #[error("table {table}: records rows are appended only through a whole-value write")]
-    AppendOnly { table: String },
-    /// A `history` row is never changed or removed.
-    #[error("table {table}: history rows are immutable")]
-    Immutable { table: String },
+    /// A spec edit (`update`) changed what only an edge writes: a `state` column (`column` is
+    /// set), or a `records` or `history` table, by an append, a change or a removal (`column` is
+    /// `None`). Rows nested in a spec child row the edit inserts or removes go with that row.
+    #[error("table {table}{}: changes only through an edge", column.as_ref().map(|column| format!(", column {column}")).unwrap_or_default())]
+    NotThroughEdge { table: String, column: Option<String> },
+    /// An edge addressed a `records` row that does not exist: to set a field of it, or to append
+    /// under it.
+    #[error("table {table} holds no row at {key:?}")]
+    NoRecord { table: String, key: Vec<Value> },
+    /// An edge named a table or field that the kind does not declare in that role. Derived handles
+    /// never do; a hand-built one may.
+    #[error("table {table} declares no edge target {field}")]
+    EdgeTarget { table: String, field: String },
+    /// Every `u32` position of a records or history table is taken.
+    #[error("table {table} has no position left")]
+    PositionsExhausted { table: String },
     /// A stored value the descriptor does not allow, such as a malformed hash or a dangling id.
     #[error("table {table}, column {column}: stored value does not match the schema")]
     Corrupt { table: String, column: String },
@@ -73,6 +82,9 @@ pub enum Malformed {
     /// A key or value count that does not match the table's columns, or a root key that is not empty.
     #[error("row of table {table} does not match its columns")]
     Shape { table: String },
+    /// A `Set` naming a field the table does not declare as one an edge sets.
+    #[error("table {table} declares no field {field} an edge sets")]
+    UnknownField { table: String, field: String },
     /// Root rows are removed by `DeleteResource` only.
     #[error("root row of table {table} deleted by row")]
     RootDelete { table: String },

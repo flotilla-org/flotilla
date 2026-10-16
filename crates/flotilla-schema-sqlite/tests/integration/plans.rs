@@ -85,6 +85,12 @@ fn the_enumeration_covers_every_kind_and_index() {
         "convoy_deliverables_evidence_metadata insert",
         "terminal_session_labels select",
         "message update version",
+        "message set state",
+        "message set subject",
+        "message_edges last position",
+        "convoy_deliverables set state",
+        "convoy_deliverables last position",
+        "convoy_deliverables_evidence last position",
         "index message_open_by_inbox first",
         "index message_open_by_inbox after",
         "index message_by_reply after",
@@ -98,4 +104,9 @@ fn the_enumeration_covers_every_kind_and_index() {
     }
     assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 6);
     assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 7);
+    assert!(!labels.iter().any(|label| label.starts_with("message_edges set ")), "history rows are never set");
+    assert!(
+        !labels.iter().any(|label| label.starts_with("message_references ") && label.ends_with(" last position")),
+        "spec collections take no positions from edges"
+    );
 }

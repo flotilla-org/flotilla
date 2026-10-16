@@ -4,6 +4,7 @@ mod bench;
 mod change_log;
 mod checks;
 mod ddl;
+mod edges;
 mod fixtures;
 mod interning;
 mod ownership;

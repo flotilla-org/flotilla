@@ -12,8 +12,8 @@ use std::{
 };
 
 use flotilla_schema::{
-    ColumnType, DdlMode, DecodeError, Decoder, Encoder, Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry, Row, RowChange, RowOp,
-    Rows, TableRole, Value,
+    ColumnType, DdlMode, DecodeError, Decoder, Edge, EdgeParts, Encoder, Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry, Row,
+    RowChange, RowOp, RowPath, Rows, TableRole, Value,
 };
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
@@ -361,10 +361,12 @@ impl Write<'_> {
         self.guarded(|ctx| ctx.insert::<K>(name, rows))
     }
 
-    /// Writes only the rows that differ between `current.value` and `next`, refusing if the
-    /// resource moved past `current.version`. A write with no row changes is a no-op.
-    /// `records` and `history` rows are only appended (`AppendOnly`, `Immutable`), and each
-    /// appended row is stamped with this write's version, whatever `next` holds.
+    /// The spec edit: writes only the rows that differ between `current.value` and `next`,
+    /// refusing if the resource moved past `current.version`. A write with no row changes is a
+    /// no-op. What edges write is refused (`NotThroughEdge`): a changed `state` column, and any
+    /// append to, change of or removal from a `records` or `history` table. Rows nested in a spec
+    /// child row the edit inserts or removes go with it, and an inserted one is stamped with this
+    /// write's version. State and records move only through [`Write::apply_edge`].
     pub fn update<K: Kind>(&mut self, current: &Loaded<K>, next: &K) -> Result<Stamp, StoreError> {
         let old = Encoder::encode(&current.value)?;
         let new = Encoder::encode(next)?;
@@ -373,6 +375,19 @@ impl Write<'_> {
 
     pub fn delete<K: Kind>(&mut self, current: Stamp) -> Result<(), StoreError> {
         self.guarded(|ctx| ctx.delete::<K>(current))
+    }
+
+    /// Applies one edge to a resource homed here, as one write at the next home sequence: the
+    /// event and every declared append go in at their table's next position under their parent
+    /// row (read backwards through the primary key), stamped with the write's sequence; the
+    /// declared fields are set by their own statements, so no other column is written; one
+    /// `change_log` entry holds exactly those row operations, with a `PutObject` for every object
+    /// the edge's values name. Refused like `update`: `NotHome`, then `Conflict` or `NotFound`
+    /// when the resource is not at `current.version`. An edge on a `records` row that does not
+    /// exist is `NoRecord`; nothing is written by a refused edge.
+    pub fn apply_edge<K: Kind>(&mut self, current: Stamp, edge: Edge<K>) -> Result<Stamp, StoreError> {
+        let parts = edge.into_parts();
+        self.guarded(|ctx| ctx.apply_edge::<K>(current, parts))
     }
 
     /// Applies a change homed elsewhere, as replication receives it: the kind must be
@@ -636,6 +651,11 @@ impl Ctx<'_> {
         let sql = self.sql(K::CODE)?;
         let changes = diff(&sql.tables, &old.tables, &new)?;
         let root_changed = old.tables[0][0].values != new[0][0].values;
+        if root_changed {
+            if let Some(column) = changed_state(&sql.tables[0], &old.tables[0][0], &new[0][0]) {
+                return Err(StoreError::NotThroughEdge { table: sql.tables[0].name.clone(), column: Some(column) });
+            }
+        }
         if !root_changed && changes.iter().all(Vec::is_empty) {
             // A no-op still answers whether the caller's version is current.
             let stored: Option<i64> =
@@ -697,6 +717,121 @@ impl Ctx<'_> {
         }
         self.append_log(identity, current.id, (sequence, version), ops)?;
         Ok(Stamp { id: current.id, version })
+    }
+
+    fn apply_edge<K: Kind>(&mut self, current: Stamp, parts: EdgeParts) -> Result<Stamp, StoreError> {
+        let identity = self.owned::<K>(current.id)?;
+        let expected = expected_version(current)?;
+        // A stale stamp is answered first: the caller re-reads on `Conflict`, which would show
+        // whatever else (such as a missing records row) also makes this edge wrong. The root
+        // update below checks the version again under the write.
+        let stored: Option<i64> =
+            self.conn.prepare_cached(&self.sql(K::CODE)?.root_version)?.query_row([current.id.0], |row| row.get(0)).optional()?;
+        if stored != Some(expected) {
+            return Err(self.stale::<K>(current));
+        }
+        let EdgeParts { sets, appends, mut objects } = parts;
+        let (mut root_sets, mut record_sets) = (Vec::new(), Vec::new());
+        for set in sets {
+            let (table, key) = self.edge_row(K::CODE, set.row)?;
+            let target = &self.sql(K::CODE)?.tables[table];
+            if !target.fields.iter().any(|field| field.name == set.field) {
+                return Err(StoreError::EdgeTarget { table: target.name.clone(), field: set.field.to_owned() });
+            }
+            let op = RowOp::Set { table: target.name.clone(), key, field: set.field.to_owned(), values: set.values };
+            if table == 0 {
+                root_sets.push(op);
+            } else {
+                record_sets.push(op);
+            }
+        }
+        let (sequence, version) = self.next_sequence()?;
+        let hashes = objects.keys().copied().collect();
+        let mut ops = self.put_objects(hashes, &mut objects)?;
+        let objects = ops.len();
+        // The root's fields first: the first of them is the optimistic version check.
+        ops.extend(root_sets);
+        ops.extend(record_sets);
+        // Positions taken by this edge, per table and parent row, after the first read.
+        let mut taken: BTreeMap<(usize, Vec<Value>), i64> = BTreeMap::new();
+        for append in appends {
+            let (parent, parent_key) = self.edge_row(K::CODE, append.under)?;
+            let table = self.child_table(K::CODE, parent, append.table, append.role)?;
+            let position = match taken.entry((table, parent_key.clone())) {
+                Entry::Occupied(mut slot) => {
+                    *slot.get_mut() += 1;
+                    *slot.get()
+                }
+                Entry::Vacant(slot) => {
+                    let Some(last) = self.last_position(K::CODE, table, current.id, &parent_key)? else {
+                        return Err(match parent {
+                            0 => self.stale::<K>(current),
+                            _ => StoreError::NoRecord { table: self.sql(K::CODE)?.tables[parent].name.clone(), key: parent_key },
+                        });
+                    };
+                    *slot.insert(last.map_or(0, |last| last + 1))
+                }
+            };
+            let tables = &self.sql(K::CODE)?.tables;
+            if position > i64::from(u32::MAX) {
+                return Err(StoreError::PositionsExhausted { table: tables[table].name.clone() });
+            }
+            if append.rows.tables.len() != 1 + descendants(tables, table) {
+                return Err(StoreError::EdgeTarget { table: tables[table].name.clone(), field: append.table.to_owned() });
+            }
+            let mut prefix = parent_key;
+            prefix.push(Value::Int(position));
+            // The appended row's tables follow its own in pre-order, so its encoding's table `n`
+            // is the kind's table `table + n`, and every parent row precedes its children.
+            for (offset, rows) in append.rows.tables.into_iter().enumerate() {
+                let target = &tables[table + offset];
+                for mut row in rows {
+                    let mut key = prefix.clone();
+                    key.append(&mut row.key);
+                    stamp(target.role, &mut row.values, sequence);
+                    ops.push(RowOp::Insert { table: target.name.clone(), key, values: row.values });
+                }
+            }
+        }
+        if !self.execute(K::CODE, current.id, &ops[objects..], sequence, Some(expected))? {
+            return Err(self.stale::<K>(current));
+        }
+        self.append_log(identity, current.id, (sequence, version), ops)?;
+        Ok(Stamp { id: current.id, version })
+    }
+
+    /// The table index and full key of the row an edge addresses.
+    fn edge_row(&self, code: KindCode, row: RowPath) -> Result<(usize, Vec<Value>), StoreError> {
+        match row {
+            RowPath::Root => Ok((0, Vec::new())),
+            RowPath::Record { table, position } => {
+                Ok((self.child_table(code, 0, table, TableRole::Records)?, vec![Value::Int(i64::from(position.0))]))
+            }
+        }
+    }
+
+    /// The table storing `field` of `parent`'s rows in `role`.
+    fn child_table(&self, code: KindCode, parent: usize, field: &str, role: TableRole) -> Result<usize, StoreError> {
+        let tables = &self.sql(code)?.tables;
+        tables
+            .iter()
+            .position(|table| table.parent == Some(parent) && table.field == field && table.role == role)
+            .ok_or_else(|| StoreError::EdgeTarget { table: tables[parent].name.clone(), field: field.to_owned() })
+    }
+
+    /// The last position of `table` under the parent row `parent_key` of resource `id`: `None`
+    /// when the parent row does not exist, `Some(None)` when it has no rows in `table`.
+    fn last_position(
+        &mut self,
+        code: KindCode,
+        table: usize,
+        id: ResourceId,
+        parent_key: &[Value],
+    ) -> Result<Option<Option<i64>>, StoreError> {
+        let mut params = vec![SqlValue::Integer(id.0)];
+        params.extend(self.params(parent_key)?);
+        let sql = &self.sql(code)?.tables[table].last_position;
+        Ok(self.conn.prepare_cached(sql)?.query_row(params_from_iter(params), |row| row.get::<_, Option<i64>>(0)).optional()?)
     }
 
     fn delete<K: Kind>(&mut self, current: Stamp) -> Result<(), StoreError> {
@@ -788,7 +923,7 @@ impl Ctx<'_> {
                     }
                     (key, values)
                 }
-                RowOp::Update { key, values, .. } => (key, values),
+                RowOp::Update { key, values, .. } | RowOp::Set { key, values, .. } => (key, values),
                 RowOp::Delete { .. } | RowOp::DeleteResource => continue,
             };
             for value in key.iter().chain(values) {
@@ -847,12 +982,36 @@ impl Ctx<'_> {
         Ok(index)
     }
 
+    /// The table and field of a `Set`, refusing a key or values that do not match them.
+    fn field_of(&self, code: KindCode, op: (&str, &[Value], &str, &[Value])) -> Result<(usize, usize), StoreError> {
+        let (table, key, field, values) = op;
+        let index = self.table_of(code, table, key, None)?;
+        let fields = &self.sql(code)?.tables[index].fields;
+        let position = fields
+            .iter()
+            .position(|candidate| candidate.name == field)
+            .ok_or_else(|| Malformed::UnknownField { table: table.to_owned(), field: field.to_owned() })?;
+        if fields[position].columns.len() != values.len() {
+            return Err(Malformed::Shape { table: table.to_owned() }.into());
+        }
+        Ok((index, position))
+    }
+
     /// Executes row ops for resource `id` through the kind's statements, as a write at
     /// `sequence`. `expected` is the root row's version before the write (`None` when it has
-    /// none). Every write moves the root to `sequence`: by the root op, or by a version update
-    /// when the ops name only child rows. Returns `false` when the root row is not at
-    /// `expected`, so the caller can tell a conflict from a missing resource.
-    fn execute(&mut self, code: KindCode, id: ResourceId, ops: &[RowOp], sequence: i64, expected: Option<i64>) -> Result<bool, StoreError> {
+    /// none). Every write moves the root to `sequence`: by the root ops (the first checks
+    /// `expected`, later ones find `sequence`), or by a version update when the ops name only
+    /// child rows. Returns `false` when the root row is not at `expected`, so the caller can tell
+    /// a conflict from a missing resource. A `Set` of a child row that does not exist is
+    /// `NoRecord`.
+    fn execute(
+        &mut self,
+        code: KindCode,
+        id: ResourceId,
+        ops: &[RowOp],
+        sequence: i64,
+        mut expected: Option<i64>,
+    ) -> Result<bool, StoreError> {
         // Every op's shape first, so a malformed change is refused as such rather than by the
         // first statement it reaches.
         let mut names_root = false;
@@ -861,6 +1020,7 @@ impl Ctx<'_> {
                 RowOp::Insert { table, key, values } | RowOp::Update { table, key, values } => {
                     names_root |= self.table_of(code, table, key, Some(values))? == 0;
                 }
+                RowOp::Set { table, key, field, values } => names_root |= self.field_of(code, (table, key, field, values))?.0 == 0,
                 RowOp::Delete { table, key } => {
                     if self.table_of(code, table, key, None)? == 0 {
                         return Err(Malformed::RootDelete { table: table.clone() }.into());
@@ -877,6 +1037,7 @@ impl Ctx<'_> {
                 return Ok(false);
             }
         }
+        let moved = Some(sequence);
         for op in ops {
             match op {
                 RowOp::PutObject { hash, bytes } => {
@@ -891,6 +1052,7 @@ impl Ctx<'_> {
                         params.extend(self.params(values)?);
                         let sql = &self.sql(code)?.tables[0].insert;
                         self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
+                        expected = moved;
                     }
                     index => self.insert_row(code, index, id, key, values)?,
                 },
@@ -913,6 +1075,33 @@ impl Ctx<'_> {
                     let sql = &self.sql(code)?.tables[index].update;
                     if self.conn.prepare_cached(sql)?.execute(params_from_iter(params))? == 0 && index == 0 {
                         return Ok(false);
+                    }
+                    if index == 0 {
+                        expected = moved;
+                    }
+                }
+                RowOp::Set { table, key, field, values } => {
+                    let (index, field) = self.field_of(code, (table, key, field, values))?;
+                    let mut params = Vec::new();
+                    if index == 0 {
+                        let Some(expected) = expected else { return Ok(false) };
+                        params.push(SqlValue::Integer(sequence));
+                        params.extend(self.params(values)?);
+                        params.extend([SqlValue::Integer(id.0), SqlValue::Integer(expected)]);
+                    } else {
+                        params.extend(self.params(values)?);
+                        params.push(SqlValue::Integer(id.0));
+                        params.extend(self.params(key)?);
+                    }
+                    let sql = &self.sql(code)?.tables[index].fields[field].update;
+                    if self.conn.prepare_cached(sql)?.execute(params_from_iter(params))? == 0 {
+                        if index == 0 {
+                            return Ok(false);
+                        }
+                        return Err(StoreError::NoRecord { table: table.clone(), key: key.clone() });
+                    }
+                    if index == 0 {
+                        expected = moved;
                     }
                 }
                 RowOp::Delete { table, key } => {
@@ -1106,25 +1295,25 @@ fn expected_version(current: Stamp) -> Result<i64, StoreError> {
     i64::try_from(current.version).map_err(|_| StoreError::Conflict { id: current.id, expected: current.version })
 }
 
-/// Per-table row changes between two sorted encodings of one resource, enforcing each table's
-/// role for a whole-value write: `child` rows change freely; `records` and `history` rows are only
-/// appended. An existing `records` row that changes or disappears is `AppendOnly`, a `history` row
-/// `Immutable`; that covers the child tables nested in such a row, which are part of it, while
-/// `records` and `history` tables nested in it may still be appended to. A removed row is allowed
-/// only when its parent row is removed too (the rows go with it).
+/// The first `state` column whose value differs between two versions of one row.
+fn changed_state(table: &TableSql, before: &Row, after: &Row) -> Option<String> {
+    let column = table.state_columns.iter().find(|column| before.values.get(**column) != after.values.get(**column))?;
+    Some(table.columns[table.key_len + column].name.clone())
+}
+
+/// Per-table row changes between two sorted encodings of one resource, enforcing a spec edit's
+/// limits: `child` rows change freely, except their `state` columns; `records` and `history` rows,
+/// and the child rows nested in them, change only through an edge (`NotThroughEdge`). The one
+/// exception is a row nested in a spec child row this write inserts or removes, which goes with
+/// that row.
 fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Result<Vec<Vec<Change<'r>>>, StoreError> {
     let mut changes: Vec<Vec<Change<'r>>> = (0..tables.len()).map(|_| Vec::new()).collect();
     let mut removed: Vec<BTreeSet<&'r [Value]>> = (0..tables.len()).map(|_| BTreeSet::new()).collect();
+    let mut inserted: Vec<BTreeSet<&'r [Value]>> = (0..tables.len()).map(|_| BTreeSet::new()).collect();
     // Rows kept by this write that belong to an existing records or history row (the row itself or
     // a child row nested in it), by key, with the index of that records or history table.
     let mut sealed: Vec<BTreeMap<&'r [Value], usize>> = (0..tables.len()).map(|_| BTreeMap::new()).collect();
-    let refuse = |sealing: usize| {
-        let table = tables[sealing].name.clone();
-        match tables[sealing].role {
-            TableRole::History => StoreError::Immutable { table },
-            _ => StoreError::AppendOnly { table },
-        }
-    };
+    let refuse = |sealing: usize| StoreError::NotThroughEdge { table: tables[sealing].name.clone(), column: None };
     for (index, table) in tables.iter().enumerate().skip(1) {
         let parent = table.parent.expect("child tables have a parent");
         let parent_key_len = tables[parent].key_len;
@@ -1158,11 +1347,11 @@ fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Re
                 }
                 Ordering::Greater => {
                     let row = new_rows.next().expect("peeked");
-                    // A new records or history row is an append; a child row added inside a kept
-                    // one changes it.
-                    if let Some(sealing) = seal(&sealed, row).filter(|_| !appended) {
+                    let parent_inserted = parent != 0 && inserted[parent].contains(&row.key[..parent_key_len]);
+                    if let Some(sealing) = seal(&sealed, row).filter(|_| !parent_inserted) {
                         return Err(refuse(sealing));
                     }
+                    inserted[index].insert(row.key.as_slice());
                     changes[index].push(Change::Insert(row));
                 }
                 Ordering::Equal => {
@@ -1171,6 +1360,9 @@ fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Re
                     if before.values != after.values {
                         if let Some(sealing) = sealing {
                             return Err(refuse(sealing));
+                        }
+                        if let Some(column) = changed_state(table, before, after) {
+                            return Err(StoreError::NotThroughEdge { table: table.name.clone(), column: Some(column) });
                         }
                         changes[index].push(Change::Update(before, after));
                     }
@@ -1182,6 +1374,18 @@ fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Re
         }
     }
     Ok(changes)
+}
+
+/// How many tables nest under `table`: they follow it in pre-order.
+fn descendants(tables: &[TableSql], table: usize) -> usize {
+    let within = |mut index: usize| loop {
+        match tables[index].parent {
+            Some(parent) if parent == table => return true,
+            Some(parent) => index = parent,
+            None => return false,
+        }
+    };
+    (table + 1..tables.len()).take_while(|index| within(*index)).count()
 }
 
 #[cfg(test)]
@@ -1241,61 +1445,67 @@ mod tests {
         );
     }
 
-    // Behaviour (#3320 rulings 2 and 5): through a whole-value write, records and history rows are
-    // only appended: changing or removing an existing records row is `AppendOnly`, a history row
-    // `Immutable`.
-    #[test]
-    fn records_and_history_rows_are_only_appended() {
-        for (role, refused) in [(TableRole::Records, "AppendOnly"), (TableRole::History, "Immutable")] {
-            let sql = tables(role, TableRole::Child);
-            let name = |result: Result<Vec<Vec<Change<'_>>>, StoreError>| match result {
-                Err(StoreError::AppendOnly { table }) => format!("AppendOnly {table}"),
-                Err(StoreError::Immutable { table }) => format!("Immutable {table}"),
-                other => format!("{:?}", other.map(|changes| summary(&changes))),
-            };
-            let old = rows(vec![row(&[0], "a")], vec![]);
-            let appended = rows(vec![row(&[0], "a"), row(&[1], "b")], vec![]);
-            assert_eq!(summary(&diff(&sql.tables, &old.tables, &appended.tables).expect("append")), [(1, "insert", vec![Value::Int(1)])]);
-            let changed = rows(vec![row(&[0], "A")], vec![]);
-            assert_eq!(name(diff(&sql.tables, &old.tables, &changed.tables)), format!("{refused} k_items"), "{role:?} changed");
-            let emptied = rows(vec![], vec![]);
-            assert_eq!(name(diff(&sql.tables, &old.tables, &emptied.tables)), format!("{refused} k_items"), "{role:?} removed");
+    fn refusal(result: Result<Vec<Vec<Change<'_>>>, StoreError>) -> String {
+        match result {
+            Err(StoreError::NotThroughEdge { table, column }) => format!("NotThroughEdge {table} {column:?}"),
+            other => format!("{:?}", other.map(|changes| summary(&changes))),
         }
     }
 
-    // Behaviour (#3320 rulings 2 and 5): a child table nested in a records or history row is part
-    // of that row: once the row exists, adding, changing or removing its child rows is refused as
-    // a change of the row. A records table nested in it still takes appends.
+    // Behaviour (#3320 ruling 1): a spec edit neither appends to, changes nor removes a records or
+    // history row: those move only through an edge (`NotThroughEdge` naming the table).
     #[test]
-    fn rows_nested_in_an_existing_record_change_it() {
-        for (role, refused) in [(TableRole::Records, "AppendOnly"), (TableRole::History, "Immutable")] {
+    fn records_and_history_rows_change_only_through_edges() {
+        for role in [TableRole::Records, TableRole::History] {
             let sql = tables(role, TableRole::Child);
+            let old = rows(vec![row(&[0], "a")], vec![]);
+            for (case, items) in
+                [("appended", vec![row(&[0], "a"), row(&[1], "b")]), ("changed", vec![row(&[0], "A")]), ("removed", vec![])]
+            {
+                let new = rows(items, vec![]);
+                assert_eq!(refusal(diff(&sql.tables, &old.tables, &new.tables)), "NotThroughEdge k_items None", "{role:?} {case}");
+            }
+        }
+    }
+
+    // Behaviour (#3320 rulings 1 and 2): a child table nested in a records or history row is part of
+    // that row: adding, changing or removing its rows is refused as a change of the row, and so is
+    // an append to a records table nested in it.
+    #[test]
+    fn rows_nested_in_an_existing_record_change_only_through_edges() {
+        for (role, nested) in
+            [(TableRole::Records, TableRole::Child), (TableRole::History, TableRole::Child), (TableRole::Records, TableRole::Records)]
+        {
+            let sql = tables(role, nested);
             let old = rows(vec![row(&[0], "a")], vec![row(&[0, 0], "n")]);
             for (case, grandchild) in
                 [("added", vec![row(&[0, 0], "n"), row(&[0, 1], "m")]), ("changed", vec![row(&[0, 0], "N")]), ("removed", vec![])]
             {
                 let new = rows(vec![row(&[0], "a")], grandchild);
-                let refusal = match diff(&sql.tables, &old.tables, &new.tables) {
-                    Err(StoreError::AppendOnly { table }) => format!("AppendOnly {table}"),
-                    Err(StoreError::Immutable { table }) => format!("Immutable {table}"),
-                    other => format!("{:?}", other.map(|changes| summary(&changes))),
-                };
-                assert_eq!(refusal, format!("{refused} k_items"), "{role:?}: a nested row {case}");
+                let refused = refusal(diff(&sql.tables, &old.tables, &new.tables));
+                assert!(refused.starts_with("NotThroughEdge k_items"), "{role:?}/{nested:?}: a nested row {case}: {refused}");
             }
-            // A new record brings its nested rows with it.
-            let new = rows(vec![row(&[0], "a"), row(&[1], "b")], vec![row(&[0, 0], "n"), row(&[1, 0], "m")]);
-            let changes = diff(&sql.tables, &old.tables, &new.tables).expect("a new record with its rows");
-            assert_eq!(summary(&changes), [(1, "insert", vec![Value::Int(1)]), (2, "insert", vec![Value::Int(1), Value::Int(0)])]);
         }
-        let sql = tables(TableRole::Records, TableRole::Records);
+    }
+
+    // Behaviour: records nested in a spec child row go with it: removed with a removed row and
+    // inserted with an inserted one, but never appended to a kept one.
+    #[test]
+    fn records_under_a_spec_child_row_go_with_it() {
+        let sql = tables(TableRole::Child, TableRole::Records);
         let old = rows(vec![row(&[0], "a")], vec![row(&[0, 0], "n")]);
-        let new = rows(vec![row(&[0], "a")], vec![row(&[0, 0], "n"), row(&[0, 1], "m")]);
-        let changes = diff(&sql.tables, &old.tables, &new.tables).expect("records nested in a kept record are appended to");
-        assert_eq!(summary(&changes), [(2, "insert", vec![Value::Int(0), Value::Int(1)])]);
-        let changed = rows(vec![row(&[0], "a")], vec![row(&[0, 0], "N")]);
-        assert!(
-            matches!(diff(&sql.tables, &old.tables, &changed.tables), Err(StoreError::AppendOnly { table }) if table == "k_items_notes")
+        let empty = rows(vec![], vec![]);
+        let changes = diff(&sql.tables, &old.tables, &empty.tables).expect("cascade allowed");
+        assert_eq!(summary(&changes), [(1, "delete", vec![Value::Int(0)]), (2, "delete", vec![Value::Int(0), Value::Int(0)])]);
+        let grown = rows(vec![row(&[0], "a"), row(&[1], "b")], vec![row(&[0, 0], "n"), row(&[1, 0], "m")]);
+        let changes = diff(&sql.tables, &old.tables, &grown.tables).expect("a new child row brings its records");
+        assert_eq!(summary(&changes), [(1, "insert", vec![Value::Int(1)]), (2, "insert", vec![Value::Int(1), Value::Int(0)])]);
+        assert_eq!(
+            refusal(diff(&sql.tables, &old.tables, &rows(vec![row(&[0], "a")], vec![]).tables)),
+            "NotThroughEdge k_items_notes None"
         );
+        let appended = rows(vec![row(&[0], "a")], vec![row(&[0, 0], "n"), row(&[0, 1], "m")]);
+        assert_eq!(refusal(diff(&sql.tables, &old.tables, &appended.tables)), "NotThroughEdge k_items_notes None");
     }
 
     // Behaviour (query-plan coverage): this module prepares only statements `Store::statements`
@@ -1311,19 +1521,5 @@ mod tests {
         assert!(!query.contains(&literal), "query.rs prepares literal SQL");
         let uncached = ["prep", "are(\""].concat();
         assert!(!source.contains(&uncached) && !query.contains(&uncached));
-    }
-
-    // Behaviour: records nested in a removed child row go with their parent.
-    #[test]
-    fn records_under_a_removed_child_row_go_with_it() {
-        let sql = tables(TableRole::Child, TableRole::Records);
-        let old = rows(vec![row(&[0], "a")], vec![row(&[0, 0], "n")]);
-        let empty = rows(vec![], vec![]);
-        let changes = diff(&sql.tables, &old.tables, &empty.tables).expect("cascade allowed");
-        assert_eq!(summary(&changes), [(1, "delete", vec![Value::Int(0)]), (2, "delete", vec![Value::Int(0), Value::Int(0)])]);
-        assert!(matches!(
-            diff(&sql.tables, &old.tables, &rows(vec![row(&[0], "a")], vec![]).tables),
-            Err(StoreError::AppendOnly { table }) if table == "k_items_notes"
-        ));
     }
 }

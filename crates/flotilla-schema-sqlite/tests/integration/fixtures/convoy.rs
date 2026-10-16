@@ -10,16 +10,17 @@
 //! - An input value that is a list (`InputValue::List`) is a child table of the inputs table,
 //!   with rows only while that variant is active.
 //! - Evidence metadata is a child map under evidence under deliverables: three levels of keys.
-//! - The convoy and deliverable machine states are `state` columns; the edges themselves are the
-//!   engine stack's work and are not part of this fixture.
+//! - The convoy and deliverable machine states are `state` columns. One `history` table holds the
+//!   events of both machines (#3208 §4.1 `convoy_edge`): a deliverable edge names its deliverable
+//!   by position. The edges' gates are the engine stack's work and are not part of this fixture.
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{Frozen, Records, Ref, State, Stored, Timestamp};
+use flotilla_schema::{Edge, EdgeError, Frozen, Records, Ref, State, Stored, Timestamp};
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
-use super::{code_enum, evolve_records, key, list, name, records, reference, stamp, text, timestamp, Fixture, Pick, SHAPES};
+use super::{appended, code_enum, key, list, name, position, records, reference, replaced, stamp, text, timestamp, Fixture, Pick, SHAPES};
 use crate::fixtures::AgentSession;
 
 /// A minimal target kind for `Convoy::project`.
@@ -49,8 +50,42 @@ pub struct Convoy {
     pub inputs: BTreeMap<String, InputValue>,
     #[store(records)]
     pub deliverables: Records<Deliverable>,
+    #[store(history)]
+    pub edges: Records<ConvoyEdgeEvent>,
     #[store(state)]
     pub state: State<ConvoyState>,
+}
+
+/// The writes a generated edge adds after its event.
+type Changes = dyn FnOnce(Edge<Convoy>) -> Result<Edge<Convoy>, EdgeError>;
+
+/// One edge event of the convoy or one of its deliverables.
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+pub struct ConvoyEdgeEvent {
+    pub edge: ConvoyEdge,
+    pub at: Timestamp,
+    #[store(intern)]
+    pub writer: String,
+}
+
+/// The #3208 §4.1 edges, convoy and deliverable machines in one table; `Promise` appends a
+/// deliverable, `Submit` appends evidence under one, `Retract` moves one's state.
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+pub enum ConvoyEdge {
+    #[store(code = 1)]
+    Deliver,
+    #[store(code = 2)]
+    Abandon {
+        #[store(intern)]
+        by: String,
+        reason: String,
+    },
+    #[store(code = 3)]
+    Promise { deliverable: u32 },
+    #[store(code = 4)]
+    Submit { deliverable: u32 },
+    #[store(code = 5)]
+    Retract { deliverable: u32, reason: String },
 }
 
 /// A frozen document: any serde type. Nested maps and lists stand for the workflow's step graph.
@@ -232,6 +267,21 @@ impl Evidence {
     }
 }
 
+impl ConvoyEdgeEvent {
+    /// Every edge in turn when covering.
+    fn generate(tc: &TestCase, pick: Pick) -> ConvoyEdgeEvent {
+        let deliverable = || tc.draw(gs::integers::<u32>());
+        let edge = match pick.variant(tc, 5, |index| index) {
+            0 => ConvoyEdge::Deliver,
+            1 => ConvoyEdge::Abandon { by: name(tc), reason: text(tc) },
+            2 => ConvoyEdge::Promise { deliverable: deliverable() },
+            3 => ConvoyEdge::Submit { deliverable: deliverable() },
+            _ => ConvoyEdge::Retract { deliverable: deliverable(), reason: text(tc) },
+        };
+        ConvoyEdgeEvent { edge, at: timestamp(tc), writer: name(tc) }
+    }
+}
+
 impl Deliverable {
     fn generate(tc: &TestCase, pick: Pick) -> Deliverable {
         Deliverable { evidence: records(tc, pick, 2, |pick| Evidence::generate(tc, pick)), ..Deliverable::spec(tc, pick) }
@@ -252,14 +302,6 @@ impl Deliverable {
             },
             evidence: Records::new(),
             state: State::new(code_enum(tc, pick, &[Open, Retracted]), timestamp(tc)),
-        }
-    }
-
-    /// Kept: its own fields unchanged, evidence appended (records in records).
-    fn evolve(&self, tc: &TestCase, pick: Pick) -> Deliverable {
-        Deliverable {
-            evidence: evolve_records(tc, pick, &self.evidence, |evidence, _| evidence.clone(), |pick| Evidence::generate(tc, pick)),
-            ..self.clone()
         }
     }
 
@@ -294,31 +336,72 @@ impl Fixture for Convoy {
             }),
             inputs: map(tc, pick, 3, |pick| InputValue::generate(tc, pick)),
             deliverables: records(tc, pick, 2, |pick| Deliverable::generate(tc, pick)),
+            edges: records(tc, pick, 2, |pick| ConvoyEdgeEvent::generate(tc, pick)),
             state: State::new(code_enum(tc, pick, &[Open, Delivered, Abandoned]), timestamp(tc)),
         }
     }
 
-    /// Spec and child tables drawn afresh; deliverables kept (their evidence appended to) or
-    /// appended.
+    /// Spec and child tables drawn afresh; state, deliverables and edge events kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> Convoy {
-        let spec = Convoy::generate(tc, pick);
-        Convoy {
-            deliverables: evolve_records(
-                tc,
-                pick,
-                &self.deliverables,
-                |deliverable, pick| deliverable.evolve(tc, pick),
-                |pick| Deliverable::generate(tc, pick),
-            ),
-            ..spec
+        Convoy { deliverables: self.deliverables.clone(), edges: self.edges.clone(), state: self.state, ..Convoy::generate(tc, pick) }
+    }
+
+    /// A convoy edge (deliver or abandon) moving the convoy's state, or a deliverable edge:
+    /// promising a deliverable (with its initial evidence: records nested in an appended record),
+    /// submitting evidence under an existing one, or retracting one (its state, on its records
+    /// row). Deliverable edges on a convoy without deliverables promise one.
+    fn edge(&self, tc: &TestCase, pick: Pick) -> (Edge<Convoy>, Convoy) {
+        use ConvoyState::*;
+        let mut choice = pick.variant(tc, 5, |index| index);
+        if self.deliverables.is_empty() && choice >= 3 {
+            choice = 2;
         }
+        let at = timestamp(tc);
+        let writer = name(tc);
+        let mut next = self.clone();
+        let (event, changes): (ConvoyEdge, Box<Changes>) = match choice {
+            0 | 1 => {
+                let edge = if choice == 0 { ConvoyEdge::Deliver } else { ConvoyEdge::Abandon { by: name(tc), reason: text(tc) } };
+                let state = State::new(if choice == 0 { Delivered } else { Abandoned }, at);
+                next.state = state;
+                (edge, Box::new(move |edge| edge.set(Convoy::STATE, &state)))
+            }
+            2 => {
+                let deliverable = Deliverable::generate(tc, pick.nth(1));
+                let position = u32::try_from(self.deliverables.len()).expect("small fixture");
+                next.deliverables = appended(tc, &self.deliverables, deliverable.clone());
+                (ConvoyEdge::Promise { deliverable: position }, Box::new(move |edge| edge.append(Convoy::DELIVERABLES, &deliverable)))
+            }
+            3 => {
+                let at = position(tc, pick.nth(1), &self.deliverables);
+                let evidence = Evidence::generate(tc, pick.nth(2));
+                next.deliverables = replaced(&self.deliverables, at, |deliverable| Deliverable {
+                    evidence: appended(tc, &deliverable.evidence, evidence.clone()),
+                    ..deliverable.clone()
+                });
+                let edge = ConvoyEdge::Submit { deliverable: at.0 };
+                (edge, Box::new(move |edge| edge.append_in(Convoy::DELIVERABLES, at, Deliverable::EVIDENCE, &evidence)))
+            }
+            _ => {
+                let at = position(tc, pick.nth(1), &self.deliverables);
+                let state = State::new(DeliverableState::Retracted, timestamp(tc));
+                next.deliverables = replaced(&self.deliverables, at, |deliverable| Deliverable { state, ..deliverable.clone() });
+                let edge = ConvoyEdge::Retract { deliverable: at.0, reason: text(tc) };
+                (edge, Box::new(move |edge| edge.set_in(Convoy::DELIVERABLES, at, Deliverable::STATE, &state)))
+            }
+        };
+        let event = ConvoyEdgeEvent { edge: event, at, writer };
+        let edge = Edge::new(Convoy::EDGES, &event).and_then(changes).expect("edge");
+        next.edges = appended(tc, &self.edges, event);
+        (edge, next)
     }
 
     fn stamped(&self, before: Option<&Convoy>, version: u64) -> Convoy {
         let deliverables = stamp(&self.deliverables, before.map(|before| &before.deliverables), version, |deliverable, before| {
             deliverable.stamped(before, version)
         });
-        Convoy { deliverables, ..self.clone() }
+        let edges = stamp(&self.edges, before.map(|before| &before.edges), version, |event, _| event.clone());
+        Convoy { deliverables, edges, ..self.clone() }
     }
 }
 
@@ -335,6 +418,7 @@ impl Convoy {
             repositories: Vec::new(),
             inputs: BTreeMap::new(),
             deliverables: Records::new(),
+            edges: Records::new(),
             state: State::new(ConvoyState::Open, Timestamp(0)),
         }
     }

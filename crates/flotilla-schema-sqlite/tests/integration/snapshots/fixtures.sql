@@ -574,6 +574,42 @@ CREATE TABLE "convoy_deliverables_evidence_metadata" (
   PRIMARY KEY ("owner", "deliverables_pos", "evidence_pos", "key"),
   FOREIGN KEY ("owner", "deliverables_pos", "evidence_pos") REFERENCES "convoy_deliverables_evidence" ("owner", "deliverables_pos", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE "convoy_edges" (
+  "owner" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
+  "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3, 4, 5)),
+  "edge_abandon_by" INTEGER REFERENCES "strings" ("id"),
+  "edge_abandon_reason" TEXT,
+  "edge_promise_deliverable" INTEGER,
+  "edge_submit_deliverable" INTEGER,
+  "edge_retract_deliverable" INTEGER,
+  "edge_retract_reason" TEXT,
+  "at" INTEGER NOT NULL,
+  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  PRIMARY KEY ("owner", "pos"),
+  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE,
+  CHECK (CASE WHEN "edge" = 2
+      THEN "edge_abandon_by" IS NOT NULL
+      AND "edge_abandon_reason" IS NOT NULL
+      ELSE "edge_abandon_by" IS NULL
+      AND "edge_abandon_reason" IS NULL
+      END),
+  CHECK (CASE WHEN "edge" = 3
+      THEN "edge_promise_deliverable" IS NOT NULL
+      ELSE "edge_promise_deliverable" IS NULL
+      END),
+  CHECK (CASE WHEN "edge" = 4
+      THEN "edge_submit_deliverable" IS NOT NULL
+      ELSE "edge_submit_deliverable" IS NULL
+      END),
+  CHECK (CASE WHEN "edge" = 5
+      THEN "edge_retract_deliverable" IS NOT NULL
+      AND "edge_retract_reason" IS NOT NULL
+      ELSE "edge_retract_deliverable" IS NULL
+      AND "edge_retract_reason" IS NULL
+      END)
+) STRICT, WITHOUT ROWID;
 CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN (1) AND "project" IS NOT NULL;
 CREATE TABLE "terminal_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),

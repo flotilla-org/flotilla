@@ -18,13 +18,13 @@
 //! Serde attributes are the resource types' own; storage ignores them (codes are explicit).
 
 use chrono::{DateTime, Utc};
-use flotilla_schema::{Identity, Records, Ref, State, Stored, Timestamp};
+use flotilla_schema::{Edge, Identity, Records, Ref, State, Stored, Timestamp};
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
 pub use super::attempt::{Attempt, Cause};
 use super::{
-    code_enum, evolve_records, floor, identity, list, name, records, reference, seq, stamp, text, time, timestamp, Fixture, Pick, SHAPES,
+    appended, code_enum, floor, identity, list, name, records, reference, seq, stamp, text, time, timestamp, Fixture, Pick, SHAPES,
 };
 
 /// A minimal target kind for `Message::inbox`.
@@ -437,14 +437,30 @@ impl Fixture for Message {
         Message::generate(tc, pick)
     }
 
-    /// The spec drawn afresh (references and all), edge events and attempts appended.
+    /// The spec drawn afresh (references and all); state, edge events and attempts kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> Message {
-        let spec = Message::generate(tc, pick);
-        Message {
-            edges: evolve_records(tc, pick, &self.edges, |edge, _| edge.clone(), |pick| MessageEdgeEvent::generate(tc, pick)),
-            attempts: evolve_records(tc, pick, &self.attempts, |attempt, _| attempt.clone(), |pick| Attempt::generate(tc, pick, text(tc))),
-            ..spec
+        Message { state: self.state, edges: self.edges.clone(), attempts: self.attempts.clone(), ..Message::generate(tc, pick) }
+    }
+
+    /// An edge event appended, the state moved, and sometimes the subject set (a multi-column
+    /// data enum, absent or present) and an attempt appended.
+    fn edge(&self, tc: &TestCase, pick: Pick) -> (Edge<Message>, Message) {
+        use MessageState::*;
+        let event = MessageEdgeEvent::generate(tc, pick);
+        let state = State::new(code_enum(tc, pick.nth(1), &[Pending, Awaiting, Settled, Dropped]), timestamp(tc));
+        let mut edge = Edge::new(Message::EDGES, &event).expect("event").set(Message::STATE, &state).expect("state");
+        let mut next = Message { edges: appended(tc, &self.edges, event), state, ..self.clone() };
+        if pick.some(tc, 6) {
+            let subject = pick.nth(2).some(tc, 8).then(|| MessageReference::generate(tc, pick.nth(3)));
+            edge = edge.set(Message::SUBJECT, &subject).expect("subject");
+            next.subject = subject;
         }
+        if pick.nth(4).some(tc, 8) {
+            let attempt = Attempt::generate(tc, pick, text(tc));
+            edge = edge.append(Message::ATTEMPTS, &attempt).expect("attempt");
+            next.attempts = appended(tc, &self.attempts, attempt);
+        }
+        (edge, next)
     }
 
     fn stored(&self) -> Message {

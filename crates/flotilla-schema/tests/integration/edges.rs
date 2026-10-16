@@ -1,0 +1,160 @@
+//! Edge handles and the backend-neutral `Edge` builder (#3320 ruling 1), without a backend.
+
+use flotilla_schema::{
+    Columns, Edge, EdgeAppend, EdgeError, EdgeSet, Encoder, FieldColumns, Frozen, Kind, Position, Records, RowPath, State, Stored,
+    TableRole, Timestamp, Value,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
+enum Phase {
+    #[store(code = 1)]
+    Requested,
+    #[store(code = 2)]
+    Realised,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+struct Ident {
+    session: String,
+    pid: Option<i64>,
+}
+
+/// A data enum whose `List` variant holds a table: a column-shaped field that spans a table.
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+enum Input {
+    #[store(code = 1)]
+    Text { value: String },
+    #[store(code = 2)]
+    List {
+        #[store(child)]
+        items: Vec<String>,
+    },
+}
+
+/// The shared lifecycle, generic over the identity a realise edge carries.
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+struct LifecycleEvent<I> {
+    #[store(flatten)]
+    identity: Option<I>,
+    at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+struct Note {
+    #[store(intern)]
+    by: String,
+    #[store(records)]
+    replies: Records<String>,
+    #[store(state)]
+    phase: State<Phase>,
+}
+
+/// A generic kind: its handles name its type parameter.
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+#[store(kind = "Lifecycle", code = 1)]
+struct Lifecycle<I> {
+    #[store(flatten)]
+    realised: Option<I>,
+    #[store(state)]
+    phase: State<Phase>,
+    input: Input,
+    #[store(frozen)]
+    doc: Option<Frozen<String>>,
+    #[store(child)]
+    labels: Vec<String>,
+    #[store(records)]
+    notes: Records<Note>,
+    #[store(history)]
+    events: Records<LifecycleEvent<I>>,
+}
+
+type Session = Lifecycle<Ident>;
+
+fn ident() -> Ident {
+    Ident { session: "s".into(), pid: Some(7) }
+}
+
+// Behaviour (#3320 ruling 1): the descriptor records each row's column-shaped fields as ranges of
+// its table's columns, state fields marked, so an edge sets exactly a field's columns and a spec
+// edit knows which columns are state. Table fields and spec collections are not fields of the row.
+#[test]
+fn rows_record_their_column_shaped_fields() {
+    let set = Session::table_set();
+    let field = |name: &str, columns, state| FieldColumns { name: name.into(), columns, state };
+    assert_eq!(
+        set.tables[0].fields,
+        [field("realised", 0..3, false), field("phase", 3..5, true), field("input", 5..7, false), field("doc", 7..8, false)]
+    );
+    let columns: Vec<&str> = set.tables[0].columns.iter().map(|column| column.name.as_str()).collect();
+    assert_eq!(
+        columns,
+        ["realised_present", "realised_session", "realised_pid", "phase", "phase_since", "input", "input_text_value", "doc"]
+    );
+    let notes = set.tables.iter().find(|table| table.name == "lifecycle_notes").expect("notes");
+    assert_eq!(notes.fields, [field("by", 1..2, false), field("phase", 2..4, true)], "after the version stamp");
+    let labels = set.tables.iter().find(|table| table.name == "lifecycle_labels").expect("labels");
+    assert!(labels.fields.is_empty(), "an element of a primitive has no named fields");
+}
+
+// Behaviour (#3320 ruling 1): an edge carries its event as an append under the root (a placeholder
+// stamp first, then the row's values; nested tables follow), each set field's values encoded by the
+// field's own adapter, appends and sets in records rows addressed by position, and every object its
+// values name. Handles exist on generic kinds and parts and are named by the field in upper case.
+#[test]
+fn edges_encode_exactly_their_declared_fields_and_rows() {
+    let realised = State::new(Phase::Realised, Timestamp(5));
+    let doc = Frozen::new("plan".to_owned()).expect("freeze");
+    let edge = Edge::new(Session::EVENTS, &LifecycleEvent { identity: Some(ident()), at: Timestamp(4) })
+        .and_then(|edge| edge.set(Session::PHASE, &realised))
+        .and_then(|edge| edge.set(Session::REALISED, &Some(ident())))
+        .and_then(|edge| edge.set(Session::DOC, &Some(doc.clone())))
+        .and_then(|edge| edge.set_in(Session::NOTES, Position(2), Note::PHASE, &realised))
+        .and_then(|edge| edge.append_in(Session::NOTES, Position(2), Note::REPLIES, &"ok".to_owned()))
+        .expect("edge");
+    let parts = edge.into_parts();
+    let int = Value::Int;
+    assert_eq!(
+        parts.sets,
+        [
+            EdgeSet { row: RowPath::Root, field: "phase", values: vec![int(2), int(5)] },
+            EdgeSet { row: RowPath::Root, field: "realised", values: vec![int(1), Value::Text("s".into()), int(7)] },
+            EdgeSet { row: RowPath::Root, field: "doc", values: vec![Value::Object(doc.hash())] },
+            EdgeSet { row: RowPath::Record { table: "notes", position: Position(2) }, field: "phase", values: vec![int(2), int(5)] },
+        ]
+    );
+    let appends: Vec<(RowPath, &str, TableRole, &Vec<Value>)> =
+        parts.appends.iter().map(|EdgeAppend { under, table, role, rows }| (*under, *table, *role, &rows.tables[0][0].values)).collect();
+    assert_eq!(
+        appends,
+        [
+            (RowPath::Root, "events", TableRole::History, &vec![int(0), int(1), Value::Text("s".into()), int(7), int(4)]),
+            (
+                RowPath::Record { table: "notes", position: Position(2) },
+                "replies",
+                TableRole::Records,
+                &vec![int(0), Value::Text("ok".into())]
+            ),
+        ]
+    );
+    assert_eq!(parts.objects.keys().copied().collect::<Vec<_>>(), [doc.hash()], "an edge carries the objects it sets");
+    let values = Encoder::columns(|e| realised.encode(e)).expect("columns").tables[0][0].values.clone();
+    assert_eq!(values, parts.sets[0].values, "a set field encodes as its columns do in the row");
+}
+
+// Behaviour (#3320 ruling 1): a column-shaped field whose value spans a nested table (a data enum
+// with a `child` variant) changes only by a spec edit, and one edge sets a field of a row once;
+// both are refused when the edge is built.
+#[test]
+fn edges_refuse_table_fields_and_repeated_fields() {
+    let event = LifecycleEvent { identity: None, at: Timestamp(1) };
+    let edge = || Edge::new(Session::EVENTS, &event).expect("event");
+    assert_eq!(edge().set(Session::INPUT, &Input::Text { value: "t".into() }), Err(EdgeError::Tables { field: "input".into() }));
+    let phase = State::new(Phase::Requested, Timestamp(2));
+    let twice = edge().set(Session::PHASE, &phase).and_then(|edge| edge.set(Session::PHASE, &phase));
+    assert_eq!(twice, Err(EdgeError::Repeated { field: "phase".into() }));
+    let other_rows = edge()
+        .set(Session::PHASE, &phase)
+        .and_then(|edge| edge.set_in(Session::NOTES, Position(0), Note::PHASE, &phase))
+        .and_then(|edge| edge.set_in(Session::NOTES, Position(1), Note::PHASE, &phase));
+    assert!(other_rows.is_ok(), "the same field of different rows is not repeated");
+}

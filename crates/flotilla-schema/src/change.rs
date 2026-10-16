@@ -42,8 +42,10 @@ pub struct RowChange {
     /// differs has missed a change (a gap).
     #[serde(rename = "p")]
     pub prev_seq: u64,
-    /// In execution order: objects, then the root row, then child deletes deepest table first,
-    /// child updates, and child inserts shallowest table first.
+    /// In execution order. A whole-value write: objects, then the root row, then child deletes
+    /// deepest table first, child updates, and child inserts shallowest table first. An edge:
+    /// objects, then the fields it sets (the root's first, then those of records rows), then the
+    /// rows it appends, each before the rows nested in it.
     #[serde(rename = "o")]
     pub ops: Vec<RowOp>,
 }
@@ -81,6 +83,19 @@ pub enum RowOp {
         table: String,
         #[serde(rename = "k")]
         key: Vec<Value>,
+        #[serde(rename = "v")]
+        values: Vec<Value>,
+    },
+    /// One field of an existing row, set by an edge: `values` are the field's columns, in order.
+    /// The root row's `version` moves with it, as with `Update`.
+    #[serde(rename = "s")]
+    Set {
+        #[serde(rename = "t")]
+        table: String,
+        #[serde(rename = "k")]
+        key: Vec<Value>,
+        #[serde(rename = "f")]
+        field: String,
         #[serde(rename = "v")]
         values: Vec<Value>,
     },

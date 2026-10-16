@@ -1,14 +1,16 @@
 //! Per-kind statements, rendered once from the descriptor when the store opens. Every statement
 //! addresses rows by primary key: the root by `id`, child rows by `owner` plus their key.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ops::Range};
 
-use flotilla_schema::{quote_ident, ColumnDef, ColumnType, Index, Table, TableRole, TableSet};
+use flotilla_schema::{quote_ident, ColumnDef, ColumnType, FieldColumns, Index, Table, TableRole, TableSet};
 
 pub(crate) struct TableSql {
     pub name: String,
     pub role: TableRole,
     pub parent: Option<usize>,
+    /// The field this table stores (empty for the root): how an edge names it.
+    pub field: String,
     /// Key columns (excluding the owner), then data columns.
     pub columns: Vec<ColumnDef>,
     pub key_len: usize,
@@ -18,6 +20,22 @@ pub(crate) struct TableSql {
     pub delete: String,
     /// Child tables: every row of one owner. The root: the row of one id, version first.
     pub select: String,
+    /// Indexes into a row's data values of `state` columns, which only an edge moves.
+    pub state_columns: Vec<usize>,
+    /// The root's and `records` tables' column-shaped fields, each with the statement an edge
+    /// sets it with: the root's also moves the version (`?1`) under the optimistic check.
+    pub fields: Vec<FieldSql>,
+    /// `records` and `history` tables: the last position under one parent row, by primary-key
+    /// range; no row when the parent row does not exist, a null when it has no rows yet.
+    /// Parameters: the owner, then the parent's key.
+    pub last_position: String,
+}
+
+/// One field an edge sets, and its statement. `columns` indexes the row's data values.
+pub(crate) struct FieldSql {
+    pub name: String,
+    pub columns: Range<usize>,
+    pub update: String,
 }
 
 pub(crate) struct KindSql {
@@ -67,7 +85,7 @@ fn assignments(columns: &[ColumnDef], from: usize) -> Vec<String> {
 
 impl KindSql {
     pub(crate) fn render(set: &TableSet) -> KindSql {
-        let tables = set.tables.iter().map(TableSql::render).collect();
+        let tables = set.tables.iter().map(|table| TableSql::render(set, table)).collect();
         let root = quote_ident(&set.tables[0].name);
         KindSql {
             tables,
@@ -91,6 +109,14 @@ impl KindSql {
                 if !sql.is_empty() {
                     out.push((format!("{} {what}", table.name), sql.clone()));
                 }
+            }
+        }
+        for table in &self.tables {
+            for field in &table.fields {
+                out.push((format!("{} set {}", table.name, field.name), field.update.clone()));
+            }
+            if !table.last_position.is_empty() {
+                out.push((format!("{} last position", table.name), table.last_position.clone()));
             }
         }
         let root = &self.tables[0].name;
@@ -156,7 +182,7 @@ fn lowest(ty: &ColumnType) -> &'static str {
 }
 
 impl TableSql {
-    fn render(table: &Table) -> TableSql {
+    fn render(set: &TableSet, table: &Table) -> TableSql {
         let name = quote_ident(&table.name);
         let columns: Vec<ColumnDef> = table.key.iter().chain(&table.columns).cloned().collect();
         let names: Vec<String> = columns.iter().map(|column| quote_ident(&column.name)).collect();
@@ -198,10 +224,23 @@ impl TableSql {
                 format!("SELECT {} FROM {name} WHERE \"owner\" = ?1 ORDER BY {}", exprs.join(", "), key_names.join(", ")),
             )
         };
+        let state_columns = table.fields.iter().filter(|field| field.state).flat_map(|field| field.columns.clone()).collect();
+        let fields = match table.role {
+            TableRole::Root | TableRole::Records => table.fields.iter().map(|field| FieldSql::render(table, field)).collect(),
+            TableRole::Child | TableRole::History => Vec::new(),
+        };
+        let last_position = match (table.role, table.parent) {
+            (TableRole::Records | TableRole::History, Some(parent)) => last_position(&set.tables[parent], table),
+            _ => String::new(),
+        };
         TableSql {
             name: table.name.clone(),
             role: table.role,
             parent: table.parent,
+            field: table.field.clone(),
+            state_columns,
+            fields,
+            last_position,
             key_len: table.key.len(),
             columns,
             insert,
@@ -210,6 +249,46 @@ impl TableSql {
             select,
         }
     }
+}
+
+impl FieldSql {
+    fn render(table: &Table, field: &FieldColumns) -> FieldSql {
+        let name = quote_ident(&table.name);
+        let columns = &table.columns[field.columns.clone()];
+        let update = if table.parent.is_none() {
+            let set = assignments(columns, 2);
+            let next = 2 + columns.len();
+            format!("UPDATE {name} SET \"version\" = ?1, {} WHERE \"id\" = ?{next} AND \"version\" = ?{}", set.join(", "), next + 1)
+        } else {
+            let set = assignments(columns, 1);
+            let owner = 1 + columns.len();
+            let key: Vec<String> =
+                table.key.iter().enumerate().map(|(n, key)| format!(" AND {} = ?{}", quote_ident(&key.name), owner + 1 + n)).collect();
+            format!("UPDATE {name} SET {} WHERE \"owner\" = ?{owner}{}", set.join(", "), key.concat())
+        };
+        FieldSql { name: field.name.clone(), columns: field.columns.clone(), update }
+    }
+}
+
+/// The last position of `table` under one row of `parent`, read backwards through the primary
+/// key's range so it is one index probe however long the table is. The outer select by the
+/// parent's primary key returns no row when the parent row is missing.
+fn last_position(parent: &Table, table: &Table) -> String {
+    let inner_key: Vec<String> =
+        table.parent_key().iter().enumerate().map(|(n, key)| format!(" AND {} = ?{}", quote_ident(&key.name), n + 2)).collect();
+    let outer = if parent.parent.is_none() {
+        "\"id\" = ?1".to_owned()
+    } else {
+        let key: Vec<String> =
+            parent.key.iter().enumerate().map(|(n, key)| format!(" AND {} = ?{}", quote_ident(&key.name), n + 2)).collect();
+        format!("\"owner\" = ?1{}", key.concat())
+    };
+    format!(
+        "SELECT (SELECT \"pos\" FROM {} WHERE \"owner\" = ?1{} ORDER BY \"pos\" DESC LIMIT 1) FROM {} WHERE {outer}",
+        quote_ident(&table.name),
+        inner_key.concat(),
+        quote_ident(&parent.name)
+    )
 }
 
 fn prefixed(items: &[String]) -> String {
@@ -280,5 +359,49 @@ mod tests {
             steps.select,
             "SELECT \"convoy_steps\".\"pos\", \"convoy_steps\".\"label\" FROM \"convoy_steps\" WHERE \"owner\" = ?1 ORDER BY \"pos\""
         );
+    }
+
+    // Glue: an edge's statements: a root field moves the version under the optimistic check and
+    // writes only its columns; a records field addresses one row by owner and key; the last
+    // position reads one parent row's range backwards, inside a select of the parent row.
+    #[test]
+    fn edge_statements_write_one_field_and_read_the_last_position() {
+        let mut layout = Layout::root("Convoy", KindCode(2));
+        layout.field("label", false, |layout| layout.column("label", ColumnType::Text, true));
+        layout.field("state", true, |layout| {
+            layout.column("state", ColumnType::Code(vec![1, 2]), true);
+            layout.column("state_since", ColumnType::Timestamp, true);
+        });
+        layout.table("deliverables", TableRole::Records, |layout| {
+            layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
+            layout.column("version", ColumnType::Integer, true);
+            layout.field("state", true, |layout| layout.column("state", ColumnType::Code(vec![1, 2]), true));
+            layout.table("evidence", TableRole::Records, |layout| {
+                layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
+                layout.column("version", ColumnType::Integer, true);
+            });
+        });
+        let sql = KindSql::render(&layout.finish());
+        let (root, deliverables, evidence) = (&sql.tables[0], &sql.tables[1], &sql.tables[2]);
+        assert_eq!(root.state_columns, [1, 2]);
+        assert_eq!(
+            root.fields[1].update,
+            "UPDATE \"convoy\" SET \"version\" = ?1, \"state\" = ?2, \"state_since\" = ?3 WHERE \"id\" = ?4 AND \"version\" = ?5"
+        );
+        assert_eq!(
+            deliverables.fields[0].update,
+            "UPDATE \"convoy_deliverables\" SET \"state\" = ?1 WHERE \"owner\" = ?2 AND \"pos\" = ?3"
+        );
+        assert_eq!(
+            deliverables.last_position,
+            "SELECT (SELECT \"pos\" FROM \"convoy_deliverables\" WHERE \"owner\" = ?1 ORDER BY \"pos\" DESC LIMIT 1) \
+             FROM \"convoy\" WHERE \"id\" = ?1"
+        );
+        assert_eq!(
+            evidence.last_position,
+            "SELECT (SELECT \"pos\" FROM \"convoy_deliverables_evidence\" WHERE \"owner\" = ?1 AND \"deliverables_pos\" = ?2 \
+             ORDER BY \"pos\" DESC LIMIT 1) FROM \"convoy_deliverables\" WHERE \"owner\" = ?1 AND \"pos\" = ?2"
+        );
+        assert!(root.last_position.is_empty() && evidence.fields.is_empty());
     }
 }

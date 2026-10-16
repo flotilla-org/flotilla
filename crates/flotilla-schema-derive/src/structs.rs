@@ -25,13 +25,59 @@ pub(crate) fn expand(input: &DeriveInput, fields: &FieldsNamed, type_attrs: Type
         (Some(kind), Some((code, _))) => {
             check_kind_name(kind)?;
             let indexes = Indexes::parse(&type_attrs.indexes, &fields)?;
-            Ok(kind_impls(input, &fields, kind, code, &indexes))
+            let handles = handles(input, &fields, true)?;
+            let kind = kind_impls(input, &fields, kind, code, &indexes);
+            Ok(quote!(#kind #handles))
         }
         (None, _) if !type_attrs.indexes.is_empty() => Err(refuse(&type_attrs.indexes[0], "`index` belongs on a kind")),
         (Some(kind), None) => Err(syn::Error::new_spanned(kind, "a kind needs a stable `code = N`")),
         (None, Some((_, span))) => Err(syn::Error::new(span, "`code` on a struct needs `kind = \"Name\"`")),
-        (None, None) => Ok(part_impls(input, &fields)),
+        (None, None) => {
+            let handles = handles(input, &fields, false)?;
+            let part = part_impls(input, &fields);
+            Ok(quote!(#part #handles))
+        }
     }
+}
+
+/// Associated consts that name the stored traits' own items: an inherent const takes precedence
+/// over a trait's in a path such as `Message::KIND`, so a handle with one of these names would
+/// silently change what that path means. `TABLES` belongs to `Element` and `Columns` (every
+/// struct), `KIND` and `CODE` to `Kind` (kinds only).
+const TRAIT_ITEMS: &[&str] = &["TABLES"];
+const KIND_ITEMS: &[&str] = &["KIND", "CODE"];
+
+/// The struct's edge handles (see `flotilla_schema::Edge`): one associated const per field, named
+/// by the field in upper case. A field whose handle would shadow a stored trait's item, or repeat
+/// another field's handle, is refused.
+fn handles(input: &DeriveInput, fields: &[Field<'_>], kind: bool) -> syn::Result<TokenStream> {
+    let mut seen = std::collections::BTreeSet::new();
+    for field in fields {
+        let name = field.handle_name();
+        if TRAIT_ITEMS.contains(&name.as_str()) || (kind && KIND_ITEMS.contains(&name.as_str())) {
+            return Err(refuse(
+                field.ident,
+                format_args!(
+                    "field `{}` would name its edge handle `{name}`, which the stored traits already use; rename the field",
+                    field.name.value()
+                ),
+            ));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(refuse(field.ident, format_args!("two fields name the same edge handle `{name}`")));
+        }
+    }
+    let ident = &input.ident;
+    // The same bounds as `Element`, so a field outside the list is reported once, by its trait.
+    let Generics { impl_generics, ty_generics, where_clause } = bounds(input, fields);
+    let consts = fields.iter().filter_map(Field::handle);
+    Ok(quote! {
+        #[automatically_derived]
+        #[allow(dead_code)]
+        impl #impl_generics #ident #ty_generics #where_clause {
+            #(#consts)*
+        }
+    })
 }
 
 fn check_kind_name(kind: &LitStr) -> syn::Result<()> {
@@ -57,7 +103,7 @@ fn element_impl(input: &DeriveInput, fields: &[Field<'_>]) -> TokenStream {
     let ident = &input.ident;
     let Generics { impl_generics, ty_generics, where_clause } = bounds(input, fields);
     let tables = fields.iter().map(Field::tables);
-    let layout = fields.iter().map(|field| field.layout(&quote!(""), &quote!(true)));
+    let layout = fields.iter().map(Field::layout_row_field);
     let encode = fields.iter().map(|field| {
         let ident = field.ident;
         field.encode(&quote!(&self.#ident))
@@ -110,7 +156,7 @@ fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u3
             const CODE: #schema::KindCode = #schema::KindCode(#code);
 
             fn table_set() -> #schema::TableSet {
-                let mut layout = #schema::Layout::root(Self::KIND, Self::CODE);
+                let mut layout = #schema::Layout::root(<Self as #schema::Kind>::KIND, <Self as #schema::Kind>::CODE);
                 <Self as #schema::Element>::layout_row(&mut layout);
                 #index_layout
                 layout.finish()

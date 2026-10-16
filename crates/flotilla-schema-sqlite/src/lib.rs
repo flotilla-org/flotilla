@@ -3,7 +3,10 @@
 //!
 //! Writes go through [`Write`], one immediate transaction holding many writes. Every write is
 //! owner-checked: only resources homed at this store's home are written here. Versions are the
-//! home's sequence, taken from `home_sequence` in the same transaction.
+//! home's sequence, taken from `home_sequence` in the same transaction. A whole value is written
+//! only to create a resource (`insert`) and for spec edits (`update`); states and `records` and
+//! `history` rows move only through [`Write::apply_edge`], which appends the edge's rows and sets
+//! only the fields it declares, each by its own statement.
 //!
 //! Every write, including a delete, takes a sequence number and appends one `change_log` row
 //! holding its [`RowChange`](flotilla_schema::RowChange) in the same transaction; an update that

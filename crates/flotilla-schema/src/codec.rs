@@ -129,6 +129,19 @@ impl Encoder {
         Ok(encoder.rows)
     }
 
+    /// Encodes the columns `f` writes into a row of their own, outside any resource: one field's
+    /// values for an edge that sets it. The row has no nested tables, so a field holding one is
+    /// refused (`EncodeError::Table`). Returns one table holding the row (key empty), and the
+    /// objects its values name.
+    pub fn columns(f: impl FnOnce(&mut Encoder) -> Result<(), EncodeError>) -> Result<Rows, EncodeError> {
+        let mut encoder =
+            Encoder { rows: Rows::with_tables(1), next: 1, scopes: Vec::new(), frames: vec![EncodeFrame::new(0, Vec::new())] };
+        f(&mut encoder)?;
+        let row = encoder.frames.pop().expect("root frame");
+        encoder.rows.tables[0].push(Row { key: row.key, values: row.values });
+        Ok(encoder.rows)
+    }
+
     /// Appends a value to the current row (or to its own key inside [`Encoder::key`]).
     pub fn put(&mut self, value: Value) {
         let frame = self.frames.last_mut().expect("encoder has a current row");

@@ -1,6 +1,6 @@
 //! The descriptor the derive produces: one kind's tables, columns, keys, CHECKs and indexes.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, ops::Range};
 
 use crate::{ddl::quote_ident, value::KindCode};
 
@@ -60,6 +60,20 @@ pub struct Table {
     pub columns: Vec<ColumnDef>,
     /// Sparse-column guards, in the order they closed; each renders as one table CHECK.
     pub guards: Vec<Guard>,
+    /// The column-shaped fields of the struct whose rows this table holds, in declaration order:
+    /// the unit an edge sets (`Edge::set`), and the columns a spec edit may not change (`state`).
+    /// Empty for tables of primitive and enum elements, which have no named fields.
+    pub fields: Vec<FieldColumns>,
+}
+
+/// One column-shaped field of a row: a range of [`Table::columns`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldColumns {
+    /// The Rust field name, as handles name it.
+    pub name: String,
+    pub columns: Range<usize>,
+    /// A `#[store(state)]` field: moved only by an edge, never by a spec edit.
+    pub state: bool,
 }
 
 /// Columns that hold only while `column = value`: a data enum variant (`column` is the tag) or a

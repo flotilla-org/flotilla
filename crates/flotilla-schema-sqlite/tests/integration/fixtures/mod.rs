@@ -2,10 +2,11 @@
 //!
 //! Each fixture generates values in two modes ([`Pick`]): drawn by Hegel, or fixed by a covering
 //! index, so that a fixture's covering indexes `0..COVERING` reach every enum variant, nested ones
-//! included, and both empty and non-empty collections. [`Fixture::evolve`] generates an update the
-//! storage rules allow: spec fields and child tables change freely, `records` and `history` rows
-//! are only appended (records nested in a kept record included). Generated rows carry arbitrary
-//! version stamps; [`Fixture::stamped`] gives the stamps the store writes instead.
+//! included, and both empty and non-empty collections. [`Fixture::evolve`] generates a spec edit:
+//! spec fields and child tables change freely, while states and `records` and `history` rows stay
+//! as they are. [`Fixture::edge`] generates an edge, the only write that moves those. Generated
+//! rows carry arbitrary version stamps; [`Fixture::stamped`] gives the stamps the store writes
+//! instead.
 
 pub mod attempt;
 pub mod convoy;
@@ -15,7 +16,7 @@ pub mod terminal;
 use std::fmt::Debug;
 
 use chrono::{DateTime, Utc};
-use flotilla_schema::{Identity, Kind, KindCode, KindRegistry, Records, Ref, Timestamp};
+use flotilla_schema::{Edge, Identity, Kind, KindCode, KindRegistry, Position, Records, Ref, Timestamp};
 use flotilla_schema_sqlite::Store;
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
@@ -33,8 +34,11 @@ pub trait Fixture: Kind + Clone + PartialEq + Debug {
     /// Covering indexes `0..COVERING` reach every variant and both empty and non-empty collections.
     const COVERING: usize;
     fn generate(tc: &TestCase, pick: Pick) -> Self;
-    /// An update of `self` the storage rules allow, with spec fields drawn afresh by `pick`.
+    /// A spec edit of `self`: spec fields drawn afresh by `pick`, states and records kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> Self;
+    /// An edge on `self` drawn by `pick`, and the value it leads to (appended rows with arbitrary
+    /// stamps; see [`Fixture::stamped`]).
+    fn edge(&self, tc: &TestCase, pick: Pick) -> (Edge<Self>, Self);
     /// The value a load returns: times floored to microseconds.
     fn stored(&self) -> Self {
         self.clone()
@@ -126,23 +130,27 @@ pub fn records<T>(tc: &TestCase, pick: Pick, max: usize, element: impl FnMut(Pic
     records
 }
 
-/// Records after an allowed update: each existing row kept at its position and stamp, its record
-/// passed through `keep` (which may append to records nested in it), then up to two rows appended.
-pub fn evolve_records<T>(
-    tc: &TestCase,
-    pick: Pick,
-    old: &Records<T>,
-    mut keep: impl FnMut(&T, Pick) -> T,
-    mut fresh: impl FnMut(Pick) -> T,
-) -> Records<T> {
+/// `records` with `record` appended, stamped arbitrarily.
+pub fn appended<T: Clone>(tc: &TestCase, records: &Records<T>, record: T) -> Records<T> {
+    let mut next = records.clone();
+    next.append(version(tc), record);
+    next
+}
+
+/// `records` with the row at `position` replaced through `f`, keeping its stamp: how an edge
+/// changes a records row.
+pub fn replaced<T: Clone>(records: &Records<T>, position: Position, mut f: impl FnMut(&T) -> T) -> Records<T> {
     let mut next = Records::new();
-    for row in old {
-        next.append(row.version, keep(&row.record, pick.nth(row.position.0 as usize)));
-    }
-    for n in 0..pick.count(tc, 2) {
-        next.append(version(tc), fresh(pick.nth(old.len() + n)));
+    for row in records {
+        next.append(row.version, if row.position == position { f(&row.record) } else { row.record.clone() });
     }
     next
+}
+
+/// A position of a non-empty `records`, drawn or covered.
+pub fn position<T>(tc: &TestCase, pick: Pick, records: &Records<T>) -> Position {
+    let index = pick.variant(tc, records.len(), |index| index);
+    Position(u32::try_from(index).expect("small fixture"))
 }
 
 /// `records` as written at `version`: rows at positions `before` lacks take `version`; each
