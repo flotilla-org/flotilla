@@ -1,0 +1,378 @@
+//! Convoy: admitted work that ends when every promise is settled (spec
+//! `machines/convoy.qnt`, ADR 0064 "A convoy ends when its work is delivered").
+//!
+//! The spec's work record is the state: each promise's resolution and the
+//! quota in force travel with every label, and an abandoned convoy also
+//! carries its reason. The request's project, promises and priority never
+//! change, so they are the spec. Promise kinds and targets are opaque data;
+//! no promise kind is named here.
+//!
+//! The identifiers placement shares with the convoy ([`ConvoyId`],
+//! [`VesselClass`], [`Priority`] and [`Quota`]) are defined here once.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Version, WrongState};
+
+/// A convoy: the convoy resource's name at its home.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConvoyId(pub String);
+
+impl ConvoyId {
+    pub fn new(name: impl Into<String>) -> Self {
+        ConvoyId(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A promise's key within one convoy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PromiseId(pub u32);
+
+/// An abstract vessel class that quota counts are granted for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VesselClass(pub u32);
+
+/// A convoy's priority; its vessels' placement requests carry it. Higher
+/// places first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Priority(pub u32);
+
+/// Per-class caps on live vessels. Admission grants a cap, never a reservation.
+pub type Quota = BTreeMap<VesselClass, u32>;
+
+/// What the convoy promises: opaque kind and target data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Promise {
+    pub kind: String,
+    pub target: String,
+}
+
+/// The spec's `ConvoyRequest`: what a caller asks to admit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConvoyRequest {
+    pub project: String,
+    pub promises: BTreeMap<PromiseId, Promise>,
+    /// The quota admitted; it becomes the state's quota in force.
+    pub quota: Quota,
+    pub priority: Priority,
+}
+
+/// The part of the request that never changes after admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConvoySpec {
+    pub project: String,
+    pub promises: BTreeMap<PromiseId, Promise>,
+    pub priority: Priority,
+}
+
+/// One promise's resolution. `Kept` and `Retracted` are final.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PromiseState {
+    Pending,
+    Kept,
+    Retracted,
+}
+
+/// Each promise's resolution, by promise.
+pub type Resolution = BTreeMap<PromiseId, PromiseState>;
+
+states! {
+    /// The spec's `State`, with its `Work` (less the immutable request) on every label.
+    pub enum ConvoyState => ConvoyLabel {
+        Open { promises: Resolution, quota: Quota } = 1,
+        Delivered { promises: Resolution, quota: Quota } = 2,
+        Abandoned { promises: Resolution, quota: Quota, reason: String } = 3,
+    }
+}
+
+impl ConvoyState {
+    /// Each promise's resolution.
+    pub fn promises(&self) -> &Resolution {
+        match self {
+            ConvoyState::Open { promises, .. } | ConvoyState::Delivered { promises, .. } | ConvoyState::Abandoned { promises, .. } => {
+                promises
+            }
+        }
+    }
+
+    /// The quota in force: the admitted one, or the last readmission's.
+    pub fn quota(&self) -> &Quota {
+        match self {
+            ConvoyState::Open { quota, .. } | ConvoyState::Delivered { quota, .. } | ConvoyState::Abandoned { quota, .. } => quota,
+        }
+    }
+
+    /// The decision's reason, once Abandoned.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            ConvoyState::Abandoned { reason, .. } => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// The promises still pending.
+    pub fn outstanding(&self) -> BTreeSet<PromiseId> {
+        self.promises().iter().filter(|(_, state)| **state == PromiseState::Pending).map(|(id, _)| *id).collect()
+    }
+}
+
+/// A promise was observed kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Keep {
+    pub promise: PromiseId,
+}
+
+/// The spec's `AcceptRetraction`: an authorised party accepts that a promise
+/// will not be kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Retract {
+    pub promise: PromiseId,
+    pub by: String,
+    pub authority: Ref<Authority>,
+}
+
+/// Every promise is settled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Deliver;
+
+/// An authorised decision to stop, with its reason. Nothing abandons a convoy automatically.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Abandon {
+    pub by: String,
+    pub reason: String,
+    pub authority: Ref<Authority>,
+}
+
+/// Readmission of the same convoy with a raised quota.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Readmit {
+    pub quota: Quota,
+    pub by: String,
+    pub authority: Ref<Authority>,
+}
+
+edges! {
+    pub enum ConvoyEdge => ConvoyEdgeKind {
+        Keep(Keep) = 1,
+        Retract(Retract) = 2,
+        Deliver(Deliver) = 3,
+        Abandon(Abandon) = 4,
+        Readmit(Readmit) = 5,
+    }
+}
+
+/// A decision by an authorised party; reads `true` when the decision is authorised.
+pub struct Authority;
+impl Kind for Authority {
+    const NAME: &'static str = "authority";
+    type Value = bool;
+}
+
+/// The spec's `Refusal`, variant for variant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConvoyRefusal {
+    NoPromises,
+    /// The spec refuses negative quota counts. Counts here are unsigned, so
+    /// neither admission nor readmission produces this.
+    InvalidQuota,
+    /// The convoy has ended (Delivered or Abandoned).
+    NotOpen,
+    UnknownPromise,
+    PromiseSettled,
+    PromisesOutstanding(BTreeSet<PromiseId>),
+    Unauthorised,
+    QuotaNotIncrease,
+}
+
+impl From<Ended<ConvoyLabel>> for ConvoyRefusal {
+    fn from(_: Ended<ConvoyLabel>) -> Self {
+        ConvoyRefusal::NotOpen
+    }
+}
+
+impl From<WrongState<ConvoyLabel, ConvoyEdgeKind>> for ConvoyRefusal {
+    fn from(_: WrongState<ConvoyLabel, ConvoyEdgeKind>) -> Self {
+        ConvoyRefusal::NotOpen
+    }
+}
+
+/// What convoy gates read.
+pub trait ConvoyWorld: Source<Authority> {}
+impl<T: Source<Authority> + ?Sized> ConvoyWorld for T {}
+
+/// An in-memory convoy world, for tests, replay and conformance.
+#[derive(Default)]
+pub struct MemoryConvoyWorld {
+    pub authority: Table<Authority>,
+}
+
+impl Source<Authority> for MemoryConvoyWorld {
+    fn lookup(&self, reference: &Ref<Authority>) -> Option<(Version, &bool)> {
+        self.authority.lookup(reference)
+    }
+}
+
+/// The Convoy machine.
+pub struct Convoy;
+
+impl Machine for Convoy {
+    const NAME: &'static str = "Convoy";
+    type Request = ConvoyRequest;
+    type Spec = ConvoySpec;
+    type State = ConvoyState;
+    type Edge = ConvoyEdge;
+    type Refusal = ConvoyRefusal;
+    type World = dyn ConvoyWorld;
+
+    fn definition() -> MachineDef<Self> {
+        use ConvoyLabel::*;
+        MachineDef::new(Open)
+            .edge(
+                EdgeDef::<Self, Keep>::new()
+                    .from([Open])
+                    .to([Open])
+                    .changes(["promises"])
+                    .gate("the promise is known and still pending", gate_keep)
+                    .effect(|_, state, keep| settle(state, keep.promise, PromiseState::Kept)),
+            )
+            .edge(
+                EdgeDef::<Self, Retract>::new()
+                    .from([Open])
+                    .to([Open])
+                    .changes(["promises"])
+                    .gate("an authorised retraction of a known, pending promise", gate_retract)
+                    .effect(|_, state, retract| settle(state, retract.promise, PromiseState::Retracted)),
+            )
+            .edge(EdgeDef::<Self, Deliver>::new().from([Open]).to([Delivered]).gate("no promise is pending", gate_deliver).effect(deliver))
+            .edge(
+                EdgeDef::<Self, Abandon>::new()
+                    .from([Open])
+                    .to([Abandoned])
+                    .changes(["reason"])
+                    .gate("an authorised decision with a reason", gate_abandon)
+                    .effect(abandon),
+            )
+            .edge(
+                EdgeDef::<Self, Readmit>::new()
+                    .from([Open])
+                    .to([Open])
+                    .changes(["quota"])
+                    .gate("an authorised quota over the same classes, no count lower", gate_readmit)
+                    .effect(readmit),
+            )
+            .end(Delivered, "the convoy delivered its promises")
+            .end(Abandoned, "the convoy was abandoned")
+    }
+
+    /// Every convoy promises something: `deliver` would hold trivially over
+    /// none. Every promise starts Pending under the admitted quota.
+    fn admit(request: ConvoyRequest) -> Result<(ConvoySpec, ConvoyState), ConvoyRefusal> {
+        if request.promises.is_empty() {
+            return Err(ConvoyRefusal::NoPromises);
+        }
+        let promises = request.promises.keys().map(|id| (*id, PromiseState::Pending)).collect();
+        let state = ConvoyState::Open { promises, quota: request.quota };
+        Ok((ConvoySpec { project: request.project, promises: request.promises, priority: request.priority }, state))
+    }
+}
+
+fn authorised(h: &mut Handle<'_, Convoy>, authority: &Ref<Authority>) -> bool {
+    h.read(authority).copied().unwrap_or(false)
+}
+
+/// Spec order: unknown, then settled.
+fn pending(h: &Handle<'_, Convoy>, promise: PromiseId) -> Result<(), ConvoyRefusal> {
+    match h.state().promises().get(&promise) {
+        None => Err(ConvoyRefusal::UnknownPromise),
+        Some(PromiseState::Pending) => Ok(()),
+        Some(_) => Err(ConvoyRefusal::PromiseSettled),
+    }
+}
+
+// Spec `Keep` carries no evidence: whether a promise is kept is its kind's
+// judgement over the kind's own observations (ADR 0064 "Promises"), made by the
+// caller before it applies `keep`. The machine enforces only that resolution is
+// final.
+fn gate_keep(h: &mut Handle<'_, Convoy>, keep: &Keep) -> Result<(), ConvoyRefusal> {
+    pending(h, keep.promise)
+}
+
+// Spec `AcceptRetraction`: authority is checked before the promise.
+fn gate_retract(h: &mut Handle<'_, Convoy>, retract: &Retract) -> Result<(), ConvoyRefusal> {
+    if !authorised(h, &retract.authority) {
+        return Err(ConvoyRefusal::Unauthorised);
+    }
+    pending(h, retract.promise)
+}
+
+fn gate_deliver(h: &mut Handle<'_, Convoy>, _: &Deliver) -> Result<(), ConvoyRefusal> {
+    let outstanding = h.state().outstanding();
+    if outstanding.is_empty() {
+        Ok(())
+    } else {
+        Err(ConvoyRefusal::PromisesOutstanding(outstanding))
+    }
+}
+
+// Spec: an unauthorised decision and an empty reason both refuse `Unauthorised`.
+fn gate_abandon(h: &mut Handle<'_, Convoy>, abandon: &Abandon) -> Result<(), ConvoyRefusal> {
+    if !authorised(h, &abandon.authority) || abandon.reason.is_empty() {
+        Err(ConvoyRefusal::Unauthorised)
+    } else {
+        Ok(())
+    }
+}
+
+// Spec: the class domain is fixed and no count may fall below the quota in force.
+fn gate_readmit(h: &mut Handle<'_, Convoy>, readmit: &Readmit) -> Result<(), ConvoyRefusal> {
+    if !authorised(h, &readmit.authority) {
+        return Err(ConvoyRefusal::Unauthorised);
+    }
+    let current = h.state().quota();
+    let same_classes = readmit.quota.keys().eq(current.keys());
+    let no_lower = readmit.quota.iter().all(|(class, count)| current.get(class).is_some_and(|old| count >= old));
+    if same_classes && no_lower {
+        Ok(())
+    } else {
+        Err(ConvoyRefusal::QuotaNotIncrease)
+    }
+}
+
+// Every effect below is declared from Open only, so the engine hands it an
+// Open state. Any other state is returned as given, which the engine refuses
+// as a fault (its label is not a declared target) rather than store.
+
+fn settle(state: ConvoyState, promise: PromiseId, to: PromiseState) -> ConvoyState {
+    match state {
+        ConvoyState::Open { mut promises, quota } => {
+            promises.insert(promise, to);
+            ConvoyState::Open { promises, quota }
+        }
+        other => other,
+    }
+}
+
+fn deliver(_: &mut Handle<'_, Convoy>, state: ConvoyState, _: &Deliver) -> ConvoyState {
+    match state {
+        ConvoyState::Open { promises, quota } => ConvoyState::Delivered { promises, quota },
+        other => other,
+    }
+}
+
+fn abandon(_: &mut Handle<'_, Convoy>, state: ConvoyState, abandon: &Abandon) -> ConvoyState {
+    match state {
+        ConvoyState::Open { promises, quota } => ConvoyState::Abandoned { promises, quota, reason: abandon.reason.clone() },
+        other => other,
+    }
+}
+
+fn readmit(_: &mut Handle<'_, Convoy>, state: ConvoyState, readmit: &Readmit) -> ConvoyState {
+    match state {
+        ConvoyState::Open { promises, .. } => ConvoyState::Open { promises, quota: readmit.quota.clone() },
+        other => other,
+    }
+}
