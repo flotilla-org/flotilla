@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports, clippy::empty_line_after_outer_attr)]
 
+use crate::common::cr_name;
 use flotilla_resources::ResumeIntent;
 
 use flotilla_store_sqlite::SqliteBackend;
@@ -1164,7 +1165,7 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
         .await
         .expect("create live vessel");
     let observed_at = chrono::Utc::now();
-    let record_name = flotilla_resources::change_request_record_name("github.com", "owner/repo", 42);
+    let record_name = cr_name("github.com", "owner/repo", 42);
     let record = change_requests
         .create(
             &InputMeta::builder().name(record_name.clone()).build(),
@@ -1781,7 +1782,10 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
     )
     .await;
     let mut events = daemon.subscribe();
-    let name = flotilla_resources::usage_record_name("codex", "ada@example.com");
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::Address::usage("codex", "ada@example.com").expect("usage address"),
+    )
+    .expect("record name");
     let create_id = daemon
         .execute(
             Command::builder()
@@ -2553,6 +2557,7 @@ async fn exercise_existing_pr_admission(continuing: bool) {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &[],
             Duration::from_secs(30),
             Duration::from_secs(30),
             chrono::Utc::now(),
@@ -2562,7 +2567,7 @@ async fn exercise_existing_pr_admission(continuing: bool) {
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");
     assert_eq!(convoy.spec.repositories[0].target_ref, "main");
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
-    let name = flotilla_resources::change_request_record_name("github.com", "owner/repo", 1071);
+    let name = cr_name("github.com", "owner/repo", 1071);
     let record = records
         .create(
             &InputMeta::builder().name(name.clone()).build(),
@@ -5281,7 +5286,7 @@ async fn landed_convoy_teardown_accepts_merged_produced_subject_when_checkout_st
         )
         .await
         .expect("create checkout without status");
-    let record_name = flotilla_resources::change_request_record_name("github.com", "owner/repo", 42);
+    let record_name = cr_name("github.com", "owner/repo", 42);
     let changes = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
     let record = changes
         .create(

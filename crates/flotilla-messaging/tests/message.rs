@@ -2215,7 +2215,11 @@ fn held_turn_release_checks_revision_and_condition(tc: hegel::TestCase) {
     runtime.block_on(async {
         let (backend, inbox) = delivery_inbox().await;
         let crs = backend.using::<ChangeRequest>("flotilla");
-        let name = change_request_record_name("github.com", "org/repo", 2920);
+        let name = flotilla_resources::address::record_name(
+            &flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 2920, &[])
+                .expect("change request address"),
+        )
+        .expect("record name");
         let record = crs
             .create(
                 &InputMeta::builder().name(name.clone()).build(),

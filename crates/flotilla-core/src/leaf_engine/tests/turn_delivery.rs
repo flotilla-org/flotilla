@@ -340,7 +340,10 @@ fn delivery_failures_are_durable_and_log_once() {
                 };
                 if kind == 2 || kind == 3 {
                     let records = backend.using::<Issue>("flotilla");
-                    let name = flotilla_resources::issue_record_name("github.com", "team/repo", 1);
+                    let name = flotilla_resources::address::record_name(
+                        &flotilla_resources::address::stored_issue_address("github.com", "team/repo", 1, &[]).expect("issue address"),
+                    )
+                    .expect("record name");
                     let record = records
                         .create(
                             &InputMeta::builder().name(name.clone()).build(),
@@ -608,7 +611,10 @@ async fn issue_turn_delivery_fires_once_for_changed_issue() {
         },
     );
     let records = backend.using::<Issue>("flotilla");
-    let name = flotilla_resources::issue_record_name("github.com", "flotilla-org/flotilla", 2052);
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_issue_address("github.com", "flotilla-org/flotilla", 2052, &[]).expect("issue address"),
+    )
+    .expect("record name");
     let issue = records
         .create(
             &InputMeta::builder().name(name.clone()).build(),
@@ -729,7 +735,7 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
         );
         let current = convoys.update_status("rejected-promise", &created.metadata.resource_version, &status).await.unwrap();
         let requests = backend.using::<ChangeRequest>("flotilla");
-        let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 42);
+        let name = cr_name("github.com", "flotilla-org/flotilla", 42);
         let cr = requests
             .create(
                 &InputMeta::builder().name(name.clone()).build(),
@@ -759,6 +765,7 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
             "rejected-promise",
             &BTreeMap::from([(name.clone(), observed)]),
             &BTreeMap::new(),
+            &[],
             Utc::now(),
             Duration::from_secs(180),
         )

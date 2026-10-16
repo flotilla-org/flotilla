@@ -10,12 +10,12 @@ use common::{
 };
 use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, VesselReconciler};
 use flotilla_resources::{
-    change_request_record_name, controller_patches, evaluate_crew_completion, evaluate_landing_settlement, external_patches,
-    implement_review_workflow_spec, interactive_single_workflow_spec, reconcile, Actuation, BoundChangeRequest, ChangeRequest,
-    ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestState,
-    ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock,
-    ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionRefusalCause,
-    CrewSource, CrewWorkPhase, InputMeta, InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation,
+    controller_patches, evaluate_crew_completion, evaluate_landing_settlement, external_patches, implement_review_workflow_spec,
+    interactive_single_workflow_spec, reconcile, Actuation, BoundChangeRequest, ChangeRequest, ChangeRequestMergeability,
+    ChangeRequestObservation, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestState, ChangeRequestStatus, Checkout,
+    CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy,
+    ConvoyEvent, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionRefusalCause, CrewSource,
+    CrewWorkPhase, InputMeta, InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation,
     ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, OwnerReference, RepositoryKey, ReviewRefPair,
     SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
     TerminalSessionSpec, TerminalSessionStatus, UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus,
@@ -27,6 +27,8 @@ use flotilla_store::{
 };
 
 use flotilla_store_testkit::fixtures as common;
+
+use crate::common::cr_name;
 
 struct AlwaysEligible;
 
@@ -84,11 +86,14 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
         ..Default::default()
     };
     let convoy = convoy_object("completion", spec, Some(status));
-    let record_name = change_request_record_name("github.com", "flotilla-org/flotilla", 42);
+    let record_name = cr_name("github.com", "flotilla-org/flotilla", 42);
     let checkouts = BTreeMap::new();
     let mut change_requests = BTreeMap::new();
     let ledger = |role: &str| {
-        let name = flotilla_resources::artifact_record_name("completion", role, "decision-ledger", "completion");
+        let name = flotilla_resources::address::record_name(
+            &flotilla_resources::address::artifact_address("completion", role, "decision-ledger", "completion").expect("artifact address"),
+        )
+        .expect("record name");
         (
             name.clone(),
             flotilla_resources::ResourceObject::<flotilla_resources::Artifact> {
@@ -115,6 +120,7 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
             &checkouts,
             records,
             artifacts,
+            &[],
             Duration::from_secs(300),
             now,
         )
@@ -137,9 +143,15 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
             }]
     )));
     artifacts.insert(ledger("coder").0, ledger("coder").1);
-    while let Some(patch) =
-        flotilla_resources::promises::next_observation(&promised, "completion", &change_requests, &artifacts, now, Duration::from_secs(300))
-    {
+    while let Some(patch) = flotilla_resources::promises::next_observation(
+        &promised,
+        "completion",
+        &change_requests,
+        &artifacts,
+        &[],
+        now,
+        Duration::from_secs(300),
+    ) {
         patch.apply(&mut promised);
     }
     assert!(flotilla_resources::promises::pending(&promised, "work", "coder").is_empty());
@@ -156,6 +168,7 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
             &checkouts,
             &change_requests,
             &artifacts,
+            &[],
             Duration::from_secs(grace as u64),
             timestamp(1 + elapsed),
         )
@@ -171,6 +184,7 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
         &checkouts,
         &change_requests,
         &artifacts,
+        &[],
         Duration::from_secs(300),
         timestamp(1),
     )
@@ -195,6 +209,7 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
                 &checkouts,
                 &change_requests,
                 &artifacts,
+                &[],
                 Duration::from_secs(300),
                 timestamp(101),
             )
@@ -219,6 +234,7 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
         &checkouts,
         &change_requests,
         &artifacts,
+        &[],
         Duration::from_secs(300),
         timestamp(1000),
     )
@@ -239,15 +255,22 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
         &checkouts,
         &change_requests,
         &artifacts,
+        &[],
         Duration::from_secs(300),
         timestamp(1000),
     )
     .expect("required unbound PR")
     .is_empty());
     artifacts.insert(ledger("reviewer").0, ledger("reviewer").1);
-    while let Some(patch) =
-        flotilla_resources::promises::next_observation(&promised, "completion", &change_requests, &artifacts, now, Duration::from_secs(300))
-    {
+    while let Some(patch) = flotilla_resources::promises::next_observation(
+        &promised,
+        "completion",
+        &change_requests,
+        &artifacts,
+        &[],
+        now,
+        Duration::from_secs(300),
+    ) {
         patch.apply(&mut promised);
     }
     assert!(flotilla_resources::promises::pending(&promised, "work", "reviewer").is_empty());
@@ -291,6 +314,7 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
                 &checkouts,
                 &late_records,
                 &artifacts,
+                &[],
                 Duration::from_secs(300),
                 timestamp(1000),
             )
@@ -352,6 +376,7 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
                         &checkouts,
                         &records,
                         &artifacts,
+                        &[],
                         Duration::from_secs(300),
                         now,
                     )
@@ -406,7 +431,7 @@ fn declared_artifact_completion_accepts_a_new_kind_and_rebinds_to_current_head()
         ..Default::default()
     };
     let convoy = convoy_object("toy", spec, Some(status));
-    let cr_name = change_request_record_name("github.com", "flotilla-org/flotilla", 42);
+    let cr_name = cr_name("github.com", "flotilla-org/flotilla", 42);
     let record = |head: &str| flotilla_resources::ResourceObject::<ChangeRequest> {
         metadata: common::object_meta(&cr_name, "flotilla", "1"),
         spec: ChangeRequestSpec::builder()
@@ -428,7 +453,10 @@ fn declared_artifact_completion_accepts_a_new_kind_and_rebinds_to_current_head()
         }),
     };
     let artifact = |head: &str| {
-        let name = flotilla_resources::artifact_record_name("toy", "coder", "toy-explainer", head);
+        let name = flotilla_resources::address::record_name(
+            &flotilla_resources::address::artifact_address("toy", "coder", "toy-explainer", head).expect("artifact address"),
+        )
+        .expect("record name");
         (
             name.clone(),
             flotilla_resources::ResourceObject::<Artifact> {
@@ -462,6 +490,7 @@ fn declared_artifact_completion_accepts_a_new_kind_and_rebinds_to_current_head()
             &BTreeMap::new(),
             change_requests,
             artifacts,
+            &[],
             Duration::from_secs(300),
             now,
         )
@@ -622,7 +651,7 @@ async fn reconcile_with_observed_change_request(
     });
     let mut spec = valid_convoy_spec();
     spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
-        .url("https://example.com/repo-a".to_string())
+        .url("https://github.com/example/repo-a".to_string())
         .repo_ref(RepositoryKey("repo-a".to_string()))
         .source_ref("main".to_string())
         .target_ref("main".to_string())
@@ -1423,6 +1452,7 @@ fn missing_change_request_is_reported_once_across_terminal_exit_entries() {
         &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
+        &[],
         Duration::from_secs(180),
         Duration::from_secs(180),
         timestamp(40),
@@ -1487,7 +1517,7 @@ fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
         ("flotilla-org/flotilla", 2394, ObservedChangeRequestState::Closed),
         ("flotilla-org/cleat", 281, ObservedChangeRequestState::Merged),
     ] {
-        let name = change_request_record_name("github.com", scope, number);
+        let name = cr_name("github.com", scope, number);
         let mut status = merged_change_request_status(now);
         status.state = Observation::known(state, now);
         records.insert(
@@ -1510,6 +1540,7 @@ fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
             &BTreeMap::new(),
             &BTreeMap::new(),
             records,
+            &[],
             Duration::from_secs(180),
             Duration::from_secs(180),
             now,
@@ -1522,7 +1553,7 @@ fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
     assert_eq!(evaluation.subjects.len(), 3);
     assert_eq!(evaluation.subjects.iter().filter(|subject| subject.state == Some(ObservedChangeRequestState::Merged)).count(), 2);
     assert_eq!(evaluation.subjects.iter().filter(|subject| subject.state == Some(ObservedChangeRequestState::Closed)).count(), 1);
-    records.remove(&change_request_record_name("github.com", "flotilla-org/cleat", 281));
+    records.remove(&cr_name("github.com", "flotilla-org/cleat", 281));
     assert!(!evaluate(&records).satisfied, "a second repository still blocks landing");
 }
 
@@ -1557,6 +1588,7 @@ fn landing_waits_for_a_branch_scan_before_treating_an_empty_subject_set_as_no_pr
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &[],
             Duration::from_secs(180),
             Duration::from_secs(180),
             timestamp(40),
@@ -1663,7 +1695,7 @@ async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
         }
         let created = convoys.create(&convoy_meta("stale-scan"), &spec).await.expect("create");
         convoys.update_status("stale-scan", &created.metadata.resource_version, &status).await.expect("status");
-        let name = change_request_record_name("github.com", "flotilla-org/flotilla", 42);
+        let name = cr_name("github.com", "flotilla-org/flotilla", 42);
         let record = requests
             .create(
                 &InputMeta::builder().name(name.clone()).build(),
@@ -1889,7 +1921,7 @@ async fn reconcile_terminal_bound_change_request(
 
     let mut spec = valid_convoy_spec();
     spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
-        .url("https://example.com/repo-a".to_string())
+        .url("https://github.com/example/repo-a".to_string())
         .repo_ref(repo_ref.clone())
         .source_ref("main".to_string())
         .target_ref("main".to_string())
@@ -2015,13 +2047,13 @@ async fn reconcile_terminal_bound_change_request(
             .expect("context checkout status update");
     }
 
-    let record_name = change_request_record_name("example.com", "repo-a", 42);
+    let record_name = cr_name("github.com", "example/repo-a", 42);
     let record = change_requests
         .create(
             &InputMeta::builder().name(record_name.clone()).build(),
             &ChangeRequestSpec::builder()
-                .service("example.com".to_string())
-                .scope("repo-a".to_string())
+                .service("github.com".to_string())
+                .scope("example/repo-a".to_string())
                 .number(42)
                 .observing_authority("host-a".to_string())
                 .build(),
@@ -2057,6 +2089,7 @@ async fn reconcile_terminal_bound_change_request(
         &BTreeMap::new(),
         &checkout_objects.into_iter().map(|checkout| (checkout.metadata.name.clone(), checkout)).collect(),
         &change_request_objects.into_iter().map(|record| (record.metadata.name.clone(), record)).collect(),
+        &[],
         Duration::from_secs(180),
         Duration::from_secs(30),
         timestamp(40),
@@ -3267,7 +3300,7 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
             convoys.update_status("convoy-a", &current.metadata.resource_version, &status).await.expect("persist settlement");
         }
         if !recognise_merge {
-            let name = change_request_record_name("example.com", "repo-a", 42);
+            let name = cr_name("github.com", "example/repo-a", 42);
             let record = changes.get(&name).await.expect("CR");
             let mut status = record.status.expect("CR status");
             status.state = Observation::known(ObservedChangeRequestState::Open, timestamp(40));
@@ -3314,7 +3347,7 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
             if delete_checkout {
                 checkouts.delete("checkout-a").await.expect("collect checkout");
             } else {
-                changes.delete(&change_request_record_name("example.com", "repo-a", 42)).await.expect("collect CR");
+                changes.delete(&cr_name("github.com", "example/repo-a", 42)).await.expect("collect CR");
             }
             let current = convoys.get("convoy-a").await.expect("convoy");
             let checkout_objects =
@@ -3326,6 +3359,7 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
                 &BTreeMap::new(),
                 &checkout_objects,
                 &change_objects,
+                &[],
                 Duration::from_secs(180),
                 Duration::from_secs(30),
                 timestamp(40),
@@ -3522,7 +3556,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
                 scope: "flotilla-org/flotilla".into(),
                 number,
             };
-            let name = change_request_record_name("github.com", "flotilla-org/flotilla", number);
+            let name = cr_name("github.com", "flotilla-org/flotilla", number);
             let record = requests
                 .create(
                     &InputMeta::builder().name(name.clone()).build(),
@@ -3592,6 +3626,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
                     &BTreeMap::new(),
                     &BTreeMap::new(),
                     &requests.list().await.unwrap().items.into_iter().map(|cr| (cr.metadata.name.clone(), cr)).collect(),
+                    &[],
                     Duration::from_secs(180),
                     Duration::from_secs(180),
                     timestamp(55),
@@ -3616,7 +3651,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
         assert!(receipt.promises.iter().all(|p| p.state == PromiseState::Kept));
         assert_eq!(serde_json::from_value::<ConvoyStatus>(serde_json::to_value(status).unwrap()).unwrap(), *status);
         for number in 1..=3 {
-            requests.delete(&change_request_record_name("github.com", "flotilla-org/flotilla", number)).await.unwrap();
+            requests.delete(&cr_name("github.com", "flotilla-org/flotilla", number)).await.unwrap();
         }
         assert_eq!(
             &evaluate_landing_settlement(
@@ -3624,6 +3659,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
                 &BTreeMap::new(),
                 &BTreeMap::new(),
                 &BTreeMap::new(),
+                &[],
                 Duration::from_secs(180),
                 Duration::from_secs(180),
                 timestamp(1000)

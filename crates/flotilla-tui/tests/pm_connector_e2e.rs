@@ -21,10 +21,9 @@ use flotilla_manifest::{
 };
 use flotilla_protocol::{HostName, IssueSource, NodeId, Relationship, Subject, SubjectKind};
 use flotilla_resources::{
-    change_request_record_name, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus,
-    ChangeRequestSubjectHistory, Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyPhase, ConvoySpec, ConvoyStatus,
-    DeclaredSubject, InputMeta, Observation, ObservedChangeRequestState, Project, ProjectSpec, ResourceObject, WatchEvent,
-    ENSURED_FROM_ANNOTATION,
+    ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy,
+    ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyPhase, ConvoySpec, ConvoyStatus, DeclaredSubject, InputMeta, Observation,
+    ObservedChangeRequestState, Project, ProjectSpec, ResourceObject, WatchEvent, ENSURED_FROM_ANNOTATION,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_tui::pm_connect::Connector;
@@ -74,7 +73,10 @@ async fn wait(label: &str, mut condition: impl FnMut() -> bool) {
     .unwrap_or_else(|_| panic!("catalog did not converge: {label}"));
 }
 fn cr_name() -> String {
-    change_request_record_name("github.com", "org/platform", 42)
+    flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("github.com", "org/platform", 42, &[]).expect("change request address"),
+    )
+    .expect("record name")
 }
 fn meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()

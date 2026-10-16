@@ -11,8 +11,8 @@ use flotilla_protocol::{IssueSource, ReferenceContext, Relationship, Subject as 
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     convoy_subject_rows, merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestSpec,
-    ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy, InputMeta, ObservedChangeRequestState, ObservedChecks, ResourceError,
-    ResourceProvenance,
+    ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks,
+    ResourceError, ResourceProvenance,
 };
 use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend};
 #[cfg(test)]
@@ -163,6 +163,7 @@ impl ChangeRequestRefresher {
 
     async fn reconcile_convoy_demands(&self, namespace: &str, demands: &mut HashMap<ChangeRequestRef, uuid::Uuid>) -> Result<(), String> {
         let convoys = self.inner.backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?;
+        let forges = self.forges(namespace).await?;
         let mut wanted = HashSet::new();
         let mut owners = HashMap::new();
         for copy in convoys.items {
@@ -173,7 +174,15 @@ impl ChangeRequestRefresher {
                 let Some(subject) = row.subject.leaf().ok().and_then(|address| ChangeRequestRef::from_address(namespace, &address)) else {
                     continue;
                 };
-                let subject = subject.normalized();
+                // Debug, not warn: this re-runs on every convoy, project and
+                // Forge change, so an undeclared host would repeat each pass.
+                let subject = match subject.clone().normalized(&forges) {
+                    Ok(subject) => subject,
+                    Err(error) => {
+                        tracing::debug!(convoy = %copy.object.metadata.name, service = %subject.service, scope = %subject.scope, number = subject.number, %error, "convoy change request subject has no address; not observed");
+                        continue;
+                    }
+                };
                 let source = IssueSource { service: subject.service.clone(), scope: subject.scope.clone() };
                 let owned = if let Some(owned) = owners.get(&source) {
                     *owned
@@ -221,7 +230,24 @@ impl ChangeRequestRefresher {
     }
 
     pub async fn observation_error(&self, subject: &ChangeRequestRef) -> Option<ObservationError> {
-        self.inner.observation_errors.lock().await.get(subject).cloned()
+        let subject = match self.normalized(subject.clone()).await {
+            Ok(subject) => subject,
+            Err(error) => return Some(ObservationError::Failed(error)),
+        };
+        self.inner.observation_errors.lock().await.get(&subject).cloned()
+    }
+
+    /// The namespace's declared Forges, which resolve a host-spelled service.
+    async fn forges(&self, namespace: &str) -> Result<Vec<ForgeSpec>, String> {
+        let forges = self.inner.backend.definitions::<Forge>(namespace).list().await.map_err(|error| error.to_string())?;
+        Ok(forges.into_iter().map(|forge| forge.spec).collect())
+    }
+
+    /// A subject respelled through its address, so every spelling of one
+    /// change request is one subject with one record name.
+    async fn normalized(&self, subject: ChangeRequestRef) -> Result<ChangeRequestRef, String> {
+        let forges = self.forges(&subject.namespace).await?;
+        subject.normalized(&forges)
     }
 
     /// Refresh a claim-time observation even before Landing has armed its
@@ -231,7 +257,8 @@ impl ChangeRequestRefresher {
     }
 
     async fn refresh_once_with_creation(&self, subject: &ChangeRequestRef, create_missing: bool) -> Result<(), ObservationError> {
-        let subject = &subject.clone().normalized();
+        let subject = &self.normalized(subject.clone()).await.map_err(ObservationError::Failed)?;
+        let record_name = subject.record_name().map_err(ObservationError::Failed)?;
         let lock = self.subject_lock(subject).await;
         let _guard = lock.lock().await;
         // Ownership and publication use the resource store's string errors, not
@@ -265,7 +292,7 @@ impl ChangeRequestRefresher {
                 return Err(error);
             }
         };
-        self.publish(subject, &subject.record_name(), status, true, false, create_missing).await.map_err(ObservationError::Failed)
+        self.publish(subject, &record_name, status, true, false, create_missing).await.map_err(ObservationError::Failed)
     }
 
     pub async fn demand(
@@ -274,10 +301,10 @@ impl ChangeRequestRefresher {
         subject: ChangeRequestRef,
         freshness: Option<DateTime<Utc>>,
     ) -> Result<(), String> {
-        let subject = subject.normalized();
+        let subject = self.normalized(subject).await?;
         let lock = self.subject_lock(&subject).await;
         let _guard = lock.lock().await;
-        let name = subject.record_name();
+        let name = subject.record_name()?;
         match self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace).get(&name).await {
             Ok(_) => {}
             Err(ResourceError::NotFound { .. }) => self.ensure_record(&subject, &name).await?,
@@ -325,7 +352,14 @@ impl ChangeRequestRefresher {
             }
             self.inner.observation_errors.lock().await.remove(&subject);
             let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
-            let result = match records.get(&subject.record_name()).await {
+            let name = match subject.record_name() {
+                Ok(name) => name,
+                Err(error) => {
+                    tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "undemanded change request names no record; not collected");
+                    continue;
+                }
+            };
+            let result = match records.get(&name).await {
                 Ok(record) if retain_change_request(&record) => {
                     self.start_retained(subject.clone()).await;
                     continue;
@@ -419,15 +453,19 @@ impl ChangeRequestRefresher {
         let namespaces = self.inner.backend.local_namespaces::<ChangeRequest>().await.map_err(|error| error.to_string())?;
         for namespace in namespaces {
             let records = self.inner.backend.using::<ChangeRequest>(&namespace);
+            let forges = self.forges(&namespace).await?;
             for record in records.list().await.map_err(|error| error.to_string())?.items {
                 if retain_change_request(&record) {
-                    self.start_retained(ChangeRequestRef {
+                    let subject = ChangeRequestRef {
                         namespace: namespace.clone(),
                         service: record.spec.service.clone(),
                         scope: record.spec.scope.clone(),
                         number: record.spec.number,
-                    })
-                    .await;
+                    };
+                    match subject.normalized(&forges) {
+                        Ok(subject) => self.start_retained(subject).await,
+                        Err(error) => tracing::warn!(record = %record.metadata.name, %error, "retained change request has no address"),
+                    }
                 } else {
                     records.delete(&record.metadata.name).await.map_err(|error| error.to_string())?;
                 }
@@ -520,9 +558,10 @@ impl ChangeRequestRefresher {
         if history.is_empty() {
             return Ok(());
         }
+        let name = subject.record_name()?;
         let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
         loop {
-            let current = match records.get(&subject.record_name()).await {
+            let current = match records.get(&name).await {
                 Ok(current) => current,
                 Err(ResourceError::NotFound { .. }) => {
                     // The observing authority may be remote. Keep a local copy
@@ -531,17 +570,17 @@ impl ChangeRequestRefresher {
                         .inner
                         .backend
                         .including_replicas::<ChangeRequest>(&subject.namespace)
-                        .get(&subject.record_name())
+                        .get(&name)
                         .await
                         .map_err(|error| error.to_string())?
                         .object;
                     let mut spec = observed.spec.clone();
                     merge_change_request_history(&mut spec.subject_of, &history);
-                    match records.create(&InputMeta::builder().name(subject.record_name()).build(), &spec).await {
+                    match records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await {
                         Ok(created) => {
                             if let Some(status) = observed.status {
                                 records
-                                    .update_status(&subject.record_name(), &created.metadata.resource_version, &status)
+                                    .update_status(&name, &created.metadata.resource_version, &status)
                                     .await
                                     .map_err(|error| error.to_string())?;
                             }
@@ -595,7 +634,13 @@ impl ChangeRequestRefresher {
     }
 
     async fn refresh_loop(&self, subject: ChangeRequestRef) {
-        let record_name = subject.record_name();
+        let record_name = match subject.record_name() {
+            Ok(name) => name,
+            Err(error) => {
+                tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "change request subject has no record");
+                return;
+            }
+        };
         loop {
             match self.collect_retained_if_terminal(&subject).await {
                 Ok(true) => return,
@@ -691,7 +736,7 @@ impl ChangeRequestRefresher {
             if owner.to_string() != self.inner.authority {
                 return Ok(false);
             }
-            let name = subject.record_name();
+            let name = subject.record_name()?;
             let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
             if create_missing {
                 self.get_or_create_record(subject, &name).await?;
@@ -719,7 +764,7 @@ impl ChangeRequestRefresher {
                 }
             }
         }
-        let name = subject.record_name();
+        let name = subject.record_name()?;
         let records = self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace);
         // A former owner can still hold its local copy after another host has
         // claimed the subject. Prefer the freshest observation across copies;
@@ -892,10 +937,11 @@ mod tests {
         recipe::FlotillaRecipes,
         wire::{MetadataTarget, MetadataValue},
     };
-    use flotilla_resources::{change_request_record_name, ChangeRequestReviewObservation, Observation, ObservedMergeability};
+    use flotilla_resources::{ChangeRequestReviewObservation, Observation, ObservedMergeability};
     use flotilla_store::{ResourceBackend, TypedResolver};
 
     use super::*;
+    use crate::testkits::cr_name;
     use flotilla_change_request::observation::parse_gh_observation;
 
     struct UnavailableSource;
@@ -1004,7 +1050,7 @@ mod tests {
             let remote_records = remote.using::<ChangeRequest>("ops");
             let record = remote_records
                 .create(
-                    &InputMeta::builder().name(subject.record_name()).build(),
+                    &InputMeta::builder().name(subject.record_name().expect("record name")).build(),
                     &ChangeRequestSpec::builder()
                         .service(subject.service.clone())
                         .scope(subject.scope.clone())
@@ -1016,7 +1062,7 @@ mod tests {
                 .expect("remote record");
             let observed = parse_gh_observation(r#"{"state":"OPEN"}"#, Utc::now()).expect("observation");
             remote_records
-                .update_status(&subject.record_name(), &record.metadata.resource_version, &observed)
+                .update_status(&subject.record_name().expect("record name"), &record.metadata.resource_version, &observed)
                 .await
                 .expect("remote observation");
             backend
@@ -1055,7 +1101,7 @@ mod tests {
             let demand = uuid::Uuid::new_v4();
             refresher.demand(demand, subject.clone(), None).await.expect("demand");
             let records = backend.using::<ChangeRequest>("ops");
-            let record = records.get(&subject.record_name()).await.expect("local history copy");
+            let record = records.get(&subject.record_name().expect("record name")).await.expect("local history copy");
             assert_eq!(record.spec.observing_authority, "remote");
             assert_eq!(record.spec.subject_of.len(), 1);
             assert_eq!(record.spec.subject_of[0].origin, "kiwi");
@@ -1063,19 +1109,19 @@ mod tests {
             let second = uuid::Uuid::new_v4();
             refresher.demand(second, subject.clone(), None).await.expect("second demand");
             assert_eq!(
-                records.get(&subject.record_name()).await.expect("history unchanged").metadata.resource_version,
+                records.get(&subject.record_name().expect("record name")).await.expect("history unchanged").metadata.resource_version,
                 record.metadata.resource_version
             );
             backend.using::<Convoy>("ops").delete("producer").await.expect("delete producer");
             refresher.release(demand).await;
             if via_replica {
                 refresher.release(second).await;
-                assert!(records.get(&subject.record_name()).await.is_ok());
-                let current = remote_records.get(&subject.record_name()).await.expect("remote current");
+                assert!(records.get(&subject.record_name().expect("record name")).await.is_ok());
+                let current = remote_records.get(&subject.record_name().expect("record name")).await.expect("remote current");
                 let mut terminal = current.status.expect("remote status");
                 terminal.state = Observation::known(ObservedChangeRequestState::Merged, Utc::now() + chrono::Duration::seconds(1));
                 remote_records
-                    .update_status(&subject.record_name(), &current.metadata.resource_version, &terminal)
+                    .update_status(&subject.record_name().expect("record name"), &current.metadata.resource_version, &terminal)
                     .await
                     .expect("remote merge");
                 backend
@@ -1084,14 +1130,14 @@ mod tests {
                     .await
                     .expect("terminal replica");
                 tokio::time::advance(RETAINED_REFRESH_INTERVAL).await;
-                wait_for_request_state(&records, &subject.record_name(), None).await;
+                wait_for_request_state(&records, &subject.record_name().expect("record name"), None).await;
                 assert!(!refresher.inner.active.lock().await.contains_key(&subject));
                 continue;
             }
             let mut terminal = record.status.expect("status");
             terminal.state = Observation::known(ObservedChangeRequestState::Closed, Utc::now());
             records
-                .update_status(&subject.record_name(), &record.metadata.resource_version, &terminal)
+                .update_status(&subject.record_name().expect("record name"), &record.metadata.resource_version, &terminal)
                 .await
                 .expect("terminal observation");
             refresher.release(second).await;
@@ -1221,7 +1267,7 @@ mod tests {
             refresher.demand(demand, subject.clone(), None).await.expect("demand");
             refresher.refresh_once(&subject).await.expect("initial observation");
             let records = backend.using::<ChangeRequest>("ops");
-            let record = records.get(&subject.record_name()).await.expect("request");
+            let record = records.get(&subject.record_name().expect("record name")).await.expect("request");
             assert_eq!(record.spec.subject_of.len(), 1);
             assert_eq!(record.spec.subject_of[0].convoy, "producer");
             assert_eq!(record.spec.subject_of[0].origin, "kiwi");
@@ -1229,7 +1275,7 @@ mod tests {
             convoys.delete("producer").await.expect("delete convoy");
             let next_observation = source.1.load(Ordering::SeqCst) + 1;
             refresher.release(demand).await;
-            assert!(records.get(&subject.record_name()).await.is_ok());
+            assert!(records.get(&subject.record_name().expect("record name")).await.is_ok());
             assert_eq!(refresher.active_demands().await, 0);
             wait_for_observation(&source, next_observation).await;
             source.0.lock().await.state = Observation::known(ObservedChangeRequestState::Draft, observed_at);
@@ -1237,19 +1283,19 @@ mod tests {
             refresher.release(uuid::Uuid::new_v4()).await;
             tokio::time::advance(Duration::from_secs(14 * 60)).await;
             assert_eq!(
-                records.get(&subject.record_name()).await.expect("slow poll").status.expect("status").state.value,
+                records.get(&subject.record_name().expect("record name")).await.expect("slow poll").status.expect("status").state.value,
                 Some(ObservedChangeRequestState::Open)
             );
             let resumed = uuid::Uuid::new_v4();
             refresher.demand(resumed, subject.clone(), None).await.expect("reactivate ordinary demand");
-            wait_for_request_state(&records, &subject.record_name(), Some(ObservedChangeRequestState::Draft)).await;
+            wait_for_request_state(&records, &subject.record_name().expect("record name"), Some(ObservedChangeRequestState::Draft)).await;
             assert_eq!(
-                records.get(&subject.record_name()).await.expect("reactivated").status.expect("status").state.value,
+                records.get(&subject.record_name().expect("record name")).await.expect("reactivated").status.expect("status").state.value,
                 Some(ObservedChangeRequestState::Draft)
             );
             refresher.release(resumed).await;
             let observations = SubjectCatalogInput {
-                change_requests: vec![records.get(&subject.record_name()).await.expect("retained")],
+                change_requests: vec![records.get(&subject.record_name().expect("record name")).await.expect("retained")],
                 ..Default::default()
             };
             let catalog = project_catalog(
@@ -1283,10 +1329,10 @@ mod tests {
                 ChangeRequestRefreshCadence::default(),
             );
             recovered.garbage_collect_orphans().await.expect("recover");
-            assert!(records.get(&subject.record_name()).await.is_ok());
+            assert!(records.get(&subject.record_name().expect("record name")).await.is_ok());
             source.0.lock().await.state = Observation::known(terminal, observed_at + chrono::Duration::seconds(1));
-            wait_for_request_state(&records, &subject.record_name(), None).await;
-            assert!(matches!(records.get(&subject.record_name()).await, Err(ResourceError::NotFound { .. })));
+            wait_for_request_state(&records, &subject.record_name().expect("record name"), None).await;
+            assert!(matches!(records.get(&subject.record_name().expect("record name")).await, Err(ResourceError::NotFound { .. })));
             let observations = SubjectCatalogInput { change_requests: records.list().await.expect("list").items, ..Default::default() };
             let catalog = project_catalog(
                 &CatalogInput {
@@ -1377,7 +1423,7 @@ mod tests {
         refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.expect("demand");
         wait_for_calls(&calls, 1).await;
         let records = backend.using::<ChangeRequest>("flotilla");
-        let first = records.get(&subject.record_name()).await.expect("first observation");
+        let first = records.get(&subject.record_name().expect("record name")).await.expect("first observation");
 
         const IDENTICAL_POLLS: usize = 4;
         for poll in 0..IDENTICAL_POLLS {
@@ -1385,7 +1431,7 @@ mod tests {
             wait_for_calls(&calls, poll + 2).await;
         }
 
-        let after = records.get(&subject.record_name()).await.expect("observation after identical polls");
+        let after = records.get(&subject.record_name().expect("record name")).await.expect("observation after identical polls");
         assert_eq!(calls.load(Ordering::SeqCst), IDENTICAL_POLLS + 1);
         assert_eq!(after.metadata.resource_version, first.metadata.resource_version, "identical observed values must produce no writes");
         assert_eq!(after.status, first.status, "poll timestamps are not persisted unless an observed value changes");
@@ -1455,7 +1501,7 @@ mod tests {
         refresher.refresh_hint(&hint).await.expect("hint");
         assert_eq!(calls.load(Ordering::SeqCst), before + 2, "both namespaces refresh once");
 
-        let name = change_request_record_name("github.com", "flotilla-org/flotilla", 2051);
+        let name = cr_name("github.com", "flotilla-org/flotilla", 2051);
         backend.using::<ChangeRequest>("ops").delete(&name).await.expect("delete record during live demand");
         refresher.refresh_hint(&hint).await.expect("hint after record deletion");
         assert!(
@@ -1485,11 +1531,11 @@ mod tests {
         refresher.demand(uuid::Uuid::new_v4(), subject.clone(), Some(Utc::now())).await.expect("freshness demand");
         wait_for_calls(&calls, 1).await;
         let records = backend.using::<ChangeRequest>("flotilla");
-        let first = records.get(&subject.record_name()).await.expect("first observation");
+        let first = records.get(&subject.record_name().expect("record name")).await.expect("first observation");
 
         tokio::time::advance(Duration::from_secs(10)).await;
         wait_for_calls(&calls, 2).await;
-        let heartbeat = records.get(&subject.record_name()).await.expect("heartbeat observation");
+        let heartbeat = records.get(&subject.record_name().expect("record name")).await.expect("heartbeat observation");
 
         assert_ne!(heartbeat.metadata.resource_version, first.metadata.resource_version);
         assert!(heartbeat.status.expect("heartbeat status").state.observed_at > first.status.expect("first status").state.observed_at);

@@ -476,8 +476,12 @@ pub fn convoy_sanctions_checkout_reclaim(convoy: &crate::ResourceObject<Convoy>)
 pub const FORCE_TEARDOWN_ANNOTATION: &str = "flotilla.work/force-teardown";
 pub const CONVOY_TEARDOWN_FINALIZER: &str = "flotilla.work/convoy-teardown";
 
-/// Canonical resource name for a convoy's explicitly bound change request.
-pub fn bound_change_request_record_name(convoy: &crate::ResourceObject<Convoy>) -> Result<Option<String>, String> {
+/// The address of a convoy's explicitly bound change request, resolving its
+/// repository's remote through `forges`.
+pub fn bound_change_request_address(
+    convoy: &crate::ResourceObject<Convoy>,
+    forges: &[crate::ForgeSpec],
+) -> Result<Option<flotilla_address::Address>, String> {
     let Some(bound) = &convoy.spec.change_request else { return Ok(None) };
     let repository = convoy
         .spec
@@ -485,10 +489,8 @@ pub fn bound_change_request_record_name(convoy: &crate::ResourceObject<Convoy>) 
         .iter()
         .find(|repository| repository.repo_ref == bound.repository_ref)
         .ok_or_else(|| format!("bound change request repository {} is absent from convoy", bound.repository_ref))?;
-    let LeafAddress::ChangeRequest { service, scope, number } = change_request_address(&repository.url, &bound.id)? else {
-        unreachable!("change_request_address always returns a change-request address")
-    };
-    Ok(Some(crate::change_request_record_name(&service, &scope, number)))
+    let number = bound.id.parse::<u64>().map_err(|_| format!("change request id `{}` is not a numeric forge number", bound.id))?;
+    crate::address::remote_change_request_address(&repository.url, number, forges).map(Some)
 }
 
 /// Select the authoritative child observation for each object name.
@@ -636,8 +638,7 @@ pub fn instantiate_turn_delivery(
                     crate::ArtifactSubjectBinding::ChangeRequestHead => change_requests
                         .iter()
                         .filter_map(|address| {
-                            let LeafAddress::ChangeRequest { service, scope, number } = address else { return None };
-                            let name = crate::change_request_record_name(service, scope, *number);
+                            let name = crate::address::leaf_record_name(address, forges).ok()?;
                             let subject = observed_change_requests.get(&name)?.status.as_ref()?.head_sha.value.clone()?;
                             Some(LeafAddress::Artifact {
                                 convoy: convoy.metadata.name.clone(),

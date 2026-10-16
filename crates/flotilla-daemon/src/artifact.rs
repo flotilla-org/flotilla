@@ -13,7 +13,7 @@ use chrono::{Duration, Utc};
 use flotilla_core::in_process::BriefArtifactWriter;
 use flotilla_protocol::CallerCrew;
 use flotilla_resources::{
-    artifact_record_name, Artifact, ArtifactSpec, Convoy, InputMeta, OwnerReference, Resource, ResourceError, ResourceObject,
+    address::artifact_slot_record_name, Artifact, ArtifactSpec, Convoy, InputMeta, OwnerReference, Resource, ResourceError, ResourceObject,
     TerminalSession, TerminalSessionSource,
 };
 use flotilla_store::ResourceBackend;
@@ -89,7 +89,7 @@ impl BriefArtifactWriter for SystemBriefArtifactWriter {
         charter_commit: Option<&str>,
     ) -> Result<String, String> {
         let digest = self.blobs.put_with_media_type(content, "text/markdown").await?;
-        let name = artifact_record_name(convoy, role, "brief", subject);
+        let name = artifact_slot_record_name(convoy, role, "brief", subject)?;
         let resolver = self.backend.using::<Artifact>(namespace);
         let prior = match resolver.get(&name).await {
             Ok(prior) => Some(prior),
@@ -205,7 +205,7 @@ impl ArtifactService<'_> {
             ArtifactBody::Bytes(bytes) => (self.blobs.put_with_media_type(bytes, &input.media_type).await?, bytes.len() as u64),
             ArtifactBody::File(path) => self.blobs.put_file_with_media_type(path, &input.media_type).await?,
         };
-        let name = artifact_record_name(&caller.convoy, &producer, &input.kind, &input.subject);
+        let name = artifact_slot_record_name(&caller.convoy, &producer, &input.kind, &input.subject)?;
         let prior = match self.backend.including_replicas::<Artifact>(self.namespace).get(&name).await {
             Ok(prior) => Some(prior.object),
             Err(ResourceError::NotFound { .. }) => None,
@@ -367,7 +367,12 @@ mod tests {
             writer.put_brief(namespace, convoy, "coder", convoy, body, Some("charter-revision")).await.expect("write admission brief");
         let artifact = backend
             .using::<Artifact>(namespace)
-            .get(&artifact_record_name(convoy, "coder", "brief", convoy))
+            .get(
+                &flotilla_resources::address::record_name(
+                    &flotilla_resources::address::artifact_address(convoy, "coder", "brief", convoy).expect("artifact address"),
+                )
+                .expect("record name"),
+            )
             .await
             .expect("brief envelope");
         assert_eq!(artifact.spec.summary["charter_commit"], "charter-revision");
@@ -550,7 +555,10 @@ mod tests {
 
         expired.subject = "pinned-head".into();
         expired.pinned = true;
-        let pinned_name = artifact_record_name("demo", "coder", "review-round", "pinned-head");
+        let pinned_name = flotilla_resources::address::record_name(
+            &flotilla_resources::address::artifact_address("demo", "coder", "review-round", "pinned-head").expect("artifact address"),
+        )
+        .expect("record name");
         resolver.create(&InputMeta::builder().name(pinned_name).build(), &expired).await.expect("create pinned artifact");
         assert_eq!(service.reap_expired().await.expect("reap pinned").len(), 1);
         assert_eq!(service.list(None, None, None).await.expect("list pinned").len(), 1);

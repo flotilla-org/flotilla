@@ -1,7 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{ApiPaths, Observation, ReplicationClass, Resource, ResourceError, StatusPatch};
+use crate::{
+    address::{stored_issue_address, Address},
+    ApiPaths, ForgeSpec, Observation, ReplicationClass, Resource, ResourceError, StatusPatch,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Issue;
@@ -29,6 +32,14 @@ pub struct IssueSpec {
     pub scope: String,
     pub number: u64,
     pub observing_authority: String,
+}
+
+impl IssueSpec {
+    /// The issue this record observes. A host-spelled service resolves only
+    /// through the Forge in `forges` that declares it.
+    pub fn address(&self, forges: &[ForgeSpec]) -> Result<Address, String> {
+        stored_issue_address(&self.service, &self.scope, self.number, forges)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,14 +72,6 @@ impl StatusPatch<IssueStatus> for IssueStatusPatch {
             Self::Observed(observation) => *status = observation.clone(),
         }
     }
-}
-
-pub fn issue_record_name(service: &str, scope: &str, number: u64) -> String {
-    fn hex(value: &str) -> String {
-        value.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-    let (service, scope) = crate::address::canonical_stored_spelling(service, scope);
-    format!("issue-{}-{}-{number}", hex(&service), hex(&scope))
 }
 
 #[cfg(test)]

@@ -2128,7 +2128,11 @@ fn duplicate_request_subjects_have_one_observation(tc: hegel::TestCase) {
         let known = tc.draw(gs::booleans());
         let canonical = index == 0 && tc.draw(gs::booleans());
         let name = if canonical {
-            flotilla_resources::change_request_record_name("github", "org/repo", number)
+            flotilla_resources::address::record_name(
+                &flotilla_resources::address::stored_change_request_address("github", "org/repo", number, &[])
+                    .expect("change request address"),
+            )
+            .expect("record name")
         } else {
             format!("duplicate-{index}")
         };

@@ -3,9 +3,9 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
 
 use crate::{
-    artifact_record_name, change_request_record_name, evaluate_leaf, issue_record_name, template_leaf, usage_record_name, Artifact,
-    ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Convoy, ConvoyLeafSubject, Issue, IssueLeafSubject, LeafSubject,
-    MessageInbox, Resource, ResourceError, ResourceObject, ThreeValue, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WorkLeafSubject,
+    address::leaf_record_name, evaluate_leaf, template_leaf, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject,
+    Convoy, ConvoyLeafSubject, Forge, Issue, IssueLeafSubject, LeafSubject, MessageInbox, Resource, ResourceError, ResourceObject,
+    ThreeValue, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WorkLeafSubject,
 };
 
 impl MessageInbox {
@@ -33,8 +33,8 @@ impl MessageInbox {
                 });
                 evaluate(subject.as_ref().map(|subject| subject as &dyn LeafSubject))
             }
-            LeafAddress::ChangeRequest { service, scope, number } => {
-                let record = self.condition_record::<ChangeRequest>(&change_request_record_name(service, scope, *number)).await?;
+            LeafAddress::ChangeRequest { .. } => {
+                let record = self.leaf_record::<ChangeRequest>(&condition.address).await?;
                 let subject = record.as_ref().map(|change_request| ChangeRequestLeafSubject {
                     change_request,
                     now,
@@ -42,19 +42,35 @@ impl MessageInbox {
                 });
                 evaluate(subject.as_ref().map(|subject| subject as &dyn LeafSubject))
             }
-            LeafAddress::Issue { service, scope, number } => {
-                let record = self.condition_record::<Issue>(&issue_record_name(service, scope, *number)).await?;
+            LeafAddress::Issue { .. } => {
+                let record = self.leaf_record::<Issue>(&condition.address).await?;
                 let subject = record.as_ref().map(|issue| IssueLeafSubject { issue, now, stale_after: self.issue_stale_after });
                 evaluate(subject.as_ref().map(|subject| subject as &dyn LeafSubject))
             }
-            LeafAddress::Usage { provider, account } => {
-                let record = self.condition_record::<Usage>(&usage_record_name(provider, account)).await?;
+            LeafAddress::Usage { .. } => {
+                let record = self.leaf_record::<Usage>(&condition.address).await?;
                 evaluate(record.as_ref().map(UsageLeafSubject).as_ref().map(|subject| subject as &dyn LeafSubject))
             }
-            LeafAddress::Artifact { convoy, producer, kind, subject } => {
-                let record = self.condition_record::<Artifact>(&artifact_record_name(convoy, producer, kind, subject)).await?;
+            LeafAddress::Artifact { .. } => {
+                let record = self.leaf_record::<Artifact>(&condition.address).await?;
                 evaluate(record.as_ref().map(ArtifactLeafSubject).as_ref().map(|subject| subject as &dyn LeafSubject))
             }
+        }
+    }
+
+    /// The record a leaf's subject is read from, or `None` when it is absent
+    /// or the leaf names no record: a service spelled by a host no Forge in
+    /// this namespace declares has no record.
+    async fn leaf_record<R: Resource>(&self, leaf: &LeafAddress) -> Result<Option<ResourceObject<R>>, ResourceError> {
+        let forges = match leaf {
+            LeafAddress::ChangeRequest { .. } | LeafAddress::Issue { .. } => {
+                self.backend.definitions::<Forge>(&self.namespace).list().await?.into_iter().map(|forge| forge.spec).collect()
+            }
+            _ => Vec::new(),
+        };
+        match leaf_record_name(leaf, &forges) {
+            Ok(name) => self.condition_record(&name).await,
+            Err(_) => Ok(None),
         }
     }
 
@@ -128,7 +144,7 @@ impl MessageInbox {
     ) -> Result<ThreeValue, ResourceError> {
         if let Some(crate::MessageReference::ChangeRequest { service, scope, number, revision }) = &message.spec.subject {
             if condition.address == (LeafAddress::ChangeRequest { service: service.clone(), scope: scope.clone(), number: *number }) {
-                let record = self.condition_record::<ChangeRequest>(&change_request_record_name(service, scope, *number)).await?;
+                let record = self.leaf_record::<ChangeRequest>(&condition.address).await?;
                 let subject = record.as_ref().map(|change_request| ChangeRequestLeafSubject {
                     change_request,
                     now,
@@ -169,7 +185,8 @@ impl MessageInbox {
         use crate::MessageReference;
         match reference {
             Some(MessageReference::ChangeRequest { service, scope, number, revision }) => {
-                let record = self.condition_record::<ChangeRequest>(&change_request_record_name(service, scope, *number)).await?;
+                let leaf = LeafAddress::ChangeRequest { service: service.clone(), scope: scope.clone(), number: *number };
+                let record = self.leaf_record::<ChangeRequest>(&leaf).await?;
                 let status = record
                     .as_ref()
                     .and_then(|record| record.status.as_ref())
@@ -182,7 +199,8 @@ impl MessageInbox {
                 Ok(head == revision && !(terminal && condition.is_some_and(|leaf| leaf.field_path != ".state")))
             }
             Some(MessageReference::Issue { service, scope, number, revision }) => {
-                let record = self.condition_record::<Issue>(&issue_record_name(service, scope, *number)).await?;
+                let leaf = LeafAddress::Issue { service: service.clone(), scope: scope.clone(), number: *number };
+                let record = self.leaf_record::<Issue>(&leaf).await?;
                 Ok(record.and_then(|record| record.status).and_then(|status| status.updated_at.value).map(|at| at.to_rfc3339()).as_ref()
                     == Some(revision))
             }

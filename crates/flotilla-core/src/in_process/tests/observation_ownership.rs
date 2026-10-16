@@ -183,7 +183,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         let record = daemon
             .resource_backend()
             .including_replicas::<flotilla_resources::ChangeRequest>("flotilla")
-            .get(&subject.record_name())
+            .get(&subject.record_name().expect("record name"))
             .await
             .unwrap();
         assert_eq!(record.object.status.unwrap().title.value.as_deref(), Some("Shared PR"));

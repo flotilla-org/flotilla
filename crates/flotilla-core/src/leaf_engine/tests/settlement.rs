@@ -75,7 +75,7 @@ async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
     );
     assert_eq!(convoys.get("wake").await.expect("open convoy").status.expect("status").phase, ConvoyPhase::Landing);
     let change_requests = backend.using::<ChangeRequest>("flotilla");
-    let record_name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1364);
+    let record_name = cr_name("github.com", "flotilla-org/flotilla", 1364);
     let change_request = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Ok(record) = change_requests.get(&record_name).await {

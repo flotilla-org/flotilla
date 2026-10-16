@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::LeafAddress;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::{ApiPaths, ReplicationClass, Resource, ResourceError, StatusPatch};
 
@@ -85,17 +84,6 @@ pub struct ArtifactSpec {
     #[builder(default)]
     #[serde(default)]
     pub pinned: bool,
-}
-
-/// Hash the complete key so punctuation and long refs cannot escape resource
-/// naming rules or collide after truncation.
-pub fn artifact_record_name(convoy: &str, producer: &str, kind: &str, subject: &str) -> String {
-    let mut hash = Sha256::new();
-    for component in [convoy, producer, kind, subject] {
-        hash.update((component.len() as u64).to_be_bytes());
-        hash.update(component.as_bytes());
-    }
-    format!("artifact-{:x}", hash.finalize())
 }
 
 #[cfg(test)]

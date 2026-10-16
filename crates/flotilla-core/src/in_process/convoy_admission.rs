@@ -5,6 +5,7 @@ use flotilla_discovery_api::{provider_config::ProviderConfigView, EnvironmentBag
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
 use flotilla_protocol::ConvoyNaming;
+use flotilla_resources::address::{record_name, remote_change_request_address};
 use flotilla_store::{DockerImageSourceStoreExt, ResolvedCascadeStoreExt, StoreQuery};
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
@@ -438,14 +439,21 @@ impl ConvoyAdmission {
             .query_declared::<Repository>(namespace, &StoreQuery::names(repository_keys.iter().map(ToString::to_string), true))
             .await
             .map_err(|error| error.to_string())?;
+        // One merged read: a remote's host resolves through its declared Forge.
+        let forges =
+            self.backend.definitions::<Forge>(namespace).list_selected(StoreQuery::default()).await.map_err(|error| error.to_string())?;
+        let forge_specs = forges.iter().map(|forge| forge.spec.clone()).collect::<Vec<_>>();
         let mut names = BTreeSet::new();
         if let Ok(number) = id.parse::<u64>() {
             for source in &repositories.items {
-                if let Some(LeafAddress::ChangeRequest { service, scope, .. }) =
-                    source.object.spec.live_remote().and_then(|remote| change_request_address(remote, id).ok())
-                {
-                    names.insert(change_request_record_name(&service, &scope, number));
-                }
+                names.extend(
+                    source
+                        .object
+                        .spec
+                        .live_remote()
+                        .and_then(|remote| remote_change_request_address(remote, number, &forge_specs).ok())
+                        .and_then(|address| record_name(&address)),
+                );
             }
         }
         let observations = self
@@ -456,6 +464,7 @@ impl ConvoyAdmission {
         let mut snapshot = flotilla_store::RequestSnapshot::new(&self.backend, namespace)?;
         snapshot.insert::<Repository>(repositories)?;
         snapshot.insert::<ResourceChangeRequest>(observations)?;
+        snapshot.insert_definitions::<Forge>(forges)?;
         Ok(snapshot.finish())
     }
 
@@ -469,6 +478,8 @@ impl ConvoyAdmission {
         let Ok(number) = change_request_id.parse::<u64>() else { return Ok(None) };
         let repositories = reads.including_replicas::<Repository>(namespace);
         let change_requests = reads.including_replicas::<ResourceChangeRequest>(namespace);
+        let forges = reads.definitions::<Forge>(namespace).list().await.map_err(|error| error.to_string())?;
+        let forges = forges.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
 
         for repository_key in repository_keys {
             let repository = match repositories.get(&repository_key.to_string()).await {
@@ -479,11 +490,12 @@ impl ConvoyAdmission {
             let Some(live_remote) = repository.object.spec.live_remote() else {
                 continue;
             };
-            let LeafAddress::ChangeRequest { service, scope, .. } = change_request_address(live_remote, change_request_id)? else {
-                unreachable!("change_request_address always returns a change-request address")
+            // A remote no Forge declares names no change request record.
+            let Some(name) = remote_change_request_address(live_remote, number, &forges).ok().and_then(|address| record_name(&address))
+            else {
+                continue;
             };
-            let record_name = change_request_record_name(&service, &scope, number);
-            let observation = match change_requests.get(&record_name).await {
+            let observation = match change_requests.get(&name).await {
                 Ok(observation) => observation,
                 Err(ResourceError::NotFound { .. }) => continue,
                 Err(error) => return Err(error.to_string()),
@@ -5279,6 +5291,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::testkits::cr_name;
     use crate::testkits::discovery::fake_discovery;
     use crate::testkits::discovery::FakeChangeRequest;
     use flotilla_protocol::ChangeRequest;
@@ -5334,10 +5347,7 @@ mod tests {
             fixture
                 .backend
                 .using::<ResourceChangeRequest>("flotilla")
-                .create(
-                    &InputMeta::builder().name(change_request_record_name(&record.service, &record.scope, record.number)).build(),
-                    &record,
-                )
+                .create(&InputMeta::builder().name(cr_name(&record.service, &record.scope, record.number)).build(), &record)
                 .await
                 .unwrap();
             for index in 0..n {

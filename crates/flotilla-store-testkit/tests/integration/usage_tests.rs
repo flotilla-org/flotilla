@@ -84,15 +84,33 @@ mod tests {
 
     #[test]
     fn provider_account_record_names_are_stable_case_insensitive_and_bounded() {
-        let lower = usage_record_name("codex", "user@example.com");
-        assert_eq!(lower, usage_record_name(" CODEX ", " User@Example.COM "));
+        let lower = flotilla_resources::address::record_name(
+            &flotilla_resources::address::Address::usage("codex", "user@example.com").expect("usage address"),
+        )
+        .expect("record name");
+        assert_eq!(
+            lower,
+            flotilla_resources::address::record_name(
+                &flotilla_resources::address::Address::usage(" CODEX ", " User@Example.COM ").expect("usage address")
+            )
+            .expect("record name")
+        );
         assert!(lower.starts_with("usage-"));
         assert_eq!(lower.len(), 60);
     }
 
     #[test]
     fn same_account_at_different_providers_has_distinct_record_names() {
-        assert_ne!(usage_record_name("codex", "user@example.com"), usage_record_name("claude", "user@example.com"));
+        assert_ne!(
+            flotilla_resources::address::record_name(
+                &flotilla_resources::address::Address::usage("codex", "user@example.com").expect("usage address")
+            )
+            .expect("record name"),
+            flotilla_resources::address::record_name(
+                &flotilla_resources::address::Address::usage("claude", "user@example.com").expect("usage address")
+            )
+            .expect("record name")
+        );
     }
 
     #[test]

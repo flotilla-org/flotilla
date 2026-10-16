@@ -1,6 +1,6 @@
 # ChangeRequest identity and convoy history
 
-A ChangeRequest subject is `(service, scope, number)`. Resource names and replica origins are storage addresses, not additional subject identities. Observers write the canonical name from `change_request_record_name`; external records can use other names.
+A ChangeRequest subject is `(service, scope, number)`. Resource names and replica origins are storage addresses, not additional subject identities. Observers write the canonical name, `flotilla_address::record_name` of the subject's address; external records can use other names.
 
 `select_change_requests` is the shared selection policy for the subject catalog, PM connector, and convoy explain. It selects a complete observation by the greatest state observation timestamp, then observing authority, canonical-name preference, namespace/name, and serialized status as a final deterministic tie-break. Missing status ranks below observed status. Local and replicated records follow the same policy. Receiving-host resource versions and synchronization timestamps do not affect selection. Unknown fields remain unknown; losing observations never fill them in. This avoids combining checks or review facts from different heads and prevents resource-list order from determining published facts.
 

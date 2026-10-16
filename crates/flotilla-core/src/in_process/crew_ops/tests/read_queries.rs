@@ -207,7 +207,10 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
 async fn completion_prefers_local_artifact_evidence() {
     let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
     create_vessel(&backend).await;
-    let name = flotilla_resources::artifact_record_name("crew", "coder", "decision-ledger", "crew");
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::artifact_address("crew", "coder", "decision-ledger", "crew").expect("artifact address"),
+    )
+    .expect("record name");
     let local = backend
         .using::<flotilla_resources::Artifact>("flotilla")
         .create(

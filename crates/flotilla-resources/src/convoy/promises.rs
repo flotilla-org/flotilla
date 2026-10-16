@@ -575,6 +575,7 @@ pub fn next_observation(
     convoy: &str,
     change_requests: &BTreeMap<String, crate::ResourceObject<crate::ChangeRequest>>,
     artifacts: &BTreeMap<String, crate::ResourceObject<crate::Artifact>>,
+    forges: &[crate::ForgeSpec],
     now: DateTime<Utc>,
     stale_after: std::time::Duration,
 ) -> Option<super::ConvoyStatusPatch> {
@@ -592,7 +593,7 @@ pub fn next_observation(
                 if let Some(operation) = ledger_submission(promise, convoy, role, artifacts, now) {
                     return Some(patch(vessel, role, operation));
                 }
-                if let Some(operation) = observed_verdict(promise, role, change_requests, artifacts, now, stale_after) {
+                if let Some(operation) = observed_verdict(promise, role, change_requests, artifacts, forges, now, stale_after) {
                     return Some(patch(vessel, role, operation));
                 }
             }
@@ -606,9 +607,9 @@ pub fn next_observation(
     }) {
         if let Some(mut operation) = discovered_submission(status, vessel, role, &subject.subject, now) {
             if let PromiseOperation::Submit { submission, .. } = &mut operation {
-                if let Ok(flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number }) = subject.subject.leaf() {
+                if let Ok(name) = subject.subject.leaf().and_then(|leaf| crate::address::leaf_record_name(&leaf, forges)) {
                     if let Some(commit) = change_requests
-                        .get(&crate::change_request_record_name(&service, &scope, number))
+                        .get(&name)
                         .and_then(|record| record.status.as_ref())
                         .and_then(|status| status.head_sha.value.as_ref())
                     {
@@ -632,7 +633,7 @@ fn ledger_submission(
     if promise.kind != PromiseKind::DecisionLedger || promise.state != PromiseState::Open {
         return None;
     }
-    let name = crate::artifact_record_name(convoy, role, "decision-ledger", convoy);
+    let name = crate::address::artifact_slot_record_name(convoy, role, "decision-ledger", convoy).ok()?;
     let artifact = artifacts.get(&name)?;
     Some(PromiseOperation::Submit {
         id: promise.id.clone(),
@@ -652,6 +653,7 @@ fn observed_verdict(
     role: &str,
     change_requests: &BTreeMap<String, crate::ResourceObject<crate::ChangeRequest>>,
     artifacts: &BTreeMap<String, crate::ResourceObject<crate::Artifact>>,
+    forges: &[crate::ForgeSpec],
     now: DateTime<Utc>,
     stale_after: std::time::Duration,
 ) -> Option<PromiseOperation> {
@@ -678,14 +680,18 @@ fn observed_verdict(
             (true, "artifact", "decision ledger artifact exists")
         }
         PromiseKind::Pr => {
-            let address = match submission.subject().parse::<flotilla_protocol::LeafAddress>() {
-                Ok(flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number }) => (service, scope, number),
-                other => {
-                    tracing::debug!(promise = %promise.id, reference = %submission.subject(), parsed = ?other, "promise submission does not name a PR");
+            let name = match submission.subject().parse::<flotilla_protocol::LeafAddress>() {
+                Ok(leaf @ flotilla_protocol::LeafAddress::ChangeRequest { .. }) => crate::address::leaf_record_name(&leaf, forges),
+                other => Err(format!("parsed as {other:?}")),
+            };
+            let name = match name {
+                Ok(name) => name,
+                Err(error) => {
+                    tracing::debug!(promise = %promise.id, reference = %submission.subject(), %error, "promise submission does not name a PR");
                     return None;
                 }
             };
-            let record = change_requests.get(&crate::change_request_record_name(&address.0, &address.1, address.2))?.status.as_ref()?;
+            let record = change_requests.get(&name)?.status.as_ref()?;
             let observation = &record.state;
             if now.signed_duration_since(observation.observed_at).to_std().is_ok_and(|age| age > stale_after) {
                 return None;
@@ -901,8 +907,16 @@ mod tests {
             super::super::SubjectDiscoverySource::Claim,
             Utc::now(),
         );
-        assert!(next_observation(&status, "convoy", &BTreeMap::new(), &BTreeMap::new(), Utc::now(), std::time::Duration::from_secs(180))
-            .is_none());
+        assert!(next_observation(
+            &status,
+            "convoy",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+            Utc::now(),
+            std::time::Duration::from_secs(180)
+        )
+        .is_none());
     }
     // ADR 0047: missing additive fields decode as an empty promise set.
     #[test]
@@ -995,7 +1009,10 @@ mod tests {
         let mut status = ConvoyStatus::default();
         apply(&mut status, "work", "coder", &submit("feature", 1));
         let now = Utc::now();
-        let name = crate::change_request_record_name("github.com", "org/repo", 1);
+        let name = crate::address::record_name(
+            &crate::address::stored_change_request_address("github.com", "org/repo", 1, &[]).expect("change request address"),
+        )
+        .expect("record name");
         let mut record = crate::ResourceObject::<crate::ChangeRequest> {
             metadata: crate::ObjectMeta {
                 name: name.clone(),
@@ -1033,6 +1050,7 @@ mod tests {
             "coder",
             &BTreeMap::from([(name.clone(), record.clone())]),
             &BTreeMap::new(),
+            &[],
             now,
             std::time::Duration::from_secs(180)
         )
@@ -1043,6 +1061,7 @@ mod tests {
             "coder",
             &BTreeMap::from([(name, record)]),
             &BTreeMap::new(),
+            &[],
             now,
             std::time::Duration::from_secs(180)
         )

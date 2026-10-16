@@ -323,7 +323,11 @@ async fn prless_decision_ledger_claim_accepts_and_settles() {
             .crew_complete_with_disposition_internal(&context, None, None, None)
             .await
             .expect_err("claim without this crew's artifact must be refused");
-        let name = flotilla_resources::artifact_record_name("ledger-claim", producer, "decision-ledger", "ledger-claim");
+        let name = flotilla_resources::address::record_name(
+            &flotilla_resources::address::artifact_address("ledger-claim", producer, "decision-ledger", "ledger-claim")
+                .expect("artifact address"),
+        )
+        .expect("record name");
         backend
             .using::<flotilla_resources::Artifact>("flotilla")
             .create(
@@ -364,7 +368,11 @@ async fn prless_decision_ledger_claim_accepts_and_settles() {
 
     // An accepted claim remains admitted on retry after evidence retention removes its artifact.
     let ledgers = backend.using::<flotilla_resources::Artifact>("flotilla");
-    let name = flotilla_resources::artifact_record_name("ledger-claim", "coder", "decision-ledger", "ledger-claim");
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::artifact_address("ledger-claim", "coder", "decision-ledger", "ledger-claim")
+            .expect("artifact address"),
+    )
+    .expect("record name");
     ledgers.delete(&name).await.expect("artifact retention");
     assert_eq!(
         daemon.crew_complete_with_disposition_internal(&context, None, None, None).await.expect("duplicate claim"),
@@ -379,6 +387,7 @@ async fn prless_decision_ledger_claim_accepts_and_settles() {
         &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
+        &[],
         std::time::Duration::from_secs(30),
         std::time::Duration::from_secs(30),
         Utc::now(),

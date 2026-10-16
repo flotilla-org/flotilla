@@ -6225,7 +6225,10 @@ async fn caller_can_stall_and_complete(daemon: &InProcessDaemon, caller: flotill
     coder.completion_conditions.clear();
     coder.promises.clear();
     convoys.update_status("own", &convoy.metadata.resource_version, &status).await.unwrap();
-    let name = flotilla_resources::artifact_record_name("own", "coder", "decision-ledger", "own");
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::artifact_address("own", "coder", "decision-ledger", "own").expect("artifact address"),
+    )
+    .expect("record name");
     backend
         .using::<flotilla_resources::Artifact>("flotilla")
         .create(
