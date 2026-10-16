@@ -162,6 +162,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
 | `flotilla-daemon` | Runtime supervision, socket server, replication composition and routed transport, peer networking, multi-host command routing |
+| `flotilla-address` | ADR 0066 addresses: typed `kind:value` segments, canonical encoding, forge-kind normalisation, lenient input through a Forge lookup, `record_name`, references and the condition/template grammar; no flotilla dependencies |
 | `flotilla-cbor` | The ADR 0063 CBOR profile over `cbor2`: deterministic writers, safe readers, limits, framing and the conformance corpus; no flotilla dependencies, so sibling repos use it through Git |
 | `flotilla-capability-contract` | Session capability contract: `CredentialCapability`, `SessionCapabilitySource`, endpoint and credential-card helpers; no flotilla dependencies |
 | `flotilla-credentials` | Host-local credential minting/delivery, agent homes and skills, private vessel configuration composition |

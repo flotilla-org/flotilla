@@ -1099,6 +1099,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-address"
+version = "0.1.0"
+dependencies = [
+ "generic-array",
+ "hegeltest",
+ "memchr",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "sha2",
+ "smallvec",
+ "syn 2.0.117",
+ "zeroize",
+]
+
+[[package]]
 name = "flotilla-agent"
 version = "0.1.0"
 dependencies = [
