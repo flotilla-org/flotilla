@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_change_request::observation::ChangeRequestObservationSource;
-use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_config::ConfigStore;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
@@ -97,11 +97,12 @@ async fn source_pagination_fairness_survives_provider_rediscovery() {
     daemon
         .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
         .expect("capability");
-    let subjects = [1, 2, 3].map(|number| ChangeRequestRef {
-        namespace: "flotilla".into(),
-        service: "github.com".into(),
-        scope: "team/one".into(),
-        number,
+    let subjects = [1, 2, 3].map(|number| {
+        ChangeRequestKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_change_request_address("github.com", "team/one", number, &[]).expect("address"),
+        )
+        .expect("key")
     });
     for _ in 0..4 {
         let error = daemon.change_request_observation_source.observe_group(&subjects, &subjects[0]).await.expect_err("incomplete history");

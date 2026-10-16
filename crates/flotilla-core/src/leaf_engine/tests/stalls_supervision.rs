@@ -1334,7 +1334,7 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
     struct LimitedSource(ObservationError);
     #[async_trait]
     impl observation::ChangeRequestObservationSource for LimitedSource {
-        async fn observe(&self, _: &ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+        async fn observe(&self, _: &ChangeRequestKey) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
             Err(self.0.clone())
         }
     }
@@ -1353,7 +1353,11 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
         Arc::new(LimitedSource(error)),
         crate::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    let subject = ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/one".into(), number: 1 };
+    let subject = ChangeRequestKey::new(
+        "flotilla",
+        flotilla_resources::address::stored_change_request_address("github.com", "team/one", 1, &[]).expect("address"),
+    )
+    .expect("key");
     refresher.refresh_once(&subject).await.expect_err("limited observation records its diagnostic");
     let (event_tx, _) = broadcast::channel(4);
     let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher);

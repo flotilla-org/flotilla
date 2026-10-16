@@ -1,4 +1,7 @@
+use std::collections::BTreeSet;
+
 use flotilla_change_request::observation;
+use flotilla_resources::Forge;
 use flotilla_store_memory::InMemoryBackend;
 
 use super::*;
@@ -430,12 +433,11 @@ async fn foreign_change_request_authority_does_not_fetch_or_write_status() {
         Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
         cadence,
     );
-    let subject = observation::ChangeRequestRef {
-        namespace: "flotilla".to_string(),
-        service: "github.com".to_string(),
-        scope: "flotilla-org/flotilla".to_string(),
-        number: 2049,
-    };
+    let subject = observation::ChangeRequestKey::new(
+        "flotilla",
+        flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2049, &[]).expect("address"),
+    )
+    .expect("key");
     let id = uuid::Uuid::new_v4();
     refresher.demand(id, subject, None).await.expect("demand foreign-owned record");
     for _ in 0..10 {
@@ -450,12 +452,11 @@ async fn foreign_change_request_authority_does_not_fetch_or_write_status() {
 async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
     let owner = ResourceBackend::new(InMemoryBackend::default());
     let reader = ResourceBackend::new(InMemoryBackend::default());
-    let subject = observation::ChangeRequestRef {
-        namespace: "flotilla".to_string(),
-        service: "github.com".to_string(),
-        scope: "flotilla-org/flotilla".to_string(),
-        number: 2051,
-    };
+    let subject = observation::ChangeRequestKey::new(
+        "flotilla",
+        flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2051, &[]).expect("address"),
+    )
+    .expect("key");
     let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
         state: Duration::from_millis(20),
         checks_pending: Duration::from_millis(20),
@@ -481,7 +482,7 @@ async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
     .expect("owner fetches");
     let records = owner.using::<ChangeRequest>("flotilla");
     tokio::time::timeout(Duration::from_secs(2), async {
-        while records.get(&subject.record_name().expect("record name")).await.expect("owner record").status.is_none() {
+        while records.get(&subject.record_name()).await.expect("owner record").status.is_none() {
             tokio::task::yield_now().await;
         }
     })
@@ -502,14 +503,8 @@ async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
     );
     let reader_id = uuid::Uuid::new_v4();
     reader_refresher.demand(reader_id, subject.clone(), None).await.expect("reader demand");
-    let initial_observed_at = records
-        .get(&subject.record_name().expect("record name"))
-        .await
-        .expect("owner record")
-        .status
-        .expect("owner status")
-        .state
-        .observed_at;
+    let initial_observed_at =
+        records.get(&subject.record_name()).await.expect("owner record").status.expect("owner status").state.observed_at;
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_millis(30)).await;
         reader
@@ -520,21 +515,14 @@ async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
     }
     assert_eq!(reader_calls.load(Ordering::SeqCst), 0, "reader must use replicated observation");
     assert!(
-        records
-            .get(&subject.record_name().expect("record name"))
-            .await
-            .expect("owner record")
-            .status
-            .expect("renewed status")
-            .state
-            .observed_at
+        records.get(&subject.record_name()).await.expect("owner record").status.expect("renewed status").state.observed_at
             > initial_observed_at,
         "healthy owner must renew unchanged observations before they become stale"
     );
-    assert!(reader.using::<ChangeRequest>("flotilla").get(&subject.record_name().expect("record name")).await.is_err());
+    assert!(reader.using::<ChangeRequest>("flotilla").get(&subject.record_name()).await.is_err());
     assert!(reader
         .including_replicas::<ChangeRequest>("flotilla")
-        .get(&subject.record_name().expect("record name"))
+        .get(&subject.record_name())
         .await
         .expect("replicated record")
         .object
@@ -603,12 +591,12 @@ async fn former_owner_evaluates_fresher_takeover_replica() {
     refresher
         .demand(
             keeper_id,
-            observation::ChangeRequestRef {
-                namespace: "flotilla".to_string(),
-                service: "github.com".to_string(),
-                scope: "flotilla-org/flotilla".to_string(),
-                number: 2052,
-            },
+            observation::ChangeRequestKey::new(
+                "flotilla",
+                flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2052, &[])
+                    .expect("address"),
+            )
+            .expect("key"),
             None,
         )
         .await
@@ -672,12 +660,11 @@ async fn former_owner_evaluates_fresher_takeover_replica() {
 async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
     let former = ResourceBackend::new(InMemoryBackend::default());
     let takeover = ResourceBackend::new(InMemoryBackend::default());
-    let subject = observation::ChangeRequestRef {
-        namespace: "flotilla".to_string(),
-        service: "github.com".to_string(),
-        scope: "flotilla-org/flotilla".to_string(),
-        number: 2053,
-    };
+    let subject = observation::ChangeRequestKey::new(
+        "flotilla",
+        flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2053, &[]).expect("address"),
+    )
+    .expect("key");
     let status = |observed_at| flotilla_resources::ChangeRequestStatus {
         title: Default::default(),
         author: Default::default(),
@@ -695,22 +682,18 @@ async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
         let records = backend.using::<ChangeRequest>("flotilla");
         let created = records
             .create(
-                &InputMeta::builder().name(subject.record_name().expect("record name")).build(),
+                &InputMeta::builder().name(subject.record_name()).build(),
                 &flotilla_resources::ChangeRequestSpec::builder()
-                    .service(subject.service.clone())
-                    .scope(subject.scope.clone())
-                    .number(subject.number)
+                    .service(subject.stored_service_scope().0)
+                    .scope(subject.stored_service_scope().1)
+                    .number(subject.number())
                     .observing_authority(authority.to_string())
                     .build(),
             )
             .await
             .expect("create authority record");
         records
-            .update_status(
-                &subject.record_name().expect("record name"),
-                &created.metadata.resource_version,
-                &status(Utc::now() - chrono::Duration::seconds(age)),
-            )
+            .update_status(&subject.record_name(), &created.metadata.resource_version, &status(Utc::now() - chrono::Duration::seconds(age)))
             .await
             .expect("publish old observation");
     }
@@ -743,11 +726,7 @@ async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
     .expect("former owner reclaims stale takeover");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let reclaimed = former
-                .using::<ChangeRequest>("flotilla")
-                .get(&subject.record_name().expect("record name"))
-                .await
-                .expect("reclaimed local record");
+            let reclaimed = former.using::<ChangeRequest>("flotilla").get(&subject.record_name()).await.expect("reclaimed local record");
             assert_eq!(reclaimed.spec.observing_authority, "former");
             if reclaimed.status.is_some_and(|status| status.state.observed_at > Utc::now() - chrono::Duration::seconds(2)) {
                 break;
@@ -764,20 +743,19 @@ async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
 async fn stale_replicated_change_request_is_claimed_by_demanding_host() {
     let owner = ResourceBackend::new(InMemoryBackend::default());
     let reader = ResourceBackend::new(InMemoryBackend::default());
-    let subject = observation::ChangeRequestRef {
-        namespace: "flotilla".to_string(),
-        service: "github.com".to_string(),
-        scope: "flotilla-org/flotilla".to_string(),
-        number: 2050,
-    };
+    let subject = observation::ChangeRequestKey::new(
+        "flotilla",
+        flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2050, &[]).expect("address"),
+    )
+    .expect("key");
     let records = owner.using::<ChangeRequest>("flotilla");
     let created = records
         .create(
-            &InputMeta::builder().name(subject.record_name().expect("record name")).build(),
+            &InputMeta::builder().name(subject.record_name()).build(),
             &flotilla_resources::ChangeRequestSpec::builder()
-                .service(subject.service.clone())
-                .scope(subject.scope.clone())
-                .number(subject.number)
+                .service(subject.stored_service_scope().0)
+                .scope(subject.stored_service_scope().1)
+                .number(subject.number())
                 .observing_authority("owner".to_string())
                 .build(),
         )
@@ -821,7 +799,7 @@ async fn stale_replicated_change_request_is_claimed_by_demanding_host() {
     refresher.demand(id, subject.clone(), None).await.expect("demand stale replica");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0, "one stale threshold must not move a healthy owner's record");
-    assert!(reader.using::<ChangeRequest>("flotilla").get(&subject.record_name().expect("record name")).await.is_err());
+    assert!(reader.using::<ChangeRequest>("flotilla").get(&subject.record_name()).await.is_err());
     let current = records.get(&created.metadata.name).await.expect("owner record");
     let mut very_old_status = old_status;
     let very_old = Utc::now() - chrono::Duration::seconds(10);
@@ -842,7 +820,7 @@ async fn stale_replicated_change_request_is_claimed_by_demanding_host() {
     })
     .await
     .expect("reader should take over and refresh");
-    let claimed = reader.using::<ChangeRequest>("flotilla").get(&subject.record_name().expect("record name")).await.expect("local claim");
+    let claimed = reader.using::<ChangeRequest>("flotilla").get(&subject.record_name()).await.expect("local claim");
     assert_eq!(claimed.spec.observing_authority, "reader");
     assert!(claimed.status.is_some());
     owner
@@ -1027,4 +1005,60 @@ async fn mixed_case_repository_leaf_reads_the_record_the_observer_writes() {
     let subscription_id = table.subscribe_wait(uuid::Uuid::new_v4(), request).await.expect("subscribe CR wait");
 
     assert_eq!(receive_fire(&mut events, subscription_id).await.value, "merged");
+}
+
+/// Boundary fake for the forge read: records each key it is asked to observe.
+#[derive(Default)]
+struct RecordingChangeRequests {
+    keys: std::sync::Mutex<Vec<ChangeRequestKey>>,
+}
+
+#[async_trait]
+impl observation::ChangeRequestObservationSource for RecordingChangeRequests {
+    async fn observe(&self, subject: &ChangeRequestKey) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+        self.keys.lock().expect("record observed key").push(subject.clone());
+        ControlledChangeRequests { merged: AtomicBool::new(true) }.observe(subject).await
+    }
+}
+
+// #3359: the observer's key is the change request's Address, so a forge-id
+// spelling and a host spelling of one change request on a declared Forge are
+// one observation subject; both waits read its one record.
+#[tokio::test]
+async fn host_and_forge_id_spellings_are_one_observation_subject() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let lab = flotilla_resources::ForgeSpec::builder()
+        .forge_id("lab".into())
+        .kind(flotilla_resources::ForgeKind::Forgejo)
+        .hosts(BTreeSet::from(["forgejo.lab.example".into()]))
+        .https_url("https://forgejo.lab.example".into())
+        .git_ssh_host("forgejo.lab.example".into())
+        .build();
+    backend.definitions::<Forge>("flotilla").create(&InputMeta::builder().name("lab".into()).build(), &lab).await.expect("Forge");
+    let (event_tx, _) = broadcast::channel(16);
+    let source = Arc::new(RecordingChangeRequests::default());
+    let refresher = ChangeRequestRefresher::new(
+        "fleet".to_string(),
+        backend.clone(),
+        "authority".to_string(),
+        source.clone(),
+        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+    );
+    let table = LeafSubscriptionTable::new(backend, broadcast_test_sink(event_tx.clone()), refresher);
+    let mut events = event_tx.subscribe();
+    let mut fired = Vec::new();
+    for (service, scope) in [("lab", "Team/Repo"), ("forgejo.lab.example", "team/repo")] {
+        let address = LeafAddress::ChangeRequest { service: service.to_string(), scope: scope.to_string(), number: 7 };
+        let request = WaitSubscriptionRequest {
+            namespace: "flotilla".to_string(),
+            leaves: vec![leaf(address, ".state", "merged")],
+            freshness_demand: None,
+        };
+        let subscription_id = table.subscribe_wait(uuid::Uuid::new_v4(), request).await.expect("subscribe CR wait");
+        fired.push(receive_fire(&mut events, subscription_id).await.value);
+    }
+
+    assert_eq!(fired, ["merged", "merged"]);
+    let keys = source.keys.lock().expect("observed keys").iter().map(|key| key.address().to_string()).collect::<BTreeSet<_>>();
+    assert_eq!(keys, BTreeSet::from(["forge:lab/repo:team%2Frepo/cr:7".to_string()]));
 }

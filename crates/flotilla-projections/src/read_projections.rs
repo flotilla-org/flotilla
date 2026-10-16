@@ -9,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_charter::ops_entry::{
     DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION, DECLARATION_REFUSED_SINCE_ANNOTATION,
     DECLARATION_STALE_AFTER, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
@@ -38,7 +38,7 @@ use flotilla_protocol::{
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::resolve_project_issue_sources_from_inventory;
 use flotilla_resources::{
-    address::{leaf_record_name, record_name},
+    address::{leaf_address, leaf_record_name, record_name},
     bound_change_request_address, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
     repository_display_labels, ChangeRequestStatus, Checkout as ResourceCheckout, Clock, ConditionValue, Convoy as ResourceConvoy,
     ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, Forge, FulfilmentKind, FulfilmentRealisation,
@@ -68,7 +68,7 @@ use flotilla_store as project_ops;
 #[async_trait]
 pub trait LeafSubscriptionRead: Send + Sync {
     fn change_request_stale_after(&self) -> Duration;
-    async fn change_request_observation_error(&self, subject: &ChangeRequestRef) -> Option<ObservationError>;
+    async fn change_request_observation_error(&self, subject: &ChangeRequestKey) -> Option<ObservationError>;
     async fn diagnostics(&self) -> Vec<(LeafSubscriptionRow, Vec<LeafFiringRecord>)>;
 }
 
@@ -1423,14 +1423,12 @@ impl ReadProjections<'_> {
         let mut observation_errors = BTreeMap::new();
         for leaf in expected_change_request_leaves {
             let Some(subject) =
-                ChangeRequestRef::from_address(namespace, &leaf.address).and_then(|subject| subject.normalized(&forges).ok())
+                leaf_address(&leaf.address, &forges).ok().and_then(|address| ChangeRequestKey::new(namespace, address).ok())
             else {
                 continue;
             };
-            if let (Some(error), Ok(name)) =
-                (self.leaf_subscriptions.change_request_observation_error(&subject).await, subject.record_name())
-            {
-                observation_errors.insert(name, error.to_string());
+            if let Some(error) = self.leaf_subscriptions.change_request_observation_error(&subject).await {
+                observation_errors.insert(subject.record_name(), error.to_string());
             }
         }
         let change_requests = expected_change_requests

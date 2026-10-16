@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
-use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_config::ConfigStore;
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use flotilla_protocol::{CliListKind, Command, CommandAction, CommandValue, HostName, RepoIdentity};
@@ -201,7 +201,11 @@ async fn cli_lists_include_active_provider_sessions() {
 
 #[test]
 fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() {
-    let requested = ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/repo".into(), number: 42 };
+    let requested = ChangeRequestKey::new(
+        "flotilla",
+        flotilla_resources::address::stored_change_request_address("github.com", "team/repo", 42, &[]).expect("address"),
+    )
+    .expect("key");
     let subject = flotilla_protocol::Subject {
         kind: flotilla_protocol::SubjectKind::ChangeRequest,
         source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "team/repo".into() },
@@ -243,17 +247,20 @@ fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() 
         spec,
         status: Some(status),
     };
-    let bound = convoy_change_request_credential_refs(&convoy, &requested).expect("active PR subjects");
+    let bound = convoy_change_request_credential_refs(&convoy, &requested, &[]).expect("active PR subjects");
     assert_eq!(bound.numbers, BTreeSet::from([42]));
     assert_eq!(bound.credentials_by_number[&42], BTreeSet::from(["github-crew-pr".to_string()]));
-    let mut unrelated = requested.clone();
-    unrelated.scope = "team/other".into();
-    assert!(convoy_change_request_credential_refs(&convoy, &unrelated).expect("other scope").numbers.is_empty());
+    let unrelated = ChangeRequestKey::new(
+        "flotilla",
+        flotilla_resources::address::stored_change_request_address("github.com", "team/other", 42, &[]).expect("address"),
+    )
+    .expect("key");
+    assert!(convoy_change_request_credential_refs(&convoy, &unrelated, &[]).expect("other scope").numbers.is_empty());
     convoy.status.as_mut().expect("status").discover_subject(
         subject,
         flotilla_protocol::Relationship::Supersedes,
         flotilla_resources::SubjectDiscoverySource::Operator,
         Utc::now(),
     );
-    assert!(convoy_change_request_credential_refs(&convoy, &requested).expect("superseded PR").numbers.is_empty());
+    assert!(convoy_change_request_credential_refs(&convoy, &requested, &[]).expect("superseded PR").numbers.is_empty());
 }

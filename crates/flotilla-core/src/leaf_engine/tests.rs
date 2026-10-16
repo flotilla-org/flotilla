@@ -8,7 +8,7 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_change_request::observation;
-use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_forge_github::github::GithubRateLimit;
 use flotilla_forge_github::github::GithubRateLimitKind;
 use flotilla_forge_github::github::GithubRetrySource;
@@ -71,7 +71,7 @@ struct UnavailableChangeRequests;
 
 #[async_trait]
 impl observation::ChangeRequestObservationSource for UnavailableChangeRequests {
-    async fn observe(&self, _subject: &observation::ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+    async fn observe(&self, _subject: &observation::ChangeRequestKey) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         Err("unavailable in non-CR leaf contract".into())
     }
 }
@@ -121,7 +121,7 @@ impl TurnDeliveryActuator for RecordingTurnDelivery {
 
 #[async_trait]
 impl observation::ChangeRequestObservationSource for ControlledChangeRequests {
-    async fn observe(&self, _subject: &observation::ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+    async fn observe(&self, _subject: &observation::ChangeRequestKey) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         let observed_at = Utc::now();
         let state = if self.merged.load(Ordering::SeqCst) {
             flotilla_resources::ObservedChangeRequestState::Merged
@@ -146,7 +146,7 @@ impl observation::ChangeRequestObservationSource for ControlledChangeRequests {
 
 #[async_trait]
 impl observation::ChangeRequestObservationSource for CountingChangeRequests {
-    async fn observe(&self, _subject: &observation::ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+    async fn observe(&self, _subject: &observation::ChangeRequestKey) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let observed_at = Utc::now();
         Ok(flotilla_resources::ChangeRequestStatus {
@@ -184,7 +184,11 @@ async fn overload_demand(table: &LeafSubscriptionTable, id: uuid::Uuid) {
         .change_requests
         .demand(
             id,
-            ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "org/repo".into(), number: 1 },
+            ChangeRequestKey::new(
+                "flotilla",
+                flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 1, &[]).expect("address"),
+            )
+            .expect("key"),
             None,
         )
         .await

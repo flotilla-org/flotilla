@@ -600,8 +600,13 @@ fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
     }
 }
 
+// An issue key names its installation by forge id, whichever stored spelling
+// it came from; its issue source is that Forge's HTTPS root, which reads
+// back to the same address. A host no Forge declares makes no key (ADR 0066 §3).
 #[test]
 fn standalone_issue_source_lookup_round_trips_installation_identity() {
+    use flotilla_resources::address::{leaf_address, stored_issue_address};
+
     let lab = flotilla_resources::ForgeSpec::builder()
         .forge_id("lab".into())
         .kind(flotilla_resources::ForgeKind::Forgejo)
@@ -613,30 +618,25 @@ fn standalone_issue_source_lookup_round_trips_installation_identity() {
     stage.forge_id = "stage".into();
     stage.https_url = "https://forgejo.example/stage".into();
     let forges = [lab, stage];
-    for (service, expected) in [
-        ("lab", "https://forgejo.example/lab"),
-        ("stage", "https://forgejo.example/stage"),
-        ("forgejo.example%2flab", "https://forgejo.example/lab"),
-        ("forgejo.example%2fstage", "https://forgejo.example/stage"),
-        ("http%3a%2f%2fforgejo.example%2flab", "http://forgejo.example/lab"),
-        ("host%3aforgejo", "https://forgejo"),
+    for (service, forge, expected) in [
+        ("lab", "lab", "https://forgejo.example/lab"),
+        ("stage", "stage", "https://forgejo.example/stage"),
+        ("forgejo.example%2flab", "lab", "https://forgejo.example/lab"),
+        ("forgejo.example%2fstage", "stage", "https://forgejo.example/stage"),
     ] {
-        let subject = crate::issue_observer::IssueRef {
-            namespace: "flotilla".into(),
-            service: service.into(),
-            scope: "Team/Repo".into(),
-            number: 12,
-        };
+        let address = stored_issue_address(service, "Team/Repo", 12, &forges).expect("address");
+        let subject = crate::issue_observer::IssueKey::new("flotilla", address).expect("key");
+        assert_eq!(subject.forge_id(), forge, "{service}");
         let source = issue_source_for_subject(&subject, &forges).expect("source");
         assert_eq!(source.service, expected);
         let reference = flotilla_protocol::IssueRef { source, id: "12".into() };
-        let declarations = if service.contains("%2f") { &[][..] } else { &forges[..] };
-        assert_eq!(
-            flotilla_resources::issue_address_with_forges(&reference, declarations).expect("round trip").to_string(),
-            format!("issue/{service}/Team/Repo/12")
-        );
+        let leaf = flotilla_resources::issue_address_with_forges(&reference, &forges).expect("round trip");
+        assert_eq!(leaf_address(&leaf, &forges).as_ref(), Ok(subject.address()), "{service}");
+    }
+    for undeclared in ["forgejo.example%2flab", "http%3a%2f%2fforgejo.example%2flab", "host%3aforgejo"] {
+        assert!(stored_issue_address(undeclared, "Team/Repo", 12, &[]).is_err(), "{undeclared}");
     }
     let orphaned =
-        crate::issue_observer::IssueRef { namespace: "flotilla".into(), service: "lab".into(), scope: "Team/Repo".into(), number: 12 };
+        crate::issue_observer::IssueKey::new("flotilla", stored_issue_address("lab", "Team/Repo", 12, &[]).expect("address")).expect("key");
     assert!(issue_source_for_subject(&orphaned, &[]).expect_err("missing Forge").contains("no Forge declaration"));
 }
