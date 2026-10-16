@@ -418,7 +418,18 @@ impl ChangeRequestLeafSubject<'_> {
         })
     }
 
-    fn is_fresh(&self, field_path: &str) -> bool {
+    pub(crate) fn is_fresh(&self, field_path: &str) -> bool {
+        // Merge is irreversible: state and merged readiness cannot age out.
+        // Other fields still describe mutable observations and retain their TTL.
+        if matches!(field_path, ".state" | ".ready")
+            && self
+                .change_request
+                .status
+                .as_ref()
+                .is_some_and(|status| status.state.value == Some(crate::ObservedChangeRequestState::Merged))
+        {
+            return true;
+        }
         self.field_observed_at(field_path)
             .and_then(|observed_at| self.now.signed_duration_since(observed_at).to_std().ok())
             .is_some_and(|age| age <= self.stale_after)
@@ -544,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_change_request_field_is_structurally_unknown() {
+    fn merged_state_and_ready_do_not_expire_but_other_fields_do() {
         let observed_at = "2026-08-03T20:00:00Z".parse().expect("time");
         let object = ResourceObject::<ChangeRequest> {
             metadata: crate::ObjectMeta {
@@ -592,7 +603,25 @@ mod tests {
             operator: LeafOperator::Equal,
             literal: "merged".to_string(),
         };
-        assert_eq!(evaluate_leaf(&leaf, Some(&subject), None).expect("evaluate").result, ThreeValue::Unknown);
+        // Merged is final for state and readiness, while checks retain freshness.
+        assert_eq!(evaluate_leaf(&leaf, Some(&subject), None).expect("evaluate").result, ThreeValue::True);
+        assert_eq!(subject.value(".ready"), Some(LeafValue::Text("true".to_string())));
+        assert_eq!(subject.value(".checks"), None);
+        // Reopenable states remain known at the TTL boundary and expire just after it.
+        for state in
+            [crate::ObservedChangeRequestState::Open, crate::ObservedChangeRequestState::Draft, crate::ObservedChangeRequestState::Closed]
+        {
+            let mut reopenable = object.clone();
+            reopenable.status.as_mut().expect("status").state = crate::Observation::known(state, observed_at);
+            for age in [180, 181] {
+                let subject = ChangeRequestLeafSubject {
+                    change_request: &reopenable,
+                    now: observed_at + chrono::Duration::seconds(age),
+                    stale_after: Duration::from_secs(180),
+                };
+                assert_eq!(subject.value(".state").is_some(), age == 180);
+            }
+        }
     }
 
     #[test]

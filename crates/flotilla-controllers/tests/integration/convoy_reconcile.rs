@@ -1457,6 +1457,124 @@ fn missing_change_request_is_reported_once_across_terminal_exit_entries() {
     );
 }
 
+// Merged observations remain terminal at any age; reopenable states expire.
+#[hegel::test]
+fn landing_many_old_merged_observations(tc: hegel::TestCase) {
+    // Cover fan-out beyond the live 16-PR convoy and ages across the expiry boundary.
+    let count = tc.draw(hegel::generators::integers::<usize>().min_value(16).max_value(32));
+    let age = tc.draw(hegel::generators::integers::<i64>().min_value(181).max_value(86400));
+    let now = timestamp(40);
+    let observed_at = now - chrono::Duration::seconds(age);
+    let subjects = (1..=count)
+        .map(|number| flotilla_resources::DeclaredSubject {
+            subject: flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+                id: number.to_string(),
+            },
+            relationship: flotilla_protocol::Relationship::Produces,
+            issue: None,
+            change_request: None,
+        })
+        .collect();
+    let spec = flotilla_resources::ConvoySpec::builder().workflow_ref("interactive".to_string()).subjects(subjects).build();
+    let mut status = bootstrapped_convoy_status();
+    status.phase = ConvoyPhase::Landing;
+    status.observed_workflow_ref = Some("interactive".to_string());
+    for work in status.work.values_mut() {
+        work.phase = WorkPhase::Complete;
+    }
+    mark_crew_done(&mut status, "implement", "coder");
+    mark_crew_done(&mut status, "review", "reviewer");
+    status.workflow_snapshot.as_mut().expect("snapshot").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+    let convoy = convoy_object("many-merged", spec, Some(status));
+    let mut records: BTreeMap<_, _> = (1..=count)
+        .map(|number| {
+            let name = cr_name("github.com", "flotilla-org/flotilla", number as u64);
+            (
+                name.clone(),
+                flotilla_resources::ResourceObject::<ChangeRequest> {
+                    metadata: common::object_meta(&name, "flotilla", "1"),
+                    spec: ChangeRequestSpec::builder()
+                        .service("github.com".to_string())
+                        .scope("flotilla-org/flotilla".to_string())
+                        .number(number as u64)
+                        .observing_authority("host-a".to_string())
+                        .build(),
+                    status: Some(merged_change_request_status(observed_at)),
+                },
+            )
+        })
+        .collect();
+    let evaluate = |records: &BTreeMap<_, _>| {
+        evaluate_landing_settlement(
+            &convoy,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            records,
+            &[],
+            Duration::from_secs(180),
+            Duration::from_secs(180),
+            now,
+        )
+    };
+    let evaluation = evaluate(&records);
+    assert!(evaluation.satisfied, "old merged observations must settle: {:?}", evaluation.unmet);
+    assert!(evaluation.unmet.is_empty(), "explain must not report merged observations as stale");
+    // The satisfied exit must drive the real lifecycle transition to Landed.
+    let settlement = flotilla_resources::convoy::reconcile::evaluate_landing_settlement_with_disposition(
+        &convoy,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &records,
+        &[],
+        Duration::from_secs(180),
+        Duration::from_secs(180),
+        now,
+    );
+    let outcome = flotilla_resources::convoy::reconcile::reconcile_internal(
+        &convoy,
+        None,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        flotilla_resources::convoy::reconcile::LifecycleConditions {
+            exit_disposition: settlement.disposition,
+            reclaim_eligible: false,
+            settlement_evidence: Some(settlement.evaluation),
+        },
+        now,
+    );
+    let mut landed = convoy.status.clone().expect("status");
+    outcome.patch.expect("landing transition").apply(&mut landed);
+    assert_eq!(landed.phase, ConvoyPhase::Landed);
+    // An unmatched exit explains a false condition, never stale Merged evidence.
+    let mut closed_only = convoy.clone();
+    if let Some(flotilla_resources::ExitDeclaration::Table(entries)) =
+        &mut closed_only.status.as_mut().expect("status").workflow_snapshot.as_mut().expect("snapshot").exit
+    {
+        entries.retain(|disposition, _| disposition == "closed-unmerged");
+    }
+    let unmatched = evaluate_landing_settlement(
+        &closed_only,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &records,
+        &[],
+        Duration::from_secs(180),
+        Duration::from_secs(180),
+        now,
+    );
+    assert!(!unmatched.satisfied);
+    assert_eq!(unmatched.unmet.len(), count);
+    assert!(unmatched.unmet.iter().all(|unmet| matches!(unmet, UnmetSettlementExpectation::ChangeRequestConditionFalse { .. })));
+    for state in [ObservedChangeRequestState::Open, ObservedChangeRequestState::Closed] {
+        records.values_mut().next().expect("record").status.as_mut().expect("status").state = Observation::known(state, observed_at);
+        let evaluation = evaluate(&records);
+        assert!(!evaluation.satisfied);
+        assert!(matches!(evaluation.unmet.as_slice(), [UnmetSettlementExpectation::StaleChangeRequest { .. }]));
+    }
+}
+
 #[test]
 fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
     let now = timestamp(40);
