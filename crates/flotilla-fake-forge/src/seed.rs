@@ -106,11 +106,12 @@ pub struct GeneratedSeed {
 /// branch a record reports. A listing that seeds nothing is refused.
 pub fn seed_from_repository_records(inputs: &[serde_json::Value], mounts: &[(String, String)]) -> Result<GeneratedSeed, String> {
     let mut by_service: BTreeMap<String, &String> = BTreeMap::new();
+    let mut mounted = std::collections::BTreeSet::new();
     for (service, mount) in mounts {
         if by_service.insert(normalize_service(service), mount).is_some() {
             return Err(format!("forge {service} is mapped twice"));
         }
-        if mounts.iter().filter(|(_, other)| other == mount).count() > 1 {
+        if !mounted.insert(mount) {
             return Err(format!("mount `{mount}` is given to more than one forge"));
         }
     }
