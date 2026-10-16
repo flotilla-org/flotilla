@@ -10,7 +10,7 @@ use flotilla_change_request::observation::{ChangeRequestKey, ChangeRequestObserv
 use flotilla_protocol::{IssueSource, ReferenceContext, Relationship, SubjectKind as ConvoySubjectKind};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
-    address::{leaf_address, stored_spelling_names},
+    address::{stored_spelling_names, subject_address},
     convoy_subject_rows, merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestSpec,
     ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks,
     ResourceError, ResourceProvenance,
@@ -172,19 +172,18 @@ impl ChangeRequestRefresher {
                 continue;
             }
             for row in convoy_subject_rows(&copy.object, &ReferenceContext::default()) {
-                let Ok(leaf) = row.subject.leaf() else { continue };
+                if row.subject.kind != ConvoySubjectKind::ChangeRequest {
+                    continue;
+                }
                 // Debug, not warn: this re-runs on every convoy, project and
                 // Forge change, so an undeclared host would repeat each pass.
-                let address = match leaf_address(&leaf, &forges) {
+                let address = match subject_address(&row.subject, &forges) {
                     Ok(address) => address,
                     Err(error) => {
-                        tracing::debug!(convoy = %copy.object.metadata.name, ?leaf, %error, "convoy subject has no address; not observed");
+                        tracing::debug!(convoy = %copy.object.metadata.name, %error, "convoy change request subject has no address; not observed");
                         continue;
                     }
                 };
-                if address.kind() != Kind::ChangeRequest {
-                    continue;
-                }
                 let subject = match ChangeRequestKey::new(namespace, address) {
                     Ok(subject) => subject,
                     Err(error) => {
@@ -504,7 +503,7 @@ impl ChangeRequestRefresher {
                 if row.subject.kind != ConvoySubjectKind::ChangeRequest {
                     continue;
                 }
-                let address = match row.subject.leaf().and_then(|leaf| leaf_address(&leaf, &forges)) {
+                let address = match subject_address(&row.subject, &forges) {
                     Ok(address) => address,
                     Err(error) => {
                         tracing::debug!(convoy = %convoy.metadata.name, %error, "convoy change request subject has no address; no history recorded");

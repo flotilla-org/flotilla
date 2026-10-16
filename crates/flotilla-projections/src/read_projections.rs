@@ -1368,7 +1368,7 @@ impl ReadProjections<'_> {
                                 ..Default::default()
                             })
                             .chain(std::iter::once(StoreQuery::names(
-                                expected_change_request_leaves(&convoy, &selected_checkouts)
+                                expected_change_request_leaves(&convoy, &forges)
                                     .map_err(|error| error.to_string())?
                                     .iter()
                                     .filter_map(|leaf| leaf_record_name(&leaf.address, &forges).ok()),
@@ -1410,8 +1410,8 @@ impl ReadProjections<'_> {
                 explain_subject_observation(&row.subject, status, landed_subjects.contains(&row.subject), now, change_request_stale_after)
             })
             .collect();
-        let expected_change_request_leaves = expected_change_request_leaves(&convoy, &selected_checkouts)
-            .map_err(|error| format!("derive expected change requests: {error}"))?;
+        let expected_change_request_leaves =
+            expected_change_request_leaves(&convoy, &forges).map_err(|error| format!("derive expected change requests: {error}"))?;
         let expected_change_requests = expected_change_request_leaves
             .iter()
             .filter(|leaf| matches!(leaf.address, flotilla_protocol::LeafAddress::ChangeRequest { .. }))

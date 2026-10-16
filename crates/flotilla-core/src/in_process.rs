@@ -3,7 +3,7 @@
 //! `InProcessDaemon` owns repos, runs refresh loops, executes commands,
 //! and broadcasts events — all within the same process.
 
-use flotilla_resources::address::{leaf_address, GITHUB_FORGE_ID};
+use flotilla_resources::address::{issue_reference_address, remote_change_request_subject, same_subject, subject_address, GITHUB_FORGE_ID};
 use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 #[cfg(test)]
 mod host_registry_tests;
@@ -87,17 +87,17 @@ use flotilla_protocol::{
 #[cfg(test)]
 use flotilla_resources::CrewMessageSender;
 use flotilla_resources::{
-    active_change_request_subjects, api_version, capped_github_app_permissions, change_request_address_with_forges,
-    host_direct_environment_name, normalize_issue_source, observed_change_request_subjects, AllocationDecision, BoundChangeRequest,
-    CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
-    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
-    ConvoyIssue, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant,
-    CredentialSource, CredentialSpec, CrewCompletionPending, CrewSource, CrewSpec, Environment as ResourceEnvironment, EnvironmentPhase,
-    Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, Host as ResourceHost, HostStatus as ResourceHostStatus, InputMeta, InputValue,
-    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectMeta,
-    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Platform,
-    Project, ProjectSpec, ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resource,
-    ResourceError, ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget, SystemClock, TerminalCrewContext, TurnDeliveryRung,
+    active_change_request_subjects, api_version, capped_github_app_permissions, host_direct_environment_name, normalize_issue_source,
+    observed_change_request_subjects, AllocationDecision, BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest,
+    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutStatus as ResourceCheckoutStatus, Clock, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue, ConvoyProvisioningState,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec,
+    CrewCompletionPending, CrewSource, CrewSpec, Environment as ResourceEnvironment, EnvironmentPhase, Forge, ForgeKind, FulfilmentGrant,
+    FulfilmentKind, Host as ResourceHost, HostStatus as ResourceHostStatus, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectMeta, ObservedChangeRequestState,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec,
+    ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceError,
+    ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget, SystemClock, TerminalCrewContext, TurnDeliveryRung,
     VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
@@ -490,11 +490,7 @@ impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationS
             .into_iter()
             .flat_map(|convoy| convoy.object.spec.issues)
             .map(|issue| issue.reference)
-            .find(|reference| {
-                flotilla_resources::issue_address_with_forges(reference, &forges)
-                    .and_then(|leaf| leaf_address(&leaf, &forges))
-                    .is_ok_and(|address| &address == subject.address())
-            })
+            .find(|reference| issue_reference_address(reference, &forges).is_ok_and(|address| &address == subject.address()))
             .unwrap_or(fallback);
         let issue = self.query_port.fetch_issue_by_ref(&reference).await?;
         let observed_at = chrono::Utc::now();
@@ -528,7 +524,7 @@ fn convoy_change_request_credential_refs(
         .into_iter()
         .filter(|bound| {
             bound.kind == flotilla_protocol::SubjectKind::ChangeRequest
-                && match bound.leaf().and_then(|leaf| leaf_address(&leaf, forges)) {
+                && match subject_address(bound, forges) {
                     Ok(address) => address.parent() == Some(requested.repository()),
                     Err(error) => {
                         tracing::debug!(convoy = %convoy.metadata.name, %error, "bound change request subject has no address; no credentials bound");
@@ -3588,10 +3584,13 @@ impl InProcessDaemon {
             .into_iter()
             .filter(|entry| entry.relationship == flotilla_protocol::Relationship::Adopts)
             .map(|entry| entry.subject)
-            .collect::<BTreeSet<_>>();
+            .collect::<Vec<_>>();
+        // Subjects keep the spelling they were recorded with; one request is
+        // one subject whatever its spelling.
         let should_discover = |subject: &flotilla_protocol::Subject| {
-            !adopted.contains(subject)
-                && !convoy.status.as_ref().is_some_and(|status| status.unlinked_subjects.contains(subject) || status.produces(subject))
+            let same = |other: &flotilla_protocol::Subject| same_subject(other, subject, &forges);
+            !adopted.iter().any(same)
+                && !convoy.status.as_ref().is_some_and(|status| status.unlinked_subjects.iter().any(same) || status.produces_any(same))
         };
         let observed_subjects = observed_change_request_subjects(&convoy, &checkouts, &forges)?;
         for subject in &observed_subjects {
@@ -3616,11 +3615,9 @@ impl InProcessDaemon {
                             flotilla_protocol::ChangeRequestStatus::Open | flotilla_protocol::ChangeRequestStatus::Draft
                         ) =>
                     {
-                        let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
-                        if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
-                            if should_discover(&subject) {
-                                subjects.push((subject, flotilla_protocol::Relationship::Produces));
-                            }
+                        let subject = remote_change_request_subject(&repository.url, &request.id, &forges)?;
+                        if should_discover(&subject) {
+                            subjects.push((subject, flotilla_protocol::Relationship::Produces));
                         }
                     }
                     Ok(_) => {}
@@ -3635,11 +3632,9 @@ impl InProcessDaemon {
                         flotilla_protocol::ChangeRequestStatus::Open | flotilla_protocol::ChangeRequestStatus::Draft
                     ) =>
                 {
-                    let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
-                    if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
-                        if should_discover(&subject) {
-                            subjects.push((subject, flotilla_protocol::Relationship::Produces));
-                        }
+                    let subject = remote_change_request_subject(&repository.url, &request.id, &forges)?;
+                    if should_discover(&subject) {
+                        subjects.push((subject, flotilla_protocol::Relationship::Produces));
                     }
                 }
                 Ok(_) => {}

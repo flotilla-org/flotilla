@@ -71,29 +71,6 @@ pub struct ReferenceContext {
 }
 
 impl Subject {
-    pub fn from_leaf(address: &LeafAddress) -> Option<Self> {
-        let (kind, service, scope, number) = match address {
-            LeafAddress::ChangeRequest { service, scope, number } => (SubjectKind::ChangeRequest, service, scope, number),
-            LeafAddress::Issue { service, scope, number } => (SubjectKind::Issue, service, scope, number),
-            _ => return None,
-        };
-        Some(Self { kind, source: IssueSource { service: service.clone(), scope: scope.clone() }, id: number.to_string() })
-    }
-
-    pub fn leaf(&self) -> Result<LeafAddress, String> {
-        let number = self.id.parse::<u64>().map_err(|_| format!("subject id `{}` is not a numeric forge number", self.id))?;
-        Ok(match self.kind {
-            SubjectKind::ChangeRequest => {
-                LeafAddress::ChangeRequest { service: self.source.service.clone(), scope: self.source.scope.clone(), number }
-            }
-            SubjectKind::Issue => LeafAddress::Issue { service: self.source.service.clone(), scope: self.source.scope.clone(), number },
-        })
-    }
-
-    pub fn internal(&self) -> Result<String, String> {
-        Ok(self.leaf()?.to_string())
-    }
-
     pub fn url(&self, context: &ReferenceContext) -> Option<String> {
         let base = context
             .repositories
@@ -137,14 +114,31 @@ impl Subject {
         if self.source.service == "github.com" {
             return format!("{}{mark}{}", self.source.scope, self.id);
         }
-        self.internal().unwrap_or_else(|_| format!("{}{mark}{}", self.source.scope, self.id))
+        // No alias names the repository: print the subject as typed leaf
+        // text, which `ReferenceContext::parse` reads back.
+        let kind = match self.kind {
+            SubjectKind::ChangeRequest => "cr",
+            SubjectKind::Issue => "issue",
+        };
+        if self.id.parse::<u64>().is_ok() {
+            format!("{kind}/{}/{}/{}", self.source.service, self.source.scope, self.id)
+        } else {
+            format!("{}{mark}{}", self.source.scope, self.id)
+        }
     }
 }
 
 impl ReferenceContext {
     pub fn parse(&self, value: &str) -> Result<Subject, String> {
         if value.starts_with("cr/") || value.starts_with("issue/") {
-            return Subject::from_leaf(&value.parse::<LeafAddress>()?).ok_or_else(|| format!("invalid subject reference `{value}`"));
+            // Typed leaf text keeps the spelling it was written with; the
+            // resources boundary resolves spellings to addresses.
+            let (kind, service, scope, number) = match value.parse::<LeafAddress>()? {
+                LeafAddress::ChangeRequest { service, scope, number } => (SubjectKind::ChangeRequest, service, scope, number),
+                LeafAddress::Issue { service, scope, number } => (SubjectKind::Issue, service, scope, number),
+                _ => return Err(format!("invalid subject reference `{value}`")),
+            };
+            return Ok(Subject { kind, source: IssueSource { service, scope }, id: number.to_string() });
         }
         if value.starts_with("https://") || value.starts_with("http://") {
             let url = url::Url::parse(value).map_err(|error| format!("invalid subject URL `{value}`: {error}"))?;
@@ -243,7 +237,9 @@ mod tests {
         };
         for reference in ["cleat!281", "flotilla-org/cleat#281", "lab:robert/project-map!12"] {
             let subject = context.parse(reference).expect("short reference");
-            assert_eq!(context.parse(&subject.internal().expect("internal")), Ok(subject.clone()));
+            let kind = if subject.kind == SubjectKind::Issue { "issue" } else { "cr" };
+            let leaf_text = format!("{kind}/{}/{}/{}", subject.source.service, subject.source.scope, subject.id);
+            assert_eq!(context.parse(&leaf_text), Ok(subject.clone()));
             assert_eq!(context.parse(&subject.short(&context)), Ok(subject.clone()));
             assert_eq!(context.parse(&subject.url(&context).expect("URL")), Ok(subject));
         }

@@ -2544,7 +2544,7 @@ async fn exercise_existing_pr_admission(continuing: bool) {
         assert!(matches!(recv_command_finished(&mut events, id).await, CommandValue::ConvoyStarted { .. }));
         let replacement = admitted_convoy(&backend, "replacement").await;
         assert_eq!(replacement.spec.change_request.as_ref().map(|bound| bound.id.as_str()), Some("1071"));
-        let leaves = flotilla_resources::expected_change_request_leaves(&replacement, &BTreeMap::new()).expect("settlement leaves");
+        let leaves = flotilla_resources::expected_change_request_leaves(&replacement, &[]).expect("settlement leaves");
         // The same PR supplies both merged and closed terminal alternatives.
         assert_eq!(leaves.len(), 2);
         assert_eq!(leaves[1].address, leaves[0].address);

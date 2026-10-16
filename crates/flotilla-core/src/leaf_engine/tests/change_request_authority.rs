@@ -996,7 +996,9 @@ async fn mixed_case_repository_leaf_reads_the_record_the_observer_writes() {
     );
     let table = LeafSubscriptionTable::new(backend, broadcast_test_sink(event_tx.clone()), refresher);
     let mut events = event_tx.subscribe();
-    let address = flotilla_resources::change_request_address("https://github.com/Flotilla-Org/Flotilla", "3351").expect("address");
+    // The capitalised spelling earlier generations wrote for that URL.
+    let address =
+        flotilla_protocol::LeafAddress::ChangeRequest { service: "github.com".into(), scope: "Flotilla-Org/Flotilla".into(), number: 3351 };
     let request = WaitSubscriptionRequest {
         namespace: "flotilla".to_string(),
         leaves: vec![leaf(address, ".state", "merged")],

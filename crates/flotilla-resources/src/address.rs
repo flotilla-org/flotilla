@@ -10,9 +10,9 @@
 
 pub use flotilla_address::{record_name, Address, Kind as AddressKind, GITHUB_FORGE_ID};
 use flotilla_address::{Forge as AddressForge, ForgeKind as AddressForgeKind, ForgeLookup, GITHUB_HOSTS};
-use flotilla_protocol::LeafAddress;
+use flotilla_protocol::{IssueRef, IssueSource, LeafAddress, Subject, SubjectKind};
 
-use crate::{canonicalize_repo_url, ForgeKind, ForgeSpec};
+use crate::{canonicalize_repo_url, normalize_issue_source, ForgeKind, ForgeSpec};
 
 /// The service stored records use for the built-in GitHub forge.
 const GITHUB_SERVICE: &str = "github.com";
@@ -101,7 +101,7 @@ pub fn repository_address(remote: &str, forges: &[ForgeSpec]) -> Result<Address,
 /// request and issue records, leaves and relay hints spell it.
 ///
 /// The service is a forge id, `github.com`, or a host or URL in the encoded
-/// spelling `issue_address_with_forges` writes when no Forge matched. A forge
+/// spelling `issue_subject_source` writes for an issue source. A forge
 /// id the directory does not hold is still accepted: its text is canonical,
 /// and canonical text needs no lookup, so its scope keeps the stored case.
 pub fn stored_repository_address(service: &str, scope: &str, forges: &[ForgeSpec]) -> Result<Address, String> {
@@ -227,6 +227,142 @@ pub fn remote_names_repository(remote: &str, forges: &[ForgeSpec], repository: &
     repository_address(remote, forges).is_ok_and(|address| &address == repository)
 }
 
+/// The leaf a change request or issue address is watched through, in the
+/// stored spelling [`stored_service_scope`] writes: `github.com` for the
+/// built-in forge and the `forge_id` otherwise, with the repository as the
+/// address holds it (the forge kind's case). This is the only writer of
+/// change request and issue leaves.
+pub fn leaf_for(address: &Address) -> Result<LeafAddress, String> {
+    let (service, scope, number) = numbered_parts(address)?;
+    match address.kind() {
+        AddressKind::ChangeRequest => Ok(LeafAddress::ChangeRequest { service, scope, number }),
+        AddressKind::Issue => Ok(LeafAddress::Issue { service, scope, number }),
+        kind => Err(format!("{address} is a {kind}, not a change request or issue")),
+    }
+}
+
+/// The text a promise submission records for the change request or issue
+/// `address`: the `cr/<service>/<scope>/<n>` form of [`leaf_for`].
+///
+/// Submissions live in stored convoy statuses, so the text keeps the shape
+/// the previous generation parses (ADR 0047); readers resolve it with
+/// [`Submission::subject_address`](crate::promises::Submission::subject_address).
+pub fn submission_subject_text(address: &Address) -> Result<String, String> {
+    leaf_for(address).map(|leaf| leaf.to_string())
+}
+
+/// The convoy subject naming the change request or issue `address`, in the
+/// stored spelling [`leaf_for`] writes.
+pub fn subject_for(address: &Address) -> Result<Subject, String> {
+    let (service, scope, number) = numbered_parts(address)?;
+    let kind = match address.kind() {
+        AddressKind::ChangeRequest => SubjectKind::ChangeRequest,
+        AddressKind::Issue => SubjectKind::Issue,
+        kind => return Err(format!("{address} is a {kind}, not a change request or issue")),
+    };
+    Ok(Subject { kind, source: IssueSource { service, scope }, id: number.to_string() })
+}
+
+/// The address a convoy subject names, whichever spelling it was recorded
+/// with: a forge id, `github.com`, a host, or an encoded issue-source URL. A
+/// host or URL resolves only through the Forge that declares it.
+pub fn subject_address(subject: &Subject, forges: &[ForgeSpec]) -> Result<Address, String> {
+    let number = subject.id.parse::<u64>().map_err(|_| format!("subject id `{}` is not a numeric forge number", subject.id))?;
+    match subject.kind {
+        SubjectKind::ChangeRequest => stored_change_request_address(&subject.source.service, &subject.source.scope, number, forges),
+        SubjectKind::Issue => stored_issue_address(&subject.source.service, &subject.source.scope, number, forges),
+    }
+}
+
+/// Whether two subjects name the same change request or issue. Subjects that
+/// do not resolve through `forges` fall back to comparing their spellings.
+pub fn same_subject(left: &Subject, right: &Subject, forges: &[ForgeSpec]) -> bool {
+    match (subject_address(left, forges), subject_address(right, forges)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// An issue's address from an issue reference, whose source names its forge
+/// by issue-service URL (`https://github.com`, or a Forge's `https_url`
+/// including any installation path prefix), forge id, or host.
+pub fn issue_reference_address(reference: &IssueRef, forges: &[ForgeSpec]) -> Result<Address, String> {
+    let source = normalize_issue_source(&reference.source);
+    let number = reference.id.parse::<u64>().map_err(|_| format!("issue id `{}` is not a numeric forge number", reference.id))?;
+    stored_issue_address(source.service.trim_end_matches('/'), &source.scope, number, forges)
+}
+
+/// The `IssueSource` a convoy subject records for the repository at `remote`:
+/// the `forge_id` of the Forge declaring the remote, else the remote's
+/// lowercased host with the repository path as given.
+///
+/// Subjects are stored in convoy specs and statuses and compared by equality
+/// (`ConvoyStatus::discover_subject`, the declared-subject dedupe), so new
+/// subjects keep the spelling existing ones were written with; converging it
+/// onto [`subject_for`] would duplicate subjects already recorded. Leaves and
+/// submission text are not spelled here; they go through [`leaf_for`].
+/// Remove once subjects compare by address (ADR 0064 cut-over).
+pub fn subject_source_for_remote(remote: &str, forges: &[ForgeSpec]) -> Result<IssueSource, String> {
+    let mut matches = Vec::new();
+    for forge in forges {
+        if let Some((owner, repo)) = forge.repository_path(remote)? {
+            matches.push((forge, format!("{owner}/{repo}")));
+        }
+    }
+    match matches.as_slice() {
+        [(forge, scope)] => Ok(IssueSource { service: forge.forge_id.clone(), scope: scope.clone() }),
+        [] => {
+            let canonical = canonicalize_repo_url(remote)?;
+            let (_, rest) = canonical.split_once("://").ok_or_else(|| format!("canonical repository remote has no scheme: {canonical}"))?;
+            let (service, scope) =
+                rest.split_once('/').ok_or_else(|| format!("canonical repository remote has no repository path: {canonical}"))?;
+            Ok(IssueSource { service: service.to_string(), scope: scope.to_string() })
+        }
+        _ => Err(format!("repository {remote} matches multiple Forge definitions")),
+    }
+}
+
+/// The convoy subject for change request `id` in the repository at
+/// `remote`, in the subject spelling [`subject_source_for_remote`] keeps.
+pub fn remote_change_request_subject(remote: &str, id: &str, forges: &[ForgeSpec]) -> Result<Subject, String> {
+    let number = id.parse::<u64>().map_err(|_| format!("change request id `{id}` is not a numeric forge number"))?;
+    Ok(Subject { kind: SubjectKind::ChangeRequest, source: subject_source_for_remote(remote, forges)?, id: number.to_string() })
+}
+
+/// The `IssueSource` a declared issue subject records when it is derived
+/// from a convoy's carried issue, where no Forge list is at hand (the spec's
+/// serializer derives it): public GitHub in its stored spelling, and any
+/// other source encoded into the service so installations sharing a host
+/// stay distinct. [`decode_service`] inverts the encoding. See
+/// [`subject_source_for_remote`] for why the subject spelling is kept.
+pub fn issue_subject_source(source: &IssueSource) -> IssueSource {
+    let source = normalize_issue_source(source);
+    let service_url = source.service.trim_end_matches('/');
+    let (scheme, location) = service_url.split_once("://").map_or(("https", service_url), |(scheme, rest)| (scheme, rest));
+    let location = location.to_ascii_lowercase().replace('%', "%25").replace('/', "%2f");
+    let service = if scheme != "https" {
+        format!("{scheme}%3a%2f%2f{location}")
+    } else if !location.contains(['.', ':']) && !location.contains("%2f") {
+        format!("host%3a{location}")
+    } else {
+        location
+    };
+    match stored_repository_address(&service, &source.scope, &[]) {
+        Ok(address) if address.get(AddressKind::Forge) == Some(GITHUB_FORGE_ID) => {
+            let (service, scope) = stored_service_scope(&address).expect("a repository address is under a forge");
+            IssueSource { service, scope }
+        }
+        _ => IssueSource { service, scope: source.scope },
+    }
+}
+
+fn numbered_parts(address: &Address) -> Result<(String, String, u64), String> {
+    let number = address.number().ok_or_else(|| format!("{address} has no number"))?;
+    let (service, scope) =
+        address.parent().as_ref().and_then(stored_service_scope).ok_or_else(|| format!("{address} is not under a forge repository"))?;
+    Ok((service, scope, number))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -308,8 +444,8 @@ mod tests {
         assert!(!remote_names_repository("https://github.com/org/other", &[], &repository));
     }
 
-    // `decode_service` inverts the spelling `issue_address_with_forges`
-    // writes for an issue source no Forge declared, including path prefixes.
+    // `decode_service` inverts the spelling `issue_subject_source` writes
+    // for an issue source, including path prefixes.
     #[test]
     fn decode_service_inverts_the_undeclared_issue_spelling() {
         let installed = ForgeSpec::builder()
@@ -320,15 +456,8 @@ mod tests {
             .git_ssh_host("forge.example".into())
             .build();
         for service_url in ["https://forge.example/install", "http://forge.example/install"] {
-            let reference = flotilla_protocol::IssueRef {
-                source: flotilla_protocol::IssueSource { service: service_url.into(), scope: "Team/Repo".into() },
-                id: "3".into(),
-            };
-            let flotilla_protocol::LeafAddress::Issue { service, scope, .. } =
-                crate::issue_address_with_forges(&reference, &[]).expect("leaf")
-            else {
-                panic!("issue leaf")
-            };
+            let reference = IssueRef { source: IssueSource { service: service_url.into(), scope: "Team/Repo".into() }, id: "3".into() };
+            let IssueSource { service, scope } = issue_subject_source(&reference.source);
             let expected = "forge:lab/repo:team%2Frepo";
             assert_eq!(
                 stored_repository_address(&service, &scope, std::slice::from_ref(&installed)).map(|a| a.to_string()).as_deref(),
@@ -394,5 +523,115 @@ mod tests {
         );
         assert!(leaf_address(&LeafAddress::Vessel { name: "work".into() }, &[]).is_err());
         assert!(leaf_address(&LeafAddress::Work { convoy: "demo".into(), work: "work".into() }, &[]).is_err());
+    }
+
+    fn github_alias() -> ForgeSpec {
+        ForgeSpec::builder()
+            .forge_id("github".into())
+            .kind(ForgeKind::Github)
+            .hosts(BTreeSet::from(["github-alias".to_string(), "github.com".to_string()]))
+            .https_url("https://github.com".into())
+            .git_ssh_host("github-alias".into())
+            .build()
+    }
+
+    /// `value` with each ASCII letter's case flipped where `flips` says so.
+    fn recase(tc: &hegel::TestCase, value: &str) -> String {
+        value
+            .chars()
+            .map(|character| {
+                if tc.draw(hegel::generators::booleans()) {
+                    if character.is_ascii_lowercase() {
+                        character.to_ascii_uppercase()
+                    } else {
+                        character.to_ascii_lowercase()
+                    }
+                } else {
+                    character
+                }
+            })
+            .collect()
+    }
+
+    // ADR 0066 Context and §3: one GitHub PR has five spellings (an HTTPS
+    // URL in any case, an scp remote, a declared Forge's SSH alias, a stored
+    // host-spelled leaf and a forge-id leaf); all name one address, and the
+    // one leaf writer spells that address `cr/github.com/<lowercase>/<n>`.
+    // The generator draws the spelling, the case of every letter of the
+    // owner and repository, and numbers across the whole u64 range.
+    #[hegel::test]
+    fn five_spellings_of_one_pull_request_collapse(tc: hegel::TestCase) {
+        let number = tc.draw(hegel::generators::integers::<u64>());
+        let owner = recase(&tc, "flotilla-org");
+        let repo = recase(&tc, "flotilla");
+        let forges = [github_alias()];
+        let spelling = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4));
+        let stored = |service: &str| LeafAddress::ChangeRequest { service: service.into(), scope: format!("{owner}/{repo}"), number };
+        let address = match spelling {
+            0 => remote_change_request_address(&format!("https://{}/{owner}/{repo}", recase(&tc, "github.com")), number, &forges),
+            1 => remote_change_request_address(&format!("git@github.com:{owner}/{repo}.git"), number, &forges),
+            2 => remote_change_request_address(&format!("git@github-alias:{owner}/{repo}.git"), number, &forges),
+            3 => leaf_address(&stored(&recase(&tc, "github.com")), &forges),
+            _ => leaf_address(&stored("github"), &forges),
+        }
+        .expect("every spelling resolves");
+        assert_eq!(address, Address::change_request(&AddressForge::github(), "flotilla-org/flotilla", number).expect("canonical"));
+        assert_eq!(
+            leaf_for(&address).map(|leaf| leaf.to_string()),
+            Ok(format!("cr/github.com/flotilla-org/flotilla/{number}")),
+            "spelling {spelling}"
+        );
+    }
+
+    // The leaf, subject and submission-text writers invert their readers:
+    // for change requests and issues on the built-in forge and on a declared
+    // Forgejo (which keeps repository case), each written form resolves back
+    // to the address it was written from, and submission text still parses
+    // as the leaf text the previous generation reads (ADR 0047).
+    #[hegel::test]
+    fn subject_leaf_and_submission_text_round_trip(tc: hegel::TestCase) {
+        let forges = [lab()];
+        let forge =
+            if tc.draw(hegel::generators::booleans()) { AddressForge::github() } else { ForgeDirectory::forge(&lab()).expect("lab") };
+        let repository = format!("{}/{}", recase(&tc, "team"), recase(&tc, "repo"));
+        let number = tc.draw(hegel::generators::integers::<u64>());
+        let address = if tc.draw(hegel::generators::booleans()) {
+            Address::change_request(&forge, &repository, number)
+        } else {
+            Address::issue(&forge, &repository, number)
+        }
+        .expect("address");
+
+        let subject = subject_for(&address).expect("subject");
+        assert_eq!(subject_address(&subject, &forges).as_ref(), Ok(&address));
+        assert_eq!(subject_address(&subject, &[]).as_ref(), Ok(&address), "the stored spelling needs no Forge list");
+        let leaf = leaf_for(&address).expect("leaf");
+        assert_eq!(leaf_address(&leaf, &forges).as_ref(), Ok(&address));
+        let text = submission_subject_text(&address).expect("text");
+        assert_eq!(text.parse::<LeafAddress>().as_ref(), Ok(&leaf));
+        assert!(same_subject(&subject, &subject_for(&leaf_address(&leaf, &[]).expect("leaf address")).expect("subject"), &[]));
+    }
+
+    // ADR 0066 §3: an issue reference names its forge by issue-service URL,
+    // including a Forge's installation path; public GitHub needs no record,
+    // and a source no Forge declares is refused.
+    #[test]
+    fn issue_references_resolve_their_forge() {
+        let installed = ForgeSpec::builder()
+            .forge_id("lab".into())
+            .kind(ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["forge.example".to_string()]))
+            .https_url("https://forge.example/install".into())
+            .git_ssh_host("forge.example".into())
+            .build();
+        let reference =
+            |service: &str| IssueRef { source: IssueSource { service: service.into(), scope: "Team/Repo".into() }, id: "3".into() };
+        let resolved = |service: &str, forges: &[ForgeSpec]| {
+            issue_reference_address(&reference(service), forges).and_then(|address| leaf_for(&address)).map(|leaf| leaf.to_string())
+        };
+        assert_eq!(resolved("https://GitHub.com", &[]).as_deref(), Ok("issue/github.com/team/repo/3"));
+        assert_eq!(resolved("https://forge.example/install/", std::slice::from_ref(&installed)).as_deref(), Ok("issue/lab/team/repo/3"));
+        assert!(resolved("https://forge.example/install", &[]).is_err());
+        assert!(resolved("https://forge.example/other", &[installed]).is_err());
     }
 }

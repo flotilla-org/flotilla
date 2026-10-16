@@ -84,15 +84,16 @@ pub fn convoy_change_request_id_for_checkout(
         return Some(id.clone());
     }
     let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref())?;
-    let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. } =
-        flotilla_resources::change_request_address_with_forges(&repository.url, "1", forges).ok()?
-    else {
-        return None;
-    };
+    let repository = flotilla_resources::address::repository_address(&repository.url, forges).ok()?;
+    // Subjects keep the spelling they were recorded with; compare the
+    // repositories they name.
     let ids = flotilla_resources::active_change_request_subjects(convoy)
         .ok()?
         .into_iter()
-        .filter(|subject| subject.source.service == service && subject.source.scope == scope)
+        .filter(|subject| {
+            flotilla_resources::address::subject_address(subject, forges)
+                .is_ok_and(|address| address.parent().as_ref() == Some(&repository))
+        })
         .map(|subject| subject.id)
         .collect::<BTreeSet<_>>();
     if ids.len() == 1 {
@@ -499,7 +500,8 @@ mod tests {
             &[forge],
         );
         assert_eq!(subjects.len(), 1);
-        assert_eq!(subjects[0].internal().expect("internal reference"), "cr/lab/robert/project-map/12");
+        assert_eq!(subjects[0].source, flotilla_protocol::IssueSource { service: "lab".into(), scope: "robert/project-map".into() });
+        assert_eq!(subjects[0].id, "12");
         let subjects = change_request_subjects_from_claim(
             "https://forge.example/team/other/repository/pulls/13",
             &repositories,
