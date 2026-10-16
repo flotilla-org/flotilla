@@ -34,6 +34,9 @@ fn segment_value(tc: &hegel::TestCase, kind: Kind) -> String {
             let length = if tc.draw(gs::booleans()) { 40 } else { 64 };
             tc.draw(gs::text().alphabet("0123456789abcdef").min_size(length).max_size(length))
         }
+        // Usage values are trimmed and lowercase; the leading letter keeps
+        // them non-empty once trimmed.
+        Kind::Usage | Kind::Account => format!("u{}", value(tc, 0).to_lowercase()).trim_end().to_string(),
         _ => value(tc, 1),
     }
 }
@@ -192,6 +195,16 @@ fn condition_other_spellings_are_refused() {
         assert!(text.parse::<Condition>().is_err(), "{text} must be refused");
         assert!(Condition::resolve(text, &BuiltinForges).is_ok(), "{text} is valid lenient input");
     }
+}
+
+// `@` separates a reference's revision; it is always encoded inside an
+// address, so a subject or revision holding `@` still round-trips.
+#[test]
+fn references_split_at_the_unencoded_at() {
+    let artifact = convoy_role("demo", "coder").artifact("note", "a@b").expect("artifact");
+    let reference = Reference::new(artifact, Revision::new("rev@1").expect("revision"));
+    assert!(reference.to_string().ends_with("of:a%40b@rev%401"));
+    assert_eq!(reference.to_string().parse::<Reference>(), Ok(reference));
 }
 
 // A reference's text and serde forms both round-trip.
@@ -397,6 +410,36 @@ mod normalisation {
         let commit = resolve(&format!("https://github.com/o/r/commit/{}", sha.to_uppercase()), &BuiltinForges).expect("commit");
         assert_eq!(commit.as_str(), format!("forge:github/repo:o%2Fr/commit:{sha}"));
         assert!(format!("forge:github/repo:o%2Fr/commit:{}", &sha[..12]).parse::<Address>().is_err());
+    }
+
+    // Strict parsing knows no forge kind but `github`'s, so another forge's
+    // repository case is not checked there; `resolve` applies its rule.
+    #[test]
+    fn strict_parse_checks_case_only_for_github_and_resolve_normalises_known_forges() {
+        let typed = "forge:lab/repo:Team%2FRepo";
+        assert_eq!(typed.parse::<Address>().map(|a| a.to_string()).as_deref(), Ok(typed));
+        assert_eq!(resolve(typed, &Lab).map(|a| a.to_string()).as_deref(), Ok("forge:lab/repo:team%2Frepo"));
+        assert!("forge:github/repo:Team%2FRepo".parse::<Address>().is_err());
+    }
+
+    // Usage records compare providers and accounts trimmed and lowercased, so
+    // the address does too: one account has one address and one record.
+    #[test]
+    fn usage_providers_and_accounts_are_trimmed_and_lowercased() {
+        let usage = Address::usage(" Claude", "Team@Example.com ").expect("usage");
+        assert_eq!(usage.as_str(), "usage:claude/account:team%40example.com");
+        assert!("usage:Claude/account:team".parse::<Address>().is_err());
+        assert!(Address::root(Kind::Usage, "Claude").is_err());
+        assert_eq!(resolve("usage:Claude/account:Team", &BuiltinForges).map(|a| a.to_string()).as_deref(), Ok("usage:claude/account:team"));
+        assert_eq!(resolve("usage/Claude/Team", &BuiltinForges).map(|a| a.to_string()).as_deref(), Ok("usage:claude/account:team"));
+    }
+
+    #[test]
+    fn browser_urls_past_the_number_resolve() {
+        for suffix in ["/files", "/commits", "/"] {
+            let input = format!("https://github.com/flotilla-org/flotilla/pull/42{suffix}");
+            assert_eq!(resolve(&input, &BuiltinForges).as_ref(), Ok(&github_cr(42)), "{input}");
+        }
     }
 
     #[test]

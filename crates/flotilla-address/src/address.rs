@@ -75,9 +75,11 @@ impl Address {
         Self::repository(forge, repository)?.child(Kind::Issue, &number.to_string())
     }
 
-    /// A usage account: `usage:<provider>/account:<account>`.
+    /// A usage account: `usage:<provider>/account:<account>`. Providers and
+    /// accounts are compared trimmed and lowercased, as usage records always
+    /// have been, so the constructor normalises both.
     pub fn usage(provider: &str, account: &str) -> Result<Self, Error> {
-        Self::root(Kind::Usage, provider)?.child(Kind::Account, account)
+        Self::root(Kind::Usage, &normalise_usage(provider))?.child(Kind::Account, &normalise_usage(account))
     }
 
     /// A one-segment address of a root kind.
@@ -187,11 +189,13 @@ impl Address {
     /// is its role.
     pub fn parent(&self) -> Option<Self> {
         let count = self.segments.len().checked_sub(1).filter(|count| *count > 0)?;
-        let mut parent = Self::empty();
-        for segment in &self.segments[..count] {
-            parent = parent.push(segment.kind, segment.value.clone()).expect("a prefix of a valid address is valid");
+        // No canonical value holds a bare `/`, so the parent's text ends at the
+        // `/` before the last segment (and before an artifact's `of:`).
+        let mut text = self.text.as_str();
+        for _ in 0..1 + usize::from(self.of.is_some()) {
+            text = text.rsplit_once('/').map(|(head, _)| head)?;
         }
-        Some(parent)
+        Some(Self { segments: self.segments[..count].to_vec(), of: None, text: text.to_string() })
     }
 
     /// Whether this address is `prefix` or lies under it, on segment
@@ -218,6 +222,7 @@ fn validate_value(kind: Kind, value: &str) -> Result<(), Error> {
     }
     match kind {
         Kind::Forge => validate_forge_id(value),
+        Kind::Usage | Kind::Account if normalise_usage(value) != value => invalid("usage providers and accounts are trimmed and lowercase"),
         Kind::ChangeRequest | Kind::Issue => {
             let canonical = value.bytes().all(|byte| byte.is_ascii_digit()) && (value == "0" || !value.starts_with('0'));
             if canonical && value.parse::<u64>().is_ok() {
@@ -238,6 +243,10 @@ fn validate_value(kind: Kind, value: &str) -> Result<(), Error> {
     }
 }
 
+pub(crate) fn normalise_usage(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
 /// GitHub and Forgejo repositories are `owner/repo`.
 fn validate_repository(kind: ForgeKind, repository: &str) -> Result<(), Error> {
     match kind {
@@ -253,6 +262,13 @@ impl FromStr for Address {
 
     /// Parses canonical text, with no lookups. Any other spelling is refused;
     /// lenient input goes through [`crate::resolve`].
+    ///
+    /// Without a lookup the parser knows only the built-in `github` forge's
+    /// kind, so it refuses an uppercase GitHub repository but cannot check the
+    /// case of another forge's. Such text is canonical only if it was printed
+    /// from an address a constructor or [`crate::resolve`] built: store and
+    /// exchange only printed addresses, and pass typed input through
+    /// `resolve`, which applies every known forge's case rule.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let mut address = Self::empty();
         for raw in text.split('/') {

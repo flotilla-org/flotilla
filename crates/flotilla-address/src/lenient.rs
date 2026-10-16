@@ -2,7 +2,7 @@
 //! canonical form (ADR 0066 §4). Only the result is ever stored or printed.
 
 use crate::{
-    address::OF,
+    address::{normalise_usage, OF},
     encoding::decode_lenient,
     forge::{forge_by_host, forge_by_id},
     Address, Error, Forge, ForgeLookup, Kind,
@@ -70,7 +70,13 @@ fn resolve_segments(input: &str, forges: &dyn ForgeLookup) -> Result<Address, Er
 fn rebuild(segments: Vec<(Kind, String)>, of: Option<&str>, forges: &dyn ForgeLookup) -> Result<Address, Error> {
     let mut iter = segments.into_iter();
     let (kind, value) = iter.next().ok_or(Error::Empty)?;
-    let mut address = if kind == Kind::Forge {
+    let mut address = if kind == Kind::Usage {
+        match iter.next() {
+            Some((Kind::Account, account)) => Address::usage(&value, &account)?,
+            Some((kind, _)) => return Err(Error::Shape { kind, parent: Some(Kind::Usage) }),
+            None => Address::root(kind, &normalise_usage(&value))?,
+        }
+    } else if kind == Kind::Forge {
         let forge = lookup(&value, forges)?;
         match iter.next() {
             Some((Kind::Repo, repository)) => Address::repository(&forge, &repository)?,
@@ -150,8 +156,9 @@ fn resolve_url(input: &str, forges: &dyn ForgeLookup) -> Result<Option<Address>,
     let parts = path.split('/').collect::<Vec<_>>();
     let address = match parts.as_slice() {
         [owner, repo] => Address::repository(&forge, &format!("{owner}/{}", repo.strip_suffix(".git").unwrap_or(repo)))?,
-        [owner, repo, "pull" | "pulls", number] => Address::change_request(&forge, &format!("{owner}/{repo}"), parse_number(number)?)?,
-        [owner, repo, "issues", number] => Address::issue(&forge, &format!("{owner}/{repo}"), parse_number(number)?)?,
+        // A pasted browser URL may continue past the number (`/files`, `/commits`).
+        [owner, repo, "pull" | "pulls", number, ..] => Address::change_request(&forge, &format!("{owner}/{repo}"), parse_number(number)?)?,
+        [owner, repo, "issues", number, ..] => Address::issue(&forge, &format!("{owner}/{repo}"), parse_number(number)?)?,
         [owner, repo, "commit", sha] => {
             Address::repository(&forge, &format!("{owner}/{repo}"))?.child(Kind::Commit, &sha.to_ascii_lowercase())?
         }
