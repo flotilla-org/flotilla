@@ -7,3 +7,55 @@ skills:
   '*':
     - flotilla-org/flotilla@flotilla-commands
     - flotilla-org/flotilla@crew-review
+dispatch_policy:
+  # Lanes rank work outside missions; priority and weight come from each Lane issue's fields.
+  # Mission and Map issues are found by ancestry and need no entry here.
+  routine_lane: routine
+  missions:
+    - name: stability
+      issue:
+        source: {service: 'https://github.com', scope: flotilla-org/flotilla}
+        id: '3326'
+    - name: test-hygiene
+      issue:
+        source: {service: 'https://github.com', scope: flotilla-org/flotilla}
+        id: '3327'
+    - name: deps-toolchain
+      issue:
+        source: {service: 'https://github.com', scope: flotilla-org/flotilla}
+        id: '3328'
+    - name: ci-infra
+      issue:
+        source: {service: 'https://github.com', scope: flotilla-org/flotilla}
+        id: '3329'
+    - name: fleet-ops
+      issue:
+        source: {service: 'https://github.com', scope: flotilla-org/flotilla}
+        id: '3330'
+    - name: docs
+      issue:
+        source: {service: 'https://github.com', scope: flotilla-org/flotilla}
+        id: '3331'
+    - name: ux-polish
+      issue:
+        source: {service: 'https://github.com', scope: flotilla-org/flotilla}
+        id: '3332'
+    - name: routine
+      issue:
+        source: {service: 'https://github.com', scope: flotilla-org/flotilla}
+        id: '3333'
+  lanes:
+    - mission: stability
+      labels: [bug]
+    - mission: test-hygiene
+      labels: [testing]
+    - mission: deps-toolchain
+      labels: [deps]
+    - mission: ci-infra
+      labels: [infrastructure]
+    - mission: fleet-ops
+      labels: [fleet-ops]
+    - mission: docs
+      labels: [documentation]
+    - mission: ux-polish
+      labels: [ui]
