@@ -45,7 +45,8 @@ impl IssueRef {
     /// every spelling of one issue is one subject.
     pub(crate) fn normalized(mut self, forges: &[ForgeSpec]) -> Result<Self, String> {
         let address = self.address(forges)?;
-        (self.service, self.scope) = stored_service_scope(&address).expect("an issue address is under a repository");
+        (self.service, self.scope) =
+            stored_service_scope(&address).ok_or_else(|| format!("{address} is not an issue under a repository"))?;
         Ok(self)
     }
 }

@@ -52,6 +52,7 @@ mod tests {
     use crate::change_request_observer::ChangeRequestRefreshCadence;
     use crate::change_request_observer::ChangeRequestRefresher;
     use crate::leaf_engine::LeafSubscriptionTable;
+    use crate::testkits::cr_name;
     use flotilla_change_request::observation::GhChangeRequestObservationSource;
     use flotilla_daemon_api::event_sink::EventSink;
     use flotilla_executor::environment_manager::EnvironmentManager;
@@ -834,15 +835,7 @@ mod tests {
         for scope in ["owner/one", "owner/two", "owner/unrelated"] {
             let record = requests
                 .create(
-                    &InputMeta::builder()
-                        .name(
-                            flotilla_resources::address::record_name(
-                                &flotilla_resources::address::stored_change_request_address("github.com", scope, 42, &[])
-                                    .expect("change request address"),
-                            )
-                            .expect("record name"),
-                        )
-                        .build(),
+                    &InputMeta::builder().name(cr_name("github.com", scope, 42)).build(),
                     &ChangeRequestSpec::builder()
                         .service("github.com".into())
                         .scope(scope.into())

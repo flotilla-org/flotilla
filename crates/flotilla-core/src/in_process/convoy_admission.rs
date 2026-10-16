@@ -5291,6 +5291,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::testkits::cr_name;
     use crate::testkits::discovery::fake_discovery;
     use crate::testkits::discovery::FakeChangeRequest;
     use flotilla_protocol::ChangeRequest;
@@ -5346,23 +5347,7 @@ mod tests {
             fixture
                 .backend
                 .using::<ResourceChangeRequest>("flotilla")
-                .create(
-                    &InputMeta::builder()
-                        .name(
-                            flotilla_resources::address::record_name(
-                                &flotilla_resources::address::stored_change_request_address(
-                                    &record.service,
-                                    &record.scope,
-                                    record.number,
-                                    &[],
-                                )
-                                .expect("change request address"),
-                            )
-                            .expect("record name"),
-                        )
-                        .build(),
-                    &record,
-                )
+                .create(&InputMeta::builder().name(cr_name(&record.service, &record.scope, record.number)).build(), &record)
                 .await
                 .unwrap();
             for index in 0..n {

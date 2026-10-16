@@ -162,11 +162,7 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
         .expect("replicate checkout evidence");
 
     let remote_records = remote.using::<ChangeRequest>("flotilla");
-    let record_name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1364, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let record_name = cr_name("github.com", "flotilla-org/flotilla", 1364);
     let record = remote_records
         .create(
             &InputMeta::builder().name(record_name).build(),
@@ -334,11 +330,7 @@ async fn replica_reading_evaluator_fires_from_authority_change_request_record() 
     let authority = ResourceBackend::new(InMemoryBackend::default());
     let subject =
         LeafAddress::ChangeRequest { service: "github.com".to_string(), scope: "flotilla-org/flotilla".to_string(), number: 1365 };
-    let name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1365, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let name = cr_name("github.com", "flotilla-org/flotilla", 1365);
     let records = authority.using::<ChangeRequest>("flotilla");
     let created = records
         .create(
@@ -411,11 +403,7 @@ async fn replica_reading_evaluator_fires_from_authority_change_request_record() 
 async fn foreign_change_request_authority_does_not_fetch_or_write_status() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let records = backend.using::<ChangeRequest>("flotilla");
-    let name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2049, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let name = cr_name("github.com", "flotilla-org/flotilla", 2049);
     records
         .create(
             &InputMeta::builder().name(name.clone()).build(),
@@ -560,11 +548,7 @@ async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
 async fn former_owner_evaluates_fresher_takeover_replica() {
     let former_owner = ResourceBackend::new(InMemoryBackend::default());
     let new_owner = ResourceBackend::new(InMemoryBackend::default());
-    let name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2052, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let name = cr_name("github.com", "flotilla-org/flotilla", 2052);
     let spec = |authority: &str| {
         flotilla_resources::ChangeRequestSpec::builder()
             .service("github.com".to_string())

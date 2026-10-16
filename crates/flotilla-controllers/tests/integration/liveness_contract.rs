@@ -61,6 +61,7 @@ use flotilla_store_testkit::WorldBuilder;
 use flotilla_store_testkit::WriteCountingBackend;
 
 use crate::common;
+use crate::common::cr_name;
 
 const NAMESPACE: &str = "flotilla";
 const INTEGRATION_TTL: Duration = Duration::hours(6);
@@ -412,11 +413,7 @@ impl WorldBuilder for ConvoyWorldBuilder {
             .map_err(|error| error.to_string())?;
 
         let change_requests = backend.using::<ChangeRequest>(NAMESPACE);
-        let record_name = flotilla_resources::address::record_name(
-            &flotilla_resources::address::stored_change_request_address("github.com", "example/repo-a", CHANGE_REQUEST_NUMBER, &[])
-                .expect("change request address"),
-        )
-        .expect("record name");
+        let record_name = cr_name("github.com", "example/repo-a", CHANGE_REQUEST_NUMBER);
         let record = change_requests
             .create(
                 &InputMeta::builder().name(record_name.clone()).build(),
@@ -463,11 +460,7 @@ impl ReconcileStep<ConvoyWorld> for ConvoyStep {
 
     async fn reconcile_step(&self, world: &mut ConvoyWorld) -> Result<LivenessStep<Self::Patch, Self::Actuation>, String> {
         let records = world.backend.using::<ChangeRequest>(NAMESPACE);
-        let record_name = flotilla_resources::address::record_name(
-            &flotilla_resources::address::stored_change_request_address("github.com", "example/repo-a", CHANGE_REQUEST_NUMBER, &[])
-                .expect("change request address"),
-        )
-        .expect("record name");
+        let record_name = cr_name("github.com", "example/repo-a", CHANGE_REQUEST_NUMBER);
         let record = records.get(&record_name).await.map_err(|error| error.to_string())?;
         let stale =
             record.status.as_ref().is_some_and(|status| world.clock.now().signed_duration_since(status.state.observed_at) > LANDING_TTL);

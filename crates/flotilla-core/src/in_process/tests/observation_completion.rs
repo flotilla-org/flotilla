@@ -26,6 +26,7 @@ use super::support::{test_meta, BatchedObservationRunner};
 use crate::in_process::CrewCompletionRefusalCause;
 use crate::in_process::InProcessDaemon;
 use crate::in_process::{forge_service_matches, repository_observes_subject};
+use crate::testkits::cr_name;
 use crate::testkits::discovery::fake_discovery_with_runner;
 
 // #2585: the real convoy resolver shares proven branch absence across callers
@@ -678,13 +679,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
     assert_ne!(refused_status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
     let observed = backend
         .using::<ResourceChangeRequest>("flotilla")
-        .get(
-            &flotilla_resources::address::record_name(
-                &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2200, &[])
-                    .expect("change request address"),
-            )
-            .expect("record name"),
-        )
+        .get(&cr_name("github.com", "flotilla-org/flotilla", 2200))
         .await
         .expect("claim-time observation");
     assert_eq!(observed.status.expect("status").mergeable.value, Some(flotilla_resources::ObservedMergeability::Conflicting));

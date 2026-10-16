@@ -3,11 +3,7 @@ use flotilla_store_sqlite::SqliteBackend;
 
 pub(super) async fn publish_merged_change_request(backend: &ResourceBackend, number: u64, authority: &str) {
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>(NAMESPACE);
-    let name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", number, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let name = cr_name("github.com", "flotilla-org/flotilla", number);
     let record = match records
         .create(
             &InputMeta::builder().name(name).build(),
@@ -22,13 +18,7 @@ pub(super) async fn publish_merged_change_request(backend: &ResourceBackend, num
     {
         Ok(record) => record,
         Err(ResourceError::Conflict { .. }) => records
-            .get(
-                &flotilla_resources::address::record_name(
-                    &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", number, &[])
-                        .expect("change request address"),
-                )
-                .expect("record name"),
-            )
+            .get(&cr_name("github.com", "flotilla-org/flotilla", number))
             .await
             .expect("read concurrently materialized CR observation"),
         Err(error) => panic!("create merged CR observation: {error}"),
@@ -353,4 +343,13 @@ pub(super) fn detection_registry(runner: Arc<dyn CommandRunner>) -> Arc<Provider
     use flotilla_discovery::registry::command_provider_registry;
     use flotilla_environment::environment::EnvironmentKind;
     Arc::new(command_provider_registry(&[EnvironmentKind::Docker, EnvironmentKind::HostDirect], runner))
+}
+
+/// The record name the observer writes for a stored `(service, scope, number)`
+/// change request spelling that needs no Forge directory.
+fn cr_name(service: &str, scope: &str, number: u64) -> String {
+    flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address(service, scope, number, &[]).expect("change request address"),
+    )
+    .expect("record name")
 }

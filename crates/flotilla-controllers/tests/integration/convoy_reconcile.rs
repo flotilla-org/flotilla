@@ -28,6 +28,8 @@ use flotilla_store::{
 
 use flotilla_store_testkit::fixtures as common;
 
+use crate::common::cr_name;
+
 struct AlwaysEligible;
 
 #[test]
@@ -84,11 +86,7 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
         ..Default::default()
     };
     let convoy = convoy_object("completion", spec, Some(status));
-    let record_name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 42, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let record_name = cr_name("github.com", "flotilla-org/flotilla", 42);
     let checkouts = BTreeMap::new();
     let mut change_requests = BTreeMap::new();
     let ledger = |role: &str| {
@@ -433,11 +431,7 @@ fn declared_artifact_completion_accepts_a_new_kind_and_rebinds_to_current_head()
         ..Default::default()
     };
     let convoy = convoy_object("toy", spec, Some(status));
-    let cr_name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 42, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let cr_name = cr_name("github.com", "flotilla-org/flotilla", 42);
     let record = |head: &str| flotilla_resources::ResourceObject::<ChangeRequest> {
         metadata: common::object_meta(&cr_name, "flotilla", "1"),
         spec: ChangeRequestSpec::builder()
@@ -1523,10 +1517,7 @@ fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
         ("flotilla-org/flotilla", 2394, ObservedChangeRequestState::Closed),
         ("flotilla-org/cleat", 281, ObservedChangeRequestState::Merged),
     ] {
-        let name = flotilla_resources::address::record_name(
-            &flotilla_resources::address::stored_change_request_address("github.com", scope, number, &[]).expect("change request address"),
-        )
-        .expect("record name");
+        let name = cr_name("github.com", scope, number);
         let mut status = merged_change_request_status(now);
         status.state = Observation::known(state, now);
         records.insert(
@@ -1562,13 +1553,7 @@ fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
     assert_eq!(evaluation.subjects.len(), 3);
     assert_eq!(evaluation.subjects.iter().filter(|subject| subject.state == Some(ObservedChangeRequestState::Merged)).count(), 2);
     assert_eq!(evaluation.subjects.iter().filter(|subject| subject.state == Some(ObservedChangeRequestState::Closed)).count(), 1);
-    records.remove(
-        &flotilla_resources::address::record_name(
-            &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/cleat", 281, &[])
-                .expect("change request address"),
-        )
-        .expect("record name"),
-    );
+    records.remove(&cr_name("github.com", "flotilla-org/cleat", 281));
     assert!(!evaluate(&records).satisfied, "a second repository still blocks landing");
 }
 
@@ -1710,11 +1695,7 @@ async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
         }
         let created = convoys.create(&convoy_meta("stale-scan"), &spec).await.expect("create");
         convoys.update_status("stale-scan", &created.metadata.resource_version, &status).await.expect("status");
-        let name = flotilla_resources::address::record_name(
-            &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 42, &[])
-                .expect("change request address"),
-        )
-        .expect("record name");
+        let name = cr_name("github.com", "flotilla-org/flotilla", 42);
         let record = requests
             .create(
                 &InputMeta::builder().name(name.clone()).build(),
@@ -2066,11 +2047,7 @@ async fn reconcile_terminal_bound_change_request(
             .expect("context checkout status update");
     }
 
-    let record_name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "example/repo-a", 42, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let record_name = cr_name("github.com", "example/repo-a", 42);
     let record = change_requests
         .create(
             &InputMeta::builder().name(record_name.clone()).build(),
@@ -3323,11 +3300,7 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
             convoys.update_status("convoy-a", &current.metadata.resource_version, &status).await.expect("persist settlement");
         }
         if !recognise_merge {
-            let name = flotilla_resources::address::record_name(
-                &flotilla_resources::address::stored_change_request_address("github.com", "example/repo-a", 42, &[])
-                    .expect("change request address"),
-            )
-            .expect("record name");
+            let name = cr_name("github.com", "example/repo-a", 42);
             let record = changes.get(&name).await.expect("CR");
             let mut status = record.status.expect("CR status");
             status.state = Observation::known(ObservedChangeRequestState::Open, timestamp(40));
@@ -3374,16 +3347,7 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
             if delete_checkout {
                 checkouts.delete("checkout-a").await.expect("collect checkout");
             } else {
-                changes
-                    .delete(
-                        &flotilla_resources::address::record_name(
-                            &flotilla_resources::address::stored_change_request_address("github.com", "example/repo-a", 42, &[])
-                                .expect("change request address"),
-                        )
-                        .expect("record name"),
-                    )
-                    .await
-                    .expect("collect CR");
+                changes.delete(&cr_name("github.com", "example/repo-a", 42)).await.expect("collect CR");
             }
             let current = convoys.get("convoy-a").await.expect("convoy");
             let checkout_objects =
@@ -3592,11 +3556,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
                 scope: "flotilla-org/flotilla".into(),
                 number,
             };
-            let name = flotilla_resources::address::record_name(
-                &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", number, &[])
-                    .expect("change request address"),
-            )
-            .expect("record name");
+            let name = cr_name("github.com", "flotilla-org/flotilla", number);
             let record = requests
                 .create(
                     &InputMeta::builder().name(name.clone()).build(),
@@ -3691,16 +3651,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
         assert!(receipt.promises.iter().all(|p| p.state == PromiseState::Kept));
         assert_eq!(serde_json::from_value::<ConvoyStatus>(serde_json::to_value(status).unwrap()).unwrap(), *status);
         for number in 1..=3 {
-            requests
-                .delete(
-                    &flotilla_resources::address::record_name(
-                        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", number, &[])
-                            .expect("change request address"),
-                    )
-                    .expect("record name"),
-                )
-                .await
-                .unwrap();
+            requests.delete(&cr_name("github.com", "flotilla-org/flotilla", number)).await.unwrap();
         }
         assert_eq!(
             &evaluate_landing_settlement(

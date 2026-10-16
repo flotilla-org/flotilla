@@ -317,6 +317,7 @@ impl LeafSubscriptionTable {
                         return Ok(());
                     }
                 }
+                // TODO(#3366): resolve with the namespace's Forges rather than an empty list.
                 let name = leaf_record_name(&leaf.address, &[])?;
                 let artifact = self
                     .inner

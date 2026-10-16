@@ -18,6 +18,7 @@ use super::support::{
     claim_crew, resume_staging_fixture, stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta, wait_for_stall,
 };
 use crate::in_process::InProcessDaemon;
+use crate::testkits::cr_name;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_daemon_api::daemon::DaemonHandle;
 
@@ -312,11 +313,7 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
     .await
     .expect("exit row armed");
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
-    let record_name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1392, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let record_name = cr_name("github.com", "flotilla-org/flotilla", 1392);
     let record = records.get(&record_name).await.expect("demanded observation record");
     let fresh = Utc::now();
     records
@@ -426,11 +423,7 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
         .await
         .expect("landing status");
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
-    let record_name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1391, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let record_name = cr_name("github.com", "flotilla-org/flotilla", 1391);
     let record = records
         .create(
             &test_meta(&record_name),

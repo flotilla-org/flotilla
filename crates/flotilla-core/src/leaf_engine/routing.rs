@@ -260,6 +260,8 @@ impl LeafSubscriptionTable {
         opening: impl Future<Output = Result<ObjectEvents, ResourceError>>,
     ) -> Result<(RowDependencies, watch::Receiver<()>), ResourceError> {
         // Production admission already derived dependencies; tests may arm directly.
+        // TODO(#3366): the fallback resolves with an empty forge list, so a
+        // host-spelled subject for a declared Forge derives no dependency.
         let dependencies =
             self.inner.routing.lock().await.dependencies.get(&row.id).cloned().unwrap_or_else(|| RowDependencies::derive(row, &[]));
         tokio::pin!(opening);

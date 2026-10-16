@@ -27,6 +27,7 @@ use crate::in_process::{
     CheckoutArchiveStatus, CheckoutIntegrationStatus, InProcessDaemon, IntegrationCondition,
 };
 use crate::repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
+use crate::testkits::cr_name;
 use crate::testkits::discovery::{fake_discovery, fake_discovery_with_runner, FakeChangeRequest};
 use crate::testkits::replay::testing::MockRunner;
 use flotilla_daemon_api::daemon::DaemonHandle;
@@ -501,11 +502,7 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
     .await;
     daemon.set_provisioning_namespace("flotilla".to_string()).await;
     let change_requests = daemon.resource_backend().using::<ResourceChangeRequest>("flotilla");
-    let change_request_name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1696, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let change_request_name = cr_name("github.com", "flotilla-org/flotilla", 1696);
     let observation = change_requests
         .create(
             &test_meta(&change_request_name),

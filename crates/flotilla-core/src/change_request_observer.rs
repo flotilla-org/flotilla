@@ -171,14 +171,17 @@ impl ChangeRequestRefresher {
                 continue;
             }
             for row in convoy_subject_rows(&copy.object, &ReferenceContext::default()) {
-                let Some(subject) = row
-                    .subject
-                    .leaf()
-                    .ok()
-                    .and_then(|address| ChangeRequestRef::from_address(namespace, &address))
-                    .and_then(|subject| subject.normalized(&forges).ok())
-                else {
+                let Some(subject) = row.subject.leaf().ok().and_then(|address| ChangeRequestRef::from_address(namespace, &address)) else {
                     continue;
+                };
+                // Debug, not warn: this re-runs on every convoy, project and
+                // Forge change, so an undeclared host would repeat each pass.
+                let subject = match subject.clone().normalized(&forges) {
+                    Ok(subject) => subject,
+                    Err(error) => {
+                        tracing::debug!(convoy = %copy.object.metadata.name, service = %subject.service, scope = %subject.scope, number = subject.number, %error, "convoy change request subject has no address; not observed");
+                        continue;
+                    }
                 };
                 let source = IssueSource { service: subject.service.clone(), scope: subject.scope.clone() };
                 let owned = if let Some(owned) = owners.get(&source) {
@@ -349,7 +352,13 @@ impl ChangeRequestRefresher {
             }
             self.inner.observation_errors.lock().await.remove(&subject);
             let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
-            let Ok(name) = subject.record_name() else { continue };
+            let name = match subject.record_name() {
+                Ok(name) => name,
+                Err(error) => {
+                    tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "undemanded change request names no record; not collected");
+                    continue;
+                }
+            };
             let result = match records.get(&name).await {
                 Ok(record) if retain_change_request(&record) => {
                     self.start_retained(subject.clone()).await;
@@ -932,6 +941,7 @@ mod tests {
     use flotilla_store::{ResourceBackend, TypedResolver};
 
     use super::*;
+    use crate::testkits::cr_name;
     use flotilla_change_request::observation::parse_gh_observation;
 
     struct UnavailableSource;
@@ -1491,11 +1501,7 @@ mod tests {
         refresher.refresh_hint(&hint).await.expect("hint");
         assert_eq!(calls.load(Ordering::SeqCst), before + 2, "both namespaces refresh once");
 
-        let name = flotilla_resources::address::record_name(
-            &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2051, &[])
-                .expect("change request address"),
-        )
-        .expect("record name");
+        let name = cr_name("github.com", "flotilla-org/flotilla", 2051);
         backend.using::<ChangeRequest>("ops").delete(&name).await.expect("delete record during live demand");
         refresher.refresh_hint(&hint).await.expect("hint after record deletion");
         assert!(

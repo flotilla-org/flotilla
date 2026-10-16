@@ -44,6 +44,7 @@ use super::*;
 use crate::change_request_observer::ChangeRequestRefresher;
 use crate::issue_observer::IssueRefreshCadence;
 use crate::issue_observer::IssueRefresher;
+use crate::testkits::cr_name;
 use crate::testkits::replay::test_runner;
 use crate::testkits::replay::Masks;
 use crate::testkits::replay::Session;
@@ -753,11 +754,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
     );
     convoys.update_status("checks-wake", &created.metadata.resource_version, &status).await.expect("active crew");
     let records = backend.using::<ChangeRequest>("flotilla");
-    let name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2596, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let name = cr_name("github.com", "flotilla-org/flotilla", 2596);
     records
         .create(
             &InputMeta::builder().name(name.clone()).build(),
@@ -1125,11 +1122,7 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
     );
     convoys.update_status("checks-wake", &created.metadata.resource_version, &status).await.expect("active crew");
     let records = backend.using::<ChangeRequest>("flotilla");
-    let name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2596, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let name = cr_name("github.com", "flotilla-org/flotilla", 2596);
     records
         .create(
             &InputMeta::builder().name(name.clone()).build(),
@@ -1421,11 +1414,7 @@ async fn assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates
         )
         .await
         .expect("landing status");
-    let cr_name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1392, &[])
-            .expect("change request address"),
-    )
-    .expect("record name");
+    let cr_name = cr_name("github.com", "flotilla-org/flotilla", 1392);
     let records = backend.clone().using::<ChangeRequest>("flotilla");
     let record = records
         .create(

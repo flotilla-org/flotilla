@@ -50,7 +50,8 @@ impl ChangeRequestRef {
     /// every spelling of one change request is one subject.
     pub fn normalized(mut self, forges: &[ForgeSpec]) -> Result<Self, String> {
         let address = self.address(forges)?;
-        (self.service, self.scope) = stored_service_scope(&address).expect("a change request address is under a repository");
+        (self.service, self.scope) =
+            stored_service_scope(&address).ok_or_else(|| format!("{address} is not a change request under a repository"))?;
         Ok(self)
     }
 }

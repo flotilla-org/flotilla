@@ -735,11 +735,7 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
         );
         let current = convoys.update_status("rejected-promise", &created.metadata.resource_version, &status).await.unwrap();
         let requests = backend.using::<ChangeRequest>("flotilla");
-        let name = flotilla_resources::address::record_name(
-            &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 42, &[])
-                .expect("change request address"),
-        )
-        .expect("record name");
+        let name = cr_name("github.com", "flotilla-org/flotilla", 42);
         let cr = requests
             .create(
                 &InputMeta::builder().name(name.clone()).build(),

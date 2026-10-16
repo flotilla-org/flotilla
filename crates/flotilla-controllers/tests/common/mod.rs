@@ -519,3 +519,12 @@ where
     }
     panic!("condition was not satisfied within {:?}", timeout);
 }
+
+/// The record name the observer writes for a stored `(service, scope, number)`
+/// change request spelling that needs no Forge directory.
+pub fn cr_name(service: &str, scope: &str, number: u64) -> String {
+    flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address(service, scope, number, &[]).expect("change request address"),
+    )
+    .expect("record name")
+}
