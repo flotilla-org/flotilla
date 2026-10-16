@@ -2122,6 +2122,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-fake-forge"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-http",
+ "flotilla-build-features-http-server",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-provider-runtime",
+ "hegeltest",
+ "http",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "flotilla-forge-forgejo"
 version = "0.1.0"
 dependencies = [
