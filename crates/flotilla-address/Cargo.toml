@@ -30,6 +30,10 @@ memchr = { version = "2" }
 serde_core = { version = "1", features = ["alloc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 
+# sha2's Apple Silicon cpufeatures path reaches libc without default/std.
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(not(target_arch = "wasm32"))'.build-dependencies]
 proc-macro2 = { version = "1", features = ["default", "proc-macro"] }
 quote = { version = "1", features = ["default", "proc-macro"] }

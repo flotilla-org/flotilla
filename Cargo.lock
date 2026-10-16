@@ -1104,6 +1104,7 @@ version = "0.1.0"
 dependencies = [
  "generic-array",
  "hegeltest",
+ "libc",
  "memchr",
  "proc-macro2",
  "quote",
