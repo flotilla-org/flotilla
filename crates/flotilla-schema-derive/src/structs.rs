@@ -2,8 +2,8 @@
 //!
 //! A kind (`#[store(kind = "Name", code = N)]`) is the root row of its own tables and implements
 //! `Element` and `Kind`. A part implements `Element` (it can be a collection's row) and, having no
-//! table fields, `Columns` and `Flat` (it can be flattened into another row). A single-field tuple
-//! struct is a transparent column.
+//! table fields, `Columns` and `Flat` (it can be flattened into another row). A part's table fields
+//! nest under its collection's table. A single-field tuple struct is a transparent column.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -131,10 +131,16 @@ fn mentions(ty: &Type, params: &[String]) -> bool {
     finder.found
 }
 
+/// A part is a collection's row (`Element`). Without table fields it is also `Columns` and `Flat`,
+/// so it can be flattened into another row; a part holding tables is only ever a row, so the
+/// missing `Flat` reports `flatten` of it at the bound.
 fn part_impls(input: &DeriveInput, fields: &[Field<'_>]) -> TokenStream {
     let schema = schema();
     let ident = &input.ident;
     let element = element_impl(input, fields);
+    if fields.iter().any(Field::is_table) {
+        return element;
+    }
     let Generics { impl_generics, ty_generics, where_clause } = bounds(input, fields);
     let tables = fields.iter().map(Field::tables);
     let layout = fields.iter().map(|field| field.layout(&quote!(name), &quote!(required)));
@@ -214,6 +220,7 @@ pub(crate) fn newtype(input: &DeriveInput, fields: &FieldsUnnamed, type_attrs: T
     let generics = Generics::new(&input.generics, [quote!(#ty: #schema::Column)]);
     let Generics { impl_generics, ty_generics, where_clause } = &generics;
     let element = columns_element(ident, &generics);
+    let key_where = Generics::new(&input.generics, [quote!(for<'__store> #ty: #schema::KeyColumn)]).where_clause;
     let wraps_string = matches!(ty, Type::Path(path) if path.qself.is_none() && path.path.is_ident("String"));
     let intern = wraps_string.then(|| {
         let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
@@ -258,6 +265,11 @@ pub(crate) fn newtype(input: &DeriveInput, fields: &FieldsUnnamed, type_attrs: T
 
         #[automatically_derived]
         impl #impl_generics #schema::Column for #ident #ty_generics #where_clause {}
+
+        // The higher-ranked bound defers the check to each use as a key, so a newtype of a type
+        // that cannot key a table (an option, a data enum) still compiles as a column.
+        #[automatically_derived]
+        impl #impl_generics #schema::KeyColumn for #ident #ty_generics #key_where {}
 
         #element
 

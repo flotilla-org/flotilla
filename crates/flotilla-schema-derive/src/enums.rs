@@ -5,7 +5,9 @@
 //! `CHECK (c IN (codes))`, implementing `CodeEnum`. An enum with a named-field variant is a data
 //! enum: the same tag column, then each data variant's fields as sparse columns
 //! `<field>_<variant>_<subfield>` inside a layout guard on the tag, which emits that variant's one
-//! CHECK. Unit variants of a data enum have no columns and so no guard.
+//! CHECK. Unit variants of a data enum have no columns and so no guard. A variant field holding a
+//! collection is a nested table `<table>_<field>_<variant>_<subfield>`, which has rows only while
+//! the variant is active.
 
 use std::collections::BTreeMap;
 
@@ -184,6 +186,9 @@ fn code_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[i64]) -> To
 
         #[automatically_derived]
         impl #impl_generics #schema::Column for #ident #ty_generics #where_clause {}
+
+        #[automatically_derived]
+        impl #impl_generics #schema::KeyColumn for #ident #ty_generics #where_clause {}
 
         #[automatically_derived]
         impl #impl_generics #schema::CodeEnum for #ident #ty_generics #where_clause {

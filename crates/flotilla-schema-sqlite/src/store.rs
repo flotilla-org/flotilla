@@ -529,7 +529,17 @@ impl Ctx<'_> {
             };
         }
         let (sequence, version) = self.next_sequence()?;
-        // The root row first: a stale version is refused before any child row changes.
+        // Objects before any row naming them: their foreign keys are checked per statement. A
+        // refused write rolls them back with its savepoint.
+        let changed = changes.iter().flatten().filter_map(|change| match change {
+            Change::Insert(row) | Change::Update(row) => Some(*row),
+            Change::Delete(_) => None,
+        });
+        // Objects first: the root and child rows reference them through immediate foreign keys.
+        // A stale write therefore inserts its objects before the version check refuses it; the
+        // savepoint rolls them back, and the cost is only paid by writes that lose a race.
+        self.put_objects(changed.chain(root_changed.then(|| &new.tables[0][0])), &new.objects)?;
+        // The root row next: a stale version is refused before any child row changes.
         let updated = if root_changed {
             let mut params = vec![SqlValue::Integer(sequence)];
             params.extend(self.params(&new.tables[0][0].values)?);
@@ -543,11 +553,6 @@ impl Ctx<'_> {
         if updated == 0 {
             return Err(self.stale::<K>(current));
         }
-        let changed = changes.iter().flatten().filter_map(|change| match change {
-            Change::Insert(row) | Change::Update(row) => Some(*row),
-            Change::Delete(_) => None,
-        });
-        self.put_objects(changed.chain(root_changed.then(|| &new.tables[0][0])), &new.objects)?;
         // Deletes deepest table first, so no child outlives its parent row.
         for (table, changes) in changes.iter().enumerate().rev() {
             for change in changes {

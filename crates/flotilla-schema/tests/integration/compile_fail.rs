@@ -1,6 +1,7 @@
 // Behaviour (#3320 compile-fail): each refused shape fails to compile. Refusals made by the derive
-// and by the field bounds (`Column`, `Flat`, `Intern`) name the closed attribute list; indirect
-// recursion is refused by the compiler as a cycle, without a message of ours. The expected stderr
+// and by the field bounds (`Column`, `Flat`, `Intern`, `KeyColumn`) name the closed attribute list;
+// indirect recursion (through `flatten` or through tables) is refused by the compiler as a cycle,
+// without a message of ours. The expected stderr
 // files are reviewed snapshots for the pinned toolchain; `TRYBUILD=overwrite` rewrites them.
 #[test]
 fn refused_shapes_fail_to_compile() {
@@ -16,12 +17,15 @@ fn refusal_snapshots_name_the_closed_list() {
     let mut checked = 0;
     for entry in std::fs::read_dir(&directory).expect("ui directory") {
         let path = entry.expect("entry").path();
-        if path.extension().is_none_or(|extension| extension != "stderr") || path.ends_with("indirect_recursion.stderr") {
+        if path.extension().is_none_or(|extension| extension != "stderr")
+            || path.ends_with("indirect_recursion.stderr")
+            || path.ends_with("indirect_recursion_child.stderr")
+        {
             continue;
         }
         let stderr = std::fs::read_to_string(&path).expect("stderr snapshot").split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(stderr.contains(&list), "{} does not name the attribute list", path.display());
         checked += 1;
     }
-    assert_eq!(checked, 8);
+    assert_eq!(checked, 16);
 }

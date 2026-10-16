@@ -6,6 +6,7 @@ license.workspace = true
 description = "Backend-neutral storage schema: descriptors, DDL rendering, logical rows and the kind registry"
 
 [dependencies]
+flotilla-cbor = { path = "../flotilla-cbor" }
 flotilla-schema-derive = { path = "../flotilla-schema-derive" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { workspace = true }

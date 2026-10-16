@@ -1,0 +1,5 @@
+error: a `Records` field needs a storage attribute; the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+ --> tests/ui/unattributed_records.rs:6:12
+  |
+6 |     field: flotilla_schema::Records<String>,
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

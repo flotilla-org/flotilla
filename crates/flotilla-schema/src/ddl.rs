@@ -207,11 +207,23 @@ CREATE INDEX "convoy_open" ON "convoy" ("phase") WHERE "done" = 0;
         layout.column("cause", ColumnType::Integer, true);
         assert!(matches!(layout.finish().validate(), Err(DescriptorError::DuplicateColumn { column, .. }) if column == "cause"));
 
-        for reserved in ["id", "version", "owner"] {
+        for reserved in ["id", "version"] {
             let mut layout = Layout::root("Edge", KindCode(1));
             layout.column(reserved, ColumnType::Text, true);
             assert!(matches!(layout.finish().validate(), Err(DescriptorError::ReservedColumn { column, .. }) if column == reserved));
         }
+        // A child table adds only `owner`; `id` and `version` are free there.
+        let child = |name: &str| {
+            let mut layout = Layout::root("Edge", KindCode(1));
+            layout.table("items", TableRole::Child, |layout| {
+                layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
+                layout.column(name, ColumnType::Integer, true);
+            });
+            layout.finish().validate()
+        };
+        assert!(matches!(child("owner"), Err(DescriptorError::ReservedColumn { column, .. }) if column == "owner"));
+        assert_eq!(child("version"), Ok(()));
+        assert_eq!(child("id"), Ok(()));
 
         // A data column colliding with the table's own key column.
         let mut layout = Layout::root("Edge", KindCode(1));

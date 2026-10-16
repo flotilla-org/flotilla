@@ -1,0 +1,5 @@
+error: `records` needs a Records<T> field; the storage derive supports only the attributes child, records, history, frozen, intern, flatten, state and code (fields and variants) and kind, code and index (types)
+ --> tests/ui/records_on_vec.rs:7:13
+  |
+7 |     events: Vec<String>,
+  |             ^^^^^^^^^^^

@@ -1,0 +1,55 @@
+error[E0275]: overflow evaluating the requirement `B: flotilla_schema::Element`
+ --> tests/ui/indirect_recursion_child.rs:5:10
+  |
+5 | #[derive(Stored)]
+  |          ^^^^^^
+  |
+  = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0275]: overflow evaluating the requirement `A: flotilla_schema::Element`
+  --> tests/ui/indirect_recursion_child.rs:12:10
+   |
+12 | #[derive(Stored)]
+   |          ^^^^^^
+   |
+   = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0275]: overflow evaluating the requirement `B: flotilla_schema::Element`
+  --> tests/ui/indirect_recursion_child.rs:19:10
+   |
+19 | #[derive(Stored)]
+   |          ^^^^^^
+   |
+note: required for `A` to implement `flotilla_schema::Element`
+  --> tests/ui/indirect_recursion_child.rs:6:8
+   |
+ 5 | #[derive(Stored)]
+   |          ------ type parameter would need to implement `flotilla_schema::Element`
+ 6 | struct A {
+   |        ^
+   = help: consider manually implementing `flotilla_schema::Element` to avoid undesired bounds caused by "imperfect derives"
+   = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
+   = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0275]: overflow evaluating the requirement `B: flotilla_schema::Element`
+  --> tests/ui/indirect_recursion_child.rs:21:8
+   |
+21 | struct Root {
+   |        ^^^^
+   |
+note: required for `A` to implement `flotilla_schema::Element`
+  --> tests/ui/indirect_recursion_child.rs:6:8
+   |
+ 5 | #[derive(Stored)]
+   |          ------ type parameter would need to implement `flotilla_schema::Element`
+ 6 | struct A {
+   |        ^
+   = help: consider manually implementing `flotilla_schema::Element` to avoid undesired bounds caused by "imperfect derives"
+   = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
+   = note: 1 redundant requirement hidden
+   = note: required for `Root` to implement `flotilla_schema::Element`
+note: required by a bound in `Kind`
+  --> src/traits.rs
+   |
+   | pub trait Kind: Element {
+   |                 ^^^^^^^ required by this bound in `Kind`
