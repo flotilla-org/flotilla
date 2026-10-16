@@ -162,6 +162,7 @@ fn number(item: &Value) -> u64 {
 #[tokio::test]
 async fn fake_reproduces_every_recorded_forgejo_answer() {
     let mut replayed = 0;
+    let mut applied = vec![0_usize; DIVERGENCES.len()];
     for (path, world) in fixtures() {
         let file = path.file_name().expect("fixture name").to_string_lossy().into_owned();
         let fixture: Fixture = serde_yml::from_str(&std::fs::read_to_string(&path).expect("read fixture")).expect("parse fixture");
@@ -171,7 +172,11 @@ async fn fake_reproduces_every_recorded_forgejo_answer() {
             let context = format!("{file} #{index} {} {}", interaction.method, interaction.url);
             let answer = send(&fake, &interaction.method, &fake_url(&interaction.url), &interaction.request_headers).await;
             assert_eq!(answer.status, interaction.status, "{context}: status");
-            let divergence = DIVERGENCES.iter().find(|divergence| divergence.fixture == file && interaction.url.ends_with(divergence.url));
+            let matched = DIVERGENCES.iter().position(|divergence| divergence.fixture == file && interaction.url.ends_with(divergence.url));
+            if let Some(index) = matched {
+                applied[index] += 1;
+            }
+            let divergence = matched.map(|index| &DIVERGENCES[index]);
             let extra = divergence.map_or(&[][..], |divergence| divergence.extra_numbers);
 
             let recorded_total = interaction.response_headers.get("x-total-count").map(|total| total.parse::<usize>().expect("count"));
@@ -214,6 +219,11 @@ async fn fake_reproduces_every_recorded_forgejo_answer() {
         assert_eq!(refused, 0, "{file}: recorded requests are within the contract, but the fake refused {refusals:?}");
     }
     assert_eq!(replayed, 12, "every recorded interaction is replayed");
+    // A divergence that no longer matches a recording would hide nothing but
+    // could hide a future mismatch: each must apply to exactly one interaction.
+    for (divergence, count) in DIVERGENCES.iter().zip(applied) {
+        assert_eq!(count, 1, "divergence for {} {} applies to {count} recorded interactions", divergence.fixture, divergence.url);
+    }
 }
 
 // Behaviour (#3374): the fixtures cover every Forgejo recording flotilla's

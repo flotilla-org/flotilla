@@ -550,3 +550,21 @@ fn refused_creations_consume_no_ids() {
     assert_eq!(next.id, first.id + 1);
     assert_eq!(next.number, first.number + 1);
 }
+
+// Behaviour (recorded lab evidence, forgejo_ghostty_governor.yaml): once a
+// pull request's head branch is deleted, its `head.ref` becomes
+// `refs/pull/<n>/head` but `head.label` keeps the branch name.
+#[tokio::test]
+async fn a_deleted_head_keeps_its_branch_label() {
+    let forge = forge();
+    let pull = forge.create_pull(&repo(), new_pull("governor-opus-5-5")).expect("pull");
+    let live = Request::get(&format!("{PULLS}/{}", pull.number)).send(&forge).await;
+    assert_eq!(
+        (live.body["head"]["ref"].as_str(), live.body["head"]["label"].as_str()),
+        (Some("governor-opus-5-5"), Some("governor-opus-5-5"))
+    );
+    forge.delete_head(&repo(), pull.number).expect("delete head");
+    let deleted = Request::get(&format!("{PULLS}/{}", pull.number)).send(&forge).await;
+    assert_eq!(deleted.body["head"]["ref"], format!("refs/pull/{}/head", pull.number));
+    assert_eq!(deleted.body["head"]["label"], "governor-opus-5-5");
+}
