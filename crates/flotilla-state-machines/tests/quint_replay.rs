@@ -28,7 +28,7 @@
 //!
 //! - **Message envelope without a deadline.** The model's envelope keeps a
 //!   `deadline` integer even when `hasDeadline` is false; Rust's
-//!   `deadline: Option<Time>` has none. Both sides compare it as 0 then.
+//!   `deadline: Option<Timestamp>` has none. Both sides compare it as 0 then.
 //! - **Message drop `receiver`.** The model's drop keeps the receiver's
 //!   session only; Rust keeps the whole [`message::Receiver`]. The rendering
 //!   keeps its session (0 for none), and Awaiting compares session and host.
@@ -69,6 +69,7 @@ use std::{
     time::Instant,
 };
 
+use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
         agent_session::{
@@ -86,8 +87,8 @@ use flotilla_state_machines::{
         },
     },
     placement::{self, Dimension, Evidence, Host, Lease, Ledger, LedgerError, Units, VesselId},
-    Attempt, AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Receipt, Ref, Resource, Time,
-    Transport, WriteError,
+    Attempt, AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Receipt, Ref, Resource, Transport,
+    WriteError,
 };
 use itf::{at, boolean, int, list, map_of, number, pairs, payload, set, set_of, show, slot, tag, text, variant};
 use serde_json::{json, Value};
@@ -100,13 +101,13 @@ const INBOX: &str = "inbox";
 /// of `ensure_bind`: every resource is named by its model id.
 const ONE: &str = "1";
 
-fn moment(ticks: i64) -> Time {
-    Time::from_micros(ticks * UNIT)
+fn moment(ticks: i64) -> Timestamp {
+    Timestamp::from_micros(ticks * UNIT)
 }
 
 /// A replayed time in model ticks. Every time the replay supplies is whole.
-fn ticks(time: Time) -> i64 {
-    let micros = time.as_micros();
+fn ticks(time: Timestamp) -> i64 {
+    let micros = time.micros();
     assert_eq!(micros % UNIT, 0, "{time} is not a whole model tick");
     micros / UNIT
 }
@@ -179,7 +180,7 @@ impl<'a> Step<'a> {
     }
 
     /// A model time for scenarios without a clock: one tick per step.
-    fn tick(&self) -> Time {
+    fn tick(&self) -> Timestamp {
         moment(i64::try_from(self.index).expect("step index"))
     }
 }
@@ -274,7 +275,7 @@ fn accept<M: Machine>(
     name: &str,
     edge: impl Into<M::Edge>,
     world: &M::World,
-    now: Time,
+    now: Timestamp,
     step: &Step,
     tally: &mut Tally,
 ) {
@@ -293,7 +294,14 @@ fn create<M: Machine>(home: &mut Home<M>, name: &str, request: M::Request, step:
 }
 
 /// Whether the Rust gates would accept `edge` now. Changes nothing.
-fn would_accept<M: Machine>(home: &Home<M>, name: &str, edge: impl Into<M::Edge>, world: &M::World, now: Time, tally: &mut Tally) -> bool {
+fn would_accept<M: Machine>(
+    home: &Home<M>,
+    name: &str,
+    edge: impl Into<M::Edge>,
+    world: &M::World,
+    now: Timestamp,
+    tally: &mut Tally,
+) -> bool {
     tally.probes += 1;
     let resource = home.get(name).expect("probed resource");
     home.definition().step(&mut Handle::on(resource, world, now), &edge.into()).is_ok()
@@ -315,7 +323,7 @@ fn assert_end_refuses<M: Machine>(
     name: &str,
     probes: Vec<M::Edge>,
     world: &M::World,
-    now: Time,
+    now: Timestamp,
     step: &Step,
     tally: &mut Tally,
 ) {
@@ -387,7 +395,7 @@ fn lifecycle_step<K: LifecycleKind>(
     seen: bool,
     matches: bool,
     identity: &str,
-    now: Time,
+    now: Timestamp,
     step: &Step,
     tally: &mut Tally,
 ) {
@@ -425,7 +433,7 @@ fn lifecycle_end_refuses<K: LifecycleKind>(
     home: &mut Home<Lifecycle<K>>,
     name: &str,
     identity: &str,
-    now: Time,
+    now: Timestamp,
     step: &Step,
     tally: &mut Tally,
 ) {
@@ -469,7 +477,7 @@ fn end_reason_name(reason: EndReason) -> &'static str {
 
 /// Every Ended session refuses attach, detach, either end and every record
 /// with `AlreadyEnded`, even with every observation present, and stays unchanged.
-fn sessions_end_refuse(sessions: &mut Home<AgentSession>, now: Time, step: &Step, tally: &mut Tally) {
+fn sessions_end_refuse(sessions: &mut Home<AgentSession>, now: Timestamp, step: &Step, tally: &mut Tally) {
     let mut world = MemoryAgentSessionWorld::default();
     world.ends.put(&Ref::new("completed"), EndReason::Completed);
     world.ends.put(&Ref::new("lost"), EndReason::Lost);
@@ -558,7 +566,13 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
 /// steps, since the model refuses them. From each reached state, every edge
 /// with its observation absent, or present with the wrong identity, reason or
 /// cause, must be refused.
-fn refuse_without_evidence(things: &Home<Lifecycle<CloneKind>>, sessions: &Home<AgentSession>, now: Time, step: &Step, tally: &mut Tally) {
+fn refuse_without_evidence(
+    things: &Home<Lifecycle<CloneKind>>,
+    sessions: &Home<AgentSession>,
+    now: Timestamp,
+    step: &Step,
+    tally: &mut Tally,
+) {
     let none = MemoryLifecycleWorld::default();
     let mut stranger = MemoryLifecycleWorld::default();
     stranger.realisations.put(&Ref::new(ONE), Observed { identity: "other".into() });
@@ -692,7 +706,7 @@ fn admit(home: &mut Home<Convoy>, step: &Step, id: i64, tally: &mut Tally) {
 /// From the reached state: an Open convoy delivers only with no promise
 /// pending (`deliveredPromisesSettled`) and never re-settles a settled promise
 /// (`settledPromisesFinal`); an ended convoy refuses everything.
-fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Time, step: &Step, tally: &mut Tally) {
+fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &Step, tally: &mut Tally) {
     let world = convoy_world(true);
     for (id, model) in entries(state, "::convoys") {
         let Some(model) = model else { continue };
@@ -927,7 +941,7 @@ impl Fleet {
 
     /// A Gone vessel's lifecycle refuses everything, and the ledger, which
     /// forgot it, neither returns nor places it again.
-    fn gone_refuses(&mut self, state: &Value, now: Time, step: &Step, tally: &mut Tally) {
+    fn gone_refuses(&mut self, state: &Value, now: Timestamp, step: &Step, tally: &mut Tally) {
         for (id, model) in entries(state, "::vessels") {
             if !model.is_some_and(|model| tag(model) == "Gone") {
                 continue;
@@ -1065,7 +1079,7 @@ fn ensure_value(resource: &Resource<Ensure>) -> Value {
 /// recorded fulfiller while none is live (`recordedBeforeCreate`,
 /// `oneLiveFulfiller`); a bind names a recorded one (`boundRecorded`); a
 /// Retired Ensure refuses everything.
-fn probe_ensure(home: &mut Home<Ensure>, fulfillers: &Fulfillers, state: &Value, now: Time, step: &Step, tally: &mut Tally) {
+fn probe_ensure(home: &mut Home<Ensure>, fulfillers: &Fulfillers, state: &Value, now: Timestamp, step: &Step, tally: &mut Tally) {
     let Some(model) = slot_at(state, "::ensures", 1) else { return };
     let world = ensure_world(fulfillers, true);
     let fulfiller = |id: i64| Ref::<ensure::Fulfiller>::new(id.to_string());
@@ -1104,7 +1118,7 @@ fn probe_ensure(home: &mut Home<Ensure>, fulfillers: &Fulfillers, state: &Value,
 /// The scenario's `L::releaseAll(recorded, true)` on retire: each recorded
 /// fulfiller is released, and one the model left unchanged (already ended)
 /// must be refused.
-fn release_all(fulfillers: &mut Fulfillers, step: &Step, now: Time, tally: &mut Tally) {
+fn release_all(fulfillers: &mut Fulfillers, step: &Step, now: Timestamp, tally: &mut Tally) {
     let model = slot_at(step.before, "::ensures", 1).expect("retiring Ensure");
     let mut world = MemoryLifecycleWorld::default();
     world.teardowns.put(&Ref::new("fulfillers"), true);
@@ -1485,7 +1499,7 @@ impl<'a> MessageReplay<'a> {
         check_store(&self.home, &model, message_value, step, "message");
         let rust = self.home.get(ONE).expect("message");
         assert_eq!(rust.events().len(), self.edges, "{step}: one edge event per accepted edge");
-        let deliveries = rust.events().iter().filter(|row| row.record.edge.kind() == MessageEdgeKind::Deliver).count();
+        let deliveries = rust.events().iter().filter(|row| row.record.edge == MessageEdgeKind::Deliver).count();
         assert!(deliveries <= 1, "{step}: delivered {deliveries} times");
     }
 

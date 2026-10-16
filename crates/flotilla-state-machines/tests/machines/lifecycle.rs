@@ -1,12 +1,13 @@
 //! The shared lifecycle against `specs/primitives/machines/lifecycle.qnt`.
 
+use flotilla_schema::{CodeEnum, Timestamp};
 use flotilla_state_machines::{
     changed,
     machines::lifecycle::{
         Absence, GiveUp, Lifecycle, LifecycleEdgeKind, LifecycleKind, LifecycleLabel, LifecycleRefusal, LifecycleState,
         MemoryLifecycleWorld, Observed, Realise, Release, Teardown, Vanish,
     },
-    Attempt, AttemptPolicy, Cause, CauseCategory, Coded, Diagram, Home, InputRead, Machine, Ref, StateValue, Time, Version, WriteError,
+    Attempt, AttemptPolicy, Cause, CauseCategory, Coded, Diagram, Home, InputRead, Machine, Ref, StateValue, Version, WriteError,
 };
 
 /// A kind for tests with an opaque request: one failure exhausts, as in the
@@ -29,8 +30,8 @@ impl LifecycleKind for Other {
 
 type P = Lifecycle<Probe>;
 
-fn at(micros: i64) -> Time {
-    Time::from_micros(micros)
+fn at(micros: i64) -> Timestamp {
+    Timestamp::from_micros(micros)
 }
 
 fn cause(detail: &str) -> Cause {
@@ -83,7 +84,7 @@ fn every_kind_validates() {
 #[test]
 fn codes_and_names_are_pinned() {
     let labels: Vec<_> = LifecycleLabel::ALL.iter().map(|s| (s.name(), s.code(), LifecycleState::fields(*s))).collect();
-    let expected: [(&str, u16, &[&str]); 4] =
+    let expected: [(&str, i64, &[&str]); 4] =
         [("Requested", 1, &[]), ("Realised", 2, &["identity"]), ("Gone", 3, &[]), ("GaveUp", 4, &["cause"])];
     assert_eq!(labels, expected);
     let edges: Vec<_> = LifecycleEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
@@ -132,7 +133,7 @@ fn realise_needs_a_matching_observation() {
     assert_eq!(h.apply("r", realise("a"), &MemoryLifecycleWorld::default(), at(1)).err(), refused(LifecycleRefusal::MissingEvidence));
     assert_eq!(h.apply("r", realise("a"), &observed("b"), at(1)).err(), refused(LifecycleRefusal::MissingEvidence));
     let event = h.apply("r", realise("a"), &observed("a"), at(2)).expect("realised");
-    assert_eq!(event.reads, [InputRead { kind: "realisation", name: "r".into(), version: Some(Version(1)) }]);
+    assert_eq!(event.payload.reads, [InputRead { kind: "realisation".into(), name: "r".into(), version: Some(Version(1)) }]);
     assert_eq!(state(&h), &LifecycleState::Realised { identity: "a".into() });
     assert_eq!(state(&h).identity(), Some("a"));
     assert!(state(&h).live() && state(&h).realised() && !state(&h).gone());

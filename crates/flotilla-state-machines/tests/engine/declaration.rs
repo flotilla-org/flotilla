@@ -4,9 +4,10 @@
 
 use std::collections::BTreeSet;
 
+use flotilla_schema::{CodeEnum, Column, Columns, DecodeError, Decoder, EncodeError, Encoder, Layout, Timestamp};
 use flotilla_state_machines::{
-    changed, edges, states, Coded, DefError, Diagram, Edge, EdgeArg, EdgeDef, EdgeKind, Ended, Fault, Handle, InputRead, Machine,
-    MachineDef, Ref, Source, StateValue, StepError, Table, Time, Version, WrongState,
+    changed, states, Coded, Datum, DefError, Diagram, Edge, EdgeArg, EdgeDef, EdgeKind, Ended, Fault, Handle, InputRead, Machine,
+    MachineDef, Ref, Source, StateValue, StepError, Table, Version, WrongState,
 };
 use hegel::generators as gs;
 
@@ -65,7 +66,7 @@ fn mermaid_renders_every_edge_its_data_and_each_end() {
 
 fn step(spec: bool, state: &Latch, world: &Table<Signal>, edge: &LatchEdge) -> (Result<Latch, StepError<LatchMachine>>, Vec<InputRead>) {
     let def = LatchMachine::definition();
-    let mut handle = Handle::<LatchMachine>::new(&spec, state, world, Time::ZERO);
+    let mut handle = Handle::<LatchMachine>::new(&spec, state, world, Timestamp::ZERO);
     let result = def.step(&mut handle, edge);
     (result, handle.reads().to_vec())
 }
@@ -111,14 +112,14 @@ fn gate_reads_are_recorded_with_versions_and_absences() {
     let mut world = Table::<Signal>::new();
     let (result, reads) = step(false, &armed(1), &world, &fire("bell"));
     assert_eq!(result, Err(StepError::Refused(LatchRefusal::NoSignal)));
-    assert_eq!(reads, [InputRead { kind: "signal", name: "bell".into(), version: None }]);
+    assert_eq!(reads, [InputRead { kind: "signal".into(), name: "bell".into(), version: None }]);
 
     world.put(&Ref::new("other"), true);
     let version = world.put(&Ref::new("bell"), true);
     assert_eq!(version, Version(2));
     let (result, reads) = step(false, &armed(1), &world, &fire("bell"));
     assert_eq!(result, Ok(Latch::Fired { shots: 0, by: "bell".into() }));
-    assert_eq!(reads, [InputRead { kind: "signal", name: "bell".into(), version: Some(Version(2)) }]);
+    assert_eq!(reads, [InputRead { kind: "signal".into(), name: "bell".into(), version: Some(Version(2)) }]);
 }
 
 // The effect produces the next state from the current value: the target
@@ -187,7 +188,7 @@ impl Machine for Rogue {
 fn a_target_outside_the_declaration_is_a_fault() {
     let world = Table::new();
     let state = armed(1);
-    let mut handle = Handle::<Rogue>::new(&(), &state, &world, Time::ZERO);
+    let mut handle = Handle::<Rogue>::new(&(), &state, &world, Timestamp::ZERO);
     assert_eq!(
         Rogue::definition().step(&mut handle, &fire("s")),
         Err(StepError::Fault(Fault::Target { edge: LatchEdgeKind::Fire, target: LatchLabel::Spent }))
@@ -202,12 +203,12 @@ fn changing_undeclared_data_is_a_fault() {
     let world = Table::new();
     let state = armed(1);
     let definition = Rogue::definition();
-    let mut handle = Handle::<Rogue>::new(&(), &state, &world, Time::ZERO);
+    let mut handle = Handle::<Rogue>::new(&(), &state, &world, Timestamp::ZERO);
     assert_eq!(
         definition.step(&mut handle, &Load { shots: 2 }.into()),
         Err(StepError::Fault(Fault::Changes { edge: LatchEdgeKind::Load, data: vec!["shots"] }))
     );
-    let mut handle = Handle::<Rogue>::new(&(), &state, &world, Time::ZERO);
+    let mut handle = Handle::<Rogue>::new(&(), &state, &world, Timestamp::ZERO);
     assert_eq!(definition.step(&mut handle, &Load { shots: 0 }.into()), Ok(armed(1)));
 }
 
@@ -259,16 +260,16 @@ fn a_judgement_reports_value_validity_and_reads() {
     let mut world = Table::<Signal>::new();
     world.put(&Ref::new("bell"), false);
     let state = armed(0);
-    let mut handle = Handle::<LatchMachine>::new(&false, &state, &world, Time::from_micros(5));
+    let mut handle = Handle::<LatchMachine>::new(&false, &state, &world, Timestamp::from_micros(5));
     let raised = handle.read(&Ref::new("bell")).copied();
     handle.read(&Ref::<Signal>::new("bell"));
-    handle.until(Time::from_micros(30));
-    handle.until(Time::from_micros(20));
-    handle.until(Time::from_micros(40));
+    handle.until(Timestamp::from_micros(30));
+    handle.until(Timestamp::from_micros(20));
+    handle.until(Timestamp::from_micros(40));
     let judged = handle.judged(raised);
     assert_eq!(judged.value, Some(false));
-    assert_eq!(judged.valid_until, Some(Time::from_micros(20)));
-    assert_eq!(judged.reads, [InputRead { kind: "signal", name: "bell".into(), version: Some(Version(1)) }]);
+    assert_eq!(judged.valid_until, Some(Timestamp::from_micros(20)));
+    assert_eq!(judged.reads, [InputRead { kind: "signal".into(), name: "bell".into(), version: Some(Version(1)) }]);
 }
 
 // A table's versions only rise: a value removed and written again is newer
@@ -328,18 +329,128 @@ fn validate_rejects_a_label_and_edge_sharing_a_word() {
     assert_eq!(Clashing::definition().validate(), Err(vec![DefError::NameClash("re_arm")]));
 }
 
+/// A hand-written code enum, outside the macros' `Stored` derive, whose
+/// codes may repeat: the only way a declaration can reach a duplicate code.
+macro_rules! hand_coded {
+    ($name:ident { $($variant:ident = $code:literal),+ }) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl Columns for $name {
+            const TABLES: usize = 0;
+
+            fn layout(layout: &mut Layout, name: &str, required: bool) {
+                i64::layout(layout, name, required);
+            }
+
+            fn encode(&self, e: &mut Encoder) -> Result<(), EncodeError> {
+                CodeEnum::code(self).encode(e)
+            }
+
+            fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError> {
+                i64::encode_absent(e)
+            }
+
+            fn decode(d: &mut Decoder) -> Result<Option<Self>, DecodeError> {
+                Ok(i64::decode(d)?.and_then(|code| Self::ALL.iter().copied().find(|value| CodeEnum::code(value) == code)))
+            }
+
+            fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {
+                i64::decode_absent(d)
+            }
+        }
+
+        impl Column for $name {}
+
+        impl CodeEnum for $name {
+            const CODES: &'static [i64] = &[$($code),+];
+
+            fn code(&self) -> i64 {
+                match self {
+                    $(Self::$variant => $code),+
+                }
+            }
+        }
+
+        impl Coded for $name {
+            const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            fn name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => stringify!($variant)),+
+                }
+            }
+        }
+    };
+}
+
 // Duplicate codes are rejected, so two names can never share stored identity.
+// The macros' derive refuses a repeated code at compile time; a hand-written
+// code enum reaches validation.
 #[test]
 fn validate_rejects_duplicate_codes() {
-    states! {
-        pub enum Twin => TwinLabel { One = 1, Two = 1 }
+    hand_coded!(TwinLabel { One = 1, Two = 1 });
+    hand_coded!(TwinEdgeKind { Go = 7, Back = 7 });
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Twin {
+        One,
+        Two,
+    }
+    impl StateValue for Twin {
+        type Label = TwinLabel;
+        fn label(&self) -> TwinLabel {
+            match self {
+                Twin::One => TwinLabel::One,
+                Twin::Two => TwinLabel::Two,
+            }
+        }
+        fn data(&self) -> Vec<(&'static str, &dyn Datum)> {
+            Vec::new()
+        }
+        fn fields(_: TwinLabel) -> &'static [&'static str] {
+            &[]
+        }
     }
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Go;
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Back;
-    edges! {
-        pub enum TwinEdge => TwinEdgeKind { Go(Go) = 7, Back(Back) = 7 }
+    #[expect(dead_code, reason = "the fixture is validated, never stepped")]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum TwinEdge {
+        Go(Go),
+        Back(Back),
+    }
+    impl Edge for TwinEdge {
+        type Kind = TwinEdgeKind;
+        fn kind(&self) -> TwinEdgeKind {
+            match self {
+                TwinEdge::Go(_) => TwinEdgeKind::Go,
+                TwinEdge::Back(_) => TwinEdgeKind::Back,
+            }
+        }
+    }
+    impl EdgeArg for Go {
+        type Edge = TwinEdge;
+        const KIND: TwinEdgeKind = TwinEdgeKind::Go;
+        fn project(edge: &TwinEdge) -> Option<&Go> {
+            match edge {
+                TwinEdge::Go(arg) => Some(arg),
+                TwinEdge::Back(_) => None,
+            }
+        }
+    }
+    impl EdgeArg for Back {
+        type Edge = TwinEdge;
+        const KIND: TwinEdgeKind = TwinEdgeKind::Back;
+        fn project(edge: &TwinEdge) -> Option<&Back> {
+            match edge {
+                TwinEdge::Back(arg) => Some(arg),
+                TwinEdge::Go(_) => None,
+            }
+        }
     }
     #[derive(Clone, Debug, PartialEq)]
     pub struct Never;

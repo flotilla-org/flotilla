@@ -6,6 +6,8 @@
 //! identity. Receipts are recorded on the session and refused once it has
 //! ended. "Running" is a judgement, not a state.
 
+use serde::{Deserialize, Serialize};
+
 use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Version, WrongState};
 
 /// Whether a channel to a Live session is attached (spec `Channel`).
@@ -16,7 +18,7 @@ pub enum Channel {
 }
 
 /// How a session ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum EndReason {
     Completed,
     Lost,
@@ -49,19 +51,19 @@ impl AgentSessionState {
 }
 
 /// A channel to the session was observed present (spec `Attach`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attach {
     pub observed: Ref<ChannelPresence>,
 }
 
 /// The channel was observed absent (spec `Detach`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Detach {
     pub observed: Ref<ChannelPresence>,
 }
 
 /// The session ended for `reason`, as observed (spec `End`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct End {
     pub reason: EndReason,
     pub observed: Ref<SessionEnd>,

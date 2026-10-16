@@ -1,15 +1,16 @@
 //! AgentSession against `specs/primitives/machines/agent_session.qnt`.
 
+use flotilla_schema::{CodeEnum, Timestamp};
 use flotilla_state_machines::{
     machines::agent_session::{
         AgentSession, AgentSessionEdgeKind, AgentSessionLabel, AgentSessionRefusal, AgentSessionState, Attach, Channel, ChannelPresence,
         Detach, End, EndReason, MemoryAgentSessionWorld, SessionEnd,
     },
-    Coded, Diagram, Home, InputRead, Machine, Receipt, Ref, Time, Transport, Version, WriteError,
+    Coded, Diagram, Home, InputRead, Machine, Receipt, Ref, Transport, Version, WriteError,
 };
 
-fn at(micros: i64) -> Time {
-    Time::from_micros(micros)
+fn at(micros: i64) -> Timestamp {
+    Timestamp::from_micros(micros)
 }
 
 fn home() -> Home<AgentSession> {
@@ -104,7 +105,7 @@ fn end_needs_an_observed_end_with_that_reason() {
         assert_eq!(h.apply("s", end(reason), &ended_with(None), at(1)).err(), refused(AgentSessionRefusal::MissingEvidence));
         assert_eq!(h.apply("s", end(reason), &ended_with(Some(other)), at(1)).err(), refused(AgentSessionRefusal::MissingEvidence));
         let event = h.apply("s", end(reason), &ended_with(Some(reason)), at(2)).expect("ended");
-        assert_eq!(event.reads, [InputRead { kind: "session_end", name: "s".into(), version: Some(Version(1)) }]);
+        assert_eq!(event.payload.reads, [InputRead { kind: "session_end".into(), name: "s".into(), version: Some(Version(1)) }]);
         assert_eq!(*state(&h), AgentSessionState::Ended { reason });
     }
 }

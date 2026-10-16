@@ -2640,12 +2640,12 @@ dependencies = [
 name = "flotilla-state-machines"
 version = "0.1.0"
 dependencies = [
+ "flotilla-schema",
  "hegeltest",
- "serde_core",
+ "serde",
  "serde_json",
  "smallvec",
  "strum 0.28.0",
- "syn 2.0.117",
 ]
 
 [[package]]

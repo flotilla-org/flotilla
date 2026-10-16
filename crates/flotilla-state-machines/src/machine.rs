@@ -16,6 +16,8 @@ use std::{
     marker::PhantomData,
 };
 
+use flotilla_schema::CodeEnum;
+
 use crate::{code::changed, Coded, Edge, EdgeArg, Handle, StateValue};
 
 /// A declared machine: a marker type naming its request, spec, state, edges,
@@ -241,8 +243,11 @@ pub enum DefError {
     UnreachableState(&'static str),
     /// Not an end, yet nothing leaves it.
     DeadState(&'static str),
-    DuplicateStateCode(u16),
-    DuplicateEdgeCode(u16),
+    /// Two labels share a code. The macros' `Stored` derive refuses this at
+    /// compile time; a hand-written code enum can still reach it.
+    DuplicateStateCode(i64),
+    /// Two edge kinds share a code; as [`DefError::DuplicateStateCode`].
+    DuplicateEdgeCode(i64),
 }
 
 impl fmt::Display for DefError {

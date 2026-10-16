@@ -19,16 +19,22 @@
 //! check, the from-label, the gate, the effect), stores the next state,
 //! appends the edge event with its reads, and returns refusals without
 //! recording them. Records (edge events, attempts and receipts) are
-//! append-only logs keyed by owner and position, and an ended resource
-//! refuses them. Edge events are history, for showing and auditing what
+//! append-only `flotilla_schema::Records`, keyed by owner and position, and
+//! an ended resource refuses them. An edge event is a
+//! `flotilla_schema::EdgeEvent` ([`EdgeEventOf`]) whose document is an
+//! [`EdgePayload`]: the edge's arguments and its reads. Edge events are history, for showing and auditing what
 //! happened; nothing that decides reads them. Retry counts, schedules and
 //! giving up are judgements over attempts ([`attempt::retry`]).
 //!
-//! Time is microseconds ([`Time`]), always supplied by the caller. The engine
-//! never reads a clock, link age or any other liveness signal.
+//! Time is `flotilla_schema::Timestamp` (microseconds), always supplied by the
+//! caller. The engine never reads a clock, link age or any other liveness
+//! signal.
 //!
-//! Nothing here touches storage, replication or a wire encoding, and no
-//! production crate depends on this one yet (`ci/build-graph/check.py`).
+//! State labels and edge kinds are `flotilla_schema` code enums, and records
+//! and events are the schema crate's types, so the storage derive stores them
+//! as they are. Nothing here touches a backend, replication or a wire
+//! encoding. The only workspace crate this one reaches is `flotilla-schema`,
+//! and no production crate depends on this one yet (`ci/build-graph/check.py`).
 
 pub mod attempt;
 mod code;
@@ -38,7 +44,6 @@ pub mod machines;
 pub mod placement;
 mod read;
 mod record;
-mod time;
 
 pub use attempt::{Attempt, AttemptPolicy, Cause, CauseCategory, Outcome, Retry, Schedule};
 pub use code::{changed, Coded, Datum, Edge, EdgeArg, StateValue};
@@ -47,5 +52,4 @@ pub use machine::{
     Check, DeclaredEdge, DefError, Diagram, EdgeDef, EdgeKind, EndDef, Ended, Fault, Label, Machine, MachineDef, StepError, WrongState,
 };
 pub use read::{Handle, InputRead, Judged, Kind, Ref, Source, Table, Version, OWN_ATTEMPTS, OWN_RECEIPTS};
-pub use record::{EdgeEvent, Position, Receipt, RecordLog, Row, Transport, Writer};
-pub use time::Time;
+pub use record::{EdgeEventOf, EdgePayload, Receipt, Transport};

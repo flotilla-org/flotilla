@@ -29,7 +29,7 @@
 //!   Rust are the gate's inputs, not state the spec has);
 //! - `receiver` the session number, or 0 with none;
 //! - `at` the drop's time in model ticks;
-//! - `watermark` and `bound` from `watermark: Option<Time>`: `Some(w)` is
+//! - `watermark` and `bound` from `watermark: Option<Timestamp>`: `Some(w)` is
 //!   `watermark: w, bound: true`, and `None` is `watermark: 0, bound: false`.
 //!   Both describe an expiry with a consumer bound, the only drop that reads
 //!   the watermark;
@@ -43,13 +43,14 @@
 
 use std::collections::BTreeMap;
 
+use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::message::{
         AppliedThrough, Binding, Condition, Deliver, DeliveryFailure, DropMessage, DropReason, Expectation, InboxBinding,
         MemoryMessageWorld, Message, MessageRefusal, MessageSpec, MessageState, Receipts, Receiver, Reply, Settle, Settlement, Supersedes,
         Supersession,
     },
-    Home, Ref, Time, Transport, WriteError,
+    Home, Ref, Transport, WriteError,
 };
 use serde_json::{json, Value};
 
@@ -89,8 +90,8 @@ fn spec_of(envelope: &Value) -> MessageSpec {
 }
 
 /// An engine time in model ticks.
-fn ticks(time: Time) -> i64 {
-    time.as_micros() / UNIT
+fn ticks(time: Timestamp) -> i64 {
+    time.micros() / UNIT
 }
 
 fn envelope_of(spec: &MessageSpec) -> Value {
@@ -138,7 +139,7 @@ fn drop_reason_of(o: &Value) -> DropReason {
 }
 
 /// The drop's world: only the evidence its reason's rule reads.
-fn drop_world(spec: &MessageSpec, o: &Value, now: Time) -> Result<MemoryMessageWorld, &'static str> {
+fn drop_world(spec: &MessageSpec, o: &Value, now: Timestamp) -> Result<MemoryMessageWorld, &'static str> {
     let mut world = MemoryMessageWorld::default();
     let binding = Ref::<Binding>::new(INBOX);
     match tag(&o["reason"]) {

@@ -1,5 +1,7 @@
 //! A small machine for exercising the engine, shared by the engine tests.
 
+use serde::{Deserialize, Serialize};
+
 use flotilla_state_machines::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Table, WrongState};
 
 // A latch that is loaded with shots and armed, then either fires (spending
@@ -14,22 +16,22 @@ states! {
 }
 
 /// Adds shots to an armed latch: an edge that changes only data.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Load {
     pub shots: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fire {
     pub signal: Ref<Signal>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Withdraw {
     pub reason: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReArm;
 
 edges! {

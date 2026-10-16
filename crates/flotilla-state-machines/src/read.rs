@@ -10,9 +10,12 @@
 //! usually a trait object whose supertraits are the [`Source`]s it needs, so a
 //! home that cannot serve a read does not compile.
 
-use std::{collections::BTreeMap, fmt, marker::PhantomData};
+use std::{borrow::Cow, collections::BTreeMap, fmt, marker::PhantomData};
 
-use crate::{Attempt, Machine, Receipt, Resource, Row, Time};
+use flotilla_schema::{RecordRow, Timestamp};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::{Attempt, Machine, Receipt, Resource};
 
 /// Something a gate or judgement can read: a resource kind, or a family of
 /// records such as one session's receipts, each named by a [`Ref`].
@@ -22,7 +25,8 @@ pub trait Kind: 'static {
     type Value;
 }
 
-/// A typed reference to one value of kind `K`.
+/// A typed reference to one value of kind `K`. Serde sees its name alone:
+/// the kind is the type's.
 pub struct Ref<K: Kind> {
     name: String,
     kind: PhantomData<fn() -> K>,
@@ -76,8 +80,22 @@ impl<K: Kind> fmt::Debug for Ref<K> {
     }
 }
 
-/// A value's version at its home: it rises on every write.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+impl<K: Kind> Serialize for Ref<K> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.name)
+    }
+}
+
+impl<'de, K: Kind> Deserialize<'de> for Ref<K> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Ref::new)
+    }
+}
+
+/// A value's version at its home: it rises on every write. A record row's
+/// `version` is the owner's `Version.0`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Version(pub u64);
 
 impl Version {
@@ -135,9 +153,11 @@ pub const OWN_RECEIPTS: &str = "receipts";
 
 /// One recorded read: what was read and the version seen, or `None` when the
 /// read found nothing. A gate relying on an absence relied on an input too.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// `kind` is a [`Kind::NAME`] (or [`OWN_ATTEMPTS`], [`OWN_RECEIPTS`]) when
+/// recorded and owned text when decoded from an edge event's document.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InputRead {
-    pub kind: &'static str,
+    pub kind: Cow<'static, str>,
     pub name: String,
     pub version: Option<Version>,
 }
@@ -148,7 +168,7 @@ pub struct InputRead {
 pub struct Judged<T> {
     pub value: T,
     /// `None` when only a change to one of `reads` can change the value.
-    pub valid_until: Option<Time>,
+    pub valid_until: Option<Timestamp>,
     pub reads: Vec<InputRead>,
 }
 
@@ -159,21 +179,21 @@ pub struct Handle<'a, M: Machine> {
     spec: &'a M::Spec,
     state: &'a M::State,
     world: &'a M::World,
-    now: Time,
+    now: Timestamp,
     reads: Vec<InputRead>,
-    valid_until: Option<Time>,
+    valid_until: Option<Timestamp>,
 }
 
 impl<'a, M: Machine> Handle<'a, M> {
     /// A handle for a pure step or judgement over a spec and state alone,
     /// with no records: own-record reads see empty logs, and record them
     /// under the empty name with version 0, which is exactly what they saw.
-    pub fn new(spec: &'a M::Spec, state: &'a M::State, world: &'a M::World, now: Time) -> Self {
+    pub fn new(spec: &'a M::Spec, state: &'a M::State, world: &'a M::World, now: Timestamp) -> Self {
         Handle { own: None, spec, state, world, now, reads: Vec::new(), valid_until: None }
     }
 
     /// A handle on a resource and its records, at `now`.
-    pub fn on(resource: &'a Resource<M>, world: &'a M::World, now: Time) -> Self {
+    pub fn on(resource: &'a Resource<M>, world: &'a M::World, now: Timestamp) -> Self {
         Handle { own: Some(resource), spec: resource.spec(), state: resource.state(), world, now, reads: Vec::new(), valid_until: None }
     }
 
@@ -194,7 +214,7 @@ impl<'a, M: Machine> Handle<'a, M> {
     }
 
     /// The time the caller supplied.
-    pub fn now(&self) -> Time {
+    pub fn now(&self) -> Timestamp {
         self.now
     }
 
@@ -205,7 +225,7 @@ impl<'a, M: Machine> Handle<'a, M> {
     {
         let world: &'a M::World = self.world;
         let found = world.lookup(reference);
-        self.record(InputRead { kind: K::NAME, name: reference.name.clone(), version: found.map(|(version, _)| version) });
+        self.record(InputRead { kind: Cow::Borrowed(K::NAME), name: reference.name.clone(), version: found.map(|(version, _)| version) });
         found.map(|(_, value)| value)
     }
 
@@ -219,19 +239,19 @@ impl<'a, M: Machine> Handle<'a, M> {
 
     fn own_read(&mut self, kind: &'static str, length: usize) {
         let name = self.name().to_string();
-        self.record(InputRead { kind, name, version: Some(Version(length as u64)) });
+        self.record(InputRead { kind: Cow::Borrowed(kind), name, version: Some(Version(length as u64)) });
     }
 
     /// The resource's own attempts, every window. Recorded with the log's
     /// length as its version.
-    pub fn attempts(&mut self) -> &'a [Row<Attempt>] {
+    pub fn attempts(&mut self) -> &'a [RecordRow<Attempt>] {
         let rows = self.own.map_or(&[][..], |own| own.attempts().rows());
         self.own_read(OWN_ATTEMPTS, rows.len());
         rows
     }
 
     /// The resource's own receipts. Recorded like [`Handle::attempts`].
-    pub fn receipts(&mut self) -> &'a [Row<Receipt>] {
+    pub fn receipts(&mut self) -> &'a [RecordRow<Receipt>] {
         let rows = self.own.map_or(&[][..], |own| own.receipts().rows());
         self.own_read(OWN_RECEIPTS, rows.len());
         rows
@@ -239,7 +259,7 @@ impl<'a, M: Machine> Handle<'a, M> {
 
     /// Declares that the value being computed may change at `moment` by time
     /// alone. The earliest declared moment wins.
-    pub fn until(&mut self, moment: Time) {
+    pub fn until(&mut self, moment: Timestamp) {
         self.valid_until = Some(self.valid_until.map_or(moment, |current| current.min(moment)));
     }
 

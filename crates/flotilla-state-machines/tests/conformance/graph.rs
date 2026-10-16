@@ -16,7 +16,7 @@ use std::{
     time::Instant,
 };
 
-use flotilla_state_machines::Time;
+use flotilla_schema::Timestamp;
 use serde_json::Value;
 
 use crate::itf::{self, normalise, payload, show, tag};
@@ -26,8 +26,8 @@ use crate::itf::{self, normalise, payload, show, tag};
 pub const UNIT: i64 = 60_000_000;
 
 /// Model time `ticks` in engine microseconds.
-pub fn tick(ticks: i64) -> Time {
-    Time::from_micros(ticks * UNIT)
+pub fn tick(ticks: i64) -> Timestamp {
+    Timestamp::from_micros(ticks * UNIT)
 }
 
 /// What the Rust side did with one probed event.

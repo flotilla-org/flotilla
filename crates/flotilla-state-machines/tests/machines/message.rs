@@ -1,19 +1,20 @@
 //! Message (spec `machines/message.qnt`; scenarios `inbox_delivery`, `message_race`;
 //! ADR 0064 "Inboxes").
 
+use flotilla_schema::{CodeEnum, Decoder, Encoder, Position, Timestamp, Value};
 use flotilla_state_machines::{
     machines::message::{
         AppliedThrough, Binding, Condition, Deliver, DropMessage, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message,
-        MessageEdgeKind, MessageLabel, MessageRefusal, MessageSpec, MessageState, Receipts, Receiver, Settle, Settlement, Supersedes,
-        Supersession,
+        MessageEdge, MessageEdgeKind, MessageLabel, MessageRefusal, MessageSpec, MessageState, Receipts, Receiver, Settle, Settlement,
+        Supersedes, Supersession,
     },
-    Coded, Diagram, Home, Kind, Machine, Receipt, Ref, Source, Time, Transport, WriteError,
+    Coded, Diagram, EdgeEventOf, EdgePayload, Home, InputRead, Kind, Machine, Receipt, Ref, Source, Transport, Version, WriteError,
 };
 
 const INBOX: &str = "project:p/role:r";
 
-fn t(micros: i64) -> Time {
-    Time::from_micros(micros)
+fn t(micros: i64) -> Timestamp {
+    Timestamp::from_micros(micros)
 }
 
 fn condition() -> Ref<Condition> {
@@ -251,7 +252,7 @@ fn expiry_needs_a_passed_deadline_and_no_expected_evidence() {
     world.condition.put(&condition(), false);
     outcome.apply("m", drop(DropReason::Expired), &world, t(6)).expect("expired");
     assert_eq!(*state(&outcome), MessageState::Dropped { reason: DropReason::Expired, receiver: None, at: t(6), watermark: None });
-    let reads = &outcome.get("m").expect("exists").events().last().expect("dropped").record.reads;
+    let reads = &outcome.get("m").expect("exists").events().last().expect("dropped").record.payload.reads;
     assert!(reads.iter().all(|read| read.kind != <AppliedThrough as Kind>::NAME), "{reads:?}");
 }
 
@@ -266,7 +267,7 @@ fn expiry_with_a_consumer_waits_for_the_watermark_and_records_it() {
     assert_eq!(home.apply("m", drop(DropReason::Expired), &world, t(7)).err(), refused(MessageRefusal::PrefixBeforeDeadline));
     world.applied_through.put(&Ref::new(INBOX), t(6));
     let event = home.apply("m", drop(DropReason::Expired), &world, t(7)).expect("expired");
-    let kinds: Vec<_> = event.reads.iter().map(|read| (read.kind, read.name.as_str())).collect();
+    let kinds: Vec<_> = event.payload.reads.iter().map(|read| (read.kind.as_ref(), read.name.as_str())).collect();
     assert!(kinds.contains(&(<Binding as Kind>::NAME, INBOX)), "{kinds:?}");
     assert!(kinds.contains(&(<AppliedThrough as Kind>::NAME, INBOX)), "{kinds:?}");
     assert_eq!(*state(&home), MessageState::Dropped { reason: DropReason::Expired, receiver: None, at: t(7), watermark: Some(t(6)) });
@@ -327,4 +328,53 @@ fn time_rules_are_strict_at_their_boundaries() {
     };
     assert_eq!(undeliverable_at(13), refused(MessageRefusal::MissingEvidence));
     assert_eq!(undeliverable_at(14), None);
+}
+
+// An edge event is the schema crate's stored row as it is: the header holds
+// the edge kind's and labels' codes, and the inline document carries the
+// typed edge and every read, so a decoded event equals the one the home
+// appended.
+#[test]
+fn edge_events_round_trip_through_the_schema_codec() {
+    let (mut home, mut world) = awaiting(None);
+    world.reply.put(&Ref::new("m"), ());
+    home.apply("m", Settle { by: Settlement::Answered }, &world, t(2)).expect("settled");
+    let events = home.get("m").expect("exists").events();
+    assert_eq!(events.iter().map(|row| (row.position, row.version)).collect::<Vec<_>>(), [(Position(0), 2), (Position(1), 3)]);
+    for row in events {
+        let rows = Encoder::encode(&row.record).expect("encodes");
+        let header: Vec<_> = rows.tables[0][0].values.iter().take(3).cloned().collect();
+        let codes = [row.record.edge.code(), row.record.from.code(), row.record.to.code()].map(Value::Int);
+        assert_eq!(header, codes);
+        assert_eq!(Decoder::decode::<EdgeEventOf<Message>>(rows).expect("decodes"), row.record);
+    }
+    let delivered = &events.rows()[0].record;
+    assert_eq!((delivered.edge.code(), delivered.from.code(), delivered.to.code()), (1, 1, 2));
+    assert_eq!(delivered.payload.edge, deliver("s1", Transport::Turn).into());
+    assert_eq!(delivered.payload.reads, [InputRead { kind: "message_receipts".into(), name: "m".into(), version: Some(Version(1)) }]);
+    assert_eq!(delivered.writer, "home");
+}
+
+// A payload's document is the edge's serde form: a reference is its name
+// alone, and every read keeps its kind, name and version (or absence).
+#[test]
+fn payload_documents_name_references_and_keep_reads() {
+    let reason = DropReason::Withdrawn { by: "ann".into(), authority: Ref::new("ops") };
+    let reads = vec![
+        InputRead { kind: "authority".into(), name: "ops".into(), version: Some(Version(4)) },
+        InputRead { kind: "binding".into(), name: INBOX.into(), version: None },
+    ];
+    let payload = EdgePayload { edge: MessageEdge::from(drop(reason)), reads };
+    let json = serde_json::to_value(&payload).expect("serialises");
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "edge": { "Drop": { "reason": { "Withdrawn": { "by": "ann", "authority": "ops" } } } },
+            "reads": [
+                { "kind": "authority", "name": "ops", "version": 4 },
+                { "kind": "binding", "name": INBOX, "version": null },
+            ],
+        })
+    );
+    assert_eq!(serde_json::from_value::<EdgePayload<MessageEdge>>(json).expect("deserialises"), payload);
 }

@@ -11,6 +11,8 @@
 
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     attempt, edges, states, AttemptPolicy, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Version, WrongState,
 };
@@ -89,31 +91,31 @@ pub struct EnsureSpec {
 }
 
 /// Names a fulfiller before it is asked for (spec `Record`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub fulfiller: Ref<Fulfiller>,
 }
 
 /// Asks for a recorded fulfiller (spec `Create`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Create {
     pub fulfiller: Ref<Fulfiller>,
 }
 
 /// Binds a recorded fulfiller (spec `Bind`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bind {
     pub fulfiller: Ref<Fulfiller>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum UnbindReason {
     Gone,
     Replaced,
 }
 
 /// Unbinds the bound fulfiller once it is gone (spec `Unbind`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unbind {
     /// Why it was unbound. No gate reads it: both reasons need the Gone
     /// observation. It is recorded on the edge event, where listings and
@@ -123,18 +125,18 @@ pub struct Unbind {
 }
 
 /// Holds the Ensure once its attempt window is spent (spec `GiveUp`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GiveUp;
 
 /// Releases a hold on someone's authority; starts a new attempt window (spec `Resume`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resume {
     pub by: String,
     pub authority: Ref<Authority>,
 }
 
 /// Ends the Ensure once its fulfillers are torn down (spec `Retire`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Retire {
     pub by: String,
     pub authority: Ref<Authority>,
