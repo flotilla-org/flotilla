@@ -11,7 +11,7 @@
 //! `Option`) is a `KeyColumn`, or `intern` fields. `order` refuses `intern` fields and references
 //! (`Ref`, `Identity`): their columns hold local surrogate ids, whose order is insertion order in one
 //! store and differs between stores, so it is no order a caller could mean. `when` conjoins `<state field> in [Variant, ...]`,
-//! whose codes come from the enum's `CodeEnum::code`, and `<optional field> is_some`. An optional
+//! whose codes come from the state's label enum (`Labelled::Label`), and `<optional field> is_some`. An optional
 //! `order` field must be required by `is_some`, so keyset paging never compares a null.
 
 use std::collections::BTreeSet;
@@ -87,12 +87,15 @@ impl<'f, 'a> Indexes<'f, 'a> {
                     // `check` resolved this field and refused it unless it is a `State<E>` field.
                     let field = find(self.fields, field).expect("checked");
                     let column = &field.name;
-                    let code_enum = shape::first_arg(field.ty).expect("checked State<E>");
-                    // Each code expression carries its variant's span, so a variant the enum
-                    // lacks is reported at the attribute that names it.
+                    let state = shape::first_arg(field.ty).expect("checked State<E>");
+                    // The codes come from the state's label enum (the code enum itself, or a
+                    // label-plus-data state's `labels` enum), never restated. Each code expression
+                    // carries its variant's span, so a label the enum lacks is reported at the
+                    // attribute that names it.
+                    let label = quote!(<#state as #schema::Labelled>::Label);
                     let codes = variants
                         .iter()
-                        .map(|variant| quote_spanned!(variant.span()=> <#code_enum as #schema::CodeEnum>::code(&<#code_enum>::#variant)));
+                        .map(|variant| quote_spanned!(variant.span()=> <#label as #schema::CodeEnum>::code(&<#label>::#variant)));
                     quote! {
                         #schema::Condition::In {
                             column: ::std::string::String::from(#column),

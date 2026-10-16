@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub(crate) fn expand(input: &DeriveInput, fields: &FieldsNamed, type_attrs: TypeAttrs) -> syn::Result<TokenStream> {
+    refuse_labels(&type_attrs)?;
     let fields = fields.named.iter().map(|field| Field::parse(field, &input.ident, None)).collect::<syn::Result<Vec<_>>>()?;
     match (&type_attrs.kind, type_attrs.code) {
         (Some(kind), Some((code, _))) => {
@@ -250,6 +251,7 @@ fn part_impls(input: &DeriveInput, fields: &[Field<'_>], indexes: &Indexes<'_, '
 /// A single-field tuple struct is transparent: its columns are its field's, under the same name.
 /// It is a `Column` (and an `Element`), and `Intern` when it wraps a `String`.
 pub(crate) fn newtype(input: &DeriveInput, fields: &FieldsUnnamed, type_attrs: TypeAttrs) -> syn::Result<TokenStream> {
+    refuse_labels(&type_attrs)?;
     let field = &fields.unnamed[0];
     if let Some(attr) = attrs::field_attr(&field.attrs)? {
         return Err(refuse(
@@ -330,6 +332,14 @@ pub(crate) fn newtype(input: &DeriveInput, fields: &FieldsUnnamed, type_attrs: T
 
         #intern
     })
+}
+
+/// `labels` names a machine's label enum, so it belongs on the state enum, not a struct.
+fn refuse_labels(type_attrs: &TypeAttrs) -> syn::Result<()> {
+    match &type_attrs.labels {
+        Some(labels) => Err(refuse(labels, "`labels` belongs on an enum whose variants are a machine's labels, not a struct")),
+        None => Ok(()),
+    }
 }
 
 /// Refusal for struct forms with no storage shape.

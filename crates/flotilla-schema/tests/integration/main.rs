@@ -5,6 +5,7 @@ mod compile_fail;
 mod edges;
 mod indexes;
 mod inline;
+mod states;
 mod tables;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;

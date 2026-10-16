@@ -618,3 +618,61 @@ CREATE TABLE "vessel" (
   "version" INTEGER NOT NULL,
   "name" TEXT NOT NULL
 ) STRICT;
+CREATE TABLE "ticket" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "queue" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "title" TEXT NOT NULL,
+  "state" INTEGER NOT NULL CHECK ("state" IN (1, 2, 3)),
+  "state_since" INTEGER NOT NULL,
+  "priority" INTEGER,
+  "owner" INTEGER REFERENCES "strings" ("id"),
+  "reason" TEXT,
+  "closed_by" INTEGER REFERENCES "strings" ("id"),
+  CHECK (CASE WHEN "state" = 1
+      THEN "priority" IS NULL
+      AND "owner" IS NULL
+      AND "reason" IS NULL
+      AND "closed_by" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 2
+      THEN "priority" IS NOT NULL
+      AND "reason" IS NULL
+      AND "closed_by" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 3
+      THEN "priority" IS NOT NULL
+      AND "reason" IS NOT NULL
+      AND "closed_by" IS NOT NULL
+      AND "owner" IS NULL
+      END)
+) STRICT;
+CREATE TABLE "ticket_assignees" (
+  "owner" INTEGER NOT NULL,
+  "value" TEXT NOT NULL,
+  PRIMARY KEY ("owner", "value"),
+  FOREIGN KEY ("owner") REFERENCES "ticket" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE "ticket_notes" (
+  "owner" INTEGER NOT NULL,
+  "key" TEXT NOT NULL,
+  "value" TEXT NOT NULL,
+  PRIMARY KEY ("owner", "key"),
+  FOREIGN KEY ("owner") REFERENCES "ticket" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE "ticket_edges" (
+  "owner" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
+  "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2)),
+  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2, 3)),
+  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2, 3)),
+  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "at" INTEGER NOT NULL,
+  "payload" BLOB NOT NULL,
+  PRIMARY KEY ("owner", "pos"),
+  FOREIGN KEY ("owner") REFERENCES "ticket" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE INDEX "ticket_edges_by_edge" ON "ticket_edges" ("edge", "at");
+CREATE INDEX "ticket_edges_by_time" ON "ticket_edges" ("at");
+CREATE INDEX "ticket_open_by_queue" ON "ticket" ("queue") WHERE "state" IN (2);

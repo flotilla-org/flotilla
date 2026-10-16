@@ -1,7 +1,7 @@
 use flotilla_schema_sqlite::Store;
 use hegel::{generators as gs, TestCase};
 
-use crate::fixtures::{store, Convoy, Fixture, Message, Pick, TerminalSession, LOCAL};
+use crate::fixtures::{store, Convoy, Fixture, Message, Pick, TerminalSession, Ticket, LOCAL};
 
 /// Inserts `first`, then evolves it through `steps` writes: mostly generated edges, and a spec
 /// edit about one write in four. After every write the snapshot and `load` decode to the model:
@@ -79,6 +79,14 @@ fn terminal_session_evolves_by_edges_and_spec_edits(tc: TestCase) {
     drawn::<TerminalSession>(&tc);
 }
 
+// Behaviour (#3373 rulings 1 and 2): the synthetic `Ticket` evolves by transitions (data-only and
+// label-changing, its collections growing, shrinking and changing) and spec edits, and after each
+// write `load_snapshot` decodes to the model.
+#[hegel::test]
+fn ticket_evolves_by_transitions_and_spec_edits(tc: TestCase) {
+    drawn::<Ticket>(&tc);
+}
+
 // Behaviour (#3320 round trip): the same law holds for every variant of every enum, nested,
 // flattened and in child tables, for every edge, and for empty and non-empty collections at every
 // depth: the covering indexes reach each of them (see each fixture's `COVERING`).
@@ -87,4 +95,5 @@ fn every_variant_round_trips_and_switches_through_writes(tc: TestCase) {
     covering::<Message>(&tc);
     covering::<Convoy>(&tc);
     covering::<TerminalSession>(&tc);
+    covering::<Ticket>(&tc);
 }

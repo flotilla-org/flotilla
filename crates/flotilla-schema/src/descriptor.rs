@@ -43,6 +43,10 @@ pub enum TableRole {
     Records,
     /// Append-only immutable rows, each stamped with the version that appended it.
     History,
+    /// A collection datum of a label-plus-data state (`#[store(labels = L)]`): one row per map key
+    /// or set value, holding rows only while the state's label carries the datum. Rows change one
+    /// at a time, and only through an edge (`Edge::transition`), never through a spec edit.
+    State,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,26 +78,50 @@ pub struct FieldColumns {
     pub columns: Range<usize>,
     /// A `#[store(state)]` field: moved only by an edge, never by a spec edit.
     pub state: bool,
+    /// A column datum of a label-plus-data state: the name of the state's label field, whose
+    /// first column is the label. `None` for the label field itself and for every other field.
+    /// The label field and its datums are set by one statement, so the per-label CHECK holds
+    /// after it.
+    pub datum_of: Option<String>,
 }
 
-/// Columns that hold only while `column = value`: a data enum variant (`column` is the tag) or a
-/// present `Option<flatten>` (`column` is `<field>_present`, `value` 1). Kept structured rather
-/// than as SQL text so tests can derive the rows each CHECK must refuse.
+impl FieldColumns {
+    /// A state's label field: a `state` field that is no datum. Its first column is the label.
+    pub fn is_label(&self) -> bool {
+        self.state && self.datum_of.is_none()
+    }
+}
+
+/// A rule on the columns of one row while `column = value`. Two kinds, each one table CHECK:
+///
+/// - **A variant guard**: columns that hold only while the guard does: a data enum variant
+///   (`column` is the tag) or a present `Option<flatten>` (`column` is `<field>_present`, `value`
+///   1). `scope` is non-empty and `absent` empty.
+/// - **A label guard** of a label-plus-data state (`#[store(labels = L)]`): `column` is the label
+///   and `value` one label's code; while it holds, the label's required data is non-null and the
+///   data it lacks is null. `scope` is empty (the other labels' guards cover their own rows) and
+///   `required` or `absent` is non-empty.
+///
+/// Kept structured rather than as SQL text so tests can derive the rows each CHECK must refuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Guard {
     pub column: String,
     pub value: i64,
     /// Columns that must be non-null while the guard holds.
     pub required: Vec<String>,
-    /// Every column declared directly inside the guard; all null while it does not hold. A nested
-    /// guard's columns are in its own scope only (its controlling column is in this one).
+    /// Every column declared directly inside a variant guard; all null while it does not hold. A
+    /// nested guard's columns are in its own scope only (its controlling column is in this one).
     pub scope: Vec<String>,
+    /// Columns that must be null while a label guard holds: the data its label lacks.
+    pub absent: Vec<String>,
 }
 
 impl Guard {
     /// `CASE WHEN <cond> THEN <required> IS NOT NULL AND ... ELSE <scope> IS NULL AND ... END`.
     /// When an enclosing guard does not hold, this guard's controlling column is null, the
-    /// condition is null and the ELSE branch applies.
+    /// condition is null and the ELSE branch applies. A label guard's THEN also requires its
+    /// `absent` columns null, and it has no ELSE: a CASE without a match is null, which a CHECK
+    /// accepts.
     pub fn check(&self) -> String {
         self.check_with(" ")
     }
@@ -101,9 +129,20 @@ impl Guard {
     /// The CHECK with `separator` before `THEN`, `ELSE` and each term, for readable DDL.
     pub fn check_with(&self, separator: &str) -> String {
         let and = format!("{separator}AND ");
-        let then = conjunction(self.required.iter().map(|name| format!("{} IS NOT NULL", quote_ident(name))), &and);
+        let required = self.required.iter().map(|name| format!("{} IS NOT NULL", quote_ident(name)));
+        let absent = self.absent.iter().map(|name| format!("{} IS NULL", quote_ident(name)));
+        let then = conjunction(required.chain(absent), &and);
+        let condition = format!("CASE WHEN {} = {}{separator}THEN {then}", quote_ident(&self.column), self.value);
+        if self.is_label() {
+            return format!("{condition}{separator}END");
+        }
         let otherwise = conjunction(self.scope.iter().map(|name| format!("{} IS NULL", quote_ident(name))), &and);
-        format!("CASE WHEN {} = {}{separator}THEN {then}{separator}ELSE {otherwise}{separator}END", quote_ident(&self.column), self.value)
+        format!("{condition}{separator}ELSE {otherwise}{separator}END")
+    }
+
+    /// A label guard of a label-plus-data state, rather than a variant guard.
+    pub fn is_label(&self) -> bool {
+        self.scope.is_empty()
     }
 }
 
@@ -284,7 +323,7 @@ impl TableSet {
             let mut columns = BTreeSet::new();
             let (reserved, data) = match table.role {
                 TableRole::Root => (RESERVED_ROOT_COLUMNS, &table.columns[..]),
-                TableRole::Child => (RESERVED_CHILD_COLUMNS, &table.columns[..]),
+                TableRole::Child | TableRole::State => (RESERVED_CHILD_COLUMNS, &table.columns[..]),
                 TableRole::Records | TableRole::History => {
                     let stamp = ColumnDef { name: RECORD_VERSION.to_owned(), ty: ColumnType::Integer, nullable: false };
                     if table.columns.first() != Some(&stamp) {

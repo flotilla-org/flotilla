@@ -20,6 +20,14 @@
 //! Nesting is one `records` level deep: [`Edge::set_in`] and [`Edge::append_in`] address a row of
 //! a `records` table of the kind itself (a deliverable) and a field or table of that row (its
 //! state, its evidence). The rows they address must exist before the edge.
+//!
+//! A state carrying data (a label-plus-data enum, `#[store(labels = L)]`) moves through
+//! [`Edge::transition`], which takes the previous and the next state value (#3373 ruling 2): it
+//! writes the label and its `since` only when the label changes, each column datum only when its
+//! columns differ, and each collection datum row by row (an insert per new key, an update per
+//! changed value, a delete per removed key), never the whole collection. Data a label change leaves
+//! behind is nulled, or its rows deleted. Every edge also names the label it leaves (`from`), which
+//! the backend checks against the stored label inside the write (#3373 ruling 5).
 
 use std::{collections::BTreeMap, fmt, marker::PhantomData};
 
@@ -29,7 +37,9 @@ use crate::{
     history::{EdgeEvent, Labelled},
     inline::Cbor,
     records::Position,
-    traits::{CodeEnum, Element},
+    state::{RowEdit, State, StateDelta},
+    time::Timestamp,
+    traits::{CodeEnum, Element, StateData},
     value::{Hash, Rows, Value},
 };
 
@@ -55,18 +65,22 @@ impl<O, F> ColumnOf<O, F> {
     }
 }
 
-/// The `#[store(state)]` field of rows of `O`, holding the state value `S`: what [`Edge::new`]
-/// writes on every edge, and [`Edge::set_in`] on a `records` row.
-pub struct StateOf<O, S>(ColumnOf<O, S>);
+/// The `#[store(state)]` field of rows of `O`, holding the state value `S`: what
+/// [`Edge::transition`] and [`Edge::new`] write, and [`Edge::set_in`] on a `records` row.
+pub struct StateOf<O, S> {
+    column: ColumnOf<O, S>,
+    /// The state value's data names: empty for a code enum.
+    data: &'static [&'static str],
+}
 
 impl<O, S> StateOf<O, S> {
     #[doc(hidden)]
-    pub const fn new(column: ColumnOf<O, S>) -> StateOf<O, S> {
-        StateOf(column)
+    pub const fn new(column: ColumnOf<O, S>, data: &'static [&'static str]) -> StateOf<O, S> {
+        StateOf { column, data }
     }
 
     pub fn name(&self) -> &'static str {
-        self.0.name
+        self.column.name
     }
 }
 
@@ -80,7 +94,7 @@ impl<O, S> Copy for StateOf<O, S> {}
 
 impl<O, S> fmt::Debug for StateOf<O, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "StateOf({})", self.0.name)
+        write!(f, "StateOf({})", self.column.name)
     }
 }
 
@@ -88,6 +102,11 @@ impl<O, S> fmt::Debug for StateOf<O, S> {
 /// [`ColumnOf`] or a [`StateOf`].
 pub trait FieldOf<O, F>: Copy {
     fn column(self) -> ColumnOf<O, F>;
+
+    /// A state field whose value carries data, which only [`Edge::transition`] writes.
+    fn carries_data(self) -> bool {
+        false
+    }
 }
 
 impl<O, F> FieldOf<O, F> for ColumnOf<O, F> {
@@ -98,7 +117,11 @@ impl<O, F> FieldOf<O, F> for ColumnOf<O, F> {
 
 impl<O, F> FieldOf<O, F> for StateOf<O, F> {
     fn column(self) -> ColumnOf<O, F> {
-        self.0
+        self.column
+    }
+
+    fn carries_data(self) -> bool {
+        !self.data.is_empty()
     }
 }
 
@@ -201,14 +224,35 @@ pub struct EdgeAppend {
     pub rows: Rows,
 }
 
+/// One row an edge inserts, updates or deletes in a table of state data (`TableRole::State`) of
+/// the row `under`: `table` names the datum, and the edit's key is the row's own key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeRow {
+    pub under: RowPath,
+    pub table: &'static str,
+    pub edit: RowEdit,
+}
+
+/// The label an edge leaves: the event's `from`, which the backend refuses unless the kind's
+/// state field `field` holds it when the edge is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LabelCheck {
+    pub field: &'static str,
+    pub code: i64,
+}
+
 /// An edge's writes, as a backend executes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeParts {
+    /// The root's state fields first (its label, then its data), contiguous, then other fields.
     pub sets: Vec<EdgeSet>,
+    /// Row edits of the state's collection data: deletes, updates, then inserts, per datum.
+    pub rows: Vec<EdgeRow>,
     /// The event first (a `history` row of the kind), then the declared appends in order.
     pub appends: Vec<EdgeAppend>,
     /// Every object the edge's values name: an edge carries the objects it sets.
     pub objects: BTreeMap<Hash, Vec<u8>>,
+    pub from: LabelCheck,
 }
 
 /// Why an edge could not be built.
@@ -225,14 +269,24 @@ pub enum EdgeError {
     /// The event's `to` label is not the label of the state the edge writes.
     #[error("the event enters label {to}, but the state written to {field} has label {state}")]
     Label { field: String, to: i64, state: i64 },
+    /// The event's `from` label is not the label of the previous state.
+    #[error("the event leaves label {from}, but the previous state of {field} has label {state}")]
+    From { field: String, from: i64, state: i64 },
+    /// The next state's `since` is not the time its label was entered: the event's `at` when the
+    /// label changes, and the previous `since` when it does not.
+    #[error("the state written to {field} has since {found}, not {expected}")]
+    Since { field: String, expected: Timestamp, found: Timestamp },
+    /// A state carrying data is written by `Edge::transition`, from the previous value.
+    #[error("the state of {field} carries data and is written by a transition from the previous value")]
+    Data { field: String },
 }
 
 /// One edge write to a resource of kind `K`, built from typed handles; see the module docs.
 ///
 /// ```text
-/// let next = State::new(MessageState::Awaiting, now);
-/// let event = EdgeEvent { edge: MessageEdgeName::Deliver, from: Pending, to: Awaiting, writer, at: now, payload };
-/// let edge = Edge::new(Message::STATE, &next, Message::EDGES, &event)?.set(Message::SUBJECT, &subject)?;
+/// let next = State::new(TicketState::Closed { .. }, event.at);
+/// let event = EdgeEvent { edge: TicketEdge::Close, from: Open, to: Closed, writer, at, payload };
+/// let edge = Edge::transition(Ticket::STATE, &previous, &next, Ticket::EDGES, &event)?.set(Ticket::TITLE, &title)?;
 /// write.apply_edge(current, edge)?;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,21 +296,81 @@ pub struct Edge<K> {
 }
 
 impl<K> Edge<K> {
-    /// An edge that moves the kind's `state` to the value `next` and appends `event` to the kind's
-    /// edge log `log`. The event's `to` must be `next`'s label; its `from` is the writer's, which
-    /// read the current state for the optimistic stamp the edge is applied under.
-    pub fn new<S: Labelled, E: CodeEnum, P: Cbor>(
-        state: StateOf<K, S>,
-        next: &S,
+    /// An edge that moves the kind's `state` from `previous` to `next` and appends `event` to the
+    /// kind's edge log `log` (#3373 rulings 2 and 3). The event must leave `previous`'s label and
+    /// enter `next`'s. When the label changes, the label and its `since` are written, and `next`'s
+    /// `since` must be the event's `at`; otherwise neither is written and `next` keeps `previous`'s
+    /// `since`. Each datum of the state is written only where it differs: a column datum's columns
+    /// when they differ (nulled when `next`'s label lacks it), and a collection datum's rows one at
+    /// a time. `previous` must be the state stored at the stamp the edge is applied under: the
+    /// backend checks the stored label and version, and derives nothing from the stored data.
+    pub fn transition<S: StateData, E: CodeEnum, P: Cbor>(
+        state: StateOf<K, State<S>>,
+        previous: &State<S>,
+        next: &State<S>,
         log: HistoryOf<K, EdgeEvent<S::Label, E, P>>,
         event: &EdgeEvent<S::Label, E, P>,
     ) -> Result<Edge<K>, EdgeError> {
-        let (to, label) = (event.to.code(), next.label().code());
+        let field = state.name();
+        let (from, held) = (event.from.code(), previous.value.code());
+        if from != held {
+            return Err(EdgeError::From { field: field.to_owned(), from, state: held });
+        }
+        let (to, label) = (event.to.code(), next.value.code());
+        if to != label {
+            return Err(EdgeError::Label { field: field.to_owned(), to, state: label });
+        }
+        let moved = held != label;
+        let since = if moved { event.at } else { previous.since };
+        if next.since != since {
+            return Err(EdgeError::Since { field: field.to_owned(), expected: since, found: next.since });
+        }
+        let mut edge = Edge::empty(field, from).appended(RowPath::Root, log, event)?;
+        if moved {
+            let values = vec![Value::Int(label), Value::Int(event.at.micros())];
+            edge.parts.sets.push(EdgeSet { row: RowPath::Root, field, values });
+        }
+        let mut delta = StateDelta::default();
+        S::delta(&previous.value, &next.value, &mut delta).map_err(|error| error.at(field))?;
+        for (datum, values) in delta.sets {
+            edge.parts.sets.push(EdgeSet { row: RowPath::Root, field: datum, values });
+        }
+        edge.parts.rows.extend(delta.rows.into_iter().map(|(table, edit)| EdgeRow { under: RowPath::Root, table, edit }));
+        edge.parts.objects.extend(delta.objects);
+        Ok(edge)
+    }
+
+    /// An edge that writes the kind's `state` as `next`, whatever it held, and appends `event` to
+    /// the kind's edge log `log`: for a state that carries no data (a code enum), whose label and
+    /// `since` are its whole value. The event's `to` must be `next`'s label; its `from` is the
+    /// writer's, which read the current state for the optimistic stamp the edge is applied under,
+    /// and the backend checks it against the stored label. A state carrying data is refused
+    /// (`EdgeError::Data`): it moves through [`Edge::transition`].
+    pub fn new<S: StateData, E: CodeEnum, P: Cbor>(
+        state: StateOf<K, State<S>>,
+        next: &State<S>,
+        log: HistoryOf<K, EdgeEvent<S::Label, E, P>>,
+        event: &EdgeEvent<S::Label, E, P>,
+    ) -> Result<Edge<K>, EdgeError> {
+        if state.carries_data() {
+            return Err(EdgeError::Data { field: state.name().to_owned() });
+        }
+        let (to, label) = (event.to.code(), next.label_code());
         if to != label {
             return Err(EdgeError::Label { field: state.name().to_owned(), to, state: label });
         }
-        let edge = Edge { parts: EdgeParts { sets: Vec::new(), appends: Vec::new(), objects: BTreeMap::new() }, kind: PhantomData };
-        edge.appended(RowPath::Root, log, event)?.setting(RowPath::Root, state.0, next)
+        Edge::empty(state.name(), event.from.code()).appended(RowPath::Root, log, event)?.setting(RowPath::Root, state.column, next)
+    }
+
+    fn empty(field: &'static str, from: i64) -> Edge<K> {
+        let parts = EdgeParts {
+            sets: Vec::new(),
+            rows: Vec::new(),
+            appends: Vec::new(),
+            objects: BTreeMap::new(),
+            from: LabelCheck { field, code: from },
+        };
+        Edge { parts, kind: PhantomData }
     }
 
     /// Sets the kind's column-shaped `field` (not its state, which [`Edge::new`] sets) to `value`.
@@ -277,6 +391,9 @@ impl<K> Edge<K> {
         field: impl FieldOf<P, F>,
         value: &F,
     ) -> Result<Edge<K>, EdgeError> {
+        if field.carries_data() {
+            return Err(EdgeError::Data { field: field.column().name.to_owned() });
+        }
         self.setting(RowPath::Record { table: records.name, position }, field.column(), value)
     }
 

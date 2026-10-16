@@ -84,6 +84,10 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "terminal_session_env",
             "terminal_session_events",
             "terminal_session_labels",
+            "ticket",
+            "ticket_assignees",
+            "ticket_edges",
+            "ticket_notes",
             "vessel",
         ]
     );

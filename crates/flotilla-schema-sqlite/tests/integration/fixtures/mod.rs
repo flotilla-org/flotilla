@@ -1,4 +1,5 @@
-//! Fixture kinds, transcribed from the real resource types rather than imported, and helpers.
+//! Fixture kinds, transcribed from the real resource types rather than imported, plus the
+//! synthetic machine-state kind `Ticket` (#3373 ruling 4), and helpers.
 //!
 //! Each fixture generates values in two modes ([`Pick`]): drawn by Hegel, or fixed by a covering
 //! index, so that a fixture's covering indexes `0..COVERING` reach every enum variant, nested ones
@@ -12,6 +13,7 @@ pub mod attempt;
 pub mod convoy;
 pub mod message;
 pub mod terminal;
+pub mod ticket;
 
 use std::fmt::Debug;
 
@@ -26,6 +28,7 @@ pub use self::{
     convoy::{Convoy, Project},
     message::{AgentSession, Inbox, Message},
     terminal::{TerminalSession, Vessel},
+    ticket::Ticket,
 };
 
 pub const LOCAL: &str = "local";
@@ -83,6 +86,7 @@ pub fn registry() -> KindRegistry {
     registry.register::<Convoy>().expect("fixture kinds register");
     registry.register::<TerminalSession>().expect("fixture kinds register");
     registry.register::<Vessel>().expect("fixture kinds register");
+    registry.register::<Ticket>().expect("fixture kinds register");
     registry
 }
 

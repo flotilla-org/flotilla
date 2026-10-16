@@ -134,6 +134,87 @@ mod tests {
         }
     }
 
+    // Behaviour (#3373 ruling 1): a label-plus-data state is refused, naming the closed list, when
+    // a datum appears with different types or attributes in two variants, when a variant has no
+    // code (or two share one), when a datum takes a storage form other than plain, `child` (a map
+    // or set) or `intern`, and when `labels` is put anywhere but on an enum.
+    #[test]
+    fn label_state_refusals_name_the_closed_list() {
+        let cases = [
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { a: String }, #[store(code = 2)] C { a: u32 } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { a: String }, #[store(code = 2)] C { #[store(intern)] a: String } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(child)] a: BTreeSet<String> }, #[store(code = 2)] C { #[store(child)] a: BTreeMap<String, String> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B, C } },
+            quote! { #[store(labels = L)] enum A { B { a: String }, #[store(code = 2)] C } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B, #[store(code = 1)] C } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B(String) } },
+            quote! { #[store(labels = L)] enum A {} },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(frozen)] a: Frozen<Doc> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(flatten)] a: Part } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(cbor)] a: Doc } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(child)] a: Vec<String> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(records)] a: Records<String> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(state)] a: State<P> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { a: Vec<String> } } },
+            quote! { #[store(labels = L, index(name = "x", eq(a)))] enum A { #[store(code = 1)] B } },
+            quote! { #[store(labels = L)] struct A { a: String } },
+            quote! { #[store(labels = L)] struct A(String); },
+            quote! { struct A { #[store(labels)] a: String } },
+            quote! { enum A { #[store(labels = L)] B } },
+        ];
+        for case in cases {
+            let message = error(case.clone());
+            assert!(message.contains(SUPPORTED), "{case} was refused without naming the list: {message}");
+        }
+        let mismatch =
+            error(quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { a: String }, #[store(code = 2)] C { a: u32 } } });
+        assert!(mismatch.contains("`a` is declared as `String` in `B` and as `u32` in `C`"), "{mismatch}");
+        assert!(error(quote! { #[store(labels = L, labels = M)] enum A { #[store(code = 1)] B } }).contains("twice"));
+    }
+
+    // Glue (#3373 ruling 1): a label-plus-data state is `Labelled` by its labels enum and
+    // `StateData` with the variants' codes ascending and its data named once each, in order of
+    // first declaration; its layout lays out each datum once, unprefixed, emits one label guard per
+    // variant naming the datums it carries, and checks the labels enum agrees code for code; each
+    // datum's delta is row by row for a collection and by columns otherwise. It is not a column or
+    // a row: it is stored only as a `State`.
+    #[test]
+    fn label_states_expand_to_labelled_state_data() {
+        let state = expanded(quote! {
+            #[store(labels = TicketLabel)]
+            enum TicketState {
+                #[store(code = 3)] Closed { #[store(child)] assignees: BTreeSet<String>, reason: String },
+                #[store(code = 1)] Draft,
+                #[store(code = 2)] Open { #[store(child)] assignees: BTreeSet<String>, #[store(intern)] owner: Option<String> },
+            }
+        });
+        for expected in [
+            ":: flotilla_schema :: Labelled for TicketState",
+            "type Label = TicketLabel",
+            "Self :: Draft => & < TicketLabel > :: Draft",
+            ":: flotilla_schema :: StateData for TicketState",
+            "const CODES : & 'static [i64] = & [1i64 , 2i64 , 3i64]",
+            "const DATA : & 'static [& 'static str] = & [\"assignees\" , \"reason\" , \"owner\"]",
+            "layout . datum (\"assignees\" , label",
+            "layout . label_guard (label , 3i64 , & datums , & [0usize , 1usize])",
+            "layout . label_guard (label , 1i64 , & datums , & [])",
+            "layout . label_guard (label , 2i64 , & datums , & [0usize , 2usize])",
+            "< TicketLabel as :: flotilla_schema :: CodeEnum > :: code (& < TicketLabel > :: Open) , 2i64",
+            "delta . table (\"assignees\"",
+            "delta . column (\"owner\"",
+            "adapt :: AsOptionalInterned as :: flotilla_schema :: adapt :: Adapter < Option < String > >",
+            "Self :: Closed { assignees : __store_assignees , .. } | Self :: Open { assignees : __store_assignees , .. }",
+            "if [3i64] . contains (& code)",
+        ] {
+            assert!(state.contains(expected), "missing {expected}");
+        }
+        assert!(!state.contains("Columns for TicketState") && !state.contains("Element for TicketState"), "stored only as a State");
+        // A code enum is its own label and a state carrying no data.
+        let code = expanded(quote! { enum Phase { #[store(code = 1)] A, #[store(code = 2)] B } });
+        assert!(code.contains("type Label = Self"), "{code}");
+        assert!(code.contains("const DATA : & 'static [& 'static str] = & []"), "{code}");
+    }
+
     // Behaviour (DESIGN indexes): `eq` and `order` name top-level single-column fields, `when`
     // allows only `<state field> in [..]` and `<optional field> is_some`, and an optional order
     // field must be required by `is_some`, and `order` refuses interned and reference fields
@@ -211,7 +292,7 @@ mod tests {
             }
         });
         for expected in [
-            "< MessageState as :: flotilla_schema :: CodeEnum > :: code (& < MessageState > :: Pending)",
+            "< < MessageState as :: flotilla_schema :: Labelled > :: Label as :: flotilla_schema :: CodeEnum > :: code (& < < MessageState as :: flotilla_schema :: Labelled > :: Label > :: Pending)",
             "pub fn open_by_inbox (inbox : & Ref < Inbox >) -> :: flotilla_schema :: IndexQuery < Self >",
             "pub fn by_reply (reply : & Ref < Message > , sender : & Name)",
             ":: flotilla_schema :: interned_value :: < Name > (sender)",
@@ -303,7 +384,7 @@ mod tests {
             "String : :: flotilla_schema :: Intern",
             "Name : :: flotilla_schema :: Intern",
             "Leaf : :: flotilla_schema :: Flat",
-            "Phase : :: flotilla_schema :: CodeEnum",
+            "Phase : :: flotilla_schema :: StateData",
             "Ref < Inbox > : :: flotilla_schema :: Column",
             "adapt :: AsOptionalInterned as :: flotilla_schema :: adapt :: Adapter < Option < Name > >",
             "adapt :: AsOptionalFlat as :: flotilla_schema :: adapt :: Adapter < Option < Leaf > >",
@@ -344,7 +425,8 @@ mod tests {
     // upper case, with the field's visibility: a `StateOf` for the state field, a `ColumnOf` for
     // another column-shaped field (its adapter encodes it; a `cbor` field's is `AsCbor`), a
     // `HistoryOf` or `RecordsOf` for a table of records, and none for a spec collection.
-    // Column-shaped fields of a row are declared as its fields, state ones marked.
+    // Column-shaped fields of a row are declared as its fields; a state field's `State` declares
+    // its own label and data fields, and its handle knows whether the state carries data.
     #[test]
     fn fields_expand_to_edge_handles() {
         let kind = expanded(quote! {
@@ -368,11 +450,12 @@ mod tests {
             "const NOTES : :: flotilla_schema :: RecordsOf < Self , Note >",
             "pub (crate) const BODY : :: flotilla_schema :: ColumnOf < Self , T >",
             "const TYPE : :: flotilla_schema :: ColumnOf < Self , u8 >",
-            "layout . field (\"state\" , true ,",
+            "< Phase as :: flotilla_schema :: StateData > :: DATA",
             "layout . field (\"body\" , false ,",
         ] {
             assert!(kind.contains(expected), "missing {expected}");
         }
+        assert!(!kind.contains("layout . field (\"state\""), "a state's `State` records its label and data fields itself");
         assert!(!kind.contains("REFS"), "spec collections have no handle");
         assert!(!kind.contains("layout . field (\"edges\""), "table fields are not row fields");
     }

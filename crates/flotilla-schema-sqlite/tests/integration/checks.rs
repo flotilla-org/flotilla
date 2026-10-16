@@ -5,7 +5,7 @@ use flotilla_schema_sqlite::Write;
 use hegel::TestCase;
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, ErrorCode};
 
-use crate::fixtures::{registry, store, Convoy, Fixture, Message, Pick, TerminalSession};
+use crate::fixtures::{registry, store, Convoy, Fixture, Message, Pick, TerminalSession, Ticket};
 
 /// A stored value of the column's type that satisfies its own column constraint and foreign key,
 /// so a refusal can only come from a guard CHECK.
@@ -65,10 +65,11 @@ fn insert_covering<K: Fixture>(write: &mut Write<'_>, tc: &TestCase) {
     }
 }
 
-// Behaviour (#3320 CHECK constraints): for every guard every fixture kind declares, in every
-// table (every data enum variant with columns and every present `Option<flatten>`, nested,
-// flattened and in child tables), a raw SQL write that sets a column of an inactive guard, or
-// nulls a required column of an active one, is refused by a CHECK; so is an unknown code in any
+// Behaviour (#3320 CHECK constraints, #3373 ruling 1): for every guard every fixture kind declares,
+// in every table (every data enum variant with columns and every present `Option<flatten>`,
+// nested, flattened and in child tables, and every label of a label-plus-data state), a raw SQL
+// write that sets a column of an inactive guard, nulls a required column of an active one, or
+// sets a datum column a holding label lacks, is refused by a CHECK; so is an unknown code in any
 // code column. Cases come from the descriptors, not a hand list, so a new variant or table is
 // covered automatically; the covering generators must reach an active and an inactive row for
 // every guard, or the test fails naming the guard.
@@ -79,6 +80,7 @@ fn raw_writes_breaking_a_variant_rule_are_refused(tc: TestCase) {
     insert_covering::<Message>(&mut write, &tc);
     insert_covering::<Convoy>(&mut write, &tc);
     insert_covering::<TerminalSession>(&mut write, &tc);
+    insert_covering::<Ticket>(&mut write, &tc);
     write.commit().expect("commit");
     let conn = store.into_connection();
     let mut guards = 0;
@@ -112,9 +114,17 @@ fn check_table(conn: &Connection, table: &Table) {
                 "{name}: nulling required {column} while `{active}` holds was accepted"
             );
         }
+        // A label guard: the data its label lacks stays null while it holds.
+        for column in &guard.absent {
+            let def = table.columns.iter().find(|def| &def.name == column).expect("absent columns are declared");
+            assert!(
+                refused_by_check(conn, table, &holding, column, valid_value(conn, def)),
+                "{name}: setting {column}, which the label of `{active}` lacks, was accepted"
+            );
+        }
         // Control: rewriting the active row's own values is accepted, so the refusals above are
         // the rule and not the statement.
-        for column in &guard.scope {
+        for column in guard.scope.iter().chain(&guard.absent) {
             let sql = format!("UPDATE {} SET {1} = {1} WHERE {active}", quote_ident(name), quote_ident(column));
             assert!(conn.execute(&sql, []).expect("unchanged rows satisfy every CHECK") >= 1, "{sql}");
         }
@@ -143,6 +153,7 @@ fn record_stamps_are_never_null(tc: TestCase) {
     insert_covering::<Message>(&mut write, &tc);
     insert_covering::<Convoy>(&mut write, &tc);
     insert_covering::<TerminalSession>(&mut write, &tc);
+    insert_covering::<Ticket>(&mut write, &tc);
     write.commit().expect("commit");
     let conn = store.into_connection();
     let mut checked = 0;
@@ -159,5 +170,5 @@ fn record_stamps_are_never_null(tc: TestCase) {
             checked += 1;
         }
     }
-    assert_eq!(checked, 7, "edges, attempts, deliverables, evidence, convoy edges, events and attempts");
+    assert_eq!(checked, 8, "edges, attempts, deliverables, evidence, convoy edges, events, attempts and ticket edges");
 }
