@@ -2147,6 +2147,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-provider-runtime",
+ "flotilla-store",
  "hegeltest",
  "http",
  "hyper",

@@ -76,6 +76,46 @@ first reference, with default branch `main`.
 errors. A seed that names a forge missing from the configuration fails
 startup before any repository is created.
 
+## Installing for a rehearsal
+
+`scripts/rehearsal/install-fake-forge.sh` installs the service on one
+rehearsal host and prints what every rehearsal host needs.
+
+1. On each rehearsal host with copied stores, list its repositories:
+   `flotilla resource list repositories > <host>.json`.
+2. Generate the seed. Each `--forge` maps the service URL that Repository
+   records name in `spec.forge.service_url` to a mount on the fake:
+
+   ```sh
+   flotilla-fake-forge seed --repositories kiwi.json --repositories feta.json --repositories udder.json \
+     --forge https://github.com=github --forge https://forgejo.lab.flotilla.work=lab --output seed.json
+   ```
+
+   Replicas are merged, and each repository appears once per mount with the
+   default branch its status reports. Records whose forge has no mount are
+   listed as skipped.
+3. On the serving host, as root:
+
+   ```sh
+   scripts/rehearsal/install-fake-forge.sh --binary ./flotilla-fake-forge \
+     --host rehearsal-feta --ip 10.77.0.12 \
+     --forge github=github-rehearsal=github.com \
+     --forge lab=lab=forgejo.lab.flotilla.work,forgejo-manchego \
+     --seed seed.json --auto-merge-after 120
+   ```
+
+   The script creates a rehearsal-only CA (kept across re-runs), a server
+   certificate for the host, one token per forge, an admin token, the config
+   and a hardened systemd unit. It then waits until every forge answers its
+   token over HTTPS.
+4. Follow what it prints. Each rehearsal host trusts the CA, holds the token
+   files and gains `[credentials.forgejo]` lines (and, for dummy crews,
+   `[dummy_fleet.shared_forge]`). The Forge and CredentialSpec records under
+   `apply/` are applied once.
+
+`--stage DIR` writes the same files under `DIR` without installing anything,
+so the output can be reviewed first.
+
 ## Pointing a rehearsal at it
 
 The rehearsal fleet's Forge records point at the fake with the Forgejo kind.
@@ -98,7 +138,8 @@ Forge id.
 The copied `lab` Forge record changes its `https_url` to
 `https://fake-forge.rehearsal:3443/lab` in the same way. Each host's daemon
 config maps the forge to a credential holding that forge's token through
-`[credentials.forgejo]`. Hosts must trust the CA that issued the fake's
+`[credentials.forgejo]`: the value names a CredentialSpec whose file source
+holds the token, which the install script prints. Hosts must trust the CA that issued the fake's
 certificate, because the providers verify TLS through the platform trust
 store.
 
