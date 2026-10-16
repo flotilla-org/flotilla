@@ -12,6 +12,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Version, WrongState};
 
 /// A convoy: the convoy resource's name at its home.
@@ -29,11 +31,11 @@ impl ConvoyId {
 }
 
 /// A promise's key within one convoy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PromiseId(pub u32);
 
 /// An abstract vessel class that quota counts are granted for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct VesselClass(pub u32);
 
 /// A convoy's priority; its vessels' placement requests carry it. Higher
@@ -121,14 +123,14 @@ impl ConvoyState {
 }
 
 /// A promise was observed kept.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Keep {
     pub promise: PromiseId,
 }
 
 /// The spec's `AcceptRetraction`: an authorised party accepts that a promise
 /// will not be kept.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Retract {
     pub promise: PromiseId,
     pub by: String,
@@ -136,11 +138,11 @@ pub struct Retract {
 }
 
 /// Every promise is settled.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deliver;
 
 /// An authorised decision to stop, with its reason. Nothing abandons a convoy automatically.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Abandon {
     pub by: String,
     pub reason: String,
@@ -148,7 +150,7 @@ pub struct Abandon {
 }
 
 /// Readmission of the same convoy with a raised quota.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Readmit {
     pub quota: Quota,
     pub by: String,

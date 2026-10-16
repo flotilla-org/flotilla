@@ -18,7 +18,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Time, Transport, Version, WrongState};
+use flotilla_schema::Timestamp;
+use serde::{Deserialize, Serialize};
+
+use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Transport, Version, WrongState};
 
 /// What would settle the message. `Nothing` settles on delivery.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,21 +36,21 @@ pub enum Expectation {
 pub struct MessageSpec {
     pub inbox: String,
     pub expectation: Expectation,
-    pub deadline: Option<Time>,
+    pub deadline: Option<Timestamp>,
     /// How long, in microseconds, the inbox must stay unbound before an
     /// undeliverable drop may cite it.
     pub unbound_after: i64,
 }
 
 /// The consumer session a receipt came from, and its host.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Receiver {
     pub session: String,
     pub host: String,
 }
 
 /// The receiver's receipt was observed. Its session need not still be bound.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deliver {
     pub receiver: Receiver,
     pub transport: Transport,
@@ -55,7 +58,7 @@ pub struct Deliver {
 
 /// What settled the message. The gate reads this message's own evidence:
 /// its reply, or its spec's outcome condition, never a caller-chosen reference.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Settlement {
     /// A reply to this message was observed; only after delivery.
     Answered,
@@ -63,13 +66,13 @@ pub enum Settlement {
     OutcomeObserved,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settle {
     pub by: Settlement,
 }
 
 /// Why a message dropped, with what the reason's gate reads.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DropReason {
     /// No receipt was confirmed within policy; never proof that no turn happened.
     Undeliverable,
@@ -98,7 +101,7 @@ states! {
         Pending = 1,
         Awaiting { receiver: Receiver } = 2,
         Settled = 3,
-        Dropped { reason: DropReason, receiver: Option<Receiver>, at: Time, watermark: Option<Time> } = 4,
+        Dropped { reason: DropReason, receiver: Option<Receiver>, at: Timestamp, watermark: Option<Timestamp> } = 4,
     }
 }
 
@@ -122,7 +125,7 @@ impl MessageState {
 }
 
 /// The spec's `DropMessage`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DropMessage {
     pub reason: DropReason,
 }
@@ -150,7 +153,7 @@ pub enum InboxBinding {
     },
     /// No consumer since `since`; the unbound timeout starts at unbind.
     Unbound {
-        since: Time,
+        since: Timestamp,
     },
 }
 
@@ -164,7 +167,7 @@ impl Kind for Binding {
 pub struct AppliedThrough;
 impl Kind for AppliedThrough {
     const NAME: &'static str = "applied_through";
-    type Value = Time;
+    type Value = Timestamp;
 }
 
 /// A reply to a message; present once observed.
@@ -417,7 +420,7 @@ fn consumer_bound(h: &mut Handle<'_, Message>) -> bool {
     matches!(h.read(&inbox), Some(InboxBinding::Bound { .. })) || h.state().receiver().is_some()
 }
 
-fn applied_through<'a>(h: &mut Handle<'a, Message>) -> Option<&'a Time> {
+fn applied_through<'a>(h: &mut Handle<'a, Message>) -> Option<&'a Timestamp> {
     let inbox = Ref::<AppliedThrough>::new(h.spec().inbox.clone());
     h.read(&inbox)
 }

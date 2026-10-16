@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use flotilla_schema::{CodeEnum, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
         Abandon, Authority, Convoy, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoyState, Deliver, Keep,
@@ -9,7 +10,7 @@ use flotilla_state_machines::{
         PromiseState::{self, Kept, Pending, Retracted},
         Quota, Readmit, Retract, VesselClass,
     },
-    Coded, Diagram, Home, Kind, Machine, Ref, StateValue, Time, WriteError,
+    Coded, Diagram, Home, Kind, Machine, Ref, StateValue, WriteError,
 };
 
 const YES: &str = "yes";
@@ -50,8 +51,8 @@ fn state(home: &Home<Convoy>) -> &ConvoyState {
     home.get("c").expect("exists").state()
 }
 
-fn at() -> Time {
-    Time::from_micros(1)
+fn at() -> Timestamp {
+    Timestamp::from_micros(1)
 }
 
 fn retract(promise: u32, authority: &str) -> Retract {
@@ -81,7 +82,7 @@ fn the_declaration_is_valid() {
 #[test]
 fn codes_are_pinned() {
     let labels: Vec<_> = ConvoyLabel::ALL.iter().map(|s| (s.name(), s.code(), ConvoyState::fields(*s))).collect();
-    let expected: [(&str, u16, &[&str]); 3] =
+    let expected: [(&str, i64, &[&str]); 3] =
         [("Open", 1, &["promises", "quota"]), ("Delivered", 2, &["promises", "quota"]), ("Abandoned", 3, &["promises", "quota", "reason"])];
     assert_eq!(labels, expected);
     let edges: Vec<_> = ConvoyEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
@@ -241,5 +242,5 @@ fn an_authorised_edge_records_its_authority_read() {
     let mut home = convoy(request(&[0], &[]));
     let w = world();
     let event = home.apply("c", retract(0, YES), &w, at()).expect("retracted");
-    assert!(event.reads.iter().any(|read| read.kind == <Authority as Kind>::NAME && read.name == YES));
+    assert!(event.payload.reads.iter().any(|read| read.kind == <Authority as Kind>::NAME && read.name == YES));
 }

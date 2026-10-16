@@ -38,10 +38,12 @@ CAPABILITY_FORBIDDEN = (
 # flotilla-cbor, the schema crates below it and the build-feature anchors.
 SCHEMA_CRATES = ("flotilla-schema-derive", "flotilla-schema", "flotilla-schema-sqlite")
 SCHEMA_ALLOWED = ("flotilla-cbor",)
-# ADR 0064: the state-machine engine is storage-free and self-contained. It
-# reaches no other workspace crate, and no production crate depends on it until
-# the stack that adds the composition-root switch names its dependents here.
+# ADR 0064, #3320 ruling 3: the state-machine engine is storage-free. In production it
+# reaches only flotilla-schema (its code enums, records, timestamps and edge events) and
+# what flotilla-schema may reach, and no production crate depends on it until the stack
+# that adds the composition-root switch names its dependents here.
 STATE_MACHINES = "flotilla-state-machines"
+STATE_MACHINES_ALLOWED = ("flotilla-schema", "flotilla-schema-derive", *SCHEMA_ALLOWED)
 STATE_MACHINE_DEPENDENTS = frozenset()
 # Known C packages and compiler drivers catch new anchors that reach them.
 # This is a metadata deny list, not build-script analysis: crates invoking a
@@ -114,25 +116,31 @@ def violations(metadata):
     for target in REPLICATION_FORBIDDEN:
         if "flotilla-replication" in packages and target in packages and reaches("flotilla-replication", target):
             errors.append(f"flotilla-replication: must not depend on {target}, directly or transitively")
+    def reached_from(start):
+        pending, reached = list(production[start]), set()
+        while pending:
+            node = pending.pop()
+            if node not in reached:
+                reached.add(node)
+                pending.extend(production[node])
+        return reached - {start}
+
     # The schema crates stay a self-contained stack: anything they reach, directly or through an
     # allowed crate, must itself be allowed. Upward schema edges are refused the same way.
     for position, schema in enumerate(SCHEMA_CRATES):
         if schema not in packages:
             continue
         allowed = {*SCHEMA_ALLOWED, *SCHEMA_CRATES[:position]}
-        pending, reached = list(production[schema]), set()
-        while pending:
-            node = pending.pop()
-            if node not in reached:
-                reached.add(node)
-                pending.extend(production[node])
-        for target in sorted(reached - {schema}):
+        for target in sorted(reached_from(schema)):
             if target not in allowed and not target.startswith("flotilla-build-features"):
                 errors.append(f"{schema}: must not depend on {target}, directly or transitively; schema crates depend only "
                               "on flotilla-cbor, lower schema crates and flotilla-build-features anchors")
     if STATE_MACHINES in packages:
-        for target in sorted(production[STATE_MACHINES]):
-            errors.append(f"{STATE_MACHINES}: must not depend on workspace crate {target}")
+        for target in sorted(reached_from(STATE_MACHINES)):
+            if target not in STATE_MACHINES_ALLOWED and not target.startswith("flotilla-build-features"):
+                errors.append(f"{STATE_MACHINES}: must not depend on {target}, directly or transitively; the engine depends only "
+                              "on flotilla-schema and what it may reach (flotilla-schema-derive, flotilla-cbor and "
+                              "flotilla-build-features anchors)")
         for name in sorted(packages):
             if name != STATE_MACHINES and STATE_MACHINES in production[name] and name not in STATE_MACHINE_DEPENDENTS:
                 errors.append(f"{name}: production dependency on {STATE_MACHINES} before the composition-root switch")

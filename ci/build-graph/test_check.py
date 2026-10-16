@@ -32,8 +32,7 @@ def graph(*packages):
 
 class BuildGraphContract(unittest.TestCase):
     def test_state_machines_are_c_free_and_self_contained(self):
-        # ADR 0064 / #3319: the engine is base-tier, uses only external crates,
-        # and may be a dev-dependency of anything.
+        # ADR 0064 / #3319: the engine is base-tier and may be a dev-dependency of anything.
         self.assertEqual(STATE_MACHINES, "flotilla-state-machines")
         self.assertEqual(layer(STATE_MACHINES), "base")
         self.assertEqual(violations(graph(
@@ -41,14 +40,36 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-core", dev=(STATE_MACHINES,)),
         )), [])
 
-    def test_state_machines_reach_no_workspace_crate(self):
-        # Finite generator: base and native targets, normal and build edges.
-        for target in ("flotilla-resources", "flotilla-store", "flotilla-cbor", "flotilla-core"):
+    def state_machines_error(self, target):
+        return (f"{STATE_MACHINES}: must not depend on {target}, directly or transitively; the engine depends only "
+                "on flotilla-schema and what it may reach (flotilla-schema-derive, flotilla-cbor and "
+                "flotilla-build-features anchors)")
+
+    def test_state_machines_may_reach_the_schema_crate(self):
+        # #3320 ruling 3: the engine uses flotilla-schema's shared types, and through it the
+        # derive, flotilla-cbor and the build-feature anchors; normal and build edges alike.
+        for kind in ("normal", "build"):
+            with self.subTest(kind=kind):
+                self.assertEqual(violations(graph(
+                    package(STATE_MACHINES, **{kind: ("flotilla-schema",)}),
+                    package("flotilla-schema", normal=("flotilla-schema-derive", "flotilla-cbor", "flotilla-build-features-base")),
+                    package("flotilla-schema-derive", normal=("flotilla-build-features",)),
+                    package("flotilla-cbor"), package("flotilla-build-features"),
+                    package("flotilla-build-features-base", normal=("flotilla-build-features",)),
+                )), [])
+
+    def test_state_machines_reach_nothing_beyond_the_schema_crate(self):
+        # Finite generator: the schema crate above flotilla-schema, base and native crates;
+        # normal and build edges; direct, and through flotilla-schema (an allowed crate).
+        for target in ("flotilla-schema-sqlite", "flotilla-resources", "flotilla-store", "flotilla-core"):
             for kind in ("normal", "build"):
-                with self.subTest(target=target, kind=kind):
-                    self.assertEqual(violations(graph(
-                        package(STATE_MACHINES, **{kind: (target,)}), package(target),
-                    )), [f"{STATE_MACHINES}: must not depend on workspace crate {target}"])
+                for middle in (target, "flotilla-schema"):
+                    through = () if middle == target else (package(middle, normal=(target,)),)
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        errors = violations(graph(package(STATE_MACHINES, **{kind: (middle,)}), *through, package(target)))
+                        self.assertIn(self.state_machines_error(target), errors)
+                        self.assertEqual([error for error in errors if error.startswith(STATE_MACHINES)],
+                                         [self.state_machines_error(target)])
 
     def test_no_production_crate_depends_on_state_machines(self):
         # Rule 2 makes "no runtime use yet" mechanical; a named allowlist relaxes it.

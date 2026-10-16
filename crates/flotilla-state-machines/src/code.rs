@@ -8,9 +8,12 @@
 //! change. [`StateValue::data`] names every datum, so the engine can check
 //! that an edge changes only the data its declaration names.
 //!
-//! Labels and edge kinds each carry an explicit code next to their name. A
-//! rename changes the name, never the code, so anything keyed by code (the
-//! storage derive, #3208) survives it. Codes are pinned by tests.
+//! Labels and edge kinds each carry an explicit code next to their name. Both
+//! macros derive `flotilla_schema::Stored` on the derived enum, so each is a
+//! schema code enum (`flotilla_schema::CodeEnum`) whose codes are the ones
+//! declared here, and the derive refuses a repeated code at compile time. A
+//! rename changes the name, never the code, so anything keyed by code (stored
+//! state columns and edge logs) survives it. Codes are pinned by tests.
 //!
 //! [`edges!`](crate::edges) declares an edge enum whose variants each wrap
 //! their own argument struct. It derives the fieldless kind enum the same way,
@@ -20,13 +23,14 @@
 
 use std::{any::Any, collections::BTreeSet, fmt::Debug, hash::Hash};
 
+use flotilla_schema::CodeEnum;
+
 /// A fieldless enum whose variants carry explicit, stable codes: a state
-/// label or an edge kind.
-pub trait Coded: Copy + Eq + Ord + Hash + Debug + 'static {
+/// label or an edge kind. The code is [`CodeEnum::code`], unique within the
+/// enum and never reused; this trait adds what the schema trait lacks.
+pub trait Coded: CodeEnum + Copy + Eq + Ord + Hash + Debug + 'static {
     /// Every variant, in declaration order.
     const ALL: &'static [Self];
-    /// The stable code; unique within the enum and never reused.
-    fn code(self) -> u16;
     /// The display name: the variant name for labels, snake_case for edge kinds.
     fn name(self) -> &'static str;
 }
@@ -89,13 +93,16 @@ pub trait EdgeArg: Clone + Debug + Sized + 'static {
 ///
 /// Each variant may carry named data in braces. The label enum is named after
 /// `=>`, its names are the variant names, and its codes are the literals given
-/// here. The expansion uses strum's derives, so the calling crate depends on
-/// `strum`, and every datum type must be `Clone + Debug + Eq + 'static`.
+/// here: the label derives `flotilla_schema::Stored` as a code enum with
+/// those codes. The expansion uses strum's and the schema crate's derives, so
+/// the calling crate depends on `strum` and `flotilla-schema`, and every datum
+/// type must be `Clone + Debug + Eq + 'static`.
 ///
 /// ```
 /// flotilla_state_machines::states! {
 ///     pub enum Door => DoorLabel { Shut = 1, Open { by: String } = 2 }
 /// }
+/// use flotilla_schema::CodeEnum;
 /// use flotilla_state_machines::{Coded, StateValue};
 /// let open = Door::Open { by: "ann".into() };
 /// assert_eq!((open.label().name(), open.label().code()), ("Open", 2));
@@ -116,17 +123,18 @@ macro_rules! states {
         #[derive(Clone, Debug, PartialEq, Eq, strum::EnumDiscriminants)]
         #[strum_discriminants(
             name($label),
-            derive(PartialOrd, Ord, Hash, strum::IntoStaticStr, strum::VariantArray)
+            derive(PartialOrd, Ord, Hash, strum::IntoStaticStr, strum::VariantArray, ::flotilla_schema::Stored)
         )]
         $vis enum $name {
-            $( $(#[$vmeta])* $variant $({ $( $(#[$fmeta])* $field: $ty ),* })? ),+
+            $(
+                $(#[$vmeta])*
+                #[strum_discriminants(store(code = $code))]
+                $variant $({ $( $(#[$fmeta])* $field: $ty ),* })?
+            ),+
         }
 
         impl $crate::Coded for $label {
             const ALL: &'static [Self] = <Self as strum::VariantArray>::VARIANTS;
-            fn code(self) -> u16 {
-                match self { $(Self::$variant => $code),+ }
-            }
             fn name(self) -> &'static str {
                 self.into()
             }
@@ -155,8 +163,13 @@ macro_rules! states {
 ///
 /// Each variant wraps its own argument struct, and each argument struct
 /// belongs to one variant. The kind enum is named after `=>`, its names are
-/// the snake_case variant names, and its codes are the literals given here.
-/// The expansion uses strum's derives, so the calling crate depends on `strum`.
+/// the snake_case variant names, and its codes are the literals given here:
+/// the kind derives `flotilla_schema::Stored` as a code enum with those codes.
+/// The edge enum derives serde's `Serialize` and `Deserialize`, so it can be
+/// an [`EdgePayload`](crate::EdgePayload)'s document, and every argument
+/// struct must implement both too. The expansion uses strum's, the schema
+/// crate's and serde's derives, so the calling crate depends on `strum`,
+/// `flotilla-schema` and `serde`.
 #[macro_export]
 macro_rules! edges {
     (
@@ -166,21 +179,18 @@ macro_rules! edges {
         }
     ) => {
         $(#[$meta])*
-        #[derive(Clone, Debug, PartialEq, Eq, strum::EnumDiscriminants)]
+        #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, strum::EnumDiscriminants)]
         #[strum_discriminants(
             name($kind),
-            derive(PartialOrd, Ord, Hash, strum::IntoStaticStr, strum::VariantArray),
+            derive(PartialOrd, Ord, Hash, strum::IntoStaticStr, strum::VariantArray, ::flotilla_schema::Stored),
             strum(serialize_all = "snake_case")
         )]
         $vis enum $name {
-            $( $(#[$vmeta])* $variant($arg) ),+
+            $( $(#[$vmeta])* #[strum_discriminants(store(code = $code))] $variant($arg) ),+
         }
 
         impl $crate::Coded for $kind {
             const ALL: &'static [Self] = <Self as strum::VariantArray>::VARIANTS;
-            fn code(self) -> u16 {
-                match self { $(Self::$variant => $code),+ }
-            }
             fn name(self) -> &'static str {
                 self.into()
             }

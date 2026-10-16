@@ -8,10 +8,14 @@
 //! Older attempts stay in the history. A listing and a `give up` gate call
 //! the same [`retry`], so they cannot disagree.
 
-use crate::{Handle, Machine, Row, Time};
+use flotilla_schema::{RecordRow, Timestamp};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{Handle, Machine};
 
 /// What kind of failure, shared across kinds; the detail is per kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CauseCategory {
     Transient,
     Refused,
@@ -20,7 +24,7 @@ pub enum CauseCategory {
     External,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Cause {
     pub category: CauseCategory,
     pub detail: String,
@@ -41,16 +45,16 @@ pub enum Outcome {
 /// One try at the resource's work, and how it ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attempt {
-    pub at: Time,
+    pub at: Timestamp,
     pub outcome: Outcome,
 }
 
 impl Attempt {
-    pub fn succeeded(at: Time) -> Self {
+    pub fn succeeded(at: Timestamp) -> Self {
         Attempt { at, outcome: Outcome::Succeeded }
     }
 
-    pub fn failed(at: Time, cause: Cause, retryable: bool) -> Self {
+    pub fn failed(at: Timestamp, cause: Cause, retryable: bool) -> Self {
         Attempt { at, outcome: Outcome::Failed { cause, retryable } }
     }
 }
@@ -92,7 +96,7 @@ pub enum Schedule {
     /// No failure since the last success in this window: try when wanted.
     Now,
     /// Retry no earlier than this moment.
-    At(Time),
+    At(Timestamp),
     /// The policy is spent, or the last failure cannot be retried.
     Exhausted,
 }
@@ -113,7 +117,7 @@ impl Retry {
     }
 
     /// Whether a retry may start at `now`.
-    pub fn due(&self, now: Time) -> bool {
+    pub fn due(&self, now: Timestamp) -> bool {
         match self.schedule {
             Schedule::Now => true,
             Schedule::At(moment) => now >= moment,
@@ -124,7 +128,7 @@ impl Retry {
 
 /// The attempts in the window that starts after the first `before`
 /// attempts, read (and recorded) through the handle.
-pub fn window<'a, M: Machine>(handle: &mut Handle<'a, M>, before: usize) -> &'a [Row<Attempt>] {
+pub fn window<'a, M: Machine>(handle: &mut Handle<'a, M>, before: usize) -> &'a [RecordRow<Attempt>] {
     let attempts = handle.attempts();
     &attempts[before.min(attempts.len())..]
 }
@@ -152,7 +156,7 @@ pub fn retry<M: Machine>(handle: &mut Handle<'_, M>, policy: &AttemptPolicy, bef
         Schedule::Exhausted
     } else {
         // The newest row is a failure, because `failed` is non-empty.
-        let last = attempts.last().map_or(Time::ZERO, |row| row.record.at);
+        let last = attempts.last().map_or(Timestamp::ZERO, |row| row.record.at);
         let moment = last.saturating_add(policy.backoff(failures));
         handle.until(moment);
         Schedule::At(moment)

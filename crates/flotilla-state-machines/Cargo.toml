@@ -5,23 +5,21 @@ edition = "2021"
 license.workspace = true
 description = "Storage-free gated state machines (ADR 0064): declarations, the single writer, records and judgements"
 
-# ci/build-graph/check.py: this crate reaches no other flotilla workspace crate,
-# and no production crate depends on it until the composition-root switch.
+# ci/build-graph/check.py: this crate reaches only flotilla-schema and what
+# flotilla-schema may reach, and no production crate depends on it until the
+# composition-root switch.
 [dependencies]
+flotilla-schema = { path = "../flotilla-schema" }
+serde = { workspace = true }
 strum = { workspace = true }
-
-# Feature anchors (docs/measurements/2747-build-graph.md), local because this
-# crate may not reach the flotilla-build-features crates: the host proc-macro
-# and dev selections match the base layer's, so builds and tests reuse them.
-[build-dependencies]
-syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 
 [dev-dependencies]
 hegeltest = { workspace = true }
 # ITF traces and exported graphs are JSON; production code never decodes them.
-# `raw_value` and serde_core's `alloc`/`result` anchor the base layer's dev selections.
-serde_json = { workspace = true, features = ["raw_value"] }
-serde_core = { version = "1", features = ["alloc", "result"] }
+serde_json = { workspace = true }
+# Test-only feature anchor (docs/measurements/2747-build-graph.md): hegeltest reaches smallvec
+# through parking_lot; select the features the base layer already uses. The host proc-macro
+# and serde selections come through flotilla-schema's flotilla-build-features anchors.
 smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }
 
 [lints]

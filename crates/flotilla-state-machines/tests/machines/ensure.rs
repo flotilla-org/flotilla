@@ -1,15 +1,16 @@
 //! Ensure against `specs/primitives/machines/ensure.qnt`.
 
+use flotilla_schema::{CodeEnum, Timestamp};
 use flotilla_state_machines::{
     machines::ensure::{
         Authority, Bind, Create, Drain, Ensure, EnsureEdgeKind, EnsureLabel, EnsureRefusal, EnsureSpec, EnsureState, Fulfiller,
         FulfillerPhase, FulfillerStatus, Fulfillers, GiveUp, MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
     },
-    Attempt, AttemptPolicy, Cause, CauseCategory, Coded, Diagram, Home, Machine, Ref, Time, WriteError,
+    Attempt, AttemptPolicy, Cause, CauseCategory, Coded, Diagram, Home, Machine, Ref, WriteError,
 };
 
-fn at(micros: i64) -> Time {
-    Time::from_micros(micros)
+fn at(micros: i64) -> Timestamp {
+    Timestamp::from_micros(micros)
 }
 
 fn home() -> Home<Ensure> {
@@ -119,7 +120,7 @@ fn record_adds_to_the_recorded_set_and_keeps_the_label() {
     let world = MemoryEnsureWorld::default();
     let event = h.apply("e", Record { fulfiller: f("a") }, &world, at(1)).expect("recorded");
     assert_eq!((event.from, event.to), (EnsureLabel::Unfulfilled, EnsureLabel::Unfulfilled));
-    assert!(event.reads.is_empty(), "an ungated record reads nothing");
+    assert!(event.payload.reads.is_empty(), "an ungated record reads nothing");
     h.apply("e", Record { fulfiller: f("a") }, &world, at(2)).expect("recorded again");
     assert_eq!(*state(&h), EnsureState::Unfulfilled { recorded: set(&["a"]), created: set(&[]), window: 0 });
 }

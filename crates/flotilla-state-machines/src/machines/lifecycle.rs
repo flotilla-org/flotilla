@@ -10,6 +10,8 @@
 
 use std::marker::PhantomData;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     attempt, edges, states, AttemptPolicy, Cause, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Version,
     WrongState,
@@ -81,26 +83,26 @@ impl LifecycleState {
 }
 
 /// The home observed the thing under `identity` (spec `Realise`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Realise {
     pub identity: String,
     pub observed: Ref<Realisation>,
 }
 
 /// The thing was torn down on purpose (spec `Release`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Release {
     pub teardown: Ref<Teardown>,
 }
 
 /// A realised thing disappeared without a release (spec `Vanish`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Vanish {
     pub observed: Ref<Absence>,
 }
 
 /// The request's attempts are spent, the last failing with `cause` (spec `GiveUp`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GiveUp {
     pub cause: Cause,
 }

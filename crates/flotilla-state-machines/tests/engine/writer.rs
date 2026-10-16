@@ -1,17 +1,18 @@
 //! The single writer, records, own-record reads and attempt judgements
 //! (ADR 0064 "Machines": state is a value, ends are ends, attempts are a history).
 
+use flotilla_schema::{Position, Timestamp};
 use flotilla_state_machines::{
     attempt::{retry, window},
-    Attempt, AttemptPolicy, Cause, CauseCategory, DefError, EdgeDef, Fault, Home, InputRead, Machine, MachineDef, Position, Receipt, Ref,
-    Retry, Schedule, Table, Time, Transport, Version, WriteError, Writer, OWN_ATTEMPTS,
+    Attempt, AttemptPolicy, Cause, CauseCategory, DefError, EdgeDef, Fault, Home, InputRead, Machine, MachineDef, Receipt, Ref, Retry,
+    Schedule, Table, Transport, Version, WriteError, OWN_ATTEMPTS,
 };
 use hegel::generators as gs;
 
 use super::latch::*;
 
-fn at(micros: i64) -> Time {
-    Time::from_micros(micros)
+fn at(micros: i64) -> Timestamp {
+    Timestamp::from_micros(micros)
 }
 
 fn raised(name: &str) -> Table<Signal> {
@@ -58,15 +59,14 @@ fn an_applied_edge_stores_the_next_state_and_appends_its_event() {
     let mut home = latch();
     let world = raised("bell");
     let event = home.apply("l", fire("bell"), &world, at(7)).expect("fires").clone();
-    assert_eq!(event.edge, LatchEdge::Fire(fire("bell")));
+    assert_eq!((event.edge, &event.payload.edge), (LatchEdgeKind::Fire, &LatchEdge::Fire(fire("bell"))));
     assert_eq!((event.from, event.to, event.at), (LatchLabel::Armed, LatchLabel::Fired, at(7)));
-    assert_eq!(event.writer, Writer("kiwi".into()));
-    assert_eq!(event.reads, [InputRead { kind: "signal", name: "bell".into(), version: Some(Version(1)) }]);
+    assert_eq!(event.writer, "kiwi");
+    assert_eq!(event.payload.reads, [InputRead { kind: "signal".into(), name: "bell".into(), version: Some(Version(1)) }]);
     let resource = home.get("l").expect("exists");
     assert_eq!(resource.state(), &Latch::Fired { shots: 1, by: "bell".into() });
     assert_eq!((resource.label(), resource.version(), resource.events().len()), (LatchLabel::Fired, Version(3), 2));
-    assert_eq!(resource.events().rows()[1].version, Version(3));
-    assert_eq!(resource.events().owner(), "l");
+    assert_eq!(resource.events().rows()[1].version, 3);
 }
 
 // Refusals go back to the caller and are never recorded.
@@ -180,7 +180,7 @@ fn a_judgement_records_own_reads_and_writes_nothing() {
     let judged = home.judge("l", &Table::new(), at(20), |h| retry(h, &policy, 0)).expect("judged");
     assert_eq!(judged.value, Retry { failures: 1, schedule: Schedule::At(at(110)), last_cause: Some(cause("down")) });
     assert_eq!(judged.valid_until, Some(at(110)));
-    assert_eq!(judged.reads, [InputRead { kind: OWN_ATTEMPTS, name: "l".into(), version: Some(Version(1)) }]);
+    assert_eq!(judged.reads, [InputRead { kind: OWN_ATTEMPTS.into(), name: "l".into(), version: Some(Version(1)) }]);
     assert_eq!(home.get("l").expect("exists").version(), before);
 }
 
@@ -365,7 +365,7 @@ fn the_writer_follows_its_rules_over_any_sequence(tc: hegel::TestCase) {
         versions.sort();
         versions.dedup();
         assert_eq!(versions.len() as u64, model.version - 1, "one row per accepted write");
-        assert!(versions.iter().all(|v| v.0 >= 2 && v.0 <= model.version));
+        assert!(versions.iter().all(|v| *v >= 2 && *v <= model.version));
         let judged = resource.judge(&world, at(now), |h| (retry(h, &policy, model.before), window(h, model.before).len()));
         assert_eq!(judged.value.0, model.expected_retry(&policy), "{op:?}");
         assert_eq!(judged.value.1, model.attempts.len() - model.before);

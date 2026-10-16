@@ -10,9 +10,11 @@
 
 use std::{collections::BTreeMap, fmt};
 
+use flotilla_schema::{EdgeEvent, Position, Records, Timestamp};
+
 use crate::{
-    Attempt, DefError, EdgeEvent, EdgeKind, Ended, Fault, Handle, Judged, Label, Machine, MachineDef, Position, Receipt, RecordLog,
-    StateValue, StepError, Time, Version, Writer, WrongState,
+    Attempt, DefError, Edge, EdgeEventOf, EdgeKind, EdgePayload, Ended, Fault, Handle, Judged, Label, Machine, MachineDef, Receipt,
+    StateValue, StepError, Version, WrongState,
 };
 
 /// One resource at its home: its spec, current state, version and records.
@@ -21,9 +23,9 @@ pub struct Resource<M: Machine> {
     spec: M::Spec,
     state: M::State,
     version: Version,
-    events: RecordLog<EdgeEvent<M>>,
-    attempts: RecordLog<Attempt>,
-    receipts: RecordLog<Receipt>,
+    events: Records<EdgeEventOf<M>>,
+    attempts: Records<Attempt>,
+    receipts: Records<Receipt>,
 }
 
 impl<M: Machine> Resource<M> {
@@ -53,20 +55,20 @@ impl<M: Machine> Resource<M> {
     /// The history of applied edges, for showing and auditing what happened.
     /// No gate, effect or judgement reads it: the current state is the answer
     /// to what is true now.
-    pub fn events(&self) -> &RecordLog<EdgeEvent<M>> {
+    pub fn events(&self) -> &Records<EdgeEventOf<M>> {
         &self.events
     }
 
-    pub fn attempts(&self) -> &RecordLog<Attempt> {
+    pub fn attempts(&self) -> &Records<Attempt> {
         &self.attempts
     }
 
-    pub fn receipts(&self) -> &RecordLog<Receipt> {
+    pub fn receipts(&self) -> &Records<Receipt> {
         &self.receipts
     }
 
     /// Runs a judgement through a recording handle. The resource is unchanged.
-    pub fn judge<T>(&self, world: &M::World, now: Time, judgement: impl FnOnce(&mut Handle<'_, M>) -> T) -> Judged<T> {
+    pub fn judge<T>(&self, world: &M::World, now: Timestamp, judgement: impl FnOnce(&mut Handle<'_, M>) -> T) -> Judged<T> {
         let mut handle = Handle::on(self, world, now);
         let value = judgement(&mut handle);
         handle.judged(value)
@@ -145,20 +147,21 @@ impl<M: Machine> fmt::Debug for WriteError<M> {
 
 /// The single writer for one machine's resources at one home.
 pub struct Home<M: Machine> {
-    writer: Writer,
+    writer: String,
     definition: MachineDef<M>,
     resources: BTreeMap<String, Resource<M>>,
 }
 
 impl<M: Machine> Home<M> {
-    /// A home writing as `writer`. Refuses a declaration that breaks the rules.
+    /// A home writing as `writer`, the identity every edge event it appends
+    /// carries. Refuses a declaration that breaks the rules.
     pub fn new(writer: impl Into<String>) -> Result<Self, Vec<DefError>> {
         let definition = M::definition();
         definition.validate()?;
-        Ok(Home { writer: Writer(writer.into()), definition, resources: BTreeMap::new() })
+        Ok(Home { writer: writer.into(), definition, resources: BTreeMap::new() })
     }
 
-    pub fn writer(&self) -> &Writer {
+    pub fn writer(&self) -> &str {
         &self.writer
     }
 
@@ -186,9 +189,9 @@ impl<M: Machine> Home<M> {
             return Err(WriteError::Fault(Fault::Initial { state: state.label() }));
         }
         let resource = Resource {
-            events: RecordLog::new(&name),
-            attempts: RecordLog::new(&name),
-            receipts: RecordLog::new(&name),
+            events: Records::new(),
+            attempts: Records::new(),
+            receipts: Records::new(),
             name: name.clone(),
             spec,
             state,
@@ -199,9 +202,16 @@ impl<M: Machine> Home<M> {
 
     /// Applies `edge` at `now`, reading `world` through the recording handle.
     /// On success the resource holds the next state, its version rises, and
-    /// the returned event (with the gate's and effect's reads) is appended to
-    /// its edge events.
-    pub fn apply(&mut self, name: &str, edge: impl Into<M::Edge>, world: &M::World, now: Time) -> Result<&EdgeEvent<M>, WriteError<M>> {
+    /// the returned event (whose payload holds the edge and the gate's and
+    /// effect's reads) is appended to its edge events, stamped with the new
+    /// version.
+    pub fn apply(
+        &mut self,
+        name: &str,
+        edge: impl Into<M::Edge>,
+        world: &M::World,
+        now: Timestamp,
+    ) -> Result<&EdgeEventOf<M>, WriteError<M>> {
         let edge = edge.into();
         let resource = self.resources.get(name).ok_or_else(|| WriteError::Unknown(name.to_string()))?;
         let mut handle = Handle::on(resource, world, now);
@@ -214,8 +224,8 @@ impl<M: Machine> Home<M> {
         let to = next.label();
         resource.version = resource.version.next();
         resource.state = next;
-        let event = EdgeEvent { edge, from, to, writer: self.writer.clone(), at: now, reads };
-        Ok(&resource.events.append(resource.version, event).record)
+        let event = EdgeEvent { edge: edge.kind(), from, to, writer: self.writer.clone(), at: now, payload: EdgePayload { edge, reads } };
+        Ok(&resource.events.append(resource.version.0, event).record)
     }
 
     /// Appends an attempt. Refused on an ended resource, with the end's
@@ -224,14 +234,14 @@ impl<M: Machine> Home<M> {
         let accepts = |definition: &MachineDef<M>, label| definition.accepts_attempts(label);
         let resource = self.writable(name, accepts)?;
         resource.version = resource.version.next();
-        Ok(resource.attempts.append(resource.version, attempt).position)
+        Ok(resource.attempts.append(resource.version.0, attempt).position)
     }
 
     /// Appends a receipt. Refused on an ended resource, with the end's reason.
     pub fn record_receipt(&mut self, name: &str, receipt: Receipt) -> Result<Position, WriteError<M>> {
         let resource = self.writable(name, any_label)?;
         resource.version = resource.version.next();
-        Ok(resource.receipts.append(resource.version, receipt).position)
+        Ok(resource.receipts.append(resource.version.0, receipt).position)
     }
 
     fn writable(&mut self, name: &str, accepts: impl Fn(&MachineDef<M>, Label<M>) -> bool) -> Result<&mut Resource<M>, WriteError<M>> {
@@ -251,7 +261,7 @@ impl<M: Machine> Home<M> {
         &self,
         name: &str,
         world: &M::World,
-        now: Time,
+        now: Timestamp,
         judgement: impl FnOnce(&mut Handle<'_, M>) -> T,
     ) -> Result<Judged<T>, WriteError<M>> {
         let resource = self.get(name).ok_or_else(|| WriteError::Unknown(name.to_string()))?;
