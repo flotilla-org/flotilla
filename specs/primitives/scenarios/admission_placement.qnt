@@ -16,10 +16,20 @@ module admission_placement {
   def used(host: int, dim: int): int = ids.filter(i => leaseOn(V::vessels.get(i), host)).fold(0, (n, i) => n + requests.get(i).shape.get(dim))
   def live(convoy: int, class: int): int = ids.filter(i => V::leased(V::vessels.get(i)) and requests.get(i).convoy == convoy and requests.get(i).class == class).size()
   def cap(convoy: int, class: int): int = match C::convoys.get(convoy) {
-    | Present(s) => C::work(s).request.quota.get(class) | Absent => 0
+    | Present(s) => C::work(s).quota.get(class) | Absent => 0
   }
+  // What each placement's priority rule read: the host's available capacity and
+  // the waiting requests. A lease holds only its request and host, so the
+  // scenario keeps this evidence for the priority invariant.
+  var placedOn: int -> { available: int -> int, waiting: Set[V::Request] }
+  action keepPlaced = placedOn' = placedOn
   val waiting = ids.filter(i => match V::vessels.get(i) { | Present(s) => match s { | Waiting(_) => true | _ => false } | Absent => false }).map(i => requests.get(i))
-  action init = all { C::init, V::init }
+  def evidence(id: int, host: int): V::Evidence = {
+    val r = requests.get(id)
+    { host: host, available: capacities.get(host).keys().mapBy(d => capacities.get(host).get(d) - used(host, d)), waiting: waiting,
+      live: live(r.convoy, r.class), cap: cap(r.convoy, r.class), admitted: cap(r.convoy, r.class) > 0 }
+  }
+  action init = all { C::init, V::init, placedOn' = Map() }
   action step = {
     nondet convoy = Set(1, 2).oneOf()
     nondet id = ids.oneOf()
@@ -30,17 +40,19 @@ module admission_placement {
       all {
         C::admitRequest(convoy, { project: "project", promises: Map(0 -> { kind: "opaque", target: "target" }), quota: Map(0 -> 1, 1 -> 1), priority: if (convoy == 1) 2 else 1 }),
         V::unchanged,
+        keepPlaced,
       },
-      all { C::readmit(convoy, Map(0 -> count, 1 -> 1), true), V::unchanged },
-      all { V::request(id, r), C::unchanged },
+      all { C::readmit(convoy, Map(0 -> count, 1 -> 1), true), V::unchanged, keepPlaced },
+      all { V::request(id, r), C::unchanged, keepPlaced },
       all {
-        V::place(id, { host: host, available: capacities.get(host).keys().mapBy(d => capacities.get(host).get(d) - used(host, d)), waiting: waiting, live: live(r.convoy, r.class), cap: cap(r.convoy, r.class), admitted: cap(r.convoy, r.class) > 0 }),
+        V::place(id, evidence(id, host)),
         C::unchanged,
+        placedOn' = placedOn.put(id, { available: evidence(id, host).available, waiting: waiting }),
       },
-      all { V::realise(id, true, true), C::unchanged },
-      all { V::release(id, true), C::unchanged },
-      all { V::vanish(id, true), C::unchanged },
-      all { V::unchanged, C::unchanged },
+      all { V::realise(id, true, true), C::unchanged, keepPlaced },
+      all { V::release(id, true), C::unchanged, keepPlaced },
+      all { V::vanish(id, true), C::unchanged, keepPlaced },
+      all { V::unchanged, C::unchanged, keepPlaced },
     }
   }
   val convoyCaps = Set(1, 2).forall(c => Set(0, 1).forall(k => live(c, k) <= cap(c, k)))
@@ -55,13 +67,14 @@ module admission_placement {
   })
   val queuePriority = ids.forall(i => match V::vessels.get(i) {
     | Present(s) => match s {
-        | Leased(v) => not(v.placement.waiting.exists(w => w.priority > v.placement.request.priority and V::fits(w, v.placement.available)))
+        | Leased(v) => placedOn.keys().contains(i) and not(placedOn.get(i).waiting.exists(w =>
+            w.priority > v.placement.request.priority and V::fits(w, placedOn.get(i).available)))
         | _ => true
       }
     | Absent => true
   })
   val safety = convoyCaps and hostCapacity and goneReturnsLease and queuePriority
-  val view = (C::convoys, V::vessels)
+  val view = (C::convoys, V::vessels, placedOn)
   // No host availability or teardown fairness is assumed.
   // No progress/liveness claim is made here. The shared runner's temporal hook
   // checks lease safety only.

@@ -1,2 +1,3 @@
-/build/
-/_apalache-out/
+# Run output from any runner or harness directory beneath specs/primitives.
+build/
+_apalache-out/

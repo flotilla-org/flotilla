@@ -65,15 +65,19 @@ check "core cfg! macro runs Windows" pull_request false "crates/flotilla-core/sr
 check "core cfg_attr runs Windows" pull_request false "crates/flotilla-core/src/x.rs" \
   $'+#[cfg_attr(unix, path = "unix.rs")]\n' "windows=true macos=false quint=false "
 
-# The Quint quick tier runs on its specs, the engine prototype and the shared
+# The Quint quick tier runs on its specs, the engine crate and the shared
 # workflow inputs, never on a diff's content.
 check "Quint spec runs Quint" pull_request false "specs/primitives/scenarios/convoy_deliver.qnt" "" \
   "windows=false macos=false quint=true "
-check "engine prototype runs Quint" merge_group false "prototypes/3108-3209/src/lib.rs" "" \
+check "engine crate runs Quint" merge_group false "crates/flotilla-state-machines/src/lib.rs" "" \
+  "windows=false macos=false quint=true "
+check "conformance harness runs Quint" pull_request false "specs/primitives/conformance/message.qnt" "" \
   "windows=false macos=false quint=true "
 check "classifier change runs every job" pull_request false "ci/platform-changes/classify.sh" "" \
   "windows=true macos=true quint=true "
-check "other prototypes skip Quint" pull_request false "prototypes/3108-3214/README.md" "" \
+check "prototypes skip Quint" pull_request false "prototypes/1262-scenarios/builtin-implement-review.yaml" "" \
+  "windows=false macos=false quint=false "
+check "other crates skip Quint" pull_request false "crates/flotilla-resources/src/lib.rs" "" \
   "windows=false macos=false quint=false "
 check "empty diff lines are not Quint content" pull_request false "crates/flotilla-core/src/x.rs" \
   $'+fn x() {}\n\n' "windows=false macos=false quint=false "

@@ -1,7 +1,8 @@
 # Decided machines, checked and replayed (#3220)
 
-These durable specs supersede the #3214 exploration, which remains under
-`prototypes/3108-3214` until the first real engine layer removes it.
+These durable specs supersede the #3214 exploration, whose prototype #3319
+retired along with the #3209 engine prototype. `crates/flotilla-state-machines`
+is the engine they check.
 ADR 0064 and [the owner resolution](https://github.com/flotilla-org/flotilla/issues/3214#issuecomment-6163958776)
 are fixed rules here. There are no design-option or mutant constants in the design.
 
@@ -10,7 +11,8 @@ machines/     Message, shared lifecycle, Convoy, Ensure, AgentSession
 world/        per-home ordered streams, host death, clock, adapter acceptance
 scenarios/    compositions and their safety / conditional liveness properties
 mutants/      single-definition overrides; each must violate a property
-check.sh      fast exhaustive safety, ITF generation, Rust replay, mutants
+conformance/  per-machine harnesses whose full reachable graphs the engine must match
+check.sh      fast exhaustive safety, graph conformance, ITF replay, mutants
 symbolic.sh   inductive and bounded SMT checks
 viewer.html   local, standalone ITF viewer
 ```
@@ -18,9 +20,11 @@ viewer.html   local, standalone ITF viewer
 ## Reading the design
 
 Each resource-kind module owns a store `id -> Absent | Present(State)`.
-Its states, events and refusals are sum types. State data belongs to its variant:
-`Awaiting` carries its receiver; `Dropped` its reason and expiry evidence;
-`Abandoned` its reason; an AgentSession is `Live(channel) | Ended`.
+Its states, events and refusals are sum types. A state is a value: its label
+plus the data that label carries, exactly what the Rust engine stores and
+compares. `Awaiting` carries its receiver; `Dropped` its reason and the evidence
+its rule consulted; `Abandoned` its reason; an AgentSession is
+`Live(channel) | Ended(reason)`.
 A pure `step(state, event)` uses `match` and returns `Moved(state) | Refused(reason)`.
 Every gate reads typed local evidence on the event inside `step`. Admission
 validates a typed request before creating a slot. Named actions look up a slot,
@@ -36,7 +40,9 @@ The step blocks contain no assignment lists or machine rules. Imported variants 
 `match` patterns (constructors in expressions remain qualified).
 
 Convoy admission accepts `{project, promises, quota, priority}`. The promise map
-is nonempty and preserves opaque kind/target data. Resolution is a map from
+is nonempty and preserves opaque kind/target data. Admission fixes the project,
+the promise definitions and the priority; the quota in force is work state, which
+readmission raises, so no admitted copy of it can go stale. Resolution is a map from
 promise id to `Pending | Kept | Retracted`; a settled promise cannot be kept or
 retracted again (`PromiseSettled`), and `Kept` is final. Terminal variants retain
 the work record so delivery and finality remain state properties. A continuing
@@ -53,9 +59,10 @@ is currently capped. No borrowing or spend accounting is modeled.
 
 The Vessel module composes the shared lifecycle's pure rules and owns placement
 state; it does not duplicate a lifecycle store. Placement evidence carries the
-observed caps, live counts, available capacity and waiting requests. Allocation
-records retain the placement snapshot, allowing the priority invariant to be a
-property of state rather than a scenario flag. Ensure carries its binding,
+observed caps, live counts, available capacity and waiting requests. A lease
+holds only its request and host. The scenario keeps what each placement's
+priority rule read (available capacity and waiting requests), so the priority
+invariant checks the evidence the rule used. Ensure carries its binding,
 recorded fulfillers and attempt window on the relevant variants.
 
 A gate's booleans represent **versioned local evidence**, not remote queries or
@@ -107,9 +114,9 @@ npm exec --yes --package=@informalsystems/quint@0.33.0 -- quint compile specs/pr
 npm exec --yes --package=@informalsystems/quint@0.33.0 -- specs/primitives/check.sh
 ```
 
-The PR description supplies an owner-applied patch for the existing Linux Test
-job; crews cannot push workflow files. Until it is applied, formal coverage is
-local. There is
+CI runs this as the Quint quick tier job (#3280), within a 20-minute step budget,
+whenever these specs, the engine crate, the compiler pin, the workflow or the
+platform classifier change. There is
 one TLC run per scenario for its aggregate safety invariant, not one per property.
 The fast bounds use two named sessions (initial consumer and replacement), two
 fulfillers, one message per scenario, two inbox stream rows, and three race stream
@@ -126,16 +133,33 @@ as `*.frames.log`. The tier then runs one aggregate TLC safety check per scenari
 and generates 128 ITF traces of up to 80 steps for **each of six** scenarios
 with seed 3220 and `quint run --mbt` in a fresh directory.
 
-Rust replay reads `mbt::actionTaken` and the `Some`/`None` picks from
-`mbt::nondetPicks`, and decodes sum values from `{tag,value}`. Race drops replay
-the chosen reason and check it against the stored reason. It drives typed
-`Home::apply` and compares every resulting machine state, delivery count and
-receiver. It also drives the prototype placement seam and compares every vessel
-lifecycle/lease against the model. Accepted operations are generated by guarded
-machine actions; existing prototype gate tests cover independently refused
-inputs. World changes supply replica observations rather than impersonating a
-production transport. Ended AgentSessions deliberately retain no channel in the
-Quint state.
+Full-graph conformance (#3109's resolution) comes next. Each machine has a small
+harness in `conformance/` whose state is the machine's state plus a probe: the
+last step's from-state, event and result. `conformance/export.sh` has TLC dump
+every reachable state, and `conformance/dump2json.py` converts the dump to Quint's
+ITF value encoding. The engine's `tests/conformance` then rebuilds every reachable
+state through the real `Home` along a path in that graph, and applies every probed
+event. The engine must accept exactly the moves the spec's `step` makes, reach the
+same state value, and refuse where the spec refuses with the same `Refusal` variant.
+Each adaptor encodes the Rust state (with the immutable spec where the Quint state
+carries request data, and attempt records for Ensure's history) in the spec's shape
+and compares it whole; its module doc lists the few remaining encoding choices.
+Harness events carry the evidence a home could observe, and the test maps each
+evidence field onto the world the gate reads. Each harness comment states its
+event domain.
+
+Rust replay (`crates/flotilla-state-machines/tests/quint_replay.rs`) reads
+`mbt::actionTaken` and the `Some`/`None` picks from `mbt::nondetPicks`, and
+decodes sum values from `{tag,value}`. Race drops replay the chosen reason and
+check it against the stored reason. It drives the engine's `Home::apply` and,
+after every step, compares every machine's state value with the model's store. It
+also drives the placement ledger and compares every vessel's lifecycle and lease
+with the model, and it keeps the evidence each placement read to compare with
+`placedOn` and check the priority rule. Accepted operations come from guarded machine actions, and graph
+conformance covers refused inputs. World changes supply replica observations
+rather than impersonating a production transport. Ended AgentSessions
+deliberately retain no channel in the Quint state. Both checks are `#[ignore]`d
+in workspace CI, which runs the crate's own fmt, Clippy and unit tests.
 
 Ten external patches each change one rule in an isolated copy: missing expiry
 watermark, cancellation only from Realised, duplicate turns, bind without drain,
@@ -144,8 +168,8 @@ priority queue, and retaining a lease after Gone, and undeliverable drops with c
 parse, compiler and tool failures are errors, never mutant detection. Production
 modules contain no mutant switches. Generated specs, ITF and logs stay in `build/`.
 Shell connects compilation to TLC (`VIEW` is not exposed by Quint's TLC runtime
-config) and invokes Cargo. Python tests cover allocation-runner contracts, not
-machine semantics. The historical exploration remains separate.
+config) and invokes Cargo. Python tests cover the runners' tool checks and the
+deep bound change, not machine semantics. The historical exploration remains separate.
 
 Open `viewer.html` directly, choose an ITF file from the printed fast-run directory,
 and use Previous/Next or the slider. It draws the states/edges visited in that
@@ -177,65 +201,26 @@ at the chosen depth (default 10); these are bounded SMT results, not induction o
 unbounded liveness proofs. The baseline TLC and Rust checks remain necessary:
 SMT does not replace trace replay. Logs go under `build/`.
 
-## Deep tier and allocation ownership
+## Deep tier
 
 ```sh
-specs/primitives/deep.sh specs/primitives/ec2-provider.sh /tmp/quint-results
+specs/primitives/deep-local.sh
 ```
 
-The optional EC2 provider needs externally supplied AWS credentials, AWS CLI,
-`QUINT_AMI_ID` (x86_64 image with the formal-modelling tools and pinned Rust),
-`QUINT_SUBNET_ID`, `QUINT_SECURITY_GROUP_ID` (SSH access), and `QUINT_KEY_NAME`.
-`QUINT_SSH_KEY_FILE` is optional when the key is already available to SSH;
-`QUINT_SSH_USER` defaults to ubuntu. The default instance is `c7i.8xlarge`,
-overridable with `QUINT_INSTANCE_TYPE`. This repository supplies no credentials
-or account/network defaults. The local gate never allocates a host.
-
-`deep.sh` owns a unique allocation and calls an executable provider with:
-
-```text
-start ALLOCATION
-run ALLOCATION SOURCE_BUNDLE
-collect ALLOCATION OUTPUT_DIRECTORY
-stop ALLOCATION
-```
-
-A Namespace/existing project provider can implement the same small interface.
-The trap collects partial results once run is reached and always stops the allocation, even when start or
-execution fails. The driver marks run reached before invoking the provider, so
-collection still runs after an execution timeout. Failed AWS teardown retains
-the local allocation state for retry diagnostics; successful teardown removes it.
-Start/run/cleanup have independent timeout limits, and signals
-enter the same cleanup path; teardown failure is a failed run. EC2 start is idempotent by
-client token, and stop searches that token even if start failed before saving an
-instance ID. `deep-contract-test.sh` checks success/start/run/collect/stop failures and execution timeout with a
-subprocess-boundary fake, without Docker or live hosts.
-
-The remote local runner uses all available TLC workers, six stream rows, safety
-and conditional liveness in one run per interaction, and a per-scenario time
-budget (default 60 seconds). It generates additional ITF traces and replays them,
-then runs the symbolic tier (default budget 180 seconds). `TLC_HEAP` defaults to
-8g. A budget exhaustion is reported separately and returns nonzero; it is never
-called a proof. Results include logs, configs, generated specs and ITF; TLC
-counterexamples are also retained in its text output. The provider collects them
-before terminating the box. Inspect `results.txt` and the individual logs, not
-only process completion.
+Run it directly on a host with Quint, JDK 21, the pinned Apalache jar and the
+pinned Rust toolchain; it allocates nothing and needs no credentials. It uses
+all available TLC workers, six stream rows, safety and conditional liveness in
+one run per interaction, and a per-scenario time budget (default 60 seconds). It
+generates additional ITF traces and replays them, then runs the symbolic tier
+(default budget 180 seconds). `TLC_HEAP` defaults to 8g. A budget exhaustion is
+reported separately and returns nonzero; it is never called a proof. Results,
+including logs, configs, generated specs and ITF, stay under `build/deep/`, and
+TLC counterexamples are retained in its text output. Inspect `results.txt` and
+the individual logs, not only process completion.
 
 ## Shape and handoff
 
-This adds the decided specs and changes the prototype engine and its CI gate.
-Production resource shapes,
-stored-record corpus and out-of-repo manifests are unchanged. The first real
-engine layer moves the Rust replay test/import onto that crate and retargets the
-checker Cargo commands, then deletes `prototypes/3108-3209` and
-`prototypes/3108-3214` as #3220 specifies. The decided specs stay here. Do not turn
-the independent prototype types into a second production implementation.
-
-The optional EC2 adapter uses trust-on-first-use SSH host keys (`accept-new`)
-with a separate known-hosts file per throwaway allocation, trusting the public
-IP supplied by the authenticated EC2 API. It refuses missing public addresses
-before attempting SSH. Its AMI must support cloud-init shell user data and
-`shutdown`: launch configures instance-initiated shutdown to terminate and
-schedules shutdown after `QUINT_MAX_LIFETIME_MINUTES` (default 30). Choose a
-lifetime longer than the intended run; this independent deadline bounds leaks
-if the local driver is killed. Normal teardown still terminates immediately.
+The decided specs stay here, and `flotilla-state-machines` is their one Rust
+implementation. Where the Rust and a spec disagree, fix the Rust. Production
+resource shapes, the stored-record corpus and out-of-repo manifests are
+unchanged; no production crate uses the engine yet.

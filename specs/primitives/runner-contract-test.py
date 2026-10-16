@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise runner boundaries without formal tools, AWS, SSH or live hosts."""
+"""Exercise the runners' preflight and deep bounds without formal tools."""
 import os
 from pathlib import Path
 import shutil
@@ -40,38 +40,6 @@ class RunnerContracts(unittest.TestCase):
             self.assertIn('Apalache jar' if tool == 'jar' else f'tool: {tool}', result.stderr)
             if tool != 'jar':
                 self.stub(tool, 'exit 99')
-
-    def test_missing_public_ip_refuses_ssh_and_sets_termination_deadline(self):
-        self.env.update(QUINT_PROVIDER_STATE=str(self.root / 'state'),
-                        QUINT_AMI_ID='ami-fake', QUINT_SUBNET_ID='subnet-fake',
-                        QUINT_SECURITY_GROUP_ID='sg-fake', QUINT_KEY_NAME='key-fake',
-                        AWS_ARGS=str(self.root / 'args'))
-        self.stub('aws', '''printf '%s\\n' "$*" >> "$AWS_ARGS"
-case "$2" in
-run-instances) echo i-fake ;;
-describe-instances) printf '%s' "$FAKE_IP" ;;
-esac''')
-        self.stub('ssh', 'echo unexpected-ssh >&2; exit 99')
-        for ip in ('None', ''):
-            self.env['FAKE_IP'] = ip
-            result = self.run_script(HERE / 'ec2-provider.sh', 'start', 'quint-3220-test')
-            self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn('no public IP', result.stderr)
-            self.assertNotIn('unexpected-ssh', result.stderr)
-        args = (self.root / 'args').read_text()
-        self.assertIn('--instance-initiated-shutdown-behavior terminate', args)
-        self.assertIn('--user-data file://', args)
-        self.assertIn('shutdown -h +30', (self.root / 'state/quint-3220-test/user-data').read_text())
-        self.env['FAKE_IP'] = '192.0.2.1'
-        self.stub('sleep', 'exit 0')
-        result = self.run_script(HERE / 'ec2-provider.sh', 'start', 'quint-3220-test')
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn('never became SSH-ready', result.stderr)
-        # No matching instance is also a successful, idempotent stop.
-        self.env['FAKE_IP'] = ''
-        result = self.run_script(HERE / 'ec2-provider.sh', 'stop', 'quint-3220-test')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((self.root / 'state/quint-3220-test').exists())
 
     def test_deep_bound_change_is_verified_before_quint(self):
         copy = self.root / 'specs'

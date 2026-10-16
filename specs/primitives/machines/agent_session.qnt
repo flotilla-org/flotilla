@@ -1,26 +1,26 @@
 // Pure typed rules, followed by this resource kind's store and named operations.
 module agent_session {
   type Channel = Detached | Attached
-  type State = Live(Channel) | Ended
+  type State = Live(Channel) | Ended(EndReason)
   type EndReason = Completed | Lost
   type Event = Attach({ channelPresent: bool }) | Detach({ channelAbsent: bool })
     | End({ reason: EndReason, observed: bool })
   type Refusal = AlreadyEnded | WrongChannel | MissingEvidence
   type Next = Moved(State) | Refused(Refusal)
   pure def step(s: State, e: Event): Next = match s {
-    | Ended => Refused(AlreadyEnded)
+    | Ended(_) => Refused(AlreadyEnded)
     | Live(channel) => match e {
       | Attach(o) => if (channel != Detached) Refused(WrongChannel)
           else if (o.channelPresent) Moved(Live(Attached)) else Refused(MissingEvidence)
       | Detach(o) => if (channel != Attached) Refused(WrongChannel)
           else if (o.channelAbsent) Moved(Live(Detached)) else Refused(MissingEvidence)
-      | End(o) => if (o.observed) Moved(Ended) else Refused(MissingEvidence)
+      | End(o) => if (o.observed) Moved(Ended(o.reason)) else Refused(MissingEvidence)
     }
   }
   pure def live(s: Slot): bool = match s { | Present(a) => match a { | Live(_) => true | _ => false } | _ => false }
 
   pure def terminalRefuses(s: State): bool = match s {
-    | Ended => Set(Attach({ channelPresent: true }), Detach({ channelAbsent: true }),
+    | Ended(_) => Set(Attach({ channelPresent: true }), Detach({ channelAbsent: true }),
         End({ reason: Completed, observed: true }), End({ reason: Lost, observed: true }))
         .forall(e => not(moved(step(s, e))))
     | _ => true

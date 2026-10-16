@@ -40,8 +40,9 @@ module convoy_deliver {
     Set(C::Pending, C::Kept, C::Retracted).map(b => Map(0 -> a, 1 -> b)))).flatten()
   pure val works = Set(Map(0 -> 1, 1 -> 1), Map(0 -> 2, 1 -> 1)).map(q =>
     Set(1, 2).map(priority => resolutions.map(ps => {
-      request: { project: "project", promises: ps.keys().mapBy(_ => { kind: "opaque", target: "target" }), quota: q, priority: priority },
-      promises: ps
+      spec: { project: "project", promises: ps.keys().mapBy(_ => { kind: "opaque", target: "target" }), priority: priority },
+      promises: ps,
+      quota: q
     }))).flatten().flatten()
   pure val slots = Set(C::Absent).union(works.map(w => Set(C::Present(C::Open(w)), C::Present(C::Delivered(w)), C::Present(C::Abandoned({ work: w, reason: "decision" })))).flatten())
   val inductive = C::convoys.in(Set(1, 2).setOfMaps(slots)) and now.in(Set(0, 1)) and safety

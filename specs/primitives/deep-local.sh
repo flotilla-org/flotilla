@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs inside the allocated formal-modelling host. A budget exhaustion is not a proof.
+# The deep tier, run directly on a host with the formal-modelling tools and the
+# pinned Rust toolchain. A budget exhaustion is not a proof.
 set -euo pipefail
 # Expanded typed compositions exceed the JVM's default parser stack.
 export JVM_ARGS="${JVM_ARGS:--Xmx3g -Xss16m}"
@@ -36,7 +37,7 @@ for scenario in convoy_deliver ensure_bind inbox_delivery message_race admission
 done
 quint run scenarios/machine_edges.qnt --backend typescript --mbt --invariant safety --seed 3220 \
   --max-samples 16 --n-traces 16 --max-steps 120 --out-itf "build/deep/machine_edges-{seq}.itf.json" > build/deep/machine_edges.simulation.log
-QUINT_TRACE_DIR="$PWD/build/deep" cargo test --manifest-path ../../prototypes/3108-3209/Cargo.toml --locked --test quint_replay -- --ignored
+QUINT_TRACE_DIR="$PWD/build/deep" cargo test -p flotilla-state-machines --locked --test quint_replay -- --ignored --nocapture
 symbolic=0
 timeout --kill-after=5s "${SYMBOLIC_SECONDS:-180}s" ./symbolic.sh || symbolic=$?
 if [ "$symbolic" != 0 ]; then
