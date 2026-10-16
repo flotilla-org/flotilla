@@ -348,7 +348,6 @@ jobs:
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: prototypes/3108-3209
           shared-key: "quint"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@v4
@@ -367,8 +366,8 @@ jobs:
             ~/.quint
           key: quint-0.33.0-apalache-0.62.1
       # Quick tier of the typed machine specs (#3280): assignment coverage,
-      # exhaustive TLC safety, generated trace replay against the prototype,
-      # and mutants. The first compile bootstraps Quint's lazily fetched
+      # exhaustive TLC safety, full-graph conformance and generated trace
+      # replay against flotilla-state-machines, and mutants. The first compile bootstraps Quint's lazily fetched
       # Apalache jar, which check.sh's preflight requires. Deep and symbolic
       # runs keep their own budgets outside CI. The first CI run took about
       # 8 minutes; the owner raised the step budget to 20 (#3280) so the engine
