@@ -4,7 +4,7 @@
 use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::agent_session::{
-        AgentSession, AgentSessionEdge, AgentSessionSpec, AgentSessionState, AgentSessionWorld, Attach, Channel, Detach, End, EndReason,
+        AgentSession, AgentSessionSpec, AgentSessionState, AgentSessionWorld, Attach, Channel, Detach, End, EndReason,
         MemoryAgentSessionWorld, Receive,
     },
     Ref, Resource, Transport,
@@ -14,7 +14,7 @@ use hegel::TestCase;
 use super::{
     code_enum,
     engine::{self, resource, Candidate},
-    name, records, stamp_flat, timestamp, Fixture, Pick,
+    name, timestamp, Fixture, Pick,
 };
 
 /// Covering indexes: the label is digit 0 (base 2), and the channel or end reason digit 1.
@@ -34,20 +34,8 @@ pub fn receive(tc: &TestCase, pick: Pick) -> Receive {
     Receive { message: name(tc), transport: code_enum(tc, pick, &[Transport::Turn, Transport::Notify, Transport::Mute]) }
 }
 
-fn edges(tc: &TestCase, pick: Pick) -> Vec<AgentSessionEdge> {
-    let observed = || Ref::new(name(tc));
-    vec![
-        Attach { observed: observed() }.into(),
-        Detach { observed: observed() }.into(),
-        End { reason: EndReason::Completed, observed: Ref::new(name(tc)) }.into(),
-        End { reason: EndReason::Lost, observed: Ref::new(name(tc)) }.into(),
-        receive(tc, pick).into(),
-    ]
-}
-
 pub fn generate(tc: &TestCase, pick: Pick) -> Resource<AgentSession> {
     resource(AgentSessionSpec {}, State::new(state_value(tc, pick), timestamp(tc)))
-        .with_events(records(tc, pick, 2, |pick| engine::event::<AgentSession>(tc, pick, &edges(tc, pick))))
 }
 
 /// A live, detached session with no history.
@@ -97,7 +85,7 @@ impl Fixture for Resource<AgentSession> {
         engine::drive(tc, pick, self, candidates(tc, pick))
     }
 
-    fn stamped(&self, before: Option<&Resource<AgentSession>>, version: u64) -> Resource<AgentSession> {
-        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version))
+    fn stamped(&self, _before: Option<&Resource<AgentSession>>, _version: u64) -> Resource<AgentSession> {
+        self.clone()
     }
 }

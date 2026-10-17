@@ -17,8 +17,7 @@
 //! | code-enum states, written whole by `Edge::new`, and edges setting a root column | `Referral::phase`, `Dossier::state`, `Referral::subject` | sub-machines without data, such as a deliverable's state |
 //!
 //! Frozen data inside a data enum variant lives in the lifecycle test kind (`TerminalSession`'s
-//! agent brief). Generic parts are covered by the engine kinds' history: every edge log is an
-//! `EdgeEvent<L, E, P>`.
+//! agent brief). Edge events are log entries, not rows (#3392 G8), so no kind here holds one.
 
 use std::collections::BTreeMap;
 
@@ -37,6 +36,7 @@ use super::{
 #[store(
     kind = "Referral",
     code = "rf",
+    edges = ReferralEdge,
     index(name = "by_session", eq(session), order(seq)),
     index(name = "by_reply", eq(in_reply_to), when(in_reply_to is_some))
 )]
@@ -55,8 +55,6 @@ pub struct Referral {
     pub ordinal: u16,
     #[store(state)]
     pub phase: State<Phase>,
-    #[store(history)]
-    pub edges: Records<ReferralEvent>,
 }
 
 /// A session name: a newtype of `String`, interned where it is stored.
@@ -82,8 +80,6 @@ pub enum ReferralEdge {
     #[store(code = "c3")]
     Amend,
 }
-
-pub type ReferralEvent = EdgeEvent<Phase, ReferralEdge, Payload<String>>;
 
 /// The seven-variant reference enum, transcribed from `flotilla_protocol::MessageReference`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]
@@ -188,16 +184,6 @@ impl Leaf {
 const PHASES: [Phase; 3] = [Phase::Draft, Phase::Sent, Phase::Read];
 const REFERRAL_EDGES: [ReferralEdge; 3] = [ReferralEdge::Send, ReferralEdge::Read, ReferralEdge::Amend];
 
-fn referral_event(tc: &TestCase, pick: Pick) -> ReferralEvent {
-    event(
-        tc,
-        code_enum(tc, pick, &REFERRAL_EDGES),
-        code_enum(tc, pick, &PHASES),
-        code_enum(tc, pick.nth(1), &PHASES),
-        payload(tc, pick, text(tc)),
-    )
-}
-
 impl Referral {
     /// Spans every field's boundaries: colliding interned text, references to missing targets at
     /// two homes, every reference and leaf variant (covering indexes `0..7` reach them under a
@@ -215,7 +201,6 @@ impl Referral {
             seq: seq(tc),
             ordinal: tc.draw(gs::integers::<u16>()),
             phase: State::new(code_enum(tc, pick, &PHASES), timestamp(tc)),
-            edges: records(tc, pick, 2, |pick| referral_event(tc, pick)),
         }
     }
 
@@ -232,7 +217,6 @@ impl Referral {
             seq: 0,
             ordinal: 0,
             phase: State::new(Phase::Draft, Timestamp(0)),
-            edges: Records::new(),
         }
     }
 }
@@ -246,9 +230,9 @@ impl Fixture for Referral {
         Referral::generate(tc, pick)
     }
 
-    /// The spec drawn afresh; the phase and edge log kept.
+    /// The spec drawn afresh; the phase kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> Referral {
-        Referral { phase: self.phase, edges: self.edges.clone(), ..Referral::generate(tc, pick) }
+        Referral { phase: self.phase, ..Referral::generate(tc, pick) }
     }
 
     /// The phase written whole (a code-enum state: any phase, as the event says), and sometimes the
@@ -256,8 +240,8 @@ impl Fixture for Referral {
     fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<Referral>, Referral)> {
         let phase = State::new(code_enum(tc, pick.nth(1), &PHASES), timestamp(tc));
         let event = event(tc, code_enum(tc, pick, &REFERRAL_EDGES), self.phase.value, phase.value, payload(tc, pick, text(tc)));
-        let mut edge = Edge::new(Referral::PHASE, &phase, Referral::EDGES, &event).expect("edge");
-        let mut next = Referral { edges: appended(tc, &self.edges, event), phase, ..self.clone() };
+        let mut edge = Edge::new(Referral::PHASE, &phase, &event).expect("edge");
+        let mut next = Referral { phase, ..self.clone() };
         if pick.some(tc, 6) {
             let subject = pick.nth(2).some(tc, 8).then(|| LeafAddress::generate(tc, pick.nth(3)));
             edge = edge.set(Referral::SUBJECT, &subject).expect("subject");
@@ -270,15 +254,15 @@ impl Fixture for Referral {
         Referral { sent_at: self.sent_at.map(floor), ..self.clone() }
     }
 
-    fn stamped(&self, before: Option<&Referral>, version: u64) -> Referral {
-        Referral { edges: stamp_flat(&self.edges, before.map(|before| &before.edges), version), ..self.clone() }
+    fn stamped(&self, _before: Option<&Referral>, _version: u64) -> Referral {
+        self.clone()
     }
 }
 
 /// A synthetic convoy-like kind: frozen documents, inputs, and deliverables whose evidence is
 /// records too, changing only through declared edges (#3320 ruling 2).
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Dossier", code = "do")]
+#[store(kind = "Dossier", code = "do", edges = DossierEdgeName)]
 pub struct Dossier {
     #[store(frozen)]
     pub workflow: Frozen<WorkflowSnapshot>,
@@ -289,13 +273,11 @@ pub struct Dossier {
     pub inputs: BTreeMap<String, InputValue>,
     #[store(records)]
     pub deliverables: Records<Deliverable>,
-    #[store(history)]
-    pub edges: Records<DossierEvent>,
     #[store(state)]
     pub state: State<DossierState>,
 }
 
-/// One edge event of the dossier or one of its deliverables.
+/// One edge event of the dossier or one of its deliverables: its log entry's header and payload.
 pub type DossierEvent = EdgeEvent<DossierState, DossierEdgeName, Payload<DossierEdge>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
@@ -470,19 +452,6 @@ impl Evidence {
 
 const DOSSIER_STATES: [DossierState; 3] = [DossierState::Open, DossierState::Delivered, DossierState::Abandoned];
 
-/// Every edge in turn when covering, between any labels.
-fn dossier_event(tc: &TestCase, pick: Pick) -> DossierEvent {
-    let deliverable = || tc.draw(gs::integers::<u32>());
-    let args = match pick.variant(tc, 5, |index| index) {
-        0 => DossierEdge::Deliver,
-        1 => DossierEdge::Abandon { by: name(tc), reason: text(tc) },
-        2 => DossierEdge::Promise { deliverable: deliverable() },
-        3 => DossierEdge::Submit { deliverable: deliverable() },
-        _ => DossierEdge::Retract { deliverable: deliverable(), reason: text(tc) },
-    };
-    event(tc, args.name(), code_enum(tc, pick, &DOSSIER_STATES), code_enum(tc, pick.nth(1), &DOSSIER_STATES), payload(tc, pick, args))
-}
-
 impl Deliverable {
     pub fn generate(tc: &TestCase, pick: Pick) -> Deliverable {
         Deliverable { evidence: records(tc, pick, 2, |pick| Evidence::generate(tc, pick)), ..Deliverable::spec(tc, pick) }
@@ -519,14 +488,13 @@ impl Fixture for Dossier {
             instruction: pick.some(tc, 7).then(|| text(tc)),
             inputs: map(tc, pick, 3, |pick| InputValue::generate(tc, pick)),
             deliverables: records(tc, pick, 2, |pick| Deliverable::generate(tc, pick)),
-            edges: records(tc, pick, 2, |pick| dossier_event(tc, pick)),
             state: State::new(code_enum(tc, pick, &DOSSIER_STATES), timestamp(tc)),
         }
     }
 
-    /// The spec and child tables drawn afresh; the state, deliverables and edge log kept.
+    /// The spec and child tables drawn afresh; the state and deliverables kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> Dossier {
-        Dossier { deliverables: self.deliverables.clone(), edges: self.edges.clone(), state: self.state, ..Dossier::generate(tc, pick) }
+        Dossier { deliverables: self.deliverables.clone(), state: self.state, ..Dossier::generate(tc, pick) }
     }
 
     /// A dossier edge (deliver or abandon) moving its state, or a deliverable edge, which writes
@@ -572,8 +540,7 @@ impl Fixture for Dossier {
             }
         };
         let event = event(tc, args.name(), self.state.value, next.state.value, payload(tc, pick, args));
-        let edge = Edge::new(Dossier::STATE, &next.state, Dossier::EDGES, &event).and_then(changes).expect("edge");
-        next.edges = appended(tc, &self.edges, event);
+        let edge = Edge::new(Dossier::STATE, &next.state, &event).and_then(changes).expect("edge");
         Some((edge, next))
     }
 
@@ -581,7 +548,7 @@ impl Fixture for Dossier {
         let deliverables = stamp(&self.deliverables, before.map(|before| &before.deliverables), version, |deliverable, before| {
             deliverable.stamped(before, version)
         });
-        Dossier { deliverables, edges: stamp_flat(&self.edges, before.map(|before| &before.edges), version), ..self.clone() }
+        Dossier { deliverables, ..self.clone() }
     }
 }
 
@@ -594,7 +561,6 @@ impl Dossier {
             instruction: None,
             inputs: BTreeMap::new(),
             deliverables: Records::new(),
-            edges: Records::new(),
             state: State::new(DossierState::Open, Timestamp(0)),
         }
     }

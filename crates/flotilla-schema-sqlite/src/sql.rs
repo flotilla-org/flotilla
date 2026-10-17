@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, ops::Range};
 
-use flotilla_schema::{quote_ident, ColumnDef, ColumnType, FieldColumns, Index, Table, TableRole, TableSet};
+use flotilla_schema::{quote_ident, Code, ColumnDef, ColumnType, FieldColumns, Index, Table, TableRole, TableSet};
 
 pub(crate) struct TableSql {
     pub name: String,
@@ -14,9 +14,16 @@ pub(crate) struct TableSql {
     /// Key columns (excluding the owner), then data columns.
     pub columns: Vec<ColumnDef>,
     pub key_len: usize,
+    /// How many trailing key columns are this table's own key.
+    pub own_key: usize,
+    /// Earlier names of `field`, which log entries may use.
+    pub field_aliases: Vec<String>,
+    /// Earlier column names, old to current, which log entries may use.
+    pub aliases: BTreeMap<String, String>,
     pub insert: String,
-    /// Empty when the table has no data columns (a set's rows are all key; a kind with no fields).
-    pub update: String,
+    /// A `child` or state-data table: the row inserted, or its values replaced, by key. Empty for
+    /// other tables.
+    pub upsert: String,
     pub delete: String,
     /// Child tables: every row of one owner. The root: the row of one id, version first.
     pub select: String,
@@ -41,6 +48,10 @@ pub(crate) struct FieldSql {
     /// The label-plus-data state the field belongs to (its label or a datum): an index into
     /// [`TableSql::groups`].
     pub group: Option<usize>,
+    /// A state's label field: a `state` field that is no datum.
+    pub label: bool,
+    /// Earlier names of the field, which log entries may use.
+    pub aliases: Vec<String>,
 }
 
 /// A label-plus-data state's fields (the label field, then its column datums in declaration
@@ -71,6 +82,10 @@ pub(crate) struct KindSql {
     /// `resource_identity_by_home`. Identities without a root row (references to resources not
     /// stored here, deleted resources) are skipped by the primary-key join.
     pub scan: String,
+    /// The kind's edge codes (`#[store(edges = E)]`): the only `edge` codes its entries carry.
+    pub edges: Vec<Code>,
+    /// The root state an edge moves, and its label codes: what an entry's `from` and `to` name.
+    pub edge_state: Option<(String, Vec<Code>)>,
 }
 
 /// One index's page queries. Both select `id` then the order columns, filter by the index's own
@@ -135,6 +150,8 @@ impl KindSql {
                 "SELECT i.\"id\" FROM \"resource_identity\" AS i CROSS JOIN {root} AS r ON r.\"id\" = i.\"id\" \
                  WHERE i.\"home\" = ?1 AND i.\"kind\" = ?2 AND i.\"id\" > ?3 ORDER BY i.\"id\" LIMIT ?4"
             ),
+            edges: set.edges.clone(),
+            edge_state: set.edge_state().map(|(field, codes)| (field.name.clone(), codes.to_vec())),
         }
     }
 
@@ -142,7 +159,7 @@ impl KindSql {
     pub(crate) fn statements(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for table in &self.tables {
-            for (what, sql) in [("insert", &table.insert), ("update", &table.update), ("delete", &table.delete), ("select", &table.select)]
+            for (what, sql) in [("insert", &table.insert), ("upsert", &table.upsert), ("delete", &table.delete), ("select", &table.select)]
             {
                 if !sql.is_empty() {
                     out.push((format!("{} {what}", table.name), sql.clone()));
@@ -231,37 +248,43 @@ impl TableSql {
         let exprs: Vec<String> = columns.iter().map(|column| select_expr(&name, column)).collect();
         let key_names = &names[..table.key.len()];
         let data = &table.columns;
-        let (insert, update, delete, select) = if table.parent.is_none() {
-            let set = assignments(data, 2);
-            let next = 2 + data.len();
+        let (insert, upsert, delete, select) = if table.parent.is_none() {
             (
                 format!(
                     "INSERT INTO {name} (\"id\", \"version\"{}) VALUES (?1, ?2{})",
                     prefixed(&names),
                     prefixed_placeholders(3, names.len())
                 ),
-                if data.is_empty() {
-                    String::new()
-                } else {
-                    format!("UPDATE {name} SET \"version\" = ?1, {} WHERE \"id\" = ?{next} AND \"version\" = ?{}", set.join(", "), next + 1)
-                },
+                String::new(),
                 String::new(),
                 format!("SELECT \"version\"{} FROM {name} WHERE \"id\" = ?1", prefixed(&exprs)),
             )
         } else {
             let key_match: Vec<String> = key_names.iter().enumerate().map(|(n, key)| format!(" AND {key} = ?{}", n + 2)).collect();
-            let update = if data.is_empty() {
-                String::new()
-            } else {
-                let set = assignments(data, 1);
-                let owner = 1 + data.len();
-                let key_match: Vec<String> =
-                    key_names.iter().enumerate().map(|(n, key)| format!(" AND {key} = ?{}", owner + 1 + n)).collect();
-                format!("UPDATE {name} SET {} WHERE \"owner\" = ?{owner}{}", set.join(", "), key_match.concat())
+            let insert = format!("INSERT INTO {name} (\"owner\"{}) VALUES (?1{})", prefixed(&names), prefixed_placeholders(2, names.len()));
+            // A collection row is put by its key: inserted, or its values replaced in place, so the
+            // rows nested in it stay.
+            let upsert = match table.role {
+                TableRole::Child | TableRole::State => {
+                    let conflict = format!("ON CONFLICT (\"owner\"{}) DO", prefixed(key_names));
+                    if data.is_empty() {
+                        format!("{insert} {conflict} NOTHING")
+                    } else {
+                        let set: Vec<String> = data
+                            .iter()
+                            .map(|column| {
+                                let column = quote_ident(&column.name);
+                                format!("{column} = excluded.{column}")
+                            })
+                            .collect();
+                        format!("{insert} {conflict} UPDATE SET {}", set.join(", "))
+                    }
+                }
+                TableRole::Root | TableRole::Records | TableRole::History => String::new(),
             };
             (
-                format!("INSERT INTO {name} (\"owner\"{}) VALUES (?1{})", prefixed(&names), prefixed_placeholders(2, names.len())),
-                update,
+                insert,
+                upsert,
                 format!("DELETE FROM {name} WHERE \"owner\" = ?1{}", key_match.concat()),
                 format!("SELECT {} FROM {name} WHERE \"owner\" = ?1 ORDER BY {}", exprs.join(", "), key_names.join(", ")),
             )
@@ -292,9 +315,12 @@ impl TableSql {
             groups,
             last_position,
             key_len: table.key.len(),
+            own_key: table.own_key,
+            field_aliases: table.field_aliases.clone(),
+            aliases: table.aliases.iter().cloned().collect(),
             columns,
             insert,
-            update,
+            upsert,
             delete,
             select,
         }
@@ -316,7 +342,14 @@ impl FieldSql {
                 table.key.iter().enumerate().map(|(n, key)| format!(" AND {} = ?{}", quote_ident(&key.name), owner + 1 + n)).collect();
             format!("UPDATE {name} SET {} WHERE \"owner\" = ?{owner}{}", set.join(", "), key.concat())
         };
-        FieldSql { name: field.name.clone(), columns: field.columns.clone(), update, group: None }
+        FieldSql {
+            name: field.name.clone(),
+            columns: field.columns.clone(),
+            update,
+            group: None,
+            label: field.is_label(),
+            aliases: field.aliases.clone(),
+        }
     }
 }
 
@@ -437,7 +470,7 @@ mod tests {
         let sql = KindSql::render(&layout.finish());
         let root = &sql.tables[0];
         assert_eq!(root.insert, "INSERT INTO \"convoy\" (\"id\", \"version\", \"name\") VALUES (?1, ?2, ?3)");
-        assert_eq!(root.update, "UPDATE \"convoy\" SET \"version\" = ?1, \"name\" = ?2 WHERE \"id\" = ?3 AND \"version\" = ?4");
+        assert!(root.upsert.is_empty(), "the root row changes field by field");
         assert_eq!(
             root.select,
             "SELECT \"version\", (SELECT \"strings\".\"s\" FROM \"strings\" WHERE \"strings\".\"id\" = \"convoy\".\"name\") \
@@ -445,7 +478,11 @@ mod tests {
         );
         let steps = &sql.tables[1];
         assert_eq!(steps.insert, "INSERT INTO \"convoy_steps\" (\"owner\", \"pos\", \"label\") VALUES (?1, ?2, ?3)");
-        assert_eq!(steps.update, "UPDATE \"convoy_steps\" SET \"label\" = ?1 WHERE \"owner\" = ?2 AND \"pos\" = ?3");
+        assert_eq!(
+            steps.upsert,
+            "INSERT INTO \"convoy_steps\" (\"owner\", \"pos\", \"label\") VALUES (?1, ?2, ?3) \
+             ON CONFLICT (\"owner\", \"pos\") DO UPDATE SET \"label\" = excluded.\"label\""
+        );
         assert_eq!(steps.delete, "DELETE FROM \"convoy_steps\" WHERE \"owner\" = ?1 AND \"pos\" = ?2");
         assert_eq!(
             steps.select,

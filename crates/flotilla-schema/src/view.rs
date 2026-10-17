@@ -83,9 +83,11 @@ pub fn render_view<'a>(sets: impl IntoIterator<Item = &'a TableSet>) -> String {
                 .filter(|child| child.parent == Some(position))
                 .map(|child| format!("`{}` ({})", child.name, role(child.role)))
                 .collect();
+            let references = set.reference_indexes();
             let indexes: Vec<String> = set
                 .indexes
                 .iter()
+                .chain(&references)
                 .filter(|index| index.table == table.name)
                 .map(|index| format!("`{}` ({})", index.name, index.columns().collect::<Vec<_>>().join(", ")))
                 .collect();

@@ -9,11 +9,12 @@
 //! engine's `deliver` (Pending to Awaiting, with its receiver) and then its `settle` (Awaiting to
 //! Settled, on the reply), each computed by the engine's home before the timed loop. An edge moves
 //! the message's state (the label, its `since` and the label's data, with the version, in the state
-//! field's one statement) and appends an edge history row, whose document holds the edge's
-//! arguments and the gate's one read. That is the edge row, the root row and the `change_log` row
-//! (plus the `home_sequence` counter and the identity's sequence): one row fewer than WORKLOAD.md's
-//! ~4 row writes per event, which counted the gate read as a row. Events are committed in batches of
-//! 1, 10, 100 and 1000 per transaction.
+//! field's one statement) and appends its event to the `log`: the entry's payload holds the edge's
+//! arguments and the gate's one read, and its effect the state as one unit (#3392 G8). That is the
+//! root row and the log row (plus the `home_sequence` counter and the identity's sequence): two rows
+//! fewer than WORKLOAD.md's ~4 row writes per event, which counted the gate read and the edge's
+//! history row. Events are committed in batches of 1, 10, 100 and 1000 per transaction, and each run
+//! reports the mean stored size of an edge's log entry (effect and payload).
 
 use std::{env, fs, path::PathBuf, process, time::Instant};
 
@@ -25,11 +26,11 @@ use flotilla_state_machines::{
 };
 use rusqlite::Connection;
 
-use crate::fixtures::{engine::NAME, message, registry, LOCAL};
+use crate::fixtures::{engine::NAME, message, origin, registry, LOCAL};
 
 const MESSAGES: usize = 10_000;
 const INBOXES: usize = 100;
-const ROWS_PER_EVENT: f64 = 3.0;
+const ROWS_PER_EVENT: f64 = 2.0;
 
 struct Database(PathBuf);
 
@@ -63,7 +64,7 @@ fn seed(store: &mut Store) -> Vec<Stamp> {
     for chunk in 0..MESSAGES / 1_000 {
         let mut write = store.write().expect("write");
         for n in chunk * 1_000..(chunk + 1) * 1_000 {
-            stamps.push(write.insert(&format!("message-{n}"), &value(n)).expect("insert"));
+            stamps.push(write.insert(&format!("message-{n}"), &value(n), &origin()).expect("insert"));
         }
         write.commit().expect("commit");
     }
@@ -124,8 +125,12 @@ fn run(batch: usize, events: usize) -> String {
     transactions.sort_by(f64::total_cmp);
     commits.sort_by(f64::total_cmp);
     let rate = n as f64 / seconds;
+    let conn = store.into_connection();
+    let entry: f64 = conn
+        .query_row("SELECT avg(length(effect) + coalesce(length(payload), 0)) FROM log WHERE cause = 'edge'", [], |row| row.get(0))
+        .expect("entry size");
     format!(
-        "| {batch:>5} | {n:>6} | {rate:>9.0} | {:>9.0} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.3} |",
+        "| {batch:>5} | {n:>6} | {rate:>9.0} | {:>9.0} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.3} | {entry:>6.0} |",
         rate * ROWS_PER_EVENT,
         percentile(&transactions, 0.5),
         percentile(&transactions, 0.99),
@@ -134,16 +139,16 @@ fn run(batch: usize, events: usize) -> String {
     )
 }
 
-// Measurement, not a pass/fail behaviour: prints sustained events/s and rows/s and per-transaction
-// and commit latency per batch size, to compare with WORKLOAD.md's 1,000 events/s sustained
-// (~4,000 rows/s) and 10,000 events/s bursts.
+// Measurement, not a pass/fail behaviour: prints sustained events/s and rows/s, per-transaction
+// and commit latency per batch size and the mean edge entry size, to compare with WORKLOAD.md's
+// 1,000 events/s sustained (~4,000 rows/s) and 10,000 events/s bursts and its log growth check.
 #[test]
 #[ignore = "load benchmark: run in release with --ignored --nocapture"]
 fn bench_message_events() {
     let mut lines = vec![
-        format!("{MESSAGES} messages over {INBOXES} inboxes; each event, one engine edge through apply_edge: state move + edge history row (one gate read in its document) + change_log"),
-        "| batch | events | events/s |    rows/s | txn p50 ms | txn p99 ms | commit p50 ms | commit p99 ms |".to_owned(),
-        "|---:|---:|---:|---:|---:|---:|---:|---:|".to_owned(),
+        format!("{MESSAGES} messages over {INBOXES} inboxes; each event, one engine edge through apply_edge: state move + log entry (one gate read in its payload)"),
+        "| batch | events | events/s |    rows/s | txn p50 ms | txn p99 ms | commit p50 ms | commit p99 ms | entry bytes |".to_owned(),
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|".to_owned(),
     ];
     for (batch, events) in [(1, 5_000), (10, 20_000), (100, 20_000), (1_000, 20_000)] {
         lines.push(run(batch, events));

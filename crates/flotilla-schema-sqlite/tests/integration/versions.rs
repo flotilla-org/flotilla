@@ -1,12 +1,10 @@
+use chrono::{DateTime, Duration};
 use flotilla_schema::Kind;
 use flotilla_schema_sqlite::{Stamp, StoreError};
+use flotilla_state_machines::machines::message::MessageSpec;
 use hegel::{generators as gs, TestCase};
 
-use chrono::{DateTime, Duration};
-
-use flotilla_state_machines::machines::message::MessageSpec;
-
-use crate::fixtures::{floor, message as messages, store, Message, Referral, Resource};
+use crate::fixtures::{floor, message as messages, origin, store, Message, Referral, Resource};
 
 fn message(inbox: &str) -> Resource<Message> {
     messages::sample().with_spec(MessageSpec { inbox: inbox.into(), unbound_after: 1, ..messages::sample_spec() })
@@ -28,18 +26,18 @@ fn versions_strictly_increase_across_writes(tc: TestCase) {
         let name = format!("m{slot}");
         let version = match live[slot] {
             None => {
-                let stamp = write.insert(&name, &message(&format!("{step}"))).expect("insert");
+                let stamp = write.insert(&name, &message(&format!("{step}")), &origin()).expect("insert");
                 live[slot] = Some(stamp);
                 Some(stamp.version)
             }
             Some(stamp) if tc.draw(gs::booleans()) => {
                 let current = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
-                let next = write.update(&current, &message(&format!("{step}"))).expect("update");
+                let next = write.update(&current, &message(&format!("{step}")), &origin()).expect("update");
                 live[slot] = Some(next);
                 Some(next.version)
             }
             Some(stamp) => {
-                write.delete::<Resource<Message>>(stamp).expect("delete");
+                write.delete::<Resource<Message>>(stamp, &origin()).expect("delete");
                 live[slot] = None;
                 None
             }
@@ -64,14 +62,14 @@ fn update_without_row_changes_is_a_no_op() {
     let time = DateTime::from_timestamp(1_700_000_000, 123_456_000).expect("in range");
     let value = Referral { sent_at: Some(time), ..Referral::sample() };
     let mut write = store.write().expect("write");
-    let stamp = write.insert("m", &value).expect("insert");
+    let stamp = write.insert("m", &value, &origin()).expect("insert");
     let current = write.load::<Referral>(stamp.id).expect("load").expect("present");
-    assert_eq!(write.update(&current, &value).expect("no-op"), stamp);
+    assert_eq!(write.update(&current, &value, &origin()).expect("no-op"), stamp);
     let finer = Referral { sent_at: Some(time + Duration::nanoseconds(999)), ..value.clone() };
     assert_eq!(floor(finer.sent_at.expect("set")), time);
-    assert_eq!(write.update(&current, &finer).expect("no-op below resolution"), stamp);
+    assert_eq!(write.update(&current, &finer, &origin()).expect("no-op below resolution"), stamp);
     // The next real write takes the very next sequence: the no-ops consumed none.
-    let next = write.update(&current, &Referral { seq: 9, ..value.clone() }).expect("update");
+    let next = write.update(&current, &Referral { seq: 9, ..value.clone() }, &origin()).expect("update");
     assert_eq!(next.version, stamp.version + 1);
     write.commit().expect("commit");
 }
@@ -82,17 +80,17 @@ fn update_without_row_changes_is_a_no_op() {
 fn stale_versions_conflict() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let stamp = write.insert("m", &message("a")).expect("insert");
+    let stamp = write.insert("m", &message("a"), &origin()).expect("insert");
     let stale = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
-    write.update(&stale, &message("b")).expect("update");
+    write.update(&stale, &message("b"), &origin()).expect("update");
     assert!(
-        matches!(write.update(&stale, &message("c")), Err(StoreError::Conflict { id, expected }) if id == stamp.id && expected == stamp.version)
+        matches!(write.update(&stale, &message("c"), &origin()), Err(StoreError::Conflict { id, expected }) if id == stamp.id && expected == stamp.version)
     );
-    assert!(matches!(write.update(&stale, &message("a")), Err(StoreError::Conflict { .. })), "a stale no-op is also a conflict");
-    assert!(matches!(write.delete::<Resource<Message>>(stamp), Err(StoreError::Conflict { .. })));
+    assert!(matches!(write.update(&stale, &message("a"), &origin()), Err(StoreError::Conflict { .. })), "a stale no-op is also a conflict");
+    assert!(matches!(write.delete::<Resource<Message>>(stamp, &origin()), Err(StoreError::Conflict { .. })));
     let unstorable = Stamp { id: stamp.id, version: u64::MAX };
-    assert!(matches!(write.delete::<Resource<Message>>(unstorable), Err(StoreError::Conflict { .. })));
-    let other = write.insert("n", &message("n")).expect("the transaction is still usable");
+    assert!(matches!(write.delete::<Resource<Message>>(unstorable, &origin()), Err(StoreError::Conflict { .. })));
+    let other = write.insert("n", &message("n"), &origin()).expect("the transaction is still usable");
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
@@ -106,11 +104,11 @@ fn stale_versions_conflict() {
 fn names_are_unique_per_kind_and_home() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let stamp = write.insert("m", &message("a")).expect("insert");
-    assert!(matches!(write.insert("m", &message("b")), Err(StoreError::Exists { .. })));
-    write.delete::<Resource<Message>>(stamp).expect("delete");
+    let stamp = write.insert("m", &message("a"), &origin()).expect("insert");
+    assert!(matches!(write.insert("m", &message("b"), &origin()), Err(StoreError::Exists { .. })));
+    write.delete::<Resource<Message>>(stamp, &origin()).expect("delete");
     assert!(write.load::<Resource<Message>>(stamp.id).expect("load").is_none());
-    let again = write.insert("m", &message("b")).expect("insert after delete");
+    let again = write.insert("m", &message("b"), &origin()).expect("insert after delete");
     assert_eq!(again.id, stamp.id, "the identity row is kept");
     assert!(again.version > stamp.version);
     write.commit().expect("commit");
@@ -122,12 +120,12 @@ fn names_are_unique_per_kind_and_home() {
 fn a_refused_write_does_not_spoil_its_batch() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let first = write.insert("a", &message("first")).expect("insert a");
+    let first = write.insert("a", &message("first"), &origin()).expect("insert a");
     let current = write.load::<Resource<Message>>(first.id).expect("load").expect("present");
-    let moved = write.update(&current, &message("second")).expect("update");
-    let refused = write.update(&current, &message("stale"));
+    let moved = write.update(&current, &message("second"), &origin()).expect("update");
+    let refused = write.update(&current, &message("stale"), &origin());
     assert!(matches!(refused, Err(StoreError::Conflict { .. })), "{refused:?}");
-    let other = write.insert("b", &message("other")).expect("insert b");
+    let other = write.insert("b", &message("other"), &origin()).expect("insert b");
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
@@ -142,9 +140,9 @@ fn a_refused_write_does_not_spoil_its_batch() {
 fn writes_to_a_deleted_resource_are_not_found() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let stamp = write.insert("gone", &message("x")).expect("insert");
+    let stamp = write.insert("gone", &message("x"), &origin()).expect("insert");
     let current = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
-    write.delete::<Resource<Message>>(stamp).expect("delete");
-    assert!(matches!(write.update(&current, &message("y")), Err(StoreError::NotFound { .. })));
-    assert!(matches!(write.delete::<Resource<Message>>(stamp), Err(StoreError::NotFound { .. })));
+    write.delete::<Resource<Message>>(stamp, &origin()).expect("delete");
+    assert!(matches!(write.update(&current, &message("y"), &origin()), Err(StoreError::NotFound { .. })));
+    assert!(matches!(write.delete::<Resource<Message>>(stamp, &origin()), Err(StoreError::NotFound { .. })));
 }

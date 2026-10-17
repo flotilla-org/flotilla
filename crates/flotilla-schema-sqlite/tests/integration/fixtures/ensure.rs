@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::ensure::{
-        Attempted, Authority, Bind, Create, Ensure, EnsureEdge, EnsureSpec, EnsureState, EnsureWorld, Fulfiller, FulfillerPhase,
-        FulfillerStatus, Hold, MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
+        Attempted, Authority, Bind, Create, Ensure, EnsureSpec, EnsureState, EnsureWorld, Fulfiller, FulfillerPhase, FulfillerStatus, Hold,
+        MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
     },
     AttemptPolicy, Cause, CauseCategory, Failure, Outcome, Ref, Resource,
 };
@@ -16,7 +16,7 @@ use hegel::{generators as gs, TestCase};
 use super::{
     code_enum,
     engine::{self, resource, Candidate},
-    name, records, stamp_flat, text, timestamp, Fixture, Pick,
+    name, text, timestamp, Fixture, Pick,
 };
 
 /// Covering indexes: the label is digit 0 (base 4) and the tally digits 2 and 3 (base 2); sets take
@@ -73,27 +73,12 @@ pub fn policy(tc: &TestCase) -> AttemptPolicy {
     }
 }
 
-fn edges(tc: &TestCase, pick: Pick) -> Vec<EnsureEdge> {
-    let fulfiller = || Ref::new(name(tc));
-    vec![
-        Record { fulfiller: fulfiller() }.into(),
-        Create { fulfiller: fulfiller() }.into(),
-        Bind { fulfiller: fulfiller() }.into(),
-        Unbind { reason: UnbindReason::Replaced, fulfiller: fulfiller() }.into(),
-        Attempted { fulfiller: fulfiller(), outcome: outcome(tc, pick) }.into(),
-        Hold.into(),
-        Resume { by: name(tc), authority: Ref::new(name(tc)) }.into(),
-        Retire { by: name(tc), authority: Ref::new(name(tc)), teardown: Ref::new(name(tc)) }.into(),
-    ]
-}
-
 pub fn spec(tc: &TestCase) -> EnsureSpec {
     EnsureSpec { inbox: name(tc), policy: policy(tc) }
 }
 
 pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Ensure> {
     resource(spec(tc), State::new(state_value(tc, pick), timestamp(tc)))
-        .with_events(records(tc, pick, 2, |pick| engine::event::<Ensure>(tc, pick, &edges(tc, pick))))
 }
 
 /// A fixed spec for example tests: `inbox`, one immediate attempt.
@@ -166,7 +151,7 @@ impl Fixture for Resource<Ensure> {
         engine::drive(tc, pick, self, candidates(tc, pick, self))
     }
 
-    fn stamped(&self, before: Option<&Resource<Ensure>>, version: u64) -> Resource<Ensure> {
-        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version))
+    fn stamped(&self, _before: Option<&Resource<Ensure>>, _version: u64) -> Resource<Ensure> {
+        self.clone()
     }
 }

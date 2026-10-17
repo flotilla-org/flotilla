@@ -8,7 +8,7 @@ use crate::{
     store::{Ctx, ResourceId},
 };
 
-/// The most rows (resource ids or change-log entries) one listing returns; a larger limit is
+/// The most rows (resource ids or log entries) one listing returns; a larger limit is
 /// lowered to it, so one call's work and memory stay bounded whatever the caller asks for.
 pub const MAX_PAGE: u32 = 10_000;
 
@@ -42,7 +42,7 @@ impl<C> Page<C> {
     }
 }
 
-/// The one limit rule of every listing (`page`, `scan`, `changes`, `changes_since`): 0 is
+/// The one limit rule of every listing (`page`, `scan`, `changes`, `changes_since`, `about`): 0 is
 /// refused, and a limit above [`MAX_PAGE`] is lowered to it.
 pub(crate) fn page_limit(limit: u32) -> Result<i64, StoreError> {
     if limit == 0 {

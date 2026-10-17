@@ -4,13 +4,17 @@
 
 use std::collections::BTreeSet;
 
-use flotilla_schema::{Cbor, Code, Decoder, EdgeParts, Encoder, Kind, KindCode, KindSpec, Labelled, RowPath, State, StateData, Timestamp};
+use flotilla_schema::{
+    Cbor, Code, CodeEnum, Decoder, EdgeParts, Encoder, Kind, KindCode, KindSpec, Labelled, Records, RowPath, State, StateData, Timestamp,
+};
 use flotilla_state_machines::{
     machines::{
         agent_session::AgentSession,
-        convoy::{Convoy, ConvoyRequest, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId, VesselClass},
+        convoy::{
+            Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyRequest, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId, VesselClass,
+        },
         ensure::{Attempted, Ensure, EnsureSpec, MemoryEnsureWorld, Record},
-        message::{Expectation, Message, MessageSpec},
+        message::{Expectation, Message, MessageEdgeKind, MessageSpec},
     },
     AttemptPolicy, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource,
 };
@@ -37,7 +41,8 @@ fn kind_codes_are_pinned() {
 
 /// `name`'s resource at `home`, encoded and decoded through the schema codec (the name and
 /// version are the store's, given back as a store gives them), and the same resource restored at
-/// another home.
+/// another home. Its edge events are log entries, not rows (#3392 G8), so the decoded resource has
+/// none.
 fn round_trip<M>(home: &Home<M>, name: &str) -> Resource<M>
 where
     M: Machine,
@@ -45,14 +50,14 @@ where
     M::State: StateData + Labelled<Label = Label<M>>,
     EdgePayload<M::Edge>: Cbor + PartialEq,
 {
-    let resource = home.get(name).expect("exists").clone();
+    let resource = home.get(name).expect("exists").clone().with_events(Records::new());
     let decoded: Resource<M> = Decoder::decode(Encoder::encode(&resource).expect("encodes")).expect("decodes");
     assert_eq!(decoded.name(), "", "the name is the store's");
     let decoded = decoded.with_identity(name, resource.version().0);
     assert_eq!(decoded, resource);
     let mut restored = Home::<M>::new("other").expect("valid");
     restored.restore(decoded).unwrap_or_else(|_| panic!("an empty home"));
-    assert_eq!(restored.get(name), Some(&resource), "restore keeps spec, state and edge log");
+    assert_eq!(restored.get(name), Some(&resource), "restore keeps spec and state");
     resource
 }
 
@@ -76,7 +81,7 @@ fn resources_survive_the_codec() {
     convoys.create("c", request, Timestamp(2)).expect("created");
     convoys.apply("c", Keep { promise: PromiseId(0) }, &MemoryConvoyWorld::default(), Timestamp(3)).expect("kept");
     let convoy = round_trip(&convoys, "c");
-    assert_eq!((convoy.events().len(), convoy.since()), (1, Timestamp(2)), "a data-only edge keeps since");
+    assert_eq!((convoy.events().len(), convoy.since()), (0, Timestamp(2)), "a data-only edge keeps since");
 
     let mut ensures = Home::<Ensure>::new("home").expect("valid");
     ensures.create("e", EnsureSpec { inbox: "i".into(), policy: AttemptPolicy::immediate(2) }, Timestamp(0)).expect("created");
@@ -84,26 +89,29 @@ fn resources_survive_the_codec() {
     let attempt = Attempted { fulfiller: Ref::new("f"), outcome: Outcome::Succeeded };
     ensures.apply("e", attempt, &MemoryEnsureWorld::default(), Timestamp(5)).expect("attempted");
     let ensure = round_trip(&ensures, "e");
-    assert_eq!(ensure.events().len(), 2, "the attempt is an edge in the log");
+    assert_eq!(ensure.events().len(), 0, "the attempt is an edge: a log entry, not a row");
     assert_eq!(ensure.state().recorded(), &BTreeSet::from([Ref::new("f")]));
 }
 
-// Attempts and receipts are edges (R4): every kind's history is its edge log alone.
+// Attempts and receipts are edges (R4), and every edge is a log entry (#3392 G8): no kind has a
+// history table. Each kind declares its machine's edge codes, the only ones its entries may carry.
 #[test]
-fn the_edge_log_is_the_only_history() {
+fn the_log_is_the_only_history() {
     let tables = |set: flotilla_schema::TableSet| set.tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
-    assert_eq!(tables(Resource::<Message>::table_set()), ["message", "message_edges"]);
-    assert_eq!(tables(Resource::<AgentSession>::table_set()), ["agent_session", "agent_session_edges"]);
-    assert_eq!(tables(Resource::<Ensure>::table_set()), ["ensure", "ensure_recorded", "ensure_created", "ensure_edges"]);
+    assert_eq!(tables(Resource::<Message>::table_set()), ["message"]);
+    assert_eq!(tables(Resource::<AgentSession>::table_set()), ["agent_session"]);
+    assert_eq!(tables(Resource::<Ensure>::table_set()), ["ensure", "ensure_recorded", "ensure_created"]);
+    assert_eq!(Resource::<Message>::table_set().edges, <MessageEdgeKind as CodeEnum>::CODES);
+    assert_eq!(Resource::<Convoy>::table_set().edges, <ConvoyEdgeKind as CodeEnum>::CODES);
 }
 
 fn root_sets(parts: &EdgeParts) -> Vec<&'static str> {
     parts.sets.iter().filter(|set| set.row == RowPath::Root).map(|set| set.field).collect()
 }
 
-// The stored edge for an applied edge writes the label and its since only when the label
-// changes, since then being the event's time, and otherwise keeps the stored since; the event is
-// the home's, and it leaves the stored label.
+// The stored edge for an applied edge writes the state as one unit (#3392 A3): its label, its
+// since (the event's time when the label changes, the stored since otherwise) and its column
+// data; the event is the entry's header, the home's, and it leaves the stored label.
 #[test]
 fn a_resources_edge_moves_since_only_with_the_label() {
     let mut home = Home::<Convoy>::new("home").expect("valid");
@@ -119,13 +127,24 @@ fn a_resources_edge_moves_since_only_with_the_label() {
     assert_eq!(resource.since(), Timestamp(1), "a data-only edge keeps since");
     let kept = resource.stored_state().clone();
     let parts = edge.into_parts();
-    assert_eq!((root_sets(&parts), parts.rows.len(), parts.from.code), (vec![], 1, Code::new("op")), "one resolution row, no root field");
-    assert_eq!(parts.appends.len(), 1, "the event");
+    assert_eq!(
+        (root_sets(&parts), parts.rows.len(), parts.from.code),
+        (vec!["state", "reason"], 1, Code::new("op")),
+        "the whole state, one resolution row"
+    );
+    assert_eq!(parts.sets[0].values[1], flotilla_schema::Value::Int(1), "the stored since");
+    assert_eq!(parts.appends.len(), 0, "the event is the entry's header, not a row");
+    let open = Code::new("op");
+    assert_eq!(
+        (parts.event.edge, parts.event.from, parts.event.to, parts.event.at),
+        (CodeEnum::code(&event.edge), open, open, Timestamp(5))
+    );
+    assert_eq!(parts.event.payload::<EdgePayload<ConvoyEdge>>().expect("payload"), event.payload);
 
     let event = home.apply("c", Deliver, &world, Timestamp(8)).expect("delivered").clone();
     let resource = home.get("c").expect("exists");
     let edge = resource.stored_edge(&kept, &event).expect("edge");
     assert_eq!(resource.stored_state(), &State::new(resource.state().clone(), Timestamp(8)), "a label change moves since");
     let parts = edge.into_parts();
-    assert_eq!((root_sets(&parts), parts.rows.len()), (vec!["state"], 0), "the label and since, no data changed");
+    assert_eq!((root_sets(&parts), parts.rows.len()), (vec!["state", "reason"], 0), "the whole state, no row changed");
 }

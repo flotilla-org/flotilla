@@ -12,19 +12,20 @@ use std::{
 };
 
 use flotilla_schema::{
-    Code, ColumnType, DdlMode, DecodeError, Decoder, Edge, EdgeParts, EdgeRow, Encoder, Hash, Identity, IndexQuery, Kind, KindCode,
-    KindRegistry, Row, RowChange, RowEdit, RowOp, RowPath, Rows, TableRole, Value,
+    Cause, Change, Code, ColumnType, DdlMode, DecodeError, Decoder, Edge, EdgeParts, EdgeRow, Effect, Encoder, Event, Hash, Identity,
+    IndexQuery, Kind, KindCode, KindRegistry, Named, Origin, Row, RowEdit, RowPath, Rows, TableRole, Timestamp, Value,
 };
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{
     cache::TwoGen,
+    effect::{named, Op},
     error::{Malformed, StoreError},
     query::{page_limit, Cursor, Page},
     shared::{
-        schema_ddl, sync_views, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_APPEND, LOG_BY_HOME,
-        LOG_BY_RESOURCE, LOG_TAKEN, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE,
-        SHARED_STATEMENTS, STRING_ID, STRING_INSERT,
+        schema_ddl, sync_views, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ,
+        LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE, LOG_EXPUNGED_AFTER,
+        OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS, STRING_ID, STRING_INSERT,
     },
     sql::{KindSql, TableSql},
 };
@@ -214,20 +215,28 @@ impl Read<'_> {
         self.ctx().snapshot(id)
     }
 
-    /// Up to `limit` logged changes of resource `id` after `after`, in sequence order: the tail that
-    /// follows a snapshot at version `after`. A limit of 0 is `ZeroLimit`; one above
-    /// [`MAX_PAGE`](crate::MAX_PAGE) is lowered to it. A page also stays within the store's byte
-    /// budget ([`MAX_CHANGES_PAGE_BYTES`] by default) and always holds at least one entry.
-    pub fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
+    /// Up to `limit` logged events of resource `id` after `after`, in sequence order: the tail that
+    /// follows a snapshot at version `after`, and the resource's history from 0. A limit of 0 is
+    /// `ZeroLimit`; one above [`MAX_PAGE`](crate::MAX_PAGE) is lowered to it. A page also stays
+    /// within the store's byte budget ([`MAX_CHANGES_PAGE_BYTES`] by default) and always holds at
+    /// least one entry.
+    pub fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
         self.ctx().changes(id, after, limit)
     }
 
-    /// Up to `limit` logged changes homed at `home` after sequence `after`, in home order; page with
+    /// Up to `limit` logged events homed at `home` after sequence `after`, in home order; page with
     /// the last returned `home_seq`. A limit of 0 is `ZeroLimit`; one above
     /// [`MAX_PAGE`](crate::MAX_PAGE) is lowered to it. A page also stays within the store's byte
     /// budget ([`MAX_CHANGES_PAGE_BYTES`] by default) and always holds at least one entry.
-    pub fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
+    pub fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
         self.ctx().changes_since(home, after, limit)
+    }
+
+    /// Up to `limit` entries about resource `id` (edges naming it as their master, G11), in time
+    /// order, after `after`, by `log_about`; see [`AboutPage`]. An entry written by any home is
+    /// read here once this store holds it. Limits as for [`Read::changes`].
+    pub fn about(&mut self, id: ResourceId, after: Option<&AboutCursor>, limit: u32) -> Result<AboutPage, StoreError> {
+        self.ctx().about(id, after, limit)
     }
 
     /// The highest sequence of `home` this store has taken or applied; 0 when none.
@@ -321,20 +330,28 @@ impl Write<'_> {
         self.ctx().snapshot(id)
     }
 
-    /// Up to `limit` logged changes of resource `id` after `after`, in sequence order: the tail that
-    /// follows a snapshot at version `after`. A limit of 0 is `ZeroLimit`; one above
-    /// [`MAX_PAGE`](crate::MAX_PAGE) is lowered to it. A page also stays within the store's byte
-    /// budget ([`MAX_CHANGES_PAGE_BYTES`] by default) and always holds at least one entry.
-    pub fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
+    /// Up to `limit` logged events of resource `id` after `after`, in sequence order: the tail that
+    /// follows a snapshot at version `after`, and the resource's history from 0. A limit of 0 is
+    /// `ZeroLimit`; one above [`MAX_PAGE`](crate::MAX_PAGE) is lowered to it. A page also stays
+    /// within the store's byte budget ([`MAX_CHANGES_PAGE_BYTES`] by default) and always holds at
+    /// least one entry.
+    pub fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
         self.ctx().changes(id, after, limit)
     }
 
-    /// Up to `limit` logged changes homed at `home` after sequence `after`, in home order; page with
+    /// Up to `limit` logged events homed at `home` after sequence `after`, in home order; page with
     /// the last returned `home_seq`. A limit of 0 is `ZeroLimit`; one above
     /// [`MAX_PAGE`](crate::MAX_PAGE) is lowered to it. A page also stays within the store's byte
     /// budget ([`MAX_CHANGES_PAGE_BYTES`] by default) and always holds at least one entry.
-    pub fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
+    pub fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
         self.ctx().changes_since(home, after, limit)
+    }
+
+    /// Up to `limit` entries about resource `id` (edges naming it as their master, G11), in time
+    /// order, after `after`, by `log_about`; see [`AboutPage`]. An entry written by any home is
+    /// read here once this store holds it. Limits as for [`Read::changes`].
+    pub fn about(&mut self, id: ResourceId, after: Option<&AboutCursor>, limit: u32) -> Result<AboutPage, StoreError> {
+        self.ctx().about(id, after, limit)
     }
 
     /// The highest sequence of `home` this store has taken or applied; 0 when none.
@@ -357,64 +374,91 @@ impl Write<'_> {
         self.ctx().scan::<K>(home, after, limit)
     }
 
-    /// Inserts a resource homed here. Its version is the next local home sequence, which also
-    /// stamps every `records` and `history` row it holds.
-    pub fn insert<K: Kind>(&mut self, name: &str, value: &K) -> Result<Stamp, StoreError> {
+    /// Inserts a resource homed here, logged as a `create` entry by `origin`. Its version is the
+    /// next local home sequence, which also stamps every `records` and `history` row it holds.
+    pub fn insert<K: Kind>(&mut self, name: &str, value: &K, origin: &Origin) -> Result<Stamp, StoreError> {
         let rows = Encoder::encode(value)?;
-        self.guarded(|ctx| ctx.insert::<K>(name, rows))
+        self.guarded(|ctx| ctx.insert::<K>(name, rows, origin.clone()))
     }
 
-    /// The spec edit: writes only the rows that differ between `current.value` and `next`,
-    /// refusing if the resource moved past `current.version`. A write with no row changes is a
-    /// no-op. What edges write is refused (`NotThroughEdge`): a changed `state` column (a label,
-    /// its `since` or a column datum), and any append to, change of or removal from a `records`,
-    /// `history` or state data table. Rows nested in a spec
-    /// child row the edit inserts or removes go with it, and an inserted one is stamped with this
-    /// write's version. State and records move only through [`Write::apply_edge`].
-    pub fn update<K: Kind>(&mut self, current: &Loaded<K>, next: &K) -> Result<Stamp, StoreError> {
+    /// The spec edit, logged as an `edit` entry by `origin`: writes only the fields and rows that
+    /// differ between `current.value` and `next`, refusing if the resource moved past
+    /// `current.version`. A write with no row changes is a no-op and logs nothing. What edges
+    /// write is refused (`NotThroughEdge`): a changed `state` column (a label, its `since` or a
+    /// column datum), and any append to, change of or removal from a `records`, `history` or state
+    /// data table. Rows nested in a spec child row the edit inserts or removes go with it, and an
+    /// inserted one is stamped with this write's version. State and records move only through
+    /// [`Write::apply_edge`].
+    pub fn update<K: Kind>(&mut self, current: &Loaded<K>, next: &K, origin: &Origin) -> Result<Stamp, StoreError> {
         let old = Encoder::encode(&current.value)?;
         let new = Encoder::encode(next)?;
-        self.guarded(|ctx| ctx.update::<K>(current.stamp(), old, new))
+        self.guarded(|ctx| ctx.update::<K>(current.stamp(), old, new, origin.clone()))
     }
 
-    pub fn delete<K: Kind>(&mut self, current: Stamp) -> Result<(), StoreError> {
-        self.guarded(|ctx| ctx.delete::<K>(current))
+    /// Deletes a resource's rows, logged as a `delete` entry by `origin`. Its history and identity
+    /// stay (#3392 G9): a delete is an event, and only [`Write::expunge`] removes them.
+    pub fn delete<K: Kind>(&mut self, current: Stamp, origin: &Origin) -> Result<(), StoreError> {
+        self.guarded(|ctx| ctx.delete::<K>(current, origin.clone()))
     }
 
-    /// Applies one edge to a resource homed here, as one write at the next home sequence: the
-    /// event and every declared append go in at their table's next position under their parent
-    /// row (read backwards through the primary key), stamped with the write's sequence; the
-    /// declared fields are set by their own statements (a label-plus-data state's label and data
-    /// by one, so its per-label CHECK holds), and its collection data rows are inserted, updated
-    /// and deleted one at a time, so no other column or row is written; one `change_log` entry
-    /// holds exactly those row operations, with a `PutObject` for every object the edge's values
-    /// name.
+    /// Removes a deleted resource's history: its log entries, then its identity, in this write's
+    /// transaction (#3392 A1), and logs one `expunge` entry naming the identity by kind, name and
+    /// home, the one entry about the resource that stays. Entries about it keep their rows, their
+    /// `about` set to null (A2). Returns the entry's home sequence.
+    ///
+    /// Refused as `NotFound`, `WrongKind` or `NotHome` for a resource this store may not write,
+    /// `Live` for one not deleted, and `Referenced` while another resource's row references it.
+    pub fn expunge<K: Kind>(&mut self, id: ResourceId, origin: &Origin) -> Result<u64, StoreError> {
+        self.guarded(|ctx| ctx.expunge::<K>(id, origin.clone()))
+    }
+
+    /// Applies one edge to a resource homed here, as one write at the next home sequence, logged
+    /// as an `edge` entry: the event's header (edge, from- and to-label, writer, time, master) and
+    /// payload, and an effect holding the edge's state as one unit, the fields it sets, the state's
+    /// collection rows it edits and the rows it appends, each at its table's next position under
+    /// its parent row (read backwards through the primary key) and stamped with the write's
+    /// sequence, with every object the edge's values name. A label-plus-data state's label and
+    /// data are set by one statement, so its per-label CHECK holds.
     ///
     /// Refusals, in order, all inside this write's transaction (#3373 ruling 5): `NotFound`,
-    /// `WrongKind` or `NotHome` for a resource this store may not write; then `Conflict` (or
-    /// `NotFound` once deleted) when the stored version is not `current.version`; then `WrongFrom`
-    /// when the stored label of the edge's state is not the event's `from`; then `NoRecord` for an
-    /// edge on a `records` row that does not exist. Nothing is written by a refused edge, and the
-    /// transaction stays usable.
+    /// `WrongKind` or `NotHome` for a resource this store may not write; then `UnknownEdge` or
+    /// `UnknownLabel` for codes that are not the kind's (`#[store(edges = E)]` and its root
+    /// state's labels); then `Conflict` (or `NotFound` once deleted) when the stored version is not
+    /// `current.version`; then `WrongFrom` when the stored label of the edge's state is not the
+    /// event's `from`; then `NoRecord` for an edge on a `records` row that does not exist. Nothing
+    /// is written by a refused edge, and the transaction stays usable.
     pub fn apply_edge<K: Kind>(&mut self, current: Stamp, edge: Edge<K>) -> Result<Stamp, StoreError> {
         let parts = edge.into_parts();
         self.guarded(|ctx| ctx.apply_edge::<K>(current, parts))
     }
 
-    /// Applies a change homed elsewhere, as replication receives it: the kind must be
-    /// registered (`UnknownKind`), the home must not be this store's (`OwnHome`), and a change at
-    /// or below the identity's sequence is `Duplicate` and changes nothing, so replaying a log is
-    /// idempotent. The identity's sequence survives a delete and any trimming of `change_log`,
-    /// so a replayed change never resurrects a deleted resource. A change whose `prev_seq` is not
-    /// the identity's sequence follows a change this store has not applied: it is a `Gap`, and
-    /// the caller fetches the missing changes first. Ops that would fail part-way are refused
-    /// before any statement runs (see `check_ops`). Otherwise the ops run through the kind's
-    /// statements, the resource's version and the identity's sequence become `home_seq`,
-    /// objects are verified against their hashes, the change is appended to this store's
-    /// `change_log` under its own home, and that home's `home_sequence` rises to at least
-    /// `home_seq`.
-    pub fn apply(&mut self, change: &RowChange) -> Result<Applied, StoreError> {
-        self.guarded(|ctx| ctx.apply(change))
+    /// Applies an event homed elsewhere, as replication receives it: the kind must be registered
+    /// (`UnknownKind`), the home must not be this store's (`OwnHome`), and an event at or below
+    /// the identity's sequence is `Duplicate` and changes nothing, so replaying a log is
+    /// idempotent. The identity's sequence survives a delete, so a replayed event never
+    /// resurrects a deleted resource. An expunged identity's entry stays as its tombstone, so a
+    /// replayed expunge, or an event of an unknown identity older than a logged expunge of it, is
+    /// `AlreadyExpunged`. An event whose `prev_seq` is not the identity's sequence follows one this
+    /// store has not applied: it is a `Gap`, and the caller fetches the missing events first. An
+    /// edge's codes are checked against the kind as the writer checks them. Otherwise the effect
+    /// is lowered and executed exactly as a local write's is, objects verified against their
+    /// hashes and a named object neither carried nor stored refused (`MissingObject`); the resource's version and the identity's sequence become `home_seq`,
+    /// the event is logged under its own home, and that home's `home_sequence` rises to at least
+    /// `home_seq`. An expunge removes the identity's entries and identity if this store holds
+    /// them, and is logged (`Expunged`).
+    pub fn apply(&mut self, event: &Event) -> Result<Applied, StoreError> {
+        self.guarded(|ctx| ctx.apply(event))
+    }
+
+    /// Seeds a replica with a resource homed elsewhere from its snapshot, as replication's catch-up
+    /// begins (#3208 snapshot plus tail): the rows as the snapshot holds them, records stamps
+    /// included, and the objects they name. The identity's sequence becomes the snapshot's version,
+    /// so the resource's entries after it apply in order. A snapshot is no event: nothing is
+    /// logged, and the entries before it stay with their home. Refused as `OwnHome` for this
+    /// store's own resources, `UnknownKind`, and `Exists` when the resource's rows or an entry at
+    /// or past the version are already here.
+    pub fn restore(&mut self, snapshot: &Snapshot) -> Result<Stamp, StoreError> {
+        self.guarded(|ctx| ctx.restore(snapshot))
     }
 
     pub fn commit(self) -> Result<(), StoreError> {
@@ -438,17 +482,93 @@ impl Write<'_> {
 /// least one entry, so paging progresses even past an entry larger than the budget.
 pub const MAX_CHANGES_PAGE_BYTES: usize = 32 * 1024 * 1024;
 
-/// What `apply` did with a change.
+/// What `apply` did with an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applied {
-    /// The change's rows were written; the resource is at the change's sequence.
+    /// The event's rows were written; the resource is at the event's sequence.
     Applied(Stamp),
-    /// The resource was already at or past the change's sequence; nothing was written.
+    /// An expunge: the identity's entries and identity are gone, and the entry is logged.
+    Expunged,
+    /// The resource was already at or past the event's sequence; nothing was written.
     Duplicate(ResourceId),
+    /// The event's identity was expunged: the event is a replayed expunge, or one older than the
+    /// logged expunge that is its tombstone. Its identity is gone, so there is no resource to
+    /// name; nothing was written, and an expunged resource never returns.
+    AlreadyExpunged,
+}
+
+/// A position in one resource's entries about it: after the entry at this time and local row.
+/// Only the store makes cursors; one is meaningful only in the store that made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AboutCursor {
+    at: Timestamp,
+    rowid: i64,
+}
+
+/// One page of entries about a resource. `next` is present when the page is full: pass it back
+/// as `after` for the next page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AboutPage {
+    pub events: Vec<Event>,
+    pub next: Option<AboutCursor>,
+}
+
+/// An entry's header columns.
+struct Header {
+    cause: Cause,
+    writer: String,
+    at: Timestamp,
+    about: Option<Identity>,
+    payload: Option<Vec<u8>>,
+}
+
+/// One `log` row as read back, in the shared select's column order.
+struct LogRow {
+    rowid: i64,
+    home_seq: i64,
+    resource: Option<i64>,
+    prev_seq: i64,
+    cause: String,
+    edge: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    about: Option<i64>,
+    writer: String,
+    at: i64,
+    payload: Option<Vec<u8>>,
+    effect: Vec<u8>,
+    home: String,
+}
+
+impl LogRow {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogRow> {
+        Ok(LogRow {
+            rowid: row.get(0)?,
+            home_seq: row.get(1)?,
+            resource: row.get(2)?,
+            prev_seq: row.get(3)?,
+            cause: row.get(4)?,
+            edge: row.get(5)?,
+            from: row.get(6)?,
+            to: row.get(7)?,
+            about: row.get(8)?,
+            writer: row.get(9)?,
+            at: row.get(10)?,
+            payload: row.get(11)?,
+            effect: row.get(12)?,
+            home: row.get(13)?,
+        })
+    }
+}
+
+/// The bytes of every object in `hashes`, taken from `objects`: an event carries every object it
+/// sets, so it applies on its own to a receiver holding the resource's earlier state.
+fn carried(hashes: BTreeSet<Hash>, mut objects: BTreeMap<Hash, Vec<u8>>) -> Result<BTreeMap<Hash, Vec<u8>>, StoreError> {
+    hashes.into_iter().map(|hash| Ok((hash, objects.remove(&hash).ok_or(DecodeError::MissingObject { hash })?))).collect()
 }
 
 /// One table's change within an update.
-enum Change<'r> {
+enum Diff<'r> {
     Insert(&'r Row),
     /// The row before, and after.
     Update(&'r Row, &'r Row),
@@ -606,31 +726,34 @@ impl Ctx<'_> {
         values.iter().map(|value| self.param(value)).collect()
     }
 
-    /// Stores the given objects, which `objects` holds; equal content shares one row. Returns a
-    /// `PutObject` for every one of them, stored now or before, moving its bytes out of
-    /// `objects`: a change carries every object it sets, so it applies on its own to a receiver
-    /// holding the resource's earlier state.
-    fn put_objects(&mut self, hashes: BTreeSet<Hash>, objects: &mut BTreeMap<Hash, Vec<u8>>) -> Result<Vec<RowOp>, StoreError> {
+    /// Stores an event's objects, each verified against its hash; equal content shares one row.
+    fn put_objects(&mut self, objects: &BTreeMap<Hash, Vec<u8>>) -> Result<(), StoreError> {
         let mut statement = self.conn.prepare_cached(OBJECT_PUT)?;
-        let mut ops = Vec::new();
-        for hash in hashes {
-            let bytes = objects.remove(&hash).ok_or(DecodeError::MissingObject { hash })?;
-            statement.execute(params![&hash.0[..], &bytes])?;
-            ops.push(RowOp::PutObject { hash, bytes });
+        for (hash, bytes) in objects {
+            if Hash::of(bytes) != *hash {
+                return Err(StoreError::TamperedObject { hash: *hash });
+            }
+            statement.execute(params![&hash.0[..], bytes])?;
         }
-        Ok(ops)
-    }
-
-    fn insert_row(&mut self, code: KindCode, table: usize, owner: ResourceId, key: &[Value], values: &[Value]) -> Result<(), StoreError> {
-        let mut params = vec![SqlValue::Integer(owner.0)];
-        params.extend(self.params(key)?);
-        params.extend(self.params(values)?);
-        let sql = &self.sql(code)?.tables[table].insert;
-        self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
         Ok(())
     }
 
-    fn insert<K: Kind>(&mut self, name: &str, mut rows: Rows) -> Result<Stamp, StoreError> {
+    /// Refuses ops naming an object the event does not carry and this store lacks: an event
+    /// carries every object it sets, and an unchanged object column names one the resource's
+    /// earlier state brought.
+    fn check_objects(&mut self, ops: &[Op], carried: &BTreeMap<Hash, Vec<u8>>) -> Result<(), StoreError> {
+        // One primary-key probe per object a row names; batch it if replication measures it (#3431).
+        let mut statement = self.conn.prepare_cached(OBJECT_EXISTS)?;
+        for value in ops.iter().flat_map(Op::values) {
+            let Value::Object(hash) = value else { continue };
+            if !carried.contains_key(hash) && statement.query_row([&hash.0[..]], |_| Ok(())).optional()?.is_none() {
+                return Err(StoreError::MissingObject { hash: *hash });
+            }
+        }
+        Ok(())
+    }
+
+    fn insert<K: Kind>(&mut self, name: &str, rows: Rows, origin: Origin) -> Result<Stamp, StoreError> {
         self.sql(K::CODE)?;
         let identity = Identity { kind: K::CODE, name: name.to_owned(), home: self.runtime.home.clone() };
         let id = self.ensure_identity(&identity)?;
@@ -639,42 +762,39 @@ impl Ctx<'_> {
             return Err(StoreError::Exists { kind: K::CODE, name: name.to_owned() });
         }
         let (sequence, version) = self.next_sequence()?;
-        // Objects before any row naming them: their foreign keys are checked per statement.
-        let hashes = rows.tables.iter().flatten().flat_map(|row| set_objects(None, row)).collect();
-        let mut ops = self.put_objects(hashes, &mut rows.objects)?;
-        let objects = ops.len();
-        // Pre-order puts every parent table before its children. Every records and history row is
-        // appended by this write, so each is stamped with its sequence.
-        for (table, table_rows) in rows.tables.into_iter().enumerate() {
-            let table = &self.sql(K::CODE)?.tables[table];
-            ops.extend(table_rows.into_iter().map(|mut row| {
-                stamp(table.role, &mut row.values, sequence);
-                RowOp::Insert { table: table.name.clone(), key: row.key, values: row.values }
-            }));
+        // Every root field, then every row in pre-order, so each parent row precedes its children.
+        let sql = self.sql(K::CODE)?;
+        let mut changes = sql.root_sets(&rows.tables[0][0].values);
+        for (table, table_rows) in rows.tables.iter().enumerate().skip(1) {
+            for row in table_rows {
+                changes.push(sql.added(table, row)?);
+            }
         }
-        self.execute(K::CODE, id, &ops[objects..], sequence, None)?;
-        self.append_log(identity, id, (sequence, version), ops)?;
+        let hashes: BTreeSet<Hash> = rows.tables.iter().flatten().flat_map(|row| set_objects(None, row)).collect();
+        let effect = Effect { changes, objects: carried(hashes, rows.objects)?, expunged: None };
+        let header = Header { cause: Cause::Create, writer: origin.writer, at: origin.at, about: None, payload: origin.payload };
+        self.write_local(K::CODE, id, header, effect, (sequence, version), None)?;
         Ok(Stamp { id, version })
     }
 
-    fn update<K: Kind>(&mut self, current: Stamp, mut old: Rows, mut new: Rows) -> Result<Stamp, StoreError> {
-        let identity = self.owned::<K>(current.id)?;
+    fn update<K: Kind>(&mut self, current: Stamp, mut old: Rows, mut new: Rows, origin: Origin) -> Result<Stamp, StoreError> {
+        self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
         // The encoder already emits each table in key order (positions ascend, maps are
         // ordered, nested rows follow their parent); the diff's merge relies on that order,
         // so it is restored here rather than trusted.
         old.sort();
         new.sort();
-        let Rows { tables: new, objects: mut new_objects } = new;
+        let Rows { tables: new, objects: new_objects } = new;
         let sql = self.sql(K::CODE)?;
-        let changes = diff(&sql.tables, &old.tables, &new)?;
+        let diffs = diff(&sql.tables, &old.tables, &new)?;
         let root_changed = old.tables[0][0].values != new[0][0].values;
         if root_changed {
             if let Some(column) = changed_state(&sql.tables[0], &old.tables[0][0], &new[0][0]) {
                 return Err(StoreError::NotThroughEdge { table: sql.tables[0].name.clone(), column: Some(column) });
             }
         }
-        if !root_changed && changes.iter().all(Vec::is_empty) {
+        if !root_changed && diffs.iter().all(Vec::is_empty) {
             // A no-op still answers whether the caller's version is current.
             let stored: Option<i64> =
                 self.conn.prepare_cached(&sql.root_version)?.query_row([current.id.0], |row| row.get(0)).optional()?;
@@ -684,67 +804,83 @@ impl Ctx<'_> {
                 None => Err(StoreError::NotFound { id: current.id }),
             };
         }
-        let (sequence, version) = self.next_sequence()?;
-        // Objects before any row naming them. A refused write rolls them back with its savepoint.
-        // Only objects this change sets: an unchanged object column names an object the
-        // receiver already holds, from a snapshot or the change that set it.
-        let changed = changes.iter().flatten().filter_map(|change| match change {
-            Change::Insert(row) => Some((None, *row)),
-            Change::Update(before, after) => Some((Some(*before), *after)),
-            Change::Delete(_) => None,
+        // The root's changed fields first: the first of them is the optimistic version check, so a
+        // stale version is refused before any child row changes.
+        let mut changes = Vec::new();
+        let (before, after) = (&old.tables[0][0].values, &new[0][0].values);
+        for field in &sql.tables[0].fields {
+            let columns = field.columns.clone();
+            if before[columns.clone()] != after[columns.clone()] {
+                let values = named(&sql.tables[0].data()[columns.clone()], &after[columns]);
+                changes.push(Change::Set { row: Vec::new(), field: field.name.clone(), values });
+            }
+        }
+        // Removals deepest table first, so no child outlives its parent row; then replaced rows;
+        // then added rows shallowest table first, so every parent row exists before its children.
+        for (table, diffs) in diffs.iter().enumerate().rev() {
+            for diff in diffs {
+                if let Diff::Delete(row) = diff {
+                    changes.push(sql.removed(table, &row.key));
+                }
+            }
+        }
+        for inserts in [false, true] {
+            for (table, diffs) in diffs.iter().enumerate() {
+                for diff in diffs {
+                    match (diff, inserts) {
+                        (Diff::Update(_, row), false) | (Diff::Insert(row), true) => changes.push(sql.added(table, row)?),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Only objects this event sets: an unchanged object column names an object the receiver
+        // already holds, from a snapshot or the event that set it.
+        let changed = diffs.iter().flatten().filter_map(|diff| match diff {
+            Diff::Insert(row) => Some((None, *row)),
+            Diff::Update(before, after) => Some((Some(*before), *after)),
+            Diff::Delete(_) => None,
         });
         let root = root_changed.then(|| (Some(&old.tables[0][0]), &new[0][0]));
         let hashes = changed.chain(root).flat_map(|(before, after)| set_objects(before, after)).collect();
-        // Objects first: the root and child rows reference them through immediate foreign keys.
-        // A stale write therefore inserts its objects before the version check refuses it; the
-        // savepoint rolls them back, and the cost is only paid by writes that lose a race.
-        let mut ops = self.put_objects(hashes, &mut new_objects)?;
-        let objects = ops.len();
-        let tables = &self.sql(K::CODE)?.tables;
-        let op = |table: usize, change: &Change<'_>| {
-            let (role, table) = (tables[table].role, tables[table].name.clone());
-            match change {
-                Change::Insert(row) => {
-                    // An inserted records or history row is appended by this write, whatever
-                    // version the caller's value held.
-                    let mut values = row.values.clone();
-                    stamp(role, &mut values, sequence);
-                    RowOp::Insert { table, key: row.key.clone(), values }
-                }
-                Change::Update(_, row) => RowOp::Update { table, key: row.key.clone(), values: row.values.clone() },
-                Change::Delete(row) => RowOp::Delete { table, key: row.key.clone() },
-            }
-        };
-        // The root row first: a stale version is refused before any child row changes.
-        if root_changed {
-            ops.push(RowOp::Update { table: tables[0].name.clone(), key: Vec::new(), values: new[0][0].values.clone() });
-        }
-        // Deletes deepest table first, so no child outlives its parent row; then updates; then
-        // inserts shallowest table first, so every parent row exists before its children.
-        for (table, changes) in changes.iter().enumerate().rev() {
-            ops.extend(changes.iter().filter(|change| matches!(change, Change::Delete(_))).map(|change| op(table, change)));
-        }
-        for inserts in [false, true] {
-            for (table, changes) in changes.iter().enumerate() {
-                let wanted = |change: &&Change<'_>| matches!((change, inserts), (Change::Update(..), false) | (Change::Insert(_), true));
-                ops.extend(changes.iter().filter(wanted).map(|change| op(table, change)));
-            }
-        }
-        if !self.execute(K::CODE, current.id, &ops[objects..], sequence, Some(expected))? {
+        let effect = Effect { changes, objects: carried(hashes, new_objects)?, expunged: None };
+        let (sequence, version) = self.next_sequence()?;
+        let header = Header { cause: Cause::Edit, writer: origin.writer, at: origin.at, about: None, payload: origin.payload };
+        if !self.write_local(K::CODE, current.id, header, effect, (sequence, version), Some(expected))? {
             return Err(self.stale::<K>(current));
         }
-        self.append_log(identity, current.id, (sequence, version), ops)?;
         Ok(Stamp { id: current.id, version })
     }
 
+    /// Refuses an edge whose codes are not the kind's: an edge code it does not declare
+    /// (`#[store(edges = E)]`), or a `from` or `to` that is no label of its root state.
+    fn check_edge(&self, code: KindCode, edge: Code, from: Code, to: Code) -> Result<(), StoreError> {
+        let sql = self.sql(code)?;
+        if !sql.edges.contains(&edge) {
+            return Err(StoreError::UnknownEdge { kind: code, edge });
+        }
+        let (_, labels) = sql.edge_state.as_ref().ok_or(StoreError::UnknownEdge { kind: code, edge })?;
+        for label in [from, to] {
+            if !labels.contains(&label) {
+                return Err(StoreError::UnknownLabel { kind: code, label });
+            }
+        }
+        Ok(())
+    }
+
     fn apply_edge<K: Kind>(&mut self, current: Stamp, parts: EdgeParts) -> Result<Stamp, StoreError> {
-        let identity = self.owned::<K>(current.id)?;
+        self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
-        let EdgeParts { sets, rows, appends, mut objects, from } = parts;
+        let EdgeParts { sets, rows, appends, objects, from, event } = parts;
+        self.check_edge(K::CODE, event.edge, event.from, event.to)?;
+        let state = self.sql(K::CODE)?.edge_state.as_ref().map(|(field, _)| field.as_str());
+        if state != Some(from.field) {
+            return Err(StoreError::EdgeTarget { table: self.sql(K::CODE)?.tables[0].name.clone(), field: from.field.to_owned() });
+        }
         // A stale stamp is answered first: the caller re-reads on `Conflict`, which would show
         // whatever else (a label other than the event's `from`, a missing records row) also makes
         // this edge wrong. Then the stored label must be the one the event leaves. One read of the
-        // root row by its primary key gives both; the root update below checks the version again
+        // root row by its primary key gives both; the root write below checks the version again
         // under the write.
         let select = {
             let sql = self.sql(K::CODE)?;
@@ -761,41 +897,56 @@ impl Ctx<'_> {
             }
             Some(_) => {}
         }
+        // The state as one unit first (its first write is the optimistic version check), then the
+        // other fields, the root's before those of records rows; then the state's collection rows,
+        // then the appends.
+        let mut states: Vec<(usize, Vec<Value>, String, Named)> = Vec::new();
         let (mut root_sets, mut record_sets) = (Vec::new(), Vec::new());
         for set in sets {
             let (table, key) = self.edge_row(K::CODE, set.row)?;
             let target = &self.sql(K::CODE)?.tables[table];
-            if !target.fields.iter().any(|field| field.name == set.field) {
-                return Err(StoreError::EdgeTarget { table: target.name.clone(), field: set.field.to_owned() });
+            let field = target
+                .fields
+                .iter()
+                .position(|field| field.name == set.field)
+                .ok_or_else(|| StoreError::EdgeTarget { table: target.name.clone(), field: set.field.to_owned() })?;
+            let values = named(&target.data()[target.fields[field].columns.clone()], &set.values);
+            // A state's label field, or a datum of it: its group's label field names the unit.
+            let label = match target.fields[field].group {
+                Some(group) => Some(target.groups[group].fields[0]),
+                None => target.fields[field].label.then_some(field),
+            };
+            if let Some(label) = label {
+                let label = target.fields[label].name.clone();
+                match states.iter_mut().find(|(t, k, l, _)| *t == table && *k == key && *l == label) {
+                    Some((_, _, _, unit)) => unit.extend(values),
+                    None => states.push((table, key, label, values)),
+                }
+                continue;
             }
-            let op = RowOp::Set { table: target.name.clone(), key, field: set.field.to_owned(), values: set.values };
+            let row = self.sql(K::CODE)?.row_path(table, &key);
+            let change = Change::Set { row, field: set.field.to_owned(), values };
             if table == 0 {
-                root_sets.push(op);
+                root_sets.push(change);
             } else {
-                record_sets.push(op);
+                record_sets.push(change);
             }
         }
-        let mut row_ops = Vec::new();
+        let sql = self.sql(K::CODE)?;
+        let mut changes: Vec<Change> =
+            states.into_iter().map(|(table, key, field, values)| Change::State { row: sql.row_path(table, &key), field, values }).collect();
+        changes.extend(root_sets);
+        changes.extend(record_sets);
         for EdgeRow { under, table, edit } in rows {
             let (parent, parent_key) = self.edge_row(K::CODE, under)?;
             let index = self.child_table(K::CODE, parent, table, TableRole::State)?;
-            let table = self.sql(K::CODE)?.tables[index].name.clone();
-            let full = |own: Vec<Value>| parent_key.iter().cloned().chain(own).collect();
-            row_ops.push(match edit {
-                RowEdit::Insert { key, values } => RowOp::Insert { table, key: full(key), values },
-                RowEdit::Update { key, values } => RowOp::Update { table, key: full(key), values },
-                RowEdit::Delete { key } => RowOp::Delete { table, key: full(key) },
+            let sql = self.sql(K::CODE)?;
+            let full = |own: Vec<Value>| parent_key.iter().cloned().chain(own).collect::<Vec<_>>();
+            changes.push(match edit {
+                RowEdit::Insert { key, values } | RowEdit::Update { key, values } => sql.added(index, &Row { key: full(key), values })?,
+                RowEdit::Delete { key } => sql.removed(index, &full(key)),
             });
         }
-        let (sequence, version) = self.next_sequence()?;
-        let hashes = objects.keys().copied().collect();
-        let mut ops = self.put_objects(hashes, &mut objects)?;
-        let objects = ops.len();
-        // The root's fields first: the first of them is the optimistic version check. Then the
-        // state data rows the edge edits, then its appends.
-        ops.extend(root_sets);
-        ops.extend(record_sets);
-        ops.extend(row_ops);
         // Positions taken by this edge, per table and parent row, after the first read.
         let mut taken: BTreeMap<(usize, Vec<Value>), i64> = BTreeMap::new();
         for append in appends {
@@ -816,31 +967,31 @@ impl Ctx<'_> {
                     *slot.insert(last.map_or(0, |last| last + 1))
                 }
             };
-            let tables = &self.sql(K::CODE)?.tables;
+            let sql = self.sql(K::CODE)?;
             if position > i64::from(u32::MAX) {
-                return Err(StoreError::PositionsExhausted { table: tables[table].name.clone() });
+                return Err(StoreError::PositionsExhausted { table: sql.tables[table].name.clone() });
             }
-            if append.rows.tables.len() != 1 + descendants(tables, table) {
-                return Err(StoreError::EdgeTarget { table: tables[table].name.clone(), field: append.table.to_owned() });
+            if append.rows.tables.len() != 1 + descendants(&sql.tables, table) {
+                return Err(StoreError::EdgeTarget { table: sql.tables[table].name.clone(), field: append.table.to_owned() });
             }
             let mut prefix = parent_key;
             prefix.push(Value::Int(position));
             // The appended row's tables follow its own in pre-order, so its encoding's table `n`
             // is the kind's table `table + n`, and every parent row precedes its children.
             for (offset, rows) in append.rows.tables.into_iter().enumerate() {
-                let target = &tables[table + offset];
-                for mut row in rows {
-                    let mut key = prefix.clone();
-                    key.append(&mut row.key);
-                    stamp(target.role, &mut row.values, sequence);
-                    ops.push(RowOp::Insert { table: target.name.clone(), key, values: row.values });
+                for row in rows {
+                    let key = prefix.iter().cloned().chain(row.key).collect();
+                    changes.push(sql.added(table + offset, &Row { key, values: row.values })?);
                 }
             }
         }
-        if !self.execute(K::CODE, current.id, &ops[objects..], sequence, Some(expected))? {
+        let (sequence, version) = self.next_sequence()?;
+        let cause = Cause::Edge { edge: event.edge, from: event.from, to: event.to };
+        let header = Header { cause, writer: event.writer, at: event.at, about: event.about, payload: Some(event.payload) };
+        let effect = Effect { changes, objects, expunged: None };
+        if !self.write_local(K::CODE, current.id, header, effect, (sequence, version), Some(expected))? {
             return Err(self.stale::<K>(current));
         }
-        self.append_log(identity, current.id, (sequence, version), ops)?;
         Ok(Stamp { id: current.id, version })
     }
 
@@ -878,115 +1029,249 @@ impl Ctx<'_> {
         Ok(self.conn.prepare_cached(sql)?.query_row(params_from_iter(params), |row| row.get::<_, Option<i64>>(0)).optional()?)
     }
 
-    fn delete<K: Kind>(&mut self, current: Stamp) -> Result<(), StoreError> {
-        let identity = self.owned::<K>(current.id)?;
+    fn delete<K: Kind>(&mut self, current: Stamp, origin: Origin) -> Result<(), StoreError> {
+        self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
         let (sequence, version) = self.next_sequence()?;
-        let ops = vec![RowOp::DeleteResource];
-        if !self.execute(K::CODE, current.id, &ops, sequence, Some(expected))? {
+        let header = Header { cause: Cause::Delete, writer: origin.writer, at: origin.at, about: None, payload: origin.payload };
+        if !self.write_local(K::CODE, current.id, header, Effect::default(), (sequence, version), Some(expected))? {
             return Err(self.stale::<K>(current));
         }
-        self.append_log(identity, current.id, (sequence, version), ops)?;
         Ok(())
     }
 
-    /// Applies a change homed elsewhere: see [`Write::apply`].
-    fn apply(&mut self, change: &RowChange) -> Result<Applied, StoreError> {
+    /// Removes a deleted resource's history and identity: see [`Write::expunge`].
+    fn expunge<K: Kind>(&mut self, id: ResourceId, origin: Origin) -> Result<u64, StoreError> {
+        let identity = self.owned::<K>(id)?;
+        let live = self.conn.prepare_cached(&self.sql(K::CODE)?.root_version)?.query_row([id.0], |_| Ok(())).optional()?;
+        if live.is_some() {
+            return Err(StoreError::Live { id });
+        }
+        let (sequence, version) = self.next_sequence()?;
+        let prev_seq = self.identity_seq(id)?;
+        let header = Header { cause: Cause::Expunge, writer: origin.writer, at: origin.at, about: None, payload: origin.payload };
+        self.remove_identity(id, &identity)?;
+        let effect = Effect { expunged: Some(identity.clone()), ..Effect::default() };
+        let bytes = effect.encode()?;
+        self.append_log(&identity.home, None, header, prev_seq, sequence, &bytes)?;
+        Ok(version)
+    }
+
+    /// Deletes an identity's log entries, then the identity: entries about it keep their rows,
+    /// their `about` set to null. A row of another resource still referencing it is `Referenced`.
+    fn remove_identity(&mut self, id: ResourceId, identity: &Identity) -> Result<(), StoreError> {
+        self.conn.prepare_cached(LOG_EXPUNGE)?.execute([id.0])?;
+        match self.conn.prepare_cached(IDENTITY_DELETE)?.execute([id.0]) {
+            Err(rusqlite::Error::SqliteFailure(error, _)) if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY => {
+                return Err(StoreError::Referenced { id });
+            }
+            result => result?,
+        };
+        // The id may be reused by a later identity, so no cache keeps it.
+        if let Some(pending) = &mut self.pending {
+            pending.identities.remove(identity);
+            pending.ids.remove(&id);
+        }
+        self.runtime.identities.remove(identity);
+        self.runtime.ids.remove(&id);
+        Ok(())
+    }
+
+    /// A local write's one path (#3392): its effect is encoded, the bytes decoded and the decoded
+    /// effect lowered and executed exactly as `apply` executes another home's, then the bytes are
+    /// logged. `false` when the root row is not at `expected`.
+    fn write_local(
+        &mut self,
+        code: KindCode,
+        id: ResourceId,
+        header: Header,
+        effect: Effect,
+        (sequence, _): (i64, u64),
+        expected: Option<i64>,
+    ) -> Result<bool, StoreError> {
+        let bytes = effect.encode()?;
+        let effect = Effect::decode(&bytes)?;
+        let home = self.runtime.home.clone();
+        let prev_seq = self.identity_seq(id)?;
+        self.record(code, id, &home, header, prev_seq, (&effect, &bytes), sequence, expected)
+    }
+
+    /// Writes an event's rows and logs it under `home` at `sequence`: its objects first (rows
+    /// reference them through immediate foreign keys), then the lowered ops, then the entry, and
+    /// the identity's sequence moves to `sequence`. `false`, with nothing logged, when the root
+    /// row is not at `expected`.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        code: KindCode,
+        id: ResourceId,
+        home: &str,
+        header: Header,
+        prev_seq: u64,
+        (effect, bytes): (&Effect, &[u8]),
+        sequence: i64,
+        expected: Option<i64>,
+    ) -> Result<bool, StoreError> {
+        let (create, delete) = (header.cause == Cause::Create, header.cause == Cause::Delete);
+        let ops = self.sql(code)?.lower(effect, sequence, create, delete)?;
+        self.put_objects(&effect.objects)?;
+        self.check_objects(&ops, &effect.objects)?;
+        if !self.execute(code, id, &ops, sequence, expected)? {
+            return Ok(false);
+        }
+        self.append_log(home, Some(id), header, prev_seq, sequence, bytes)?;
+        self.set_identity_seq(id, sequence)?;
+        Ok(true)
+    }
+
+    /// Applies an event homed elsewhere: see [`Write::apply`].
+    fn apply(&mut self, event: &Event) -> Result<Applied, StoreError> {
         let (root, root_table) = {
-            let sql = self.sql(change.kind)?;
+            let sql = self.sql(event.kind)?;
             (sql.root_version.clone(), sql.tables[0].name.clone())
         };
-        if change.home == self.runtime.home {
-            return Err(StoreError::OwnHome { home: change.home.clone() });
+        if event.home == self.runtime.home {
+            return Err(StoreError::OwnHome { home: event.home.clone() });
         }
-        let sequence = i64::try_from(change.home_seq)
-            .ok()
-            .filter(|sequence| *sequence > 0)
-            .ok_or(Malformed::Sequence { home_seq: change.home_seq })?;
-        let identity = Identity { kind: change.kind, name: change.name.clone(), home: change.home.clone() };
+        let sequence =
+            i64::try_from(event.home_seq).ok().filter(|sequence| *sequence > 0).ok_or(Malformed::Sequence { home_seq: event.home_seq })?;
+        let identity = event.identity();
         // Read-only first: a duplicate or a gap creates no identity or string row. The identity's
         // sequence outlives a delete, so it alone decides both; an unknown identity is at 0, and
-        // no change is at 0, so an unknown identity is never a duplicate.
+        // no event is at 0, so an unknown identity is never a duplicate.
         let known = self.resolve(&identity)?;
         let current = known.map_or(Ok(0), |id| self.identity_seq(id))?;
-        if let Some(id) = known.filter(|_| change.home_seq <= current) {
+        if let Some(id) = known.filter(|_| event.home_seq <= current) {
             return Ok(Applied::Duplicate(id));
         }
-        if change.prev_seq != current {
-            return Err(StoreError::Gap { expected: current, found: change.prev_seq });
-        }
-        // Duplicates and gaps are per identity, but a home numbers each change once: a sequence
+        // Duplicates and gaps are per identity, but a home numbers each event once: a sequence
         // already logged for another resource is the sender's error, refused before any write.
-        if let Some(home) = self.string_id(&change.home)? {
-            if self.conn.prepare_cached(LOG_TAKEN)?.query_row(params![home, sequence], |_| Ok(())).optional()?.is_some() {
-                return Err(Malformed::ReusedSequence { home: change.home.clone(), home_seq: change.home_seq }.into());
+        // The one exception is a replayed expunge, whose identity is gone.
+        if let Some(home) = self.string_id(&event.home)? {
+            let logged: Option<String> =
+                self.conn.prepare_cached(LOG_CAUSE)?.query_row(params![home, sequence], |row| row.get(0)).optional()?;
+            match logged {
+                Some(cause) if cause == Cause::Expunge.name() && event.cause == Cause::Expunge => return Ok(Applied::AlreadyExpunged),
+                Some(_) => return Err(Malformed::ReusedSequence { home: event.home.clone(), home_seq: event.home_seq }.into()),
+                None => {}
             }
+        }
+        if event.cause == Cause::Expunge {
+            return self.apply_expunge(event, known, current, sequence);
+        }
+        // An expunged identity has no row to hold its sequence, but its expunge entry stays: an
+        // event older than it is a late duplicate, never a new resource.
+        if known.is_none() && self.expunged_after(&identity, sequence)? {
+            return Ok(Applied::AlreadyExpunged);
+        }
+        if event.prev_seq != current {
+            return Err(StoreError::Gap { expected: current, found: event.prev_seq });
+        }
+        if let Cause::Edge { edge, from, to } = event.cause {
+            self.check_edge(event.kind, edge, from, to)?;
+        } else if event.about.is_some() || (event.cause == Cause::Delete && !event.effect.changes.is_empty()) {
+            return Err(Malformed::Shape { table: root_table }.into());
         }
         let id = match known {
             Some(id) => id,
             None => self.ensure_identity(&identity)?,
         };
         let stored: Option<i64> = self.conn.prepare_cached(&root)?.query_row([id.0], |row| row.get(0)).optional()?;
-        self.check_ops(&identity, &root_table, stored.is_some(), &change.ops)?;
-        if !self.execute(change.kind, id, &change.ops, sequence, stored)? {
+        if event.cause == Cause::Create && stored.is_some() {
+            return Err(StoreError::Exists { kind: identity.kind, name: identity.name });
+        }
+        let bytes = event.effect.encode()?;
+        let header = Header {
+            cause: event.cause,
+            writer: event.writer.clone(),
+            at: event.at,
+            about: event.about.clone(),
+            payload: event.payload.clone(),
+        };
+        if !self.record(event.kind, id, &event.home, header, event.prev_seq, (&event.effect, &bytes), sequence, stored)? {
             return Err(StoreError::NotFound { id });
         }
-        let home = self.intern(&change.home)?;
-        self.conn.prepare_cached(LOG_APPEND)?.execute(params![home, sequence, id.0, change.encode()?])?;
-        self.set_identity_seq(id, sequence)?;
+        let home = self.intern(&event.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
-        Ok(Applied::Applied(Stamp { id, version: change.home_seq }))
+        Ok(Applied::Applied(Stamp { id, version: event.home_seq }))
     }
 
-    /// Refuses, before any statement runs, a change that would fail part-way: a root `Insert`
-    /// for a resource whose root row exists (`Exists`); a row naming an object the change puts
-    /// only later (`Malformed::ObjectOrder`); a row naming an object the change does not carry
-    /// and this store lacks (`MissingObject`). A change carries every object it sets; an
-    /// unchanged object column of an updated row names an object the resource's earlier state
-    /// brought.
-    fn check_ops(&mut self, identity: &Identity, root: &str, exists: bool, ops: &[RowOp]) -> Result<(), StoreError> {
-        let carried: BTreeSet<Hash> = ops
-            .iter()
-            .filter_map(|op| match op {
-                RowOp::PutObject { hash, .. } => Some(*hash),
-                _ => None,
-            })
-            .collect();
-        let mut put = BTreeSet::new();
-        // One primary-key probe per object a row names; batch it if replication measures it.
-        let mut statement = self.conn.prepare_cached(OBJECT_EXISTS)?;
-        for op in ops {
-            let (key, values) = match op {
-                RowOp::PutObject { hash, .. } => {
-                    put.insert(*hash);
-                    continue;
-                }
-                RowOp::Insert { table, key, values } => {
-                    if exists && table == root {
-                        return Err(StoreError::Exists { kind: identity.kind, name: identity.name.clone() });
-                    }
-                    (key, values)
-                }
-                RowOp::Update { key, values, .. } | RowOp::Set { key, values, .. } => (key, values),
-                RowOp::Delete { .. } | RowOp::DeleteResource => continue,
-            };
-            for value in key.iter().chain(values) {
-                let Value::Object(hash) = value else { continue };
-                if put.contains(hash) {
-                    continue;
-                }
-                if carried.contains(hash) {
-                    return Err(Malformed::ObjectOrder { hash: *hash }.into());
-                }
-                if statement.query_row([&hash.0[..]], |_| Ok(())).optional()?.is_none() {
-                    return Err(StoreError::MissingObject { hash: *hash });
-                }
+    /// Whether this store logged an expunge of `identity` after `sequence` of its home.
+    fn expunged_after(&mut self, identity: &Identity, sequence: i64) -> Result<bool, StoreError> {
+        let Some(home) = self.string_id(&identity.home)? else { return Ok(false) };
+        let mut statement = self.conn.prepare_cached(LOG_EXPUNGED_AFTER)?;
+        let effects = statement.query_map(params![home, sequence], |row| row.get::<_, Vec<u8>>(0))?;
+        for effect in effects {
+            if Effect::decode(&effect?)?.expunged.as_ref() == Some(identity) {
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     }
 
-    /// The home sequence of the identity's last change; 0 when it has none.
+    /// Another home's expunge: the identity's entries and identity go, if this store holds them,
+    /// and the entry is logged. A store that never held the identity (it learned of the resource
+    /// only after its entries were expunged at home) logs the entry alone.
+    fn apply_expunge(&mut self, event: &Event, known: Option<ResourceId>, current: u64, sequence: i64) -> Result<Applied, StoreError> {
+        let identity = event.identity();
+        if event.effect.expunged.as_ref() != Some(&identity) || !event.effect.changes.is_empty() || event.about.is_some() {
+            return Err(Malformed::Shape { table: self.sql(event.kind)?.tables[0].name.clone() }.into());
+        }
+        if let Some(id) = known {
+            if event.prev_seq != current {
+                return Err(StoreError::Gap { expected: current, found: event.prev_seq });
+            }
+            let live = self.conn.prepare_cached(&self.sql(event.kind)?.root_version)?.query_row([id.0], |_| Ok(())).optional()?;
+            if live.is_some() {
+                return Err(StoreError::Live { id });
+            }
+            self.remove_identity(id, &identity)?;
+        }
+        let header =
+            Header { cause: Cause::Expunge, writer: event.writer.clone(), at: event.at, about: None, payload: event.payload.clone() };
+        let bytes = event.effect.encode()?;
+        self.append_log(&event.home, None, header, event.prev_seq, sequence, &bytes)?;
+        let home = self.intern(&event.home)?;
+        self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
+        Ok(Applied::Expunged)
+    }
+
+    /// Seeds a resource from its snapshot: see [`Write::restore`].
+    fn restore(&mut self, snapshot: &Snapshot) -> Result<Stamp, StoreError> {
+        let root = self.sql(snapshot.kind)?.root_version.clone();
+        if snapshot.home == self.runtime.home {
+            return Err(StoreError::OwnHome { home: snapshot.home.clone() });
+        }
+        let sequence = i64::try_from(snapshot.version)
+            .ok()
+            .filter(|sequence| *sequence > 0)
+            .ok_or(Malformed::Sequence { home_seq: snapshot.version })?;
+        let identity = Identity { kind: snapshot.kind, name: snapshot.name.clone(), home: snapshot.home.clone() };
+        let exists = || StoreError::Exists { kind: identity.kind, name: identity.name.clone() };
+        let id = self.ensure_identity(&identity)?;
+        if self.identity_seq(id)? >= snapshot.version
+            || self.conn.prepare_cached(&root)?.query_row([id.0], |_| Ok(())).optional()?.is_some()
+        {
+            return Err(exists());
+        }
+        let tables = self.sql(snapshot.kind)?.tables.len();
+        if snapshot.rows.tables.len() != tables || snapshot.rows.tables[0].len() != 1 {
+            return Err(Malformed::Shape { table: self.sql(snapshot.kind)?.tables[0].name.clone() }.into());
+        }
+        let mut ops = vec![Op::Root { values: snapshot.rows.tables[0][0].values.clone() }];
+        for (table, rows) in snapshot.rows.tables.iter().enumerate().skip(1) {
+            ops.extend(rows.iter().map(|row| Op::Insert { table, key: row.key.clone(), values: row.values.clone() }));
+        }
+        self.put_objects(&snapshot.rows.objects)?;
+        self.check_objects(&ops, &snapshot.rows.objects)?;
+        self.execute(snapshot.kind, id, &ops, sequence, None)?;
+        self.set_identity_seq(id, sequence)?;
+        let home = self.intern(&snapshot.home)?;
+        self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
+        Ok(Stamp { id, version: snapshot.version })
+    }
+
+    /// The home sequence of the identity's last event; 0 when it has none.
     fn identity_seq(&mut self, id: ResourceId) -> Result<u64, StoreError> {
         let seq: i64 = self.conn.prepare_cached(IDENTITY_SEQ)?.query_row([id.0], |row| row.get(0))?;
         u64::try_from(seq).map_err(|_| StoreError::Corrupt { table: "resource_identity".into(), column: "seq".into() })
@@ -997,86 +1282,59 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    /// Appends a local write's change under this home, at the sequence the write took.
+    /// Appends one entry under `home` at `sequence`: `resource` is `None` only for an expunge.
     fn append_log(
         &mut self,
-        identity: Identity,
-        id: ResourceId,
-        (sequence, version): (i64, u64),
-        ops: Vec<RowOp>,
+        home: &str,
+        resource: Option<ResourceId>,
+        header: Header,
+        prev_seq: u64,
+        sequence: i64,
+        effect: &[u8],
     ) -> Result<(), StoreError> {
-        let home = self.intern(&identity.home)?;
-        let prev_seq = self.identity_seq(id)?;
-        let change = RowChange { kind: identity.kind, name: identity.name, home: identity.home, home_seq: version, prev_seq, ops };
-        self.conn.prepare_cached(LOG_APPEND)?.execute(params![home, sequence, id.0, change.encode()?])?;
-        self.set_identity_seq(id, sequence)?;
+        let home = self.intern(home)?;
+        let writer = self.intern(&header.writer)?;
+        let about = header.about.as_ref().map(|about| self.ensure_identity(about)).transpose()?.map(|id| id.0);
+        let (edge, from, to) = match header.cause {
+            Cause::Edge { edge, from, to } => (Some(edge), Some(from), Some(to)),
+            _ => (None, None, None),
+        };
+        let (edge, from, to) = (edge.as_ref().map(Code::as_str), from.as_ref().map(Code::as_str), to.as_ref().map(Code::as_str));
+        let prev_seq = i64::try_from(prev_seq).map_err(|_| Malformed::Sequence { home_seq: prev_seq })?;
+        self.conn.prepare_cached(LOG_APPEND)?.execute(params![
+            home,
+            sequence,
+            resource.map(|id| id.0),
+            prev_seq,
+            header.cause.name(),
+            edge,
+            from,
+            to,
+            about,
+            writer,
+            header.at.micros(),
+            header.payload,
+            effect
+        ])?;
         Ok(())
     }
 
-    /// The index of a change's table within its kind, refusing a key or values that do not
-    /// match its columns. `values` is `None` for a delete.
-    fn table_of(&self, code: KindCode, name: &str, key: &[Value], values: Option<&[Value]>) -> Result<usize, StoreError> {
-        let tables = &self.sql(code)?.tables;
-        let index = tables.iter().position(|table| table.name == name).ok_or_else(|| Malformed::UnknownTable { table: name.to_owned() })?;
-        let table = &tables[index];
-        let data = table.columns.len() - table.key_len;
-        if key.len() != table.key_len || values.is_some_and(|values| values.len() != data) {
-            return Err(Malformed::Shape { table: name.to_owned() }.into());
-        }
-        Ok(index)
-    }
-
-    /// The table and field of a `Set`, refusing a key or values that do not match them.
-    fn field_of(&self, code: KindCode, op: (&str, &[Value], &str, &[Value])) -> Result<(usize, usize), StoreError> {
-        let (table, key, field, values) = op;
-        let index = self.table_of(code, table, key, None)?;
-        let fields = &self.sql(code)?.tables[index].fields;
-        let position = fields
-            .iter()
-            .position(|candidate| candidate.name == field)
-            .ok_or_else(|| Malformed::UnknownField { table: table.to_owned(), field: field.to_owned() })?;
-        if fields[position].columns.len() != values.len() {
-            return Err(Malformed::Shape { table: table.to_owned() }.into());
-        }
-        Ok((index, position))
-    }
-
-    /// Executes row ops for resource `id` through the kind's statements, as a write at
-    /// `sequence`. `expected` is the root row's version before the write (`None` when it has
-    /// none). Every write moves the root to `sequence`: by the root ops (the first checks
-    /// `expected`, later ones find `sequence`), or by a version update when the ops name only
-    /// child rows. Returns `false` when the root row is not at `expected`, so the caller can tell
-    /// a conflict from a missing resource. A `Set` of a child row that does not exist is
-    /// `NoRecord`. The contiguous `Set`s of one label-plus-data state of one row run as one
-    /// statement, so the state's per-label CHECK holds after it (a label and the data it brings
-    /// change together).
+    /// Executes ops for resource `id` as a write at `sequence`. `expected` is the root row's
+    /// version before the write (`None` when it has none). Every write moves the root to
+    /// `sequence`: by the root ops (the first checks `expected`, later ones find `sequence`), or
+    /// by a version update when the ops name only child rows. Returns `false` when the root row
+    /// is not at `expected`, so the caller can tell a conflict from a missing resource. A `Set` of
+    /// a child row that does not exist is `NoRecord`. A label-plus-data state's fields are set by
+    /// one statement, so its per-label CHECK holds after it.
     fn execute(
         &mut self,
         code: KindCode,
         id: ResourceId,
-        ops: &[RowOp],
+        ops: &[Op],
         sequence: i64,
         mut expected: Option<i64>,
     ) -> Result<bool, StoreError> {
-        // Every op's shape first, so a malformed change is refused as such rather than by the
-        // first statement it reaches.
-        let mut names_root = false;
-        for op in ops {
-            match op {
-                RowOp::Insert { table, key, values } | RowOp::Update { table, key, values } => {
-                    names_root |= self.table_of(code, table, key, Some(values))? == 0;
-                }
-                RowOp::Set { table, key, field, values } => names_root |= self.field_of(code, (table, key, field, values))?.0 == 0,
-                RowOp::Delete { table, key } => {
-                    if self.table_of(code, table, key, None)? == 0 {
-                        return Err(Malformed::RootDelete { table: table.clone() }.into());
-                    }
-                }
-                RowOp::DeleteResource => names_root = true,
-                RowOp::PutObject { .. } => {}
-            }
-        }
-        if !names_root {
+        if !ops.iter().any(Op::names_root) {
             let Some(expected) = expected else { return Ok(false) };
             let sql = &self.sql(code)?.root_update_version;
             if self.conn.prepare_cached(sql)?.execute(params![sequence, id.0, expected])? == 0 {
@@ -1084,33 +1342,32 @@ impl Ctx<'_> {
             }
         }
         let moved = Some(sequence);
-        let mut next = 0;
-        while let Some(op) = ops.get(next) {
-            next += 1;
+        for op in ops {
             match op {
-                RowOp::PutObject { hash, bytes } => {
-                    if Hash::of(bytes) != *hash {
-                        return Err(StoreError::TamperedObject { hash: *hash });
-                    }
-                    self.conn.prepare_cached(OBJECT_PUT)?.execute(params![&hash.0[..], bytes])?;
+                Op::Root { values } => {
+                    let mut params = vec![SqlValue::Integer(id.0), SqlValue::Integer(sequence)];
+                    params.extend(self.params(values)?);
+                    let sql = &self.sql(code)?.tables[0].insert;
+                    self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
+                    expected = moved;
                 }
-                RowOp::Insert { table, key, values } => match self.table_of(code, table, key, Some(values))? {
-                    0 => {
-                        let mut params = vec![SqlValue::Integer(id.0), SqlValue::Integer(sequence)];
-                        params.extend(self.params(values)?);
-                        let sql = &self.sql(code)?.tables[0].insert;
-                        self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
-                        expected = moved;
-                    }
-                    index => self.insert_row(code, index, id, key, values)?,
-                },
-                RowOp::Update { table, key, values } => {
-                    let index = self.table_of(code, table, key, Some(values))?;
-                    if self.sql(code)?.tables[index].update.is_empty() {
-                        return Err(Malformed::Shape { table: table.clone() }.into());
-                    }
+                Op::Insert { table, key, values } => {
+                    let mut params = vec![SqlValue::Integer(id.0)];
+                    params.extend(self.params(key)?);
+                    params.extend(self.params(values)?);
+                    let sql = &self.sql(code)?.tables[*table].insert;
+                    self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
+                }
+                Op::Put { table, key, values } => {
+                    let mut params = vec![SqlValue::Integer(id.0)];
+                    params.extend(self.params(key)?);
+                    params.extend(self.params(values)?);
+                    let sql = &self.sql(code)?.tables[*table].upsert;
+                    self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
+                }
+                Op::Set { table, key, field, values } => {
                     let mut params = Vec::new();
-                    if index == 0 {
+                    if *table == 0 {
                         let Some(expected) = expected else { return Ok(false) };
                         params.push(SqlValue::Integer(sequence));
                         params.extend(self.params(values)?);
@@ -1120,65 +1377,26 @@ impl Ctx<'_> {
                         params.push(SqlValue::Integer(id.0));
                         params.extend(self.params(key)?);
                     }
-                    let sql = &self.sql(code)?.tables[index].update;
-                    if self.conn.prepare_cached(sql)?.execute(params_from_iter(params))? == 0 && index == 0 {
+                    let sql = self.sql(code)?.tables[*table].fields[*field].update.clone();
+                    if !self.row_written(code, &sql, params, *table, key)? {
                         return Ok(false);
                     }
-                    if index == 0 {
+                    if *table == 0 {
                         expected = moved;
                     }
                 }
-                RowOp::Set { table, key, field, values } => {
-                    let (index, field) = self.field_of(code, (table, key, field, values))?;
-                    // A label-plus-data state's fields are set together, by one statement: the
-                    // contiguous `Set`s of one row's state (each field once) form one write.
-                    let mut set: Vec<(usize, &[Value])> = vec![(field, values)];
-                    let group = self.sql(code)?.tables[index].fields[field].group;
-                    if let Some(group) = group {
-                        while let Some(RowOp::Set { table: next_table, key: next_key, field: next_field, values: next_values }) =
-                            ops.get(next)
-                        {
-                            if next_table != table || next_key != key {
-                                break;
-                            }
-                            let (_, member) = self.field_of(code, (next_table, next_key, next_field, next_values))?;
-                            if self.sql(code)?.tables[index].fields[member].group != Some(group)
-                                || set.iter().any(|(set, _)| *set == member)
-                            {
-                                break;
-                            }
-                            set.push((member, next_values));
-                            next += 1;
-                        }
-                    }
+                Op::State { table, key, group, members } => {
                     let mut params = Vec::new();
-                    let check = if index == 0 {
+                    let check = if *table == 0 {
                         let Some(expected) = expected else { return Ok(false) };
                         params.push(SqlValue::Integer(sequence));
                         Some(expected)
                     } else {
                         None
                     };
-                    match group {
-                        None => params.extend(self.params(values)?),
-                        Some(group) => {
-                            let members: Vec<(usize, usize)> = {
-                                let table = &self.sql(code)?.tables[index];
-                                table.groups[group].fields.iter().map(|member| (*member, table.fields[*member].columns.len())).collect()
-                            };
-                            for (member, columns) in members {
-                                match set.iter().find(|(set, _)| *set == member) {
-                                    Some((_, values)) => {
-                                        params.push(SqlValue::Integer(1));
-                                        params.extend(self.params(values)?);
-                                    }
-                                    None => {
-                                        params.push(SqlValue::Integer(0));
-                                        params.extend(std::iter::repeat_n(SqlValue::Null, columns));
-                                    }
-                                }
-                            }
-                        }
+                    for values in members {
+                        params.push(SqlValue::Integer(1));
+                        params.extend(self.params(values)?);
                     }
                     match check {
                         Some(expected) => params.extend([SqlValue::Integer(id.0), SqlValue::Integer(expected)]),
@@ -1187,29 +1405,24 @@ impl Ctx<'_> {
                             params.extend(self.params(key)?);
                         }
                     }
-                    let table_sql = &self.sql(code)?.tables[index];
-                    let sql = match group {
-                        None => &table_sql.fields[field].update,
-                        Some(group) => &table_sql.groups[group].update,
-                    };
-                    if self.conn.prepare_cached(sql)?.execute(params_from_iter(params))? == 0 {
-                        if index == 0 {
-                            return Ok(false);
-                        }
-                        return Err(StoreError::NoRecord { table: table.clone(), key: key.clone() });
+                    let sql = self.sql(code)?.tables[*table].groups[*group].update.clone();
+                    if !self.row_written(code, &sql, params, *table, key)? {
+                        return Ok(false);
                     }
-                    if index == 0 {
+                    if *table == 0 {
                         expected = moved;
                     }
                 }
-                RowOp::Delete { table, key } => {
-                    let index = self.table_of(code, table, key, None)?;
+                Op::Delete { table, key } => {
+                    if *table == 0 {
+                        return Err(Malformed::RootDelete { table: self.sql(code)?.tables[0].name.clone() }.into());
+                    }
                     let mut params = vec![SqlValue::Integer(id.0)];
                     params.extend(self.params(key)?);
-                    let sql = &self.sql(code)?.tables[index].delete;
+                    let sql = &self.sql(code)?.tables[*table].delete;
                     self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
                 }
-                RowOp::DeleteResource => {
+                Op::DeleteResource => {
                     let Some(expected) = expected else { return Ok(false) };
                     // Child rows go with the root row through their cascading foreign keys.
                     let sql = &self.sql(code)?.root_delete;
@@ -1222,23 +1435,100 @@ impl Ctx<'_> {
         Ok(true)
     }
 
-    /// Logged changes of one resource after `after`, by `change_log_by_resource`.
-    fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
-        let after = i64::try_from(after).unwrap_or(i64::MAX);
-        let limit = page_limit(limit)?;
-        let mut statement = self.conn.prepare_cached(LOG_BY_RESOURCE)?;
-        let rows = statement.query_map(params![id.0, after, limit], |row| row.get::<_, Vec<u8>>(0))?;
-        page(rows, self.runtime.change_page_bytes)
+    /// Runs one row's field update: `false` when the root row is not at the expected version; a
+    /// `records` row that does not exist is `NoRecord`.
+    fn row_written(&mut self, code: KindCode, sql: &str, params: Vec<SqlValue>, table: usize, key: &[Value]) -> Result<bool, StoreError> {
+        if self.conn.prepare_cached(sql)?.execute(params_from_iter(params))? > 0 {
+            return Ok(true);
+        }
+        if table == 0 {
+            return Ok(false);
+        }
+        Err(StoreError::NoRecord { table: self.sql(code)?.tables[table].name.clone(), key: key.to_vec() })
     }
 
-    /// Logged changes homed at `home` after `after`, in home order, by the primary key.
-    fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<RowChange>, StoreError> {
+    /// Logged events of one resource after `after`, by `log_by_resource`.
+    fn changes(&mut self, id: ResourceId, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let limit = page_limit(limit)?;
+        self.events(LOG_BY_RESOURCE, params![id.0, after, limit]).map(|events| events.into_iter().map(|(_, event)| event).collect())
+    }
+
+    /// Logged events homed at `home` after `after`, in home order, by the primary key.
+    fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
         let limit = page_limit(limit)?;
         let Some(home) = self.string_id(home)? else { return Ok(Vec::new()) };
         let after = i64::try_from(after).unwrap_or(i64::MAX);
-        let mut statement = self.conn.prepare_cached(LOG_BY_HOME)?;
-        let rows = statement.query_map(params![home, after, limit], |row| row.get::<_, Vec<u8>>(0))?;
-        page(rows, self.runtime.change_page_bytes)
+        self.events(LOG_BY_HOME, params![home, after, limit]).map(|events| events.into_iter().map(|(_, event)| event).collect())
+    }
+
+    /// Entries about resource `id`, in time order, by `log_about`.
+    fn about(&mut self, id: ResourceId, after: Option<&AboutCursor>, limit: u32) -> Result<AboutPage, StoreError> {
+        let limit = page_limit(limit)?;
+        let events = match after {
+            None => self.events(LOG_ABOUT_FIRST, params![id.0, limit])?,
+            Some(cursor) => self.events(LOG_ABOUT_AFTER, params![id.0, cursor.at.micros(), cursor.rowid, limit])?,
+        };
+        let full = events.len() == usize::try_from(limit).unwrap_or(usize::MAX);
+        let next = events.last().filter(|_| full).map(|(rowid, event)| AboutCursor { at: event.at, rowid: *rowid });
+        Ok(AboutPage { events: events.into_iter().map(|(_, event)| event).collect(), next })
+    }
+
+    /// Reads entries until the next would take the page past the store's byte budget; the first is
+    /// always taken, so a page is never empty while entries remain. Each comes with its rowid.
+    fn events(&mut self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<(i64, Event)>, StoreError> {
+        let rows: Vec<LogRow> = {
+            let mut statement = self.conn.prepare_cached(sql)?;
+            let rows = statement.query_map(params, LogRow::read)?;
+            let mut out = Vec::new();
+            let mut used = 0usize;
+            for row in rows {
+                let row = row?;
+                used = used.saturating_add(row.effect.len()).saturating_add(row.payload.as_ref().map_or(0, Vec::len));
+                if !out.is_empty() && used > self.runtime.change_page_bytes {
+                    break;
+                }
+                out.push(row);
+            }
+            out
+        };
+        rows.into_iter().map(|row| self.event(row)).collect()
+    }
+
+    fn event(&mut self, row: LogRow) -> Result<(i64, Event), StoreError> {
+        let corrupt = |column: &str| StoreError::Corrupt { table: "log".into(), column: column.into() };
+        let effect = Effect::decode(&row.effect)?;
+        let identity = match row.resource {
+            Some(id) => self.identity_of(ResourceId(id))?.ok_or_else(|| corrupt("resource"))?,
+            None => effect.expunged.clone().ok_or_else(|| corrupt("effect"))?,
+        };
+        let cause = match (row.cause.as_str(), row.edge.as_deref(), row.from.as_deref(), row.to.as_deref()) {
+            ("create", None, None, None) => Cause::Create,
+            ("edit", None, None, None) => Cause::Edit,
+            ("edge", Some(edge), Some(from), Some(to)) => {
+                let code = |text: &str, column: &str| Code::parse(text).map_err(|_| corrupt(column));
+                Cause::Edge { edge: code(edge, "edge")?, from: code(from, "from")?, to: code(to, "to")? }
+            }
+            ("delete", None, None, None) => Cause::Delete,
+            ("expunge", None, None, None) => Cause::Expunge,
+            _ => return Err(corrupt("cause")),
+        };
+        let about = row.about.map(|id| self.identity_of(ResourceId(id))?.ok_or_else(|| corrupt("about"))).transpose()?;
+        let sequence = |value: i64, column: &str| u64::try_from(value).map_err(|_| corrupt(column));
+        let event = Event {
+            kind: identity.kind,
+            name: identity.name,
+            home: row.home,
+            home_seq: sequence(row.home_seq, "home_seq")?,
+            prev_seq: sequence(row.prev_seq, "prev_seq")?,
+            cause,
+            writer: row.writer,
+            at: Timestamp(row.at),
+            about,
+            payload: row.payload,
+            effect,
+        };
+        Ok((row.rowid, event))
     }
 
     /// The highest sequence taken (this home) or applied (another home) for `home`; 0 when none.
@@ -1350,22 +1640,6 @@ impl Ctx<'_> {
     }
 }
 
-/// Decodes log entries until the next would take the page past `budget` encoded bytes; the
-/// first entry is always taken, so a page is never empty while entries remain.
-fn page(entries: impl Iterator<Item = rusqlite::Result<Vec<u8>>>, budget: usize) -> Result<Vec<RowChange>, StoreError> {
-    let mut changes = Vec::new();
-    let mut used = 0usize;
-    for bytes in entries {
-        let bytes = bytes?;
-        used = used.saturating_add(bytes.len());
-        if !changes.is_empty() && used > budget {
-            break;
-        }
-        changes.push(RowChange::decode(&bytes)?);
-    }
-    Ok(changes)
-}
-
 /// The objects a row write sets: every object of an inserted row (`before` is `None`), and the
 /// object columns of an updated row whose value differs from `before`.
 fn set_objects<'r>(before: Option<&'r Row>, after: &'r Row) -> impl Iterator<Item = Hash> + 'r {
@@ -1376,14 +1650,6 @@ fn set_objects<'r>(before: Option<&'r Row>, after: &'r Row) -> impl Iterator<Ite
         Value::Object(hash) => Some(*hash),
         _ => None,
     })
-}
-
-/// Sets an appended `records` or `history` row's version stamp (its first value, as the
-/// descriptor validates) to the sequence of the write appending it.
-fn stamp(role: TableRole, values: &mut [Value], sequence: i64) {
-    if matches!(role, TableRole::Records | TableRole::History) {
-        values[0] = Value::Int(sequence);
-    }
 }
 
 /// A caller's version as stored. One that cannot be stored cannot be current either.
@@ -1403,8 +1669,8 @@ fn changed_state(table: &TableSql, before: &Row, after: &Row) -> Option<String> 
 /// (`NotThroughEdge`). The one
 /// exception is a row nested in a spec child row this write inserts or removes, which goes with
 /// that row.
-fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Result<Vec<Vec<Change<'r>>>, StoreError> {
-    let mut changes: Vec<Vec<Change<'r>>> = (0..tables.len()).map(|_| Vec::new()).collect();
+fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Result<Vec<Vec<Diff<'r>>>, StoreError> {
+    let mut changes: Vec<Vec<Diff<'r>>> = (0..tables.len()).map(|_| Vec::new()).collect();
     let mut removed: Vec<BTreeSet<&'r [Value]>> = (0..tables.len()).map(|_| BTreeSet::new()).collect();
     let mut inserted: Vec<BTreeSet<&'r [Value]>> = (0..tables.len()).map(|_| BTreeSet::new()).collect();
     // Rows kept by this write that belong to an existing records or history row (the row itself or
@@ -1441,7 +1707,7 @@ fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Re
                         return Err(refuse(sealing));
                     }
                     removed[index].insert(row.key.as_slice());
-                    changes[index].push(Change::Delete(row));
+                    changes[index].push(Diff::Delete(row));
                 }
                 Ordering::Greater => {
                     let row = new_rows.next().expect("peeked");
@@ -1450,7 +1716,7 @@ fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Re
                         return Err(refuse(sealing));
                     }
                     inserted[index].insert(row.key.as_slice());
-                    changes[index].push(Change::Insert(row));
+                    changes[index].push(Diff::Insert(row));
                 }
                 Ordering::Equal => {
                     let (before, after) = (old_rows.next().expect("peeked"), new_rows.next().expect("peeked"));
@@ -1462,7 +1728,7 @@ fn diff<'r>(tables: &[TableSql], old: &'r [Vec<Row>], new: &'r [Vec<Row>]) -> Re
                         if let Some(column) = changed_state(table, before, after) {
                             return Err(StoreError::NotThroughEdge { table: table.name.clone(), column: Some(column) });
                         }
-                        changes[index].push(Change::Update(before, after));
+                        changes[index].push(Diff::Update(before, after));
                     }
                     if let Some(sealing) = sealing {
                         sealed[index].insert(before.key.as_slice(), sealing);
@@ -1490,7 +1756,7 @@ fn descendants(tables: &[TableSql], table: usize) -> usize {
 mod tests {
     use flotilla_schema::{ColumnType, KindCode, Layout, Row, Rows, TableRole, Value};
 
-    use super::{diff, Change};
+    use super::{diff, Diff};
     use crate::{error::StoreError, sql::KindSql};
 
     fn row(key: &[i64], value: &str) -> Row {
@@ -1514,14 +1780,14 @@ mod tests {
         KindSql::render(&layout.finish())
     }
 
-    fn summary(changes: &[Vec<Change<'_>>]) -> Vec<(usize, &'static str, Vec<Value>)> {
+    fn summary(changes: &[Vec<Diff<'_>>]) -> Vec<(usize, &'static str, Vec<Value>)> {
         let mut out = Vec::new();
         for (table, changes) in changes.iter().enumerate() {
             for change in changes {
                 let (kind, row) = match change {
-                    Change::Insert(row) => ("insert", row),
-                    Change::Update(_, row) => ("update", row),
-                    Change::Delete(row) => ("delete", row),
+                    Diff::Insert(row) => ("insert", row),
+                    Diff::Update(_, row) => ("update", row),
+                    Diff::Delete(row) => ("delete", row),
                 };
                 out.push((table, kind, row.key.clone()));
             }
@@ -1543,7 +1809,7 @@ mod tests {
         );
     }
 
-    fn refusal(result: Result<Vec<Vec<Change<'_>>>, StoreError>) -> String {
+    fn refusal(result: Result<Vec<Vec<Diff<'_>>>, StoreError>) -> String {
         match result {
             Err(StoreError::NotThroughEdge { table, column }) => format!("NotThroughEdge {table} {column:?}"),
             other => format!("{:?}", other.map(|changes| summary(&changes))),

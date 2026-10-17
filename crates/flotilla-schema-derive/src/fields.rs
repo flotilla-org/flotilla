@@ -25,23 +25,29 @@ pub(crate) struct Field<'a> {
     pub shape: FieldShape,
     /// A datum of a label-plus-data state: a `child` datum's table is in the `state` role.
     pub state_datum: bool,
+    /// The earlier column name below the enclosing prefix (`#[store(alias = "old")]`), formed as
+    /// `name` is.
+    pub alias: Option<LitStr>,
 }
 
 impl<'a> Field<'a> {
     /// Classifies a named field; `variant` is the snake_case variant name inside a data enum.
     pub(crate) fn parse(field: &'a SynField, owner: &Ident, variant: Option<&str>) -> syn::Result<Field<'a>> {
         let ident = field.ident.as_ref().expect("named field");
-        let shape = shape::classify(attrs::field_attr(&field.attrs)?, &field.ty, owner)?;
+        let attrs = attrs::field_attrs(&field.attrs)?;
+        let shape = shape::classify(attrs.shape, &field.ty, owner)?;
         let plain = ident.unraw().to_string();
-        let name = match variant {
+        let prefixed = |plain: &str| match variant {
             Some(variant) => format!("{variant}_{plain}"),
-            None => plain.clone(),
+            None => plain.to_owned(),
         };
+        let name = prefixed(&plain);
+        let alias = attrs.alias.map(|alias| LitStr::new(&prefixed(&alias.value()), alias.span()));
         let local = match variant {
             Some(variant) => format_ident!("__store_{}_{}", variant, plain),
             None => format_ident!("__store_{}", plain),
         };
-        Ok(Field { ident, local, name: LitStr::new(&name, ident.span()), ty: &field.ty, vis: &field.vis, shape, state_datum: false })
+        Ok(Field { ident, local, name: LitStr::new(&name, ident.span()), ty: &field.ty, vis: &field.vis, shape, state_datum: false, alias })
     }
 
     /// The adapter type implementing `Adapter<FieldTy>` for this field's attribute.
@@ -126,20 +132,35 @@ impl<'a> Field<'a> {
 
     /// Declares the field's columns under `prefix` (an expression of type `&str`).
     pub(crate) fn layout(&self, prefix: &TokenStream, required: &TokenStream) -> TokenStream {
+        let layout = self.layout_columns(prefix, required);
+        self.aliased(prefix, layout)
+    }
+
+    fn layout_columns(&self, prefix: &TokenStream, required: &TokenStream) -> TokenStream {
         let (schema, via, name) = (schema(), self.via(), &self.name);
         quote!(#via::layout(layout, &#schema::Layout::join(#prefix, #name), #required);)
+    }
+
+    /// `layout` inside the field's alias scope, when it has an earlier name.
+    fn aliased(&self, prefix: &TokenStream, layout: TokenStream) -> TokenStream {
+        let Some(alias) = &self.alias else { return layout };
+        let (schema, name) = (schema(), &self.name);
+        quote! {
+            layout.alias(&#schema::Layout::join(#prefix, #name), &#schema::Layout::join(#prefix, #alias), |layout| { #layout });
+        }
     }
 
     /// Declares the field as one of its row's own fields: column-shaped fields are recorded in the
     /// table's `fields`, the unit an edge sets; table fields declare their table, and a `state`
     /// field's `State` records its label field and data fields itself.
     pub(crate) fn layout_row_field(&self) -> TokenStream {
-        let layout = self.layout(&quote!(""), &quote!(true));
+        let prefix = quote!("");
+        let layout = self.layout_columns(&prefix, &quote!(true));
         if self.is_table() || self.shape == FieldShape::State {
-            return layout;
+            return self.aliased(&prefix, layout);
         }
         let (name, state) = (&self.name, self.shape == FieldShape::State);
-        quote!(layout.field(#name, #state, |layout| { #layout });)
+        self.aliased(&prefix, quote!(layout.field(#name, #state, |layout| { #layout });))
     }
 
     /// The edge handle's name: the field name in upper case (`state` is `STATE`).

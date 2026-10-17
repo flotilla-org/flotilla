@@ -22,6 +22,14 @@ pub const CODES_DDL: &str = "CREATE TABLE IF NOT EXISTS codes (
   PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
 ";
 
+/// The `codes` field naming a kind's edge codes, the `edge` of its `log` entries (#3392 D4). A
+/// table's own fields are Rust identifiers, optionally prefixed by a table and `.`, so a field
+/// with `:` never collides with one.
+pub const LOG_EDGE_FIELD: &str = "log:edge";
+
+/// The `codes` field naming a kind's state labels, the `from` and `to` of its `log` entries.
+pub const LOG_LABEL_FIELD: &str = "log:label";
+
 /// The suffix of a table's readable view: `<table>_view`.
 pub const VIEW_SUFFIX: &str = "_view";
 
@@ -52,9 +60,9 @@ pub fn render_ddl_with(set: &TableSet, mode: DdlMode) -> String {
     for table in &set.tables {
         render_table(&mut out, set, table, exists);
     }
-    let mut indexes: Vec<_> = set.indexes.iter().collect();
+    let mut indexes: Vec<_> = set.indexes.iter().cloned().chain(set.reference_indexes()).collect();
     indexes.sort_by_key(|index| index.object_name());
-    for index in indexes {
+    for index in &indexes {
         let columns: Vec<String> = index.columns().map(quote_ident).collect();
         let name = quote_ident(&index.object_name());
         let _ = write!(out, "CREATE INDEX {exists}{name} ON {} ({})", quote_ident(&index.table), columns.join(", "));
@@ -88,11 +96,13 @@ fn text_literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
-/// The kind's rows of `codes`. Opening an existing database upserts them and deletes the
-/// kind's other rows, writing nothing when they are unchanged.
+/// The kind's rows of `codes`: its tables' code columns, then, for a kind declaring edges, its
+/// edge codes and its root state's labels under [`LOG_EDGE_FIELD`] and [`LOG_LABEL_FIELD`], which
+/// the store's readable `log_view` names entries by. Opening an existing database upserts them and
+/// deletes the kind's other rows, writing nothing when they are unchanged.
 fn render_codes(out: &mut String, set: &TableSet, mode: DdlMode) {
     let kind = text_literal(set.code.as_str());
-    let rows: Vec<(String, String, String)> = set
+    let mut rows: Vec<(String, String, String)> = set
         .tables
         .iter()
         .flat_map(|table| table.codes.iter().map(move |codes| (table, codes)))
@@ -101,6 +111,19 @@ fn render_codes(out: &mut String, set: &TableSet, mode: DdlMode) {
             codes.names.iter().map(move |(code, name)| (field.clone(), code_literal(*code), text_literal(name)))
         })
         .collect();
+    let edge = text_literal(LOG_EDGE_FIELD);
+    rows.extend(set.edges.iter().zip(&set.edge_names).map(|(code, name)| (edge.clone(), code_literal(*code), text_literal(name))));
+    if !set.edges.is_empty() {
+        let root = &set.tables[0];
+        let labels = set.edge_state().and_then(|(field, _)| {
+            let column = &root.columns[field.columns.start].name;
+            root.codes.iter().find(|codes| &codes.column == column)
+        });
+        let label = text_literal(LOG_LABEL_FIELD);
+        rows.extend(
+            labels.into_iter().flat_map(|codes| &codes.names).map(|(code, name)| (label.clone(), code_literal(*code), text_literal(name))),
+        );
+    }
     if !rows.is_empty() {
         let values: Vec<String> = rows.iter().map(|(field, code, name)| format!("({kind}, {field}, {code}, {name})")).collect();
         let _ = write!(out, "INSERT INTO \"codes\" (\"kind\", \"field\", \"code\", \"name\") VALUES\n  {}", values.join(",\n  "));
@@ -263,7 +286,8 @@ mod tests {
 
     // Behaviour (DESIGN DDL): STRICT tables in pre-order; the root keyed by its identity id; each
     // child keyed by owner plus its logical key, with a cascading FK to its parent's full key;
-    // per-type REFERENCES and CHECKs; indexes sorted by name after the tables. Then (#3392 D4)
+    // per-type REFERENCES and CHECKs; indexes, declared and one per child-table reference column,
+    // sorted by name after the tables. Then (#3392 D4)
     // the kind's `codes` rows, and one view per table naming its codes and interned strings.
     #[test]
     fn renders_tables_keys_and_indexes() {
@@ -293,6 +317,7 @@ CREATE TABLE "convoy_deliverables_evidence" (
   FOREIGN KEY ("owner", "deliverables_pos") REFERENCES "convoy_deliverables" ("owner", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "convoy_by_name" ON "convoy" ("name");
+CREATE INDEX "convoy_deliverables_target_ref" ON "convoy_deliverables" ("target");
 CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN ('dr', 'op') AND "phase" IS NOT NULL;
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('k2', 'phase', 'dr', 'Draft'),
@@ -330,7 +355,7 @@ FROM "convoy_deliverables_evidence";
     fn idempotent_mode_guards_every_statement() {
         let ddl = render_ddl_with(&convoy().finish(), DdlMode::IfNotExists);
         assert_eq!(ddl.matches("CREATE TABLE IF NOT EXISTS ").count(), 3);
-        assert_eq!(ddl.matches("CREATE INDEX IF NOT EXISTS ").count(), 2);
+        assert_eq!(ddl.matches("CREATE INDEX IF NOT EXISTS ").count(), 3);
         assert!(ddl.contains("ON CONFLICT (\"kind\", \"field\", \"code\") DO UPDATE"), "the kind's codes are upserted");
         assert!(ddl.contains("DELETE FROM \"codes\" WHERE \"kind\" = 'k2' AND (\"field\", \"code\") NOT IN (VALUES ('phase', 'dr'), ('phase', 'op'), ('phase', 'sh'));"), "and only they are kept");
         assert_eq!(ddl.matches("CREATE VIEW ").count(), 0, "the store recreates only changed views");
@@ -498,5 +523,32 @@ FROM "convoy_deliverables_evidence";
         assert_eq!(problem(index(&["phase"], &[], in_seq)), Some(IndexProblem::Codes("seq".into())));
         let seq_present = vec![Condition::NotNull { column: "seq".into() }];
         assert_eq!(problem(index(&["phase"], &[], seq_present)), Some(IndexProblem::NotNullable("seq".into())));
+    }
+
+    // Behaviour (#3392 lane 3 ruling 1): each reference column of a child table, key or data, gets
+    // an index leading with it, partial when it is nullable, unless a declared index already leads
+    // with it; the root's reference columns get none.
+    #[test]
+    fn child_reference_columns_are_indexed() {
+        let mut layout = Layout::root("Note", KindCode::new("k1"));
+        layout.column("author", ColumnType::Ref, true);
+        layout.table("links", TableRole::Child, |layout| {
+            layout.key(|layout| layout.column("target", ColumnType::Ref, true));
+            layout.column("via", ColumnType::Ref, false);
+            layout.column("by", ColumnType::Ref, true);
+        });
+        layout.index(Index { name: "by_by".into(), table: "note_links".into(), eq: vec!["by".into()], order: vec![], predicate: vec![] });
+        let set = layout.finish();
+        set.validate().expect("valid descriptor");
+        let ddl = render_ddl(&set);
+        let indexes: Vec<&str> = ddl.lines().filter(|line| line.starts_with("CREATE INDEX")).collect();
+        assert_eq!(
+            indexes,
+            [
+                r#"CREATE INDEX "note_links_by_by" ON "note_links" ("by");"#,
+                r#"CREATE INDEX "note_links_target_ref" ON "note_links" ("target");"#,
+                r#"CREATE INDEX "note_links_via_ref" ON "note_links" ("via") WHERE "via" IS NOT NULL;"#,
+            ]
+        );
     }
 }

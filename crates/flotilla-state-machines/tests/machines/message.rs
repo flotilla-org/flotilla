@@ -1,14 +1,14 @@
 //! Message (spec `machines/message.qnt`; scenarios `inbox_delivery`, `message_race`;
 //! ADR 0064 "Inboxes").
 
-use flotilla_schema::{Code, CodeEnum, Decoder, Encoder, Position, Timestamp, Value};
+use flotilla_schema::{Code, CodeEnum, Position, Timestamp};
 use flotilla_state_machines::{
     machines::message::{
         AppliedThrough, Binding, Condition, Deliver, DropMessage, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message,
         MessageEdge, MessageEdgeKind, MessageLabel, MessageRefusal, MessageSpec, MessageState, Receipts, Receiver, Settle, Settlement,
         Supersedes, Supersession,
     },
-    Coded, Diagram, EdgeEventOf, EdgePayload, Home, InputRead, Kind, Machine, Ref, Source, Transport, Version, WriteError,
+    Coded, Diagram, EdgePayload, Home, InputRead, Kind, Machine, Ref, Source, Transport, Version, WriteError,
 };
 
 const INBOX: &str = "project:p/role:r";
@@ -334,29 +334,24 @@ fn time_rules_are_strict_at_their_boundaries() {
     assert_eq!(undeliverable_at(14), None);
 }
 
-// An edge event is the schema crate's stored row as it is: the header holds
-// the edge kind's and labels' codes, and the inline document carries the
-// typed edge and every read, so a decoded event equals the one the home
-// appended.
+// An edge event is the header and payload of its log entry: the header holds the edge kind's and
+// labels' codes, and the inline document carries the typed edge and every read, so a decoded
+// payload equals the one the home appended.
 #[test]
 fn edge_events_round_trip_through_the_schema_codec() {
     let (mut home, mut world) = awaiting(None);
     world.reply.put(&Ref::new("m"), ());
-    home.apply("m", Settle { by: Settlement::Answered }, &world, t(2)).expect("settled");
-    let events = home.get("m").expect("exists").events();
+    let previous = home.get("m").expect("exists").stored_state().clone();
+    let event = home.apply("m", Settle { by: Settlement::Answered }, &world, t(2)).expect("settled").clone();
+    let resource = home.get("m").expect("exists");
+    let events = resource.events();
     assert_eq!(events.iter().map(|row| (row.position, row.version)).collect::<Vec<_>>(), [(Position(0), 2), (Position(1), 3)]);
-    for row in events {
-        let rows = Encoder::encode(&row.record).expect("encodes");
-        let header: Vec<_> = rows.tables[0][0].values.iter().take(3).cloned().collect();
-        let codes = [row.record.edge.code(), row.record.from.code(), row.record.to.code()].map(|code| Value::Text(code.to_string()));
-        assert_eq!(header, codes);
-        assert_eq!(Decoder::decode::<EdgeEventOf<Message>>(rows).expect("decodes"), row.record);
-    }
+    let header = resource.stored_edge(&previous, &event).expect("edge").into_parts().event;
+    assert_eq!((header.edge, header.from, header.to), (event.edge.code(), event.from.code(), event.to.code()));
+    assert_eq!(header.payload::<EdgePayload<MessageEdge>>().expect("decodes"), event.payload);
     let delivered = &events.rows()[0].record;
     assert_eq!((delivered.edge.code(), delivered.from.code(), delivered.to.code()), (Code::new("de"), Code::new("pe"), Code::new("aw")));
     assert_eq!(delivered.payload.edge, deliver("s1", Transport::Turn).into());
-    assert_eq!(delivered.payload.reads, [InputRead { kind: "message_receipts".into(), name: "m".into(), version: Some(Version(1)) }]);
-    assert_eq!(delivered.writer, "home");
 }
 
 // A payload's document is the edge's serde form: a reference is its name

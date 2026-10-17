@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
-        Abandon, Convoy, ConvoyEdge, ConvoySpec, ConvoyState, ConvoyWorld, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId,
+        Abandon, Convoy, ConvoySpec, ConvoyState, ConvoyWorld, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId,
         PromiseState, Readmit, Retract, VesselClass,
     },
     Ref, Resource,
@@ -16,7 +16,7 @@ use hegel::{generators as gs, TestCase};
 use super::{
     code_enum,
     engine::{self, resource, Candidate},
-    name, records, stamp_flat, text, timestamp, Fixture, Pick,
+    name, text, timestamp, Fixture, Pick,
 };
 
 /// Covering indexes: the label is digit 0 (base 3); collections take every size in turn.
@@ -57,18 +57,6 @@ fn authority(tc: &TestCase) -> Ref<flotilla_state_machines::machines::convoy::Au
     Ref::new(name(tc))
 }
 
-/// One edge of every kind, for generated history.
-fn edges(tc: &TestCase) -> Vec<ConvoyEdge> {
-    let promise = PromiseId(tc.draw(gs::integers::<u32>()));
-    vec![
-        Keep { promise }.into(),
-        Retract { promise, by: name(tc), authority: authority(tc) }.into(),
-        Deliver.into(),
-        Abandon { by: name(tc), reason: text(tc), authority: authority(tc) }.into(),
-        Readmit { quota: quota(tc, Pick::Draw), by: name(tc), authority: authority(tc) }.into(),
-    ]
-}
-
 /// The project, promise definitions and priority, drawn or covered.
 pub fn spec(tc: &TestCase, pick: Pick) -> ConvoySpec {
     ConvoySpec {
@@ -80,7 +68,6 @@ pub fn spec(tc: &TestCase, pick: Pick) -> ConvoySpec {
 
 pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Convoy> {
     resource(spec(tc, pick), State::new(state_value(tc, pick), timestamp(tc)))
-        .with_events(records(tc, pick, 2, |pick| engine::event::<Convoy>(tc, pick, &edges(tc))))
 }
 
 /// A fixed open convoy for example tests: one pending promise under a quota of one.
@@ -152,7 +139,7 @@ impl Fixture for Resource<Convoy> {
         edge(tc, pick, self)
     }
 
-    fn stamped(&self, before: Option<&Resource<Convoy>>, version: u64) -> Resource<Convoy> {
-        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version))
+    fn stamped(&self, _before: Option<&Resource<Convoy>>, _version: u64) -> Resource<Convoy> {
+        self.clone()
     }
 }

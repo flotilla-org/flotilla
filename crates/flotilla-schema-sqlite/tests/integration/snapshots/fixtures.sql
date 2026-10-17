@@ -7,11 +7,21 @@ CREATE TABLE resource_identity (
 CREATE INDEX resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
 CREATE TABLE home_sequence (home INTEGER PRIMARY KEY REFERENCES strings(id), last INTEGER NOT NULL) STRICT;
-CREATE TABLE change_log (
+CREATE TABLE log (
   home INTEGER NOT NULL REFERENCES strings(id), home_seq INTEGER NOT NULL,
-  resource_id INTEGER NOT NULL REFERENCES resource_identity(id), change BLOB NOT NULL,
-  PRIMARY KEY (home, home_seq)) STRICT;
-CREATE INDEX change_log_by_resource ON change_log (resource_id, home_seq);
+  resource INTEGER REFERENCES resource_identity(id), prev_seq INTEGER NOT NULL,
+  cause TEXT NOT NULL CHECK (cause IN ('create', 'edit', 'edge', 'delete', 'expunge')),
+  edge TEXT, "from" TEXT, "to" TEXT,
+  about INTEGER REFERENCES resource_identity(id) ON DELETE SET NULL,
+  writer INTEGER NOT NULL REFERENCES strings(id), at INTEGER NOT NULL,
+  payload BLOB, effect BLOB NOT NULL,
+  PRIMARY KEY (home, home_seq),
+  CHECK ((resource IS NULL) = (cause = 'expunge')),
+  CHECK (CASE WHEN cause = 'edge' THEN edge IS NOT NULL AND "from" IS NOT NULL AND "to" IS NOT NULL
+    ELSE edge IS NULL AND "from" IS NULL AND "to" IS NULL AND about IS NULL END)) STRICT;
+CREATE INDEX log_by_resource ON log (resource, home_seq);
+CREATE INDEX log_about ON log (about, at) WHERE about IS NOT NULL;
+CREATE INDEX log_expunges ON log (home, home_seq) WHERE cause = 'expunge';
 CREATE TABLE codes (
   kind TEXT NOT NULL, field TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
   PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
@@ -31,21 +41,6 @@ CREATE TABLE "agent_session" (
       AND "channel" IS NULL
       END)
 ) STRICT;
-CREATE TABLE "agent_session_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" TEXT NOT NULL CHECK ("edge" IN ('at', 'de', 'en', 'rv')),
-  "from" TEXT NOT NULL CHECK ("from" IN ('en', 'li')),
-  "to" TEXT NOT NULL CHECK ("to" IN ('en', 'li')),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "agent_session" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE INDEX "agent_session_edges_by_edge" ON "agent_session_edges" ("edge", "at");
-CREATE INDEX "agent_session_edges_by_time" ON "agent_session_edges" ("at");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('as', 'state', 'en', 'Ended'),
   ('as', 'state', 'li', 'Live'),
@@ -53,14 +48,12 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('as', 'channel', 'de', 'Detached'),
   ('as', 'reason', 'co', 'Completed'),
   ('as', 'reason', 'lo', 'Lost'),
-  ('as', 'edges.edge', 'at', 'Attach'),
-  ('as', 'edges.edge', 'de', 'Detach'),
-  ('as', 'edges.edge', 'en', 'End'),
-  ('as', 'edges.edge', 'rv', 'Receive'),
-  ('as', 'edges.from', 'en', 'Ended'),
-  ('as', 'edges.from', 'li', 'Live'),
-  ('as', 'edges.to', 'en', 'Ended'),
-  ('as', 'edges.to', 'li', 'Live');
+  ('as', 'log:edge', 'at', 'Attach'),
+  ('as', 'log:edge', 'de', 'Detach'),
+  ('as', 'log:edge', 'en', 'End'),
+  ('as', 'log:edge', 'rv', 'Receive'),
+  ('as', 'log:label', 'en', 'Ended'),
+  ('as', 'log:label', 'li', 'Live');
 CREATE VIEW "agent_session_view" AS SELECT
   "agent_session"."id",
   "agent_session"."version",
@@ -69,17 +62,6 @@ CREATE VIEW "agent_session_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'channel' AND "code" = "agent_session"."channel") AS "channel",
   (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'reason' AND "code" = "agent_session"."reason") AS "reason"
 FROM "agent_session";
-CREATE VIEW "agent_session_edges_view" AS SELECT
-  "agent_session_edges"."owner",
-  "agent_session_edges"."pos",
-  "agent_session_edges"."version",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'edges.edge' AND "code" = "agent_session_edges"."edge") AS "edge",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'edges.from' AND "code" = "agent_session_edges"."from") AS "from",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'edges.to' AND "code" = "agent_session_edges"."to") AS "to",
-  (SELECT "s" FROM "strings" WHERE "id" = "agent_session_edges"."writer") AS "writer",
-  "agent_session_edges"."at",
-  "agent_session_edges"."payload"
-FROM "agent_session_edges";
 CREATE TABLE "convoy" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -120,21 +102,6 @@ CREATE TABLE "convoy_quota" (
   PRIMARY KEY ("owner", "key"),
   FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "convoy_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" TEXT NOT NULL CHECK ("edge" IN ('ab', 'de', 'ke', 'ra', 'rt')),
-  "from" TEXT NOT NULL CHECK ("from" IN ('ab', 'de', 'op')),
-  "to" TEXT NOT NULL CHECK ("to" IN ('ab', 'de', 'op')),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE INDEX "convoy_edges_by_edge" ON "convoy_edges" ("edge", "at");
-CREATE INDEX "convoy_edges_by_time" ON "convoy_edges" ("at");
 CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN ('op');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'state', 'ab', 'Abandoned'),
@@ -143,17 +110,14 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'resolution.value', 'ke', 'Kept'),
   ('cv', 'resolution.value', 'pe', 'Pending'),
   ('cv', 'resolution.value', 'rt', 'Retracted'),
-  ('cv', 'edges.edge', 'ab', 'Abandon'),
-  ('cv', 'edges.edge', 'de', 'Deliver'),
-  ('cv', 'edges.edge', 'ke', 'Keep'),
-  ('cv', 'edges.edge', 'ra', 'Readmit'),
-  ('cv', 'edges.edge', 'rt', 'Retract'),
-  ('cv', 'edges.from', 'ab', 'Abandoned'),
-  ('cv', 'edges.from', 'de', 'Delivered'),
-  ('cv', 'edges.from', 'op', 'Open'),
-  ('cv', 'edges.to', 'ab', 'Abandoned'),
-  ('cv', 'edges.to', 'de', 'Delivered'),
-  ('cv', 'edges.to', 'op', 'Open');
+  ('cv', 'log:edge', 'ab', 'Abandon'),
+  ('cv', 'log:edge', 'de', 'Deliver'),
+  ('cv', 'log:edge', 'ke', 'Keep'),
+  ('cv', 'log:edge', 'ra', 'Readmit'),
+  ('cv', 'log:edge', 'rt', 'Retract'),
+  ('cv', 'log:label', 'ab', 'Abandoned'),
+  ('cv', 'log:label', 'de', 'Delivered'),
+  ('cv', 'log:label', 'op', 'Open');
 CREATE VIEW "convoy_view" AS SELECT
   "convoy"."id",
   "convoy"."version",
@@ -179,17 +143,6 @@ CREATE VIEW "convoy_quota_view" AS SELECT
   "convoy_quota"."key",
   "convoy_quota"."value"
 FROM "convoy_quota";
-CREATE VIEW "convoy_edges_view" AS SELECT
-  "convoy_edges"."owner",
-  "convoy_edges"."pos",
-  "convoy_edges"."version",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'edges.edge' AND "code" = "convoy_edges"."edge") AS "edge",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'edges.from' AND "code" = "convoy_edges"."from") AS "from",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'edges.to' AND "code" = "convoy_edges"."to") AS "to",
-  (SELECT "s" FROM "strings" WHERE "id" = "convoy_edges"."writer") AS "writer",
-  "convoy_edges"."at",
-  "convoy_edges"."payload"
-FROM "convoy_edges";
 CREATE TABLE "dossier" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -279,21 +232,6 @@ CREATE TABLE "dossier_deliverables_evidence_metadata" (
   PRIMARY KEY ("owner", "deliverables_pos", "evidence_pos", "key"),
   FOREIGN KEY ("owner", "deliverables_pos", "evidence_pos") REFERENCES "dossier_deliverables_evidence" ("owner", "deliverables_pos", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "dossier_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" TEXT NOT NULL CHECK ("edge" IN ('c1', 'c2', 'c3', 'c4', 'c5')),
-  "from" TEXT NOT NULL CHECK ("from" IN ('c1', 'c2', 'c3')),
-  "to" TEXT NOT NULL CHECK ("to" IN ('c1', 'c2', 'c3')),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "dossier" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE INDEX "dossier_edges_by_edge" ON "dossier_edges" ("edge", "at");
-CREATE INDEX "dossier_edges_by_time" ON "dossier_edges" ("at");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('do', 'state', 'c1', 'Open'),
   ('do', 'state', 'c2', 'Delivered'),
@@ -308,17 +246,14 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('do', 'deliverables.source', 'c2', 'Dispatcher'),
   ('do', 'deliverables.state', 'c1', 'Open'),
   ('do', 'deliverables.state', 'c2', 'Retracted'),
-  ('do', 'edges.edge', 'c1', 'Deliver'),
-  ('do', 'edges.edge', 'c2', 'Abandon'),
-  ('do', 'edges.edge', 'c3', 'Promise'),
-  ('do', 'edges.edge', 'c4', 'Submit'),
-  ('do', 'edges.edge', 'c5', 'Retract'),
-  ('do', 'edges.from', 'c1', 'Open'),
-  ('do', 'edges.from', 'c2', 'Delivered'),
-  ('do', 'edges.from', 'c3', 'Abandoned'),
-  ('do', 'edges.to', 'c1', 'Open'),
-  ('do', 'edges.to', 'c2', 'Delivered'),
-  ('do', 'edges.to', 'c3', 'Abandoned');
+  ('do', 'log:edge', 'c1', 'Deliver'),
+  ('do', 'log:edge', 'c2', 'Abandon'),
+  ('do', 'log:edge', 'c3', 'Promise'),
+  ('do', 'log:edge', 'c4', 'Submit'),
+  ('do', 'log:edge', 'c5', 'Retract'),
+  ('do', 'log:label', 'c1', 'Open'),
+  ('do', 'log:label', 'c2', 'Delivered'),
+  ('do', 'log:label', 'c3', 'Abandoned');
 CREATE VIEW "dossier_view" AS SELECT
   "dossier"."id",
   "dossier"."version",
@@ -370,17 +305,6 @@ CREATE VIEW "dossier_deliverables_evidence_metadata_view" AS SELECT
   "dossier_deliverables_evidence_metadata"."key",
   "dossier_deliverables_evidence_metadata"."value"
 FROM "dossier_deliverables_evidence_metadata";
-CREATE VIEW "dossier_edges_view" AS SELECT
-  "dossier_edges"."owner",
-  "dossier_edges"."pos",
-  "dossier_edges"."version",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'do' AND "field" = 'edges.edge' AND "code" = "dossier_edges"."edge") AS "edge",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'do' AND "field" = 'edges.from' AND "code" = "dossier_edges"."from") AS "from",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'do' AND "field" = 'edges.to' AND "code" = "dossier_edges"."to") AS "to",
-  (SELECT "s" FROM "strings" WHERE "id" = "dossier_edges"."writer") AS "writer",
-  "dossier_edges"."at",
-  "dossier_edges"."payload"
-FROM "dossier_edges";
 CREATE TABLE "ensure" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -434,22 +358,7 @@ CREATE TABLE "ensure_created" (
   PRIMARY KEY ("owner", "value"),
   FOREIGN KEY ("owner") REFERENCES "ensure" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "ensure_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" TEXT NOT NULL CHECK ("edge" IN ('at', 'bi', 'cr', 'ho', 'rc', 'rs', 'rt', 'ub')),
-  "from" TEXT NOT NULL CHECK ("from" IN ('fu', 'he', 'rt', 'un')),
-  "to" TEXT NOT NULL CHECK ("to" IN ('fu', 'he', 'rt', 'un')),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "ensure" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
 CREATE INDEX "ensure_by_inbox" ON "ensure" ("inbox");
-CREATE INDEX "ensure_edges_by_edge" ON "ensure_edges" ("edge", "at");
-CREATE INDEX "ensure_edges_by_time" ON "ensure_edges" ("at");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('en', 'state', 'fu', 'Fulfilled'),
   ('en', 'state', 'he', 'Held'),
@@ -460,22 +369,18 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('en', 'last_failure_cause_category', 'mx', 'MissingCapability'),
   ('en', 'last_failure_cause_category', 'rf', 'Refused'),
   ('en', 'last_failure_cause_category', 'tr', 'Transient'),
-  ('en', 'edges.edge', 'at', 'Attempted'),
-  ('en', 'edges.edge', 'bi', 'Bind'),
-  ('en', 'edges.edge', 'cr', 'Create'),
-  ('en', 'edges.edge', 'ho', 'Hold'),
-  ('en', 'edges.edge', 'rc', 'Record'),
-  ('en', 'edges.edge', 'rs', 'Resume'),
-  ('en', 'edges.edge', 'rt', 'Retire'),
-  ('en', 'edges.edge', 'ub', 'Unbind'),
-  ('en', 'edges.from', 'fu', 'Fulfilled'),
-  ('en', 'edges.from', 'he', 'Held'),
-  ('en', 'edges.from', 'rt', 'Retired'),
-  ('en', 'edges.from', 'un', 'Unfulfilled'),
-  ('en', 'edges.to', 'fu', 'Fulfilled'),
-  ('en', 'edges.to', 'he', 'Held'),
-  ('en', 'edges.to', 'rt', 'Retired'),
-  ('en', 'edges.to', 'un', 'Unfulfilled');
+  ('en', 'log:edge', 'at', 'Attempted'),
+  ('en', 'log:edge', 'bi', 'Bind'),
+  ('en', 'log:edge', 'cr', 'Create'),
+  ('en', 'log:edge', 'ho', 'Hold'),
+  ('en', 'log:edge', 'rc', 'Record'),
+  ('en', 'log:edge', 'rs', 'Resume'),
+  ('en', 'log:edge', 'rt', 'Retire'),
+  ('en', 'log:edge', 'ub', 'Unbind'),
+  ('en', 'log:label', 'fu', 'Fulfilled'),
+  ('en', 'log:label', 'he', 'Held'),
+  ('en', 'log:label', 'rt', 'Retired'),
+  ('en', 'log:label', 'un', 'Unfulfilled');
 CREATE VIEW "ensure_view" AS SELECT
   "ensure"."id",
   "ensure"."version",
@@ -501,17 +406,6 @@ CREATE VIEW "ensure_created_view" AS SELECT
   "ensure_created"."owner",
   (SELECT "s" FROM "strings" WHERE "id" = "ensure_created"."value") AS "value"
 FROM "ensure_created";
-CREATE VIEW "ensure_edges_view" AS SELECT
-  "ensure_edges"."owner",
-  "ensure_edges"."pos",
-  "ensure_edges"."version",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'edges.edge' AND "code" = "ensure_edges"."edge") AS "edge",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'edges.from' AND "code" = "ensure_edges"."from") AS "from",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'edges.to' AND "code" = "ensure_edges"."to") AS "to",
-  (SELECT "s" FROM "strings" WHERE "id" = "ensure_edges"."writer") AS "writer",
-  "ensure_edges"."at",
-  "ensure_edges"."payload"
-FROM "ensure_edges";
 CREATE TABLE "message" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -587,22 +481,7 @@ CREATE TABLE "message" (
       THEN "reason" IS NOT NULL
       END)
 ) STRICT;
-CREATE TABLE "message_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" TEXT NOT NULL CHECK ("edge" IN ('de', 'dr', 'se')),
-  "from" TEXT NOT NULL CHECK ("from" IN ('aw', 'dr', 'pe', 'se')),
-  "to" TEXT NOT NULL CHECK ("to" IN ('aw', 'dr', 'pe', 'se')),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "message" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
 CREATE INDEX "message_deadline" ON "message" ("deadline") WHERE "state" IN ('pe', 'aw') AND "deadline" IS NOT NULL;
-CREATE INDEX "message_edges_by_edge" ON "message_edges" ("edge", "at");
-CREATE INDEX "message_edges_by_time" ON "message_edges" ("at");
 CREATE INDEX "message_open_by_inbox" ON "message" ("inbox") WHERE "state" IN ('pe', 'aw');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ms', 'expectation', 'no', 'Nothing'),
@@ -617,17 +496,13 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ms', 'reason', 'su', 'Superseded'),
   ('ms', 'reason', 'un', 'Undeliverable'),
   ('ms', 'reason', 'wi', 'Withdrawn'),
-  ('ms', 'edges.edge', 'de', 'Deliver'),
-  ('ms', 'edges.edge', 'dr', 'Drop'),
-  ('ms', 'edges.edge', 'se', 'Settle'),
-  ('ms', 'edges.from', 'aw', 'Awaiting'),
-  ('ms', 'edges.from', 'dr', 'Dropped'),
-  ('ms', 'edges.from', 'pe', 'Pending'),
-  ('ms', 'edges.from', 'se', 'Settled'),
-  ('ms', 'edges.to', 'aw', 'Awaiting'),
-  ('ms', 'edges.to', 'dr', 'Dropped'),
-  ('ms', 'edges.to', 'pe', 'Pending'),
-  ('ms', 'edges.to', 'se', 'Settled');
+  ('ms', 'log:edge', 'de', 'Deliver'),
+  ('ms', 'log:edge', 'dr', 'Drop'),
+  ('ms', 'log:edge', 'se', 'Settle'),
+  ('ms', 'log:label', 'aw', 'Awaiting'),
+  ('ms', 'log:label', 'dr', 'Dropped'),
+  ('ms', 'log:label', 'pe', 'Pending'),
+  ('ms', 'log:label', 'se', 'Settled');
 CREATE VIEW "message_view" AS SELECT
   "message"."id",
   "message"."version",
@@ -645,17 +520,6 @@ CREATE VIEW "message_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "message"."reason_authority") AS "reason_authority",
   "message"."watermark"
 FROM "message";
-CREATE VIEW "message_edges_view" AS SELECT
-  "message_edges"."owner",
-  "message_edges"."pos",
-  "message_edges"."version",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'edges.edge' AND "code" = "message_edges"."edge") AS "edge",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'edges.from' AND "code" = "message_edges"."from") AS "from",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'edges.to' AND "code" = "message_edges"."to") AS "to",
-  (SELECT "s" FROM "strings" WHERE "id" = "message_edges"."writer") AS "writer",
-  "message_edges"."at",
-  "message_edges"."payload"
-FROM "message_edges";
 CREATE TABLE "referral" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -828,23 +692,10 @@ CREATE TABLE "referral_references" (
       AND "id" IS NULL
       END)
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "referral_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" TEXT NOT NULL CHECK ("edge" IN ('c1', 'c2', 'c3')),
-  "from" TEXT NOT NULL CHECK ("from" IN ('c1', 'c2', 'c3')),
-  "to" TEXT NOT NULL CHECK ("to" IN ('c1', 'c2', 'c3')),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "referral" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
 CREATE INDEX "referral_by_reply" ON "referral" ("in_reply_to") WHERE "in_reply_to" IS NOT NULL;
 CREATE INDEX "referral_by_session" ON "referral" ("session", "seq");
-CREATE INDEX "referral_edges_by_edge" ON "referral_edges" ("edge", "at");
-CREATE INDEX "referral_edges_by_time" ON "referral_edges" ("at");
+CREATE INDEX "referral_references_repository_ref" ON "referral_references" ("repository") WHERE "repository" IS NOT NULL;
+CREATE INDEX "referral_references_resource_ref" ON "referral_references" ("resource") WHERE "resource" IS NOT NULL;
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('rf', 'subject', 'c1', 'Convoy'),
   ('rf', 'subject', 'c2', 'ChangeRequest'),
@@ -865,15 +716,12 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('rf', 'references.tag', 'c5', 'Issue'),
   ('rf', 'references.tag', 'c6', 'Comment'),
   ('rf', 'references.tag', 'c7', 'ControlRecord'),
-  ('rf', 'edges.edge', 'c1', 'Send'),
-  ('rf', 'edges.edge', 'c2', 'Read'),
-  ('rf', 'edges.edge', 'c3', 'Amend'),
-  ('rf', 'edges.from', 'c1', 'Draft'),
-  ('rf', 'edges.from', 'c2', 'Sent'),
-  ('rf', 'edges.from', 'c3', 'Read'),
-  ('rf', 'edges.to', 'c1', 'Draft'),
-  ('rf', 'edges.to', 'c2', 'Sent'),
-  ('rf', 'edges.to', 'c3', 'Read');
+  ('rf', 'log:edge', 'c1', 'Send'),
+  ('rf', 'log:edge', 'c2', 'Read'),
+  ('rf', 'log:edge', 'c3', 'Amend'),
+  ('rf', 'log:label', 'c1', 'Draft'),
+  ('rf', 'log:label', 'c2', 'Sent'),
+  ('rf', 'log:label', 'c3', 'Read');
 CREATE VIEW "referral_view" AS SELECT
   "referral"."id",
   "referral"."version",
@@ -913,17 +761,6 @@ CREATE VIEW "referral_references_view" AS SELECT
   "referral_references"."resource",
   "referral_references"."id"
 FROM "referral_references";
-CREATE VIEW "referral_edges_view" AS SELECT
-  "referral_edges"."owner",
-  "referral_edges"."pos",
-  "referral_edges"."version",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'rf' AND "field" = 'edges.edge' AND "code" = "referral_edges"."edge") AS "edge",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'rf' AND "field" = 'edges.from' AND "code" = "referral_edges"."from") AS "from",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'rf' AND "field" = 'edges.to' AND "code" = "referral_edges"."to") AS "to",
-  (SELECT "s" FROM "strings" WHERE "id" = "referral_edges"."writer") AS "writer",
-  "referral_edges"."at",
-  "referral_edges"."payload"
-FROM "referral_edges";
 CREATE TABLE "ticket" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -984,34 +821,16 @@ CREATE TABLE "ticket_notes" (
   PRIMARY KEY ("owner", "key"),
   FOREIGN KEY ("owner") REFERENCES "ticket" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "ticket_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" TEXT NOT NULL CHECK ("edge" IN ('c1', 'c2')),
-  "from" TEXT NOT NULL CHECK ("from" IN ('c1', 'c2', 'c3')),
-  "to" TEXT NOT NULL CHECK ("to" IN ('c1', 'c2', 'c3')),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "ticket" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE INDEX "ticket_edges_by_edge" ON "ticket_edges" ("edge", "at");
-CREATE INDEX "ticket_edges_by_time" ON "ticket_edges" ("at");
 CREATE INDEX "ticket_open_by_queue" ON "ticket" ("queue") WHERE "state" IN ('c2');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('tk', 'state', 'c1', 'Draft'),
   ('tk', 'state', 'c2', 'Open'),
   ('tk', 'state', 'c3', 'Closed'),
-  ('tk', 'edges.edge', 'c1', 'Edit'),
-  ('tk', 'edges.edge', 'c2', 'Move'),
-  ('tk', 'edges.from', 'c1', 'Draft'),
-  ('tk', 'edges.from', 'c2', 'Open'),
-  ('tk', 'edges.from', 'c3', 'Closed'),
-  ('tk', 'edges.to', 'c1', 'Draft'),
-  ('tk', 'edges.to', 'c2', 'Open'),
-  ('tk', 'edges.to', 'c3', 'Closed');
+  ('tk', 'log:edge', 'c1', 'Edit'),
+  ('tk', 'log:edge', 'c2', 'Move'),
+  ('tk', 'log:label', 'c1', 'Draft'),
+  ('tk', 'log:label', 'c2', 'Open'),
+  ('tk', 'log:label', 'c3', 'Closed');
 CREATE VIEW "ticket_view" AS SELECT
   "ticket"."id",
   "ticket"."version",
@@ -1037,17 +856,6 @@ CREATE VIEW "ticket_notes_view" AS SELECT
   "ticket_notes"."key",
   "ticket_notes"."value"
 FROM "ticket_notes";
-CREATE VIEW "ticket_edges_view" AS SELECT
-  "ticket_edges"."owner",
-  "ticket_edges"."pos",
-  "ticket_edges"."version",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'tk' AND "field" = 'edges.edge' AND "code" = "ticket_edges"."edge") AS "edge",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'tk' AND "field" = 'edges.from' AND "code" = "ticket_edges"."from") AS "from",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'tk' AND "field" = 'edges.to' AND "code" = "ticket_edges"."to") AS "to",
-  (SELECT "s" FROM "strings" WHERE "id" = "ticket_edges"."writer") AS "writer",
-  "ticket_edges"."at",
-  "ticket_edges"."payload"
-FROM "ticket_edges";
 CREATE TABLE "terminal_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -1138,22 +946,7 @@ CREATE TABLE "terminal_session_labels" (
   PRIMARY KEY ("owner", "value"),
   FOREIGN KEY ("owner") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "terminal_session_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" TEXT NOT NULL CHECK ("edge" IN ('at', 'gu', 'rl', 'rs', 'va')),
-  "from" TEXT NOT NULL CHECK ("from" IN ('go', 'gu', 'rl', 'rq')),
-  "to" TEXT NOT NULL CHECK ("to" IN ('go', 'gu', 'rl', 'rq')),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
 CREATE INDEX "terminal_session_by_vessel" ON "terminal_session" ("vessel", "ordinal");
-CREATE INDEX "terminal_session_edges_by_edge" ON "terminal_session_edges" ("edge", "at");
-CREATE INDEX "terminal_session_edges_by_time" ON "terminal_session_edges" ("at");
 CREATE INDEX "terminal_session_live_by_pool" ON "terminal_session" ("pool") WHERE "state" IN ('rq', 'rl');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ts', 'source', 'c1', 'Tool'),
@@ -1172,19 +965,15 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ts', 'cause_category', 'mx', 'MissingCapability'),
   ('ts', 'cause_category', 'rf', 'Refused'),
   ('ts', 'cause_category', 'tr', 'Transient'),
-  ('ts', 'edges.edge', 'at', 'Attempted'),
-  ('ts', 'edges.edge', 'gu', 'GiveUp'),
-  ('ts', 'edges.edge', 'rl', 'Realise'),
-  ('ts', 'edges.edge', 'rs', 'Release'),
-  ('ts', 'edges.edge', 'va', 'Vanish'),
-  ('ts', 'edges.from', 'go', 'Gone'),
-  ('ts', 'edges.from', 'gu', 'GaveUp'),
-  ('ts', 'edges.from', 'rl', 'Realised'),
-  ('ts', 'edges.from', 'rq', 'Requested'),
-  ('ts', 'edges.to', 'go', 'Gone'),
-  ('ts', 'edges.to', 'gu', 'GaveUp'),
-  ('ts', 'edges.to', 'rl', 'Realised'),
-  ('ts', 'edges.to', 'rq', 'Requested');
+  ('ts', 'log:edge', 'at', 'Attempted'),
+  ('ts', 'log:edge', 'gu', 'GiveUp'),
+  ('ts', 'log:edge', 'rl', 'Realise'),
+  ('ts', 'log:edge', 'rs', 'Release'),
+  ('ts', 'log:edge', 'va', 'Vanish'),
+  ('ts', 'log:label', 'go', 'Gone'),
+  ('ts', 'log:label', 'gu', 'GaveUp'),
+  ('ts', 'log:label', 'rl', 'Realised'),
+  ('ts', 'log:label', 'rq', 'Requested');
 CREATE VIEW "terminal_session_view" AS SELECT
   "terminal_session"."id",
   "terminal_session"."version",
@@ -1217,17 +1006,6 @@ CREATE VIEW "terminal_session_labels_view" AS SELECT
   "terminal_session_labels"."owner",
   "terminal_session_labels"."value"
 FROM "terminal_session_labels";
-CREATE VIEW "terminal_session_edges_view" AS SELECT
-  "terminal_session_edges"."owner",
-  "terminal_session_edges"."pos",
-  "terminal_session_edges"."version",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'edges.edge' AND "code" = "terminal_session_edges"."edge") AS "edge",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'edges.from' AND "code" = "terminal_session_edges"."from") AS "from",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'edges.to' AND "code" = "terminal_session_edges"."to") AS "to",
-  (SELECT "s" FROM "strings" WHERE "id" = "terminal_session_edges"."writer") AS "writer",
-  "terminal_session_edges"."at",
-  "terminal_session_edges"."payload"
-FROM "terminal_session_edges";
 CREATE TABLE "vessel" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -1238,3 +1016,19 @@ CREATE VIEW "vessel_view" AS SELECT
   "vessel"."version",
   "vessel"."name"
 FROM "vessel";
+CREATE VIEW "log_view" AS SELECT
+  (SELECT "s" FROM "strings" WHERE "id" = "l"."home") AS "home",
+  "l"."home_seq",
+  "i"."kind",
+  (SELECT "s" FROM "strings" WHERE "id" = "i"."name") AS "name",
+  "l"."prev_seq",
+  "l"."cause",
+  (SELECT "name" FROM "codes" WHERE "kind" = "i"."kind" AND "field" = 'log:edge' AND "code" = "l"."edge") AS "edge",
+  (SELECT "name" FROM "codes" WHERE "kind" = "i"."kind" AND "field" = 'log:label' AND "code" = "l"."from") AS "from",
+  (SELECT "name" FROM "codes" WHERE "kind" = "i"."kind" AND "field" = 'log:label' AND "code" = "l"."to") AS "to",
+  (SELECT "a"."kind" || ':' || (SELECT "s" FROM "strings" WHERE "id" = "a"."name") || '@' || (SELECT "s" FROM "strings" WHERE "id" = "a"."home") FROM "resource_identity" AS "a" WHERE "a"."id" = "l"."about") AS "about",
+  (SELECT "s" FROM "strings" WHERE "id" = "l"."writer") AS "writer",
+  "l"."at",
+  "l"."payload",
+  "l"."effect"
+FROM "log" AS "l" LEFT JOIN "resource_identity" AS "i" ON "i"."id" = "l"."resource";

@@ -76,7 +76,7 @@ pub struct Identity {
 
 /// One logical column value. `Str`, `Ref` and `Object` are resolved to local ids only by a backend.
 ///
-/// Serde (used by change-log entries only) names variants with one letter, writes blobs as byte
+/// Serde (used by log entries only) names variants with one letter, writes blobs as byte
 /// strings and references as `[kind, name, home]`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Value {

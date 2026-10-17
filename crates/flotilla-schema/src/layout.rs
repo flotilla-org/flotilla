@@ -32,6 +32,34 @@ struct Frame {
     /// Fields being declared: only a row's own fields (depth 0) are recorded, not the fields of a
     /// struct flattened into one of them.
     field_depth: usize,
+    /// Open alias scopes, outermost first: `(current, old)` names of a renamed field, prefixed.
+    aliases: Vec<(String, String)>,
+}
+
+impl Frame {
+    fn new(table: usize) -> Frame {
+        Frame { table, scopes: Vec::new(), key_mode: false, field_depth: 0, aliases: Vec::new() }
+    }
+
+    /// The earlier names of `name` under the open alias scopes: each scope whose current name is
+    /// `name` or a `_`-joined prefix of it gives its old name in its place, innermost first, so
+    /// nested renames compose.
+    fn old_names(&self, name: &str) -> Vec<String> {
+        let mut names = vec![name.to_owned()];
+        for (current, old) in self.aliases.iter().rev() {
+            let renamed: Vec<String> = names
+                .iter()
+                .filter_map(|name| match name.strip_prefix(current.as_str()) {
+                    Some("") => Some(old.clone()),
+                    Some(rest) if rest.starts_with('_') => Some(format!("{old}{rest}")),
+                    _ => None,
+                })
+                .collect();
+            names.extend(renamed);
+        }
+        names.remove(0);
+        names
+    }
 }
 
 /// The columns declared inside one scope, and those of them its value requires when present.
@@ -56,10 +84,19 @@ impl Layout {
             enums: Vec::new(),
             codes: Vec::new(),
             fields: Vec::new(),
+            field_aliases: Vec::new(),
+            aliases: Vec::new(),
         };
         Layout {
-            set: TableSet { kind: kind.to_owned(), code, tables: vec![root], indexes: Vec::new() },
-            frames: vec![Frame { table: 0, scopes: Vec::new(), key_mode: false, field_depth: 0 }],
+            set: TableSet {
+                kind: kind.to_owned(),
+                code,
+                tables: vec![root],
+                indexes: Vec::new(),
+                edges: Vec::new(),
+                edge_names: Vec::new(),
+            },
+            frames: vec![Frame::new(0)],
         }
     }
 
@@ -83,6 +120,7 @@ impl Layout {
         let name = if name.is_empty() { "value" } else { name };
         let frame = self.frames.last_mut().expect("layout has a current table");
         let table = &mut self.set.tables[frame.table];
+        table.aliases.extend(frame.old_names(name).into_iter().map(|old| (old, name.to_owned())));
         if frame.key_mode {
             table.key.push(ColumnDef { name: name.to_owned(), ty, nullable: false });
             table.own_key += 1;
@@ -172,7 +210,8 @@ impl Layout {
     /// `<parent field>_<column>`.
     pub fn table(&mut self, field: &str, role: TableRole, f: impl FnOnce(&mut Layout)) {
         assert!(role != TableRole::Root, "only the kind declares the root table");
-        let parent_index = self.frames.last().expect("layout has a current table").table;
+        let frame = self.frames.last().expect("layout has a current table");
+        let (parent_index, field_aliases) = (frame.table, frame.old_names(field));
         let parent = &self.set.tables[parent_index];
         let inherited = parent.key.len() - parent.own_key;
         let key = parent
@@ -196,9 +235,11 @@ impl Layout {
             enums: Vec::new(),
             codes: Vec::new(),
             fields: Vec::new(),
+            field_aliases,
+            aliases: Vec::new(),
         };
         self.set.tables.push(table);
-        self.frames.push(Frame { table: self.set.tables.len() - 1, scopes: Vec::new(), key_mode: false, field_depth: 0 });
+        self.frames.push(Frame::new(self.set.tables.len() - 1));
         f(self);
         let frame = self.frames.pop().expect("table frame pushed above");
         assert!(frame.scopes.is_empty() && !frame.key_mode, "scopes and keys close inside their table");
@@ -223,7 +264,8 @@ impl Layout {
         // A datum holding a table declares no columns here, and is not a field of the row.
         if record && (datum_of.is_none() || end > start) {
             let datum_of = datum_of.map(str::to_owned);
-            self.set.tables[table].fields.push(FieldColumns { name: name.to_owned(), columns: start..end, state, datum_of });
+            let aliases = self.frames.last().expect("layout has a current table").old_names(name);
+            self.set.tables[table].fields.push(FieldColumns { name: name.to_owned(), columns: start..end, state, datum_of, aliases });
         }
     }
 
@@ -235,6 +277,24 @@ impl Layout {
     pub fn scope(&mut self, f: impl FnOnce(&mut Layout)) -> DatumColumns {
         let scope = self.scoped(f);
         DatumColumns { columns: scope.columns, required: scope.required }
+    }
+
+    /// Declares a renamed field (`#[store(alias = "old")]`): every column, field and nested table
+    /// `f` declares under the current name `current` (prefixed) also answers to `old`, so log
+    /// entries written under the old name still decode. An alias belongs to its table: the columns
+    /// of a nested table restart their names and take no alias from an enclosing scope.
+    pub fn alias(&mut self, current: &str, old: &str, f: impl FnOnce(&mut Layout)) {
+        self.frame().aliases.push((current.to_owned(), old.to_owned()));
+        f(self);
+        self.frame().aliases.pop();
+    }
+
+    /// Declares the kind's edge codes (`#[store(edges = E)]`) and the variant names carrying them,
+    /// in the same order.
+    pub fn edges(&mut self, codes: &[Code], names: &[&str]) {
+        debug_assert_eq!(codes.len(), names.len(), "one name per code");
+        self.set.edges = codes.to_vec();
+        self.set.edge_names = names.iter().map(|name| (*name).to_owned()).collect();
     }
 
     /// [`Layout::scope`] for one datum of a label-plus-data state whose label column is `label`. A

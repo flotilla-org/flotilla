@@ -2,8 +2,8 @@
 //! concrete request, declared here because a lifecycle kind's request is its spec, which declares
 //! the stored kind wherever the request is owned (#3319, #3392 ruling D5). The stored kind is
 //! `Resource<Lifecycle<Terminal>>`: the engine supplies the storable state (`LifecycleState`, with
-//! the attempt tally while Requested) and history (the edge log, attempts among its edges); the
-//! request's columns are this test kind's own,
+//! the attempt tally while Requested); its history, attempts among its edges, is its log entries;
+//! the request's columns are this test kind's own,
 //! transcribed from the #3208 §4.3 sketch:
 //! - `vessel` is a reference to the `Vessel` kind (a target kind of the test registry), so a
 //!   lifecycle row also exercises references to kinds and their identity rows;
@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_schema::{Edge, Frozen, Ref, State, Stored};
 use flotilla_state_machines::{
     machines::lifecycle::{
-        Absence, Attempted, GiveUp, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld,
-        Observed, Realisation, Realise, Release, Teardown, Vanish,
+        Absence, Attempted, GiveUp, Lifecycle, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld, Observed, Realisation,
+        Realise, Release, Teardown, Vanish,
     },
     Resource,
 };
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     engine::{self, resource, Candidate},
     ensure::{cause, outcome, tally},
-    key, list, name, records, reference, stamp_flat, text, timestamp, Fixture, Pick,
+    key, list, name, reference, text, timestamp, Fixture, Pick,
 };
 
 /// A minimal target kind for `TerminalSession::vessel`.
@@ -110,16 +110,6 @@ pub fn state_value(tc: &TestCase, pick: Pick) -> LifecycleState {
     }
 }
 
-fn edges(tc: &TestCase, pick: Pick) -> Vec<LifecycleEdge> {
-    vec![
-        Realise { identity: text(tc), observed: flotilla_state_machines::Ref::new(name(tc)) }.into(),
-        Release { teardown: flotilla_state_machines::Ref::new(name(tc)) }.into(),
-        Vanish { observed: flotilla_state_machines::Ref::new(name(tc)) }.into(),
-        GiveUp { cause: cause(tc, pick) }.into(),
-        Attempted { outcome: outcome(tc, pick) }.into(),
-    ]
-}
-
 /// Drawn keys collide (and so dedupe); covering keys are distinct.
 pub fn map<V>(tc: &TestCase, pick: Pick, max: usize, mut value: impl FnMut(Pick) -> V) -> BTreeMap<String, V> {
     (0..pick.count(tc, max))
@@ -155,7 +145,6 @@ pub fn request(tc: &TestCase, pick: Pick) -> TerminalRequest {
 
 pub fn generate(tc: &TestCase, pick: Pick) -> TerminalSession {
     resource(request(tc, pick), State::new(state_value(tc, pick), timestamp(tc)))
-        .with_events(records(tc, pick, 3, |pick| engine::event::<Lifecycle<Terminal>>(tc, pick, &edges(tc, pick))))
 }
 
 fn boxed(world: MemoryLifecycleWorld) -> Box<dyn LifecycleWorld> {
@@ -198,7 +187,7 @@ impl Fixture for TerminalSession {
         generate(tc, pick)
     }
 
-    /// The request drawn afresh; the state and events kept.
+    /// The request drawn afresh; the state kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> TerminalSession {
         self.clone().with_spec(request(tc, pick))
     }
@@ -207,7 +196,7 @@ impl Fixture for TerminalSession {
         engine::drive(tc, pick, self, candidates(tc, self))
     }
 
-    fn stamped(&self, before: Option<&TerminalSession>, version: u64) -> TerminalSession {
-        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version))
+    fn stamped(&self, _before: Option<&TerminalSession>, _version: u64) -> TerminalSession {
+        self.clone()
     }
 }

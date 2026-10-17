@@ -7,7 +7,7 @@ use syn::{parenthesized, Attribute, LitStr};
 /// The closed attribute list, named by every refusal. `flotilla-schema` repeats this text in its
 /// trait diagnostics and a test there keeps the two equal.
 pub(crate) const SUPPORTED: &str = "the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-                                    flatten, state and code (fields and variants) and kind, code, state, index and labels (types)";
+                                    flatten, state, alias and code (fields and variants) and kind, code, state, index, labels and edges (types)";
 
 /// A refusal: names what was refused and the closed list.
 pub(crate) fn refuse(tokens: impl ToTokens, what: impl std::fmt::Display) -> syn::Error {
@@ -31,6 +31,16 @@ pub(crate) struct TypeAttrs {
     /// `Resource<M>`), which lays out the spec, then its state `S` as the field `state`, then
     /// its records (#3392 ruling D5).
     pub state: Option<syn::Type>,
+    /// `edges = E`: the code enum of a kind's edges, whose codes are the only `edge` codes its log
+    /// entries may carry (#3392 A7).
+    pub edges: Option<syn::Path>,
+}
+
+/// A field's storage attributes: at most one shape attribute, and an optional `alias = "old"`
+/// naming the field's earlier name (#3392 A7).
+pub(crate) struct FieldAttrs {
+    pub shape: Option<FieldAttr>,
+    pub alias: Option<LitStr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +94,7 @@ fn path_name(path: &syn::Path) -> String {
 }
 
 pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
-    let mut parsed = TypeAttrs { kind: None, code: None, indexes: Vec::new(), labels: None, state: None };
+    let mut parsed = TypeAttrs { kind: None, code: None, indexes: Vec::new(), labels: None, state: None, edges: None };
     for attr in store_attrs(attrs) {
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
@@ -119,7 +129,13 @@ pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
                         return Err(meta.error("`state` is given twice"));
                     }
                 }
-                _ if FieldAttr::parse(&name).is_some() => {
+                "edges" => {
+                    let value: syn::Path = meta.value()?.parse()?;
+                    if parsed.edges.replace(value).is_some() {
+                        return Err(meta.error("`edges` is given twice"));
+                    }
+                }
+                _ if FieldAttr::parse(&name).is_some() || name == "alias" => {
                     return Err(refuse(&meta.path, format_args!("`{name}` is a field attribute, not a type attribute")));
                 }
                 _ => return Err(refuse(&meta.path, format_args!("unknown storage attribute `{name}`"))),
@@ -130,14 +146,24 @@ pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
     Ok(parsed)
 }
 
-pub(crate) fn field_attr(attrs: &[Attribute]) -> syn::Result<Option<FieldAttr>> {
-    let mut found: Option<FieldAttr> = None;
+pub(crate) fn field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
+    let mut found = FieldAttrs { shape: None, alias: None };
     for attr in store_attrs(attrs) {
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
+            if name == "alias" {
+                let value: LitStr = meta.value()?.parse()?;
+                if value.value().is_empty() {
+                    return Err(refuse(&value, "`alias` names the field's earlier name, which is not empty"));
+                }
+                if found.alias.replace(value).is_some() {
+                    return Err(meta.error("`alias` is given twice"));
+                }
+                return Ok(());
+            }
             let Some(parsed) = FieldAttr::parse(&name) else {
                 let what = match name.as_str() {
-                    "kind" | "index" | "labels" => format!("`{name}` is a type attribute, not a field attribute"),
+                    "kind" | "index" | "labels" | "edges" => format!("`{name}` is a type attribute, not a field attribute"),
                     "code" => "`code` belongs on enum variants and kinds, not fields".to_owned(),
                     _ => format!("unknown storage attribute `{name}`"),
                 };
@@ -146,7 +172,7 @@ pub(crate) fn field_attr(attrs: &[Attribute]) -> syn::Result<Option<FieldAttr>> 
             if !meta.input.is_empty() && !meta.input.peek(syn::Token![,]) {
                 return Err(refuse(&meta.path, format_args!("`{name}` takes no arguments")));
             }
-            if let Some(previous) = found.replace(parsed) {
+            if let Some(previous) = found.shape.replace(parsed) {
                 return Err(refuse(
                     &meta.path,
                     format_args!("a field takes one storage attribute, found `{}` and `{name}`", previous.name()),
