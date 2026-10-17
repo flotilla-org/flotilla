@@ -22,7 +22,7 @@
 
 use std::collections::BTreeSet;
 
-use flotilla_schema::Stored;
+use flotilla_schema::{Address, Stored};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -166,10 +166,9 @@ impl Work {
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(kind = "Ensure", code = "en", state = EnsureState, index(name = "by_inbox", eq(inbox)))]
 pub struct EnsureSpec {
-    /// The inbox whose [`Drain`] a bind waits on. An address: plain interned
-    /// text until `flotilla-address` is adopted.
-    #[store(intern)]
-    pub inbox: String,
+    /// The inbox whose [`Drain`] a bind waits on: the address a Message names
+    /// (ruling D3), read by its canonical text.
+    pub inbox: Address,
     #[store(flatten)]
     pub policy: AttemptPolicy,
 }
@@ -479,7 +478,7 @@ fn gate_bind(h: &mut Handle<'_, Ensure>, edge: &Bind) -> Result<(), EnsureRefusa
         return Err(EnsureRefusal::NotRecorded);
     }
     let ready = h.read(&edge.fulfiller).is_some_and(|status| status.phase == FulfillerPhase::Realised && status.can_receive);
-    let drain = Ref::<Drain>::new(h.spec().inbox.clone());
+    let drain = Ref::<Drain>::new(h.spec().inbox.as_str());
     if ready && h.read(&drain) == Some(&true) {
         Ok(())
     } else {

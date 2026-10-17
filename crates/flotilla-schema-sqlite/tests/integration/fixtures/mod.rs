@@ -253,6 +253,11 @@ pub fn name(tc: &TestCase) -> String {
     tc.draw(gs::sampled_from(vec!["alice".to_owned(), "bob".to_owned(), String::new(), "ünïcødé".to_owned()]))
 }
 
+/// The project-rooted address of `name`, for hand-written rows.
+pub fn addr(name: &str) -> Address {
+    Address::project(name).expect("valid name")
+}
+
 /// Addresses (#3392 G1) from a small set, so equal addresses share one interned string: a
 /// project, a role inbox under it (its value escaped), and a change request outside flotilla.
 pub fn address(tc: &TestCase) -> Address {

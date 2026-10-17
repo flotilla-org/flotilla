@@ -1,7 +1,7 @@
 //! Message (spec `machines/message.qnt`; scenarios `inbox_delivery`, `message_race`;
 //! ADR 0064 "Inboxes").
 
-use flotilla_schema::{Code, CodeEnum, Position, Timestamp};
+use flotilla_schema::{Address, Code, CodeEnum, Position, Timestamp};
 use flotilla_state_machines::{
     machines::message::{
         AppliedThrough, Binding, Condition, Deliver, DropMessage, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message,
@@ -17,12 +17,26 @@ fn t(micros: i64) -> Timestamp {
     Timestamp::from_micros(micros)
 }
 
-fn condition() -> Ref<Condition> {
-    Ref::new("build-green")
+/// The project-rooted address of `name`.
+fn a(name: &str) -> Address {
+    Address::project(name).expect("valid name")
+}
+
+fn inbox() -> Address {
+    INBOX.parse().expect("canonical inbox")
+}
+
+fn condition() -> Address {
+    a("build-green")
+}
+
+/// The world's key for [`condition`]: its canonical text.
+fn condition_ref() -> Ref<Condition> {
+    Ref::new(condition().as_str())
 }
 
 fn spec(expectation: Expectation, deadline: Option<i64>) -> MessageSpec {
-    MessageSpec { inbox: INBOX.into(), expectation, deadline: deadline.map(t), unbound_after: 10 }
+    MessageSpec { inbox: inbox(), expectation, deadline: deadline.map(t), unbound_after: 10 }
 }
 
 fn home(spec: MessageSpec) -> Home<Message> {
@@ -189,9 +203,9 @@ fn an_observed_outcome_settles_from_pending() {
 
     let mut outcome = home(spec(Expectation::Outcome { condition: condition() }, None));
     assert_eq!(outcome.apply("m", observed(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
-    world.condition.put(&condition(), false);
+    world.condition.put(&condition_ref(), false);
     assert_eq!(outcome.apply("m", observed(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
-    world.condition.put(&condition(), true);
+    world.condition.put(&condition_ref(), true);
     outcome.apply("m", observed(), &world, t(2)).expect("settled");
     assert_eq!(*state(&outcome), MessageState::Settled { receiver: None }, "settled from Pending: no receiver");
 }
@@ -201,12 +215,12 @@ fn an_observed_outcome_settles_from_pending() {
 fn supersession_must_name_this_message() {
     let mut home = home(spec(Expectation::Reply, None));
     let mut world = MemoryMessageWorld::default();
-    let by: Ref<Supersession> = Ref::new("m2");
-    let superseded = || drop(DropReason::Superseded { by: Ref::new("m2") });
+    let by = a("m2");
+    let superseded = || drop(DropReason::Superseded { by: by.clone() });
     assert_eq!(home.apply("m", superseded(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
-    world.supersession.put(&by, Supersedes { older: "other".into() });
+    world.supersession.put(&Ref::<Supersession>::new(by.as_str()), Supersedes { older: "other".into() });
     assert_eq!(home.apply("m", superseded(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
-    world.supersession.put(&by, Supersedes { older: "m".into() });
+    world.supersession.put(&Ref::<Supersession>::new(by.as_str()), Supersedes { older: "m".into() });
     home.apply("m", superseded(), &world, t(1)).expect("dropped");
     assert_eq!(*state(&home), MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: None, watermark: None });
 }
@@ -217,11 +231,11 @@ fn supersession_must_name_this_message() {
 #[test]
 fn deliberate_drops_need_authority() {
     let mut world = MemoryMessageWorld::default();
-    world.authority.put(&Ref::new("no"), false);
-    world.authority.put(&Ref::new("yes"), true);
+    world.authority.put(&Ref::new(a("no").as_str()), false);
+    world.authority.put(&Ref::new(a("yes").as_str()), true);
     receipt(&mut world, "s1", Transport::Turn);
-    let withdrawn = |a: &str| drop(DropReason::Withdrawn { by: "sender".into(), authority: Ref::new(a) });
-    let unreachable = |a: &str| drop(DropReason::ConsumerUnreachable { by: "supervisor".into(), authority: Ref::new(a) });
+    let withdrawn = |name: &str| drop(DropReason::Withdrawn { by: a("sender"), authority: a(name) });
+    let unreachable = |name: &str| drop(DropReason::ConsumerUnreachable { by: a("supervisor"), authority: a(name) });
     for (reason, delivered) in [(withdrawn as fn(&str) -> DropMessage, false), (unreachable, true)] {
         let mut home = home(spec(Expectation::Reply, None));
         if delivered {
@@ -249,9 +263,9 @@ fn expiry_needs_a_passed_deadline_and_no_expected_evidence() {
     world.reply.put(&Ref::new("m"), ());
     assert_eq!(reply.apply("m", drop(DropReason::Expired), &world, t(6)).err(), refused(MessageRefusal::ExpectationMet));
     let mut outcome = home(spec(Expectation::Outcome { condition: condition() }, Some(5)));
-    world.condition.put(&condition(), true);
+    world.condition.put(&condition_ref(), true);
     assert_eq!(outcome.apply("m", drop(DropReason::Expired), &world, t(6)).err(), refused(MessageRefusal::ExpectationMet));
-    world.condition.put(&condition(), false);
+    world.condition.put(&condition_ref(), false);
     outcome.apply("m", drop(DropReason::Expired), &world, t(6)).expect("expired");
     assert_eq!(*state(&outcome), MessageState::Dropped { reason: DropReason::Expired, receiver: None, watermark: None });
     let dropped = outcome.get("m").expect("exists").events().last().expect("dropped");
@@ -360,9 +374,9 @@ fn edge_events_round_trip_through_the_schema_codec() {
 // (or absence).
 #[test]
 fn payload_documents_name_references_and_keep_reads() {
-    let reason = DropReason::Withdrawn { by: "ann".into(), authority: Ref::new("ops") };
+    let reason = DropReason::Withdrawn { by: a("ann"), authority: a("ops") };
     let reads = vec![
-        InputRead { kind: "authority".into(), name: "ops".into(), version: Some(Version(4)) },
+        InputRead { kind: "authority".into(), name: "project:ops".into(), version: Some(Version(4)) },
         InputRead { kind: "binding".into(), name: INBOX.into(), version: None },
     ];
     let payload = EdgePayload { edge: MessageEdge::from(drop(reason)), reads };
@@ -370,9 +384,9 @@ fn payload_documents_name_references_and_keep_reads() {
     assert_eq!(
         json,
         serde_json::json!({
-            "edge": ["dr", { "reason": { "Withdrawn": { "by": "ann", "authority": "ops" } } }],
+            "edge": ["dr", { "reason": { "Withdrawn": { "by": "project:ann", "authority": "project:ops" } } }],
             "reads": [
-                { "kind": "authority", "name": "ops", "version": 4 },
+                { "kind": "authority", "name": "project:ops", "version": 4 },
                 { "kind": "binding", "name": INBOX, "version": null },
             ],
         })

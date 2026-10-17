@@ -76,7 +76,7 @@ use std::{
     time::Instant,
 };
 
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Address, Timestamp};
 use flotilla_state_machines::{
     machines::{
         agent_session::{
@@ -101,8 +101,14 @@ use serde_json::{json, Value};
 
 /// Microseconds per model clock tick (ten minutes).
 const UNIT: i64 = 600_000_000;
-/// The inbox every replayed message and Ensure names.
-const INBOX: &str = "inbox";
+/// The inbox every replayed message and Ensure names, as the world keys it:
+/// the canonical text of [`inbox`].
+const INBOX: &str = "project:inbox";
+/// The authorised party, the superseding message and the outcome condition, as
+/// the world keys them: each address's canonical text.
+const OWNER: &str = "project:owner";
+const NEWER: &str = "project:newer";
+const OUTCOME: &str = "project:outcome";
 /// The one message (id 1) of the message scenarios, and the one Ensure (id 1)
 /// of `ensure_bind`: every resource is named by its model id.
 const ONE: &str = "1";
@@ -133,7 +139,12 @@ fn cause(detail: &str) -> Cause {
 
 /// The authorised party's reference; its value is the model's `authorised` flag.
 fn owner<K: Kind>() -> Ref<K> {
-    Ref::new("owner")
+    Ref::new(OWNER)
+}
+
+/// A canonical address; the world is keyed by its text.
+fn at_address(text: &str) -> Address {
+    text.parse().unwrap_or_else(|error| panic!("{text} as an address: {error}"))
 }
 
 /// A receipt's transport, as the scenarios name it.
@@ -1262,7 +1273,7 @@ fn ensure_bind(trace: &Trace, tally: &mut Tally) {
         match step.action() {
             // The spec's `MAX_FAILURES = 2`.
             "request" => {
-                create(&mut home, ONE, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(2) }, &world, &step, tally)
+                create(&mut home, ONE, EnsureSpec { inbox: at_address(INBOX), policy: AttemptPolicy::immediate(2) }, &world, &step, tally)
             }
             "record" => accept(&mut home, ONE, ensure::Record { fulfiller }, &world, now, &step, tally),
             "create" => {
@@ -1369,9 +1380,9 @@ fn drop_reason(v: &Value) -> DropReason {
     match tag(v) {
         "Undeliverable" => DropReason::Undeliverable,
         "Expired" => DropReason::Expired,
-        "Superseded" => DropReason::Superseded { by: Ref::new("newer") },
-        "Withdrawn" => DropReason::Withdrawn { by: "owner".into(), authority: owner() },
-        "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: "owner".into(), authority: owner() },
+        "Superseded" => DropReason::Superseded { by: at_address(NEWER) },
+        "Withdrawn" => DropReason::Withdrawn { by: at_address(OWNER), authority: at_address(OWNER) },
+        "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: at_address(OWNER), authority: at_address(OWNER) },
         other => panic!("drop reason {other}"),
     }
 }
@@ -1475,11 +1486,11 @@ impl<'a> MessageReplay<'a> {
         let expectation = tag(&envelope["expectation"]);
         let deadline = boolean(&envelope["hasDeadline"]).then(|| number(&envelope["deadline"]));
         let spec = MessageSpec {
-            inbox: INBOX.into(),
+            inbox: at_address(INBOX),
             expectation: match expectation {
                 "Nothing" => Expectation::Nothing,
                 "Reply" => Expectation::Reply,
-                "Outcome" => Expectation::Outcome { condition: Ref::new("outcome") },
+                "Outcome" => Expectation::Outcome { condition: at_address(OUTCOME) },
                 other => panic!("expectation {other}"),
             },
             deadline: deadline.map(moment),
@@ -1525,7 +1536,7 @@ impl<'a> MessageReplay<'a> {
         if stream.any("reply") {
             world.reply.put(&Ref::new(ONE), ());
         }
-        world.condition.put(&Ref::new("outcome"), stream.any("outcome"));
+        world.condition.put(&Ref::new(OUTCOME), stream.any("outcome"));
         if stream.any("failure") {
             world.delivery_failure.put(&Ref::new(ONE), ());
         }
@@ -1541,7 +1552,7 @@ impl<'a> MessageReplay<'a> {
         let evidence = witness || self.feed == Feed::Race;
         world.authority.put(&owner(), evidence);
         if evidence {
-            world.supersession.put(&Ref::new("newer"), message::Supersedes { older: ONE.into() });
+            world.supersession.put(&Ref::new(NEWER), message::Supersedes { older: ONE.into() });
         }
         world
     }
@@ -1641,7 +1652,7 @@ impl<'a> MessageReplay<'a> {
                 deliver(1).into(),
                 message::Settle { by: message::Settlement::Answered }.into(),
                 message::Settle { by: message::Settlement::OutcomeObserved }.into(),
-                message::DropMessage { reason: DropReason::Withdrawn { by: "owner".into(), authority: owner() } }.into(),
+                message::DropMessage { reason: DropReason::Withdrawn { by: at_address(OWNER), authority: at_address(OWNER) } }.into(),
                 message::DropMessage { reason: DropReason::Expired }.into(),
                 message::DropMessage { reason: DropReason::Undeliverable }.into(),
             ];

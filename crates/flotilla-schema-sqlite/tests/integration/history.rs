@@ -20,7 +20,7 @@ use hegel::TestCase;
 use rusqlite::Connection;
 
 use crate::fixtures::{
-    agent_session, engine, message, origin, registry, store,
+    addr, agent_session, engine, message, origin, registry, store,
     synthetic::{DossierEdge, DossierEvent, DossierState},
     AgentSession, Dossier, Fixture, GateRead, Message, Payload, Pick, Referral, Resource, LOCAL,
 };
@@ -125,7 +125,7 @@ fn a_delete_keeps_history_and_an_expunge_removes_it() {
     let mut write = source.write().expect("write");
     let stamp = write.insert("m", &message::sample(), &origin()).expect("insert");
     let current = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
-    let edited = write.update(&current, &message::sample_in("edited"), &origin()).expect("edit");
+    let edited = write.update(&current, &message::sample_in(addr("edited")), &origin()).expect("edit");
     write.delete::<Resource<Message>>(edited, &Origin::new("deleter", Timestamp(9))).expect("delete");
     write.insert("other", &message::sample(), &origin()).expect("a resource that stays");
     write.commit().expect("commit");

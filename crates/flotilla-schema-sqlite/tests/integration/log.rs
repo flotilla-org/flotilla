@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use flotilla_state_machines::machines::message::MessageSpec;
 
 use crate::fixtures::{
-    message as messages, origin, registry, store,
+    addr, message as messages, origin, registry, store,
     synthetic::{workflow, InputValue},
     AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Ticket, Vessel, LOCAL,
 };
@@ -228,7 +228,7 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
     let mut write = remote.write().expect("write");
     let stamp = write.insert("far", &messages::sample(), &origin()).expect("insert");
     let current = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
-    write.update(&current, &messages::sample_in("edited"), &origin()).expect("update");
+    write.update(&current, &messages::sample_in(addr("edited")), &origin()).expect("update");
     write.commit().expect("commit");
     let changes = remote.read().expect("read").changes_since("remote", 0, 10).expect("log");
 
@@ -239,8 +239,8 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
     }
     let id = write.resolve(Resource::<Message>::CODE, "far", "remote").expect("resolve").expect("present");
     let current = write.load::<Resource<Message>>(id).expect("load").expect("present");
-    assert_eq!((current.version, current.value.spec().inbox.as_str()), (changes[1].home_seq, "edited"));
-    let next = current.value.clone().with_spec(MessageSpec { inbox: "local edit".into(), ..current.value.spec().clone() });
+    assert_eq!((current.version, current.value.spec().inbox.name()), (changes[1].home_seq, "edited"));
+    let next = current.value.clone().with_spec(MessageSpec { inbox: addr("local edit"), ..current.value.spec().clone() });
     assert!(matches!(write.update(&current, &next, &origin()), Err(StoreError::NotHome { .. })));
     assert!(matches!(write.delete::<Resource<Message>>(current.stamp(), &origin()), Err(StoreError::NotHome { .. })));
 
@@ -462,7 +462,7 @@ fn log(store: &mut Store, home: &str) -> Vec<Event> {
 }
 
 fn message(inbox: &str) -> Resource<Message> {
-    messages::sample_in(inbox)
+    messages::sample_in(addr(inbox))
 }
 
 /// Inserts `name`, then rewrites its inbox once per entry of `bodies`, in one transaction.

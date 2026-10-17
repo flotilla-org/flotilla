@@ -14,7 +14,7 @@ use flotilla_state_machines::{
 use hegel::{generators as gs, TestCase};
 
 use super::{
-    code_enum,
+    addr, address, code_enum,
     engine::{self, resource, Candidate},
     name, text, timestamp, Fixture, Pick,
 };
@@ -74,7 +74,7 @@ pub fn policy(tc: &TestCase) -> AttemptPolicy {
 }
 
 pub fn spec(tc: &TestCase) -> EnsureSpec {
-    EnsureSpec { inbox: name(tc), policy: policy(tc) }
+    EnsureSpec { inbox: address(tc), policy: policy(tc) }
 }
 
 pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Ensure> {
@@ -83,7 +83,7 @@ pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Ensure> {
 
 /// A fixed spec for example tests: `inbox`, one immediate attempt.
 pub fn sample_spec() -> EnsureSpec {
-    EnsureSpec { inbox: "inbox".into(), policy: AttemptPolicy::immediate(1) }
+    EnsureSpec { inbox: addr("inbox"), policy: AttemptPolicy::immediate(1) }
 }
 
 /// An unfulfilled Ensure with nothing recorded and no history.
@@ -111,7 +111,7 @@ pub fn candidates(tc: &TestCase, pick: Pick, ensure: &Resource<Ensure>) -> Vec<C
         candidates.push((Create { fulfiller: fulfiller.clone() }.into(), boxed(MemoryEnsureWorld::default()), now));
         let mut world = MemoryEnsureWorld::default();
         world.fulfillers.put(&fulfiller, FulfillerStatus { phase: FulfillerPhase::Realised, can_receive: true });
-        world.drains.put(&Ref::new(ensure.spec().inbox.clone()), true);
+        world.drains.put(&Ref::new(ensure.spec().inbox.as_str()), true);
         candidates.push((Bind { fulfiller }.into(), boxed(world), now));
     }
     if let Some(bound) = state.bound() {

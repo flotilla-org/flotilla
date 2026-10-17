@@ -7,7 +7,7 @@ use flotilla_schema_sqlite::{Loaded, Stamp, Store, StoreError};
 use flotilla_state_machines::{
     machines::{
         ensure::{EnsureSpec, EnsureState, MemoryEnsureWorld, Record},
-        message::{Deliver, MemoryMessageWorld, MessageWorld, Receiver, Settle, Settlement},
+        message::{Deliver, MemoryMessageWorld, MessageState, MessageWorld, Receiver, Settle, Settlement},
     },
     Ref, Transport,
 };
@@ -15,6 +15,7 @@ use hegel::TestCase;
 use rusqlite::Connection;
 
 use crate::fixtures::{
+    addr,
     engine::{step, NAME},
     ensure, message, origin, registry, store,
     synthetic::{workflow, Deliverable, DeliverableState, Evidence, InputValue, PromiseKind, PromiseSource},
@@ -103,7 +104,7 @@ fn spec_edits_refuse_what_only_edges_write() {
     let later = ensure
         .clone()
         .with_state(State::new(ensure.state().clone(), Timestamp(9)))
-        .with_spec(EnsureSpec { inbox: "edited".into(), ..ensure.spec().clone() });
+        .with_spec(EnsureSpec { inbox: addr("edited"), ..ensure.spec().clone() });
     assert_eq!(refused(write.update(&current, &later, &origin())), "ensure.state_since", "a spec field beside it does not excuse it");
     let deliverables = |f: Edit<Deliverable>| Dossier { deliverables: with_rows(&dossier.deliverables, f), ..dossier.clone() };
     let retracted = deliverables(&|rows| rows[0].1.state = State::new(DeliverableState::Retracted, Timestamp(5)));
@@ -119,7 +120,7 @@ fn spec_edits_refuse_what_only_edges_write() {
 
     // Allowed in the same transaction: a spec edit, then the engine's record edge appending its
     // event and growing the state's recorded set, whatever stamps the caller's rows hold.
-    let edited = ensure.clone().with_spec(EnsureSpec { inbox: "edited".into(), ..ensure.spec().clone() });
+    let edited = ensure.clone().with_spec(EnsureSpec { inbox: addr("edited"), ..ensure.spec().clone() });
     let stamp = write.update(&current, &edited, &origin()).expect("spec edit");
     let (edge, next) =
         step(&edited, "dave", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(8)).expect("recorded");
@@ -173,8 +174,9 @@ fn writes_touch_only_their_rows() {
     };
     let (mut store, _) = rows_written(store, |_| {});
     // The strings the edges write are interned first, so no `strings` row is counted below.
-    for (n, string) in ["s", "h", "w"].into_iter().enumerate() {
-        insert(&mut store, &format!("pre{n}"), &message::sample_in(string));
+    for (n, (session, host)) in [("s", "h"), ("w", "w")].into_iter().enumerate() {
+        let awaiting = MessageState::Awaiting { receiver: Receiver { session: session.into(), host: host.into() } };
+        insert(&mut store, &format!("pre{n}"), &message::sample().with_state(State::new(awaiting, Timestamp(0))));
     }
     let current = insert(&mut store, "m", &message::sample());
     let dossier_current = insert(&mut store, "d", &dossier);

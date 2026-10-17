@@ -16,6 +16,11 @@
 //! keyed by the spec's inbox: the inbox's consumer binding and the applied
 //! keepalive watermark of the bound consumer host's stream into this home.
 //!
+//! The inbox, an outcome's condition and a drop reason's references are
+//! addresses (#3392 G1, ruling D3): stored as interned canonical text, and read
+//! through the world by that text. The receiver stays plain interned text until
+//! who may consume a message is ruled (#3424).
+//!
 //! The spec's envelope is the immutable [`MessageSpec`]; the rest of its
 //! state is the state's data: the one receiver (required while Awaiting, and
 //! kept, if any, when Settled or Dropped), and Dropped's reason and the
@@ -28,7 +33,7 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{Cause, CodeEnum, Event, EventError, KindSpec, Stored, Timestamp};
+use flotilla_schema::{Address, Cause, CodeEnum, Event, EventError, KindSpec, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -45,11 +50,7 @@ pub enum Expectation {
     #[store(code = "re")]
     Reply,
     #[store(code = "ou")]
-    Outcome {
-        /// An address: plain interned text until `flotilla-address` is adopted.
-        #[store(intern)]
-        condition: Ref<Condition>,
-    },
+    Outcome { condition: Address },
 }
 
 /// The message as sent: the spec's envelope. Immutable. It declares the stored
@@ -64,9 +65,7 @@ pub enum Expectation {
     index(name = "deadline", order(deadline), when(state in [Pending, Awaiting], deadline is_some))
 )]
 pub struct MessageSpec {
-    /// An address: plain interned text until `flotilla-address` is adopted.
-    #[store(intern)]
-    pub inbox: String,
+    pub inbox: Address,
     pub expectation: Expectation,
     pub deadline: Option<Timestamp>,
     /// How long, in microseconds, the inbox must stay unbound before an
@@ -74,8 +73,9 @@ pub struct MessageSpec {
     pub unbound_after: i64,
 }
 
-/// The consumer session a receipt came from, and its host. Stored flattened;
-/// both are addresses, plain interned text until `flotilla-address` is adopted.
+/// The consumer session a receipt came from, and its host. Stored flattened,
+/// as plain interned text: who may consume a message (an agent session, a
+/// person through a surface, or a controller) is ruled in #3424.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub struct Receiver {
     #[store(intern)]
@@ -107,8 +107,8 @@ pub struct Settle {
 }
 
 /// Why a message dropped, with what the reason's gate reads. Stored as a data
-/// enum under the Dropped label; its references are plain interned text until
-/// `flotilla-address` is adopted.
+/// enum under the Dropped label; its references are addresses, each datum
+/// one interned column shared by name across the reasons.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 pub enum DropReason {
     /// No receipt was confirmed within policy; never proof that no turn happened.
@@ -118,26 +118,13 @@ pub enum DropReason {
     Expired,
     /// A newer message replaces this one.
     #[store(code = "su")]
-    Superseded {
-        #[store(intern)]
-        by: Ref<Supersession>,
-    },
+    Superseded { by: Address },
     /// The sender cancelled without a replacement.
     #[store(code = "wi")]
-    Withdrawn {
-        #[store(intern)]
-        by: String,
-        #[store(intern)]
-        authority: Ref<Authority>,
-    },
+    Withdrawn { by: Address, authority: Address },
     /// A deliberate drop of a message whose consumer stays silent.
     #[store(code = "cu")]
-    ConsumerUnreachable {
-        #[store(intern)]
-        by: String,
-        #[store(intern)]
-        authority: Ref<Authority>,
-    },
+    ConsumerUnreachable { by: Address, authority: Address },
 }
 
 states! {
@@ -489,7 +476,7 @@ fn gate_settle(h: &mut Handle<'_, Message>, settle: &Settle) -> Result<(), Messa
             h.read(&Ref::<Reply>::new(own)).is_some()
         }
         Settlement::OutcomeObserved => match expectation {
-            Expectation::Outcome { condition } => h.read(condition).copied().unwrap_or(false),
+            Expectation::Outcome { condition } => outcome_observed(h, condition),
             _ => return Err(MessageRefusal::UnsupportedSettlement),
         },
     };
@@ -500,8 +487,12 @@ fn gate_settle(h: &mut Handle<'_, Message>, settle: &Settle) -> Result<(), Messa
     }
 }
 
-fn authorised(h: &mut Handle<'_, Message>, authority: &Ref<Authority>) -> Result<(), MessageRefusal> {
-    if h.read(authority).copied().unwrap_or(false) {
+fn outcome_observed(h: &mut Handle<'_, Message>, condition: &Address) -> bool {
+    h.read(&Ref::<Condition>::new(condition.as_str())).copied().unwrap_or(false)
+}
+
+fn authorised(h: &mut Handle<'_, Message>, authority: &Address) -> Result<(), MessageRefusal> {
+    if h.read(&Ref::<Authority>::new(authority.as_str())).copied().unwrap_or(false) {
         Ok(())
     } else {
         Err(MessageRefusal::Unauthorised)
@@ -514,7 +505,7 @@ fn gate_drop(h: &mut Handle<'_, Message>, drop: &DropMessage) -> Result<(), Mess
         DropReason::Undeliverable => undeliverable(h),
         DropReason::Superseded { by } => {
             let own = h.name().to_string();
-            match h.read(by) {
+            match h.read(&Ref::<Supersession>::new(by.as_str())) {
                 Some(supersedes) if supersedes.older == own => Ok(()),
                 _ => Err(MessageRefusal::MissingEvidence),
             }
@@ -525,12 +516,12 @@ fn gate_drop(h: &mut Handle<'_, Message>, drop: &DropMessage) -> Result<(), Mess
 
 // Spec `bound`: a consumer bound to the inbox, or a receiver.
 fn consumer_bound(h: &mut Handle<'_, Message>) -> bool {
-    let inbox = Ref::<Binding>::new(h.spec().inbox.clone());
+    let inbox = Ref::<Binding>::new(h.spec().inbox.as_str());
     matches!(h.read(&inbox), Some(InboxBinding::Bound { .. })) || h.state().receiver().is_some()
 }
 
 fn applied_through<'a>(h: &mut Handle<'a, Message>) -> Option<&'a Timestamp> {
-    let inbox = Ref::<AppliedThrough>::new(h.spec().inbox.clone());
+    let inbox = Ref::<AppliedThrough>::new(h.spec().inbox.as_str());
     h.read(&inbox)
 }
 
@@ -551,7 +542,7 @@ fn expired(h: &mut Handle<'_, Message>) -> Result<(), MessageRefusal> {
             let own = h.name().to_string();
             h.read(&Ref::<Reply>::new(own)).is_some()
         }
-        Expectation::Outcome { condition } => h.read(condition).copied().unwrap_or(false),
+        Expectation::Outcome { condition } => outcome_observed(h, condition),
     };
     if met {
         Err(MessageRefusal::ExpectationMet)
@@ -570,7 +561,7 @@ fn undeliverable(h: &mut Handle<'_, Message>) -> Result<(), MessageRefusal> {
         return Err(MessageRefusal::ReceiptConfirmed);
     }
     let spec = h.spec();
-    let unbound_past_threshold = match h.read(&Ref::<Binding>::new(spec.inbox.clone())) {
+    let unbound_past_threshold = match h.read(&Ref::<Binding>::new(spec.inbox.as_str())) {
         Some(InboxBinding::Unbound { since }) => h.now().since(*since) > spec.unbound_after,
         _ => false,
     };

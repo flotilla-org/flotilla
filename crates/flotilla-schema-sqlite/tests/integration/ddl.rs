@@ -7,7 +7,7 @@ use flotilla_state_machines::{
     Ref, Transport,
 };
 
-use crate::fixtures::{engine, message, origin, registry, store, Message, Resource, LOCAL};
+use crate::fixtures::{addr, engine, message, origin, registry, store, Message, Resource, LOCAL};
 
 // Behaviour (#3320 DDL snapshot): the fixtures' DDL is deterministic and checked in. Any diff
 // fails; `UPDATE_DDL_SNAPSHOT=1` rewrites the snapshot for review.
@@ -51,7 +51,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
     let message = message::sample().with_spec(spec.clone());
     let stamp = write.insert("m", &message, &origin()).expect("insert");
     let current = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
-    write.update(&current, &message.with_spec(MessageSpec { inbox: "c".into(), ..spec }), &origin()).expect("update");
+    write.update(&current, &message.with_spec(MessageSpec { inbox: addr("c"), ..spec }), &origin()).expect("update");
     write.commit().expect("commit");
 
     let conn = store.into_connection();
@@ -111,7 +111,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
 fn reopening_keeps_tables_and_rows() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let message = message::sample_in("kept");
+    let message = message::sample_in(addr("kept"));
     let stamp = write.insert("m", &message, &origin()).expect("insert");
     write.commit().expect("commit");
     let mut store = Store::open(store.into_connection(), LOCAL, registry()).expect("reopen");
@@ -126,7 +126,7 @@ fn reopening_keeps_tables_and_rows() {
 fn readable_views_name_codes_and_strings() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    write.insert("m", &message::sample_in("inbox-a"), &origin()).expect("insert");
+    write.insert("m", &message::sample_in(addr("inbox-a")), &origin()).expect("insert");
     write.commit().expect("commit");
     let conn = Store::open(store.into_connection(), LOCAL, registry()).expect("reopen").into_connection();
     let raw: (String, String) =
@@ -135,7 +135,7 @@ fn readable_views_name_codes_and_strings() {
     let view: (String, String, String) = conn
         .query_row("SELECT inbox, state, expectation FROM message_view", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .expect("view");
-    assert_eq!(view, ("inbox-a".to_owned(), "Pending".to_owned(), "Reply".to_owned()));
+    assert_eq!(view, ("project:inbox-a".to_owned(), "Pending".to_owned(), "Reply".to_owned()));
     let edge: String = conn
         .query_row("SELECT name FROM codes WHERE kind = 'ms' AND field = 'log:edge' AND code = 'dr'", [], |row| row.get(0))
         .expect("code");

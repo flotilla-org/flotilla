@@ -4,10 +4,10 @@ use flotilla_schema_sqlite::{Stamp, StoreError};
 use flotilla_state_machines::machines::message::MessageSpec;
 use hegel::{generators as gs, TestCase};
 
-use crate::fixtures::{floor, message as messages, origin, store, Message, Referral, Resource};
+use crate::fixtures::{addr, floor, message as messages, origin, store, Message, Referral, Resource};
 
 fn message(inbox: &str) -> Resource<Message> {
-    messages::sample().with_spec(MessageSpec { inbox: inbox.into(), unbound_after: 1, ..messages::sample_spec() })
+    messages::sample().with_spec(MessageSpec { inbox: addr(inbox), unbound_after: 1, ..messages::sample_spec() })
 }
 
 // Behaviour (ADR 0064, #3320 sequencing): every write takes the home's next sequence, so the
@@ -130,8 +130,8 @@ fn a_refused_write_does_not_spoil_its_batch() {
 
     let mut read = store.read().expect("read");
     let a = read.load::<Resource<Message>>(first.id).expect("load a").expect("a present");
-    assert_eq!((a.value.spec().inbox.as_str(), a.version), ("second", moved.version));
-    assert_eq!(read.load::<Resource<Message>>(other.id).expect("load b").expect("b present").value.spec().inbox, "other");
+    assert_eq!((a.value.spec().inbox.name(), a.version), ("second", moved.version));
+    assert_eq!(read.load::<Resource<Message>>(other.id).expect("load b").expect("b present").value.spec().inbox.name(), "other");
 }
 
 // Behaviour: identity rows outlive their resource, so a write to a deleted resource is

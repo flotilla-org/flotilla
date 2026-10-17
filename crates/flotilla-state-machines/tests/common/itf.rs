@@ -20,7 +20,12 @@ pub fn text(v: &Value) -> &str {
 /// project-rooted address whose one value is that text, and back through
 /// [`Address::name`].
 pub fn address(v: &Value) -> Address {
-    Address::project(text(v)).unwrap_or_else(|error| panic!("model text {v} as an address: {error}"))
+    address_of(text(v))
+}
+
+/// The project-rooted address whose one value is `text`.
+pub fn address_of(text: &str) -> Address {
+    Address::project(text).unwrap_or_else(|error| panic!("model text {text:?} as an address: {error}"))
 }
 
 pub fn boolean(v: &Value) -> bool {

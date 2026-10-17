@@ -46,7 +46,7 @@ use crate::{
 };
 
 const NAME: &str = "e";
-const INBOX: &str = "inbox";
+const INBOX: &str = "project:inbox";
 const OPERATOR: &str = "operator";
 
 fn f(id: i64) -> Ref<Fulfiller> {
@@ -127,7 +127,7 @@ impl Conformance for EnsureConformance {
         let mut home = Home::<Ensure>::new("home").expect("valid declaration");
         home.create(
             NAME,
-            EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(2) },
+            EnsureSpec { inbox: INBOX.parse().expect("canonical inbox"), policy: AttemptPolicy::immediate(2) },
             &MemoryEnsureWorld::default(),
             Timestamp(0),
         )

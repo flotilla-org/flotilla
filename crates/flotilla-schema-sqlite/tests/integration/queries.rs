@@ -75,7 +75,7 @@ fn drawn_message(tc: &TestCase) -> Resource<Message> {
 /// `message` with a drawn inbox and deadline from the small domains.
 fn drawn_spec(tc: &TestCase, message: Resource<Message>) -> Resource<Message> {
     let spec = MessageSpec {
-        inbox: tc.draw(gs::sampled_from(vec!["i0".to_owned(), "i1".to_owned()])),
+        inbox: project(&tc.draw(gs::sampled_from(vec!["i0".to_owned(), "i1".to_owned()]))),
         deadline: tc.draw(gs::booleans()).then(|| small_time(tc)),
         ..message::spec(tc, Pick::Draw)
     };
@@ -90,8 +90,9 @@ fn open(message: &Resource<Message>) -> bool {
 fn check_messages(tc: &TestCase, store: &mut Store, model: &BTreeMap<ResourceId, Resource<Message>>) {
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(4));
     for inbox in ["i0", "i1"] {
+        let inbox = project(inbox);
         let want = expected(model, |m| open(m) && m.spec().inbox == inbox, |_| ());
-        assert_eq!(collect(store, &MessageSpec::open_by_inbox(&inbox.to_owned()), limit), want, "open_by_inbox {inbox}");
+        assert_eq!(collect(store, &MessageSpec::open_by_inbox(&inbox), limit), want, "open_by_inbox {inbox}");
     }
     let want = expected(model, |m| open(m) && m.spec().deadline.is_some(), |m| m.spec().deadline.map(Timestamp::micros));
     assert_eq!(collect(store, &MessageSpec::deadline(), limit), want, "deadline");
@@ -238,7 +239,7 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
     }
     for n in 0..tc.draw(gs::integers::<usize>().max_value(6)) {
         let ensure = ensure::generate(&tc, Pick::Draw);
-        let ensure = ensure.clone().with_spec(EnsureSpec { inbox: pick(&["i0", "i1"]), ..ensure.spec().clone() });
+        let ensure = ensure.clone().with_spec(EnsureSpec { inbox: project(&pick(&["i0", "i1"])), ..ensure.spec().clone() });
         ensures.insert(write.insert(&format!("e{n}"), &ensure, &origin()).expect("insert").id, ensure);
     }
     write.commit().expect("commit");
@@ -259,8 +260,9 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
         assert_eq!(collect(&mut store, &TerminalRequest::live_by_pool(&pool.to_owned()), limit), want);
     }
     for inbox in ["i0", "i1", "i2"] {
+        let inbox = project(inbox);
         let want = expected(&ensures, |e: &Resource<Ensure>| e.spec().inbox == inbox, |_| ());
-        assert_eq!(collect(&mut store, &EnsureSpec::by_inbox(&inbox.to_owned()), limit), want);
+        assert_eq!(collect(&mut store, &EnsureSpec::by_inbox(&inbox), limit), want);
     }
 }
 
@@ -280,7 +282,7 @@ fn unknown_arguments_give_an_empty_page_and_create_nothing() {
     let mut store = store();
     insert_messages(&mut store, 2, |_| message::sample());
     let mut read = store.read().expect("read");
-    let page = read.page(&MessageSpec::open_by_inbox(&"never".to_owned()), None, 10).expect("page");
+    let page = read.page(&MessageSpec::open_by_inbox(&project("never")), None, 10).expect("page");
     assert_eq!(page, Page { ids: vec![], next: None });
     let page = read.page(&Referral::by_session(&Ref::new("never", LOCAL)), None, 10).expect("page");
     assert!(page.ids.is_empty());
@@ -310,10 +312,10 @@ fn cursors_are_bound_to_their_query() {
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
-    let inbox = MessageSpec::open_by_inbox(&"inbox".to_owned());
+    let inbox = MessageSpec::open_by_inbox(&project("inbox"));
     let cursor = read.page(&inbox, None, 1).expect("page").next.expect("more follow");
     assert_eq!(read.page(&inbox, Some(&cursor), 5).expect("continue").ids.len(), 2);
-    let other_inbox = MessageSpec::open_by_inbox(&"other".to_owned());
+    let other_inbox = MessageSpec::open_by_inbox(&project("other"));
     assert!(matches!(read.page(&other_inbox, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
     let deadline = MessageSpec::deadline();
     assert!(matches!(read.page(&deadline, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
@@ -328,7 +330,7 @@ fn limits_are_required_and_capped() {
     let mut store = store();
     insert_messages(&mut store, MAX_PAGE as usize + 1, |_| message::sample());
     let mut read = store.read().expect("read");
-    let inbox = MessageSpec::open_by_inbox(&"inbox".to_owned());
+    let inbox = MessageSpec::open_by_inbox(&project("inbox"));
     assert!(matches!(read.page(&inbox, None, 0), Err(StoreError::ZeroLimit)));
     assert!(matches!(read.scan::<Resource<Message>>(LOCAL, None, 0), Err(StoreError::ZeroLimit)));
     let page = read.page(&inbox, None, u32::MAX).expect("page");
