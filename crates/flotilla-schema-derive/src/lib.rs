@@ -215,6 +215,15 @@ mod tests {
         assert!(mismatch.contains("`a` is declared as `String` in `B` and as `u32` in `C`"), "{mismatch}");
         assert!(mismatch.contains("or is `T` in some and `Option<T>` in others"), "{mismatch}");
         assert!(error(quote! { #[store(labels = L, labels = M)] enum A { #[store(code = "c1")] B } }).contains("twice"));
+        // #3392 ruling D3: interned data of different Rust types does not share a column, in a
+        // data enum or a state.
+        for case in [
+            quote! { enum A { #[store(code = "c1")] B { #[store(intern)] a: String }, #[store(code = "c2")] C { #[store(intern)] a: Name } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(intern)] a: String }, #[store(code = "c2")] C { #[store(intern)] a: Name } } },
+        ] {
+            let interned = error(case.clone());
+            assert!(interned.contains("`a` is declared as `String` in `B` and as `Name` in `C`"), "{case}: {interned}");
+        }
     }
 
     // Glue (#3373 ruling 1): a label-plus-data state is `Labelled` by its labels enum and
