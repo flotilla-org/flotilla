@@ -7,10 +7,10 @@ cd "$(dirname "$0")/.."
 jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
 mkdir -p build
 run=$(mktemp -d "$PWD/build/mutants.XXXXXX")
-for mutant in expiry_without_watermark release_only_realised duplicate_turn bind_without_drain promise_resettled quota_exceeded host_overbooked queue_bypassed lease_retained undeliverable_with_receipt; do
+for mutant in expiry_without_watermark release_only_realised duplicate_turn bind_without_drain promise_resettled quota_exceeded host_overbooked queue_bypassed lease_retained undeliverable_with_receipt hold_ignores_window hold_counts_past_success; do
   case "$mutant" in
     expiry_without_watermark) scenario=message_race ;;
-    release_only_realised) scenario=ensure_bind ;;
+    release_only_realised|hold_ignores_window|hold_counts_past_success) scenario=ensure_bind ;;
     duplicate_turn|bind_without_drain|undeliverable_with_receipt) scenario=inbox_delivery ;;
     promise_resettled) scenario=convoy_deliver ;;
     *) scenario=admission_placement ;;
