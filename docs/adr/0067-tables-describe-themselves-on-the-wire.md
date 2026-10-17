@@ -1,6 +1,6 @@
 # 67. Tables describe themselves on the wire
 
-**Status:** Accepted, not yet implemented (owner rulings, 2026-10-16 to 2026-10-17)
+**Status:** Accepted, not yet implemented (owner rulings, 2026-10-16 to 2026-10-17); amended 2026-10-17 after binnacle's review (#3427, see decisions 15 and 16)
 **Date:** 2026-10-17
 **Amends:** [ADR 0012](0012-tables-are-the-consumer-side-view-layer.md): "layout never lives in the store and never crosses the wire" becomes "meaning crosses the wire; layout does not".
 **Relates to:**
@@ -30,13 +30,13 @@ What exists:
 
 ### 1. Meaning crosses the wire; layout does not (amends ADR 0012)
 
-A table's description carries what its columns mean: names, types, the key, references to other tables, enum variant names and roles. Widths, column order, hidden columns, user labels, colours and themes stay in the viewer. Presentation hints, such as a default label, a priority for narrow screens or a preferred view, may come later as hints a viewer is free to ignore. They are not part of the first version. The store never holds presentation.
+A table's description carries what its columns mean: names, types, the key, references to other tables, enum variant names and roles. Widths, column order, hidden columns, user labels, colours and themes stay in the viewer. Presentation hints, such as a priority for narrow screens or a preferred view, may come later as hints a viewer is free to ignore. They are not part of the first version. The one exception is a default label: Frictionless's optional `title` may carry one now (decision 16). Units are meaning, not presentation (decision 16). The store never holds presentation.
 
 ### 2. The description is Frictionless Table Schema v2; the stream is ours
 
 - **The column description adopts [Frictionless Table Schema v2](https://datapackage.org/standard/table-schema/)**: `fields`, `primaryKey`, `foreignKeys` (whose `reference.resource` names the target table), and `categories` as `{value, label}` for enum codes. Field descriptors allow extra properties, which is where roles go.
 - **flotilla uses a profile of it.** Values are native JSON and CBOR values. The properties that describe parsing text, such as `trueValues`, `groupChar` and `decimalChar`, are not used.
-- **Column types map directly:** Integer, Bool and Text to integer, boolean and string; Timestamp to datetime; Blob to string with format binary; Frozen and Cbor to object; Code to integer with categories; Ref to a foreign key.
+- **Column types map directly:** Integer, Bool and Text to integer, boolean and string; Timestamp to datetime; Blob to string with format binary; Frozen and Cbor to object; Code to string with categories (stored codes are short explicit text, #3392 ruling G7); Ref to a foreign key.
 - **The stream envelope is flotilla's own** (decision 8), because no standard covers live changes.
 - Rejected: the Kubernetes Table (thin types, string-like cells, no keys or references); Grafana data frames (tied to Grafana; flotilla borrows its idea of explicit roles); Arrow (kept for a later bulk export, decision 11).
 
@@ -50,7 +50,7 @@ A table's description carries what its columns mean: names, types, the key, refe
 
 ### 4. One wire table per stored table
 
-- **Each stored table is its own wire table:** the root, each child table, records and history. Child rows carry the parent's key as a foreign key.
+- **Each stored table is its own wire table:** the root, each child table, records, and the per-home event `log` (#3392, #3407), which replaced the per-kind history tables. Child rows carry the parent's key as a foreign key.
 - **A viewer drills by asking for the child table filtered to the parent's key** (decision 12). This is ADR 0012's navigation stack, and it matches binnacle's flat grid.
 - **The listing of tables groups them by kind,** as `TableSet` does, naming the root.
 - **A collection change is one row change on its child table,** never a re-send of the parent.
@@ -65,7 +65,7 @@ A table's description carries what its columns mean: names, types, the key, refe
 
 ### 6. Roles come from structure first, then from attributes
 
-- **The first version ships roles the descriptor already knows:** key, ref, state, since, transition from and to, sequence, and time. The derive sets them where it generates those columns (mapping B's state label and `state_since`, history edge events, keys and references). They travel in the field-property slot.
+- **The first version ships roles the descriptor already knows:** key, ref, state, since, transition from and to, sequence, and time. The derive sets them where it generates those columns (mapping B's state label and `state_since`, the `log` table's edge `from` and `to` columns, keys and references). They travel in the field-property slot.
 - **Hand-written role attributes come next,** for example a time or graph-edge marker on a field, followed by presentation hints (decision 1). Both are additive.
 - **Roles are never guessed from column names.**
 
@@ -100,7 +100,7 @@ Rejected: a separate table-streaming protocol beside the surface channel, which 
 
 - **Rows are paged by keyset** on the sort columns, then the primary key. The primary key breaks ties, so the order is total and stable.
 - **The cursor is an opaque token** encoding the last row's sort values and primary key. It holds natural keys only, so it stays valid across hosts and restarts. A cursor the server cannot honour gets `resync`.
-- **Rows that move between pages may be skipped or repeated.** If a row's sort value changes while a client pages, the keyset continues from the old position. This is the normal keyset trade-off and is accepted. A viewer that needs an exact picture subscribes to the stream instead.
+- **Rows that move between pages may be skipped or repeated.** If a row's sort value changes while a client pages, the keyset continues from the old position. This is the normal keyset trade-off and is accepted. A viewer that needs an exact picture subscribes to the stream instead, and a scrolling grid subscribes to a view (decision 15).
 - **The derive's store-local `Cursor`** stays as the store's internal pager. The wire cursor is a separate type.
 - **binnacle's `u64` Keys are made on the client.** A server-backed Table Source interns each row's primary key through binnacle's `KeyInterner`. Keys never cross the wire.
 - **A request can choose its columns** (`?columns=`). The primary key always comes back. The `table` message lists only the columns sent. With no selection, every column comes back. Sorting by an unselected column still works, because the server builds the cursor from the row it read.
@@ -117,7 +117,7 @@ Rejected: a separate table-streaming protocol beside the surface channel, which 
 Every rendering is chosen by `Accept`, or `?format=` for browsers and curl, and is generated from the description and roles, never from code for one table.
 
 - **The declared diagram:** each kind's state machine as mermaid, from `MachineDef::mermaid`, at the kind's description route.
-- **The observed diagram:** a history table (one carrying the transition roles) rendered as a mermaid `stateDiagram` of the transitions that actually happened, with counts on each edge, for one record or for all of them. An observed edge missing from the declared diagram is a bug.
+- **The observed diagram:** a kind's edge entries in the `log` table (the rows carrying the transition roles) rendered as a mermaid `stateDiagram` of the transitions that actually happened, with counts on each edge, for one record or for all of them. An observed edge missing from the declared diagram is a bug.
 - **The schema view:** the Markdown view from `render_view`.
 - **Arrow** (`application/vnd.apache.arrow.stream`) waits for a real bulk consumer.
 - **HTML is not a server rendering.** The inspector is a viewer that reads JSON or CBOR.
@@ -143,13 +143,36 @@ Every rendering is chosen by `Accept`, or `?format=` for browsers and curl, and 
 - **The table routes and the inspector sit behind ADR 0065's router.** They get its bearer token or browser cookie, its Host and Origin checks, and a TCP listener that binds loopback only and is off unless declared.
 - **They serve a caller no more than the resource routes already serve that caller.** Any redaction a kind applies on the resource routes applies to its tables too. Neither column selection nor resolving interned text may get around it.
 
+### 15. Grids subscribe to views, kept in position by the server (amendment, #3427)
+
+binnacle's grid works by Position: it needs the count, the keys for a range of positions, where a given key now sits (Locate), and changes given as positions. Decision 8's live messages name only the row that changed, so a client cannot place a change in a large sorted table without holding the whole ordered key list. Keyset paging's skipped and repeated rows (decision 9) would show in a scrolling grid.
+
+- **A view subscription sits beside the table subscription,** on the ADR 0065 WebSocket. A client subscribes to a view: a table, its `where` clauses, a sort and a window of positions. It moves the window as the user scrolls.
+- **The server sends:** the view's count; the rows in the window; changes as positions (inserted at, removed at, moved from and to, and content changed for rows in the window); count changes; and answers to "what is the position of key K?".
+- **The server keeps each live view as an in-memory ordered index** of its keys, a B-tree with subtree counts. It is built once from the store's ordered query, which an index can serve, and each change the view sees is one O(log n) update that yields its position. A 100,000-key view is a few megabytes and about 17 comparisons per change. The cost scales with the number of open views, not with the store. Positions are never stored per sort order: that would renumber rows on every insert for orders nobody is watching, and SQLite cannot find a key's position without counting.
+- **Append-ordered views,** such as the `log` by sequence, insert at the end, so their index is trivial.
+- **This is decision 10's "server-side position index"**, now the basis of live views rather than an optimisation added later. Decision 10's `?offset` and counts still serve GET.
+- **The plain table subscription and GET stay** for small tables, curl, scripts, agents and replication-style consumers. A small table can still be fetched whole and sorted by binnacle's in-memory source.
+
+### 16. Smaller points from binnacle's review (amendment, #3427)
+
+1. **Snapshot consistency.** Every GET page and every `rows` batch carries the sequence number it reflects, so a client that mixes paged fetches with a live stream knows which changes to apply.
+2. **Capabilities are described.** Field properties say whether a field can be sorted and which `where` operators it supports, so a viewer can disable a control up front rather than learn from a 400.
+3. **Ordering is specified.** Nulls sort first, and text sorts by Unicode code point (SQLite's `BINARY` ordering), so a browser sort and a server sort of the same table agree.
+4. **Composite keys have one encoding:** the ADR 0063 deterministic CBOR of the key tuple. Equal keys always intern to the same binnacle Key.
+5. **A `count` message** carries a changed count, including corrections to an estimate (decision 10).
+6. **Units are meaning.** A field property gives a value's unit as a UCUM code (for example `By` for bytes, `s` for seconds), so a generic viewer can align and format values.
+7. **Default labels.** Frictionless's optional `title` may carry a column's default label now. A viewer may ignore it, and user settings override it. Priority and preferred view stay deferred (decision 1).
+8. **Requests can be cancelled.** Every WebSocket request carries a request id, and a `cancel` message withdraws a superseded window or Locate request.
+9. **Room for grouping and pivots.** A row's key is not assumed to be a stored primary key (group and subtotal rows are keyed by group paths), and a view's columns may change while it is live. No grouping or pivot work is planned; the vocabulary only avoids ruling it out.
+
 ## Consequences
 
 - ADR 0012's per-surface column registries shrink to layout and actions. What a column means comes from the server.
 - ADR 0012's planned generic tier (`QueryId::Resources { kind }`) is delivered as table routes rather than as a new named query.
 - The `result_set.rs` module rule that presentation never appears on the wire still holds: only meaning crosses.
 - flotilla-schema's role widens from storage to description. Storage renderings live in flotilla-schema-sqlite.
-- binnacle#47's server-backed Table Source has a fixed contract to implement: decisions 2, 8, 9 and 10.
+- binnacle#47's server-backed Table Source has a fixed contract to implement: the view subscription (decision 15) for large tables, and decisions 2, 8, 9, 10 and 16 throughout.
 - flotilla-protocol gains a dependency on flotilla-schema (decision 7). The build-graph check and the CLAUDE.md crate table, which calls flotilla-protocol serde-only, change with the first PR that adds the dependency.
 - Decisions 3, 6, 7 and 11 build on the unmerged #3319 stack's descriptor, and decisions 8 to 10 refine #3249. If either design shifts, this ADR is the place to amend.
 - Outside data, such as GitHub issues, can use the builder or the describe-only derive and be served the same way.
