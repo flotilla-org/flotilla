@@ -453,7 +453,9 @@ impl RevisionedFile for GitRevisionedFile {
 #[async_trait]
 pub trait Vcs: Send + Sync {
     /// Fetch a branch into an object cache and resolve it to an immutable commit.
-    /// The fetch itself has a 60-second deadline; cache lock wait is excluded.
+    /// The reader waits at most 60 seconds once it owns the cache; lock wait
+    /// is excluded. Cancellation leaves a writer owning exclusion until Git
+    /// exits, bounded by a separate five-minute command deadline plus cleanup.
     async fn fetch_revision(&self, _cache: &Path, _repo: &str, _branch: &str) -> Result<String, String> {
         Err(REVISION_FETCH_UNAVAILABLE.into())
     }
@@ -714,29 +716,45 @@ impl Vcs for FlotillaVcs {
             // This private object cache is mutated only under this exclusion.
             // Every fetch retains it until the command exits, so a shallow lock
             // found here cannot belong to any live fetch owned by this daemon.
-            let shallow_lock = directory.join("shallow.lock");
-            match tokio::fs::remove_file(&shallow_lock).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("recover stale Git lock {}: {error}", shallow_lock.display())),
+            // Production charter caches live under the daemon's private state
+            // directory; flotillad-lifecycle.lock excludes a second daemon for
+            // that state directory. Standalone validation uses a separate
+            // inspector cache. Do not use this cache as an operator-managed
+            // Git repository. Recover only known transaction locks, never
+            // arbitrary pack temporaries or recursively discovered files.
+            for name in ["shallow.lock", "FETCH_HEAD.lock", "packed-refs.lock", "config.lock", "HEAD.lock"] {
+                let path = directory.join(name);
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("recover stale Git lock {}: {error}", path.display())),
+                }
             }
             let backend = GitCliBackend::new(&directory, &*runner);
             backend.run(&["init", "--bare", "."]).await?;
             backend.run(&["check-ref-format", &format!("refs/heads/{branch}")]).await?;
-            // Bound stalled HTTP transfers without cancelling Git's lock cleanup.
+            // A hard writer deadline covers every transport and credential
+            // helper. The local runner sends SIGTERM, escalates if needed, and
+            // reaps Git before returning, while this task still owns exclusion.
             backend
-                .run(&[
-                    "-c",
-                    "http.lowSpeedLimit=1",
-                    "-c",
-                    "http.lowSpeedTime=60",
-                    "fetch",
-                    "--depth=1",
-                    "--no-tags",
-                    "--",
-                    &repo,
-                    &format!("refs/heads/{branch}"),
-                ])
+                .run_with_timeout(
+                    &[
+                        "-c",
+                        "http.lowSpeedLimit=1",
+                        "-c",
+                        "http.lowSpeedTime=60",
+                        "fetch",
+                        "--depth=1",
+                        "--no-tags",
+                        // No detached maintenance writer may outlive the fetch
+                        // and keep a transaction lock after exclusion is released.
+                        "--no-auto-maintenance",
+                        "--",
+                        &repo,
+                        &format!("refs/heads/{branch}"),
+                    ],
+                    Duration::from_secs(300),
+                )
                 .await?;
             Ok(backend.resolve_ref("FETCH_HEAD^{commit}").await?.trim().to_string())
         });
@@ -1727,6 +1745,15 @@ impl<'a> GitCliBackend<'a> {
         }
     }
 
+    async fn run_with_timeout(&self, args: &[&str], timeout: Duration) -> Result<String, String> {
+        // Object-cache commands use discovery addressing, within the private
+        // bare repository. Keep this narrow instead of duplicating -C assembly.
+        if !matches!(self.addressing, GitAddressing::Discover) {
+            return Err("bounded Git transaction requires discovery addressing".into());
+        }
+        self.runner.run_with_timeout("git", args, self.checkout, &command_channel_label("git", args), timeout).await
+    }
+
     async fn output(&self, args: &[&str]) -> Result<CommandOutput, String> {
         if !matches!(self.addressing, GitAddressing::Discover) {
             let checkout = self.checkout.to_str().ok_or_else(|| "checkout path is not valid UTF-8".to_string())?;
@@ -2281,7 +2308,8 @@ mod tests {
     use flotilla_replay_testkit::testing::TimeoutOnlyRunner;
 
     // A subprocess double holds fetch open. Cache contention must not consume
-    // its 60-second deadline; the fetch itself still expires after exactly 60s.
+    // its 60-second reader deadline. The detached writer retains exclusion
+    // until its separate hard command deadline and cleanup have completed.
     #[tokio::test]
     async fn revision_fetch_deadline_excludes_cache_lock_wait() {
         struct HeldFetch {
@@ -2337,8 +2365,15 @@ mod tests {
         assert!(!task.is_finished(), "fetch retains its full 60-second budget");
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
-        assert!(task.is_finished(), "fetch itself must expire after 60 seconds");
+        assert!(task.is_finished(), "the reader must expire after 60 seconds");
         assert_eq!(task.await.expect("fetch task").expect_err("fetch deadline"), "revision fetch exceeded 60 seconds");
+        assert!(lock.try_lock().is_err(), "a timed-out reader must leave the running writer excluded");
+        tokio::time::advance(Duration::from_secs(241)).await;
+        let guard = tokio::time::timeout(Duration::from_secs(1), lock.lock()).await.expect("hard writer deadline releases exclusion");
+        drop(guard);
+        runner.release.notify_one();
+        let vcs = FlotillaVcs::object_cache(runner);
+        assert_eq!(vcs.fetch_revision(cache.path(), repo, "main").await.expect("fetch after hard deadline"), "commit");
     }
 
     // A cancelled charter read must not interrupt Git while it owns shallow.lock.

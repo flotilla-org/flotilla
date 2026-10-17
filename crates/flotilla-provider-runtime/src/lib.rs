@@ -236,6 +236,9 @@ pub trait CommandRunner: Send + Sync {
     /// its local child processes; wrappers must forward the deadline to their
     /// inner runner. Killing an SSH or Docker client cannot guarantee that a
     /// command on the remote host or inside the container has stopped.
+    /// The local process runner gives a timed-out writer a termination grace
+    /// period and reaps it before returning; callers retaining locks must own
+    /// this future until it completes rather than cancelling it themselves.
     async fn run_with_timeout(
         &self,
         cmd: &str,
@@ -579,6 +582,75 @@ impl CommandRunner for ProcessCommandRunner {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
             Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    }
+
+    async fn run_with_timeout(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        _label: &ChannelLabel,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        use tokio::io::AsyncReadExt;
+
+        let mut child = Self::checked_command(cmd, args, cwd)
+            .await?
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        let mut guard = ProcessGroupGuard::for_child(&child)?;
+        async fn drain(mut pipe: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).await.map(|_| bytes)
+        }
+        let stdout = tokio::spawn(drain(child.stdout.take().expect("piped stdout")));
+        let stderr = tokio::spawn(drain(child.stderr.take().expect("piped stderr")));
+        let waited = tokio::time::timeout(timeout, child.wait()).await;
+        let timed_out = waited.is_err();
+        let status = match waited {
+            Ok(status) => status.map_err(|error| error.to_string())?,
+            Err(_) => {
+                #[cfg(unix)]
+                {
+                    // Unlike dropping command_output, give writers a catchable
+                    // signal and await cleanup before their caller releases locks.
+                    unsafe { libc::killpg(guard.0, libc::SIGTERM) };
+                    // Keep the leader unreaped throughout the grace period:
+                    // its PID/group cannot be reused even if it exits before a
+                    // helper which ignores TERM. Then stop the entire group
+                    // before reaping and releasing the writer's exclusion.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    unsafe { libc::killpg(guard.0, libc::SIGKILL) };
+                    child.wait().await.map_err(|error| error.to_string())?
+                }
+                #[cfg(not(unix))]
+                {
+                    child.kill().await.map_err(|error| error.to_string())?;
+                    child.wait().await.map_err(|error| error.to_string())?
+                }
+            }
+        };
+        #[cfg(unix)]
+        {
+            guard.0 = 0;
+        }
+        let collect = |result: Result<std::io::Result<Vec<u8>>, tokio::task::JoinError>| {
+            result.map_err(|error| error.to_string())?.map_err(|error| error.to_string())
+        };
+        let stdout = collect(stdout.await)?;
+        let stderr = collect(stderr.await)?;
+        if timed_out {
+            Err(command_timeout_message(cmd, timeout))
+        } else if status.success() {
+            Ok(String::from_utf8_lossy(&stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&stderr).into_owned())
         }
     }
 
@@ -1027,6 +1099,47 @@ mod tests {
             .await
             .expect("stream stdin");
         assert_eq!(tokio::fs::read(piped).await.expect("piped bytes"), bytes);
+    }
+
+    // The local process boundary must finish SIGTERM cleanup and reap a timed
+    // out writer before returning; its caller can then release a filesystem lock.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_deadline_waits_for_cleanup_and_reaps_the_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("pid");
+        let cleaned = directory.path().join("cleaned");
+        let args = [
+            "-c",
+            "trap 'sleep 0.1; : > \"$2\"; exit 0' TERM; echo $$ > \"$1\"; while :; do sleep 0.01; done",
+            "test",
+            pid_path.to_str().unwrap(),
+            cleaned.to_str().unwrap(),
+        ];
+        let error = ProcessCommandRunner
+            .run_with_timeout("sh", &args, directory.path(), &ChannelLabel::Default, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert_eq!(error, command_timeout_message("sh", Duration::from_millis(500)));
+        assert!(cleaned.exists(), "deadline must await the command's catchable termination cleanup");
+        let pid: i32 = std::fs::read_to_string(pid_path).unwrap().trim().parse().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "the writer must already be reaped when the deadline returns");
+    }
+
+    // A writer or helper ignoring TERM must still die at the hard deadline's
+    // escalation, and the returned timeout must mean the writer was reaped.
+    // This is a real local process-boundary contract, independent of Git.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_deadline_reaps_a_writer_ignoring_sigterm() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("pid");
+        let args = ["-c", "trap '' TERM; echo $$ > \"$1\"; while :; do sleep 0.01; done", "test", pid_path.to_str().unwrap()];
+        let timeout = Duration::from_millis(500);
+        let result = ProcessCommandRunner.run_with_timeout("sh", &args, directory.path(), &ChannelLabel::Default, timeout).await;
+        assert_eq!(result.unwrap_err(), command_timeout_message("sh", timeout));
+        let pid: i32 = std::fs::read_to_string(pid_path).unwrap().trim().parse().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "TERM-ignoring writer must already be reaped");
     }
 
     // Dropping a graceful command (a deadline or a cancelled caller) must

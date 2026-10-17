@@ -12,8 +12,8 @@ use flotilla_charter::{
     ops_entry::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION},
 };
 use flotilla_resources::{
-    parse_layer_directory, CharterSource, ImageLayer, ImageLayerSource, InputMeta, Project, ProjectRepositoryRole, ProjectSpec, Repository,
-    ResourceError, ResourceObject, MANAGED_BY_LABEL,
+    parse_layer_directory, CharterSource, ConditionValue, HostCondition, ImageLayer, ImageLayerSource, InputMeta, Project,
+    ProjectRepositoryRole, ProjectSpec, Repository, ResourceError, ResourceObject, MANAGED_BY_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use tracing::warn;
@@ -73,14 +73,26 @@ struct LayerRefusal {
     error: String,
     delay: std::time::Duration,
     retry_at: tokio::time::Instant,
+    observed_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl LayerRefreshState {
-    pub(super) fn diagnoses(&self) -> Vec<String> {
+    pub(super) fn conditions(&self) -> Vec<HostCondition> {
         self.refusals
             .iter()
             .map(|((namespace, project), refusal)| {
-                format!("ProjectImageLayer/{namespace}/{project}: {}; retaining previous layer and retrying with backoff", refusal.error)
+                HostCondition::builder()
+                    .condition_type(format!("ProjectImageLayer/{namespace}/{project}"))
+                    .value(ConditionValue::False)
+                    .reason("SourceRefused")
+                    .message(format!(
+                        "project {namespace}/{project}: {}; retaining previous layer and retrying with backoff",
+                        refusal.error
+                    ))
+                    .observed_at(refusal.observed_at)
+                    .blocks_readiness(false)
+                    .blocks_forge_observation(false)
+                    .build()
             })
             .collect()
     }
@@ -91,14 +103,17 @@ impl LayerRefreshState {
             .is_some_and(|refusal| &refusal.source == source && tokio::time::Instant::now() < refusal.retry_at)
     }
 
+    // Preserve the complete source/error identity. Different refusals get an
+    // initial retry; repeated identical errors back off. Dynamic-message error
+    // classification can be added when the inspector exposes typed errors.
     fn refused(&mut self, namespace: &str, project: &str, source: &CharterSource, error: String) {
         let key = (namespace.to_string(), project.to_string());
-        let delay = self
-            .refusals
-            .get(&key)
-            .filter(|previous| previous.source == *source && previous.error == error)
-            .map_or(std::time::Duration::from_secs(60), |previous| (previous.delay * 2).min(std::time::Duration::from_secs(3600)));
-        self.refusals.insert(key, LayerRefusal { source: source.clone(), error, delay, retry_at: tokio::time::Instant::now() + delay });
+        let previous = self.refusals.get(&key).filter(|previous| previous.source == *source && previous.error == error);
+        let observed_at = previous.map_or_else(chrono::Utc::now, |previous| previous.observed_at);
+        let delay =
+            previous.map_or(std::time::Duration::from_secs(60), |previous| (previous.delay * 2).min(std::time::Duration::from_secs(3600)));
+        self.refusals
+            .insert(key, LayerRefusal { source: source.clone(), error, delay, retry_at: tokio::time::Instant::now() + delay, observed_at });
     }
 }
 
@@ -115,6 +130,7 @@ impl ProjectService<'_> {
             .map_err(|error| error.to_string())?
             .items
             .into_iter()
+            .filter(|project| project.metadata.deletion_timestamp.is_none())
             .map(|project| project.metadata.name)
             .collect::<std::collections::BTreeSet<_>>();
         let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
@@ -349,12 +365,15 @@ mod tests {
             service.reconcile_project_image_layers().await.unwrap();
         }
         assert_eq!(source.reads.lock().unwrap().len(), 1);
-        let diagnoses = service.image_layer_refresh.lock().await.diagnoses();
+        let diagnoses = service.image_layer_refresh.lock().await.conditions();
         assert_eq!(diagnoses.len(), 1);
-        assert!(diagnoses[0].contains("app") && diagnoses[0].contains("/cache/shallow.lock"));
+        assert_eq!(diagnoses[0].condition_type, "ProjectImageLayer/flotilla/app");
+        assert!(!diagnoses[0].blocks_readiness && !diagnoses[0].blocks_forge_observation);
+        assert!(diagnoses[0].message.contains("app") && diagnoses[0].message.contains("/cache/shallow.lock"));
         tokio::time::advance(std::time::Duration::from_secs(60)).await;
         service.reconcile_project_image_layers().await.unwrap();
         assert_eq!(source.reads.lock().unwrap().len(), 2);
+        assert_eq!(service.image_layer_refresh.lock().await.conditions()[0].observed_at, diagnoses[0].observed_at);
         tokio::time::advance(std::time::Duration::from_secs(119)).await;
         service.reconcile_project_image_layers().await.unwrap();
         assert_eq!(source.reads.lock().unwrap().len(), 2);
@@ -363,8 +382,25 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         service.reconcile_project_image_layers().await.unwrap();
         assert_eq!(source.reads.lock().unwrap().len(), 3);
-        assert!(service.image_layer_refresh.lock().await.diagnoses().is_empty());
+        assert!(service.image_layer_refresh.lock().await.conditions().is_empty());
         assert!(backend.using::<ImageLayer>("flotilla").get(&layer_name("1.0.0")).await.is_ok());
+
+        // Deleting projects must lose their diagnosis even while a finalizer
+        // keeps their local resource visible during teardown.
+        *source.error.lock().unwrap() = Some("again".into());
+        service.reconcile_project_image_layers().await.unwrap();
+        assert_eq!(service.image_layer_refresh.lock().await.conditions().len(), 1);
+        let projects = backend.using::<Project>("flotilla");
+        let project = projects.get("app").await.unwrap();
+        backend
+            .definitions::<Project>("flotilla")
+            .apply(&InputMeta::builder().name("app".into()).finalizers(vec!["test/hold".into()]).build(), &project.spec)
+            .await
+            .unwrap();
+        projects.delete("app").await.unwrap();
+        assert!(projects.get("app").await.unwrap().metadata.deletion_timestamp.is_some());
+        service.reconcile_project_image_layers().await.unwrap();
+        assert!(service.image_layer_refresh.lock().await.conditions().is_empty());
     }
 
     // Across duplicate, changed-error, and changed-source sequences the retry
@@ -392,7 +428,7 @@ mod tests {
                 state.refused("ns", "app", &source, error.clone());
                 assert!(state.deferred("ns", "app", &source));
                 assert!(!state.deferred("ns", "app", &CharterSource::LocalDirectory { directory: "/other".into() }));
-                assert_eq!(state.diagnoses().len(), 1);
+                assert_eq!(state.conditions().len(), 1);
                 tokio::time::advance(std::time::Duration::from_secs(expected - 1)).await;
                 assert!(state.deferred("ns", "app", &source));
                 tokio::time::advance(std::time::Duration::from_secs(1)).await;
@@ -405,7 +441,7 @@ mod tests {
     // default branch becomes the project's layer; unchanged definitions are
     // never rewritten, a version bump replaces the layer, an invalid layer
     // keeps the previous one, and removing the directory removes the layer.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn primary_repository_layer_follows_the_default_branch() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let observed = ResourceBackend::new(InMemoryBackend::observed());
@@ -463,7 +499,6 @@ mod tests {
         assert_eq!(names().await, [layer_name("1.1.0")], "an invalid layer keeps the previous one");
 
         *source.files.lock().expect("files") = None;
-        tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(60)).await;
         service.reconcile_project_image_layers().await.expect("opt out");
         assert!(names().await.is_empty(), "removing the directory removes the layer");

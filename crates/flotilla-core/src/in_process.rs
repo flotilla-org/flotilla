@@ -1432,10 +1432,11 @@ pub struct InProcessDaemon {
     /// Admission cleanup and resource deletion share this lock with adoption.
     observed_checkout_reconciliation: Arc<Mutex<()>>,
     aggregator_projection_state: AggregatorProjectionState,
+    /// Project image-layer refusal state, shared by timer and explicit refreshes.
+    image_layer_refresh: Arc<Mutex<project_image_layers::LayerRefreshState>>,
     /// Provisioning namespace used by daemon-side resource operations (e.g.
     /// looking up the Convoy whose task is being marked complete). Set by the
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
-    image_layer_refresh: Arc<Mutex<project_image_layers::LayerRefreshState>>,
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
     checkout_namespace_changes: tokio::sync::watch::Sender<()>,
     fleet: FleetService,
@@ -4915,6 +4916,11 @@ impl InProcessDaemon {
         self.forge_budgets.rows(self.host_name().as_str())
     }
 
+    /// Current advisory project source refusals for the host heartbeat.
+    pub async fn project_image_layer_conditions(&self) -> Vec<flotilla_resources::HostCondition> {
+        self.image_layer_refresh.lock().await.conditions()
+    }
+
     pub async fn fleet_health_internal(&self) -> Result<FleetHealthResponse, String> {
         let now = Utc::now();
         let namespace = self.provisioning_namespace().await;
@@ -4925,9 +4931,6 @@ impl InProcessDaemon {
             .read_projections()
             .fleet_health_request(&reads, &namespace, host_list, self.local_host_id().map(|id| id.to_string()), now)
             .await?;
-        if let Some(local) = response.hosts.iter_mut().find(|host| host.is_local) {
-            local.degraded_conditions.extend(self.image_layer_refresh.lock().await.diagnoses());
-        }
         response.forge_budgets.retain(|row| row.host != self.host_name().as_str());
         response.forge_budgets.extend(self.forge_budget_rows());
         Ok(response)

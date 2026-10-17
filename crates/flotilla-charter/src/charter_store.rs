@@ -831,8 +831,12 @@ mod tests {
         #[async_trait::async_trait]
         impl CommandRunner for Git {
             async fn run(&self, _: &str, args: &[&str], cwd: &Path, _: &ChannelLabel) -> Result<String, String> {
-                if args.contains(&"fetch") && cwd.join("shallow.lock").exists() {
-                    return Err(format!("Unable to create {}/shallow.lock: File exists", cwd.display()));
+                if args.contains(&"fetch") {
+                    for name in ["shallow.lock", "FETCH_HEAD.lock", "packed-refs.lock", "config.lock", "HEAD.lock"] {
+                        if cwd.join(name).exists() {
+                            return Err(format!("Unable to create {}/{name}: File exists", cwd.display()));
+                        }
+                    }
                 }
                 Ok(if args.contains(&"ls-tree") {
                     "100644 blob abc 5\tproject.yaml\0".into()
@@ -862,13 +866,18 @@ mod tests {
         let repo = "https://example.test/charter";
         let directory = cache.path().join(format!("{:x}", Sha256::digest(repo.as_bytes())));
         tokio::fs::create_dir_all(&directory).await.unwrap();
-        tokio::fs::write(directory.join("shallow.lock"), "leftover").await.unwrap();
+        for name in ["shallow.lock", "FETCH_HEAD.lock", "packed-refs.lock", "config.lock", "HEAD.lock"] {
+            tokio::fs::write(directory.join(name), "leftover").await.unwrap();
+        }
+        tokio::fs::create_dir_all(directory.join("objects/pack")).await.unwrap();
+        tokio::fs::write(directory.join("objects/pack/tmp_unrelated"), "keep").await.unwrap();
         let vcs = FlotillaVcs::object_cache(Arc::new(Git));
         let source = CharterSource::Repository { repo: repo.into(), branch: "main".into(), path: ".".into() };
         let snapshot = read_charter_source(&source, cache.path(), Some(&vcs)).await.expect("recovered refresh");
         assert_eq!(snapshot.revision, "commit");
         assert_eq!(snapshot.files, BTreeMap::from([("project.yaml".into(), "hello".into())]));
         assert!(!directory.join("shallow.lock").exists());
+        assert_eq!(tokio::fs::read_to_string(directory.join("objects/pack/tmp_unrelated")).await.unwrap(), "keep");
     }
 
     // This double stands in for a hung Git subprocess; all earlier commands finish.
