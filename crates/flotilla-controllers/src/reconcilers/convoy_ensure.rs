@@ -367,11 +367,10 @@ impl EnsurePass<'_> {
         name: &str,
         scope: EnsureConvoyScope,
     ) -> Result<Vec<ReadResourceObject<ResourceConvoy>>, String> {
-        let query = flotilla_store::StoreQuery {
-            fields: BTreeMap::from([(format!("metadata.annotations.\"{ENSURED_FROM_ANNOTATION}\""), name.into())]),
-            include_replicas: matches!(scope, EnsureConvoyScope::IncludingReplicas),
-            ..flotilla_store::live_convoys_query()
-        };
+        let mut query = flotilla_store::live_convoys_query();
+        // Add the ensure selector without replacing any inherited live predicates.
+        query.fields.insert(format!("metadata.annotations.\"{ENSURED_FROM_ANNOTATION}\""), name.into());
+        query.include_replicas = matches!(scope, EnsureConvoyScope::IncludingReplicas);
         self.resource_backend
             .query_declared::<ResourceConvoy>(namespace, &query)
             .await

@@ -236,12 +236,15 @@ fn select_crew_artifacts(
     selected
 }
 
+// Legacy queues and pending follow-ups on terminal convoys are ignored (#3430),
+// including when a name is selected. No name means all live convoys in the namespace.
 fn convoy_names_query(name: Option<&str>, include_replicas: bool) -> StoreQuery {
-    StoreQuery {
-        fields: name.map(|name| BTreeMap::from([("metadata.name".into(), name.into())])).unwrap_or_default(),
-        include_replicas,
-        ..flotilla_store::live_convoys_query()
+    let mut query = flotilla_store::live_convoys_query();
+    query.include_replicas = include_replicas;
+    if let Some(name) = name {
+        query.fields.insert("metadata.name".into(), name.into());
     }
+    query
 }
 
 fn crew_change_request_query(
@@ -3281,7 +3284,7 @@ impl CrewService {
             }
         }
         let convoys = self.resource_backend.using::<ResourceConvoy>(namespace);
-        // A background backfill examines all queues; interactive callers select one convoy.
+        // Backfill only live queues: a selected name never bypasses the phase predicate.
         for source in convoys.query_declared(&convoy_names_query(name, false)).await.map_err(|error| error.to_string())?.items {
             let candidate = source.object;
             let lock = self.convoy_message_lock(namespace, &candidate.metadata.name).await;

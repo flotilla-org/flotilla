@@ -250,5 +250,6 @@ async fn legacy_adoption_reads_only_live_convoys() {
     let (result, reads) = measure_reads(crew.adopt_legacy_convoy_queues_once("flotilla", None)).await;
     result.expect("adopt");
     reads.of(&backend).assert_no_lists("legacy adoption");
+    // Two queries each read the 10 Active rows plus the fixture's live "crew" convoy.
     assert_eq!(reads.of(&backend).objects("Convoy", ReadOperation::Query), 22);
 }
