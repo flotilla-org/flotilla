@@ -225,27 +225,14 @@ async fn legacy_adoption_reads_only_live_convoys() {
     use flotilla_store_testkit::{measure_reads, ReadOperation};
     let (crew, backend, _, _temp) = fixture(CrewWorkPhase::Working).await;
 
-    let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
-    for index in 0..310 {
-        let convoy = convoys
-            .create(
-                &flotilla_resources::InputMeta::builder().name(format!("history-{index}")).build(),
-                &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).build(),
-            )
-            .await
-            .expect("create convoy");
-        convoys
-            .update_status(
-                &convoy.metadata.name,
-                &convoy.metadata.resource_version,
-                &flotilla_resources::ConvoyStatus {
-                    phase: if index < 300 { flotilla_resources::ConvoyPhase::Landed } else { flotilla_resources::ConvoyPhase::Active },
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("status");
-    }
+    flotilla_store_testkit::fixtures::seed_convoy_history()
+        .backend(&backend)
+        .namespace("flotilla")
+        .landed(300)
+        .active(10)
+        .call()
+        .await
+        .expect("convoy history");
 
     let (result, reads) = measure_reads(crew.adopt_legacy_convoy_queues_once("flotilla", None)).await;
     result.expect("adopt");

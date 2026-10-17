@@ -1001,27 +1001,14 @@ mod tests {
         use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt};
         let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
 
-        let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
-        for index in 0..310 {
-            let convoy = convoys
-                .create(
-                    &flotilla_resources::InputMeta::builder().name(format!("history-{index}")).build(),
-                    &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).build(),
-                )
-                .await
-                .expect("create convoy");
-            convoys
-                .update_status(
-                    &convoy.metadata.name,
-                    &convoy.metadata.resource_version,
-                    &flotilla_resources::ConvoyStatus {
-                        phase: if index < 300 { flotilla_resources::ConvoyPhase::Landed } else { flotilla_resources::ConvoyPhase::Active },
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("status");
-        }
+        flotilla_store_testkit::fixtures::seed_convoy_history()
+            .backend(&backend)
+            .namespace("flotilla")
+            .landed(300)
+            .active(10)
+            .call()
+            .await
+            .expect("convoy history");
 
         let refresher = ChangeRequestRefresher::new(
             "fleet".into(),

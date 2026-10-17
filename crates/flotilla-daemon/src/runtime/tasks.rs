@@ -597,6 +597,8 @@ where
         resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Consume the immediate tick; the subscribed startup scan handles recovery once.
         resync.tick().await;
+        // One startup attempt; after success or failure, retry adoption only
+        // when resync fires. Watch events and subscription retries do not adopt.
         let mut adopt_legacy = true;
         loop {
             let (mut convoys, mut sessions) = match subscribe().await {

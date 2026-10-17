@@ -94,6 +94,36 @@ pub fn convoy_spec(workflow_ref: &str) -> RealConvoySpec {
     spec
 }
 
+/// Seed retained terminal history and a live tail for caller read-budget tests.
+#[bon::builder]
+pub async fn seed_convoy_history(
+    backend: &flotilla_store::ResourceBackend,
+    namespace: &str,
+    landed: usize,
+    active: usize,
+) -> Result<(), flotilla_resources::ResourceError> {
+    let convoys = backend.using::<RealConvoy>(namespace);
+    for index in 0..landed + active {
+        let convoy = convoys
+            .create(
+                &InputMeta::builder().name(format!("history-{index}")).build(),
+                &RealConvoySpec::builder().workflow_ref("workflow".into()).build(),
+            )
+            .await?;
+        convoys
+            .update_status(
+                &convoy.metadata.name,
+                &convoy.metadata.resource_version,
+                &RealConvoyStatus {
+                    phase: if index < landed { flotilla_resources::ConvoyPhase::Landed } else { flotilla_resources::ConvoyPhase::Active },
+                    ..Default::default()
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus {
     RealConvoyStatus {
         naming: None,
