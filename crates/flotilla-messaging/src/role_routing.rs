@@ -106,9 +106,70 @@ async fn topic_contacts_in_snapshot(
     routing: TopicRouting<'_>,
     receivers: &MessageReceiverSnapshot,
 ) -> Result<Vec<RoleContact>, ResourceError> {
-    let TopicRouting { project, topic, sender, reach } = routing;
+    topic_candidates(backend, namespace, routing, ReceiverPresence::Current(receivers)).await
+}
+
+// A deliberately broad preload set: presence and sender exclusion need holder
+// evidence. These addresses must never be used as the final routing result.
+pub(crate) async fn topic_receiver_addresses(
+    backend: &ResourceBackend,
+    namespace: &str,
+    addresses: &[&str],
+) -> Result<Vec<String>, ResourceError> {
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
     let hierarchy = ProjectHierarchy::load_for_inspection(backend, namespace).await?;
     let projects = backend.definitions::<Project>(namespace).list().await?;
+    let mut candidates = BTreeSet::new();
+    for address in addresses {
+        // Message::validate_spec rejects malformed topics at admission. Keep
+        // the resolver's error if corrupt stored data bypasses that boundary.
+        let (project, topic) = parse_topic_address(address).ok_or_else(|| ResourceError::invalid("invalid topic address"))?;
+        let reach = if topic == "supervision" { TopicReach::Ancestors } else { TopicReach::SubtreeSubscriptions };
+        candidates.extend(
+            topic_candidates_from_declarations(
+                backend,
+                namespace,
+                TopicRouting::builder().project(project).topic(topic).reach(reach).build(),
+                ReceiverPresence::Candidates,
+                &hierarchy,
+                &projects,
+            )
+            .await?
+            .into_iter()
+            .map(|contact| contact.address),
+        );
+    }
+    Ok(candidates.into_iter().collect())
+}
+
+#[derive(Clone, Copy)]
+enum ReceiverPresence<'a> {
+    Candidates,
+    Current(&'a MessageReceiverSnapshot),
+}
+
+async fn topic_candidates(
+    backend: &ResourceBackend,
+    namespace: &str,
+    routing: TopicRouting<'_>,
+    receivers: ReceiverPresence<'_>,
+) -> Result<Vec<RoleContact>, ResourceError> {
+    let hierarchy = ProjectHierarchy::load_for_inspection(backend, namespace).await?;
+    let projects = backend.definitions::<Project>(namespace).list().await?;
+    topic_candidates_from_declarations(backend, namespace, routing, receivers, &hierarchy, &projects).await
+}
+
+async fn topic_candidates_from_declarations(
+    backend: &ResourceBackend,
+    namespace: &str,
+    routing: TopicRouting<'_>,
+    receivers: ReceiverPresence<'_>,
+    hierarchy: &ProjectHierarchy,
+    projects: &[crate::ResourceObject<Project>],
+) -> Result<Vec<RoleContact>, ResourceError> {
+    let TopicRouting { project, topic, sender, reach } = routing;
     if !projects.iter().any(|object| object.metadata.name == project) {
         return Ok(Vec::new());
     }
@@ -133,10 +194,13 @@ async fn topic_contacts_in_snapshot(
                     continue;
                 }
                 let address = definition.principal.clone().unwrap_or_else(|| format!("{name}/{role}"));
-                let holder = if definition.principal.is_some() { None } else { receivers.resolve(&address)? };
+                let holder = match receivers {
+                    ReceiverPresence::Current(receivers) if definition.principal.is_none() => receivers.resolve(&address)?,
+                    _ => None,
+                };
                 // Principal roles are declared terminal recipients. Automated roles
                 // exist only with current holders, not merely inherited definitions.
-                if holder.is_none() && definition.principal.is_none() {
+                if matches!(receivers, ReceiverPresence::Current(_)) && holder.is_none() && definition.principal.is_none() {
                     continue;
                 }
                 if sender.is_some_and(|sender| {
