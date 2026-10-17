@@ -262,8 +262,10 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
 #[tokio::test]
 async fn landing_discovery_window_has_an_owed_row_then_settles() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let wake = supervision_wake(&backend);
+    let mut wake = supervision_wake(&backend);
     let now = Utc::now();
+    let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(now));
+    wake.subscriptions = wake.subscriptions.with_clock(clock.clone());
     create_convoy(
         &backend,
         "discovering",
@@ -322,18 +324,31 @@ async fn landing_discovery_window_has_an_owed_row_then_settles() {
         )
         .await
         .unwrap();
-    for step in 0..3 {
-        if step == 1 {
-            flotilla_store::apply_status_patch(
-                &convoys,
-                "discovering",
-                &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: now },
-            )
-            .await
-            .unwrap();
-        }
-        if step == 2 {
-            vessels.delete("producer").await.unwrap();
+    enum Setup {
+        PendingScan,
+        RecordScan,
+        RemoveVessel,
+    }
+    let stages = [
+        (Setup::PendingScan, ("branch_subject_scan", "forge")),
+        (Setup::RecordScan, ("Vessel", "producer")),
+        (Setup::RemoveVessel, ("Convoy", "discovering")),
+    ];
+    for (setup, expected_maker) in stages {
+        match setup {
+            Setup::PendingScan => {}
+            Setup::RecordScan => {
+                flotilla_store::apply_status_patch(
+                    &convoys,
+                    "discovering",
+                    &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: now },
+                )
+                .await
+                .unwrap();
+            }
+            Setup::RemoveVessel => {
+                vessels.delete("producer").await.unwrap();
+            }
         }
         let objects = HashMap::from([("discovering".into(), convoys.get("discovering").await.unwrap())]);
         wake.sync_rows("flotilla", &objects).await.unwrap();
@@ -342,13 +357,24 @@ async fn landing_discovery_window_has_an_owed_row_then_settles() {
         assert!(status.stalled.is_none(), "pending discovery must not be a no-row stall: {:?}", status.stalled);
         let rows = wake.subscriptions.rows().await;
         assert_eq!(rows.len(), 1);
-        if step > 0 {
-            let expected_kind = if step == 1 { "Vessel" } else { "Convoy" };
-            let expected_name = if step == 1 { "producer" } else { "discovering" };
-            assert!(matches!(&rows[0].maker, LeafMaker::Controller { resource_kind, name: Some(name), .. }
-                if resource_kind == expected_kind && name == expected_name));
-        } else {
-            assert!(matches!(&rows[0].maker, LeafMaker::Observed { refresher, .. } if refresher == "branch_subject_scan"));
+        let actual_maker = match &rows[0].maker {
+            LeafMaker::Controller { resource_kind, name: Some(name), .. } => (resource_kind.as_str(), name.as_str()),
+            LeafMaker::Observed { refresher, external_party } => (refresher.as_str(), external_party.as_str()),
+            maker => panic!("unexpected settlement producer: {maker:?}"),
+        };
+        assert_eq!(actual_maker, expected_maker);
+        if matches!(setup, Setup::RecordScan) {
+            // Producer identity, rather than synthetic retry timestamps, keeps
+            // the Vessel subscription stable as rederivation advances time.
+            let original = &rows[0];
+            for seconds in [1, 31, 181] {
+                clock.set(now + chrono::Duration::seconds(seconds));
+                wake.sync_rows("flotilla", &objects).await.expect("rederive with advancing clock");
+                let rederived = wake.subscriptions.rows().await;
+                assert_eq!(rederived.len(), 1);
+                assert_eq!(rederived[0].id, original.id, "rederivation must retain the standing subscription");
+                assert_eq!(rederived[0].created_at, original.created_at);
+            }
         }
     }
 }

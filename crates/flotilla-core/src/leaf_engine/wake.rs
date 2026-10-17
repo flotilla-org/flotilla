@@ -644,13 +644,7 @@ impl ReconcilerWake {
                                     CheckoutSpec::FreshClone(spec) => &spec.r#ref,
                                     CheckoutSpec::Observed(spec) => &spec.r#ref,
                                 };
-                                // The integration observer probes this checkout's
-                                // branch, normalized exactly like ls-remote input.
-                                if branch.starts_with("refs/") {
-                                    branch == reference
-                                } else {
-                                    format!("refs/heads/{branch}") == *reference
-                                }
+                                crate::checkout_integration::remote_ref_for_branch(branch) == *reference
                             })
                             .map(|checkout| LeafMaker::Observed {
                                 refresher: "checkout_integration".into(),
@@ -659,7 +653,7 @@ impl ReconcilerWake {
                         _ => None,
                     };
                     if let Some(maker) = maker {
-                        if !settlement_makers.contains(&maker) {
+                        if !settlement_makers.iter().any(|existing| same_standing_maker(existing, &maker)) {
                             settlement_makers.push(maker);
                         }
                     }
