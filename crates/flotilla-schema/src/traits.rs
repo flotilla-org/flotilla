@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::{
+    code::Code,
     codec::{DecodeError, Decoder, EncodeError, Encoder},
     descriptor::{ColumnType, TableSet},
     history::Labelled,
@@ -18,7 +19,7 @@ use crate::{
 /// The closed attribute list, named by every refusal. The derive refuses with the same text.
 pub const SUPPORTED_ATTRIBUTES: &str =
     "the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, \
-                                        state and code (fields and variants) and kind, code, index and labels (types)";
+                                        state and code (fields and variants) and kind, code, state, index and labels (types)";
 
 /// Anything that lays out as zero or more columns of the current row, plus nested tables.
 #[doc(hidden)]
@@ -40,7 +41,7 @@ pub trait Columns: Sized {
 /// A type usable as a field with no attribute.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a storage column: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-               flatten, state and code (fields and variants) and kind, code, index and labels (types)",
+               flatten, state and code (fields and variants) and kind, code, state, index and labels (types)",
     label = "needs a column type or one of the storage attributes",
     note = "column types are integers, bool, String, Vec<u8>, Timestamp, DateTime<Utc>, Option of a column, and enums and newtypes deriving Stored"
 )]
@@ -49,7 +50,7 @@ pub trait Column: Columns {}
 /// A struct usable under `#[store(flatten)]`: it derives `Stored` and has no table fields.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-               flatten, state and code (fields and variants) and kind, code, index and labels (types)",
+               flatten, state and code (fields and variants) and kind, code, state, index and labels (types)",
     label = "flatten needs a struct deriving Stored with no table fields"
 )]
 pub trait Flat: Columns {}
@@ -60,17 +61,21 @@ pub trait Flat: Columns {}
 /// whose values span several columns or none.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot key a child table or an index: the storage derive supports only the attributes child, records, history, frozen, cbor, \
-               intern, flatten, state and code (fields and variants) and kind, code, index and labels (types)",
+               intern, flatten, state and code (fields and variants) and kind, code, state, index and labels (types)",
     label = "map keys, set values and index columns are single-column types: scalars, code enums, references and their newtypes"
 )]
 pub trait KeyColumn: Column {}
 
 /// A unit enum with a stable code on every variant: the target of `#[store(state)]` and of index
-/// predicates. Codes come from `#[store(code = N)]`, never from serde names or declaration order.
+/// predicates. Codes come from `#[store(code = "..")]` (short text, #3392 ruling G7), never from
+/// serde names or declaration order.
 pub trait CodeEnum: Column {
     /// Every variant's code, ascending.
-    const CODES: &'static [i64];
-    fn code(&self) -> i64;
+    const CODES: &'static [Code];
+    /// The Rust name of the variant carrying each of [`CodeEnum::CODES`], in the same order: the
+    /// `codes` table's names, which only the readable views read.
+    const NAMES: &'static [&'static str];
+    fn code(&self) -> Code;
 }
 
 /// The value of a `#[store(state)]` field's `State<S>`: a code enum (the label alone) or a
@@ -79,7 +84,7 @@ pub trait CodeEnum: Column {
 /// `State<S>` lays out the label column and `<field>_since`, and this trait the data after them.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be a state: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-               flatten, state and code (fields and variants) and kind, code, index and labels (types)",
+               flatten, state and code (fields and variants) and kind, code, state, index and labels (types)",
     label = "a state is a code enum, or an enum deriving Stored with #[store(labels = Label)]"
 )]
 #[doc(hidden)]
@@ -87,18 +92,20 @@ pub trait StateData: Labelled + Sized {
     /// Tables the data declares, in pre-order.
     const TABLES: usize;
     /// Every label's code, ascending: the variant codes.
-    const CODES: &'static [i64];
+    const CODES: &'static [Code];
+    /// The Rust name of each label, in the order of [`StateData::CODES`].
+    const NAMES: &'static [&'static str];
     /// The data's names in declaration order; empty for a code enum.
     const DATA: &'static [&'static str];
     /// The label's code, as stored.
-    fn code(&self) -> i64;
+    fn code(&self) -> Code;
     /// Declares the data's columns and tables, and one CHECK per label on the label column `label`.
     fn layout_data(layout: &mut Layout, label: &str);
     fn encode_data(&self, e: &mut Encoder) -> Result<(), EncodeError>;
     fn encode_absent_data(e: &mut Encoder) -> Result<(), EncodeError>;
     /// The value whose label has code `code` (one of [`StateData::CODES`]), reading its data and
     /// refusing data stored under labels that lack it.
-    fn decode_data(code: i64, d: &mut Decoder) -> Result<Self, DecodeError>;
+    fn decode_data(code: Code, d: &mut Decoder) -> Result<Self, DecodeError>;
     fn decode_absent_data(d: &mut Decoder) -> Result<(), DecodeError>;
     /// Records in `delta` the data that differs from `previous` to `next`: each column datum whose
     /// columns differ, and each row of a collection datum that differs.
@@ -108,7 +115,7 @@ pub trait StateData: Labelled + Sized {
 /// A `#[store(intern)]` target: stored as an id in `strings`.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be interned: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-               flatten, state and code (fields and variants) and kind, code, index and labels (types)",
+               flatten, state and code (fields and variants) and kind, code, state, index and labels (types)",
     label = "intern needs String or a newtype of String"
 )]
 pub trait Intern {
@@ -119,7 +126,7 @@ pub trait Intern {
 /// A table row: a struct deriving `Stored`, or a primitive/enum element of a collection.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a storage row: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-               flatten, state and code (fields and variants) and kind, code, index and labels (types)",
+               flatten, state and code (fields and variants) and kind, code, state, index and labels (types)",
     label = "collection elements are structs, enums or newtypes deriving Stored, or column primitives"
 )]
 pub trait Element: Sized {
@@ -130,15 +137,43 @@ pub trait Element: Sized {
     fn decode_row(d: &mut Decoder) -> Result<Self, DecodeError>;
 }
 
-/// A resource kind: a struct with `#[store(kind = "...", code = N)]`.
+/// A resource kind: a struct with `#[store(kind = "...", code = "..")]`.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` is not a stored kind: a kind is a struct deriving Stored with #[store(kind = \"Name\", code = N)]",
+    message = "`{Self}` is not a stored kind: a kind is a struct deriving Stored with #[store(kind = \"Name\", code = \"..\")]",
     label = "not a stored kind"
 )]
 pub trait Kind: Element {
     const KIND: &'static str;
     const CODE: KindCode;
     fn table_set() -> TableSet;
+
+    /// The value loaded as resource `name` at `version`. The store keeps a resource's name (its
+    /// identity row) and version beside its rows; a holder kind that carries them (the engine's
+    /// `Resource<M>`, #3392 ruling D5) takes them here, and any other kind is unchanged.
+    fn with_identity(self, name: &str, version: u64) -> Self {
+        let _ = (name, version);
+        self
+    }
+}
+
+/// The spec of a kind stored through a generic holder: a struct deriving `Stored` with
+/// `#[store(kind = "Name", code = "..", state = S)]` (#3392 ruling D5). The holder (the engine's
+/// `Resource<M>`) is the stored kind: its root row is the spec's columns, then its state `S` as
+/// the field `state`, then its records, and it supplies the identity and version. The spec
+/// carries what is particular to the kind: its name and code, its interning and its indexes,
+/// whose `state in [...]` names the holder's state.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a kind's spec: a spec is a struct deriving Stored with #[store(kind = \"Name\", code = \"..\", state = State)]",
+    label = "not a kind's spec"
+)]
+pub trait KindSpec: Element {
+    const KIND: &'static str;
+    const CODE: KindCode;
+    /// The state the holder stores beside the spec.
+    type State: StateData;
+    /// Declares the kind's indexes on its root table: the holder calls this after laying out the
+    /// spec, the state and the records.
+    fn layout_indexes(layout: &mut Layout);
 }
 
 impl Intern for String {
@@ -271,12 +306,13 @@ scalar!(Identity, ColumnType::Ref, |this| Ok(Value::Ref(this.clone())), |value| 
     other => Err(DecodeError::unexpected("reference", &other)),
 });
 
-/// An optional column is the inner type's columns, nullable.
+/// An optional column is the inner type's columns, nullable: present when the first of them is
+/// non-null (a data enum's tag, say), and all null when absent.
 impl<T: Column> Columns for Option<T> {
     const TABLES: usize = T::TABLES;
 
     fn layout(layout: &mut Layout, name: &str, _required: bool) {
-        T::layout(layout, name, false);
+        layout.optional(|layout| T::layout(layout, name, true));
     }
 
     fn encode(&self, e: &mut Encoder) -> Result<(), EncodeError> {
@@ -345,7 +381,7 @@ mod tests {
 
     #[test]
     fn options_are_nullable_columns() {
-        let mut layout = Layout::root("K", KindCode(1));
+        let mut layout = Layout::root("K", KindCode::new("k1"));
         <Option<String> as Columns>::layout(&mut layout, "note", true);
         String::layout_row(&mut layout);
         let set = layout.finish();

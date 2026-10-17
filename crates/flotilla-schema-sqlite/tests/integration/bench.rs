@@ -17,15 +17,15 @@
 
 use std::{env, fs, path::PathBuf, process, time::Instant};
 
-use flotilla_schema::{Edge, Timestamp};
+use flotilla_schema::{Edge, Kind, Timestamp};
 use flotilla_schema_sqlite::{Stamp, Store};
 use flotilla_state_machines::{
     machines::message::{Deliver, MemoryMessageWorld, Message, MessageWorld, Receiver, Settle, Settlement},
-    Home, MachineRow, Ref, Transport, Version,
+    Home, Ref, Resource, Transport,
 };
 use rusqlite::Connection;
 
-use crate::fixtures::{engine::NAME, message, registry, MessageRow, LOCAL};
+use crate::fixtures::{engine::NAME, message, registry, LOCAL};
 
 const MESSAGES: usize = 10_000;
 const INBOXES: usize = 100;
@@ -53,8 +53,8 @@ fn open(batch: usize) -> (Database, Store) {
     (database, Store::open(conn, LOCAL, registry()).expect("store"))
 }
 
-fn value(n: usize) -> MessageRow {
-    MessageRow { inbox: format!("inbox-{}", n % INBOXES), ..message::sample() }
+fn value(n: usize) -> Resource<Message> {
+    message::sample_in(format!("inbox-{}", n % INBOXES))
 }
 
 /// The messages' stamps.
@@ -72,23 +72,23 @@ fn seed(store: &mut Store) -> Vec<Stamp> {
 
 /// Message `n`'s two events, as the engine applies them: its delivery to a session (the gate
 /// reads the session's receipt) and its settlement on the reply (the gate reads the reply).
-fn events(n: usize) -> [Edge<MessageRow>; 2] {
+fn events(n: usize) -> [Edge<Resource<Message>>; 2] {
     let session = format!("session-{}", n % 50);
     let mut world = MemoryMessageWorld::default();
     world.receipts.put(&Ref::new(NAME), [(session.clone(), Transport::Turn)].into());
     world.reply.put(&Ref::new(NAME), ());
     let world: Box<dyn MessageWorld> = Box::new(world);
     let mut home = Home::<Message>::new(LOCAL).expect("valid");
-    let row = value(n);
-    home.restore(NAME, Version(1), row.parts()).unwrap_or_else(|_| panic!("an empty home"));
+    home.restore(value(n).with_identity(NAME, 1)).unwrap_or_else(|_| panic!("an empty home"));
     let at = Timestamp(n as i64);
+    let pending = home.get(NAME).expect("present").stored_state().clone();
     let deliver = Deliver { receiver: Receiver { session, host: "consumer".into() }, transport: Transport::Turn };
     let event = home.apply(NAME, deliver, &*world, at).unwrap_or_else(|_| panic!("delivered")).clone();
-    let (first, state) = row.edge(&event, home.get(NAME).expect("present").state().clone()).expect("edge");
-    let delivered = MessageRow { state, ..row };
+    let first = home.get(NAME).expect("present").stored_edge(&pending, &event).expect("edge");
+    let delivered = home.get(NAME).expect("present").stored_state().clone();
     let event =
         home.apply(NAME, Settle { by: Settlement::Answered }, &*world, at.saturating_add(1)).unwrap_or_else(|_| panic!("settled")).clone();
-    let (second, _) = delivered.edge(&event, home.get(NAME).expect("present").state().clone()).expect("edge");
+    let second = home.get(NAME).expect("present").stored_edge(&delivered, &event).expect("edge");
     [first, second]
 }
 
@@ -100,7 +100,8 @@ fn run(batch: usize, events: usize) -> String {
     let (_database, mut store) = open(batch);
     let mut messages = seed(&mut store);
     assert!(events <= 2 * MESSAGES, "each message takes two events");
-    let mut pending: Vec<std::vec::IntoIter<Edge<MessageRow>>> = (0..MESSAGES).map(|n| Vec::from(self::events(n)).into_iter()).collect();
+    let mut pending: Vec<std::vec::IntoIter<Edge<Resource<Message>>>> =
+        (0..MESSAGES).map(|n| Vec::from(self::events(n)).into_iter()).collect();
     let mut transactions = Vec::new();
     let mut commits = Vec::new();
     let start = Instant::now();

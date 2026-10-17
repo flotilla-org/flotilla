@@ -1,20 +1,20 @@
-//! The engine's AgentSession (`flotilla_state_machines::machines::agent_session::AgentSessionRow`,
-//! kind code 3): generators, and the worlds that let each edge pass its gate.
+//! The engine's AgentSession (`Resource<AgentSession>`, declared by `AgentSessionSpec`, kind code
+//! `as`): generators, and the worlds that let each edge pass its gate.
 
-use flotilla_schema::{Edge, Records, State, Timestamp};
+use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::agent_session::{
-        AgentSession, AgentSessionEdge, AgentSessionState, AgentSessionWorld, Attach, Channel, Detach, End, EndReason,
+        AgentSession, AgentSessionEdge, AgentSessionSpec, AgentSessionState, AgentSessionWorld, Attach, Channel, Detach, End, EndReason,
         MemoryAgentSessionWorld,
     },
-    Receipt, Ref, Transport,
+    Receipt, Ref, Resource, Transport,
 };
 use hegel::TestCase;
 
 use super::{
     code_enum,
-    engine::{self, Candidate},
-    name, records, stamp_flat, timestamp, AgentSessionRow, Fixture, Pick,
+    engine::{self, resource, Candidate},
+    name, records, stamp_flat, timestamp, Fixture, Pick,
 };
 
 /// Covering indexes: the label is digit 0 (base 2), and the channel or end reason digit 1.
@@ -43,21 +43,15 @@ pub fn receipt(tc: &TestCase, pick: Pick) -> Receipt {
     Receipt { message: name(tc), transport: code_enum(tc, pick, &[Transport::Turn, Transport::Notify, Transport::Mute]), at: timestamp(tc) }
 }
 
-pub fn generate(tc: &TestCase, pick: Pick) -> AgentSessionRow {
-    AgentSessionRow {
-        state: State::new(state_value(tc, pick), timestamp(tc)),
-        edges: records(tc, pick, 2, |pick| engine::event::<AgentSession>(tc, pick, &edges(tc))),
-        receipts: records(tc, pick.nth(1), 2, |pick| receipt(tc, pick)),
-    }
+pub fn generate(tc: &TestCase, pick: Pick) -> Resource<AgentSession> {
+    resource(AgentSessionSpec {}, State::new(state_value(tc, pick), timestamp(tc)))
+        .with_events(records(tc, pick, 2, |pick| engine::event::<AgentSession>(tc, pick, &edges(tc))))
+        .with_receipts(records(tc, pick.nth(1), 2, |pick| receipt(tc, pick)))
 }
 
 /// A live, detached session with no history.
-pub fn sample() -> AgentSessionRow {
-    AgentSessionRow {
-        state: State::new(AgentSessionState::Live { channel: Channel::Detached }, Timestamp(0)),
-        edges: Records::new(),
-        receipts: Records::new(),
-    }
+pub fn sample() -> Resource<AgentSession> {
+    resource(AgentSessionSpec {}, State::new(AgentSessionState::Live { channel: Channel::Detached }, Timestamp(0)))
 }
 
 fn boxed(world: MemoryAgentSessionWorld) -> Box<dyn AgentSessionWorld> {
@@ -85,27 +79,27 @@ pub fn candidates(tc: &TestCase) -> Vec<Candidate<AgentSession>> {
     candidates
 }
 
-impl Fixture for AgentSessionRow {
+impl Fixture for Resource<AgentSession> {
     const COVERING: usize = COVERING;
 
-    fn generate(tc: &TestCase, pick: Pick) -> AgentSessionRow {
+    fn generate(tc: &TestCase, pick: Pick) -> Resource<AgentSession> {
         generate(tc, pick)
     }
 
     /// A session has no spec: a spec edit writes the same value.
-    fn evolve(&self, _tc: &TestCase, _pick: Pick) -> AgentSessionRow {
+    fn evolve(&self, _tc: &TestCase, _pick: Pick) -> Resource<AgentSession> {
         self.clone()
     }
 
-    fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<AgentSessionRow>, AgentSessionRow)> {
+    fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<Resource<AgentSession>>, Resource<AgentSession>)> {
         engine::drive(tc, pick, self, candidates(tc))
     }
 
-    fn stamped(&self, before: Option<&AgentSessionRow>, version: u64) -> AgentSessionRow {
-        AgentSessionRow {
-            edges: stamp_flat(&self.edges, before.map(|before| &before.edges), version),
-            receipts: stamp_flat(&self.receipts, before.map(|before| &before.receipts), version),
-            ..self.clone()
-        }
+    fn stamped(&self, before: Option<&Resource<AgentSession>>, version: u64) -> Resource<AgentSession> {
+        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version)).with_receipts(stamp_flat(
+            self.receipts(),
+            before.map(|before| before.receipts()),
+            version,
+        ))
     }
 }

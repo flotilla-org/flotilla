@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_schema::{
-    quote_ident, Edge, EdgeEvent, Kind, Labelled, Position, Records, Row, RowChange, RowOp, State, TableRole, Timestamp, Value,
+    quote_ident, Code, Edge, EdgeEvent, Kind, Labelled, Position, Records, Row, RowChange, RowOp, State, TableRole, Timestamp, Value,
 };
 use flotilla_schema_sqlite::{Applied, ResourceId, Snapshot, Stamp, Store, StoreError};
 use hegel::{generators as gs, TestCase};
@@ -143,9 +143,16 @@ fn a_transition_logs_exactly_the_rows_and_columns_that_differ(tc: TestCase) {
         let stamped = Value::Int(i64::try_from(next.version).expect("stored"));
         assert_eq!(events.len(), 1, "one event");
         assert_eq!(events[0][0], stamped);
-        let [_, _, Value::Int(from), Value::Int(to), _, Value::Int(at), _] = events[0][..] else { panic!("event header {:?}", events[0]) };
+        let [_, _, Value::Text(from), Value::Text(to), _, Value::Int(at), _] = &events[0][..] else {
+            panic!("event header {:?}", events[0])
+        };
+        let at = *at;
         let label = field("state").start;
-        assert_eq!((old_root[label].clone(), new_root[label].clone()), (Value::Int(from), Value::Int(to)), "the event names the move");
+        assert_eq!(
+            (old_root[label].clone(), new_root[label].clone()),
+            (Value::Text(from.clone()), Value::Text(to.clone())),
+            "the event names the move"
+        );
         let since = new_root[label + 1].clone();
         assert_eq!(since, if from == to { old_root[label + 1].clone() } else { Value::Int(at) }, "since moves only with the label");
         assert_eq!(logged_fields.contains("state"), from != to);
@@ -258,7 +265,7 @@ fn edge_refusals_come_in_a_fixed_order() {
     assert!(matches!(write.apply_edge(inserted, wrong_from()), Err(StoreError::Conflict { .. })), "a stale stamp first");
     let refused = write.apply_edge(moved, wrong_from());
     assert!(
-        matches!(&refused, Err(StoreError::WrongFrom { id, field, from: 3, stored: 2 }) if *id == moved.id && field == "state"),
+        matches!(&refused, Err(StoreError::WrongFrom { id, field, from, stored }) if *id == moved.id && field == "state" && *from == Code::new("c3") && stored == "c2"),
         "{refused:?}"
     );
 
@@ -274,7 +281,10 @@ fn edge_refusals_come_in_a_fixed_order() {
     .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence()))
     .expect("edge");
     let refused = write.apply_edge(dossier, both.clone());
-    assert!(matches!(&refused, Err(StoreError::WrongFrom { from: 2, stored: 1, .. })), "the label before the records row: {refused:?}");
+    assert!(
+        matches!(&refused, Err(StoreError::WrongFrom { from, stored, .. }) if *from == Code::new("c2") && stored == "c1"),
+        "the label before the records row: {refused:?}"
+    );
     let missing = Edge::new(
         Dossier::STATE,
         &delivered,
@@ -379,13 +389,15 @@ fn a_label_and_its_data_change_in_one_statement() {
     let by = |id: ResourceId| format!("WHERE {} = {}", quote_ident("id"), id.0);
     let closed_by: i64 = conn.query_row("SELECT min(id) FROM strings", [], |row| row.get(0)).expect("a string");
     let signed = format!("signature_who = {closed_by}, signature_at = 4");
-    let closing = format!("state = 3, closed_by = {closed_by}, hold_present = NULL");
+    let closing = format!("state = 'c3', closed_by = {closed_by}");
     assert!(refused_by_check(&conn, &format!("UPDATE ticket SET {closing}, {signed} {}", by(stamp.id))), "no reason");
     assert!(refused_by_check(&conn, &format!("UPDATE ticket SET {closing}, reason = 'r' {}", by(stamp.id))), "no signature");
     assert!(refused_by_check(&conn, &format!("UPDATE ticket SET reason = 'r' {}", by(stamp.id))), "Open lacks a reason");
     assert!(refused_by_check(&conn, &format!("UPDATE ticket SET {signed} {}", by(stamp.id))), "Open lacks a signature");
-    assert!(refused_by_check(&conn, &format!("UPDATE ticket SET hold_present = 1 {}", by(stamp.id))), "a present hold needs its columns");
-    assert!(refused_by_check(&conn, &format!("UPDATE ticket SET hold_present = NULL {}", by(stamp.id))), "Open carries a hold flag");
+    assert!(refused_by_check(&conn, &format!("UPDATE ticket SET hold_by = 'x' {}", by(stamp.id))), "a present hold needs its columns");
+    assert!(refused_by_check(&conn, &format!("UPDATE ticket SET hold_until = 3 {}", by(stamp.id))), "an absent hold is all null");
+    assert_eq!(conn.execute(&format!("UPDATE ticket SET hold_by = 'x', hold_until = 3 {}", by(stamp.id)), []).expect("a whole hold"), 1);
+    conn.execute(&format!("UPDATE ticket SET hold_by = NULL, hold_until = NULL {}", by(stamp.id)), []).expect("no hold again");
     let together = format!("UPDATE ticket SET {closing}, reason = 'r', {signed} {}", by(stamp.id));
     assert_eq!(conn.execute(&together, []).expect("one statement"), 1);
 
@@ -395,10 +407,10 @@ fn a_label_and_its_data_change_in_one_statement() {
     assert!(matches!(refused, Err(StoreError::Decode(flotilla_schema::DecodeError::AbsentRows { .. }))), "{refused:?}");
 }
 
-// Behaviour (coordinator addition, flattened data): a flattened datum is one field of the state:
-// an optional one's flag and columns move together when it appears, changes or goes (its flag 0
-// for `None` under a label carrying it, null under one lacking it), and a required one is written
-// whole when its label is entered. Each logged `Set` names the datum alone.
+// Behaviour (coordinator addition, flattened data, #3392 G5): a flattened datum is one field of the
+// state: an optional one's columns move together when it appears, changes or goes (all null for
+// `None`, as under a label lacking it, so leaving an absent hold behind writes nothing), and a
+// required one is written whole when its label is entered. Each logged `Set` names the datum alone.
 #[test]
 fn a_flattened_datum_moves_as_one_field() {
     let mut store = store();
@@ -413,15 +425,14 @@ fn a_flattened_datum_moves_as_one_field() {
         hold: Some(Hold { by: "bo".into(), until: Timestamp(7) }),
     };
     for (next, at, expected) in [
-        (held, 3, vec![("hold", vec![Value::Int(1), Value::Text("bo".into()), Value::Int(7)])]),
-        (open(&["a"], 1), 4, vec![("hold", vec![Value::Int(0), Value::Null, Value::Null])]),
+        (held, 3, vec![("hold", vec![Value::Text("bo".into()), Value::Int(7)])]),
+        (open(&["a"], 1), 4, vec![("hold", vec![Value::Null, Value::Null])]),
         (
             closed(),
             5,
             vec![
-                ("state", vec![Value::Int(3), Value::Int(5)]),
+                ("state", vec![Value::Text("c3".into()), Value::Int(5)]),
                 ("priority", vec![Value::Int(0)]),
-                ("hold", vec![Value::Null, Value::Null, Value::Null]),
                 ("reason", vec![Value::Text("done".into())]),
                 ("closed_by", vec![Value::Str("ann".into())]),
                 ("signature", vec![Value::Str("ann".into()), Value::Int(2)]),

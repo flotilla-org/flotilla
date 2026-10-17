@@ -1,6 +1,6 @@
 //! The shared lifecycle against `specs/primitives/machines/lifecycle.qnt`.
 
-use flotilla_schema::{CodeEnum, Timestamp};
+use flotilla_schema::{Code, CodeEnum, Timestamp};
 use flotilla_state_machines::{
     changed,
     machines::lifecycle::{
@@ -40,7 +40,7 @@ fn cause(detail: &str) -> Cause {
 
 fn home() -> Home<P> {
     let mut home = Home::new("kiwi").expect("valid declaration");
-    home.create("r", "opaque request".to_string()).expect("created");
+    home.create("r", "opaque request".to_string(), Timestamp(0)).expect("created");
     home
 }
 
@@ -84,11 +84,18 @@ fn every_kind_validates() {
 #[test]
 fn codes_and_names_are_pinned() {
     let labels: Vec<_> = LifecycleLabel::ALL.iter().map(|s| (s.name(), s.code(), LifecycleState::fields(*s))).collect();
-    let expected: [(&str, i64, &[&str]); 4] =
-        [("Requested", 1, &[]), ("Realised", 2, &["identity"]), ("Gone", 3, &[]), ("GaveUp", 4, &["cause"])];
+    let expected: [(&str, Code, &[&str]); 4] = [
+        ("Requested", Code::new("rq"), &[]),
+        ("Realised", Code::new("rl"), &["identity"]),
+        ("Gone", Code::new("go"), &[]),
+        ("GaveUp", Code::new("gu"), &["cause"]),
+    ];
     assert_eq!(labels, expected);
     let edges: Vec<_> = LifecycleEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    assert_eq!(edges, [("realise", 1), ("release", 2), ("vanish", 3), ("give_up", 4)]);
+    assert_eq!(
+        edges,
+        [("realise", Code::new("rl")), ("release", Code::new("rs")), ("vanish", Code::new("va")), ("give_up", Code::new("gu"))]
+    );
 }
 
 // The diagram shows the ADR's table: realise, release from both live states,
@@ -216,7 +223,7 @@ fn give_up_needs_exhausted_attempts_with_that_cause() {
 fn the_default_policy_gives_up_after_three_failures() {
     let world = MemoryLifecycleWorld::default();
     let mut h: Home<Lifecycle<Other>> = Home::new("kiwi").expect("valid declaration");
-    h.create("r", (1, 2)).expect("created");
+    h.create("r", (1, 2), Timestamp(0)).expect("created");
     for n in 1..=3 {
         let refusal = h.apply("r", GiveUp { cause: cause("boom") }, &world, at(n)).err();
         assert_eq!(refusal, Some(WriteError::Refused(LifecycleRefusal::MissingEvidence)), "after {} failures", n - 1);

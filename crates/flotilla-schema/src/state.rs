@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    code::{code_value, decode_code},
     codec::{DecodeError, Decoder, EncodeError, Encoder},
-    descriptor::ColumnType,
     history::Labelled,
     layout::Layout,
     time::Timestamp,
@@ -52,14 +52,14 @@ impl<E: StateData> Columns for State<E> {
 
     fn layout(layout: &mut Layout, name: &str, required: bool) {
         layout.field(name, true, |layout| {
-            layout.column(name, ColumnType::Code(E::CODES.to_vec()), required);
+            layout.code(name, E::CODES, E::NAMES, required);
             Timestamp::layout(layout, &Layout::join(name, "since"), required);
         });
         E::layout_data(layout, name);
     }
 
     fn encode(&self, e: &mut Encoder) -> Result<(), EncodeError> {
-        e.put(Value::Int(self.value.code()));
+        e.put(code_value(self.value.code()));
         self.since.encode(e).map_err(|error| error.at("since"))?;
         self.value.encode_data(e)
     }
@@ -71,12 +71,7 @@ impl<E: StateData> Columns for State<E> {
     }
 
     fn decode(d: &mut Decoder) -> Result<Option<Self>, DecodeError> {
-        let code = match d.take()? {
-            Value::Null => None,
-            Value::Int(code) if E::CODES.contains(&code) => Some(code),
-            Value::Int(code) => return Err(DecodeError::Code { column: String::new(), code }),
-            other => return Err(DecodeError::unexpected("integer", &other)),
-        };
+        let code = decode_code(d, E::CODES)?;
         let since = Timestamp::decode(d).map_err(|error| error.at("since"))?;
         match (code, since) {
             (None, None) => E::decode_absent_data(d).map(|()| None),
@@ -116,27 +111,17 @@ pub struct StateDelta {
     pub(crate) objects: BTreeMap<Hash, Vec<u8>>,
 }
 
-type Encode<F> = fn(&F, &mut Encoder) -> Result<(), EncodeError>;
-type EncodeAbsent = fn(&mut Encoder) -> Result<(), EncodeError>;
-
 impl StateDelta {
-    /// A column datum `name`: `previous` and `next` are `None` under a label that lacks it, when
-    /// its columns are null. Recorded with `next`'s values when the encoded columns differ.
-    pub fn column<F>(
+    /// A column datum `name`: `encode` writes the datum's columns of a state value (null under a
+    /// label that lacks it). Recorded with `next`'s values when the encoded columns differ.
+    pub fn column<S>(
         &mut self,
         name: &'static str,
-        encode: Encode<F>,
-        absent: EncodeAbsent,
-        previous: Option<&F>,
-        next: Option<&F>,
+        encode: impl Fn(&S, &mut Encoder) -> Result<(), EncodeError>,
+        previous: &S,
+        next: &S,
     ) -> Result<(), EncodeError> {
-        let encoded = |value: Option<&F>| {
-            Encoder::columns(|e| match value {
-                Some(value) => encode(value, e),
-                None => absent(e),
-            })
-            .map_err(|error| error.at(name))
-        };
+        let encoded = |value: &S| Encoder::columns(|e| encode(value, e)).map_err(|error| error.at(name));
         let before = encoded(previous)?.tables.swap_remove(0).swap_remove(0).values;
         let mut after = encoded(next)?;
         let values = after.tables.swap_remove(0).swap_remove(0).values;
@@ -147,22 +132,18 @@ impl StateDelta {
         Ok(())
     }
 
-    /// A collection datum `name` (one table of single-table rows): one edit per row that differs,
-    /// by key: deletes, then updates, then inserts, each in key order.
-    pub fn table<F>(
+    /// A collection datum `name` (one table of single-table rows): `encode` writes the datum's
+    /// table of a state value (no rows under a label that lacks it). One edit per row that
+    /// differs, by key: deletes, then updates, then inserts, each in key order.
+    pub fn table<S>(
         &mut self,
         name: &'static str,
-        encode: Encode<F>,
-        absent: EncodeAbsent,
-        previous: Option<&F>,
-        next: Option<&F>,
+        encode: impl Fn(&S, &mut Encoder) -> Result<(), EncodeError>,
+        previous: &S,
+        next: &S,
     ) -> Result<(), EncodeError> {
-        let encoded = |value: Option<&F>| {
-            let mut rows = Encoder::fragment(1, |e| match value {
-                Some(value) => encode(value, e),
-                None => absent(e),
-            })
-            .map_err(|error| error.at(name))?;
+        let encoded = |value: &S| {
+            let mut rows = Encoder::fragment(1, |e| encode(value, e)).map_err(|error| error.at(name))?;
             rows.sort();
             Ok::<_, EncodeError>(rows)
         };

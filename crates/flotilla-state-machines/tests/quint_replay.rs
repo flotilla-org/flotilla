@@ -287,7 +287,7 @@ fn accept<M: Machine>(
 
 /// A model step created this resource, so the Rust machine must admit it.
 fn create<M: Machine>(home: &mut Home<M>, name: &str, request: M::Request, step: &Step, tally: &mut Tally) {
-    if let Err(error) = home.create(name, request) {
+    if let Err(error) = home.create(name, request, Timestamp(0)) {
         panic!("{step}: the model created {} {name}; Rust refused it: {error:?}", M::NAME);
     }
     tally.writes += 1;
@@ -1315,14 +1315,14 @@ fn message_value(resource: &Resource<Message>) -> Value {
             "Awaiting",
             json!({ "envelope": envelope, "receiver": { "session": int(session_number(receiver)), "host": receiver.host } }),
         ),
-        MessageState::Settled => variant("Settled", envelope),
-        MessageState::Dropped { reason, dropped_receiver: receiver, at, watermark } => variant(
+        MessageState::Settled { .. } => variant("Settled", envelope),
+        MessageState::Dropped { reason, receiver, watermark } => variant(
             "Dropped",
             json!({
                 "reason": constant(reason_name(reason)),
                 "envelope": envelope,
                 "receiver": int(receiver.as_ref().map_or(0, session_number)),
-                "at": int(ticks(*at)),
+                "at": int(ticks(resource.events().iter().last().expect("a dropped message has its drop event").record.at)),
                 "watermark": int(watermark.map_or(0, ticks)),
                 "bound": watermark.is_some(),
                 "receipt": false,
@@ -1368,11 +1368,11 @@ impl<'a> MessageReplay<'a> {
             unbound_after: UNIT,
         };
         let mut home = Home::new("home").expect("declaration");
-        home.create(ONE, spec).expect("message");
+        home.create(ONE, spec, Timestamp(0)).expect("message");
         let sessions = (feed == Feed::Inbox).then(|| {
             let mut sessions = Home::new("consumer").expect("declaration");
             for (id, _) in entries(&trace.states[0], "::sessions") {
-                sessions.create(id.to_string(), ()).expect("session");
+                sessions.create(id.to_string(), (), Timestamp(0)).expect("session");
             }
             sessions
         });

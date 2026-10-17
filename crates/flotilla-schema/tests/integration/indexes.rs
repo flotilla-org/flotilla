@@ -1,17 +1,17 @@
 //! Derived indexes: the descriptor entry, its DDL and the typed query constructors.
 
 use flotilla_schema::{
-    render_ddl, Condition, EncodeError, Identity, Index, IndexQuery, Kind, KindCode, Ref, State, Stored, TableSet, Value,
+    render_ddl, Code, Condition, EncodeError, Identity, Index, IndexQuery, Kind, KindCode, Ref, State, Stored, TableSet, Value,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 enum Phase {
     // Codes deliberately unlike declaration positions: predicates must read them from the enum.
-    #[store(code = 9)]
+    #[store(code = "c9")]
     Open,
-    #[store(code = 7)]
+    #[store(code = "c7")]
     Waiting,
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Closed,
 }
 
@@ -19,7 +19,7 @@ enum Phase {
 struct Pool(String);
 
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Desk", code = 2)]
+#[store(kind = "Desk", code = "k2")]
 struct Desk {
     label: String,
 }
@@ -27,7 +27,7 @@ struct Desk {
 #[derive(Debug, Clone, PartialEq, Stored)]
 #[store(
     kind = "Ticket",
-    code = 1,
+    code = "k1",
     index(name = "open_by_desk", eq(desk), order(seq), when(phase in [Open, Waiting])),
     index(name = "by_parent", eq(parent, pool), when(parent is_some)),
     index(name = "due", order(due), when(phase in [Waiting], due is_some))
@@ -45,7 +45,7 @@ struct Ticket {
 
 /// A generic kind still gets its constructor.
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Holder", code = 3, index(name = "by_seq", order(seq)))]
+#[store(kind = "Holder", code = "k3", index(name = "by_seq", order(seq)))]
 struct Holder<T> {
     seq: i64,
     extra: T,
@@ -66,12 +66,15 @@ fn indexes_become_descriptor_entries() {
         (open.table.as_str(), open.eq.as_slice(), open.order.as_slice()),
         ("ticket", &["desk".to_owned()][..], &["seq".to_owned()][..])
     );
-    assert_eq!(open.predicate, [Condition::In { column: "phase".into(), codes: vec![9, 7] }]);
+    assert_eq!(open.predicate, [Condition::In { column: "phase".into(), codes: vec![Code::new("c9"), Code::new("c7")] }]);
     let parent = index(&set, "by_parent");
     assert_eq!(parent.eq, ["parent", "pool"]);
     assert_eq!(parent.predicate, [Condition::NotNull { column: "parent".into() }]);
     let due = index(&set, "due");
-    assert_eq!(due.predicate, [Condition::In { column: "phase".into(), codes: vec![7] }, Condition::NotNull { column: "due".into() }]);
+    assert_eq!(
+        due.predicate,
+        [Condition::In { column: "phase".into(), codes: vec![Code::new("c7")] }, Condition::NotNull { column: "due".into() }]
+    );
     assert_eq!(Holder::<String>::table_set().indexes[0].order, ["seq"]);
 }
 
@@ -84,8 +87,8 @@ fn indexes_render_as_partial_indexes() {
         indexes,
         [
             r#"CREATE INDEX "ticket_by_parent" ON "ticket" ("parent", "pool") WHERE "parent" IS NOT NULL;"#,
-            r#"CREATE INDEX "ticket_due" ON "ticket" ("due") WHERE "phase" IN (7) AND "due" IS NOT NULL;"#,
-            r#"CREATE INDEX "ticket_open_by_desk" ON "ticket" ("desk", "seq") WHERE "phase" IN (9, 7);"#,
+            r#"CREATE INDEX "ticket_due" ON "ticket" ("due") WHERE "phase" IN ('c7') AND "due" IS NOT NULL;"#,
+            r#"CREATE INDEX "ticket_open_by_desk" ON "ticket" ("desk", "seq") WHERE "phase" IN ('c9', 'c7');"#,
         ]
     );
 }
@@ -96,11 +99,11 @@ fn indexes_render_as_partial_indexes() {
 fn constructors_carry_logical_arguments() {
     let query: IndexQuery<Ticket> = Ticket::open_by_desk(&Ref::new("front", "home-a"));
     assert_eq!(query.index(), "open_by_desk");
-    let desk = Identity { kind: KindCode(2), name: "front".into(), home: "home-a".into() };
+    let desk = Identity { kind: KindCode::new("k2"), name: "front".into(), home: "home-a".into() };
     assert_eq!(query.eq(), Ok(&[Value::Ref(desk)][..]));
 
     let query = Ticket::by_parent(&Ref::new("t", "h"), &Pool("blue".into()));
-    let parent = Identity { kind: KindCode(1), name: "t".into(), home: "h".into() };
+    let parent = Identity { kind: KindCode::new("k1"), name: "t".into(), home: "h".into() };
     assert_eq!(query.eq(), Ok(&[Value::Ref(parent), Value::Str("blue".into())][..]));
 
     assert_eq!(Ticket::due().eq(), Ok(&[][..]));
@@ -108,7 +111,7 @@ fn constructors_carry_logical_arguments() {
 }
 
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Counter", code = 4, index(name = "by_count", eq(count)))]
+#[store(kind = "Counter", code = "k4", index(name = "by_count", eq(count)))]
 struct Counter {
     count: u64,
 }

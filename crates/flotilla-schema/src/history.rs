@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{time::Timestamp, traits::CodeEnum, Stored};
+use crate::{code::Code, time::Timestamp, traits::CodeEnum, Stored};
 
 /// One edge event, stored in the kind's `#[store(history)]` edge log as
 ///
@@ -49,7 +49,7 @@ pub trait Labelled {
 
     /// The label's code: what the state's label column stores, and what an edge event's `from`
     /// and `to` name.
-    fn label_code(&self) -> i64 {
+    fn label_code(&self) -> Code {
         self.label().code()
     }
 }

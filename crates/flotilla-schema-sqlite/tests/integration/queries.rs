@@ -4,17 +4,22 @@ use std::collections::BTreeMap;
 
 use flotilla_schema::{IndexQuery, Kind, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{Cursor, Page, ResourceId, Store, StoreError, MAX_PAGE};
-use flotilla_state_machines::machines::{convoy::ConvoyState, lifecycle::LifecycleState, message::MessageState};
+use flotilla_state_machines::machines::{
+    convoy::{ConvoySpec, ConvoyState},
+    ensure::EnsureSpec,
+    lifecycle::LifecycleState,
+    message::{MessageSpec, MessageState},
+};
 use hegel::{generators as gs, TestCase};
 
 use crate::fixtures::{
-    convoy, ensure, message, store, terminal, AgentSessionRow, ConvoyRow, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession,
-    Vessel, LOCAL,
+    convoy, ensure, message, store, terminal, terminal::TerminalRequest, AgentSession, Convoy, Ensure, Fixture, Message, Pick, Referral,
+    Resource, TerminalSession, Vessel, LOCAL,
 };
 
 /// Every id of `query`, page by page with `limit`. Each page holds at most `limit` ids, a page
 /// with a successor is full, and paging ends: a cursor that does not advance fails here.
-fn collect<K: Kind>(store: &mut Store, query: &IndexQuery<K>, limit: u32) -> Vec<ResourceId> {
+fn collect<K>(store: &mut Store, query: &IndexQuery<K>, limit: u32) -> Vec<ResourceId> {
     let mut read = store.read().expect("read");
     let mut ids = Vec::new();
     let mut after: Option<Cursor> = None;
@@ -63,31 +68,36 @@ fn small_time(tc: &TestCase) -> Timestamp {
 
 /// A drawn message whose indexed fields come from small domains, so equal order values (ties
 /// broken by id) and shared inboxes occur, in every label.
-fn drawn_message(tc: &TestCase) -> MessageRow {
-    MessageRow {
-        inbox: tc.draw(gs::sampled_from(vec!["i0".to_owned(), "i1".to_owned()])),
-        deadline: tc.draw(gs::booleans()).then(|| small_time(tc)),
-        state: State::new(message::state_value(tc, Pick::Draw), Timestamp(0)),
-        ..message::generate(tc, Pick::Draw)
-    }
+fn drawn_message(tc: &TestCase) -> Resource<Message> {
+    drawn_spec(tc, message::generate(tc, Pick::Draw).with_state(State::new(message::state_value(tc, Pick::Draw), Timestamp(0))))
 }
 
-fn open(message: &MessageRow) -> bool {
-    matches!(message.state.value, MessageState::Pending | MessageState::Awaiting { .. })
+/// `message` with a drawn inbox and deadline from the small domains.
+fn drawn_spec(tc: &TestCase, message: Resource<Message>) -> Resource<Message> {
+    let spec = MessageSpec {
+        inbox: tc.draw(gs::sampled_from(vec!["i0".to_owned(), "i1".to_owned()])),
+        deadline: tc.draw(gs::booleans()).then(|| small_time(tc)),
+        ..message::spec(tc, Pick::Draw)
+    };
+    message.with_spec(spec)
+}
+
+fn open(message: &Resource<Message>) -> bool {
+    matches!(message.state(), MessageState::Pending | MessageState::Awaiting { .. })
 }
 
 /// Checks every Message query and the scan against the model, with a drawn page size.
-fn check_messages(tc: &TestCase, store: &mut Store, model: &BTreeMap<ResourceId, MessageRow>) {
+fn check_messages(tc: &TestCase, store: &mut Store, model: &BTreeMap<ResourceId, Resource<Message>>) {
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(4));
     for inbox in ["i0", "i1"] {
-        let want = expected(model, |m| open(m) && m.inbox == inbox, |_| ());
-        assert_eq!(collect(store, &MessageRow::open_by_inbox(&inbox.to_owned()), limit), want, "open_by_inbox {inbox}");
+        let want = expected(model, |m| open(m) && m.spec().inbox == inbox, |_| ());
+        assert_eq!(collect(store, &MessageSpec::open_by_inbox(&inbox.to_owned()), limit), want, "open_by_inbox {inbox}");
     }
-    let want = expected(model, |m| open(m) && m.deadline.is_some(), |m| m.deadline.map(Timestamp::micros));
-    assert_eq!(collect(store, &MessageRow::deadline(), limit), want, "deadline");
+    let want = expected(model, |m| open(m) && m.spec().deadline.is_some(), |m| m.spec().deadline.map(Timestamp::micros));
+    assert_eq!(collect(store, &MessageSpec::deadline(), limit), want, "deadline");
     let all: Vec<ResourceId> = model.keys().copied().collect();
-    assert_eq!(scan_all::<MessageRow>(store, LOCAL, limit), all, "scan");
-    assert_eq!(scan_all::<MessageRow>(store, "elsewhere", limit), Vec::<ResourceId>::new());
+    assert_eq!(scan_all::<Resource<Message>>(store, LOCAL, limit), all, "scan");
+    assert_eq!(scan_all::<Resource<Message>>(store, "elsewhere", limit), Vec::<ResourceId>::new());
 }
 
 // Behaviour (DESIGN queries, #3320): after any sequence of inserts, spec edits, edges and deletes, paging a
@@ -98,7 +108,7 @@ fn check_messages(tc: &TestCase, store: &mut Store, model: &BTreeMap<ResourceId,
 #[hegel::test(test_cases = 60)]
 fn index_pages_and_scans_match_the_model(tc: TestCase) {
     let mut store = store();
-    let mut model: BTreeMap<ResourceId, MessageRow> = BTreeMap::new();
+    let mut model: BTreeMap<ResourceId, Resource<Message>> = BTreeMap::new();
     let mut names = 0;
     let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(16));
     for _ in 0..steps {
@@ -113,9 +123,9 @@ fn index_pages_and_scans_match_the_model(tc: TestCase) {
             }
             op if !ids.is_empty() => {
                 let id = ids[tc.draw(gs::integers::<usize>().max_value(ids.len() - 1))];
-                let current = write.load::<MessageRow>(id).expect("load").expect("present");
+                let current = write.load::<Resource<Message>>(id).expect("load").expect("present");
                 if op == 2 {
-                    let next = MessageRow { state: current.value.state.clone(), edges: current.value.edges.clone(), ..drawn_message(&tc) };
+                    let next = drawn_spec(&tc, current.value.clone());
                     write.update(&current, &next).expect("update");
                     model.insert(id, next);
                 } else if op == 3 {
@@ -125,7 +135,7 @@ fn index_pages_and_scans_match_the_model(tc: TestCase) {
                         model.insert(id, next);
                     }
                 } else {
-                    write.delete::<MessageRow>(current.stamp()).expect("delete");
+                    write.delete::<Resource<Message>>(current.stamp()).expect("delete");
                     model.remove(&id);
                 }
             }
@@ -181,7 +191,11 @@ fn reference_indexes_match_the_model(tc: TestCase) {
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(4));
     for session in ["s0", "s1", "s2"] {
         let want = expected(&model, |r: &Referral| r.session.name == session, |r| r.seq);
-        assert_eq!(collect(&mut store, &Referral::by_session(&Ref::<AgentSessionRow>::new(session, LOCAL)), limit), want, "{session}");
+        assert_eq!(
+            collect(&mut store, &Referral::by_session(&Ref::<Resource<AgentSession>>::new(session, LOCAL)), limit),
+            want,
+            "{session}"
+        );
     }
     for n in 0..6 {
         let target = format!("m{n}");
@@ -203,44 +217,49 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
     let pick = |names: &[&str]| tc.draw(gs::sampled_from(names.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>()));
     let mut write = store.write().expect("write");
     for n in 0..tc.draw(gs::integers::<usize>().max_value(8)) {
-        let convoy = ConvoyRow { project: pick(&["p0", "p1"]), ..convoy::generate(&tc, Pick::Draw) };
+        let convoy = convoy::generate(&tc, Pick::Draw);
+        let convoy = convoy.clone().with_spec(ConvoySpec { project: pick(&["p0", "p1"]), ..convoy.spec().clone() });
         convoys.insert(write.insert(&format!("c{n}"), &convoy).expect("insert").id, convoy);
     }
     for n in 0..tc.draw(gs::integers::<usize>().max_value(8)) {
-        let session = TerminalSession {
+        let session = terminal::generate(&tc, Pick::Draw);
+        let request = TerminalRequest {
             vessel: Ref::new(pick(&["v0", "v1"]), LOCAL),
             ordinal: tc.draw(gs::integers::<u16>().max_value(2)),
             pool: pick(&["blue", "green"]),
-            ..terminal::generate(&tc, Pick::Draw)
+            ..session.spec().clone()
         };
+        let session = session.with_spec(request);
         sessions.insert(write.insert(&format!("t{n}"), &session).expect("insert").id, session);
     }
     for n in 0..tc.draw(gs::integers::<usize>().max_value(6)) {
-        let ensure = EnsureRow { inbox: pick(&["i0", "i1"]), ..ensure::generate(&tc, Pick::Draw) };
+        let ensure = ensure::generate(&tc, Pick::Draw);
+        let ensure = ensure.clone().with_spec(EnsureSpec { inbox: pick(&["i0", "i1"]), ..ensure.spec().clone() });
         ensures.insert(write.insert(&format!("e{n}"), &ensure).expect("insert").id, ensure);
     }
     write.commit().expect("commit");
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
     for project in ["p0", "p1", "p2"] {
-        let want = expected(&convoys, |c: &ConvoyRow| matches!(c.state.value, ConvoyState::Open { .. }) && c.project == project, |_| ());
-        assert_eq!(collect(&mut store, &ConvoyRow::open_by_project(&project.to_owned()), limit), want);
+        let want =
+            expected(&convoys, |c: &Resource<Convoy>| matches!(c.state(), ConvoyState::Open { .. }) && c.spec().project == project, |_| ());
+        assert_eq!(collect(&mut store, &ConvoySpec::open_by_project(&project.to_owned()), limit), want);
     }
     for vessel in ["v0", "v1", "v2"] {
-        let want = expected(&sessions, |s: &TerminalSession| s.vessel.name == vessel, |s| s.ordinal);
-        assert_eq!(collect(&mut store, &TerminalSession::by_vessel(&Ref::<Vessel>::new(vessel, LOCAL)), limit), want);
+        let want = expected(&sessions, |s: &TerminalSession| s.spec().vessel.name == vessel, |s| s.spec().ordinal);
+        assert_eq!(collect(&mut store, &TerminalRequest::by_vessel(&Ref::<Vessel>::new(vessel, LOCAL)), limit), want);
     }
     for pool in ["blue", "green", "red"] {
-        let live = |s: &TerminalSession| matches!(s.state.value, LifecycleState::Requested | LifecycleState::Realised { .. });
-        let want = expected(&sessions, |s: &TerminalSession| live(s) && s.pool == pool, |_| ());
-        assert_eq!(collect(&mut store, &TerminalSession::live_by_pool(&pool.to_owned()), limit), want);
+        let live = |s: &TerminalSession| matches!(s.state(), LifecycleState::Requested | LifecycleState::Realised { .. });
+        let want = expected(&sessions, |s: &TerminalSession| live(s) && s.spec().pool == pool, |_| ());
+        assert_eq!(collect(&mut store, &TerminalRequest::live_by_pool(&pool.to_owned()), limit), want);
     }
     for inbox in ["i0", "i1", "i2"] {
-        let want = expected(&ensures, |e: &EnsureRow| e.inbox == inbox, |_| ());
-        assert_eq!(collect(&mut store, &EnsureRow::by_inbox(&inbox.to_owned()), limit), want);
+        let want = expected(&ensures, |e: &Resource<Ensure>| e.spec().inbox == inbox, |_| ());
+        assert_eq!(collect(&mut store, &EnsureSpec::by_inbox(&inbox.to_owned()), limit), want);
     }
 }
 
-fn insert_messages(store: &mut Store, count: usize, value: impl Fn(usize) -> MessageRow) {
+fn insert_messages(store: &mut Store, count: usize, value: impl Fn(usize) -> Resource<Message>) {
     let mut write = store.write().expect("write");
     for n in 0..count {
         write.insert(&format!("m{n}"), &value(n)).expect("insert");
@@ -256,15 +275,15 @@ fn unknown_arguments_give_an_empty_page_and_create_nothing() {
     let mut store = store();
     insert_messages(&mut store, 2, |_| message::sample());
     let mut read = store.read().expect("read");
-    let page = read.page(&MessageRow::open_by_inbox(&"never".to_owned()), None, 10).expect("page");
+    let page = read.page(&MessageSpec::open_by_inbox(&"never".to_owned()), None, 10).expect("page");
     assert_eq!(page, Page { ids: vec![], next: None });
     let page = read.page(&Referral::by_session(&Ref::new("never", LOCAL)), None, 10).expect("page");
     assert!(page.ids.is_empty());
-    assert_eq!(read.resolve(AgentSessionRow::CODE, "never", LOCAL).expect("resolve"), None, "the query created no identity");
-    let page = read.page(&TerminalSession::live_by_pool(&"unseen-pool".to_owned()), None, 10).expect("page");
+    assert_eq!(read.resolve(Resource::<AgentSession>::CODE, "never", LOCAL).expect("resolve"), None, "the query created no identity");
+    let page = read.page(&TerminalRequest::live_by_pool(&"unseen-pool".to_owned()), None, 10).expect("page");
     assert!(page.ids.is_empty());
     assert_eq!(read.page(&Referral::by_session(&Ref::new("session", "nowhere")), None, 10).expect("page").ids, vec![]);
-    assert_eq!(read.scan::<MessageRow>("nowhere", None, 10).expect("scan"), Page { ids: vec![], next: None });
+    assert_eq!(read.scan::<Resource<Message>>("nowhere", None, 10).expect("scan"), Page { ids: vec![], next: None });
     drop(read);
     let conn = store.into_connection();
     let created: i64 =
@@ -277,21 +296,23 @@ fn unknown_arguments_give_an_empty_page_and_create_nothing() {
 #[test]
 fn cursors_are_bound_to_their_query() {
     let mut store = store();
-    insert_messages(&mut store, 3, |n| MessageRow { deadline: Some(Timestamp(n as i64)), ..message::sample() });
+    insert_messages(&mut store, 3, |n| {
+        message::sample().with_spec(MessageSpec { deadline: Some(Timestamp(n as i64)), ..message::sample_spec() })
+    });
     let mut write = store.write().expect("write");
     write.insert("c", &convoy::sample()).expect("insert");
     write.insert("c2", &convoy::sample()).expect("insert");
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
-    let inbox = MessageRow::open_by_inbox(&"inbox".to_owned());
+    let inbox = MessageSpec::open_by_inbox(&"inbox".to_owned());
     let cursor = read.page(&inbox, None, 1).expect("page").next.expect("more follow");
     assert_eq!(read.page(&inbox, Some(&cursor), 5).expect("continue").ids.len(), 2);
-    let other_inbox = MessageRow::open_by_inbox(&"other".to_owned());
+    let other_inbox = MessageSpec::open_by_inbox(&"other".to_owned());
     assert!(matches!(read.page(&other_inbox, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
-    let deadline = MessageRow::deadline();
+    let deadline = MessageSpec::deadline();
     assert!(matches!(read.page(&deadline, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
-    let convoy_cursor = read.page(&ConvoyRow::open_by_project(&"p".to_owned()), None, 1).expect("page").next.expect("more");
+    let convoy_cursor = read.page(&ConvoySpec::open_by_project(&"p".to_owned()), None, 1).expect("page").next.expect("more");
     assert!(matches!(read.page(&inbox, Some(&convoy_cursor), 5), Err(StoreError::CursorMismatch { .. })));
 }
 
@@ -302,15 +323,15 @@ fn limits_are_required_and_capped() {
     let mut store = store();
     insert_messages(&mut store, MAX_PAGE as usize + 1, |_| message::sample());
     let mut read = store.read().expect("read");
-    let inbox = MessageRow::open_by_inbox(&"inbox".to_owned());
+    let inbox = MessageSpec::open_by_inbox(&"inbox".to_owned());
     assert!(matches!(read.page(&inbox, None, 0), Err(StoreError::ZeroLimit)));
-    assert!(matches!(read.scan::<MessageRow>(LOCAL, None, 0), Err(StoreError::ZeroLimit)));
+    assert!(matches!(read.scan::<Resource<Message>>(LOCAL, None, 0), Err(StoreError::ZeroLimit)));
     let page = read.page(&inbox, None, u32::MAX).expect("page");
     assert_eq!(page.ids.len(), MAX_PAGE as usize);
     assert_eq!(read.page(&inbox, page.next.as_ref(), u32::MAX).expect("rest").ids.len(), 1);
-    let scan = read.scan::<MessageRow>(LOCAL, None, u32::MAX).expect("scan");
+    let scan = read.scan::<Resource<Message>>(LOCAL, None, u32::MAX).expect("scan");
     assert_eq!(scan.ids.len(), MAX_PAGE as usize);
-    assert_eq!(read.scan::<MessageRow>(LOCAL, scan.next, u32::MAX).expect("rest").ids.len(), 1);
+    assert_eq!(read.scan::<Resource<Message>>(LOCAL, scan.next, u32::MAX).expect("rest").ids.len(), 1);
 }
 
 // Behaviour (DESIGN queries): rows sharing one order value are ordered by id, and a page boundary

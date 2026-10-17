@@ -30,11 +30,11 @@ pub type EdgeEventOf<M> = flotilla_schema::EdgeEvent<Label<M>, EdgeKind<M>, Edge
 /// a muted delivery still counts as delivered (ADR 0064).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub enum Transport {
-    #[store(code = 1)]
+    #[store(code = "tu")]
     Turn,
-    #[store(code = 2)]
+    #[store(code = "no")]
     Notify,
-    #[store(code = 3)]
+    #[store(code = "mu")]
     Mute,
 }
 

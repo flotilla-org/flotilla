@@ -66,19 +66,20 @@ impl Ctx<'_> {
         })
     }
 
-    pub(crate) fn page<K: Kind>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
+    pub(crate) fn page<K>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
+        let kind = query.kind();
         let limit = page_limit(limit)?;
         let eq = query.eq()?;
         // Only the order width is taken here: argument lookups need `self` mutably, and the
         // statement text is borrowed from the per-kind SQL just before it runs.
         let order = self
-            .sql(K::CODE)?
+            .sql(kind)?
             .indexes
             .get(query.index())
-            .ok_or_else(|| StoreError::UnknownIndex { kind: K::CODE, index: query.index().to_owned() })?
+            .ok_or_else(|| StoreError::UnknownIndex { kind, index: query.index().to_owned() })?
             .order;
         if let Some(cursor) = after {
-            if cursor.kind != K::CODE || cursor.index != query.index() || cursor.eq != eq {
+            if cursor.kind != kind || cursor.index != query.index() || cursor.eq != eq {
                 return Err(StoreError::CursorMismatch { index: query.index().to_owned() });
             }
         }
@@ -95,7 +96,7 @@ impl Ctx<'_> {
         }
         // One row beyond the limit tells whether another page follows.
         params.push(SqlValue::Integer(limit + 1));
-        let index = &self.sql(K::CODE)?.indexes[query.index()];
+        let index = &self.sql(kind)?.indexes[query.index()];
         let statement = if after.is_some() { &index.after } else { &index.first };
         let mut rows: Vec<(ResourceId, Vec<SqlValue>)> = self
             .conn
@@ -109,9 +110,7 @@ impl Ctx<'_> {
         let more = rows.len() as i64 > limit;
         rows.truncate(limit as usize);
         let next = match rows.last() {
-            Some((id, values)) if more => {
-                Some(Cursor { kind: K::CODE, index: query.index(), eq: eq.to_vec(), order: values.clone(), id: *id })
-            }
+            Some((id, values)) if more => Some(Cursor { kind, index: query.index(), eq: eq.to_vec(), order: values.clone(), id: *id }),
             _ => None,
         };
         Ok(Page { ids: rows.into_iter().map(|(id, _)| id).collect(), next })
@@ -125,7 +124,7 @@ impl Ctx<'_> {
         let mut ids: Vec<ResourceId> = self
             .conn
             .prepare_cached(&self.sql(K::CODE)?.scan)?
-            .query_map(params![home, K::CODE.0, after, limit + 1], |row| row.get(0).map(ResourceId))?
+            .query_map(params![home, K::CODE.as_str(), after, limit + 1], |row| row.get(0).map(ResourceId))?
             .collect::<Result<_, _>>()?;
         let more = ids.len() as i64 > limit;
         ids.truncate(limit as usize);

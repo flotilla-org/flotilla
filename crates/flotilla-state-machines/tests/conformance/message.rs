@@ -22,13 +22,15 @@
 //!
 //! State mapping: the envelope is the immutable [`MessageSpec`] (expectation,
 //! and the deadline as `hasDeadline` and `deadline`); `Pending` and `Settled`
-//! carry it, `Awaiting { receiver }` is `Awaiting({envelope, receiver})` with
-//! session `s<n>` as `n`, and `Dropped { reason, dropped_receiver, at, watermark }` is
-//! the spec's whole drop record:
+//! carry it (Settled's kept receiver is not in the active spec), `Awaiting
+//! { receiver }` is `Awaiting({envelope, receiver})` with session `s<n>` as
+//! `n`, and `Dropped { reason, receiver, watermark }` is the spec's whole drop
+//! record:
 //! - `reason` by constructor (the evidence references a reason carries in
 //!   Rust are the gate's inputs, not state the spec has);
 //! - `receiver` the session number, or 0 with none;
-//! - `at` the drop's time in model ticks;
+//! - `at` the drop's time in model ticks: the drop event's time, which is the
+//!   state's `since` (#3392 ruling G4);
 //! - `watermark` and `bound` from `watermark: Option<Timestamp>`: `Some(w)` is
 //!   `watermark: w, bound: true`, and `None` is `watermark: 0, bound: false`.
 //!   Both describe an expiry with a consumer bound, the only drop that reads
@@ -195,7 +197,7 @@ impl Conformance for MessageConformance {
 
     fn create(state: &Value) -> Home<Message> {
         let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, spec_of(payload(state))).expect("created");
+        home.create(NAME, spec_of(payload(state)), Timestamp(0)).expect("created");
         home
     }
 
@@ -244,16 +246,19 @@ impl Conformance for MessageConformance {
     }
 
     fn encode(home: &Home<Message>) -> Value {
+        fn dropped_at(m: &flotilla_state_machines::Resource<Message>) -> Timestamp {
+            m.events().iter().last().expect("a dropped message has its drop event").record.at
+        }
         let m = home.get(NAME).expect("exists");
         let envelope = envelope_of(m.spec());
         match m.state() {
             MessageState::Pending => variant("Pending", envelope),
-            MessageState::Settled => variant("Settled", envelope),
+            MessageState::Settled { .. } => variant("Settled", envelope),
             MessageState::Awaiting { receiver } => {
                 let receiver = json!({ "session": int(session_number(receiver)), "host": receiver.host });
                 variant("Awaiting", json!({ "envelope": envelope, "receiver": receiver }))
             }
-            MessageState::Dropped { reason, dropped_receiver: receiver, at, watermark } => {
+            MessageState::Dropped { reason, receiver, watermark } => {
                 let reason = match reason {
                     DropReason::Undeliverable => "Undeliverable",
                     DropReason::Expired => "Expired",
@@ -267,7 +272,7 @@ impl Conformance for MessageConformance {
                         "reason": bare(reason),
                         "envelope": envelope,
                         "receiver": int(receiver.as_ref().map_or(0, session_number)),
-                        "at": int(ticks(*at)),
+                        "at": int(ticks(dropped_at(m))),
                         "watermark": int(watermark.map_or(0, ticks)),
                         "bound": watermark.is_some(),
                         "receipt": false,

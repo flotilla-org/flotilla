@@ -1,4 +1,4 @@
-error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, index and labels (types)
+error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, state, index and labels (types)
  --> tests/ui/flatten_non_flat.rs:9:10
   |
 9 | #[derive(Stored)]
@@ -11,7 +11,7 @@ help: the trait `Flat` is not implemented for `Inbox`
   | ^^^^^^^^^^^^
   = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, index and labels (types)
+error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, state, index and labels (types)
   --> tests/ui/flatten_non_flat.rs:11:8
    |
 11 | struct Ticket {
@@ -32,7 +32,7 @@ note: required for `Ticket` to implement `flotilla_schema::Element`
    |
  9 | #[derive(Stored)]
    |          ------ type parameter would need to implement `flotilla_schema::Element`
-10 | #[store(kind = "Ticket", code = 1)]
+10 | #[store(kind = "Ticket", code = "k1")]
 11 | struct Ticket {
    |        ^^^^^^
    = help: consider manually implementing `flotilla_schema::Element` to avoid undesired bounds caused by "imperfect derives"
@@ -44,7 +44,7 @@ note: required by a bound in `Kind`
    |                 ^^^^^^^ required by this bound in `Kind`
    = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, index and labels (types)
+error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, state, index and labels (types)
   --> tests/ui/flatten_non_flat.rs:9:10
    |
  9 | #[derive(Stored)]
@@ -65,12 +65,12 @@ note: required for `Ticket` to implement `flotilla_schema::Element`
    |
  9 | #[derive(Stored)]
    |          ------ type parameter would need to implement `flotilla_schema::Element`
-10 | #[store(kind = "Ticket", code = 1)]
+10 | #[store(kind = "Ticket", code = "k1")]
 11 | struct Ticket {
    |        ^^^^^^
    = help: consider manually implementing `flotilla_schema::Element` to avoid undesired bounds caused by "imperfect derives"
    = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
-note: required by a bound in `KIND`
+note: required by a bound in `flotilla_schema::Kind::KIND`
   --> src/traits.rs
    |
    | pub trait Kind: Element {

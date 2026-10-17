@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_schema::{
-    DecodeError, Decoder, Element, EncodeError, Encoder, Frozen, Hash, Identity, Kind, KindCode, Records, Row, Stored, TableRole,
-    Timestamp, Value,
+    Code, DecodeError, Decoder, Element, EncodeError, Encoder, Frozen, Hash, Identity, Kind, KindCode, Records, Row, Stored, TableRole,
+    Timestamp, Value, When,
 };
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
@@ -21,9 +21,9 @@ struct Tag(String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Stored)]
 enum Phase {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Early,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Late,
 }
 
@@ -46,14 +46,14 @@ struct Step {
 /// A data enum whose `List` variant holds a table and `Text` a column.
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 enum Input {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Text { value: String },
-    #[store(code = 2)]
+    #[store(code = "c2")]
     List {
         #[store(child)]
         items: Vec<String>,
     },
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Unset,
 }
 
@@ -79,12 +79,12 @@ struct Attempt<A> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 enum Edge<I> {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Realise {
         #[store(flatten)]
         identity: I,
     },
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Vanish,
 }
 
@@ -95,7 +95,7 @@ struct Ident {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
-#[store(kind = "Plan", code = 1)]
+#[store(kind = "Plan", code = "k1")]
 struct Plan {
     #[store(frozen)]
     doc: Frozen<Doc>,
@@ -155,7 +155,7 @@ fn plan(tc: &TestCase) -> Plan {
         steps: up_to(tc, 3, || Step {
             label: short(tc),
             gates: up_to(tc, 2, || Gate {
-                observed: Identity { kind: KindCode(2), name: short(tc), home: "h".into() },
+                observed: Identity { kind: KindCode::new("k2"), name: short(tc), home: "h".into() },
                 version: tc.draw(gs::integers::<u64>().max_value(i64::MAX as u64)),
             }),
             notes: up_to(tc, 2, || (short(tc), short(tc))).into_iter().collect(),
@@ -213,22 +213,32 @@ fn tables_follow_the_naming_and_key_rules() {
             ("plan_steps", Child, vec!["pos"], vec!["label"]),
             ("plan_steps_gates", Child, vec!["steps_pos", "pos"], vec!["observed", "version"]),
             ("plan_steps_notes", Child, vec!["steps_pos", "key"], vec!["value"]),
-            ("plan_inputs", Child, vec!["key"], vec!["tag", "text_value"]),
-            ("plan_inputs_list_items", Child, vec!["inputs_key", "pos"], vec!["value"]),
+            ("plan_inputs", Child, vec!["key"], vec!["tag", "value"]),
+            ("plan_inputs_items", Child, vec!["inputs_key", "pos"], vec!["value"]),
             ("plan_phases", Child, vec!["value"], vec![]),
             ("plan_deliverables", Records, vec!["pos"], vec!["version", "label"]),
             ("plan_deliverables_evidence", Records, vec!["deliverables_pos", "pos"], vec!["version", "note"]),
             ("plan_deliverables_evidence_meta", Child, vec!["deliverables_pos", "evidence_pos", "key"], vec!["value"]),
             ("plan_attempts", History, vec!["pos"], vec!["version", "what", "at"]),
-            ("plan_edges", History, vec!["pos"], vec!["version", "tag", "realise_identity_session", "realise_identity_pid"]),
+            ("plan_edges", History, vec!["pos"], vec!["version", "tag", "identity_session", "identity_pid"]),
         ]
     );
     let parents: Vec<Option<usize>> = set.tables.iter().map(|t| t.parent).collect();
     assert_eq!(parents, [None, Some(0), Some(1), Some(1), Some(0), Some(4), Some(0), Some(0), Some(7), Some(8), Some(0), Some(0)]);
     let inputs = &set.tables[4];
-    assert_eq!(inputs.guards.len(), 1, "only Text has columns");
-    assert_eq!((inputs.guards[0].column.as_str(), inputs.guards[0].value), ("tag", 1));
-    assert_eq!(set.tables[11].guards[0].required, ["realise_identity_session"]);
+    let guards: Vec<(&str, &When, &[String], &[String])> =
+        inputs.guards.iter().map(|guard| (guard.column.as_str(), &guard.when, &guard.required[..], &guard.absent[..])).collect();
+    let (value, none) = (["value".to_owned()], []);
+    assert_eq!(
+        guards,
+        [
+            ("tag", &When::Is(Code::new("c1")), &value[..], &none[..]),
+            ("tag", &When::Is(Code::new("c2")), &none[..], &value[..]),
+            ("tag", &When::Is(Code::new("c3")), &none[..], &value[..]),
+        ],
+        "one CHECK per variant; a datum holding a table has no columns to check"
+    );
+    assert_eq!(set.tables[11].guards[0].required, ["identity_session"]);
 }
 
 // Behaviour (DESIGN codec): every shape round-trips through logical rows, at every depth and

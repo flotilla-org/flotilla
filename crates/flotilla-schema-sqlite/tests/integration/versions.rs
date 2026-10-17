@@ -1,12 +1,15 @@
+use flotilla_schema::Kind;
 use flotilla_schema_sqlite::{Stamp, StoreError};
 use hegel::{generators as gs, TestCase};
 
 use chrono::{DateTime, Duration};
 
-use crate::fixtures::{floor, message as messages, store, MessageRow as Message, Referral};
+use flotilla_state_machines::machines::message::MessageSpec;
 
-fn message(inbox: &str) -> Message {
-    Message { inbox: inbox.into(), unbound_after: 1, ..messages::sample() }
+use crate::fixtures::{floor, message as messages, store, Message, Referral, Resource};
+
+fn message(inbox: &str) -> Resource<Message> {
+    messages::sample().with_spec(MessageSpec { inbox: inbox.into(), unbound_after: 1, ..messages::sample_spec() })
 }
 
 // Behaviour (ADR 0064, #3320 sequencing): every write takes the home's next sequence, so the
@@ -30,13 +33,13 @@ fn versions_strictly_increase_across_writes(tc: TestCase) {
                 Some(stamp.version)
             }
             Some(stamp) if tc.draw(gs::booleans()) => {
-                let current = write.load::<Message>(stamp.id).expect("load").expect("present");
+                let current = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
                 let next = write.update(&current, &message(&format!("{step}"))).expect("update");
                 live[slot] = Some(next);
                 Some(next.version)
             }
             Some(stamp) => {
-                write.delete::<Message>(stamp).expect("delete");
+                write.delete::<Resource<Message>>(stamp).expect("delete");
                 live[slot] = None;
                 None
             }
@@ -80,21 +83,22 @@ fn stale_versions_conflict() {
     let mut store = store();
     let mut write = store.write().expect("write");
     let stamp = write.insert("m", &message("a")).expect("insert");
-    let stale = write.load::<Message>(stamp.id).expect("load").expect("present");
+    let stale = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
     write.update(&stale, &message("b")).expect("update");
     assert!(
         matches!(write.update(&stale, &message("c")), Err(StoreError::Conflict { id, expected }) if id == stamp.id && expected == stamp.version)
     );
     assert!(matches!(write.update(&stale, &message("a")), Err(StoreError::Conflict { .. })), "a stale no-op is also a conflict");
-    assert!(matches!(write.delete::<Message>(stamp), Err(StoreError::Conflict { .. })));
+    assert!(matches!(write.delete::<Resource<Message>>(stamp), Err(StoreError::Conflict { .. })));
     let unstorable = Stamp { id: stamp.id, version: u64::MAX };
-    assert!(matches!(write.delete::<Message>(unstorable), Err(StoreError::Conflict { .. })));
+    assert!(matches!(write.delete::<Resource<Message>>(unstorable), Err(StoreError::Conflict { .. })));
     let other = write.insert("n", &message("n")).expect("the transaction is still usable");
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
-    assert_eq!(read.load::<Message>(stamp.id).expect("load").expect("present").value, message("b"));
-    assert!(read.load::<Message>(other.id).expect("load").is_some());
+    let loaded = read.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
+    assert_eq!(loaded.value, message("b").with_identity("m", loaded.version));
+    assert!(read.load::<Resource<Message>>(other.id).expect("load").is_some());
 }
 
 // Behaviour: an inserted name cannot be inserted again while it exists; after a delete it can.
@@ -104,8 +108,8 @@ fn names_are_unique_per_kind_and_home() {
     let mut write = store.write().expect("write");
     let stamp = write.insert("m", &message("a")).expect("insert");
     assert!(matches!(write.insert("m", &message("b")), Err(StoreError::Exists { .. })));
-    write.delete::<Message>(stamp).expect("delete");
-    assert!(write.load::<Message>(stamp.id).expect("load").is_none());
+    write.delete::<Resource<Message>>(stamp).expect("delete");
+    assert!(write.load::<Resource<Message>>(stamp.id).expect("load").is_none());
     let again = write.insert("m", &message("b")).expect("insert after delete");
     assert_eq!(again.id, stamp.id, "the identity row is kept");
     assert!(again.version > stamp.version);
@@ -119,7 +123,7 @@ fn a_refused_write_does_not_spoil_its_batch() {
     let mut store = store();
     let mut write = store.write().expect("write");
     let first = write.insert("a", &message("first")).expect("insert a");
-    let current = write.load::<Message>(first.id).expect("load").expect("present");
+    let current = write.load::<Resource<Message>>(first.id).expect("load").expect("present");
     let moved = write.update(&current, &message("second")).expect("update");
     let refused = write.update(&current, &message("stale"));
     assert!(matches!(refused, Err(StoreError::Conflict { .. })), "{refused:?}");
@@ -127,9 +131,9 @@ fn a_refused_write_does_not_spoil_its_batch() {
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
-    let a = read.load::<Message>(first.id).expect("load a").expect("a present");
-    assert_eq!((a.value.inbox.as_str(), a.version), ("second", moved.version));
-    assert_eq!(read.load::<Message>(other.id).expect("load b").expect("b present").value.inbox, "other");
+    let a = read.load::<Resource<Message>>(first.id).expect("load a").expect("a present");
+    assert_eq!((a.value.spec().inbox.as_str(), a.version), ("second", moved.version));
+    assert_eq!(read.load::<Resource<Message>>(other.id).expect("load b").expect("b present").value.spec().inbox, "other");
 }
 
 // Behaviour: identity rows outlive their resource, so a write to a deleted resource is
@@ -139,8 +143,8 @@ fn writes_to_a_deleted_resource_are_not_found() {
     let mut store = store();
     let mut write = store.write().expect("write");
     let stamp = write.insert("gone", &message("x")).expect("insert");
-    let current = write.load::<Message>(stamp.id).expect("load").expect("present");
-    write.delete::<Message>(stamp).expect("delete");
+    let current = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
+    write.delete::<Resource<Message>>(stamp).expect("delete");
     assert!(matches!(write.update(&current, &message("y")), Err(StoreError::NotFound { .. })));
-    assert!(matches!(write.delete::<Message>(stamp), Err(StoreError::NotFound { .. })));
+    assert!(matches!(write.delete::<Resource<Message>>(stamp), Err(StoreError::NotFound { .. })));
 }

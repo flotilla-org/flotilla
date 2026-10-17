@@ -1,6 +1,6 @@
 //! Ensure against `specs/primitives/machines/ensure.qnt`.
 
-use flotilla_schema::{CodeEnum, Timestamp};
+use flotilla_schema::{Code, CodeEnum, Timestamp};
 use flotilla_state_machines::{
     machines::ensure::{
         Authority, Bind, Create, Drain, Ensure, EnsureEdgeKind, EnsureLabel, EnsureRefusal, EnsureSpec, EnsureState, Fulfiller,
@@ -15,7 +15,7 @@ fn at(micros: i64) -> Timestamp {
 
 fn home() -> Home<Ensure> {
     let mut home = Home::new("kiwi").expect("valid declaration");
-    home.create("e", EnsureSpec { inbox: "inbox".into(), policy: AttemptPolicy::immediate(1) }).expect("created");
+    home.create("e", EnsureSpec { inbox: "inbox".into(), policy: AttemptPolicy::immediate(1) }, Timestamp(0)).expect("created");
     home
 }
 
@@ -86,9 +86,23 @@ fn the_declaration_validates_and_record_states_why_it_is_ungated() {
 #[test]
 fn codes_and_names_are_pinned() {
     let labels: Vec<_> = EnsureLabel::ALL.iter().map(|s| (s.name(), s.code())).collect();
-    assert_eq!(labels, [("Unfulfilled", 1), ("Fulfilled", 2), ("Held", 3), ("Retired", 4)]);
+    assert_eq!(
+        labels,
+        [("Unfulfilled", Code::new("un")), ("Fulfilled", Code::new("fu")), ("Held", Code::new("he")), ("Retired", Code::new("rt"))]
+    );
     let edges: Vec<_> = EnsureEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    assert_eq!(edges, [("record", 1), ("create", 2), ("bind", 3), ("unbind", 4), ("give_up", 5), ("resume", 6), ("retire", 7)]);
+    assert_eq!(
+        edges,
+        [
+            ("record", Code::new("rc")),
+            ("create", Code::new("cr")),
+            ("bind", Code::new("bi")),
+            ("unbind", Code::new("ub")),
+            ("give_up", Code::new("gu")),
+            ("resume", Code::new("rs")),
+            ("retire", Code::new("rt"))
+        ]
+    );
 }
 
 // The diagram shows the ADR's table with each edge's changed data, retire

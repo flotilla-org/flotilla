@@ -1,14 +1,17 @@
-//! Code generation for structs: kinds, parts and newtypes.
+//! Code generation for structs: kinds, kind specs, parts and newtypes.
 //!
-//! A kind (`#[store(kind = "Name", code = N)]`) is the root row of its own tables and implements
-//! `Element` and `Kind`. A part implements `Element` (it can be a collection's row) and, having no
-//! table fields, `Columns` and `Flat` (it can be flattened into another row). A part's table fields
-//! nest under its collection's table, and its declared indexes are on that table. A single-field
-//! tuple struct is a transparent column.
+//! A kind (`#[store(kind = "Name", code = "..")]`) is the root row of its own tables and implements
+//! `Element` and `Kind`. A kind spec (`#[store(kind = "Name", code = "..", state = S)]`) is the
+//! spec of a kind a generic holder stores (#3392 ruling D5): it implements `Element` and
+//! `KindSpec`, and its indexes may name the holder's `state`. A part implements `Element` (it can
+//! be a collection's row) and, having no table fields, `Columns` and `Flat` (it can be flattened
+//! into another row). A part's table fields nest under its collection's table, and its declared
+//! indexes are on that table. A single-field tuple struct is a transparent column.
 
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{
+    ext::IdentExt,
     visit::{self, Visit},
     DeriveInput, FieldsNamed, FieldsUnnamed, LitStr, Type,
 };
@@ -23,18 +26,25 @@ use crate::{
 pub(crate) fn expand(input: &DeriveInput, fields: &FieldsNamed, type_attrs: TypeAttrs) -> syn::Result<TokenStream> {
     refuse_labels(&type_attrs)?;
     let fields = fields.named.iter().map(|field| Field::parse(field, &input.ident, None)).collect::<syn::Result<Vec<_>>>()?;
+    if let (Some(state), Some(kind), Some((code, _))) = (&type_attrs.state, &type_attrs.kind, &type_attrs.code) {
+        check_kind_name(kind)?;
+        return spec_impls(input, &fields, kind, code, state, &type_attrs.indexes);
+    }
+    if let Some(state) = &type_attrs.state {
+        return Err(refuse(state, "`state = ..` names the state of a kind's spec, which needs `kind = \"Name\"` and `code = \"..\"`"));
+    }
     match (&type_attrs.kind, type_attrs.code) {
         (Some(kind), Some((code, _))) => {
             check_kind_name(kind)?;
-            let indexes = Indexes::parse(&type_attrs.indexes, &fields)?;
+            let indexes = Indexes::parse(&type_attrs.indexes, &fields, None)?;
             let handles = handles(input, &fields, true)?;
-            let kind = kind_impls(input, &fields, kind, code, &indexes);
+            let kind = kind_impls(input, &fields, kind, &code, &indexes);
             Ok(quote!(#kind #handles))
         }
-        (Some(kind), None) => Err(syn::Error::new_spanned(kind, "a kind needs a stable `code = N`")),
+        (Some(kind), None) => Err(syn::Error::new_spanned(kind, "a kind needs a stable `code = \"..\"`")),
         (None, Some((_, span))) => Err(syn::Error::new(span, "`code` on a struct needs `kind = \"Name\"`")),
         (None, None) => {
-            let indexes = Indexes::parse(&type_attrs.indexes, &fields)?;
+            let indexes = Indexes::parse(&type_attrs.indexes, &fields, None)?;
             let handles = handles(input, &fields, false)?;
             let part = part_impls(input, &fields, &indexes);
             Ok(quote!(#part #handles))
@@ -142,7 +152,7 @@ fn element_impl(input: &DeriveInput, fields: &[Field<'_>], indexes: TokenStream)
 /// lead back through `Message`'s own field bounds. Concrete fields are still checked through the
 /// `Element` supertrait. Declared indexes join the descriptor after the root's layout, and each
 /// gets a query constructor.
-fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u32, indexes: &Indexes<'_, '_>) -> TokenStream {
+fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: &str, indexes: &Indexes<'_, '_>) -> TokenStream {
     let schema = schema();
     let ident = &input.ident;
     let element = element_impl(input, fields, TokenStream::new());
@@ -157,7 +167,7 @@ fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u3
         #[automatically_derived]
         impl #impl_generics #schema::Kind for #ident #ty_generics #where_clause {
             const KIND: &'static str = #kind;
-            const CODE: #schema::KindCode = #schema::KindCode(#code);
+            const CODE: #schema::KindCode = #schema::KindCode::new(#code);
 
             fn table_set() -> #schema::TableSet {
                 let mut layout = #schema::Layout::root(<Self as #schema::Kind>::KIND, <Self as #schema::Kind>::CODE);
@@ -169,6 +179,54 @@ fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u3
 
         #constructors
     }
+}
+
+/// A kind spec: its fields are the root row's first columns, and its indexes join the holder's
+/// table set after the holder has laid out the spec, the state and the records. Its fields have no
+/// edge handles: a spec changes only by a spec edit, and the holder's state and records have
+/// handles on the holder. The state belongs to the holder, so no field may be one or be named
+/// like it.
+fn spec_impls(
+    input: &DeriveInput,
+    fields: &[Field<'_>],
+    kind: &LitStr,
+    code: &str,
+    state: &Type,
+    indexes: &[TokenStream],
+) -> syn::Result<TokenStream> {
+    for field in fields {
+        if field.shape == FieldShape::State {
+            return Err(refuse(field.ident, "a spec has no state field: the holder stores the state named by `state = ..`"));
+        }
+        if field.ident.unraw() == "state" {
+            return Err(refuse(field.ident, "the holder's state is the field `state`; rename this field"));
+        }
+    }
+    let indexes = Indexes::parse(indexes, fields, Some(state))?;
+    let schema = schema();
+    let ident = &input.ident;
+    let element = element_impl(input, fields, TokenStream::new());
+    let params: Vec<_> = input.generics.type_params().map(|param| param.ident.to_string()).collect();
+    let generic = fields.iter().filter(|field| mentions(field.ty, &params)).map(Field::bound);
+    let Generics { impl_generics, ty_generics, where_clause } = Generics::new(&input.generics, generic);
+    let index_layout = indexes.layout();
+    let constructors = indexes.constructors(input);
+    Ok(quote! {
+        #element
+
+        #[automatically_derived]
+        impl #impl_generics #schema::KindSpec for #ident #ty_generics #where_clause {
+            const KIND: &'static str = #kind;
+            const CODE: #schema::KindCode = #schema::KindCode::new(#code);
+            type State = #state;
+
+            fn layout_indexes(layout: &mut #schema::Layout) {
+                #index_layout
+            }
+        }
+
+        #constructors
+    })
 }
 
 /// Whether `ty` names any of the type parameters.
@@ -270,6 +328,9 @@ pub(crate) fn newtype(input: &DeriveInput, fields: &FieldsUnnamed, type_attrs: T
     }
     if let Some((_, span)) = type_attrs.code {
         return Err(syn::Error::new(span, "`code` on a struct needs `kind = \"Name\"`"));
+    }
+    if let Some(state) = &type_attrs.state {
+        return Err(refuse(state, "`state = ..` belongs on a kind's spec struct"));
     }
     let schema = schema();
     let ident = &input.ident;

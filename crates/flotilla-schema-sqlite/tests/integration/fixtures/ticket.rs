@@ -18,15 +18,15 @@ use super::{appended, code_enum, key, list, name, payload, records, stamp, text,
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 pub enum TicketLabel {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Draft,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Open,
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Closed,
 }
 
-/// A hold on an open ticket: an optional flattened datum, behind its `hold_present` flag.
+/// A hold on an open ticket: an optional flattened datum, present by its first required column.
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 pub struct Hold {
     pub by: String,
@@ -44,9 +44,9 @@ pub struct Signature {
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 #[store(labels = TicketLabel)]
 pub enum TicketState {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Draft,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Open {
         #[store(child)]
         assignees: BTreeSet<String>,
@@ -58,7 +58,7 @@ pub enum TicketState {
         #[store(flatten)]
         hold: Option<Hold>,
     },
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Closed {
         #[store(child)]
         assignees: BTreeSet<String>,
@@ -76,9 +76,9 @@ pub enum TicketState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 pub enum TicketEdgeName {
     /// The label stays; only data changes.
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Edit,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Move,
 }
 
@@ -87,7 +87,7 @@ pub type TicketEvent = EdgeEvent<TicketLabel, TicketEdgeName, Payload<String>>;
 /// Open tickets of a queue: an index predicate on a label-plus-data state, its code taken from
 /// `TicketLabel`.
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Ticket", code = 8, index(name = "open_by_queue", eq(queue), when(state in [Open])))]
+#[store(kind = "Ticket", code = "tk", index(name = "open_by_queue", eq(queue), when(state in [Open])))]
 pub struct Ticket {
     #[store(intern)]
     pub queue: String,

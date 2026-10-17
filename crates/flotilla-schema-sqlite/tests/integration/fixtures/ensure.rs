@@ -1,22 +1,22 @@
-//! The engine's Ensure (`flotilla_state_machines::machines::ensure::EnsureRow`, kind code 9):
+//! The engine's Ensure (`Resource<Ensure>`, declared by `EnsureSpec`, kind code `en`):
 //! generators, and the worlds that let each edge pass its gate.
 
 use std::collections::BTreeSet;
 
-use flotilla_schema::{Edge, Records, State, Timestamp};
+use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::ensure::{
-        Authority, Bind, Create, Ensure, EnsureEdge, EnsureState, EnsureWorld, Fulfiller, FulfillerPhase, FulfillerStatus, GiveUp,
-        MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
+        Authority, Bind, Create, Ensure, EnsureEdge, EnsureSpec, EnsureState, EnsureWorld, Fulfiller, FulfillerPhase, FulfillerStatus,
+        GiveUp, MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
     },
-    Attempt, AttemptPolicy, Cause, CauseCategory, Ref,
+    Attempt, AttemptPolicy, Cause, CauseCategory, Ref, Resource,
 };
 use hegel::{generators as gs, TestCase};
 
 use super::{
     code_enum,
-    engine::{self, Candidate},
-    name, records, stamp_flat, text, timestamp, EnsureRow, Fixture, Pick,
+    engine::{self, resource, Candidate},
+    name, records, stamp_flat, text, timestamp, Fixture, Pick,
 };
 
 /// Covering indexes: the label is digit 0 (base 4); sets take every size in turn, and attempts
@@ -75,25 +75,25 @@ fn edges(tc: &TestCase) -> Vec<EnsureEdge> {
     ]
 }
 
-pub fn generate(tc: &TestCase, pick: Pick) -> EnsureRow {
-    EnsureRow {
-        inbox: name(tc),
-        policy: policy(tc),
-        state: State::new(state_value(tc, pick), timestamp(tc)),
-        edges: records(tc, pick, 2, |pick| engine::event::<Ensure>(tc, pick, &edges(tc))),
-        attempts: records(tc, pick.nth(2), 3, |pick| attempt(tc, pick)),
-    }
+pub fn spec(tc: &TestCase) -> EnsureSpec {
+    EnsureSpec { inbox: name(tc), policy: policy(tc) }
+}
+
+pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Ensure> {
+    resource(spec(tc), State::new(state_value(tc, pick), timestamp(tc)))
+        .with_events(records(tc, pick, 2, |pick| engine::event::<Ensure>(tc, pick, &edges(tc))))
+        .with_attempts(records(tc, pick.nth(2), 3, |pick| attempt(tc, pick)))
+}
+
+/// A fixed spec for example tests: `inbox`, one immediate attempt.
+pub fn sample_spec() -> EnsureSpec {
+    EnsureSpec { inbox: "inbox".into(), policy: AttemptPolicy::immediate(1) }
 }
 
 /// An unfulfilled Ensure with nothing recorded and no history.
-pub fn sample() -> EnsureRow {
-    EnsureRow {
-        inbox: "inbox".into(),
-        policy: AttemptPolicy::immediate(1),
-        state: State::new(EnsureState::Unfulfilled { recorded: BTreeSet::new(), created: BTreeSet::new(), window: 0 }, Timestamp(0)),
-        edges: Records::new(),
-        attempts: Records::new(),
-    }
+pub fn sample() -> Resource<Ensure> {
+    let unfulfilled = EnsureState::Unfulfilled { recorded: BTreeSet::new(), created: BTreeSet::new(), window: 0 };
+    resource(sample_spec(), State::new(unfulfilled, Timestamp(0)))
 }
 
 fn boxed(world: MemoryEnsureWorld) -> Box<dyn EnsureWorld> {
@@ -103,9 +103,9 @@ fn boxed(world: MemoryEnsureWorld) -> Box<dyn EnsureWorld> {
 /// Every edge the Ensure's state may take: recording a fulfiller; creating or binding a recorded
 /// one (realised, able to receive, its inbox drained); unbinding the bound one once gone; giving
 /// up on the attempts it holds; and resuming and retiring on authority, retiring once torn down.
-pub fn candidates(tc: &TestCase, pick: Pick, row: &EnsureRow) -> Vec<Candidate<Ensure>> {
+pub fn candidates(tc: &TestCase, pick: Pick, ensure: &Resource<Ensure>) -> Vec<Candidate<Ensure>> {
     let now = timestamp(tc);
-    let state = &row.state.value;
+    let state = ensure.state();
     let mut candidates = Vec::new();
     candidates.push((Record { fulfiller: Ref::new(name(tc)) }.into(), boxed(MemoryEnsureWorld::default()), now));
     let recorded: Vec<&Ref<Fulfiller>> = state.recorded().iter().collect();
@@ -114,7 +114,7 @@ pub fn candidates(tc: &TestCase, pick: Pick, row: &EnsureRow) -> Vec<Candidate<E
         candidates.push((Create { fulfiller: fulfiller.clone() }.into(), boxed(MemoryEnsureWorld::default()), now));
         let mut world = MemoryEnsureWorld::default();
         world.fulfillers.put(&fulfiller, FulfillerStatus { phase: FulfillerPhase::Realised, can_receive: true });
-        world.drains.put(&Ref::new(row.inbox.clone()), true);
+        world.drains.put(&Ref::new(ensure.spec().inbox.clone()), true);
         candidates.push((Bind { fulfiller }.into(), boxed(world), now));
     }
     if let Some(bound) = state.bound() {
@@ -136,27 +136,27 @@ pub fn candidates(tc: &TestCase, pick: Pick, row: &EnsureRow) -> Vec<Candidate<E
     candidates
 }
 
-impl Fixture for EnsureRow {
+impl Fixture for Resource<Ensure> {
     const COVERING: usize = COVERING;
 
-    fn generate(tc: &TestCase, pick: Pick) -> EnsureRow {
+    fn generate(tc: &TestCase, pick: Pick) -> Resource<Ensure> {
         generate(tc, pick)
     }
 
     /// The inbox and policy drawn afresh; the state, edge log and attempts kept.
-    fn evolve(&self, tc: &TestCase, _pick: Pick) -> EnsureRow {
-        EnsureRow { inbox: name(tc), policy: policy(tc), ..self.clone() }
+    fn evolve(&self, tc: &TestCase, _pick: Pick) -> Resource<Ensure> {
+        self.clone().with_spec(spec(tc))
     }
 
-    fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<EnsureRow>, EnsureRow)> {
+    fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<Resource<Ensure>>, Resource<Ensure>)> {
         engine::drive(tc, pick, self, candidates(tc, pick, self))
     }
 
-    fn stamped(&self, before: Option<&EnsureRow>, version: u64) -> EnsureRow {
-        EnsureRow {
-            edges: stamp_flat(&self.edges, before.map(|before| &before.edges), version),
-            attempts: stamp_flat(&self.attempts, before.map(|before| &before.attempts), version),
-            ..self.clone()
-        }
+    fn stamped(&self, before: Option<&Resource<Ensure>>, version: u64) -> Resource<Ensure> {
+        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version)).with_attempts(stamp_flat(
+            self.attempts(),
+            before.map(|before| before.attempts()),
+            version,
+        ))
     }
 }

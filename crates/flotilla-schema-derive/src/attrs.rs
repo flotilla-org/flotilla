@@ -2,12 +2,12 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::ToTokens;
-use syn::{parenthesized, Attribute, LitInt, LitStr};
+use syn::{parenthesized, Attribute, LitStr};
 
 /// The closed attribute list, named by every refusal. `flotilla-schema` repeats this text in its
 /// trait diagnostics and a test there keeps the two equal.
 pub(crate) const SUPPORTED: &str = "the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-                                    flatten, state and code (fields and variants) and kind, code, index and labels (types)";
+                                    flatten, state and code (fields and variants) and kind, code, state, index and labels (types)";
 
 /// A refusal: names what was refused and the closed list.
 pub(crate) fn refuse(tokens: impl ToTokens, what: impl std::fmt::Display) -> syn::Error {
@@ -21,12 +21,16 @@ pub(crate) fn refuse_at(span: proc_macro2::Span, what: impl std::fmt::Display) -
 
 pub(crate) struct TypeAttrs {
     pub kind: Option<LitStr>,
-    pub code: Option<(u32, Span)>,
+    pub code: Option<(String, Span)>,
     /// `index(...)` bodies, parsed against the kind's fields by `index::Indexes`.
     pub indexes: Vec<TokenStream>,
     /// `labels = L`: the enum is a machine's state, label `L` plus data shared by name across the
     /// labels (#3373 ruling 1).
     pub labels: Option<syn::Path>,
+    /// `state = S` on a kind's spec: the kind is stored through a generic holder (the engine's
+    /// `Resource<M>`), which lays out the spec, then its state `S` as the field `state`, then
+    /// its records (#3392 ruling D5).
+    pub state: Option<syn::Type>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +84,7 @@ fn path_name(path: &syn::Path) -> String {
 }
 
 pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
-    let mut parsed = TypeAttrs { kind: None, code: None, indexes: Vec::new(), labels: None };
+    let mut parsed = TypeAttrs { kind: None, code: None, indexes: Vec::new(), labels: None, state: None };
     for attr in store_attrs(attrs) {
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
@@ -92,8 +96,8 @@ pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
                     }
                 }
                 "code" => {
-                    let value: LitInt = meta.value()?.parse()?;
-                    let code = value.base10_parse::<u32>()?;
+                    let value = code_literal(meta.value()?.parse()?)?;
+                    let code = code(&value)?;
                     if parsed.code.replace((code, value.span())).is_some() {
                         return Err(meta.error("`code` is given twice"));
                     }
@@ -107,6 +111,12 @@ pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
                     let value: syn::Path = meta.value()?.parse()?;
                     if parsed.labels.replace(value).is_some() {
                         return Err(meta.error("`labels` is given twice"));
+                    }
+                }
+                "state" if meta.input.peek(syn::Token![=]) => {
+                    let value: syn::Type = meta.value()?.parse()?;
+                    if parsed.state.replace(value).is_some() {
+                        return Err(meta.error("`state` is given twice"));
                     }
                 }
                 _ if FieldAttr::parse(&name).is_some() => {
@@ -148,7 +158,7 @@ pub(crate) fn field_attr(attrs: &[Attribute]) -> syn::Result<Option<FieldAttr>> 
     Ok(found)
 }
 
-pub(crate) fn variant_code(attrs: &[Attribute]) -> syn::Result<Option<(i64, Span)>> {
+pub(crate) fn variant_code(attrs: &[Attribute]) -> syn::Result<Option<(String, Span)>> {
     let mut code = None;
     for attr in store_attrs(attrs) {
         attr.parse_nested_meta(|meta| {
@@ -156,12 +166,42 @@ pub(crate) fn variant_code(attrs: &[Attribute]) -> syn::Result<Option<(i64, Span
             if name != "code" {
                 return Err(refuse(&meta.path, format_args!("`{name}` is not a variant attribute")));
             }
-            let value: LitInt = meta.value()?.parse()?;
-            if code.replace((value.base10_parse::<i64>()?, value.span())).is_some() {
+            let value = code_literal(meta.value()?.parse()?)?;
+            if code.replace((self::code(&value)?, value.span())).is_some() {
                 return Err(meta.error("`code` is given twice"));
             }
             Ok(())
         })?;
     }
     Ok(code)
+}
+
+/// The longest code, in bytes; `flotilla_schema::Code::MAX` repeats it, and its `const fn new`
+/// checks every generated code again when the crate compiles.
+const CODE_MAX: usize = 8;
+
+/// The literal of `code = ..`: text, refusing the integer codes #3392 ruling G7 retired.
+fn code_literal(value: syn::Lit) -> syn::Result<LitStr> {
+    match value {
+        syn::Lit::Str(text) => Ok(text),
+        other => Err(syn::Error::new_spanned(other, "a code is short text written by hand, such as `code = \"dr\"`, not a number")),
+    }
+}
+
+/// A stored code (#3392 ruling G7): short explicit text, one to eight bytes, a lowercase ASCII
+/// letter then lowercase letters, digits or `_`. Written by hand, never generated from a name.
+fn code(value: &LitStr) -> syn::Result<String> {
+    let code = value.value();
+    let mut bytes = code.bytes();
+    let valid = code.len() <= CODE_MAX
+        && bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    if valid {
+        Ok(code)
+    } else {
+        Err(syn::Error::new_spanned(
+            value,
+            format!("a code is short text written by hand: one to {CODE_MAX} bytes, a lowercase ASCII letter then lowercase letters, digits or `_`, such as \"dr\""),
+        ))
+    }
 }

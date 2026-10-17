@@ -1,9 +1,11 @@
 use std::{env, fs, path::Path};
 
-use flotilla_schema::{render_view, DdlMode};
+use flotilla_schema::{render_view, DdlMode, Kind};
 use flotilla_schema_sqlite::{schema_ddl, Store};
 
-use crate::fixtures::{message, registry, store, MessageRow, LOCAL};
+use flotilla_state_machines::machines::message::MessageSpec;
+
+use crate::fixtures::{message, registry, store, Message, Resource, LOCAL};
 
 // Behaviour (#3320 DDL snapshot): the fixtures' DDL is deterministic and checked in. Any diff
 // fails; `UPDATE_DDL_SNAPSHOT=1` rewrites the snapshot for review.
@@ -43,10 +45,11 @@ fn fixture_schema_view_matches_the_snapshot() {
 fn every_table_is_strict_and_foreign_keys_hold() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let message = MessageRow { deadline: Some(flotilla_schema::Timestamp(3)), unbound_after: 4, ..message::sample() };
+    let spec = MessageSpec { deadline: Some(flotilla_schema::Timestamp(3)), unbound_after: 4, ..message::sample_spec() };
+    let message = message::sample().with_spec(spec.clone());
     let stamp = write.insert("m", &message).expect("insert");
-    let current = write.load::<MessageRow>(stamp.id).expect("load").expect("present");
-    write.update(&current, &MessageRow { inbox: "c".into(), ..message }).expect("update");
+    let current = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
+    write.update(&current, &message.with_spec(MessageSpec { inbox: "c".into(), ..spec })).expect("update");
     write.commit().expect("commit");
 
     let conn = store.into_connection();
@@ -63,6 +66,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "agent_session_edges",
             "agent_session_receipts",
             "change_log",
+            "codes",
             "convoy",
             "convoy_edges",
             "convoy_promises",
@@ -74,7 +78,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "dossier_deliverables_evidence_metadata",
             "dossier_edges",
             "dossier_inputs",
-            "dossier_inputs_list_items",
+            "dossier_inputs_items",
             "ensure",
             "ensure_attempts",
             "ensure_created",
@@ -91,8 +95,8 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "strings",
             "terminal_session",
             "terminal_session_attempts",
+            "terminal_session_edges",
             "terminal_session_env",
-            "terminal_session_events",
             "terminal_session_labels",
             "ticket",
             "ticket_assignees",
@@ -115,10 +119,54 @@ fn every_table_is_strict_and_foreign_keys_hold() {
 fn reopening_keeps_tables_and_rows() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let message = MessageRow { inbox: "kept".into(), ..message::sample() };
+    let message = message::sample_in("kept");
     let stamp = write.insert("m", &message).expect("insert");
     write.commit().expect("commit");
     let mut store = Store::open(store.into_connection(), LOCAL, registry()).expect("reopen");
     let mut read = store.read().expect("read");
-    assert_eq!(read.load::<MessageRow>(stamp.id).expect("load").expect("present").value, message);
+    assert_eq!(read.load::<Resource<Message>>(stamp.id).expect("load").expect("present").value, message.with_identity("m", stamp.version));
+}
+
+// Behaviour (#3392 ruling D4): codes stay short, and each kind table has a readable view naming
+// every code by its variant and every interned column by its text, through `codes` and
+// `strings`. Reopening replaces a kind's `codes` rows and recreates its views.
+#[test]
+fn readable_views_name_codes_and_strings() {
+    let mut store = store();
+    let mut write = store.write().expect("write");
+    write.insert("m", &message::sample_in("inbox-a")).expect("insert");
+    write.commit().expect("commit");
+    let conn = Store::open(store.into_connection(), LOCAL, registry()).expect("reopen").into_connection();
+    let raw: (String, String) =
+        conn.query_row("SELECT state, expectation FROM message", [], |row| Ok((row.get(0)?, row.get(1)?))).expect("raw");
+    assert_eq!(raw, ("pe".to_owned(), "re".to_owned()), "the table holds codes");
+    let view: (String, String, String) = conn
+        .query_row("SELECT inbox, state, expectation FROM message_view", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("view");
+    assert_eq!(view, ("inbox-a".to_owned(), "Pending".to_owned(), "Reply".to_owned()));
+    let edge: String = conn
+        .query_row("SELECT name FROM codes WHERE kind = 'ms' AND field = 'edges.edge' AND code = 'dr'", [], |row| row.get(0))
+        .expect("code");
+    assert_eq!(edge, "Drop");
+    let views: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type = 'view'", [], |row| row.get(0)).expect("views");
+    let tables: usize = registry().iter().map(|set| set.tables.len()).sum();
+    assert_eq!(views, tables as i64, "one view per kind table");
+}
+
+// Behaviour (#3392 D4, review of 2026-10-17): reopening an unchanged schema changes nothing: no
+// row is written and the schema cookie stays, so other connections keep their prepared
+// statements. A view that is missing is created again.
+#[test]
+fn reopening_an_unchanged_schema_changes_nothing() {
+    let conn = store().into_connection();
+    let cookie = |conn: &rusqlite::Connection| -> i64 { conn.query_row("PRAGMA schema_version", [], |row| row.get(0)).expect("cookie") };
+    let before = (cookie(&conn), conn.total_changes());
+    let conn = Store::open(conn, LOCAL, registry()).expect("reopen").into_connection();
+    assert_eq!((cookie(&conn), conn.total_changes()), before);
+    conn.execute_batch("DROP VIEW message_view").expect("drop");
+    let conn = Store::open(conn, LOCAL, registry()).expect("reopen").into_connection();
+    let views: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'message_view'", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(views, 1, "a missing view is recreated");
 }

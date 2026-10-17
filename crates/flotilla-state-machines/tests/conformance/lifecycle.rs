@@ -16,6 +16,7 @@
 //! part of the spec's rule, so the adaptor records every cause as
 //! [`CauseCategory::Transient`] and encodes the detail only.
 
+use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::lifecycle::{
         GiveUp, Lifecycle, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed, Realise, Release, Vanish,
@@ -76,7 +77,7 @@ impl Conformance for LifecycleConformance {
 
     fn create(_: &Value) -> Home<P> {
         let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, ()).expect("created");
+        home.create(NAME, (), Timestamp(0)).expect("created");
         home
     }
 

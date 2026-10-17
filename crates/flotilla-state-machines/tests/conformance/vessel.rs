@@ -31,6 +31,7 @@
 //! remaining difference from a single resource: the ledger forgets a released
 //! vessel, so the composite keeps the returned lease to show `Gone(placement)`.
 
+use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyId, Priority, VesselClass},
@@ -160,7 +161,7 @@ impl Composed {
         match ledger.place(&self.id, evidence.host) {
             Ok(lease) => {
                 let mut home = Home::new("home").expect("valid declaration");
-                home.create(NAME, lease.request.clone()).expect("created");
+                home.create(NAME, lease.request.clone(), Timestamp(0)).expect("created");
                 self.ledger = ledger;
                 self.lifecycle = Some(home);
                 Step::Accepted

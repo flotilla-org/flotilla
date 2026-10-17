@@ -1,22 +1,22 @@
-//! The engine's Convoy (`flotilla_state_machines::machines::convoy::ConvoyRow`, kind code 5):
+//! The engine's Convoy (`Resource<Convoy>`, declared by `ConvoySpec`, kind code `cv`):
 //! generators, and the worlds that let each edge pass its gate.
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{Edge, Records, State, Timestamp};
+use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
-        Abandon, Convoy, ConvoyEdge, ConvoyState, ConvoyWorld, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId,
+        Abandon, Convoy, ConvoyEdge, ConvoySpec, ConvoyState, ConvoyWorld, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId,
         PromiseState, Readmit, Retract, VesselClass,
     },
-    Ref,
+    Ref, Resource,
 };
 use hegel::{generators as gs, TestCase};
 
 use super::{
     code_enum,
-    engine::{self, Candidate},
-    name, records, stamp_flat, text, timestamp, ConvoyRow, Fixture, Pick,
+    engine::{self, resource, Candidate},
+    name, records, stamp_flat, text, timestamp, Fixture, Pick,
 };
 
 /// Covering indexes: the label is digit 0 (base 3); collections take every size in turn.
@@ -69,29 +69,30 @@ fn edges(tc: &TestCase) -> Vec<ConvoyEdge> {
     ]
 }
 
-pub fn generate(tc: &TestCase, pick: Pick) -> ConvoyRow {
-    ConvoyRow {
+/// The project, promise definitions and priority, drawn or covered.
+pub fn spec(tc: &TestCase, pick: Pick) -> ConvoySpec {
+    ConvoySpec {
         project: name(tc),
         promises: map(tc, pick.nth(2), 2, |pick, n| (PromiseId(small(tc, pick, n)), Promise { kind: name(tc), target: name(tc) })),
         priority: Priority(tc.draw(gs::integers::<u32>())),
-        state: State::new(state_value(tc, pick), timestamp(tc)),
-        edges: records(tc, pick, 2, |pick| engine::event::<Convoy>(tc, pick, &edges(tc))),
     }
 }
 
+pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Convoy> {
+    resource(spec(tc, pick), State::new(state_value(tc, pick), timestamp(tc)))
+        .with_events(records(tc, pick, 2, |pick| engine::event::<Convoy>(tc, pick, &edges(tc))))
+}
+
 /// A fixed open convoy for example tests: one pending promise under a quota of one.
-pub fn sample() -> ConvoyRow {
+pub fn sample() -> Resource<Convoy> {
     let promise = PromiseId(0);
-    ConvoyRow {
+    let spec = ConvoySpec {
         project: "p".into(),
         promises: [(promise, Promise { kind: "change".into(), target: "main".into() })].into(),
         priority: Priority(1),
-        state: State::new(
-            ConvoyState::Open { resolution: [(promise, PromiseState::Pending)].into(), quota: [(VesselClass(0), 1)].into() },
-            Timestamp(0),
-        ),
-        edges: Records::new(),
-    }
+    };
+    let open = ConvoyState::Open { resolution: [(promise, PromiseState::Pending)].into(), quota: [(VesselClass(0), 1)].into() };
+    resource(spec, State::new(open, Timestamp(0)))
 }
 
 fn boxed(world: MemoryConvoyWorld) -> Box<dyn ConvoyWorld> {
@@ -106,10 +107,10 @@ fn authorised(authority: &Ref<flotilla_state_machines::machines::convoy::Authori
 
 /// Every edge an open convoy may take: keeping or retracting a pending promise, delivering,
 /// abandoning with a reason, and readmitting with every count raised or kept.
-pub fn candidates(tc: &TestCase, pick: Pick, row: &ConvoyRow) -> Vec<Candidate<Convoy>> {
+pub fn candidates(tc: &TestCase, pick: Pick, convoy: &Resource<Convoy>) -> Vec<Candidate<Convoy>> {
     let now = timestamp(tc);
     let mut candidates = Vec::new();
-    let pending: Vec<PromiseId> = row.state.value.outstanding().into_iter().collect();
+    let pending: Vec<PromiseId> = convoy.state().outstanding().into_iter().collect();
     if !pending.is_empty() {
         let promise = pending[pick.nth(3).variant(tc, pending.len(), |index| index)];
         candidates.push((Keep { promise }.into(), boxed(MemoryConvoyWorld::default()), now));
@@ -120,9 +121,8 @@ pub fn candidates(tc: &TestCase, pick: Pick, row: &ConvoyRow) -> Vec<Candidate<C
     let authority = authority(tc);
     let reason = format!("{}.", text(tc));
     candidates.push((Abandon { by: name(tc), reason, authority: authority.clone() }.into(), authorised(&authority), now));
-    let raised = row
-        .state
-        .value
+    let raised = convoy
+        .state()
         .quota()
         .iter()
         .map(|(class, count)| (*class, count.saturating_add(tc.draw(gs::integers::<u32>().max_value(2)))))
@@ -132,27 +132,27 @@ pub fn candidates(tc: &TestCase, pick: Pick, row: &ConvoyRow) -> Vec<Candidate<C
     candidates
 }
 
-pub fn edge(tc: &TestCase, pick: Pick, row: &ConvoyRow) -> Option<(Edge<ConvoyRow>, ConvoyRow)> {
-    engine::drive(tc, pick, row, candidates(tc, pick, row))
+pub fn edge(tc: &TestCase, pick: Pick, convoy: &Resource<Convoy>) -> Option<(Edge<Resource<Convoy>>, Resource<Convoy>)> {
+    engine::drive(tc, pick, convoy, candidates(tc, pick, convoy))
 }
 
-impl Fixture for ConvoyRow {
+impl Fixture for Resource<Convoy> {
     const COVERING: usize = COVERING;
 
-    fn generate(tc: &TestCase, pick: Pick) -> ConvoyRow {
+    fn generate(tc: &TestCase, pick: Pick) -> Resource<Convoy> {
         generate(tc, pick)
     }
 
     /// The project, promise definitions and priority drawn afresh; the state and edge log kept.
-    fn evolve(&self, tc: &TestCase, pick: Pick) -> ConvoyRow {
-        ConvoyRow { state: self.state.clone(), edges: self.edges.clone(), ..generate(tc, pick) }
+    fn evolve(&self, tc: &TestCase, pick: Pick) -> Resource<Convoy> {
+        self.clone().with_spec(spec(tc, pick))
     }
 
-    fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<ConvoyRow>, ConvoyRow)> {
+    fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<Resource<Convoy>>, Resource<Convoy>)> {
         edge(tc, pick, self)
     }
 
-    fn stamped(&self, before: Option<&ConvoyRow>, version: u64) -> ConvoyRow {
-        ConvoyRow { edges: stamp_flat(&self.edges, before.map(|before| &before.edges), version), ..self.clone() }
+    fn stamped(&self, before: Option<&Resource<Convoy>>, version: u64) -> Resource<Convoy> {
+        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version))
     }
 }

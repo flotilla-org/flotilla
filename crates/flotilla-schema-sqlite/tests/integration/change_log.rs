@@ -10,10 +10,12 @@ use flotilla_schema_sqlite::{Applied, Malformed, ResourceId, Snapshot, Stamp, St
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
+use flotilla_state_machines::machines::message::MessageSpec;
+
 use crate::fixtures::{
     message as messages, registry, store,
     synthetic::{workflow, InputValue},
-    AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow as Message, Pick, Referral, TerminalSession, Ticket, LOCAL,
+    AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Ticket, LOCAL,
 };
 
 const REPLICA: &str = "replica";
@@ -94,10 +96,10 @@ fn step<K: Fixture>(tc: &TestCase, write: &mut Write<'_>, live: &mut Option<Stam
 /// Every slot's resource: kind code and name.
 fn slots() -> Vec<(KindCode, String)> {
     [
-        Message::CODE,
-        AgentSessionRow::CODE,
-        ConvoyRow::CODE,
-        EnsureRow::CODE,
+        Resource::<Message>::CODE,
+        Resource::<AgentSession>::CODE,
+        Resource::<Convoy>::CODE,
+        Resource::<Ensure>::CODE,
         TerminalSession::CODE,
         Ticket::CODE,
         Referral::CODE,
@@ -160,10 +162,10 @@ fn the_change_log_replays_into_another_store(tc: TestCase) {
         let (code, name) = &slots()[slot];
         let (live, last) = (&mut live[slot], &mut last);
         match *code {
-            Message::CODE => step::<Message>(&tc, &mut write, live, name, last),
-            AgentSessionRow::CODE => step::<AgentSessionRow>(&tc, &mut write, live, name, last),
-            ConvoyRow::CODE => step::<ConvoyRow>(&tc, &mut write, live, name, last),
-            EnsureRow::CODE => step::<EnsureRow>(&tc, &mut write, live, name, last),
+            Resource::<Message>::CODE => step::<Resource<Message>>(&tc, &mut write, live, name, last),
+            Resource::<AgentSession>::CODE => step::<Resource<AgentSession>>(&tc, &mut write, live, name, last),
+            Resource::<Convoy>::CODE => step::<Resource<Convoy>>(&tc, &mut write, live, name, last),
+            Resource::<Ensure>::CODE => step::<Resource<Ensure>>(&tc, &mut write, live, name, last),
             Ticket::CODE => step::<Ticket>(&tc, &mut write, live, name, last),
             Referral::CODE => step::<Referral>(&tc, &mut write, live, name, last),
             Dossier::CODE => step::<Dossier>(&tc, &mut write, live, name, last),
@@ -220,8 +222,8 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
     let mut remote = Store::open(Connection::open_in_memory().expect("db"), "remote", registry()).expect("open remote");
     let mut write = remote.write().expect("write");
     let stamp = write.insert("far", &messages::sample()).expect("insert");
-    let current = write.load::<Message>(stamp.id).expect("load").expect("present");
-    write.update(&current, &Message { inbox: "edited".into(), ..messages::sample() }).expect("update");
+    let current = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
+    write.update(&current, &messages::sample_in("edited")).expect("update");
     write.commit().expect("commit");
     let changes = remote.read().expect("read").changes_since("remote", 0, 10).expect("log");
 
@@ -230,18 +232,18 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
     for change in &changes {
         assert!(matches!(write.apply(change).expect("apply"), Applied::Applied(_)));
     }
-    let id = write.resolve(Message::CODE, "far", "remote").expect("resolve").expect("present");
-    let current = write.load::<Message>(id).expect("load").expect("present");
-    assert_eq!((current.version, current.value.inbox.as_str()), (changes[1].home_seq, "edited"));
-    let next = Message { inbox: "local edit".into(), ..current.value.clone() };
+    let id = write.resolve(Resource::<Message>::CODE, "far", "remote").expect("resolve").expect("present");
+    let current = write.load::<Resource<Message>>(id).expect("load").expect("present");
+    assert_eq!((current.version, current.value.spec().inbox.as_str()), (changes[1].home_seq, "edited"));
+    let next = current.value.clone().with_spec(MessageSpec { inbox: "local edit".into(), ..current.value.spec().clone() });
     assert!(matches!(write.update(&current, &next), Err(StoreError::NotHome { .. })));
-    assert!(matches!(write.delete::<Message>(current.stamp()), Err(StoreError::NotHome { .. })));
+    assert!(matches!(write.delete::<Resource<Message>>(current.stamp()), Err(StoreError::NotHome { .. })));
 
     let own = RowChange { home: LOCAL.into(), name: "mine".into(), ..changes[0].clone() };
     assert!(matches!(write.apply(&own), Err(StoreError::OwnHome { home }) if home == LOCAL));
-    assert_eq!(write.resolve(Message::CODE, "mine", LOCAL).expect("resolve"), None, "a refused apply writes nothing");
-    let unknown = RowChange { kind: KindCode(999), ..changes[0].clone() };
-    assert!(matches!(write.apply(&unknown), Err(StoreError::UnknownKind { code: KindCode(999) })));
+    assert_eq!(write.resolve(Resource::<Message>::CODE, "mine", LOCAL).expect("resolve"), None, "a refused apply writes nothing");
+    let unknown = RowChange { kind: KindCode::new("k999"), ..changes[0].clone() };
+    assert!(matches!(write.apply(&unknown), Err(StoreError::UnknownKind { code }) if code == KindCode::new("k999")));
     write.commit().expect("commit");
 }
 
@@ -316,7 +318,7 @@ fn malformed_changes_are_refused() {
     write.insert("m", &messages::sample()).expect("insert");
     write.commit().expect("commit");
     let change = first_change(&mut source, LOCAL);
-    let root = Message::table_set().tables[0].name.clone();
+    let root = Resource::<Message>::table_set().tables[0].name.clone();
     let with = |op: RowOp| RowChange { ops: vec![op], ..change.clone() };
     let mut target = replica();
     let mut write = target.write().expect("write");
@@ -447,10 +449,10 @@ fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
 // `changes`, paged two at a time), holds the newest snapshot: each tail change carries its objects.
 #[hegel::test]
 fn a_snapshot_plus_its_tail_is_the_newest_snapshot(tc: TestCase) {
-    snapshot_plus_tail::<Message>(&tc);
-    snapshot_plus_tail::<AgentSessionRow>(&tc);
-    snapshot_plus_tail::<ConvoyRow>(&tc);
-    snapshot_plus_tail::<EnsureRow>(&tc);
+    snapshot_plus_tail::<Resource<Message>>(&tc);
+    snapshot_plus_tail::<Resource<AgentSession>>(&tc);
+    snapshot_plus_tail::<Resource<Convoy>>(&tc);
+    snapshot_plus_tail::<Resource<Ensure>>(&tc);
     snapshot_plus_tail::<TerminalSession>(&tc);
     snapshot_plus_tail::<Ticket>(&tc);
     snapshot_plus_tail::<Referral>(&tc);
@@ -462,8 +464,8 @@ fn log(store: &mut Store, home: &str) -> Vec<RowChange> {
     store.read().expect("read").changes_since(home, 0, 100).expect("log")
 }
 
-fn message(inbox: &str) -> Message {
-    Message { inbox: inbox.into(), ..messages::sample() }
+fn message(inbox: &str) -> Resource<Message> {
+    messages::sample_in(inbox)
 }
 
 /// Inserts `name`, then rewrites its inbox once per entry of `bodies`, in one transaction.
@@ -471,7 +473,7 @@ fn write_history(store: &mut Store, name: &str, bodies: &[&str]) {
     let mut write = store.write().expect("write");
     let mut stamp = write.insert(name, &message("first")).expect("insert");
     for body in bodies {
-        let current = write.load::<Message>(stamp.id).expect("load").expect("present");
+        let current = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
         stamp = write.update(&current, &message(body)).expect("update");
     }
     write.commit().expect("commit");
@@ -485,9 +487,9 @@ fn trimming_the_log_never_resurrects_a_deleted_resource() {
     let mut source = store();
     write_history(&mut source, "m", &["second"]);
     let mut write = source.write().expect("write");
-    let id = write.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
-    let current = write.load::<Message>(id).expect("load").expect("present");
-    write.delete::<Message>(current.stamp()).expect("delete");
+    let id = write.resolve(Resource::<Message>::CODE, "m", LOCAL).expect("resolve").expect("present");
+    let current = write.load::<Resource<Message>>(id).expect("load").expect("present");
+    write.delete::<Resource<Message>>(current.stamp()).expect("delete");
     write.commit().expect("commit");
     let changes = log(&mut source, LOCAL);
 
@@ -504,7 +506,7 @@ fn trimming_the_log_never_resurrects_a_deleted_resource() {
     for change in &changes {
         assert!(matches!(write.apply(change).expect("replay"), Applied::Duplicate(_)), "{change:?}");
     }
-    let id = write.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("identity kept");
+    let id = write.resolve(Resource::<Message>::CODE, "m", LOCAL).expect("resolve").expect("identity kept");
     assert_eq!(write.load_snapshot(id).expect("snapshot"), None);
 }
 
@@ -516,9 +518,9 @@ fn a_skipped_change_is_a_gap() {
     let mut source = store();
     write_history(&mut source, "m", &["second", "third"]);
     let mut write = source.write().expect("write");
-    let id = write.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
-    let current = write.load::<Message>(id).expect("load").expect("present");
-    write.delete::<Message>(current.stamp()).expect("delete");
+    let id = write.resolve(Resource::<Message>::CODE, "m", LOCAL).expect("resolve").expect("present");
+    let current = write.load::<Resource<Message>>(id).expect("load").expect("present");
+    write.delete::<Resource<Message>>(current.stamp()).expect("delete");
     write.insert("m", &message("again")).expect("insert again");
     write.commit().expect("commit");
     let changes = log(&mut source, LOCAL);
@@ -532,16 +534,17 @@ fn a_skipped_change_is_a_gap() {
         write.apply(&changes[1]),
         Err(StoreError::Gap { expected: 0, found, .. }) if found == seqs[0]
     ));
-    assert_eq!(write.resolve(Message::CODE, "m", LOCAL).expect("resolve"), None, "a refused apply writes nothing");
+    assert_eq!(write.resolve(Resource::<Message>::CODE, "m", LOCAL).expect("resolve"), None, "a refused apply writes nothing");
     write.apply(&changes[0]).expect("insert");
     assert!(matches!(write.apply(&changes[2]), Err(StoreError::Gap { expected, found, .. }) if expected == seqs[0] && found == seqs[1]));
-    let id = write.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
-    assert_eq!(write.load::<Message>(id).expect("load").expect("present").value, message("first"), "the gap changed nothing");
+    let id = write.resolve(Resource::<Message>::CODE, "m", LOCAL).expect("resolve").expect("present");
+    let loaded = write.load::<Resource<Message>>(id).expect("load").expect("present");
+    assert_eq!(loaded.value, message("first").with_identity("m", loaded.version), "the gap changed nothing");
     for change in &changes[1..] {
         assert!(matches!(write.apply(change).expect("in order"), Applied::Applied(_)));
     }
     write.commit().expect("commit");
-    let source_id = source.read().expect("read").resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
+    let source_id = source.read().expect("read").resolve(Resource::<Message>::CODE, "m", LOCAL).expect("resolve").expect("present");
     let expected = source.read().expect("read").load_snapshot(source_id).expect("snapshot");
     assert_eq!(target.read().expect("read").load_snapshot(id).expect("snapshot"), expected);
 }
@@ -592,8 +595,8 @@ fn a_refused_apply_leaves_no_cached_identity() {
     assert!(matches!(write.apply(&a[1]), Err(StoreError::Gap { .. })));
     let Applied::Applied(b_stamp) = write.apply(&b[0]).expect("b") else { panic!("b applies") };
     assert_eq!(b_stamp.id, ResourceId(1), "b reuses the rowid a's refused apply rolled back");
-    assert_eq!(write.resolve(Message::CODE, "a", LOCAL).expect("resolve"), None, "a's rolled-back id is not cached");
-    assert_eq!(write.load::<Message>(b_stamp.id).expect("load").expect("present").name, "b");
+    assert_eq!(write.resolve(Resource::<Message>::CODE, "a", LOCAL).expect("resolve"), None, "a's rolled-back id is not cached");
+    assert_eq!(write.load::<Resource<Message>>(b_stamp.id).expect("load").expect("present").name, "b");
     let Applied::Applied(a_stamp) = write.apply(&a[0]).expect("a") else { panic!("a applies") };
     assert_ne!(a_stamp.id, b_stamp.id);
     // A never-seen identity whose first change is not an insert: no gap (0), but nothing to update.
@@ -602,16 +605,16 @@ fn a_refused_apply_leaves_no_cached_identity() {
     write.commit().expect("commit");
 
     let mut write = target.write().expect("write");
-    assert_eq!(write.resolve(Message::CODE, "c", LOCAL).expect("resolve"), None);
+    assert_eq!(write.resolve(Resource::<Message>::CODE, "c", LOCAL).expect("resolve"), None);
     for change in a[1..].iter().chain(&b[1..]).chain(&c) {
         assert!(matches!(write.apply(change).expect("apply"), Applied::Applied(_)));
     }
     write.commit().expect("commit");
     for name in ["a", "b", "c"] {
-        let source_id = source.read().expect("read").resolve(Message::CODE, name, LOCAL).expect("resolve").expect("present");
+        let source_id = source.read().expect("read").resolve(Resource::<Message>::CODE, name, LOCAL).expect("resolve").expect("present");
         let expected = source.read().expect("read").load_snapshot(source_id).expect("snapshot");
         let mut read = target.read().expect("read");
-        let id = read.resolve(Message::CODE, name, LOCAL).expect("resolve").expect("present");
+        let id = read.resolve(Resource::<Message>::CODE, name, LOCAL).expect("resolve").expect("present");
         assert_eq!(read.load_snapshot(id).expect("snapshot"), expected, "{name}");
     }
 }
@@ -625,7 +628,7 @@ fn change_pages_respect_their_limit() {
     let mut read = source.read().expect("read");
     assert!(matches!(read.changes_since(LOCAL, 0, 0), Err(StoreError::ZeroLimit)));
     assert_eq!(read.changes_since(LOCAL, 0, 2).expect("page").len(), 2);
-    let id = read.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
+    let id = read.resolve(Resource::<Message>::CODE, "m", LOCAL).expect("resolve").expect("present");
     assert!(matches!(read.changes(id, 0, 0), Err(StoreError::ZeroLimit)));
     assert_eq!(read.changes(id, 0, u32::MAX).expect("page").len(), 3);
 }
@@ -649,7 +652,7 @@ fn a_reused_home_sequence_is_refused() {
         matches!(&refused, Err(StoreError::MalformedChange(Malformed::ReusedSequence { home_seq, .. })) if *home_seq == change.home_seq),
         "{refused:?}"
     );
-    assert_eq!(write.resolve(Message::CODE, "b", LOCAL).expect("resolve"), None);
+    assert_eq!(write.resolve(Resource::<Message>::CODE, "b", LOCAL).expect("resolve"), None);
     write.commit().expect("commit");
 }
 
@@ -671,7 +674,7 @@ fn change_pages_respect_their_byte_budget() {
     let mut store = with_budget(store, sizes[0] + sizes[1] - 1);
     assert_eq!(store.read().expect("read").changes_since(LOCAL, 0, 100).expect("page"), changes[..1]);
     let mut store = with_budget(store, 1);
-    let id = store.read().expect("read").resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
+    let id = store.read().expect("read").resolve(Resource::<Message>::CODE, "m", LOCAL).expect("resolve").expect("present");
     let mut walked = Vec::new();
     let mut after = 0;
     loop {

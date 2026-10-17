@@ -6,7 +6,7 @@ use flotilla_schema::{quote_ident, Edge, EdgeEvent, Hash, Kind, Records, State, 
 use flotilla_schema_sqlite::{Loaded, Stamp, Store, StoreError};
 use flotilla_state_machines::{
     machines::{
-        ensure::{EnsureEdgeKind, EnsureLabel, EnsureState, MemoryEnsureWorld, Record},
+        ensure::{EnsureEdgeKind, EnsureLabel, EnsureSpec, EnsureState, MemoryEnsureWorld, Record},
         message::{Deliver, MemoryMessageWorld, MessageWorld, Receiver, Settle, Settlement},
     },
     Attempt, EdgeEventOf, EdgePayload, InputRead, Ref, Transport, Version,
@@ -18,7 +18,7 @@ use crate::fixtures::{
     engine::{step, NAME},
     ensure, message, registry, store,
     synthetic::{workflow, Deliverable, DeliverableState, Evidence, InputValue, PromiseKind, PromiseSource},
-    AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession, LOCAL,
+    AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, LOCAL,
 };
 
 /// A record edge's event on an unfulfilled Ensure, as its log holds it.
@@ -108,31 +108,34 @@ fn refused(result: Result<Stamp, StoreError>) -> String {
 #[test]
 fn spec_edits_refuse_what_only_edges_write() {
     let mut store = store();
-    let ensure = EnsureRow { edges: records(vec![event("alice"), event("bob")]), attempts: records(vec![attempt(2)]), ..ensure::sample() };
+    let ensure = ensure::sample().with_events(records(vec![event("alice"), event("bob")])).with_attempts(records(vec![attempt(2)]));
     let current = insert(&mut store, "e", &ensure);
     let dossier = Dossier { deliverables: records(vec![deliverable(vec![evidence("e0"), evidence("e1")])]), ..Dossier::sample(0) };
     let dossier_current = insert(&mut store, "d", &dossier);
     let (ensure, dossier) = (&current.value, &dossier_current.value);
-    let stamps = ensure.edges.iter().map(|row| row.version).chain(dossier.deliverables.iter().map(|row| row.version));
+    let stamps = ensure.events().iter().map(|row| row.version).chain(dossier.deliverables.iter().map(|row| row.version));
     assert_eq!(stamps.collect::<Vec<_>>(), [current.version, current.version, dossier_current.version], "the insert stamps every row");
 
     let mut write = store.write().expect("write");
     type Event = EdgeEventOf<flotilla_state_machines::machines::ensure::Ensure>;
-    let edges = |f: Edit<Event>| EnsureRow { edges: with_rows(&ensure.edges, f), ..ensure.clone() };
+    let edges = |f: Edit<Event>| ensure.clone().with_events(with_rows(ensure.events(), f));
     assert_eq!(refused(write.update(&current, &edges(&|rows| rows.push((0, event("carol")))))), "ensure_edges", "no append");
     assert_eq!(refused(write.update(&current, &edges(&|rows| drop(rows.pop())))), "ensure_edges");
     assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].1 = event("carol")))), "ensure_edges");
     assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].0 += 1))), "ensure_edges", "the stamp is part of the row");
     let with_read = edges(&|rows| rows[0].1.payload.reads.push(read()));
     assert_eq!(refused(write.update(&current, &with_read)), "ensure_edges", "gate reads are part of the edge row");
-    let more_attempts = EnsureRow { attempts: with_rows(&ensure.attempts, |rows| rows.push((0, attempt(3)))), ..ensure.clone() };
+    let more_attempts = ensure.clone().with_attempts(with_rows(ensure.attempts(), |rows| rows.push((0, attempt(3)))));
     assert_eq!(refused(write.update(&current, &more_attempts)), "ensure_attempts");
-    let fewer_attempts = EnsureRow { attempts: Records::new(), ..ensure.clone() };
+    let fewer_attempts = ensure.clone().with_attempts(Records::new());
     assert_eq!(refused(write.update(&current, &fewer_attempts)), "ensure_attempts");
     let held = EnsureState::Held { recorded: Default::default(), created: Default::default(), window: 0 };
-    let moved = EnsureRow { state: State::new(held, ensure.state.since), ..ensure.clone() };
+    let moved = ensure.clone().with_state(State::new(held, ensure.since()));
     assert_eq!(refused(write.update(&current, &moved)), "ensure.state");
-    let later = EnsureRow { state: State::new(ensure.state.value.clone(), Timestamp(9)), inbox: "edited".into(), ..ensure.clone() };
+    let later = ensure
+        .clone()
+        .with_state(State::new(ensure.state().clone(), Timestamp(9)))
+        .with_spec(EnsureSpec { inbox: "edited".into(), ..ensure.spec().clone() });
     assert_eq!(refused(write.update(&current, &later)), "ensure.state_since", "a spec field beside it does not excuse it");
     let deliverables = |f: Edit<Deliverable>| Dossier { deliverables: with_rows(&dossier.deliverables, f), ..dossier.clone() };
     let retracted = deliverables(&|rows| rows[0].1.state = State::new(DeliverableState::Retracted, Timestamp(5)));
@@ -148,15 +151,15 @@ fn spec_edits_refuse_what_only_edges_write() {
 
     // Allowed in the same transaction: a spec edit, then the engine's record edge appending its
     // event and growing the state's recorded set, whatever stamps the caller's rows hold.
-    let edited = EnsureRow { inbox: "edited".into(), ..ensure.clone() };
+    let edited = ensure.clone().with_spec(EnsureSpec { inbox: "edited".into(), ..ensure.spec().clone() });
     let stamp = write.update(&current, &edited).expect("spec edit");
     let (edge, next) =
         step(&edited, "dave", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(8)).expect("recorded");
     let stamp = write.apply_edge(stamp, edge).expect("edge");
     write.commit().expect("commit");
-    let expected = next.stamped(Some(&edited), stamp.version);
+    let expected = next.stamped(Some(&edited), stamp.version).with_identity("e", stamp.version);
     assert_eq!(load(&mut store, &current).value, expected);
-    assert!(expected.state.value.recorded().contains(&Ref::new("f")));
+    assert!(expected.state().recorded().contains(&Ref::new("f")));
     assert_eq!(load(&mut store, &dossier_current).value, *dossier, "the refused writes changed nothing");
 }
 
@@ -203,7 +206,7 @@ fn writes_touch_only_their_rows() {
     let (mut store, _) = rows_written(store, |_| {});
     // The strings the edges write are interned first, so no `strings` row is counted below.
     for (n, string) in ["s", "h", "w"].into_iter().enumerate() {
-        insert(&mut store, &format!("pre{n}"), &MessageRow { inbox: string.into(), ..message::sample() });
+        insert(&mut store, &format!("pre{n}"), &message::sample_in(string));
     }
     let current = insert(&mut store, "m", &message::sample());
     let dossier_current = insert(&mut store, "d", &dossier);
@@ -295,7 +298,7 @@ fn nested_rows_go_with_their_parent() {
     let next = Dossier { inputs: [("b".to_owned(), InputValue::Text { value: "t".into() })].into(), ..current.value.clone() };
     update(&mut store, &current, &next);
     let conn = store.into_connection();
-    let items: i64 = conn.query_row("SELECT count(*) FROM dossier_inputs_list_items", [], |row| row.get(0)).expect("count");
+    let items: i64 = conn.query_row("SELECT count(*) FROM dossier_inputs_items", [], |row| row.get(0)).expect("count");
     assert_eq!(items, 0, "a removed input's items and a switched variant's items are gone");
     assert_eq!(foreign_key_violations(&conn), 0);
 
@@ -344,10 +347,10 @@ fn owned_rows_in(conn: &Connection, table: &Table) -> i64 {
 // depth, for every fixture; the covering values fill every table first.
 #[hegel::test]
 fn deleting_a_resource_empties_every_table(tc: TestCase) {
-    delete_cascades::<MessageRow>(&tc);
-    delete_cascades::<AgentSessionRow>(&tc);
-    delete_cascades::<ConvoyRow>(&tc);
-    delete_cascades::<EnsureRow>(&tc);
+    delete_cascades::<Resource<Message>>(&tc);
+    delete_cascades::<Resource<AgentSession>>(&tc);
+    delete_cascades::<Resource<Convoy>>(&tc);
+    delete_cascades::<Resource<Ensure>>(&tc);
     delete_cascades::<TerminalSession>(&tc);
     delete_cascades::<Referral>(&tc);
     delete_cascades::<Dossier>(&tc);

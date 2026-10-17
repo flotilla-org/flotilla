@@ -29,21 +29,21 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     appended, code_enum, event, floor, identity, list, name, payload, position, records, reference, replaced, seq, stamp, stamp_flat,
-    terminal::map, text, time, timestamp, AgentSessionRow, Fixture, Payload, Pick, SHAPES,
+    terminal::map, text, time, timestamp, AgentSession, Fixture, Payload, Pick, Resource, SHAPES,
 };
 
 /// A synthetic message-like kind: references, addressing and plain spec columns.
 #[derive(Debug, Clone, PartialEq, Stored)]
 #[store(
     kind = "Referral",
-    code = 10,
+    code = "rf",
     index(name = "by_session", eq(session), order(seq)),
     index(name = "by_reply", eq(in_reply_to), when(in_reply_to is_some))
 )]
 pub struct Referral {
     #[store(intern)]
     pub sender: AgentName,
-    pub session: Ref<AgentSessionRow>,
+    pub session: Ref<Resource<AgentSession>>,
     pub in_reply_to: Option<Ref<Referral>>,
     #[store(child)]
     pub references: Vec<Reference>,
@@ -65,21 +65,21 @@ pub struct AgentName(pub String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 pub enum Phase {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Draft,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Sent,
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Read,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 pub enum ReferralEdge {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Send,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Read,
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Amend,
 }
 
@@ -88,7 +88,7 @@ pub type ReferralEvent = EdgeEvent<Phase, ReferralEdge, Payload<String>>;
 /// The seven-variant reference enum, transcribed from `flotilla_protocol::MessageReference`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]
 pub enum Reference {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     ChangeRequest {
         #[store(intern)]
         service: String,
@@ -96,13 +96,13 @@ pub enum Reference {
         number: u64,
         revision: String,
     },
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Commit { repository: Identity, revision: String },
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Ref { repository: Identity, name: String, revision: String },
-    #[store(code = 4)]
+    #[store(code = "c4")]
     Artifact { resource: Identity, revision: String },
-    #[store(code = 5)]
+    #[store(code = "c5")]
     Issue {
         #[store(intern)]
         service: String,
@@ -110,7 +110,7 @@ pub enum Reference {
         number: u64,
         revision: String,
     },
-    #[store(code = 6)]
+    #[store(code = "c6")]
     Comment {
         #[store(intern)]
         service: String,
@@ -118,7 +118,7 @@ pub enum Reference {
         id: String,
         revision: String,
     },
-    #[store(code = 7)]
+    #[store(code = "c7")]
     ControlRecord { resource: Identity, revision: String },
 }
 
@@ -132,25 +132,25 @@ pub struct Leaf {
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 pub enum LeafAddress {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Convoy { name: String },
-    #[store(code = 2)]
+    #[store(code = "c2")]
     ChangeRequest {
         #[store(intern)]
         service: String,
         number: u64,
     },
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Usage { provider: String, account: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 pub enum Operator {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Equal,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     LessThan,
-    #[store(code = 3)]
+    #[store(code = "c3")]
     GreaterThan,
 }
 
@@ -278,7 +278,7 @@ impl Fixture for Referral {
 /// A synthetic convoy-like kind: frozen documents, inputs, and deliverables whose evidence is
 /// records too, changing only through declared edges (#3320 ruling 2).
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Dossier", code = 11)]
+#[store(kind = "Dossier", code = "do")]
 pub struct Dossier {
     #[store(frozen)]
     pub workflow: Frozen<WorkflowSnapshot>,
@@ -300,15 +300,15 @@ pub type DossierEvent = EdgeEvent<DossierState, DossierEdgeName, Payload<Dossier
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 pub enum DossierEdgeName {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Deliver,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Abandon,
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Promise,
-    #[store(code = 4)]
+    #[store(code = "c4")]
     Submit,
-    #[store(code = 5)]
+    #[store(code = "c5")]
     Retract,
 }
 
@@ -351,16 +351,16 @@ pub struct PlacementSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 pub enum InputValue {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Text { value: String },
-    #[store(code = 2)]
-    Number { value: i64 },
-    #[store(code = 3)]
+    #[store(code = "c2")]
+    Number { number: i64 },
+    #[store(code = "c3")]
     List {
         #[store(child)]
         items: Vec<String>,
     },
-    #[store(code = 4)]
+    #[store(code = "c4")]
     Unset,
 }
 
@@ -378,20 +378,20 @@ pub struct Deliverable {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 pub enum PromiseKind {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     ChangeRequest,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Artifact,
 }
 
 #[derive(Debug, Clone, PartialEq, Stored)]
 pub enum PromiseSource {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Workflow {
         #[store(intern)]
         step: String,
     },
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Dispatcher,
 }
 
@@ -415,19 +415,19 @@ pub struct Verdict {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 pub enum DossierState {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Open,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Delivered,
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Abandoned,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 pub enum DeliverableState {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Open,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Retracted,
 }
 
@@ -450,7 +450,7 @@ impl InputValue {
     fn generate(tc: &TestCase, pick: Pick) -> InputValue {
         match pick.variant(tc, 4, |index| index) {
             0 => InputValue::Text { value: text(tc) },
-            1 => InputValue::Number { value: tc.draw(gs::integers::<i64>()) },
+            1 => InputValue::Number { number: tc.draw(gs::integers::<i64>()) },
             2 => InputValue::List { items: list(tc, pick.nth(1), 2, |_| text(tc)) },
             _ => InputValue::Unset,
         }

@@ -18,15 +18,15 @@ use crate::{Handle, Machine};
 /// by code, so a rename keeps every stored category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub enum CauseCategory {
-    #[store(code = 1)]
+    #[store(code = "tr")]
     Transient,
-    #[store(code = 2)]
+    #[store(code = "rf")]
     Refused,
-    #[store(code = 3)]
+    #[store(code = "mc")]
     Misconfigured,
-    #[store(code = 4)]
+    #[store(code = "mx")]
     MissingCapability,
-    #[store(code = 5)]
+    #[store(code = "ex")]
     External,
 }
 
@@ -46,9 +46,9 @@ impl Cause {
 
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub enum Outcome {
-    #[store(code = 1)]
+    #[store(code = "ok")]
     Succeeded,
-    #[store(code = 2)]
+    #[store(code = "fa")]
     Failed {
         #[store(flatten)]
         cause: Cause,

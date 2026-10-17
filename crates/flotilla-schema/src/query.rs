@@ -1,34 +1,42 @@
 //! Backend-neutral index queries: what a generated query constructor returns.
 //!
 //! `#[store(index(name = "open_by_inbox", eq(inbox), ...))]` generates
-//! `Message::open_by_inbox(inbox: &Ref<Inbox>) -> IndexQuery<Message>`. The query names the index
-//! and carries its `eq` arguments as logical values (strings and identities, not local ids), so
-//! any backend can run it; the sqlite runtime pages it by keyset.
+//! `Message::open_by_inbox(inbox: &Ref<Inbox>) -> IndexQuery<Message>`. The query names its kind
+//! and index and carries its `eq` arguments as logical values (strings and identities, not local
+//! ids), so any backend can run it; the sqlite runtime pages it by keyset. A kind's spec declares
+//! the indexes of the kind its holder stores (`MessageSpec::open_by_inbox`), so the query's type is
+//! the declaring type and the kind is named by its code.
 
 use std::{fmt, marker::PhantomData};
 
 use crate::{
     codec::{EncodeError, Encoder},
-    traits::{Element, Intern, KeyColumn, Kind},
-    value::Value,
+    traits::{Element, Intern, KeyColumn},
+    value::{KindCode, Value},
 };
 
-/// A query of one declared index of kind `K`: rows matching its predicate whose `eq` columns
-/// equal the arguments, in `order..., id` order.
+/// A query of one index that `K` declares (a kind, or a kind's spec): rows of the kind matching
+/// its predicate whose `eq` columns equal the arguments, in `order..., id` order.
 pub struct IndexQuery<K> {
+    kind: KindCode,
     index: &'static str,
     /// An argument that cannot be stored (a `u64` above `i64::MAX`) surfaces when the query runs,
     /// so constructors stay infallible.
     eq: Result<Vec<Value>, EncodeError>,
-    kind: PhantomData<fn() -> K>,
+    declared_by: PhantomData<fn() -> K>,
 }
 
-impl<K: Kind> IndexQuery<K> {
-    /// For generated constructors: `index` is the declared name, `eq` the encoded arguments in
-    /// declaration order.
+impl<K> IndexQuery<K> {
+    /// For generated constructors: `kind` is the code of the kind the index is on, `index` the
+    /// declared name, `eq` the encoded arguments in declaration order.
     #[doc(hidden)]
-    pub fn new(index: &'static str, eq: Result<Vec<Value>, EncodeError>) -> IndexQuery<K> {
-        IndexQuery { index, eq, kind: PhantomData }
+    pub fn new(kind: KindCode, index: &'static str, eq: Result<Vec<Value>, EncodeError>) -> IndexQuery<K> {
+        IndexQuery { kind, index, eq, declared_by: PhantomData }
+    }
+
+    /// The code of the kind whose rows the query reads.
+    pub fn kind(&self) -> KindCode {
+        self.kind
     }
 
     /// The declared index name, unique within `K`.
@@ -44,13 +52,13 @@ impl<K: Kind> IndexQuery<K> {
 
 impl<K> Clone for IndexQuery<K> {
     fn clone(&self) -> IndexQuery<K> {
-        IndexQuery { index: self.index, eq: self.eq.clone(), kind: PhantomData }
+        IndexQuery { kind: self.kind, index: self.index, eq: self.eq.clone(), declared_by: PhantomData }
     }
 }
 
 impl<K> fmt::Debug for IndexQuery<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IndexQuery").field("index", &self.index).field("eq", &self.eq).finish()
+        f.debug_struct("IndexQuery").field("kind", &self.kind).field("index", &self.index).field("eq", &self.eq).finish()
     }
 }
 

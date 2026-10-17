@@ -108,12 +108,12 @@ pub trait EdgeArg: Clone + Debug + Sized + 'static {
 ///
 /// ```
 /// flotilla_state_machines::states! {
-///     pub enum Door => DoorLabel { Shut = 1, Open { #[store(intern)] by: String } = 2 }
+///     pub enum Door => DoorLabel { Shut = "sh", Open { #[store(intern)] by: String } = "op" }
 /// }
 /// use flotilla_schema::CodeEnum;
 /// use flotilla_state_machines::{Coded, StateValue};
 /// let open = Door::Open { by: "ann".into() };
-/// assert_eq!((open.label().name(), open.label().code()), ("Open", 2));
+/// assert_eq!((open.label().name(), open.label().code().as_str()), ("Open", "op"));
 /// assert_eq!(Door::fields(DoorLabel::Open), ["by"]);
 /// ```
 #[macro_export]

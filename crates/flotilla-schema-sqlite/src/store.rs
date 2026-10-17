@@ -12,8 +12,8 @@ use std::{
 };
 
 use flotilla_schema::{
-    ColumnType, DdlMode, DecodeError, Decoder, Edge, EdgeParts, EdgeRow, Encoder, Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry,
-    Row, RowChange, RowEdit, RowOp, RowPath, Rows, TableRole, Value,
+    Code, ColumnType, DdlMode, DecodeError, Decoder, Edge, EdgeParts, EdgeRow, Encoder, Hash, Identity, IndexQuery, Kind, KindCode,
+    KindRegistry, Row, RowChange, RowEdit, RowOp, RowPath, Rows, TableRole, Value,
 };
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
@@ -22,7 +22,7 @@ use crate::{
     error::{Malformed, StoreError},
     query::{page_limit, Cursor, Page},
     shared::{
-        schema_ddl, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_APPEND, LOG_BY_HOME,
+        schema_ddl, sync_views, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_APPEND, LOG_BY_HOME,
         LOG_BY_RESOURCE, LOG_TAKEN, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE,
         SHARED_STATEMENTS, STRING_ID, STRING_INSERT,
     },
@@ -79,12 +79,13 @@ impl Snapshot {
         self.clone().into_value()
     }
 
-    /// Like [`Snapshot::decode`], without copying the rows.
+    /// Like [`Snapshot::decode`], without copying the rows. A holder kind takes the snapshot's
+    /// name and version ([`Kind::with_identity`]).
     pub fn into_value<K: Kind>(self) -> Result<K, StoreError> {
         if self.kind != K::CODE {
             return Err(DecodeError::WrongKind { expected: K::KIND.to_owned(), found: self.kind.to_string() }.into());
         }
-        Ok(Decoder::decode::<K>(self.rows)?)
+        Ok(Decoder::decode::<K>(self.rows)?.with_identity(&self.name, self.version))
     }
 }
 
@@ -128,12 +129,14 @@ impl Store {
     }
 
     /// Enables foreign keys, creates the shared tables and every registered kind's tables if they
-    /// do not exist, and renders each kind's statements once.
+    /// do not exist, brings the `codes` rows and readable views up to date, and renders each
+    /// kind's statements once.
     pub fn open_with(mut conn: Connection, home: &str, kinds: KindRegistry, options: StoreOptions) -> Result<Store, StoreError> {
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.set_prepared_statement_cache_capacity(options.statement_cache);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(&schema_ddl(&kinds, DdlMode::IfNotExists))?;
+        sync_views(&tx, &kinds)?;
         tx.commit()?;
         let sql = kinds.iter().map(|set| (set.code, KindSql::render(set))).collect();
         let runtime = Runtime {
@@ -236,7 +239,7 @@ impl Read<'_> {
     /// [`Page`] and [`Cursor`]. An `eq` argument naming a string or resource this store has never
     /// seen matches nothing, and the query creates nothing. A `limit` of 0 is refused and one above
     /// [`MAX_PAGE`] lowered to it.
-    pub fn page<K: Kind>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
+    pub fn page<K>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
         self.ctx().page(query, after, limit)
     }
 
@@ -343,7 +346,7 @@ impl Write<'_> {
     /// [`Page`] and [`Cursor`]. An `eq` argument naming a string or resource this store has never
     /// seen matches nothing, and the query creates nothing. A `limit` of 0 is refused and one above
     /// [`MAX_PAGE`] lowered to it.
-    pub fn page<K: Kind>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
+    pub fn page<K>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
         self.ctx().page(query, after, limit)
     }
 
@@ -520,7 +523,7 @@ impl Ctx<'_> {
         let id = self
             .conn
             .prepare_cached(IDENTITY_RESOLVE)?
-            .query_row(params![identity.kind.0, name, home], |row| row.get::<_, i64>(0))
+            .query_row(params![identity.kind.as_str(), name, home], |row| row.get::<_, i64>(0))
             .optional()?
             .map(ResourceId);
         if let Some(id) = id {
@@ -535,7 +538,7 @@ impl Ctx<'_> {
         }
         let name = self.intern(&identity.name)?;
         let home = self.intern(&identity.home)?;
-        self.conn.prepare_cached(IDENTITY_INSERT)?.execute(params![identity.kind.0, name, home])?;
+        self.conn.prepare_cached(IDENTITY_INSERT)?.execute(params![identity.kind.as_str(), name, home])?;
         let id = ResourceId(self.conn.last_insert_rowid());
         self.remember_identity(identity, id);
         Ok(id)
@@ -546,11 +549,18 @@ impl Ctx<'_> {
         if let Some(identity) = cached.or_else(|| self.runtime.ids.get(&id)) {
             return Ok(Some(identity));
         }
-        let identity = self
+        let stored = self
             .conn
             .prepare_cached(IDENTITY_OF)?
-            .query_row([id.0], |row| Ok(Identity { kind: KindCode(row.get(0)?), name: row.get(1)?, home: row.get(2)? }))
+            .query_row([id.0], |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?)))
             .optional()?;
+        let identity = stored
+            .map(|(kind, name, home)| {
+                let kind = Code::parse(&kind)
+                    .map_err(|_| StoreError::Corrupt { table: "resource_identity".to_owned(), column: "kind".to_owned() })?;
+                Ok::<_, StoreError>(Identity { kind: KindCode(kind), name, home })
+            })
+            .transpose()?;
         if let Some(identity) = &identity {
             self.remember_identity(identity, id);
         }
@@ -741,12 +751,12 @@ impl Ctx<'_> {
             let table = || sql.tables[0].name.clone();
             sql.labels.get(from.field).cloned().ok_or_else(|| StoreError::EdgeTarget { table: table(), field: from.field.to_owned() })?
         };
-        let stored: Option<(i64, i64)> =
+        let stored: Option<(i64, String)> =
             self.conn.prepare_cached(&select)?.query_row([current.id.0], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
         match stored {
             Some((version, _)) if version != expected => return Err(self.stale::<K>(current)),
             None => return Err(self.stale::<K>(current)),
-            Some((_, label)) if label != from.code => {
+            Some((_, label)) if from.code != label.as_str() => {
                 return Err(StoreError::WrongFrom { id: current.id, field: from.field.to_owned(), from: from.code, stored: label });
             }
             Some(_) => {}
@@ -1313,7 +1323,7 @@ impl Ctx<'_> {
             let corrupt = || StoreError::Corrupt { table: name.clone(), column: column.name.clone() };
             let logical = match (&column.ty, value) {
                 (_, SqlValue::Null) => Value::Null,
-                (ColumnType::Text, SqlValue::Text(text)) => Value::Text(text),
+                (ColumnType::Text | ColumnType::Code(_), SqlValue::Text(text)) => Value::Text(text),
                 (ColumnType::Blob | ColumnType::Cbor, SqlValue::Blob(bytes)) => Value::Blob(bytes),
                 (ColumnType::Interned, SqlValue::Text(text)) => Value::Str(text),
                 (ColumnType::Ref, SqlValue::Integer(id)) => Value::Ref(self.identity_of(ResourceId(id))?.ok_or_else(corrupt)?),
@@ -1330,9 +1340,7 @@ impl Ctx<'_> {
                     }
                     Value::Object(hash)
                 }
-                (ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp | ColumnType::Code(_), SqlValue::Integer(int)) => {
-                    Value::Int(int)
-                }
+                (ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp, SqlValue::Integer(int)) => Value::Int(int),
                 _ => return Err(corrupt()),
             };
             values.push(logical);
@@ -1494,7 +1502,7 @@ mod tests {
     }
 
     fn tables(child: TableRole, grandchild: TableRole) -> KindSql {
-        let mut layout = Layout::root("K", KindCode(1));
+        let mut layout = Layout::root("K", KindCode::new("k1"));
         layout.table("items", child, |layout| {
             layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
             layout.column("label", ColumnType::Text, true);

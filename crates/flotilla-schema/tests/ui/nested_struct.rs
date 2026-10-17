@@ -6,7 +6,7 @@ struct Cause {
 }
 
 #[derive(Stored)]
-#[store(kind = "Ticket", code = 1)]
+#[store(kind = "Ticket", code = "k1")]
 struct Ticket {
     cause: Cause,
 }

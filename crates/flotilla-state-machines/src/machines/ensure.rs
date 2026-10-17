@@ -9,20 +9,19 @@
 //! `history` is the Ensure's attempt records, and its `Fail` is
 //! [`Home::record_attempt`](crate::Home::record_attempt), not an edge.
 //!
-//! The stored kind is [`EnsureRow`] (code 9, the next code after the schema
-//! stack's test kinds): the spec's inbox and flattened policy, the state
+//! The stored kind is `Resource<Ensure>` (code `en`), declared by
+//! [`EnsureSpec`]: the spec's inbox and flattened policy, the state
 //! (with the recorded and created fulfillers as child tables of state data,
 //! which `record` and `create` grow a row at a time), the edge log and the
 //! attempts.
 
 use std::collections::BTreeSet;
 
-use flotilla_schema::{Records, State, Stored, Timestamp};
+use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attempt, edges, states, Attempt, AttemptPolicy, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref,
-    Resource, RowParts, Source, Table, Version, WrongState,
+    attempt, edges, states, AttemptPolicy, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Version, WrongState,
 };
 
 /// Fulfiller references, in name order. Fulfiller names are addresses: plain
@@ -39,23 +38,23 @@ states! {
             #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,
             #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
             window: u32,
-        } = 1,
+        } = "un",
         Fulfilled {
             #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,
             #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
             window: u32,
             #[store(intern)] bound: Ref<Fulfiller>,
-        } = 2,
+        } = "fu",
         Held {
             #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,
             #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
             window: u32,
-        } = 3,
+        } = "he",
         Retired {
             #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,
             #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
             window: u32,
-        } = 4,
+        } = "rt",
     }
 }
 
@@ -109,12 +108,17 @@ impl EnsureState {
     }
 }
 
-/// What an Ensure keeps bound, and how its attempts are judged.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What an Ensure keeps bound, and how its attempts are judged. It declares
+/// the stored Ensure (kind code `en`), indexed by inbox, the read a binding
+/// change makes.
+#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+#[store(kind = "Ensure", code = "en", state = EnsureState, index(name = "by_inbox", eq(inbox)))]
 pub struct EnsureSpec {
     /// The inbox whose [`Drain`] a bind waits on. An address: plain interned
     /// text until `flotilla-address` is adopted.
+    #[store(intern)]
     pub inbox: String,
+    #[store(flatten)]
     pub policy: AttemptPolicy,
 }
 
@@ -173,13 +177,13 @@ pub struct Retire {
 
 edges! {
     pub enum EnsureEdge => EnsureEdgeKind {
-        Record(Record) = 1,
-        Create(Create) = 2,
-        Bind(Bind) = 3,
-        Unbind(Unbind) = 4,
-        GiveUp(GiveUp) = 5,
-        Resume(Resume) = 6,
-        Retire(Retire) = 7,
+        Record(Record) = "rc",
+        Create(Create) = "cr",
+        Bind(Bind) = "bi",
+        Unbind(Unbind) = "ub",
+        GiveUp(GiveUp) = "gu",
+        Resume(Resume) = "rs",
+        Retire(Retire) = "rt",
     }
 }
 
@@ -302,6 +306,7 @@ impl Machine for Ensure {
     type Edge = EnsureEdge;
     type Refusal = EnsureRefusal;
     type World = dyn EnsureWorld;
+    const RECORDS_ATTEMPTS: bool = true;
 
     fn definition() -> MachineDef<Self> {
         use EnsureLabel::*;
@@ -476,60 +481,4 @@ fn gate_retire(h: &mut Handle<'_, Ensure>, edge: &Retire) -> Result<(), EnsureRe
         return Err(EnsureRefusal::MissingEvidence);
     }
     Ok(())
-}
-
-/// The stored Ensure (kind code 9): the spec's inbox and flattened policy,
-/// the state, the edge log and the attempts. Indexed by inbox, the read a
-/// binding change makes.
-#[derive(Clone, Debug, PartialEq, Stored)]
-#[store(kind = "Ensure", code = 9, index(name = "by_inbox", eq(inbox)))]
-pub struct EnsureRow {
-    /// An address: plain interned text until `flotilla-address` is adopted.
-    #[store(intern)]
-    pub inbox: String,
-    #[store(flatten)]
-    pub policy: AttemptPolicy,
-    #[store(state)]
-    pub state: State<EnsureState>,
-    #[store(history)]
-    pub edges: Records<EdgeEventOf<Ensure>>,
-    #[store(history)]
-    pub attempts: Records<Attempt>,
-}
-
-impl EnsureRow {
-    pub fn spec(&self) -> EnsureSpec {
-        EnsureSpec { inbox: self.inbox.clone(), policy: self.policy }
-    }
-}
-
-impl MachineRow for EnsureRow {
-    type Machine = Ensure;
-    const STATE_FIELD: flotilla_schema::StateOf<Self, State<EnsureState>> = EnsureRow::STATE;
-    const EDGE_LOG: flotilla_schema::HistoryOf<Self, EdgeEventOf<Ensure>> = EnsureRow::EDGES;
-
-    fn of(resource: &Resource<Ensure>, since: Timestamp) -> EnsureRow {
-        let spec = resource.spec().clone();
-        EnsureRow {
-            inbox: spec.inbox,
-            policy: spec.policy,
-            state: State::new(resource.state().clone(), since),
-            edges: resource.events().clone(),
-            attempts: resource.attempts().clone(),
-        }
-    }
-
-    fn state(&self) -> &State<EnsureState> {
-        &self.state
-    }
-
-    fn parts(&self) -> RowParts<Ensure> {
-        RowParts {
-            spec: self.spec(),
-            state: self.state.value.clone(),
-            events: self.edges.clone(),
-            attempts: self.attempts.clone(),
-            receipts: Records::new(),
-        }
-    }
 }

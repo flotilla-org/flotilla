@@ -5,7 +5,7 @@ use flotilla_schema_sqlite::StoreError;
 use crate::fixtures::{
     agent_session, store,
     synthetic::{AgentName, Phase, Reference, ReferralEdge, ReferralEvent},
-    AgentSessionRow, Payload, Referral, LOCAL,
+    AgentSession, Payload, Referral, Resource, LOCAL,
 };
 
 fn referral(seq: u64) -> Referral {
@@ -62,7 +62,8 @@ fn references_to_missing_targets_create_their_identity() {
     let mut write = store.write().expect("write");
     let value = Referral { session: Ref::new("later", LOCAL), in_reply_to: Some(Ref::new("gone", "elsewhere")), ..Referral::sample() };
     let stamp = write.insert("m", &value).expect("insert");
-    let session = write.resolve(AgentSessionRow::CODE, "later", LOCAL).expect("resolve").expect("identity created by the reference");
+    let session =
+        write.resolve(Resource::<AgentSession>::CODE, "later", LOCAL).expect("resolve").expect("identity created by the reference");
     let reply = write.resolve(Referral::CODE, "gone", "elsewhere").expect("resolve").expect("identity created by the reference");
     assert_eq!(write.load::<Referral>(reply).expect("load"), None, "an identity is not a resource");
     let target = write.insert("later", &agent_session::sample()).expect("target inserted after the reference");
@@ -106,7 +107,7 @@ fn equal_interned_strings_share_one_row() {
     assert_eq!(rows, 1);
     let distinct: i64 = conn
         .query_row(
-            "SELECT count(DISTINCT m.sender) + count(DISTINCT r.change_request_service) + count(DISTINCT e.writer) \
+            "SELECT count(DISTINCT m.sender) + count(DISTINCT r.service) + count(DISTINCT e.writer) \
              FROM referral m JOIN referral_edges e ON e.owner = m.id JOIN referral_references r ON r.owner = m.id",
             [],
             |row| row.get(0),
@@ -116,7 +117,7 @@ fn equal_interned_strings_share_one_row() {
     let same: i64 = conn
         .query_row(
             "SELECT count(*) FROM referral m JOIN referral_edges e ON e.owner = m.id JOIN referral_references r ON r.owner = m.id \
-             WHERE m.sender = r.change_request_service AND m.sender = e.writer",
+             WHERE m.sender = r.service AND m.sender = e.writer",
             [],
             |row| row.get(0),
         )

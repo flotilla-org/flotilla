@@ -16,7 +16,7 @@ use std::{
     marker::PhantomData,
 };
 
-use flotilla_schema::CodeEnum;
+use flotilla_schema::{Code, CodeEnum};
 
 use crate::{code::changed, Coded, Edge, EdgeArg, Handle, StateValue};
 
@@ -39,6 +39,11 @@ pub trait Machine: Sized + 'static {
     /// What gates, effects and judgements may read; usually a trait object
     /// whose supertraits are the [`Source`](crate::Source)s the machine needs.
     type World: ?Sized;
+    /// Whether the machine's stored kind keeps an `attempts` table. Attempts are recorded only
+    /// where they are stored: without the table every label refuses them.
+    const RECORDS_ATTEMPTS: bool = false;
+    /// Whether the stored kind keeps a `receipts` table; as [`Machine::RECORDS_ATTEMPTS`].
+    const RECORDS_RECEIPTS: bool = false;
 
     fn definition() -> MachineDef<Self>;
 
@@ -245,9 +250,9 @@ pub enum DefError {
     DeadState(&'static str),
     /// Two labels share a code. The macros' `Stored` derive refuses this at
     /// compile time; a hand-written code enum can still reach it.
-    DuplicateStateCode(i64),
+    DuplicateStateCode(Code),
     /// Two edge kinds share a code; as [`DefError::DuplicateStateCode`].
-    DuplicateEdgeCode(i64),
+    DuplicateEdgeCode(Code),
 }
 
 impl fmt::Display for DefError {
@@ -339,9 +344,10 @@ impl<M: Machine> MachineDef<M> {
         self
     }
 
-    /// Whether an attempt may be recorded under `label` (ends aside).
+    /// Whether an attempt may be recorded under `label` (ends aside): never when the stored
+    /// kind keeps no attempts ([`Machine::RECORDS_ATTEMPTS`]).
     pub fn accepts_attempts(&self, label: Label<M>) -> bool {
-        self.attempts_in.as_ref().is_none_or(|labels| labels.contains(&label))
+        M::RECORDS_ATTEMPTS && self.attempts_in.as_ref().is_none_or(|labels| labels.contains(&label))
     }
 
     pub fn initial(&self) -> Label<M> {

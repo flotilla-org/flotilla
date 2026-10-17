@@ -2,12 +2,15 @@
 //!
 //! The stored kinds are the engine's machine declarations (#3319, #3373 ruling 4): Message,
 //! AgentSession, Convoy and Ensure from `flotilla_state_machines::machines`, and `TerminalSession`,
-//! a lifecycle kind whose row is declared here, beside its request (`terminal`). Their edges are
-//! real transitions: each fixture's [`Fixture::edge`] builds a home holding the stored row, a world
-//! that makes a drawn edge pass its gate, applies the edge through the engine, and turns the result
-//! into the stored edge ([`engine::drive`]). Every stored transition is one the engine's rules
-//! allow. The rows' spec fields, states and history are generated freely: history is never read to
-//! decide, and a stored row need not be one the engine could have reached.
+//! a lifecycle kind whose request is declared here (`terminal`); each is stored as the engine's
+//! `Resource`, declared by its spec (#3392 ruling D5). Their edges are real transitions: each
+//! fixture's [`Fixture::edge`] builds a home holding the stored resource, a world that makes a
+//! drawn edge pass its gate, applies the edge through the engine, and turns the result into the
+//! stored edge ([`engine::drive`]). Every stored transition is one the engine's rules allow. The
+//! resources' specs, states and history are generated freely: history is never read to decide,
+//! and a stored resource need not be one the engine could have reached. A generated resource has
+//! an empty name and version 0; a load gives it the store's (`Kind::with_identity`), so tests
+//! compare loads with models identified the same way.
 //!
 //! The synthetic kinds cover the derive features no engine kind uses yet: the label-plus-data
 //! `Ticket` (`ticket`), and `Referral` and `Dossier` (`synthetic`, whose module doc lists each
@@ -35,7 +38,10 @@ use std::fmt::Debug;
 use chrono::{DateTime, Utc};
 use flotilla_schema::{Edge, EdgeEvent, Identity, Kind, KindCode, KindRegistry, Position, Records, Ref, Timestamp};
 use flotilla_schema_sqlite::Store;
-pub use flotilla_state_machines::machines::{agent_session::AgentSessionRow, convoy::ConvoyRow, ensure::EnsureRow, message::MessageRow};
+pub use flotilla_state_machines::{
+    machines::{agent_session::AgentSession, convoy::Convoy, ensure::Ensure, message::Message},
+    Resource,
+};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -96,13 +102,13 @@ pub trait Fixture: Kind + Clone + PartialEq + Debug {
 
 pub fn registry() -> KindRegistry {
     let mut registry = KindRegistry::new();
-    registry.register::<MessageRow>().expect("fixture kinds register");
-    registry.register::<AgentSessionRow>().expect("fixture kinds register");
-    registry.register::<ConvoyRow>().expect("fixture kinds register");
+    registry.register::<Resource<Message>>().expect("fixture kinds register");
+    registry.register::<Resource<AgentSession>>().expect("fixture kinds register");
+    registry.register::<Resource<Convoy>>().expect("fixture kinds register");
     registry.register::<TerminalSession>().expect("fixture kinds register");
     registry.register::<Vessel>().expect("fixture kinds register");
     registry.register::<Ticket>().expect("fixture kinds register");
-    registry.register::<EnsureRow>().expect("fixture kinds register");
+    registry.register::<Resource<Ensure>>().expect("fixture kinds register");
     registry.register::<Referral>().expect("fixture kinds register");
     registry.register::<Dossier>().expect("fixture kinds register");
     registry
@@ -257,7 +263,7 @@ pub fn reference<K>(tc: &TestCase) -> Ref<K> {
 }
 
 pub fn identity(tc: &TestCase) -> Identity {
-    Identity { kind: KindCode(tc.draw(gs::integers::<u32>())), name: name(tc), home: home(tc) }
+    Identity { kind: KindCode::new(tc.draw(gs::sampled_from(vec!["a", "k1", "zz_9", "abcdefgh"]))), name: name(tc), home: home(tc) }
 }
 
 pub fn timestamp(tc: &TestCase) -> Timestamp {

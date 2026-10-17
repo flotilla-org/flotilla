@@ -9,7 +9,7 @@
 //! use flotilla_schema::{render_ddl, Decoder, Encoder, Kind, Stored};
 //!
 //! #[derive(Debug, PartialEq, Stored)]
-//! #[store(kind = "Note", code = 9)]
+//! #[store(kind = "Note", code = "k9")]
 //! struct Note {
 //!     body: String,
 //!     pinned: Option<bool>,
@@ -32,7 +32,7 @@
 //! }
 //!
 //! #[derive(flotilla_schema::Stored)]
-//! #[store(kind = "Whole", code = 1)]
+//! #[store(kind = "Whole", code = "k1")]
 //! struct Whole {
 //!     part: Part,
 //! }
@@ -44,6 +44,7 @@ extern crate self as flotilla_schema;
 #[doc(hidden)]
 pub mod adapt;
 mod change;
+mod code;
 mod codec;
 mod ddl;
 mod descriptor;
@@ -63,11 +64,14 @@ mod value;
 mod view;
 
 pub use change::{ChangeError, RowChange, RowOp, CHANGE_LIMITS};
+#[doc(hidden)]
+pub use code::{code_value, decode_code};
+pub use code::{Code, CodeError};
 pub use codec::{DecodeError, Decoder, EncodeError, Encoder};
-pub use ddl::{quote_ident, render_ddl, render_ddl_with, DdlMode};
+pub use ddl::{code_field, quote_ident, render_ddl, render_ddl_with, render_views, DdlMode, CODES_DDL, VIEW_SUFFIX};
 pub use descriptor::{
-    ColumnDef, ColumnType, Condition, DescriptorError, FieldColumns, Guard, Index, IndexProblem, Table, TableRole, TableSet,
-    RECORD_VERSION, RESERVED_CHILD_COLUMNS, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES,
+    code_literal, CodeNames, ColumnDef, ColumnType, Condition, DescriptorError, Expansion, FieldColumns, Guard, Index, IndexProblem, Table,
+    TableRole, TableSet, When, RECORD_VERSION, RESERVED_CHILD_COLUMNS, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES,
 };
 pub use edge::{
     AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf, RowPath,
@@ -86,6 +90,6 @@ pub use registry::{KindRegistry, RegistryError};
 pub use state::StateDelta;
 pub use state::{RowEdit, State};
 pub use time::Timestamp;
-pub use traits::{CodeEnum, Column, Columns, Element, Flat, Intern, KeyColumn, Kind, StateData, SUPPORTED_ATTRIBUTES};
+pub use traits::{CodeEnum, Column, Columns, Element, Flat, Intern, KeyColumn, Kind, KindSpec, StateData, SUPPORTED_ATTRIBUTES};
 pub use value::{Hash, Identity, KindCode, Row, Rows, Value};
 pub use view::{column_count, enum_columns, render_view, state_data, WIDE};

@@ -8,22 +8,22 @@ mod plain {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Stored)]
     pub enum Phase {
-        #[store(code = 1)]
+        #[store(code = "c1")]
         Open,
-        #[store(code = 2)]
+        #[store(code = "c2")]
         Closed,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Stored)]
     pub enum Event {
-        #[store(code = 1)]
+        #[store(code = "c1")]
         Opened { by: String },
-        #[store(code = 2)]
+        #[store(code = "c2")]
         Closed,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Stored)]
-    #[store(kind = "Ticket", code = 1)]
+    #[store(kind = "Ticket", code = "k1")]
     pub struct Ticket {
         pub title: String,
         #[store(state)]
@@ -40,29 +40,29 @@ mod renamed {
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
     pub enum Phase {
         #[serde(rename = "opened-at-last")]
-        #[store(code = 1)]
+        #[store(code = "c1")]
         Open,
         #[serde(alias = "shut")]
-        #[store(code = 2)]
+        #[store(code = "c2")]
         Closed,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Stored)]
     #[serde(tag = "type", rename_all = "kebab-case")]
     pub enum Event {
-        #[store(code = 1)]
+        #[store(code = "c1")]
         Opened {
             #[serde(rename = "author")]
             by: String,
         },
         #[serde(rename = "done")]
-        #[store(code = 2)]
+        #[store(code = "c2")]
         Closed,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Stored)]
     #[serde(rename = "TicketV2", rename_all = "camelCase")]
-    #[store(kind = "Ticket", code = 1)]
+    #[store(kind = "Ticket", code = "k1")]
     pub struct Ticket {
         #[serde(rename = "headline")]
         pub title: String,

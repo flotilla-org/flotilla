@@ -4,9 +4,9 @@
 //! each label-plus-data state's label, data columns and data tables. A label-plus-data state is
 //! not enum expansion: its data columns are shared by name across its labels.
 
-use std::{collections::BTreeSet, fmt::Write};
+use std::fmt::Write;
 
-use crate::descriptor::{ColumnType, Table, TableRole, TableSet, RESERVED_CHILD_COLUMNS, RESERVED_ROOT_COLUMNS};
+use crate::descriptor::{Table, TableRole, TableSet, RESERVED_CHILD_COLUMNS, RESERVED_ROOT_COLUMNS};
 
 /// A table wider than this many columns is called out for review.
 pub const WIDE: usize = 30;
@@ -21,33 +21,17 @@ pub fn column_count(table: &Table) -> usize {
 }
 
 /// Columns that exist because a data enum was expanded into its row, by the enum's tag column: the
-/// tag and every column its variants declare, nested enums and flattened options included. Only
-/// outermost enums are listed; a nested enum's columns count toward the enum holding it.
+/// tag and every column its variants' data declares (mapping B: shared by name across the
+/// variants), nested enums and optional values included. Only outermost enums are listed; a nested
+/// enum's columns count toward the enum holding it.
 pub fn enum_columns(table: &Table) -> Vec<(&str, usize)> {
-    let tag = |name: &str| table.columns.iter().any(|column| column.name == name && matches!(column.ty, ColumnType::Code(_)));
-    // A variant guard's controlling column is a data enum's tag (a code) or an optional flatten's
-    // flag. A label guard (a label-plus-data state's) is not enum expansion.
-    let variant = || table.guards.iter().filter(|guard| !guard.is_label());
-    let tags: BTreeSet<&str> = variant().map(|guard| guard.column.as_str()).filter(|column| tag(column)).collect();
-    let mut groups = Vec::new();
-    let mut nested = BTreeSet::new();
-    for &root in &tags {
-        let mut members: BTreeSet<&str> = BTreeSet::new();
-        let mut frontier = vec![root];
-        while let Some(column) = frontier.pop() {
-            for guard in variant().filter(|guard| guard.column == column) {
-                for name in &guard.scope {
-                    if members.insert(name.as_str()) {
-                        frontier.push(name.as_str());
-                    }
-                }
-            }
-        }
-        nested.extend(members.iter().copied().filter(|member| tags.contains(member)));
-        groups.push((root, 1 + members.len()));
-    }
-    groups.retain(|(root, _)| !nested.contains(root));
-    groups
+    let nested = |tag: &str| table.enums.iter().any(|other| other.columns.iter().any(|column| column == tag));
+    table
+        .enums
+        .iter()
+        .filter(|expansion| !nested(&expansion.tag))
+        .map(|expansion| (expansion.tag.as_str(), 1 + expansion.columns.len()))
+        .collect()
 }
 
 /// The label-plus-data states of one table: each label field's name, its data columns, and the

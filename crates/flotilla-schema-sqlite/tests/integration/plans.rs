@@ -187,8 +187,8 @@ fn edge_log_indexes_serve_history_reads() {
             "message_edges_by_time",
             "referral_edges_by_edge",
             "referral_edges_by_time",
-            "terminal_session_events_by_edge",
-            "terminal_session_events_by_time",
+            "terminal_session_edges_by_edge",
+            "terminal_session_edges_by_time",
             "ticket_edges_by_edge",
             "ticket_edges_by_time",
         ]

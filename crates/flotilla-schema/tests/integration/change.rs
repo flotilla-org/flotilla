@@ -15,7 +15,7 @@ fn value(tc: &TestCase) -> Value {
         3 => Value::Blob(tc.draw(gs::binary().max_size(8))),
         4 => Value::Str(tc.draw(gs::text().max_size(8))),
         5 => Value::Ref(Identity {
-            kind: KindCode(tc.draw(gs::integers::<u32>())),
+            kind: KindCode::new(tc.draw(gs::sampled_from(vec!["a", "k1", "zz_9", "abcdefgh"]))),
             name: tc.draw(gs::text().max_size(4)),
             home: tc.draw(gs::text().max_size(4)),
         }),
@@ -49,7 +49,7 @@ fn op(tc: &TestCase) -> RowOp {
 #[hegel::test]
 fn row_changes_round_trip_through_cbor(tc: TestCase) {
     let change = RowChange {
-        kind: KindCode(tc.draw(gs::integers::<u32>())),
+        kind: KindCode::new(tc.draw(gs::sampled_from(vec!["a", "k1", "zz_9", "abcdefgh"]))),
         name: tc.draw(gs::text().max_size(8)),
         home: tc.draw(gs::text().max_size(8)),
         home_seq: tc.draw(gs::integers::<u64>().min_value(0).max_value(i64::MAX as u64)),
@@ -72,7 +72,7 @@ fn limits_admit_a_maximal_frozen_document_with_its_rows() {
     let bytes = vec![7u8; 1024 * 1024];
     let mut ops = vec![RowOp::PutObject { hash: Hash::of(&bytes), bytes }];
     ops.extend((0..10_000).map(insert));
-    let change = RowChange { kind: KindCode(1), name: "m".into(), home: "h".into(), home_seq: 1, prev_seq: 0, ops };
+    let change = RowChange { kind: KindCode::new("k1"), name: "m".into(), home: "h".into(), home_seq: 1, prev_seq: 0, ops };
     let encoded = change.encode().expect("a maximal document fits");
     assert_eq!(RowChange::decode(&encoded).expect("decode"), change);
 
@@ -85,7 +85,7 @@ fn limits_admit_a_maximal_frozen_document_with_its_rows() {
 #[test]
 fn a_hash_of_the_wrong_length_is_refused() {
     let change = RowChange {
-        kind: KindCode(1),
+        kind: KindCode::new("k1"),
         name: "m".into(),
         home: "h".into(),
         home_seq: 1,

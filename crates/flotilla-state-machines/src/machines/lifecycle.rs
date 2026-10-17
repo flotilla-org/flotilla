@@ -47,12 +47,12 @@ pub struct Lifecycle<K: LifecycleKind>(PhantomData<fn() -> K>);
 states! {
     /// The spec's `State`: `Requested | Realised(str) | Gone | GaveUp(str)`.
     pub enum LifecycleState => LifecycleLabel {
-        Requested = 1,
+        Requested = "rq",
         /// Observed under `identity`.
-        Realised { identity: String } = 2,
-        Gone = 3,
+        Realised { identity: String } = "rl",
+        Gone = "go",
         /// The attempts were spent, the last failing with `cause`.
-        GaveUp { #[store(flatten)] cause: Cause } = 4,
+        GaveUp { #[store(flatten)] cause: Cause } = "gu",
     }
 }
 
@@ -120,10 +120,10 @@ pub struct GiveUp {
 
 edges! {
     pub enum LifecycleEdge => LifecycleEdgeKind {
-        Realise(Realise) = 1,
-        Release(Release) = 2,
-        Vanish(Vanish) = 3,
-        GiveUp(GiveUp) = 4,
+        Realise(Realise) = "rl",
+        Release(Release) = "rs",
+        Vanish(Vanish) = "va",
+        GiveUp(GiveUp) = "gu",
     }
 }
 
@@ -213,6 +213,7 @@ impl<K: LifecycleKind> Machine for Lifecycle<K> {
     type Edge = LifecycleEdge;
     type Refusal = LifecycleRefusal;
     type World = dyn LifecycleWorld;
+    const RECORDS_ATTEMPTS: bool = true;
 
     fn definition() -> MachineDef<Self> {
         use LifecycleLabel::*;

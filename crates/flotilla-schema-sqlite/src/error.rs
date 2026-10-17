@@ -1,4 +1,4 @@
-use flotilla_schema::{ChangeError, DecodeError, EncodeError, Hash, KindCode, RegistryError, Value};
+use flotilla_schema::{ChangeError, Code, DecodeError, EncodeError, Hash, KindCode, RegistryError, Value};
 
 use crate::store::ResourceId;
 
@@ -28,7 +28,7 @@ pub enum StoreError {
     /// `stored`, at the version the caller read (#3373 ruling 5). Checked inside the write, after
     /// the version: a stale stamp is `Conflict` whatever the label.
     #[error("resource {id}: the edge leaves label {from} of {field}, which holds label {stored}")]
-    WrongFrom { id: ResourceId, field: String, from: i64, stored: i64 },
+    WrongFrom { id: ResourceId, field: String, from: Code, stored: String },
     #[error("a {kind} resource named {name} already exists here")]
     Exists { kind: KindCode, name: String },
     /// A spec edit (`update`) changed what only an edge writes: a `state` column (`column` is

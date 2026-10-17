@@ -217,11 +217,9 @@ impl IndexSql {
 /// column type (a REAL, say) must choose its own lower bound.
 fn lowest(ty: &ColumnType) -> &'static str {
     match ty {
-        ColumnType::Text => "''",
+        ColumnType::Text | ColumnType::Code(_) => "''",
         ColumnType::Blob | ColumnType::Frozen | ColumnType::Cbor => "x''",
-        ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp | ColumnType::Code(_) | ColumnType::Interned | ColumnType::Ref => {
-            "-9223372036854775808"
-        }
+        ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp | ColumnType::Interned | ColumnType::Ref => "-9223372036854775808",
     }
 }
 
@@ -399,7 +397,7 @@ fn prefixed_placeholders(from: usize, count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_schema::{render_ddl, ColumnType, KindCode, Layout, TableRole};
+    use flotilla_schema::{render_ddl, Code, ColumnType, KindCode, Layout, TableRole, CODES_DDL};
     use rusqlite::Connection;
 
     use super::KindSql;
@@ -409,12 +407,12 @@ mod tests {
     // own row's string; unqualified, the subquery would compare `strings` with itself.
     #[test]
     fn interned_columns_named_like_strings_columns_read_their_own_string() {
-        let mut layout = Layout::root("Note", KindCode(1));
+        let mut layout = Layout::root("Note", KindCode::new("k1"));
         layout.column("s", ColumnType::Interned, true);
         layout.column("id_text", ColumnType::Text, true);
         let set = layout.finish();
         let conn = Connection::open_in_memory().expect("open");
-        conn.execute_batch(&format!("{SHARED_DDL}{}", render_ddl(&set))).expect("ddl");
+        conn.execute_batch(&format!("{SHARED_DDL}{CODES_DDL}{}", render_ddl(&set))).expect("ddl");
         conn.execute_batch(
             "INSERT INTO strings (id, s) VALUES (1, 'first'), (2, 'second'), (3, 'n'), (4, 'h');
              INSERT INTO resource_identity (id, kind, name, home) VALUES (2, 1, 3, 4);
@@ -430,7 +428,7 @@ mod tests {
     // runtime passes them (data values, then owner and key).
     #[test]
     fn statements_address_rows_by_primary_key() {
-        let mut layout = Layout::root("Convoy", KindCode(2));
+        let mut layout = Layout::root("Convoy", KindCode::new("k2"));
         layout.column("name", ColumnType::Interned, true);
         layout.table("steps", TableRole::Child, |layout| {
             layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
@@ -460,16 +458,16 @@ mod tests {
     // position reads one parent row's range backwards, inside a select of the parent row.
     #[test]
     fn edge_statements_write_one_field_and_read_the_last_position() {
-        let mut layout = Layout::root("Convoy", KindCode(2));
+        let mut layout = Layout::root("Convoy", KindCode::new("k2"));
         layout.field("label", false, |layout| layout.column("label", ColumnType::Text, true));
         layout.field("state", true, |layout| {
-            layout.column("state", ColumnType::Code(vec![1, 2]), true);
+            layout.column("state", ColumnType::Code(vec![Code::new("c1"), Code::new("c2")]), true);
             layout.column("state_since", ColumnType::Timestamp, true);
         });
         layout.table("deliverables", TableRole::Records, |layout| {
             layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
             layout.column("version", ColumnType::Integer, true);
-            layout.field("state", true, |layout| layout.column("state", ColumnType::Code(vec![1, 2]), true));
+            layout.field("state", true, |layout| layout.column("state", ColumnType::Code(vec![Code::new("c1"), Code::new("c2")]), true));
             layout.table("evidence", TableRole::Records, |layout| {
                 layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
                 layout.column("version", ColumnType::Integer, true);

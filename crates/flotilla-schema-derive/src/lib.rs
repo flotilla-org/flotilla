@@ -41,7 +41,8 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         Data::Union(data) => Err(refuse(data.union_token, "unions cannot be stored")),
         Data::Enum(data) => enums::expand(input, data, type_attrs),
         Data::Struct(data) => match &data.fields {
-            Fields::Named(fields) if fields.named.is_empty() => Err(structs::refuse_empty(input)),
+            // A kind's spec may be empty: the holder stores the state and records.
+            Fields::Named(fields) if fields.named.is_empty() && type_attrs.state.is_none() => Err(structs::refuse_empty(input)),
             Fields::Named(fields) => structs::expand(input, fields, type_attrs),
             Fields::Unnamed(fields) if fields.unnamed.len() == 1 => structs::newtype(input, fields, type_attrs),
             Fields::Unnamed(fields) => Err(refuse(fields, "tuple structs with more than one field cannot be stored; use named fields")),
@@ -72,7 +73,7 @@ mod tests {
         let cases = [
             quote! { struct A { #[store(unknown)] a: String } },
             quote! { struct A { #[store(index)] a: String } },
-            quote! { struct A { #[store(code = 1)] a: String } },
+            quote! { struct A { #[store(code = "c1")] a: String } },
             quote! { struct A { #[store(child, intern)] a: Vec<String> } },
             quote! { struct A { #[store(intern(x))] a: String } },
             quote! { struct A { #[store(cbor, frozen)] a: String } },
@@ -108,18 +109,20 @@ mod tests {
             quote! { struct A(String, String); },
             quote! { struct A; },
             quote! { struct A {} },
-            quote! { enum A { #[store(code = 1)] B(String) } },
+            quote! { enum A { #[store(code = "c1")] B(String) } },
             quote! { enum A { #[store(child)] B } },
-            quote! { enum A { #[store(code = 1)] B { a: Vec<String> } } },
-            quote! { enum A { #[store(code = 1)] B, C } },
-            quote! { enum A { #[store(code = 1)] B, #[store(code = 1)] C } },
-            quote! { enum A { #[store(code = 1)] Ab { c: String }, #[store(code = 2)] AB { c: String } } },
-            quote! { enum A { #[store(code = 1)] B { a: String }, #[store(code = 1)] C } },
-            quote! { enum A { #[store(code = 1)] B { a: String }, C { b: i64 } } },
+            quote! { enum A { #[store(code = "c1")] B { a: Vec<String> } } },
+            quote! { enum A { #[store(code = "c1")] B, C } },
+            quote! { enum A { #[store(code = "c1")] B, #[store(code = "c1")] C } },
+            quote! { enum A { #[store(code = "c1")] Ab { c: String }, #[store(code = "c2")] AB { c: u32 } } },
+            quote! { enum A { #[store(code = "c1")] Ab { c: String }, #[store(code = "c2")] AB { c: Option<u32> } } },
+            quote! { enum A { #[store(code = "c1")] Ab { #[store(intern)] c: String }, #[store(code = "c2")] AB { c: Option<String> } } },
+            quote! { enum A { #[store(code = "c1")] B { a: String }, #[store(code = "c1")] C } },
+            quote! { enum A { #[store(code = "c1")] B { a: String }, C { b: i64 } } },
             quote! { enum A {} },
-            quote! { #[store(kind = "A", code = 1)] enum A { #[store(code = 1)] B } },
-            quote! { enum A { #[store(code = 1)] B { #[store(state)] a: String } } },
-            quote! { enum A { #[store(code = 1)] B { a: Option<A> } } },
+            quote! { #[store(kind = "A", code = "k1")] enum A { #[store(code = "c1")] B } },
+            quote! { enum A { #[store(code = "c1")] B { #[store(state)] a: String } } },
+            quote! { enum A { #[store(code = "c1")] B { a: Option<A> } } },
             quote! { struct A { #[store(child)] a: Option<Vec<String>> } },
             quote! { struct A { #[store(child)] a: Vec<Self> } },
             quote! { struct A { #[store(records)] a: Records<A> } },
@@ -134,31 +137,70 @@ mod tests {
         }
     }
 
+    // Behaviour (#3392 G7): a code is short text written by hand, one to eight bytes, a lowercase
+    // letter then lowercase letters, digits or `_`; an integer code, anything else, or a code two
+    // variants share is refused at compile time.
+    #[test]
+    fn codes_are_short_hand_written_text() {
+        for case in [
+            quote! { enum A { #[store(code = 1)] B } },
+            quote! { enum A { #[store(code = "")] B } },
+            quote! { enum A { #[store(code = "Dr")] B } },
+            quote! { enum A { #[store(code = "1d")] B } },
+            quote! { enum A { #[store(code = "toolong_")] B, #[store(code = "abcdefghi")] C } },
+            quote! { enum A { #[store(code = "a-b")] B } },
+            quote! { #[store(kind = "A", code = 1)] struct A { a: String } },
+            quote! { #[store(kind = "A", code = "A")] struct A { a: String } },
+        ] {
+            let message = error(case.clone());
+            assert!(message.contains("a code is short text written by hand"), "{case}: {message}");
+        }
+        assert!(error(quote! { enum A { #[store(code = "dr")] B, #[store(code = "dr")] C } })
+            .contains("code \"dr\" is used by both `B` and `C`"));
+        assert!(expand(&syn::parse2(quote! { enum A { #[store(code = "abcdefgh")] B, #[store(code = "x_9")] C } }).expect("parse")).is_ok());
+    }
+
+    // Behaviour (#3392 G5, G6): a datum shared by name across a data enum's or a state's variants
+    // has one type and attribute in each, or is `T` in some and `Option<T>` in others; the derive
+    // lays it out once, as the option, and requires it under the variants carrying `T`.
+    #[test]
+    fn a_datum_may_be_t_in_one_variant_and_an_option_in_another() {
+        for case in [
+            quote! { enum A { #[store(code = "b")] B { #[store(intern)] a: String }, #[store(code = "c")] C { #[store(intern)] a: Option<String> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "b")] B { #[store(flatten)] a: P }, #[store(code = "c")] C { #[store(flatten)] a: Option<P> } } },
+        ] {
+            let expanded = expanded(case.clone());
+            assert!(expanded.contains("Layout :: required_of"), "{case}: {expanded}");
+            assert!(expanded.contains("(0usize , true)") && expanded.contains("(0usize , false)"), "{case}: {expanded}");
+        }
+        let uniform = expanded(quote! { enum A { #[store(code = "b")] B { a: String }, #[store(code = "c")] C { a: String } } });
+        assert!(!uniform.contains("required_of"), "{uniform}");
+    }
+
     // Behaviour (#3373 ruling 1): a label-plus-data state is refused, naming the closed list, when
     // a datum appears with different types or attributes in two variants, when a variant has no
     // code (or two share one), when a datum takes a storage form other than plain, `child` (a map
-    // or set), `intern` or `flatten`, and when `labels` is put anywhere but on an enum. A flattened
-    // datum and its `Option` are different types, so they cannot share a name.
+    // or set), `intern` or `flatten`, and when `labels` is put anywhere but on an enum.
     #[test]
     fn label_state_refusals_name_the_closed_list() {
         let cases = [
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { a: String }, #[store(code = 2)] C { a: u32 } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { a: String }, #[store(code = 2)] C { #[store(intern)] a: String } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(flatten)] a: P }, #[store(code = 2)] C { #[store(flatten)] a: Option<P> } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(flatten)] a: P }, #[store(code = 2)] C { a: P } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(child)] a: BTreeSet<String> }, #[store(code = 2)] C { #[store(child)] a: BTreeMap<String, String> } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B, C } },
-            quote! { #[store(labels = L)] enum A { B { a: String }, #[store(code = 2)] C } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B, #[store(code = 1)] C } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B(String) } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { a: String }, #[store(code = "c2")] C { a: u32 } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { a: String }, #[store(code = "c2")] C { #[store(intern)] a: String } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(flatten)] a: P }, #[store(code = "c2")] C { #[store(flatten)] a: Option<Q> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(flatten)] a: P }, #[store(code = "c2")] C { a: P } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(child)] a: BTreeSet<String> }, #[store(code = "c2")] C { #[store(child)] a: BTreeMap<String, String> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B, C } },
+            quote! { #[store(labels = L)] enum A { B { a: String }, #[store(code = "c2")] C } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B, #[store(code = "c1")] C } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B(String) } },
             quote! { #[store(labels = L)] enum A {} },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(frozen)] a: Frozen<Doc> } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(cbor)] a: Doc } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(child)] a: Vec<String> } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(records)] a: Records<String> } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { #[store(state)] a: State<P> } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { a: Vec<String> } } },
-            quote! { #[store(labels = L, index(name = "x", eq(a)))] enum A { #[store(code = 1)] B } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(frozen)] a: Frozen<Doc> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(cbor)] a: Doc } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(child)] a: Vec<String> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(records)] a: Records<String> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(state)] a: State<P> } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { a: Vec<String> } } },
+            quote! { #[store(labels = L, index(name = "x", eq(a)))] enum A { #[store(code = "c1")] B } },
             quote! { #[store(labels = L)] struct A { a: String } },
             quote! { #[store(labels = L)] struct A(String); },
             quote! { struct A { #[store(labels)] a: String } },
@@ -169,9 +211,10 @@ mod tests {
             assert!(message.contains(SUPPORTED), "{case} was refused without naming the list: {message}");
         }
         let mismatch =
-            error(quote! { #[store(labels = L)] enum A { #[store(code = 1)] B { a: String }, #[store(code = 2)] C { a: u32 } } });
+            error(quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { a: String }, #[store(code = "c2")] C { a: u32 } } });
         assert!(mismatch.contains("`a` is declared as `String` in `B` and as `u32` in `C`"), "{mismatch}");
-        assert!(error(quote! { #[store(labels = L, labels = M)] enum A { #[store(code = 1)] B } }).contains("twice"));
+        assert!(mismatch.contains("or is `T` in some and `Option<T>` in others"), "{mismatch}");
+        assert!(error(quote! { #[store(labels = L, labels = M)] enum A { #[store(code = "c1")] B } }).contains("twice"));
     }
 
     // Glue (#3373 ruling 1): a label-plus-data state is `Labelled` by its labels enum and
@@ -185,9 +228,9 @@ mod tests {
         let state = expanded(quote! {
             #[store(labels = TicketLabel)]
             enum TicketState {
-                #[store(code = 3)] Closed { #[store(child)] assignees: BTreeSet<String>, reason: String },
-                #[store(code = 1)] Draft,
-                #[store(code = 2)] Open {
+                #[store(code = "c3")] Closed { #[store(child)] assignees: BTreeSet<String>, reason: String },
+                #[store(code = "c1")] Draft,
+                #[store(code = "c2")] Open {
                     #[store(child)] assignees: BTreeSet<String>,
                     #[store(intern)] owner: Option<String>,
                     #[store(flatten)] hold: Option<Hold>,
@@ -200,18 +243,19 @@ mod tests {
             "type Label = TicketLabel",
             "Self :: Draft => & < TicketLabel > :: Draft",
             ":: flotilla_schema :: StateData for TicketState",
-            "const CODES : & 'static [i64] = & [1i64 , 2i64 , 3i64]",
+            "const CODES : & 'static [:: flotilla_schema :: Code] = & [const { :: flotilla_schema :: Code :: new (\"c1\") } , const { :: flotilla_schema :: Code :: new (\"c2\") } , const { :: flotilla_schema :: Code :: new (\"c3\") }]",
             "const DATA : & 'static [& 'static str] = & [\"assignees\" , \"reason\" , \"owner\" , \"hold\" , \"signature\"]",
             "layout . datum (\"assignees\" , label",
-            "layout . label_guard (label , 3i64 , & datums , & [0usize , 1usize])",
-            "layout . label_guard (label , 1i64 , & datums , & [])",
-            "layout . label_guard (label , 2i64 , & datums , & [0usize , 2usize , 3usize , 4usize])",
-            "< TicketLabel as :: flotilla_schema :: CodeEnum > :: code (& < TicketLabel > :: Open) , 2i64",
+            "layout . tag_guard (label , const { :: flotilla_schema :: Code :: new (\"c3\") } , & datums , & [(0usize , true) , (1usize , true)])",
+            "layout . tag_guard (label , const { :: flotilla_schema :: Code :: new (\"c1\") } , & datums , & [])",
+            "layout . tag_guard (label , const { :: flotilla_schema :: Code :: new (\"c2\") } , & datums , & [(0usize , true) , (2usize , false) , (3usize , false) , (4usize , true)])",
+            "< TicketLabel as :: flotilla_schema :: CodeEnum > :: code (& < TicketLabel > :: Open) , const { :: flotilla_schema :: Code :: new (\"c2\") }",
             "delta . table (\"assignees\"",
             "delta . column (\"owner\"",
             "adapt :: AsOptionalInterned as :: flotilla_schema :: adapt :: Adapter < Option < String > >",
-            "Self :: Closed { assignees : __store_assignees , .. } | Self :: Open { assignees : __store_assignees , .. }",
-            "if [3i64] . contains (& code)",
+            "Self :: Closed { assignees : __store_assignees , .. } => {",
+            "Self :: Open { assignees : __store_assignees , .. } => {",
+            "if code . as_str () == \"c3\"",
             "adapt :: AsOptionalFlat as :: flotilla_schema :: adapt :: Adapter < Option < Hold > >",
             "Hold : :: flotilla_schema :: Flat",
             "Signature : :: flotilla_schema :: Flat",
@@ -221,7 +265,7 @@ mod tests {
         }
         assert!(!state.contains("Columns for TicketState") && !state.contains("Element for TicketState"), "stored only as a State");
         // A code enum is its own label and a state carrying no data.
-        let code = expanded(quote! { enum Phase { #[store(code = 1)] A, #[store(code = 2)] B } });
+        let code = expanded(quote! { enum Phase { #[store(code = "c1")] A, #[store(code = "c2")] B } });
         assert!(code.contains("type Label = Self"), "{code}");
         assert!(code.contains("const DATA : & 'static [& 'static str] = & []"), "{code}");
     }
@@ -235,7 +279,7 @@ mod tests {
     fn index_refusals_name_the_closed_list() {
         let kind = |index: proc_macro2::TokenStream| {
             quote! {
-                #[store(kind = "A", code = 1, #index)]
+                #[store(kind = "A", code = "k1", #index)]
                 struct A {
                     a: Ref<B>,
                     b: Option<u64>,
@@ -282,7 +326,7 @@ mod tests {
         assert!(expand(&syn::parse2(kind(quote!(index(name = "x", eq(a, c, g), order(b), when(b is_some))))).expect("parse")).is_ok());
         assert!(error(kind(quote!(index(name = "x", order(c))))).contains("cannot order an index"));
         assert!(error(quote! { #[store(index(name = "x", eq(a)))] struct A(String); }).contains("belongs on a kind or a part struct"));
-        assert!(error(quote! { #[store(index(name = "x", eq(a)))] enum A { #[store(code = 1)] B } })
+        assert!(error(quote! { #[store(index(name = "x", eq(a)))] enum A { #[store(code = "c1")] B } })
             .contains("belongs on a kind or a part struct"));
     }
 
@@ -291,7 +335,7 @@ mod tests {
     #[test]
     fn indexes_expand_to_descriptors_and_constructors() {
         let expanded = expanded(quote! {
-            #[store(kind = "Message", code = 1,
+            #[store(kind = "Message", code = "k1",
                 index(name = "open_by_inbox", eq(inbox), order(seq), when(state in [Pending, Awaiting])),
                 index(name = "by_reply", eq(reply, sender), when(reply is_some)))]
             struct Message {
@@ -350,17 +394,17 @@ mod tests {
 
     #[test]
     fn kinds_need_a_name_and_a_code_together() {
-        assert!(error(quote! { #[store(kind = "A")] struct A { a: String } }).contains("needs a stable `code = N`"));
-        assert!(error(quote! { #[store(code = 1)] struct A { a: String } }).contains("needs `kind"));
-        assert!(error(quote! { #[store(kind = "snake_case", code = 1)] struct A { a: String } }).contains("UpperCamelCase"));
-        assert!(error(quote! { #[store(kind = "A", kind = "B", code = 1)] struct A { a: String } }).contains("twice"));
+        assert!(error(quote! { #[store(kind = "A")] struct A { a: String } }).contains("needs a stable `code = \"..\"`"));
+        assert!(error(quote! { #[store(code = "c1")] struct A { a: String } }).contains("needs `kind"));
+        assert!(error(quote! { #[store(kind = "snake_case", code = "k1")] struct A { a: String } }).contains("UpperCamelCase"));
+        assert!(error(quote! { #[store(kind = "A", kind = "B", code = "k1")] struct A { a: String } }).contains("twice"));
     }
 
     // Glue: an accepted kind expands to the Element and Kind impls with per-field Column bounds.
     #[test]
     fn kinds_expand_with_per_field_bounds() {
         let input: DeriveInput = syn::parse2(quote! {
-            #[store(kind = "Message", code = 7)]
+            #[store(kind = "Message", code = "k7")]
             struct Message<T> { body: String, r#type: Option<T> }
         })
         .expect("parse");
@@ -410,7 +454,7 @@ mod tests {
     #[test]
     fn kind_impls_bound_only_generic_fields() {
         let expanded = expanded(quote! {
-            #[store(kind = "Message", code = 1)]
+            #[store(kind = "Message", code = "k1")]
             struct Message<T> { reply: Option<Ref<Message<T>>>, body: String, extra: T }
         });
         let kind = &expanded[expanded.find(":: flotilla_schema :: Kind for").expect("kind impl")..];
@@ -420,16 +464,29 @@ mod tests {
         assert!(!header.contains("String :"), "concrete fields are checked through Element only: {header}");
     }
 
-    // Behaviour (DESIGN codes): a code enum's CODES are ascending whatever the declaration order,
-    // and a data enum's variant columns are `<variant>_<field>` below the prefix.
+    // Behaviour (DESIGN codes, #3392 G6): a code enum's CODES are ascending whatever the
+    // declaration order, and a data enum's datums are named by the field alone below the prefix
+    // (mapping B), with one tag guard per variant, unit variants included (they null every datum).
     #[test]
-    fn enums_take_codes_and_variant_prefixes() {
-        let code = expanded(quote! { enum Phase { #[store(code = 3)] Late, #[store(code = 1)] Early } });
-        assert!(code.contains("const CODES : & 'static [i64] = & [1i64 , 3i64]"), "{code}");
-        let data = expanded(quote! { enum Edge { #[store(code = 2)] DropIt { #[store(intern)] by: String }, #[store(code = 1)] Go } });
-        assert!(data.contains("\"drop_it_by\""), "{data}");
-        assert!(data.contains("layout . guard (tag , 2i64"), "{data}");
-        assert!(!data.contains("layout . guard (tag , 1i64"), "unit variants have no guard");
+    fn enums_take_codes_and_shared_datums() {
+        let code = expanded(quote! { enum Phase { #[store(code = "late")] Late, #[store(code = "early")] Early } });
+        let early = "const { :: flotilla_schema :: Code :: new (\"early\") }";
+        let late = "const { :: flotilla_schema :: Code :: new (\"late\") }";
+        assert!(code.contains(&format!("const CODES : & 'static [:: flotilla_schema :: Code] = & [{early} , {late}]")), "{code}");
+        let data =
+            expanded(quote! { enum Edge { #[store(code = "dr")] DropIt { #[store(intern)] by: String }, #[store(code = "go")] Go } });
+        assert!(data.contains("\"by\"") && !data.contains("drop_it"), "{data}");
+        assert!(
+            data.contains(
+                "layout . tag_guard (tag , const { :: flotilla_schema :: Code :: new (\"dr\") } , & datums , & [(0usize , true)])"
+            ),
+            "{data}"
+        );
+        assert!(
+            data.contains("layout . tag_guard (tag , const { :: flotilla_schema :: Code :: new (\"go\") } , & datums , & [])"),
+            "{data}"
+        );
+        assert!(data.contains("layout . expansion (tag , & datums)"), "{data}");
     }
 
     // Behaviour (#3320 ruling 1): every field of a struct gets an edge handle named by the field in
@@ -441,7 +498,7 @@ mod tests {
     #[test]
     fn fields_expand_to_edge_handles() {
         let kind = expanded(quote! {
-            #[store(kind = "Message", code = 1)]
+            #[store(kind = "Message", code = "k1")]
             struct Message<T> {
                 #[store(state)] state: State<Phase>,
                 #[store(history)] pub edges: Records<Event<T>>,
@@ -477,10 +534,10 @@ mod tests {
     #[test]
     fn handles_that_would_shadow_trait_items_are_refused() {
         for case in [
-            quote! { #[store(kind = "A", code = 1)] struct A { kind: String } },
-            quote! { #[store(kind = "A", code = 1)] struct A { code: u32 } },
+            quote! { #[store(kind = "A", code = "k1")] struct A { kind: String } },
+            quote! { #[store(kind = "A", code = "k1")] struct A { code: u32 } },
             quote! { struct A { tables: u32 } },
-            quote! { #[store(kind = "A", code = 1)] struct A { r#tables: u32 } },
+            quote! { #[store(kind = "A", code = "k1")] struct A { r#tables: u32 } },
         ] {
             let message = error(case.clone());
             assert!(message.contains(SUPPORTED) && message.contains("edge handle"), "{case}: {message}");
@@ -508,5 +565,45 @@ mod tests {
     fn newtypes_of_string_intern() {
         assert!(expanded(quote! { struct Name(String); }).contains(":: flotilla_schema :: Intern for Name"));
         assert!(!expanded(quote! { struct Count(u32); }).contains("Intern for"));
+    }
+
+    // Behaviour (#3392 ruling D5): a kind's spec (`state = S` beside `kind` and `code`) declares
+    // the kind a generic holder stores: it is a row (`Element`) and a `KindSpec` naming its state,
+    // with no `Kind` and no edge handles of its own; its indexes may name the holder's `state`, and
+    // their queries carry the spec's kind code. A spec may be empty.
+    #[test]
+    fn specs_declare_a_holders_kind() {
+        let spec = expanded(quote! {
+            #[store(kind = "Message", code = "ms", state = MessageState,
+                index(name = "open_by_inbox", eq(inbox), when(state in [Pending, Awaiting])))]
+            struct MessageSpec {
+                #[store(intern)] inbox: String,
+                deadline: Option<Timestamp>,
+            }
+        });
+        for expected in [
+            ":: flotilla_schema :: Element for MessageSpec",
+            ":: flotilla_schema :: KindSpec for MessageSpec",
+            "type State = MessageState ;",
+            "column : :: std :: string :: String :: from (\"state\")",
+            "< < MessageState as :: flotilla_schema :: Labelled > :: Label > :: Pending",
+            "IndexQuery :: new (< Self as :: flotilla_schema :: KindSpec > :: CODE",
+        ] {
+            assert!(spec.contains(expected), "missing {expected} in {spec}");
+        }
+        assert!(!spec.contains(":: flotilla_schema :: Kind for"), "the holder is the kind");
+        assert!(!spec.contains("const INBOX"), "no edge handles on a spec");
+        assert!(expanded(quote! { #[store(kind = "Session", code = "as", state = SessionState)] struct SessionSpec {} })
+            .contains("KindSpec for SessionSpec"));
+        for (case, problem) in [
+            (quote! { #[store(state = S)] struct A { a: u8 } }, "needs `kind"),
+            (quote! { #[store(kind = "A", code = "k1", state = S)] struct A { #[store(state)] s: State<S> } }, "no state field"),
+            (quote! { #[store(kind = "A", code = "k1", state = S)] struct A { state: u8 } }, "rename this field"),
+            (quote! { #[store(state = S)] enum A { #[store(code = "c1")] B } }, "spec struct"),
+            (quote! { #[store(kind = "A", code = "k1", index(name = "x", eq(a), when(state in [B])))] struct A { a: u8 } }, "not a field"),
+        ] {
+            let message = error(case.clone());
+            assert!(message.contains(SUPPORTED) && message.contains(problem), "{case}: {message}");
+        }
     }
 }
