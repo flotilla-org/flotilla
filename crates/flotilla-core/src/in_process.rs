@@ -1435,6 +1435,7 @@ pub struct InProcessDaemon {
     /// Provisioning namespace used by daemon-side resource operations (e.g.
     /// looking up the Convoy whose task is being marked complete). Set by the
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
+    image_layer_refresh: Arc<Mutex<project_image_layers::LayerRefreshState>>,
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
     checkout_namespace_changes: tokio::sync::watch::Sender<()>,
     fleet: FleetService,
@@ -2000,6 +2001,7 @@ impl InProcessDaemon {
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
             aggregator_projection_state: aggregator_projection_state.clone(),
+            image_layer_refresh: Default::default(),
             provisioning_namespace: Arc::clone(&provisioning_namespace),
             fleet: FleetService::new(
                 aggregator_projection_state.clone(),
@@ -4275,6 +4277,7 @@ impl InProcessDaemon {
 
     fn project_service(&self) -> project_ops::ProjectService<'_> {
         project_ops::ProjectService {
+            image_layer_refresh: Arc::clone(&self.image_layer_refresh),
             resource_backend: &self.resource_backend,
             observed_resource_backend: &self.observed_resource_backend,
             clock: &self.clock,
@@ -4922,6 +4925,9 @@ impl InProcessDaemon {
             .read_projections()
             .fleet_health_request(&reads, &namespace, host_list, self.local_host_id().map(|id| id.to_string()), now)
             .await?;
+        if let Some(local) = response.hosts.iter_mut().find(|host| host.is_local) {
+            local.degraded_conditions.extend(self.image_layer_refresh.lock().await.diagnoses());
+        }
         response.forge_budgets.retain(|row| row.host != self.host_name().as_str());
         response.forge_budgets.extend(self.forge_budget_rows());
         Ok(response)

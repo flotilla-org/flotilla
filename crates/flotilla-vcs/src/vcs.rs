@@ -700,23 +700,51 @@ impl FlotillaVcs {
 #[async_trait]
 impl Vcs for FlotillaVcs {
     async fn fetch_revision(&self, cache: &Path, repo: &str, branch: &str) -> Result<String, String> {
-        // Keep fetch+resolve atomic across providers sharing an object cache.
         let directory = revision_cache(cache, repo);
-        let lock = object_cache_lock(&directory);
-        let _guard = lock.lock().await;
-        tokio::fs::create_dir_all(&directory).await.map_err(|error| error.to_string())?;
-        let backend = GitCliBackend::new(&directory, &*self.runner);
-        backend.run(&["init", "--bare", "."]).await?;
-        backend.run(&["check-ref-format", &format!("refs/heads/{branch}")]).await?;
-        // Readers need only the tip tree. No ref records it, so a later shallow
-        // fetch of an advanced or rewritten head never needs the old history.
-        tokio::time::timeout(
-            Duration::from_secs(60),
-            backend.run(&["fetch", "--depth=1", "--no-tags", "--", repo, &format!("refs/heads/{branch}")]),
-        )
-        .await
-        .map_err(|_| REVISION_FETCH_TIMEOUT.to_string())??;
-        Ok(backend.resolve_ref("FETCH_HEAD^{commit}").await?.trim().to_string())
+        let guard = object_cache_lock(&directory).lock_owned().await;
+        let runner = Arc::clone(&self.runner);
+        let repo = repo.to_string();
+        let branch = branch.to_string();
+        // A source read has a shorter deadline than a fetch. Its cancellation
+        // must not SIGKILL Git mid-write or release exclusion before Git exits.
+        // The owned task finishes the transaction even if its reader goes away.
+        let fetch = tokio::spawn(async move {
+            let _guard = guard;
+            tokio::fs::create_dir_all(&directory).await.map_err(|error| error.to_string())?;
+            // This private object cache is mutated only under this exclusion.
+            // Every fetch retains it until the command exits, so a shallow lock
+            // found here cannot belong to any live fetch owned by this daemon.
+            let shallow_lock = directory.join("shallow.lock");
+            match tokio::fs::remove_file(&shallow_lock).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("recover stale Git lock {}: {error}", shallow_lock.display())),
+            }
+            let backend = GitCliBackend::new(&directory, &*runner);
+            backend.run(&["init", "--bare", "."]).await?;
+            backend.run(&["check-ref-format", &format!("refs/heads/{branch}")]).await?;
+            // Bound stalled HTTP transfers without cancelling Git's lock cleanup.
+            backend
+                .run(&[
+                    "-c",
+                    "http.lowSpeedLimit=1",
+                    "-c",
+                    "http.lowSpeedTime=60",
+                    "fetch",
+                    "--depth=1",
+                    "--no-tags",
+                    "--",
+                    &repo,
+                    &format!("refs/heads/{branch}"),
+                ])
+                .await?;
+            Ok(backend.resolve_ref("FETCH_HEAD^{commit}").await?.trim().to_string())
+        });
+        // Timing out the reader detaches the task; it does not abort the writer.
+        tokio::time::timeout(Duration::from_secs(60), fetch)
+            .await
+            .map_err(|_| REVISION_FETCH_TIMEOUT.to_string())?
+            .map_err(|error| format!("revision fetch task: {error}"))?
     }
 
     // FETCH_HEAD's mtime is the last use: every source read fetches first.
@@ -2311,6 +2339,56 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(task.is_finished(), "fetch itself must expire after 60 seconds");
         assert_eq!(task.await.expect("fetch task").expect_err("fetch deadline"), "revision fetch exceeded 60 seconds");
+    }
+
+    // A cancelled charter read must not interrupt Git while it owns shallow.lock.
+    // The injected command runner stands in for the Git subprocess boundary.
+    #[tokio::test]
+    async fn cancelled_revision_fetch_keeps_cache_excluded_until_git_finishes() {
+        struct Fetch {
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl CommandRunner for Fetch {
+            async fn run(&self, _: &str, args: &[&str], _: &Path, _: &flotilla_provider_runtime::ChannelLabel) -> Result<String, String> {
+                if args.contains(&"fetch") {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                Ok("commit".into())
+            }
+            async fn run_output(
+                &self,
+                _: &str,
+                _: &[&str],
+                _: &Path,
+                _: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<CommandOutput, String> {
+                unreachable!()
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                true
+            }
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let directory = revision_cache(cache.path(), "repo");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        tokio::fs::write(directory.join("shallow.lock"), "leftover").await.unwrap();
+        let runner = Arc::new(Fetch { started: tokio::sync::Notify::new(), release: tokio::sync::Notify::new() });
+        let vcs = FlotillaVcs::object_cache(runner.clone());
+        let path = cache.path().to_owned();
+        let task = tokio::spawn(async move { vcs.fetch_revision(&path, "repo", "main").await });
+        runner.started.notified().await;
+        assert!(!directory.join("shallow.lock").exists(), "leftover lock is recovered before fetching");
+        tokio::fs::write(directory.join("shallow.lock"), "live").await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let lock = object_cache_lock(&directory);
+        assert!(lock.try_lock().is_err(), "the running fetch still owns the cache after caller cancellation");
+        assert_eq!(tokio::fs::read_to_string(directory.join("shallow.lock")).await.unwrap(), "live");
+        runner.release.notify_one();
+        let _guard = lock.lock().await;
     }
 
     fn git_text(cwd: &Path, args: &[&str]) -> String {

@@ -823,6 +823,54 @@ mod tests {
         }
     }
 
+    // A leftover shallow.lock must recover through the real RevisionedTree/Vcs
+    // path. This runner replaces only the Git subprocess, not the recovery logic.
+    #[tokio::test]
+    async fn charter_refresh_recovers_leftover_shallow_lock() {
+        struct Git;
+        #[async_trait::async_trait]
+        impl CommandRunner for Git {
+            async fn run(&self, _: &str, args: &[&str], cwd: &Path, _: &ChannelLabel) -> Result<String, String> {
+                if args.contains(&"fetch") && cwd.join("shallow.lock").exists() {
+                    return Err(format!("Unable to create {}/shallow.lock: File exists", cwd.display()));
+                }
+                Ok(if args.contains(&"ls-tree") {
+                    "100644 blob abc 5\tproject.yaml\0".into()
+                } else if args.contains(&"rev-parse") {
+                    "commit".into()
+                } else {
+                    String::new()
+                })
+            }
+            async fn run_output(
+                &self,
+                _: &str,
+                _: &[&str],
+                _: &Path,
+                _: &ChannelLabel,
+            ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+                unreachable!()
+            }
+            async fn run_to_file(&self, _: &str, _: &[&str], _: &Path, destination: &Path) -> Result<(), String> {
+                tokio::fs::write(destination, "hello").await.map_err(|error| error.to_string())
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                true
+            }
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let repo = "https://example.test/charter";
+        let directory = cache.path().join(format!("{:x}", Sha256::digest(repo.as_bytes())));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        tokio::fs::write(directory.join("shallow.lock"), "leftover").await.unwrap();
+        let vcs = FlotillaVcs::object_cache(Arc::new(Git));
+        let source = CharterSource::Repository { repo: repo.into(), branch: "main".into(), path: ".".into() };
+        let snapshot = read_charter_source(&source, cache.path(), Some(&vcs)).await.expect("recovered refresh");
+        assert_eq!(snapshot.revision, "commit");
+        assert_eq!(snapshot.files, BTreeMap::from([("project.yaml".into(), "hello".into())]));
+        assert!(!directory.join("shallow.lock").exists());
+    }
+
     // This double stands in for a hung Git subprocess; all earlier commands finish.
     struct HungFetchRunner;
 

@@ -62,6 +62,46 @@ pub(super) async fn primary_layer_home(
     Ok(Some(LayerHome::Source(CharterSource::Repository { repo, branch, path })))
 }
 
+/// Host-local retry state; successful reads and source changes reset refusal backoff.
+#[derive(Default)]
+pub(super) struct LayerRefreshState {
+    refusals: BTreeMap<(String, String), LayerRefusal>,
+}
+
+struct LayerRefusal {
+    source: CharterSource,
+    error: String,
+    delay: std::time::Duration,
+    retry_at: tokio::time::Instant,
+}
+
+impl LayerRefreshState {
+    pub(super) fn diagnoses(&self) -> Vec<String> {
+        self.refusals
+            .iter()
+            .map(|((namespace, project), refusal)| {
+                format!("ProjectImageLayer/{namespace}/{project}: {}; retaining previous layer and retrying with backoff", refusal.error)
+            })
+            .collect()
+    }
+
+    fn deferred(&self, namespace: &str, project: &str, source: &CharterSource) -> bool {
+        self.refusals
+            .get(&(namespace.into(), project.into()))
+            .is_some_and(|refusal| &refusal.source == source && tokio::time::Instant::now() < refusal.retry_at)
+    }
+
+    fn refused(&mut self, namespace: &str, project: &str, source: &CharterSource, error: String) {
+        let key = (namespace.to_string(), project.to_string());
+        let delay = self
+            .refusals
+            .get(&key)
+            .filter(|previous| previous.source == *source && previous.error == error)
+            .map_or(std::time::Duration::from_secs(60), |previous| (previous.delay * 2).min(std::time::Duration::from_secs(3600)));
+        self.refusals.insert(key, LayerRefusal { source: source.clone(), error, delay, retry_at: tokio::time::Instant::now() + delay });
+    }
+}
+
 impl ProjectService<'_> {
     /// Sync every project's layer directory this host is responsible for.
     /// Each project's failure is reported and leaves its previous layer.
@@ -78,6 +118,7 @@ impl ProjectService<'_> {
             .map(|project| project.metadata.name)
             .collect::<std::collections::BTreeSet<_>>();
         let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+        self.image_layer_refresh.lock().await.refusals.retain(|(ns, project), _| ns != &namespace || local.contains(project));
         for project in projects {
             if project.metadata.deletion_timestamp.is_some() || !local.contains(&project.metadata.name) {
                 continue;
@@ -91,8 +132,14 @@ impl ProjectService<'_> {
                 }
             };
             if let LayerHome::Source(source) = home {
-                if let Err(error) = self.sync_project_image_layer(&namespace, &project.metadata.name, &source).await {
-                    warn!(project = %project.metadata.name, %error, "project image layer refused; keeping the previous layer");
+                if self.image_layer_refresh.lock().await.deferred(&namespace, &project.metadata.name, &source) {
+                    continue;
+                }
+                match self.sync_project_image_layer(&namespace, &project.metadata.name, &source).await {
+                    Ok(()) => {
+                        self.image_layer_refresh.lock().await.refusals.remove(&(namespace.clone(), project.metadata.name.clone()));
+                    }
+                    Err(error) => self.image_layer_refresh.lock().await.refused(&namespace, &project.metadata.name, &source, error),
                 }
             }
         }
@@ -197,6 +244,7 @@ mod tests {
     struct LayerSource {
         files: Mutex<Option<BTreeMap<String, Vec<u8>>>>,
         reads: Mutex<Vec<CharterSource>>,
+        error: Mutex<Option<String>>,
     }
 
     #[async_trait]
@@ -207,6 +255,9 @@ mod tests {
 
         async fn image_layer_snapshot(&self, source: &CharterSource) -> Result<Option<LayerDirectorySnapshot>, String> {
             self.reads.lock().expect("reads").push(source.clone());
+            if let Some(error) = self.error.lock().unwrap().clone() {
+                return Err(error);
+            }
             Ok(self.files.lock().expect("files").clone().map(|files| LayerDirectorySnapshot { revision: "commit".into(), files }))
         }
     }
@@ -280,6 +331,76 @@ mod tests {
         backend.using::<Project>("flotilla").create(&InputMeta::builder().name("app".into()).build(), &spec).await.expect("project");
     }
 
+    // Repeated failures retain the previous layer, back off reads, and expose
+    // exactly one current project diagnosis, cleared by a successful retry.
+    #[tokio::test(start_paused = true)]
+    async fn image_layer_refusal_backs_off_and_recovers() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let observed = ResourceBackend::new(InMemoryBackend::observed());
+        seed(&backend, None).await;
+        let source = Arc::new(LayerSource::default());
+        let operations = Operations(source.clone());
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let namespace = std::sync::RwLock::new("flotilla".to_string());
+        let service = service(&backend, &observed, &clock, &namespace, &operations);
+        *source.error.lock().unwrap() = Some("Unable to create /cache/shallow.lock: File exists".into());
+        service.reconcile_project_image_layers().await.unwrap();
+        for _ in 0..10 {
+            service.reconcile_project_image_layers().await.unwrap();
+        }
+        assert_eq!(source.reads.lock().unwrap().len(), 1);
+        let diagnoses = service.image_layer_refresh.lock().await.diagnoses();
+        assert_eq!(diagnoses.len(), 1);
+        assert!(diagnoses[0].contains("app") && diagnoses[0].contains("/cache/shallow.lock"));
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        service.reconcile_project_image_layers().await.unwrap();
+        assert_eq!(source.reads.lock().unwrap().len(), 2);
+        tokio::time::advance(std::time::Duration::from_secs(119)).await;
+        service.reconcile_project_image_layers().await.unwrap();
+        assert_eq!(source.reads.lock().unwrap().len(), 2);
+        *source.error.lock().unwrap() = None;
+        *source.files.lock().unwrap() = Some(layer_files("1.0.0"));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        service.reconcile_project_image_layers().await.unwrap();
+        assert_eq!(source.reads.lock().unwrap().len(), 3);
+        assert!(service.image_layer_refresh.lock().await.diagnoses().is_empty());
+        assert!(backend.using::<ImageLayer>("flotilla").get(&layer_name("1.0.0")).await.is_ok());
+    }
+
+    // Across duplicate, changed-error, and changed-source sequences the retry
+    // delay grows only for identical refusals and stays within 60..=3600s.
+    #[hegel::test]
+    fn refusal_delay_is_bounded_and_resets(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(20));
+        let changes: Vec<_> = (0..count).map(|_| tc.draw(gs::integers::<u8>().min_value(0).max_value(2))).collect();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+        runtime.block_on(async {
+            let mut state = LayerRefreshState::default();
+            let mut directory = String::from("/initial");
+            let mut error = String::from("initial");
+            let mut expected = 0u64;
+            for (step, change) in changes.into_iter().enumerate() {
+                if change == 1 {
+                    directory = format!("/source-{step}");
+                }
+                if change == 2 {
+                    error = format!("error-{step}");
+                }
+                expected = if change == 0 && expected != 0 { (expected * 2).min(3600) } else { 60 };
+                let source = CharterSource::LocalDirectory { directory: directory.clone() };
+                state.refused("ns", "app", &source, error.clone());
+                assert!(state.deferred("ns", "app", &source));
+                assert!(!state.deferred("ns", "app", &CharterSource::LocalDirectory { directory: "/other".into() }));
+                assert_eq!(state.diagnoses().len(), 1);
+                tokio::time::advance(std::time::Duration::from_secs(expected - 1)).await;
+                assert!(state.deferred("ns", "app", &source));
+                tokio::time::advance(std::time::Duration::from_secs(1)).await;
+                assert!(!state.deferred("ns", "app", &source));
+            }
+        });
+    }
+
     // ADR 0062 (B3): the primary repository's `.flotilla/image/` at its
     // default branch becomes the project's layer; unchanged definitions are
     // never rewritten, a version bump replaces the layer, an invalid layer
@@ -295,6 +416,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
         let service = ProjectService {
+            image_layer_refresh: Default::default(),
             resource_backend: &backend,
             observed_resource_backend: &observed,
             clock: &clock,
@@ -341,6 +463,8 @@ mod tests {
         assert_eq!(names().await, [layer_name("1.1.0")], "an invalid layer keeps the previous one");
 
         *source.files.lock().expect("files") = None;
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
         service.reconcile_project_image_layers().await.expect("opt out");
         assert!(names().await.is_empty(), "removing the directory removes the layer");
     }
@@ -353,6 +477,7 @@ mod tests {
         operations: &'a Operations,
     ) -> ProjectService<'a> {
         ProjectService {
+            image_layer_refresh: Default::default(),
             resource_backend: backend,
             observed_resource_backend: observed,
             clock,
