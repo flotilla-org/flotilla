@@ -579,6 +579,7 @@ impl ReconcilerWake {
             let cached = final_inputs.as_ref().is_some_and(|inputs| {
                 views.final_settlements.lock().expect("settlement cache lock poisoned").get(&convoy.metadata.name) == Some(inputs)
             });
+            let mut settlement_makers = Vec::new();
             let satisfied = if cached {
                 true
             } else {
@@ -612,10 +613,69 @@ impl ReconcilerWake {
                 } else {
                     views.final_settlements.lock().expect("settlement cache lock poisoned").remove(&convoy.metadata.name);
                 }
+                // Empty exit tables still have a producer while discovery or
+                // checkout evidence is pending. Invalid/no-exit evaluations do
+                // not acquire a blanket dependency: those can be real dead ends.
+                use flotilla_resources::UnmetSettlementExpectation as Unmet;
+                for unmet in &settlement.unmet {
+                    let maker = match unmet {
+                        Unmet::SubjectDiscoveryPending { .. } => {
+                            Some(LeafMaker::Observed { refresher: "branch_subject_scan".into(), external_party: "forge".into() })
+                        }
+                        Unmet::MissingCheckout { checkout } => convoy_vessels
+                            .values()
+                            .find(|vessel| {
+                                vessel.status.as_ref().is_some_and(|status| status.checkout_refs.values().any(|name| name == checkout))
+                            })
+                            .map(|vessel| {
+                                let now = self.subscriptions.inner.clock.now();
+                                LeafMaker::Controller {
+                                    resource_kind: "Vessel".into(),
+                                    name: Some(vessel.metadata.name.clone()),
+                                    retry: ControllerRetry::retryable_at(None, now, now),
+                                    ceiling: RetryCeiling::default(),
+                                }
+                            }),
+                        Unmet::MissingObservedRef { reference } | Unmet::StaleObservedRef { reference, .. } => checkouts
+                            .values()
+                            .find(|checkout| {
+                                let branch = match &checkout.spec {
+                                    CheckoutSpec::Worktree(spec) => &spec.r#ref,
+                                    CheckoutSpec::FreshClone(spec) => &spec.r#ref,
+                                    CheckoutSpec::Observed(spec) => &spec.r#ref,
+                                };
+                                // The integration observer probes this checkout's
+                                // branch, normalized exactly like ls-remote input.
+                                if branch.starts_with("refs/") {
+                                    branch == reference
+                                } else {
+                                    format!("refs/heads/{branch}") == *reference
+                                }
+                            })
+                            .map(|checkout| LeafMaker::Observed {
+                                refresher: "checkout_integration".into(),
+                                external_party: format!("Checkout/{}", checkout.metadata.name),
+                            }),
+                        _ => None,
+                    };
+                    if let Some(maker) = maker {
+                        if !settlement_makers.contains(&maker) {
+                            settlement_makers.push(maker);
+                        }
+                    }
+                }
                 settlement.satisfied
             };
+            let now = self.subscriptions.inner.clock.now();
             if satisfied {
-                let now = self.subscriptions.inner.clock.now();
+                settlement_makers.push(LeafMaker::Controller {
+                    resource_kind: "Convoy".into(),
+                    name: Some(convoy.metadata.name.clone()),
+                    retry: ControllerRetry::retryable_at(None, now, now),
+                    ceiling: RetryCeiling::default(),
+                });
+            }
+            for maker in settlement_makers {
                 desired.push(LeafSubscriptionRow {
                     id: uuid::Uuid::nil(),
                     namespace: namespace.into(),
@@ -626,12 +686,7 @@ impl ReconcilerWake {
                         literal: "Landed".into(),
                     }],
                     watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
-                    maker: LeafMaker::Controller {
-                        resource_kind: "Convoy".into(),
-                        name: Some(convoy.metadata.name.clone()),
-                        retry: ControllerRetry::retryable_at(None, now, now),
-                        ceiling: RetryCeiling::default(),
-                    },
+                    maker,
                     freshness_demand: None,
                     created_at: now,
                     episode_key: EpisodeKeyFields::default(),

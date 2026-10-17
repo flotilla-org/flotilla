@@ -255,3 +255,243 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
         }
     });
 }
+
+// #3428: finished crews do not owe another turn while branch discovery is
+// pending. Discovery and a live Vessel owe evidence before the Convoy controller
+// owes Landed; removal of a completed Vessel discharges its checkout expectation.
+#[tokio::test]
+async fn landing_discovery_window_has_an_owed_row_then_settles() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let wake = supervision_wake(&backend);
+    let now = Utc::now();
+    create_convoy(
+        &backend,
+        "discovering",
+        ConvoyStatus {
+            phase: ConvoyPhase::Landing,
+            workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
+                stall_nudges: Default::default(),
+                supervision: None,
+                exit: Some(ExitDeclaration::standard_table()),
+                turn_delivery: Default::default(),
+                vessels: vec![],
+            }),
+            work: BTreeMap::from([(
+                "work".into(),
+                WorkState::builder()
+                    .phase(WorkPhase::Complete)
+                    .placement(flotilla_resources::PlacementStatus {
+                        fields: BTreeMap::from([("checkout_refs".into(), serde_json::json!({"repo": "checkout"}))]),
+                    })
+                    .build(),
+            )]),
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from_iter(
+                    ["governor", "aide"]
+                        .map(|role| (role.into(), flotilla_resources::CrewWorkState::builder().phase(CrewWorkPhase::Done).build())),
+                ),
+            )]),
+            ..Default::default()
+        },
+    )
+    .await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let vessels = backend.using::<Vessel>("flotilla");
+    let vessel = vessels
+        .create(
+            &InputMeta::builder().name("producer".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "discovering".into())])).build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "discovering".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+    vessels
+        .update_status(
+            "producer",
+            &vessel.metadata.resource_version,
+            &flotilla_resources::VesselStatus {
+                checkout_refs: BTreeMap::from([(RepositoryKey("repo".into()), "checkout".into())]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    for step in 0..3 {
+        if step == 1 {
+            flotilla_store::apply_status_patch(
+                &convoys,
+                "discovering",
+                &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: now },
+            )
+            .await
+            .unwrap();
+        }
+        if step == 2 {
+            vessels.delete("producer").await.unwrap();
+        }
+        let objects = HashMap::from([("discovering".into(), convoys.get("discovering").await.unwrap())]);
+        wake.sync_rows("flotilla", &objects).await.unwrap();
+        wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
+        let status = convoys.get("discovering").await.unwrap().status.unwrap();
+        assert!(status.stalled.is_none(), "pending discovery must not be a no-row stall: {:?}", status.stalled);
+        let rows = wake.subscriptions.rows().await;
+        assert_eq!(rows.len(), 1);
+        if step > 0 {
+            let expected_kind = if step == 1 { "Vessel" } else { "Convoy" };
+            let expected_name = if step == 1 { "producer" } else { "discovering" };
+            assert!(matches!(&rows[0].maker, LeafMaker::Controller { resource_kind, name: Some(name), .. }
+                if resource_kind == expected_kind && name == expected_name));
+        } else {
+            assert!(matches!(&rows[0].maker, LeafMaker::Observed { refresher, .. } if refresher == "branch_subject_scan"));
+        }
+    }
+}
+
+// #3428: a Landing convoy with no exit and no evidence producer still has
+// no route forward. Keep the empty-row stall and its diagnostic evidence.
+#[tokio::test]
+async fn landing_with_nothing_owed_stalls_with_evidence() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let wake = supervision_wake(&backend);
+    create_convoy(&backend, "dead-end", ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() }).await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let objects = HashMap::from([("dead-end".into(), convoys.get("dead-end").await.unwrap())]);
+    wake.sync_rows("flotilla", &objects).await.unwrap();
+    assert!(wake.subscriptions.rows().await.is_empty());
+    wake.judge_stalls_at("flotilla", &objects, Utc::now()).await.unwrap();
+    let stall = convoys.get("dead-end").await.unwrap().status.unwrap().stalled.expect("genuine dead end stalls");
+    assert_eq!(stall.source, flotilla_resources::StallEvidenceSource::LeafEngine);
+    assert_eq!(stall.evidence, "no armed row with an able maker");
+}
+
+// #3428: Git owes missing/stale digest evidence while the checkout exists.
+// Fresh matching evidence transfers the obligation to the Convoy controller;
+// a fresh mismatch or an absent producer remains a genuine dead end.
+#[hegel::test]
+fn landing_digest_evidence_obligations_follow_observations(tc: hegel::TestCase) {
+    // Duplicate refreshes and arbitrary state changes cross the exact TTL;
+    // fixed boundary cases guarantee that every obligation transition runs.
+    let qualified_branch = tc.draw(hegel::generators::booleans());
+    let count = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(5));
+    let mut steps = vec![0, 1, 2, 3];
+    steps.extend((0..count).map(|_| tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3))));
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let mut wake = supervision_wake(&backend);
+        let now = Utc::now();
+        wake.subscriptions = wake.subscriptions.with_clock(Arc::new(flotilla_store_testkit::VirtualClock::new(now)));
+        create_convoy(
+            &backend,
+            "digest",
+            ConvoyStatus {
+                phase: ConvoyPhase::Landing,
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([(
+                        "coder".into(),
+                        CrewWorkState::builder()
+                            .phase(CrewWorkPhase::Done)
+                            .claim_evidence(flotilla_resources::SettlementClaimEvidence {
+                                refs: flotilla_resources::ReviewRefPair { base: "main".into(), head: "refs/heads/branch".into() },
+                                bundle_url: "https://example.test/bundle".into(),
+                                claimed_head_digest: "expected".into(),
+                            })
+                            .build(),
+                    )]),
+                )]),
+                ..Default::default()
+            },
+        )
+        .await;
+        let checkouts = backend.using::<Checkout>("flotilla");
+        checkouts
+            .create(
+                &InputMeta::builder()
+                    .name("digest-checkout".into())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.into(), "digest".into())]))
+                    .build(),
+                &CheckoutSpec::Observed(
+                    ObservedCheckoutSpec::builder()
+                        .r#ref(if qualified_branch { "refs/heads/branch" } else { "branch" }.into())
+                        .path("/unused".into())
+                        .repo_ref(RepositoryKey("repo".into()))
+                        .host_ref("host".into())
+                        .is_main(false)
+                        .build(),
+                ),
+            )
+            .await
+            .unwrap();
+        let convoys = backend.using::<Convoy>("flotilla");
+        for step in steps {
+            let checkout = checkouts.get("digest-checkout").await.unwrap();
+            let mut status = flotilla_resources::CheckoutStatus::default();
+            if step != 0 {
+                status.integration.remote_refs.insert(
+                    "refs/heads/branch".into(),
+                    flotilla_resources::RemoteRefObservation {
+                        digest: if step == 3 { "different" } else { "expected" }.into(),
+                        observed_at: (if step == 1 {
+                            now - chrono::Duration::from_std(flotilla_resources::LANDING_EVIDENCE_TTL).unwrap()
+                        } else {
+                            now
+                        })
+                        .to_rfc3339(),
+                    },
+                );
+            }
+            checkouts.update_status("digest-checkout", &checkout.metadata.resource_version, &status).await.unwrap();
+            let objects = HashMap::from([("digest".into(), convoys.get("digest").await.unwrap())]);
+            wake.sync_rows("flotilla", &objects).await.unwrap();
+            wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
+            assert_eq!(convoys.get("digest").await.unwrap().status.unwrap().stalled.is_some(), step == 3);
+            let rows = wake.subscriptions.rows().await;
+            if step < 2 {
+                assert!(rows
+                    .iter()
+                    .any(|row| matches!(&row.maker, LeafMaker::Observed { refresher, .. } if refresher == "checkout_integration")));
+            } else if step == 2 {
+                assert!(rows
+                    .iter()
+                    .any(|row| matches!(&row.maker, LeafMaker::Controller { resource_kind, .. } if resource_kind == "Convoy")));
+            } else {
+                assert!(rows.is_empty());
+            }
+        }
+        checkouts.delete("digest-checkout").await.unwrap();
+        let objects = HashMap::from([("digest".into(), convoys.get("digest").await.unwrap())]);
+        wake.sync_rows("flotilla", &objects).await.unwrap();
+        wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
+        assert!(wake.subscriptions.rows().await.is_empty());
+        assert!(convoys.get("digest").await.unwrap().status.unwrap().stalled.is_some());
+        checkouts
+            .create(
+                &InputMeta::builder()
+                    .name("unrelated-checkout".into())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.into(), "digest".into())]))
+                    .build(),
+                &CheckoutSpec::Observed(
+                    ObservedCheckoutSpec::builder()
+                        .r#ref("other-branch".into())
+                        .path("/unused".into())
+                        .repo_ref(RepositoryKey("repo".into()))
+                        .host_ref("host".into())
+                        .is_main(false)
+                        .build(),
+                ),
+            )
+            .await
+            .unwrap();
+        let objects = HashMap::from([("digest".into(), convoys.get("digest").await.unwrap())]);
+        wake.sync_rows("flotilla", &objects).await.unwrap();
+        wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
+        assert!(wake.subscriptions.rows().await.is_empty(), "an unrelated branch cannot produce the missing ref");
+        assert!(convoys.get("digest").await.unwrap().status.unwrap().stalled.is_some());
+    });
+}
