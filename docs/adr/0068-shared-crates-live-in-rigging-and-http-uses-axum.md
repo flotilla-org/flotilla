@@ -65,7 +65,14 @@ flotilla talks to cleat as a program, by command line and JSON today and by HTTP
 
 - **Each consumer names rigging once,** in its workspace `Cargo.toml` `[workspace.dependencies]`, with a single `rev`. Its crates use `workspace = true`, so two crates in one project cannot pin different revisions.
 - **`consumers.toml` in rigging lists every consumer and the revision it pins.** It is updated in the same change that bumps a consumer.
-- **Bumps are automated after a trial.** Renovate is tried first on one consumer (porthole, which also pins jackstay). If it does not bump a Git `rev` cleanly, a scheduled job in rigging reads `consumers.toml` and opens the bump PRs itself.
+- **Bumps are automated after a trial** (flotilla-org/rigging#2). Renovate is tried first on one consumer (porthole, which also pins jackstay). If it does not bump a Git `rev` cleanly, a scheduled job in rigging reads `consumers.toml` and opens the bump PRs itself.
+
+### Still to verify
+
+These do not change the decisions above, but each is checked before work that relies on it:
+- whether axum's `Send` handlers can use Worker types, when the relay's routing moves to axum;
+- whether Renovate bumps Git `rev` pins (flotilla-org/rigging#2);
+- whether cleat routes with axum (flotilla-org/cleat#345).
 
 ## Consequences
 

@@ -2,6 +2,7 @@
 
 **Status:** Accepted, not yet implemented (owner rulings, 2026-10-14; #3245)
 **Date:** 2026-10-14
+**See also:** [ADR 0068](0068-shared-crates-live-in-rigging-and-http-uses-axum.md): the router uses axum, and its Unix-socket, token and Host/Origin machinery lives in the shared rigging repo
 **Relates to:**
 - [ADR 0047](0047-stored-data-stays-decodable-across-one-generation.md): wire formats change freely, and the fingerprint handshake refuses mismatched binaries;
 - [ADR 0056](0056-action-recipes-are-platform-independent-addresses.md): attach recipes are platform-independent addresses;
