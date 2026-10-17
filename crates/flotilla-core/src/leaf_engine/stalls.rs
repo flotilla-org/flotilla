@@ -305,6 +305,8 @@ impl ReconcilerWake {
             .filter(|current| current.provenance == flotilla_resources::ResourceProvenance::Local)
             .map(|current| (&current.object.metadata.name, &current.object.metadata.resource_version))
             .collect::<HashMap<_, _>>();
+        // The handle is shared with the loop; one lookup per tick is enough.
+        let controller_queue = self.subscriptions.inner.controller_queues.lock().await.get(namespace).cloned();
         for convoy in convoys.values().map(ConvoyRead::convoy) {
             // Rows belong to the caller's convoy revision. A judge tick can win
             // the select before its convoy-watch wake; do not publish a new
@@ -831,24 +833,37 @@ impl ReconcilerWake {
                                         Err(error) => Some(ObservationError::Failed(error.clone())),
                                     };
                                     let deadline = if let Ok(subject) = subject {
-                                        let proposed = self
-                                            .subscriptions
-                                            .inner
-                                            .change_requests
-                                            .refresh_grace_deadline(&subject, row.freshness_demand, row.created_at)
-                                            .await;
-                                        let mut grace = self.subscriptions.inner.observer_grace.lock().await;
-                                        // Pin the first stale episode's deadline: repeatedly
-                                        // failed refreshes must not renew their own grace.
-                                        // Fresh evidence or row removal starts a new episode.
-                                        let deadline = grace.entry((row.id, subject)).or_insert(proposed);
-                                        // Explicit forge backoff still protects the maker. It
-                                        // does not let ordinary repeated failures slide grace.
-                                        if let Some(retry_at) = refresh_error.as_ref().and_then(ObservationError::retry_at) {
-                                            *deadline =
-                                                (*deadline).max(self.subscriptions.inner.change_requests.retry_grace_deadline(retry_at));
-                                        }
-                                        Some(*deadline)
+                                        let key = (row.id, subject);
+                                        let cached = self.subscriptions.inner.observer_grace.lock().await.get(&key).copied();
+                                        // The pinned deadline is an episode property. Consult
+                                        // the observer's schedule only on the first stale tick,
+                                        // never while holding the grace-map lock.
+                                        let deadline = if let Some(deadline) = cached {
+                                            deadline
+                                        } else {
+                                            let proposed = self
+                                                .subscriptions
+                                                .inner
+                                                .change_requests
+                                                .refresh_grace_deadline(&key.1, row.freshness_demand, row.created_at)
+                                                .await;
+                                            *self.subscriptions.inner.observer_grace.lock().await.entry(key.clone()).or_insert(proposed)
+                                        };
+                                        // Explicit forge backoff may extend a pinned episode;
+                                        // ordinary repeated failures cannot renew its grace.
+                                        let extended =
+                                            refresh_error.as_ref().and_then(ObservationError::retry_at).map_or(deadline, |retry_at| {
+                                                deadline.max(self.subscriptions.inner.change_requests.retry_grace_deadline(retry_at))
+                                            });
+                                        let deadline = if extended > deadline {
+                                            let mut grace = self.subscriptions.inner.observer_grace.lock().await;
+                                            let stored = grace.entry(key).or_insert(deadline);
+                                            *stored = (*stored).max(extended);
+                                            *stored
+                                        } else {
+                                            deadline
+                                        };
+                                        Some(deadline)
                                     } else {
                                         // A formerly resolvable address no longer names an
                                         // observer; do not retain its old grace entry.
@@ -859,11 +874,11 @@ impl ReconcilerWake {
                                         unknown = true;
                                         continue 'rows;
                                     }
+                                    // The deadline is stable evidence of observer lag. Do not
+                                    // rewrite the convoy each second merely to increment a
+                                    // duration; began_at already records the stall episode.
                                     let lag = deadline.map_or(String::new(), |deadline| {
-                                        format!(
-                                            "; observer behind scheduled refresh grace by {}s (deadline {deadline})",
-                                            now.signed_duration_since(deadline).num_seconds()
-                                        )
+                                        format!("; observer behind scheduled refresh grace since {deadline}")
                                     });
                                     reason = Some(format!(
                                         "change_request observer: {}{lag}",
@@ -884,12 +899,8 @@ impl ReconcilerWake {
                     }
                     LeafMaker::Controller { resource_kind, name, retry, ceiling } => {
                         let reason = if resource_kind == "Convoy" {
-                            self.subscriptions
-                                .inner
-                                .controller_queues
-                                .lock()
-                                .await
-                                .get(namespace)
+                            controller_queue
+                                .as_ref()
                                 .and_then(|queue| queue.stall_reason(now, CONVOY_CONTROLLER_PROGRESS_BOUND))
                                 .map(|reason| format!("Convoy controller for {}: {reason}", name.as_deref().unwrap_or("unknown")))
                         } else {
