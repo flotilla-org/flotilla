@@ -11,7 +11,7 @@ use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
 use crate::fixtures::{
-    message as messages, registry, store,
+    addr, message as messages, registry, store,
     synthetic::{workflow, InputValue},
     AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow as Message, Pick, Referral, TerminalSession, Ticket, VesselRow,
     LOCAL,
@@ -224,7 +224,7 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
     let mut write = remote.write().expect("write");
     let stamp = write.insert("far", &messages::sample()).expect("insert");
     let current = write.load::<Message>(stamp.id).expect("load").expect("present");
-    write.update(&current, &Message { inbox: "edited".into(), ..messages::sample() }).expect("update");
+    write.update(&current, &Message { inbox: addr("edited"), ..messages::sample() }).expect("update");
     write.commit().expect("commit");
     let changes = remote.read().expect("read").changes_since("remote", 0, 10).expect("log");
 
@@ -235,8 +235,8 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
     }
     let id = write.resolve(Message::CODE, "far", "remote").expect("resolve").expect("present");
     let current = write.load::<Message>(id).expect("load").expect("present");
-    assert_eq!((current.version, current.value.inbox.as_str()), (changes[1].home_seq, "edited"));
-    let next = Message { inbox: "local edit".into(), ..current.value.clone() };
+    assert_eq!((current.version, current.value.inbox.name()), (changes[1].home_seq, "edited"));
+    let next = Message { inbox: addr("local edit"), ..current.value.clone() };
     assert!(matches!(write.update(&current, &next), Err(StoreError::NotHome { .. })));
     assert!(matches!(write.delete::<Message>(current.stamp()), Err(StoreError::NotHome { .. })));
 
@@ -467,7 +467,7 @@ fn log(store: &mut Store, home: &str) -> Vec<RowChange> {
 }
 
 fn message(inbox: &str) -> Message {
-    Message { inbox: inbox.into(), ..messages::sample() }
+    Message { inbox: addr(inbox), ..messages::sample() }
 }
 
 /// Inserts `name`, then rewrites its inbox once per entry of `bodies`, in one transaction.

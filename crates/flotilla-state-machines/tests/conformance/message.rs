@@ -43,7 +43,7 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Address, Timestamp};
 use flotilla_state_machines::{
     machines::message::{
         AppliedThrough, Binding, Condition, Deliver, DeliveryFailure, DropMessage, DropReason, Expectation, InboxBinding,
@@ -56,33 +56,41 @@ use serde_json::{json, Value};
 
 use crate::{
     graph::{self, bare, refusal, tick, Conformance, Report, Step, UNIT},
-    itf::{boolean, int, number, payload, tag, text, variant},
+    itf::{address, address_of, boolean, int, number, payload, tag, variant},
 };
 
 const NAME: &str = "m";
 const INBOX: &str = "project:p/role:r";
-const CONDITION: &str = "condition";
+const CONDITION: &str = "project:condition";
+const NEWER: &str = "project:newer";
+const SENDER: &str = "project:sender";
+const SUPERVISOR: &str = "project:supervisor";
+
+/// Canonical address text the harness names.
+fn at(text: &str) -> Address {
+    text.parse().expect("canonical address")
+}
 /// The harness's deadline value: an envelope without a deadline still carries it.
 const HARNESS_DEADLINE: i64 = 1;
 
 /// The receiver session for spec session number `n`.
-fn session(n: i64) -> String {
-    format!("s{n}")
+fn session(n: i64) -> Address {
+    address_of(&format!("s{n}"))
 }
 
 fn session_number(receiver: &Receiver) -> i64 {
-    receiver.session.trim_start_matches('s').parse().expect("conformance session name")
+    receiver.session.name().trim_start_matches('s').parse().expect("conformance session name")
 }
 
 fn spec_of(envelope: &Value) -> MessageSpec {
     let expectation = match tag(&envelope["expectation"]) {
         "Nothing" => Expectation::Nothing,
         "Reply" => Expectation::Reply,
-        "Outcome" => Expectation::Outcome { condition: Ref::new(CONDITION) },
+        "Outcome" => Expectation::Outcome { condition: at(CONDITION) },
         other => panic!("expectation {other}"),
     };
     MessageSpec {
-        inbox: INBOX.into(),
+        inbox: at(INBOX),
         expectation,
         deadline: boolean(&envelope["hasDeadline"]).then(|| tick(number(&envelope["deadline"]))),
         unbound_after: UNIT,
@@ -123,17 +131,17 @@ fn outcome<T>(result: Result<T, WriteError<Message>>) -> Step {
     refusal(name)
 }
 
-fn put_receipt(world: &mut MemoryMessageWorld, session: &str, transport: Transport) {
-    world.receipts.put(&Ref::<Receipts>::new(NAME), BTreeMap::from([(session.to_string(), transport)]));
+fn put_receipt(world: &mut MemoryMessageWorld, session: &Address, transport: Transport) {
+    world.receipts.put(&Ref::<Receipts>::new(NAME), BTreeMap::from([(session.clone(), transport)]));
 }
 
 fn drop_reason_of(o: &Value) -> DropReason {
     match tag(&o["reason"]) {
         "Undeliverable" => DropReason::Undeliverable,
         "Expired" => DropReason::Expired,
-        "Superseded" => DropReason::Superseded { by: Ref::new("newer") },
-        "Withdrawn" => DropReason::Withdrawn { by: "sender".into(), authority: Ref::new("sender") },
-        "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: "supervisor".into(), authority: Ref::new("supervisor") },
+        "Superseded" => DropReason::Superseded { by: at(NEWER) },
+        "Withdrawn" => DropReason::Withdrawn { by: at(SENDER), authority: at(SENDER) },
+        "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: at(SUPERVISOR), authority: at(SUPERVISOR) },
         other => panic!("drop reason {other}"),
     }
 }
@@ -174,13 +182,13 @@ fn drop_world(spec: &MessageSpec, o: &Value, now: Timestamp) -> Result<MemoryMes
         }
         "Superseded" => {
             let older = if boolean(&o["supersedes"]) { NAME } else { "another" };
-            world.supersession.put(&Ref::<Supersession>::new("newer"), Supersedes { older: older.into() });
+            world.supersession.put(&Ref::<Supersession>::new(NEWER), Supersedes { older: older.into() });
         }
         "Withdrawn" => {
-            world.authority.put(&Ref::new("sender"), boolean(&o["authorised"]));
+            world.authority.put(&Ref::new(SENDER), boolean(&o["authorised"]));
         }
         "ConsumerUnreachable" => {
-            world.authority.put(&Ref::new("supervisor"), boolean(&o["authorised"]));
+            world.authority.put(&Ref::new(SUPERVISOR), boolean(&o["authorised"]));
         }
         other => panic!("drop reason {other}"),
     }
@@ -205,9 +213,9 @@ impl Conformance for MessageConformance {
         match tag(event) {
             "Deliver" => {
                 let who = session(number(&o["receiver"]["session"]));
-                let receiver = Receiver { session: who.clone(), host: text(&o["receiver"]["host"]).into() };
+                let receiver = Receiver { session: who.clone(), host: address(&o["receiver"]["host"]) };
                 if boolean(&o["observed"]) {
-                    let from = if boolean(&o["receiverMatches"]) { who } else { "another".into() };
+                    let from = if boolean(&o["receiverMatches"]) { who } else { address_of("another") };
                     let transport = if boolean(&o["transportMatches"]) { Transport::Turn } else { Transport::Notify };
                     put_receipt(&mut world, &from, transport);
                 }
@@ -250,7 +258,7 @@ impl Conformance for MessageConformance {
             MessageState::Pending => variant("Pending", envelope),
             MessageState::Settled => variant("Settled", envelope),
             MessageState::Awaiting { receiver } => {
-                let receiver = json!({ "session": int(session_number(receiver)), "host": receiver.host });
+                let receiver = json!({ "session": int(session_number(receiver)), "host": receiver.host.name() });
                 variant("Awaiting", json!({ "envelope": envelope, "receiver": receiver }))
             }
             MessageState::Dropped { reason, dropped_receiver: receiver, at, watermark } => {

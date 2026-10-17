@@ -16,11 +16,16 @@ pub fn text(v: &Value) -> &str {
 }
 
 /// A model string that the engine holds as an address (a convoy's project, a
-/// promise's target): the specs keep it opaque text, so it maps to the
-/// project-rooted address whose one value is that text, and back through
-/// [`Address::name`].
+/// promise's target, a message's inbox, receiver and drop references): the
+/// specs keep it opaque text, so it maps to the project-rooted address whose
+/// one value is that text, and back through [`Address::name`].
 pub fn address(v: &Value) -> Address {
-    Address::project(text(v)).unwrap_or_else(|error| panic!("model text {v} as an address: {error}"))
+    address_of(text(v))
+}
+
+/// [`address`] for model text the harness names itself.
+pub fn address_of(text: &str) -> Address {
+    Address::project(text).unwrap_or_else(|error| panic!("model text {text:?} as an address: {error}"))
 }
 
 pub fn boolean(v: &Value) -> bool {

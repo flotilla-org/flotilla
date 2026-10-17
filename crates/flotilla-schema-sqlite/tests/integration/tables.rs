@@ -15,6 +15,7 @@ use hegel::TestCase;
 use rusqlite::Connection;
 
 use crate::fixtures::{
+    addr,
     engine::{step, NAME},
     ensure, message, registry, store,
     synthetic::{workflow, Deliverable, DeliverableState, Evidence, InputValue, PromiseKind, PromiseSource},
@@ -132,7 +133,7 @@ fn spec_edits_refuse_what_only_edges_write() {
     let held = EnsureState::Held { recorded: Default::default(), created: Default::default(), window: 0 };
     let moved = EnsureRow { state: State::new(held, ensure.state.since), ..ensure.clone() };
     assert_eq!(refused(write.update(&current, &moved)), "ensure.state");
-    let later = EnsureRow { state: State::new(ensure.state.value.clone(), Timestamp(9)), inbox: "edited".into(), ..ensure.clone() };
+    let later = EnsureRow { state: State::new(ensure.state.value.clone(), Timestamp(9)), inbox: addr("edited"), ..ensure.clone() };
     assert_eq!(refused(write.update(&current, &later)), "ensure.state_since", "a spec field beside it does not excuse it");
     let deliverables = |f: Edit<Deliverable>| Dossier { deliverables: with_rows(&dossier.deliverables, f), ..dossier.clone() };
     let retracted = deliverables(&|rows| rows[0].1.state = State::new(DeliverableState::Retracted, Timestamp(5)));
@@ -148,7 +149,7 @@ fn spec_edits_refuse_what_only_edges_write() {
 
     // Allowed in the same transaction: a spec edit, then the engine's record edge appending its
     // event and growing the state's recorded set, whatever stamps the caller's rows hold.
-    let edited = EnsureRow { inbox: "edited".into(), ..ensure.clone() };
+    let edited = EnsureRow { inbox: addr("edited"), ..ensure.clone() };
     let stamp = write.update(&current, &edited).expect("spec edit");
     let (edge, next) =
         step(&edited, "dave", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(8)).expect("recorded");
@@ -201,24 +202,26 @@ fn writes_touch_only_their_rows() {
         ..Dossier::sample(0)
     };
     let (mut store, _) = rows_written(store, |_| {});
-    // The strings the edges write are interned first, so no `strings` row is counted below.
+    // The strings the edges write (the receiver's addresses and the writer) are interned first,
+    // so no `strings` row is counted below.
     for (n, string) in ["s", "h", "w"].into_iter().enumerate() {
-        insert(&mut store, &format!("pre{n}"), &MessageRow { inbox: string.into(), ..message::sample() });
+        insert(&mut store, &format!("pre{n}"), &MessageRow { inbox: addr(string), ..message::sample() });
     }
+    let writer = addr("w");
     let current = insert(&mut store, "m", &message::sample());
     let dossier_current = insert(&mut store, "d", &dossier);
 
     let mut world = MemoryMessageWorld::default();
-    world.receipts.put(&Ref::new(NAME), [("s".to_owned(), Transport::Turn)].into());
+    world.receipts.put(&Ref::new(NAME), [(addr("s"), Transport::Turn)].into());
     world.reply.put(&Ref::new(NAME), ());
     let world: Box<dyn MessageWorld> = Box::new(world);
-    let deliver = Deliver { receiver: Receiver { session: "s".into(), host: "h".into() }, transport: Transport::Turn };
-    let (edge, delivered) = step(&current.value, "w", deliver, &*world, Timestamp(5)).expect("delivered");
+    let deliver = Deliver { receiver: Receiver { session: addr("s"), host: addr("h") }, transport: Transport::Turn };
+    let (edge, delivered) = step(&current.value, writer.as_str(), deliver, &*world, Timestamp(5)).expect("delivered");
     let (mut store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
     assert_eq!(written, 5, "the event row, the state with the version, the home and identity sequences and the change log");
 
     let current = load(&mut store, &current);
-    let (edge, _) = step(&delivered, "w", Settle { by: Settlement::Answered }, &*world, Timestamp(6)).expect("settled");
+    let (edge, _) = step(&delivered, writer.as_str(), Settle { by: Settlement::Answered }, &*world, Timestamp(6)).expect("settled");
     let (store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
     assert_eq!(written, 5, "gate reads add no rows, and leaving a label's data is the same statement");
 

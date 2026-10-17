@@ -67,7 +67,12 @@ fn round_trip<R: MachineRow + PartialEq + std::fmt::Debug>(home: &Home<R::Machin
 #[test]
 fn rows_hold_their_resource() {
     let mut messages = Home::<Message>::new("home").expect("valid");
-    let spec = MessageSpec { inbox: "i".into(), expectation: Expectation::Reply, deadline: Some(Timestamp(9)), unbound_after: 3 };
+    let spec = MessageSpec {
+        inbox: Address::project("i").expect("inbox"),
+        expectation: Expectation::Reply,
+        deadline: Some(Timestamp(9)),
+        unbound_after: 3,
+    };
     messages.create("m", spec.clone(), &MemoryMessageWorld::default(), Timestamp(0)).expect("created");
     let row: MessageRow = round_trip(&messages, "m", Timestamp(1));
     assert_eq!((row.spec(), row.state.since), (spec, Timestamp(1)));
@@ -86,7 +91,12 @@ fn rows_hold_their_resource() {
 
     let mut ensures = Home::<Ensure>::new("home").expect("valid");
     ensures
-        .create("e", EnsureSpec { inbox: "i".into(), policy: AttemptPolicy::immediate(2) }, &MemoryEnsureWorld::default(), Timestamp(0))
+        .create(
+            "e",
+            EnsureSpec { inbox: Address::project("i").expect("inbox"), policy: AttemptPolicy::immediate(2) },
+            &MemoryEnsureWorld::default(),
+            Timestamp(0),
+        )
         .expect("created");
     ensures.apply("e", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(4)).expect("recorded");
     ensures.record_attempt("e", flotilla_state_machines::Attempt::succeeded(Timestamp(5))).expect("attempt");

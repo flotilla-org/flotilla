@@ -14,7 +14,7 @@ use flotilla_state_machines::{
 use hegel::{generators as gs, TestCase};
 
 use super::{
-    code_enum,
+    addr, address, code_enum,
     engine::{self, Candidate},
     name, records, stamp_flat, text, timestamp, EnsureRow, Fixture, Pick,
 };
@@ -77,7 +77,7 @@ fn edges(tc: &TestCase) -> Vec<EnsureEdge> {
 
 pub fn generate(tc: &TestCase, pick: Pick) -> EnsureRow {
     EnsureRow {
-        inbox: name(tc),
+        inbox: address(tc),
         policy: policy(tc),
         state: State::new(state_value(tc, pick), timestamp(tc)),
         edges: records(tc, pick, 2, |pick| engine::event::<Ensure>(tc, pick, &edges(tc))),
@@ -88,7 +88,7 @@ pub fn generate(tc: &TestCase, pick: Pick) -> EnsureRow {
 /// An unfulfilled Ensure with nothing recorded and no history.
 pub fn sample() -> EnsureRow {
     EnsureRow {
-        inbox: "inbox".into(),
+        inbox: addr("inbox"),
         policy: AttemptPolicy::immediate(1),
         state: State::new(EnsureState::Unfulfilled { recorded: BTreeSet::new(), created: BTreeSet::new(), window: 0 }, Timestamp(0)),
         edges: Records::new(),
@@ -114,7 +114,7 @@ pub fn candidates(tc: &TestCase, pick: Pick, row: &EnsureRow) -> Vec<Candidate<E
         candidates.push((Create { fulfiller: fulfiller.clone() }.into(), boxed(MemoryEnsureWorld::default()), now));
         let mut world = MemoryEnsureWorld::default();
         world.fulfillers.put(&fulfiller, FulfillerStatus { phase: FulfillerPhase::Realised, can_receive: true });
-        world.drains.put(&Ref::new(row.inbox.clone()), true);
+        world.drains.put(&Ref::new(row.inbox.as_str()), true);
         candidates.push((Bind { fulfiller }.into(), boxed(world), now));
     }
     if let Some(bound) = state.bound() {
@@ -145,7 +145,7 @@ impl Fixture for EnsureRow {
 
     /// The inbox and policy drawn afresh; the state, edge log and attempts kept.
     fn evolve(&self, tc: &TestCase, _pick: Pick) -> EnsureRow {
-        EnsureRow { inbox: name(tc), policy: policy(tc), ..self.clone() }
+        EnsureRow { inbox: address(tc), policy: policy(tc), ..self.clone() }
     }
 
     fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<EnsureRow>, EnsureRow)> {
