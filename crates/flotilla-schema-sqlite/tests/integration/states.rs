@@ -4,9 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{
-    quote_ident, Edge, EdgeEvent, Kind, Labelled, Position, Records, Row, RowChange, RowOp, State, TableRole, Timestamp, Value,
-};
+use flotilla_schema::{quote_ident, Edge, EdgeEvent, Kind, Labelled, Position, Row, RowChange, RowOp, State, TableRole, Timestamp, Value};
 use flotilla_schema_sqlite::{Applied, ResourceId, Snapshot, Stamp, Store, StoreError};
 use hegel::{generators as gs, TestCase};
 use rusqlite::{Connection, ErrorCode};
@@ -48,7 +46,7 @@ fn apply_counted(store: Store, current: Stamp, edge: Edge<Ticket>) -> (Store, St
 }
 
 fn ticket(state: TicketState) -> Ticket {
-    Ticket { queue: "q".into(), title: "t".into(), state: State::new(state, Timestamp(1)), edges: Records::new() }
+    Ticket { queue: "q".into(), title: "t".into(), state: State::new(state, Timestamp(1)) }
 }
 
 fn open(assignees: &[&str], priority: u8) -> TicketState {
@@ -80,7 +78,7 @@ fn event(from: TicketLabel, to: TicketLabel, at: i64) -> EdgeEvent<TicketLabel, 
 fn edge(previous: &State<TicketState>, next: TicketState, at: i64) -> Edge<Ticket> {
     let (from, to) = (*previous.value.label(), *next.label());
     let next = State::new(next, if from == to { previous.since } else { Timestamp(at) });
-    Edge::transition(Ticket::STATE, previous, &next, Ticket::EDGES, &event(from, to, at)).expect("edge")
+    Edge::transition(Ticket::STATE, previous, &next, &event(from, to, at)).expect("edge")
 }
 
 // Behaviour (#3373 rulings 2 and 3, touched rows): every transition logs exactly the rows and
@@ -250,7 +248,6 @@ fn edge_refusals_come_in_a_fixed_order() {
             Ticket::STATE,
             &previous,
             &State::new(TicketState::Draft, Timestamp(3)),
-            Ticket::EDGES,
             &event(TicketLabel::Closed, TicketLabel::Draft, 3),
         )
         .expect("edge")
@@ -265,24 +262,15 @@ fn edge_refusals_come_in_a_fixed_order() {
     // An edge built whole, leaving the wrong label and appending under a missing deliverable.
     let dossier = write.insert("c", &Dossier::sample(0)).expect("insert");
     let delivered = State::new(DossierState::Delivered, Timestamp(6));
-    let both = Edge::new(
-        Dossier::STATE,
-        &delivered,
-        Dossier::EDGES,
-        &dossier_event(DossierEdge::Deliver, DossierState::Delivered, DossierState::Delivered),
-    )
-    .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence()))
-    .expect("edge");
+    let both =
+        Edge::new(Dossier::STATE, &delivered, &dossier_event(DossierEdge::Deliver, DossierState::Delivered, DossierState::Delivered))
+            .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence()))
+            .expect("edge");
     let refused = write.apply_edge(dossier, both.clone());
     assert!(matches!(&refused, Err(StoreError::WrongFrom { from: 2, stored: 1, .. })), "the label before the records row: {refused:?}");
-    let missing = Edge::new(
-        Dossier::STATE,
-        &delivered,
-        Dossier::EDGES,
-        &dossier_event(DossierEdge::Deliver, DossierState::Open, DossierState::Delivered),
-    )
-    .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence()))
-    .expect("edge");
+    let missing = Edge::new(Dossier::STATE, &delivered, &dossier_event(DossierEdge::Deliver, DossierState::Open, DossierState::Delivered))
+        .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence()))
+        .expect("edge");
     assert!(matches!(write.apply_edge(dossier, missing), Err(StoreError::NoRecord { .. })), "then the records row");
     let stale = Stamp { version: dossier.version - 1, ..dossier };
     assert!(matches!(write.apply_edge(stale, both), Err(StoreError::Conflict { .. })), "a stale stamp before the label");
@@ -315,7 +303,6 @@ fn a_refused_edge_writes_nothing_and_the_transaction_goes_on() {
         Ticket::STATE,
         &previous,
         &State::new(open(&["z"], 0), Timestamp(4)),
-        Ticket::EDGES,
         &event(TicketLabel::Closed, TicketLabel::Open, 4),
     )
     .expect("edge");

@@ -730,7 +730,7 @@ impl Ctx<'_> {
     fn apply_edge<K: Kind>(&mut self, current: Stamp, parts: EdgeParts) -> Result<Stamp, StoreError> {
         let identity = self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
-        let EdgeParts { sets, rows, appends, mut objects, from } = parts;
+        let EdgeParts { sets, rows, appends, mut objects, from, event: _ } = parts;
         // A stale stamp is answered first: the caller re-reads on `Conflict`, which would show
         // whatever else (a label other than the event's `from`, a missing records row) also makes
         // this edge wrong. Then the stored label must be the one the event leaves. One read of the

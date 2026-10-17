@@ -3,11 +3,11 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{Edge, Records, State, Timestamp};
+use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
-        Abandon, Convoy, ConvoyEdge, ConvoyState, ConvoyWorld, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId,
-        PromiseState, Readmit, Retract, VesselClass,
+        Abandon, Convoy, ConvoyState, ConvoyWorld, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId, PromiseState, Readmit,
+        Retract, VesselClass,
     },
     Ref,
 };
@@ -16,7 +16,7 @@ use hegel::{generators as gs, TestCase};
 use super::{
     code_enum,
     engine::{self, Candidate},
-    name, records, stamp_flat, text, timestamp, ConvoyRow, Fixture, Pick,
+    name, text, timestamp, ConvoyRow, Fixture, Pick,
 };
 
 /// Covering indexes: the label is digit 0 (base 3); collections take every size in turn.
@@ -57,25 +57,12 @@ fn authority(tc: &TestCase) -> Ref<flotilla_state_machines::machines::convoy::Au
     Ref::new(name(tc))
 }
 
-/// One edge of every kind, for generated history.
-fn edges(tc: &TestCase) -> Vec<ConvoyEdge> {
-    let promise = PromiseId(tc.draw(gs::integers::<u32>()));
-    vec![
-        Keep { promise }.into(),
-        Retract { promise, by: name(tc), authority: authority(tc) }.into(),
-        Deliver.into(),
-        Abandon { by: name(tc), reason: text(tc), authority: authority(tc) }.into(),
-        Readmit { quota: quota(tc, Pick::Draw), by: name(tc), authority: authority(tc) }.into(),
-    ]
-}
-
 pub fn generate(tc: &TestCase, pick: Pick) -> ConvoyRow {
     ConvoyRow {
         project: name(tc),
         promises: map(tc, pick.nth(2), 2, |pick, n| (PromiseId(small(tc, pick, n)), Promise { kind: name(tc), target: name(tc) })),
         priority: Priority(tc.draw(gs::integers::<u32>())),
         state: State::new(state_value(tc, pick), timestamp(tc)),
-        edges: records(tc, pick, 2, |pick| engine::event::<Convoy>(tc, pick, &edges(tc))),
     }
 }
 
@@ -90,7 +77,6 @@ pub fn sample() -> ConvoyRow {
             ConvoyState::Open { resolution: [(promise, PromiseState::Pending)].into(), quota: [(VesselClass(0), 1)].into() },
             Timestamp(0),
         ),
-        edges: Records::new(),
     }
 }
 
@@ -145,14 +131,14 @@ impl Fixture for ConvoyRow {
 
     /// The project, promise definitions and priority drawn afresh; the state and edge log kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> ConvoyRow {
-        ConvoyRow { state: self.state.clone(), edges: self.edges.clone(), ..generate(tc, pick) }
+        ConvoyRow { state: self.state.clone(), ..generate(tc, pick) }
     }
 
     fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<ConvoyRow>, ConvoyRow)> {
         edge(tc, pick, self)
     }
 
-    fn stamped(&self, before: Option<&ConvoyRow>, version: u64) -> ConvoyRow {
-        ConvoyRow { edges: stamp_flat(&self.edges, before.map(|before| &before.edges), version), ..self.clone() }
+    fn stamped(&self, _before: Option<&ConvoyRow>, _version: u64) -> ConvoyRow {
+        self.clone()
     }
 }

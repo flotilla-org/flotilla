@@ -1,15 +1,15 @@
 //! Child, records and history tables and frozen objects through SQLite.
 
-use std::{borrow::Cow, collections::BTreeMap};
+use std::collections::BTreeMap;
 
-use flotilla_schema::{quote_ident, Edge, EdgeEvent, Hash, Kind, Records, State, Table, Timestamp};
+use flotilla_schema::{quote_ident, Edge, Hash, Kind, Records, State, Table, Timestamp};
 use flotilla_schema_sqlite::{Loaded, Stamp, Store, StoreError};
 use flotilla_state_machines::{
     machines::{
-        ensure::{EnsureEdgeKind, EnsureLabel, EnsureState, MemoryEnsureWorld, Record},
+        ensure::{EnsureState, MemoryEnsureWorld, Record},
         message::{Deliver, MemoryMessageWorld, MessageWorld, Receiver, Settle, Settlement},
     },
-    Attempt, EdgeEventOf, EdgePayload, InputRead, Ref, Transport, Version,
+    Attempt, Ref, Transport,
 };
 use hegel::TestCase;
 use rusqlite::Connection;
@@ -22,21 +22,6 @@ use crate::fixtures::{
 };
 
 /// A record edge's event on an unfulfilled Ensure, as its log holds it.
-fn event(writer: &str) -> EdgeEventOf<flotilla_state_machines::machines::ensure::Ensure> {
-    EdgeEvent {
-        edge: EnsureEdgeKind::Record,
-        from: EnsureLabel::Unfulfilled,
-        to: EnsureLabel::Unfulfilled,
-        writer: writer.into(),
-        at: Timestamp(1),
-        payload: EdgePayload { edge: Record { fulfiller: Ref::new("f") }.into(), reads: Vec::new() },
-    }
-}
-
-fn read() -> InputRead {
-    InputRead { kind: Cow::Borrowed("fulfiller"), name: "f".into(), version: Some(Version(1)) }
-}
-
 fn attempt(at: i64) -> Attempt {
     Attempt::succeeded(Timestamp(at))
 }
@@ -101,30 +86,25 @@ fn refused(result: Result<Stamp, StoreError>) -> String {
 
 // Behaviour (#3320 ruling 1): a spec edit (`update`) refuses what only an edge writes, naming the
 // table or column: a changed state column (`state`, `state_since`; a deliverable's state is part
-// of its records row), and any append to, change of or removal from a history table (edge events,
-// their documents' gate reads, attempts) or a records table (deliverables, evidence under a kept
+// of its records row), and any append to, change of or removal from a history table (attempts) or
+// a records table (deliverables, evidence under a kept
 // deliverable). A refused write changes nothing and the transaction stays usable: a spec edit and
 // an engine edge then commit, the edge's event stamped with its version.
 #[test]
 fn spec_edits_refuse_what_only_edges_write() {
     let mut store = store();
-    let ensure = EnsureRow { edges: records(vec![event("alice"), event("bob")]), attempts: records(vec![attempt(2)]), ..ensure::sample() };
+    let ensure = EnsureRow { attempts: records(vec![attempt(1), attempt(2)]), ..ensure::sample() };
     let current = insert(&mut store, "e", &ensure);
     let dossier = Dossier { deliverables: records(vec![deliverable(vec![evidence("e0"), evidence("e1")])]), ..Dossier::sample(0) };
     let dossier_current = insert(&mut store, "d", &dossier);
     let (ensure, dossier) = (&current.value, &dossier_current.value);
-    let stamps = ensure.edges.iter().map(|row| row.version).chain(dossier.deliverables.iter().map(|row| row.version));
+    let stamps = ensure.attempts.iter().map(|row| row.version).chain(dossier.deliverables.iter().map(|row| row.version));
     assert_eq!(stamps.collect::<Vec<_>>(), [current.version, current.version, dossier_current.version], "the insert stamps every row");
 
     let mut write = store.write().expect("write");
-    type Event = EdgeEventOf<flotilla_state_machines::machines::ensure::Ensure>;
-    let edges = |f: Edit<Event>| EnsureRow { edges: with_rows(&ensure.edges, f), ..ensure.clone() };
-    assert_eq!(refused(write.update(&current, &edges(&|rows| rows.push((0, event("carol")))))), "ensure_edges", "no append");
-    assert_eq!(refused(write.update(&current, &edges(&|rows| drop(rows.pop())))), "ensure_edges");
-    assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].1 = event("carol")))), "ensure_edges");
-    assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].0 += 1))), "ensure_edges", "the stamp is part of the row");
-    let with_read = edges(&|rows| rows[0].1.payload.reads.push(read()));
-    assert_eq!(refused(write.update(&current, &with_read)), "ensure_edges", "gate reads are part of the edge row");
+    let attempts = |f: Edit<Attempt>| EnsureRow { attempts: with_rows(&ensure.attempts, f), ..ensure.clone() };
+    assert_eq!(refused(write.update(&current, &attempts(&|rows| rows[1].1 = attempt(3)))), "ensure_attempts");
+    assert_eq!(refused(write.update(&current, &attempts(&|rows| rows[1].0 += 1))), "ensure_attempts", "the stamp is part of the row");
     let more_attempts = EnsureRow { attempts: with_rows(&ensure.attempts, |rows| rows.push((0, attempt(3)))), ..ensure.clone() };
     assert_eq!(refused(write.update(&current, &more_attempts)), "ensure_attempts");
     let fewer_attempts = EnsureRow { attempts: Records::new(), ..ensure.clone() };

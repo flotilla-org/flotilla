@@ -7,11 +7,20 @@ CREATE TABLE resource_identity (
 CREATE INDEX resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
 CREATE TABLE home_sequence (home INTEGER PRIMARY KEY REFERENCES strings(id), last INTEGER NOT NULL) STRICT;
-CREATE TABLE change_log (
+CREATE TABLE log (
   home INTEGER NOT NULL REFERENCES strings(id), home_seq INTEGER NOT NULL,
-  resource_id INTEGER NOT NULL REFERENCES resource_identity(id), change BLOB NOT NULL,
-  PRIMARY KEY (home, home_seq)) STRICT;
-CREATE INDEX change_log_by_resource ON change_log (resource_id, home_seq);
+  resource INTEGER REFERENCES resource_identity(id), prev_seq INTEGER NOT NULL,
+  cause TEXT NOT NULL CHECK (cause IN ('create', 'edit', 'edge', 'delete', 'expunge')),
+  edge INTEGER, "from" INTEGER, "to" INTEGER,
+  about INTEGER REFERENCES resource_identity(id) ON DELETE SET NULL,
+  writer INTEGER NOT NULL REFERENCES strings(id), at INTEGER NOT NULL,
+  payload BLOB, effect BLOB NOT NULL,
+  PRIMARY KEY (home, home_seq),
+  CHECK ((resource IS NULL) = (cause = 'expunge')),
+  CHECK (CASE WHEN cause = 'edge' THEN edge IS NOT NULL AND "from" IS NOT NULL AND "to" IS NOT NULL
+    ELSE edge IS NULL AND "from" IS NULL AND "to" IS NULL AND about IS NULL END)) STRICT;
+CREATE INDEX log_by_resource ON log (resource, home_seq);
+CREATE INDEX log_about ON log (about, at) WHERE about IS NOT NULL;
 CREATE TABLE "message" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -93,22 +102,7 @@ CREATE TABLE "message" (
       AND "receiver_host" IS NULL
       END)
 ) STRICT;
-CREATE TABLE "message_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3)),
-  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2, 3, 4)),
-  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2, 3, 4)),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "message" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
 CREATE INDEX "message_deadline" ON "message" ("deadline") WHERE "state" IN (1, 2) AND "deadline" IS NOT NULL;
-CREATE INDEX "message_edges_by_edge" ON "message_edges" ("edge", "at");
-CREATE INDEX "message_edges_by_time" ON "message_edges" ("at");
 CREATE INDEX "message_open_by_inbox" ON "message" ("inbox") WHERE "state" IN (1, 2);
 CREATE TABLE "agent_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
@@ -126,19 +120,6 @@ CREATE TABLE "agent_session" (
       AND "channel" IS NULL
       END)
 ) STRICT;
-CREATE TABLE "agent_session_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3)),
-  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2)),
-  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2)),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "agent_session" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
 CREATE TABLE "agent_session_receipts" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
@@ -149,8 +130,6 @@ CREATE TABLE "agent_session_receipts" (
   PRIMARY KEY ("owner", "pos"),
   FOREIGN KEY ("owner") REFERENCES "agent_session" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX "agent_session_edges_by_edge" ON "agent_session_edges" ("edge", "at");
-CREATE INDEX "agent_session_edges_by_time" ON "agent_session_edges" ("at");
 CREATE TABLE "convoy" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -191,21 +170,6 @@ CREATE TABLE "convoy_quota" (
   PRIMARY KEY ("owner", "key"),
   FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "convoy_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3, 4, 5)),
-  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2, 3)),
-  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2, 3)),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "convoy" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE INDEX "convoy_edges_by_edge" ON "convoy_edges" ("edge", "at");
-CREATE INDEX "convoy_edges_by_time" ON "convoy_edges" ("at");
 CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN (1);
 CREATE TABLE "terminal_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
@@ -268,19 +232,6 @@ CREATE TABLE "terminal_session_labels" (
   PRIMARY KEY ("owner", "value"),
   FOREIGN KEY ("owner") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "terminal_session_events" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3, 4)),
-  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2, 3, 4)),
-  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2, 3, 4)),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
 CREATE TABLE "terminal_session_attempts" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
@@ -302,8 +253,6 @@ CREATE TABLE "terminal_session_attempts" (
       END)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "terminal_session_by_vessel" ON "terminal_session" ("vessel", "ordinal");
-CREATE INDEX "terminal_session_events_by_edge" ON "terminal_session_events" ("edge", "at");
-CREATE INDEX "terminal_session_events_by_time" ON "terminal_session_events" ("at");
 CREATE INDEX "terminal_session_live_by_pool" ON "terminal_session" ("pool") WHERE "state" IN (1, 2);
 CREATE TABLE "vessel" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
@@ -372,21 +321,6 @@ CREATE TABLE "ticket_notes" (
   PRIMARY KEY ("owner", "key"),
   FOREIGN KEY ("owner") REFERENCES "ticket" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "ticket_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2)),
-  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2, 3)),
-  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2, 3)),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "ticket" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE INDEX "ticket_edges_by_edge" ON "ticket_edges" ("edge", "at");
-CREATE INDEX "ticket_edges_by_time" ON "ticket_edges" ("at");
 CREATE INDEX "ticket_open_by_queue" ON "ticket" ("queue") WHERE "state" IN (2);
 CREATE TABLE "ensure" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
@@ -429,19 +363,6 @@ CREATE TABLE "ensure_created" (
   PRIMARY KEY ("owner", "value"),
   FOREIGN KEY ("owner") REFERENCES "ensure" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "ensure_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3, 4, 5, 6, 7)),
-  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2, 3, 4)),
-  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2, 3, 4)),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "ensure" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
 CREATE TABLE "ensure_attempts" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
@@ -463,8 +384,6 @@ CREATE TABLE "ensure_attempts" (
       END)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "ensure_by_inbox" ON "ensure" ("inbox");
-CREATE INDEX "ensure_edges_by_edge" ON "ensure_edges" ("edge", "at");
-CREATE INDEX "ensure_edges_by_time" ON "ensure_edges" ("at");
 CREATE TABLE "referral" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -616,23 +535,8 @@ CREATE TABLE "referral_references" (
       AND "control_record_revision" IS NULL
       END)
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "referral_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3)),
-  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2, 3)),
-  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2, 3)),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "referral" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
 CREATE INDEX "referral_by_reply" ON "referral" ("in_reply_to") WHERE "in_reply_to" IS NOT NULL;
 CREATE INDEX "referral_by_session" ON "referral" ("session", "seq");
-CREATE INDEX "referral_edges_by_edge" ON "referral_edges" ("edge", "at");
-CREATE INDEX "referral_edges_by_time" ON "referral_edges" ("at");
 CREATE TABLE "dossier" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -715,18 +619,3 @@ CREATE TABLE "dossier_deliverables_evidence_metadata" (
   PRIMARY KEY ("owner", "deliverables_pos", "evidence_pos", "key"),
   FOREIGN KEY ("owner", "deliverables_pos", "evidence_pos") REFERENCES "dossier_deliverables_evidence" ("owner", "deliverables_pos", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "dossier_edges" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3, 4, 5)),
-  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2, 3)),
-  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2, 3)),
-  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "at" INTEGER NOT NULL,
-  "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "dossier" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE INDEX "dossier_edges_by_edge" ON "dossier_edges" ("edge", "at");
-CREATE INDEX "dossier_edges_by_time" ON "dossier_edges" ("at");

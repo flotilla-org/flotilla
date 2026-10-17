@@ -70,8 +70,8 @@ pub use descriptor::{
     RECORD_VERSION, RESERVED_CHILD_COLUMNS, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES,
 };
 pub use edge::{
-    AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf, RowPath,
-    StateOf,
+    AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeHeader, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf,
+    RowPath, StateOf,
 };
 pub use flotilla_schema_derive::Stored;
 pub use frozen::{Freezable, Frozen};

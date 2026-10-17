@@ -4,11 +4,30 @@ use flotilla_schema::{render_ddl_with, DdlMode, KindRegistry};
 
 /// `strings` interns names and interned columns; `resource_identity` holds every resource's
 /// (kind, name, home), with homes filtered through `resource_identity_by_home`, and its `seq`:
-/// the home sequence of the last change written or applied for it, kept after a delete as a
-/// tombstone, so replaying an older change is a duplicate however much `change_log` is trimmed;
-/// `objects` holds frozen documents by hash, always ADR 0063 canonical CBOR, so no media column; `home_sequence.last`
-/// is each home's sequence, which never decreases and does not depend on `change_log` rows, so deleting log
-/// rows never lets a sequence repeat; `change_log` holds every write's row changes per home.
+/// the home sequence of the last event written or applied for it, kept after a delete as a
+/// tombstone, so replaying an older event is a duplicate; `objects` holds frozen documents by
+/// hash, always ADR 0063 canonical CBOR, so no media column; `home_sequence.last` is each home's
+/// sequence, which never decreases, so a sequence never repeats.
+///
+/// `log` is the per-home event log (#3392 G8): one entry per write, keyed by the home and the
+/// sequence the write took, which is also the resource's version after it. Each entry is an event:
+///
+/// - the resource it changed and the resource's sequence before it (`prev_seq`, for gaps);
+/// - its cause: `create`, `edit` (a spec edit), `edge`, `delete` or `expunge`; an edge's header
+///   (`edge`, `from` and `to`, codes of the kind's edges and labels, which the writer and `apply`
+///   check against the kind, since one table holds no per-kind CHECK) and its master (`about`);
+/// - who wrote it (`writer`) and when (`at`);
+/// - `payload`, the explanation: an edge's arguments and recorded reads, or a create's admission
+///   request, as one inline CBOR document;
+/// - `effect`, the authoritative change: named field-level changes in the kind's own terms, as
+///   canonical CBOR, never positional row operations.
+///
+/// The kind tables are a view of the log, written in the same transaction; reads never replay it.
+/// Nothing trims the log (G9): a delete is an event and keeps the resource's entries and identity,
+/// and only an expunge removes them. An expunge entry outlives the identity row it removes, so it
+/// alone has no `resource`; its effect names the identity. `log_by_resource` is a resource's
+/// history in sequence order, and `log_about` the entries about a master in time order.
+///
 /// No database created by an earlier generation of these tables exists: the first production
 /// generation is the baseline, and ADR 0047's N→N+1 rule applies from then.
 pub(crate) const SHARED_DDL: &str = "\
@@ -21,11 +40,20 @@ CREATE TABLE IF NOT EXISTS resource_identity (
 CREATE INDEX IF NOT EXISTS resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE IF NOT EXISTS objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS home_sequence (home INTEGER PRIMARY KEY REFERENCES strings(id), last INTEGER NOT NULL) STRICT;
-CREATE TABLE IF NOT EXISTS change_log (
+CREATE TABLE IF NOT EXISTS log (
   home INTEGER NOT NULL REFERENCES strings(id), home_seq INTEGER NOT NULL,
-  resource_id INTEGER NOT NULL REFERENCES resource_identity(id), change BLOB NOT NULL,
-  PRIMARY KEY (home, home_seq)) STRICT;
-CREATE INDEX IF NOT EXISTS change_log_by_resource ON change_log (resource_id, home_seq);
+  resource INTEGER REFERENCES resource_identity(id), prev_seq INTEGER NOT NULL,
+  cause TEXT NOT NULL CHECK (cause IN ('create', 'edit', 'edge', 'delete', 'expunge')),
+  edge INTEGER, \"from\" INTEGER, \"to\" INTEGER,
+  about INTEGER REFERENCES resource_identity(id) ON DELETE SET NULL,
+  writer INTEGER NOT NULL REFERENCES strings(id), at INTEGER NOT NULL,
+  payload BLOB, effect BLOB NOT NULL,
+  PRIMARY KEY (home, home_seq),
+  CHECK ((resource IS NULL) = (cause = 'expunge')),
+  CHECK (CASE WHEN cause = 'edge' THEN edge IS NOT NULL AND \"from\" IS NOT NULL AND \"to\" IS NOT NULL
+    ELSE edge IS NULL AND \"from\" IS NULL AND \"to\" IS NULL AND about IS NULL END)) STRICT;
+CREATE INDEX IF NOT EXISTS log_by_resource ON log (resource, home_seq);
+CREATE INDEX IF NOT EXISTS log_about ON log (about, at) WHERE about IS NOT NULL;
 ";
 
 /// Every statement the runtime prepares outside the per-kind statements. `Store::statements` lists

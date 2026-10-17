@@ -3,15 +3,17 @@
 
 use std::collections::BTreeSet;
 
-use flotilla_schema::{Decoder, EdgeParts, Encoder, Kind, KindCode, RowPath, State, Timestamp};
+use flotilla_schema::{CodeEnum, Decoder, EdgeParts, Encoder, Kind, KindCode, RowPath, State, Timestamp};
 use flotilla_state_machines::{
     machines::{
         agent_session::{AgentSession, AgentSessionRow},
-        convoy::{Convoy, ConvoyRequest, ConvoyRow, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId, VesselClass},
+        convoy::{
+            Convoy, ConvoyEdge, ConvoyRequest, ConvoyRow, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId, VesselClass,
+        },
         ensure::{Ensure, EnsureRow, EnsureSpec, MemoryEnsureWorld, Record},
         message::{Expectation, Message, MessageRow, MessageSpec},
     },
-    AttemptPolicy, Home, MachineRow, Ref, Version,
+    AttemptPolicy, EdgePayload, Home, MachineRow, Ref, Version,
 };
 
 // Kind codes are stored with every identity and change, so they are pinned: Message 1,
@@ -39,7 +41,8 @@ fn round_trip<R: MachineRow + PartialEq + std::fmt::Debug>(home: &Home<R::Machin
     row
 }
 
-// A resource's row holds its spec, state and records as they are: it survives the schema codec,
+// A resource's row holds its spec, state and records (not its edge events, which are log entries)
+// as they are: it survives the schema codec,
 // and a home restoring it holds the same resource.
 #[test]
 fn rows_hold_their_resource() {
@@ -58,15 +61,14 @@ fn rows_hold_their_resource() {
     let request = ConvoyRequest { project: "p".into(), promises, quota: [(VesselClass(1), 2)].into(), priority: Priority(4) };
     convoys.create("c", request).expect("created");
     convoys.apply("c", Keep { promise: PromiseId(0) }, &MemoryConvoyWorld::default(), Timestamp(3)).expect("kept");
-    let row: ConvoyRow = round_trip(&convoys, "c", Timestamp(2));
-    assert_eq!(row.edges.len(), 1);
+    round_trip::<ConvoyRow>(&convoys, "c", Timestamp(2));
 
     let mut ensures = Home::<Ensure>::new("home").expect("valid");
     ensures.create("e", EnsureSpec { inbox: "i".into(), policy: AttemptPolicy::immediate(2) }).expect("created");
     ensures.apply("e", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(4)).expect("recorded");
     ensures.record_attempt("e", flotilla_state_machines::Attempt::succeeded(Timestamp(5))).expect("attempt");
     let row: EnsureRow = round_trip(&ensures, "e", Timestamp(0));
-    assert_eq!((row.edges.len(), row.attempts.len()), (1, 1));
+    assert_eq!(row.attempts.len(), 1);
     assert_eq!(row.state.value.recorded(), &BTreeSet::from([Ref::new("f")]));
 }
 
@@ -90,7 +92,9 @@ fn a_rows_edge_moves_since_only_with_the_label() {
     assert_eq!(kept.since, Timestamp(1), "a data-only edge keeps since");
     let parts = edge.into_parts();
     assert_eq!((root_sets(&parts), parts.rows.len(), parts.from.code), (vec![], 1, 1), "one resolution row, no root field");
-    assert_eq!(parts.appends.len(), 1, "the event");
+    assert_eq!(parts.appends.len(), 0, "the event is the entry's header, not a row");
+    assert_eq!((parts.event.edge, parts.event.from, parts.event.to, parts.event.at), (event.edge.code(), 1, 1, Timestamp(5)));
+    assert_eq!(parts.event.payload::<EdgePayload<ConvoyEdge>>().expect("payload"), event.payload);
 
     let row = ConvoyRow { state: kept, ..row };
     let event = home.apply("c", Deliver, &world, Timestamp(8)).expect("delivered").clone();

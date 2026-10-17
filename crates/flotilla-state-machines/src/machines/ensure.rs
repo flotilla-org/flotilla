@@ -21,8 +21,8 @@ use flotilla_schema::{Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attempt, edges, states, Attempt, AttemptPolicy, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref,
-    Resource, RowParts, Source, Table, Version, WrongState,
+    attempt, edges, states, Attempt, AttemptPolicy, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts,
+    Source, Table, Version, WrongState,
 };
 
 /// Fulfiller references, in name order. Fulfiller names are addresses: plain
@@ -492,8 +492,6 @@ pub struct EnsureRow {
     #[store(state)]
     pub state: State<EnsureState>,
     #[store(history)]
-    pub edges: Records<EdgeEventOf<Ensure>>,
-    #[store(history)]
     pub attempts: Records<Attempt>,
 }
 
@@ -506,7 +504,6 @@ impl EnsureRow {
 impl MachineRow for EnsureRow {
     type Machine = Ensure;
     const STATE_FIELD: flotilla_schema::StateOf<Self, State<EnsureState>> = EnsureRow::STATE;
-    const EDGE_LOG: flotilla_schema::HistoryOf<Self, EdgeEventOf<Ensure>> = EnsureRow::EDGES;
 
     fn of(resource: &Resource<Ensure>, since: Timestamp) -> EnsureRow {
         let spec = resource.spec().clone();
@@ -514,7 +511,6 @@ impl MachineRow for EnsureRow {
             inbox: spec.inbox,
             policy: spec.policy,
             state: State::new(resource.state().clone(), since),
-            edges: resource.events().clone(),
             attempts: resource.attempts().clone(),
         }
     }
@@ -527,7 +523,7 @@ impl MachineRow for EnsureRow {
         RowParts {
             spec: self.spec(),
             state: self.state.value.clone(),
-            events: self.edges.clone(),
+            events: Records::new(),
             attempts: self.attempts.clone(),
             receipts: Records::new(),
         }

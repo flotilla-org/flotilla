@@ -22,8 +22,8 @@ use flotilla_schema::{Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    edges, states, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts, Source, Table,
-    Version, WrongState,
+    edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts, Source, Table, Version,
+    WrongState,
 };
 
 /// A convoy: the convoy resource's name at its home.
@@ -443,8 +443,6 @@ pub struct ConvoyRow {
     pub priority: Priority,
     #[store(state)]
     pub state: State<ConvoyState>,
-    #[store(history)]
-    pub edges: Records<EdgeEventOf<Convoy>>,
 }
 
 impl ConvoyRow {
@@ -457,7 +455,6 @@ impl ConvoyRow {
 impl MachineRow for ConvoyRow {
     type Machine = Convoy;
     const STATE_FIELD: flotilla_schema::StateOf<Self, State<ConvoyState>> = ConvoyRow::STATE;
-    const EDGE_LOG: flotilla_schema::HistoryOf<Self, EdgeEventOf<Convoy>> = ConvoyRow::EDGES;
 
     fn of(resource: &Resource<Convoy>, since: Timestamp) -> ConvoyRow {
         let spec = resource.spec().clone();
@@ -466,7 +463,6 @@ impl MachineRow for ConvoyRow {
             promises: spec.promises,
             priority: spec.priority,
             state: State::new(resource.state().clone(), since),
-            edges: resource.events().clone(),
         }
     }
 
@@ -478,7 +474,7 @@ impl MachineRow for ConvoyRow {
         RowParts {
             spec: self.spec(),
             state: self.state.value.clone(),
-            events: self.edges.clone(),
+            events: Records::new(),
             attempts: Records::new(),
             receipts: Records::new(),
         }

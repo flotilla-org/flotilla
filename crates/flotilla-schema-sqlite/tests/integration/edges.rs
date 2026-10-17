@@ -192,14 +192,13 @@ fn event(args: DossierEdge, from: DossierState, to: DossierState) -> DossierEven
 /// A deliverable edge on a sample dossier: it writes the dossier's state unchanged.
 fn staying_open(args: DossierEdge) -> Result<Edge<Dossier>, EdgeError> {
     let open = Dossier::sample(0).state;
-    Edge::new(Dossier::STATE, &open, Dossier::EDGES, &event(args, DossierState::Open, DossierState::Open))
+    Edge::new(Dossier::STATE, &open, &event(args, DossierState::Open, DossierState::Open))
 }
 
 /// The deliver edge on an open dossier.
 fn deliver() -> Edge<Dossier> {
     let delivered = State::new(DossierState::Delivered, Timestamp(8));
-    Edge::new(Dossier::STATE, &delivered, Dossier::EDGES, &event(DossierEdge::Deliver, DossierState::Open, DossierState::Delivered))
-        .expect("edge")
+    Edge::new(Dossier::STATE, &delivered, &event(DossierEdge::Deliver, DossierState::Open, DossierState::Delivered)).expect("edge")
 }
 
 fn load(store: &mut Store, id: ResourceId) -> Dossier {
@@ -248,17 +247,10 @@ fn deliverables_move_and_take_evidence_through_edges() {
         .expect("edge");
     let refused = write.apply_edge(retracted, retract_missing);
     assert!(matches!(&refused, Err(StoreError::NoRecord { table, .. }) if table == "dossier_deliverables"), "{refused:?}");
-    let last = write.apply_edge(retracted, deliver()).expect("a refused edge leaves the transaction usable");
+    let _last = write.apply_edge(retracted, deliver()).expect("a refused edge leaves the transaction usable");
     write.commit().expect("commit");
 
     let dossier = load(&mut store, inserted.id);
-    let versions: Vec<(u64, DossierState)> = dossier.edges.iter().map(|row| (row.version, row.record.to)).collect();
-    assert_eq!(
-        versions,
-        [(submitted.version, DossierState::Open), (retracted.version, DossierState::Open), (last.version, DossierState::Delivered)],
-        "one event per edge, in order"
-    );
-    assert_eq!(dossier.edges.last().map(|row| &row.record.payload.args), Some(&DossierEdge::Deliver), "the document round-trips");
     let evidence_rows: Vec<(u32, u64, &str)> = dossier.deliverables.rows()[0]
         .record
         .evidence

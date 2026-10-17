@@ -115,7 +115,7 @@ fn index_pages_and_scans_match_the_model(tc: TestCase) {
                 let id = ids[tc.draw(gs::integers::<usize>().max_value(ids.len() - 1))];
                 let current = write.load::<MessageRow>(id).expect("load").expect("present");
                 if op == 2 {
-                    let next = MessageRow { state: current.value.state.clone(), edges: current.value.edges.clone(), ..drawn_message(&tc) };
+                    let next = MessageRow { state: current.value.state.clone(), ..drawn_message(&tc) };
                     write.update(&current, &next).expect("update");
                     model.insert(id, next);
                 } else if op == 3 {
@@ -165,7 +165,7 @@ fn reference_indexes_match_the_model(tc: TestCase) {
             2 => {
                 let id = ids[tc.draw(gs::integers::<usize>().max_value(ids.len() - 1))];
                 let current = write.load::<Referral>(id).expect("load").expect("present");
-                let next = Referral { phase: current.value.phase, edges: current.value.edges.clone(), ..drawn_referral(&tc) };
+                let next = Referral { phase: current.value.phase, ..drawn_referral(&tc) };
                 write.update(&current, &next).expect("update");
                 model.insert(id, next.stored());
             }

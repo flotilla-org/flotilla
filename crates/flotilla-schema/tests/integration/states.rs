@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_schema::{
     render_ddl, ColumnType, Condition, DecodeError, Decoder, Edge, EdgeError, EdgeEvent, EdgeParts, EdgeRow, EdgeSet, Encoder,
-    FieldColumns, Kind, LabelCheck, Labelled, Records, RowEdit, RowPath, Rows, State, StateData, Stored, TableRole, Timestamp, Value,
+    FieldColumns, Kind, LabelCheck, Labelled, RowEdit, RowPath, Rows, State, StateData, Stored, TableRole, Timestamp, Value,
 };
 use hegel::{generators as gs, TestCase};
 
@@ -86,8 +86,6 @@ struct Ticket {
     title: String,
     #[store(state)]
     state: State<TicketState>,
-    #[store(history)]
-    edges: Records<TicketEvent>,
 }
 
 /// Keys and values from tiny alphabets, so two drawn collections share keys and values often: a
@@ -139,7 +137,6 @@ fn ticket(tc: &TestCase) -> Ticket {
         queue: small(tc, &["q", "r"]),
         title: tc.draw(gs::text().max_size(3)),
         state: State::new(state_value(tc), Timestamp(tc.draw(gs::integers::<i64>()))),
-        edges: Records::new(),
     }
 }
 
@@ -153,7 +150,7 @@ fn transition(previous: &State<TicketState>, next: TicketState, at: i64) -> (Edg
     let (from, to) = (*previous.value.label(), *next.label());
     let since = if from == to { previous.since } else { Timestamp(at) };
     let next = State::new(next, since);
-    let edge = Edge::transition(Ticket::STATE, previous, &next, Ticket::EDGES, &event(from, to, at)).expect("edge");
+    let edge = Edge::transition(Ticket::STATE, previous, &next, &event(from, to, at)).expect("edge");
     (edge, next)
 }
 
@@ -241,11 +238,7 @@ fn a_label_state_is_one_label_column_and_shared_data() {
         .collect();
     assert_eq!(
         tables,
-        [
-            ("ticket_assignees", TableRole::State, vec!["value"], vec![]),
-            ("ticket_notes", TableRole::State, vec!["key"], vec!["value"]),
-            ("ticket_edges", TableRole::History, vec!["pos"], vec!["version", "edge", "from", "to", "writer", "at", "payload"]),
-        ]
+        [("ticket_assignees", TableRole::State, vec!["value"], vec![]), ("ticket_notes", TableRole::State, vec!["key"], vec!["value"]),]
     );
     let index = set.indexes.iter().find(|index| index.name == "live_by_queue").expect("declared");
     assert_eq!(index.predicate, [Condition::In { column: "state".into(), codes: vec![2, 3] }]);
@@ -285,8 +278,7 @@ fn label_states_round_trip(tc: TestCase) {
 }
 
 fn rows_of(state: TicketState) -> Rows {
-    Encoder::encode(&Ticket { queue: "q".into(), title: "t".into(), state: State::new(state, Timestamp(1)), edges: Records::new() })
-        .expect("encode")
+    Encoder::encode(&Ticket { queue: "q".into(), title: "t".into(), state: State::new(state, Timestamp(1)) }).expect("encode")
 }
 
 // Behaviour (#3373 ruling 1): rows of a datum's table exist only while the label carries the datum,
@@ -334,8 +326,9 @@ fn open(assignees: &[&str], notes: &[(&str, &str)], priority: u8, owner: Option<
 // Behaviour (#3373 rulings 2 and 3): a transition writes the label and its `since` (the event's
 // `at`) only when the label changes, each column datum only when its columns differ (nulled when
 // the next label lacks it), and each collection datum row by row: a delete per removed key, an
-// update per changed value and an insert per new key, never the unchanged rows. It appends the
-// event and names the label it leaves, for the store to check.
+// update per changed value and an insert per new key, never the unchanged rows. It appends no
+// row for the event (the event is its log entry's header) and names the label it leaves, for the
+// store to check.
 #[test]
 fn transitions_write_exactly_the_data_that_differs() {
     let previous = State::new(open(&["x", "y"], &[("k", "1"), ("m", "2")], 1, Some("ann")), Timestamp(5));
@@ -374,7 +367,7 @@ fn transitions_write_exactly_the_data_that_differs() {
             row("notes", RowEdit::Update { key: vec![text("k")], values: vec![text("3")] }),
         ]
     );
-    assert_eq!(appends.len(), 1, "the event");
+    assert_eq!(appends.len(), 0, "the event is the log entry's header, not a row");
     assert_eq!(from, LabelCheck { field: "state", code: 2 });
 
     // Data only: the label and since stay, one note is added.
@@ -400,9 +393,8 @@ fn transitions_write_exactly_the_data_that_differs() {
 fn transitions_refuse_inconsistent_events_and_since() {
     let previous = State::new(open(&[], &[], 0, None), Timestamp(5));
     let draft = State::new(TicketState::Draft, Timestamp(9));
-    let attempt = |next: &State<TicketState>, from, to, at| {
-        Edge::transition(Ticket::STATE, &previous, next, Ticket::EDGES, &event(from, to, at)).map(|_| ())
-    };
+    let attempt =
+        |next: &State<TicketState>, from, to, at| Edge::transition(Ticket::STATE, &previous, next, &event(from, to, at)).map(|_| ());
     use TicketLabel::*;
     assert_eq!(attempt(&draft, Draft, Draft, 9), Err(EdgeError::From { field: "state".into(), from: 1, state: 2 }));
     assert_eq!(attempt(&draft, Open, Closed, 9), Err(EdgeError::Label { field: "state".into(), to: 3, state: 1 }));
@@ -416,7 +408,7 @@ fn transitions_refuse_inconsistent_events_and_since() {
         Err(EdgeError::Since { field: "state".into(), expected: Timestamp(5), found: Timestamp(7) })
     );
     assert_eq!(attempt(&draft, Open, Draft, 9), Ok(()));
-    assert_eq!(Edge::new(Ticket::STATE, &draft, Ticket::EDGES, &event(Open, Draft, 9)), Err(EdgeError::Data { field: "state".into() }));
+    assert_eq!(Edge::new(Ticket::STATE, &draft, &event(Open, Draft, 9)), Err(EdgeError::Data { field: "state".into() }));
 }
 
 /// `rows` with an edge's sets and row edits applied, as a backend would: each set replaces its
@@ -490,12 +482,7 @@ fn the_view_shows_label_states_as_state_data() {
     let set = Ticket::table_set();
     assert_eq!(flotilla_schema::enum_columns(&set.tables[0]), []);
     let view = flotilla_schema::render_view([&set]);
-    assert!(
-        view.contains(
-            "| `ticket` | root | 15 | – | `ticket_assignees` (state data), `ticket_notes` (state data), `ticket_edges` (history) |"
-        ),
-        "{view}"
-    );
+    assert!(view.contains("| `ticket` | root | 15 | – | `ticket_assignees` (state data), `ticket_notes` (state data) |"), "{view}");
     assert!(view.contains("| `ticket_notes` | state data | 3 | – | – | – |"), "{view}");
     assert!(view.ends_with(
         "States with data (one label column, then data shared by name across the labels):\n\

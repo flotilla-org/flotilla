@@ -1,11 +1,11 @@
 use chrono::DateTime;
-use flotilla_schema::{EdgeEvent, EncodeError, Kind, Records, Ref, Timestamp};
+use flotilla_schema::{EncodeError, Kind, Ref};
 use flotilla_schema_sqlite::StoreError;
 
 use crate::fixtures::{
     agent_session, store,
-    synthetic::{AgentName, Phase, Reference, ReferralEdge, ReferralEvent},
-    AgentSessionRow, Payload, Referral, LOCAL,
+    synthetic::{AgentName, Reference},
+    AgentSessionRow, Referral, LOCAL,
 };
 
 fn referral(seq: u64) -> Referral {
@@ -85,19 +85,9 @@ fn references_to_missing_targets_create_their_identity() {
 fn equal_interned_strings_share_one_row() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let event: ReferralEvent = EdgeEvent {
-        edge: ReferralEdge::Send,
-        from: Phase::Draft,
-        to: Phase::Sent,
-        writer: "carol".into(),
-        at: Timestamp(1),
-        payload: Payload { args: String::new(), reads: Vec::new() },
-    };
     let reference = Reference::ChangeRequest { service: "carol".into(), scope: "s".into(), number: 1, revision: "r".into() };
     for name in ["a", "b"] {
-        let mut edges = Records::new();
-        edges.append(0, event.clone());
-        let value = Referral { sender: AgentName("carol".into()), references: vec![reference.clone()], edges, ..Referral::sample() };
+        let value = Referral { sender: AgentName("carol".into()), references: vec![reference.clone()], ..Referral::sample() };
         write.insert(name, &value).expect("insert");
     }
     write.commit().expect("commit");
@@ -106,17 +96,16 @@ fn equal_interned_strings_share_one_row() {
     assert_eq!(rows, 1);
     let distinct: i64 = conn
         .query_row(
-            "SELECT count(DISTINCT m.sender) + count(DISTINCT r.change_request_service) + count(DISTINCT e.writer) \
-             FROM referral m JOIN referral_edges e ON e.owner = m.id JOIN referral_references r ON r.owner = m.id",
+            "SELECT count(DISTINCT m.sender) + count(DISTINCT r.change_request_service) \
+             FROM referral m JOIN referral_references r ON r.owner = m.id",
             [],
             |row| row.get(0),
         )
         .expect("count");
-    assert_eq!(distinct, 3, "every column of every row names the one row");
+    assert_eq!(distinct, 2, "every column of every row names the one row");
     let same: i64 = conn
         .query_row(
-            "SELECT count(*) FROM referral m JOIN referral_edges e ON e.owner = m.id JOIN referral_references r ON r.owner = m.id \
-             WHERE m.sender = r.change_request_service AND m.sender = e.writer",
+            "SELECT count(*) FROM referral m JOIN referral_references r ON r.owner = m.id WHERE m.sender = r.change_request_service",
             [],
             |row| row.get(0),
         )

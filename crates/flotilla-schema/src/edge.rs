@@ -2,9 +2,9 @@
 //!
 //! A machine's state is a value, its label plus its data (#3319 ruling of 2026-10-15), and every
 //! edge writes it: a state-machine edge is one write that sets the kind's `#[store(state)]` field
-//! to the new state value, appends its [`EdgeEvent`] to the kind's edge log (a `history` table),
-//! and may set other fields it declares (root columns, or fields of one existing `records` row)
-//! and append declared `records` or `history` rows. [`Edge`] describes such a write without a
+//! to the new state value, logs its [`EdgeEvent`] as the header and payload of the write's entry
+//! in the store's per-home `log` (#3392 G8), and may set other fields it declares (root columns,
+//! or fields of one existing `records` row) and append declared `records` or `history` rows. [`Edge`] describes such a write without a
 //! backend: it encodes each named field through the field's own adapter into
 //! logical values, and each appended row through its `Element` codec. A backend resolves the
 //! tables, takes the next positions and stamps every appended row with the write's sequence.
@@ -13,7 +13,7 @@
 //! `Stored` (a kind or a part), an associated const named by the field in upper case:
 //! `Message::STATE: StateOf<Message, State<MessageState>>` for a `state` field,
 //! `Message::SUBJECT: ColumnOf<Message, Option<MessageReference>>` for another column-shaped field,
-//! `Message::EDGES: HistoryOf<Message, MessageEdgeEvent>` for a `history` field and
+//! `Session::RECEIPTS: HistoryOf<Session, Receipt>` for a `history` field and
 //! `Convoy::DELIVERABLES: RecordsOf<Convoy, Deliverable>` for a `records` field. Spec collections
 //! (`child`) have no handle: they change only by a spec edit.
 //!
@@ -35,12 +35,12 @@ use crate::{
     codec::{EncodeError, Encoder},
     descriptor::TableRole,
     history::{EdgeEvent, Labelled},
-    inline::Cbor,
+    inline::{Cbor, INLINE_LIMITS},
     records::Position,
     state::{RowEdit, State, StateDelta},
     time::Timestamp,
     traits::{CodeEnum, Element, StateData},
-    value::{Hash, Rows, Value},
+    value::{Hash, Identity, Rows, Value},
 };
 
 /// A column-shaped field `F` of rows of `O` (a kind or a part): what [`Edge::set`] and
@@ -241,6 +241,27 @@ pub struct LabelCheck {
     pub code: i64,
 }
 
+/// An edge's event as its `log` entry records it: the header columns and the payload's canonical
+/// CBOR (#3392 G8). `about` is the edge's master, the resource it is about (G11), when it
+/// declares one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeHeader {
+    pub edge: i64,
+    pub from: i64,
+    pub to: i64,
+    pub writer: String,
+    pub at: Timestamp,
+    pub payload: Vec<u8>,
+    pub about: Option<Identity>,
+}
+
+impl EdgeHeader {
+    /// The payload as the edge wrote it.
+    pub fn payload<P: Cbor>(&self) -> Result<P, EdgeError> {
+        flotilla_cbor::from_slice(&self.payload, &INLINE_LIMITS).map_err(|error| EdgeError::Payload { kind: error.kind() })
+    }
+}
+
 /// An edge's writes, as a backend executes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeParts {
@@ -248,11 +269,12 @@ pub struct EdgeParts {
     pub sets: Vec<EdgeSet>,
     /// Row edits of the state's collection data: deletes, updates, then inserts, per datum.
     pub rows: Vec<EdgeRow>,
-    /// The event first (a `history` row of the kind), then the declared appends in order.
+    /// The declared appends, in order.
     pub appends: Vec<EdgeAppend>,
     /// Every object the edge's values name: an edge carries the objects it sets.
     pub objects: BTreeMap<Hash, Vec<u8>>,
     pub from: LabelCheck,
+    pub event: EdgeHeader,
 }
 
 /// Why an edge could not be built.
@@ -279,6 +301,9 @@ pub enum EdgeError {
     /// A state carrying data is written by `Edge::transition`, from the previous value.
     #[error("the state of {field} carries data and is written by a transition from the previous value")]
     Data { field: String },
+    /// The event's payload is not an inline CBOR document within its bounds.
+    #[error("the event payload is not an inline document: {kind:?}")]
+    Payload { kind: flotilla_cbor::ErrorKind },
 }
 
 /// One edge write to a resource of kind `K`, built from typed handles; see the module docs.
@@ -286,7 +311,7 @@ pub enum EdgeError {
 /// ```text
 /// let next = State::new(TicketState::Closed { .. }, event.at);
 /// let event = EdgeEvent { edge: TicketEdge::Close, from: Open, to: Closed, writer, at, payload };
-/// let edge = Edge::transition(Ticket::STATE, &previous, &next, Ticket::EDGES, &event)?.set(Ticket::TITLE, &title)?;
+/// let edge = Edge::transition(Ticket::STATE, &previous, &next, &event)?.set(Ticket::TITLE, &title)?;
 /// write.apply_edge(current, edge)?;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,8 +321,8 @@ pub struct Edge<K> {
 }
 
 impl<K> Edge<K> {
-    /// An edge that moves the kind's `state` from `previous` to `next` and appends `event` to the
-    /// kind's edge log `log` (#3373 rulings 2 and 3). The event must leave `previous`'s label and
+    /// An edge that moves the kind's `state` from `previous` to `next`, logged as `event` (#3373
+    /// rulings 2 and 3, #3392 G8). The event must leave `previous`'s label and
     /// enter `next`'s. When the label changes, the label and its `since` are written, and `next`'s
     /// `since` must be the event's `at`; otherwise neither is written and `next` keeps `previous`'s
     /// `since`. Each datum of the state is written only where it differs: a column datum's columns
@@ -308,7 +333,6 @@ impl<K> Edge<K> {
         state: StateOf<K, State<S>>,
         previous: &State<S>,
         next: &State<S>,
-        log: HistoryOf<K, EdgeEvent<S::Label, E, P>>,
         event: &EdgeEvent<S::Label, E, P>,
     ) -> Result<Edge<K>, EdgeError> {
         let field = state.name();
@@ -325,7 +349,7 @@ impl<K> Edge<K> {
         if next.since != since {
             return Err(EdgeError::Since { field: field.to_owned(), expected: since, found: next.since });
         }
-        let mut edge = Edge::empty(field, from).appended(RowPath::Root, log, event)?;
+        let mut edge = Edge::empty(field, event)?;
         if moved {
             let values = vec![Value::Int(label), Value::Int(event.at.micros())];
             edge.parts.sets.push(EdgeSet { row: RowPath::Root, field, values });
@@ -340,8 +364,8 @@ impl<K> Edge<K> {
         Ok(edge)
     }
 
-    /// An edge that writes the kind's `state` as `next`, whatever it held, and appends `event` to
-    /// the kind's edge log `log`: for a state that carries no data (a code enum), whose label and
+    /// An edge that writes the kind's `state` as `next`, whatever it held, logged as `event`: for a
+    /// state that carries no data (a code enum), whose label and
     /// `since` are its whole value. The event's `to` must be `next`'s label; its `from` is the
     /// writer's, which read the current state for the optimistic stamp the edge is applied under,
     /// and the backend checks it against the stored label. A state carrying data is refused
@@ -349,7 +373,6 @@ impl<K> Edge<K> {
     pub fn new<S: StateData, E: CodeEnum, P: Cbor>(
         state: StateOf<K, State<S>>,
         next: &State<S>,
-        log: HistoryOf<K, EdgeEvent<S::Label, E, P>>,
         event: &EdgeEvent<S::Label, E, P>,
     ) -> Result<Edge<K>, EdgeError> {
         if state.carries_data() {
@@ -359,18 +382,36 @@ impl<K> Edge<K> {
         if to != label {
             return Err(EdgeError::Label { field: state.name().to_owned(), to, state: label });
         }
-        Edge::empty(state.name(), event.from.code()).appended(RowPath::Root, log, event)?.setting(RowPath::Root, state.column, next)
+        Edge::empty(state.name(), event)?.setting(RowPath::Root, state.column, next)
     }
 
-    fn empty(field: &'static str, from: i64) -> Edge<K> {
+    fn empty<L: CodeEnum, E: CodeEnum, P: Cbor>(field: &'static str, event: &EdgeEvent<L, E, P>) -> Result<Edge<K>, EdgeError> {
+        let payload = flotilla_cbor::to_vec(&event.payload, &INLINE_LIMITS).map_err(|error| EdgeError::Payload { kind: error.kind() })?;
+        let header = EdgeHeader {
+            edge: event.edge.code(),
+            from: event.from.code(),
+            to: event.to.code(),
+            writer: event.writer.clone(),
+            at: event.at,
+            payload,
+            about: None,
+        };
         let parts = EdgeParts {
             sets: Vec::new(),
             rows: Vec::new(),
             appends: Vec::new(),
             objects: BTreeMap::new(),
-            from: LabelCheck { field, code: from },
+            from: LabelCheck { field, code: header.from },
+            event: header,
         };
-        Edge { parts, kind: PhantomData }
+        Ok(Edge { parts, kind: PhantomData })
+    }
+
+    /// Names the edge's master, the resource it is about (#3392 G11): the entry's `about`, which
+    /// that resource's gates read as entries about it.
+    pub fn about(mut self, about: Identity) -> Edge<K> {
+        self.parts.event.about = Some(about);
+        self
     }
 
     /// Sets the kind's column-shaped `field` (not its state, which [`Edge::new`] sets) to `value`.

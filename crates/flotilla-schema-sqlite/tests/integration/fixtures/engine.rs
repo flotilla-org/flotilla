@@ -1,13 +1,11 @@
 //! Driving the engine for the engine kinds' fixtures: an edge on a stored row is one the engine
 //! applied, through `Home`, to the resource the row holds.
 
-use std::borrow::Cow;
-
 use flotilla_schema::{Cbor, Edge, Labelled, StateData, Timestamp};
-use flotilla_state_machines::{Coded, EdgeEventOf, EdgePayload, Home, InputRead, Label, Machine, MachineRow, Version};
-use hegel::{generators as gs, TestCase};
+use flotilla_state_machines::{EdgePayload, Home, Label, Machine, MachineRow, Version};
+use hegel::TestCase;
 
-use super::{code_enum, list, name, timestamp, Pick};
+use super::{name, Pick};
 
 /// The resource's name at a fixture's home: the worlds key the resource's own evidence (a
 /// message's receipts, its reply) by it.
@@ -57,30 +55,6 @@ where
     let next = R::of(resource, state.since);
     assert_eq!(next.state(), &state, "the row of the moved resource holds the edge's state");
     Some((edge, next))
-}
-
-/// A history event as a generator leaves it: any of `edges` between any labels. History is never
-/// read to decide, so a stored log need not be a path through the machine.
-pub fn event<M: Machine>(tc: &TestCase, pick: Pick, edges: &[M::Edge]) -> EdgeEventOf<M> {
-    let edge = edges[pick.variant(tc, edges.len(), |index| index)].clone();
-    let labels = Label::<M>::ALL;
-    flotilla_schema::EdgeEvent {
-        edge: flotilla_state_machines::Edge::kind(&edge),
-        from: code_enum(tc, pick, labels),
-        to: code_enum(tc, pick.nth(1), labels),
-        writer: name(tc),
-        at: timestamp(tc),
-        payload: EdgePayload { edge, reads: reads(tc, pick) },
-    }
-}
-
-/// Up to two recorded reads, decoded text and all.
-pub fn reads(tc: &TestCase, pick: Pick) -> Vec<InputRead> {
-    list(tc, pick, 2, |_| InputRead {
-        kind: Cow::Owned(name(tc)),
-        name: name(tc),
-        version: tc.draw(gs::booleans()).then(|| Version(tc.draw(gs::integers::<u64>()))),
-    })
 }
 
 /// A time at which the engine's arithmetic on `base` cannot overflow: `base` plus `by`, saturated.

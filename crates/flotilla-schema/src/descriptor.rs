@@ -6,7 +6,7 @@ use crate::{ddl::quote_ident, value::KindCode};
 
 /// Schema object names of the shared tables and their indexes; no kind table or index may take one.
 pub const SHARED_NAMES: &[&str] =
-    &["strings", "resource_identity", "resource_identity_by_home", "objects", "home_sequence", "change_log", "change_log_by_resource"];
+    &["strings", "resource_identity", "resource_identity_by_home", "objects", "home_sequence", "log", "log_by_resource", "log_about"];
 
 /// Column names the backend adds to a kind's root table.
 pub const RESERVED_ROOT_COLUMNS: &[&str] = &["id", "version"];
@@ -192,7 +192,7 @@ pub enum ColumnType {
 /// A declared index on one of a kind's tables: `eq` columns compared for equality, then `order`
 /// columns, under a partial-index predicate. On the root table every query the backend generates
 /// for it orders by `order..., id`, so the row id is the index's last key. On a nested table
-/// (declared on the part struct whose rows it holds, such as an edge log's `EdgeEvent`) the
+/// (declared on the part struct whose rows it holds) the
 /// table's primary key `owner, ..., pos` ends the index instead, as SQLite appends it to every
 /// index of a `WITHOUT ROWID` table.
 #[derive(Debug, Clone, PartialEq, Eq)]

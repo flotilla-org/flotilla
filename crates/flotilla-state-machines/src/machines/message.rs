@@ -26,8 +26,8 @@ use flotilla_schema::{Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    edges, states, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts, Source, Table,
-    Transport, Version, WrongState,
+    edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts, Source, Table, Transport,
+    Version, WrongState,
 };
 
 /// What would settle the message. `Nothing` settles on delivery.
@@ -542,8 +542,6 @@ pub struct MessageRow {
     pub unbound_after: i64,
     #[store(state)]
     pub state: State<MessageState>,
-    #[store(history)]
-    pub edges: Records<EdgeEventOf<Message>>,
 }
 
 impl MessageRow {
@@ -561,7 +559,6 @@ impl MessageRow {
 impl MachineRow for MessageRow {
     type Machine = Message;
     const STATE_FIELD: flotilla_schema::StateOf<Self, State<MessageState>> = MessageRow::STATE;
-    const EDGE_LOG: flotilla_schema::HistoryOf<Self, EdgeEventOf<Message>> = MessageRow::EDGES;
 
     fn of(resource: &Resource<Message>, since: Timestamp) -> MessageRow {
         let spec = resource.spec().clone();
@@ -571,7 +568,6 @@ impl MachineRow for MessageRow {
             deadline: spec.deadline,
             unbound_after: spec.unbound_after,
             state: State::new(resource.state().clone(), since),
-            edges: resource.events().clone(),
         }
     }
 
@@ -583,7 +579,7 @@ impl MachineRow for MessageRow {
         RowParts {
             spec: self.spec(),
             state: self.state.value.clone(),
-            events: self.edges.clone(),
+            events: Records::new(),
             attempts: Records::new(),
             receipts: Records::new(),
         }
