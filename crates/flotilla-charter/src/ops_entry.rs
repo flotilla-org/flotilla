@@ -178,7 +178,6 @@ fn required(value: String, field: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-
     use super::{parse_operational_entry, OperationalEntryDefinition};
 
     #[test]
