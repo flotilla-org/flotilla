@@ -62,6 +62,27 @@ pub(super) async fn primary_layer_home(
     Ok(Some(LayerHome::Source(CharterSource::Repository { repo, branch, path })))
 }
 
+/// Maximum UTF-8 bytes in one project image-layer heartbeat message.
+const MAX_LAYER_DIAGNOSIS_BYTES: usize = 4096;
+
+fn bounded_layer_diagnosis(message: String) -> String {
+    if message.len() <= MAX_LAYER_DIAGNOSIS_BYTES {
+        return message;
+    }
+    let marker = "\n...[truncated]...\n";
+    let mut head = (MAX_LAYER_DIAGNOSIS_BYTES - marker.len()) / 2;
+    while !message.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = message.len() - (MAX_LAYER_DIAGNOSIS_BYTES - marker.len() - head);
+    while !message.is_char_boundary(tail) {
+        tail += 1;
+    }
+    // Keep project identity at the front and the fatal cause/lock path at the
+    // end, rather than letting a long progress log crowd out the diagnosis.
+    format!("{}{}{}", &message[..head], marker, &message[tail..])
+}
+
 /// Host-local retry state; successful reads and source changes reset refusal backoff.
 #[derive(Default)]
 pub(super) struct LayerRefreshState {
@@ -85,10 +106,10 @@ impl LayerRefreshState {
                     .condition_type(format!("ProjectImageLayer/{namespace}/{project}"))
                     .value(ConditionValue::False)
                     .reason("SourceRefused")
-                    .message(format!(
+                    .message(bounded_layer_diagnosis(format!(
                         "project {namespace}/{project}: {}; retaining previous layer and retrying with backoff",
                         refusal.error
-                    ))
+                    )))
                     .observed_at(refusal.observed_at)
                     .blocks_readiness(false)
                     .blocks_forge_observation(false)
@@ -139,24 +160,26 @@ impl ProjectService<'_> {
             if project.metadata.deletion_timestamp.is_some() || !local.contains(&project.metadata.name) {
                 continue;
             }
-            let home = match self.layer_home(&namespace, &project).await {
-                Ok(Some(home)) => home,
-                Ok(None) => continue,
+            let source = match self.layer_home(&namespace, &project).await {
+                Ok(Some(LayerHome::Source(source))) => source,
+                Ok(None) | Ok(Some(LayerHome::Elsewhere)) => {
+                    self.image_layer_refresh.lock().await.refusals.remove(&(namespace.clone(), project.metadata.name.clone()));
+                    continue;
+                }
                 Err(error) => {
+                    self.image_layer_refresh.lock().await.refusals.remove(&(namespace.clone(), project.metadata.name.clone()));
                     warn!(project = %project.metadata.name, %error, "project image layer source unavailable");
                     continue;
                 }
             };
-            if let LayerHome::Source(source) = home {
-                if self.image_layer_refresh.lock().await.deferred(&namespace, &project.metadata.name, &source) {
-                    continue;
+            if self.image_layer_refresh.lock().await.deferred(&namespace, &project.metadata.name, &source) {
+                continue;
+            }
+            match self.sync_project_image_layer(&namespace, &project.metadata.name, &source).await {
+                Ok(()) => {
+                    self.image_layer_refresh.lock().await.refusals.remove(&(namespace.clone(), project.metadata.name.clone()));
                 }
-                match self.sync_project_image_layer(&namespace, &project.metadata.name, &source).await {
-                    Ok(()) => {
-                        self.image_layer_refresh.lock().await.refusals.remove(&(namespace.clone(), project.metadata.name.clone()));
-                    }
-                    Err(error) => self.image_layer_refresh.lock().await.refused(&namespace, &project.metadata.name, &source, error),
-                }
+                Err(error) => self.image_layer_refresh.lock().await.refused(&namespace, &project.metadata.name, &source, error),
             }
         }
         Ok(())
@@ -401,6 +424,71 @@ mod tests {
         assert!(projects.get("app").await.unwrap().metadata.deletion_timestamp.is_some());
         service.reconcile_project_image_layers().await.unwrap();
         assert!(service.image_layer_refresh.lock().await.conditions().is_empty());
+    }
+
+    // A refusal belongs to one readable layer home. Removing the code home,
+    // losing its default branch, or losing the repository clears that old
+    // diagnosis without retrying a fetch still inside its backoff window.
+    #[tokio::test(start_paused = true)]
+    async fn image_layer_refusal_clears_when_its_home_disappears() {
+        for mode in 0..3 {
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let observed = ResourceBackend::new(InMemoryBackend::observed());
+            seed(&backend, None).await;
+            let source = Arc::new(LayerSource::default());
+            *source.error.lock().unwrap() = Some("old /cache/shallow.lock refusal".into());
+            let operations = Operations(source.clone());
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let namespace = std::sync::RwLock::new("flotilla".to_string());
+            let service = service(&backend, &observed, &clock, &namespace, &operations);
+            service.reconcile_project_image_layers().await.unwrap();
+            assert_eq!(service.image_layer_refresh.lock().await.conditions().len(), 1);
+            let mut project = backend.using::<Project>("flotilla").get("app").await.unwrap();
+            let repository_name = project.spec.repositories[1].repo.to_string();
+            match mode {
+                0 => {
+                    project.spec.repositories.clear();
+                    backend
+                        .definitions::<Project>("flotilla")
+                        .apply(&InputMeta::builder().name("app".into()).build(), &project.spec)
+                        .await
+                        .unwrap();
+                }
+                1 => {
+                    let repositories = backend.using::<Repository>("flotilla");
+                    let repository = repositories.get(&repository_name).await.unwrap();
+                    repositories
+                        .update_status(&repository_name, &repository.metadata.resource_version, &RepositoryStatus::default())
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    backend.using::<Repository>("flotilla").delete(&repository_name).await.unwrap();
+                }
+            }
+            service.reconcile_project_image_layers().await.unwrap();
+            assert!(service.image_layer_refresh.lock().await.conditions().is_empty(), "obsolete home mode {mode} must lose its refusal");
+            assert_eq!(source.reads.lock().unwrap().len(), 1);
+        }
+    }
+
+    // Host heartbeat diagnoses are capped at 4096 UTF-8 bytes, preserving
+    // project identity and the trailing lock cause across short/long errors.
+    #[hegel::test]
+    fn image_layer_diagnosis_bounds_long_unicode_errors(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Empty through 9000 bytes crosses the cap and multibyte boundaries.
+        let repeats = tc.draw(gs::integers::<usize>().min_value(0).max_value(1500));
+        let error = format!("git progress: {} fatal: /cache/shallow.lock: File exists", "é界\n".repeat(repeats));
+        let mut state = LayerRefreshState::default();
+        state.refused("ns", "app", &CharterSource::LocalDirectory { directory: "/source".into() }, error.clone());
+        let conditions = state.conditions();
+        let message = &conditions[0].message;
+        assert!(message.len() <= 4096, "heartbeat message grew to {} bytes", message.len());
+        assert!(message.contains("project ns/app") && message.contains("/cache/shallow.lock"));
+        if error.len() < 3000 {
+            assert!(message.contains(&error));
+        }
     }
 
     // Across duplicate, changed-error, and changed-source sequences the retry

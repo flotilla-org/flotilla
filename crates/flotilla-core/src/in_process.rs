@@ -1432,7 +1432,7 @@ pub struct InProcessDaemon {
     /// Admission cleanup and resource deletion share this lock with adoption.
     observed_checkout_reconciliation: Arc<Mutex<()>>,
     aggregator_projection_state: AggregatorProjectionState,
-    /// Project image-layer refusal state, shared by timer and explicit refreshes.
+    /// Project image-layer refusal state, retained across periodic reconciliations.
     image_layer_refresh: Arc<Mutex<project_image_layers::LayerRefreshState>>,
     /// Provisioning namespace used by daemon-side resource operations (e.g.
     /// looking up the Convoy whose task is being marked complete). Set by the

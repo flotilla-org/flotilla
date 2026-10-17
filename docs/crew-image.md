@@ -386,6 +386,17 @@ for that identity: identical inputs are not retried. Change the definition to
 get a new identity, or delete the `ImageBuild` to rebuild the same identity;
 the next admission re-creates it.
 
+Primary-repository image layers sync during periodic charter reconciliation.
+A failed read keeps the previous layer and publishes one advisory Host
+condition. Identical refusals retry after 60 seconds, doubling up to one
+hour; a changed source resets that backoff. `flotilla project refresh`
+reloads the project declaration and operational entries; it does not force
+this image-layer sync or clear its backoff. `flotilla image check` reads the
+requested branch directly, so it can validate a fix while sync is backed
+off, without updating the stored primary-repository layer. Heartbeat
+refusal messages are capped at 4096 UTF-8 bytes, retaining their beginning
+and end; full error text still identifies repeated refusals for backoff.
+
 ## Checking a branch before merge
 
 ```sh
