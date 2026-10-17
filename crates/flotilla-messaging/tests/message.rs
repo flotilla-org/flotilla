@@ -609,7 +609,7 @@ async fn delivery_receiver_reads_are_bounded() {
         }
     }
     assert_eq!(counts[0], [0; 3], "idle passes do not load receiver evidence");
-    assert_eq!(counts[1], [2; 3], "one local and replica read per receiver kind");
+    assert_eq!(counts[1], [1, 1, 0], "one scoped query per addressed kind; explicit roles need no ensures");
     assert_eq!(counts[1], counts[2]);
 }
 
@@ -2538,6 +2538,27 @@ async fn addressed_receiver_reads_ignore_unrelated_holders() {
                     .expect("noise message");
             }
         }
+        // #3433: the delivery pass must hydrate only addressed receiver rows,
+        // even with unrelated holders and active messages sharing the inbox.
+        let inbox = flotilla_messaging::MessageInbox::new(backend.clone(), "flotilla");
+        for (index, address) in ["flotilla/convoy/work/coder", "flotilla/coder"].into_iter().enumerate() {
+            let mut intent = spec(None, MessageExpectation::Reply);
+            intent.receiver = address.into();
+            inbox.accept(&InputMeta::builder().name(format!("addressed-{index}")).build(), &intent, at(10)).await.expect("admit");
+        }
+        let transport = FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: flotilla_messaging::MessageTransportOutcome::NotSubmitted { reason: "unused".into() },
+            accepted: Default::default(),
+            working: Default::default(),
+        };
+        let before = backend.read_snapshot();
+        inbox.reconcile_delivery(&transport, at(20)).await.expect("delivery pass");
+        let pass = backend.read_snapshot().since(&before);
+        for kind in ["Convoy", "TerminalSession", "ConvoyEnsure"] {
+            assert_eq!(pass.objects_by_kind().get(kind), Some(&1), "delivery receiver rows: {pass}");
+        }
         let before = backend.read_snapshot();
         let snapshot = MessageReceiverSnapshot::load_for_addresses(
             &backend,
@@ -2745,4 +2766,53 @@ fn concurrent_partial_admissions_preserve_one_acceptance_order() {
         .collect();
     assert_eq!(admitted[0].status, admitted[1].status);
     assert!(admitted[0].status.as_ref().expect("admitted").accepted_sequence.is_some());
+}
+
+// N→N+1 receipts without role_address still accept a reply from the recorded
+// incarnation after its standing-role declaration has disappeared.
+#[tokio::test]
+async fn legacy_project_role_reply_uses_recorded_incarnation() {
+    let (backend, inbox) = delivery_inbox().await;
+    let messages = backend.using::<Message>("flotilla");
+    for index in 0..3 {
+        messages.delete(&format!("message-{index}")).await.expect("remove fixture messages");
+    }
+    let mut request = spec(None, MessageExpectation::Reply);
+    request.sender = "system:checks".into();
+    request.receiver = "flotilla/governor".into();
+    let message = messages.create(&InputMeta::builder().name("legacy-request".into()).build(), &request).await.expect("request");
+    messages
+        .update_status(
+            "legacy-request",
+            &message.metadata.resource_version,
+            &MessageStatus::builder()
+                .phase(MessagePhase::Delivered)
+                .since(at(10))
+                .reason("legacy receipt".into())
+                .resolved_receiver(
+                    ResolvedMessageReceiver::builder()
+                        .crew_id("crew".into())
+                        .session("session".into())
+                        .delivered_at(at(10))
+                        .evidence("accepted".into())
+                        .build(),
+                )
+                .build(),
+        )
+        .await
+        .expect("legacy status");
+    let mut reply = spec(None, MessageExpectation::None);
+    reply.sender = "flotilla/convoy/work/coder".into();
+    reply.receiver = request.sender;
+    reply.in_reply_to = Some("legacy-request".into());
+    inbox.accept(&InputMeta::builder().name("legacy-reply".into()).build(), &reply, at(11)).await.expect("reply");
+    let transport = FakeMessageTransport {
+        submissions: Default::default(),
+        observations: Default::default(),
+        outcome: flotilla_messaging::MessageTransportOutcome::NotSubmitted { reason: "unused".into() },
+        accepted: Default::default(),
+        working: Default::default(),
+    };
+    inbox.reconcile_delivery(&transport, at(20)).await.expect("correlation");
+    assert_eq!(messages.get("legacy-request").await.expect("request").status.expect("status").phase, MessagePhase::Answered);
 }

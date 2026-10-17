@@ -122,7 +122,7 @@ impl MessageInbox {
             tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.release_closed(&messages)).await.ok();
             return Ok(());
         }
-        let snapshot = MessageReceiverSnapshot::load(&self.backend, &self.namespace).await?;
+        let snapshot = self.load_delivery_receivers(&messages).await?;
         let receivers = &snapshot;
         messages.sort_by_key(|message| {
             (
@@ -186,7 +186,7 @@ impl MessageInbox {
                     {
                         if reply.object.spec.in_reply_to.as_deref() == Some(message.metadata.name.as_str())
                             && reply.object.spec.receiver == message.spec.sender
-                            && Self::reply_sender_matches(receivers, message, &reply.object.spec.sender)?
+                            && self.reply_sender_matches(message, &reply.object.spec.sender).await?
                         {
                             answered = true;
                             break;
@@ -312,8 +312,29 @@ impl MessageInbox {
             )
             .await?;
         }
-        let snapshot = MessageReceiverSnapshot::load(&self.backend, &self.namespace).await?;
+        let snapshot = self.load_delivery_receivers(std::slice::from_ref(&message)).await?;
         self.clear_signal(&snapshot, &message).await
+    }
+
+    // Freeze only addressed holders. Topics expand to declared subscriber roles;
+    // sender exclusion and holder precedence still run against the frozen batch.
+    async fn load_delivery_receivers(&self, messages: &[ResourceObject<Message>]) -> Result<MessageReceiverSnapshot, ResourceError> {
+        let mut addresses = std::collections::BTreeSet::new();
+        let topics = messages
+            .iter()
+            .filter(|message| message.spec.receiver.starts_with("topic:"))
+            .map(|message| message.spec.receiver.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for topic in topics {
+            addresses.extend(crate::role_routing::topic_receiver_addresses(&self.backend, &self.namespace, topic).await?);
+        }
+        for message in messages {
+            if message.spec.receiver.starts_with("topic:") {
+                continue;
+            }
+            addresses.insert(message.spec.receiver.clone());
+        }
+        MessageReceiverSnapshot::load_for_addresses(&self.backend, &self.namespace, &addresses.into_iter().collect::<Vec<_>>()).await
     }
 
     fn delivered_role_address(
@@ -365,11 +386,7 @@ impl MessageInbox {
         }
     }
 
-    fn reply_sender_matches(
-        receivers: &MessageReceiverSnapshot,
-        message: &ResourceObject<Message>,
-        sender: &str,
-    ) -> Result<bool, ResourceError> {
+    async fn reply_sender_matches(&self, message: &ResourceObject<Message>, sender: &str) -> Result<bool, ResourceError> {
         if sender == message.spec.receiver {
             return Ok(true);
         }
@@ -394,8 +411,18 @@ impl MessageInbox {
         }
         // N→N+1 fallback: find the recorded incarnation directly, without
         // requiring its old convoy to remain the current project-role holder.
-        let holders = receivers.terminals();
-        Ok(holders.iter().any(|holder| {
+        let holders = self
+            .backend
+            .query_declared::<TerminalSession>(
+                &self.namespace,
+                &crate::StoreQuery {
+                    fields: BTreeMap::from([("status.crew.id".into(), receiver.crew_id.clone())]),
+                    include_replicas: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(holders.items.iter().any(|holder| {
             let labels = &holder.object.metadata.labels;
             holder.object.status.as_ref().is_some_and(|status| {
                 status.crew.as_ref().is_some_and(|crew| crew.id == receiver.crew_id)
@@ -800,7 +827,7 @@ impl MessageInbox {
                 None => {
                     // The idle caller saw no active Messages; this query can
                     // find one only if admission raced with gate cleanup.
-                    loaded = MessageReceiverSnapshot::load(&self.backend, &self.namespace).await?;
+                    loaded = self.load_delivery_receivers(&active).await?;
                     &loaded
                 }
             };

@@ -106,6 +106,29 @@ async fn topic_contacts_in_snapshot(
     routing: TopicRouting<'_>,
     receivers: &MessageReceiverSnapshot,
 ) -> Result<Vec<RoleContact>, ResourceError> {
+    topic_candidates(backend, namespace, routing, Some(receivers)).await
+}
+
+pub(crate) async fn topic_receiver_addresses(
+    backend: &ResourceBackend,
+    namespace: &str,
+    address: &str,
+) -> Result<Vec<String>, ResourceError> {
+    let (project, topic) = parse_topic_address(address).ok_or_else(|| ResourceError::invalid("invalid topic address"))?;
+    let reach = if topic == "supervision" { TopicReach::Ancestors } else { TopicReach::SubtreeSubscriptions };
+    Ok(topic_candidates(backend, namespace, TopicRouting::builder().project(project).topic(topic).reach(reach).build(), None)
+        .await?
+        .into_iter()
+        .map(|contact| contact.address)
+        .collect())
+}
+
+async fn topic_candidates(
+    backend: &ResourceBackend,
+    namespace: &str,
+    routing: TopicRouting<'_>,
+    receivers: Option<&MessageReceiverSnapshot>,
+) -> Result<Vec<RoleContact>, ResourceError> {
     let TopicRouting { project, topic, sender, reach } = routing;
     let hierarchy = ProjectHierarchy::load_for_inspection(backend, namespace).await?;
     let projects = backend.definitions::<Project>(namespace).list().await?;
@@ -133,10 +156,13 @@ async fn topic_contacts_in_snapshot(
                     continue;
                 }
                 let address = definition.principal.clone().unwrap_or_else(|| format!("{name}/{role}"));
-                let holder = if definition.principal.is_some() { None } else { receivers.resolve(&address)? };
+                let holder = match receivers {
+                    Some(receivers) if definition.principal.is_none() => receivers.resolve(&address)?,
+                    _ => None,
+                };
                 // Principal roles are declared terminal recipients. Automated roles
                 // exist only with current holders, not merely inherited definitions.
-                if holder.is_none() && definition.principal.is_none() {
+                if receivers.is_some() && holder.is_none() && definition.principal.is_none() {
                     continue;
                 }
                 if sender.is_some_and(|sender| {
