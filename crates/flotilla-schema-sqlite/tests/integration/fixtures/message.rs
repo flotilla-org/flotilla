@@ -1,7 +1,7 @@
 //! The engine's Message (`Resource<Message>`, declared by `MessageSpec`, kind code `ms`):
 //! generators, and the worlds that let each edge pass its gate.
 
-use flotilla_schema::{Edge, State, Timestamp};
+use flotilla_schema::{Address, Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::message::{
         Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageSpec, MessageState, MessageWorld, Receiver,
@@ -12,7 +12,7 @@ use flotilla_state_machines::{
 use hegel::{generators as gs, TestCase};
 
 use super::{
-    code_enum,
+    addr, address, code_enum,
     engine::{self, after, resource, Candidate, NAME},
     name, timestamp, Fixture, Pick,
 };
@@ -34,7 +34,7 @@ pub fn expectation(tc: &TestCase, pick: Pick) -> Expectation {
     match pick.digit(tc, 3, 1) {
         0 => Expectation::Nothing,
         1 => Expectation::Reply,
-        _ => Expectation::Outcome { condition: Ref::new(name(tc)) },
+        _ => Expectation::Outcome { condition: address(tc) },
     }
 }
 
@@ -42,9 +42,9 @@ pub fn reason(tc: &TestCase, pick: Pick) -> DropReason {
     match pick.digit(tc, 5, 4) {
         0 => DropReason::Undeliverable,
         1 => DropReason::Expired,
-        2 => DropReason::Superseded { by: Ref::new(name(tc)) },
-        3 => DropReason::Withdrawn { by: name(tc), authority: Ref::new(name(tc)) },
-        _ => DropReason::ConsumerUnreachable { by: name(tc), authority: Ref::new(name(tc)) },
+        2 => DropReason::Superseded { by: address(tc) },
+        3 => DropReason::Withdrawn { by: address(tc), authority: address(tc) },
+        _ => DropReason::ConsumerUnreachable { by: address(tc), authority: address(tc) },
     }
 }
 
@@ -65,7 +65,7 @@ pub fn state_value(tc: &TestCase, pick: Pick) -> MessageState {
 /// The envelope, drawn or covered.
 pub fn spec(tc: &TestCase, pick: Pick) -> MessageSpec {
     MessageSpec {
-        inbox: name(tc),
+        inbox: address(tc),
         expectation: expectation(tc, pick),
         deadline: pick.some(tc, 8).then(|| timestamp(tc)),
         unbound_after: tc.draw(gs::integers::<i64>()),
@@ -78,7 +78,7 @@ pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Message> {
 
 /// A fixed envelope for example tests: expecting a reply in `inbox`, no deadline.
 pub fn sample_spec() -> MessageSpec {
-    MessageSpec { inbox: "inbox".into(), expectation: Expectation::Reply, deadline: None, unbound_after: 0 }
+    MessageSpec { inbox: addr("inbox"), expectation: Expectation::Reply, deadline: None, unbound_after: 0 }
 }
 
 /// A fixed message for example tests: [`sample_spec`], Pending, no history.
@@ -87,8 +87,8 @@ pub fn sample() -> Resource<Message> {
 }
 
 /// [`sample`] in another inbox.
-pub fn sample_in(inbox: impl Into<String>) -> Resource<Message> {
-    sample().with_spec(MessageSpec { inbox: inbox.into(), ..sample_spec() })
+pub fn sample_in(inbox: Address) -> Resource<Message> {
+    sample().with_spec(MessageSpec { inbox, ..sample_spec() })
 }
 
 fn boxed(world: MemoryMessageWorld) -> Box<dyn MessageWorld> {
@@ -116,27 +116,27 @@ pub fn candidates(tc: &TestCase, message: &Resource<Message>) -> Vec<Candidate<M
     candidates.push((Settle { by: Settlement::Answered }.into(), boxed(world), now));
     if let Expectation::Outcome { condition } = &spec.expectation {
         let mut world = MemoryMessageWorld::default();
-        world.condition.put(condition, true);
+        world.condition.put(&Ref::new(condition.as_str()), true);
         candidates.push((Settle { by: Settlement::OutcomeObserved }.into(), boxed(world), now));
     }
 
-    let (by, authority) = (name(tc), Ref::new(name(tc)));
+    let (by, authority) = (address(tc), address(tc));
     for reason in [
         DropReason::Withdrawn { by: by.clone(), authority: authority.clone() },
         DropReason::ConsumerUnreachable { by, authority: authority.clone() },
     ] {
         let mut world = MemoryMessageWorld::default();
-        world.authority.put(&authority, true);
+        world.authority.put(&Ref::new(authority.as_str()), true);
         candidates.push((DropMessage { reason }.into(), boxed(world), now));
     }
-    let newer = Ref::new(name(tc));
+    let newer = address(tc);
     let mut world = MemoryMessageWorld::default();
-    world.supersession.put(&newer, Supersedes { older: NAME.into() });
+    world.supersession.put(&Ref::new(newer.as_str()), Supersedes { older: NAME.into() });
     candidates.push((DropMessage { reason: DropReason::Superseded { by: newer } }.into(), boxed(world), now));
     if let Some(deadline) = spec.deadline {
         let past = after(deadline, tc.draw(gs::integers::<i64>().min_value(1).max_value(3)));
         let mut world = MemoryMessageWorld::default();
-        world.applied_through.put(&Ref::new(spec.inbox.clone()), after(past, 1));
+        world.applied_through.put(&Ref::new(spec.inbox.as_str()), after(past, 1));
         candidates.push((DropMessage { reason: DropReason::Expired }.into(), boxed(world), past));
     }
     let mut world = MemoryMessageWorld::default();

@@ -33,7 +33,7 @@ fn cause(detail: &str) -> Cause {
 /// spending itself.
 fn latch() -> Home<LatchMachine> {
     let mut home = Home::new("kiwi").expect("valid declaration");
-    home.create("l", false, Timestamp(0)).expect("created");
+    home.create("l", false, &Table::new(), Timestamp(0)).expect("created");
     home.apply("l", Load { shots: 2 }, &Table::new(), at(0)).expect("loaded");
     home
 }
@@ -58,31 +58,33 @@ fn judge_retry(latch: &Resource<LatchMachine>, policy: &AttemptPolicy, now: Time
     })
 }
 
-// Admission creates the resource in the state it returns, at version 1.
+// Admission creates the resource in the state it returns, at the version its
+// home's log gives the create (the first: 1).
 #[test]
 fn creation_stores_the_admitted_state() {
     let mut home = Home::<LatchMachine>::new("kiwi").expect("valid declaration");
-    let created = home.create("l", true, Timestamp(0)).expect("created");
+    let created = home.create("l", true, &Table::new(), Timestamp(0)).expect("created").resource;
     assert_eq!((created.state(), created.spec(), created.version()), (&armed(0), &true, Version(1)));
-    assert!(created.events().is_empty());
+    assert!(home.log().history("l", Version(0), usize::MAX).is_empty(), "a create is no edge");
 }
 
-// An accepted edge stores the next state, raises the version, and appends
+// An accepted edge stores the next state, takes the log's version, and logs
 // one event holding the typed edge, the labels it moved between, the writer,
 // the time and the gate's reads.
 #[test]
 fn an_applied_edge_stores_the_next_state_and_appends_its_event() {
     let mut home = latch();
     let world = raised("bell");
-    let event = home.apply("l", fire("bell"), &world, at(7)).expect("fires").clone();
+    let event = home.apply("l", fire("bell"), &world, at(7)).expect("fires");
     assert_eq!((event.edge, &event.payload.edge), (LatchEdgeKind::Fire, &LatchEdge::Fire(fire("bell"))));
     assert_eq!((event.from, event.to, event.at), (LatchLabel::Armed, LatchLabel::Fired, at(7)));
     assert_eq!(event.writer, "kiwi");
     assert_eq!(event.payload.reads, [InputRead { kind: "signal".into(), name: "bell".into(), version: Some(Version(1)) }]);
     let resource = home.get("l").expect("exists");
     assert_eq!(resource.state(), &Latch::Fired { shots: 1, by: "bell".into() });
-    assert_eq!((resource.label(), resource.version(), resource.events().len()), (LatchLabel::Fired, Version(3), 2));
-    assert_eq!(resource.events().rows()[1].version, 3);
+    let history = home.log().history("l", Version(0), usize::MAX);
+    assert_eq!((resource.label(), resource.version(), history.len()), (LatchLabel::Fired, Version(3), 2));
+    assert_eq!(history[1], (Version(3), &event), "the event the home returned, logged at the version it adopted");
 }
 
 // Refusals go back to the caller and are never recorded.
@@ -94,7 +96,7 @@ fn a_refusal_records_nothing() {
     assert_eq!(home.apply("l", ReArm, &empty, at(1)).err(), Some(WriteError::Refused(LatchRefusal::WrongState)));
     assert_eq!(home.apply("l", Load { shots: 0 }, &empty, at(1)).err(), Some(WriteError::Refused(LatchRefusal::NoShots)));
     let resource = home.get("l").expect("exists");
-    assert_eq!((resource.state(), resource.version(), resource.events().len()), (&armed(2), Version(2), 1));
+    assert_eq!((resource.state(), resource.version(), home.log().history("l", Version(0), usize::MAX).len()), (&armed(2), Version(2), 1));
 }
 
 // An end refuses every edge, attempts and notes too, with the end's reason.
@@ -108,7 +110,7 @@ fn an_ended_resource_refuses_every_edge() {
     assert_eq!(home.apply("l", note(), &Table::new(), at(2)).err(), ended);
     let resource = home.get("l").expect("exists");
     assert_eq!(resource.state(), &Latch::Withdrawn { reason: "no longer wanted".into() });
-    assert_eq!((resource.version(), resource.events().len()), (Version(3), 2));
+    assert_eq!((resource.version(), home.log().history("l", Version(0), usize::MAX).len()), (Version(3), 2));
 }
 
 // An attempt is an edge like any other: it leaves only the labels it is
@@ -116,7 +118,7 @@ fn an_ended_resource_refuses_every_edge() {
 #[test]
 fn an_attempt_is_an_edge_on_its_labels() {
     let mut home = latch();
-    let event = home.apply("l", failed("down", true), &Table::new(), at(1)).expect("attempted").clone();
+    let event = home.apply("l", failed("down", true), &Table::new(), at(1)).expect("attempted");
     assert_eq!((event.edge, event.from, event.to), (LatchEdgeKind::Try, LatchLabel::Armed, LatchLabel::Armed));
     assert_eq!(event.payload.edge, LatchEdge::Try(failed("down", true)));
     let state = home.get("l").expect("exists").state().clone();
@@ -131,18 +133,43 @@ fn an_attempt_is_an_edge_on_its_labels() {
 fn an_edge_about_a_master_records_only_its_event() {
     let mut home = latch();
     let before = home.get("l").expect("exists").state().clone();
-    let event = home.apply("l", note(), &Table::new(), at(1)).expect("noted").clone();
+    let event = home.apply("l", note(), &Table::new(), at(1)).expect("noted");
     assert_eq!(home.definition().master(&event.payload.edge).as_deref(), Some("m"));
     assert_eq!(home.definition().master(&fire("bell").into()), None);
     assert!(home.definition().find(LatchEdgeKind::Note).expect("declared").has_master());
     let resource = home.get("l").expect("exists");
-    assert_eq!((resource.state(), resource.version(), resource.events().len()), (&before, Version(3), 2));
+    assert_eq!((resource.state(), resource.version(), home.log().history("l", Version(0), usize::MAX).len()), (&before, Version(3), 2));
+}
+
+// The in-memory log keeps the store's contract (R1, R2): one sequence per
+// home, so the writes to two resources interleave in it and each resource
+// holds the sequence of its last write; history pages as a range over
+// (resource, sequence); and a resource restored from a store at a version
+// above the log's sequence moves on past it.
+#[test]
+fn the_memory_log_sequences_its_home_and_pages_history() {
+    let mut home = latch();
+    home.create("m", false, &Table::new(), Timestamp(0)).expect("created");
+    home.apply("m", Load { shots: 1 }, &Table::new(), at(1)).expect("loaded");
+    home.apply("l", note(), &Table::new(), at(2)).expect("noted");
+    let versions = (home.get("l").expect("l").version(), home.get("m").expect("m").version());
+    assert_eq!((versions, home.log().last_sequence()), ((Version(5), Version(4)), 5), "l took 1, 2 and 5; m 3 and 4");
+    let page =
+        |after: u64| home.log().history("l", Version(after), 1).iter().map(|(version, event)| (version.0, event.edge)).collect::<Vec<_>>();
+    assert_eq!((page(0), page(2), page(5)), (vec![(2, LatchEdgeKind::Load)], vec![(5, LatchEdgeKind::Note)], vec![]));
+
+    let l = home.get("l").expect("l");
+    let stored = Resource::stored("far", *l.spec(), l.stored_state().clone(), Version(40));
+    let mut restored = Home::<LatchMachine>::new("kiwi").expect("valid declaration");
+    restored.restore(stored).expect("restored");
+    restored.apply("far", note(), &Table::new(), at(3)).expect("noted");
+    assert_eq!(restored.get("far").expect("far").version(), Version(41));
 }
 
 #[test]
 fn creation_refuses_a_duplicate_name_and_unknown_names_are_reported() {
     let mut home = latch();
-    assert_eq!(home.create("l", true, Timestamp(0)).err(), Some(WriteError::Exists("l".into())));
+    assert_eq!(home.create("l", true, &Table::new(), Timestamp(0)).err(), Some(WriteError::Exists("l".into())));
     assert_eq!(home.apply("x", ReArm, &Table::new(), at(1)).err(), Some(WriteError::Unknown("x".into())));
     assert_eq!(home.judge("x", &Table::new(), at(1), |h| h.state().clone()).err(), Some(WriteError::Unknown("x".into())));
 }
@@ -162,7 +189,7 @@ fn a_home_refuses_an_invalid_declaration() {
         fn definition() -> MachineDef<Self> {
             MachineDef::new(LatchLabel::Armed)
         }
-        fn admit(_: ()) -> Result<((), Latch), LatchRefusal> {
+        fn admit(_: &mut flotilla_state_machines::Admission<'_, Self>, _: ()) -> Result<((), Latch), LatchRefusal> {
             Ok(((), armed(0)))
         }
     }
@@ -196,12 +223,15 @@ fn admission_outside_the_initial_label_is_a_fault() {
                 .end(Spent, "spent")
                 .end(Withdrawn, "withdrawn")
         }
-        fn admit(_: ()) -> Result<((), Latch), LatchRefusal> {
+        fn admit(_: &mut flotilla_state_machines::Admission<'_, Self>, _: ()) -> Result<((), Latch), LatchRefusal> {
             Ok(((), Latch::Spent { shots: 0 }))
         }
     }
     let mut home = Home::<Late>::new("kiwi").expect("valid declaration");
-    assert_eq!(home.create("l", (), Timestamp(0)).err(), Some(WriteError::Fault(Fault::Initial { state: LatchLabel::Spent })));
+    assert_eq!(
+        home.create("l", (), &Table::new(), Timestamp(0)).err(),
+        Some(WriteError::Fault(Fault::Initial { state: LatchLabel::Spent }))
+    );
     assert!(home.get("l").is_none());
 }
 
@@ -326,7 +356,7 @@ fn the_writer_follows_its_rules_over_any_sequence(tc: hegel::TestCase) {
     let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(40));
     let policy = AttemptPolicy { max_failures: tc.draw(gs::integers::<u32>().min_value(1).max_value(3)), base: 50, factor: 2, cap: 300 };
     let mut home = Home::<LatchMachine>::new("kiwi").expect("valid");
-    home.create("l", spent, Timestamp(0)).expect("created");
+    home.create("l", spent, &Table::new(), Timestamp(0)).expect("created");
     let mut model = Model { state: armed(0), version: 1, attempts: Vec::new(), before: 0 };
     let mut now = 0i64;
     for _ in 0..steps {
@@ -393,11 +423,8 @@ fn the_writer_follows_its_rules_over_any_sequence(tc: hegel::TestCase) {
             (actual, wanted) => assert_eq!(actual, wanted, "{op:?}"),
         }
         assert_eq!(resource.version(), Version(model.version), "{op:?}");
-        // Events have dense positions and the versions of the writes that appended them.
-        let versions: Vec<u64> = resource.events().rows().iter().map(|row| row.version).collect();
-        for (i, row) in resource.events().rows().iter().enumerate() {
-            assert_eq!(row.position.0 as usize, i);
-        }
+        // The log holds one event per accepted edge, at the version its write gave.
+        let versions: Vec<u64> = home.log().history("l", Version(0), usize::MAX).iter().map(|(version, _)| version.0).collect();
         assert_eq!(versions, (2..=model.version).collect::<Vec<_>>(), "one event per accepted write");
         let judged = judge_retry(resource, &policy, at(now));
         assert_eq!(judged.value, model.expected_retry(&policy), "{op:?}");

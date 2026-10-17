@@ -1,7 +1,7 @@
 //! Message (spec `machines/message.qnt`; scenarios `inbox_delivery`, `message_race`;
 //! ADR 0064 "Inboxes").
 
-use flotilla_schema::{Code, CodeEnum, Position, Timestamp};
+use flotilla_schema::{Address, Code, CodeEnum, EdgeHeader, Origin, Timestamp};
 use flotilla_state_machines::{
     machines::message::{
         AppliedThrough, Binding, Condition, Deliver, DropMessage, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message,
@@ -17,17 +17,31 @@ fn t(micros: i64) -> Timestamp {
     Timestamp::from_micros(micros)
 }
 
-fn condition() -> Ref<Condition> {
-    Ref::new("build-green")
+/// The project-rooted address of `name`.
+fn a(name: &str) -> Address {
+    Address::project(name).expect("valid name")
+}
+
+fn inbox() -> Address {
+    INBOX.parse().expect("canonical inbox")
+}
+
+fn condition() -> Address {
+    a("build-green")
+}
+
+/// The world's key for [`condition`]: its canonical text.
+fn condition_ref() -> Ref<Condition> {
+    Ref::new(condition().as_str())
 }
 
 fn spec(expectation: Expectation, deadline: Option<i64>) -> MessageSpec {
-    MessageSpec { inbox: INBOX.into(), expectation, deadline: deadline.map(t), unbound_after: 10 }
+    MessageSpec { inbox: inbox(), expectation, deadline: deadline.map(t), unbound_after: 10 }
 }
 
 fn home(spec: MessageSpec) -> Home<Message> {
-    let mut home = Home::new("home").expect("valid declaration");
-    home.create("m", spec, Timestamp(0)).expect("created");
+    let mut home = Home::<Message>::new("home").expect("valid declaration");
+    home.create("m", spec, &MemoryMessageWorld::default(), Timestamp(0)).expect("created");
     home
 }
 
@@ -134,7 +148,7 @@ fn deliver_records_one_receiver_and_awaits() {
     receipt(&mut world, "replacement", Transport::Turn);
     assert_eq!(home.apply("m", deliver("replacement", Transport::Turn), &world, t(2)).err(), refused(MessageRefusal::WrongState));
     assert_eq!(*state(&home), MessageState::Awaiting { receiver: session("old") });
-    assert_eq!(home.get("m").expect("exists").events().len(), 1, "one delivery");
+    assert_eq!(home.log().history("m", Version(0), usize::MAX).len(), 1, "one delivery");
 }
 
 // With nothing expected, delivery settles the message, keeping its receiver
@@ -189,9 +203,9 @@ fn an_observed_outcome_settles_from_pending() {
 
     let mut outcome = home(spec(Expectation::Outcome { condition: condition() }, None));
     assert_eq!(outcome.apply("m", observed(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
-    world.condition.put(&condition(), false);
+    world.condition.put(&condition_ref(), false);
     assert_eq!(outcome.apply("m", observed(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
-    world.condition.put(&condition(), true);
+    world.condition.put(&condition_ref(), true);
     outcome.apply("m", observed(), &world, t(2)).expect("settled");
     assert_eq!(*state(&outcome), MessageState::Settled { receiver: None }, "settled from Pending: no receiver");
 }
@@ -201,12 +215,12 @@ fn an_observed_outcome_settles_from_pending() {
 fn supersession_must_name_this_message() {
     let mut home = home(spec(Expectation::Reply, None));
     let mut world = MemoryMessageWorld::default();
-    let by: Ref<Supersession> = Ref::new("m2");
-    let superseded = || drop(DropReason::Superseded { by: Ref::new("m2") });
+    let by = a("m2");
+    let superseded = || drop(DropReason::Superseded { by: by.clone() });
     assert_eq!(home.apply("m", superseded(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
-    world.supersession.put(&by, Supersedes { older: "other".into() });
+    world.supersession.put(&Ref::<Supersession>::new(by.as_str()), Supersedes { older: "other".into() });
     assert_eq!(home.apply("m", superseded(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
-    world.supersession.put(&by, Supersedes { older: "m".into() });
+    world.supersession.put(&Ref::<Supersession>::new(by.as_str()), Supersedes { older: "m".into() });
     home.apply("m", superseded(), &world, t(1)).expect("dropped");
     assert_eq!(*state(&home), MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: None, watermark: None });
 }
@@ -217,11 +231,11 @@ fn supersession_must_name_this_message() {
 #[test]
 fn deliberate_drops_need_authority() {
     let mut world = MemoryMessageWorld::default();
-    world.authority.put(&Ref::new("no"), false);
-    world.authority.put(&Ref::new("yes"), true);
+    world.authority.put(&Ref::new(a("no").as_str()), false);
+    world.authority.put(&Ref::new(a("yes").as_str()), true);
     receipt(&mut world, "s1", Transport::Turn);
-    let withdrawn = |a: &str| drop(DropReason::Withdrawn { by: "sender".into(), authority: Ref::new(a) });
-    let unreachable = |a: &str| drop(DropReason::ConsumerUnreachable { by: "supervisor".into(), authority: Ref::new(a) });
+    let withdrawn = |name: &str| drop(DropReason::Withdrawn { by: a("sender"), authority: a(name) });
+    let unreachable = |name: &str| drop(DropReason::ConsumerUnreachable { by: a("supervisor"), authority: a(name) });
     for (reason, delivered) in [(withdrawn as fn(&str) -> DropMessage, false), (unreachable, true)] {
         let mut home = home(spec(Expectation::Reply, None));
         if delivered {
@@ -249,14 +263,15 @@ fn expiry_needs_a_passed_deadline_and_no_expected_evidence() {
     world.reply.put(&Ref::new("m"), ());
     assert_eq!(reply.apply("m", drop(DropReason::Expired), &world, t(6)).err(), refused(MessageRefusal::ExpectationMet));
     let mut outcome = home(spec(Expectation::Outcome { condition: condition() }, Some(5)));
-    world.condition.put(&condition(), true);
+    world.condition.put(&condition_ref(), true);
     assert_eq!(outcome.apply("m", drop(DropReason::Expired), &world, t(6)).err(), refused(MessageRefusal::ExpectationMet));
-    world.condition.put(&condition(), false);
+    world.condition.put(&condition_ref(), false);
     outcome.apply("m", drop(DropReason::Expired), &world, t(6)).expect("expired");
     assert_eq!(*state(&outcome), MessageState::Dropped { reason: DropReason::Expired, receiver: None, watermark: None });
-    let dropped = outcome.get("m").expect("exists").events().last().expect("dropped");
-    assert_eq!(dropped.record.at, t(6), "the drop's time is its event's, the state's since (G4)");
-    let reads = &dropped.record.payload.reads;
+    let history = outcome.log().history("m", Version(0), usize::MAX);
+    let (_, dropped) = history.last().expect("dropped");
+    assert_eq!(dropped.at, t(6), "the drop's time is its event's, the state's since (G4)");
+    let reads = &dropped.payload.reads;
     assert!(reads.iter().all(|read| read.kind != <AppliedThrough as Kind>::NAME), "{reads:?}");
 }
 
@@ -342,25 +357,28 @@ fn edge_events_round_trip_through_the_schema_codec() {
     let (mut home, mut world) = awaiting(None);
     world.reply.put(&Ref::new("m"), ());
     let previous = home.get("m").expect("exists").stored_state().clone();
-    let event = home.apply("m", Settle { by: Settlement::Answered }, &world, t(2)).expect("settled").clone();
+    let event = home.apply("m", Settle { by: Settlement::Answered }, &world, t(2)).expect("settled");
     let resource = home.get("m").expect("exists");
-    let events = resource.events();
-    assert_eq!(events.iter().map(|row| (row.position, row.version)).collect::<Vec<_>>(), [(Position(0), 2), (Position(1), 3)]);
+    let events = home.log().history("m", Version(0), usize::MAX);
+    assert_eq!(events.iter().map(|(version, _)| *version).collect::<Vec<_>>(), [Version(2), Version(3)], "the log's sequence");
+    assert_eq!(resource.version(), Version(3), "the home adopts the log's version");
     let header = resource.stored_edge(&previous, &event).expect("edge").into_parts().event;
     assert_eq!((header.edge, header.from, header.to), (event.edge.code(), event.from.code(), event.to.code()));
     assert_eq!(header.payload::<EdgePayload<MessageEdge>>().expect("decodes"), event.payload);
-    let delivered = &events.rows()[0].record;
+    let delivered = events[0].1;
     assert_eq!((delivered.edge.code(), delivered.from.code(), delivered.to.code()), (Code::new("de"), Code::new("pe"), Code::new("aw")));
     assert_eq!(delivered.payload.edge, deliver("s1", Transport::Turn).into());
 }
 
-// A payload's document is the edge's serde form: a reference is its name
-// alone, and every read keeps its kind, name and version (or absence).
+// A payload's document is the edge's serde form: its code and arguments, never
+// its variant name, so renaming an edge leaves stored payloads decodable; a
+// reference is its name alone, and every read keeps its kind, name and version
+// (or absence).
 #[test]
 fn payload_documents_name_references_and_keep_reads() {
-    let reason = DropReason::Withdrawn { by: "ann".into(), authority: Ref::new("ops") };
+    let reason = DropReason::Withdrawn { by: a("ann"), authority: a("ops") };
     let reads = vec![
-        InputRead { kind: "authority".into(), name: "ops".into(), version: Some(Version(4)) },
+        InputRead { kind: "authority".into(), name: "project:ops".into(), version: Some(Version(4)) },
         InputRead { kind: "binding".into(), name: INBOX.into(), version: None },
     ];
     let payload = EdgePayload { edge: MessageEdge::from(drop(reason)), reads };
@@ -368,12 +386,31 @@ fn payload_documents_name_references_and_keep_reads() {
     assert_eq!(
         json,
         serde_json::json!({
-            "edge": { "Drop": { "reason": { "Withdrawn": { "by": "ann", "authority": "ops" } } } },
+            "edge": ["dr", { "reason": { "Withdrawn": { "by": "project:ann", "authority": "project:ops" } } }],
             "reads": [
-                { "kind": "authority", "name": "ops", "version": 4 },
+                { "kind": "authority", "name": "project:ops", "version": 4 },
                 { "kind": "binding", "name": INBOX, "version": null },
             ],
         })
     );
     assert_eq!(serde_json::from_value::<EdgePayload<MessageEdge>>(json).expect("deserialises"), payload);
+    let unknown = serde_json::json!({ "edge": ["zz", {}], "reads": [] });
+    let refused = serde_json::from_value::<EdgePayload<MessageEdge>>(unknown).expect_err("no edge has code zz");
+    assert!(refused.to_string().contains("unknown MessageEdge code \"zz\""), "{refused}");
+    // A document is exactly [code, arguments]: a third element is refused, as JSON and as the
+    // stored CBOR.
+    let trailing = serde_json::json!({ "edge": ["dr", { "reason": "Expired" }, "junk"], "reads": [] });
+    let refused = serde_json::from_value::<EdgePayload<MessageEdge>>(trailing.clone()).expect_err("a third element");
+    assert!(refused.to_string().contains("invalid length 3, expected a MessageEdge as [code, arguments]"), "{refused}");
+    let stored = Origin::new("w", t(0)).with_payload(&trailing).expect("encodes").payload.expect("a payload");
+    let header = EdgeHeader {
+        edge: Code::new("dr"),
+        from: Code::new("pe"),
+        to: Code::new("dr"),
+        writer: "w".into(),
+        at: t(0),
+        payload: stored,
+        about: None,
+    };
+    assert!(header.payload::<EdgePayload<MessageEdge>>().is_err(), "a stored payload with a third element is refused");
 }

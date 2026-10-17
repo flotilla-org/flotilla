@@ -72,7 +72,7 @@ fn units(v: &Value) -> Units {
 
 fn request_of(v: &Value) -> Request {
     Request {
-        convoy: ConvoyId::new(count(&v["convoy"]).to_string()),
+        convoy: ConvoyId::new(count(&v["convoy"]).to_string(), "home"),
         class: VesselClass(count(&v["class"])),
         shape: units(&v["shape"]),
         priority: Priority(count(&v["priority"])),
@@ -84,7 +84,7 @@ fn units_value(units: &Units) -> Value {
 }
 
 fn request_value(r: &Request) -> Value {
-    let convoy: i64 = r.convoy.as_str().parse().expect("conformance convoy name");
+    let convoy: i64 = r.convoy.name.parse().expect("conformance convoy name");
     json!({ "convoy": int(convoy), "class": int(r.class.0.into()), "shape": units_value(&r.shape), "priority": int(r.priority.0.into()) })
 }
 
@@ -160,8 +160,8 @@ impl Composed {
         };
         match ledger.place(&self.id, evidence.host) {
             Ok(lease) => {
-                let mut home = Home::new("home").expect("valid declaration");
-                home.create(NAME, lease.request.clone(), Timestamp(0)).expect("created");
+                let mut home = Home::<Lifecycle<VesselKind>>::new("home").expect("valid declaration");
+                home.create(NAME, lease.request.clone(), &MemoryLifecycleWorld::default(), Timestamp(0)).expect("created");
                 self.ledger = ledger;
                 self.lifecycle = Some(home);
                 Step::Accepted

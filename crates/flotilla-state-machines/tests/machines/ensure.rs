@@ -6,16 +6,25 @@ use flotilla_state_machines::{
         Attempted, Authority, Bind, Create, Drain, Ensure, EnsureEdgeKind, EnsureLabel, EnsureRefusal, EnsureSpec, EnsureState, Fulfiller,
         FulfillerPhase, FulfillerStatus, Fulfillers, Hold, MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
     },
-    AttemptPolicy, Cause, CauseCategory, Coded, Diagram, Failure, Home, Machine, Outcome, Ref, WriteError,
+    AttemptPolicy, Cause, CauseCategory, Coded, Diagram, Failure, Home, Machine, Outcome, Ref, Version, WriteError,
 };
 
 fn at(micros: i64) -> Timestamp {
     Timestamp::from_micros(micros)
 }
 
+/// The inbox the Ensure keeps bound; the world keys its drain by this text.
+const INBOX: &str = "project:p/role:r";
+
 fn home() -> Home<Ensure> {
-    let mut home = Home::new("kiwi").expect("valid declaration");
-    home.create("e", EnsureSpec { inbox: "inbox".into(), policy: AttemptPolicy::immediate(2) }, Timestamp(0)).expect("created");
+    let mut home = Home::<Ensure>::new("kiwi").expect("valid declaration");
+    home.create(
+        "e",
+        EnsureSpec { inbox: INBOX.parse().expect("canonical inbox"), policy: AttemptPolicy::immediate(2) },
+        &MemoryEnsureWorld::default(),
+        Timestamp(0),
+    )
+    .expect("created");
     home
 }
 
@@ -79,7 +88,7 @@ fn bound_home() -> (Home<Ensure>, MemoryEnsureWorld) {
     let mut world = MemoryEnsureWorld::default();
     h.apply("e", Record { fulfiller: f("a") }, &world, at(1)).expect("recorded");
     world.fulfillers.put(&f("a"), status(FulfillerPhase::Realised, true));
-    world.drains.put(&Ref::<Drain>::new("inbox"), true);
+    world.drains.put(&Ref::<Drain>::new(INBOX), true);
     h.apply("e", Bind { fulfiller: f("a") }, &world, at(2)).expect("bound");
     (h, world)
 }
@@ -189,7 +198,7 @@ fn bind_needs_a_realised_receiving_fulfiller_and_a_drained_inbox() {
     let mut h = home();
     let mut world = MemoryEnsureWorld::default();
     world.fulfillers.put(&f("a"), status(FulfillerPhase::Realised, true));
-    world.drains.put(&Ref::<Drain>::new("inbox"), true);
+    world.drains.put(&Ref::<Drain>::new(INBOX), true);
     assert_eq!(h.apply("e", Bind { fulfiller: f("a") }, &world, at(1)).err(), refused(EnsureRefusal::NotRecorded));
     h.apply("e", Record { fulfiller: f("a") }, &world, at(1)).expect("recorded");
     for (phase, can_receive, drained) in [
@@ -200,7 +209,7 @@ fn bind_needs_a_realised_receiving_fulfiller_and_a_drained_inbox() {
     ] {
         let mut world = MemoryEnsureWorld::default();
         world.fulfillers.put(&f("a"), status(phase, can_receive));
-        world.drains.put(&Ref::<Drain>::new("inbox"), drained);
+        world.drains.put(&Ref::<Drain>::new(INBOX), drained);
         assert_eq!(h.apply("e", Bind { fulfiller: f("a") }, &world, at(2)).err(), refused(EnsureRefusal::MissingEvidence));
     }
     assert_eq!(h.apply("e", Bind { fulfiller: f("b") }, &world, at(2)).err(), refused(EnsureRefusal::NotRecorded));
@@ -237,7 +246,7 @@ fn unbind_needs_the_bound_fulfiller_gone() {
 fn attempts_keep_the_windows_tally() {
     let mut h = home();
     let world = MemoryEnsureWorld::default();
-    let event = h.apply("e", failed(true), &world, at(1)).expect("attempted").clone();
+    let event = h.apply("e", failed(true), &world, at(1)).expect("attempted");
     assert_eq!((event.from, event.to), (EnsureLabel::Unfulfilled, EnsureLabel::Unfulfilled));
     assert!(event.payload.reads.is_empty(), "an ungated attempt reads nothing");
     let latest = Failure { at: at(1), cause: cause(), retryable: true };
@@ -248,7 +257,7 @@ fn attempts_keep_the_windows_tally() {
     h.apply("e", failed(true), &world, at(3)).expect("attempted");
     h.apply("e", failed(false), &world, at(4)).expect("attempted");
     assert_eq!(tally(&h), (2, Some(Failure { at: at(4), cause: cause(), retryable: false })));
-    assert_eq!(h.get("e").expect("exists").events().len(), 4, "every attempt stays in the log");
+    assert_eq!(h.log().history("e", Version(0), usize::MAX).len(), 4, "every attempt stays in the log");
 }
 
 // Hold needs an exhausted window (spec `exhausted`): the policy's consecutive
@@ -295,7 +304,7 @@ fn bind_and_unbind_keep_the_windows_tally() {
     h.apply("e", Record { fulfiller: f("a") }, &world, at(1)).expect("recorded");
     h.apply("e", failed(true), &world, at(2)).expect("attempted");
     world.fulfillers.put(&f("a"), status(FulfillerPhase::Realised, true));
-    world.drains.put(&Ref::<Drain>::new("inbox"), true);
+    world.drains.put(&Ref::<Drain>::new(INBOX), true);
     h.apply("e", Bind { fulfiller: f("a") }, &world, at(3)).expect("bound");
     assert_eq!(state(&h).failures(), 1, "binding keeps the tally");
     world.fulfillers.put(&f("a"), status(FulfillerPhase::Gone, false));
@@ -332,7 +341,7 @@ fn resume_opens_a_new_window() {
     // A failure in the new window that cannot be retried exhausts it again.
     h.apply("e", failed(false), &world, at(6)).expect("attempted");
     h.apply("e", Hold, &world, at(7)).expect("held again");
-    let attempts = h.get("e").expect("exists").events().iter().filter(|row| row.record.edge == EnsureEdgeKind::Attempted).count();
+    let attempts = h.log().history("e", Version(0), usize::MAX).iter().filter(|(_, event)| event.edge == EnsureEdgeKind::Attempted).count();
     assert_eq!(attempts, 2, "the old attempt stays in the log");
 }
 

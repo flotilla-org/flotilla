@@ -10,18 +10,22 @@
 //!
 //! [`Ledger`] is a pure, in-memory host ledger that computes the snapshot and
 //! holds the live leases. Releasing a lease removes it: the ledger keeps no
-//! history. Every failure is an explicit error; nothing panics.
+//! history. The leases are a view over the live Vessel resources, which store
+//! each lease as their spec, so a restarted ledger is rebuilt from them
+//! ([`Ledger::restore`]). Every failure is an explicit error; nothing panics.
 
 use std::collections::BTreeMap;
+
+use flotilla_schema::Stored;
 
 use crate::machines::convoy::{ConvoyId, Priority, Quota, VesselClass};
 
 /// A host that capacity is leased on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
 pub struct Host(pub u32);
 
 /// One capacity dimension, such as cores or memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
 pub struct Dimension(pub u32);
 
 /// Units by capacity dimension: a request's shape, or a host's capacity.
@@ -234,6 +238,28 @@ impl Ledger {
             Vessel::Leased(lease) => Ok(lease),
             Vessel::Waiting(_) => Err(LedgerError::NotLeased(id.clone())),
         }
+    }
+
+    /// Puts back the lease of a live vessel granted before a restart, read from
+    /// its stored spec ([`live_leases`](crate::machines::vessel::live_leases)):
+    /// the ledger's leases are a view over the live Vessels, so it is rebuilt
+    /// from them rather than kept. Refused when `id` is already known, or when
+    /// the lease names an unknown host or does not fit the host's capacity
+    /// beside the leases already restored. A refusal leaves the ledger as it
+    /// was and names the vessel. What a restart does with such a vessel (a
+    /// host's capacity shrank, or the host is gone) is the startup caller's
+    /// decision, not the ledger's; see #3438.
+    pub fn restore(&mut self, id: VesselId, lease: Lease) -> Result<(), LedgerError> {
+        if self.vessels.contains_key(&id) {
+            return Err(LedgerError::DuplicateRequest(id));
+        }
+        let host = lease.host;
+        self.vessels.insert(id.clone(), Vessel::Leased(lease));
+        if let Err(error) = self.available(host) {
+            self.vessels.remove(&id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Returns vessel `id`'s lease and forgets the vessel, freeing its shape.

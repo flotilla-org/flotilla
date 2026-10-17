@@ -18,7 +18,7 @@ use std::{
 
 use flotilla_schema::{Code, CodeEnum};
 
-use crate::{code::changed, Coded, Edge, EdgeArg, Handle, StateValue};
+use crate::{code::changed, Admission, Coded, Edge, EdgeArg, Handle, StateValue};
 
 /// A declared machine: a marker type naming its request, spec, state, edges,
 /// refusal and readable world.
@@ -44,7 +44,9 @@ pub trait Machine: Sized + 'static {
 
     /// Admission: whether `request` may be created at all, and if so its
     /// immutable spec and initial state, whose label must be the declared one.
-    fn admit(request: Self::Request) -> Result<(Self::Spec, Self::State), Self::Refusal>;
+    /// Whatever the request names by address that must exist is read through
+    /// `admission`, which records each read for the create (#3392 G1).
+    fn admit(admission: &mut Admission<'_, Self>, request: Self::Request) -> Result<(Self::Spec, Self::State), Self::Refusal>;
 }
 
 /// The label enum of machine `M`'s states.

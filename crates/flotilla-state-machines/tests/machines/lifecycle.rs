@@ -39,8 +39,8 @@ fn cause(detail: &str) -> Cause {
 }
 
 fn home() -> Home<P> {
-    let mut home = Home::new("kiwi").expect("valid declaration");
-    home.create("r", "opaque request".to_string(), Timestamp(0)).expect("created");
+    let mut home = Home::<P>::new("kiwi").expect("valid declaration");
+    home.create("r", "opaque request".to_string(), &MemoryLifecycleWorld::default(), Timestamp(0)).expect("created");
     home
 }
 
@@ -236,7 +236,7 @@ fn give_up_needs_exhausted_attempts_with_that_cause() {
 fn the_default_policy_gives_up_after_three_failures() {
     let world = MemoryLifecycleWorld::default();
     let mut h: Home<Lifecycle<Other>> = Home::new("kiwi").expect("valid declaration");
-    h.create("r", (1, 2), Timestamp(0)).expect("created");
+    h.create("r", (1, 2), &world, Timestamp(0)).expect("created");
     for n in 1..=3 {
         let refusal = h.apply("r", GiveUp { cause: cause("boom") }, &world, at(n)).err();
         assert_eq!(refusal, Some(WriteError::Refused(LifecycleRefusal::MissingEvidence)), "after {} failures", n - 1);

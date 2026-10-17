@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Code, CodeEnum, Timestamp};
+use flotilla_schema::{Address, Code, CodeEnum, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
         Abandon, Authority, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoyState, Deliver, Keep,
@@ -10,7 +10,7 @@ use flotilla_state_machines::{
         PromiseState::{self, Kept, Pending, Retracted},
         Quota, Readmit, Retract, VesselClass,
     },
-    Coded, Diagram, EdgePayload, Home, Kind, Machine, Ref, StateValue, WriteError,
+    Coded, Diagram, EdgePayload, Home, InputRead, Kind, Machine, Ref, StateValue, Version, WriteError,
 };
 
 const YES: &str = "yes";
@@ -24,26 +24,35 @@ fn promises(states: &[(u32, PromiseState)]) -> BTreeMap<PromiseId, PromiseState>
     states.iter().map(|(id, state)| (PromiseId(*id), *state)).collect()
 }
 
+fn project() -> Address {
+    Address::project("flotilla").expect("project address")
+}
+
+fn target() -> Address {
+    "forge:github/repo:flotilla-org%2Fflotilla/cr:1".parse().expect("canonical address")
+}
+
 fn request(promises: &[u32], counts: &[(u32, u32)]) -> ConvoyRequest {
     ConvoyRequest {
-        project: "project".into(),
-        promises: promises.iter().map(|id| (PromiseId(*id), Promise { kind: "opaque".into(), target: "target".into() })).collect(),
+        project: project(),
+        promises: promises.iter().map(|id| (PromiseId(*id), Promise { kind: "opaque".into(), target: target() })).collect(),
         quota: quota(counts),
         priority: Priority(1),
     }
 }
 
-// An authority `yes` that is authorised and one `no` that is not; anything else is absent.
+// The project exists; an authority `yes` that is authorised and one `no` that is not; anything
+// else is absent.
 fn world() -> MemoryConvoyWorld {
-    let mut world = MemoryConvoyWorld::default();
+    let mut world = MemoryConvoyWorld::default().with_project(&project());
     world.authority.put(&Ref::new(YES), true);
     world.authority.put(&Ref::new(NO), false);
     world
 }
 
 fn convoy(request: ConvoyRequest) -> Home<Convoy> {
-    let mut home = Home::new("home").expect("valid declaration");
-    home.create("c", request, Timestamp(0)).expect("admitted");
+    let mut home = Home::<Convoy>::new("home").expect("valid declaration");
+    home.create("c", request, &world(), at()).expect("admitted");
     home
 }
 
@@ -137,10 +146,31 @@ stateDiagram-v2
 #[test]
 fn admission_requires_a_promise() {
     let mut home: Home<Convoy> = Home::new("home").expect("valid");
-    assert_eq!(home.create("empty", request(&[], &[(0, 1)]), Timestamp(0)).err(), refused(ConvoyRefusal::NoPromises));
-    let admitted = home.create("c", request(&[0, 1], &[(0, 1)]), Timestamp(0)).expect("admitted");
+    assert_eq!(home.create("empty", request(&[], &[(0, 1)]), &world(), at()).err(), refused(ConvoyRefusal::NoPromises));
+    let admitted = home.create("c", request(&[0, 1], &[(0, 1)]), &world(), at()).expect("admitted").resource;
     assert_eq!(admitted.state(), &ConvoyState::Open { resolution: promises(&[(0, Pending), (1, Pending)]), quota: quota(&[(0, 1)]) });
     assert_eq!((admitted.spec().promises.len(), admitted.spec().priority), (2, Priority(1)));
+}
+
+// #3392 G1: the project is a definitions-class kind named by address, so its existence is a
+// recorded read at admission, not a foreign key. An unknown project is refused and creates
+// nothing; a known one is admitted, and the create carries the version admission saw.
+#[test]
+fn admission_reads_the_project_by_address() {
+    let mut home: Home<Convoy> = Home::new("home").expect("valid");
+    let empty = MemoryConvoyWorld::default();
+    assert_eq!(home.create("c", request(&[0], &[]), &empty, at()).err(), refused(ConvoyRefusal::UnknownProject));
+    assert!(home.get("c").is_none(), "a refused admission creates nothing");
+    assert_eq!(home.log().last_sequence(), 0, "and writes nothing to the log");
+    let other = MemoryConvoyWorld::default().with_project(&Address::project("elsewhere").expect("project"));
+    assert_eq!(home.create("c", request(&[0], &[]), &other, at()).err(), refused(ConvoyRefusal::UnknownProject));
+    let mut world = MemoryConvoyWorld::default();
+    world.projects.put(&Ref::new("project:noise"), ());
+    let version = world.projects.put(&Ref::new(project().as_str()), ());
+    let created = home.create("c", request(&[0], &[]), &world, at()).expect("admitted");
+    assert_eq!(created.reads, [InputRead { kind: "project".into(), name: "project:flotilla".into(), version: Some(version) }]);
+    assert_eq!(created.resource.spec().project, project());
+    assert_eq!(version, Version(2));
 }
 
 // Keep settles a known pending promise and stays Open; an unknown promise is
@@ -263,7 +293,7 @@ fn an_authorised_edge_records_its_authority_read() {
 #[test]
 fn convoy_edge_events_round_trip_through_the_schema_codec() {
     let mut home = Home::<Convoy>::new("home").expect("valid");
-    home.create("c", request(&[0, 1], &[(0, 1), (3, 2)]), Timestamp(0)).expect("admitted");
+    home.create("c", request(&[0, 1], &[(0, 1), (3, 2)]), &world(), at()).expect("admitted");
     let world = world();
     let edges: [(ConvoyEdge, i64); 4] = [
         (readmit(&[(0, 2), (3, 2)], YES).into(), 1),
@@ -273,7 +303,7 @@ fn convoy_edge_events_round_trip_through_the_schema_codec() {
     ];
     for (edge, at) in edges {
         let previous = home.get("c").expect("exists").stored_state().clone();
-        let event = home.apply("c", edge, &world, Timestamp(at)).expect("applied").clone();
+        let event = home.apply("c", edge, &world, Timestamp(at)).expect("applied");
         let header = home.get("c").expect("exists").stored_edge(&previous, &event).expect("edge").into_parts().event;
         assert_eq!((header.edge, header.from, header.to), (event.edge.code(), event.from.code(), event.to.code()));
         assert_eq!(header.payload::<EdgePayload<ConvoyEdge>>().expect("decodes"), event.payload);

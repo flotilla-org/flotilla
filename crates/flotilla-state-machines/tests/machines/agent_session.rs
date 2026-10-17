@@ -14,8 +14,8 @@ fn at(micros: i64) -> Timestamp {
 }
 
 fn home() -> Home<AgentSession> {
-    let mut home = Home::new("kiwi").expect("valid declaration");
-    home.create("s", (), Timestamp(0)).expect("created");
+    let mut home = Home::<AgentSession>::new("kiwi").expect("valid declaration");
+    home.create("s", (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("created");
     home
 }
 
@@ -95,7 +95,7 @@ fn mermaid_is_pinned() {
 fn a_receipt_is_a_receive_edge_about_its_message() {
     let mut h = home();
     let receive = || Receive { message: "m".into(), transport: Transport::Notify };
-    let event = h.apply("s", receive(), &channel(None), at(1)).expect("received while detached").clone();
+    let event = h.apply("s", receive(), &channel(None), at(1)).expect("received while detached");
     assert_eq!((event.from, event.to), (AgentSessionLabel::Live, AgentSessionLabel::Live));
     assert!(event.payload.reads.is_empty(), "an ungated receipt reads nothing");
     assert_eq!(h.definition().master(&event.payload.edge).as_deref(), Some("m"));
@@ -103,7 +103,7 @@ fn a_receipt_is_a_receive_edge_about_its_message() {
     h.apply("s", attach(), &channel(Some(true)), at(2)).expect("attached");
     h.apply("s", receive(), &channel(None), at(3)).expect("received while attached");
     assert_eq!(*state(&h), live(Channel::Attached), "a receipt keeps the channel");
-    assert_eq!(h.get("s").expect("exists").events().len(), 3);
+    assert_eq!(h.log().history("s", Version(0), usize::MAX).len(), 3);
 }
 
 // A new session is Live and Detached; a name is created once.
@@ -111,7 +111,7 @@ fn a_receipt_is_a_receive_edge_about_its_message() {
 fn create_makes_a_live_detached_session_once() {
     let mut h = home();
     assert_eq!(*state(&h), live(Channel::Detached));
-    assert_eq!(h.create("s", (), Timestamp(0)).err(), Some(WriteError::Exists("s".into())));
+    assert_eq!(h.create("s", (), &MemoryAgentSessionWorld::default(), Timestamp(0)).err(), Some(WriteError::Exists("s".into())));
     assert_eq!(h.apply("other", attach(), &channel(Some(true)), at(1)).err(), Some(WriteError::Unknown("other".into())));
 }
 

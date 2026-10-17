@@ -44,7 +44,7 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Address, Timestamp};
 use flotilla_state_machines::{
     machines::message::{
         AppliedThrough, Binding, Condition, Deliver, DeliveryFailure, DropMessage, DropReason, Expectation, InboxBinding,
@@ -62,9 +62,17 @@ use crate::{
 
 const NAME: &str = "m";
 const INBOX: &str = "project:p/role:r";
-const CONDITION: &str = "condition";
+const CONDITION: &str = "project:condition";
+const NEWER: &str = "project:newer";
+const SENDER: &str = "project:sender";
+const SUPERVISOR: &str = "project:supervisor";
 /// The harness's deadline value: an envelope without a deadline still carries it.
 const HARNESS_DEADLINE: i64 = 1;
+
+/// A canonical address; gates read the world by its text.
+fn at(text: &str) -> Address {
+    text.parse().expect("canonical conformance address")
+}
 
 /// The receiver session for spec session number `n`.
 fn session(n: i64) -> String {
@@ -79,11 +87,11 @@ fn spec_of(envelope: &Value) -> MessageSpec {
     let expectation = match tag(&envelope["expectation"]) {
         "Nothing" => Expectation::Nothing,
         "Reply" => Expectation::Reply,
-        "Outcome" => Expectation::Outcome { condition: Ref::new(CONDITION) },
+        "Outcome" => Expectation::Outcome { condition: at(CONDITION) },
         other => panic!("expectation {other}"),
     };
     MessageSpec {
-        inbox: INBOX.into(),
+        inbox: at(INBOX),
         expectation,
         deadline: boolean(&envelope["hasDeadline"]).then(|| tick(number(&envelope["deadline"]))),
         unbound_after: UNIT,
@@ -132,9 +140,9 @@ fn drop_reason_of(o: &Value) -> DropReason {
     match tag(&o["reason"]) {
         "Undeliverable" => DropReason::Undeliverable,
         "Expired" => DropReason::Expired,
-        "Superseded" => DropReason::Superseded { by: Ref::new("newer") },
-        "Withdrawn" => DropReason::Withdrawn { by: "sender".into(), authority: Ref::new("sender") },
-        "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: "supervisor".into(), authority: Ref::new("supervisor") },
+        "Superseded" => DropReason::Superseded { by: at(NEWER) },
+        "Withdrawn" => DropReason::Withdrawn { by: at(SENDER), authority: at(SENDER) },
+        "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: at(SUPERVISOR), authority: at(SUPERVISOR) },
         other => panic!("drop reason {other}"),
     }
 }
@@ -175,13 +183,13 @@ fn drop_world(spec: &MessageSpec, o: &Value, now: Timestamp) -> Result<MemoryMes
         }
         "Superseded" => {
             let older = if boolean(&o["supersedes"]) { NAME } else { "another" };
-            world.supersession.put(&Ref::<Supersession>::new("newer"), Supersedes { older: older.into() });
+            world.supersession.put(&Ref::<Supersession>::new(NEWER), Supersedes { older: older.into() });
         }
         "Withdrawn" => {
-            world.authority.put(&Ref::new("sender"), boolean(&o["authorised"]));
+            world.authority.put(&Ref::new(SENDER), boolean(&o["authorised"]));
         }
         "ConsumerUnreachable" => {
-            world.authority.put(&Ref::new("supervisor"), boolean(&o["authorised"]));
+            world.authority.put(&Ref::new(SUPERVISOR), boolean(&o["authorised"]));
         }
         other => panic!("drop reason {other}"),
     }
@@ -195,8 +203,8 @@ impl Conformance for MessageConformance {
     type Subject = Home<Message>;
 
     fn create(state: &Value) -> Home<Message> {
-        let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, spec_of(payload(state)), Timestamp(0)).expect("created");
+        let mut home = Home::<Message>::new("home").expect("valid declaration");
+        home.create(NAME, spec_of(payload(state)), &MemoryMessageWorld::default(), Timestamp(0)).expect("created");
         home
     }
 

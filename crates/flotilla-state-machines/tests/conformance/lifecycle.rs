@@ -26,7 +26,7 @@ use flotilla_state_machines::{
         Attempted, GiveUp, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed,
         Realise, Release, Vanish,
     },
-    AttemptPolicy, Cause, CauseCategory, Home, Outcome, Ref, WriteError,
+    AttemptPolicy, Cause, CauseCategory, Home, Outcome, Ref, Version, WriteError,
 };
 use serde_json::{json, Value};
 
@@ -99,8 +99,8 @@ impl Conformance for LifecycleConformance {
     type Subject = Home<P>;
 
     fn create(_: &Value) -> Home<P> {
-        let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, (), Timestamp(0)).expect("created");
+        let mut home = Home::<P>::new("home").expect("valid declaration");
+        home.create(NAME, (), &MemoryLifecycleWorld::default(), Timestamp(0)).expect("created");
         home
     }
 
@@ -142,10 +142,11 @@ impl Conformance for LifecycleConformance {
 
     fn encode(home: &Home<P>) -> Value {
         let resource = home.get(NAME).expect("exists");
-        let attempts: Vec<&Outcome> = resource
-            .events()
-            .iter()
-            .filter_map(|row| match &row.record.payload.edge {
+        let attempts: Vec<&Outcome> = home
+            .log()
+            .history(NAME, Version(0), usize::MAX)
+            .into_iter()
+            .filter_map(|(_, event)| match &event.payload.edge {
                 LifecycleEdge::Attempted(attempted) => Some(&attempted.outcome),
                 _ => None,
             })

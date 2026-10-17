@@ -20,7 +20,7 @@ use hegel::TestCase;
 use rusqlite::Connection;
 
 use crate::fixtures::{
-    agent_session, engine, message, origin, registry, store,
+    addr, agent_session, engine, message, origin, registry, store,
     synthetic::{DossierEdge, DossierEvent, DossierState},
     AgentSession, Dossier, Fixture, GateRead, Message, Payload, Pick, Referral, Resource, LOCAL,
 };
@@ -125,7 +125,7 @@ fn a_delete_keeps_history_and_an_expunge_removes_it() {
     let mut write = source.write().expect("write");
     let stamp = write.insert("m", &message::sample(), &origin()).expect("insert");
     let current = write.load::<Resource<Message>>(stamp.id).expect("load").expect("present");
-    let edited = write.update(&current, &message::sample_in("edited"), &origin()).expect("edit");
+    let edited = write.update(&current, &message::sample_in(addr("edited")), &origin()).expect("edit");
     write.delete::<Resource<Message>>(edited, &Origin::new("deleter", Timestamp(9))).expect("delete");
     write.insert("other", &message::sample(), &origin()).expect("a resource that stays");
     write.commit().expect("commit");
@@ -414,7 +414,7 @@ fn renamed_fields_read_entries_written_under_their_aliases() {
     };
     let mut old = open(LOCAL, |kinds| kinds.register::<Before>().expect("register"));
     let mut notes = Records::new();
-    notes.append(0, OldNote { text: "first".into() });
+    notes.append(0, OldNote { text: "first".into() }).expect("room");
     let value = Before { title: "t".into(), who: Person { name: "ann".into() }, tags: vec!["a".into(), "b".into()], notes };
     let mut write = old.write().expect("write");
     write.insert("n", &value, &origin()).expect("insert");
@@ -523,7 +523,7 @@ fn a_messages_delivery_gate_reads_the_receipts_about_it() {
     let world = log_world(&mut store, stored.id);
     assert!(home.apply("m", deliver("t", Transport::Turn), &world, Timestamp(4)).is_err(), "another session's receipt does not count");
     assert!(home.apply("m", deliver("s", Transport::Notify), &world, Timestamp(4)).is_err(), "nor another transport");
-    let event = home.apply("m", deliver("s", Transport::Turn), &world, Timestamp(4)).expect("delivered").clone();
+    let event = home.apply("m", deliver("s", Transport::Turn), &world, Timestamp(4)).expect("delivered");
     let read = event.payload.reads.iter().find(|read| read.kind == Receipts::NAME).expect("the receipts read");
     assert_eq!((read.name.as_str(), read.version), ("m", Some(Version(1))));
 }

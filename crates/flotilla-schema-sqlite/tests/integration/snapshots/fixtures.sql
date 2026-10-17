@@ -1009,13 +1009,121 @@ FROM "terminal_session_labels";
 CREATE TABLE "vessel" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
-  "name" TEXT NOT NULL
+  "convoy" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
+  "class" INTEGER NOT NULL,
+  "priority" INTEGER NOT NULL,
+  "host" INTEGER NOT NULL,
+  "state" TEXT NOT NULL CHECK ("state" IN ('go', 'gu', 'rl', 'rq')),
+  "state_since" INTEGER NOT NULL,
+  "failures" INTEGER,
+  "last_failure_at" INTEGER,
+  "last_failure_cause_category" TEXT CHECK ("last_failure_cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
+  "last_failure_cause_detail" TEXT,
+  "last_failure_retryable" INTEGER CHECK ("last_failure_retryable" IN (0, 1)),
+  "identity" TEXT,
+  "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
+  "cause_detail" TEXT,
+  CHECK (CASE WHEN "last_failure_at" IS NOT NULL
+      THEN "last_failure_cause_category" IS NOT NULL
+      AND "last_failure_cause_detail" IS NOT NULL
+      AND "last_failure_retryable" IS NOT NULL
+      ELSE "last_failure_cause_category" IS NULL
+      AND "last_failure_cause_detail" IS NULL
+      AND "last_failure_retryable" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 'rq'
+      THEN "failures" IS NOT NULL
+      AND "identity" IS NULL
+      AND "cause_category" IS NULL
+      AND "cause_detail" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 'rl'
+      THEN "identity" IS NOT NULL
+      AND "failures" IS NULL
+      AND "last_failure_at" IS NULL
+      AND "last_failure_cause_category" IS NULL
+      AND "last_failure_cause_detail" IS NULL
+      AND "last_failure_retryable" IS NULL
+      AND "cause_category" IS NULL
+      AND "cause_detail" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 'go'
+      THEN "failures" IS NULL
+      AND "last_failure_at" IS NULL
+      AND "last_failure_cause_category" IS NULL
+      AND "last_failure_cause_detail" IS NULL
+      AND "last_failure_retryable" IS NULL
+      AND "identity" IS NULL
+      AND "cause_category" IS NULL
+      AND "cause_detail" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 'gu'
+      THEN "cause_category" IS NOT NULL
+      AND "cause_detail" IS NOT NULL
+      AND "failures" IS NULL
+      AND "last_failure_at" IS NULL
+      AND "last_failure_cause_category" IS NULL
+      AND "last_failure_cause_detail" IS NULL
+      AND "last_failure_retryable" IS NULL
+      AND "identity" IS NULL
+      END)
 ) STRICT;
+CREATE TABLE "vessel_shape" (
+  "owner" INTEGER NOT NULL,
+  "key" INTEGER NOT NULL,
+  "value" INTEGER NOT NULL,
+  PRIMARY KEY ("owner", "key"),
+  FOREIGN KEY ("owner") REFERENCES "vessel" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE INDEX "vessel_by_convoy" ON "vessel" ("convoy");
+CREATE INDEX "vessel_live_by_host" ON "vessel" ("host") WHERE "state" IN ('rq', 'rl');
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('ve', 'state', 'go', 'Gone'),
+  ('ve', 'state', 'gu', 'GaveUp'),
+  ('ve', 'state', 'rl', 'Realised'),
+  ('ve', 'state', 'rq', 'Requested'),
+  ('ve', 'last_failure_cause_category', 'ex', 'External'),
+  ('ve', 'last_failure_cause_category', 'mc', 'Misconfigured'),
+  ('ve', 'last_failure_cause_category', 'mx', 'MissingCapability'),
+  ('ve', 'last_failure_cause_category', 'rf', 'Refused'),
+  ('ve', 'last_failure_cause_category', 'tr', 'Transient'),
+  ('ve', 'cause_category', 'ex', 'External'),
+  ('ve', 'cause_category', 'mc', 'Misconfigured'),
+  ('ve', 'cause_category', 'mx', 'MissingCapability'),
+  ('ve', 'cause_category', 'rf', 'Refused'),
+  ('ve', 'cause_category', 'tr', 'Transient'),
+  ('ve', 'log:edge', 'at', 'Attempted'),
+  ('ve', 'log:edge', 'gu', 'GiveUp'),
+  ('ve', 'log:edge', 'rl', 'Realise'),
+  ('ve', 'log:edge', 'rs', 'Release'),
+  ('ve', 'log:edge', 'va', 'Vanish'),
+  ('ve', 'log:label', 'go', 'Gone'),
+  ('ve', 'log:label', 'gu', 'GaveUp'),
+  ('ve', 'log:label', 'rl', 'Realised'),
+  ('ve', 'log:label', 'rq', 'Requested');
 CREATE VIEW "vessel_view" AS SELECT
   "vessel"."id",
   "vessel"."version",
-  "vessel"."name"
+  "vessel"."convoy",
+  "vessel"."class",
+  "vessel"."priority",
+  "vessel"."host",
+  (SELECT "name" FROM "codes" WHERE "kind" = 've' AND "field" = 'state' AND "code" = "vessel"."state") AS "state",
+  "vessel"."state_since",
+  "vessel"."failures",
+  "vessel"."last_failure_at",
+  (SELECT "name" FROM "codes" WHERE "kind" = 've' AND "field" = 'last_failure_cause_category' AND "code" = "vessel"."last_failure_cause_category") AS "last_failure_cause_category",
+  "vessel"."last_failure_cause_detail",
+  "vessel"."last_failure_retryable",
+  "vessel"."identity",
+  (SELECT "name" FROM "codes" WHERE "kind" = 've' AND "field" = 'cause_category' AND "code" = "vessel"."cause_category") AS "cause_category",
+  "vessel"."cause_detail"
 FROM "vessel";
+CREATE VIEW "vessel_shape_view" AS SELECT
+  "vessel_shape"."owner",
+  "vessel_shape"."key",
+  "vessel_shape"."value"
+FROM "vessel_shape";
 CREATE VIEW "log_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "l"."home") AS "home",
   "l"."home_seq",

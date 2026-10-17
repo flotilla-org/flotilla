@@ -3,6 +3,7 @@
 //! nodes in the same encoding as `quint run --out-itf` traces.
 #![allow(dead_code)]
 
+use flotilla_schema::Address;
 use serde_json::Value;
 
 /// An ITF integer (`{"#bigint": "n"}`).
@@ -12,6 +13,19 @@ pub fn number(v: &Value) -> i64 {
 
 pub fn text(v: &Value) -> &str {
     v.as_str().unwrap_or_else(|| panic!("ITF string, found {v}"))
+}
+
+/// A model string that the engine holds as an address (a convoy's project, a
+/// promise's target): the specs keep it opaque text, so it maps to the
+/// project-rooted address whose one value is that text, and back through
+/// [`Address::name`].
+pub fn address(v: &Value) -> Address {
+    address_of(text(v))
+}
+
+/// The project-rooted address whose one value is `text`.
+pub fn address_of(text: &str) -> Address {
+    Address::project(text).unwrap_or_else(|error| panic!("model text {text:?} as an address: {error}"))
 }
 
 pub fn boolean(v: &Value) -> bool {

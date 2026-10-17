@@ -76,7 +76,7 @@ use std::{
     time::Instant,
 };
 
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Address, Timestamp};
 use flotilla_state_machines::{
     machines::{
         agent_session::{
@@ -94,15 +94,21 @@ use flotilla_state_machines::{
         },
     },
     placement::{self, Dimension, Evidence, Host, Lease, Ledger, LedgerError, Units, VesselId},
-    AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Ref, Resource, Transport, WriteError,
+    AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Ref, Resource, Transport, Version, WriteError,
 };
-use itf::{at, boolean, int, list, map_of, number, pairs, payload, set, set_of, show, slot, tag, text, variant};
+use itf::{address, at, boolean, int, list, map_of, number, pairs, payload, set, set_of, show, slot, tag, text, variant};
 use serde_json::{json, Value};
 
 /// Microseconds per model clock tick (ten minutes).
 const UNIT: i64 = 600_000_000;
-/// The inbox every replayed message and Ensure names.
-const INBOX: &str = "inbox";
+/// The inbox every replayed message and Ensure names, as the world keys it:
+/// the canonical text of [`inbox`].
+const INBOX: &str = "project:inbox";
+/// The authorised party, the superseding message and the outcome condition, as
+/// the world keys them: each address's canonical text.
+const OWNER: &str = "project:owner";
+const NEWER: &str = "project:newer";
+const OUTCOME: &str = "project:outcome";
 /// The one message (id 1) of the message scenarios, and the one Ensure (id 1)
 /// of `ensure_bind`: every resource is named by its model id.
 const ONE: &str = "1";
@@ -133,7 +139,12 @@ fn cause(detail: &str) -> Cause {
 
 /// The authorised party's reference; its value is the model's `authorised` flag.
 fn owner<K: Kind>() -> Ref<K> {
-    Ref::new("owner")
+    Ref::new(OWNER)
+}
+
+/// A canonical address; the world is keyed by its text.
+fn at_address(text: &str) -> Address {
+    text.parse().unwrap_or_else(|error| panic!("{text} as an address: {error}"))
 }
 
 /// A receipt's transport, as the scenarios name it.
@@ -151,8 +162,8 @@ fn transport(name: &str) -> Transport {
 fn receipts_about(sessions: &Home<AgentSession>, message: &str) -> BTreeMap<String, Vec<Transport>> {
     let mut about = BTreeMap::new();
     for session in sessions.resources() {
-        for row in session.events().iter() {
-            let edge = &row.record.payload.edge;
+        for (_, event) in sessions.log().history(session.name(), Version(0), usize::MAX) {
+            let edge = &event.payload.edge;
             if sessions.definition().master(edge).as_deref() == Some(message) {
                 let AgentSessionEdge::Receive(receive) = edge else { panic!("only a receipt is about a message") };
                 about.entry(session.name().to_string()).or_insert_with(Vec::new).push(receive.transport);
@@ -258,11 +269,11 @@ fn slots(model: &Value, render: impl Fn(i64) -> Option<Value>) -> Value {
 
 /// Every resource at `home` agrees with the model store `model`: the same
 /// value in each slot, and no resource outside the model's ids.
-fn check_store<M: Machine>(home: &Home<M>, model: &Value, render: impl Fn(&Resource<M>) -> Value, step: &Step, what: &str) {
+fn check_store<M: Machine>(home: &Home<M>, model: &Value, render: impl Fn(&Home<M>, &Resource<M>) -> Value, step: &Step, what: &str) {
     let ids: BTreeSet<i64> = pairs(model).iter().map(|pair| number(&pair[0])).collect();
     let stray: Vec<&str> = home.resources().map(Resource::name).filter(|name| !ids.contains(&id_of(name))).collect();
     assert!(stray.is_empty(), "{step}: {what} {stray:?} exist in Rust only");
-    same(&slots(model, |id| home.get(&id.to_string()).map(&render)), model, step, what);
+    same(&slots(model, |id| home.get(&id.to_string()).map(|resource| render(home, resource))), model, step, what);
 }
 
 // ---------------------------------------------------------------------------
@@ -318,8 +329,8 @@ fn accept<M: Machine>(
 }
 
 /// A model step created this resource, so the Rust machine must admit it.
-fn create<M: Machine>(home: &mut Home<M>, name: &str, request: M::Request, step: &Step, tally: &mut Tally) {
-    if let Err(error) = home.create(name, request, Timestamp(0)) {
+fn create<M: Machine>(home: &mut Home<M>, name: &str, request: M::Request, world: &M::World, step: &Step, tally: &mut Tally) {
+    if let Err(error) = home.create(name, request, world, Timestamp(0)) {
         panic!("{step}: the model created {} {name}; Rust refused it: {error:?}", M::NAME);
     }
     tally.writes += 1;
@@ -344,8 +355,9 @@ fn ended<M: Machine>(home: &Home<M>, name: &str) -> bool {
     home.get(name).is_some_and(|resource| home.definition().end_reason(resource.label()).is_some())
 }
 
-fn shape<M: Machine>(resource: &Resource<M>) -> (M::State, u64, usize) {
-    (resource.state().clone(), resource.version().0, resource.events().len())
+fn shape<M: Machine>(home: &Home<M>, name: &str) -> (M::State, u64, usize) {
+    let resource = home.get(name).expect("ended resource");
+    (resource.state().clone(), resource.version().0, home.log().history(name, Version(0), usize::MAX).len())
 }
 
 /// An ended resource refuses every edge, attempts and receipts among them,
@@ -363,7 +375,7 @@ fn assert_end_refuses<M: Machine>(
     let state = resource.label();
     let reason = home.definition().end_reason(state).unwrap_or_else(|| panic!("{step}: {} {name} is not in an end", M::NAME));
     let ended: M::Refusal = Ended { state, reason }.into();
-    let before = shape(resource);
+    let before = shape(home, name);
     for edge in probes {
         let kind = edge.kind();
         match home.apply(name, edge, world, now) {
@@ -372,7 +384,7 @@ fn assert_end_refuses<M: Machine>(
         }
         tally.refusals += 1;
     }
-    assert_eq!(shape(home.get(name).expect("ended resource")), before, "{step}: refusals changed {} {name}", M::NAME);
+    assert_eq!(shape(home, name), before, "{step}: refusals changed {} {name}", M::NAME);
 }
 
 // ---------------------------------------------------------------------------
@@ -415,13 +427,14 @@ fn lifecycle_outcome_value(outcome: &Outcome) -> Value {
 /// The spec's `Requested(List[AttemptOutcome]) | Realised(str) | Gone | GaveUp(str)`,
 /// with Requested's history the resource's `Attempted` log entries. Checks
 /// the Requested tally against them.
-fn lifecycle_value<K: LifecycleKind>(resource: &Resource<Lifecycle<K>>) -> Value {
+fn lifecycle_value<K: LifecycleKind>(home: &Home<Lifecycle<K>>, resource: &Resource<Lifecycle<K>>) -> Value {
     match resource.state() {
         LifecycleState::Requested { failures, last_failure } => {
-            let attempts: Vec<&Outcome> = resource
-                .events()
-                .iter()
-                .filter_map(|row| match &row.record.payload.edge {
+            let attempts: Vec<&Outcome> = home
+                .log()
+                .history(resource.name(), Version(0), usize::MAX)
+                .into_iter()
+                .filter_map(|(_, event)| match &event.payload.edge {
                     LifecycleEdge::Attempted(attempted) => Some(&attempted.outcome),
                     _ => None,
                 })
@@ -573,9 +586,9 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
         match step.action() {
             // L::request and A::request share a name; the store that changed says which.
             "request" if slot_at(step.before, "::resources", 1).is_none() && slot_at(step.after, "::resources", 1).is_some() => {
-                create(&mut things, ONE, (), &step, tally);
+                create(&mut things, ONE, (), &MemoryLifecycleWorld::default(), &step, tally);
             }
-            "request" => create(&mut sessions, ONE, (), &step, tally),
+            "request" => create(&mut sessions, ONE, (), &MemoryAgentSessionWorld::default(), &step, tally),
             op @ ("realise" | "release" | "vanish") => lifecycle_step(&mut things, ONE, op, seen, matches, "model", now, &step, tally),
             "attempt" => {
                 let outcome = match tag(step.pick("outcome")) {
@@ -628,7 +641,7 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
             other => panic!("{step}: machine_edges operation {other}"),
         }
         check_store(&things, store(step.after, "::resources"), lifecycle_value, &step, "lifecycle");
-        check_store(&sessions, store(step.after, "::sessions"), |r| session_value(r.state()), &step, "session");
+        check_store(&sessions, store(step.after, "::sessions"), |_, r| session_value(r.state()), &step, "session");
         if ended(&things, ONE) {
             lifecycle_end_refuses(&mut things, ONE, "model", now, &step, tally);
         }
@@ -716,12 +729,10 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
     let work = convoy_work(state);
     let spec = &work["spec"];
     ConvoyRequest {
-        project: text(&spec["project"]).into(),
+        project: address(&spec["project"]),
         promises: pairs(&spec["promises"])
             .iter()
-            .map(|pair| {
-                (PromiseId(small(&pair[0])), Promise { kind: text(&pair[1]["kind"]).into(), target: text(&pair[1]["target"]).into() })
-            })
+            .map(|pair| (PromiseId(small(&pair[0])), Promise { kind: text(&pair[1]["kind"]).into(), target: address(&pair[1]["target"]) }))
             .collect(),
         quota: quota(&work["quota"]),
         priority: Priority(small(&spec["priority"])),
@@ -744,9 +755,9 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
     let work = |promises: &convoy::Resolution, quota: &Quota| {
         json!({
             "spec": {
-                "project": spec.project,
+                "project": spec.project.name(),
                 "promises": map_of(spec.promises.iter().map(|(id, promise)| {
-                    (int(id.0.into()), json!({ "kind": promise.kind, "target": promise.target }))
+                    (int(id.0.into()), json!({ "kind": promise.kind, "target": promise.target.name() }))
                 })),
                 "priority": int(spec.priority.0.into()),
             },
@@ -764,7 +775,7 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
 }
 
 fn check_convoys(home: &Home<Convoy>, state: &Value, step: &Step) {
-    check_store(home, store(state, "::convoys"), convoy_value, step, "convoy");
+    check_store(home, store(state, "::convoys"), |_, convoy| convoy_value(convoy), step, "convoy");
 }
 
 fn convoy_world(authorised: bool) -> MemoryConvoyWorld {
@@ -775,7 +786,10 @@ fn convoy_world(authorised: bool) -> MemoryConvoyWorld {
 
 fn admit(home: &mut Home<Convoy>, step: &Step, id: i64, tally: &mut Tally) {
     let model = slot_at(step.after, "::convoys", id).expect("admitted convoy");
-    create(home, &id.to_string(), convoy_request(model), step, tally);
+    let request = convoy_request(model);
+    // The model admitted it, so its project was known.
+    let world = MemoryConvoyWorld::default().with_project(&request.project);
+    create(home, &id.to_string(), request, &world, step, tally);
 }
 
 /// From the reached state: an Open convoy delivers only with no promise
@@ -871,7 +885,7 @@ fn units_value(units: &Units) -> Value {
 
 fn placement_request(v: &Value) -> placement::Request {
     placement::Request {
-        convoy: ConvoyId::new(number(&v["convoy"]).to_string()),
+        convoy: ConvoyId::new(number(&v["convoy"]).to_string(), "home"),
         class: VesselClass(small(&v["class"])),
         shape: units(&v["shape"]),
         priority: Priority(small(&v["priority"])),
@@ -881,7 +895,7 @@ fn placement_request(v: &Value) -> placement::Request {
 /// The spec's vessel `Request`.
 fn request_value(request: &placement::Request) -> Value {
     json!({
-        "convoy": int(id_of(request.convoy.as_str())),
+        "convoy": int(id_of(&request.convoy.name)),
         "class": int(request.class.0.into()),
         "shape": units_value(&request.shape),
         "priority": int(request.priority.0.into()),
@@ -931,7 +945,7 @@ impl Fleet {
     fn sync_caps(&mut self, convoy: i64) {
         let name = convoy.to_string();
         let quota = self.convoys.get(&name).expect("admitted convoy").state().quota().clone();
-        self.ledger.set_caps(ConvoyId::new(name), quota);
+        self.ledger.set_caps(ConvoyId::new(name, "home"), quota);
     }
 
     /// The spec's `Waiting(Request) | Leased({ placement, lifecycle }) | Gone(Placement)`,
@@ -945,7 +959,7 @@ impl Fleet {
             (Some(placement::Vessel::Waiting(request)), None, None) => Some(variant("Waiting", request_value(request))),
             (Some(placement::Vessel::Leased(lease)), None, Some(life)) if !life.gone() => Some(variant(
                 "Leased",
-                json!({ "placement": lease_value(lease), "lifecycle": lifecycle_value(resource.expect("a leased vessel's lifecycle")) }),
+                json!({ "placement": lease_value(lease), "lifecycle": lifecycle_value(&self.vessels, resource.expect("a leased vessel's lifecycle")) }),
             )),
             (None, Some(lease), Some(LifecycleState::Gone)) => Some(variant("Gone", lease_value(lease))),
             (held, returned, life) => {
@@ -1000,7 +1014,7 @@ impl Fleet {
                 let evidence = trial.evidence(&vessel, host).expect("a waiting vessel's evidence");
                 let Ok(lease) = trial.place(&vessel, host).cloned() else { continue };
                 for convoy in [1, 2] {
-                    let convoy = ConvoyId::new(convoy.to_string());
+                    let convoy = ConvoyId::new(convoy.to_string(), "home");
                     for class in [VesselClass(0), VesselClass(1)] {
                         let (live, cap) = (trial.live(&convoy, class), trial.cap(&convoy, class));
                         assert!(live <= cap, "{step}: placing vessel {id} on {host:?} leases {live} of {convoy:?} {class:?}, cap {cap}");
@@ -1070,7 +1084,7 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
                     other => panic!("{step}: placed vessel {id} is {other:?}"),
                 };
                 fleet.placed.insert(id, Placed { request, evidence });
-                create(&mut fleet.vessels, &name, (), &step, tally);
+                create(&mut fleet.vessels, &name, (), &MemoryLifecycleWorld::default(), &step, tally);
             }
             "realise" => lifecycle_step(&mut fleet.vessels, &name, "realise", true, true, "vessel", now, &step, tally),
             // Gone returns the lease; the harness keeps it.
@@ -1142,11 +1156,11 @@ fn outcome_value(outcome: &Outcome) -> Value {
 /// the history as the Ensure's `Attempted` entries, and the window as how
 /// many came before the last `Resume`. The state's tally must agree with
 /// the window's outcomes.
-fn ensure_value(resource: &Resource<Ensure>) -> Value {
+fn ensure_value(home: &Home<Ensure>, resource: &Resource<Ensure>) -> Value {
     let mut history = Vec::new();
     let mut window = 0;
-    for row in resource.events().iter() {
-        match &row.record.payload.edge {
+    for (_, event) in home.log().history(resource.name(), Version(0), usize::MAX) {
+        match &event.payload.edge {
             EnsureEdge::Attempted(attempted) => history.push(attempted),
             EnsureEdge::Resume(_) => window = history.len(),
             _ => {}
@@ -1260,11 +1274,13 @@ fn ensure_bind(trace: &Trace, tally: &mut Tally) {
         let fulfiller = Ref::<ensure::Fulfiller>::new(name.clone());
         match step.action() {
             // The spec's `MAX_FAILURES = 2`.
-            "request" => create(&mut home, ONE, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(2) }, &step, tally),
+            "request" => {
+                create(&mut home, ONE, EnsureSpec { inbox: at_address(INBOX), policy: AttemptPolicy::immediate(2) }, &world, &step, tally)
+            }
             "record" => accept(&mut home, ONE, ensure::Record { fulfiller }, &world, now, &step, tally),
             "create" => {
                 accept(&mut home, ONE, ensure::Create { fulfiller }, &world, now, &step, tally);
-                create(&mut fulfillers, &name, (), &step, tally);
+                create(&mut fulfillers, &name, (), &MemoryLifecycleWorld::default(), &step, tally);
             }
             op @ ("realise" | "release" | "vanish") => lifecycle_step(&mut fulfillers, &name, op, true, true, "model", now, &step, tally),
             "bind" => accept(&mut home, ONE, ensure::Bind { fulfiller }, &world, now, &step, tally),
@@ -1366,9 +1382,9 @@ fn drop_reason(v: &Value) -> DropReason {
     match tag(v) {
         "Undeliverable" => DropReason::Undeliverable,
         "Expired" => DropReason::Expired,
-        "Superseded" => DropReason::Superseded { by: Ref::new("newer") },
-        "Withdrawn" => DropReason::Withdrawn { by: "owner".into(), authority: owner() },
-        "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: "owner".into(), authority: owner() },
+        "Superseded" => DropReason::Superseded { by: at_address(NEWER) },
+        "Withdrawn" => DropReason::Withdrawn { by: at_address(OWNER), authority: at_address(OWNER) },
+        "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: at_address(OWNER), authority: at_address(OWNER) },
         other => panic!("drop reason {other}"),
     }
 }
@@ -1472,23 +1488,23 @@ impl<'a> MessageReplay<'a> {
         let expectation = tag(&envelope["expectation"]);
         let deadline = boolean(&envelope["hasDeadline"]).then(|| number(&envelope["deadline"]));
         let spec = MessageSpec {
-            inbox: INBOX.into(),
+            inbox: at_address(INBOX),
             expectation: match expectation {
                 "Nothing" => Expectation::Nothing,
                 "Reply" => Expectation::Reply,
-                "Outcome" => Expectation::Outcome { condition: Ref::new("outcome") },
+                "Outcome" => Expectation::Outcome { condition: at_address(OUTCOME) },
                 other => panic!("expectation {other}"),
             },
             deadline: deadline.map(moment),
             // Both scenarios drop as undeliverable once `now - unboundAt > 1`.
             unbound_after: UNIT,
         };
-        let mut home = Home::new("home").expect("declaration");
-        home.create(ONE, spec, Timestamp(0)).expect("message");
+        let mut home = Home::<Message>::new("home").expect("declaration");
+        home.create(ONE, spec, &MemoryMessageWorld::default(), Timestamp(0)).expect("message");
         let sessions = (feed == Feed::Inbox).then(|| {
-            let mut sessions = Home::new("consumer").expect("declaration");
+            let mut sessions = Home::<AgentSession>::new("consumer").expect("declaration");
             for (id, _) in entries(&trace.states[0], "::sessions") {
-                sessions.create(id.to_string(), (), Timestamp(0)).expect("session");
+                sessions.create(id.to_string(), (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("session");
             }
             sessions
         });
@@ -1522,7 +1538,7 @@ impl<'a> MessageReplay<'a> {
         if stream.any("reply") {
             world.reply.put(&Ref::new(ONE), ());
         }
-        world.condition.put(&Ref::new("outcome"), stream.any("outcome"));
+        world.condition.put(&Ref::new(OUTCOME), stream.any("outcome"));
         if stream.any("failure") {
             world.delivery_failure.put(&Ref::new(ONE), ());
         }
@@ -1538,7 +1554,7 @@ impl<'a> MessageReplay<'a> {
         let evidence = witness || self.feed == Feed::Race;
         world.authority.put(&owner(), evidence);
         if evidence {
-            world.supersession.put(&Ref::new("newer"), message::Supersedes { older: ONE.into() });
+            world.supersession.put(&Ref::new(NEWER), message::Supersedes { older: ONE.into() });
         }
         world
     }
@@ -1608,7 +1624,7 @@ impl<'a> MessageReplay<'a> {
         self.check(step);
         self.probe(step, tally);
         if let Some(sessions) = self.sessions.as_mut() {
-            check_store(sessions, store(step.after, "::sessions"), |r| session_value(r.state()), step, "session");
+            check_store(sessions, store(step.after, "::sessions"), |_, r| session_value(r.state()), step, "session");
             let about = receipts_about(sessions, ONE);
             let counts: BTreeMap<String, usize> = about.iter().map(|(name, entries)| (name.clone(), entries.len())).collect();
             assert_eq!(counts, self.receipts, "{step}: receipts about the message, by session");
@@ -1620,10 +1636,10 @@ impl<'a> MessageReplay<'a> {
     /// each accepted edge left one event and at most one was a delivery.
     fn check(&self, step: &Step) {
         let model = without_unset_deadline(store(step.after, "::messages"));
-        check_store(&self.home, &model, message_value, step, "message");
-        let rust = self.home.get(ONE).expect("message");
-        assert_eq!(rust.events().len(), self.edges, "{step}: one edge event per accepted edge");
-        let deliveries = rust.events().iter().filter(|row| row.record.edge == MessageEdgeKind::Deliver).count();
+        check_store(&self.home, &model, |_, message| message_value(message), step, "message");
+        let history = self.home.log().history(ONE, Version(0), usize::MAX);
+        assert_eq!(history.len(), self.edges, "{step}: one edge event per accepted edge");
+        let deliveries = history.iter().filter(|(_, event)| event.edge == MessageEdgeKind::Deliver).count();
         assert!(deliveries <= 1, "{step}: delivered {deliveries} times");
     }
 
@@ -1638,7 +1654,7 @@ impl<'a> MessageReplay<'a> {
                 deliver(1).into(),
                 message::Settle { by: message::Settlement::Answered }.into(),
                 message::Settle { by: message::Settlement::OutcomeObserved }.into(),
-                message::DropMessage { reason: DropReason::Withdrawn { by: "owner".into(), authority: owner() } }.into(),
+                message::DropMessage { reason: DropReason::Withdrawn { by: at_address(OWNER), authority: at_address(OWNER) } }.into(),
                 message::DropMessage { reason: DropReason::Expired }.into(),
                 message::DropMessage { reason: DropReason::Undeliverable }.into(),
             ];

@@ -13,11 +13,10 @@
 //! `L`, code for code, its label column is the state field, and its datums are named by the datum
 //! alone.
 //!
-//! A datum has one type and attribute in every variant carrying it, except that interned data may
-//! be any internable type (all are one `strings` id; lane 4 of #3392 removes this exemption, ruling
-//! D3), and a datum may be `T` in one variant and
-//! `Option<T>` in another (#3392 ruling G5): one nullable column group, required
-//! by the CHECKs of the variants carrying `T`. A datum's table holds rows only while the variant
+//! A datum has one type and attribute in every variant carrying it (#3392 ruling D3: interned data
+//! of different Rust types does not share a column either), except that a datum may be `T` in one
+//! variant and `Option<T>` in another (#3392 ruling G5): one nullable column group, required by the
+//! CHECKs of the variants carrying `T`. A datum's table holds rows only while the variant
 //! carries it, and decoding refuses rows otherwise. A state's datum is unattributed (its columns),
 //! `child` (a `BTreeMap` or `BTreeSet`, changed row by row), `intern` or `flatten`; a data enum's
 //! datum may take any field form.
@@ -409,13 +408,7 @@ fn datums<'v, 'a>(variants: &'v [Variant<'a>], state: bool) -> syn::Result<Vec<D
                 Some(datum) => {
                     let first = &datum.decls[0];
                     let (first_ty, first_shape, _) = declared(first.field);
-                    // Every internable type is one `strings` id: interned data shares a column
-                    // whatever its Rust type (a name, or a reference kept as text). Temporary
-                    // (#3392 ruling D3): lane 4 (#3410) makes Message's inbox, receiver and
-                    // drop-reason references `Address`, so `DropReason`'s `by` has one type, and
-                    // then removes this exemption.
-                    let interned = matches!(shape, FieldShape::Intern { .. });
-                    if (first_ty != ty && !interned) || first_shape != shape {
+                    if first_ty != ty || first_shape != shape {
                         let full = |field: &Field<'_>| {
                             let ty = field.ty;
                             quote!(#ty).to_string()
@@ -423,7 +416,7 @@ fn datums<'v, 'a>(variants: &'v [Variant<'a>], state: bool) -> syn::Result<Vec<D
                         return Err(refuse(
                             field.ident,
                             format_args!(
-                                "datum `{name}` is declared as `{}` in `{}` and as `{}` in `{}`; a datum has one type and attribute in every variant carrying it (any internable type under `intern`), or is `T` in some and `Option<T>` in others",
+                                "datum `{name}` is declared as `{}` in `{}` and as `{}` in `{}`; a datum has one type and attribute in every variant carrying it, or is `T` in some and `Option<T>` in others",
                                 full(first.field),
                                 first.variant,
                                 full(field),

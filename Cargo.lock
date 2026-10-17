@@ -2641,6 +2641,7 @@ name = "flotilla-schema"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flotilla-address",
  "flotilla-build-features",
  "flotilla-build-features-base",
  "flotilla-build-features-types",

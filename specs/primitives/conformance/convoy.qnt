@@ -8,7 +8,8 @@ module convoy_conformance {
   var slot: C::Slot
   var probe: Probe
   pure val promiseSets = Set(Set(), Set(0), Set(0, 1))
-  pure val requests = promiseSets.map(ps => { project: "project", promises: ps.mapBy(_ => { kind: "opaque", target: "target" }), quota: Map(0 -> 1, 1 -> 1), priority: 1 })
+  pure val requests = promiseSets.map(ps => Set(true, false).map(known =>
+    { project: "project", projectKnown: known, promises: ps.mapBy(_ => { kind: "opaque", target: "target" }), quota: Map(0 -> 1, 1 -> 1), priority: 1 })).flatten()
   // Quotas: an increase, a decrease and a changed class domain. Negative counts
   // are omitted: Rust quota counts are unsigned, so InvalidQuota is unrepresentable.
   pure val quotas = Set(Map(0 -> 2, 1 -> 1), Map(0 -> 0, 1 -> 1), Map(0 -> 1))

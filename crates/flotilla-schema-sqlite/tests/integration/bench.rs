@@ -26,7 +26,7 @@ use flotilla_state_machines::{
 };
 use rusqlite::Connection;
 
-use crate::fixtures::{engine::NAME, message, origin, registry, LOCAL};
+use crate::fixtures::{addr, engine::NAME, message, origin, registry, LOCAL};
 
 const MESSAGES: usize = 10_000;
 const INBOXES: usize = 100;
@@ -55,7 +55,7 @@ fn open(batch: usize) -> (Database, Store) {
 }
 
 fn value(n: usize) -> Resource<Message> {
-    message::sample_in(format!("inbox-{}", n % INBOXES))
+    message::sample_in(addr(&format!("inbox-{}", n % INBOXES)))
 }
 
 /// The messages' stamps.

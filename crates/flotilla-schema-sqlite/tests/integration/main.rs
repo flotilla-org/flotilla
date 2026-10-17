@@ -6,6 +6,7 @@ mod ddl;
 mod edges;
 mod fixtures;
 mod history;
+mod homes;
 mod interning;
 mod log;
 mod ownership;

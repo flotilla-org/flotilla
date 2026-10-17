@@ -36,7 +36,7 @@ use flotilla_state_machines::{
         Attempted, Bind, Create, Drain, Ensure, EnsureEdge, EnsureRefusal, EnsureSpec, EnsureState, Fulfiller, FulfillerPhase,
         FulfillerStatus, Fulfillers, Hold, MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
     },
-    AttemptPolicy, Cause, CauseCategory, Home, Outcome, Ref, Resource, WriteError,
+    AttemptPolicy, Cause, CauseCategory, Home, Outcome, Ref, Version, WriteError,
 };
 use serde_json::{json, Value};
 
@@ -46,7 +46,7 @@ use crate::{
 };
 
 const NAME: &str = "e";
-const INBOX: &str = "inbox";
+const INBOX: &str = "project:inbox";
 const OPERATOR: &str = "operator";
 
 fn f(id: i64) -> Ref<Fulfiller> {
@@ -93,11 +93,12 @@ fn outcome_value(outcome: &Outcome) -> Value {
 
 /// The spec's `Work`: the state's fulfillers, and the history and window
 /// from the Ensure's log. Checks the state's tally against the window.
-fn work(e: &Resource<Ensure>) -> Value {
+fn work(home: &Home<Ensure>) -> Value {
+    let e = home.get(NAME).expect("exists");
     let mut history = Vec::new();
     let mut window = 0;
-    for row in e.events().iter() {
-        match &row.record.payload.edge {
+    for (_, event) in home.log().history(NAME, Version(0), usize::MAX) {
+        match &event.payload.edge {
             EnsureEdge::Attempted(attempted) => history.push(attempted),
             EnsureEdge::Resume(_) => window = history.len(),
             _ => {}
@@ -124,8 +125,14 @@ impl Conformance for EnsureConformance {
     type Subject = Home<Ensure>;
 
     fn create(_: &Value) -> Home<Ensure> {
-        let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(2) }, Timestamp(0)).expect("created");
+        let mut home = Home::<Ensure>::new("home").expect("valid declaration");
+        home.create(
+            NAME,
+            EnsureSpec { inbox: INBOX.parse().expect("canonical inbox"), policy: AttemptPolicy::immediate(2) },
+            &MemoryEnsureWorld::default(),
+            Timestamp(0),
+        )
+        .expect("created");
         home
     }
 
@@ -202,10 +209,10 @@ impl Conformance for EnsureConformance {
     fn encode(home: &Home<Ensure>) -> Value {
         let e = home.get(NAME).expect("exists");
         match e.state() {
-            EnsureState::Unfulfilled { .. } => variant("Unfulfilled", work(e)),
-            EnsureState::Fulfilled { bound, .. } => variant("Fulfilled", json!({ "work": work(e), "bound": int(id_of(bound.name())) })),
-            EnsureState::Held { .. } => variant("Held", work(e)),
-            EnsureState::Retired { .. } => variant("Retired", work(e)),
+            EnsureState::Unfulfilled { .. } => variant("Unfulfilled", work(home)),
+            EnsureState::Fulfilled { bound, .. } => variant("Fulfilled", json!({ "work": work(home), "bound": int(id_of(bound.name())) })),
+            EnsureState::Held { .. } => variant("Held", work(home)),
+            EnsureState::Retired { .. } => variant("Retired", work(home)),
         }
     }
 
