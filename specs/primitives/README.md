@@ -82,7 +82,7 @@ The scenarios encode these rulings:
 
 | Scenario | Fixed rules and safety | Deep temporal checks |
 |---|---|---|
-| Convoy | nonempty admission; deliver requires every promise kept or an accepted retraction; abandon requires an authorised decision | once promises are satisfied, fair delivery ends the convoy |
+| Convoy | nonempty admission of a known project; deliver requires every promise kept or an accepted retraction; abandon requires an authorised decision | once promises are satisfied, fair delivery ends the convoy |
 | Inbox / replacement / unbind | turn before receipt; per-session dedupe; drain observed receipts before bind; accept an old session's receipt; one receiver; no undeliverable drop with an observed receipt; unbound timeout starts at unbind | observed receipts make progress under fair home delivery; observed session ends and sustained silence trigger owner unbind reactions |
 | Ensure | record before create; bind only Realised/receiving; release and observe Gone before replacement; retire releases every created fulfiller, including Requested; resume retains history and moves the window | a bound fulfiller observed Gone is eventually unbound under a fair owner reaction |
 | Message race | outcome may settle Pending; terminal edges refuse; expiry waits for the consumer prefix past the deadline and loses to visible evidence; supersede and withdrawn reasons | visible expected evidence eventually settles under fair settlement; ends remain final |

@@ -667,9 +667,9 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
     let work = |promises: &convoy::Resolution, quota: &Quota| {
         json!({
             "spec": {
-                "project": spec.project,
+                "project": spec.project.name(),
                 "promises": map_of(spec.promises.iter().map(|(id, promise)| {
-                    (int(id.0.into()), json!({ "kind": promise.kind, "target": promise.target }))
+                    (int(id.0.into()), json!({ "kind": promise.kind, "target": promise.target.name() }))
                 })),
                 "priority": int(spec.priority.0.into()),
             },
@@ -699,7 +699,7 @@ fn convoy_world(authorised: bool) -> MemoryConvoyWorld {
 fn admit(home: &mut Home<Convoy>, step: &Step, id: i64, tally: &mut Tally) {
     let model = slot_at(step.after, "::convoys", id).expect("admitted convoy");
     let request = convoy_request(model);
-    // The spec's admission reads no world: every project it names exists.
+    // The model admitted it, so its project was known.
     let world = MemoryConvoyWorld::default().with_project(&request.project);
     create(home, &id.to_string(), request, &world, step, tally);
 }

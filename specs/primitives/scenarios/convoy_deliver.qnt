@@ -12,7 +12,7 @@ module convoy_deliver {
     nondet reason = Set("", "decision").oneOf()
     any {
       all {
-        C::admitRequest(id, { project: "project", promises: promises.mapBy(_ => { kind: "opaque", target: "target" }), quota: Map(0 -> 1, 1 -> 1), priority: id }),
+        C::admitRequest(id, { project: "project", projectKnown: true, promises: promises.mapBy(_ => { kind: "opaque", target: "target" }), quota: Map(0 -> 1, 1 -> 1), priority: id }),
         keepWorld,
       },
       all { C::keep(id, p), keepWorld },
@@ -40,7 +40,7 @@ module convoy_deliver {
     Set(C::Pending, C::Kept, C::Retracted).map(b => Map(0 -> a, 1 -> b)))).flatten()
   pure val works = Set(Map(0 -> 1, 1 -> 1), Map(0 -> 2, 1 -> 1)).map(q =>
     Set(1, 2).map(priority => resolutions.map(ps => {
-      spec: { project: "project", promises: ps.keys().mapBy(_ => { kind: "opaque", target: "target" }), priority: priority },
+      spec: { project: "project", projectKnown: true, promises: ps.keys().mapBy(_ => { kind: "opaque", target: "target" }), priority: priority },
       promises: ps,
       quota: q
     }))).flatten().flatten()

@@ -73,7 +73,6 @@ fn refusal_of(refusal: ConvoyRefusal) -> Value {
             return variant("PromisesOutstanding", set_of(ids.iter().map(|p| int(p.0.into()))));
         }
         ConvoyRefusal::NoPromises => "NoPromises",
-        // The spec's admission reads no world, so the harness world holds every project.
         ConvoyRefusal::UnknownProject => "UnknownProject",
         ConvoyRefusal::InvalidQuota => "InvalidQuota",
         ConvoyRefusal::NotOpen => "NotOpen",
@@ -114,10 +113,15 @@ fn admitted_request(work: &Value) -> ConvoyRequest {
     request_of(&request)
 }
 
-/// A world in which the request's project exists: the spec's admission reads
-/// no world, so every project it names is one the engine finds.
-fn projects(request: &ConvoyRequest) -> MemoryConvoyWorld {
-    MemoryConvoyWorld::default().with_project(&request.project)
+/// The world admission reads: the request's project exists when the spec's
+/// `projectKnown` says so.
+fn projects(request: &ConvoyRequest, known: bool) -> MemoryConvoyWorld {
+    let world = MemoryConvoyWorld::default();
+    if known {
+        world.with_project(&request.project)
+    } else {
+        world
+    }
 }
 
 struct ConvoyConformance;
@@ -131,7 +135,8 @@ impl Conformance for ConvoyConformance {
     fn create(state: &Value) -> Home<Convoy> {
         let mut home = Home::<Convoy>::new("home").expect("valid declaration");
         let request = admitted_request(payload(state));
-        home.create(NAME, request.clone(), &projects(&request), tick(0)).expect("admitted");
+        // An admitted convoy's project was known.
+        home.create(NAME, request.clone(), &projects(&request, true), tick(0)).expect("admitted");
         home
     }
 
@@ -182,7 +187,8 @@ fn check_admissions(nodes: &[Value], report: &mut Report) {
         let mut home = Home::<Convoy>::new("home").expect("valid declaration");
         let request_value = request;
         let request = request_of(request_value);
-        let rust = match home.create(NAME, request.clone(), &projects(&request), tick(0)) {
+        let world = projects(&request, boolean(&request_value["projectKnown"]));
+        let rust = match home.create(NAME, request.clone(), &world, tick(0)) {
             Ok(_) => variant("Moved", ConvoyConformance::encode(&home)),
             Err(WriteError::Refused(r)) => variant("Refused", refusal_of(r)),
             Err(other) => panic!("admission of {}: {other:?}", show(request_value)),
@@ -194,8 +200,8 @@ fn check_admissions(nodes: &[Value], report: &mut Report) {
     }
 }
 
-// Admission refuses a request without promises and opens any other with every
-// promise pending; every reachable convoy state is reached in Rust by the
+// Admission refuses a request without promises or naming an unknown project,
+// and opens any other with every promise pending; every reachable convoy state is reached in Rust by the
 // spec's path; and every probe agrees, including the outstanding promises a
 // refused delivery names.
 #[test]
