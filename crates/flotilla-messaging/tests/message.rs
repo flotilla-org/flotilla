@@ -598,7 +598,9 @@ async fn delivery_receiver_reads_are_bounded() {
         };
         let before = memory.read_snapshot();
         inbox.reconcile_delivery(&transport, at(20)).await.expect("delivery pass");
-        let calls = memory.read_snapshot().since(&before).calls_by_kind();
+        let delta = memory.read_snapshot().since(&before);
+        let calls = delta.calls_by_kind();
+        eprintln!("delivery measurement: active={n}, reads={}, by_kind={calls:?}", calls.values().sum::<usize>());
         counts.push(["Convoy", "TerminalSession", "ConvoyEnsure"].map(|kind| calls.get(kind).copied().unwrap_or_default()));
         assert!(transport.submissions.lock().expect("submissions").is_empty());
         for message in backend.using::<Message>("flotilla").list().await.expect("messages").items {
@@ -2641,4 +2643,37 @@ async fn message_query_phase_classification_matches_model() {
             assert!(messages.query(&MessageQuery::AuditBefore { before: at(21) }).await.expect("deleted audit entry").is_empty());
         }
     }
+}
+
+// The inbox owns the earliest future delivery deadline, regardless of record
+// name or insertion order. Empty and terminal-only inboxes have no timer.
+#[hegel::test]
+fn inbox_delivery_deadline_is_earliest(tc: hegel::TestCase) {
+    let delays: Vec<i64> = (0..tc.draw(gs::integers::<usize>().min_value(1).max_value(12)))
+        .map(|_| tc.draw(gs::integers::<i64>().min_value(1).max_value(120)))
+        .collect();
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let inbox = MessageInbox::new(backend.clone(), "flotilla");
+        assert_eq!(inbox.next_delivery_wake(at(10)).await.unwrap(), None);
+        for (i, delay) in delays.iter().enumerate() {
+            let mut intent = spec(None, MessageExpectation::Reply);
+            intent.deadline = Some(at(10 + delay));
+            inbox.accept(&InputMeta::builder().name(format!("deadline-{i}")).build(), &intent, at(10)).await.unwrap();
+        }
+        assert_eq!(
+            inbox.next_delivery_wake(at(10)).await.unwrap(),
+            Some(std::time::Duration::from_secs(*delays.iter().min().unwrap() as u64))
+        );
+        for i in 0..delays.len() {
+            flotilla_store::apply_status_patch(
+                &backend.using::<Message>("flotilla"),
+                &format!("deadline-{i}"),
+                &MessageStatusPatch::Finish { phase: MessagePhase::Expired, reason: "closed".into(), at: at(11) },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(inbox.next_delivery_wake(at(10)).await.unwrap(), None);
+    });
 }

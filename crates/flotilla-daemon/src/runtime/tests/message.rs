@@ -1162,3 +1162,94 @@ async fn codex_idle_hook_confirms_held_submission() {
         }
     }
 }
+
+// #3408: a namespace resync must cost one delivery pass, independent of the
+// number of active messages. Real inbox/store/watch collaborators keep this
+// at the scheduling seam; absent receivers avoid terminal subprocesses.
+#[tokio::test(start_paused = true)]
+async fn message_resync_coalesces_active_messages() {
+    for n in [0, 1, 10, 100] {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-resync\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(temp.path().to_path_buf()));
+        let daemon = InProcessDaemon::new(
+            vec![],
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            HostName::new("message-resync"),
+            Arc::new(crate::peer::HostPeerOverlay::default()),
+        )
+        .await;
+        let inbox = daemon.message_inbox(NAMESPACE).await;
+        let messages = daemon.resource_backend().using::<flotilla_resources::Message>(NAMESPACE);
+        for i in 0..n {
+            inbox
+                .accept(
+                    &empty_meta(&format!("message-{i}")),
+                    &flotilla_resources::MessageSpec::builder()
+                        .sender("principal:test".into())
+                        .receiver(format!("flotilla/missing/work/role-{i}"))
+                        .relation(flotilla_resources::MessageRelation::System)
+                        .body("wake".into())
+                        .build(),
+                    Utc::now(),
+                )
+                .await
+                .expect("admit");
+        }
+        let state = Arc::new(ControllerRuntimeState::new(
+            daemon,
+            config,
+            Arc::new(ProviderRegistry::new()),
+            None,
+            "host-test".into(),
+            "host-direct-host-test".into(),
+        ));
+        let metrics = Arc::new(flotilla_store::load_metrics::ControllerLoadMetrics::default());
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let controller = super::super::message::MessageController { state, namespace: NAMESPACE.into() };
+        let task = tokio::spawn(controller.run(Duration::from_secs(60), heartbeat, Arc::clone(&metrics)));
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+        let before = metrics.snapshot().reconcile.count();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+        let passes = metrics.snapshot().reconcile.count() - before;
+        assert_eq!(passes, 1, "active={n}: resync must run one inbox pass");
+        // New-message watches must still wake an idle inbox, including after
+        // startup with no records. Admissions can interleave with passes;
+        // liveness here complements the quiescent resync budget above.
+        let before = metrics.snapshot().reconcile.count();
+        for i in 0..n.max(1) {
+            inbox
+                .accept(
+                    &empty_meta(&format!("new-message-{i}")),
+                    &flotilla_resources::MessageSpec::builder()
+                        .sender("principal:test".into())
+                        .receiver(format!("flotilla/missing/work/new-role-{i}"))
+                        .relation(flotilla_resources::MessageRelation::System)
+                        .body("wake".into())
+                        .build(),
+                    Utc::now(),
+                )
+                .await
+                .expect("new admission");
+        }
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+        let passes = metrics.snapshot().reconcile.count() - before;
+        assert!(passes > 0, "active={n}: new admissions must wake delivery");
+        // Every interleaved admission must have reached a delivery pass, even
+        // if its watch event arrived while a previous snapshot was in use.
+        for i in 0..n.max(1) {
+            let message = messages.get(&format!("new-message-{i}")).await.expect("new message");
+            assert_eq!(message.status.expect("observed").reason.as_deref(), Some("receiver role has no current holder"));
+        }
+        assert!(!task.is_finished(), "inbox loop must remain live");
+        task.abort();
+    }
+}

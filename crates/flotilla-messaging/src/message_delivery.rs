@@ -71,6 +71,34 @@ pub trait MessageTransport: Send + Sync {
 }
 
 impl MessageInbox {
+    /// The namespace owns one replaceable deadline for delivery retries,
+    /// expiry, hold escalation and acceptance debounce.
+    pub async fn next_delivery_wake(&self, now: DateTime<Utc>) -> Result<Option<Duration>, ResourceError> {
+        let messages = self.messages.query(&MessageQuery::active()).await?;
+        let next = messages
+            .iter()
+            .filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+            .flat_map(|message| {
+                let status = message.status.as_ref();
+                let submission = status.and_then(|status| status.submission.as_ref());
+                [
+                    message.spec.deadline.filter(|deadline| *deadline > now),
+                    status.and_then(|status| status.retry.as_ref()).and_then(|retry| retry.next_attempt_at()).filter(|due| *due > now),
+                    submission
+                        .map(|submission| submission.started_at + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR)
+                        .filter(|due| *due > now),
+                    submission
+                        .and_then(|submission| submission.working_since)
+                        .map(|since| since + flotilla_resources::delivery_hold::DELIVERY_WORKING_DEBOUNCE_FOR)
+                        .filter(|due| *due > now),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .min();
+        Ok(next.and_then(|due| (due - now).to_std().ok()))
+    }
+
     /// A pass with active Messages observes holders, including held submissions.
     /// Idle passes skip receiver reads but still repair abandoned gates. Admission and
     /// delivery serialize separately; admission never waits on transport I/O.
