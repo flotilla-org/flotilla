@@ -399,7 +399,7 @@ def run_command(arguments, description, capture=False):
 def validate_private_key(path):
     try:
         metadata = Path(path).lstat()
-        parent = Path(path).parent.stat()
+        parent = Path(path).parent.lstat()
     except OSError as error:
         raise SigningError(f"cannot inspect private key file {path}: {error}") from error
     if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != os.geteuid():
@@ -441,6 +441,36 @@ def validate_certificate_identity(path, identity, team_id):
             fields.setdefault(name.strip(), []).append(value.strip())
     if fields.get("CN") != [identity] or fields.get("OU") != [team_id]:
         raise SigningError("signing certificate subject does not match the pinned identity/team")
+
+
+def validate_signing_pair(certificate, private_key):
+    public_key = run_command(
+        [
+            OPENSSL,
+            "pkey",
+            "-in",
+            str(private_key),
+            "-passin",
+            "pass:",
+            "-pubout",
+        ],
+        "read signing key public component",
+        capture=True,
+    ).stdout
+    certificate_key = run_command(
+        [
+            OPENSSL,
+            "x509",
+            "-in",
+            str(certificate),
+            "-pubkey",
+            "-noout",
+        ],
+        "read certificate public key",
+        capture=True,
+    ).stdout
+    if not public_key.strip() or public_key != certificate_key:
+        raise SigningError("private key does not match the signing certificate")
 
 
 def sign_payloads(stage, identity, expected_team_id, entitlements, expected_entitlements, certificate, private_key):
@@ -596,13 +626,14 @@ def parse_args():
 
 def main():
     args = parse_args()
-    validate_private_key(args.private_key_file)
-    certificate_pem, certificate_sha256 = read_certificate(args.certificate_file)
-    validate_certificate_identity(args.certificate_file, args.identity, args.expected_team_id)
     if not GENERATION_PATTERN.fullmatch(args.generation):
         raise SigningError("generation has an invalid format")
     if not OWNER_PATTERN.fullmatch(args.output_owner):
         raise SigningError("output owner has an invalid format")
+    validate_private_key(args.private_key_file)
+    certificate_pem, certificate_sha256 = read_certificate(args.certificate_file)
+    validate_certificate_identity(args.certificate_file, args.identity, args.expected_team_id)
+    validate_signing_pair(args.certificate_file, args.private_key_file)
     entitlements = Path(args.entitlements_file)
     try:
         entitlements_bytes = entitlements.read_bytes()
@@ -654,8 +685,13 @@ def main():
             archive_bytes, stage, args.generation, sources, protocol
         )
         signed_payloads = sign_payloads(
-            stage, args.identity, args.expected_team_id, entitlements, expected_entitlements,
-            args.certificate_file, args.private_key_file
+            stage,
+            args.identity,
+            args.expected_team_id,
+            entitlements,
+            expected_entitlements,
+            args.certificate_file,
+            args.private_key_file,
         )
         signed_manifest = {
             "schema_version": 1,

@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).parent
@@ -66,6 +67,10 @@ class DarwinSignTests(unittest.TestCase):
                 else:
                     self.signer.validate_private_key(self.key)
         self.root.chmod(0o700)
+        directory_link = self.root / 'linked-directory'
+        directory_link.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(self.signer.SigningError, 'directory'):
+            self.signer.validate_private_key(directory_link / self.key.name)
         metadata = list(self.root.stat())
         metadata[4] = os.geteuid() + 1
         original_stat = Path.stat
@@ -74,6 +79,14 @@ class DarwinSignTests(unittest.TestCase):
         with patch.object(Path, 'stat', stat_path):
             with self.assertRaisesRegex(self.signer.SigningError, 'directory'):
                 self.signer.validate_private_key(self.key)
+
+    def test_invalid_names_refused_before_file_access(self):
+        # Invalid generation/owner formats must fail before inspecting key files.
+        for generation, owner, error in (('!invalid', 'test', 'generation'), ('valid', '!invalid', 'owner')):
+            args = SimpleNamespace(generation=generation, output_owner=owner)
+            with self.subTest(error=error), patch.object(self.signer, 'parse_args', return_value=args):
+                with self.assertRaisesRegex(self.signer.SigningError, error):
+                    self.signer.main()
 
     def test_unsafe_key_refused_before_other_inputs(self):
         # The command refuses an unsafe key before reading tokens or contacting
@@ -174,6 +187,12 @@ elif '--display' in args:
                 with self.assertRaisesRegex(signer.SigningError, 'pinned identity/team'):
                     signer.validate_certificate_identity(cert, identity, team)
         signer.validate_private_key(self.key)
+        signer.validate_signing_pair(cert, self.key)
+        other_key = self.root / 'other-key.pem'
+        subprocess.run([openssl, 'genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048',
+                        '-out', str(other_key)], check=True, capture_output=True)
+        with self.assertRaisesRegex(signer.SigningError, 'does not match'):
+            signer.validate_signing_pair(cert, other_key)
         signer.cms_sign(attestation, signature, cert, self.key)
         pem, digest = signer.read_certificate(cert)
         self.assertEqual(finalizer.verify_cms(content, signature.read_bytes(), pem, pem), digest)

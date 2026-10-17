@@ -99,10 +99,19 @@ paths in the signer's existing invocation alongside `--identity` and
 `--expected-team-id`; keep the currently deployed identity, team and entitlements.
 The key must be a regular file (no symlinks), owned by the effective signing user,
 with mode exactly 0600; its parent directory must be owned by the signing user
-and not group/world-writable. The signer refuses otherwise, before network access,
-and checks the certificate subject against the pinned identity/team before signing.
+and not group/world-writable, and must not itself be a symlink. The signer refuses otherwise, before network access,
+and checks the certificate subject against the pinned identity/team and the
+key/certificate public-key match before any network access.
 No signing operation uses a keychain. `/usr/bin/codesign` remains the public-key
 verification tool for strict validity, authority, team and entitlements.
+
+The certificate file must contain **only the leaf certificate** (the finalizer
+pins that single certificate). Do not append intermediates to it. The pinned
+rcodesign 0.29.0 automatically registers the Apple intermediate/root chain from
+its bundled public Apple CA certificates when loading an Apple-issued signing
+certificate; it does not need a keychain lookup to obtain that chain. See the
+[pinned certificate-source implementation](https://github.com/indygreg/apple-platform-rs/blob/2312b1e5bd77322c019613e0ca624e222c6c6e08/apple-codesign/src/cli/certificate_source.rs#L103)
+and [chain registration](https://github.com/indygreg/apple-platform-rs/blob/2312b1e5bd77322c019613e0ca624e222c6c6e08/apple-codesign/src/signing_settings.rs#L357).
 
 ### Owner: one-time export
 
@@ -209,7 +218,22 @@ identity/team/entitlements plus these two file arguments. Resume submissions and
 sign a fresh generation over SSH, then run the unchanged
 `lab-fleet-finalize-darwin` with the existing pinned certificate and
 `--expected-identity`. Confirm its CMS verification and the signer's macOS
-verification checks pass before the next roll. No deployment or key export is
+verification checks pass before the next roll. Also inspect the embedded chain
+on a signed payload (set `SIGNED_PAYLOAD` to its extracted path):
+
+```sh
+chain_dir=$(mktemp -d)
+/usr/bin/codesign -d --extract-certificates "$chain_dir/embedded-" "$SIGNED_PAYLOAD"
+for certificate in "$chain_dir"/embedded-*; do
+  /opt/homebrew/opt/openssl@3/bin/openssl x509 -inform DER -in "$certificate" -noout -subject -issuer
+done
+rm -r "$chain_dir"
+```
+
+Confirm the embedded leaf is the pinned identity and its issuing Apple
+intermediate is present. Stop deployment if the chain is missing; do not append
+certificates to the pinned leaf file or change keychain access lists to work
+around it. No deployment or key export is
 performed by this PR. Rolling the script back also requires restoring its old
 invocation and reintroduces the keychain prompt.
 
