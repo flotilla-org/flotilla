@@ -6,6 +6,7 @@
 //! never on provider runtime, discovery, VCS, core, storage or composition
 //! roots. The build-graph gate enforces the same upward-dependency prohibition.
 pub mod dummy_fleet;
+pub mod forge_override;
 pub mod log_file;
 pub mod provider_config;
 
@@ -292,6 +293,9 @@ pub struct DaemonConfig {
     pub admission: AdmissionConfig,
     #[serde(default)]
     pub credentials: CredentialHealthConfig,
+    /// Host-local provider substitutions keyed by the original forge service URL.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub forge_overrides: BTreeMap<String, forge_override::ForgeOverride>,
     #[serde(default)]
     pub logging: DaemonLoggingConfig,
     #[serde(default)]
@@ -326,6 +330,7 @@ impl Default for DaemonConfig {
             host_name: None,
             admission: AdmissionConfig::default(),
             credentials: CredentialHealthConfig::default(),
+            forge_overrides: BTreeMap::new(),
             logging: DaemonLoggingConfig::default(),
             environments: BTreeMap::new(),
             manifests: None,

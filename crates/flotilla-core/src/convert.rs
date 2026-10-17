@@ -37,6 +37,7 @@ pub fn assertion_to_discovery_entry(assertion: &EnvironmentAssertion) -> Discove
             detail.insert("remote_name".into(), remote_name.clone());
             "remote_host"
         }
+        EnvironmentAssertion::ForgeOverride { .. } => "forge_override",
         EnvironmentAssertion::OriginForge { spec } => {
             detail.insert("forge_id".into(), spec.forge_id.clone());
             detail.insert("kind".into(), format!("{:?}", spec.kind));
@@ -92,7 +93,8 @@ pub fn inventory_from_bag(bag: &EnvironmentBag) -> ToolInventory {
             }
             EnvironmentAssertion::VcsCheckoutDetected { .. }
             | EnvironmentAssertion::RemoteHost { .. }
-            | EnvironmentAssertion::OriginForge { .. } => {}
+            | EnvironmentAssertion::OriginForge { .. }
+            | EnvironmentAssertion::ForgeOverride { .. } => {}
         }
     }
 

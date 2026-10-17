@@ -479,6 +479,8 @@ mod tests {
             agent: DummyAgentConfig { turn_delay_ms: 1_500, fail_rate: 0.0, stall_rate: 0.0, long_runner_turns: 1 },
             shared_forge: Some(DummySharedForgeConfig {
                 service_url: fake.service_url("github"),
+                endpoint_url: None,
+                kind: flotilla_resources::ForgeKind::Forgejo,
                 token_path: token.path().to_string_lossy().into_owned(),
                 base_branch: "main".into(),
             }),

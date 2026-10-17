@@ -21,7 +21,7 @@ requests finish, then exits.
 ## Configuration
 
 ```toml
-public_url = "https://fake-forge.rehearsal:3443"   # origin the Forge records name: scheme, host, port; no path
+public_url = "https://fake-forge.rehearsal:3443"   # execution endpoint origin: scheme, host, port; no path
 listen = "0.0.0.0:3443"                             # Forgejo API (HTTPS)
 admin_listen = "0.0.0.0:3444"                       # admin API (HTTPS), a separate listener
 tls_cert = "/etc/flotilla-fake-forge/server.pem"    # certificate chain, PEM
@@ -99,8 +99,8 @@ rehearsal host and prints what every rehearsal host needs.
    ```sh
    scripts/rehearsal/install-fake-forge.sh --binary ./flotilla-fake-forge \
      --host rehearsal-feta --ip 10.77.0.12 \
-     --forge github=github-rehearsal=github.com \
-     --forge lab=lab=forgejo.lab.flotilla.work,forgejo-manchego \
+     --forge github=github=https://github.com \
+     --forge lab=lab=https://forgejo.lab.flotilla.work \
      --seed seed.json --auto-merge-after 120
    ```
 
@@ -109,39 +109,63 @@ rehearsal host and prints what every rehearsal host needs.
    and a hardened systemd unit. It then waits until every forge answers its
    token over HTTPS.
 4. Follow what it prints. Each rehearsal host trusts the CA, holds the token
-   files and gains `[credentials.forgejo]` lines (and, for dummy crews,
-   `[dummy_fleet.shared_forge]`). The Forge and CredentialSpec records under
-   `apply/` are applied once.
+   files and gains `[forge_overrides]` lines (and, for dummy crews,
+   `[dummy_fleet.shared_forge]`). The host-local bindings under
+   `apply/daemon.toml` are installed on every rehearsal daemon.
 
 `--stage DIR` writes the same files under `DIR` without installing anything,
 so the output can be reviewed first.
 
 ## Pointing a rehearsal at it
 
-The rehearsal fleet's Forge records point at the fake with the Forgejo kind.
-For github.com projects:
+Keep the copied Forge, Repository, issue and change-request records unchanged.
+Install provider substitutions in each rehearsal daemon's `daemon.toml`:
 
-```yaml
-forge_id: github-rehearsal
-kind: forgejo
-hosts: [github.com]
-https_url: https://fake-forge.rehearsal:3443/github
+```toml
+[forge_overrides."https://github.com"]
+provider = "forgejo"
+endpoint_url = "https://fake-forge.rehearsal:3443/github"
+token_path = "/etc/flotilla-rehearsal/tokens/github"
+
+[forge_overrides."https://forgejo.lab.flotilla.work"]
+provider = "forgejo"
+endpoint_url = "https://fake-forge.rehearsal:3443/lab"
+token_path = "/etc/flotilla-rehearsal/tokens/lab"
 ```
 
-The record cannot use the id `github`: ADR 0066 reserves it for public GitHub
-(kind `github`, `https://github.com`), and admission refuses any other forge
-under that id. The rehearsal record claims the `github.com` host instead, so
-github.com remotes resolve to it, and the Forgejo providers serve them. The
-mount name (`github` above) is only a path on the fake and need not match the
-Forge id.
+Keys are the original canonical service URLs, including installation paths if
+present, without trailing slashes. The endpoint mount belongs only to execution.
+GitHub stays GitHub in stored data; its issues and PR claims keep github.com URLs.
+The override selects the Forgejo adapter and its fake-only token before provider
+construction, including for builtin public GitHub without a Forge record. It does
+not rewrite Git remotes or change Forge ownership/admission. A missing override
+token refuses provider construction rather than using the original credential.
+Remove the bindings to restore ordinary provider discovery.
 
-The copied `lab` Forge record changes its `https_url` to
-`https://fake-forge.rehearsal:3443/lab` in the same way. Each host's daemon
-config maps the forge to a credential holding that forge's token through
-`[credentials.forgejo]`: the value names a CredentialSpec whose file source
-holds the token, which the install script prints. Hosts must trust the CA that issued the fake's
-certificate, because the providers verify TLS through the platform trust
-store.
+The installer accepts `--forge MOUNT=TOKEN_LABEL=ORIGINAL_SERVICE_URL`, including
+original installation prefixes and ports. Legacy hostname lists are also
+accepted; their first host supplies an unprefixed HTTPS service URL. Original
+SSH aliases remain in the copied Forge record and need no extra override.
+
+For dummy crews, select the logical forge and its fake endpoint separately:
+
+```toml
+[dummy_fleet.shared_forge]
+service_url = "https://github.com"
+kind = "github"
+endpoint_url = "https://fake-forge.rehearsal:3443/github"
+token_path = "/etc/flotilla-rehearsal/tokens/github"
+```
+
+This existing shared-crew setting selects one forge per daemon. Its logical
+service and kind must match the repositories assigned to those dummy crews.
+Numbers come from the fake, but submitted claims use the original service URL
+and its URL syntax (`pull` for GitHub, `pulls` for Forgejo). Existing shared-forge
+configs without `endpoint_url` retain their previous behavior.
+
+Hosts must trust the rehearsal CA because providers verify TLS through the
+platform trust store. Overrides are local execution settings, never replicated
+resource changes. Apply them only to the isolated rehearsal fleet.
 
 ## Admin API
 

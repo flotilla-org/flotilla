@@ -15,13 +15,41 @@ pub enum VcsKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EnvironmentAssertion {
-    BinaryAvailable { name: String, path: ExecutionEnvironmentPath, version: Option<String> },
-    EnvVarSet { key: String, value: String },
-    VcsCheckoutDetected { root: ExecutionEnvironmentPath, kind: VcsKind, is_main_checkout: bool },
-    RemoteHost { host: String, owner: String, repo: String, remote_name: String },
-    OriginForge { spec: ForgeSpec },
-    AuthFileExists { provider: String, path: ExecutionEnvironmentPath },
-    SocketAvailable { name: String, path: DaemonHostPath },
+    BinaryAvailable {
+        name: String,
+        path: ExecutionEnvironmentPath,
+        version: Option<String>,
+    },
+    EnvVarSet {
+        key: String,
+        value: String,
+    },
+    VcsCheckoutDetected {
+        root: ExecutionEnvironmentPath,
+        kind: VcsKind,
+        is_main_checkout: bool,
+    },
+    RemoteHost {
+        host: String,
+        owner: String,
+        repo: String,
+        remote_name: String,
+    },
+    OriginForge {
+        spec: ForgeSpec,
+    },
+    /// Execution binding only: the origin identity and remote remain unchanged.
+    ForgeOverride {
+        binding: flotilla_config::forge_override::ForgeOverride,
+    },
+    AuthFileExists {
+        provider: String,
+        path: ExecutionEnvironmentPath,
+    },
+    SocketAvailable {
+        name: String,
+        path: DaemonHostPath,
+    },
 }
 
 impl EnvironmentAssertion {
@@ -140,6 +168,19 @@ impl EnvironmentBag {
             }
             _ => None,
         })
+    }
+
+    pub fn forge_override(&self) -> Option<&flotilla_config::forge_override::ForgeOverride> {
+        self.assertions.iter().find_map(|assertion| match assertion {
+            EnvironmentAssertion::ForgeOverride { binding } => Some(binding),
+            _ => None,
+        })
+    }
+
+    /// Provider selection may differ from the logical forge kind in rehearsal.
+    pub fn uses_forgejo(&self) -> bool {
+        self.forge_override().is_some()
+            || self.find_origin_forge().is_some_and(|forge| forge.kind == flotilla_resources::ForgeKind::Forgejo)
     }
 
     pub fn find_origin_forge(&self) -> Option<&ForgeSpec> {

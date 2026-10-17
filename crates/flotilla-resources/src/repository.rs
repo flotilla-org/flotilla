@@ -93,7 +93,12 @@ impl RepositorySpec {
         if let RepositoryIdentity::Forge { owner, repo_name, .. } = &self.identity {
             let expected = format!("{owner}/{repo_name}");
             for remote in remotes {
-                if forge_from_canonical_remote(remote)?.repository != expected {
+                // The logical service can include an installation prefix. Its
+                // canonical remote carries that prefix, while transport aliases
+                // may still name owner/repo directly.
+                let canonical_path =
+                    self.forge.as_ref().and_then(|forge| remote.strip_prefix(&format!("{}/", forge.service_url.trim_end_matches('/'))));
+                if canonical_path != Some(expected.as_str()) && forge_from_canonical_remote(remote)?.repository != expected {
                     return Err(format!("remote `{remote}` does not match forge repository `{expected}`"));
                 }
             }
@@ -846,5 +851,36 @@ mod fact_dialect_tests {
         let stable = "https://github.com/flotilla-org/flotilla";
         let error = RepositorySpec::remote(stable).expect("repository").remove_remote(stable).expect_err("stable remote removal");
         assert!(error.contains("stable identity remote"));
+    }
+}
+
+#[cfg(test)]
+mod prefixed_service_tests {
+    use super::*;
+    use hegel::generators as gs;
+
+    // A declared Forge repository round-trips without treating its installation
+    // prefix as part of the owner. Invalid owner changes are still refused.
+    #[hegel::test]
+    fn prefixed_forge_repository_round_trips(tc: hegel::TestCase) {
+        // Cover root, single/nested prefixes and a prefix equal to the owner.
+        let prefixes = ["", "/forge", "/team", "/forge/nested"];
+        let prefix = prefixes[tc.draw(gs::integers::<usize>().min_value(0).max_value(prefixes.len() - 1))];
+        let forge = crate::ForgeSpec::builder()
+            .forge_id("lab".into())
+            .kind(crate::ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["lab.example".into()]))
+            .https_url(format!("https://lab.example{prefix}"))
+            .git_ssh_host("ssh-lab".into())
+            .build();
+        let spec = RepositorySpec::remote(format!("https://lab.example{prefix}/team/repo"))
+            .expect("remote")
+            .on_forge(&forge)
+            .expect("logical forge");
+        let encoded = serde_json::to_value(&spec).expect("encode");
+        let decoded: RepositorySpec = serde_json::from_value(encoded).expect("decode prefixed service");
+        assert_eq!(decoded, spec);
+        assert_eq!(decoded.forge().expect("forge").repository, "team/repo");
+        assert!(decoded.with_remotes([format!("https://lab.example{prefix}/other/repo")]).is_err());
     }
 }

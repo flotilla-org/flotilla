@@ -325,6 +325,28 @@ mod tests {
         (provider, source)
     }
 
+    // Copied issues keep their original source while all HTTP operations reach
+    // the fake. Run the real provider contract through its in-process adapter.
+    #[tokio::test]
+    async fn rehearsal_queries_keep_original_issue_sources() {
+        let fake = RecordedWorld::ZellijIssues.seed(FAKE_URL, "lab", FAKE_TOKEN);
+        let source = IssueSource { service: "https://github.com".into(), scope: RecordedWorld::ZellijIssues.repo_slug().into() };
+        let provider = ForgejoIssueProvider::new(
+            Arc::new(InProcessClient::new(Arc::clone(&fake))),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new(
+                source.service.clone(),
+                Some(format!("{}/api/v1", fake.service_url("lab"))),
+                ForgejoAuth { token: FAKE_TOKEN.into(), token_path: PathBuf::from("fake-token") },
+            ),
+        );
+        assert_provider_contract(&provider, &source, "9", "2026-01-01T00:00:00Z").await;
+        let issue = provider.fetch_by_id(&IssueRef { source: source.clone(), id: "9".into() }).await.expect("copied issue");
+        assert_eq!(issue.reference.source, source);
+        assert_eq!(provider.html_url(&issue.reference), format!("https://github.com/{}/issues/9", source.scope));
+        assert_no_refusals(&fake);
+    }
+
     fn assert_no_refusals(fake: &FakeForge) {
         let (refusals, count) = fake.refusals();
         assert_eq!(count, 0, "the fake refused provider requests: {refusals:?}");

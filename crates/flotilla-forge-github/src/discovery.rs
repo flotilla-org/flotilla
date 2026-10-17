@@ -13,6 +13,9 @@ pub fn github_repo_slug(env: &EnvironmentBag) -> Result<String, Vec<UnmetRequire
         unmet.push(UnmetRequirement::MissingBinary("gh".into()));
     }
     let remote = env.find_origin_remote().filter(|(host, _, _)| {
+        if env.forge_override().is_some() {
+            return false;
+        }
         env.find_origin_forge().map_or_else(|| host.eq_ignore_ascii_case("github.com"), |forge| forge.kind == ForgeKind::Github)
     });
     if remote.is_none() {

@@ -35,6 +35,25 @@ fn forgejo_provider_config(
     config: &DaemonHostPath,
     settings: &ProviderConfig,
 ) -> Result<ForgejoIssueProviderConfig, Vec<UnmetRequirement>> {
+    if let Some(binding) = env.forge_override() {
+        binding.validate().map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
+        let identity = env.repo_identity().ok_or_else(|| vec![UnmetRequirement::MissingRemoteHost("origin".into())])?;
+        let flotilla_config::forge_override::ForgeOverride::Forgejo { endpoint_url, token_path } = binding;
+        let auth_bag =
+            EnvironmentBag::new().with(flotilla_discovery_api::EnvironmentAssertion::auth_file(FORGEJO_AUTH_PROVIDER, token_path));
+        let auth = resolve_forgejo_auth(&auth_bag, config, &ForgejoIssueTrackerConfig::default())
+            .map_err(|error| vec![UnmetRequirement::MissingAuth(error)])?;
+        let mut resolved = ForgejoIssueProviderConfig::new(
+            format!("https://{}", identity.authority),
+            Some(format!("{}/api/v1", endpoint_url.trim_end_matches('/'))),
+            auth,
+        );
+        resolved.kind = env.find_origin_forge().map_or_else(
+            || if identity.authority.eq_ignore_ascii_case("github.com") { ForgeKind::Github } else { ForgeKind::Forgejo },
+            |forge| forge.kind,
+        );
+        return Ok(resolved);
+    }
     let forge = env.find_origin_forge().filter(|forge| forge.kind == ForgeKind::Forgejo);
     let forgejo = settings.issue_tracker.forgejo.clone().unwrap_or_default();
     let service_url = forge
@@ -197,5 +216,42 @@ mod tests {
         let auth = resolve_forgejo_auth(&bag, &config_base, &ForgejoIssueTrackerConfig::default()).expect("expanded daemon credential");
         assert_eq!(auth.token_path, credentials.join("lab-forgejo-daemon.token"));
         assert_eq!(auth.token, "daemon");
+    }
+}
+
+#[cfg(test)]
+mod rehearsal_tests {
+    use super::*;
+    use flotilla_config::forge_override::ForgeOverride;
+    use flotilla_discovery_api::EnvironmentAssertion;
+
+    // The identity survives adapter substitution, while endpoint and credential
+    // are selected exclusively from the explicit override, including mount paths.
+    #[test]
+    fn rehearsal_config_separates_identity_endpoint_and_credentials() {
+        let temp = tempfile::tempdir().expect("token dir");
+        let token = temp.path().join("fake-token");
+        std::fs::write(&token, "fake-token\n").expect("fake credential");
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::remote_host("github.com", "team", "repo", "origin"))
+            .with(EnvironmentAssertion::auth_file("forgejo", "/must-not-read-real-token"))
+            .with(EnvironmentAssertion::ForgeOverride {
+                binding: ForgeOverride::Forgejo {
+                    endpoint_url: "https://fake:3443/github/".into(),
+                    token_path: token.to_string_lossy().into_owned(),
+                },
+            });
+        let resolved =
+            forgejo_provider_config(&bag, &DaemonHostPath::new(temp.path()), &ProviderConfig::default()).expect("rehearsal config");
+        assert_eq!(resolved.service_url, "https://github.com");
+        assert_eq!(resolved.api_base_url, "https://fake:3443/github/api/v1");
+        assert_eq!(resolved.auth.token_path, token);
+        assert_eq!(resolved.auth.token, "fake-token");
+        assert_eq!(resolved.change_request_url("team/repo", "17"), "https://github.com/team/repo/pull/17");
+        std::fs::remove_file(&token).expect("remove fake credential");
+        assert!(
+            forgejo_provider_config(&bag, &DaemonHostPath::new(temp.path()), &ProviderConfig::default()).is_err(),
+            "missing fake credentials cannot fall back to real ones"
+        );
     }
 }

@@ -669,3 +669,85 @@ fn issue_source_is_the_declared_forge_https_root() {
     .expect("key");
     assert_eq!(issue_source_for_subject(&github, &forges).expect("github source").service, "https://github.com");
 }
+
+// Rehearsal substitutes execution without changing copied identities, remotes,
+// or Forge definitions. Both builtin GitHub and a declared Forgejo use this seam.
+#[tokio::test]
+async fn rehearsal_binding_preserves_copied_forge_data() {
+    use flotilla_discovery_api::Factory;
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+
+    for (service, declared) in
+        [("https://github.com", false), ("https://github.com", true), ("https://lab.example", true), ("https://lab.example/forge", true)]
+    {
+        let temp = tempfile::tempdir().expect("config");
+        let token = temp.path().join("fake-token");
+        std::fs::write(&token, "fake-only-token").expect("token");
+        std::fs::write(
+            temp.path().join("daemon.toml"),
+            format!(
+                "machine_id = \"rehearsal\"\n[forge_overrides.\"{service}\"]\nprovider = \"forgejo\"\nendpoint_url = \"https://fake.example:3443/mount\"\ntoken_path = {:?}\n",
+                token.to_str().expect("path")
+            ),
+        ).expect("daemon config");
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let mut repository = RepositorySpec::remote(format!("{service}/team/repo")).expect("copied repository");
+        if declared {
+            let github = service == "https://github.com";
+            let id = if github { "github" } else { "lab" };
+            let host = if github { "github.com" } else { "lab.example" };
+            let forge = flotilla_resources::ForgeSpec::builder()
+                .forge_id(id.into())
+                .kind(if github { flotilla_resources::ForgeKind::Github } else { flotilla_resources::ForgeKind::Forgejo })
+                .hosts(BTreeSet::from([host.into()]))
+                .https_url(service.into())
+                .git_ssh_host("ssh-lab".into())
+                .build();
+            backend.definitions::<flotilla_resources::Forge>("flotilla").create(&test_meta(id), &forge).await.expect("copied forge");
+            repository = repository.on_forge(&forge).expect("logical identity");
+        }
+        let resolved = crate::in_process::forge_for_remote(&backend, "flotilla", &format!("{service}/team/repo"))
+            .await
+            .expect("logical forge resolution");
+        assert_eq!(resolved.as_ref().map(|forge| forge.https_url.as_str()), declared.then_some(service));
+        let copied = backend
+            .using::<Repository>("flotilla")
+            .create(&test_meta(&repository.key().to_string()), &repository)
+            .await
+            .expect("copied record");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let discovery = fake_discovery(false);
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            config.clone(),
+            discovery,
+            HostName::new("rehearsal"),
+            backend.clone(),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        let bag = super::super::convoy_admission::repository_provider_bag(
+            &backend,
+            &config,
+            &daemon.environment_manager,
+            &daemon.local_environment_id,
+            "flotilla",
+            &repository,
+        )
+        .await
+        .expect("execution bag");
+        let bag = bag.with(flotilla_discovery_api::EnvironmentAssertion::binary("gh", "/usr/bin/gh"));
+        let identity = bag.repo_identity().expect("identity");
+        assert_eq!(format!("https://{}", identity.authority), service);
+        assert_eq!(identity.path, "team/repo");
+        let after = backend.using::<Repository>("flotilla").get(&repository.key().to_string()).await.expect("unchanged record");
+        assert_eq!(serde_json::to_value(after).expect("after"), serde_json::to_value(copied).expect("before"));
+        assert_eq!(bag.find_origin_forge().map(|forge| forge.https_url.as_str()), declared.then_some(service));
+        assert!(flotilla_forge_github::discovery::github_repo_slug(&bag).is_err(), "real GitHub provider must decline override");
+        let root = ExecutionEnvironmentPath::new(temp.path());
+        let selected = flotilla_change_request::factories::forgejo::ForgejoChangeRequestFactory
+            .probe(&bag, &config, &root, daemon.discovery.runner.clone())
+            .await;
+        assert!(selected.is_ok(), "fake Forgejo provider must be selected: {:?}", selected.err());
+    }
+}

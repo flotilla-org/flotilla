@@ -13,7 +13,6 @@ use flotilla_forge_forgejo::discovery::bounded_forgejo_provider_config;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ReqwestHttpClient;
-use flotilla_resources::ForgeKind;
 
 use crate::forgejo::ForgejoChangeRequestProvider;
 use crate::ChangeRequestTracker;
@@ -43,7 +42,7 @@ impl Factory for ForgejoChangeRequestFactory {
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
-        if !env.find_origin_forge().is_some_and(|forge| forge.kind == ForgeKind::Forgejo) {
+        if !env.uses_forgejo() {
             return Err(vec![UnmetRequirement::MissingRemoteHost("Forgejo origin".into())]);
         }
         let settings = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
