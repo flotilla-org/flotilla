@@ -662,6 +662,8 @@ pub(super) fn resource_decode_quarantine_condition(
     if object_quarantines.is_empty() && event_quarantines.is_empty() {
         return None;
     }
+    // Extend this list when source_owner gains another stored election input
+    // or ForgeReads gains another demand/result kind; keep its scope test aligned.
     let forge_kinds = [
         Host::API_PATHS.kind,
         Forge::API_PATHS.kind,

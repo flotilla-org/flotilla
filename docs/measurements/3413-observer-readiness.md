@@ -110,13 +110,21 @@ until its owning daemon republishes the classified condition. This is solely
 an N→N+1 decoder shim, marked for removal after one fleet roll; new constructors
 have no default. The stored corpus is decoded without regenerating its fixtures. New raw Host-status patches and authored documents require an explicit boolean; missing, null or non-boolean decisions are rejected before the compatibility decoder.
 
-No out-of-repo Host-status/HostCondition author was identified. The known
+There are no known out-of-repo Host-status/HostCondition authors: the audit found
+only the in-repo production paths listed below. The known
 producers are the in-repo daemon runtime, resources sleep-inhibition patch,
 core Cleat assessment, and projections issue-budget health. Host definitions
 and host-local config supply specs, not these runtime conditions; no companion
 project-map/ops manifest change is required. Generic API clients authoring new
 Host-condition JSON must include the explicit boolean. Existing serialized
 status records remain decodable through the compatibility record.
+
+**Roll note:** a stored old projection condition temporarily inherits its old
+admission-blocking policy. The owning daemon's first successful heartbeat
+replaces legacy conditions with current health, removing the old projection
+condition or writing it with `blocks_forge_observation=false`. That clears the
+conservative observation block even if admission remains unready. Check that
+heartbeat publication has completed after rolling each host.
 
 ## Deterministic regression
 
