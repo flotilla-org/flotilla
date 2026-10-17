@@ -22,10 +22,10 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 #[cfg(unix)]
 use flotilla_provider_runtime::ProcessCommandRunner;
 #[cfg(unix)]
-use flotilla_resources::{K8sResourceObject, Project, ReplicationClass, ResourceObject};
+use flotilla_resources::{K8sResourceObject, Project, ReplicationClass, ResourceError, ResourceObject};
 use flotilla_store::validate_resource_document;
 #[cfg(unix)]
-use flotilla_store::{validate_message_migration_complete, REGISTERED_RESOURCE_KINDS};
+use flotilla_store::{decode_stored_resource_document, validate_message_migration_complete, REGISTERED_RESOURCE_KINDS};
 #[cfg(unix)]
 use flotilla_vcs::{
     providers::git_worktree::GitWorktreeStrategy,
@@ -177,7 +177,7 @@ async fn validate_daemon_with_preview(
                         }
                     }
                 }
-                if let Err(error) = validate_message_migration_complete(item).and_then(|()| validate_resource_document(item)) {
+                if let Err(error) = validate_stored_record(item) {
                     eprintln!("{label}/{name}: {error}");
                     failed = true;
                 }
@@ -636,6 +636,13 @@ fn parse_documents(path: &Path, content: &str) -> Result<Vec<Value>> {
     }
 }
 
+/// Live-store records were written by the running generation, so the candidate
+/// checks that it can read them (N→N+1), not that they meet current authoring rules.
+#[cfg(unix)]
+fn validate_stored_record(item: &Value) -> Result<(), ResourceError> {
+    validate_message_migration_complete(item).and_then(|()| decode_stored_resource_document(item))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use flotilla_store_memory::InMemoryBackend;
@@ -774,6 +781,33 @@ mod tests {
         let error = validate_resource_document(&document).expect_err("unknown nested status field must fail");
         assert!(error.to_string().contains("status.workflow_snapshot.vessels[0]"), "{error}");
         assert!(error.to_string().contains("retired_field"), "{error}");
+    }
+
+    // Authoring rules added after a record was stored must not refuse the
+    // candidate: #3420 requires an explicit forge-observation decision on new
+    // Host conditions, while stored conditions decode through its default.
+    #[test]
+    fn stored_records_are_checked_for_decoding_not_authoring_rules() {
+        use flotilla_resources::{api_version, ConditionValue, Host, HostCondition, HostStatus, Resource};
+        let condition = HostCondition::builder()
+            .condition_type("Example")
+            .value(ConditionValue::False)
+            .reason("Example")
+            .message("stored by the previous generation")
+            .observed_at(chrono::Utc::now())
+            .blocks_forge_observation(false)
+            .build();
+        let mut status = serde_json::to_value(HostStatus { conditions: vec![condition], ..Default::default() }).unwrap();
+        status["conditions"][0].as_object_mut().unwrap().remove("blocks_forge_observation");
+        let document = serde_json::json!({
+            "apiVersion": api_version(Host::API_PATHS),
+            "kind": "Host",
+            "metadata": {"name": "host"},
+            "spec": {},
+            "status": status,
+        });
+        assert!(validate_resource_document(&document).is_err(), "authoring still requires the decision");
+        super::validate_stored_record(&document).expect("previous-generation Host record decodes");
     }
 
     // Process-boundary stand-in serves previous-generation raw records. The
