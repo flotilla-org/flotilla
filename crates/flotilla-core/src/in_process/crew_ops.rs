@@ -237,11 +237,10 @@ fn select_crew_artifacts(
 }
 
 fn convoy_names_query(name: Option<&str>, include_replicas: bool) -> StoreQuery {
-    // An empty filter is used only by namespace-wide startup/reconciliation passes.
     StoreQuery {
         fields: name.map(|name| BTreeMap::from([("metadata.name".into(), name.into())])).unwrap_or_default(),
         include_replicas,
-        ..Default::default()
+        ..flotilla_store::live_convoys_query()
     }
 }
 
@@ -1095,7 +1094,6 @@ impl CrewService {
         let routing = self.resolve_crew_routing_context(requested).await?;
         let namespace = routing.command_context.namespace.as_deref().expect("resolved crew routing context has a namespace");
         let convoy_name = routing.command_context.convoy.as_deref().expect("resolved crew routing context has a convoy");
-        self.adopt_legacy_convoy_queues_before_command(namespace, convoy_name).await?;
         let message_lock = self.convoy_message_lock(namespace, convoy_name).await;
         let _message_guard = message_lock.lock().await;
         let context = self.resolve_crew_context_from_routing(&routing, true).await?;
@@ -2510,7 +2508,6 @@ impl CrewService {
         if prompt.trim().is_empty() {
             return Err("convoy resume requires a non-empty prompt".to_string());
         }
-        self.adopt_legacy_convoy_queues_before_command(namespace, name).await?;
         let message_lock = self.convoy_message_lock(namespace, name).await;
         let _message_guard = message_lock.lock().await;
         self.convoy_resume_with_sender_locked(namespace, name, prompt, target, attribution, intent).await
@@ -2767,7 +2764,6 @@ impl CrewService {
     }
 
     pub(super) async fn withdraw_pending_brief(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {
-        self.adopt_legacy_convoy_queues_before_command(namespace, name).await?;
         let message_lock = self.convoy_message_lock(namespace, name).await;
         let _message_guard = message_lock.lock().await;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
@@ -3202,26 +3198,10 @@ impl CrewService {
         Ok(crate::leaf_engine::CrewTurnAdmission { new_turn, rung, message })
     }
 
-    // Deliberately rescan through the one-generation window: a replica containing
-    // old intent can arrive after a previous successful adoption sweep. A permanent
-    // namespace latch would skip that newly arrived work. Remove after #2710's roll.
-    async fn adopt_legacy_convoy_queues_before_command(&self, namespace: &str, name: &str) -> Result<(), String> {
-        let convoys =
-            self.resource_backend.including_replicas::<ResourceConvoy>(namespace).get_all(name).await.map_err(|error| error.to_string())?;
-        if convoys.items.iter().any(|source| {
-            source.object.status.as_ref().is_some_and(|status| {
-                status.turn_deliveries.values().any(|queue| queue.pending_brief.is_some() || queue.pending_supervisor_turn.is_some())
-            })
-        }) {
-            self.reconcile_pending_supervisor_turns_selected(namespace, Some(name)).await?;
-        }
-        Ok(())
-    }
-
     // Convoy queues remain decodable and adoptable for #2710's one-generation window.
     // Terminal receipt/launch-witness retirement and the pre-roll guard from #2878
     // remain intact. Remove this convoy-only adoption after the first #2710 roll.
-    async fn adopt_legacy_convoy_queues_once(&self, namespace: &str, name: Option<&str>) -> Result<(), String> {
+    pub(super) async fn adopt_legacy_convoy_queues_once(&self, namespace: &str, name: Option<&str>) -> Result<(), String> {
         // Previous-generation authority queues may arrive before a local
         // TerminalSession payload. Their receiver home adopts the same IDs.
         let candidates = self
@@ -3390,7 +3370,6 @@ impl CrewService {
         self.reconcile_pending_supervisor_turns_selected(namespace, None).await
     }
     async fn reconcile_pending_supervisor_turns_selected(&self, namespace: &str, name: Option<&str>) -> Result<(), String> {
-        self.adopt_legacy_convoy_queues_once(namespace, name).await?;
         let convoys = self.resource_backend.using::<ResourceConvoy>(namespace);
         let candidates = convoys.query_declared(&convoy_names_query(name, false)).await.map_err(|error| error.to_string())?.items;
         let mut references = BTreeMap::<String, Vec<String>>::new();

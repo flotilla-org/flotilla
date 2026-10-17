@@ -136,6 +136,7 @@ mod heartbeat;
 mod memory_tests;
 mod message;
 mod seed;
+mod supervisor_turns;
 mod terminal;
 mod work_credentials;
 

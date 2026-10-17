@@ -220,3 +220,67 @@ async fn convoy_read_decode_cost() {
         .await,
     );
 }
+
+// #3430: count the bodies the old callers decoded versus indexed live/ensure
+// queries. Half are replicas; real corpus snapshots retain production body sizes.
+#[tokio::test]
+#[ignore = "measurement; run explicitly with --ignored --nocapture"]
+async fn convoy_filter_pushdown_decode_cost() {
+    use flotilla_resources::ConvoyPhase;
+    use flotilla_store::{live_convoys_query, StoreQuery};
+    use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt};
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("filters.sqlite");
+    let backend = ResourceBackend::new(SqliteBackend::open(&path).expect("sqlite")).with_read_counts();
+    let convoys = backend.using::<Convoy>(NAMESPACE);
+    let corpus = corpus();
+    for index in 0..310 {
+        let (spec, status) = &corpus[index % corpus.len()];
+        let name = format!("c-{index:03}");
+        let meta = InputMeta::builder()
+            .name(name.clone())
+            .annotations(BTreeMap::from([("flotilla.work/ensured-from".into(), if index % 10 < 5 { "wanted" } else { "other" }.into())]))
+            .build();
+        let created = convoys.create(&meta, spec).await.expect("convoy");
+        let mut status = status.clone().unwrap_or_default();
+        status.phase = if index < 300 { ConvoyPhase::Landed } else { ConvoyPhase::Active };
+        convoys.update_status(&name, &created.metadata.resource_version, &status).await.expect("status");
+    }
+    let mut replicas = convoys.list().await.expect("fixture");
+    replicas.items.retain(|object| object.metadata.name[2..].parse::<usize>().expect("index") % 2 == 0);
+    backend.replica_writer::<Convoy>(NodeId::new("remote"), NAMESPACE).replace(&replicas, Utc::now()).await.expect("replicas");
+    for object in &replicas.items {
+        convoys.delete(&object.metadata.name).await.expect("move to replica");
+    }
+    let raw = rusqlite::Connection::open(&path).expect("raw measurement connection");
+    let bytes = |predicate: &str| -> usize {
+        ["resource_objects", "replica_objects"]
+            .into_iter()
+            .map(|table| {
+                raw.query_row(
+                    &format!("SELECT COALESCE(SUM(LENGTH(CAST(body_json AS BLOB))), 0) FROM {table} WHERE kind = 'Convoy' AND {predicate}"),
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .expect("stored bytes")
+            })
+            .sum()
+    };
+    let (before, reads) = measure_reads(backend.including_replicas::<Convoy>(NAMESPACE).list()).await;
+    assert_eq!(before.expect("before").items.len(), 310);
+    eprintln!("before list: {} rows, {} stored bytes decoded/call", reads.of(&backend).objects_by_kind()["Convoy"], bytes("1"));
+    let (after, reads) = measure_reads(backend.query_declared::<Convoy>(NAMESPACE, &live_convoys_query())).await;
+    assert_eq!(after.expect("live").items.len(), 10);
+    eprintln!(
+        "after live: {} rows, {} stored bytes decoded/call",
+        reads.of(&backend).objects_by_kind()["Convoy"],
+        bytes("json_extract(body_json, '$.status.phase') = 'Active'")
+    );
+    let query = StoreQuery {
+        fields: BTreeMap::from([("metadata.annotations.\"flotilla.work/ensured-from\"".into(), "wanted".into())]),
+        ..live_convoys_query()
+    };
+    let (after, reads) = measure_reads(backend.query_declared::<Convoy>(NAMESPACE, &query)).await;
+    assert_eq!(after.expect("ensured").items.len(), 5);
+    eprintln!("after ensured live: {} rows, {} stored bytes decoded/call", reads.of(&backend).objects_by_kind()["Convoy"], bytes("json_extract(body_json, '$.status.phase') = 'Active' AND json_extract(body_json, '$.metadata.annotations.\"flotilla.work/ensured-from\"') = 'wanted'"));
+}

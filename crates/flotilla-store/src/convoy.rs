@@ -15,6 +15,25 @@ use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 // records. A bounded retry also handles observation freshness without an event.
 const PROMISE_OBSERVATION_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Indexed live inventory, including records whose initial status is not written yet.
+/// Keep retained terminal bodies out of event-driven readers.
+pub fn live_convoys_query() -> crate::StoreQuery {
+    crate::StoreQuery {
+        any_of: Some(vec![
+            crate::StoreQuery {
+                field_values: BTreeMap::from([(
+                    "status.phase".into(),
+                    ["Pending", "Active", "Interrupted", "Landing", "Anchored"].map(String::from).to_vec(),
+                )]),
+                ..Default::default()
+            },
+            crate::StoreQuery { missing_fields: std::collections::BTreeSet::from(["status.phase".into()]), ..Default::default() },
+        ]),
+        include_replicas: true,
+        ..Default::default()
+    }
+}
+
 #[derive(Clone)]
 pub struct ConvoyReconciler {
     templates: DefinitionResolver<WorkflowTemplate>,

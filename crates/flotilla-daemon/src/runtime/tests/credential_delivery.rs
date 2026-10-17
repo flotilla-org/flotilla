@@ -1014,3 +1014,42 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
     assert!(finish["fields"]["duration_ms"].as_f64().expect("duration") >= 38_650.0);
     runtime.shutdown();
 }
+
+// Credential attention ignores terminal convoy history before decoding it.
+#[tokio::test]
+async fn credential_attention_reads_only_live_convoys() {
+    use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt};
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
+    for index in 0..310 {
+        let convoy = convoys
+            .create(
+                &flotilla_resources::InputMeta::builder().name(format!("history-{index}")).build(),
+                &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).build(),
+            )
+            .await
+            .expect("create convoy");
+        convoys
+            .update_status(
+                &convoy.metadata.name,
+                &convoy.metadata.resource_version,
+                &flotilla_resources::ConvoyStatus {
+                    phase: if index < 300 { flotilla_resources::ConvoyPhase::Landed } else { flotilla_resources::ConvoyPhase::Active },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("status");
+    }
+
+    let failure = CredentialRefreshError {
+        environment_ref: "missing".into(),
+        credential_name: Some("github-app".into()),
+        message: "unavailable".into(),
+        should_surface: true,
+    };
+    let (result, reads) =
+        measure_reads(super::super::credentials::reconcile_credential_refresh_attention_in(&backend, "flotilla", &[failure])).await;
+    result.expect("attention");
+    assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&10));
+}

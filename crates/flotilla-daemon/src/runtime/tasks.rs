@@ -597,17 +597,27 @@ where
         resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Consume the immediate tick; the subscribed startup scan handles recovery once.
         resync.tick().await;
+        let mut adopt_legacy = true;
         loop {
             let (mut convoys, mut sessions) = match subscribe().await {
                 Ok((convoys, sessions)) => (convoys.ready_chunks(64), sessions.ready_chunks(64)),
                 Err(error) => {
                     report_watch_failure(&error);
                     // A broken watch must not disable the periodic recovery pass.
+                    if adopt_legacy {
+                        if let Err(error) = daemon.adopt_legacy_convoy_queues_once(&namespace).await {
+                            report_reconcile_failure(&error);
+                        }
+                        adopt_legacy = false;
+                    }
                     if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
                         report_reconcile_failure(&error);
                     }
                     failures = failures.saturating_add(1);
-                    tokio::time::sleep(retry_backoff.delay(failures)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(retry_backoff.delay(failures)) => {},
+                        _ = resync.tick() => { adopt_legacy = true; },
+                    }
                     continue;
                 }
             };
@@ -615,6 +625,12 @@ where
             // Invariant: a no-op reconcile_pending_supervisor_turns_once must issue no
             // writes, or its own watch events would keep this loop running.
             loop {
+                if adopt_legacy {
+                    if let Err(error) = daemon.adopt_legacy_convoy_queues_once(&namespace).await {
+                        report_reconcile_failure(&error);
+                    }
+                    adopt_legacy = false;
+                }
                 if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
                     report_reconcile_failure(&error);
                 }
@@ -626,6 +642,7 @@ where
                     events = sessions.next() => events,
                     _ = resync.tick() => {
                         failures = 0;
+                        adopt_legacy = true;
                         continue;
                     },
                 };
