@@ -66,7 +66,10 @@ invariant checks the evidence the rule used. Ensure carries its binding,
 recorded fulfillers, attempt history and window on the relevant variants. Each
 attempt is an `Attempted` edge with its outcome; `Hold` needs the window's
 consecutive failures since its last success to reach `MAX_FAILURES` (2 in the
-model), or its last failure to be non-retryable. A receipt is the consumer
+model), or its last failure to be non-retryable. The shared lifecycle's
+Requested carries its own attempt history under the same rule, with no
+windows: `GiveUp` needs that history exhausted and its last failure to have
+the cause given up with. A receipt is the consumer
 session's `Receive` edge, whose master is the message; the inbox scenario
 publishes its stream row with that edge, so the message reads the receipts
 about it.
@@ -148,9 +151,9 @@ state through the real `Home` along a path in that graph, and applies every prob
 event. The engine must accept exactly the moves the spec's `step` makes, reach the
 same state value, and refuse where the spec refuses with the same `Refusal` variant.
 Each adaptor encodes the Rust state (with the immutable spec where the Quint state
-carries request data, and the `Attempted` log entries for Ensure's history and
-window) in the spec's shape and compares it whole, checking Ensure's state tally
-against that window; its module doc lists the few remaining encoding choices.
+carries request data, and the `Attempted` log entries for the attempt histories
+of Ensure and the lifecycle) in the spec's shape and compares it whole,
+checking each state's tally against those entries; its module doc lists the few remaining encoding choices.
 Harness events carry the evidence a home could observe, and the test maps each
 evidence field onto the world the gate reads. Each harness comment states its
 event domain.
@@ -168,11 +171,13 @@ rather than impersonating a production transport. Ended AgentSessions
 deliberately retain no channel in the Quint state. Both checks are `#[ignore]`d
 in workspace CI, which runs the crate's own fmt, Clippy and unit tests.
 
-Twelve external patches each change one rule in an isolated copy: missing expiry
+Fourteen external patches each change one rule in an isolated copy: missing expiry
 watermark, cancellation only from Realised, duplicate turns, bind without drain,
 resettling a promise, exceeding convoy caps, overbooking hosts and bypassing the
 priority queue, retaining a lease after Gone, undeliverable drops with confirmed
-receipts, and holding an Ensure on failures before its window or before its last success. Each must produce an actual TLC invariant counterexample;
+receipts, holding an Ensure on failures before its window or before its last success, and
+giving a lifecycle up with a cause other than its last failure's or on failures
+before its last success. Each must produce an actual TLC invariant counterexample;
 parse, compiler and tool failures are errors, never mutant detection. Production
 modules contain no mutant switches. Generated specs, ITF and logs stay in `build/`.
 Shell connects compilation to TLC (`VIEW` is not exposed by Quint's TLC runtime
