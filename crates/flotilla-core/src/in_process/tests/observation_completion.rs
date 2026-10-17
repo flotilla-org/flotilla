@@ -479,7 +479,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
                     "work".to_string(),
                     BTreeMap::from([
                         ("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
-                        ("bosun".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
+                        ("bosun".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()),
                     ]),
                 )]),
                 ..Default::default()

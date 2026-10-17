@@ -493,9 +493,10 @@ impl ReconcilerWake {
                                     })
                             })
                         });
-                        // Reporting a stall creates an actor obligation of its own,
-                        // even when this role has no declared settlement claim.
-                        if !owes_claim && work.phase != CrewWorkPhase::Stalled {
+                        // Working owes a report for the current task, even without a
+                        // declared claim. Pending roles remain available; a declared
+                        // stall also creates an obligation until it is resolved.
+                        if !owes_claim && !matches!(work.phase, CrewWorkPhase::Working | CrewWorkPhase::Stalled) {
                             continue;
                         }
                         if status.stalled.as_ref().is_some_and(|stalled| {
