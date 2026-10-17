@@ -523,7 +523,7 @@ fn a_messages_delivery_gate_reads_the_receipts_about_it() {
     let world = log_world(&mut store, stored.id);
     assert!(home.apply("m", deliver("t", Transport::Turn), &world, Timestamp(4)).is_err(), "another session's receipt does not count");
     assert!(home.apply("m", deliver("s", Transport::Notify), &world, Timestamp(4)).is_err(), "nor another transport");
-    let event = home.apply("m", deliver("s", Transport::Turn), &world, Timestamp(4)).expect("delivered").clone();
+    let event = home.apply("m", deliver("s", Transport::Turn), &world, Timestamp(4)).expect("delivered");
     let read = event.payload.reads.iter().find(|read| read.kind == Receipts::NAME).expect("the receipts read");
     assert_eq!((read.name.as_str(), read.version), ("m", Some(Version(1))));
 }

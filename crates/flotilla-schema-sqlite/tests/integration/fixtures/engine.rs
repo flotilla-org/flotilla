@@ -1,7 +1,7 @@
 //! Driving the engine for the engine kinds' fixtures: an edge on a stored resource is one the
 //! engine applied, through `Home`, to that resource.
 
-use flotilla_schema::{Cbor, Edge, Identity, Kind, KindSpec, Labelled, Records, State, StateData, Timestamp};
+use flotilla_schema::{Cbor, Edge, Identity, Kind, KindSpec, Labelled, State, StateData, Timestamp};
 use flotilla_state_machines::{machines::message::Message, EdgePayload, Home, Label, Machine, Resource, Version};
 use hegel::TestCase;
 
@@ -65,13 +65,12 @@ where
     let previous = resource.stored_state().clone();
     let version = resource.version().0;
     home.restore(resource.clone().with_identity(NAME, version)).unwrap_or_else(|_| panic!("an empty home takes the resource"));
-    let event = home.apply(NAME, edge, world, now).ok()?.clone();
+    let event = home.apply(NAME, edge, world, now).ok()?;
     let next = home.get(NAME).expect("restored").clone();
     // Every master an engine edge names in these fixtures is a message at this home.
     let master = |name: &str| Identity { kind: Resource::<Message>::CODE, name: name.to_owned(), home: LOCAL.to_owned() };
     let edge = next.stored_edge_about(&previous, &event, master).expect("an applied edge is storable");
-    // The event is the edge's log entry, not a row of the resource (#3392 G8).
-    Some((edge, next.with_events(Records::new())))
+    Some((edge, next))
 }
 
 /// A time at which the engine's arithmetic on `base` cannot overflow: `base` plus `by`, saturated.

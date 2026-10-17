@@ -8,17 +8,21 @@
 //! then the state as the field `state` (one label column, `state_since` set
 //! only when the label changes, and the label's data); the store keeps the
 //! name (the identity row) and the version. Edge events, attempts and receipts
-//! among them (R4), are no part of the row: each is the header and payload of
-//! its write's entry in the store's per-home log (#3392 G8), so a resource
-//! read from rows has no events, and the kind declares its machine's edge
+//! among them (R4), are no part of the row or the resource (#3373 ruling R1):
+//! each is the header and payload of its write's entry in the store's
+//! per-home log (#3392 G8), read in pages and decoded by
+//! [`edge_event`](crate::edge_event), and the kind declares its machine's edge
 //! codes, the only ones its entries may carry. [`Resource::stored_edge`] turns
-//! an edge the home applied into the stored edge that persists it. Nothing here calls a store: the storage port, with the home
-//! deciding and `apply_edge` persisting in one transaction, is a later layer.
+//! an edge the home applied into the stored edge that persists it, and the
+//! version `apply_edge` returns is the one the home adopts
+//! ([`Log`](crate::Log), R2). Nothing here calls a store: the storage port, a
+//! `Log` with the home deciding and `apply_edge` persisting in one
+//! transaction, is a later layer.
 
 use flotilla_schema::{
     adapt::{Adapter, AsColumns},
     Cbor, CodeEnum, ColumnOf, DecodeError, Decoder, Edge, EdgeError, Element, EncodeError, Encoder, Identity, Kind, KindCode, KindRegistry,
-    KindSpec, Labelled, Layout, Records, RegistryError, State, StateData, StateOf, TableSet,
+    KindSpec, Labelled, Layout, RegistryError, State, StateData, StateOf, TableSet,
 };
 
 use crate::{
@@ -66,14 +70,13 @@ where
     }
 
     /// The name and version are the store's ([`Kind::with_identity`]): a
-    /// resource decoded from rows alone has an empty name, version 0 and no
-    /// events (they are its log entries).
+    /// resource decoded from rows alone has an empty name and version 0.
     fn decode_row(d: &mut Decoder) -> Result<Self, DecodeError> {
         let spec = <M::Spec as Element>::decode_row(d)?;
         let state = <AsColumns as Adapter<StoredState<M>>>::decode(d)
             .map_err(|error| error.at("state"))?
             .ok_or_else(|| DecodeError::missing("state"))?;
-        Ok(Resource { name: String::new(), spec, state, version: Version(0), events: Records::new() })
+        Ok(Resource { name: String::new(), spec, state, version: Version(0) })
     }
 }
 

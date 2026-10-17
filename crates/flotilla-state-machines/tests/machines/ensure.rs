@@ -6,7 +6,7 @@ use flotilla_state_machines::{
         Attempted, Authority, Bind, Create, Drain, Ensure, EnsureEdgeKind, EnsureLabel, EnsureRefusal, EnsureSpec, EnsureState, Fulfiller,
         FulfillerPhase, FulfillerStatus, Fulfillers, Hold, MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
     },
-    AttemptPolicy, Cause, CauseCategory, Coded, Diagram, Failure, Home, Machine, Outcome, Ref, WriteError,
+    AttemptPolicy, Cause, CauseCategory, Coded, Diagram, Failure, Home, Machine, Outcome, Ref, Version, WriteError,
 };
 
 fn at(micros: i64) -> Timestamp {
@@ -246,7 +246,7 @@ fn unbind_needs_the_bound_fulfiller_gone() {
 fn attempts_keep_the_windows_tally() {
     let mut h = home();
     let world = MemoryEnsureWorld::default();
-    let event = h.apply("e", failed(true), &world, at(1)).expect("attempted").clone();
+    let event = h.apply("e", failed(true), &world, at(1)).expect("attempted");
     assert_eq!((event.from, event.to), (EnsureLabel::Unfulfilled, EnsureLabel::Unfulfilled));
     assert!(event.payload.reads.is_empty(), "an ungated attempt reads nothing");
     let latest = Failure { at: at(1), cause: cause(), retryable: true };
@@ -257,7 +257,7 @@ fn attempts_keep_the_windows_tally() {
     h.apply("e", failed(true), &world, at(3)).expect("attempted");
     h.apply("e", failed(false), &world, at(4)).expect("attempted");
     assert_eq!(tally(&h), (2, Some(Failure { at: at(4), cause: cause(), retryable: false })));
-    assert_eq!(h.get("e").expect("exists").events().len(), 4, "every attempt stays in the log");
+    assert_eq!(h.log().history("e", Version(0), usize::MAX).len(), 4, "every attempt stays in the log");
 }
 
 // Hold needs an exhausted window (spec `exhausted`): the policy's consecutive
@@ -341,7 +341,7 @@ fn resume_opens_a_new_window() {
     // A failure in the new window that cannot be retried exhausts it again.
     h.apply("e", failed(false), &world, at(6)).expect("attempted");
     h.apply("e", Hold, &world, at(7)).expect("held again");
-    let attempts = h.get("e").expect("exists").events().iter().filter(|row| row.record.edge == EnsureEdgeKind::Attempted).count();
+    let attempts = h.log().history("e", Version(0), usize::MAX).iter().filter(|(_, event)| event.edge == EnsureEdgeKind::Attempted).count();
     assert_eq!(attempts, 2, "the old attempt stays in the log");
 }
 

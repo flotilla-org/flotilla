@@ -1,9 +1,9 @@
-//! Edge events: rows that belong to one resource, kept in `flotilla_schema::Records`.
+//! Edge events: what each of a resource's edges recorded, as its entry in the
+//! home's per-home log (#3392 G8).
 //!
 //! An event has no identity, watch or lifecycle of its own (ADR 0064). Only
-//! the home appends, positions are dense and never reused, and nothing removes
-//! or rewrites a row. Each row carries the owner's version at the write that
-//! appended it ([`Version`](crate::Version)'s `u64`).
+//! the home writes one, through its [`Log`](crate::Log), which gives it the
+//! write's sequence; nothing removes or rewrites one short of an expunge.
 
 use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};

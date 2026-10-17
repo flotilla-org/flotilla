@@ -1,7 +1,7 @@
 //! Message (spec `machines/message.qnt`; scenarios `inbox_delivery`, `message_race`;
 //! ADR 0064 "Inboxes").
 
-use flotilla_schema::{Address, Code, CodeEnum, Position, Timestamp};
+use flotilla_schema::{Address, Code, CodeEnum, Timestamp};
 use flotilla_state_machines::{
     machines::message::{
         AppliedThrough, Binding, Condition, Deliver, DropMessage, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message,
@@ -148,7 +148,7 @@ fn deliver_records_one_receiver_and_awaits() {
     receipt(&mut world, "replacement", Transport::Turn);
     assert_eq!(home.apply("m", deliver("replacement", Transport::Turn), &world, t(2)).err(), refused(MessageRefusal::WrongState));
     assert_eq!(*state(&home), MessageState::Awaiting { receiver: session("old") });
-    assert_eq!(home.get("m").expect("exists").events().len(), 1, "one delivery");
+    assert_eq!(home.log().history("m", Version(0), usize::MAX).len(), 1, "one delivery");
 }
 
 // With nothing expected, delivery settles the message, keeping its receiver
@@ -268,9 +268,10 @@ fn expiry_needs_a_passed_deadline_and_no_expected_evidence() {
     world.condition.put(&condition_ref(), false);
     outcome.apply("m", drop(DropReason::Expired), &world, t(6)).expect("expired");
     assert_eq!(*state(&outcome), MessageState::Dropped { reason: DropReason::Expired, receiver: None, watermark: None });
-    let dropped = outcome.get("m").expect("exists").events().last().expect("dropped");
-    assert_eq!(dropped.record.at, t(6), "the drop's time is its event's, the state's since (G4)");
-    let reads = &dropped.record.payload.reads;
+    let history = outcome.log().history("m", Version(0), usize::MAX);
+    let (_, dropped) = history.last().expect("dropped");
+    assert_eq!(dropped.at, t(6), "the drop's time is its event's, the state's since (G4)");
+    let reads = &dropped.payload.reads;
     assert!(reads.iter().all(|read| read.kind != <AppliedThrough as Kind>::NAME), "{reads:?}");
 }
 
@@ -356,14 +357,15 @@ fn edge_events_round_trip_through_the_schema_codec() {
     let (mut home, mut world) = awaiting(None);
     world.reply.put(&Ref::new("m"), ());
     let previous = home.get("m").expect("exists").stored_state().clone();
-    let event = home.apply("m", Settle { by: Settlement::Answered }, &world, t(2)).expect("settled").clone();
+    let event = home.apply("m", Settle { by: Settlement::Answered }, &world, t(2)).expect("settled");
     let resource = home.get("m").expect("exists");
-    let events = resource.events();
-    assert_eq!(events.iter().map(|row| (row.position, row.version)).collect::<Vec<_>>(), [(Position(0), 2), (Position(1), 3)]);
+    let events = home.log().history("m", Version(0), usize::MAX);
+    assert_eq!(events.iter().map(|(version, _)| *version).collect::<Vec<_>>(), [Version(2), Version(3)], "the log's sequence");
+    assert_eq!(resource.version(), Version(3), "the home adopts the log's version");
     let header = resource.stored_edge(&previous, &event).expect("edge").into_parts().event;
     assert_eq!((header.edge, header.from, header.to), (event.edge.code(), event.from.code(), event.to.code()));
     assert_eq!(header.payload::<EdgePayload<MessageEdge>>().expect("decodes"), event.payload);
-    let delivered = &events.rows()[0].record;
+    let delivered = events[0].1;
     assert_eq!((delivered.edge.code(), delivered.from.code(), delivered.to.code()), (Code::new("de"), Code::new("pe"), Code::new("aw")));
     assert_eq!(delivered.payload.edge, deliver("s1", Transport::Turn).into());
 }

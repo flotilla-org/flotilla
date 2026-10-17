@@ -5,8 +5,7 @@
 use std::collections::BTreeSet;
 
 use flotilla_schema::{
-    Address, Cbor, Code, CodeEnum, Decoder, EdgeParts, Encoder, Kind, KindCode, KindSpec, Labelled, Records, RowPath, State, StateData,
-    Timestamp,
+    Address, Cbor, Code, CodeEnum, Decoder, EdgeParts, Encoder, Kind, KindCode, KindSpec, Labelled, RowPath, State, StateData, Timestamp,
 };
 use flotilla_state_machines::{
     kinds,
@@ -21,7 +20,7 @@ use flotilla_state_machines::{
         vessel::{live_leases, Vessel},
     },
     placement::{Dimension, Host, Lease, Ledger, LedgerError, Request, VesselId},
-    AttemptPolicy, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource,
+    AttemptPolicy, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource, Version,
 };
 
 // Kind codes are stored with every identity and change, so the production registry pins them,
@@ -68,7 +67,7 @@ where
     M::State: StateData + Labelled<Label = Label<M>>,
     EdgePayload<M::Edge>: Cbor + PartialEq,
 {
-    let resource = home.get(name).expect("exists").clone().with_events(Records::new());
+    let resource = home.get(name).expect("exists").clone();
     let decoded: Resource<M> = Decoder::decode(Encoder::encode(&resource).expect("encodes")).expect("decodes");
     assert_eq!(decoded.name(), "", "the name is the store's");
     let decoded = decoded.with_identity(name, resource.version().0);
@@ -104,7 +103,7 @@ fn resources_survive_the_codec() {
     convoys.create("c", request, &MemoryConvoyWorld::default().with_project(&project()), Timestamp(2)).expect("created");
     convoys.apply("c", Keep { promise: PromiseId(0) }, &MemoryConvoyWorld::default(), Timestamp(3)).expect("kept");
     let convoy = round_trip(&convoys, "c");
-    assert_eq!((convoy.events().len(), convoy.since()), (0, Timestamp(2)), "a data-only edge keeps since");
+    assert_eq!((convoy.version(), convoy.since()), (Version(2), Timestamp(2)), "a data-only edge keeps since");
 
     let mut ensures = Home::<Ensure>::new("home").expect("valid");
     ensures
@@ -119,7 +118,7 @@ fn resources_survive_the_codec() {
     let attempt = Attempted { fulfiller: Ref::new("f"), outcome: Outcome::Succeeded };
     ensures.apply("e", attempt, &MemoryEnsureWorld::default(), Timestamp(5)).expect("attempted");
     let ensure = round_trip(&ensures, "e");
-    assert_eq!(ensure.events().len(), 0, "the attempt is an edge: a log entry, not a row");
+    assert_eq!(ensures.log().history("e", Version(0), usize::MAX).len(), 2, "the attempt is an edge: a log entry, not a row");
     assert_eq!(ensure.state().recorded(), &BTreeSet::from([Ref::new("f")]));
 
     // A vessel's convoy is homed elsewhere: its reference keeps the convoy's home (#3392 G3).
@@ -223,7 +222,7 @@ fn a_resources_edge_moves_since_only_with_the_label() {
         .expect("created");
     let created = home.get("c").expect("exists").stored_state().clone();
 
-    let event = home.apply("c", Keep { promise: PromiseId(0) }, &world, Timestamp(5)).expect("kept").clone();
+    let event = home.apply("c", Keep { promise: PromiseId(0) }, &world, Timestamp(5)).expect("kept");
     let resource = home.get("c").expect("exists");
     let edge = resource.stored_edge(&created, &event).expect("edge");
     assert_eq!(resource.since(), Timestamp(1), "a data-only edge keeps since");
@@ -243,7 +242,7 @@ fn a_resources_edge_moves_since_only_with_the_label() {
     );
     assert_eq!(parts.event.payload::<EdgePayload<ConvoyEdge>>().expect("payload"), event.payload);
 
-    let event = home.apply("c", Deliver, &world, Timestamp(8)).expect("delivered").clone();
+    let event = home.apply("c", Deliver, &world, Timestamp(8)).expect("delivered");
     let resource = home.get("c").expect("exists");
     let edge = resource.stored_edge(&kept, &event).expect("edge");
     assert_eq!(resource.stored_state(), &State::new(resource.state().clone(), Timestamp(8)), "a label change moves since");

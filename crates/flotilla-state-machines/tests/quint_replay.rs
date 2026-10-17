@@ -94,7 +94,7 @@ use flotilla_state_machines::{
         },
     },
     placement::{self, Dimension, Evidence, Host, Lease, Ledger, LedgerError, Units, VesselId},
-    AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Ref, Resource, Transport, WriteError,
+    AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Ref, Resource, Transport, Version, WriteError,
 };
 use itf::{address, at, boolean, int, list, map_of, number, pairs, payload, set, set_of, show, slot, tag, text, variant};
 use serde_json::{json, Value};
@@ -162,8 +162,8 @@ fn transport(name: &str) -> Transport {
 fn receipts_about(sessions: &Home<AgentSession>, message: &str) -> BTreeMap<String, Vec<Transport>> {
     let mut about = BTreeMap::new();
     for session in sessions.resources() {
-        for row in session.events().iter() {
-            let edge = &row.record.payload.edge;
+        for (_, event) in sessions.log().history(session.name(), Version(0), usize::MAX) {
+            let edge = &event.payload.edge;
             if sessions.definition().master(edge).as_deref() == Some(message) {
                 let AgentSessionEdge::Receive(receive) = edge else { panic!("only a receipt is about a message") };
                 about.entry(session.name().to_string()).or_insert_with(Vec::new).push(receive.transport);
@@ -269,11 +269,11 @@ fn slots(model: &Value, render: impl Fn(i64) -> Option<Value>) -> Value {
 
 /// Every resource at `home` agrees with the model store `model`: the same
 /// value in each slot, and no resource outside the model's ids.
-fn check_store<M: Machine>(home: &Home<M>, model: &Value, render: impl Fn(&Resource<M>) -> Value, step: &Step, what: &str) {
+fn check_store<M: Machine>(home: &Home<M>, model: &Value, render: impl Fn(&Home<M>, &Resource<M>) -> Value, step: &Step, what: &str) {
     let ids: BTreeSet<i64> = pairs(model).iter().map(|pair| number(&pair[0])).collect();
     let stray: Vec<&str> = home.resources().map(Resource::name).filter(|name| !ids.contains(&id_of(name))).collect();
     assert!(stray.is_empty(), "{step}: {what} {stray:?} exist in Rust only");
-    same(&slots(model, |id| home.get(&id.to_string()).map(&render)), model, step, what);
+    same(&slots(model, |id| home.get(&id.to_string()).map(|resource| render(home, resource))), model, step, what);
 }
 
 // ---------------------------------------------------------------------------
@@ -355,8 +355,9 @@ fn ended<M: Machine>(home: &Home<M>, name: &str) -> bool {
     home.get(name).is_some_and(|resource| home.definition().end_reason(resource.label()).is_some())
 }
 
-fn shape<M: Machine>(resource: &Resource<M>) -> (M::State, u64, usize) {
-    (resource.state().clone(), resource.version().0, resource.events().len())
+fn shape<M: Machine>(home: &Home<M>, name: &str) -> (M::State, u64, usize) {
+    let resource = home.get(name).expect("ended resource");
+    (resource.state().clone(), resource.version().0, home.log().history(name, Version(0), usize::MAX).len())
 }
 
 /// An ended resource refuses every edge, attempts and receipts among them,
@@ -374,7 +375,7 @@ fn assert_end_refuses<M: Machine>(
     let state = resource.label();
     let reason = home.definition().end_reason(state).unwrap_or_else(|| panic!("{step}: {} {name} is not in an end", M::NAME));
     let ended: M::Refusal = Ended { state, reason }.into();
-    let before = shape(resource);
+    let before = shape(home, name);
     for edge in probes {
         let kind = edge.kind();
         match home.apply(name, edge, world, now) {
@@ -383,7 +384,7 @@ fn assert_end_refuses<M: Machine>(
         }
         tally.refusals += 1;
     }
-    assert_eq!(shape(home.get(name).expect("ended resource")), before, "{step}: refusals changed {} {name}", M::NAME);
+    assert_eq!(shape(home, name), before, "{step}: refusals changed {} {name}", M::NAME);
 }
 
 // ---------------------------------------------------------------------------
@@ -426,13 +427,14 @@ fn lifecycle_outcome_value(outcome: &Outcome) -> Value {
 /// The spec's `Requested(List[AttemptOutcome]) | Realised(str) | Gone | GaveUp(str)`,
 /// with Requested's history the resource's `Attempted` log entries. Checks
 /// the Requested tally against them.
-fn lifecycle_value<K: LifecycleKind>(resource: &Resource<Lifecycle<K>>) -> Value {
+fn lifecycle_value<K: LifecycleKind>(home: &Home<Lifecycle<K>>, resource: &Resource<Lifecycle<K>>) -> Value {
     match resource.state() {
         LifecycleState::Requested { failures, last_failure } => {
-            let attempts: Vec<&Outcome> = resource
-                .events()
-                .iter()
-                .filter_map(|row| match &row.record.payload.edge {
+            let attempts: Vec<&Outcome> = home
+                .log()
+                .history(resource.name(), Version(0), usize::MAX)
+                .into_iter()
+                .filter_map(|(_, event)| match &event.payload.edge {
                     LifecycleEdge::Attempted(attempted) => Some(&attempted.outcome),
                     _ => None,
                 })
@@ -639,7 +641,7 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
             other => panic!("{step}: machine_edges operation {other}"),
         }
         check_store(&things, store(step.after, "::resources"), lifecycle_value, &step, "lifecycle");
-        check_store(&sessions, store(step.after, "::sessions"), |r| session_value(r.state()), &step, "session");
+        check_store(&sessions, store(step.after, "::sessions"), |_, r| session_value(r.state()), &step, "session");
         if ended(&things, ONE) {
             lifecycle_end_refuses(&mut things, ONE, "model", now, &step, tally);
         }
@@ -773,7 +775,7 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
 }
 
 fn check_convoys(home: &Home<Convoy>, state: &Value, step: &Step) {
-    check_store(home, store(state, "::convoys"), convoy_value, step, "convoy");
+    check_store(home, store(state, "::convoys"), |_, convoy| convoy_value(convoy), step, "convoy");
 }
 
 fn convoy_world(authorised: bool) -> MemoryConvoyWorld {
@@ -957,7 +959,7 @@ impl Fleet {
             (Some(placement::Vessel::Waiting(request)), None, None) => Some(variant("Waiting", request_value(request))),
             (Some(placement::Vessel::Leased(lease)), None, Some(life)) if !life.gone() => Some(variant(
                 "Leased",
-                json!({ "placement": lease_value(lease), "lifecycle": lifecycle_value(resource.expect("a leased vessel's lifecycle")) }),
+                json!({ "placement": lease_value(lease), "lifecycle": lifecycle_value(&self.vessels, resource.expect("a leased vessel's lifecycle")) }),
             )),
             (None, Some(lease), Some(LifecycleState::Gone)) => Some(variant("Gone", lease_value(lease))),
             (held, returned, life) => {
@@ -1154,11 +1156,11 @@ fn outcome_value(outcome: &Outcome) -> Value {
 /// the history as the Ensure's `Attempted` entries, and the window as how
 /// many came before the last `Resume`. The state's tally must agree with
 /// the window's outcomes.
-fn ensure_value(resource: &Resource<Ensure>) -> Value {
+fn ensure_value(home: &Home<Ensure>, resource: &Resource<Ensure>) -> Value {
     let mut history = Vec::new();
     let mut window = 0;
-    for row in resource.events().iter() {
-        match &row.record.payload.edge {
+    for (_, event) in home.log().history(resource.name(), Version(0), usize::MAX) {
+        match &event.payload.edge {
             EnsureEdge::Attempted(attempted) => history.push(attempted),
             EnsureEdge::Resume(_) => window = history.len(),
             _ => {}
@@ -1622,7 +1624,7 @@ impl<'a> MessageReplay<'a> {
         self.check(step);
         self.probe(step, tally);
         if let Some(sessions) = self.sessions.as_mut() {
-            check_store(sessions, store(step.after, "::sessions"), |r| session_value(r.state()), step, "session");
+            check_store(sessions, store(step.after, "::sessions"), |_, r| session_value(r.state()), step, "session");
             let about = receipts_about(sessions, ONE);
             let counts: BTreeMap<String, usize> = about.iter().map(|(name, entries)| (name.clone(), entries.len())).collect();
             assert_eq!(counts, self.receipts, "{step}: receipts about the message, by session");
@@ -1634,10 +1636,10 @@ impl<'a> MessageReplay<'a> {
     /// each accepted edge left one event and at most one was a delivery.
     fn check(&self, step: &Step) {
         let model = without_unset_deadline(store(step.after, "::messages"));
-        check_store(&self.home, &model, message_value, step, "message");
-        let rust = self.home.get(ONE).expect("message");
-        assert_eq!(rust.events().len(), self.edges, "{step}: one edge event per accepted edge");
-        let deliveries = rust.events().iter().filter(|row| row.record.edge == MessageEdgeKind::Deliver).count();
+        check_store(&self.home, &model, |_, message| message_value(message), step, "message");
+        let history = self.home.log().history(ONE, Version(0), usize::MAX);
+        assert_eq!(history.len(), self.edges, "{step}: one edge event per accepted edge");
+        let deliveries = history.iter().filter(|(_, event)| event.edge == MessageEdgeKind::Deliver).count();
         assert!(deliveries <= 1, "{step}: delivered {deliveries} times");
     }
 

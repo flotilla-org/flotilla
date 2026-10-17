@@ -302,7 +302,7 @@ fn convoy_edge_events_round_trip_through_the_schema_codec() {
     ];
     for (edge, at) in edges {
         let previous = home.get("c").expect("exists").stored_state().clone();
-        let event = home.apply("c", edge, &world, Timestamp(at)).expect("applied").clone();
+        let event = home.apply("c", edge, &world, Timestamp(at)).expect("applied");
         let header = home.get("c").expect("exists").stored_edge(&previous, &event).expect("edge").into_parts().event;
         assert_eq!((header.edge, header.from, header.to), (event.edge.code(), event.from.code(), event.to.code()));
         assert_eq!(header.payload::<EdgePayload<ConvoyEdge>>().expect("decodes"), event.payload);
