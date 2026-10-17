@@ -120,6 +120,10 @@ def _():
     # the two index entries, ~300 B. Nothing trims the log (G9): an entry goes only when its
     # resource is expunged, after the archive holds it.
     log_entry_bytes = 300
+    # Measured per-host durable write rate: one daemon holding 1,000 open convoys on today's
+    # control plane (#3206 dummy-fleet baseline `d1-n1000`, 2026-10-14). It counts every write
+    # on today's store; the ADR 0064 path is to be measured with the same plans (#3425).
+    durable_writes_per_s_measured = 138
     convoys_finished_per_day_per_running = 0.5  # turnover estimate
     match_fraction = 0.05  # share of events a filtered client subscribes to
     # Compact resident form: frozen workflow snapshots shared by content hash,
@@ -136,6 +140,7 @@ def _():
         convoys_finished_per_day_per_running,
         decode_ms_per_mb,
         distinct_snapshots,
+        durable_writes_per_s_measured,
         finished_summary,
         heartbeat_interval_s,
         heartbeat_wal_bytes,
@@ -281,20 +286,26 @@ def _(heartbeat_interval_s, heartbeat_wal_bytes, hosts, mo):
 
 
 @app.cell
-def _(change_events, history_window_days, log_entry_bytes, mo):
-    GB = 1024**3
+def _(change_events, durable_writes_per_s_measured, history_window_days, log_entry_bytes, mo):
+    _GB = 1024**3
     log_per_day = change_events.value * 86_400 * log_entry_bytes
     retained = log_per_day * history_window_days.value
-    budget_rate = 10 * GB / (86_400 * history_window_days.value * log_entry_bytes)
+    budget_rate = 10 * _GB / (86_400 * history_window_days.value * log_entry_bytes)
+    measured_per_day = durable_writes_per_s_measured * 86_400 * log_entry_bytes
+    measured_retained = measured_per_day * history_window_days.value
     mo.md(
         f"""
         ## Log growth
 
         If every one of `change_events` = {change_events.value:,}/s were a durable write, the per-home log would grow by
-        **{log_per_day / GB:,.1f} GB per day** at ~{log_entry_bytes} B per entry, and hold
-        **{retained / GB:,.0f} GB** over `history_window` ({history_window_days.value} days) before archive and expunge.
+        **{log_per_day / _GB:,.1f} GB per day** at ~{log_entry_bytes} B per entry, and hold
+        **{retained / _GB:,.0f} GB** over `history_window` ({history_window_days.value} days) before archive and expunge.
         The 10 GB disk budget holds about **{budget_rate:,.0f} durable writes/s** sustained over that window;
-        observations and heartbeats (latest only) must stay out of the log.
+        the log holds desired and decided state only, and observations and heartbeats (latest only) stay out of it.
+
+        At the measured per-host rate of {durable_writes_per_s_measured}/s (#3206, 1,000 open convoys on one daemon),
+        the log grows by **{measured_per_day / _GB:,.1f} GB per day** and holds **{measured_retained / _GB:,.0f} GB** over
+        `history_window`: {"within" if measured_retained <= 10 * _GB else "**over**"} the 10 GB budget.
         """
     )
     return

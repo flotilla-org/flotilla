@@ -21,6 +21,7 @@ CREATE TABLE log (
     ELSE edge IS NULL AND "from" IS NULL AND "to" IS NULL AND about IS NULL END)) STRICT;
 CREATE INDEX log_by_resource ON log (resource, home_seq);
 CREATE INDEX log_about ON log (about, at) WHERE about IS NOT NULL;
+CREATE INDEX log_expunges ON log (home, home_seq) WHERE cause = 'expunge';
 CREATE TABLE "message" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -537,6 +538,10 @@ CREATE TABLE "referral_references" (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "referral_by_reply" ON "referral" ("in_reply_to") WHERE "in_reply_to" IS NOT NULL;
 CREATE INDEX "referral_by_session" ON "referral" ("session", "seq");
+CREATE INDEX "referral_references_artifact_resource_ref" ON "referral_references" ("artifact_resource") WHERE "artifact_resource" IS NOT NULL;
+CREATE INDEX "referral_references_commit_repository_ref" ON "referral_references" ("commit_repository") WHERE "commit_repository" IS NOT NULL;
+CREATE INDEX "referral_references_control_record_resource_ref" ON "referral_references" ("control_record_resource") WHERE "control_record_resource" IS NOT NULL;
+CREATE INDEX "referral_references_ref_repository_ref" ON "referral_references" ("ref_repository") WHERE "ref_repository" IS NOT NULL;
 CREATE TABLE "dossier" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

@@ -26,7 +26,9 @@ use flotilla_schema::{render_ddl_with, DdlMode, KindRegistry};
 /// Nothing trims the log (G9): a delete is an event and keeps the resource's entries and identity,
 /// and only an expunge removes them. An expunge entry outlives the identity row it removes, so it
 /// alone has no `resource`; its effect names the identity. `log_by_resource` is a resource's
-/// history in sequence order, and `log_about` the entries about a master in time order.
+/// history in sequence order, `log_about` the entries about a master in time order, and the
+/// partial `log_expunges` a home's expunge entries, the tombstones `apply` checks an event for an
+/// unknown identity against, so that check visits expunges only, not every later entry.
 ///
 /// No database created by an earlier generation of these tables exists: the first production
 /// generation is the baseline, and ADR 0047's N→N+1 rule applies from then.
@@ -54,6 +56,7 @@ CREATE TABLE IF NOT EXISTS log (
     ELSE edge IS NULL AND \"from\" IS NULL AND \"to\" IS NULL AND about IS NULL END)) STRICT;
 CREATE INDEX IF NOT EXISTS log_by_resource ON log (resource, home_seq);
 CREATE INDEX IF NOT EXISTS log_about ON log (about, at) WHERE about IS NOT NULL;
+CREATE INDEX IF NOT EXISTS log_expunges ON log (home, home_seq) WHERE cause = 'expunge';
 ";
 
 /// Every statement the runtime prepares outside the per-kind statements. `Store::statements` lists

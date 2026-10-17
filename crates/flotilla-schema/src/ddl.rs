@@ -34,9 +34,9 @@ pub fn render_ddl_with(set: &TableSet, mode: DdlMode) -> String {
     for table in &set.tables {
         render_table(&mut out, set, table, exists);
     }
-    let mut indexes: Vec<_> = set.indexes.iter().collect();
+    let mut indexes: Vec<_> = set.indexes.iter().cloned().chain(set.reference_indexes()).collect();
     indexes.sort_by_key(|index| index.object_name());
-    for index in indexes {
+    for index in &indexes {
         let columns: Vec<String> = index.columns().map(quote_ident).collect();
         let name = quote_ident(&index.object_name());
         let _ = write!(out, "CREATE INDEX {exists}{name} ON {} ({})", quote_ident(&index.table), columns.join(", "));
@@ -150,7 +150,8 @@ mod tests {
 
     // Behaviour (DESIGN DDL): STRICT tables in pre-order; the root keyed by its identity id; each
     // child keyed by owner plus its logical key, with a cascading FK to its parent's full key;
-    // per-type REFERENCES and CHECKs; indexes sorted by name after the tables.
+    // per-type REFERENCES and CHECKs; indexes, declared and one per child-table reference column,
+    // sorted by name after the tables.
     #[test]
     fn renders_tables_keys_and_indexes() {
         let expected = r#"CREATE TABLE "convoy" (
@@ -179,6 +180,7 @@ CREATE TABLE "convoy_deliverables_evidence" (
   FOREIGN KEY ("owner", "deliverables_pos") REFERENCES "convoy_deliverables" ("owner", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "convoy_by_name" ON "convoy" ("name");
+CREATE INDEX "convoy_deliverables_target_ref" ON "convoy_deliverables" ("target");
 CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "phase" IS NOT NULL;
 "#;
         let set = convoy().finish();
@@ -191,7 +193,7 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
     fn idempotent_mode_guards_every_statement() {
         let ddl = render_ddl_with(&convoy().finish(), DdlMode::IfNotExists);
         assert_eq!(ddl.matches("CREATE TABLE IF NOT EXISTS ").count(), 3);
-        assert_eq!(ddl.matches("CREATE INDEX IF NOT EXISTS ").count(), 2);
+        assert_eq!(ddl.matches("CREATE INDEX IF NOT EXISTS ").count(), 3);
     }
 
     #[test]
@@ -338,5 +340,32 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
         assert_eq!(problem(index(&["phase"], &[], in_seq)), Some(IndexProblem::Codes("seq".into())));
         let seq_present = vec![Condition::NotNull { column: "seq".into() }];
         assert_eq!(problem(index(&["phase"], &[], seq_present)), Some(IndexProblem::NotNullable("seq".into())));
+    }
+
+    // Behaviour (#3392 lane 3 ruling 1): each reference column of a child table, key or data, gets
+    // an index leading with it, partial when it is nullable, unless a declared index already leads
+    // with it; the root's reference columns get none.
+    #[test]
+    fn child_reference_columns_are_indexed() {
+        let mut layout = Layout::root("Note", KindCode(1));
+        layout.column("author", ColumnType::Ref, true);
+        layout.table("links", TableRole::Child, |layout| {
+            layout.key(|layout| layout.column("target", ColumnType::Ref, true));
+            layout.column("via", ColumnType::Ref, false);
+            layout.column("by", ColumnType::Ref, true);
+        });
+        layout.index(Index { name: "by_by".into(), table: "note_links".into(), eq: vec!["by".into()], order: vec![], predicate: vec![] });
+        let set = layout.finish();
+        set.validate().expect("valid descriptor");
+        let ddl = render_ddl(&set);
+        let indexes: Vec<&str> = ddl.lines().filter(|line| line.starts_with("CREATE INDEX")).collect();
+        assert_eq!(
+            indexes,
+            [
+                r#"CREATE INDEX "note_links_by_by" ON "note_links" ("by");"#,
+                r#"CREATE INDEX "note_links_target_ref" ON "note_links" ("target");"#,
+                r#"CREATE INDEX "note_links_via_ref" ON "note_links" ("via") WHERE "via" IS NOT NULL;"#,
+            ]
+        );
     }
 }

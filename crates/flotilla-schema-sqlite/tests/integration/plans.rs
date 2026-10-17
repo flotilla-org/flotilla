@@ -39,14 +39,6 @@ fn every_prepared_statement_searches_by_key() {
     for (label, sql) in &statements {
         let rows = plan(&conn, sql);
         let mut problems = Vec::new();
-        // Removing an identity checks every foreign key that references it, and a child table's
-        // reference column has no index of its own, so the check scans that table. Only an
-        // expunge removes an identity, once per resource; `identity_removal_checks_references`
-        // pins which tables it scans.
-        let rows: Vec<String> = match label.as_str() {
-            "identity_delete" => rows.into_iter().filter(|row| !row.starts_with("SCAN")).collect(),
-            _ => rows,
-        };
         if rows.iter().any(|row| row.split_whitespace().any(|word| word == "SCAN")) {
             problems.push("scans");
         }
@@ -149,27 +141,30 @@ fn the_enumeration_covers_every_kind_and_index() {
     );
 }
 
-// Behaviour (#3392 A1): removing an identity (an expunge) checks each foreign key referencing it:
-// root rows and root reference columns by key or declared index, the log by its own indexes, and
-// child tables' reference columns, which have no index, by a scan of that table. The scanned tables
-// are pinned here, so a new unindexed reference column is a decision rather than a surprise.
+// Behaviour (#3392 A1, lane 3 ruling 1): removing an identity (an expunge) checks each foreign key
+// referencing it by a search, never a scan: root rows and root reference columns by key or declared
+// index, child tables' reference columns by their generated `<column>_ref` indexes, and the log by
+// its own indexes. Expunges come about as often as creations, so a scan would grow with the store.
 #[test]
 fn identity_removal_checks_references() {
     let (conn, statements) = statements();
     let sql = &statements.iter().find(|(label, _)| label == "identity_delete").expect("a shared statement").1;
     let rows = plan(&conn, sql);
-    let mut scanned: Vec<&str> = rows.iter().filter_map(|row| row.strip_prefix("SCAN ")).collect();
-    scanned.dedup();
-    assert_eq!(scanned, ["referral_references"], "{rows:?}");
+    assert!(!rows.iter().any(|row| row.contains("SCAN")), "{rows:?}");
     assert!(
         rows.iter().any(|row| row.contains("log_about (about=?)")) && rows.iter().any(|row| row.contains("log_by_resource (resource=?)"))
     );
+    for column in ["artifact_resource", "commit_repository", "control_record_resource", "ref_repository"] {
+        let index = format!("referral_references_{column}_ref ({column}=?)");
+        assert!(rows.iter().any(|row| row.contains(&index)), "{index}: {rows:?}");
+    }
 }
 
 // Behaviour (#3392 G8, G11): the log's reads each search their own index in its order, with no scan
 // and no temporary sort: a resource's history by `log_by_resource`, a home's entries by the primary
-// key, the entries about a master by the partial `log_about`, and the expunge's removal of a
-// resource's entries by `log_by_resource`.
+// key, the entries about a master by the partial `log_about`, the expunge's removal of a
+// resource's entries by `log_by_resource`, and the tombstone check of an unknown identity by the
+// partial `log_expunges`, which holds expunge entries only.
 #[test]
 fn log_reads_search_their_own_index() {
     let (conn, statements) = statements();
@@ -179,6 +174,7 @@ fn log_reads_search_their_own_index() {
         ("log_about_first", "USING INDEX log_about (about=?)"),
         ("log_about_after", "USING INDEX log_about (about=? AND at>?)"),
         ("log_expunge", "USING COVERING INDEX log_by_resource (resource=?)"),
+        ("log_expunged_after", "USING INDEX log_expunges (home=? AND home_seq>?)"),
     ];
     for (label, index) in expected {
         let sql = &statements.iter().find(|(candidate, _)| candidate == label).expect("a shared statement").1;

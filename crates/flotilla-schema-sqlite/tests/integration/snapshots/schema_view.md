@@ -24,7 +24,7 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 | `ensure_created` | state data | 2 | – | – | – |
 | `ensure_attempts` | history | 8 | 4: `outcome` 4 | – | – |
 | `referral` | root | 25 | 12: `condition_address` 6, `subject` 6 | `referral_references` (child) | `by_session` (session, seq), `by_reply` (in_reply_to) |
-| `referral_references` | child | 24 | 22: `tag` 22 | – | – |
+| `referral_references` | child | 24 | 22: `tag` 22 | – | `commit_repository_ref` (commit_repository), `ref_repository_ref` (ref_repository), `artifact_resource_ref` (artifact_resource), `control_record_resource_ref` (control_record_resource) |
 | `dossier` | root | 7 | – | `dossier_inputs` (child), `dossier_deliverables` (records) | – |
 | `dossier_inputs` | child | 5 | 3: `tag` 3 | `dossier_inputs_list_items` (child) | – |
 | `dossier_inputs_list_items` | child | 4 | – | – | – |

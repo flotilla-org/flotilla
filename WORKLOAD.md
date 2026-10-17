@@ -95,13 +95,24 @@ The checks:
   `running_convoys`.
 - **Delivery, naive** (one store read per event per watcher) = `change_events` x
   `view_clients` = 50k / 5M store reads per second. Target: zero.
-- **Log growth** (#3392: one per-home log entry per durable write, ~300 B with its header and
-  index entries, from a Message edge's measured 166-224 B of effect and payload; nothing trims
-  the log, and entries go only on expunge after archiving): if every `change_events` write were
-  durable, ~24 GB / ~240 GB per day, and ~170 GB / ~1.7 TB over `history_window`. **Fails** the
-  10 GB disk budget unless durable writes stay near 60/s sustained over the window: observations
-  and heartbeats (latest only) stay out of the log, and finished resources archive and expunge
-  on time.
+- **Log growth** (#3392): one per-home log entry per durable write, ~300 B with its header and
+  index entries, from a Message edge's measured 166-224 B of effect and payload. Nothing trims
+  the log: entries go only on expunge, after archiving, so it holds about `history_window` of
+  writes. **The log holds desired and decided state only**: creates, spec edits, edges, deletes
+  and expunges (owner, 2026-10-17). Observations live in the observed store, latest value only:
+  provider refreshes, checkout facts, keepalives and stream watermarks. The 10 GB disk budget
+  holds ~59 durable writes/s per host, sustained over `history_window`.
+  - **Measured per-host durable write rate: 138 writes/s** on one daemon holding 1,000 open
+    convoys (`running_convoys` at Target), and 95/s at 100 open (#3206 dummy-fleet baseline,
+    2026-10-14, today's control plane). At ~300 B per entry that is ~3.3 GB per day and ~23 GB
+    over `history_window`. **Fails** the 10 GB budget by ~2.3x: the log fits only if decided
+    writes stay under ~43% of today's rate.
+  - If every `change_events` write were durable, the log would grow ~24 GB / ~240 GB per day,
+    and hold ~170 GB / ~1.7 TB over `history_window`.
+  - The measured rate overstates the log. It counts every write on today's store, including the
+    multi-writer status retries ADR 0064 retires, and the dummy fleet turns convoys over at
+    0.38/s, ~65x the 0.5 per running slot per day assumed above. It is the rate the budget is
+    checked against until the same plans run on the ADR 0064 path (#3425).
 - **Heartbeat WAL at today's amplification** (~91 KB per Host status write, every 5 s) =
   ~75 GB / ~750 GB per day. Heartbeats are observations: latest value only, not durable
   history.

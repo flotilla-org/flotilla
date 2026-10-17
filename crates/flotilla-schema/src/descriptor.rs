@@ -442,8 +442,44 @@ impl TableSet {
         Ok(())
     }
 
-    /// The names this kind takes in the backend's schema namespace: its tables, then its indexes.
+    /// The names this kind takes in the backend's schema namespace: its tables, then its declared
+    /// and its reference indexes.
     pub fn object_names(&self) -> impl Iterator<Item = String> + '_ {
-        self.tables.iter().map(|table| table.name.clone()).chain(self.indexes.iter().map(Index::object_name))
+        let references = self.reference_indexes().into_iter().map(|index| index.object_name());
+        self.tables.iter().map(|table| table.name.clone()).chain(self.indexes.iter().map(Index::object_name)).chain(references)
+    }
+
+    /// One index per reference column of a child table, named `<column>_ref` (partial on the
+    /// column being present when it is nullable), so the foreign-key check of removing an identity
+    /// (an expunge) searches each child table rather than scanning it (#3392 lane 3 ruling 1).
+    /// A child table's rows are keyed by their owner first, and nothing else indexes the column.
+    /// A column a declared index already leads with is skipped. Root reference columns are left to
+    /// declared indexes, as the root is keyed by the resource itself.
+    pub fn reference_indexes(&self) -> Vec<Index> {
+        let mut out = Vec::new();
+        for table in self.tables.iter().filter(|table| table.parent.is_some()) {
+            for column in table.key.iter().chain(&table.columns).filter(|column| column.ty == ColumnType::Ref) {
+                let declared = self.indexes.iter().any(|index| {
+                    index.table == table.name
+                        && index.columns().next() == Some(column.name.as_str())
+                        && index
+                            .predicate
+                            .iter()
+                            .all(|condition| matches!(condition, Condition::NotNull { column: name } if *name == column.name))
+                });
+                if declared {
+                    continue;
+                }
+                let predicate = if column.nullable { vec![Condition::NotNull { column: column.name.clone() }] } else { Vec::new() };
+                out.push(Index {
+                    name: format!("{}_ref", column.name),
+                    table: table.name.clone(),
+                    eq: vec![column.name.clone()],
+                    order: Vec::new(),
+                    predicate,
+                });
+            }
+        }
+        out
     }
 }
