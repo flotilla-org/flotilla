@@ -3,17 +3,19 @@
 //! A session is Live with a channel that attaches and detaches as observed,
 //! until its end is observed: then it is Ended, carrying the reason, so a
 //! listing shows whether it completed or was lost. The session's name is its
-//! identity. Receipts are recorded on the session and refused once it has
-//! ended. "Running" is a judgement, not a state.
+//! identity. A receipt is the session's [`Receive`] edge (R4, G11): Live to
+//! the same Live, refused once the session has ended. Its master is the
+//! message it is for, so the message's gates read the receipts about it.
+//! "Running" is a judgement, not a state.
 //!
 //! The stored kind is `Resource<AgentSession>` (code `as`), declared by
-//! [`AgentSessionSpec`]: the state, the edge log, and the receipts, which
-//! never change once appended, as `history`.
+//! [`AgentSessionSpec`]: the state and the edge log as `history`, receipts
+//! among its edges.
 
 use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 
-use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Version, WrongState};
+use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Transport, Version, WrongState};
 
 /// Whether a channel to a Live session is attached (spec `Channel`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
@@ -78,11 +80,22 @@ pub struct End {
     pub observed: Ref<SessionEnd>,
 }
 
+/// The consumer took a turn for `message`, reached by `transport` (spec
+/// `Receive`). The message is the edge's master: the log entry is about it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Receive {
+    /// The message's name at its home. An address: plain interned text until
+    /// a later layer adopts `flotilla-address`.
+    pub message: String,
+    pub transport: Transport,
+}
+
 edges! {
     pub enum AgentSessionEdge => AgentSessionEdgeKind {
         Attach(Attach) = "at",
         Detach(Detach) = "de",
         End(End) = "en",
+        Receive(Receive) = "rv",
     }
 }
 
@@ -161,7 +174,6 @@ impl Machine for AgentSession {
     type Edge = AgentSessionEdge;
     type Refusal = AgentSessionRefusal;
     type World = dyn AgentSessionWorld;
-    const RECORDS_RECEIPTS: bool = true;
 
     fn definition() -> MachineDef<Self> {
         use AgentSessionLabel::*;
@@ -181,6 +193,14 @@ impl Machine for AgentSession {
                     .changes(["channel"])
                     .gate("the channel is attached and is observed absent", gate_detach)
                     .effect(|_, _, _| AgentSessionState::Live { channel: Channel::Detached }),
+            )
+            .edge(
+                EdgeDef::<Self, Receive>::new()
+                    .from([Live])
+                    .to([Live])
+                    .about(|receive| &receive.message)
+                    .ungated("a receipt reports a turn the consumer took; the message's own gates judge it")
+                    .effect(|_, state, _| state),
             )
             .edge(
                 EdgeDef::<Self, End>::new()

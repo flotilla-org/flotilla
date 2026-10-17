@@ -7,8 +7,8 @@
 //! state. The holder supplies the rest: its root row is the spec's columns,
 //! then the state as the field `state` (one label column, `state_since` set
 //! only when the label changes, and the label's data), then the edge log
-//! `edges` and, where the machine keeps them, `attempts` and `receipts`, all
-//! `history`; the store keeps the name (the identity row) and the version.
+//! `edges` as `history`, attempts and receipts among its edges (R4); the
+//! store keeps the name (the identity row) and the version.
 //! [`Resource::stored_edge`] turns an edge the home applied into the stored edge that
 //! persists it. Nothing here calls a store: the storage port, with the home
 //! deciding and `apply_edge` persisting in one transaction, is a later layer.
@@ -19,7 +19,7 @@ use flotilla_schema::{
     Layout, Records, State, StateData, StateOf, TableSet,
 };
 
-use crate::{Attempt, EdgeEventOf, EdgePayload, Label, Machine, Receipt, Resource, Version};
+use crate::{EdgeEventOf, EdgePayload, Label, Machine, Resource, Version};
 
 /// Machine `M`'s state as stored: the value and the time its label was entered.
 pub type StoredState<M> = State<<M as Machine>::State>;
@@ -33,33 +33,18 @@ where
 {
     const TABLES: usize = <M::Spec as Element>::TABLES
         + <AsColumns as Adapter<StoredState<M>>>::TABLES
-        + <AsHistory as Adapter<Records<EdgeEventOf<M>>>>::TABLES
-        + if M::RECORDS_ATTEMPTS { <AsHistory as Adapter<Records<Attempt>>>::TABLES } else { 0 }
-        + if M::RECORDS_RECEIPTS { <AsHistory as Adapter<Records<Receipt>>>::TABLES } else { 0 };
+        + <AsHistory as Adapter<Records<EdgeEventOf<M>>>>::TABLES;
 
     fn layout_row(layout: &mut Layout) {
         <M::Spec as Element>::layout_row(layout);
         <AsColumns as Adapter<StoredState<M>>>::layout(layout, "state", true);
         <AsHistory as Adapter<Records<EdgeEventOf<M>>>>::layout(layout, "edges", true);
-        if M::RECORDS_ATTEMPTS {
-            <AsHistory as Adapter<Records<Attempt>>>::layout(layout, "attempts", true);
-        }
-        if M::RECORDS_RECEIPTS {
-            <AsHistory as Adapter<Records<Receipt>>>::layout(layout, "receipts", true);
-        }
     }
 
     fn encode_row(&self, e: &mut Encoder) -> Result<(), EncodeError> {
         self.spec.encode_row(e)?;
         <AsColumns as Adapter<StoredState<M>>>::encode(&self.state, e).map_err(|error| error.at("state"))?;
-        <AsHistory as Adapter<Records<EdgeEventOf<M>>>>::encode(&self.events, e).map_err(|error| error.at("edges"))?;
-        if M::RECORDS_ATTEMPTS {
-            <AsHistory as Adapter<Records<Attempt>>>::encode(&self.attempts, e).map_err(|error| error.at("attempts"))?;
-        }
-        if M::RECORDS_RECEIPTS {
-            <AsHistory as Adapter<Records<Receipt>>>::encode(&self.receipts, e).map_err(|error| error.at("receipts"))?;
-        }
-        Ok(())
+        <AsHistory as Adapter<Records<EdgeEventOf<M>>>>::encode(&self.events, e).map_err(|error| error.at("edges"))
     }
 
     /// The name and version are the store's ([`Kind::with_identity`]): a
@@ -69,19 +54,11 @@ where
         let state = <AsColumns as Adapter<StoredState<M>>>::decode(d)
             .map_err(|error| error.at("state"))?
             .ok_or_else(|| DecodeError::missing("state"))?;
-        let events = history::<EdgeEventOf<M>>(d, "edges", true)?;
-        let attempts = history::<Attempt>(d, "attempts", M::RECORDS_ATTEMPTS)?;
-        let receipts = history::<Receipt>(d, "receipts", M::RECORDS_RECEIPTS)?;
-        Ok(Resource { name: String::new(), spec, state, version: Version(0), events, attempts, receipts })
+        let events = <AsHistory as Adapter<Records<EdgeEventOf<M>>>>::decode(d)
+            .map_err(|error| error.at("edges"))?
+            .ok_or_else(|| DecodeError::missing("edges"))?;
+        Ok(Resource { name: String::new(), spec, state, version: Version(0), events })
     }
-}
-
-/// A history table's rows, or none when the kind keeps no such table.
-fn history<R: Element>(d: &mut Decoder, name: &str, stored: bool) -> Result<Records<R>, DecodeError> {
-    if !stored {
-        return Ok(Records::new());
-    }
-    <AsHistory as Adapter<Records<R>>>::decode(d).map_err(|error| error.at(name))?.ok_or_else(|| DecodeError::missing(name))
 }
 
 impl<M> Kind for Resource<M>

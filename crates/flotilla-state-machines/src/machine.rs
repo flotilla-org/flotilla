@@ -39,11 +39,6 @@ pub trait Machine: Sized + 'static {
     /// What gates, effects and judgements may read; usually a trait object
     /// whose supertraits are the [`Source`](crate::Source)s the machine needs.
     type World: ?Sized;
-    /// Whether the machine's stored kind keeps an `attempts` table. Attempts are recorded only
-    /// where they are stored: without the table every label refuses them.
-    const RECORDS_ATTEMPTS: bool = false;
-    /// Whether the stored kind keeps a `receipts` table; as [`Machine::RECORDS_ATTEMPTS`].
-    const RECORDS_RECEIPTS: bool = false;
 
     fn definition() -> MachineDef<Self>;
 
@@ -65,16 +60,16 @@ pub struct Ended<L> {
     pub reason: &'static str,
 }
 
-/// An edge was attempted from a state it does not leave. `edge` is `None`
-/// for a record that the state does not accept, such as an attempt.
+/// An edge was attempted from a state it does not leave.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WrongState<L, K> {
     pub state: L,
-    pub edge: Option<K>,
+    pub edge: K,
 }
 
 type GateFn<M> = dyn Fn(&mut Handle<'_, M>, &<M as Machine>::Edge) -> Option<Result<(), <M as Machine>::Refusal>>;
 type EffectFn<M> = dyn Fn(&mut Handle<'_, M>, <M as Machine>::State, &<M as Machine>::Edge) -> Option<<M as Machine>::State>;
+type MasterFn<M> = dyn Fn(&<M as Machine>::Edge) -> Option<String>;
 
 /// What an edge checks before it moves.
 pub enum Check<M: Machine> {
@@ -91,12 +86,13 @@ pub struct EdgeDef<M: Machine, A> {
     changes: Vec<&'static str>,
     check: Option<Check<M>>,
     effect: Option<Box<EffectFn<M>>>,
+    master: Option<Box<MasterFn<M>>>,
     arg: PhantomData<fn(&A)>,
 }
 
 impl<M: Machine, A: EdgeArg<Edge = M::Edge>> EdgeDef<M, A> {
     pub fn new() -> Self {
-        EdgeDef { from: Vec::new(), to: Vec::new(), changes: Vec::new(), check: None, effect: None, arg: PhantomData }
+        EdgeDef { from: Vec::new(), to: Vec::new(), changes: Vec::new(), check: None, effect: None, master: None, arg: PhantomData }
     }
 
     /// Labels this edge leaves. May be called more than once.
@@ -156,6 +152,17 @@ impl<M: Machine, A: EdgeArg<Edge = M::Edge>> EdgeDef<M, A> {
         self.effect = Some(Box::new(effect));
         self
     }
+
+    /// Declares the argument naming the edge's master: the resource the edge
+    /// is about (G11), such as the message a session's receipt is for. The
+    /// log keeps the master's name as the entry's `about`, so the master's
+    /// gates and judgements read the entries about it. An edge with a master
+    /// may leave its state unchanged: its entry is what it records.
+    pub fn about(mut self, master: fn(&A) -> &str) -> Self {
+        let master = move |edge: &M::Edge| A::project(edge).map(|arg| master(arg).to_string());
+        self.master = Some(Box::new(master));
+        self
+    }
 }
 
 impl<M: Machine, A: EdgeArg<Edge = M::Edge>> Default for EdgeDef<M, A> {
@@ -172,9 +179,15 @@ pub struct DeclaredEdge<M: Machine> {
     pub changes: Vec<&'static str>,
     check: Option<Check<M>>,
     effect: Option<Box<EffectFn<M>>>,
+    master: Option<Box<MasterFn<M>>>,
 }
 
 impl<M: Machine> DeclaredEdge<M> {
+    /// Whether the edge declares a master ([`EdgeDef::about`]).
+    pub fn has_master(&self) -> bool {
+        self.master.is_some()
+    }
+
     /// The sentence the gate enforces, for a gated edge.
     pub fn gate_doc(&self) -> Option<&'static str> {
         match &self.check {
@@ -213,7 +226,6 @@ pub struct MachineDef<M: Machine> {
     edges: Vec<DeclaredEdge<M>>,
     ends: Vec<EndDef<Label<M>>>,
     by_kind: BTreeMap<EdgeKind<M>, usize>,
-    attempts_in: Option<Vec<Label<M>>>,
 }
 
 /// A rule a declaration breaks.
@@ -232,7 +244,8 @@ pub enum DefError {
     EdgeWithoutEffect(&'static str),
     EdgeWithoutTarget(&'static str),
     EdgeWithoutSource(&'static str),
-    /// Neither changes data nor leaves its label: it could never alter the state.
+    /// Neither changes data nor leaves its label, and names no master: it
+    /// could never alter the state, and its entry would be about nothing.
     InertEdge(&'static str),
     /// A changed datum that no target label carries.
     UnknownData {
@@ -313,7 +326,7 @@ impl<M: Machine> Debug for StepError<M> {
 
 impl<M: Machine> MachineDef<M> {
     pub fn new(initial: Label<M>) -> Self {
-        MachineDef { initial, edges: Vec::new(), ends: Vec::new(), by_kind: BTreeMap::new(), attempts_in: None }
+        MachineDef { initial, edges: Vec::new(), ends: Vec::new(), by_kind: BTreeMap::new() }
     }
 
     /// Adds an edge, typed on its argument struct. A second declaration of the
@@ -328,6 +341,7 @@ impl<M: Machine> MachineDef<M> {
             changes: edge.changes,
             check: edge.check,
             effect: edge.effect,
+            master: edge.master,
         });
         self
     }
@@ -337,17 +351,9 @@ impl<M: Machine> MachineDef<M> {
         self
     }
 
-    /// Attempts may be recorded only under these labels. Without this
-    /// declaration they may be recorded under any label but an end.
-    pub fn attempts_in(mut self, labels: impl IntoIterator<Item = Label<M>>) -> Self {
-        self.attempts_in = Some(labels.into_iter().collect());
-        self
-    }
-
-    /// Whether an attempt may be recorded under `label` (ends aside): never when the stored
-    /// kind keeps no attempts ([`Machine::RECORDS_ATTEMPTS`]).
-    pub fn accepts_attempts(&self, label: Label<M>) -> bool {
-        M::RECORDS_ATTEMPTS && self.attempts_in.as_ref().is_none_or(|labels| labels.contains(&label))
+    /// The master `edge` names, when its declaration has one ([`EdgeDef::about`]).
+    pub fn master(&self, edge: &M::Edge) -> Option<String> {
+        self.find(edge.kind()).and_then(|declared| declared.master.as_ref()).and_then(|master| master(edge))
     }
 
     pub fn initial(&self) -> Label<M> {
@@ -404,6 +410,7 @@ impl<M: Machine> MachineDef<M> {
                 errors.insert(DefError::EdgeWithoutSource(name));
             }
             if edge.changes.is_empty()
+                && edge.master.is_none()
                 && !edge.from.is_empty()
                 && !edge.to.is_empty()
                 && edge.from.iter().all(|from| edge.to.iter().all(|to| from == to))
@@ -507,7 +514,7 @@ impl<M: Machine> MachineDef<M> {
         let undeclared = || StepError::Fault(Fault::Undeclared { edge: kind });
         let declared = self.find(kind).ok_or_else(undeclared)?;
         if !declared.from.contains(&label) {
-            return Err(StepError::Refused(WrongState { state: label, edge: Some(kind) }.into()));
+            return Err(StepError::Refused(WrongState { state: label, edge: kind }.into()));
         }
         match &declared.check {
             Some(Check::Gate { gate, .. }) => gate(handle, edge).ok_or_else(undeclared)?.map_err(StepError::Refused)?,

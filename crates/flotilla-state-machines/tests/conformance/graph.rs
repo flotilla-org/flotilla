@@ -61,9 +61,9 @@ pub trait Conformance {
     fn apply(subject: &mut Self::Subject, event: &Value) -> Step;
 
     /// The Rust state value in the spec's ITF shape: read from
-    /// `Resource::state()`, the immutable spec where the spec's state carries
-    /// request data, and attempt records where its history is attempts.
-    /// Never from edge events.
+    /// `Resource::state()`, and the immutable spec where the spec's state
+    /// carries request data. Edge events only where the spec's state keeps
+    /// the log itself: Ensure's history of attempts and its window.
     fn encode(subject: &Self::Subject) -> Value;
 
     /// Rises on every accepted write, so an unchanged version means a refusal recorded nothing.

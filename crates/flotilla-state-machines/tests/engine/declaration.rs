@@ -17,10 +17,6 @@ fn fire(name: &str) -> LatchEdge {
     Fire { signal: Ref::new(name) }.into()
 }
 
-fn armed(shots: u32) -> Latch {
-    Latch::Armed { shots }
-}
-
 // Codes are stable identities: a rename must never change them. This pins them.
 #[test]
 fn codes_and_names_are_pinned() {
@@ -30,7 +26,8 @@ fn codes_and_names_are_pinned() {
         [("Armed", Code::new("ar")), ("Fired", Code::new("fi")), ("Spent", Code::new("sp")), ("Withdrawn", Code::new("wd"))]
     );
     let edges: Vec<_> = LatchEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    assert_eq!(edges, [("fire", Code::new("fi")), ("withdraw", Code::new("wd")), ("re_arm", Code::new("ra")), ("load", Code::new("lo"))]);
+    let codes = [("fire", "fi"), ("withdraw", "wd"), ("re_arm", "ra"), ("load", "lo"), ("try", "tr"), ("note", "no")];
+    assert_eq!(edges, codes.map(|(name, code)| (name, Code::new(code))));
     assert_eq!(fire("s").kind(), LatchEdgeKind::Fire);
 }
 
@@ -43,7 +40,7 @@ fn a_state_value_names_its_label_and_data() {
     let data: Vec<_> = fired.data().into_iter().map(|(name, value)| (name, format!("{value:?}"))).collect();
     assert_eq!(data, [("shots", "2".to_string()), ("by", "\"bell\"".to_string())]);
     let fields: Vec<_> = LatchLabel::ALL.iter().map(|label| Latch::fields(*label)).collect();
-    assert_eq!(fields, [&["shots"][..], &["shots", "by"], &["shots"], &["reason"]]);
+    assert_eq!(fields, [&["shots", "failures", "last_failure"][..], &["shots", "by"], &["shots"], &["reason"]]);
 }
 
 #[test]
@@ -53,17 +50,20 @@ fn the_latch_declaration_validates() {
 
 // The diagram is drawn from the same declaration the engine enforces: each
 // transition names its edge and the data it changes. The label view leaves
-// out the edge that changes only data.
+// out the edges that keep their label.
 #[test]
 fn mermaid_renders_every_edge_its_data_and_each_end() {
     let head = "---\ntitle: Latch\n---\nstateDiagram-v2\n  direction LR\n  [*] --> Armed\n";
     let moves = "  Armed --> Fired: fire [shots, by]\n  Armed --> Spent: fire [shots, by]\n\
                  \x20 Armed --> Withdrawn: withdraw [reason]\n  Fired --> Withdrawn: withdraw [reason]\n\
-                 \x20 Fired --> Armed: re_arm\n";
+                 \x20 Fired --> Armed: re_arm [failures, last_failure]\n";
     let ends = "  Spent --> [*]\n  note right of Spent: the latch fired for good\n\
                 \x20 Withdrawn --> [*]\n  note right of Withdrawn: the latch was withdrawn\n";
     let definition = LatchMachine::definition();
-    assert_eq!(definition.mermaid(Diagram::Full), format!("{head}  Armed --> Armed: load [shots]\n{moves}{ends}"));
+    let full = format!(
+        "{head}  Armed --> Armed: load [shots]\n{moves}  Armed --> Armed: try [failures, last_failure]\n  Armed --> Armed: note\n{ends}"
+    );
+    assert_eq!(definition.mermaid(Diagram::Full), full);
     assert_eq!(definition.mermaid(Diagram::Labels), format!("{head}{moves}{ends}"));
 }
 
@@ -177,7 +177,7 @@ impl Machine for Rogue {
                     .from([LatchLabel::Armed])
                     .to([LatchLabel::Armed])
                     .ungated("a test fixture")
-                    .effect(|_, state, load| Latch::Armed { shots: shots(&state) + load.shots }),
+                    .effect(|_, state, load| armed(shots(&state) + load.shots)),
             )
     }
     fn admit(_: ()) -> Result<((), Latch), LatchRefusal> {
@@ -223,7 +223,8 @@ fn changed_names_new_and_altered_data_only() {
     let fired = Latch::Fired { shots: 2, by: "bell".into() };
     assert_eq!(changed(&armed(2), &fired), BTreeSet::from(["by"]));
     assert_eq!(changed(&armed(3), &fired), BTreeSet::from(["shots", "by"]));
-    assert_eq!(changed(&fired, &armed(2)), BTreeSet::new());
+    assert_eq!(changed(&fired, &armed(2)), BTreeSet::from(["failures", "last_failure"]), "Armed's tally is new data");
+    assert_eq!(changed(&fired, &Latch::Spent { shots: 2 }), BTreeSet::new());
     assert_eq!(changed(&fired, &Latch::Withdrawn { reason: "r".into() }), BTreeSet::from(["reason"]));
 }
 
@@ -231,7 +232,7 @@ fn draw_latch(tc: &hegel::TestCase) -> Latch {
     let shots = tc.draw(gs::integers::<u32>().min_value(0).max_value(2));
     let word = |tc: &hegel::TestCase| ["", "bell", "horn"][tc.draw(gs::integers::<usize>().min_value(0).max_value(2))].to_string();
     match tc.draw(gs::integers::<u8>().min_value(0).max_value(3)) {
-        0 => Latch::Armed { shots },
+        0 => armed(shots),
         1 => Latch::Fired { shots, by: word(tc) },
         2 => Latch::Spent { shots },
         _ => Latch::Withdrawn { reason: word(tc) },
@@ -324,6 +325,8 @@ fn validate_rejects_a_label_and_edge_sharing_a_word() {
                 .edge(edge::<Withdraw>(Armed, ClashLabel::ReArm))
                 .edge(edge::<ReArm>(ClashLabel::ReArm, Loaded))
                 .edge(edge::<Load>(Loaded, Armed))
+                .edge(edge::<Try>(Loaded, Armed))
+                .edge(edge::<Note>(Loaded, Armed))
         }
         fn admit(_: ()) -> Result<((), Clash), LatchRefusal> {
             Ok(((), Clash::Armed))
@@ -506,7 +509,8 @@ enum Checked {
 
 /// One generated edge declaration: which kind, the from- and to-sets as bit
 /// masks over the four labels, the data it declares changing, how it is
-/// checked and whether it has an effect.
+/// checked, whether it has an effect, and (for a note) whether it names its
+/// master.
 #[derive(Clone, Debug)]
 struct Drawn {
     kind: usize,
@@ -515,10 +519,11 @@ struct Drawn {
     changes: Vec<&'static str>,
     check: Checked,
     effect: bool,
+    about: bool,
 }
 
 /// Data names to declare: each label's data, and one no label carries.
-const DATA: [&str; 4] = ["shots", "by", "reason", "bogus"];
+const DATA: [&str; 5] = ["shots", "by", "reason", "failures", "bogus"];
 
 fn labels_in(mask: u8) -> Vec<LatchLabel> {
     LatchLabel::ALL.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, s)| *s).collect()
@@ -537,13 +542,31 @@ fn build(initial: usize, edges: &[Drawn], ends: &[(usize, bool)]) -> MachineDef<
         }
         def.edge(e)
     }
+    fn note(def: MachineDef<LatchMachine>, d: &Drawn) -> MachineDef<LatchMachine> {
+        if !d.about {
+            return add::<Note>(def, d);
+        }
+        let mut e = EdgeDef::<LatchMachine, Note>::new().from(labels_in(d.from)).to(labels_in(d.to)).changes(d.changes.iter().copied());
+        e = e.about(|note| &note.subject);
+        e = match d.check {
+            Checked::Gated => e.gate("drawn", |_, _| Ok(())),
+            Checked::Ungated { reasoned } => e.ungated(if reasoned { "drawn" } else { " " }),
+            Checked::Unchecked => e,
+        };
+        if d.effect {
+            e = e.effect(|_, state, _| state);
+        }
+        def.edge(e)
+    }
     let mut def = MachineDef::new(LatchLabel::ALL[initial]);
     for d in edges {
         def = match d.kind {
             0 => add::<Fire>(def, d),
             1 => add::<Withdraw>(def, d),
             2 => add::<ReArm>(def, d),
-            _ => add::<Load>(def, d),
+            3 => add::<Load>(def, d),
+            4 => add::<Try>(def, d),
+            _ => note(def, d),
         };
     }
     for (state, reasoned) in ends {
@@ -581,8 +604,8 @@ fn expected(initial: usize, edges: &[Drawn], ends: &[(usize, bool)]) -> BTreeSet
         if d.from == 0 {
             errors.insert(DefError::EdgeWithoutSource(name));
         }
-        // Inert: no data changes, and every from-label equals every to-label.
-        if d.changes.is_empty() && d.from != 0 && d.from == d.to && d.from.count_ones() == 1 {
+        // Inert: no data changes, no master, and every from-label equals every to-label.
+        if d.changes.is_empty() && !d.about && d.from != 0 && d.from == d.to && d.from.count_ones() == 1 {
             errors.insert(DefError::InertEdge(name));
         }
         for data in &d.changes {
@@ -635,14 +658,15 @@ fn expected(initial: usize, edges: &[Drawn], ends: &[(usize, bool)]) -> BTreeSet
 // validate() reports exactly the violated rules for any declaration. The
 // generator spans every rule: from- and to-sets over all 16 masks (including
 // empty, and inert self-loops), changed data carried by some labels and by none, gated, ungated
-// with and without a reason, and unchecked edges, missing effects, kinds
-// declared zero, one or two times, and ends repeated or without a reason.
+// with and without a reason, and unchecked edges, missing effects, notes
+// with and without a master, kinds declared zero, one or two times, and ends
+// repeated or without a reason.
 fn validate_case(tc: hegel::TestCase) {
     let initial = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
     let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
     let edges: Vec<Drawn> = (0..count)
         .map(|_| {
-            let kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+            let kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(5));
             let from = tc.draw(gs::integers::<u8>().min_value(0).max_value(15));
             let to = tc.draw(gs::integers::<u8>().min_value(0).max_value(15));
             let changes = DATA.iter().copied().filter(|_| tc.draw(gs::integers::<u8>().min_value(0).max_value(3)) == 0).collect();
@@ -653,7 +677,8 @@ fn validate_case(tc: hegel::TestCase) {
                 _ => Checked::Gated,
             };
             let effect = tc.draw(gs::integers::<u8>().min_value(0).max_value(5)) > 0;
-            Drawn { kind, from, to, changes, check, effect }
+            let about = kind == 5 && tc.draw(gs::booleans());
+            Drawn { kind, from, to, changes, check, effect, about }
         })
         .collect();
     let end_count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));

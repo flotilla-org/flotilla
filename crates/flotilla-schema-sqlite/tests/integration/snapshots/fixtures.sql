@@ -35,22 +35,12 @@ CREATE TABLE "agent_session_edges" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
-  "edge" TEXT NOT NULL CHECK ("edge" IN ('at', 'de', 'en')),
+  "edge" TEXT NOT NULL CHECK ("edge" IN ('at', 'de', 'en', 'rv')),
   "from" TEXT NOT NULL CHECK ("from" IN ('en', 'li')),
   "to" TEXT NOT NULL CHECK ("to" IN ('en', 'li')),
   "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "at" INTEGER NOT NULL,
   "payload" BLOB NOT NULL,
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "agent_session" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE TABLE "agent_session_receipts" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "message" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "transport" TEXT NOT NULL CHECK ("transport" IN ('mu', 'no', 'tu')),
-  "at" INTEGER NOT NULL,
   PRIMARY KEY ("owner", "pos"),
   FOREIGN KEY ("owner") REFERENCES "agent_session" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
@@ -66,13 +56,11 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('as', 'edges.edge', 'at', 'Attach'),
   ('as', 'edges.edge', 'de', 'Detach'),
   ('as', 'edges.edge', 'en', 'End'),
+  ('as', 'edges.edge', 'rv', 'Receive'),
   ('as', 'edges.from', 'en', 'Ended'),
   ('as', 'edges.from', 'li', 'Live'),
   ('as', 'edges.to', 'en', 'Ended'),
-  ('as', 'edges.to', 'li', 'Live'),
-  ('as', 'receipts.transport', 'mu', 'Mute'),
-  ('as', 'receipts.transport', 'no', 'Notify'),
-  ('as', 'receipts.transport', 'tu', 'Turn');
+  ('as', 'edges.to', 'li', 'Live');
 CREATE VIEW "agent_session_view" AS SELECT
   "agent_session"."id",
   "agent_session"."version",
@@ -92,14 +80,6 @@ CREATE VIEW "agent_session_edges_view" AS SELECT
   "agent_session_edges"."at",
   "agent_session_edges"."payload"
 FROM "agent_session_edges";
-CREATE VIEW "agent_session_receipts_view" AS SELECT
-  "agent_session_receipts"."owner",
-  "agent_session_receipts"."pos",
-  "agent_session_receipts"."version",
-  (SELECT "s" FROM "strings" WHERE "id" = "agent_session_receipts"."message") AS "message",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'receipts.transport' AND "code" = "agent_session_receipts"."transport") AS "transport",
-  "agent_session_receipts"."at"
-FROM "agent_session_receipts";
 CREATE TABLE "convoy" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -411,22 +391,34 @@ CREATE TABLE "ensure" (
   "policy_cap" INTEGER NOT NULL,
   "state" TEXT NOT NULL CHECK ("state" IN ('fu', 'he', 'rt', 'un')),
   "state_since" INTEGER NOT NULL,
-  "window" INTEGER,
+  "failures" INTEGER,
+  "last_failure_at" INTEGER,
+  "last_failure_cause_category" TEXT CHECK ("last_failure_cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
+  "last_failure_cause_detail" TEXT,
+  "last_failure_retryable" INTEGER CHECK ("last_failure_retryable" IN (0, 1)),
   "bound" INTEGER REFERENCES "strings" ("id"),
+  CHECK (CASE WHEN "last_failure_at" IS NOT NULL
+      THEN "last_failure_cause_category" IS NOT NULL
+      AND "last_failure_cause_detail" IS NOT NULL
+      AND "last_failure_retryable" IS NOT NULL
+      ELSE "last_failure_cause_category" IS NULL
+      AND "last_failure_cause_detail" IS NULL
+      AND "last_failure_retryable" IS NULL
+      END),
   CHECK (CASE WHEN "state" = 'un'
-      THEN "window" IS NOT NULL
+      THEN "failures" IS NOT NULL
       AND "bound" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'fu'
-      THEN "window" IS NOT NULL
+      THEN "failures" IS NOT NULL
       AND "bound" IS NOT NULL
       END),
   CHECK (CASE WHEN "state" = 'he'
-      THEN "window" IS NOT NULL
+      THEN "failures" IS NOT NULL
       AND "bound" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'rt'
-      THEN "window" IS NOT NULL
+      THEN "failures" IS NOT NULL
       AND "bound" IS NULL
       END)
 ) STRICT;
@@ -446,7 +438,7 @@ CREATE TABLE "ensure_edges" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
-  "edge" TEXT NOT NULL CHECK ("edge" IN ('bi', 'cr', 'gu', 'rc', 'rs', 'rt', 'ub')),
+  "edge" TEXT NOT NULL CHECK ("edge" IN ('at', 'bi', 'cr', 'ho', 'rc', 'rs', 'rt', 'ub')),
   "from" TEXT NOT NULL CHECK ("from" IN ('fu', 'he', 'rt', 'un')),
   "to" TEXT NOT NULL CHECK ("to" IN ('fu', 'he', 'rt', 'un')),
   "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
@@ -454,28 +446,6 @@ CREATE TABLE "ensure_edges" (
   "payload" BLOB NOT NULL,
   PRIMARY KEY ("owner", "pos"),
   FOREIGN KEY ("owner") REFERENCES "ensure" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE TABLE "ensure_attempts" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "at" INTEGER NOT NULL,
-  "outcome" TEXT NOT NULL CHECK ("outcome" IN ('fa', 'ok')),
-  "outcome_cause_category" TEXT CHECK ("outcome_cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
-  "outcome_cause_detail" TEXT,
-  "outcome_retryable" INTEGER CHECK ("outcome_retryable" IN (0, 1)),
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "ensure" ("id") ON DELETE CASCADE,
-  CHECK (CASE WHEN "outcome" = 'ok'
-      THEN "outcome_cause_category" IS NULL
-      AND "outcome_cause_detail" IS NULL
-      AND "outcome_retryable" IS NULL
-      END),
-  CHECK (CASE WHEN "outcome" = 'fa'
-      THEN "outcome_cause_category" IS NOT NULL
-      AND "outcome_cause_detail" IS NOT NULL
-      AND "outcome_retryable" IS NOT NULL
-      END)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "ensure_by_inbox" ON "ensure" ("inbox");
 CREATE INDEX "ensure_edges_by_edge" ON "ensure_edges" ("edge", "at");
@@ -485,9 +455,15 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('en', 'state', 'he', 'Held'),
   ('en', 'state', 'rt', 'Retired'),
   ('en', 'state', 'un', 'Unfulfilled'),
+  ('en', 'last_failure_cause_category', 'ex', 'External'),
+  ('en', 'last_failure_cause_category', 'mc', 'Misconfigured'),
+  ('en', 'last_failure_cause_category', 'mx', 'MissingCapability'),
+  ('en', 'last_failure_cause_category', 'rf', 'Refused'),
+  ('en', 'last_failure_cause_category', 'tr', 'Transient'),
+  ('en', 'edges.edge', 'at', 'Attempted'),
   ('en', 'edges.edge', 'bi', 'Bind'),
   ('en', 'edges.edge', 'cr', 'Create'),
-  ('en', 'edges.edge', 'gu', 'GiveUp'),
+  ('en', 'edges.edge', 'ho', 'Hold'),
   ('en', 'edges.edge', 'rc', 'Record'),
   ('en', 'edges.edge', 'rs', 'Resume'),
   ('en', 'edges.edge', 'rt', 'Retire'),
@@ -499,14 +475,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('en', 'edges.to', 'fu', 'Fulfilled'),
   ('en', 'edges.to', 'he', 'Held'),
   ('en', 'edges.to', 'rt', 'Retired'),
-  ('en', 'edges.to', 'un', 'Unfulfilled'),
-  ('en', 'attempts.outcome', 'fa', 'Failed'),
-  ('en', 'attempts.outcome', 'ok', 'Succeeded'),
-  ('en', 'attempts.outcome_cause_category', 'ex', 'External'),
-  ('en', 'attempts.outcome_cause_category', 'mc', 'Misconfigured'),
-  ('en', 'attempts.outcome_cause_category', 'mx', 'MissingCapability'),
-  ('en', 'attempts.outcome_cause_category', 'rf', 'Refused'),
-  ('en', 'attempts.outcome_cause_category', 'tr', 'Transient');
+  ('en', 'edges.to', 'un', 'Unfulfilled');
 CREATE VIEW "ensure_view" AS SELECT
   "ensure"."id",
   "ensure"."version",
@@ -517,7 +486,11 @@ CREATE VIEW "ensure_view" AS SELECT
   "ensure"."policy_cap",
   (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'state' AND "code" = "ensure"."state") AS "state",
   "ensure"."state_since",
-  "ensure"."window",
+  "ensure"."failures",
+  "ensure"."last_failure_at",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'last_failure_cause_category' AND "code" = "ensure"."last_failure_cause_category") AS "last_failure_cause_category",
+  "ensure"."last_failure_cause_detail",
+  "ensure"."last_failure_retryable",
   (SELECT "s" FROM "strings" WHERE "id" = "ensure"."bound") AS "bound"
 FROM "ensure";
 CREATE VIEW "ensure_recorded_view" AS SELECT
@@ -539,16 +512,6 @@ CREATE VIEW "ensure_edges_view" AS SELECT
   "ensure_edges"."at",
   "ensure_edges"."payload"
 FROM "ensure_edges";
-CREATE VIEW "ensure_attempts_view" AS SELECT
-  "ensure_attempts"."owner",
-  "ensure_attempts"."pos",
-  "ensure_attempts"."version",
-  "ensure_attempts"."at",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'attempts.outcome' AND "code" = "ensure_attempts"."outcome") AS "outcome",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'attempts.outcome_cause_category' AND "code" = "ensure_attempts"."outcome_cause_category") AS "outcome_cause_category",
-  "ensure_attempts"."outcome_cause_detail",
-  "ensure_attempts"."outcome_retryable"
-FROM "ensure_attempts";
 CREATE TABLE "message" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -1099,6 +1062,11 @@ CREATE TABLE "terminal_session" (
   "source_brief" BLOB REFERENCES "objects" ("hash"),
   "state" TEXT NOT NULL CHECK ("state" IN ('go', 'gu', 'rl', 'rq')),
   "state_since" INTEGER NOT NULL,
+  "failures" INTEGER,
+  "last_failure_at" INTEGER,
+  "last_failure_cause_category" TEXT CHECK ("last_failure_cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
+  "last_failure_cause_detail" TEXT,
+  "last_failure_retryable" INTEGER CHECK ("last_failure_retryable" IN (0, 1)),
   "identity" TEXT,
   "cause_category" TEXT CHECK ("cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
   "cause_detail" TEXT,
@@ -1112,24 +1080,48 @@ CREATE TABLE "terminal_session" (
       AND "source_brief" IS NOT NULL
       AND "source_command" IS NULL
       END),
+  CHECK (CASE WHEN "last_failure_at" IS NOT NULL
+      THEN "last_failure_cause_category" IS NOT NULL
+      AND "last_failure_cause_detail" IS NOT NULL
+      AND "last_failure_retryable" IS NOT NULL
+      ELSE "last_failure_cause_category" IS NULL
+      AND "last_failure_cause_detail" IS NULL
+      AND "last_failure_retryable" IS NULL
+      END),
   CHECK (CASE WHEN "state" = 'rq'
-      THEN "identity" IS NULL
+      THEN "failures" IS NOT NULL
+      AND "identity" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'rl'
       THEN "identity" IS NOT NULL
+      AND "failures" IS NULL
+      AND "last_failure_at" IS NULL
+      AND "last_failure_cause_category" IS NULL
+      AND "last_failure_cause_detail" IS NULL
+      AND "last_failure_retryable" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'go'
-      THEN "identity" IS NULL
+      THEN "failures" IS NULL
+      AND "last_failure_at" IS NULL
+      AND "last_failure_cause_category" IS NULL
+      AND "last_failure_cause_detail" IS NULL
+      AND "last_failure_retryable" IS NULL
+      AND "identity" IS NULL
       AND "cause_category" IS NULL
       AND "cause_detail" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'gu'
       THEN "cause_category" IS NOT NULL
       AND "cause_detail" IS NOT NULL
+      AND "failures" IS NULL
+      AND "last_failure_at" IS NULL
+      AND "last_failure_cause_category" IS NULL
+      AND "last_failure_cause_detail" IS NULL
+      AND "last_failure_retryable" IS NULL
       AND "identity" IS NULL
       END)
 ) STRICT;
@@ -1150,7 +1142,7 @@ CREATE TABLE "terminal_session_edges" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
-  "edge" TEXT NOT NULL CHECK ("edge" IN ('gu', 'rl', 'rs', 'va')),
+  "edge" TEXT NOT NULL CHECK ("edge" IN ('at', 'gu', 'rl', 'rs', 'va')),
   "from" TEXT NOT NULL CHECK ("from" IN ('go', 'gu', 'rl', 'rq')),
   "to" TEXT NOT NULL CHECK ("to" IN ('go', 'gu', 'rl', 'rq')),
   "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
@@ -1158,28 +1150,6 @@ CREATE TABLE "terminal_session_edges" (
   "payload" BLOB NOT NULL,
   PRIMARY KEY ("owner", "pos"),
   FOREIGN KEY ("owner") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE TABLE "terminal_session_attempts" (
-  "owner" INTEGER NOT NULL,
-  "pos" INTEGER NOT NULL,
-  "version" INTEGER NOT NULL,
-  "at" INTEGER NOT NULL,
-  "outcome" TEXT NOT NULL CHECK ("outcome" IN ('fa', 'ok')),
-  "outcome_cause_category" TEXT CHECK ("outcome_cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
-  "outcome_cause_detail" TEXT,
-  "outcome_retryable" INTEGER CHECK ("outcome_retryable" IN (0, 1)),
-  PRIMARY KEY ("owner", "pos"),
-  FOREIGN KEY ("owner") REFERENCES "terminal_session" ("id") ON DELETE CASCADE,
-  CHECK (CASE WHEN "outcome" = 'ok'
-      THEN "outcome_cause_category" IS NULL
-      AND "outcome_cause_detail" IS NULL
-      AND "outcome_retryable" IS NULL
-      END),
-  CHECK (CASE WHEN "outcome" = 'fa'
-      THEN "outcome_cause_category" IS NOT NULL
-      AND "outcome_cause_detail" IS NOT NULL
-      AND "outcome_retryable" IS NOT NULL
-      END)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "terminal_session_by_vessel" ON "terminal_session" ("vessel", "ordinal");
 CREATE INDEX "terminal_session_edges_by_edge" ON "terminal_session_edges" ("edge", "at");
@@ -1192,11 +1162,17 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ts', 'state', 'gu', 'GaveUp'),
   ('ts', 'state', 'rl', 'Realised'),
   ('ts', 'state', 'rq', 'Requested'),
+  ('ts', 'last_failure_cause_category', 'ex', 'External'),
+  ('ts', 'last_failure_cause_category', 'mc', 'Misconfigured'),
+  ('ts', 'last_failure_cause_category', 'mx', 'MissingCapability'),
+  ('ts', 'last_failure_cause_category', 'rf', 'Refused'),
+  ('ts', 'last_failure_cause_category', 'tr', 'Transient'),
   ('ts', 'cause_category', 'ex', 'External'),
   ('ts', 'cause_category', 'mc', 'Misconfigured'),
   ('ts', 'cause_category', 'mx', 'MissingCapability'),
   ('ts', 'cause_category', 'rf', 'Refused'),
   ('ts', 'cause_category', 'tr', 'Transient'),
+  ('ts', 'edges.edge', 'at', 'Attempted'),
   ('ts', 'edges.edge', 'gu', 'GiveUp'),
   ('ts', 'edges.edge', 'rl', 'Realise'),
   ('ts', 'edges.edge', 'rs', 'Release'),
@@ -1208,14 +1184,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ts', 'edges.to', 'go', 'Gone'),
   ('ts', 'edges.to', 'gu', 'GaveUp'),
   ('ts', 'edges.to', 'rl', 'Realised'),
-  ('ts', 'edges.to', 'rq', 'Requested'),
-  ('ts', 'attempts.outcome', 'fa', 'Failed'),
-  ('ts', 'attempts.outcome', 'ok', 'Succeeded'),
-  ('ts', 'attempts.outcome_cause_category', 'ex', 'External'),
-  ('ts', 'attempts.outcome_cause_category', 'mc', 'Misconfigured'),
-  ('ts', 'attempts.outcome_cause_category', 'mx', 'MissingCapability'),
-  ('ts', 'attempts.outcome_cause_category', 'rf', 'Refused'),
-  ('ts', 'attempts.outcome_cause_category', 'tr', 'Transient');
+  ('ts', 'edges.to', 'rq', 'Requested');
 CREATE VIEW "terminal_session_view" AS SELECT
   "terminal_session"."id",
   "terminal_session"."version",
@@ -1230,6 +1199,11 @@ CREATE VIEW "terminal_session_view" AS SELECT
   "terminal_session"."source_brief",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'state' AND "code" = "terminal_session"."state") AS "state",
   "terminal_session"."state_since",
+  "terminal_session"."failures",
+  "terminal_session"."last_failure_at",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'last_failure_cause_category' AND "code" = "terminal_session"."last_failure_cause_category") AS "last_failure_cause_category",
+  "terminal_session"."last_failure_cause_detail",
+  "terminal_session"."last_failure_retryable",
   "terminal_session"."identity",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'cause_category' AND "code" = "terminal_session"."cause_category") AS "cause_category",
   "terminal_session"."cause_detail"
@@ -1254,16 +1228,6 @@ CREATE VIEW "terminal_session_edges_view" AS SELECT
   "terminal_session_edges"."at",
   "terminal_session_edges"."payload"
 FROM "terminal_session_edges";
-CREATE VIEW "terminal_session_attempts_view" AS SELECT
-  "terminal_session_attempts"."owner",
-  "terminal_session_attempts"."pos",
-  "terminal_session_attempts"."version",
-  "terminal_session_attempts"."at",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'attempts.outcome' AND "code" = "terminal_session_attempts"."outcome") AS "outcome",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'attempts.outcome_cause_category' AND "code" = "terminal_session_attempts"."outcome_cause_category") AS "outcome_cause_category",
-  "terminal_session_attempts"."outcome_cause_detail",
-  "terminal_session_attempts"."outcome_retryable"
-FROM "terminal_session_attempts";
 CREATE TABLE "vessel" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

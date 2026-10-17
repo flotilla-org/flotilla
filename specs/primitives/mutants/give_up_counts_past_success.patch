@@ -1,0 +1,11 @@
+--- a/machines/lifecycle.qnt
++++ b/machines/lifecycle.qnt
+@@ -15,7 +15,7 @@
+   // Ensure's exhaustion rule: only the failures after the latest success
+   // count, and a failure that is not retryable exhausts at once.
+   pure def failureCount(h: List[AttemptOutcome]): int = h.indices().filter(i =>
+-    failed(h[i]) and not(h.indices().exists(j => j > i and not(failed(h[j]))))).size()
++    failed(h[i])).size()
+   pure def exhausted(h: List[AttemptOutcome]): bool = failureCount(h) >= MAX_FAILURES or
+     (h.length() > 0 and (match h[h.length() - 1] { | Failed(f) => not(f.retryable) | _ => false }))
+   // The cause of the last attempt, when it failed.

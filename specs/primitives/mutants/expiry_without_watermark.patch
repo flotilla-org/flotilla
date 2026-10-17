@@ -1,6 +1,6 @@
 --- a/machines/message.qnt
 +++ b/machines/message.qnt
-@@ -48,7 +48,7 @@
+@@ -51,7 +51,7 @@
              val bound = o.bound or receiver(s) != 0
              val refusal = match o.reason {
                | Expired => if (not(env.hasDeadline) or o.now <= env.deadline) Refused(MissingEvidence)

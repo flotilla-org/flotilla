@@ -4,7 +4,7 @@ module agent_session {
   type State = Live(Channel) | Ended(EndReason)
   type EndReason = Completed | Lost
   type Event = Attach({ channelPresent: bool }) | Detach({ channelAbsent: bool })
-    | End({ reason: EndReason, observed: bool })
+    | End({ reason: EndReason, observed: bool }) | Receive({ message: int, transport: str })
   type Refusal = AlreadyEnded | WrongChannel | MissingEvidence
   type Next = Moved(State) | Refused(Refusal)
   pure def step(s: State, e: Event): Next = match s {
@@ -14,6 +14,8 @@ module agent_session {
           else if (o.channelPresent) Moved(Live(Attached)) else Refused(MissingEvidence)
       | Detach(o) => if (channel != Attached) Refused(WrongChannel)
           else if (o.channelAbsent) Moved(Live(Detached)) else Refused(MissingEvidence)
+      // message is the master: its identity becomes the log entry's about.
+      | Receive(_) => Moved(Live(channel))
       | End(o) => if (o.observed) Moved(Ended(o.reason)) else Refused(MissingEvidence)
     }
   }
@@ -21,7 +23,7 @@ module agent_session {
 
   pure def terminalRefuses(s: State): bool = match s {
     | Ended(_) => Set(Attach({ channelPresent: true }), Detach({ channelAbsent: true }),
-        End({ reason: Completed, observed: true }), End({ reason: Lost, observed: true }))
+        Receive({ message: 1, transport: "local" }), End({ reason: Completed, observed: true }), End({ reason: Lost, observed: true }))
         .forall(e => not(moved(step(s, e))))
     | _ => true
   }
@@ -45,6 +47,7 @@ module agent_session {
   }
   action attach(id: int, present: bool): bool = fire(id, Attach({ channelPresent: present }))
   action detach(id: int, absent: bool): bool = fire(id, Detach({ channelAbsent: absent }))
+  action receive(id: int, message: int, transport: str): bool = fire(id, Receive({ message: message, transport: transport }))
   action end(id: int, reason: EndReason, observed: bool): bool = fire(id, End({ reason: reason, observed: observed }))
 
 }

@@ -8,7 +8,7 @@ use flotilla_state_machines::{
         MessageEdge, MessageEdgeKind, MessageLabel, MessageRefusal, MessageSpec, MessageState, Receipts, Receiver, Settle, Settlement,
         Supersedes, Supersession,
     },
-    Coded, Diagram, EdgeEventOf, EdgePayload, Home, InputRead, Kind, Machine, Receipt, Ref, Source, Transport, Version, WriteError,
+    Coded, Diagram, EdgeEventOf, EdgePayload, Home, InputRead, Kind, Machine, Ref, Source, Transport, Version, WriteError,
 };
 
 const INBOX: &str = "project:p/role:r";
@@ -137,8 +137,8 @@ fn deliver_records_one_receiver_and_awaits() {
     assert_eq!(home.get("m").expect("exists").events().len(), 1, "one delivery");
 }
 
-// With nothing expected, delivery settles the message, which then refuses
-// every edge and record as Ended.
+// With nothing expected, delivery settles the message, keeping its receiver
+// (G5); it then refuses every edge as Ended.
 #[test]
 fn delivering_an_expectation_free_message_settles_it() {
     let mut home = home(spec(Expectation::Nothing, Some(5)));
@@ -151,7 +151,6 @@ fn delivering_an_expectation_free_message_settles_it() {
     assert_eq!(home.apply("m", drop(DropReason::Expired), &world, t(9)).err(), ended);
     let settle = Settle { by: Settlement::OutcomeObserved };
     assert_eq!(home.apply("m", settle, &world, t(2)).err(), ended);
-    assert_eq!(home.record_receipt("m", Receipt { message: "m".into(), transport: Transport::Turn, at: t(3) }).err(), ended);
 }
 
 // Answered settles only after delivery (WrongState while Pending), only a

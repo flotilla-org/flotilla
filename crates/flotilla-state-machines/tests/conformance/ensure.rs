@@ -1,8 +1,8 @@
 //! Ensure against `conformance/ensure.qnt`.
 //!
-//! Fulfiller `i` is the reference `f<i>`; the Ensure's policy gives up after
-//! one failure in the current window ([`AttemptPolicy::immediate`]`(1)`), the
-//! spec's `history.length() - window >= 1`.
+//! Fulfiller `i` is the reference `f<i>`; the Ensure's policy is exhausted
+//! after two consecutive failures in the current window
+//! ([`AttemptPolicy::immediate`]`(2)`), the spec's `MAX_FAILURES`.
 //!
 //! Event mapping, each with a fresh [`MemoryEnsureWorld`]. The harness
 //! derives `Create` and `Bind` evidence from a world of fulfiller phases in
@@ -12,40 +12,37 @@
 //! - `Create{id, noLive, absent}`: nothing observed when both hold; `f<id>`
 //!   Gone for `noLive and not absent`; another recorded fulfiller Requested
 //!   for `not noLive and absent`; `f<id>` Requested when neither holds.
-//! - `Fail({id, limit})`: a failed attempt record whose cause detail names
-//!   fulfiller `f<id>`. The spec refuses it
-//!   `HistoryFull` once the history reaches `limit`: that is the model's bound
-//!   on its history, which Rust (an unbounded attempt log) does not have, so
-//!   those probes are counted and skipped.
+//! - `Attempted({id, outcome})`: the attempt edge naming `f<id>`, with
+//!   `Succeeded`, or a failure (a fixed cause) retryable as the spec says.
 //! - `Bind{id, realised, canReceive}`: `f<id>` Realised (else Requested) with
 //!   `canReceive`; the inbox has drained.
 //! - `Unbind{reason, observed, gone}`: `f<observed>` Gone (else Realised).
-//! - `GiveUp`, `Resume{authorised}`, `Retire{authorised, teardownComplete}`:
+//! - `Hold`, `Resume{authorised}`, `Retire{authorised, teardownComplete}`:
 //!   those edges, reading authority and teardown.
 //!
 //! State mapping: the spec's `Work = {recorded, created, history, window}` is
-//! the state's `recorded`, `created` and `window` (the attempts before the
-//! current window) with `history` read from the Ensure's attempt records, one
-//! entry per attempt; `Fulfilled { bound, .. }` is `Fulfilled({work, bound})`,
-//! and the other labels carry their work. Fulfiller references `f<i>` encode
-//! as `i`. The one remaining difference: the spec's history lists the
-//! fulfiller each failure named, while a Rust attempt has a time and an
-//! outcome, so the adaptor writes the fulfiller's name as the failure's cause
-//! detail and encodes the history from it.
+//! the state's `recorded` and `created`, with `history` the Ensure's
+//! `Attempted` log entries in order and `window` the number of them before
+//! the last `Resume` entry; `Fulfilled { bound, .. }` is
+//! `Fulfilled({work, bound})`, and the other labels carry their work.
+//! Fulfiller references `f<i>` encode as `i`. The remaining difference: the
+//! state keeps the window's tally (`failures`, `last_failure`) instead of the
+//! history, so encoding also checks that tally against the spec's
+//! `failureCount` and the window's last outcome.
 
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::ensure::{
-        Bind, Create, Drain, Ensure, EnsureRefusal, EnsureSpec, EnsureState, Fulfiller, FulfillerPhase, FulfillerStatus, Fulfillers,
-        GiveUp, MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
+        Attempted, Bind, Create, Drain, Ensure, EnsureEdge, EnsureRefusal, EnsureSpec, EnsureState, Fulfiller, FulfillerPhase,
+        FulfillerStatus, Fulfillers, Hold, MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
     },
-    Attempt, AttemptPolicy, Cause, CauseCategory, Home, Outcome, Ref, Resource, WriteError,
+    AttemptPolicy, Cause, CauseCategory, Home, Outcome, Ref, Resource, WriteError,
 };
 use serde_json::{json, Value};
 
 use crate::{
     graph::{self, refusal, tick, Conformance, Report, Step},
-    itf::{boolean, int, number, payload, set_of, tag, variant},
+    itf::{boolean, int, number, payload, set_of, tag, unit, variant},
 };
 
 const NAME: &str = "e";
@@ -80,44 +77,55 @@ fn outcome<T>(result: Result<T, WriteError<Ensure>>) -> Step {
             EnsureRefusal::MissingEvidence => "MissingEvidence",
             EnsureRefusal::NotExhausted => "NotExhausted",
             EnsureRefusal::Unauthorised => "Unauthorised",
-            EnsureRefusal::HistoryFull => "HistoryFull",
         },
         Err(other) => return refusal(&format!("{other:?}")),
     };
     refusal(name)
 }
 
-/// The spec's `Work`: the state's data, and the history from the attempt
-/// records, each failure naming its fulfiller in its cause detail.
-fn work(e: &Resource<Ensure>) -> Value {
-    let history: Vec<Value> = e
-        .attempts()
-        .iter()
-        .map(|row| match &row.record.outcome {
-            Outcome::Failed { cause, .. } => int(id_of(&cause.detail)),
-            Outcome::Succeeded => panic!("the harness records failures only"),
-        })
-        .collect();
-    let state = e.state();
-    let window = i64::from(state.window());
-    json!({ "recorded": ids(state.recorded()), "created": ids(state.created()), "history": history, "window": int(window) })
+/// The spec's `AttemptOutcome`.
+fn outcome_value(outcome: &Outcome) -> Value {
+    match outcome {
+        Outcome::Succeeded => variant("Succeeded", unit()),
+        Outcome::Failed { retryable, .. } => variant("Failed", json!({ "retryable": retryable })),
+    }
 }
 
-/// Why the probes the spec refuses at its history bound are skipped.
-const HISTORY_FULL: &str = "the spec's HistoryFull model bound; Rust attempts are an unbounded log";
+/// The spec's `Work`: the state's fulfillers, and the history and window
+/// from the Ensure's log. Checks the state's tally against the window.
+fn work(e: &Resource<Ensure>) -> Value {
+    let mut history = Vec::new();
+    let mut window = 0;
+    for row in e.events().iter() {
+        match &row.record.payload.edge {
+            EnsureEdge::Attempted(attempted) => history.push(attempted),
+            EnsureEdge::Resume(_) => window = history.len(),
+            _ => {}
+        }
+    }
+    let state = e.state();
+    let current = &history[window..];
+    let since_success = current.iter().rev().take_while(|a| matches!(a.outcome, Outcome::Failed { .. })).count();
+    assert_eq!(state.failures() as usize, since_success, "the tally counts the window's failures since its last success");
+    let last_retryable = current.last().and_then(|a| match a.outcome {
+        Outcome::Failed { retryable, .. } => Some(retryable),
+        Outcome::Succeeded => None,
+    });
+    assert_eq!(state.last_failure().map(|f| f.retryable), last_retryable, "the tally keeps the window's last failure");
+    let history: Vec<Value> =
+        history.iter().map(|a| json!({ "id": int(id_of(a.fulfiller.name())), "outcome": outcome_value(&a.outcome) })).collect();
+    json!({ "recorded": ids(state.recorded()), "created": ids(state.created()), "history": history, "window": int(window as i64) })
+}
 
 struct EnsureConformance;
 
 impl Conformance for EnsureConformance {
     const MACHINE: &'static str = "ensure";
-    // The spec's model bound on recorded failures; the attempt log is unbounded.
-    const NEVER_REFUSED: &'static [&'static str] = &["HistoryFull"];
-    const UNREALISABLE: &'static [(&'static str, usize)] = &[(HISTORY_FULL, 27)];
     type Subject = Home<Ensure>;
 
     fn create(_: &Value) -> Home<Ensure> {
         let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(1) }, Timestamp(0)).expect("created");
+        home.create(NAME, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(2) }, Timestamp(0)).expect("created");
         home
     }
 
@@ -148,15 +156,16 @@ impl Conformance for EnsureConformance {
                 }
                 outcome(home.apply(NAME, Create { fulfiller: f(id) }, &world, at))
             }
-            "Fail" => {
-                let e = home.get(NAME).expect("exists");
-                let limit = usize::try_from(number(&o["limit"])).expect("model limit");
-                if matches!(e.state(), EnsureState::Unfulfilled { .. }) && e.attempts().len() >= limit {
-                    return Step::Unrealisable(HISTORY_FULL);
-                }
-                let named = f(number(&o["id"]));
-                let failed = Attempt::failed(at, Cause::new(CauseCategory::Transient, named.name()), true);
-                outcome(home.record_attempt(NAME, failed))
+            "Attempted" => {
+                let attempt = match tag(&o["outcome"]) {
+                    "Succeeded" => Outcome::Succeeded,
+                    "Failed" => Outcome::Failed {
+                        cause: Cause::new(CauseCategory::Transient, "attempt failed"),
+                        retryable: boolean(&payload(&o["outcome"])["retryable"]),
+                    },
+                    other => panic!("attempt outcome {other}"),
+                };
+                outcome(home.apply(NAME, Attempted { fulfiller: f(number(&o["id"])), outcome: attempt }, &world, at))
             }
             "Bind" => {
                 let id = number(&o["id"]);
@@ -176,7 +185,7 @@ impl Conformance for EnsureConformance {
                 };
                 outcome(home.apply(NAME, Unbind { reason, fulfiller: f(id) }, &world, at))
             }
-            "GiveUp" => outcome(home.apply(NAME, GiveUp, &world, at)),
+            "Hold" => outcome(home.apply(NAME, Hold, &world, at)),
             "Resume" => {
                 world.authorities.put(&authority, boolean(&o["authorised"]));
                 outcome(home.apply(NAME, Resume { by: OPERATOR.into(), authority }, &world, at))
@@ -207,8 +216,7 @@ impl Conformance for EnsureConformance {
 
 // Every reachable Ensure state is reached in Rust by the spec's path, and
 // every probe agrees: the same move, or the same refusal with nothing
-// recorded. Failures past the spec's model bound on its history are counted
-// and skipped.
+// recorded.
 #[test]
 #[ignore = "export graphs with specs/primitives/check.sh"]
 fn ensure_follows_the_full_graph() {

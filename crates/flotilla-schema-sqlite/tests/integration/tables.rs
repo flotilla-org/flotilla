@@ -9,7 +9,7 @@ use flotilla_state_machines::{
         ensure::{EnsureEdgeKind, EnsureLabel, EnsureSpec, EnsureState, MemoryEnsureWorld, Record},
         message::{Deliver, MemoryMessageWorld, MessageWorld, Receiver, Settle, Settlement},
     },
-    Attempt, EdgeEventOf, EdgePayload, InputRead, Ref, Transport, Version,
+    EdgeEventOf, EdgePayload, InputRead, Ref, Transport, Version,
 };
 use hegel::TestCase;
 use rusqlite::Connection;
@@ -35,10 +35,6 @@ fn event(writer: &str) -> EdgeEventOf<flotilla_state_machines::machines::ensure:
 
 fn read() -> InputRead {
     InputRead { kind: Cow::Borrowed("fulfiller"), name: "f".into(), version: Some(Version(1)) }
-}
-
-fn attempt(at: i64) -> Attempt {
-    Attempt::succeeded(Timestamp(at))
 }
 
 fn evidence(reference: &str) -> Evidence {
@@ -102,13 +98,13 @@ fn refused(result: Result<Stamp, StoreError>) -> String {
 // Behaviour (#3320 ruling 1): a spec edit (`update`) refuses what only an edge writes, naming the
 // table or column: a changed state column (`state`, `state_since`; a deliverable's state is part
 // of its records row), and any append to, change of or removal from a history table (edge events,
-// their documents' gate reads, attempts) or a records table (deliverables, evidence under a kept
+// their documents' gate reads, attempts and receipts among them) or a records table (deliverables, evidence under a kept
 // deliverable). A refused write changes nothing and the transaction stays usable: a spec edit and
 // an engine edge then commit, the edge's event stamped with its version.
 #[test]
 fn spec_edits_refuse_what_only_edges_write() {
     let mut store = store();
-    let ensure = ensure::sample().with_events(records(vec![event("alice"), event("bob")])).with_attempts(records(vec![attempt(2)]));
+    let ensure = ensure::sample().with_events(records(vec![event("alice"), event("bob")]));
     let current = insert(&mut store, "e", &ensure);
     let dossier = Dossier { deliverables: records(vec![deliverable(vec![evidence("e0"), evidence("e1")])]), ..Dossier::sample(0) };
     let dossier_current = insert(&mut store, "d", &dossier);
@@ -125,11 +121,7 @@ fn spec_edits_refuse_what_only_edges_write() {
     assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].0 += 1))), "ensure_edges", "the stamp is part of the row");
     let with_read = edges(&|rows| rows[0].1.payload.reads.push(read()));
     assert_eq!(refused(write.update(&current, &with_read)), "ensure_edges", "gate reads are part of the edge row");
-    let more_attempts = ensure.clone().with_attempts(with_rows(ensure.attempts(), |rows| rows.push((0, attempt(3)))));
-    assert_eq!(refused(write.update(&current, &more_attempts)), "ensure_attempts");
-    let fewer_attempts = ensure.clone().with_attempts(Records::new());
-    assert_eq!(refused(write.update(&current, &fewer_attempts)), "ensure_attempts");
-    let held = EnsureState::Held { recorded: Default::default(), created: Default::default(), window: 0 };
+    let held = EnsureState::Held { recorded: Default::default(), created: Default::default(), failures: 0, last_failure: None };
     let moved = ensure.clone().with_state(State::new(held, ensure.since()));
     assert_eq!(refused(write.update(&current, &moved)), "ensure.state");
     let later = ensure

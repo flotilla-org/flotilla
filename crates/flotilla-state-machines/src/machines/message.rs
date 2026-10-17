@@ -7,7 +7,10 @@
 //! applied watermark for expiry, receipts and the binding for undeliverable,
 //! and an authority for deliberate drops. Gates never read link health.
 //!
-//! Records keyed by the message's own name: [`Receipts`], [`Reply`] (the
+//! A receipt is a consumer session's `Receive` edge whose master is this
+//! message (G11); [`Receipts`] is those entries about the message, by
+//! session. Read through the world until the per-home log's `about` index
+//! serves them. Also keyed by the message's own name: [`Reply`] (the
 //! expiry check) and [`DeliveryFailure`]. [`Binding`] and [`AppliedThrough`] are
 //! keyed by the spec's inbox: the inbox's consumer binding and the applied
 //! keepalive watermark of the bound consumer host's stream into this home.
@@ -19,9 +22,8 @@
 //! (#3392 rulings G4 and G5).
 //!
 //! The stored kind is `Resource<Message>` (code `ms`), declared by
-//! [`MessageSpec`]: the envelope as columns, the state, and the edge log. A
-//! message records no attempts or receipts; the consumer's receipts are its
-//! session's.
+//! [`MessageSpec`]: the envelope as columns, the state, and the edge log.
+//! The consumer's receipts are its session's edges.
 
 use std::collections::BTreeMap;
 
@@ -185,7 +187,9 @@ edges! {
     }
 }
 
-/// Observed receipts for one message, by consumer session.
+/// The receipts about one message, by consumer session: each consumer
+/// session's `Receive` entries whose master is the message, and the
+/// transport each reached it by.
 pub struct Receipts;
 impl Kind for Receipts {
     const NAME: &'static str = "message_receipts";
@@ -524,9 +528,9 @@ fn undeliverable(h: &mut Handle<'_, Message>) -> Result<(), MessageRefusal> {
     }
 }
 
-// Spec `Dropped({reason, receiver, at, watermark, bound})`: the watermark only
+// Spec `Dropped({reason, receiver, watermark, bound})`: the watermark only
 // when an expiry consulted it, which is exactly when a consumer was bound.
-// The spec's `at` is the drop event's time, the state's `since`. The effect
+// A drop's time is the drop event's, the state's `since` (G4). The effect
 // re-reads what the gate read; each read is recorded once.
 fn drop_message(h: &mut Handle<'_, Message>, state: MessageState, drop: &DropMessage) -> MessageState {
     let watermark = match drop.reason {
