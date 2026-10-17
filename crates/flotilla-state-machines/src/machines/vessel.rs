@@ -60,6 +60,8 @@ pub struct VesselRow {
     #[store(child)]
     pub shape: BTreeMap<Dimension, u32>,
     pub priority: Priority,
+    /// The placement host: a capacity-ledger id, not a stored resource, so
+    /// a plain column rather than a `Ref`.
     pub host: Host,
     #[store(state)]
     pub state: State<LifecycleState>,
@@ -100,6 +102,8 @@ impl MachineRow for VesselRow {
         &self.state
     }
 
+    /// A vessel records no receipts, so the row has no receipts table and
+    /// restores none; a lifecycle that recorded them would need one.
     fn parts(&self) -> RowParts<Vessel> {
         RowParts {
             spec: self.lease(),
