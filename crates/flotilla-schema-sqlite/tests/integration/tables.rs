@@ -1,41 +1,25 @@
 //! Child, records and history tables and frozen objects through SQLite.
 
-use std::{borrow::Cow, collections::BTreeMap};
+use std::collections::BTreeMap;
 
-use flotilla_schema::{quote_ident, Edge, EdgeEvent, Hash, Kind, Records, State, Table, Timestamp};
+use flotilla_schema::{quote_ident, Edge, Hash, Kind, Records, State, Table, Timestamp};
 use flotilla_schema_sqlite::{Loaded, Stamp, Store, StoreError};
 use flotilla_state_machines::{
     machines::{
-        ensure::{EnsureEdgeKind, EnsureLabel, EnsureSpec, EnsureState, MemoryEnsureWorld, Record},
+        ensure::{EnsureSpec, EnsureState, MemoryEnsureWorld, Record},
         message::{Deliver, MemoryMessageWorld, MessageWorld, Receiver, Settle, Settlement},
     },
-    EdgeEventOf, EdgePayload, InputRead, Ref, Transport, Version,
+    Ref, Transport,
 };
 use hegel::TestCase;
 use rusqlite::Connection;
 
 use crate::fixtures::{
     engine::{step, NAME},
-    ensure, message, registry, store,
+    ensure, message, origin, registry, store,
     synthetic::{workflow, Deliverable, DeliverableState, Evidence, InputValue, PromiseKind, PromiseSource},
     AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, LOCAL,
 };
-
-/// A record edge's event on an unfulfilled Ensure, as its log holds it.
-fn event(writer: &str) -> EdgeEventOf<flotilla_state_machines::machines::ensure::Ensure> {
-    EdgeEvent {
-        edge: EnsureEdgeKind::Record,
-        from: EnsureLabel::Unfulfilled,
-        to: EnsureLabel::Unfulfilled,
-        writer: writer.into(),
-        at: Timestamp(1),
-        payload: EdgePayload { edge: Record { fulfiller: Ref::new("f") }.into(), reads: Vec::new() },
-    }
-}
-
-fn read() -> InputRead {
-    InputRead { kind: Cow::Borrowed("fulfiller"), name: "f".into(), version: Some(Version(1)) }
-}
 
 fn evidence(reference: &str) -> Evidence {
     Evidence { reference: reference.into(), submitted_at: Timestamp(3), verdict: None, metadata: BTreeMap::new() }
@@ -77,7 +61,7 @@ fn with_rows<T: Clone>(records: &Records<T>, f: impl FnOnce(&mut Vec<(u64, T)>))
 
 fn insert<K: Kind>(store: &mut Store, name: &str, value: &K) -> Loaded<K> {
     let mut write = store.write().expect("write");
-    let stamp = write.insert(name, value).expect("insert");
+    let stamp = write.insert(name, value, &origin()).expect("insert");
     let loaded = write.load::<K>(stamp.id).expect("load").expect("present");
     write.commit().expect("commit");
     loaded
@@ -97,54 +81,46 @@ fn refused(result: Result<Stamp, StoreError>) -> String {
 
 // Behaviour (#3320 ruling 1): a spec edit (`update`) refuses what only an edge writes, naming the
 // table or column: a changed state column (`state`, `state_since`; a deliverable's state is part
-// of its records row), and any append to, change of or removal from a history table (edge events,
-// their documents' gate reads, attempts and receipts among them) or a records table (deliverables, evidence under a kept
+// of its records row), and any append to, change of or removal from a records table (deliverables,
+// evidence under a kept
 // deliverable). A refused write changes nothing and the transaction stays usable: a spec edit and
 // an engine edge then commit, the edge's event stamped with its version.
 #[test]
 fn spec_edits_refuse_what_only_edges_write() {
     let mut store = store();
-    let ensure = ensure::sample().with_events(records(vec![event("alice"), event("bob")]));
+    let ensure = ensure::sample();
     let current = insert(&mut store, "e", &ensure);
     let dossier = Dossier { deliverables: records(vec![deliverable(vec![evidence("e0"), evidence("e1")])]), ..Dossier::sample(0) };
     let dossier_current = insert(&mut store, "d", &dossier);
     let (ensure, dossier) = (&current.value, &dossier_current.value);
-    let stamps = ensure.events().iter().map(|row| row.version).chain(dossier.deliverables.iter().map(|row| row.version));
-    assert_eq!(stamps.collect::<Vec<_>>(), [current.version, current.version, dossier_current.version], "the insert stamps every row");
+    let stamps = dossier.deliverables.iter().map(|row| row.version);
+    assert_eq!(stamps.collect::<Vec<_>>(), [dossier_current.version], "the insert stamps every row");
 
     let mut write = store.write().expect("write");
-    type Event = EdgeEventOf<flotilla_state_machines::machines::ensure::Ensure>;
-    let edges = |f: Edit<Event>| ensure.clone().with_events(with_rows(ensure.events(), f));
-    assert_eq!(refused(write.update(&current, &edges(&|rows| rows.push((0, event("carol")))))), "ensure_edges", "no append");
-    assert_eq!(refused(write.update(&current, &edges(&|rows| drop(rows.pop())))), "ensure_edges");
-    assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].1 = event("carol")))), "ensure_edges");
-    assert_eq!(refused(write.update(&current, &edges(&|rows| rows[1].0 += 1))), "ensure_edges", "the stamp is part of the row");
-    let with_read = edges(&|rows| rows[0].1.payload.reads.push(read()));
-    assert_eq!(refused(write.update(&current, &with_read)), "ensure_edges", "gate reads are part of the edge row");
     let held = EnsureState::Held { recorded: Default::default(), created: Default::default(), failures: 0, last_failure: None };
     let moved = ensure.clone().with_state(State::new(held, ensure.since()));
-    assert_eq!(refused(write.update(&current, &moved)), "ensure.state");
+    assert_eq!(refused(write.update(&current, &moved, &origin())), "ensure.state");
     let later = ensure
         .clone()
         .with_state(State::new(ensure.state().clone(), Timestamp(9)))
         .with_spec(EnsureSpec { inbox: "edited".into(), ..ensure.spec().clone() });
-    assert_eq!(refused(write.update(&current, &later)), "ensure.state_since", "a spec field beside it does not excuse it");
+    assert_eq!(refused(write.update(&current, &later, &origin())), "ensure.state_since", "a spec field beside it does not excuse it");
     let deliverables = |f: Edit<Deliverable>| Dossier { deliverables: with_rows(&dossier.deliverables, f), ..dossier.clone() };
     let retracted = deliverables(&|rows| rows[0].1.state = State::new(DeliverableState::Retracted, Timestamp(5)));
-    assert_eq!(refused(write.update(&dossier_current, &retracted)), "dossier_deliverables", "only an edge moves a record");
-    assert_eq!(refused(write.update(&dossier_current, &deliverables(&|rows| rows.clear()))), "dossier_deliverables");
+    assert_eq!(refused(write.update(&dossier_current, &retracted, &origin())), "dossier_deliverables", "only an edge moves a record");
+    assert_eq!(refused(write.update(&dossier_current, &deliverables(&|rows| rows.clear()), &origin())), "dossier_deliverables");
     let promised = deliverables(&|rows| rows.push((0, deliverable(Vec::new()))));
-    assert_eq!(refused(write.update(&dossier_current, &promised)), "dossier_deliverables");
+    assert_eq!(refused(write.update(&dossier_current, &promised, &origin())), "dossier_deliverables");
     let submitted =
         deliverables(&|rows| rows[0].1.evidence = with_rows(&rows[0].1.evidence, |evidence| evidence.push((0, evidence_row()))));
-    assert_eq!(refused(write.update(&dossier_current, &submitted)), "dossier_deliverables_evidence");
+    assert_eq!(refused(write.update(&dossier_current, &submitted, &origin())), "dossier_deliverables_evidence");
     let fewer_evidence = deliverables(&|rows| rows[0].1.evidence = with_rows(&rows[0].1.evidence, |evidence| drop(evidence.pop())));
-    assert_eq!(refused(write.update(&dossier_current, &fewer_evidence)), "dossier_deliverables_evidence");
+    assert_eq!(refused(write.update(&dossier_current, &fewer_evidence, &origin())), "dossier_deliverables_evidence");
 
     // Allowed in the same transaction: a spec edit, then the engine's record edge appending its
     // event and growing the state's recorded set, whatever stamps the caller's rows hold.
     let edited = ensure.clone().with_spec(EnsureSpec { inbox: "edited".into(), ..ensure.spec().clone() });
-    let stamp = write.update(&current, &edited).expect("spec edit");
+    let stamp = write.update(&current, &edited, &origin()).expect("spec edit");
     let (edge, next) =
         step(&edited, "dave", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(8)).expect("recorded");
     let stamp = write.apply_edge(stamp, edge).expect("edge");
@@ -172,7 +148,7 @@ fn rows_written(store: Store, f: impl FnOnce(&mut Store)) -> (Store, u64) {
 
 fn update<K: Kind>(store: &mut Store, current: &Loaded<K>, next: &K) {
     let mut write = store.write().expect("write");
-    write.update(current, next).expect("update");
+    write.update(current, next, &origin()).expect("update");
     write.commit().expect("commit");
 }
 
@@ -182,10 +158,10 @@ fn apply_edge<K: Kind>(store: &mut Store, current: Stamp, edge: Edge<K>) {
     write.commit().expect("commit");
 }
 
-// Behaviour (#3320 production shape): a write touches only its rows, plus the home sequence, the
-// identity's sequence and one change-log row. An engine edge appending its event and moving the
-// state is two row writes (the event insert, and the one state statement that also moves the
-// version and writes the label's data), whatever gate reads its document holds. A spec edit
+// Behaviour (#3320 production shape, #3392 G8): a write touches only its rows, plus the home
+// sequence, the identity's sequence and one log row. An engine edge moving the state is one row
+// write (the one state statement that also moves the version and writes the label's data),
+// whatever gate reads its document holds: the event is the log row. A spec edit
 // changing one of three inputs is one update and the root version; an unchanged value writes
 // nothing.
 #[test]
@@ -210,17 +186,17 @@ fn writes_touch_only_their_rows() {
     let deliver = Deliver { receiver: Receiver { session: "s".into(), host: "h".into() }, transport: Transport::Turn };
     let (edge, delivered) = step(&current.value, "w", deliver, &*world, Timestamp(5)).expect("delivered");
     let (mut store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
-    assert_eq!(written, 5, "the event row, the state with the version, the home and identity sequences and the change log");
+    assert_eq!(written, 4, "the state with the version, the home and identity sequences and the log entry");
 
     let current = load(&mut store, &current);
     let (edge, _) = step(&delivered, "w", Settle { by: Settlement::Answered }, &*world, Timestamp(6)).expect("settled");
     let (store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
-    assert_eq!(written, 5, "gate reads add no rows, and leaving a label's data is the same statement");
+    assert_eq!(written, 4, "gate reads add no rows, and leaving a label's data is the same statement");
 
     let mut changed = dossier.clone();
     changed.inputs.insert("b".into(), InputValue::Text { value: "B".into() });
     let (mut store, written) = rows_written(store, |store| update(store, &dossier_current, &changed));
-    assert_eq!(written, 5, "one input row, the root version, the home sequence, the identity sequence and the change log");
+    assert_eq!(written, 5, "one input row, the root version, the home sequence, the identity sequence and the log entry");
 
     let dossier_current = load(&mut store, &dossier_current);
     let (_, written) = rows_written(store, |store| update(store, &dossier_current, &changed));
@@ -298,7 +274,7 @@ fn nested_rows_go_with_their_parent() {
     let current = load(&mut store, &current);
     assert_eq!(current.value, next);
     let mut write = store.write().expect("write");
-    write.delete::<Dossier>(current.stamp()).expect("delete");
+    write.delete::<Dossier>(current.stamp(), &origin()).expect("delete");
     write.commit().expect("commit");
     let conn = store.into_connection();
     for (table, rows) in owned_rows::<Dossier>(&conn, current.id.0) {
@@ -320,7 +296,7 @@ fn delete_cascades<K: Fixture>(tc: &TestCase) {
     let mut store = Store::open(conn, LOCAL, registry()).expect("reopen");
     let mut write = store.write().expect("write");
     for current in &loaded {
-        write.delete::<K>(current.stamp()).expect("delete");
+        write.delete::<K>(current.stamp(), &origin()).expect("delete");
     }
     write.commit().expect("commit");
     let conn = store.into_connection();

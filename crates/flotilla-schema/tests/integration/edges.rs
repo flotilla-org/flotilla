@@ -1,8 +1,8 @@
 //! Edge handles and the backend-neutral `Edge` builder (#3320 ruling 1), without a backend.
 
 use flotilla_schema::{
-    Code, ColumnType, Columns, Edge, EdgeAppend, EdgeError, EdgeEvent, EdgeSet, Encoder, FieldColumns, Frozen, Index, Kind, Position,
-    Records, RowPath, State, Stored, TableRole, Timestamp, Value,
+    Code, Columns, Edge, EdgeAppend, EdgeError, EdgeEvent, EdgeHeader, EdgeSet, Encoder, FieldColumns, Frozen, Identity, Kind, KindCode,
+    Position, Records, RowPath, State, Stored, TableRole, Timestamp, Value,
 };
 use serde::{Deserialize, Serialize};
 
@@ -79,7 +79,7 @@ struct Lifecycle<I> {
     #[store(records)]
     notes: Records<Note>,
     #[store(history)]
-    events: Records<EdgeEvent<Phase, LifecycleEdge, LifecycleArgs<I>>>,
+    receipts: Records<String>,
 }
 
 type Session = Lifecycle<Ident>;
@@ -94,7 +94,7 @@ fn ident() -> Ident {
 #[test]
 fn rows_record_their_column_shaped_fields() {
     let set = Session::table_set();
-    let field = |name: &str, columns, state| FieldColumns { name: name.into(), columns, state, datum_of: None };
+    let field = |name: &str, columns, state| FieldColumns { name: name.into(), columns, state, datum_of: None, aliases: Vec::new() };
     assert_eq!(
         set.tables[0].fields,
         [field("realised", 0..2, false), field("phase", 2..4, true), field("input", 4..6, false), field("doc", 6..7, false)]
@@ -107,44 +107,46 @@ fn rows_record_their_column_shaped_fields() {
     assert!(labels.fields.is_empty(), "an element of a primitive has no named fields");
 }
 
-// Behaviour (#3320 ruling of 2026-10-15): an edge log is one row per event, a fixed header of
-// columns (edge code, from- and to-label, interned writer, time) after the version stamp and one
-// inline CBOR document of the arguments, never expanded into columns or tables. Its table is
-// indexed for events of one edge in time order and for time ranges; the primary key (owner, pos)
-// gives one resource's log in order.
+// Behaviour (#3392 G8): an edge's event is no row of the kind: it is the header of the write's
+// log entry (edge code, from- and to-label, writer, time, master) and one inline CBOR document of
+// the arguments, so a kind declares no edge-log table.
 #[test]
-fn edge_logs_store_a_header_and_one_document_per_event() {
+fn edge_events_are_the_log_entry_header() {
     let set = Session::table_set();
-    let events = set.tables.iter().find(|table| table.name == "lifecycle_events").expect("events");
-    let columns: Vec<(&str, &ColumnType, bool)> =
-        events.columns.iter().map(|column| (column.name.as_str(), &column.ty, column.nullable)).collect();
+    let tables: Vec<(&str, TableRole)> = set.tables.iter().map(|table| (table.name.as_str(), table.role)).collect();
     assert_eq!(
-        columns,
+        tables,
         [
-            ("version", &ColumnType::Integer, false),
-            ("edge", &ColumnType::Code(vec![Code::new("c1"), Code::new("c2")]), false),
-            ("from", &ColumnType::Code(vec![Code::new("c1"), Code::new("c2")]), false),
-            ("to", &ColumnType::Code(vec![Code::new("c1"), Code::new("c2")]), false),
-            ("writer", &ColumnType::Interned, false),
-            ("at", &ColumnType::Timestamp, false),
-            ("payload", &ColumnType::Cbor, false),
+            ("lifecycle", TableRole::Root),
+            ("lifecycle_input_items", TableRole::Child),
+            ("lifecycle_labels", TableRole::Child),
+            ("lifecycle_notes", TableRole::Records),
+            ("lifecycle_notes_replies", TableRole::Records),
+            ("lifecycle_receipts", TableRole::History),
         ]
     );
-    assert!(!set.tables.iter().any(|table| table.parent == set.tables.iter().position(|table| table.name == "lifecycle_events")));
-    let index = |name: &str, eq: &[&str], order: &[&str]| Index {
-        name: name.into(),
-        table: "lifecycle_events".into(),
-        eq: eq.iter().map(|column| column.to_string()).collect(),
-        order: order.iter().map(|column| column.to_string()).collect(),
-        predicate: Vec::new(),
-    };
-    assert_eq!(set.indexes, [index("by_edge", &["edge"], &["at"]), index("by_time", &[], &["at"])]);
+    let realise = event(LifecycleEdge::Realise, Phase::Realised, Some(ident()));
+    let about = Identity { kind: KindCode::new("k4"), name: "m".into(), home: "h".into() };
+    let edge = Edge::new(Session::PHASE, &State::new(Phase::Realised, Timestamp(4)), &realise).expect("edge").about(about.clone());
+    let header = edge.into_parts().event;
+    assert_eq!(
+        header,
+        EdgeHeader {
+            edge: Code::new("c1"),
+            from: Code::new("c1"),
+            to: Code::new("c2"),
+            writer: "w".into(),
+            at: Timestamp(4),
+            payload: flotilla_cbor::to_vec(&realise.payload, &flotilla_schema::INLINE_LIMITS).expect("cbor"),
+            about: Some(about),
+        }
+    );
+    assert_eq!(header.payload::<LifecycleArgs<Ident>>(), Ok(realise.payload));
     assert_eq!(set.validate(), Ok(()));
 }
 
-// Behaviour (#3320 ruling 1, and #3319's state value): every edge writes the kind's state value and
-// appends its event to the edge log under the root (a placeholder stamp first, then the header and
-// the document), each set field's values encoded by the field's own adapter, appends and sets in
+// Behaviour (#3320 ruling 1, and #3319's state value): every edge writes the kind's state value,
+// each set field's values encoded by the field's own adapter, appends and sets in
 // records rows addressed by position, and every object its values name. Handles exist on generic
 // kinds and parts and are named by the field in upper case.
 #[test]
@@ -152,7 +154,7 @@ fn edges_encode_exactly_their_declared_fields_and_rows() {
     let realised = State::new(Phase::Realised, Timestamp(5));
     let doc = Frozen::new("plan".to_owned()).expect("freeze");
     let realise = event(LifecycleEdge::Realise, Phase::Realised, Some(ident()));
-    let edge = Edge::new(Session::PHASE, &realised, Session::EVENTS, &realise)
+    let edge = Edge::new(Session::PHASE, &realised, &realise)
         .and_then(|edge| edge.set(Session::REALISED, &Some(ident())))
         .and_then(|edge| edge.set(Session::DOC, &Some(doc.clone())))
         .and_then(|edge| edge.set_in(Session::NOTES, Position(2), Note::PHASE, &realised))
@@ -177,28 +179,12 @@ fn edges_encode_exactly_their_declared_fields_and_rows() {
         parts.appends.iter().map(|EdgeAppend { under, table, role, rows }| (*under, *table, *role, &rows.tables[0][0].values)).collect();
     assert_eq!(
         appends,
-        [
-            (
-                RowPath::Root,
-                "events",
-                TableRole::History,
-                &vec![
-                    int(0),
-                    Value::Text("c1".into()),
-                    Value::Text("c1".into()),
-                    Value::Text("c2".into()),
-                    Value::Str("w".into()),
-                    int(4),
-                    Value::Blob(flotilla_cbor::to_vec(&realise.payload, &flotilla_schema::INLINE_LIMITS).expect("cbor")),
-                ]
-            ),
-            (
-                RowPath::Record { table: "notes", position: Position(2) },
-                "replies",
-                TableRole::Records,
-                &vec![int(0), Value::Text("ok".into())]
-            ),
-        ]
+        [(
+            RowPath::Record { table: "notes", position: Position(2) },
+            "replies",
+            TableRole::Records,
+            &vec![int(0), Value::Text("ok".into())]
+        ),]
     );
     assert_eq!(parts.objects.keys().copied().collect::<Vec<_>>(), [doc.hash()], "an edge carries the objects it sets");
     let values = Encoder::columns(|e| realised.encode(e)).expect("columns").tables[0][0].values.clone();
@@ -213,7 +199,7 @@ fn edges_encode_exactly_their_declared_fields_and_rows() {
 fn edges_refuse_table_fields_repeated_fields_and_a_mislabelled_event() {
     let phase = State::new(Phase::Requested, Timestamp(2));
     let retire = event::<Ident>(LifecycleEdge::Retire, Phase::Requested, None);
-    let edge = || Edge::new(Session::PHASE, &phase, Session::EVENTS, &retire).expect("event");
+    let edge = || Edge::new(Session::PHASE, &phase, &retire).expect("event");
     assert_eq!(edge().set(Session::INPUT, &Input::Text { value: "t".into() }), Err(EdgeError::Tables { field: "input".into() }));
     let twice = edge().set(Session::REALISED, &None).and_then(|edge| edge.set(Session::REALISED, &None));
     assert_eq!(twice, Err(EdgeError::Repeated { field: "realised".into() }));
@@ -223,7 +209,7 @@ fn edges_refuse_table_fields_repeated_fields_and_a_mislabelled_event() {
     assert!(other_rows.is_ok(), "the same field of different rows is not repeated");
     let realised = State::new(Phase::Realised, Timestamp(2));
     assert_eq!(
-        Edge::new(Session::PHASE, &realised, Session::EVENTS, &retire),
+        Edge::new(Session::PHASE, &realised, &retire),
         Err(EdgeError::Label { field: "phase".into(), to: Code::new("c1"), state: Code::new("c2") })
     );
 }

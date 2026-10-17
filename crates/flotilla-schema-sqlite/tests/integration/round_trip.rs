@@ -7,7 +7,7 @@ use hegel::{generators as gs, TestCase};
 
 use crate::fixtures::terminal::Terminal;
 use crate::fixtures::{
-    store, AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Ticket, LOCAL,
+    origin, store, AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Ticket, LOCAL,
 };
 
 /// Inserts `first`, then evolves it through `steps` writes: mostly generated edges, and a spec
@@ -17,7 +17,7 @@ use crate::fixtures::{
 /// an edge.
 fn evolve<K: Fixture>(tc: &TestCase, store: &mut Store, name: &str, first: &K, steps: usize, pick: impl Fn(usize) -> Pick) {
     let mut write = store.write().expect("write");
-    let inserted = write.insert(name, first).expect("insert");
+    let inserted = write.insert(name, first, &origin()).expect("insert");
     write.commit().expect("commit");
     let mut model = first.stamped(None, inserted.version).stored().with_identity(name, inserted.version);
     let mut stamp = inserted;
@@ -43,7 +43,7 @@ fn evolve<K: Fixture>(tc: &TestCase, store: &mut Store, name: &str, first: &K, s
             }
             None => {
                 let next = current.value.evolve(tc, pick(step));
-                stamp = write.update(&current, &next).expect("a spec edit keeps states and records");
+                stamp = write.update(&current, &next, &origin()).expect("a spec edit keeps states and records");
                 if next.stored() == current.value {
                     assert_eq!(stamp, current.stamp(), "an update with no row changes is a no-op");
                 }
@@ -142,9 +142,9 @@ where
     for index in 0..<Resource<M>>::COVERING {
         let resource = Resource::<M>::generate(tc, Pick::Cover(index));
         for lead in 0..8 {
-            if let Some((_, next)) = Fixture::edge(&resource, tc, Pick::Cover(lead)) {
-                let edge = next.events().last().expect("the edge appended its event").record.edge;
-                let kind = EdgeKind::<M>::ALL.iter().find(|kind| kind.code() == edge.code()).expect("a declared kind");
+            if let Some((edge, _)) = Fixture::edge(&resource, tc, Pick::Cover(lead)) {
+                let edge = edge.into_parts().event.edge;
+                let kind = EdgeKind::<M>::ALL.iter().find(|kind| kind.code() == edge).expect("a declared kind");
                 reached.insert(kind.name());
             }
         }

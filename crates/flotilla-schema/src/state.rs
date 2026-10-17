@@ -99,9 +99,9 @@ pub enum RowEdit {
     Delete { key: Vec<Value> },
 }
 
-/// What differs between two values of one label-plus-data state (#3373 ruling 2): the column
-/// datums whose columns differ, with their new values, and the rows of collection datums that
-/// differ, never a whole collection. Generated `StateData::delta` code fills it in, one datum at a
+/// What an edge writes between two values of one label-plus-data state (#3373 ruling 2, #3392
+/// A3): every column datum, with its new values, and the rows of collection datums that differ,
+/// never a whole collection. Generated `StateData::delta` code fills it in, one datum at a
 /// time; [`Edge::transition`](crate::Edge::transition) turns it into an edge's writes.
 #[doc(hidden)]
 #[derive(Debug, Default)]
@@ -113,22 +113,20 @@ pub struct StateDelta {
 
 impl StateDelta {
     /// A column datum `name`: `encode` writes the datum's columns of a state value (null under a
-    /// label that lacks it). Recorded with `next`'s values when the encoded columns differ.
+    /// label that lacks it). Recorded with `next`'s values always, since the state is written as
+    /// one unit (#3392 A3); `previous` is unused.
     pub fn column<S>(
         &mut self,
         name: &'static str,
         encode: impl Fn(&S, &mut Encoder) -> Result<(), EncodeError>,
-        previous: &S,
+        _previous: &S,
         next: &S,
     ) -> Result<(), EncodeError> {
         let encoded = |value: &S| Encoder::columns(|e| encode(value, e)).map_err(|error| error.at(name));
-        let before = encoded(previous)?.tables.swap_remove(0).swap_remove(0).values;
         let mut after = encoded(next)?;
         let values = after.tables.swap_remove(0).swap_remove(0).values;
-        if values != before {
-            self.keep_objects(&values, &mut after.objects);
-            self.sets.push((name, values));
-        }
+        self.keep_objects(&values, &mut after.objects);
+        self.sets.push((name, values));
         Ok(())
     }
 

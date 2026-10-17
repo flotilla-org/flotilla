@@ -5,7 +5,7 @@ use rusqlite::Connection;
 
 use flotilla_state_machines::machines::message::MessageSpec;
 
-use crate::fixtures::{message, registry, Message, Resource, LOCAL};
+use crate::fixtures::{message, origin, registry, Message, Resource, LOCAL};
 
 // Behaviour (#3320 ownership): the generated write path refuses rows whose identity is homed
 // elsewhere; only the replication applier writes them. The foreign row is written by a store
@@ -15,7 +15,7 @@ fn writes_to_resources_homed_elsewhere_are_refused() {
     let conn = Connection::open_in_memory().expect("in-memory database");
     let mut remote = Store::open(conn, "remote", registry()).expect("open as remote");
     let mut write = remote.write().expect("write");
-    write.insert("far", &message::sample_in("replicated")).expect("replica row");
+    write.insert("far", &message::sample_in("replicated"), &origin()).expect("replica row");
     write.commit().expect("commit");
     let conn = remote.into_connection();
     let mut store = Store::open(conn, LOCAL, registry()).expect("reopen");
@@ -29,10 +29,10 @@ fn writes_to_resources_homed_elsewhere_are_refused() {
 
     let mut write = store.write().expect("write");
     let next = current.value.clone().with_spec(MessageSpec { inbox: "local edit".into(), ..current.value.spec().clone() });
-    assert!(matches!(write.update(&current, &next), Err(StoreError::NotHome { home, .. }) if home == "remote"));
-    assert!(matches!(write.delete::<Resource<Message>>(Stamp { id, version: 1 }), Err(StoreError::NotHome { .. })));
+    assert!(matches!(write.update(&current, &next, &origin()), Err(StoreError::NotHome { home, .. }) if home == "remote"));
+    assert!(matches!(write.delete::<Resource<Message>>(Stamp { id, version: 1 }, &origin()), Err(StoreError::NotHome { .. })));
     // A local resource of the same name is a different identity.
-    let local = write.insert("far", &next).expect("local insert");
+    let local = write.insert("far", &next, &origin()).expect("local insert");
     assert_ne!(local.id, id);
     write.commit().expect("commit");
 

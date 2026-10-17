@@ -6,20 +6,22 @@
 //! (`#[store(kind = "Message", code = "ms", state = MessageState)]`), and its
 //! state. The holder supplies the rest: its root row is the spec's columns,
 //! then the state as the field `state` (one label column, `state_since` set
-//! only when the label changes, and the label's data), then the edge log
-//! `edges` as `history`, attempts and receipts among its edges (R4); the
-//! store keeps the name (the identity row) and the version.
-//! [`Resource::stored_edge`] turns an edge the home applied into the stored edge that
-//! persists it. Nothing here calls a store: the storage port, with the home
+//! only when the label changes, and the label's data); the store keeps the
+//! name (the identity row) and the version. Edge events, attempts and receipts
+//! among them (R4), are no part of the row: each is the header and payload of
+//! its write's entry in the store's per-home log (#3392 G8), so a resource
+//! read from rows has no events, and the kind declares its machine's edge
+//! codes, the only ones its entries may carry. [`Resource::stored_edge`] turns
+//! an edge the home applied into the stored edge that persists it. Nothing here calls a store: the storage port, with the home
 //! deciding and `apply_edge` persisting in one transaction, is a later layer.
 
 use flotilla_schema::{
-    adapt::{Adapter, AsColumns, AsHistory},
-    Cbor, ColumnOf, DecodeError, Decoder, Edge, EdgeError, Element, EncodeError, Encoder, HistoryOf, Kind, KindCode, KindSpec, Labelled,
-    Layout, Records, State, StateData, StateOf, TableSet,
+    adapt::{Adapter, AsColumns},
+    Cbor, CodeEnum, ColumnOf, DecodeError, Decoder, Edge, EdgeError, Element, EncodeError, Encoder, Identity, Kind, KindCode, KindSpec,
+    Labelled, Layout, Records, State, StateData, StateOf, TableSet,
 };
 
-use crate::{EdgeEventOf, EdgePayload, Label, Machine, Resource, Version};
+use crate::{EdgeEventOf, EdgeKind, EdgePayload, Label, Machine, Resource, Version};
 
 /// Machine `M`'s state as stored: the value and the time its label was entered.
 pub type StoredState<M> = State<<M as Machine>::State>;
@@ -31,33 +33,27 @@ where
     M::State: StateData + Labelled<Label = Label<M>>,
     EdgePayload<M::Edge>: Cbor,
 {
-    const TABLES: usize = <M::Spec as Element>::TABLES
-        + <AsColumns as Adapter<StoredState<M>>>::TABLES
-        + <AsHistory as Adapter<Records<EdgeEventOf<M>>>>::TABLES;
+    const TABLES: usize = <M::Spec as Element>::TABLES + <AsColumns as Adapter<StoredState<M>>>::TABLES;
 
     fn layout_row(layout: &mut Layout) {
         <M::Spec as Element>::layout_row(layout);
         <AsColumns as Adapter<StoredState<M>>>::layout(layout, "state", true);
-        <AsHistory as Adapter<Records<EdgeEventOf<M>>>>::layout(layout, "edges", true);
     }
 
     fn encode_row(&self, e: &mut Encoder) -> Result<(), EncodeError> {
         self.spec.encode_row(e)?;
-        <AsColumns as Adapter<StoredState<M>>>::encode(&self.state, e).map_err(|error| error.at("state"))?;
-        <AsHistory as Adapter<Records<EdgeEventOf<M>>>>::encode(&self.events, e).map_err(|error| error.at("edges"))
+        <AsColumns as Adapter<StoredState<M>>>::encode(&self.state, e).map_err(|error| error.at("state"))
     }
 
     /// The name and version are the store's ([`Kind::with_identity`]): a
-    /// resource decoded from rows alone has an empty name and version 0.
+    /// resource decoded from rows alone has an empty name, version 0 and no
+    /// events (they are its log entries).
     fn decode_row(d: &mut Decoder) -> Result<Self, DecodeError> {
         let spec = <M::Spec as Element>::decode_row(d)?;
         let state = <AsColumns as Adapter<StoredState<M>>>::decode(d)
             .map_err(|error| error.at("state"))?
             .ok_or_else(|| DecodeError::missing("state"))?;
-        let events = <AsHistory as Adapter<Records<EdgeEventOf<M>>>>::decode(d)
-            .map_err(|error| error.at("edges"))?
-            .ok_or_else(|| DecodeError::missing("edges"))?;
-        Ok(Resource { name: String::new(), spec, state, version: Version(0), events })
+        Ok(Resource { name: String::new(), spec, state, version: Version(0), events: Records::new() })
     }
 }
 
@@ -75,6 +71,7 @@ where
         let mut layout = Layout::root(Self::KIND, Self::CODE);
         Self::layout_row(&mut layout);
         <M::Spec as KindSpec>::layout_indexes(&mut layout);
+        layout.edges(<EdgeKind<M> as CodeEnum>::CODES, <EdgeKind<M> as CodeEnum>::NAMES);
         layout.finish()
     }
 
@@ -95,14 +92,35 @@ where
         ColumnOf::new("state", <AsColumns as Adapter<StoredState<M>>>::TABLES, <AsColumns as Adapter<StoredState<M>>>::encode),
         M::State::DATA,
     );
-    /// Edge handle of the edge log `edges`.
-    pub const EDGES: HistoryOf<Self, EdgeEventOf<M>> = HistoryOf::new("edges");
-
     /// The stored edge for `event`, which the home appended when it moved this
-    /// resource from `previous` to its current state: the label and its since
-    /// only when the label changes, each datum only where it differs, and the
-    /// event appended to the edge log.
+    /// resource from `previous` to its current state: the state as one unit
+    /// (its label, its since, which moves only when the label changes, and
+    /// every datum), each collection datum row by row, logged as the event.
+    ///
+    /// An edge whose declaration names a master ([`EdgeDef::about`]) is stored
+    /// with [`Resource::stored_edge_about`], which also logs the master.
+    ///
+    /// [`EdgeDef::about`]: crate::EdgeDef::about
     pub fn stored_edge(&self, previous: &StoredState<M>, event: &EdgeEventOf<M>) -> Result<Edge<Self>, EdgeError> {
-        Edge::transition(Self::STATE, previous, &self.state, Self::EDGES, event)
+        Edge::transition(Self::STATE, previous, &self.state, event)
+    }
+
+    /// [`Resource::stored_edge`], with the edge's master as its log entry's
+    /// `about` (#3392 G11) when its declaration names one: `master` gives the
+    /// identity (kind, name, home) of the master the edge names, such as the
+    /// message a session's receipt is for, so the master's gates read the
+    /// entries about it. The engine names a master by its name alone; the
+    /// writer knows its kind and home.
+    pub fn stored_edge_about(
+        &self,
+        previous: &StoredState<M>,
+        event: &EdgeEventOf<M>,
+        master: impl FnOnce(&str) -> Identity,
+    ) -> Result<Edge<Self>, EdgeError> {
+        let edge = self.stored_edge(previous, event)?;
+        Ok(match M::definition().master(&event.payload.edge) {
+            Some(name) => edge.about(master(&name)),
+            None => edge,
+        })
     }
 }

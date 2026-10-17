@@ -4,8 +4,8 @@
 use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::message::{
-        Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageEdge, MessageSpec, MessageState, MessageWorld,
-        Receiver, Settle, Settlement, Supersedes,
+        Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageSpec, MessageState, MessageWorld, Receiver,
+        Settle, Settlement, Supersedes,
     },
     Ref, Resource, Transport,
 };
@@ -14,7 +14,7 @@ use hegel::{generators as gs, TestCase};
 use super::{
     code_enum,
     engine::{self, after, resource, Candidate, NAME},
-    name, records, stamp_flat, timestamp, Fixture, Pick,
+    name, timestamp, Fixture, Pick,
 };
 
 /// Covering indexes: the label is digit 0 (base 4), a drop's reason digit 1 (base 5) and whether
@@ -62,17 +62,6 @@ pub fn state_value(tc: &TestCase, pick: Pick) -> MessageState {
     }
 }
 
-/// One edge of every kind and argument variant, for generated history.
-fn edges(tc: &TestCase, pick: Pick) -> Vec<MessageEdge> {
-    let mut edges = vec![
-        Deliver { receiver: receiver(tc), transport: transport(tc, pick) }.into(),
-        Settle { by: Settlement::Answered }.into(),
-        Settle { by: Settlement::OutcomeObserved }.into(),
-    ];
-    edges.extend((0..5).map(|n| MessageEdge::from(DropMessage { reason: reason(tc, Pick::Cover(n * 4)) })));
-    edges
-}
-
 /// The envelope, drawn or covered.
 pub fn spec(tc: &TestCase, pick: Pick) -> MessageSpec {
     MessageSpec {
@@ -85,7 +74,6 @@ pub fn spec(tc: &TestCase, pick: Pick) -> MessageSpec {
 
 pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Message> {
     resource(spec(tc, pick), State::new(state_value(tc, pick), timestamp(tc)))
-        .with_events(records(tc, pick, 3, |pick| engine::event::<Message>(tc, pick, &edges(tc, pick))))
 }
 
 /// A fixed envelope for example tests: expecting a reply in `inbox`, no deadline.
@@ -178,7 +166,7 @@ impl Fixture for Resource<Message> {
         edge(tc, pick, self)
     }
 
-    fn stamped(&self, before: Option<&Resource<Message>>, version: u64) -> Resource<Message> {
-        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version))
+    fn stamped(&self, _before: Option<&Resource<Message>>, _version: u64) -> Resource<Message> {
+        self.clone()
     }
 }

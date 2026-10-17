@@ -35,6 +35,15 @@ impl<K: Eq + Hash + Clone, V: Clone> TwoGen<K, V> {
         self.young.insert(key, value);
     }
 
+    pub(crate) fn remove<Q>(&mut self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        self.young.remove(key);
+        self.old.remove(key);
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.young.len() + self.old.len()

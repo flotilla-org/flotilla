@@ -1,42 +1,36 @@
-//! Edge history rows: one row per state-machine edge event (#3320 ruling of 2026-10-15).
+//! Edge events: what one state-machine edge did, as the per-home log records it (#3392 G8).
 //!
-//! A machine's state is a value, the label plus its data (#3319). The edge log is history only:
-//! read to show and audit what happened, never to decide. Each event is a fixed header of columns,
-//! indexed for the questions history answers, and one inline CBOR document holding the edge's
-//! arguments and gate reads, whose shape can change without a schema change.
+//! A machine's state is a value, the label plus its data (#3319). An edge's event is no row of
+//! the kind: it is the header and payload of the edge's entry in the store's per-home `log`,
+//! read to show and audit what happened, never to decide. The header (edge, labels, writer and
+//! time) is columns of that entry; the payload, the edge's arguments and recorded reads, is one
+//! inline CBOR document whose shape can change without a schema change.
 
 use serde::{Deserialize, Serialize};
 
-use crate::{code::Code, time::Timestamp, traits::CodeEnum, Stored};
+use crate::{code::Code, time::Timestamp, traits::CodeEnum};
 
-/// One edge event, stored in the kind's `#[store(history)]` edge log as
+/// One edge event: the header and payload of the edge's `log` entry,
 ///
 /// ```text
-/// owner, pos, version | edge, from, to, writer, at | payload
-///   (primary key)       (header columns)             (inline CBOR: arguments and gate reads)
+/// cause 'edge', edge, from, to, writer, at | payload
+///   (header columns)                         (inline CBOR: arguments and recorded reads)
 /// ```
 ///
 /// `L` is the machine's state label and `E` its edge names, both code enums (as [`Edge::new`]
-/// requires); `P` is the document, any serde type.
+/// requires); `P` is the document, any serde type. The edge in `edge` and the document's
+/// arguments are the writer's to keep consistent.
 ///
 /// [`Edge::new`]: crate::Edge::new
-/// The log's table is indexed for one resource's events in order (its primary key), events of one
-/// edge in time order (`<table>_by_edge`) and time ranges across resources (`<table>_by_time`).
-/// The edge in `edge` and the document's arguments are the writer's to keep consistent.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Stored)]
-// Clippy reads `order(at)` in both indexes as one attribute given twice.
-#[allow(clippy::duplicated_attributes)]
-#[store(index(name = "by_edge", eq(edge), order(at)), index(name = "by_time", order(at)))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EdgeEvent<L, E, P> {
     pub edge: E,
     /// The label the resource left.
     pub from: L,
     /// The label the resource entered: the label of the state the edge writes.
     pub to: L,
-    #[store(intern)]
     pub writer: String,
     pub at: Timestamp,
-    #[store(cbor)]
     pub payload: P,
 }
 

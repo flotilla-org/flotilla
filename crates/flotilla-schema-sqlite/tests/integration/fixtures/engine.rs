@@ -1,13 +1,11 @@
 //! Driving the engine for the engine kinds' fixtures: an edge on a stored resource is one the
 //! engine applied, through `Home`, to that resource.
 
-use std::borrow::Cow;
+use flotilla_schema::{Cbor, Edge, Identity, Kind, KindSpec, Labelled, Records, State, StateData, Timestamp};
+use flotilla_state_machines::{machines::message::Message, EdgePayload, Home, Label, Machine, Resource, Version};
+use hegel::TestCase;
 
-use flotilla_schema::{Cbor, Edge, Kind, KindSpec, Labelled, State, StateData, Timestamp};
-use flotilla_state_machines::{Coded, EdgeEventOf, EdgePayload, Home, InputRead, Label, Machine, Resource, Version};
-use hegel::{generators as gs, TestCase};
-
-use super::{code_enum, list, name, timestamp, Pick};
+use super::{name, Pick, LOCAL};
 
 /// The resource's name at a fixture's home: the worlds key the resource's own evidence (a
 /// message's receipts, its reply) by it.
@@ -69,32 +67,11 @@ where
     home.restore(resource.clone().with_identity(NAME, version)).unwrap_or_else(|_| panic!("an empty home takes the resource"));
     let event = home.apply(NAME, edge, world, now).ok()?.clone();
     let next = home.get(NAME).expect("restored").clone();
-    let edge = next.stored_edge(&previous, &event).expect("an applied edge is storable");
-    Some((edge, next))
-}
-
-/// A history event as a generator leaves it: any of `edges` between any labels. History is never
-/// read to decide, so a stored log need not be a path through the machine.
-pub fn event<M: Machine>(tc: &TestCase, pick: Pick, edges: &[M::Edge]) -> EdgeEventOf<M> {
-    let edge = edges[pick.variant(tc, edges.len(), |index| index)].clone();
-    let labels = Label::<M>::ALL;
-    flotilla_schema::EdgeEvent {
-        edge: flotilla_state_machines::Edge::kind(&edge),
-        from: code_enum(tc, pick, labels),
-        to: code_enum(tc, pick.nth(1), labels),
-        writer: name(tc),
-        at: timestamp(tc),
-        payload: EdgePayload { edge, reads: reads(tc, pick) },
-    }
-}
-
-/// Up to two recorded reads, decoded text and all.
-pub fn reads(tc: &TestCase, pick: Pick) -> Vec<InputRead> {
-    list(tc, pick, 2, |_| InputRead {
-        kind: Cow::Owned(name(tc)),
-        name: name(tc),
-        version: tc.draw(gs::booleans()).then(|| Version(tc.draw(gs::integers::<u64>()))),
-    })
+    // Every master an engine edge names in these fixtures is a message at this home.
+    let master = |name: &str| Identity { kind: Resource::<Message>::CODE, name: name.to_owned(), home: LOCAL.to_owned() };
+    let edge = next.stored_edge_about(&previous, &event, master).expect("an applied edge is storable");
+    // The event is the edge's log entry, not a row of the resource (#3392 G8).
+    Some((edge, next.with_events(Records::new())))
 }
 
 /// A time at which the engine's arithmetic on `base` cannot overflow: `base` plus `by`, saturated.

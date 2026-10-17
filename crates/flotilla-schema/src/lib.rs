@@ -43,12 +43,12 @@ extern crate self as flotilla_schema;
 
 #[doc(hidden)]
 pub mod adapt;
-mod change;
 mod code;
 mod codec;
 mod ddl;
 mod descriptor;
 mod edge;
+mod event;
 mod frozen;
 mod history;
 mod inline;
@@ -63,20 +63,22 @@ mod traits;
 mod value;
 mod view;
 
-pub use change::{ChangeError, RowChange, RowOp, CHANGE_LIMITS};
 #[doc(hidden)]
 pub use code::{code_value, decode_code};
 pub use code::{Code, CodeError};
 pub use codec::{DecodeError, Decoder, EncodeError, Encoder};
-pub use ddl::{code_field, quote_ident, render_ddl, render_ddl_with, render_views, DdlMode, CODES_DDL, VIEW_SUFFIX};
+pub use ddl::{
+    code_field, quote_ident, render_ddl, render_ddl_with, render_views, DdlMode, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD, VIEW_SUFFIX,
+};
 pub use descriptor::{
     code_literal, CodeNames, ColumnDef, ColumnType, Condition, DescriptorError, Expansion, FieldColumns, Guard, Index, IndexProblem, Table,
     TableRole, TableSet, When, RECORD_VERSION, RESERVED_CHILD_COLUMNS, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES,
 };
 pub use edge::{
-    AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf, RowPath,
-    StateOf,
+    AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeHeader, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf,
+    RowPath, StateOf,
 };
+pub use event::{Cause, Change, Effect, Event, EventError, Named, Origin, Step, LOG_LIMITS};
 pub use flotilla_schema_derive::Stored;
 pub use frozen::{Freezable, Frozen};
 pub use history::{EdgeEvent, Labelled};

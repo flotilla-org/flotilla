@@ -1,12 +1,13 @@
 // Keep integration coverage in one executable to avoid linking the crate graph per module.
 // Tests share a process: isolate state and keep process-wide mutations in separate targets.
 mod bench;
-mod change_log;
 mod checks;
 mod ddl;
 mod edges;
 mod fixtures;
+mod history;
 mod interning;
+mod log;
 mod ownership;
 mod plans;
 mod queries;

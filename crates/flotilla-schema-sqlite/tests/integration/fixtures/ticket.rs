@@ -11,10 +11,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Edge, EdgeEvent, Labelled, Records, State, Stored, Timestamp};
+use flotilla_schema::{Edge, EdgeEvent, Labelled, State, Stored, Timestamp};
 use hegel::{generators as gs, TestCase};
 
-use super::{appended, code_enum, key, list, name, payload, records, stamp, text, timestamp, Fixture, Payload, Pick, SHAPES};
+use super::{key, list, name, payload, text, timestamp, Fixture, Payload, Pick, SHAPES};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 pub enum TicketLabel {
@@ -87,15 +87,13 @@ pub type TicketEvent = EdgeEvent<TicketLabel, TicketEdgeName, Payload<String>>;
 /// Open tickets of a queue: an index predicate on a label-plus-data state, its code taken from
 /// `TicketLabel`.
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Ticket", code = "tk", index(name = "open_by_queue", eq(queue), when(state in [Open])))]
+#[store(kind = "Ticket", code = "tk", edges = TicketEdgeName, index(name = "open_by_queue", eq(queue), when(state in [Open])))]
 pub struct Ticket {
     #[store(intern)]
     pub queue: String,
     pub title: String,
     #[store(state)]
     pub state: State<TicketState>,
-    #[store(history)]
-    pub edges: Records<TicketEvent>,
 }
 
 /// Map values from a two-letter alphabet, so a changed note often keeps its value.
@@ -195,19 +193,6 @@ pub fn next_value(tc: &TestCase, pick: Pick, previous: &TicketState) -> TicketSt
     }
 }
 
-fn edge_event(tc: &TestCase, pick: Pick) -> TicketEvent {
-    use TicketLabel::*;
-    let labels = [Draft, Open, Closed];
-    EdgeEvent {
-        edge: code_enum(tc, pick, &[TicketEdgeName::Edit, TicketEdgeName::Move]),
-        from: code_enum(tc, pick, &labels),
-        to: code_enum(tc, pick.nth(1), &labels),
-        writer: name(tc),
-        at: timestamp(tc),
-        payload: payload(tc, pick, text(tc)),
-    }
-}
-
 /// The transition from `previous` to `value`: the event leaves and enters the two labels, and the
 /// next state's since is the event's time on a label change, the previous since otherwise.
 pub fn transition(
@@ -221,7 +206,7 @@ pub fn transition(
     let edge = if from == to { TicketEdgeName::Edit } else { TicketEdgeName::Move };
     let event = EdgeEvent { edge, from, to, writer: name(tc), at, payload: payload(tc, pick, text(tc)) };
     let next = State::new(value, if from == to { previous.since } else { at });
-    let built = Edge::transition(Ticket::STATE, previous, &next, Ticket::EDGES, &event).expect("transition");
+    let built = Edge::transition(Ticket::STATE, previous, &next, &event).expect("transition");
     (built, next, event)
 }
 
@@ -230,12 +215,7 @@ impl Fixture for Ticket {
     const COVERING: usize = SHAPES;
 
     fn generate(tc: &TestCase, pick: Pick) -> Ticket {
-        Ticket {
-            queue: name(tc),
-            title: text(tc),
-            state: State::new(state_value(tc, pick), timestamp(tc)),
-            edges: records(tc, pick, 2, |pick| edge_event(tc, pick)),
-        }
+        Ticket { queue: name(tc), title: text(tc), state: State::new(state_value(tc, pick), timestamp(tc)) }
     }
 
     fn evolve(&self, tc: &TestCase, _pick: Pick) -> Ticket {
@@ -244,11 +224,11 @@ impl Fixture for Ticket {
 
     fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<Ticket>, Ticket)> {
         let value = next_value(tc, pick, &self.state.value);
-        let (edge, state, event) = transition(tc, pick, &self.state, value);
-        Some((edge, Ticket { state, edges: appended(tc, &self.edges, event), ..self.clone() }))
+        let (edge, state, _) = transition(tc, pick, &self.state, value);
+        Some((edge, Ticket { state, ..self.clone() }))
     }
 
-    fn stamped(&self, before: Option<&Ticket>, version: u64) -> Ticket {
-        Ticket { edges: stamp(&self.edges, before.map(|before| &before.edges), version, |edge, _| edge.clone()), ..self.clone() }
+    fn stamped(&self, _before: Option<&Ticket>, _version: u64) -> Ticket {
+        self.clone()
     }
 }

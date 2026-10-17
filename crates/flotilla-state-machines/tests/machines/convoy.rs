@@ -2,15 +2,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Code, CodeEnum, Decoder, Encoder, Timestamp};
+use flotilla_schema::{Code, CodeEnum, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
-        Abandon, Authority, Convoy, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoyState, Deliver, Keep,
+        Abandon, Authority, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoyState, Deliver, Keep,
         MemoryConvoyWorld, Priority, Promise, PromiseId,
         PromiseState::{self, Kept, Pending, Retracted},
         Quota, Readmit, Retract, VesselClass,
     },
-    Coded, Diagram, EdgeEventOf, Home, Kind, Machine, Ref, StateValue, WriteError,
+    Coded, Diagram, EdgePayload, Home, Kind, Machine, Ref, StateValue, WriteError,
 };
 
 const YES: &str = "yes";
@@ -257,23 +257,25 @@ fn an_authorised_edge_records_its_authority_read() {
     assert!(event.payload.reads.iter().any(|read| read.kind == <Authority as Kind>::NAME && read.name == YES));
 }
 
-// Every convoy edge's event is storable as it is: the schema codec's CBOR profile takes text map
-// keys only, so a readmission's quota (keyed by vessel class) travels as a list of pairs, and each
-// event decodes to the one the home appended.
+// Every convoy edge's event is storable as it is: the log entry's payload is an inline CBOR
+// document, whose profile takes text map keys only, so a readmission's quota (keyed by vessel
+// class) travels as a list of pairs, and each payload decodes to the one the home appended.
 #[test]
 fn convoy_edge_events_round_trip_through_the_schema_codec() {
     let mut home = Home::<Convoy>::new("home").expect("valid");
     home.create("c", request(&[0, 1], &[(0, 1), (3, 2)]), Timestamp(0)).expect("admitted");
     let world = world();
-    home.apply("c", readmit(&[(0, 2), (3, 2)], YES), &world, Timestamp(1)).expect("readmitted");
-    home.apply("c", Keep { promise: PromiseId(0) }, &world, Timestamp(2)).expect("kept");
-    home.apply("c", Retract { promise: PromiseId(1), by: "lead".into(), authority: Ref::new(YES) }, &world, Timestamp(3))
-        .expect("retracted");
-    home.apply("c", Deliver, &world, Timestamp(4)).expect("delivered");
-    let events = home.get("c").expect("exists").events();
-    assert_eq!(events.len(), 4);
-    for row in events {
-        let rows = Encoder::encode(&row.record).expect("encodes");
-        assert_eq!(Decoder::decode::<EdgeEventOf<Convoy>>(rows).expect("decodes"), row.record);
+    let edges: [(ConvoyEdge, i64); 4] = [
+        (readmit(&[(0, 2), (3, 2)], YES).into(), 1),
+        (Keep { promise: PromiseId(0) }.into(), 2),
+        (Retract { promise: PromiseId(1), by: "lead".into(), authority: Ref::new(YES) }.into(), 3),
+        (Deliver.into(), 4),
+    ];
+    for (edge, at) in edges {
+        let previous = home.get("c").expect("exists").stored_state().clone();
+        let event = home.apply("c", edge, &world, Timestamp(at)).expect("applied").clone();
+        let header = home.get("c").expect("exists").stored_edge(&previous, &event).expect("edge").into_parts().event;
+        assert_eq!((header.edge, header.from, header.to), (event.edge.code(), event.from.code(), event.to.code()));
+        assert_eq!(header.payload::<EdgePayload<ConvoyEdge>>().expect("decodes"), event.payload);
     }
 }

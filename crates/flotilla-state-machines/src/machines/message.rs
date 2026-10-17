@@ -9,8 +9,9 @@
 //!
 //! A receipt is a consumer session's `Receive` edge whose master is this
 //! message (G11); [`Receipts`] is those entries about the message, by
-//! session. Read through the world until the per-home log's `about` index
-//! serves them. Also keyed by the message's own name: [`Reply`] (the
+//! session, read through the world: [`ReceiptLog`] serves them from the
+//! per-home log's entries about the message (D1), and the in-memory world's
+//! table stands in for tests, replay and conformance. Also keyed by the message's own name: [`Reply`] (the
 //! expiry check) and [`DeliveryFailure`]. [`Binding`] and [`AppliedThrough`] are
 //! keyed by the spec's inbox: the inbox's consumer binding and the applied
 //! keepalive watermark of the bound consumer host's stream into this home.
@@ -22,15 +23,19 @@
 //! (#3392 rulings G4 and G5).
 //!
 //! The stored kind is `Resource<Message>` (code `ms`), declared by
-//! [`MessageSpec`]: the envelope as columns, the state, and the edge log.
-//! The consumer's receipts are its session's edges.
+//! [`MessageSpec`]: the envelope as columns and the state; its edges are
+//! its log entries. The consumer's receipts are its session's edges.
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{Stored, Timestamp};
+use flotilla_schema::{Cause, CodeEnum, Event, EventError, KindSpec, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Transport, Version, WrongState};
+use crate::{
+    edges,
+    machines::agent_session::{AgentSessionEdge, AgentSessionEdgeKind, AgentSessionSpec, Receive},
+    states, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Transport, Version, WrongState,
+};
 
 /// What would settle the message. `Nothing` settles on delivery.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
@@ -194,6 +199,58 @@ pub struct Receipts;
 impl Kind for Receipts {
     const NAME: &'static str = "message_receipts";
     type Value = BTreeMap<String, Transport>;
+}
+
+/// [`Receipts`] served from the store's log (#3392 G11, D1): the entries
+/// about each message, as a store's `about` read pages them, give the
+/// receipts a message's gates read. An entry about a message that is not an
+/// AgentSession's `Receive` for it is no receipt and is skipped; a `Receive`
+/// whose payload does not decode is refused. A message's version is the
+/// number of receipts about it: entries are only appended while the
+/// message is live, so a later read never sees fewer. A message with no
+/// entries reads as absent.
+#[derive(Debug, Default)]
+pub struct ReceiptLog {
+    messages: BTreeMap<String, (Version, BTreeMap<String, Transport>)>,
+}
+
+impl ReceiptLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records `entries`, the log entries about `message`, as its receipts:
+    /// the session (each entry's resource) and the transport of its
+    /// `Receive`, a later receipt from one session replacing an earlier one.
+    pub fn insert<'a>(&mut self, message: &str, entries: impl IntoIterator<Item = &'a Event>) -> Result<(), EventError> {
+        let mut receipts = BTreeMap::new();
+        let mut count = 0;
+        for entry in entries {
+            let Cause::Edge { edge, .. } = entry.cause else { continue };
+            if entry.kind != <AgentSessionSpec as KindSpec>::CODE || edge != CodeEnum::code(&AgentSessionEdgeKind::Receive) {
+                continue;
+            }
+            let Some(payload) = entry.payload::<EdgePayload<AgentSessionEdge>>() else { continue };
+            if let AgentSessionEdge::Receive(Receive { message: about, transport }) = payload?.edge {
+                if about == message {
+                    receipts.insert(entry.name.clone(), transport);
+                    count += 1;
+                }
+            }
+        }
+        if count == 0 {
+            self.messages.remove(message);
+        } else {
+            self.messages.insert(message.to_owned(), (Version(count), receipts));
+        }
+        Ok(())
+    }
+}
+
+impl Source<Receipts> for ReceiptLog {
+    fn lookup(&self, reference: &Ref<Receipts>) -> Option<(Version, &BTreeMap<String, Transport>)> {
+        self.messages.get(reference.name()).map(|(version, receipts)| (*version, receipts))
+    }
 }
 
 /// An inbox's consumer binding.
