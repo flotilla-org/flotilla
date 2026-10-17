@@ -13,6 +13,9 @@
 //!   cargo test --release -p flotilla-daemon --locked --test dummy_fleet_load load_baseline -- --ignored --nocapture
 //! ```
 //!
+//! `FLOTILLA_LOAD_TRACE=1` records controller errors/restarts and slow Message
+//! receipt timestamps, including the durable submission instant, to stderr.
+//!
 //! `FLOTILLA_LOAD_MAX_RESIDENT_GIB` stops admitting convoys once the process
 //! holds that much memory, so a plan the host cannot hold reports how far it
 //! got. Progress lines every 30 s survive a run the host kills.
@@ -216,6 +219,11 @@ async fn watch_messages(backend: &ResourceBackend, view: Arc<HomeView>) {
             if delivered.insert(message.metadata.name.clone()) {
                 let latency = receipt.delivered_at - message.metadata.creation_timestamp;
                 view.turn_delivery.record(latency.to_std().unwrap_or_default());
+                if latency >= chrono::Duration::seconds(5) {
+                    tracing::info!(name = %message.metadata.name, receiver = %message.spec.receiver,
+                        created_at = %message.metadata.creation_timestamp, submitted_at = ?message.status.as_ref().and_then(|s| s.submission.as_ref()).map(|s| s.started_at),
+                        delivered_at = %receipt.delivered_at, latency_ms = latency.num_milliseconds(), "load slow message receipt");
+                }
             }
         }
     });
@@ -400,6 +408,14 @@ async fn load_driver_smoke() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "load measurement: run explicitly with FLOTILLA_LOAD_* settings"]
 async fn load_baseline() {
+    if std::env::var_os("FLOTILLA_LOAD_TRACE").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter("flotilla_daemon::runtime::message=warn,flotilla_daemon::runtime::terminal=warn,flotilla_daemon::supervisor=warn,dummy_fleet_load=info")
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .try_init()
+            .expect("load tracing");
+    }
     let homes = env_or("FLOTILLA_LOAD_DAEMONS", 1usize);
     let fleet = InProcessFleet::start(homes, &dummy_fleet_settings()).await;
     let plan = LoadPlan {

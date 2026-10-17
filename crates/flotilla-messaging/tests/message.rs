@@ -2678,3 +2678,71 @@ fn inbox_delivery_deadline_is_earliest(tc: hegel::TestCase) {
         assert_eq!(inbox.next_delivery_wake(at(10)).await.unwrap(), None);
     });
 }
+
+// Separate inbox handles share a store, but not their process-local admission
+// locks. Recovery racing the original admission must converge on one order.
+#[test]
+fn concurrent_partial_admissions_preserve_one_acceptance_order() {
+    use flotilla_store::{ReadObserver, ReadOperation};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Barrier,
+    };
+
+    #[derive(Debug)]
+    struct ConcurrentAdmissionReads {
+        armed: AtomicBool,
+        arrivals: AtomicUsize,
+        barrier: Barrier,
+    }
+    impl ReadObserver for ConcurrentAdmissionReads {
+        fn read(&self, kind: &str, operation: ReadOperation, _: usize) {
+            if self.armed.load(Ordering::SeqCst)
+                && kind == "Message"
+                && operation == ReadOperation::Query
+                && self.arrivals.fetch_add(1, Ordering::SeqCst) < 2
+            {
+                // Message queries notify after releasing the store lock. Both
+                // real admissions have now read the same interrupted intent.
+                self.barrier.wait();
+            }
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    let observer =
+        Arc::new(ConcurrentAdmissionReads { armed: AtomicBool::new(false), arrivals: AtomicUsize::new(0), barrier: Barrier::new(2) });
+    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_observer(observer.clone()));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    let meta = InputMeta::builder().name("racing-admission".into()).build();
+    let intent = spec(None, MessageExpectation::Reply);
+    runtime.block_on(backend.using::<Message>("flotilla").create(&meta, &intent)).expect("interrupted admission");
+    observer.armed.store(true, Ordering::SeqCst);
+    let results = std::thread::scope(|scope| {
+        let tasks: Vec<_> = (0..2)
+            .map(|_| {
+                let inbox = MessageInbox::new(backend.clone(), "flotilla");
+                let meta = &meta;
+                let intent = &intent;
+                scope.spawn(move || {
+                    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(inbox.accept(
+                        meta,
+                        intent,
+                        at(10),
+                    ))
+                })
+            })
+            .collect();
+        tasks.into_iter().map(|task| task.join().expect("admission thread")).collect::<Vec<_>>()
+    });
+    let admitted: Vec<_> = results
+        .into_iter()
+        .map(|result| match result.expect("both admissions succeed") {
+            MessageAdmission::Accepted(message) => message,
+            other => panic!("unexpected admission {other:?}"),
+        })
+        .collect();
+    assert_eq!(admitted[0].status, admitted[1].status);
+    assert!(admitted[0].status.as_ref().expect("admitted").accepted_sequence.is_some());
+}

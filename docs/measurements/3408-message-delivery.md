@@ -7,6 +7,121 @@ production controller cadences, and no concurrent builds during measurement.
 The reports below describe the initial implementation at `d78d3c180`.
 This is a small vessel comparison, not the operator's feta d1-n1000 check.
 
+## Operator investigation: the failed passes and latency tail
+
+The original two-failure run did not initialize a tracing subscriber, and its
+SQLite temporary directory was removed at shutdown. Its two exact historical
+error objects/resource IDs cannot be recovered from the retained counters.
+At that revision (`d78d3c180`), only `reconcile_delivery` errors incremented the
+Message failure counter: deadline-query and dependency-watch errors did not.
+This already excludes those two paths as the source of the original counter.
+The same 100-convoy settings with narrow tracing reproduced **two failed
+passes**, with these actual returned errors:
+
+```text
+2026-10-17T15:39:35.896661Z phase=delivery
+resource conflict for message-a7b3cf1b7d753aa0adf9c095c3c408016b10be79b9bf0ed0cc7225e4db00968d: stale resourceVersion
+2026-10-17T15:39:36.678848Z phase=delivery
+invalid resource: message acceptance order cannot change
+```
+
+The supervisor restarted the namespace loop after 100 ms and 200 ms,
+respectively. Neither error came from the deadline timer or a dependency-watch
+restart. These are observed reproductions, not a retroactive claim to know the
+unlogged historical resource IDs.
+
+### Causes, classification, and fixes
+
+1. **Concurrent completion of an interrupted admission.** The daemon's CrewOps
+   and the leaf engine each cache their own `MessageInbox` handles. These share
+   the store but not their process-local admission locks. Both can read the
+   same status-less Message. `accept_locked` formerly initialized status using
+   the previously read resource version without retrying if the other handle
+   won first. The losing write returned `stale resourceVersion`. A second
+   traced run with the **old per-message controller from `782cf8037`** returned
+   the same admission error at 15:44:27.830090Z (expected version/sequence 364).
+   This race is pre-existing, not introduced by the namespace loop.
+   Admission now retries bounded optimistic conflicts, re-reads the winner,
+   and keeps its initialized status and canonical predecessor.
+2. **A stale delivery snapshot clears the new admission order.** A pass can
+   capture an intent before admission assigns `accepted_sequence`. The former
+   `MessageInbox::write` re-read the latest resource version, but wrote the
+   status from the earlier snapshot. It therefore attempted to replace a
+   newly assigned sequence with `None`; the resource validator correctly
+   rejected it. A diagnostic run captured `snapshot_sequence=None`,
+   `current_sequence=Some(499)`, `requested_sequence=None`, and a requested
+   `Deliverable` phase. This write implementation was also unchanged from the
+   base commit. Delivery now preserves the sequence from the current stored
+   status when applying its proposed status.
+
+The namespace controller makes an escaped pass error a supervised loop restart;
+the old controller isolated it as an object reconcile error and had many queued
+opportunities to try another whole-inbox pass. That difference did not create
+the store races. Fixing them in messaging avoids relying on redundant passes or
+restart/relist to make progress. No admission/routing intent or stored shape
+changes.
+
+Both fixes have deterministic tests using the real in-memory store:
+
+```sh
+cargo test -p flotilla-messaging --locked --test message concurrent_partial_admissions_preserve_one_acceptance_order
+cargo test -p flotilla-messaging --locked --lib stale_delivery_snapshot_preserves_completed_admission
+```
+
+Both tests failed before the fixes with the exact corresponding error above
+and passed after. The first uses two independent inboxes and a read observer
+barrier after their real Message queries to force the competing initialization.
+The second holds a real status-less snapshot across completion of admission,
+then exercises the delivery status writer. Two targeted mutants (drop conflict
+retry; drop preservation of the current sequence) each make their test fail.
+
+### Does this explain the p99/max regression?
+
+**Not fully.** Removing the failures does not remove the approximately
+30-second tail, and the old controller reproduces that tail too. Repeated small
+runs show p99 sensitivity to a few slow receipts; they do not establish a
+causal latency improvement or regression from the new scheduler.
+All rows below use p50 / p90 / p99 / max and the same 100-convoy load settings:
+
+| Diagnostic run | Message failures | Message reconcile | Turn delivery |
+|---|---:|---|---|
+| Unfixed namespace, two errors captured | 2 | 98.3 / 475 / 2097 / 2169 ms (n=270) | 1966 / 4456 / 32506 / 34426 ms (n=192) |
+| Unfixed namespace, status-write details captured | 3 | 115 / 508 / 1901 / 2856 ms (n=275) | 1835 / 4719 / 7340 / 31900 ms (n=190) |
+| Old per-message scheduling | 1 | 3.3 / 254 / 1114 / 1977 ms (n=634) | 2032 / 4456 / 32506 / 33431 ms (n=190) |
+| Namespace with both race fixes | **0** | 123 / 590 / 1311 / 2080 ms (n=256) | 1573 / 3801 / 9961 / 31475 ms (n=183) |
+
+For example, the old-controller run recorded a 31.748-second receipt whose
+Message was created at 15:44:30.273325729, had durable submission intent at
+15:44:30.360732471, and received its receipt at 15:45:02.021594217. That is only
+87 ms before intent and 31.661 seconds after it. The zero-failure fixed run's
+maximum Message was created at 15:49:17.802443435, had submission intent at
+15:49:18.029947868, and received its receipt at 15:49:49.277894019: 228 ms before
+intent and 31.248 seconds after. The trace measures durable intent, **not** the
+instant of terminal input, so it does not distinguish waiting for guarded input
+readiness from waiting for acceptance evidence. It does show that these tails
+are not explained by a queue of Message-name reconciles or the two errors'
+300 ms of supervisor backoff alone. A contribution from aborted pass work to
+individual other receipts is not excluded.
+
+`FLOTILLA_LOAD_TRACE=1` now opt-in enables structured controller error/restart
+logs and slow-receipt timestamps in the standalone ignored harness. Runtime
+failure logs distinguish `phase=delivery` from `phase=deadline`. Temporary
+messaging write diagnostics were removed. To repeat the smaller diagnostic run:
+
+```sh
+FLOTILLA_LOAD_TRACE=1 FLOTILLA_LOAD_DAEMONS=1 FLOTILLA_LOAD_RUNNING=100 \
+FLOTILLA_LOAD_RAMP_PER_SECOND=20 FLOTILLA_LOAD_MERGE_AFTER_MS=180000 \
+FLOTILLA_LOAD_WINDOW_SECS=60 FLOTILLA_LOAD_REPORT=/tmp/message-diagnostic \
+cargo test -p flotilla-daemon --locked --test dummy_fleet_load load_baseline -- --ignored --nocapture \
+  > /tmp/message-diagnostic.log 2>&1
+```
+
+Captured runs and red/mutant outputs are retained in crew artifact
+`artifact/artifact-edead40a086d0a754193e1cebea1fe44388e198ad3942e43561d515837771243`.
+
+The operator's full d1-n1000 comparison and the remaining intent-to-receipt tail
+remain tracked in #3421. The crew did not run the operator-only full setting.
+
 ## Commands
 
 ```sh
@@ -215,7 +330,7 @@ Open at the end of the window:
 Run from this branch on feta, using the original release load profile:
 
 ```sh
-FLOTILLA_LOAD_DAEMONS=1 FLOTILLA_LOAD_RUNNING=1000 \
+FLOTILLA_LOAD_TRACE=1 FLOTILLA_LOAD_DAEMONS=1 FLOTILLA_LOAD_RUNNING=1000 \
 FLOTILLA_LOAD_RAMP_PER_SECOND=20 FLOTILLA_LOAD_MERGE_AFTER_MS=180000 \
 FLOTILLA_LOAD_WINDOW_SECS=300 FLOTILLA_LOAD_REPORT=/tmp/message-d1-n1000 \
 cargo test --release -p flotilla-daemon --locked --test dummy_fleet_load load_baseline -- --ignored --nocapture

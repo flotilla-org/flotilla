@@ -749,8 +749,12 @@ impl MessageInbox {
         if current.status.as_ref().is_some_and(|current| current.phase.is_terminal()) {
             return Ok(());
         }
-        if current.status.as_ref() != Some(status) {
-            self.messages.update_status(&message.metadata.name, &current.metadata.resource_version, status).await?;
+        let mut status = status.clone();
+        // Admission can finish after this pass captured a status-less intent.
+        // Delivery must never clear an order assigned since that snapshot.
+        status.accepted_sequence = current.status.as_ref().and_then(|current| current.accepted_sequence).or(status.accepted_sequence);
+        if current.status.as_ref() != Some(&status) {
+            self.messages.update_status(&message.metadata.name, &current.metadata.resource_version, &status).await?;
         }
         Ok(())
     }
@@ -932,6 +936,33 @@ async fn release(transport: &dyn MessageTransport, batch: &MessageBatch) {
 #[cfg(test)]
 mod framing_tests {
     use super::*;
+
+    // A pass can hold a snapshot from before admission finishes. Its later
+    // status write must preserve the immutable order assigned in the meantime.
+    #[tokio::test]
+    async fn stale_delivery_snapshot_preserves_completed_admission() {
+        let backend = crate::ResourceBackend::new(flotilla_store_testkit::memory_backend());
+        let inbox = MessageInbox::new(backend.clone(), "project");
+        let stored = backend.using::<Message>("project");
+        let mut intent = messages().remove(0);
+        intent.receiver = "project/convoy/work/coder".into();
+        let meta = InputMeta::builder().name("admission-race".into()).build();
+        let snapshot = stored.create(&meta, &intent).await.expect("partial intent");
+        let mut proposed = status_for(&snapshot);
+        proposed.phase = MessagePhase::Deliverable;
+        let admitted = match inbox.accept(&meta, &intent, Utc::now()).await.expect("finish admission") {
+            crate::MessageAdmission::Accepted(message) => message,
+            other => panic!("unexpected admission {other:?}"),
+        };
+        assert!(admitted.status.as_ref().expect("admitted status").accepted_sequence.is_some());
+        inbox.write(&snapshot, &proposed).await.expect("stale pass must preserve admission order");
+        let current = stored.get(&meta.name).await.expect("current message");
+        assert_eq!(
+            current.status.as_ref().expect("status").accepted_sequence,
+            admitted.status.as_ref().expect("admitted status").accepted_sequence
+        );
+        assert_eq!(current.status.expect("status").phase, MessagePhase::Deliverable);
+    }
 
     fn messages() -> Vec<MessageSpec> {
         vec![

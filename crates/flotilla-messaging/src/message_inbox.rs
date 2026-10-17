@@ -174,17 +174,39 @@ impl MessageInbox {
                 .await?;
             }
         }
-        let status = crate::MessageStatus::builder()
-            .phase(MessagePhase::Accepted)
-            .since(message.metadata.creation_timestamp)
-            // Kubernetes resource versions are opaque on older or extension
-            // API servers and can exceed u64. Their creation timestamps and
-            // immutable names give a deterministic fallback without refusing admission.
-            .maybe_accepted_sequence(if self.backend.serves_read_views() { None } else { message.metadata.resource_version.parse().ok() })
-            .reason("waiting for receiver resolution".into())
-            .build();
-        let message = self.messages.update_status(&meta.name, &message.metadata.resource_version, &status).await?;
-        Ok(MessageAdmission::Accepted(message))
+        // Separate inbox handles can finish the same interrupted admission.
+        // Re-read after conflicts and keep the winner's immutable order/status.
+        let mut message = message;
+        for _ in 0..3 {
+            if let Some(reference) = message.status.as_ref().and_then(|status| status.canonical_predecessor.as_ref()) {
+                if reference.namespace != self.namespace {
+                    return Err(ResourceError::invalid("canonical predecessor is outside the receiver inbox"));
+                }
+                let predecessor = self.messages.get(&reference.name).await?;
+                return Ok(MessageAdmission::Suppressed { predecessor });
+            }
+            if message.status.is_some() {
+                return Ok(MessageAdmission::Accepted(message));
+            }
+            let status = crate::MessageStatus::builder()
+                .phase(MessagePhase::Accepted)
+                .since(message.metadata.creation_timestamp)
+                // Kubernetes resource versions are opaque; preserve the existing
+                // timestamp/name fallback on backends serving read views.
+                .maybe_accepted_sequence(if self.backend.serves_read_views() {
+                    None
+                } else {
+                    message.metadata.resource_version.parse().ok()
+                })
+                .reason("waiting for receiver resolution".into())
+                .build();
+            match self.messages.update_status(&meta.name, &message.metadata.resource_version, &status).await {
+                Ok(message) => return Ok(MessageAdmission::Accepted(message)),
+                Err(ResourceError::Conflict { .. }) => message = self.messages.get(&meta.name).await?,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ResourceError::conflict(&meta.name, "admission retry budget exhausted"))
     }
 }
 

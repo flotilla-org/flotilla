@@ -114,8 +114,12 @@ async fn run_delivery(
         metrics.queue_peak.observe(1);
         let started = tokio::time::Instant::now();
         let result = async {
-            inbox.reconcile_delivery(transport, Utc::now()).await?;
-            inbox.next_delivery_wake(Utc::now()).await
+            inbox.reconcile_delivery(transport, Utc::now()).await.inspect_err(|error| {
+                tracing::warn!(controller = "Message", phase = "delivery", %error, "message inbox pass failed");
+            })?;
+            inbox.next_delivery_wake(Utc::now()).await.inspect_err(|error| {
+                tracing::warn!(controller = "Message", phase = "deadline", %error, "message inbox pass failed");
+            })
         }
         .await;
         // Include failed attempts, matching the object-controller histogram.
