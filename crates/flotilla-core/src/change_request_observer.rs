@@ -78,6 +78,8 @@ struct ChangeRequestRefresherInner {
     subject_locks: Mutex<HashMap<ChangeRequestKey, Weak<Mutex<()>>>>,
     relay_healthy: std::sync::atomic::AtomicBool,
     relay_wake: Notify,
+    #[cfg(test)]
+    grace_schedule_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl ChangeRequestRefresher {
@@ -100,6 +102,8 @@ impl ChangeRequestRefresher {
                 subject_locks: Mutex::new(HashMap::new()),
                 relay_healthy: std::sync::atomic::AtomicBool::new(false),
                 relay_wake: Notify::new(),
+                #[cfg(test)]
+                grace_schedule_reads: Default::default(),
             }),
         }
     }
@@ -254,6 +258,8 @@ impl ChangeRequestRefresher {
         freshness: Option<DateTime<Utc>>,
         created_at: DateTime<Utc>,
     ) -> DateTime<Utc> {
+        #[cfg(test)]
+        self.inner.grace_schedule_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let active = self.inner.active.lock().await;
         let (next, cadence) = active.get(subject).map_or_else(
             || {
@@ -263,6 +269,11 @@ impl ChangeRequestRefresher {
             |refresh| (refresh.next_refresh_at, refresh.scheduled_cadence),
         );
         cadence_deadline(next, cadence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn grace_schedule_reads(&self) -> usize {
+        self.inner.grace_schedule_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn retry_grace_deadline(&self, retry_at: DateTime<Utc>) -> DateTime<Utc> {

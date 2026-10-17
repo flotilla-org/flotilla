@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
 use flotilla_resources::{
     actor_obligation,
-    address::{leaf_for, subject_address},
+    address::{leaf_address, leaf_for, record_name, subject_address},
     instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest, Checkout,
     CheckoutSpec, ControllerRetry, Convoy, ConvoyPhase, CrewWorkPhase, Forge, InstantiatedExit, LeafMaker, ResourceError, ResourceObject,
     RetryCeiling, StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WorkPhase,
@@ -66,6 +66,59 @@ struct CachedLocalConvoys {
     objects: Arc<SharedConvoyInventory>,
 }
 
+// Only cache positive proofs whose time-sensitive leaves are final (Merged
+// state/readiness or a claim exit). Every resource input is revision-keyed;
+// mutable observations and digest freshness always use the evaluator again.
+#[derive(PartialEq, Eq)]
+struct FinalSettlementInputs {
+    convoy: String,
+    vessels: Vec<(String, String)>,
+    checkouts: Vec<(String, String)>,
+    observations: BTreeMap<String, String>,
+    forges: Vec<flotilla_resources::ForgeSpec>,
+}
+
+fn selected_versions<R: flotilla_resources::Resource>(objects: &BTreeMap<String, ResourceObject<R>>) -> Vec<(String, String)> {
+    objects.iter().map(|(name, object)| (name.clone(), object.metadata.resource_version.clone())).collect()
+}
+
+impl FinalSettlementInputs {
+    fn new(
+        convoy: &ResourceObject<Convoy>,
+        exit: &InstantiatedExit,
+        vessels: &BTreeMap<String, ResourceObject<Vessel>>,
+        checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+        observations: &BTreeMap<String, ResourceObject<ChangeRequest>>,
+        forges: &[flotilla_resources::ForgeSpec],
+    ) -> Option<Self> {
+        let mut revisions = BTreeMap::new();
+        match exit {
+            InstantiatedExit::Claim => {}
+            InstantiatedExit::Table(entries) => {
+                for leaf in entries.iter().flat_map(|entry| &entry.leaves) {
+                    if !matches!(leaf.field_path.as_str(), ".state" | ".ready") {
+                        return None;
+                    }
+                    let name = record_name(&leaf_address(&leaf.address, forges).ok()?)?;
+                    let observation = observations.get(&name)?;
+                    if observation.status.as_ref()?.state.value != Some(flotilla_resources::ObservedChangeRequestState::Merged) {
+                        return None;
+                    }
+                    revisions.insert(name, observation.metadata.resource_version.clone());
+                }
+            }
+            InstantiatedExit::None => return None,
+        }
+        Some(Self {
+            convoy: convoy.metadata.resource_version.clone(),
+            vessels: selected_versions(vessels),
+            checkouts: selected_versions(checkouts),
+            observations: revisions,
+            forges: forges.to_vec(),
+        })
+    }
+}
+
 pub(super) struct LeafViews {
     pub(super) defaults: WatchView<flotilla_resources::CrewDefaults>,
     pub(super) fleet: WatchView<flotilla_resources::FleetDesignation>,
@@ -79,6 +132,9 @@ pub(super) struct LeafViews {
     pub(super) messages: WatchView<flotilla_resources::Message>,
     pub(super) forges: WatchView<Forge>,
     local_convoys: tokio::sync::Mutex<Option<CachedLocalConvoys>>,
+    final_settlements: std::sync::Mutex<HashMap<String, FinalSettlementInputs>>,
+    #[cfg(test)]
+    pub(super) settlement_evaluations: std::sync::atomic::AtomicUsize,
 }
 impl LeafViews {
     async fn start(backend: &ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
@@ -95,6 +151,9 @@ impl LeafViews {
             messages: WatchView::start(backend.clone(), namespace).await?,
             forges: WatchView::start(backend.clone(), namespace).await?,
             local_convoys: Default::default(),
+            final_settlements: Default::default(),
+            #[cfg(test)]
+            settlement_evaluations: Default::default(),
         })
     }
     async fn local_convoys(&self) -> Result<Arc<HashMap<String, SharedConvoy>>, String> {
@@ -301,6 +360,13 @@ impl ReconcilerWake {
         let observed_change_requests =
             freshest_change_requests(&change_request_sources(change_request_list)).into_iter().collect::<BTreeMap<_, _>>();
         let vessel_sources = views.vessels.list().await.map_err(|error| error.to_string())?.items;
+        // Pruning bounds memory. Revision keys also invalidate proofs when a
+        // convoy leaves and re-enters Landing between these snapshots.
+        views.final_settlements.lock().expect("settlement cache lock poisoned").retain(|name, _| {
+            convoys
+                .get(name)
+                .is_some_and(|convoy| convoy.convoy().status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing))
+        });
         let mut desired = Vec::<LeafSubscriptionRow>::new();
         for convoy in convoys.values().map(ConvoyRead::convoy).filter(|convoy| {
             convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing))
@@ -368,7 +434,8 @@ impl ReconcilerWake {
                     episode_key: EpisodeKeyFields::default(),
                 });
             }
-            for vessel in select_convoy_children(convoy, &vessel_sources).values() {
+            let convoy_vessels = select_convoy_children(convoy, &vessel_sources);
+            for vessel in convoy_vessels.values() {
                 let Some(vessel_status) = vessel.status.as_ref() else { continue };
                 let Some(environment_ref) = vessel_status.environment_ref.as_ref() else { continue };
                 for (kind, retry) in [
@@ -502,20 +569,52 @@ impl ReconcilerWake {
                 }
                 continue;
             }
-            // Use the same settlement evaluator as the controller. This includes
-            // claim exits and Merged finality, rather than inferring satisfaction
-            // from an empty subscription set.
-            let settlement = flotilla_resources::evaluate_landing_settlement(
-                convoy,
-                &select_convoy_children(convoy, &vessel_sources).into_iter().map(|(name, object)| (name, object.clone())).collect(),
-                &checkouts.into_iter().map(|(name, object)| (name, object.clone())).collect(),
-                &observed_change_requests,
-                &forges,
-                self.subscriptions.change_request_stale_after(),
-                flotilla_resources::LANDING_EVIDENCE_TTL,
-                self.subscriptions.inner.clock.now(),
-            );
-            if settlement.satisfied {
+            // Instantiation failure disables caching, but settlement still runs
+            // before deciding whether exit-table subscriptions can be derived.
+            let exit = instantiate_exit(convoy, &forges);
+            let final_inputs = exit
+                .as_ref()
+                .ok()
+                .and_then(|exit| FinalSettlementInputs::new(convoy, exit, &convoy_vessels, &checkouts, &observed_change_requests, &forges));
+            let cached = final_inputs.as_ref().is_some_and(|inputs| {
+                views.final_settlements.lock().expect("settlement cache lock poisoned").get(&convoy.metadata.name) == Some(inputs)
+            });
+            let satisfied = if cached {
+                true
+            } else {
+                #[cfg(test)]
+                views.settlement_evaluations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Use the same evaluator as the controller. Reuse the child
+                // selections above without cloning their resource bodies again.
+                let settlement = flotilla_resources::evaluate_landing_settlement(
+                    convoy,
+                    &convoy_vessels,
+                    &checkouts,
+                    &observed_change_requests,
+                    &forges,
+                    self.subscriptions.change_request_stale_after(),
+                    flotilla_resources::LANDING_EVIDENCE_TTL,
+                    self.subscriptions.inner.clock.now(),
+                );
+                if settlement.satisfied
+                    && matches!(
+                        settlement.mode,
+                        flotilla_resources::SettlementMode::ClaimExit | flotilla_resources::SettlementMode::WorldTerminal
+                    )
+                {
+                    if let Some(inputs) = final_inputs {
+                        views
+                            .final_settlements
+                            .lock()
+                            .expect("settlement cache lock poisoned")
+                            .insert(convoy.metadata.name.clone(), inputs);
+                    }
+                } else {
+                    views.final_settlements.lock().expect("settlement cache lock poisoned").remove(&convoy.metadata.name);
+                }
+                settlement.satisfied
+            };
+            if satisfied {
                 let now = self.subscriptions.inner.clock.now();
                 desired.push(LeafSubscriptionRow {
                     id: uuid::Uuid::nil(),
@@ -538,7 +637,7 @@ impl ReconcilerWake {
                     episode_key: EpisodeKeyFields::default(),
                 });
             }
-            let exit = match instantiate_exit(convoy, &forges) {
+            let exit = match exit {
                 Ok(exit) => exit,
                 Err(error) => {
                     tracing::warn!(convoy = %convoy.metadata.name, %error, "derive reconciler leaf subscriptions failed");
