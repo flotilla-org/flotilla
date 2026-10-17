@@ -255,3 +255,27 @@ fn decode_refuses_rows_outside_the_layout() {
     assert_eq!(decode("cause_detail", Value::Text("x".into())), DecodeError::missing("cause_phase"), "a partly present flatten");
     assert_eq!(decode("phase_since", Value::Null), DecodeError::missing("phase_since"));
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+enum Shape {
+    #[store(code = "c1")]
+    Square { side: String },
+}
+
+/// A sibling field named like a data enum's datum column: `shape_side` twice under mapping B.
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+#[store(kind = "Clash", code = "k8")]
+struct Clash {
+    shape: Shape,
+    shape_side: String,
+}
+
+// Behaviour (#3392 G6): mapping B names a datum's columns by the enum field and the datum alone,
+// so a sibling field can take the same name; the descriptor refuses it, and so does the registry.
+#[test]
+fn a_datum_column_named_like_a_sibling_field_is_refused() {
+    let refused =
+        Err(flotilla_schema::DescriptorError::DuplicateColumn { kind: "Clash".into(), table: "clash".into(), column: "shape_side".into() });
+    assert_eq!(Clash::table_set().validate(), refused);
+    assert!(flotilla_schema::KindRegistry::new().register::<Clash>().is_err());
+}

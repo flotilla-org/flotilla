@@ -152,3 +152,21 @@ fn readable_views_name_codes_and_strings() {
     let tables: usize = registry().iter().map(|set| set.tables.len()).sum();
     assert_eq!(views, tables as i64, "one view per kind table");
 }
+
+// Behaviour (#3392 D4, review of 2026-10-17): reopening an unchanged schema changes nothing: no
+// row is written and the schema cookie stays, so other connections keep their prepared
+// statements. A view that is missing is created again.
+#[test]
+fn reopening_an_unchanged_schema_changes_nothing() {
+    let conn = store().into_connection();
+    let cookie = |conn: &rusqlite::Connection| -> i64 { conn.query_row("PRAGMA schema_version", [], |row| row.get(0)).expect("cookie") };
+    let before = (cookie(&conn), conn.total_changes());
+    let conn = Store::open(conn, LOCAL, registry()).expect("reopen").into_connection();
+    assert_eq!((cookie(&conn), conn.total_changes()), before);
+    conn.execute_batch("DROP VIEW message_view").expect("drop");
+    let conn = Store::open(conn, LOCAL, registry()).expect("reopen").into_connection();
+    let views: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'message_view'", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(views, 1, "a missing view is recreated");
+}

@@ -6,9 +6,9 @@
 //!
 //! Stored codes are short (G7), so a table is read through its view: `<table>_view` has the
 //! table's columns in order, with each code column replaced by its variant's Rust name from
-//! `codes` and each interned column by its text from `strings`. A view holds no data, so a store
-//! opening an existing database drops and recreates it; it upserts the kind's `codes` rows and
-//! deletes any others, so an unchanged schema writes no row.
+//! `codes` and each interned column by its text from `strings`. A store opening an existing
+//! database upserts the kind's `codes` rows and deletes any others, and recreates only the views
+//! whose statement changed ([`render_views`]), so an unchanged schema changes nothing.
 
 use std::fmt::Write as _;
 
@@ -64,13 +64,16 @@ pub fn render_ddl_with(set: &TableSet, mode: DdlMode) -> String {
         out.push_str(";\n");
     }
     render_codes(&mut out, set, mode);
-    for table in &set.tables {
-        render_readable(&mut out, set, table, mode);
+    if mode == DdlMode::Create {
+        for (_, view) in render_views(set) {
+            let _ = writeln!(out, "{view};");
+        }
     }
     out
 }
 
-/// The `codes` field of column `column` of `table`; see [`CODES_DDL`].
+/// The `codes` field of column `column` of `table`; see [`CODES_DDL`]. Column names are Rust
+/// identifiers and hold no `.`, so a root column never collides with a nested `<table>.<column>`.
 pub fn code_field(set: &TableSet, table: &Table, column: &str) -> String {
     if table.parent.is_none() {
         return column.to_owned();
@@ -116,10 +119,17 @@ fn render_codes(out: &mut String, set: &TableSet, mode: DdlMode) {
     }
 }
 
-/// `<table>_view`: the table's columns in order, code columns as their names and interned columns
-/// as their text.
-fn render_readable(out: &mut String, set: &TableSet, table: &Table, mode: DdlMode) {
-    let name = quote_ident(&format!("{}{VIEW_SUFFIX}", table.name));
+/// Each table's readable view, `<table>_view`, as (name, `CREATE VIEW` statement without its
+/// `;`): the table's columns in order, code columns as their names and interned columns as their
+/// text. `render_ddl` includes them; a store opening an existing database (the `IfNotExists`
+/// form, which omits them) recreates only a view whose stored statement differs, so an
+/// unchanged schema changes nothing on open.
+pub fn render_views(set: &TableSet) -> Vec<(String, String)> {
+    set.tables.iter().map(|table| readable(set, table)).collect()
+}
+
+fn readable(set: &TableSet, table: &Table) -> (String, String) {
+    let name = format!("{}{VIEW_SUFFIX}", table.name);
     let source = quote_ident(&table.name);
     let mut lines: Vec<String> = match table.parent {
         None => ["id", "version"].iter().map(|column| format!("{source}.{}", quote_ident(column))).collect(),
@@ -139,10 +149,8 @@ fn render_readable(out: &mut String, set: &TableSet, table: &Table, mode: DdlMod
             _ => value,
         });
     }
-    if mode == DdlMode::IfNotExists {
-        let _ = writeln!(out, "DROP VIEW IF EXISTS {name};");
-    }
-    let _ = writeln!(out, "CREATE VIEW {name} AS SELECT\n  {}\nFROM {source};", lines.join(",\n  "));
+    let sql = format!("CREATE VIEW {} AS SELECT\n  {}\nFROM {source}", quote_ident(&name), lines.join(",\n  "));
+    (name, sql)
 }
 
 fn render_table(out: &mut String, set: &TableSet, table: &Table, exists: &str) {
@@ -325,8 +333,8 @@ FROM "convoy_deliverables_evidence";
         assert_eq!(ddl.matches("CREATE INDEX IF NOT EXISTS ").count(), 2);
         assert!(ddl.contains("ON CONFLICT (\"kind\", \"field\", \"code\") DO UPDATE"), "the kind's codes are upserted");
         assert!(ddl.contains("DELETE FROM \"codes\" WHERE \"kind\" = 'k2' AND (\"field\", \"code\") NOT IN (VALUES ('phase', 'dr'), ('phase', 'op'), ('phase', 'sh'));"), "and only they are kept");
-        assert_eq!(ddl.matches("DROP VIEW IF EXISTS ").count(), 3, "views are recreated");
-        assert_eq!(ddl.matches("CREATE VIEW ").count(), 3);
+        assert_eq!(ddl.matches("CREATE VIEW ").count(), 0, "the store recreates only changed views");
+        assert_eq!(super::render_views(&convoy().finish()).len(), 3);
     }
 
     // Behaviour (#3392 D4): a nested table's code columns are named `<table>.<column>` in

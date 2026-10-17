@@ -22,7 +22,7 @@ use crate::{
     error::{Malformed, StoreError},
     query::{page_limit, Cursor, Page},
     shared::{
-        schema_ddl, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_APPEND, LOG_BY_HOME,
+        schema_ddl, sync_views, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_APPEND, LOG_BY_HOME,
         LOG_BY_RESOURCE, LOG_TAKEN, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE,
         SHARED_STATEMENTS, STRING_ID, STRING_INSERT,
     },
@@ -129,12 +129,14 @@ impl Store {
     }
 
     /// Enables foreign keys, creates the shared tables and every registered kind's tables if they
-    /// do not exist, and renders each kind's statements once.
+    /// do not exist, brings the `codes` rows and readable views up to date, and renders each
+    /// kind's statements once.
     pub fn open_with(mut conn: Connection, home: &str, kinds: KindRegistry, options: StoreOptions) -> Result<Store, StoreError> {
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.set_prepared_statement_cache_capacity(options.statement_cache);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(&schema_ddl(&kinds, DdlMode::IfNotExists))?;
+        sync_views(&tx, &kinds)?;
         tx.commit()?;
         let sql = kinds.iter().map(|set| (set.code, KindSql::render(set))).collect();
         let runtime = Runtime {

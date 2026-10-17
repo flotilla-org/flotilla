@@ -1,6 +1,7 @@
 //! The shared tables every kind's tables reference.
 
-use flotilla_schema::{render_ddl_with, DdlMode, KindRegistry, CODES_DDL};
+use flotilla_schema::{quote_ident, render_ddl_with, render_views, DdlMode, KindRegistry, CODES_DDL};
+use rusqlite::{Connection, OptionalExtension};
 
 /// `strings` interns names and interned columns; `resource_identity` holds every resource's
 /// (kind, name, home), with homes filtered through `resource_identity_by_home`, and its `seq`:
@@ -72,6 +73,9 @@ pub(crate) const LOG_BY_RESOURCE: &str =
 pub(crate) const LOG_BY_HOME: &str = "SELECT change FROM change_log WHERE home = ?1 AND home_seq > ?2 ORDER BY home_seq LIMIT ?3";
 pub(crate) const SEQUENCE_LAST: &str = "SELECT last FROM home_sequence WHERE home = ?1";
 pub(crate) const OBJECT_BYTES: &str = "SELECT bytes FROM objects WHERE hash = ?1";
+/// Read once per view on open, outside the runtime's statements: it reads the schema table, which
+/// has no index to search by key.
+pub(crate) const VIEW_SQL: &str = "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?1";
 
 /// The whole schema a store with these kinds holds: shared tables and `codes`, then each kind in
 /// code order, with its `codes` rows and readable views.
@@ -85,4 +89,20 @@ pub fn schema_ddl(kinds: &KindRegistry, mode: DdlMode) -> String {
         ddl.push_str(&render_ddl_with(set, mode));
     }
     ddl
+}
+
+/// Brings every kind's readable views up to date on open: a view whose stored statement differs
+/// (or that is missing) is dropped and created again, and an unchanged one is left alone, so
+/// opening an unchanged schema neither writes nor bumps the schema cookie other connections
+/// re-prepare on.
+pub(crate) fn sync_views(conn: &Connection, kinds: &KindRegistry) -> rusqlite::Result<()> {
+    for set in kinds.iter() {
+        for (name, sql) in render_views(set) {
+            let stored: Option<String> = conn.query_row(VIEW_SQL, [&name], |row| row.get(0)).optional()?;
+            if stored.as_deref() != Some(sql.as_str()) {
+                conn.execute_batch(&format!("DROP VIEW IF EXISTS {};\n{sql};", quote_ident(&name)))?;
+            }
+        }
+    }
+    Ok(())
 }

@@ -76,8 +76,10 @@ impl Code {
     }
 
     pub fn as_str(&self) -> &str {
-        // Every byte was checked to be ASCII on construction.
-        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or_default()
+        match std::str::from_utf8(&self.bytes[..usize::from(self.len)]) {
+            Ok(text) => text,
+            Err(_) => unreachable!("every byte of a code was checked to be ASCII on construction"),
+        }
     }
 }
 
