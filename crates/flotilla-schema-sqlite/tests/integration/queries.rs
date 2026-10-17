@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{IndexQuery, Kind, Ref, State, Timestamp};
+use flotilla_schema::{Address, IndexQuery, Kind, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{Cursor, Page, ResourceId, Store, StoreError, MAX_PAGE};
 use flotilla_state_machines::machines::{
     convoy::{ConvoySpec, ConvoyState},
@@ -206,6 +206,10 @@ fn reference_indexes_match_the_model(tc: TestCase) {
     assert_eq!(scan_all::<Referral>(&mut store, LOCAL, limit), all, "scan skips identities without a row");
 }
 
+fn project(name: &str) -> Address {
+    Address::project(name).expect("project address")
+}
+
 // Behaviour (DESIGN queries): the other engine kinds' indexes, an interned `eq` under a label
 // predicate (Convoy's open convoys of a project, a terminal session pool's live sessions), a
 // reference `eq` ordered by a spec column (a vessel's sessions) and a bare interned `eq` (an
@@ -218,7 +222,7 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
     let mut write = store.write().expect("write");
     for n in 0..tc.draw(gs::integers::<usize>().max_value(8)) {
         let convoy = convoy::generate(&tc, Pick::Draw);
-        let convoy = convoy.clone().with_spec(ConvoySpec { project: pick(&["p0", "p1"]), ..convoy.spec().clone() });
+        let convoy = convoy.clone().with_spec(ConvoySpec { project: project(&pick(&["p0", "p1"])), ..convoy.spec().clone() });
         convoys.insert(write.insert(&format!("c{n}"), &convoy, &origin()).expect("insert").id, convoy);
     }
     for n in 0..tc.draw(gs::integers::<usize>().max_value(8)) {
@@ -240,9 +244,10 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
     write.commit().expect("commit");
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
     for project in ["p0", "p1", "p2"] {
+        let project = self::project(project);
         let want =
             expected(&convoys, |c: &Resource<Convoy>| matches!(c.state(), ConvoyState::Open { .. }) && c.spec().project == project, |_| ());
-        assert_eq!(collect(&mut store, &ConvoySpec::open_by_project(&project.to_owned()), limit), want);
+        assert_eq!(collect(&mut store, &ConvoySpec::open_by_project(&project), limit), want);
     }
     for vessel in ["v0", "v1", "v2"] {
         let want = expected(&sessions, |s: &TerminalSession| s.spec().vessel.name == vessel, |s| s.spec().ordinal);
@@ -312,7 +317,7 @@ fn cursors_are_bound_to_their_query() {
     assert!(matches!(read.page(&other_inbox, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
     let deadline = MessageSpec::deadline();
     assert!(matches!(read.page(&deadline, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
-    let convoy_cursor = read.page(&ConvoySpec::open_by_project(&"p".to_owned()), None, 1).expect("page").next.expect("more");
+    let convoy_cursor = read.page(&ConvoySpec::open_by_project(&project("p")), None, 1).expect("page").next.expect("more");
     assert!(matches!(read.page(&inbox, Some(&convoy_cursor), 5), Err(StoreError::CursorMismatch { .. })));
 }
 

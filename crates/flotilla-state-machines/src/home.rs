@@ -14,8 +14,8 @@ use std::{collections::BTreeMap, fmt};
 use flotilla_schema::{EdgeEvent, Records, State, Timestamp};
 
 use crate::{
-    DefError, Edge, EdgeEventOf, EdgeKind, EdgePayload, Fault, Handle, Judged, Label, Machine, MachineDef, StateValue, StepError,
-    StoredState, Version,
+    Admission, DefError, Edge, EdgeEventOf, EdgeKind, EdgePayload, Fault, Handle, InputRead, Judged, Label, Machine, MachineDef,
+    StateValue, StepError, StoredState, Version,
 };
 
 /// One resource at its home: its name, spec, current state (with the time its label was entered),
@@ -142,6 +142,21 @@ where
     }
 }
 
+/// A created resource and the reads its admission relied on.
+pub struct Created<'a, M: Machine> {
+    pub resource: &'a Resource<M>,
+    pub reads: Vec<InputRead>,
+}
+
+impl<M: Machine> fmt::Debug for Created<'_, M>
+where
+    M::Spec: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Created").field("resource", &self.resource).field("reads", &self.reads).finish()
+    }
+}
+
 /// Why a write did not happen.
 pub enum WriteError<M: Machine> {
     /// No resource of that name at this home.
@@ -227,20 +242,30 @@ impl<M: Machine> Home<M> {
         self.resources.values()
     }
 
-    /// Admits `request` at `now` and creates the resource in the state
-    /// admission returns, which must carry the declared initial label, entered
-    /// at `now`.
-    pub fn create(&mut self, name: impl Into<String>, request: M::Request, now: Timestamp) -> Result<&Resource<M>, WriteError<M>> {
+    /// Admits `request` at `now`, reading `world` through the recording
+    /// admission handle, and creates the resource in the state admission
+    /// returns, which must carry the declared initial label, entered at `now`.
+    /// Returns the resource and the reads admission relied on, for the
+    /// create's event.
+    pub fn create(
+        &mut self,
+        name: impl Into<String>,
+        request: M::Request,
+        world: &M::World,
+        now: Timestamp,
+    ) -> Result<Created<'_, M>, WriteError<M>> {
         let name = name.into();
         if self.resources.contains_key(&name) {
             return Err(WriteError::Exists(name));
         }
-        let (spec, state) = M::admit(request).map_err(WriteError::Refused)?;
+        let mut admission = Admission::new(world, now);
+        let (spec, state) = M::admit(&mut admission, request).map_err(WriteError::Refused)?;
         if state.label() != self.definition.initial() {
             return Err(WriteError::Fault(Fault::Initial { state: state.label() }));
         }
         let resource = Resource::stored(name.clone(), spec, State::new(state, now), Version(1));
-        Ok(self.resources.entry(name).or_insert(resource))
+        let reads = admission.into_reads();
+        Ok(Created { resource: self.resources.entry(name).or_insert(resource), reads })
     }
 
     /// Places a resource read from storage at this home, as stored: its spec,

@@ -124,8 +124,14 @@ impl Conformance for EnsureConformance {
     type Subject = Home<Ensure>;
 
     fn create(_: &Value) -> Home<Ensure> {
-        let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(2) }, Timestamp(0)).expect("created");
+        let mut home = Home::<Ensure>::new("home").expect("valid declaration");
+        home.create(
+            NAME,
+            EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(2) },
+            &MemoryEnsureWorld::default(),
+            Timestamp(0),
+        )
+        .expect("created");
         home
     }
 

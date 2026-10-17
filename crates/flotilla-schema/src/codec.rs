@@ -46,6 +46,9 @@ pub enum DecodeError {
     OutOfRange { column: String, value: i64 },
     #[error("column {column}: unknown code {code:?}")]
     Code { column: String, code: String },
+    /// Interned text in an address column that is not a canonical address (ADR 0066 §4).
+    #[error("column {column}: `{text}` is not a canonical address: {reason}")]
+    Address { column: String, text: String, reason: String },
     /// A reference whose stored identity is of another kind than the field's `Ref<K>`.
     #[error("column {column}: reference to kind {found}, expected kind {expected}")]
     RefKind { column: String, expected: KindCode, found: KindCode },
@@ -86,6 +89,7 @@ impl DecodeError {
             DecodeError::Type { column, expected, found } => DecodeError::Type { column: join(field, &column), expected, found },
             DecodeError::OutOfRange { column, value } => DecodeError::OutOfRange { column: join(field, &column), value },
             DecodeError::Code { column, code } => DecodeError::Code { column: join(field, &column), code },
+            DecodeError::Address { column, text, reason } => DecodeError::Address { column: join(field, &column), text, reason },
             DecodeError::Exhausted { column } => DecodeError::Exhausted { column: join(field, &column) },
             DecodeError::RefKind { column, expected, found } => DecodeError::RefKind { column: join(field, &column), expected, found },
             DecodeError::Position { column, expected, found } => DecodeError::Position { column: join(field, &column), expected, found },

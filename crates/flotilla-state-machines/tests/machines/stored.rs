@@ -5,16 +5,17 @@
 use std::collections::BTreeSet;
 
 use flotilla_schema::{
-    Cbor, Code, CodeEnum, Decoder, EdgeParts, Encoder, Kind, KindCode, KindSpec, Labelled, Records, RowPath, State, StateData, Timestamp,
+    Address, Cbor, Code, CodeEnum, Decoder, EdgeParts, Encoder, Kind, KindCode, KindSpec, Labelled, Records, RowPath, State, StateData,
+    Timestamp,
 };
 use flotilla_state_machines::{
     machines::{
-        agent_session::AgentSession,
+        agent_session::{AgentSession, MemoryAgentSessionWorld},
         convoy::{
             Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyRequest, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId, VesselClass,
         },
         ensure::{Attempted, Ensure, EnsureSpec, MemoryEnsureWorld, Record},
-        message::{Expectation, Message, MessageEdgeKind, MessageSpec},
+        message::{Expectation, MemoryMessageWorld, Message, MessageEdgeKind, MessageSpec},
     },
     AttemptPolicy, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource,
 };
@@ -37,6 +38,14 @@ fn kind_codes_are_pinned() {
             ("Ensure", KindCode::new("en"))
         ]
     );
+}
+
+fn project() -> Address {
+    Address::project("p").expect("project")
+}
+
+fn promise() -> Promise {
+    Promise { kind: "k".into(), target: Address::project("t").expect("target") }
 }
 
 /// `name`'s resource at `home`, encoded and decoded through the schema codec (the name and
@@ -67,24 +76,26 @@ where
 fn resources_survive_the_codec() {
     let mut messages = Home::<Message>::new("home").expect("valid");
     let spec = MessageSpec { inbox: "i".into(), expectation: Expectation::Reply, deadline: Some(Timestamp(9)), unbound_after: 3 };
-    messages.create("m", spec.clone(), Timestamp(1)).expect("created");
+    messages.create("m", spec.clone(), &MemoryMessageWorld::default(), Timestamp(1)).expect("created");
     let message = round_trip(&messages, "m");
     assert_eq!((message.spec(), message.since()), (&spec, Timestamp(1)));
 
     let mut sessions = Home::<AgentSession>::new("home").expect("valid");
-    sessions.create("s", (), Timestamp(2)).expect("created");
+    sessions.create("s", (), &MemoryAgentSessionWorld::default(), Timestamp(2)).expect("created");
     round_trip(&sessions, "s");
 
     let mut convoys = Home::<Convoy>::new("home").expect("valid");
-    let promises = [(PromiseId(0), Promise { kind: "k".into(), target: "t".into() })].into();
-    let request = ConvoyRequest { project: "p".into(), promises, quota: [(VesselClass(1), 2)].into(), priority: Priority(4) };
-    convoys.create("c", request, Timestamp(2)).expect("created");
+    let promises = [(PromiseId(0), promise())].into();
+    let request = ConvoyRequest { project: project(), promises, quota: [(VesselClass(1), 2)].into(), priority: Priority(4) };
+    convoys.create("c", request, &MemoryConvoyWorld::default().with_project(&project()), Timestamp(2)).expect("created");
     convoys.apply("c", Keep { promise: PromiseId(0) }, &MemoryConvoyWorld::default(), Timestamp(3)).expect("kept");
     let convoy = round_trip(&convoys, "c");
     assert_eq!((convoy.events().len(), convoy.since()), (0, Timestamp(2)), "a data-only edge keeps since");
 
     let mut ensures = Home::<Ensure>::new("home").expect("valid");
-    ensures.create("e", EnsureSpec { inbox: "i".into(), policy: AttemptPolicy::immediate(2) }, Timestamp(0)).expect("created");
+    ensures
+        .create("e", EnsureSpec { inbox: "i".into(), policy: AttemptPolicy::immediate(2) }, &MemoryEnsureWorld::default(), Timestamp(0))
+        .expect("created");
     ensures.apply("e", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(4)).expect("recorded");
     let attempt = Attempted { fulfiller: Ref::new("f"), outcome: Outcome::Succeeded };
     ensures.apply("e", attempt, &MemoryEnsureWorld::default(), Timestamp(5)).expect("attempted");
@@ -115,10 +126,10 @@ fn root_sets(parts: &EdgeParts) -> Vec<&'static str> {
 #[test]
 fn a_resources_edge_moves_since_only_with_the_label() {
     let mut home = Home::<Convoy>::new("home").expect("valid");
-    let promises = [(PromiseId(0), Promise { kind: "k".into(), target: "t".into() })].into();
-    home.create("c", ConvoyRequest { project: "p".into(), promises, quota: [].into(), priority: Priority(1) }, Timestamp(1))
+    let promises = [(PromiseId(0), promise())].into();
+    let world = MemoryConvoyWorld::default().with_project(&project());
+    home.create("c", ConvoyRequest { project: project(), promises, quota: [].into(), priority: Priority(1) }, &world, Timestamp(1))
         .expect("created");
-    let world = MemoryConvoyWorld::default();
     let created = home.get("c").expect("exists").stored_state().clone();
 
     let event = home.apply("c", Keep { promise: PromiseId(0) }, &world, Timestamp(5)).expect("kept").clone();

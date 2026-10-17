@@ -180,7 +180,7 @@ impl Machine for Rogue {
                     .effect(|_, state, load| armed(shots(&state) + load.shots)),
             )
     }
-    fn admit(_: ()) -> Result<((), Latch), LatchRefusal> {
+    fn admit(_: &mut flotilla_state_machines::Admission<'_, Self>, _: ()) -> Result<((), Latch), LatchRefusal> {
         Ok(((), armed(0)))
     }
 }
@@ -328,7 +328,7 @@ fn validate_rejects_a_label_and_edge_sharing_a_word() {
                 .edge(edge::<Try>(Loaded, Armed))
                 .edge(edge::<Note>(Loaded, Armed))
         }
-        fn admit(_: ()) -> Result<((), Clash), LatchRefusal> {
+        fn admit(_: &mut flotilla_state_machines::Admission<'_, Self>, _: ()) -> Result<((), Clash), LatchRefusal> {
             Ok(((), Clash::Armed))
         }
     }
@@ -487,7 +487,7 @@ fn validate_rejects_duplicate_codes() {
                     EdgeDef::<Self, Back>::new().from([TwinLabel::Two]).to([TwinLabel::One]).ungated("fixture").effect(|_, _, _| Twin::One),
                 )
         }
-        fn admit(_: ()) -> Result<((), Twin), Never> {
+        fn admit(_: &mut flotilla_state_machines::Admission<'_, Self>, _: ()) -> Result<((), Twin), Never> {
             Ok(((), Twin::One))
         }
     }

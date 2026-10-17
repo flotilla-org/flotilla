@@ -226,6 +226,52 @@ pub struct Judged<T> {
     pub reads: Vec<InputRead>,
 }
 
+/// What admission sees: the world and the caller's time, through recorded
+/// reads (#3392 G1). A request that names a definitions-class kind or
+/// anything outside the store names it by address, and admission checks that
+/// it exists by reading it here, so the create records the version it saw,
+/// or the absence, as a gate does. Nothing checks existence by foreign key.
+pub struct Admission<'a, M: Machine> {
+    world: &'a M::World,
+    now: Timestamp,
+    reads: Vec<InputRead>,
+}
+
+impl<'a, M: Machine> Admission<'a, M> {
+    pub fn new(world: &'a M::World, now: Timestamp) -> Self {
+        Admission { world, now, reads: Vec::new() }
+    }
+
+    /// The time the caller supplied.
+    pub fn now(&self) -> Timestamp {
+        self.now
+    }
+
+    /// Reads `reference` and records the version seen, or the absence.
+    pub fn read<K: Kind>(&mut self, reference: &Ref<K>) -> Option<&'a K::Value>
+    where
+        M::World: Source<K>,
+    {
+        let world: &'a M::World = self.world;
+        let found = world.lookup(reference);
+        let read = InputRead { kind: Cow::Borrowed(K::NAME), name: reference.name.clone(), version: found.map(|(version, _)| version) };
+        if !self.reads.contains(&read) {
+            self.reads.push(read);
+        }
+        found.map(|(_, value)| value)
+    }
+
+    /// The distinct reads recorded so far, in order.
+    pub fn reads(&self) -> &[InputRead] {
+        &self.reads
+    }
+
+    /// The reads admission relied on, for the create that persists it.
+    pub fn into_reads(self) -> Vec<InputRead> {
+        self.reads
+    }
+}
+
 /// The only way a gate, an effect or a judgement sees anything beyond its
 /// edge argument and the current state. Every read through it is recorded.
 pub struct Handle<'a, M: Machine> {

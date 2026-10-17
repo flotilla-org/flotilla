@@ -14,7 +14,7 @@ use flotilla_state_machines::{
 use hegel::{generators as gs, TestCase};
 
 use super::{
-    code_enum,
+    address, code_enum,
     engine::{self, resource, Candidate},
     name, text, timestamp, Fixture, Pick,
 };
@@ -60,8 +60,8 @@ fn authority(tc: &TestCase) -> Ref<flotilla_state_machines::machines::convoy::Au
 /// The project, promise definitions and priority, drawn or covered.
 pub fn spec(tc: &TestCase, pick: Pick) -> ConvoySpec {
     ConvoySpec {
-        project: name(tc),
-        promises: map(tc, pick.nth(2), 2, |pick, n| (PromiseId(small(tc, pick, n)), Promise { kind: name(tc), target: name(tc) })),
+        project: address(tc),
+        promises: map(tc, pick.nth(2), 2, |pick, n| (PromiseId(small(tc, pick, n)), Promise { kind: name(tc), target: address(tc) })),
         priority: Priority(tc.draw(gs::integers::<u32>())),
     }
 }
@@ -74,8 +74,8 @@ pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Convoy> {
 pub fn sample() -> Resource<Convoy> {
     let promise = PromiseId(0);
     let spec = ConvoySpec {
-        project: "p".into(),
-        promises: [(promise, Promise { kind: "change".into(), target: "main".into() })].into(),
+        project: "project:p".parse().expect("address"),
+        promises: [(promise, Promise { kind: "change".into(), target: "forge:github/repo:o%2Fr/cr:1".parse().expect("address") })].into(),
         priority: Priority(1),
     };
     let open = ConvoyState::Open { resolution: [(promise, PromiseState::Pending)].into(), quota: [(VesselClass(0), 1)].into() };

@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     edges,
     machines::agent_session::{AgentSessionEdge, AgentSessionEdgeKind, AgentSessionSpec, Receive},
-    states, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Transport, Version, WrongState,
+    states, Admission, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Transport, Version, WrongState,
 };
 
 /// What would settle the message. `Nothing` settles on delivery.
@@ -447,7 +447,7 @@ impl Machine for Message {
             .end(Dropped, "the message was dropped")
     }
 
-    fn admit(spec: MessageSpec) -> Result<(MessageSpec, MessageState), MessageRefusal> {
+    fn admit(_: &mut Admission<'_, Message>, spec: MessageSpec) -> Result<(MessageSpec, MessageState), MessageRefusal> {
         Ok((spec, MessageState::Pending))
     }
 }

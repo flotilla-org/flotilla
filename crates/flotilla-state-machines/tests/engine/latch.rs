@@ -160,7 +160,7 @@ impl Machine for LatchMachine {
             .end(Withdrawn, "the latch was withdrawn")
     }
 
-    fn admit(spent: bool) -> Result<(bool, Latch), LatchRefusal> {
+    fn admit(_: &mut flotilla_state_machines::Admission<'_, Self>, spent: bool) -> Result<(bool, Latch), LatchRefusal> {
         Ok((spent, armed(0)))
     }
 }

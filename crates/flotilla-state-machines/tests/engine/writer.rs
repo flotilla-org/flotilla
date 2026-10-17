@@ -33,7 +33,7 @@ fn cause(detail: &str) -> Cause {
 /// spending itself.
 fn latch() -> Home<LatchMachine> {
     let mut home = Home::new("kiwi").expect("valid declaration");
-    home.create("l", false, Timestamp(0)).expect("created");
+    home.create("l", false, &Table::new(), Timestamp(0)).expect("created");
     home.apply("l", Load { shots: 2 }, &Table::new(), at(0)).expect("loaded");
     home
 }
@@ -62,7 +62,7 @@ fn judge_retry(latch: &Resource<LatchMachine>, policy: &AttemptPolicy, now: Time
 #[test]
 fn creation_stores_the_admitted_state() {
     let mut home = Home::<LatchMachine>::new("kiwi").expect("valid declaration");
-    let created = home.create("l", true, Timestamp(0)).expect("created");
+    let created = home.create("l", true, &Table::new(), Timestamp(0)).expect("created").resource;
     assert_eq!((created.state(), created.spec(), created.version()), (&armed(0), &true, Version(1)));
     assert!(created.events().is_empty());
 }
@@ -142,7 +142,7 @@ fn an_edge_about_a_master_records_only_its_event() {
 #[test]
 fn creation_refuses_a_duplicate_name_and_unknown_names_are_reported() {
     let mut home = latch();
-    assert_eq!(home.create("l", true, Timestamp(0)).err(), Some(WriteError::Exists("l".into())));
+    assert_eq!(home.create("l", true, &Table::new(), Timestamp(0)).err(), Some(WriteError::Exists("l".into())));
     assert_eq!(home.apply("x", ReArm, &Table::new(), at(1)).err(), Some(WriteError::Unknown("x".into())));
     assert_eq!(home.judge("x", &Table::new(), at(1), |h| h.state().clone()).err(), Some(WriteError::Unknown("x".into())));
 }
@@ -162,7 +162,7 @@ fn a_home_refuses_an_invalid_declaration() {
         fn definition() -> MachineDef<Self> {
             MachineDef::new(LatchLabel::Armed)
         }
-        fn admit(_: ()) -> Result<((), Latch), LatchRefusal> {
+        fn admit(_: &mut flotilla_state_machines::Admission<'_, Self>, _: ()) -> Result<((), Latch), LatchRefusal> {
             Ok(((), armed(0)))
         }
     }
@@ -196,12 +196,15 @@ fn admission_outside_the_initial_label_is_a_fault() {
                 .end(Spent, "spent")
                 .end(Withdrawn, "withdrawn")
         }
-        fn admit(_: ()) -> Result<((), Latch), LatchRefusal> {
+        fn admit(_: &mut flotilla_state_machines::Admission<'_, Self>, _: ()) -> Result<((), Latch), LatchRefusal> {
             Ok(((), Latch::Spent { shots: 0 }))
         }
     }
     let mut home = Home::<Late>::new("kiwi").expect("valid declaration");
-    assert_eq!(home.create("l", (), Timestamp(0)).err(), Some(WriteError::Fault(Fault::Initial { state: LatchLabel::Spent })));
+    assert_eq!(
+        home.create("l", (), &Table::new(), Timestamp(0)).err(),
+        Some(WriteError::Fault(Fault::Initial { state: LatchLabel::Spent }))
+    );
     assert!(home.get("l").is_none());
 }
 
@@ -326,7 +329,7 @@ fn the_writer_follows_its_rules_over_any_sequence(tc: hegel::TestCase) {
     let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(40));
     let policy = AttemptPolicy { max_failures: tc.draw(gs::integers::<u32>().min_value(1).max_value(3)), base: 50, factor: 2, cap: 300 };
     let mut home = Home::<LatchMachine>::new("kiwi").expect("valid");
-    home.create("l", spent, Timestamp(0)).expect("created");
+    home.create("l", spent, &Table::new(), Timestamp(0)).expect("created");
     let mut model = Model { state: armed(0), version: 1, attempts: Vec::new(), before: 0 };
     let mut now = 0i64;
     for _ in 0..steps {

@@ -26,8 +26,8 @@ use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attempt, edges, states, AttemptPolicy, EdgeDef, Ended, Failure, Handle, Kind, Machine, MachineDef, Outcome, Ref, Source, Table,
-    Version, WrongState,
+    attempt, edges, states, Admission, AttemptPolicy, EdgeDef, Ended, Failure, Handle, Kind, Machine, MachineDef, Outcome, Ref, Source,
+    Table, Version, WrongState,
 };
 
 /// Fulfiller references, in name order. Fulfiller names are addresses: plain
@@ -437,7 +437,7 @@ impl Machine for Ensure {
             .end(Retired, "the ensure is retired")
     }
 
-    fn admit(spec: EnsureSpec) -> Result<(EnsureSpec, EnsureState), EnsureRefusal> {
+    fn admit(_: &mut Admission<'_, Ensure>, spec: EnsureSpec) -> Result<(EnsureSpec, EnsureState), EnsureRefusal> {
         let work = Work { recorded: BTreeSet::new(), created: BTreeSet::new(), failures: 0, last_failure: None };
         Ok((spec, work.unfulfilled()))
     }

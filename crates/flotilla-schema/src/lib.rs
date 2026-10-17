@@ -79,6 +79,7 @@ pub use edge::{
     RowPath, StateOf,
 };
 pub use event::{Cause, Change, Effect, Event, EventError, Named, Origin, Step, LOG_LIMITS};
+pub use flotilla_address::Address;
 pub use flotilla_schema_derive::Stored;
 pub use frozen::{Freezable, Frozen};
 pub use history::{EdgeEvent, Labelled};

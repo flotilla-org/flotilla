@@ -36,7 +36,7 @@ pub mod ticket;
 use std::fmt::Debug;
 
 use chrono::{DateTime, Utc};
-use flotilla_schema::{Edge, EdgeEvent, Identity, Kind, KindCode, KindRegistry, Origin, Position, Records, Ref, Timestamp};
+use flotilla_schema::{Address, Edge, EdgeEvent, Identity, Kind, KindCode, KindRegistry, Origin, Position, Records, Ref, Timestamp};
 use flotilla_schema_sqlite::Store;
 pub use flotilla_state_machines::{
     machines::{agent_session::AgentSession, convoy::Convoy, ensure::Ensure, message::Message},
@@ -251,6 +251,18 @@ pub fn seq(tc: &TestCase) -> u64 {
 /// Interned values collide often, so equal strings share `strings` rows.
 pub fn name(tc: &TestCase) -> String {
     tc.draw(gs::sampled_from(vec!["alice".to_owned(), "bob".to_owned(), String::new(), "ünïcødé".to_owned()]))
+}
+
+/// Addresses (#3392 G1) from a small set, so equal addresses share one interned string: a
+/// project, a role inbox under it (its value escaped), and a change request outside flotilla.
+pub fn address(tc: &TestCase) -> Address {
+    let text = tc.draw(gs::sampled_from(vec![
+        "project:alice",
+        "project:bob",
+        "project:alice/role:co%20der",
+        "forge:github/repo:flotilla-org%2Fflotilla/cr:42",
+    ]));
+    text.parse().expect("canonical fixture address")
 }
 
 /// Map keys and set values from a small alphabet, so they collide and dedupe.
