@@ -552,11 +552,8 @@ fn evaluate_exit_with_disposition(
             Ok(evaluation) => match change_requests.get(&name) {
                 None => Err(UnmetSettlementExpectation::MissingChangeRequest { record: name }),
                 Some(record) => {
-                    let observed_at = record.status.as_ref().map(|status| status.state.observed_at);
-                    if observed_at
-                        .and_then(|at| now.signed_duration_since(at).to_std().ok())
-                        .is_none_or(|age| age > change_request_stale_after)
-                    {
+                    if subject.as_ref().is_none_or(|subject| !subject.is_fresh(".state")) {
+                        let observed_at = record.status.as_ref().map(|status| status.state.observed_at);
                         Err(UnmetSettlementExpectation::StaleChangeRequest { record: name, observed_at })
                     } else {
                         Err(UnmetSettlementExpectation::ChangeRequestConditionFalse {
