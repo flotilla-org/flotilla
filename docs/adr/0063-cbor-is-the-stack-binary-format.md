@@ -4,6 +4,7 @@
 **Date:** 2026-10-13
 **Scope:** Flotilla and its sibling projects: Jackstay, Katzensteg, porthole, Wheelhouse, cleat, Tender
 **Relates to:** ADR 0047 (wire formats change freely; stored data stays decodable for one generation), flotilla-org/jackstay#104 (first adopter)
+**See also:** [ADR 0068](0068-shared-crates-live-in-rigging-and-http-uses-axum.md): `flotilla-cbor` moves to the shared rigging repo, where sibling projects take it from
 
 ## Context
 

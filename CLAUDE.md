@@ -164,7 +164,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
 | `flotilla-daemon` | Runtime supervision, socket server, replication composition and routed transport, peer networking, multi-host command routing |
 | `flotilla-address` | ADR 0066 addresses: typed `kind:value` segments, canonical encoding, forge-kind normalisation, lenient input through a Forge lookup, `record_name`, references and the condition/template grammar; no flotilla dependencies |
-| `flotilla-cbor` | The ADR 0063 CBOR profile over `cbor2`: deterministic writers, safe readers, limits, framing and the conformance corpus; no flotilla dependencies, so sibling repos use it through Git |
+| `flotilla-cbor` | The ADR 0063 CBOR profile over `cbor2`: deterministic writers, safe readers, limits, framing and the conformance corpus; no flotilla dependencies; moving to the shared [rigging](https://github.com/flotilla-org/rigging) repo, where sibling projects take it from (ADR 0068) |
 | `flotilla-capability-contract` | Session capability contract: `CredentialCapability`, `SessionCapabilitySource`, endpoint and credential-card helpers; no flotilla dependencies |
 | `flotilla-credentials` | Host-local credential minting/delivery, agent homes and skills, private vessel configuration composition |
 | `flotilla-projections` | Surface read models, host/fleet views, dispatch board, query actions, durable/observed aggregation and demand-backed issue materialization; reads host inputs through ports |
@@ -185,7 +185,6 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-commands` | Resource-oriented command preparation and execution |
 | `flotilla-transport` | Framed message sessions over Unix sockets or in-memory channels for daemon client and peer connections |
 | `tender` | Publication, discovery, pinned-exposure, and raw-stream contracts with an in-memory adapter and shared behavior tests |
-| `cleat` | Terminal I/O: PTY management, VT engine, session persistence |
 | `flotilla` (root) | Thin `src/main.rs` entry point |
 
 ### Key Modules
