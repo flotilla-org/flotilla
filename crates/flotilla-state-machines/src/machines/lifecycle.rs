@@ -3,16 +3,20 @@
 //! Six kinds share one machine: vessels, environments, checkouts, clones,
 //! image builds and terminal sessions. A thing is requested, realised once its
 //! home observes it under the expected identity, and gone once released or
-//! observed absent. A request that never realises gives up when its attempts
-//! are spent. [`Lifecycle<K>`] is that machine, with each kind's opaque
-//! request as its spec; the state carries the realised identity and the cause
-//! given up with.
+//! observed absent. Each try at realising it is an [`Attempted`] edge (R4);
+//! a request that never realises gives up when its attempts are spent.
+//! [`Lifecycle<K>`] is that machine, with each kind's opaque request as its
+//! spec; the state carries the attempt tally while Requested, the realised
+//! identity and the cause given up with.
+//!
+//! The spec's Requested carries its attempt history, and `GiveUp` is judged
+//! by Ensure's exhaustion rule over it. Here Requested keeps only the tally
+//! the `Attempted` edges leave (D2: a decision reads no log).
 //!
 //! Storage: the engine provides the storable state ([`LifecycleState`]) and
-//! history ([`LifecycleEvent`] and `Attempt`); a lifecycle kind's stored row
-//! (its request's columns, `#[store(state)] State<LifecycleState>`, the edge
-//! log and the attempts) is declared by whoever owns its request, with a
-//! kind code of its own.
+//! history ([`LifecycleEvent`]); a lifecycle kind's stored row (its request's
+//! columns, `#[store(state)] State<LifecycleState>` and the edge log) is
+//! declared by whoever owns its request, with a kind code of its own.
 
 use std::marker::PhantomData;
 
@@ -20,8 +24,8 @@ use flotilla_schema::EdgeEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attempt, edges, states, AttemptPolicy, Cause, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table,
-    Version, WrongState,
+    attempt, edges, states, AttemptPolicy, Cause, EdgeDef, EdgePayload, Ended, Failure, Handle, Kind, Machine, MachineDef, Outcome, Ref,
+    Source, Table, Version, WrongState,
 };
 
 /// One kind sharing the lifecycle: its name, request and retry policy.
@@ -45,9 +49,11 @@ pub const DEFAULT_POLICY: AttemptPolicy = AttemptPolicy { max_failures: 3, base:
 pub struct Lifecycle<K: LifecycleKind>(PhantomData<fn() -> K>);
 
 states! {
-    /// The spec's `State`: `Requested | Realised(str) | Gone | GaveUp(str)`.
+    /// The spec's `State`: `Requested(history) | Realised(str) | Gone | GaveUp(str)`.
+    /// Requested keeps the tally of the spec's attempt history:
+    /// consecutive failures since the last success, and the latest.
     pub enum LifecycleState => LifecycleLabel {
-        Requested = "rq",
+        Requested { failures: u32, #[store(flatten)] last_failure: Option<Failure> } = "rq",
         /// Observed under `identity`.
         Realised { identity: String } = "rl",
         Gone = "go",
@@ -61,9 +67,14 @@ states! {
 pub type LifecycleEvent = EdgeEvent<LifecycleLabel, LifecycleEdgeKind, EdgePayload<LifecycleEdge>>;
 
 impl LifecycleState {
+    /// Requested, with no attempt yet.
+    pub const fn requested() -> Self {
+        LifecycleState::Requested { failures: 0, last_failure: None }
+    }
+
     /// Spec `live`: Requested or Realised.
     pub fn live(&self) -> bool {
-        matches!(self, LifecycleState::Requested | LifecycleState::Realised { .. })
+        matches!(self, LifecycleState::Requested { .. } | LifecycleState::Realised { .. })
     }
 
     /// Spec `realised`.
@@ -112,6 +123,12 @@ pub struct Vanish {
     pub observed: Ref<Absence>,
 }
 
+/// One try at realising the thing, and how it ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attempted {
+    pub outcome: Outcome,
+}
+
 /// The request's attempts are spent, the last failing with `cause` (spec `GiveUp`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GiveUp {
@@ -124,6 +141,7 @@ edges! {
         Release(Release) = "rs",
         Vanish(Vanish) = "va",
         GiveUp(GiveUp) = "gu",
+        Attempted(Attempted) = "at",
     }
 }
 
@@ -213,7 +231,6 @@ impl<K: LifecycleKind> Machine for Lifecycle<K> {
     type Edge = LifecycleEdge;
     type Refusal = LifecycleRefusal;
     type World = dyn LifecycleWorld;
-    const RECORDS_ATTEMPTS: bool = true;
 
     fn definition() -> MachineDef<Self> {
         use LifecycleLabel::*;
@@ -241,6 +258,14 @@ impl<K: LifecycleKind> Machine for Lifecycle<K> {
                     .effect(|_, _, _| LifecycleState::Gone),
             )
             .edge(
+                EdgeDef::<Self, Attempted>::new()
+                    .from([Requested])
+                    .to([Requested])
+                    .changes(["failures", "last_failure"])
+                    .ungated("an attempt reports how a try ended; giving up judges the tally it leaves")
+                    .effect(attempted),
+            )
+            .edge(
                 EdgeDef::<Self, GiveUp>::new()
                     .from([Requested])
                     .to([GaveUp])
@@ -250,12 +275,11 @@ impl<K: LifecycleKind> Machine for Lifecycle<K> {
             )
             .end(Gone, "the thing is gone")
             .end(GaveUp, "the request gave up")
-            .attempts_in([Requested])
     }
 
     /// Every request is admitted: the spec's `request` has no rule.
     fn admit(request: K::Request) -> Result<(K::Request, LifecycleState), LifecycleRefusal> {
-        Ok((request, LifecycleState::Requested))
+        Ok((request, LifecycleState::requested()))
     }
 }
 
@@ -285,10 +309,23 @@ fn gate_vanish<K: LifecycleKind>(h: &mut Handle<'_, Lifecycle<K>>, edge: &Vanish
     }
 }
 
-// Spec: `o.exhausted and o.lastCauseMatches`, judged by the shared retry
-// judgement over every attempt: the lifecycle has no attempt windows.
+fn attempted<K: LifecycleKind>(h: &mut Handle<'_, Lifecycle<K>>, state: LifecycleState, edge: &Attempted) -> LifecycleState {
+    let (failures, last_failure) = match state {
+        LifecycleState::Requested { failures, .. } => attempt::tally(failures, &edge.outcome, h.now()),
+        // The edge leaves only Requested.
+        _ => attempt::tally(0, &edge.outcome, h.now()),
+    };
+    LifecycleState::Requested { failures, last_failure }
+}
+
+// Spec: `exhausted(h) and lastCauseIs(h, o.cause)`, judged by the shared
+// retry judgement over the Requested tally: the lifecycle has no windows.
 fn gate_give_up<K: LifecycleKind>(h: &mut Handle<'_, Lifecycle<K>>, edge: &GiveUp) -> Result<(), LifecycleRefusal> {
-    let retry = attempt::retry(h, &K::policy(), 0);
+    let (failures, last) = match h.state() {
+        LifecycleState::Requested { failures, last_failure } => (*failures, last_failure.as_ref()),
+        _ => (0, None),
+    };
+    let retry = attempt::retry(h, &K::policy(), failures, last);
     if retry.exhausted() && retry.last_cause.as_ref() == Some(&edge.cause) {
         Ok(())
     } else {

@@ -1,14 +1,16 @@
-//! Attempts are history, not counters.
+//! Attempts are edges, judged from the state they leave.
 //!
-//! An attempt is a record on the resource that made it. The retry count, the
-//! schedule and giving up are judgements over those records and a policy,
-//! counted within the current attempt window. Where a window starts is the
-//! machine's own state: Ensure's `resume` stores how many attempts came
-//! before it, and a machine without windows counts from the first attempt.
-//! Older attempts stay in the history. A listing and a `give up` gate call
-//! the same [`retry`], so they cannot disagree.
+//! An attempt is an edge on the resource that made it (R4, G10), carrying
+//! its [`Outcome`]: success, or a failure with its cause and whether it may
+//! be retried. Its log entry is the history; its effect keeps the current
+//! window's tally in the state data, the consecutive failures since the last
+//! success and the latest [`Failure`], so the decision path reads the state
+//! and never the log. A machine with windows opens a new one by clearing the
+//! tally (Ensure's `resume`). The retry count, the schedule and exhaustion
+//! are judgements over that tally and a policy; a listing and a hold or
+//! give-up gate call the same [`retry`], so they cannot disagree.
 
-use flotilla_schema::{RecordRow, Stored, Timestamp};
+use flotilla_schema::{Stored, Timestamp};
 
 use serde::{Deserialize, Serialize};
 
@@ -30,8 +32,8 @@ pub enum CauseCategory {
     External,
 }
 
-/// Stored flattened: an attempt's failure and a lifecycle's `GaveUp` carry
-/// its category and detail as two columns.
+/// Stored flattened: a [`Failure`] and a lifecycle's `GaveUp` carry its
+/// category and detail as two columns.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub struct Cause {
     pub category: CauseCategory,
@@ -44,33 +46,35 @@ impl Cause {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+/// How one attempt ended: the argument of an attempt edge.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
-    #[store(code = "ok")]
     Succeeded,
-    #[store(code = "fa")]
-    Failed {
-        #[store(flatten)]
-        cause: Cause,
-        retryable: bool,
-    },
+    Failed { cause: Cause, retryable: bool },
 }
 
-/// One try at the resource's work, and how it ended: a row of the resource's
-/// `history` table of attempts.
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
-pub struct Attempt {
+/// The latest failure in the current attempt window, kept in the state data
+/// of each label that judges attempts, beside the count of consecutive
+/// failures. Stored flattened, with its cause flattened in turn.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
+pub struct Failure {
+    /// When the attempt edge recording it was applied.
     pub at: Timestamp,
-    pub outcome: Outcome,
+    #[store(flatten)]
+    pub cause: Cause,
+    pub retryable: bool,
 }
 
-impl Attempt {
-    pub fn succeeded(at: Timestamp) -> Self {
-        Attempt { at, outcome: Outcome::Succeeded }
-    }
-
-    pub fn failed(at: Timestamp, cause: Cause, retryable: bool) -> Self {
-        Attempt { at, outcome: Outcome::Failed { cause, retryable } }
+/// What an attempt applied at `at` leaves in the state: a success clears the
+/// window's failures, and a failure adds one and becomes the latest. The
+/// spec's counts are unbounded; this one saturates at `u32::MAX`, far past
+/// any policy's `max_failures`, so exhaustion is unchanged.
+pub fn tally(failures: u32, outcome: &Outcome, at: Timestamp) -> (u32, Option<Failure>) {
+    match outcome {
+        Outcome::Succeeded => (0, None),
+        Outcome::Failed { cause, retryable } => {
+            (failures.saturating_add(1), Some(Failure { at, cause: cause.clone(), retryable: *retryable }))
+        }
     }
 }
 
@@ -142,40 +146,20 @@ impl Retry {
     }
 }
 
-/// The attempts in the window that starts after the first `before`
-/// attempts, read (and recorded) through the handle.
-pub fn window<'a, M: Machine>(handle: &mut Handle<'a, M>, before: usize) -> &'a [RecordRow<Attempt>] {
-    let attempts = handle.attempts();
-    &attempts[before.min(attempts.len())..]
-}
-
-/// The retry judgement over the window after the first `before` attempts,
-/// under `policy`. A pending retry makes the judgement valid until its
-/// moment. The backoff counts from the newest attempt's recorded `at`:
-/// attempts are appended in the order the home learns of them, and the
-/// caller supplies their times.
-pub fn retry<M: Machine>(handle: &mut Handle<'_, M>, policy: &AttemptPolicy, before: usize) -> Retry {
-    let attempts = window(handle, before);
-    let failed: Vec<(&Cause, bool)> = attempts
-        .iter()
-        .rev()
-        .map_while(|row| match &row.record.outcome {
-            Outcome::Failed { cause, retryable } => Some((cause, *retryable)),
-            Outcome::Succeeded => None,
-        })
-        .collect();
-    let failures = u32::try_from(failed.len()).unwrap_or(u32::MAX);
-    let Some((cause, retryable)) = failed.first() else {
+/// The retry judgement for the current window, from the state's tally:
+/// `failures` consecutive failures since the last success (or since the
+/// window opened), the latest being `last`. A pending retry makes the
+/// judgement valid until its moment, which counts from the latest failure.
+pub fn retry<M: Machine>(handle: &mut Handle<'_, M>, policy: &AttemptPolicy, failures: u32, last: Option<&Failure>) -> Retry {
+    let Some(last) = last.filter(|_| failures > 0) else {
         return Retry { failures: 0, schedule: Schedule::Now, last_cause: None };
     };
-    let schedule = if !retryable || failures >= policy.max_failures.max(1) {
+    let schedule = if !last.retryable || failures >= policy.max_failures.max(1) {
         Schedule::Exhausted
     } else {
-        // The newest row is a failure, because `failed` is non-empty.
-        let last = attempts.last().map_or(Timestamp::ZERO, |row| row.record.at);
-        let moment = last.saturating_add(policy.backoff(failures));
+        let moment = last.at.saturating_add(policy.backoff(failures));
         handle.until(moment);
         Schedule::At(moment)
     };
-    Retry { failures, schedule, last_cause: Some((*cause).clone()) }
+    Retry { failures, schedule, last_cause: Some(last.cause.clone()) }
 }

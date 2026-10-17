@@ -5,6 +5,8 @@
 //! - `Detach{channelAbsent}`: the channel presence reads `not channelAbsent`
 //!   (an observed absence is a `false` observation).
 //! - `End{reason, observed}`: the session's end is observed with `reason` iff `observed`.
+//! - `Receive{message, transport}`: the receive edge for message `m<message>`
+//!   by that transport (`turn`, `notify` or `mute`); it reads nothing.
 //!
 //! State mapping, one to one: `Live { channel }` is `Live(channel)` and
 //! `Ended { reason }` is `Ended(reason)`, with the same constructor names.
@@ -12,15 +14,15 @@
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::agent_session::{
-        AgentSession, AgentSessionRefusal, AgentSessionState, Attach, Channel, Detach, End, EndReason, MemoryAgentSessionWorld,
+        AgentSession, AgentSessionRefusal, AgentSessionState, Attach, Channel, Detach, End, EndReason, MemoryAgentSessionWorld, Receive,
     },
-    Home, Ref, WriteError,
+    Home, Ref, Transport, WriteError,
 };
 use serde_json::Value;
 
 use crate::{
     graph::{self, bare, refusal, tick, Conformance, Report, Step},
-    itf::{boolean, payload, tag, variant},
+    itf::{boolean, number, payload, tag, text, variant},
 };
 
 const NAME: &str = "s";
@@ -70,6 +72,16 @@ impl Conformance for SessionConformance {
                     world.ends.put(&Ref::new(NAME), reason);
                 }
                 outcome(home.apply(NAME, End { reason, observed: Ref::new(NAME) }, &world, at))
+            }
+            "Receive" => {
+                let transport = match text(&o["transport"]) {
+                    "turn" => Transport::Turn,
+                    "notify" => Transport::Notify,
+                    "mute" => Transport::Mute,
+                    other => panic!("transport {other}"),
+                };
+                let message = format!("m{}", number(&o["message"]));
+                outcome(home.apply(NAME, Receive { message, transport }, &world, at))
             }
             other => panic!("agent session event {other}"),
         }

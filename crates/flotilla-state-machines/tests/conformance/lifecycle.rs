@@ -5,39 +5,43 @@
 //!   `present`, under the edge's identity iff `matches`.
 //! - `Release{teardownComplete}`: the teardown reads `teardownComplete`.
 //! - `Vanish{absent}`: the absence reads `absent`.
-//! - `GiveUp{exhausted, lastCauseMatches, cause}`: when `exhausted`, one failed
-//!   attempt is recorded first (the probe kind gives up after one failure),
-//!   with the edge's cause iff `lastCauseMatches`; otherwise no attempt.
+//! - `Attempted(outcome)`: an [`Attempted`] edge with that outcome.
+//! - `GiveUp{cause}`: a [`GiveUp`] edge with that cause; the probe kind's
+//!   policy gives up after the spec's `MAX_FAILURES` (2) failures.
 //!
-//! State mapping: `Requested` and `Gone` one to one, `Realised { identity }`
-//! is `Realised(identity)`, and `GaveUp { cause }` is `GaveUp(cause.detail)`.
-//! The one remaining difference: the spec's cause is a string, while a Rust
-//! [`Cause`] also has a category, shared across kinds. The category is not
-//! part of the spec's rule, so the adaptor records every cause as
-//! [`CauseCategory::Transient`] and encodes the detail only.
+//! State mapping: `Requested(history)` is `Requested { .. }` with `history`
+//! the resource's `Attempted` log entries in order. The state keeps only the
+//! tally of that history (D2: a decision reads no log), so encoding also
+//! checks the tally against the history's failures since its last success
+//! and its last outcome. `Gone` is one to one, `Realised { identity }` is
+//! `Realised(identity)`, and `GaveUp { cause }` is `GaveUp(cause.detail)`.
+//! The spec's cause is a string, while a Rust [`Cause`] also has a category,
+//! shared across kinds. The category is not part of the spec's rule, so the
+//! adaptor records every cause as [`CauseCategory::Transient`] and encodes
+//! the detail only.
 
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::lifecycle::{
-        GiveUp, Lifecycle, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed, Realise, Release, Vanish,
+        Attempted, GiveUp, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed,
+        Realise, Release, Vanish,
     },
-    Attempt, AttemptPolicy, Cause, CauseCategory, Home, Ref, WriteError,
+    AttemptPolicy, Cause, CauseCategory, Home, Outcome, Ref, WriteError,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::{
     graph::{self, bare, refusal, tick, Conformance, Report, Step},
-    itf::{boolean, payload, tag, text, variant},
+    itf::{boolean, payload, tag, text, unit, variant},
 };
 
-/// A lifecycle kind whose requests give up after one failure, so the spec's
-/// `exhausted` is one recorded failed attempt.
+/// A lifecycle kind whose requests give up after the spec's `MAX_FAILURES`.
 struct Probe;
 impl LifecycleKind for Probe {
     const NAME: &'static str = "Probe";
     type Request = ();
     fn policy() -> AttemptPolicy {
-        AttemptPolicy::immediate(1)
+        AttemptPolicy::immediate(2)
     }
 }
 
@@ -59,10 +63,29 @@ fn outcome<T>(result: Result<T, WriteError<P>>) -> Step {
     }
 }
 
-/// A lifecycle state value in the spec's shape; the vessel adaptor shares it.
-pub fn encode_state(state: &LifecycleState) -> Value {
+/// The spec's `AttemptOutcome`.
+fn outcome_value(outcome: &Outcome) -> Value {
+    match outcome {
+        Outcome::Succeeded => variant("Succeeded", unit()),
+        Outcome::Failed { cause, retryable } => variant("Failed", json!({ "retryable": retryable, "cause": cause.detail })),
+    }
+}
+
+/// A lifecycle state value in the spec's shape, given the resource's
+/// attempts in order; the vessel adaptor shares it with none. Checks the
+/// Requested tally against those attempts.
+pub fn encode_state(state: &LifecycleState, attempts: &[&Outcome]) -> Value {
     match state {
-        LifecycleState::Requested => bare("Requested"),
+        LifecycleState::Requested { failures, last_failure } => {
+            let since_success = attempts.iter().rev().take_while(|o| matches!(o, Outcome::Failed { .. })).count();
+            assert_eq!(*failures as usize, since_success, "the tally counts the failures since the last success");
+            let last = attempts.last().and_then(|o| match o {
+                Outcome::Failed { cause, retryable } => Some((cause, *retryable)),
+                Outcome::Succeeded => None,
+            });
+            assert_eq!(last_failure.as_ref().map(|f| (&f.cause, f.retryable)), last, "the tally keeps the last outcome's failure");
+            variant("Requested", Value::Array(attempts.iter().map(|o| outcome_value(o)).collect()))
+        }
         LifecycleState::Realised { identity } => variant("Realised", Value::from(identity.as_str())),
         LifecycleState::Gone => bare("Gone"),
         LifecycleState::GaveUp { cause } => variant("GaveUp", Value::from(cause.detail.as_str())),
@@ -79,16 +102,6 @@ impl Conformance for LifecycleConformance {
         let mut home = Home::new("home").expect("valid declaration");
         home.create(NAME, (), Timestamp(0)).expect("created");
         home
-    }
-
-    fn prepare(home: &mut Home<P>, event: &Value) {
-        if tag(event) == "GiveUp" && boolean(&payload(event)["exhausted"]) {
-            let o = payload(event);
-            let detail = text(&o["cause"]);
-            let last = if boolean(&o["lastCauseMatches"]) { detail.to_string() } else { format!("not-{detail}") };
-            // Outside Requested this is refused like the edge; the edge's refusal is compared.
-            let _ = home.record_attempt(NAME, Attempt::failed(tick(1), cause(&last), true));
-        }
     }
 
     fn apply(home: &mut Home<P>, event: &Value) -> Step {
@@ -112,13 +125,32 @@ impl Conformance for LifecycleConformance {
                 world.absences.put(&Ref::new(NAME), boolean(&o["absent"]));
                 outcome(home.apply(NAME, Vanish { observed: Ref::new(NAME) }, &world, at))
             }
+            "Attempted" => {
+                let attempted = match tag(o) {
+                    "Succeeded" => Outcome::Succeeded,
+                    _ => {
+                        let failed = payload(o);
+                        Outcome::Failed { cause: cause(text(&failed["cause"])), retryable: boolean(&failed["retryable"]) }
+                    }
+                };
+                outcome(home.apply(NAME, Attempted { outcome: attempted }, &world, at))
+            }
             "GiveUp" => outcome(home.apply(NAME, GiveUp { cause: cause(text(&o["cause"])) }, &world, at)),
             other => panic!("lifecycle event {other}"),
         }
     }
 
     fn encode(home: &Home<P>) -> Value {
-        encode_state(home.get(NAME).expect("exists").state())
+        let resource = home.get(NAME).expect("exists");
+        let attempts: Vec<&Outcome> = resource
+            .events()
+            .iter()
+            .filter_map(|row| match &row.record.payload.edge {
+                LifecycleEdge::Attempted(attempted) => Some(&attempted.outcome),
+                _ => None,
+            })
+            .collect();
+        encode_state(resource.state(), &attempts)
     }
 
     fn version(home: &Home<P>) -> u64 {

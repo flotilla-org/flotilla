@@ -8,10 +8,13 @@ module message {
   pure val dropReasons = Set(Undeliverable, Expired, Superseded, Withdrawn, ConsumerUnreachable)
   // A drop records the evidence its reason's rule consulted: the applied
   // watermark and the binding only for an expiry, the receipt only for undeliverable.
-  type Drop = { reason: DropReason, envelope: Envelope, receiver: int, at: int, watermark: int, bound: bool, receipt: bool }
-  type State = Pending(Envelope) | Awaiting(Delivery) | Settled(Envelope) | Dropped(Drop)
+  type Drop = { reason: DropReason, envelope: Envelope, receiver: int, watermark: int, bound: bool, receipt: bool }
+  type State = Pending(Envelope) | Awaiting(Delivery) | Settled({ envelope: Envelope, receiver: int }) | Dropped(Drop)
+  // Evidence is read from versioned Receive entries whose about is this message.
+  // receiverMatches and transportMatches compare the recorded edge arguments.
   type Receipt = { observed: bool, receiverMatches: bool, transportMatches: bool, receiver: Receiver }
   type Settlement = Answered({ observed: bool }) | OutcomeObserved({ observed: bool })
+  // receipt means a Receive entry about this message is present in the applied log.
   type DropEvidence = { reason: DropReason, now: int, bound: bool, appliedThrough: int,
     met: bool, receipt: bool, noConsumerPastThreshold: bool, failure: bool, supersedes: bool, authorised: bool }
   type Event = Deliver(Receipt) | Settle(Settlement) | DropMessage(DropEvidence)
@@ -19,9 +22,9 @@ module message {
     | PrefixBeforeDeadline | ExpectationMet | ReceiptConfirmed | Unauthorised
   type Next = Moved(State) | Refused(Refusal)
   pure def envelope(s: State): Envelope = match s {
-    | Pending(e) => e | Awaiting(d) => d.envelope | Settled(e) => e | Dropped(d) => d.envelope
+    | Pending(e) => e | Awaiting(d) => d.envelope | Settled(d) => d.envelope | Dropped(d) => d.envelope
   }
-  pure def receiver(s: State): int = match s { | Awaiting(d) => d.receiver.session | Dropped(d) => d.receiver | _ => 0 }
+  pure def receiver(s: State): int = match s { | Awaiting(d) => d.receiver.session | Settled(d) => d.receiver | Dropped(d) => d.receiver | _ => 0 }
   pure def ended(s: State): bool = match s { | Settled(_) => true | Dropped(_) => true | _ => false }
   pure def pending(slot: Slot): bool = match slot { | Present(s) => match s { | Pending(_) => true | _ => false } | _ => false }
   pure def step(s: State, event: Event): Next = match s {
@@ -31,18 +34,18 @@ module message {
       match event {
         | Deliver(r) => match s {
             | Pending(_) => if (not(r.observed and r.receiverMatches and r.transportMatches)) Refused(IncorrectReceipt)
-                else if (env.expectation == Nothing) Moved(Settled(env))
+                else if (env.expectation == Nothing) Moved(Settled({ envelope: env, receiver: r.receiver.session }))
                 else Moved(Awaiting({ envelope: env, receiver: r.receiver }))
             | _ => Refused(WrongState)
           }
         | Settle(by) => match by {
             | Answered(o) => match s {
                 | Awaiting(_) => if (env.expectation != Reply) Refused(UnsupportedSettlement)
-                    else if (o.observed) Moved(Settled(env)) else Refused(MissingEvidence)
+                    else if (o.observed) Moved(Settled({ envelope: env, receiver: receiver(s) })) else Refused(MissingEvidence)
                 | _ => Refused(WrongState)
               }
             | OutcomeObserved(o) => if (env.expectation != Outcome) Refused(UnsupportedSettlement)
-                else if (o.observed) Moved(Settled(env)) else Refused(MissingEvidence)
+                else if (o.observed) Moved(Settled({ envelope: env, receiver: receiver(s) })) else Refused(MissingEvidence)
           }
         | DropMessage(o) =>
             val bound = o.bound or receiver(s) != 0
@@ -62,7 +65,7 @@ module message {
             match refusal {
               | Refused(r) => Refused(r)
               | Moved(_) => Moved(Dropped({ reason: o.reason, envelope: env, receiver: receiver(s),
-                  at: o.now, watermark: if (o.reason == Expired and bound) o.appliedThrough else 0,
+                  watermark: if (o.reason == Expired and bound) o.appliedThrough else 0,
                   bound: o.reason == Expired and bound, receipt: if (o.reason == Undeliverable) o.receipt else false }))
             }
       }

@@ -4,9 +4,9 @@ use flotilla_schema::{Code, CodeEnum, Timestamp};
 use flotilla_state_machines::{
     machines::agent_session::{
         AgentSession, AgentSessionEdgeKind, AgentSessionLabel, AgentSessionRefusal, AgentSessionState, Attach, Channel, ChannelPresence,
-        Detach, End, EndReason, MemoryAgentSessionWorld, SessionEnd,
+        Detach, End, EndReason, MemoryAgentSessionWorld, Receive, SessionEnd,
     },
-    Coded, Diagram, Home, InputRead, Machine, Receipt, Ref, Transport, Version, WriteError,
+    Coded, Diagram, Home, InputRead, Machine, Ref, Transport, Version, WriteError,
 };
 
 fn at(micros: i64) -> Timestamp {
@@ -71,19 +71,39 @@ fn codes_and_names_are_pinned() {
     let labels: Vec<_> = AgentSessionLabel::ALL.iter().map(|s| (s.name(), s.code())).collect();
     assert_eq!(labels, [("Live", Code::new("li")), ("Ended", Code::new("en"))]);
     let edges: Vec<_> = AgentSessionEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    assert_eq!(edges, [("attach", Code::new("at")), ("detach", Code::new("de")), ("end", Code::new("en"))]);
+    let codes = [("attach", "at"), ("detach", "de"), ("end", "en"), ("receive", "rv")];
+    assert_eq!(edges, codes.map(|(name, code)| (name, Code::new(code))));
 }
 
-// The diagram shows the ADR's table: the channel moving within Live, and
-// Live → Ended with its reason; the labels view keeps only the end.
+// The diagram shows the ADR's table: the channel moving within Live, a
+// receipt keeping Live, and Live → Ended with its reason; the labels view
+// keeps only the end.
 #[test]
 fn mermaid_is_pinned() {
     let head = "---\ntitle: AgentSession\n---\nstateDiagram-v2\n  direction LR\n  [*] --> Live\n";
-    let channel = "  Live --> Live: attach [channel]\n  Live --> Live: detach [channel]\n";
+    let channel = "  Live --> Live: attach [channel]\n  Live --> Live: detach [channel]\n  Live --> Live: receive\n";
     let rest = "  Live --> Ended: end [reason]\n  Ended --> [*]\n  note right of Ended: the session has ended\n";
     let definition = AgentSession::definition();
     assert_eq!(definition.mermaid(Diagram::Full), format!("{head}{channel}{rest}"));
     assert_eq!(definition.mermaid(Diagram::Labels), format!("{head}{rest}"));
+}
+
+// A receipt is a Receive edge (R4, G11): Live to the same Live on either
+// channel, reading nothing, its event carrying the message and transport,
+// and its master the message, so the message's gates find the entries about it.
+#[test]
+fn a_receipt_is_a_receive_edge_about_its_message() {
+    let mut h = home();
+    let receive = || Receive { message: "m".into(), transport: Transport::Notify };
+    let event = h.apply("s", receive(), &channel(None), at(1)).expect("received while detached").clone();
+    assert_eq!((event.from, event.to), (AgentSessionLabel::Live, AgentSessionLabel::Live));
+    assert!(event.payload.reads.is_empty(), "an ungated receipt reads nothing");
+    assert_eq!(h.definition().master(&event.payload.edge).as_deref(), Some("m"));
+    assert_eq!(h.definition().master(&attach().into()), None);
+    h.apply("s", attach(), &channel(Some(true)), at(2)).expect("attached");
+    h.apply("s", receive(), &channel(None), at(3)).expect("received while attached");
+    assert_eq!(*state(&h), live(Channel::Attached), "a receipt keeps the channel");
+    assert_eq!(h.get("s").expect("exists").events().len(), 3);
 }
 
 // A new session is Live and Detached; a name is created once.
@@ -130,21 +150,20 @@ fn channel_edges_need_the_right_channel_then_an_observation() {
     assert_eq!(*state(&h), live(Channel::Detached));
 }
 
-// Once ended, every edge refuses AlreadyEnded before any channel check, and
-// receipts, recorded on the session while it is Live, are refused too.
+// Once ended, every edge refuses AlreadyEnded before any channel check,
+// receipts too.
 #[test]
 fn an_ended_session_refuses_everything_with_already_ended() {
     let mut h = home();
     h.apply("s", attach(), &channel(Some(true)), at(1)).expect("attached");
-    let receipt = Receipt { message: "m".into(), transport: Transport::Turn, at: at(1) };
-    h.record_receipt("s", receipt.clone()).expect("receipt recorded while live");
-    assert_eq!(h.get("s").expect("exists").receipts().len(), 1);
+    let receipt = Receive { message: "m".into(), transport: Transport::Turn };
+    h.apply("s", receipt.clone(), &channel(None), at(1)).expect("received while live");
     h.apply("s", end(EndReason::Lost), &ended_with(Some(EndReason::Lost)), at(2)).expect("ended");
     let already = refused(AgentSessionRefusal::AlreadyEnded);
     // Attach would be WrongChannel and detach would pass on a live session.
     assert_eq!(h.apply("s", attach(), &channel(Some(true)), at(3)).err(), already);
     assert_eq!(h.apply("s", detach(), &channel(Some(false)), at(3)).err(), already);
     assert_eq!(h.apply("s", end(EndReason::Lost), &ended_with(Some(EndReason::Lost)), at(3)).err(), already);
-    assert_eq!(h.record_receipt("s", receipt).err(), already);
+    assert_eq!(h.apply("s", receipt, &channel(None), at(3)).err(), already);
     assert_eq!(*state(&h), AgentSessionState::Ended { reason: EndReason::Lost });
 }

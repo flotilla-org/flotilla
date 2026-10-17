@@ -14,14 +14,14 @@ use std::{borrow::Cow, collections::BTreeMap, fmt, marker::PhantomData};
 
 use flotilla_schema::{
     adapt::{Adapter, AsInterned},
-    Column, Columns, DecodeError, Decoder, Element, EncodeError, Encoder, Intern, KeyColumn, Layout, RecordRow, Timestamp,
+    Column, Columns, DecodeError, Decoder, Element, EncodeError, Encoder, Intern, KeyColumn, Layout, Timestamp,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Attempt, Machine, Receipt, Resource};
+use crate::{Machine, Resource};
 
-/// Something a gate or judgement can read: a resource kind, or a family of
-/// records such as one session's receipts, each named by a [`Ref`].
+/// Something a gate or judgement can read: a resource kind, or the log
+/// entries about a master such as one message's receipts, each named by a [`Ref`].
 pub trait Kind: 'static {
     /// The stable name recorded with each read.
     const NAME: &'static str;
@@ -206,15 +206,9 @@ impl<K: Kind> Source<K> for Table<K> {
     }
 }
 
-/// The [`InputRead::kind`] of a read of the resource's own attempts.
-pub const OWN_ATTEMPTS: &str = "attempts";
-/// The [`InputRead::kind`] of a read of the resource's own receipts.
-pub const OWN_RECEIPTS: &str = "receipts";
-
 /// One recorded read: what was read and the version seen, or `None` when the
 /// read found nothing. A gate relying on an absence relied on an input too.
-/// `kind` is a [`Kind::NAME`] (or [`OWN_ATTEMPTS`], [`OWN_RECEIPTS`]) when
-/// recorded and owned text when decoded from an edge event's document.
+/// `kind` is a [`Kind::NAME`] when recorded and owned text when decoded from an edge event's document.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InputRead {
     pub kind: Cow<'static, str>,
@@ -246,13 +240,12 @@ pub struct Handle<'a, M: Machine> {
 
 impl<'a, M: Machine> Handle<'a, M> {
     /// A handle for a pure step or judgement over a spec and state alone,
-    /// with no records: own-record reads see empty logs, and record them
-    /// under the empty name with version 0, which is exactly what they saw.
+    /// with no resource: its name is empty.
     pub fn new(spec: &'a M::Spec, state: &'a M::State, world: &'a M::World, now: Timestamp) -> Self {
         Handle { own: None, spec, state, world, now, reads: Vec::new(), valid_until: None }
     }
 
-    /// A handle on a resource and its records, at `now`.
+    /// A handle on a resource, at `now`.
     pub fn on(resource: &'a Resource<M>, world: &'a M::World, now: Timestamp) -> Self {
         Handle { own: Some(resource), spec: resource.spec(), state: resource.state(), world, now, reads: Vec::new(), valid_until: None }
     }
@@ -295,26 +288,6 @@ impl<'a, M: Machine> Handle<'a, M> {
         if !self.reads.contains(&read) {
             self.reads.push(read);
         }
-    }
-
-    fn own_read(&mut self, kind: &'static str, length: usize) {
-        let name = self.name().to_string();
-        self.record(InputRead { kind: Cow::Borrowed(kind), name, version: Some(Version(length as u64)) });
-    }
-
-    /// The resource's own attempts, every window. Recorded with the log's
-    /// length as its version.
-    pub fn attempts(&mut self) -> &'a [RecordRow<Attempt>] {
-        let rows = self.own.map_or(&[][..], |own| own.attempts().rows());
-        self.own_read(OWN_ATTEMPTS, rows.len());
-        rows
-    }
-
-    /// The resource's own receipts. Recorded like [`Handle::attempts`].
-    pub fn receipts(&mut self) -> &'a [RecordRow<Receipt>] {
-        let rows = self.own.map_or(&[][..], |own| own.receipts().rows());
-        self.own_read(OWN_RECEIPTS, rows.len());
-        rows
     }
 
     /// Declares that the value being computed may change at `moment` by time

@@ -48,7 +48,7 @@ module message_race {
   }
   val inTimeEvidence = source.rows.indices().exists(i => ((expectation == M::Reply and source.rows[i].kind == "reply") or (expectation == M::Outcome and source.rows[i].kind == "outcome")) and source.rows[i].at <= 1)
   val expiryLosesToEvidence = match current { | Dropped(d) => d.reason != M::Expired or not(inTimeEvidence) | _ => true }
-  val expiredPastPrefix = match current { | Dropped(d) => d.reason != M::Expired or (d.at > d.envelope.deadline and d.watermark > d.envelope.deadline) | _ => true }
+  val expiredPastPrefix = match current { | Dropped(d) => d.reason != M::Expired or d.watermark > d.envelope.deadline | _ => true }
   val noUndeliverableReceipt = match current { | Dropped(d) => d.reason != M::Undeliverable or not(d.receipt) | _ => true }
   val safety = noUndeliverableReceipt and expiryLosesToEvidence and expiredPastPrefix
   val view = (M::messages, source, now)

@@ -63,7 +63,16 @@ observed caps, live counts, available capacity and waiting requests. A lease
 holds only its request and host. The scenario keeps what each placement's
 priority rule read (available capacity and waiting requests), so the priority
 invariant checks the evidence the rule used. Ensure carries its binding,
-recorded fulfillers and attempt window on the relevant variants.
+recorded fulfillers, attempt history and window on the relevant variants. Each
+attempt is an `Attempted` edge with its outcome; `Hold` needs the window's
+consecutive failures since its last success to reach `MAX_FAILURES` (2 in the
+model), or its last failure to be non-retryable. The shared lifecycle's
+Requested carries its own attempt history under the same rule, with no
+windows: `GiveUp` needs that history exhausted and its last failure to have
+the cause given up with. A receipt is the consumer
+session's `Receive` edge, whose master is the message; the inbox scenario
+publishes its stream row with that edge, so the message reads the receipts
+about it.
 
 A gate's booleans represent **versioned local evidence**, not remote queries or
 link health. Bind receives realised/can-receive facts; expiry reads the applied
@@ -84,10 +93,10 @@ The scenarios encode these rulings:
 |---|---|---|
 | Convoy | nonempty admission; deliver requires every promise kept or an accepted retraction; abandon requires an authorised decision | once promises are satisfied, fair delivery ends the convoy |
 | Inbox / replacement / unbind | turn before receipt; per-session dedupe; drain observed receipts before bind; accept an old session's receipt; one receiver; no undeliverable drop with an observed receipt; unbound timeout starts at unbind | observed receipts make progress under fair home delivery; observed session ends and sustained silence trigger owner unbind reactions |
-| Ensure | record before create; bind only Realised/receiving; release and observe Gone before replacement; retire releases every created fulfiller, including Requested; resume retains history and moves the window | a bound fulfiller observed Gone is eventually unbound under a fair owner reaction |
+| Ensure | record before create; bind only Realised/receiving; release and observe Gone before replacement; retire releases every created fulfiller, including Requested; a hold follows a failure in the current window; resume retains history and moves the window | a bound fulfiller observed Gone is eventually unbound under a fair owner reaction |
 | Message race | outcome may settle Pending; terminal edges refuse; expiry waits for the consumer prefix past the deadline and loses to visible evidence; supersede and withdrawn reasons | visible expected evidence eventually settles under fair settlement; ends remain final |
 | Admission / placement | two convoys, two hosts, three placement requests, two abstract classes and two capacity dimensions; convoy caps, host leases, Gone lease return, priority order | no availability fairness assumed |
-| Machine edges | all lifecycle and session edges, matching/missing evidence, exhausted attempts, ended resources | finite gate/edge coverage in the fast tier |
+| Machine edges | all lifecycle and session edges (receipts too), matching/missing evidence, exhausted attempts, ended resources | finite gate/edge coverage in the fast tier |
 
 Safety is expressed over typed state wherever possible: delivery promises,
 recorded bindings, retirement, receiver identity, drop reasons, expiry evidence
@@ -142,8 +151,9 @@ state through the real `Home` along a path in that graph, and applies every prob
 event. The engine must accept exactly the moves the spec's `step` makes, reach the
 same state value, and refuse where the spec refuses with the same `Refusal` variant.
 Each adaptor encodes the Rust state (with the immutable spec where the Quint state
-carries request data, and attempt records for Ensure's history) in the spec's shape
-and compares it whole; its module doc lists the few remaining encoding choices.
+carries request data, and the `Attempted` log entries for the attempt histories
+of Ensure and the lifecycle) in the spec's shape and compares it whole,
+checking each state's tally against those entries; its module doc lists the few remaining encoding choices.
 Harness events carry the evidence a home could observe, and the test maps each
 evidence field onto the world the gate reads. Each harness comment states its
 event domain.
@@ -161,10 +171,13 @@ rather than impersonating a production transport. Ended AgentSessions
 deliberately retain no channel in the Quint state. Both checks are `#[ignore]`d
 in workspace CI, which runs the crate's own fmt, Clippy and unit tests.
 
-Ten external patches each change one rule in an isolated copy: missing expiry
+Fourteen external patches each change one rule in an isolated copy: missing expiry
 watermark, cancellation only from Realised, duplicate turns, bind without drain,
 resettling a promise, exceeding convoy caps, overbooking hosts and bypassing the
-priority queue, and retaining a lease after Gone, and undeliverable drops with confirmed receipts. Each must produce an actual TLC invariant counterexample;
+priority queue, retaining a lease after Gone, undeliverable drops with confirmed
+receipts, holding an Ensure on failures before its window or before its last success, and
+giving a lifecycle up with a cause other than its last failure's or on failures
+before its last success. Each must produce an actual TLC invariant counterexample;
 parse, compiler and tool failures are errors, never mutant detection. Production
 modules contain no mutant switches. Generated specs, ITF and logs stay in `build/`.
 Shell connects compilation to TLC (`VIEW` is not exposed by Quint's TLC runtime

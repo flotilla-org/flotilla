@@ -15,7 +15,7 @@ module vessel {
             else if (o.live >= o.cap) Refused(QuotaExceeded)
             else if (not(fits(r, o.available))) Refused(DoesNotFit)
             else if (o.waiting.exists(w => w.priority > r.priority and fits(w, o.available))) Refused(HigherPriorityWaiting)
-            else Moved(Leased({ placement: { request: r, host: o.host }, lifecycle: L::Requested }))
+            else Moved(Leased({ placement: { request: r, host: o.host }, lifecycle: L::Requested([]) }))
         | _ => Refused(WrongState)
       }
     | Leased(v) => val result = match e {

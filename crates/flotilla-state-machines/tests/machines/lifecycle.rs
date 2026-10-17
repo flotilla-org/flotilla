@@ -4,10 +4,10 @@ use flotilla_schema::{Code, CodeEnum, Timestamp};
 use flotilla_state_machines::{
     changed,
     machines::lifecycle::{
-        Absence, GiveUp, Lifecycle, LifecycleEdgeKind, LifecycleKind, LifecycleLabel, LifecycleRefusal, LifecycleState,
+        Absence, Attempted, GiveUp, Lifecycle, LifecycleEdgeKind, LifecycleKind, LifecycleLabel, LifecycleRefusal, LifecycleState,
         MemoryLifecycleWorld, Observed, Realise, Release, Teardown, Vanish,
     },
-    Attempt, AttemptPolicy, Cause, CauseCategory, Coded, Diagram, Home, InputRead, Machine, Ref, StateValue, Version, WriteError,
+    AttemptPolicy, Cause, CauseCategory, Coded, Diagram, Failure, Home, InputRead, Machine, Outcome, Ref, StateValue, Version, WriteError,
 };
 
 /// A kind for tests with an opaque request: one failure exhausts, as in the
@@ -70,6 +70,14 @@ fn refused(refusal: LifecycleRefusal) -> Option<WriteError<P>> {
     Some(WriteError::Refused(refusal))
 }
 
+fn failed(detail: &str) -> Attempted {
+    Attempted { outcome: Outcome::Failed { cause: cause(detail), retryable: true } }
+}
+
+fn succeeded() -> Attempted {
+    Attempted { outcome: Outcome::Succeeded }
+}
+
 // Every kind shares one declaration, and it follows the engine's rules; the
 // machine takes its name from the kind.
 #[test]
@@ -80,30 +88,28 @@ fn every_kind_validates() {
 }
 
 // Codes are stable identities: a rename must never change them. Each label
-// carries the spec's data.
+// carries the spec's data, and Requested the attempt tally the spec abstracts.
 #[test]
 fn codes_and_names_are_pinned() {
     let labels: Vec<_> = LifecycleLabel::ALL.iter().map(|s| (s.name(), s.code(), LifecycleState::fields(*s))).collect();
     let expected: [(&str, Code, &[&str]); 4] = [
-        ("Requested", Code::new("rq"), &[]),
+        ("Requested", Code::new("rq"), &["failures", "last_failure"]),
         ("Realised", Code::new("rl"), &["identity"]),
         ("Gone", Code::new("go"), &[]),
         ("GaveUp", Code::new("gu"), &["cause"]),
     ];
     assert_eq!(labels, expected);
     let edges: Vec<_> = LifecycleEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    assert_eq!(
-        edges,
-        [("realise", Code::new("rl")), ("release", Code::new("rs")), ("vanish", Code::new("va")), ("give_up", Code::new("gu"))]
-    );
+    let codes = [("realise", "rl"), ("release", "rs"), ("vanish", "va"), ("give_up", "gu"), ("attempted", "at")];
+    assert_eq!(edges, codes.map(|(name, code)| (name, Code::new(code))));
 }
 
 // The diagram shows the ADR's table: realise, release from both live states,
 // vanish from Realised, give up from Requested, the data each changes, and
-// both ends. No edge keeps its label, so both drawings are the same.
+// both ends. The labels view leaves out attempts, which keep Requested.
 #[test]
 fn the_diagram_is_pinned() {
-    let expected = "---
+    let labels = "---
 title: Probe
 ---
 stateDiagram-v2
@@ -119,8 +125,12 @@ stateDiagram-v2
   GaveUp --> [*]
   note right of GaveUp: the request gave up
 ";
-    assert_eq!(P::definition().mermaid(Diagram::Full), expected);
-    assert_eq!(P::definition().mermaid(Diagram::Labels), expected);
+    let full = labels.replace(
+        "  Requested --> GaveUp: give_up [cause]\n",
+        "  Requested --> Requested: attempted [failures, last_failure]\n  Requested --> GaveUp: give_up [cause]\n",
+    );
+    assert_eq!(P::definition().mermaid(Diagram::Full), full);
+    assert_eq!(P::definition().mermaid(Diagram::Labels), labels);
 }
 
 // Admission keeps the opaque request as the spec and starts Requested.
@@ -128,7 +138,7 @@ stateDiagram-v2
 fn admission_starts_requested() {
     let h = home();
     let r = h.get("r").expect("exists");
-    assert_eq!((r.spec().as_str(), r.state()), ("opaque request", &LifecycleState::Requested));
+    assert_eq!((r.spec().as_str(), r.state()), ("opaque request", &LifecycleState::requested()));
     assert!(r.state().live() && !r.state().realised() && !r.state().gone());
 }
 
@@ -173,7 +183,7 @@ fn release_needs_a_complete_teardown() {
 fn going_leaves_the_identity_behind_without_changing_data() {
     let realised = LifecycleState::Realised { identity: "a".into() };
     assert!(changed(&realised, &LifecycleState::Gone).is_empty());
-    assert_eq!(changed(&LifecycleState::Requested, &realised).into_iter().collect::<Vec<_>>(), ["identity"]);
+    assert_eq!(changed(&LifecycleState::requested(), &realised).into_iter().collect::<Vec<_>>(), ["identity"]);
     let declared = P::definition();
     let release = declared.find(LifecycleEdgeKind::Release).expect("declared");
     assert!(release.changes.is_empty());
@@ -203,11 +213,14 @@ fn give_up_needs_exhausted_attempts_with_that_cause() {
     let mut h = home();
     let give_up = GiveUp { cause: cause("boom") };
     assert_eq!(h.apply("r", give_up.clone(), &world, at(1)).err(), refused(LifecycleRefusal::MissingEvidence));
-    h.record_attempt("r", Attempt::failed(at(1), cause("other"), true)).expect("recorded");
+    h.apply("r", failed("other"), &world, at(1)).expect("attempted");
     assert_eq!(h.apply("r", give_up.clone(), &world, at(2)).err(), refused(LifecycleRefusal::MissingEvidence));
-    h.record_attempt("r", Attempt::succeeded(at(2))).expect("recorded");
+    h.apply("r", succeeded(), &world, at(2)).expect("attempted");
+    assert_eq!(state(&h), &LifecycleState::requested(), "a success clears the tally");
     assert_eq!(h.apply("r", give_up.clone(), &world, at(3)).err(), refused(LifecycleRefusal::MissingEvidence));
-    h.record_attempt("r", Attempt::failed(at(3), cause("boom"), true)).expect("recorded");
+    h.apply("r", failed("boom"), &world, at(3)).expect("attempted");
+    let failure = Failure { at: at(3), cause: cause("boom"), retryable: true };
+    assert_eq!(state(&h), &LifecycleState::Requested { failures: 1, last_failure: Some(failure) });
     h.apply("r", give_up, &world, at(4)).expect("gave up");
     assert_eq!(state(&h), &LifecycleState::GaveUp { cause: cause("boom") });
     assert_eq!(state(&h).cause(), Some(&cause("boom")));
@@ -227,7 +240,7 @@ fn the_default_policy_gives_up_after_three_failures() {
     for n in 1..=3 {
         let refusal = h.apply("r", GiveUp { cause: cause("boom") }, &world, at(n)).err();
         assert_eq!(refusal, Some(WriteError::Refused(LifecycleRefusal::MissingEvidence)), "after {} failures", n - 1);
-        h.record_attempt("r", Attempt::failed(at(n), cause("boom"), true)).expect("recorded");
+        h.apply("r", Attempted { outcome: Outcome::Failed { cause: cause("boom"), retryable: true } }, &world, at(n)).expect("attempted");
     }
     h.apply("r", GiveUp { cause: cause("boom") }, &world, at(4)).expect("gave up");
 }
@@ -241,7 +254,7 @@ fn ends_refuse_everything() {
     let mut gone_home = home();
     gone_home.apply("r", release(), &world, at(1)).expect("released");
     let mut gave_up = home();
-    gave_up.record_attempt("r", Attempt::failed(at(1), cause("boom"), true)).expect("recorded");
+    gave_up.apply("r", failed("boom"), &world, at(1)).expect("attempted");
     gave_up.apply("r", GiveUp { cause: cause("boom") }, &world, at(1)).expect("gave up");
     for (mut h, reason) in [(gone_home, "the thing is gone"), (gave_up, "the request gave up")] {
         let ended = refused(LifecycleRefusal::Ended(reason));
@@ -249,14 +262,14 @@ fn ends_refuse_everything() {
         assert_eq!(h.apply("r", release(), &world, at(2)).err(), ended);
         assert_eq!(h.apply("r", vanish(), &world, at(2)).err(), ended);
         assert_eq!(h.apply("r", GiveUp { cause: cause("boom") }, &world, at(2)).err(), ended);
-        assert_eq!(h.record_attempt("r", Attempt::succeeded(at(2))).err(), ended);
+        assert_eq!(h.apply("r", succeeded(), &world, at(2)).err(), ended);
     }
 }
 
-// Attempts are recorded only while Requested.
+// Attempts are edges that leave only Requested.
 #[test]
 fn attempts_only_while_requested() {
     let mut h = home();
     h.apply("r", realise("a"), &observed("a"), at(1)).expect("realised");
-    assert_eq!(h.record_attempt("r", Attempt::succeeded(at(2))).err(), refused(LifecycleRefusal::WrongState));
+    assert_eq!(h.apply("r", succeeded(), &MemoryLifecycleWorld::default(), at(2)).err(), refused(LifecycleRefusal::WrongState));
 }

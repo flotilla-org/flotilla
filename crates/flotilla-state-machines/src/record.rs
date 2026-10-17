@@ -1,12 +1,11 @@
-//! Records: rows that belong to one resource, kept in `flotilla_schema::Records`.
+//! Edge events: rows that belong to one resource, kept in `flotilla_schema::Records`.
 //!
-//! A record has no identity, watch or lifecycle of its own (ADR 0064). Only
+//! An event has no identity, watch or lifecycle of its own (ADR 0064). Only
 //! the home appends, positions are dense and never reused, and nothing removes
 //! or rewrites a row. Each row carries the owner's version at the write that
-//! appended it ([`Version`](crate::Version)'s `u64`), which orders rows across
-//! a resource's logs.
+//! appended it ([`Version`](crate::Version)'s `u64`).
 
-use flotilla_schema::{Stored, Timestamp};
+use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 
 use crate::{EdgeKind, InputRead, Label, Machine};
@@ -26,7 +25,8 @@ pub struct EdgePayload<E> {
 /// replay of events, answers what is true now.
 pub type EdgeEventOf<M> = flotilla_schema::EdgeEvent<Label<M>, EdgeKind<M>, EdgePayload<<M as Machine>::Edge>>;
 
-/// How a turn reached its consumer. Filtering chooses how, never whether:
+/// How a turn reached its consumer: an argument of a session's `Receive`
+/// edge and of a message's `Deliver`. Filtering chooses how, never whether:
 /// a muted delivery still counts as delivered (ADR 0064).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub enum Transport {
@@ -36,16 +36,4 @@ pub enum Transport {
     Notify,
     #[store(code = "mu")]
     Mute,
-}
-
-/// A consumer's receipt for one message, appended after its turn: a row of
-/// the session's `history` table of receipts. Receipts never change.
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
-pub struct Receipt {
-    /// The message's name at its home. An address: plain interned text until
-    /// a later layer adopts `flotilla-address`.
-    #[store(intern)]
-    pub message: String,
-    pub transport: Transport,
-    pub at: Timestamp,
 }
