@@ -187,8 +187,8 @@ fn record_stamps_are_never_null(tc: TestCase) {
         }
     }
     assert_eq!(
-        checked, 13,
-        "every engine kind's edges, the session's receipts, the Ensure's and the terminal session's attempts, the ticket's and \
-         referral's edges, and the dossier's deliverables, evidence and edges"
+        checked, 10,
+        "every engine kind's edges (receipts and attempts among them), the ticket's and referral's edges, and the dossier's \
+         deliverables, evidence and edges"
     );
 }

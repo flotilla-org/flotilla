@@ -2,13 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 
-use flotilla_state_machines::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Table, WrongState};
+use flotilla_state_machines::{
+    attempt, edges, states, EdgeDef, Ended, Failure, Handle, Kind, Machine, MachineDef, Outcome, Ref, Table, WrongState,
+};
 
 // A latch that is loaded with shots and armed, then either fires (spending
-// itself when its spec says so) or is withdrawn with a reason.
+// itself when its spec says so) or is withdrawn with a reason. While armed
+// it keeps the tally of its attempts at firing; re-arming opens a new window.
 states! {
     pub enum Latch => LatchLabel {
-        Armed { shots: u32 } = "ar",
+        Armed { shots: u32, failures: u32, #[store(flatten)] last_failure: Option<Failure> } = "ar",
         Fired { shots: u32, by: String } = "fi",
         Spent { shots: u32 } = "sp",
         Withdrawn { reason: String } = "wd",
@@ -34,13 +37,33 @@ pub struct Withdraw {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReArm;
 
+/// One attempt at firing, and how it ended: an edge that changes the tally.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Try {
+    pub outcome: Outcome,
+}
+
+/// A note about `subject`, its master: an edge that changes nothing but its
+/// log entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Note {
+    pub subject: String,
+}
+
 edges! {
     pub enum LatchEdge => LatchEdgeKind {
         Fire(Fire) = "fi",
         Withdraw(Withdraw) = "wd",
         ReArm(ReArm) = "ra",
         Load(Load) = "lo",
+        Try(Try) = "tr",
+        Note(Note) = "no",
     }
+}
+
+/// An armed latch with `shots` and no attempts.
+pub fn armed(shots: u32) -> Latch {
+    Latch::Armed { shots, failures: 0, last_failure: None }
 }
 
 pub struct Signal;
@@ -81,9 +104,6 @@ impl Machine for LatchMachine {
     type Edge = LatchEdge;
     type Refusal = LatchRefusal;
     type World = Table<Signal>;
-    // The latch exercises the writer's records, so its stored kind would keep both.
-    const RECORDS_ATTEMPTS: bool = true;
-    const RECORDS_RECEIPTS: bool = true;
 
     fn definition() -> MachineDef<Self> {
         use LatchLabel::*;
@@ -113,22 +133,50 @@ impl Machine for LatchMachine {
                     .effect(|_, _, withdraw| Latch::Withdrawn { reason: withdraw.reason.clone() }),
             )
             .edge(
-                EdgeDef::<Self, ReArm>::new().from([Fired]).to([Armed]).ungated("re-arming a fired latch needs no evidence").effect(re_arm),
+                EdgeDef::<Self, ReArm>::new()
+                    .from([Fired])
+                    .to([Armed])
+                    .changes(["failures", "last_failure"])
+                    .ungated("re-arming a fired latch needs no evidence")
+                    .effect(re_arm),
+            )
+            .edge(
+                EdgeDef::<Self, Try>::new()
+                    .from([Armed])
+                    .to([Armed])
+                    .changes(["failures", "last_failure"])
+                    .ungated("an attempt reports how a try ended")
+                    .effect(try_once),
+            )
+            .edge(
+                EdgeDef::<Self, Note>::new()
+                    .from([Armed])
+                    .to([Armed])
+                    .about(|note| &note.subject)
+                    .ungated("a note is its log entry")
+                    .effect(|_, state, _| state),
             )
             .end(Spent, "the latch fired for good")
             .end(Withdrawn, "the latch was withdrawn")
-            .attempts_in([Armed])
     }
 
     fn admit(spent: bool) -> Result<(bool, Latch), LatchRefusal> {
-        Ok((spent, Latch::Armed { shots: 0 }))
+        Ok((spent, armed(0)))
     }
 }
 
 pub fn shots(latch: &Latch) -> u32 {
     match latch {
-        Latch::Armed { shots } | Latch::Fired { shots, .. } | Latch::Spent { shots } => *shots,
+        Latch::Armed { shots, .. } | Latch::Fired { shots, .. } | Latch::Spent { shots } => *shots,
         Latch::Withdrawn { .. } => 0,
+    }
+}
+
+/// The armed latch's attempt tally; none in any other label.
+pub fn tally(latch: &Latch) -> (u32, Option<&Failure>) {
+    match latch {
+        Latch::Armed { failures, last_failure, .. } => (*failures, last_failure.as_ref()),
+        _ => (0, None),
     }
 }
 
@@ -141,7 +189,15 @@ fn gate_load(_: &mut Handle<'_, LatchMachine>, load: &Load) -> Result<(), LatchR
 }
 
 fn load(_: &mut Handle<'_, LatchMachine>, state: Latch, load: &Load) -> Latch {
-    Latch::Armed { shots: shots(&state) + load.shots }
+    match state {
+        Latch::Armed { shots, failures, last_failure } => Latch::Armed { shots: shots + load.shots, failures, last_failure },
+        other => armed(shots(&other) + load.shots),
+    }
+}
+
+fn try_once(h: &mut Handle<'_, LatchMachine>, state: Latch, edge: &Try) -> Latch {
+    let (failures, last_failure) = attempt::tally(tally(&state).0, &edge.outcome, h.now());
+    Latch::Armed { shots: shots(&state), failures, last_failure }
 }
 
 // Typed on its own argument: no match on the edge enum. Reads the current
@@ -174,5 +230,5 @@ fn gate_withdraw(_: &mut Handle<'_, LatchMachine>, withdraw: &Withdraw) -> Resul
 }
 
 fn re_arm(_: &mut Handle<'_, LatchMachine>, state: Latch, _: &ReArm) -> Latch {
-    Latch::Armed { shots: shots(&state) }
+    armed(shots(&state))
 }

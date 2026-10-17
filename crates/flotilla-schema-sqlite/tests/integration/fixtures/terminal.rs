@@ -1,8 +1,9 @@
 //! `TerminalSession`: a lifecycle kind (`flotilla_state_machines::machines::lifecycle`) with a
 //! concrete request, declared here because a lifecycle kind's request is its spec, which declares
 //! the stored kind wherever the request is owned (#3319, #3392 ruling D5). The stored kind is
-//! `Resource<Lifecycle<Terminal>>`: the engine supplies the storable state (`LifecycleState`) and
-//! history (the edge log and `Attempt`s); the request's columns are this test kind's own,
+//! `Resource<Lifecycle<Terminal>>`: the engine supplies the storable state (`LifecycleState`, with
+//! the attempt tally while Requested) and history (the edge log, attempts among its edges); the
+//! request's columns are this test kind's own,
 //! transcribed from the #3208 §4.3 sketch:
 //! - `vessel` is a reference to the `Vessel` kind (a target kind of the test registry), so a
 //!   lifecycle row also exercises references to kinds and their identity rows;
@@ -15,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_schema::{Edge, Frozen, Ref, State, Stored};
 use flotilla_state_machines::{
     machines::lifecycle::{
-        Absence, GiveUp, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld, Observed,
-        Realisation, Realise, Release, Teardown, Vanish,
+        Absence, Attempted, GiveUp, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld,
+        Observed, Realisation, Realise, Release, Teardown, Vanish,
     },
     Resource,
 };
@@ -25,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     engine::{self, resource, Candidate},
-    ensure::{attempt, cause},
+    ensure::{cause, outcome, tally},
     key, list, name, records, reference, stamp_flat, text, timestamp, Fixture, Pick,
 };
 
@@ -93,12 +94,16 @@ pub struct Brief {
     pub skills: Vec<String>,
 }
 
-/// Covering indexes: the label is digit 0 (base 4), the source digit 2 (base 2).
+/// Covering indexes: the label is digit 0 (base 4), the source digit 2 (base 2), and Requested's
+/// tally digits 3 and 4 (base 2).
 pub const COVERING: usize = 48;
 
 pub fn state_value(tc: &TestCase, pick: Pick) -> LifecycleState {
     match pick.digit(tc, 4, 1) {
-        0 => LifecycleState::Requested,
+        0 => {
+            let (failures, last_failure) = tally(tc, pick, 8);
+            LifecycleState::Requested { failures, last_failure }
+        }
         1 => LifecycleState::Realised { identity: text(tc) },
         2 => LifecycleState::Gone,
         _ => LifecycleState::GaveUp { cause: cause(tc, pick) },
@@ -111,6 +116,7 @@ fn edges(tc: &TestCase, pick: Pick) -> Vec<LifecycleEdge> {
         Release { teardown: flotilla_state_machines::Ref::new(name(tc)) }.into(),
         Vanish { observed: flotilla_state_machines::Ref::new(name(tc)) }.into(),
         GiveUp { cause: cause(tc, pick) }.into(),
+        Attempted { outcome: outcome(tc, pick) }.into(),
     ]
 }
 
@@ -150,7 +156,6 @@ pub fn request(tc: &TestCase, pick: Pick) -> TerminalRequest {
 pub fn generate(tc: &TestCase, pick: Pick) -> TerminalSession {
     resource(request(tc, pick), State::new(state_value(tc, pick), timestamp(tc)))
         .with_events(records(tc, pick, 3, |pick| engine::event::<Lifecycle<Terminal>>(tc, pick, &edges(tc, pick))))
-        .with_attempts(records(tc, pick.nth(1), 3, |pick| attempt(tc, pick)))
 }
 
 fn boxed(world: MemoryLifecycleWorld) -> Box<dyn LifecycleWorld> {
@@ -158,7 +163,8 @@ fn boxed(world: MemoryLifecycleWorld) -> Box<dyn LifecycleWorld> {
 }
 
 /// Every edge a live session may take: realising under an observed identity, releasing once torn
-/// down, vanishing when observed absent, and giving up with its last attempt's cause.
+/// down, vanishing when observed absent, an attempt of either outcome, and giving up with its last
+/// failure's cause.
 pub fn candidates(tc: &TestCase, session: &TerminalSession) -> Vec<Candidate<Lifecycle<Terminal>>> {
     let now = timestamp(tc);
     let mut candidates = Vec::new();
@@ -174,10 +180,11 @@ pub fn candidates(tc: &TestCase, session: &TerminalSession) -> Vec<Candidate<Lif
     let mut world = MemoryLifecycleWorld::default();
     world.absences.put(&absent, true);
     candidates.push((Vanish { observed: absent }.into(), boxed(world), now));
-    let last = session.attempts().last().and_then(|row| match &row.record.outcome {
-        flotilla_state_machines::Outcome::Failed { cause, .. } => Some(cause.clone()),
-        flotilla_state_machines::Outcome::Succeeded => None,
-    });
+    candidates.push((Attempted { outcome: outcome(tc, Pick::Draw) }.into(), boxed(MemoryLifecycleWorld::default()), now));
+    let last = match session.state() {
+        LifecycleState::Requested { last_failure, .. } => last_failure.as_ref().map(|failure| failure.cause.clone()),
+        _ => None,
+    };
     if let Some(cause) = last {
         candidates.push((GiveUp { cause }.into(), boxed(MemoryLifecycleWorld::default()), now));
     }
@@ -191,7 +198,7 @@ impl Fixture for TerminalSession {
         generate(tc, pick)
     }
 
-    /// The request drawn afresh; the state, events and attempts kept.
+    /// The request drawn afresh; the state and events kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> TerminalSession {
         self.clone().with_spec(request(tc, pick))
     }
@@ -201,10 +208,6 @@ impl Fixture for TerminalSession {
     }
 
     fn stamped(&self, before: Option<&TerminalSession>, version: u64) -> TerminalSession {
-        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version)).with_attempts(stamp_flat(
-            self.attempts(),
-            before.map(|before| before.attempts()),
-            version,
-        ))
+        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version))
     }
 }

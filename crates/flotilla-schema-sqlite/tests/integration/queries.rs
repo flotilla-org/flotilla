@@ -249,7 +249,7 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
         assert_eq!(collect(&mut store, &TerminalRequest::by_vessel(&Ref::<Vessel>::new(vessel, LOCAL)), limit), want);
     }
     for pool in ["blue", "green", "red"] {
-        let live = |s: &TerminalSession| matches!(s.state(), LifecycleState::Requested | LifecycleState::Realised { .. });
+        let live = |s: &TerminalSession| matches!(s.state(), LifecycleState::Requested { .. } | LifecycleState::Realised { .. });
         let want = expected(&sessions, |s: &TerminalSession| live(s) && s.spec().pool == pool, |_| ());
         assert_eq!(collect(&mut store, &TerminalRequest::live_by_pool(&pool.to_owned()), limit), want);
     }

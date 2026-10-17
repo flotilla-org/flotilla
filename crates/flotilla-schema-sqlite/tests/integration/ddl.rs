@@ -64,7 +64,6 @@ fn every_table_is_strict_and_foreign_keys_hold() {
         [
             "agent_session",
             "agent_session_edges",
-            "agent_session_receipts",
             "change_log",
             "codes",
             "convoy",
@@ -80,7 +79,6 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "dossier_inputs",
             "dossier_inputs_items",
             "ensure",
-            "ensure_attempts",
             "ensure_created",
             "ensure_edges",
             "ensure_recorded",
@@ -94,7 +92,6 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "resource_identity",
             "strings",
             "terminal_session",
-            "terminal_session_attempts",
             "terminal_session_edges",
             "terminal_session_env",
             "terminal_session_labels",
