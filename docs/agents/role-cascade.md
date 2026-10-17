@@ -193,10 +193,8 @@ custom leaves without a supported promise kind retain their checks under
 Project-map's applied manifest inventory additionally contains
 `crew-defaults-fleet.json`, `repository-andamento.json`,
 `repository-cleat-github.json`, and `repository-flotilla-github.json`. The
-checked-in Flotilla `ops/usage-observer.ensure.md` declares role presence,
-workflow choice and genuine placement/presentation overrides;
-`ops/usage-observer.md` supplies local tool workflow content. Neither currently
-repeats a governor agent/model default.
+Flotilla repository itself checks in no standing ensures: the usage observer
+that used to live in `ops/` was retired on 2026-10-17.
 
 ### Derived relationships
 

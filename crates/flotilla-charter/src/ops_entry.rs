@@ -178,7 +178,6 @@ fn required(value: String, field: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
 
     use super::{parse_operational_entry, OperationalEntryDefinition};
 
@@ -239,10 +238,12 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_usage_observer_is_a_standing_tool_workflow_ensured_on_kiwi() {
-        let workflow = parse_operational_entry(include_str!("../../../ops/usage-observer.md"))
-            .expect("parse usage observer workflow")
-            .expect("usage observer workflow entry");
+    fn standing_tool_workflow_and_pinned_ensure_parse() {
+        let workflow = parse_operational_entry(
+            "---\nkind: workflow_template\nname: usage-observer\nrepos: [flotilla]\n---\nvessels:\n  - name: observe\n    crew:\n      - role: poller\n        needs: [host_account_reach, \"platform:macos\"]\n        command: scripts/usage-observer\n",
+        )
+        .expect("parse usage observer workflow")
+        .expect("usage observer workflow entry");
         let OperationalEntryDefinition::WorkflowTemplate(workflow) = workflow.definition else {
             panic!("usage observer should be a workflow template");
         };
@@ -252,9 +253,11 @@ mod tests {
             flotilla_resources::CrewSource::Tool { command } if command == "scripts/usage-observer"
         ));
 
-        let ensure = parse_operational_entry(include_str!("../../../ops/usage-observer.ensure.md"))
-            .expect("parse usage observer ensure")
-            .expect("usage observer ensure entry");
+        let ensure = parse_operational_entry(
+            "---\nkind: ensure\nrole: usage-observer\nrepos: [flotilla]\n---\nworkflow: usage-observer\nplacement: host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3\npresents-as: fleet\n",
+        )
+        .expect("parse usage observer ensure")
+        .expect("usage observer ensure entry");
         assert!(matches!(
             ensure.definition,
             OperationalEntryDefinition::Ensure(super::EnsureEntry {
@@ -306,98 +309,5 @@ mod tests {
         let error = parse_operational_entry("---\nkind: ensure\nrole: governor\n---\nworkflow: governor\nagent: claude-code\n")
             .expect_err("unknown agent field");
         assert!(error.contains("unknown field `agent`"));
-    }
-
-    #[test]
-    fn checked_in_usage_observer_script_preserves_translation_and_coalescing_rules() {
-        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/usage-observer");
-        let expected_codex_name = flotilla_resources::address::record_name(
-            &flotilla_resources::address::Address::usage("codex", "Ada@Example.com").expect("usage address"),
-        )
-        .expect("record name");
-        let expected_claude_name = flotilla_resources::address::record_name(
-            &flotilla_resources::address::Address::usage("claude", "Ada@Example.com").expect("usage address"),
-        )
-        .expect("record name");
-        let program = r#"
-import copy
-import runpy
-import sys
-from types import SimpleNamespace
-
-observer = runpy.run_path(sys.argv[1], run_name="usage_observer_test")
-assert observer["record_name"](" CODEX ", " Ada@Example.com ") == sys.argv[2]
-assert observer["record_name"]("claude", "Ada@Example.com") == sys.argv[3]
-assert sys.argv[2] != sys.argv[3]
-
-payload = {
-    "provider": "codex",
-    "usage": {
-        "primary": {"usedPercent": 8.0, "resetsAt": "2026-08-10T12:00:00Z"},
-        "secondary": {"usedPercent": 35.0},
-        "extraRateWindows": [{
-            "id": "codex-spark",
-            "title": "Codex Spark",
-            "window": {"usedPercent": 73.0},
-        }],
-        "providerCost": {"used": 12.5, "limit": 50.0, "currencyCode": "USD", "balance": 37.5},
-        "codexResetCredits": {"availableCount": 2},
-        "updatedAt": "2026-08-10T10:00:00Z",
-        "identity": {"accountEmail": "Ada@Example.com", "loginMethod": "plus"},
-    },
-    "pace": None,
-}
-account, current = observer["translate_payload"]("codex", payload)
-assert account == "Ada@Example.com"
-assert [(window["name"], window["used_percent"]) for window in current["windows"]] == [
-    ("session", 8.0), ("weekly", 35.0), ("codex-spark", 73.0)
-]
-assert current["provider_cost"]["balance"] == 37.5
-assert current["reset_credits_available"] == 2
-assert "provider" not in current
-
-runtime = observer["ensure_usage"].__globals__
-documents = []
-runtime["flotilla_command"] = lambda arguments: SimpleNamespace(returncode=1, stdout="", stderr="not found")
-runtime["command_with_document"] = lambda arguments, document: documents.append(document) or SimpleNamespace(returncode=0, stdout="", stderr="")
-observer["ensure_usage"](sys.argv[2], "codex", account)
-assert documents == [{
-    "kind": "Usage",
-    "metadata": {"name": sys.argv[2]},
-    "spec": {"provider": "codex", "account": "Ada@Example.com"},
-}]
-
-sub_threshold = copy.deepcopy(current)
-sub_threshold["windows"][0]["used_percent"] = 8.999
-sub_threshold["observed_at"] = "2026-08-10T10:59:00Z"
-assert not observer["material_change"](current, sub_threshold)
-
-threshold = copy.deepcopy(current)
-threshold["windows"][0]["used_percent"] = 9.0
-assert observer["material_change"](current, threshold)
-
-structural = copy.deepcopy(current)
-structural["windows"][0]["resets_at"] = "2026-08-10T13:00:00Z"
-assert observer["material_change"](current, structural)
-
-heartbeat = copy.deepcopy(current)
-heartbeat["observed_at"] = "2026-08-10T11:00:00Z"
-assert observer["material_change"](current, heartbeat)
-
-patches = []
-runtime = observer["run_cycle"].__globals__
-runtime["poll"] = lambda provider: [(account, current)] if provider == "codex" else []
-runtime["ensure_usage"] = lambda name, provider, account: None
-runtime["patch_status"] = lambda name, status: patches.append((name, status))
-last_written = {}
-observer["run_cycle"](last_written)
-observer["run_cycle"](last_written)
-assert len(patches) == 1
-"#;
-        let output = Command::new("python3")
-            .args(["-c", program, script, &expected_codex_name, &expected_claude_name])
-            .output()
-            .expect("run usage observer Python contract test");
-        assert!(output.status.success(), "usage observer Python contract failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 }
