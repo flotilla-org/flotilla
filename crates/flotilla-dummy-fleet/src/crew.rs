@@ -192,6 +192,7 @@ impl Crew {
         // Keep completion counters per script, rather than per follow-up report.
         if matches!(ending, Some(Ending::Completed)) {
             while self.next_turn().await.is_some() {
+                // Report this follow-up without repeating the original completion message or URL.
                 if self.complete(None).await.is_none() {
                     break;
                 }
