@@ -9,8 +9,7 @@
 //! `history` is the Ensure's attempt records, and its `Fail` is
 //! [`Home::record_attempt`](crate::Home::record_attempt), not an edge.
 //!
-//! The stored kind is [`EnsureRow`] (code 9, the next code after the schema
-//! stack's test kinds): the spec's inbox and flattened policy, the state
+//! The stored kind is [`EnsureRow`] (code `en`): the spec's inbox and flattened policy, the state
 //! (with the recorded and created fulfillers as child tables of state data,
 //! which `record` and `create` grow a row at a time), the edge log and the
 //! attempts.
@@ -39,23 +38,23 @@ states! {
             #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,
             #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
             window: u32,
-        } = 1,
+        } = "un",
         Fulfilled {
             #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,
             #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
             window: u32,
             #[store(intern)] bound: Ref<Fulfiller>,
-        } = 2,
+        } = "fu",
         Held {
             #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,
             #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
             window: u32,
-        } = 3,
+        } = "he",
         Retired {
             #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,
             #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
             window: u32,
-        } = 4,
+        } = "rt",
     }
 }
 
@@ -173,13 +172,13 @@ pub struct Retire {
 
 edges! {
     pub enum EnsureEdge => EnsureEdgeKind {
-        Record(Record) = 1,
-        Create(Create) = 2,
-        Bind(Bind) = 3,
-        Unbind(Unbind) = 4,
-        GiveUp(GiveUp) = 5,
-        Resume(Resume) = 6,
-        Retire(Retire) = 7,
+        Record(Record) = "rc",
+        Create(Create) = "cr",
+        Bind(Bind) = "bi",
+        Unbind(Unbind) = "ub",
+        GiveUp(GiveUp) = "gu",
+        Resume(Resume) = "rs",
+        Retire(Retire) = "rt",
     }
 }
 
@@ -478,11 +477,11 @@ fn gate_retire(h: &mut Handle<'_, Ensure>, edge: &Retire) -> Result<(), EnsureRe
     Ok(())
 }
 
-/// The stored Ensure (kind code 9): the spec's inbox and flattened policy,
+/// The stored Ensure (kind code `en`): the spec's inbox and flattened policy,
 /// the state, the edge log and the attempts. Indexed by inbox, the read a
 /// binding change makes.
 #[derive(Clone, Debug, PartialEq, Stored)]
-#[store(kind = "Ensure", code = 9, index(name = "by_inbox", eq(inbox)))]
+#[store(kind = "Ensure", code = "en", index(name = "by_inbox", eq(inbox)))]
 pub struct EnsureRow {
     /// An address: plain interned text until `flotilla-address` is adopted.
     #[store(intern)]

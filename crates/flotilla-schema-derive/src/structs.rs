@@ -1,6 +1,6 @@
 //! Code generation for structs: kinds, parts and newtypes.
 //!
-//! A kind (`#[store(kind = "Name", code = N)]`) is the root row of its own tables and implements
+//! A kind (`#[store(kind = "Name", code = "..")]`) is the root row of its own tables and implements
 //! `Element` and `Kind`. A part implements `Element` (it can be a collection's row) and, having no
 //! table fields, `Columns` and `Flat` (it can be flattened into another row). A part's table fields
 //! nest under its collection's table, and its declared indexes are on that table. A single-field
@@ -28,10 +28,10 @@ pub(crate) fn expand(input: &DeriveInput, fields: &FieldsNamed, type_attrs: Type
             check_kind_name(kind)?;
             let indexes = Indexes::parse(&type_attrs.indexes, &fields)?;
             let handles = handles(input, &fields, true)?;
-            let kind = kind_impls(input, &fields, kind, code, &indexes);
+            let kind = kind_impls(input, &fields, kind, &code, &indexes);
             Ok(quote!(#kind #handles))
         }
-        (Some(kind), None) => Err(syn::Error::new_spanned(kind, "a kind needs a stable `code = N`")),
+        (Some(kind), None) => Err(syn::Error::new_spanned(kind, "a kind needs a stable `code = \"..\"`")),
         (None, Some((_, span))) => Err(syn::Error::new(span, "`code` on a struct needs `kind = \"Name\"`")),
         (None, None) => {
             let indexes = Indexes::parse(&type_attrs.indexes, &fields)?;
@@ -142,7 +142,7 @@ fn element_impl(input: &DeriveInput, fields: &[Field<'_>], indexes: TokenStream)
 /// lead back through `Message`'s own field bounds. Concrete fields are still checked through the
 /// `Element` supertrait. Declared indexes join the descriptor after the root's layout, and each
 /// gets a query constructor.
-fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u32, indexes: &Indexes<'_, '_>) -> TokenStream {
+fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: &str, indexes: &Indexes<'_, '_>) -> TokenStream {
     let schema = schema();
     let ident = &input.ident;
     let element = element_impl(input, fields, TokenStream::new());
@@ -157,7 +157,7 @@ fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u3
         #[automatically_derived]
         impl #impl_generics #schema::Kind for #ident #ty_generics #where_clause {
             const KIND: &'static str = #kind;
-            const CODE: #schema::KindCode = #schema::KindCode(#code);
+            const CODE: #schema::KindCode = #schema::KindCode::new(#code);
 
             fn table_set() -> #schema::TableSet {
                 let mut layout = #schema::Layout::root(<Self as #schema::Kind>::KIND, <Self as #schema::Kind>::CODE);

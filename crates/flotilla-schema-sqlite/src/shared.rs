@@ -14,7 +14,7 @@ use flotilla_schema::{render_ddl_with, DdlMode, KindRegistry};
 pub(crate) const SHARED_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS strings (id INTEGER PRIMARY KEY, s TEXT NOT NULL UNIQUE) STRICT;
 CREATE TABLE IF NOT EXISTS resource_identity (
-  id INTEGER PRIMARY KEY, kind INTEGER NOT NULL,
+  id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
   name INTEGER NOT NULL REFERENCES strings(id), home INTEGER NOT NULL REFERENCES strings(id),
   seq INTEGER NOT NULL DEFAULT 0,
   UNIQUE (kind, name, home)) STRICT;

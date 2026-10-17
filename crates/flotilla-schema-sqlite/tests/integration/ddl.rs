@@ -74,7 +74,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "dossier_deliverables_evidence_metadata",
             "dossier_edges",
             "dossier_inputs",
-            "dossier_inputs_list_items",
+            "dossier_inputs_items",
             "ensure",
             "ensure_attempts",
             "ensure_created",

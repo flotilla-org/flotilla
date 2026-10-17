@@ -1,27 +1,29 @@
 //! Label-plus-data states (#3373 rulings 1 to 3), without a backend: a synthetic `Ticket` kind
 //! whose state is `#[store(labels = TicketLabel)]`. It is clearly synthetic: no engine kind is a
 //! ticket; it exercises every datum form (plain, `child` set and map, `intern`, optional and
-//! required) and a label that carries no data.
+//! required), a datum that is `T` under one label and `Option<T>` under another (#3392 ruling G5),
+//! and a label that carries no data.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_schema::{
-    render_ddl, ColumnType, Condition, DecodeError, Decoder, Edge, EdgeError, EdgeEvent, EdgeParts, EdgeRow, EdgeSet, Encoder,
+    render_ddl, Code, ColumnType, Condition, DecodeError, Decoder, Edge, EdgeError, EdgeEvent, EdgeParts, EdgeRow, EdgeSet, Encoder,
     FieldColumns, Kind, LabelCheck, Labelled, Records, RowEdit, RowPath, Rows, State, StateData, Stored, TableRole, Timestamp, Value,
 };
 use hegel::{generators as gs, TestCase};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 enum TicketLabel {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Draft,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Open,
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Closed,
 }
 
-/// A hold on an open ticket: an optional flattened datum, behind its `hold_present` flag.
+/// A hold on a ticket: an optional flattened datum while Open, present by its first required
+/// column, and required once Closed.
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 struct Hold {
     by: String,
@@ -39,9 +41,9 @@ struct Signature {
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 #[store(labels = TicketLabel)]
 enum TicketState {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Draft,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Open {
         #[store(child)]
         assignees: BTreeSet<String>,
@@ -53,16 +55,18 @@ enum TicketState {
         #[store(flatten)]
         hold: Option<Hold>,
     },
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Closed {
         #[store(child)]
         assignees: BTreeSet<String>,
         #[store(child)]
         notes: BTreeMap<String, String>,
         priority: u8,
-        reason: String,
         #[store(intern)]
-        closed_by: String,
+        owner: String,
+        #[store(flatten)]
+        hold: Hold,
+        reason: String,
         #[store(flatten)]
         signature: Signature,
     },
@@ -70,16 +74,16 @@ enum TicketState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 enum TicketEdge {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Edit,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Move,
 }
 
 type TicketEvent = EdgeEvent<TicketLabel, TicketEdge, String>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
-#[store(kind = "Ticket", code = 8, index(name = "live_by_queue", eq(queue), when(state in [Open, Closed])))]
+#[store(kind = "Ticket", code = "k8", index(name = "live_by_queue", eq(queue), when(state in [Open, Closed])))]
 struct Ticket {
     #[store(intern)]
     queue: String,
@@ -124,8 +128,9 @@ fn state_value(tc: &TestCase) -> TicketState {
             assignees: assignees(tc),
             notes: notes(tc),
             priority: tc.draw(gs::integers::<u8>().min_value(0).max_value(1)),
+            owner: small(tc, &["ann", "bo"]),
+            hold: Hold { by: small(tc, &["ann", "bo"]), until: Timestamp(tc.draw(gs::integers::<i64>().min_value(0).max_value(1))) },
             reason: small(tc, &["done", "dup"]),
-            closed_by: small(tc, &["ann", "bo"]),
             signature: Signature {
                 who: small(tc, &["ann", "bo"]),
                 at: Timestamp(tc.draw(gs::integers::<i64>().min_value(0).max_value(1))),
@@ -165,8 +170,11 @@ fn column(name: &str, ty: ColumnType, nullable: bool) -> (String, ColumnType, bo
 // `<field>_since`, then one column group per column datum and one `state` table per collection
 // datum, each declared once and named by the datum whatever labels carry it. Datum columns are
 // nullable, and one CHECK per label requires the label's own required data and nulls the data it
-// lacks (Draft carries none; only Closed requires a reason). A flattened datum is its struct's
-// columns `<datum>_<field>`, behind a `<datum>_present` flag when optional. The label field and each column datum
+// lacks (Draft carries none; only Closed requires a reason). A datum that is `Option<T>` under
+// Open and `T` under Closed (`owner`, `hold`) is one nullable column group, required by Closed's
+// CHECK alone (#3392 G5). A flattened datum is its struct's columns `<datum>_<field>`; an optional
+// one is present by its first required column, with one CHECK keeping its columns all set or all
+// null (no presence flag). The label field and each column datum
 // are state fields of the row, the datums marked with their label field; a map datum's table is
 // keyed by owner and map key, a set datum's by owner and value. An index predicate on the state
 // takes its codes from the labels enum.
@@ -181,15 +189,13 @@ fn a_label_state_is_one_label_column_and_shared_data() {
         [
             column("queue", ColumnType::Interned, false),
             column("title", ColumnType::Text, false),
-            column("state", ColumnType::Code(vec![1, 2, 3]), false),
+            column("state", ColumnType::Code(vec![Code::new("c1"), Code::new("c2"), Code::new("c3")]), false),
             column("state_since", ColumnType::Timestamp, false),
             column("priority", ColumnType::Integer, true),
             column("owner", ColumnType::Interned, true),
-            column("hold_present", ColumnType::Bool, true),
             column("hold_by", ColumnType::Text, true),
             column("hold_until", ColumnType::Timestamp, true),
             column("reason", ColumnType::Text, true),
-            column("closed_by", ColumnType::Interned, true),
             column("signature_who", ColumnType::Interned, true),
             column("signature_at", ColumnType::Timestamp, true),
         ]
@@ -208,29 +214,27 @@ fn a_label_state_is_one_label_column_and_shared_data() {
             field("state", 2..4, true, None),
             field("priority", 4..5, true, Some("state")),
             field("owner", 5..6, true, Some("state")),
-            field("hold", 6..9, true, Some("state")),
-            field("reason", 9..10, true, Some("state")),
-            field("closed_by", 10..11, true, Some("state")),
-            field("signature", 11..13, true, Some("state")),
+            field("hold", 6..8, true, Some("state")),
+            field("reason", 8..9, true, Some("state")),
+            field("signature", 9..11, true, Some("state")),
         ]
     );
     let checks: Vec<String> = root.guards.iter().map(|guard| guard.check()).collect();
     assert_eq!(
         checks,
         [
-            "CASE WHEN \"hold_present\" = 1 THEN \"hold_by\" IS NOT NULL AND \"hold_until\" IS NOT NULL \
-             ELSE \"hold_by\" IS NULL AND \"hold_until\" IS NULL END",
-            "CASE WHEN \"state\" = 1 THEN \"priority\" IS NULL AND \"owner\" IS NULL AND \"hold_present\" IS NULL AND \"reason\" IS NULL \
-             AND \"closed_by\" IS NULL AND \"signature_who\" IS NULL AND \"signature_at\" IS NULL END",
-            "CASE WHEN \"state\" = 2 THEN \"priority\" IS NOT NULL AND \"hold_present\" IS NOT NULL AND \"reason\" IS NULL \
-             AND \"closed_by\" IS NULL AND \"signature_who\" IS NULL AND \"signature_at\" IS NULL END",
-            "CASE WHEN \"state\" = 3 THEN \"priority\" IS NOT NULL AND \"reason\" IS NOT NULL AND \"closed_by\" IS NOT NULL \
-             AND \"signature_who\" IS NOT NULL AND \"signature_at\" IS NOT NULL AND \"owner\" IS NULL AND \"hold_present\" IS NULL END",
+            "CASE WHEN \"hold_by\" IS NOT NULL THEN \"hold_until\" IS NOT NULL ELSE \"hold_until\" IS NULL END",
+            "CASE WHEN \"state\" = 'c1' THEN \"priority\" IS NULL AND \"owner\" IS NULL AND \"hold_by\" IS NULL AND \"hold_until\" IS NULL \
+             AND \"reason\" IS NULL AND \"signature_who\" IS NULL AND \"signature_at\" IS NULL END",
+            "CASE WHEN \"state\" = 'c2' THEN \"priority\" IS NOT NULL AND \"reason\" IS NULL \
+             AND \"signature_who\" IS NULL AND \"signature_at\" IS NULL END",
+            "CASE WHEN \"state\" = 'c3' THEN \"priority\" IS NOT NULL AND \"owner\" IS NOT NULL AND \"hold_by\" IS NOT NULL \
+             AND \"hold_until\" IS NOT NULL AND \"reason\" IS NOT NULL AND \"signature_who\" IS NOT NULL AND \"signature_at\" IS NOT NULL END",
         ]
     );
-    // A flattened optional datum keeps its presence guard: its columns are null unless it is
-    // present, and its flag is null under a label lacking it.
-    assert!(!root.guards[0].is_label() && root.guards[1..].iter().all(|guard| guard.is_label()));
+    // The optional flattened datum keeps its presence CHECK, which also covers Closed; no CHECK
+    // expands an enum.
+    assert!(root.enums.is_empty());
     let tables: Vec<(&str, TableRole, Vec<&str>, Vec<&str>)> = set.tables[1..]
         .iter()
         .map(|table| {
@@ -248,7 +252,7 @@ fn a_label_state_is_one_label_column_and_shared_data() {
         ]
     );
     let index = set.indexes.iter().find(|index| index.name == "live_by_queue").expect("declared");
-    assert_eq!(index.predicate, [Condition::In { column: "state".into(), codes: vec![2, 3] }]);
+    assert_eq!(index.predicate, [Condition::In { column: "state".into(), codes: vec![Code::new("c2"), Code::new("c3")] }]);
     let ddl = render_ddl(&set);
     assert!(
         ddl.contains(
@@ -256,8 +260,9 @@ fn a_label_state_is_one_label_column_and_shared_data() {
         ),
         "{ddl}"
     );
-    assert!(ddl.contains("CHECK (CASE WHEN \"state\" = 2\n      THEN \"priority\" IS NOT NULL\n      AND \"hold_present\" IS NOT NULL\n      AND \"reason\" IS NULL"), "{ddl}");
-    assert_eq!(<TicketState as StateData>::DATA, ["assignees", "notes", "priority", "owner", "hold", "reason", "closed_by", "signature"]);
+    assert!(ddl.contains("CHECK (CASE WHEN \"state\" = 'c2'\n      THEN \"priority\" IS NOT NULL\n      AND \"reason\" IS NULL"), "{ddl}");
+    assert!(ddl.contains("\"state\" TEXT NOT NULL CHECK (\"state\" IN ('c1', 'c2', 'c3'))"), "{ddl}");
+    assert_eq!(<TicketState as StateData>::DATA, ["assignees", "notes", "priority", "owner", "hold", "reason", "signature"]);
 }
 
 // Behaviour (#3373 ruling 1): every value of a label-plus-data state round-trips through its rows:
@@ -274,12 +279,13 @@ fn label_states_round_trip(tc: TestCase) {
             assert!(root[4..].iter().all(|value| *value == Value::Null), "Draft carries no data: {root:?}");
             assert!(assignees.is_empty() && notes.is_empty());
         }
-        TicketState::Open { assignees: set, notes: map, .. } => {
-            assert!(root[9..].iter().all(|value| *value == Value::Null), "Open lacks a reason and a signature");
-            assert_ne!(root[6], Value::Null, "an Open ticket's hold flag is 0 or 1");
+        TicketState::Open { assignees: set, notes: map, owner, hold, .. } => {
+            assert!(root[8..].iter().all(|value| *value == Value::Null), "Open lacks a reason and a signature");
+            assert_eq!(root[5] == Value::Null, owner.is_none(), "an Open ticket's owner is optional");
+            assert_eq!(root[6..8].iter().all(|value| *value == Value::Null), hold.is_none(), "an absent hold is all null");
             assert_eq!((assignees.len(), notes.len()), (set.len(), map.len()));
         }
-        TicketState::Closed { .. } => assert!(root[5..9].iter().all(|value| *value == Value::Null), "Closed lacks an owner and a hold"),
+        TicketState::Closed { .. } => assert!(root[4..].iter().all(|value| *value != Value::Null), "Closed requires all its data"),
     }
     assert_eq!(Decoder::decode::<Ticket>(rows).expect("decode"), value);
 }
@@ -299,25 +305,33 @@ fn decoding_refuses_data_a_label_lacks() {
     assert_eq!(Decoder::decode::<Ticket>(orphan), Err(DecodeError::AbsentRows { table: 1 }));
 
     let mut stray = rows_of(TicketState::Draft);
-    stray.tables[0][0].values[9] = Value::Text("why".into());
+    stray.tables[0][0].values[8] = Value::Text("why".into());
     assert!(matches!(Decoder::decode::<Ticket>(stray), Err(DecodeError::Type { expected: "null", .. })));
 
     let closed = TicketState::Closed {
         assignees: BTreeSet::new(),
         notes: BTreeMap::new(),
         priority: 0,
+        owner: "ann".into(),
+        hold: Hold { by: "ann".into(), until: Timestamp(2) },
         reason: "done".into(),
-        closed_by: "ann".into(),
         signature: Signature { who: "ann".into(), at: Timestamp(2) },
     };
     let mut missing = rows_of(closed.clone());
-    missing.tables[0][0].values[9] = Value::Null;
+    missing.tables[0][0].values[8] = Value::Null;
     assert!(matches!(Decoder::decode::<Ticket>(missing), Err(DecodeError::Missing { column }) if column.ends_with("reason")));
-    let mut unsigned = rows_of(closed);
-    unsigned.tables[0][0].values[11] = Value::Null;
+    let mut unsigned = rows_of(closed.clone());
+    unsigned.tables[0][0].values[10] = Value::Null;
     assert!(Decoder::decode::<Ticket>(unsigned).is_err(), "a required flattened datum's columns are required");
+    // A datum that is `T` under Closed is required there, though nullable under Open.
+    let mut unowned = rows_of(closed.clone());
+    unowned.tables[0][0].values[5] = Value::Null;
+    assert!(matches!(Decoder::decode::<Ticket>(unowned), Err(DecodeError::Missing { column }) if column.ends_with("owner")));
+    let mut unheld = rows_of(closed);
+    unheld.tables[0][0].values[6..8].fill(Value::Null);
+    assert!(matches!(Decoder::decode::<Ticket>(unheld), Err(DecodeError::Missing { column }) if column.ends_with("hold")));
     let mut stray_hold = rows_of(TicketState::Draft);
-    stray_hold.tables[0][0].values[8] = Value::Int(3);
+    stray_hold.tables[0][0].values[7] = Value::Int(3);
     assert!(matches!(Decoder::decode::<Ticket>(stray_hold), Err(DecodeError::Type { expected: "null", .. })), "a hold under Draft");
 }
 
@@ -343,8 +357,9 @@ fn transitions_write_exactly_the_data_that_differs() {
         assignees: ["y", "z"].map(str::to_owned).into(),
         notes: [("k".to_owned(), "3".to_owned())].into(),
         priority: 1,
+        owner: "bo".into(),
+        hold: Hold { by: "bo".into(), until: Timestamp(9) },
         reason: "done".into(),
-        closed_by: "bo".into(),
         signature: Signature { who: "bo".into(), at: Timestamp(9) },
     };
     let (edge, next) = transition(&previous, closed, 9);
@@ -354,11 +369,10 @@ fn transitions_write_exactly_the_data_that_differs() {
     assert_eq!(
         sets,
         [
-            set("state", vec![Value::Int(3), Value::Int(9)]),
-            set("owner", vec![Value::Null]),
-            set("hold", vec![Value::Null, Value::Null, Value::Null]),
+            set("state", vec![Value::Text("c3".into()), Value::Int(9)]),
+            set("owner", vec![Value::Str("bo".into())]),
+            set("hold", vec![Value::Text("bo".into()), Value::Int(9)]),
             set("reason", vec![Value::Text("done".into())]),
-            set("closed_by", vec![Value::Str("bo".into())]),
             set("signature", vec![Value::Str("bo".into()), Value::Int(9)]),
         ],
         "priority is unchanged"
@@ -375,7 +389,7 @@ fn transitions_write_exactly_the_data_that_differs() {
         ]
     );
     assert_eq!(appends.len(), 1, "the event");
-    assert_eq!(from, LabelCheck { field: "state", code: 2 });
+    assert_eq!(from, LabelCheck { field: "state", code: Code::new("c2") });
 
     // Data only: the label and since stay, one note is added.
     let (edge, next) = transition(&previous, open(&["x", "y"], &[("k", "1"), ("m", "2"), ("n", "4")], 1, Some("ann")), 11);
@@ -387,7 +401,7 @@ fn transitions_write_exactly_the_data_that_differs() {
     // Into a label carrying nothing: every datum is nulled and every row deleted.
     let parts = transition(&previous, TicketState::Draft, 12).0.into_parts();
     let fields: Vec<&str> = parts.sets.iter().map(|set| set.field).collect();
-    assert_eq!(fields, ["state", "priority", "owner", "hold"], "the hold's flag goes from 0 to null");
+    assert_eq!(fields, ["state", "priority", "owner"], "an absent hold is already null");
     assert_eq!(parts.rows.len(), 4);
     assert!(parts.rows.iter().all(|row| matches!(row.edit, RowEdit::Delete { .. })));
 }
@@ -404,8 +418,14 @@ fn transitions_refuse_inconsistent_events_and_since() {
         Edge::transition(Ticket::STATE, &previous, next, Ticket::EDGES, &event(from, to, at)).map(|_| ())
     };
     use TicketLabel::*;
-    assert_eq!(attempt(&draft, Draft, Draft, 9), Err(EdgeError::From { field: "state".into(), from: 1, state: 2 }));
-    assert_eq!(attempt(&draft, Open, Closed, 9), Err(EdgeError::Label { field: "state".into(), to: 3, state: 1 }));
+    assert_eq!(
+        attempt(&draft, Draft, Draft, 9),
+        Err(EdgeError::From { field: "state".into(), from: Code::new("c1"), state: Code::new("c2") })
+    );
+    assert_eq!(
+        attempt(&draft, Open, Closed, 9),
+        Err(EdgeError::Label { field: "state".into(), to: Code::new("c3"), state: Code::new("c1") })
+    );
     assert_eq!(
         attempt(&draft, Open, Draft, 8),
         Err(EdgeError::Since { field: "state".into(), expected: Timestamp(8), found: Timestamp(9) })
@@ -492,14 +512,14 @@ fn the_view_shows_label_states_as_state_data() {
     let view = flotilla_schema::render_view([&set]);
     assert!(
         view.contains(
-            "| `ticket` | root | 15 | – | `ticket_assignees` (state data), `ticket_notes` (state data), `ticket_edges` (history) |"
+            "| `ticket` | root | 13 | – | `ticket_assignees` (state data), `ticket_notes` (state data), `ticket_edges` (history) |"
         ),
         "{view}"
     );
     assert!(view.contains("| `ticket_notes` | state data | 3 | – | – | – |"), "{view}");
     assert!(view.ends_with(
         "States with data (one label column, then data shared by name across the labels):\n\
-         - `ticket`.`state`: label `state` and `state_since`; data columns `priority`, `owner`, `hold_present`, `hold_by`, `hold_until`, `reason`, `closed_by`, \
+         - `ticket`.`state`: label `state` and `state_since`; data columns `priority`, `owner`, `hold_by`, `hold_until`, `reason`, \
          `signature_who`, `signature_at`; \
          data tables `ticket_assignees`, `ticket_notes`\n"
     ));

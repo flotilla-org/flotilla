@@ -6,7 +6,7 @@
 //! identity. Receipts are recorded on the session and refused once it has
 //! ended. "Running" is a judgement, not a state.
 //!
-//! The stored kind is [`AgentSessionRow`] (code 3): the state, the edge log,
+//! The stored kind is [`AgentSessionRow`] (code `as`): the state, the edge log,
 //! and the receipts, which never change once appended, as `history`.
 
 use flotilla_schema::{Records, State, Stored, Timestamp};
@@ -20,26 +20,26 @@ use crate::{
 /// Whether a channel to a Live session is attached (spec `Channel`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
 pub enum Channel {
-    #[store(code = 1)]
+    #[store(code = "de")]
     Detached,
-    #[store(code = 2)]
+    #[store(code = "at")]
     Attached,
 }
 
 /// How a session ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub enum EndReason {
-    #[store(code = 1)]
+    #[store(code = "co")]
     Completed,
-    #[store(code = 2)]
+    #[store(code = "lo")]
     Lost,
 }
 
 states! {
     /// The spec's `State`, with Ended carrying its reason.
     pub enum AgentSessionState => AgentSessionLabel {
-        Live { channel: Channel } = 1,
-        Ended { reason: EndReason } = 2,
+        Live { channel: Channel } = "li",
+        Ended { reason: EndReason } = "en",
     }
 }
 
@@ -82,9 +82,9 @@ pub struct End {
 
 edges! {
     pub enum AgentSessionEdge => AgentSessionEdgeKind {
-        Attach(Attach) = 1,
-        Detach(Detach) = 2,
-        End(End) = 3,
+        Attach(Attach) = "at",
+        Detach(Detach) = "de",
+        End(End) = "en",
     }
 }
 
@@ -227,10 +227,10 @@ fn gate_end(h: &mut Handle<'_, AgentSession>, edge: &End) -> Result<(), AgentSes
     }
 }
 
-/// The stored AgentSession (kind code 3): the state, the edge log and the
+/// The stored AgentSession (kind code `as`): the state, the edge log and the
 /// receipts. The session's name is its identity, so it has no spec columns.
 #[derive(Clone, Debug, PartialEq, Stored)]
-#[store(kind = "AgentSession", code = 3)]
+#[store(kind = "AgentSession", code = "as")]
 pub struct AgentSessionRow {
     #[store(state)]
     pub state: State<AgentSessionState>,

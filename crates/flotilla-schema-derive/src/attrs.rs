@@ -2,7 +2,7 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::ToTokens;
-use syn::{parenthesized, Attribute, LitInt, LitStr};
+use syn::{parenthesized, Attribute, LitStr};
 
 /// The closed attribute list, named by every refusal. `flotilla-schema` repeats this text in its
 /// trait diagnostics and a test there keeps the two equal.
@@ -21,7 +21,7 @@ pub(crate) fn refuse_at(span: proc_macro2::Span, what: impl std::fmt::Display) -
 
 pub(crate) struct TypeAttrs {
     pub kind: Option<LitStr>,
-    pub code: Option<(u32, Span)>,
+    pub code: Option<(String, Span)>,
     /// `index(...)` bodies, parsed against the kind's fields by `index::Indexes`.
     pub indexes: Vec<TokenStream>,
     /// `labels = L`: the enum is a machine's state, label `L` plus data shared by name across the
@@ -92,8 +92,8 @@ pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
                     }
                 }
                 "code" => {
-                    let value: LitInt = meta.value()?.parse()?;
-                    let code = value.base10_parse::<u32>()?;
+                    let value = code_literal(meta.value()?.parse()?)?;
+                    let code = code(&value)?;
                     if parsed.code.replace((code, value.span())).is_some() {
                         return Err(meta.error("`code` is given twice"));
                     }
@@ -148,7 +148,7 @@ pub(crate) fn field_attr(attrs: &[Attribute]) -> syn::Result<Option<FieldAttr>> 
     Ok(found)
 }
 
-pub(crate) fn variant_code(attrs: &[Attribute]) -> syn::Result<Option<(i64, Span)>> {
+pub(crate) fn variant_code(attrs: &[Attribute]) -> syn::Result<Option<(String, Span)>> {
     let mut code = None;
     for attr in store_attrs(attrs) {
         attr.parse_nested_meta(|meta| {
@@ -156,12 +156,42 @@ pub(crate) fn variant_code(attrs: &[Attribute]) -> syn::Result<Option<(i64, Span
             if name != "code" {
                 return Err(refuse(&meta.path, format_args!("`{name}` is not a variant attribute")));
             }
-            let value: LitInt = meta.value()?.parse()?;
-            if code.replace((value.base10_parse::<i64>()?, value.span())).is_some() {
+            let value = code_literal(meta.value()?.parse()?)?;
+            if code.replace((self::code(&value)?, value.span())).is_some() {
                 return Err(meta.error("`code` is given twice"));
             }
             Ok(())
         })?;
     }
     Ok(code)
+}
+
+/// The longest code, in bytes; `flotilla_schema::Code::MAX` repeats it, and its `const fn new`
+/// checks every generated code again when the crate compiles.
+const CODE_MAX: usize = 8;
+
+/// The literal of `code = ..`: text, refusing the integer codes #3392 ruling G7 retired.
+fn code_literal(value: syn::Lit) -> syn::Result<LitStr> {
+    match value {
+        syn::Lit::Str(text) => Ok(text),
+        other => Err(syn::Error::new_spanned(other, "a code is short text written by hand, such as `code = \"dr\"`, not a number")),
+    }
+}
+
+/// A stored code (#3392 ruling G7): short explicit text, one to eight bytes, a lowercase ASCII
+/// letter then lowercase letters, digits or `_`. Written by hand, never generated from a name.
+fn code(value: &LitStr) -> syn::Result<String> {
+    let code = value.value();
+    let mut bytes = code.bytes();
+    let valid = code.len() <= CODE_MAX
+        && bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    if valid {
+        Ok(code)
+    } else {
+        Err(syn::Error::new_spanned(
+            value,
+            format!("a code is short text written by hand: one to {CODE_MAX} bytes, a lowercase ASCII letter then lowercase letters, digits or `_`, such as \"dr\""),
+        ))
+    }
 }

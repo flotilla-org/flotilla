@@ -32,6 +32,7 @@
 use std::{collections::BTreeMap, fmt, marker::PhantomData};
 
 use crate::{
+    code::Code,
     codec::{EncodeError, Encoder},
     descriptor::TableRole,
     history::{EdgeEvent, Labelled},
@@ -238,7 +239,7 @@ pub struct EdgeRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LabelCheck {
     pub field: &'static str,
-    pub code: i64,
+    pub code: Code,
 }
 
 /// An edge's writes, as a backend executes them.
@@ -268,10 +269,10 @@ pub enum EdgeError {
     Repeated { field: String },
     /// The event's `to` label is not the label of the state the edge writes.
     #[error("the event enters label {to}, but the state written to {field} has label {state}")]
-    Label { field: String, to: i64, state: i64 },
+    Label { field: String, to: Code, state: Code },
     /// The event's `from` label is not the label of the previous state.
     #[error("the event leaves label {from}, but the previous state of {field} has label {state}")]
-    From { field: String, from: i64, state: i64 },
+    From { field: String, from: Code, state: Code },
     /// The next state's `since` is not the time its label was entered: the event's `at` when the
     /// label changes, and the previous `since` when it does not.
     #[error("the state written to {field} has since {found}, not {expected}")]
@@ -327,7 +328,7 @@ impl<K> Edge<K> {
         }
         let mut edge = Edge::empty(field, from).appended(RowPath::Root, log, event)?;
         if moved {
-            let values = vec![Value::Int(label), Value::Int(event.at.micros())];
+            let values = vec![Value::Text(label.to_string()), Value::Int(event.at.micros())];
             edge.parts.sets.push(EdgeSet { row: RowPath::Root, field, values });
         }
         let mut delta = StateDelta::default();
@@ -362,7 +363,7 @@ impl<K> Edge<K> {
         Edge::empty(state.name(), event.from.code()).appended(RowPath::Root, log, event)?.setting(RowPath::Root, state.column, next)
     }
 
-    fn empty(field: &'static str, from: i64) -> Edge<K> {
+    fn empty(field: &'static str, from: Code) -> Edge<K> {
         let parts = EdgeParts {
             sets: Vec::new(),
             rows: Vec::new(),

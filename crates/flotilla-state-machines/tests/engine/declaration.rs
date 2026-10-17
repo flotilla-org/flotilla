@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use flotilla_schema::{CodeEnum, Column, Columns, DecodeError, Decoder, EncodeError, Encoder, Layout, Timestamp};
+use flotilla_schema::{Code, CodeEnum, Column, Columns, DecodeError, Decoder, EncodeError, Encoder, Layout, Timestamp};
 use flotilla_state_machines::{
     changed, states, Coded, Datum, DefError, Diagram, Edge, EdgeArg, EdgeDef, EdgeKind, Ended, Fault, Handle, InputRead, Machine,
     MachineDef, Ref, Source, StateValue, StepError, Table, Version, WrongState,
@@ -25,9 +25,12 @@ fn armed(shots: u32) -> Latch {
 #[test]
 fn codes_and_names_are_pinned() {
     let labels: Vec<_> = LatchLabel::ALL.iter().map(|s| (s.name(), s.code())).collect();
-    assert_eq!(labels, [("Armed", 1), ("Fired", 2), ("Spent", 3), ("Withdrawn", 4)]);
+    assert_eq!(
+        labels,
+        [("Armed", Code::new("ar")), ("Fired", Code::new("fi")), ("Spent", Code::new("sp")), ("Withdrawn", Code::new("wd"))]
+    );
     let edges: Vec<_> = LatchEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    assert_eq!(edges, [("fire", 10), ("withdraw", 11), ("re_arm", 12), ("load", 13)]);
+    assert_eq!(edges, [("fire", Code::new("fi")), ("withdraw", Code::new("wd")), ("re_arm", Code::new("ra")), ("load", Code::new("lo"))]);
     assert_eq!(fire("s").kind(), LatchEdgeKind::Fire);
 }
 
@@ -290,7 +293,7 @@ fn table_versions_rise_across_removal() {
 #[test]
 fn validate_rejects_a_label_and_edge_sharing_a_word() {
     states! {
-        pub enum Clash => ClashLabel { Armed = 1, ReArm = 2, Loaded = 3 }
+        pub enum Clash => ClashLabel { Armed = "ar", ReArm = "ra", Loaded = "lo" }
     }
     impl From<Ended<ClashLabel>> for LatchRefusal {
         fn from(_: Ended<ClashLabel>) -> Self {
@@ -342,34 +345,34 @@ macro_rules! hand_coded {
             const TABLES: usize = 0;
 
             fn layout(layout: &mut Layout, name: &str, required: bool) {
-                i64::layout(layout, name, required);
+                String::layout(layout, name, required);
             }
 
             fn encode(&self, e: &mut Encoder) -> Result<(), EncodeError> {
-                CodeEnum::code(self).encode(e)
+                CodeEnum::code(self).as_str().to_owned().encode(e)
             }
 
             fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError> {
-                i64::encode_absent(e)
+                String::encode_absent(e)
             }
 
             fn decode(d: &mut Decoder) -> Result<Option<Self>, DecodeError> {
-                Ok(i64::decode(d)?.and_then(|code| Self::ALL.iter().copied().find(|value| CodeEnum::code(value) == code)))
+                Ok(String::decode(d)?.and_then(|code| Self::ALL.iter().copied().find(|value| CodeEnum::code(value) == code.as_str())))
             }
 
             fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {
-                i64::decode_absent(d)
+                String::decode_absent(d)
             }
         }
 
         impl Column for $name {}
 
         impl CodeEnum for $name {
-            const CODES: &'static [i64] = &[$($code),+];
+            const CODES: &'static [Code] = &[$(Code::new($code)),+];
 
-            fn code(&self) -> i64 {
+            fn code(&self) -> Code {
                 match self {
-                    $(Self::$variant => $code),+
+                    $(Self::$variant => Code::new($code)),+
                 }
             }
         }
@@ -391,8 +394,8 @@ macro_rules! hand_coded {
 // code enum reaches validation.
 #[test]
 fn validate_rejects_duplicate_codes() {
-    hand_coded!(TwinLabel { One = 1, Two = 1 });
-    hand_coded!(TwinEdgeKind { Go = 7, Back = 7 });
+    hand_coded!(TwinLabel { One = "tw", Two = "tw" });
+    hand_coded!(TwinEdgeKind { Go = "go", Back = "go" });
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum Twin {
         One,
@@ -484,7 +487,10 @@ fn validate_rejects_duplicate_codes() {
             Ok(((), Twin::One))
         }
     }
-    assert_eq!(Twins::definition().validate(), Err(vec![DefError::DuplicateStateCode(1), DefError::DuplicateEdgeCode(7)]));
+    assert_eq!(
+        Twins::definition().validate(),
+        Err(vec![DefError::DuplicateStateCode(Code::new("tw")), DefError::DuplicateEdgeCode(Code::new("go"))])
+    );
 }
 
 // ---- validate() as a property over generated declarations ----

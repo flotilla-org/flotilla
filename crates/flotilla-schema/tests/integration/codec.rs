@@ -2,7 +2,7 @@
 //! `state` and references, without a backend.
 
 use flotilla_schema::{
-    snake_case, CodeEnum, ColumnType, DecodeError, Decoder, Element, Encoder, Identity, Kind, KindCode, Layout, Ref, Rows, State, Stored,
+    Code, CodeEnum, ColumnType, DecodeError, Decoder, Element, Encoder, Guard, Identity, Kind, KindCode, Layout, Ref, Rows, State, Stored,
     Timestamp, Value,
 };
 use hegel::{generators as gs, TestCase};
@@ -12,9 +12,9 @@ struct Name(String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 enum Phase {
-    #[store(code = 7)]
+    #[store(code = "c7")]
     Late,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Early,
 }
 
@@ -26,31 +26,31 @@ struct Cause {
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 enum Reason {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Failed {
         #[store(flatten)]
         cause: Cause,
     },
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Expired,
-    #[store(code = 3)]
+    #[store(code = "c3")]
     Moved { to: Ref<Ticket> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 enum Event {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Dropped {
         reason: Reason,
         #[store(intern)]
         by: Option<Name>,
     },
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Noted { note: Option<String>, authority: Identity },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
-#[store(kind = "Ticket", code = 4)]
+#[store(kind = "Ticket", code = "k4")]
 struct Ticket {
     #[store(intern)]
     holder: Name,
@@ -86,7 +86,11 @@ fn ticket(tc: &TestCase) -> Ticket {
         0 => None,
         1 => Some(Event::Noted {
             note: tc.draw(gs::booleans()).then(|| tc.draw(gs::text().max_size(3))),
-            authority: Identity { kind: KindCode(tc.draw(gs::integers::<u32>())), name: "n".into(), home: "h".into() },
+            authority: Identity {
+                kind: KindCode::new(tc.draw(gs::sampled_from(vec!["a", "k1", "zz_9"]))),
+                name: "n".into(),
+                home: "h".into(),
+            },
         }),
         variant => Some(Event::Dropped {
             reason: match variant {
@@ -119,59 +123,72 @@ fn set(rows: &mut Rows, column: &str, value: Value) {
     rows.tables[0][0].values[index] = value;
 }
 
-// Behaviour (DESIGN codec): decoding the encoded rows gives back the value for every variant,
-// with one value per declared column, and every column outside the active variants is null.
+// Behaviour (DESIGN codec, #3392 G6): decoding the encoded rows gives back the value for every
+// variant, with one value per declared column, and every datum a variant lacks is null.
 #[hegel::test]
 fn derived_shapes_round_trip_through_logical_rows(tc: TestCase) {
     let value = ticket(&tc);
     let rows = Encoder::encode(&value).expect("encode");
     let columns = columns(&rows);
-    let active = |prefix: &str| columns.iter().filter(|(name, value)| name.starts_with(prefix) && *value != Value::Null).count();
+    let active = |names: &[&str]| columns.iter().filter(|(name, value)| names.contains(&name.as_str()) && *value != Value::Null).count();
     if !matches!(value.event, Some(Event::Dropped { .. })) {
-        assert_eq!(active("event_dropped_"), 0);
+        assert_eq!(active(&["event_reason", "event_reason_cause_phase", "event_reason_cause_detail", "event_reason_to", "event_by"]), 0);
     }
     if !matches!(value.event, Some(Event::Noted { .. })) {
-        assert_eq!(active("event_noted_"), 0);
+        assert_eq!(active(&["event_note", "event_authority"]), 0);
     }
     assert_eq!(Decoder::decode::<Ticket>(rows).expect("decode"), value);
 }
 
-// Behaviour (DESIGN naming): the column of each shape. Interned and reference columns carry
-// strings and identities in logical rows; codes are the explicit ones, ascending.
+// Behaviour (DESIGN naming, #3392 G5-G7): the column of each shape. Interned and reference
+// columns carry strings and identities in logical rows; codes are the explicit text ones,
+// ascending. A data enum is its tag then each datum once, `<tag>_<datum>`, shared by name across
+// its variants (mapping B), with one CHECK per variant; an optional flatten has no presence flag.
 #[test]
 fn derived_columns_follow_the_naming_rules() {
     let set = Ticket::table_set();
     set.validate().expect("valid");
     let root = &set.tables[0];
     let shape: Vec<(&str, &ColumnType, bool)> = root.columns.iter().map(|c| (c.name.as_str(), &c.ty, c.nullable)).collect();
-    let code = ColumnType::Code(vec![2, 7]);
+    let codes = |codes: &[&str]| ColumnType::Code(codes.iter().map(|code| Code::new(code)).collect());
+    let code = codes(&["c2", "c7"]);
     assert_eq!(
         shape,
         [
             ("holder", &ColumnType::Interned, false),
             ("title", &ColumnType::Text, false),
-            ("cause_present", &ColumnType::Bool, false),
             ("cause_phase", &code, true),
             ("cause_detail", &ColumnType::Text, true),
             ("phase", &code, false),
             ("phase_since", &ColumnType::Timestamp, false),
-            ("event", &ColumnType::Code(vec![1, 2]), true),
-            ("event_dropped_reason", &ColumnType::Code(vec![1, 2, 3]), true),
-            ("event_dropped_reason_failed_cause_phase", &code, true),
-            ("event_dropped_reason_failed_cause_detail", &ColumnType::Text, true),
-            ("event_dropped_reason_moved_to", &ColumnType::Ref, true),
-            ("event_dropped_by", &ColumnType::Interned, true),
-            ("event_noted_note", &ColumnType::Text, true),
-            ("event_noted_authority", &ColumnType::Ref, true),
+            ("event", &codes(&["c1", "c2"]), true),
+            ("event_reason", &codes(&["c1", "c2", "c3"]), true),
+            ("event_reason_cause_phase", &code, true),
+            ("event_reason_cause_detail", &ColumnType::Text, true),
+            ("event_reason_to", &ColumnType::Ref, true),
+            ("event_by", &ColumnType::Interned, true),
+            ("event_note", &ColumnType::Text, true),
+            ("event_authority", &ColumnType::Ref, true),
             ("parent", &ColumnType::Ref, true),
         ]
     );
-    let guards: Vec<String> = root.guards.iter().map(|guard| format!("{} = {}", guard.column, guard.value)).collect();
-    assert_eq!(guards, ["cause_present = 1", "event = 1", "event_dropped_reason = 1", "event_dropped_reason = 3", "event = 2"]);
-    assert_eq!(root.guards[1].required, ["event_dropped_reason"], "an optional field is in scope but not required");
-    assert_eq!(root.guards[1].scope, ["event_dropped_reason", "event_dropped_by"]);
-    assert_eq!(Phase::CODES, [2, 7]);
-    assert_eq!((Phase::Late.code(), Phase::Early.code()), (7, 2));
+    let guards: Vec<String> = root.guards.iter().map(Guard::check).collect();
+    assert_eq!(
+        guards,
+        [
+            r#"CASE WHEN "cause_phase" IS NOT NULL THEN "cause_detail" IS NOT NULL ELSE "cause_detail" IS NULL END"#,
+            r#"CASE WHEN "event_reason" = 'c1' THEN "event_reason_cause_phase" IS NOT NULL AND "event_reason_cause_detail" IS NOT NULL AND "event_reason_to" IS NULL END"#,
+            r#"CASE WHEN "event_reason" = 'c2' THEN "event_reason_cause_phase" IS NULL AND "event_reason_cause_detail" IS NULL AND "event_reason_to" IS NULL END"#,
+            r#"CASE WHEN "event_reason" = 'c3' THEN "event_reason_to" IS NOT NULL AND "event_reason_cause_phase" IS NULL AND "event_reason_cause_detail" IS NULL END"#,
+            r#"CASE WHEN "event" = 'c1' THEN "event_reason" IS NOT NULL AND "event_note" IS NULL AND "event_authority" IS NULL END"#,
+            r#"CASE WHEN "event" = 'c2' THEN "event_authority" IS NOT NULL AND "event_reason" IS NULL AND "event_reason_cause_phase" IS NULL AND "event_reason_cause_detail" IS NULL AND "event_reason_to" IS NULL AND "event_by" IS NULL END"#,
+            r#"CASE WHEN "event" IS NOT NULL THEN 1 ELSE "event_reason" IS NULL AND "event_reason_cause_phase" IS NULL AND "event_reason_cause_detail" IS NULL AND "event_reason_to" IS NULL AND "event_by" IS NULL AND "event_note" IS NULL AND "event_authority" IS NULL END"#,
+        ]
+    );
+    let enums: Vec<(&str, usize)> = root.enums.iter().map(|expansion| (expansion.tag.as_str(), expansion.columns.len())).collect();
+    assert_eq!(enums, [("event_reason", 3), ("event", 7)]);
+    assert_eq!(Phase::CODES, [Code::new("c2"), Code::new("c7")]);
+    assert_eq!((Phase::Late.code(), Phase::Early.code()), (Code::new("c7"), Code::new("c2")));
 
     let value = Ticket {
         holder: Name("o".into()),
@@ -184,54 +201,28 @@ fn derived_columns_follow_the_naming_rules() {
     let columns = columns(&Encoder::encode(&value).expect("encode"));
     assert_eq!(columns[0].1, Value::Str("o".into()));
     assert_eq!(columns[1].1, Value::Text("t".into()));
-    assert_eq!(columns[2].1, Value::Int(0), "an absent flatten is present = 0, not null");
-    assert_eq!((&columns[5].1, &columns[6].1), (&Value::Int(7), &Value::Int(5)));
-    assert_eq!(columns[15].1, Value::Ref(Identity { kind: KindCode(4), name: "p".into(), home: "h".into() }));
-}
-
-// Behaviour: the derive names variant columns with its own copy of the snake-case rule; it must
-// agree with `flotilla_schema::snake_case`, acronyms included, or names would drift silently.
-#[derive(Stored)]
-enum Acronyms {
-    #[store(code = 1)]
-    HTTPRoute { to: String },
-    #[store(code = 2)]
-    ResolvedHTTP { by: String },
-    #[store(code = 3)]
-    Ipv4Address { at: String },
-}
-
-#[test]
-fn variant_columns_use_the_schema_snake_case() {
-    let mut layout = Layout::root("Acronyms", KindCode(1));
-    Acronyms::layout_row(&mut layout);
-    let names: Vec<String> = layout.finish().tables[0].columns.iter().map(|column| column.name.clone()).collect();
-    let expected: Vec<String> = std::iter::once("tag".to_owned())
-        .chain(
-            [("HTTPRoute", "to"), ("ResolvedHTTP", "by"), ("Ipv4Address", "at")]
-                .map(|(variant, field)| format!("{}_{field}", snake_case(variant))),
-        )
-        .collect();
-    assert_eq!(names, expected);
-    assert_eq!(names[1], "http_route_to");
+    assert_eq!((&columns[2].1, &columns[3].1), (&Value::Null, &Value::Null), "an absent flatten is its columns, null");
+    assert_eq!((&columns[4].1, &columns[5].1), (&Value::Text("c7".into()), &Value::Int(5)));
+    assert_eq!(columns[14].1, Value::Ref(Identity { kind: KindCode::new("k4"), name: "p".into(), home: "h".into() }));
 }
 
 // Behaviour (DESIGN elements): enums and newtypes are collection rows too; a data enum's tag is
-// `tag` and its variant columns `<variant>_<field>`, a scalar's column `value`.
+// `tag` and its datums are named by the datum alone, a scalar's column `value`.
 #[test]
 fn enums_and_newtypes_lay_out_as_rows() {
-    let mut layout = Layout::root("Rows", KindCode(1));
+    let mut layout = Layout::root("Rows", KindCode::new("k1"));
     Reason::layout_row(&mut layout);
     Phase::layout_row(&mut layout);
     Name::layout_row(&mut layout);
     let set = layout.finish();
     let names: Vec<&str> = set.tables[0].columns.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, ["tag", "failed_cause_phase", "failed_cause_detail", "moved_to", "value", "value"]);
+    assert_eq!(names, ["tag", "cause_phase", "cause_detail", "to", "value", "value"]);
 }
 
 // Behaviour (#3320): decoding refuses stored values the type cannot hold, with typed errors
-// naming the column: an unknown code, a reference to another kind, a column of an inactive
-// variant, a missing required column of the active one, and a flatten marked absent with values.
+// naming the column: an unknown code or one stored as an integer, a reference to another kind, a
+// datum the active variant lacks, a missing required column of the active one, and a partly
+// present optional flatten.
 #[test]
 fn decode_refuses_rows_outside_the_layout() {
     let value = Ticket {
@@ -248,21 +239,19 @@ fn decode_refuses_rows_outside_the_layout() {
         set(&mut rows, column, stored);
         Decoder::decode::<Ticket>(rows).expect_err("refused")
     };
-    assert_eq!(decode("phase", Value::Int(3)), DecodeError::Code { column: "phase".into(), code: 3 });
-    assert_eq!(decode("event_dropped_reason", Value::Int(9)), DecodeError::Code { column: "event_dropped_reason".into(), code: 9 });
+    assert_eq!(decode("phase", Value::Text("c3".into())), DecodeError::Code { column: "phase".into(), code: "c3".into() });
+    assert!(matches!(decode("phase", Value::Int(7)), DecodeError::Type { column, .. } if column == "phase"));
+    assert_eq!(decode("event_reason", Value::Text("c9".into())), DecodeError::Code { column: "event_reason".into(), code: "c9".into() });
     assert_eq!(
-        decode("parent", Value::Ref(Identity { kind: KindCode(5), name: "p".into(), home: "h".into() })),
-        DecodeError::RefKind { column: "parent".into(), expected: KindCode(4), found: KindCode(5) }
+        decode("parent", Value::Ref(Identity { kind: KindCode::new("k5"), name: "p".into(), home: "h".into() })),
+        DecodeError::RefKind { column: "parent".into(), expected: KindCode::new("k4"), found: KindCode::new("k5") }
     );
-    assert!(
-        matches!(decode("event_noted_note", Value::Text("x".into())), DecodeError::Type { column, .. } if column == "event_noted_note")
-    );
+    assert!(matches!(decode("event_note", Value::Text("x".into())), DecodeError::Type { column, .. } if column == "event_note"));
     assert!(matches!(
-        decode("event_dropped_reason_moved_to", Value::Ref(Identity { kind: KindCode(4), name: "p".into(), home: "h".into() })),
-        DecodeError::Type { column, .. } if column == "event_dropped_reason_moved_to"
+        decode("event_reason_to", Value::Ref(Identity { kind: KindCode::new("k4"), name: "p".into(), home: "h".into() })),
+        DecodeError::Type { column, .. } if column == "event_reason_to"
     ));
-    assert_eq!(decode("event_dropped_reason", Value::Null), DecodeError::missing("event_dropped_reason"));
-    assert!(matches!(decode("cause_detail", Value::Text("x".into())), DecodeError::Type { column, .. } if column == "cause_detail"));
-    assert_eq!(decode("cause_present", Value::Int(1)), DecodeError::missing("cause"));
+    assert_eq!(decode("event_reason", Value::Null), DecodeError::missing("event_reason"));
+    assert_eq!(decode("cause_detail", Value::Text("x".into())), DecodeError::missing("cause_phase"), "a partly present flatten");
     assert_eq!(decode("phase_since", Value::Null), DecodeError::missing("phase_since"));
 }

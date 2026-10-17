@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeSet, ops::Range};
 
-use crate::{ddl::quote_ident, value::KindCode};
+use crate::{code::Code, ddl::quote_ident, value::KindCode};
 
 /// Schema object names of the shared tables and their indexes; no kind table or index may take one.
 pub const SHARED_NAMES: &[&str] =
@@ -62,8 +62,10 @@ pub struct Table {
     /// How many trailing `key` columns are this table's own key.
     pub own_key: usize,
     pub columns: Vec<ColumnDef>,
-    /// Sparse-column guards, in the order they closed; each renders as one table CHECK.
+    /// Tag and presence guards, in the order they were declared; each renders as one table CHECK.
     pub guards: Vec<Guard>,
+    /// The data enums expanded into this table's columns, outermost and nested.
+    pub enums: Vec<Expansion>,
     /// The column-shaped fields of the struct whose rows this table holds, in declaration order:
     /// the unit an edge sets (`Edge::set`), and the columns a spec edit may not change (`state`).
     /// Empty for tables of primitive and enum elements, which have no named fields.
@@ -92,36 +94,42 @@ impl FieldColumns {
     }
 }
 
-/// A rule on the columns of one row while `column = value`. Two kinds, each one table CHECK:
+/// When a [`Guard`] holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum When {
+    /// The controlling column holds this code: one label of a state, or one variant of a data enum.
+    Is(Code),
+    /// The controlling column is not null: an optional value is present. Its controlling column is
+    /// the value's first required column, so presence needs no flag of its own (#3392 ruling G5).
+    Present,
+}
+
+/// A rule on the columns of one row, one table CHECK. Two kinds:
 ///
-/// - **A variant guard**: columns that hold only while the guard does: a data enum variant
-///   (`column` is the tag) or a present `Option<flatten>` (`column` is `<field>_present`, `value`
-///   1). `scope` is non-empty and `absent` empty.
-/// - **A label guard** of a label-plus-data state (`#[store(labels = L)]`): `column` is the label
-///   and `value` one label's code; while it holds, the label's required data is non-null and the
-///   data it lacks is null. `scope` is empty (the other labels' guards cover their own rows) and
-///   `required` or `absent` is non-empty.
+/// - **A tag guard** (`When::Is`): while a state's label or a data enum's tag (mapping B, #3392
+///   ruling G6) holds one code, the data that code carries as required is non-null and the data
+///   it lacks is null. It has no ELSE: the guards of the other codes cover their own rows, and a
+///   null tag (an absent enum) is covered by the guard of the value holding it.
+/// - **A presence guard** (`When::Present`): an optional value of several columns is present when
+///   its first required column is non-null; then its other required columns are non-null, and
+///   otherwise every one of its columns is null.
 ///
 /// Kept structured rather than as SQL text so tests can derive the rows each CHECK must refuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Guard {
     pub column: String,
-    pub value: i64,
+    pub when: When,
     /// Columns that must be non-null while the guard holds.
     pub required: Vec<String>,
-    /// Every column declared directly inside a variant guard; all null while it does not hold. A
-    /// nested guard's columns are in its own scope only (its controlling column is in this one).
-    pub scope: Vec<String>,
-    /// Columns that must be null while a label guard holds: the data its label lacks.
+    /// Columns that must be null while the guard holds: the data a tag lacks.
     pub absent: Vec<String>,
+    /// Columns that must be null while the guard does not hold: a presence guard's other columns.
+    pub otherwise: Vec<String>,
 }
 
 impl Guard {
-    /// `CASE WHEN <cond> THEN <required> IS NOT NULL AND ... ELSE <scope> IS NULL AND ... END`.
-    /// When an enclosing guard does not hold, this guard's controlling column is null, the
-    /// condition is null and the ELSE branch applies. A label guard's THEN also requires its
-    /// `absent` columns null, and it has no ELSE: a CASE without a match is null, which a CHECK
-    /// accepts.
+    /// `CASE WHEN <cond> THEN <required> IS NOT NULL AND <absent> IS NULL [ELSE <otherwise> IS
+    /// NULL] END`. A CASE without a match is null, which a CHECK accepts.
     pub fn check(&self) -> String {
         self.check_with(" ")
     }
@@ -132,18 +140,32 @@ impl Guard {
         let required = self.required.iter().map(|name| format!("{} IS NOT NULL", quote_ident(name)));
         let absent = self.absent.iter().map(|name| format!("{} IS NULL", quote_ident(name)));
         let then = conjunction(required.chain(absent), &and);
-        let condition = format!("CASE WHEN {} = {}{separator}THEN {then}", quote_ident(&self.column), self.value);
-        if self.is_label() {
-            return format!("{condition}{separator}END");
+        let column = quote_ident(&self.column);
+        let condition = match &self.when {
+            When::Is(code) => format!("{column} = {}", code_literal(*code)),
+            When::Present => format!("{column} IS NOT NULL"),
+        };
+        let mut out = format!("CASE WHEN {condition}{separator}THEN {then}");
+        if !self.otherwise.is_empty() {
+            let otherwise = conjunction(self.otherwise.iter().map(|name| format!("{} IS NULL", quote_ident(name))), &and);
+            out.push_str(&format!("{separator}ELSE {otherwise}"));
         }
-        let otherwise = conjunction(self.scope.iter().map(|name| format!("{} IS NULL", quote_ident(name))), &and);
-        format!("{condition}{separator}ELSE {otherwise}{separator}END")
+        out.push_str(&format!("{separator}END"));
+        out
     }
+}
 
-    /// A label guard of a label-plus-data state, rather than a variant guard.
-    pub fn is_label(&self) -> bool {
-        self.scope.is_empty()
-    }
+/// A code as an SQL string literal. Codes hold only letters, digits and `_`, so need no escaping.
+pub fn code_literal(code: Code) -> String {
+    format!("'{code}'")
+}
+
+/// The columns a data enum expands into in one table: its tag and every column its variants'
+/// data declares, nested enums and optional values included. Recorded for the schema view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expansion {
+    pub tag: String,
+    pub columns: Vec<String>,
 }
 
 fn conjunction(terms: impl Iterator<Item = String>, and: &str) -> String {
@@ -177,8 +199,8 @@ pub enum ColumnType {
     Blob,
     /// Microseconds since the Unix epoch.
     Timestamp,
-    /// A stable enum code, restricted to the listed codes.
-    Code(Vec<i64>),
+    /// A stable enum code (short text), restricted to the listed codes.
+    Code(Vec<Code>),
     /// An id in `strings`.
     Interned,
     /// An id in `resource_identity`.
@@ -211,7 +233,7 @@ pub struct Index {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Condition {
     /// A code column holds one of `codes` (taken from the enum, never restated).
-    In { column: String, codes: Vec<i64> },
+    In { column: String, codes: Vec<Code> },
     /// A nullable column is present.
     NotNull { column: String },
 }
@@ -226,7 +248,7 @@ impl Condition {
     pub fn sql(&self) -> String {
         match self {
             Condition::In { column, codes } => {
-                let codes: Vec<String> = codes.iter().map(i64::to_string).collect();
+                let codes: Vec<String> = codes.iter().copied().map(code_literal).collect();
                 format!("{} IN ({})", quote_ident(column), codes.join(", "))
             }
             Condition::NotNull { column } => format!("{} IS NOT NULL", quote_ident(column)),

@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-use crate::descriptor::{ColumnDef, ColumnType, Table, TableRole, TableSet};
+use crate::descriptor::{code_literal, ColumnDef, ColumnType, Table, TableRole, TableSet};
 
 /// Whether statements may meet objects that already exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +88,7 @@ fn render_table(out: &mut String, set: &TableSet, table: &Table, exists: &str) {
 fn column(column: &ColumnDef) -> String {
     let name = quote_ident(&column.name);
     let sql_type = match column.ty {
-        ColumnType::Text => "TEXT",
+        ColumnType::Text | ColumnType::Code(_) => "TEXT",
         ColumnType::Blob | ColumnType::Frozen | ColumnType::Cbor => "BLOB",
         _ => "INTEGER",
     };
@@ -104,7 +104,7 @@ fn column(column: &ColumnDef) -> String {
             let _ = write!(out, " CHECK ({name} IN (0, 1))");
         }
         ColumnType::Code(codes) => {
-            let codes: Vec<String> = codes.iter().map(i64::to_string).collect();
+            let codes: Vec<String> = codes.iter().copied().map(code_literal).collect();
             let _ = write!(out, " CHECK ({name} IN ({}))", codes.join(", "));
         }
         ColumnType::Integer | ColumnType::Text | ColumnType::Blob | ColumnType::Cbor | ColumnType::Timestamp => {}
@@ -116,16 +116,21 @@ fn column(column: &ColumnDef) -> String {
 mod tests {
     use super::{render_ddl, render_ddl_with, DdlMode};
     use crate::{
+        code::Code,
         descriptor::{ColumnType, Condition, DescriptorError, Index, IndexProblem, TableRole, RECORD_VERSION},
         layout::Layout,
         value::KindCode,
     };
 
+    fn codes(codes: &[&str]) -> Vec<Code> {
+        codes.iter().map(|code| Code::new(code)).collect()
+    }
+
     fn convoy() -> Layout {
-        let mut layout = Layout::root("Convoy", KindCode(2));
+        let mut layout = Layout::root("Convoy", KindCode::new("k2"));
         layout.column("name", ColumnType::Interned, true);
         layout.column("done", ColumnType::Bool, true);
-        layout.column("phase", ColumnType::Code(vec![1, 2, 3]), false);
+        layout.column("phase", ColumnType::Code(codes(&["dr", "op", "sh"])), false);
         layout.column("workflow", ColumnType::Frozen, true);
         layout.table("deliverables", TableRole::Records, |layout| {
             layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
@@ -142,7 +147,10 @@ mod tests {
             table: "convoy".into(),
             eq: vec!["name".into()],
             order: vec![],
-            predicate: vec![Condition::In { column: "phase".into(), codes: vec![1, 2] }, Condition::NotNull { column: "phase".into() }],
+            predicate: vec![
+                Condition::In { column: "phase".into(), codes: codes(&["dr", "op"]) },
+                Condition::NotNull { column: "phase".into() },
+            ],
         });
         layout.index(Index { name: "by_name".into(), table: "convoy".into(), eq: vec!["name".into()], order: vec![], predicate: vec![] });
         layout
@@ -158,7 +166,7 @@ mod tests {
   "version" INTEGER NOT NULL,
   "name" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "done" INTEGER NOT NULL CHECK ("done" IN (0, 1)),
-  "phase" INTEGER CHECK ("phase" IN (1, 2, 3)),
+  "phase" TEXT CHECK ("phase" IN ('dr', 'op', 'sh')),
   "workflow" BLOB NOT NULL REFERENCES "objects" ("hash")
 ) STRICT;
 CREATE TABLE "convoy_deliverables" (
@@ -179,7 +187,7 @@ CREATE TABLE "convoy_deliverables_evidence" (
   FOREIGN KEY ("owner", "deliverables_pos") REFERENCES "convoy_deliverables" ("owner", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "convoy_by_name" ON "convoy" ("name");
-CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "phase" IS NOT NULL;
+CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN ('dr', 'op') AND "phase" IS NOT NULL;
 "#;
         let set = convoy().finish();
         set.validate().expect("valid descriptor");
@@ -196,31 +204,33 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
 
     #[test]
     fn guard_checks_render_as_table_constraints() {
-        let mut layout = Layout::root("Edge", KindCode(1));
-        layout.column("event", ColumnType::Code(vec![1, 2]), true);
-        layout.guard("event", 1, |layout| layout.column("event_drop_cause", ColumnType::Text, true));
+        let mut layout = Layout::root("Edge", KindCode::new("k1"));
+        layout.column("event", ColumnType::Code(codes(&["dr", "go"])), true);
+        let datums = [layout.scope(|layout| layout.column("event_cause", ColumnType::Text, true))];
+        layout.tag_guard("event", Code::new("dr"), &datums, &[(0, true)]);
+        layout.tag_guard("event", Code::new("go"), &datums, &[]);
         let ddl = render_ddl(&layout.finish());
         assert!(ddl.contains(
-            "  \"event_drop_cause\" TEXT,\n  CHECK (CASE WHEN \"event\" = 1\n      THEN \"event_drop_cause\" IS NOT NULL\n      ELSE \"event_drop_cause\" IS NULL\n      END)\n) STRICT;"
-        ));
+            "  \"event_cause\" TEXT,\n  CHECK (CASE WHEN \"event\" = 'dr'\n      THEN \"event_cause\" IS NOT NULL\n      END),\n  CHECK (CASE WHEN \"event\" = 'go'\n      THEN \"event_cause\" IS NULL\n      END)\n) STRICT;"
+        ), "{ddl}");
     }
 
     // Behaviour: validation refuses names the DDL cannot hold unambiguously.
     #[test]
     fn validate_refuses_duplicate_and_reserved_names() {
-        let mut layout = Layout::root("Edge", KindCode(1));
+        let mut layout = Layout::root("Edge", KindCode::new("k1"));
         layout.column("cause", ColumnType::Text, true);
         layout.column("cause", ColumnType::Integer, true);
         assert!(matches!(layout.finish().validate(), Err(DescriptorError::DuplicateColumn { column, .. }) if column == "cause"));
 
         for reserved in ["id", "version"] {
-            let mut layout = Layout::root("Edge", KindCode(1));
+            let mut layout = Layout::root("Edge", KindCode::new("k1"));
             layout.column(reserved, ColumnType::Text, true);
             assert!(matches!(layout.finish().validate(), Err(DescriptorError::ReservedColumn { column, .. }) if column == reserved));
         }
         // A child table adds only `owner`; `id` and `version` are free there.
         let child = |name: &str| {
-            let mut layout = Layout::root("Edge", KindCode(1));
+            let mut layout = Layout::root("Edge", KindCode::new("k1"));
             layout.table("items", TableRole::Child, |layout| {
                 layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
                 layout.column(name, ColumnType::Integer, true);
@@ -233,7 +243,7 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
         // `records` and `history` tables start with the version stamp, and reserve its name.
         for role in [TableRole::Records, TableRole::History] {
             let records = |columns: &[&str]| {
-                let mut layout = Layout::root("Edge", KindCode(1));
+                let mut layout = Layout::root("Edge", KindCode::new("k1"));
                 layout.table("events", role, |layout| {
                     layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
                     for name in columns {
@@ -255,7 +265,7 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
         }
 
         // A data column colliding with the table's own key column.
-        let mut layout = Layout::root("Edge", KindCode(1));
+        let mut layout = Layout::root("Edge", KindCode::new("k1"));
         layout.table("items", TableRole::Child, |layout| {
             layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
             layout.column("pos", ColumnType::Text, true);
@@ -263,7 +273,7 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
         assert!(matches!(layout.finish().validate(), Err(DescriptorError::DuplicateColumn { column, .. }) if column == "pos"));
 
         // `a` + field `b_c` and `a_b` + field `c` both render `a_b_c`.
-        let mut layout = Layout::root("A", KindCode(1));
+        let mut layout = Layout::root("A", KindCode::new("k1"));
         layout.table("b_c", TableRole::Child, |layout| layout.key(|layout| layout.column("pos", ColumnType::Integer, true)));
         layout.table("b", TableRole::Child, |layout| {
             layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
@@ -272,13 +282,13 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
         assert!(matches!(layout.finish().validate(), Err(DescriptorError::DuplicateName { name, .. }) if name == "a_b_c"));
 
         // Indexes share the namespace as `<table>_<name>`.
-        let mut layout = Layout::root("Edge", KindCode(1));
+        let mut layout = Layout::root("Edge", KindCode::new("k1"));
         layout.table("items", TableRole::Child, |layout| layout.key(|layout| layout.column("pos", ColumnType::Integer, true)));
         layout.index(Index { name: "items".into(), table: "edge".into(), eq: vec![], order: vec![], predicate: vec![] });
         assert!(matches!(layout.finish().validate(), Err(DescriptorError::DuplicateName { name, .. }) if name == "edge_items"));
 
         assert!(matches!(
-            Layout::root("Objects", KindCode(1)).finish().validate(),
+            Layout::root("Objects", KindCode::new("k1")).finish().validate(),
             Err(DescriptorError::ReservedName { name, .. }) if name == "objects"
         ));
     }
@@ -290,8 +300,8 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
     #[test]
     fn validate_refuses_malformed_indexes() {
         let problem = |index: Index| {
-            let mut layout = Layout::root("Note", KindCode(1));
-            layout.column("phase", ColumnType::Code(vec![1, 2]), true);
+            let mut layout = Layout::root("Note", KindCode::new("k1"));
+            layout.column("phase", ColumnType::Code(codes(&["dr", "op"])), true);
             layout.column("due", ColumnType::Timestamp, false);
             layout.column("seq", ColumnType::Integer, true);
             layout.column("owner", ColumnType::Ref, true);
@@ -330,11 +340,11 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN (1, 2) AND "pha
             assert_eq!(problem(index(&[], &[surrogate], vec![])), Some(IndexProblem::SurrogateOrder(surrogate.into())));
             assert_eq!(problem(index(&[surrogate], &[], vec![])), None, "{surrogate} may still be an eq column");
         }
-        let codes = |codes: Vec<i64>| vec![Condition::In { column: "phase".into(), codes }];
-        assert_eq!(problem(index(&["seq"], &[], codes(vec![2]))), None);
-        assert_eq!(problem(index(&["seq"], &[], codes(vec![3]))), Some(IndexProblem::Codes("phase".into())));
-        assert_eq!(problem(index(&["seq"], &[], codes(vec![]))), Some(IndexProblem::Codes("phase".into())));
-        let in_seq = vec![Condition::In { column: "seq".into(), codes: vec![1] }];
+        let phases = |listed: &[&str]| vec![Condition::In { column: "phase".into(), codes: codes(listed) }];
+        assert_eq!(problem(index(&["seq"], &[], phases(&["op"]))), None);
+        assert_eq!(problem(index(&["seq"], &[], phases(&["sh"]))), Some(IndexProblem::Codes("phase".into())));
+        assert_eq!(problem(index(&["seq"], &[], phases(&[]))), Some(IndexProblem::Codes("phase".into())));
+        let in_seq = vec![Condition::In { column: "seq".into(), codes: codes(&["dr"]) }];
         assert_eq!(problem(index(&["phase"], &[], in_seq)), Some(IndexProblem::Codes("seq".into())));
         let seq_present = vec![Condition::NotNull { column: "seq".into() }];
         assert_eq!(problem(index(&["phase"], &[], seq_present)), Some(IndexProblem::NotNullable("seq".into())));

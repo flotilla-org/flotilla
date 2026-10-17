@@ -1,12 +1,20 @@
 //! Builds a kind's [`TableSet`] from the derive's `layout` calls.
 //!
-//! Generated code walks a type's fields in declaration order and declares columns, guards and
-//! nested tables here. Guards are how sparse columns get their CHECKs: a data enum variant or an
-//! `Option<flatten>` opens one, and closing it emits exactly one CHECK covering the columns
-//! declared directly inside it.
+//! Generated code walks a type's fields in declaration order and declares columns, scopes and
+//! nested tables here. Scopes are how nullable data gets its CHECKs (#3392 rulings G5 and G6):
+//!
+//! - an optional value of several columns ([`Layout::optional`]) is present when its first
+//!   required column is non-null, and closing it emits one presence CHECK;
+//! - a datum shared by name across a state's labels or a data enum's variants ([`Layout::scope`],
+//!   [`Layout::datum`]) collects its columns, and one CHECK per label or variant
+//!   ([`Layout::tag_guard`]) requires the data that code carries and nulls the data it lacks.
+//!
+//! Closing a scope adds its columns to the enclosing scope, so a value that holds another value's
+//! columns nulls them all when it is absent.
 
 use crate::{
-    descriptor::{ColumnDef, ColumnType, FieldColumns, Guard, Index, Table, TableRole, TableSet},
+    code::Code,
+    descriptor::{ColumnDef, ColumnType, Expansion, FieldColumns, Guard, Index, Table, TableRole, TableSet, When},
     value::KindCode,
 };
 
@@ -15,15 +23,22 @@ pub struct Layout {
     frames: Vec<Frame>,
 }
 
-/// One table being declared; its guard stack stays with it, so a nested table opened inside a
-/// guard starts unguarded.
+/// One table being declared; its scope stack stays with it, so a nested table opened inside a
+/// scope starts outside any.
 struct Frame {
     table: usize,
-    guards: Vec<Guard>,
+    scopes: Vec<Scope>,
     key_mode: bool,
     /// Fields being declared: only a row's own fields (depth 0) are recorded, not the fields of a
     /// struct flattened into one of them.
     field_depth: usize,
+}
+
+/// The columns declared inside one scope, and those of them its value requires when present.
+#[derive(Default)]
+struct Scope {
+    columns: Vec<String>,
+    required: Vec<String>,
 }
 
 impl Layout {
@@ -38,11 +53,12 @@ impl Layout {
             own_key: 0,
             columns: Vec::new(),
             guards: Vec::new(),
+            enums: Vec::new(),
             fields: Vec::new(),
         };
         Layout {
             set: TableSet { kind: kind.to_owned(), code, tables: vec![root], indexes: Vec::new() },
-            frames: vec![Frame { table: 0, guards: Vec::new(), key_mode: false, field_depth: 0 }],
+            frames: vec![Frame { table: 0, scopes: Vec::new(), key_mode: false, field_depth: 0 }],
         }
     }
 
@@ -55,9 +71,13 @@ impl Layout {
         }
     }
 
+    fn frame(&mut self) -> &mut Frame {
+        self.frames.last_mut().expect("layout has a current table")
+    }
+
     /// Declares a column of the current table. An empty name is a scalar element's `value`.
-    /// Outside any guard a required column is `NOT NULL`; inside one it is nullable and the
-    /// innermost guard's CHECK requires it while the guard holds.
+    /// Outside any scope a required column is `NOT NULL`; inside one it is nullable, and the
+    /// scope's CHECKs require it where its value is present.
     pub fn column(&mut self, name: &str, ty: ColumnType, required: bool) {
         let name = if name.is_empty() { "value" } else { name };
         let frame = self.frames.last_mut().expect("layout has a current table");
@@ -67,11 +87,11 @@ impl Layout {
             table.own_key += 1;
             return;
         }
-        let nullable = match frame.guards.last_mut() {
-            Some(guard) => {
-                guard.scope.push(name.to_owned());
+        let nullable = match frame.scopes.last_mut() {
+            Some(scope) => {
+                scope.columns.push(name.to_owned());
                 if required {
-                    guard.required.push(name.to_owned());
+                    scope.required.push(name.to_owned());
                 }
                 true
             }
@@ -82,41 +102,56 @@ impl Layout {
 
     /// Declares the current table's own key: columns declared inside `f` become key columns.
     pub fn key(&mut self, f: impl FnOnce(&mut Layout)) {
-        let frame = self.frames.last_mut().expect("layout has a current table");
+        let frame = self.frame();
         assert!(!frame.key_mode, "key declarations do not nest");
-        assert!(frame.guards.is_empty(), "a key cannot be declared inside a guard");
+        assert!(frame.scopes.is_empty(), "a key cannot be declared inside a scope");
         frame.key_mode = true;
         f(self);
-        self.frames.last_mut().expect("layout has a current table").key_mode = false;
+        self.frame().key_mode = false;
     }
 
-    /// Declares columns that hold only while `column = value`. The controlling column must already
-    /// be declared in the enclosing scope. Nested tables declared inside are not guarded by a
-    /// CHECK: the codec writes them no rows while the guard does not hold, and refuses rows there.
-    pub fn guard(&mut self, column: &str, value: i64, f: impl FnOnce(&mut Layout)) {
-        let frame = self.frames.last_mut().expect("layout has a current table");
-        frame.guards.push(Guard { column: column.to_owned(), value, required: Vec::new(), scope: Vec::new(), absent: Vec::new() });
-        // The table lists guards in the order they open, so an outer CHECK precedes its nested ones.
-        // The slot holds a placeholder until `f` returns and the finished guard replaces it; a
-        // layout is only read after `finish`, so the placeholder is never observed.
-        let slot = self.set.tables[frame.table].guards.len();
-        self.set.tables[frame.table].guards.push(Guard {
-            column: String::new(),
-            value,
-            required: Vec::new(),
-            scope: Vec::new(),
-            absent: Vec::new(),
-        });
+    /// Runs `f` in a new scope and closes it, adding its columns to the enclosing scope (not as
+    /// required: the enclosing value decides whether they hold).
+    fn scoped(&mut self, f: impl FnOnce(&mut Layout)) -> Scope {
+        self.frame().scopes.push(Scope::default());
         f(self);
-        let frame = self.frames.last_mut().expect("layout has a current table");
-        let guard = frame.guards.pop().expect("guard opened above");
-        // A guard with no columns of its own (a variant holding only tables) would render an
-        // always-true CHECK; nothing nested can have opened inside it, as a nested guard's
-        // controlling column belongs to this scope.
-        if guard.scope.is_empty() {
-            self.set.tables[frame.table].guards.remove(slot);
-        } else {
-            self.set.tables[frame.table].guards[slot] = guard;
+        let frame = self.frame();
+        let scope = frame.scopes.pop().expect("scope pushed above");
+        if let Some(outer) = frame.scopes.last_mut() {
+            outer.columns.extend(scope.columns.iter().cloned());
+        }
+        scope
+    }
+
+    /// Declares an optional value: `f` declares the value's columns as if required, and they are
+    /// nullable. The value is present when its first required column is non-null (#3392 ruling
+    /// G5: no presence flag); a value of several columns gets one CHECK requiring its other
+    /// required columns while present and nulling all of them while absent. Nested tables declared
+    /// inside are not checked: the codec writes them no rows while the value is absent.
+    ///
+    /// # Panics
+    ///
+    /// When `f` declares no required column directly, presence would be undecidable: an optional
+    /// value needs a required column of its own.
+    pub fn optional(&mut self, f: impl FnOnce(&mut Layout)) {
+        let scope = self.scoped(f);
+        if scope.columns.is_empty() {
+            return;
+        }
+        let first = scope.required.first().cloned().unwrap_or_else(|| {
+            panic!("an optional value needs a required column to mark its presence; its columns are {:?}", scope.columns)
+        });
+        if scope.columns.len() > 1 {
+            let others = |names: &[String]| names.iter().filter(|name| **name != first).cloned().collect::<Vec<_>>();
+            let guard = Guard {
+                column: first.clone(),
+                when: When::Present,
+                required: others(&scope.required),
+                absent: Vec::new(),
+                otherwise: others(&scope.columns),
+            };
+            let table = self.frame().table;
+            self.set.tables[table].guards.push(guard);
         }
     }
 
@@ -146,13 +181,14 @@ impl Layout {
             own_key: 0,
             columns: Vec::new(),
             guards: Vec::new(),
+            enums: Vec::new(),
             fields: Vec::new(),
         };
         self.set.tables.push(table);
-        self.frames.push(Frame { table: self.set.tables.len() - 1, guards: Vec::new(), key_mode: false, field_depth: 0 });
+        self.frames.push(Frame { table: self.set.tables.len() - 1, scopes: Vec::new(), key_mode: false, field_depth: 0 });
         f(self);
         let frame = self.frames.pop().expect("table frame pushed above");
-        assert!(frame.guards.is_empty() && !frame.key_mode, "guards and keys close inside their table");
+        assert!(frame.scopes.is_empty() && !frame.key_mode, "scopes and keys close inside their table");
     }
 
     /// Declares one column-shaped field of the current row: the columns `f` declares are recorded
@@ -164,12 +200,12 @@ impl Layout {
     }
 
     fn record_field(&mut self, name: &str, state: bool, datum_of: Option<&str>, f: impl FnOnce(&mut Layout)) {
-        let frame = self.frames.last_mut().expect("layout has a current table");
+        let frame = self.frame();
         let (table, record) = (frame.table, frame.field_depth == 0 && !frame.key_mode);
         frame.field_depth += 1;
         let start = self.set.tables[table].columns.len();
         f(self);
-        self.frames.last_mut().expect("layout has a current table").field_depth -= 1;
+        self.frame().field_depth -= 1;
         let end = self.set.tables[table].columns.len();
         // A datum holding a table declares no columns here, and is not a field of the row.
         if record && (datum_of.is_none() || end > start) {
@@ -178,44 +214,62 @@ impl Layout {
         }
     }
 
-    /// Declares one datum of a label-plus-data state whose label column is `label`: the columns
-    /// and tables `f` declares are nullable (a datum is null, or has no rows, under a label that
-    /// lacks it), and the returned [`DatumColumns`] say which columns the datum declares and which
-    /// of them a label carrying it requires, for [`Layout::label_guard`]. A datum with columns is
-    /// recorded as a state field of the row, `datum_of` the label; one holding a table is not a
-    /// field (its rows change one at a time).
-    pub fn datum(&mut self, name: &str, label: &str, f: impl FnOnce(&mut Layout)) -> DatumColumns {
-        let frame = self.frames.last_mut().expect("layout has a current table");
-        // A collecting scope: the columns `f` declares directly land in it, nullable, as they would
-        // in a guard, but it renders no CHECK of its own. A data enum inside the datum opens its own
-        // guards, whose controlling tag is in this scope.
-        frame.guards.push(Guard { column: String::new(), value: 0, required: Vec::new(), scope: Vec::new(), absent: Vec::new() });
-        self.record_field(name, true, Some(label), f);
-        let frame = self.frames.last_mut().expect("layout has a current table");
-        let collected = frame.guards.pop().expect("collecting scope pushed above");
-        DatumColumns { columns: collected.scope, required: collected.required }
+    /// Declares one datum of a data enum, shared by name across the variants carrying it (mapping
+    /// B, #3392 ruling G6): the columns and tables `f` declares are nullable (a datum is null, or
+    /// has no rows, under a variant that lacks it), and the returned [`DatumColumns`] say which
+    /// columns the datum declares and which of them a variant carrying it requires, for
+    /// [`Layout::tag_guard`].
+    pub fn scope(&mut self, f: impl FnOnce(&mut Layout)) -> DatumColumns {
+        let scope = self.scoped(f);
+        DatumColumns { columns: scope.columns, required: scope.required }
     }
 
-    /// Declares the CHECK of one label of a label-plus-data state: while `label = code`, the
-    /// required columns of every datum in `carried` are non-null and every column of the other
-    /// datums is null. `datums` are the state's datums in declaration order and `carried` holds
-    /// the indexes of those this label carries. A label constraining nothing (it carries every
-    /// datum, none of whose columns it requires) emits no CHECK.
-    pub fn label_guard(&mut self, label: &str, code: i64, datums: &[DatumColumns], carried: &[usize]) {
+    /// [`Layout::scope`] for one datum of a label-plus-data state whose label column is `label`. A
+    /// datum with columns is also recorded as a state field of the row, `datum_of` the label; one
+    /// holding a table is not a field (its rows change one at a time).
+    pub fn datum(&mut self, name: &str, label: &str, f: impl FnOnce(&mut Layout)) -> DatumColumns {
+        let mut columns = DatumColumns::default();
+        self.record_field(name, true, Some(label), |layout| columns = layout.scope(f));
+        columns
+    }
+
+    /// The columns `f` requires when laid out as a required value, without declaring anything: a
+    /// datum declared `T` under one code and `Option<T>` under another (#3392 ruling G5) is laid
+    /// out once, as the option, and its codes carrying `T` require these.
+    pub fn required_of(f: impl FnOnce(&mut Layout)) -> Vec<String> {
+        let mut scratch = Layout::root("Scratch", KindCode::new("scratch"));
+        scratch.scope(f).required
+    }
+
+    /// Declares the CHECK of one code of a tag column `tag` (a state's label, or a data enum's tag):
+    /// while `tag = code`, the required columns of every datum in `carried` whose flag is `true`
+    /// (the code carries it as `T`, not `Option<T>`) are non-null and every column of the other
+    /// datums is null. `datums` are the datums in declaration order and `carried` holds the indexes
+    /// of those this code carries. A code constraining nothing emits no CHECK.
+    pub fn tag_guard(&mut self, tag: &str, code: Code, datums: &[DatumColumns], carried: &[(usize, bool)]) {
         let mut required = Vec::new();
         let mut absent = Vec::new();
         for (index, datum) in datums.iter().enumerate() {
-            if carried.contains(&index) {
-                required.extend(datum.required.iter().cloned());
-            } else {
-                absent.extend(datum.columns.iter().cloned());
+            match carried.iter().find(|(carried, _)| *carried == index) {
+                Some((_, true)) => required.extend(datum.required.iter().cloned()),
+                Some((_, false)) => {}
+                None => absent.extend(datum.columns.iter().cloned()),
             }
         }
         if required.is_empty() && absent.is_empty() {
             return;
         }
-        let table = self.frames.last().expect("layout has a current table").table;
-        self.set.tables[table].guards.push(Guard { column: label.to_owned(), value: code, required, scope: Vec::new(), absent });
+        let table = self.frame().table;
+        let guard = Guard { column: tag.to_owned(), when: When::Is(code), required, absent, otherwise: Vec::new() };
+        self.set.tables[table].guards.push(guard);
+    }
+
+    /// Records that the data enum with tag column `tag` expanded into `datums`' columns, for the
+    /// schema view.
+    pub fn expansion(&mut self, tag: &str, datums: &[DatumColumns]) {
+        let table = self.frame().table;
+        let columns = datums.iter().flat_map(|datum| datum.columns.iter().cloned()).collect();
+        self.set.tables[table].enums.push(Expansion { tag: tag.to_owned(), columns });
     }
 
     /// The name of the table being declared: where generated code places a declared index.
@@ -233,8 +287,8 @@ impl Layout {
     }
 }
 
-/// The columns one datum of a label-plus-data state declares directly, and those of them a label
-/// carrying the datum requires; see [`Layout::datum`].
+/// The columns one datum declares, and those of them a code carrying it requires; see
+/// [`Layout::scope`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DatumColumns {
     pub columns: Vec<String>,
@@ -267,8 +321,9 @@ pub fn snake_case(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{snake_case, Layout};
+    use super::{snake_case, DatumColumns, Layout};
     use crate::{
+        code::Code,
         descriptor::{ColumnDef, ColumnType, Guard, TableRole},
         value::KindCode,
     };
@@ -281,14 +336,14 @@ mod tests {
         assert_eq!(snake_case("ResolvedHTTP"), "resolved_http");
         assert_eq!(snake_case("Ipv4Address"), "ipv4_address");
         assert_eq!(snake_case("snake_already"), "snake_already");
-        assert_eq!(Layout::root("TerminalSession", KindCode(3)).finish().tables[0].name, "terminal_session");
+        assert_eq!(Layout::root("TerminalSession", KindCode::new("ts")).finish().tables[0].name, "terminal_session");
     }
 
     // Behaviour: an element's unnamed column is `value`, so a field named `value` beside it in
     // the same table is a duplicate the descriptor refuses rather than a silent collision.
     #[test]
     fn a_field_named_like_the_element_column_is_refused() {
-        let mut layout = Layout::root("Note", KindCode(1));
+        let mut layout = Layout::root("Note", KindCode::new("no"));
         layout.table("items", TableRole::Child, |layout| {
             layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
             layout.column("", ColumnType::Text, true);
@@ -297,55 +352,73 @@ mod tests {
         assert!(matches!(layout.finish().validate(), Err(crate::DescriptorError::DuplicateColumn { column, .. }) if column == "value"));
     }
 
-    // Behaviour (DESIGN guards): a required column inside a guard is nullable and required by that
-    // guard's CHECK; a nested guard's controlling column is in the outer scope, while the nested
-    // guard's own columns are covered only by its own CHECK, which follows the outer one. Outside guards
-    // required means NOT NULL. A guard without columns emits no CHECK.
+    // Behaviour (#3392 G5): an optional value is present when its first required column is
+    // non-null; a value of several columns gets one presence CHECK, a single column none. Inside a
+    // scope a required column is nullable, and closing a scope adds its columns (not as required)
+    // to the enclosing one, so an absent outer value nulls an inner value's columns too.
     #[test]
-    fn nested_guards_emit_one_check_each() {
-        let mut layout = Layout::root("Edge", KindCode(1));
-        layout.column("event", ColumnType::Code(vec![1, 2]), true);
-        layout.guard("event", 1, |layout| {
-            layout.column("event_drop_reason", ColumnType::Code(vec![1, 2]), true);
-            layout.guard("event_drop_reason", 2, |layout| {
-                layout.column("event_drop_reason_undeliverable_cause", ColumnType::Text, true);
-                layout.column("event_drop_reason_undeliverable_note", ColumnType::Text, false);
-            });
-            layout.column("event_drop_at", ColumnType::Timestamp, false);
+    fn optional_values_are_present_by_their_first_required_column() {
+        let mut layout = Layout::root("Edge", KindCode::new("ed"));
+        layout.optional(|layout| {
+            layout.column("hold_note", ColumnType::Text, false);
+            layout.column("hold_by", ColumnType::Text, true);
+            layout.optional(|layout| layout.column("hold_until", ColumnType::Timestamp, true));
+            layout.column("hold_at", ColumnType::Timestamp, true);
         });
-        layout.guard("event", 2, |_| {});
+        layout.optional(|layout| layout.column("watermark", ColumnType::Timestamp, true));
         let set = layout.finish();
         let root = &set.tables[0];
-        let nullable: Vec<(&str, bool)> = root.columns.iter().map(|c| (c.name.as_str(), c.nullable)).collect();
-        assert_eq!(
-            nullable,
-            [
-                ("event", false),
-                ("event_drop_reason", true),
-                ("event_drop_reason_undeliverable_cause", true),
-                ("event_drop_reason_undeliverable_note", true),
-                ("event_drop_at", true),
-            ]
-        );
+        assert!(root.columns.iter().all(|column| column.nullable));
         let checks: Vec<String> = root.guards.iter().map(Guard::check).collect();
         assert_eq!(
             checks,
+            ["CASE WHEN \"hold_by\" IS NOT NULL THEN \"hold_at\" IS NOT NULL \
+              ELSE \"hold_note\" IS NULL AND \"hold_until\" IS NULL AND \"hold_at\" IS NULL END"]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "needs a required column")]
+    fn an_optional_value_without_a_required_column_is_refused() {
+        let mut layout = Layout::root("Edge", KindCode::new("ed"));
+        layout.optional(|layout| layout.column("note", ColumnType::Text, false));
+    }
+
+    // Behaviour (#3392 G5, G6): one CHECK per code of a tag column requires the data the code
+    // carries as `T` and nulls the data it lacks; data it carries as `Option<T>` is unconstrained,
+    // and a code constraining nothing emits no CHECK.
+    #[test]
+    fn tag_guards_require_carried_data_and_null_the_rest() {
+        let mut layout = Layout::root("Edge", KindCode::new("ed"));
+        let (a, b) = (Code::new("a"), Code::new("b"));
+        layout.column("tag", ColumnType::Code(vec![a, b]), true);
+        let datums = [
+            layout.scope(|layout| layout.column("tag_by", ColumnType::Text, true)),
+            layout.scope(|layout| layout.optional(|layout| layout.column("tag_at", ColumnType::Timestamp, true))),
+        ];
+        assert_eq!(datums[1], DatumColumns { columns: vec!["tag_at".into()], required: vec![] });
+        let at_required = Layout::required_of(|layout| layout.column("tag_at", ColumnType::Timestamp, true));
+        let datums = [datums[0].clone(), DatumColumns { required: at_required, ..datums[1].clone() }];
+        layout.tag_guard("tag", a, &datums, &[(0, true), (1, true)]);
+        layout.tag_guard("tag", b, &datums, &[(1, false)]);
+        layout.tag_guard("tag", Code::new("c"), &datums, &[(0, false), (1, false)]);
+        let checks: Vec<String> = layout.finish().tables[0].guards.iter().map(Guard::check).collect();
+        assert_eq!(
+            checks,
             [
-                "CASE WHEN \"event\" = 1 THEN \"event_drop_reason\" IS NOT NULL \
-                 ELSE \"event_drop_reason\" IS NULL AND \"event_drop_at\" IS NULL END",
-                "CASE WHEN \"event_drop_reason\" = 2 THEN \"event_drop_reason_undeliverable_cause\" IS NOT NULL \
-                 ELSE \"event_drop_reason_undeliverable_cause\" IS NULL AND \"event_drop_reason_undeliverable_note\" IS NULL END",
+                "CASE WHEN \"tag\" = 'a' THEN \"tag_by\" IS NOT NULL AND \"tag_at\" IS NOT NULL END",
+                "CASE WHEN \"tag\" = 'b' THEN \"tag_by\" IS NULL END",
             ]
         );
     }
 
     // Behaviour (DESIGN naming): a child table is `<parent>_<field>`; its key is the ancestors' own
-    // keys renamed `<ancestor field>_<column>` followed by its own key. Guards stay with their table.
+    // keys renamed `<ancestor field>_<column>` followed by its own key. Scopes stay with their table.
     #[test]
     fn nested_tables_inherit_renamed_keys() {
-        let mut layout = Layout::root("Convoy", KindCode(2));
+        let mut layout = Layout::root("Convoy", KindCode::new("cv"));
         layout.column("state", ColumnType::Integer, true);
-        layout.guard("state", 1, |layout| {
+        layout.scope(|layout| {
             layout.table("deliverables", TableRole::Records, |layout| {
                 layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
                 layout.column("title", ColumnType::Text, true);
@@ -367,6 +440,6 @@ mod tests {
         assert_eq!(evidence.own_key, 1);
         assert_eq!(evidence.parent_key().len(), 1);
         assert_eq!(evidence.columns[0].name, "value");
-        assert!(set.tables[0].guards.is_empty(), "a guard holding only a table emits no CHECK");
+        assert!(set.tables[0].guards.is_empty());
     }
 }

@@ -295,7 +295,7 @@ fn nested_rows_go_with_their_parent() {
     let next = Dossier { inputs: [("b".to_owned(), InputValue::Text { value: "t".into() })].into(), ..current.value.clone() };
     update(&mut store, &current, &next);
     let conn = store.into_connection();
-    let items: i64 = conn.query_row("SELECT count(*) FROM dossier_inputs_list_items", [], |row| row.get(0)).expect("count");
+    let items: i64 = conn.query_row("SELECT count(*) FROM dossier_inputs_items", [], |row| row.get(0)).expect("count");
     assert_eq!(items, 0, "a removed input's items and a switched variant's items are gone");
     assert_eq!(foreign_key_violations(&conn), 0);
 

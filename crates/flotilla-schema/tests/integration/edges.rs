@@ -1,16 +1,16 @@
 //! Edge handles and the backend-neutral `Edge` builder (#3320 ruling 1), without a backend.
 
 use flotilla_schema::{
-    ColumnType, Columns, Edge, EdgeAppend, EdgeError, EdgeEvent, EdgeSet, Encoder, FieldColumns, Frozen, Index, Kind, Position, Records,
-    RowPath, State, Stored, TableRole, Timestamp, Value,
+    Code, ColumnType, Columns, Edge, EdgeAppend, EdgeError, EdgeEvent, EdgeSet, Encoder, FieldColumns, Frozen, Index, Kind, Position,
+    Records, RowPath, State, Stored, TableRole, Timestamp, Value,
 };
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 enum Phase {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Requested,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Realised,
 }
 
@@ -23,9 +23,9 @@ struct Ident {
 /// A data enum whose `List` variant holds a table: a column-shaped field that spans a table.
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 enum Input {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Text { value: String },
-    #[store(code = 2)]
+    #[store(code = "c2")]
     List {
         #[store(child)]
         items: Vec<String>,
@@ -34,9 +34,9 @@ enum Input {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 enum LifecycleEdge {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Realise,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Retire,
 }
 
@@ -65,7 +65,7 @@ struct Note {
 
 /// A generic kind: its handles name its type parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
-#[store(kind = "Lifecycle", code = 1)]
+#[store(kind = "Lifecycle", code = "k1")]
 struct Lifecycle<I> {
     #[store(flatten)]
     realised: Option<I>,
@@ -97,13 +97,10 @@ fn rows_record_their_column_shaped_fields() {
     let field = |name: &str, columns, state| FieldColumns { name: name.into(), columns, state, datum_of: None };
     assert_eq!(
         set.tables[0].fields,
-        [field("realised", 0..3, false), field("phase", 3..5, true), field("input", 5..7, false), field("doc", 7..8, false)]
+        [field("realised", 0..2, false), field("phase", 2..4, true), field("input", 4..6, false), field("doc", 6..7, false)]
     );
     let columns: Vec<&str> = set.tables[0].columns.iter().map(|column| column.name.as_str()).collect();
-    assert_eq!(
-        columns,
-        ["realised_present", "realised_session", "realised_pid", "phase", "phase_since", "input", "input_text_value", "doc"]
-    );
+    assert_eq!(columns, ["realised_session", "realised_pid", "phase", "phase_since", "input", "input_value", "doc"]);
     let notes = set.tables.iter().find(|table| table.name == "lifecycle_notes").expect("notes");
     assert_eq!(notes.fields, [field("by", 1..2, false), field("phase", 2..4, true)], "after the version stamp");
     let labels = set.tables.iter().find(|table| table.name == "lifecycle_labels").expect("labels");
@@ -125,9 +122,9 @@ fn edge_logs_store_a_header_and_one_document_per_event() {
         columns,
         [
             ("version", &ColumnType::Integer, false),
-            ("edge", &ColumnType::Code(vec![1, 2]), false),
-            ("from", &ColumnType::Code(vec![1, 2]), false),
-            ("to", &ColumnType::Code(vec![1, 2]), false),
+            ("edge", &ColumnType::Code(vec![Code::new("c1"), Code::new("c2")]), false),
+            ("from", &ColumnType::Code(vec![Code::new("c1"), Code::new("c2")]), false),
+            ("to", &ColumnType::Code(vec![Code::new("c1"), Code::new("c2")]), false),
             ("writer", &ColumnType::Interned, false),
             ("at", &ColumnType::Timestamp, false),
             ("payload", &ColumnType::Cbor, false),
@@ -166,10 +163,14 @@ fn edges_encode_exactly_their_declared_fields_and_rows() {
     assert_eq!(
         parts.sets,
         [
-            EdgeSet { row: RowPath::Root, field: "phase", values: vec![int(2), int(5)] },
-            EdgeSet { row: RowPath::Root, field: "realised", values: vec![int(1), Value::Text("s".into()), int(7)] },
+            EdgeSet { row: RowPath::Root, field: "phase", values: vec![Value::Text("c2".into()), int(5)] },
+            EdgeSet { row: RowPath::Root, field: "realised", values: vec![Value::Text("s".into()), int(7)] },
             EdgeSet { row: RowPath::Root, field: "doc", values: vec![Value::Object(doc.hash())] },
-            EdgeSet { row: RowPath::Record { table: "notes", position: Position(2) }, field: "phase", values: vec![int(2), int(5)] },
+            EdgeSet {
+                row: RowPath::Record { table: "notes", position: Position(2) },
+                field: "phase",
+                values: vec![Value::Text("c2".into()), int(5)]
+            },
         ]
     );
     let appends: Vec<(RowPath, &str, TableRole, &Vec<Value>)> =
@@ -183,9 +184,9 @@ fn edges_encode_exactly_their_declared_fields_and_rows() {
                 TableRole::History,
                 &vec![
                     int(0),
-                    int(1),
-                    int(1),
-                    int(2),
+                    Value::Text("c1".into()),
+                    Value::Text("c1".into()),
+                    Value::Text("c2".into()),
                     Value::Str("w".into()),
                     int(4),
                     Value::Blob(flotilla_cbor::to_vec(&realise.payload, &flotilla_schema::INLINE_LIMITS).expect("cbor")),
@@ -223,6 +224,6 @@ fn edges_refuse_table_fields_repeated_fields_and_a_mislabelled_event() {
     let realised = State::new(Phase::Realised, Timestamp(2));
     assert_eq!(
         Edge::new(Session::PHASE, &realised, Session::EVENTS, &retire),
-        Err(EdgeError::Label { field: "phase".into(), to: 1, state: 2 })
+        Err(EdgeError::Label { field: "phase".into(), to: Code::new("c1"), state: Code::new("c2") })
     );
 }

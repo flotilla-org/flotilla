@@ -8,10 +8,10 @@ use flotilla_state_machines::{edges, states, EdgeDef, Ended, Handle, Kind, Machi
 // itself when its spec says so) or is withdrawn with a reason.
 states! {
     pub enum Latch => LatchLabel {
-        Armed { shots: u32 } = 1,
-        Fired { shots: u32, by: String } = 2,
-        Spent { shots: u32 } = 3,
-        Withdrawn { reason: String } = 4,
+        Armed { shots: u32 } = "ar",
+        Fired { shots: u32, by: String } = "fi",
+        Spent { shots: u32 } = "sp",
+        Withdrawn { reason: String } = "wd",
     }
 }
 
@@ -36,10 +36,10 @@ pub struct ReArm;
 
 edges! {
     pub enum LatchEdge => LatchEdgeKind {
-        Fire(Fire) = 10,
-        Withdraw(Withdraw) = 11,
-        ReArm(ReArm) = 12,
-        Load(Load) = 13,
+        Fire(Fire) = "fi",
+        Withdraw(Withdraw) = "wd",
+        ReArm(ReArm) = "ra",
+        Load(Load) = "lo",
     }
 }
 

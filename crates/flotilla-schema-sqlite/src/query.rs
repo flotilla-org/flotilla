@@ -125,7 +125,7 @@ impl Ctx<'_> {
         let mut ids: Vec<ResourceId> = self
             .conn
             .prepare_cached(&self.sql(K::CODE)?.scan)?
-            .query_map(params![home, K::CODE.0, after, limit + 1], |row| row.get(0).map(ResourceId))?
+            .query_map(params![home, K::CODE.as_str(), after, limit + 1], |row| row.get(0).map(ResourceId))?
             .collect::<Result<_, _>>()?;
         let more = ids.len() as i64 > limit;
         ids.truncate(limit as usize);

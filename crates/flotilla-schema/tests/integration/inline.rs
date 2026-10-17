@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{ColumnType, DecodeError, Decoder, EncodeError, Encoder, Kind, Stored, Value, INLINE_LIMITS};
+use flotilla_schema::{Code, ColumnType, DecodeError, Decoder, EncodeError, Encoder, Kind, Stored, Value, INLINE_LIMITS};
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
@@ -16,15 +16,15 @@ struct Args {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Stored)]
 enum Shape {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Round,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 enum Variant {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Plain,
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Carrying {
         #[store(cbor)]
         args: Args,
@@ -32,7 +32,7 @@ enum Variant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
-#[store(kind = "Doc", code = 1)]
+#[store(kind = "Doc", code = "k1")]
 struct Doc {
     shape: Shape,
     #[store(cbor)]
@@ -62,11 +62,11 @@ fn cbor_fields_are_one_column_of_canonical_cbor(tc: TestCase) {
     assert_eq!(
         columns,
         [
-            ("shape", &ColumnType::Code(vec![1]), false),
+            ("shape", &ColumnType::Code(vec![Code::new("c1")]), false),
             ("args", &ColumnType::Cbor, false),
             ("maybe", &ColumnType::Cbor, false),
-            ("variant", &ColumnType::Code(vec![1, 2]), false),
-            ("variant_carrying_args", &ColumnType::Cbor, true),
+            ("variant", &ColumnType::Code(vec![Code::new("c1"), Code::new("c2")]), false),
+            ("variant_args", &ColumnType::Cbor, true),
         ]
     );
     assert_eq!(set.tables.len(), 1, "a document adds no table");

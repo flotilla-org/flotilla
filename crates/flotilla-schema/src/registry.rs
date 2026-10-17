@@ -73,8 +73,8 @@ mod tests {
         value::KindCode,
     };
 
-    fn kind(name: &str, code: u32) -> TableSet {
-        let mut layout = Layout::root(name, KindCode(code));
+    fn kind(name: &str, code: &str) -> TableSet {
+        let mut layout = Layout::root(name, KindCode::new(code));
         layout.column("body", ColumnType::Text, true);
         layout.finish()
     }
@@ -84,27 +84,29 @@ mod tests {
     #[test]
     fn registry_rejects_duplicates_and_looks_up_by_code() {
         let mut registry = KindRegistry::new();
-        registry.register_table_set(kind("Message", 1)).expect("first kind");
-        assert_eq!(registry.get(KindCode(1)).map(|set| set.kind.as_str()), Some("Message"));
-        assert_eq!(registry.get(KindCode(2)), None);
+        registry.register_table_set(kind("Message", "k1")).expect("first kind");
+        assert_eq!(registry.get(KindCode::new("k1")).map(|set| set.kind.as_str()), Some("Message"));
+        assert_eq!(registry.get(KindCode::new("k2")), None);
         assert!(matches!(
-            registry.register_table_set(kind("Convoy", 1)),
-            Err(RegistryError::DuplicateCode { code: KindCode(1), existing, kind }) if existing == "Message" && kind == "Convoy"
+            registry.register_table_set(kind("Convoy", "k1")),
+            Err(RegistryError::DuplicateCode { code, existing, kind }) if code == KindCode::new("k1") && existing == "Message" && kind == "Convoy"
         ));
-        assert!(matches!(registry.register_table_set(kind("Message", 2)), Err(RegistryError::DuplicateName { kind }) if kind == "Message"));
-        assert!(matches!(registry.register_table_set(kind("Objects", 3)), Err(RegistryError::Descriptor(_))));
-        registry.register_table_set(kind("Convoy", 2)).expect("distinct kind");
+        assert!(
+            matches!(registry.register_table_set(kind("Message", "k2")), Err(RegistryError::DuplicateName { kind }) if kind == "Message")
+        );
+        assert!(matches!(registry.register_table_set(kind("Objects", "k3")), Err(RegistryError::Descriptor(_))));
+        registry.register_table_set(kind("Convoy", "k2")).expect("distinct kind");
         assert_eq!(registry.iter().count(), 2);
     }
 
     #[test]
     fn registry_rejects_table_names_shared_across_kinds() {
         let mut registry = KindRegistry::new();
-        let mut layout = Layout::root("Message", KindCode(1));
+        let mut layout = Layout::root("Message", KindCode::new("k1"));
         layout.table("log", TableRole::Child, |layout| layout.key(|layout| layout.column("pos", ColumnType::Integer, true)));
         registry.register_table_set(layout.finish()).expect("first kind");
         assert!(matches!(
-            registry.register_table_set(kind("MessageLog", 2)),
+            registry.register_table_set(kind("MessageLog", "k2")),
             Err(RegistryError::DuplicateObject { name, .. }) if name == "message_log"
         ));
     }

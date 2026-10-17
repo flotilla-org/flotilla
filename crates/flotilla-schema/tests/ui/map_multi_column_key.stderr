@@ -47,7 +47,7 @@ note: required for `Ticket` to implement `flotilla_schema::Element`
    |
 12 | #[derive(Stored)]
    |          ------ type parameter would need to implement `flotilla_schema::Element`
-13 | #[store(kind = "Ticket", code = 1)]
+13 | #[store(kind = "Ticket", code = "k1")]
 14 | struct Ticket {
    |        ^^^^^^
    = help: consider manually implementing `flotilla_schema::Element` to avoid undesired bounds caused by "imperfect derives"
@@ -84,7 +84,7 @@ note: required for `Ticket` to implement `flotilla_schema::Element`
    |
 12 | #[derive(Stored)]
    |          ------ type parameter would need to implement `flotilla_schema::Element`
-13 | #[store(kind = "Ticket", code = 1)]
+13 | #[store(kind = "Ticket", code = "k1")]
 14 | struct Ticket {
    |        ^^^^^^
    = help: consider manually implementing `flotilla_schema::Element` to avoid undesired bounds caused by "imperfect derives"

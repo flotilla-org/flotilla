@@ -1,6 +1,6 @@
 //! AgentSession against `specs/primitives/machines/agent_session.qnt`.
 
-use flotilla_schema::{CodeEnum, Timestamp};
+use flotilla_schema::{Code, CodeEnum, Timestamp};
 use flotilla_state_machines::{
     machines::agent_session::{
         AgentSession, AgentSessionEdgeKind, AgentSessionLabel, AgentSessionRefusal, AgentSessionState, Attach, Channel, ChannelPresence,
@@ -69,9 +69,9 @@ fn the_declaration_validates() {
 #[test]
 fn codes_and_names_are_pinned() {
     let labels: Vec<_> = AgentSessionLabel::ALL.iter().map(|s| (s.name(), s.code())).collect();
-    assert_eq!(labels, [("Live", 1), ("Ended", 2)]);
+    assert_eq!(labels, [("Live", Code::new("li")), ("Ended", Code::new("en"))]);
     let edges: Vec<_> = AgentSessionEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    assert_eq!(edges, [("attach", 1), ("detach", 2), ("end", 3)]);
+    assert_eq!(edges, [("attach", Code::new("at")), ("detach", Code::new("de")), ("end", Code::new("en"))]);
 }
 
 // The diagram shows the ADR's table: the channel moving within Live, and

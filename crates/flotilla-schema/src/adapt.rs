@@ -122,52 +122,36 @@ impl<T: Intern> Adapter<Option<T>> for AsOptionalInterned {
     }
 }
 
-/// `#[store(flatten)] Option<T>`: a `<field>_present` flag guarding the struct's columns.
-///
-/// The flag is 1 when the value is present and 0 when it is `None`; it is null only when the
-/// enclosing value is itself absent (an inactive variant), so absence at each level stays distinct.
+/// `#[store(flatten)] Option<T>`: the struct's columns, nullable. The value is present when its
+/// first required column is non-null (#3392 ruling G5: no presence flag), and one CHECK keeps its
+/// columns all set or all null.
 #[doc(hidden)]
 pub struct AsOptionalFlat;
 
 impl<T: Flat> Adapter<Option<T>> for AsOptionalFlat {
     const TABLES: usize = T::TABLES;
 
-    fn layout(layout: &mut Layout, name: &str, required: bool) {
-        let present = Layout::join(name, "present");
-        layout.column(&present, ColumnType::Bool, required);
-        layout.guard(&present, 1, |layout| T::layout(layout, name, true));
+    fn layout(layout: &mut Layout, name: &str, _required: bool) {
+        layout.optional(|layout| T::layout(layout, name, true));
     }
 
     fn encode(value: &Option<T>, e: &mut Encoder) -> Result<(), EncodeError> {
         match value {
-            Some(value) => {
-                e.put(Value::Int(1));
-                value.encode(e)
-            }
-            None => {
-                e.put(Value::Int(0));
-                T::encode_absent(e)
-            }
+            Some(value) => value.encode(e),
+            None => T::encode_absent(e),
         }
     }
 
     fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError> {
-        e.put(Value::Null);
         T::encode_absent(e)
     }
 
+    /// `Some(None)` when the struct's columns are all null: the value is absent.
     fn decode(d: &mut Decoder) -> Result<Option<Option<T>>, DecodeError> {
-        match d.take().map_err(|error| error.at("present"))? {
-            Value::Null => T::decode_absent(d).map(|()| None),
-            Value::Int(0) => T::decode_absent(d).map(|()| Some(None)),
-            Value::Int(1) => Ok(Some(Some(T::decode(d)?.ok_or_else(|| DecodeError::missing(""))?))),
-            Value::Int(other) => Err(DecodeError::OutOfRange { column: "present".to_owned(), value: other }),
-            other => Err(DecodeError::unexpected("boolean", &other).at("present")),
-        }
+        T::decode(d).map(Some)
     }
 
     fn decode_absent(d: &mut Decoder) -> Result<(), DecodeError> {
-        null(d).map_err(|error| error.at("present"))?;
         T::decode_absent(d)
     }
 }

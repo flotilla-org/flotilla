@@ -1,6 +1,6 @@
 //! The shared lifecycle against `specs/primitives/machines/lifecycle.qnt`.
 
-use flotilla_schema::{CodeEnum, Timestamp};
+use flotilla_schema::{Code, CodeEnum, Timestamp};
 use flotilla_state_machines::{
     changed,
     machines::lifecycle::{
@@ -84,11 +84,18 @@ fn every_kind_validates() {
 #[test]
 fn codes_and_names_are_pinned() {
     let labels: Vec<_> = LifecycleLabel::ALL.iter().map(|s| (s.name(), s.code(), LifecycleState::fields(*s))).collect();
-    let expected: [(&str, i64, &[&str]); 4] =
-        [("Requested", 1, &[]), ("Realised", 2, &["identity"]), ("Gone", 3, &[]), ("GaveUp", 4, &["cause"])];
+    let expected: [(&str, Code, &[&str]); 4] = [
+        ("Requested", Code::new("rq"), &[]),
+        ("Realised", Code::new("rl"), &["identity"]),
+        ("Gone", Code::new("go"), &[]),
+        ("GaveUp", Code::new("gu"), &["cause"]),
+    ];
     assert_eq!(labels, expected);
     let edges: Vec<_> = LifecycleEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    assert_eq!(edges, [("realise", 1), ("release", 2), ("vanish", 3), ("give_up", 4)]);
+    assert_eq!(
+        edges,
+        [("realise", Code::new("rl")), ("release", Code::new("rs")), ("vanish", Code::new("va")), ("give_up", Code::new("gu"))]
+    );
 }
 
 // The diagram shows the ADR's table: realise, release from both live states,

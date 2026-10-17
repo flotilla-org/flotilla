@@ -1,6 +1,7 @@
-//! The database refuses rows that break a variant's column rule, whoever writes them.
+//! The database refuses rows that break a tag's or an optional value's column rule, whoever writes
+//! them.
 
-use flotilla_schema::{quote_ident, ColumnDef, ColumnType, Guard, Table, TableRole, RECORD_VERSION};
+use flotilla_schema::{code_literal, quote_ident, ColumnDef, ColumnType, Guard, Table, TableRole, When, RECORD_VERSION};
 use flotilla_schema_sqlite::Write;
 use hegel::TestCase;
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, ErrorCode};
@@ -15,7 +16,7 @@ fn valid_value(conn: &Connection, column: &ColumnDef) -> SqlValue {
     let any = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, SqlValue>(0)).expect("a stored row");
     match &column.ty {
         ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp => SqlValue::Integer(1),
-        ColumnType::Code(codes) => SqlValue::Integer(codes[0]),
+        ColumnType::Code(codes) => SqlValue::Text(codes[0].to_string()),
         ColumnType::Text => SqlValue::Text("x".into()),
         ColumnType::Blob | ColumnType::Cbor => SqlValue::Blob(vec![0]),
         ColumnType::Frozen => any("SELECT hash FROM objects LIMIT 1"),
@@ -25,7 +26,10 @@ fn valid_value(conn: &Connection, column: &ColumnDef) -> SqlValue {
 }
 
 fn condition(guard: &Guard) -> String {
-    format!("{} = {}", quote_ident(&guard.column), guard.value)
+    match &guard.when {
+        When::Is(code) => format!("{} = {}", quote_ident(&guard.column), code_literal(*code)),
+        When::Present => format!("{} IS NOT NULL", quote_ident(&guard.column)),
+    }
 }
 
 /// A row's primary key columns: `id` on the root; `owner` and the logical key on child tables.
@@ -79,14 +83,14 @@ fn insert_all(write: &mut Write<'_>, tc: &TestCase) {
     insert_covering::<Dossier>(write, tc);
 }
 
-// Behaviour (#3320 CHECK constraints, #3373 ruling 1): for every guard every fixture kind declares,
-// in every table (every data enum variant with columns and every present `Option<flatten>`,
-// nested, flattened and in child tables, and every label of a label-plus-data state), a raw SQL
-// write that sets a column of an inactive guard, nulls a required column of an active one, or
-// sets a datum column a holding label lacks, is refused by a CHECK; so is an unknown code in any
-// code column. Cases come from the descriptors, not a hand list, so a new variant or table is
-// covered automatically; the covering generators must reach an active and an inactive row for
-// every guard, or the test fails naming the guard.
+// Behaviour (#3320 CHECK constraints, #3373 ruling 1, #3392 G5 and G6): for every guard every
+// fixture kind declares, in every table (every data enum variant and every label of a state, by
+// mapping B, and every optional value of several columns, nested, flattened and in child tables),
+// a raw SQL write that nulls a required column while the guard holds, sets a datum column the
+// holding code lacks, or sets a column of an absent optional value, is refused by a CHECK; so is
+// an unknown code in any code column. Cases come from the descriptors, not a hand list, so a new
+// variant or table is covered automatically; the covering generators must reach a holding row for
+// every guard, and an absent one for every optional value, or the test fails naming the guard.
 #[hegel::test]
 fn raw_writes_breaking_a_variant_rule_are_refused(tc: TestCase) {
     let mut store = store();
@@ -108,15 +112,17 @@ fn check_table(conn: &Connection, table: &Table) {
     let name = &table.name;
     for guard in &table.guards {
         let active = condition(guard);
-        // Inactive: the controlling column differs or is null (an enclosing guard is inactive).
-        let inactive = row_where(conn, table, &format!("{} IS NOT {}", quote_ident(&guard.column), guard.value))
-            .unwrap_or_else(|| panic!("{name}: no row leaves `{active}` inactive"));
-        for column in &guard.scope {
-            let def = table.columns.iter().find(|def| &def.name == column).expect("scope columns are declared");
-            assert!(
-                refused_by_check(conn, table, &inactive, column, valid_value(conn, def)),
-                "{name}: setting {column} while `{active}` does not hold was accepted"
-            );
+        // An optional value: while absent (its first required column null), its other columns are.
+        if !guard.otherwise.is_empty() {
+            let absent = row_where(conn, table, &format!("{} IS NULL", quote_ident(&guard.column)))
+                .unwrap_or_else(|| panic!("{name}: no row leaves `{active}` absent"));
+            for column in &guard.otherwise {
+                let def = table.columns.iter().find(|def| &def.name == column).expect("guarded columns are declared");
+                assert!(
+                    refused_by_check(conn, table, &absent, column, valid_value(conn, def)),
+                    "{name}: setting {column} while `{active}` does not hold was accepted"
+                );
+            }
         }
         let holding = row_where(conn, table, &active).unwrap_or_else(|| panic!("{name}: the covering values never make `{active}` hold"));
         for column in &guard.required {
@@ -125,7 +131,7 @@ fn check_table(conn: &Connection, table: &Table) {
                 "{name}: nulling required {column} while `{active}` holds was accepted"
             );
         }
-        // A label guard: the data its label lacks stays null while it holds.
+        // A tag guard: the data its code lacks stays null while it holds.
         for column in &guard.absent {
             let def = table.columns.iter().find(|def| &def.name == column).expect("absent columns are declared");
             assert!(
@@ -135,7 +141,7 @@ fn check_table(conn: &Connection, table: &Table) {
         }
         // Control: rewriting the active row's own values is accepted, so the refusals above are
         // the rule and not the statement.
-        for column in guard.scope.iter().chain(&guard.absent) {
+        for column in guard.otherwise.iter().chain(&guard.absent) {
             let sql = format!("UPDATE {} SET {1} = {1} WHERE {active}", quote_ident(name), quote_ident(column));
             assert!(conn.execute(&sql, []).expect("unchanged rows satisfy every CHECK") >= 1, "{sql}");
         }
@@ -145,9 +151,11 @@ fn check_table(conn: &Connection, table: &Table) {
         let ColumnType::Code(codes) = &column.ty else { continue };
         let key = row_where(conn, table, &format!("{} IS NOT NULL", quote_ident(&column.name)))
             .unwrap_or_else(|| panic!("{name}: no row sets code column {}", column.name));
-        for unknown in [codes.iter().min().expect("codes") - 1, codes.iter().max().expect("codes") + 1] {
+        let first = codes.iter().min().expect("codes");
+        for unknown in [format!("{first}0"), "zz_none".to_owned(), first.as_str().to_uppercase()] {
+            assert!(!codes.iter().any(|code| *code == unknown.as_str()), "{unknown} is a code");
             assert!(
-                refused_by_check(conn, table, &key, &column.name, SqlValue::Integer(unknown)),
+                refused_by_check(conn, table, &key, &column.name, SqlValue::Text(unknown.clone())),
                 "{name}.{} accepted code {unknown}",
                 column.name
             );

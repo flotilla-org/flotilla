@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{CodeEnum, Decoder, Encoder, Timestamp};
+use flotilla_schema::{Code, CodeEnum, Decoder, Encoder, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
         Abandon, Authority, Convoy, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoyState, Deliver, Keep,
@@ -82,14 +82,23 @@ fn the_declaration_is_valid() {
 #[test]
 fn codes_are_pinned() {
     let labels: Vec<_> = ConvoyLabel::ALL.iter().map(|s| (s.name(), s.code(), ConvoyState::fields(*s))).collect();
-    let expected: [(&str, i64, &[&str]); 3] = [
-        ("Open", 1, &["resolution", "quota"]),
-        ("Delivered", 2, &["resolution", "quota"]),
-        ("Abandoned", 3, &["resolution", "quota", "reason"]),
+    let expected: [(&str, Code, &[&str]); 3] = [
+        ("Open", Code::new("op"), &["resolution", "quota"]),
+        ("Delivered", Code::new("de"), &["resolution", "quota"]),
+        ("Abandoned", Code::new("ab"), &["resolution", "quota", "reason"]),
     ];
     assert_eq!(labels, expected);
     let edges: Vec<_> = ConvoyEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    assert_eq!(edges, [("keep", 1), ("retract", 2), ("deliver", 3), ("abandon", 4), ("readmit", 5)]);
+    assert_eq!(
+        edges,
+        [
+            ("keep", Code::new("ke")),
+            ("retract", Code::new("rt")),
+            ("deliver", Code::new("de")),
+            ("abandon", Code::new("ab")),
+            ("readmit", Code::new("ra"))
+        ]
+    );
 }
 
 // The diagram is drawn from the declaration: every edge with the data it

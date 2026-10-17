@@ -240,8 +240,8 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
     let own = RowChange { home: LOCAL.into(), name: "mine".into(), ..changes[0].clone() };
     assert!(matches!(write.apply(&own), Err(StoreError::OwnHome { home }) if home == LOCAL));
     assert_eq!(write.resolve(Message::CODE, "mine", LOCAL).expect("resolve"), None, "a refused apply writes nothing");
-    let unknown = RowChange { kind: KindCode(999), ..changes[0].clone() };
-    assert!(matches!(write.apply(&unknown), Err(StoreError::UnknownKind { code: KindCode(999) })));
+    let unknown = RowChange { kind: KindCode::new("k999"), ..changes[0].clone() };
+    assert!(matches!(write.apply(&unknown), Err(StoreError::UnknownKind { code }) if code == KindCode::new("k999")));
     write.commit().expect("commit");
 }
 

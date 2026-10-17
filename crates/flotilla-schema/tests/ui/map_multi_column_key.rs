@@ -10,7 +10,7 @@ struct Pair {
 }
 
 #[derive(Stored)]
-#[store(kind = "Ticket", code = 1)]
+#[store(kind = "Ticket", code = "k1")]
 struct Ticket {
     #[store(child)]
     by_pair: BTreeMap<Pair, String>,

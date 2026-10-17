@@ -5,10 +5,24 @@ use std::{collections::BTreeMap, fmt};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-/// The stable numeric code of a resource kind. Codes never change once a kind is stored.
+use crate::code::Code;
+
+/// The stable code of a resource kind (#3392 ruling G7): short text written by hand. Codes never
+/// change once a kind is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct KindCode(pub u32);
+pub struct KindCode(pub Code);
+
+impl KindCode {
+    /// The kind code `text`; panics (a compile error in a `const` context) when it is not a code.
+    pub const fn new(text: &str) -> KindCode {
+        KindCode(Code::new(text))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
 
 impl fmt::Display for KindCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

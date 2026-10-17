@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::{
+    code::Code,
     codec::{DecodeError, Decoder, EncodeError, Encoder},
     descriptor::{ColumnType, TableSet},
     history::Labelled,
@@ -66,11 +67,12 @@ pub trait Flat: Columns {}
 pub trait KeyColumn: Column {}
 
 /// A unit enum with a stable code on every variant: the target of `#[store(state)]` and of index
-/// predicates. Codes come from `#[store(code = N)]`, never from serde names or declaration order.
+/// predicates. Codes come from `#[store(code = "..")]` (short text, #3392 ruling G7), never from
+/// serde names or declaration order.
 pub trait CodeEnum: Column {
     /// Every variant's code, ascending.
-    const CODES: &'static [i64];
-    fn code(&self) -> i64;
+    const CODES: &'static [Code];
+    fn code(&self) -> Code;
 }
 
 /// The value of a `#[store(state)]` field's `State<S>`: a code enum (the label alone) or a
@@ -87,18 +89,18 @@ pub trait StateData: Labelled + Sized {
     /// Tables the data declares, in pre-order.
     const TABLES: usize;
     /// Every label's code, ascending: the variant codes.
-    const CODES: &'static [i64];
+    const CODES: &'static [Code];
     /// The data's names in declaration order; empty for a code enum.
     const DATA: &'static [&'static str];
     /// The label's code, as stored.
-    fn code(&self) -> i64;
+    fn code(&self) -> Code;
     /// Declares the data's columns and tables, and one CHECK per label on the label column `label`.
     fn layout_data(layout: &mut Layout, label: &str);
     fn encode_data(&self, e: &mut Encoder) -> Result<(), EncodeError>;
     fn encode_absent_data(e: &mut Encoder) -> Result<(), EncodeError>;
     /// The value whose label has code `code` (one of [`StateData::CODES`]), reading its data and
     /// refusing data stored under labels that lack it.
-    fn decode_data(code: i64, d: &mut Decoder) -> Result<Self, DecodeError>;
+    fn decode_data(code: Code, d: &mut Decoder) -> Result<Self, DecodeError>;
     fn decode_absent_data(d: &mut Decoder) -> Result<(), DecodeError>;
     /// Records in `delta` the data that differs from `previous` to `next`: each column datum whose
     /// columns differ, and each row of a collection datum that differs.
@@ -130,9 +132,9 @@ pub trait Element: Sized {
     fn decode_row(d: &mut Decoder) -> Result<Self, DecodeError>;
 }
 
-/// A resource kind: a struct with `#[store(kind = "...", code = N)]`.
+/// A resource kind: a struct with `#[store(kind = "...", code = "..")]`.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` is not a stored kind: a kind is a struct deriving Stored with #[store(kind = \"Name\", code = N)]",
+    message = "`{Self}` is not a stored kind: a kind is a struct deriving Stored with #[store(kind = \"Name\", code = \"..\")]",
     label = "not a stored kind"
 )]
 pub trait Kind: Element {
@@ -271,12 +273,13 @@ scalar!(Identity, ColumnType::Ref, |this| Ok(Value::Ref(this.clone())), |value| 
     other => Err(DecodeError::unexpected("reference", &other)),
 });
 
-/// An optional column is the inner type's columns, nullable.
+/// An optional column is the inner type's columns, nullable: present when the first of them is
+/// non-null (a data enum's tag, say), and all null when absent.
 impl<T: Column> Columns for Option<T> {
     const TABLES: usize = T::TABLES;
 
     fn layout(layout: &mut Layout, name: &str, _required: bool) {
-        T::layout(layout, name, false);
+        layout.optional(|layout| T::layout(layout, name, true));
     }
 
     fn encode(&self, e: &mut Encoder) -> Result<(), EncodeError> {
@@ -345,7 +348,7 @@ mod tests {
 
     #[test]
     fn options_are_nullable_columns() {
-        let mut layout = Layout::root("K", KindCode(1));
+        let mut layout = Layout::root("K", KindCode::new("k1"));
         <Option<String> as Columns>::layout(&mut layout, "note", true);
         String::layout_row(&mut layout);
         let set = layout.finish();

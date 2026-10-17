@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use flotilla_schema::{Decoder, EdgeParts, Encoder, Kind, KindCode, RowPath, State, Timestamp};
+use flotilla_schema::{Code, Decoder, EdgeParts, Encoder, Kind, KindCode, RowPath, State, Timestamp};
 use flotilla_state_machines::{
     machines::{
         agent_session::{AgentSession, AgentSessionRow},
@@ -24,7 +24,15 @@ fn kind_codes_are_pinned() {
         (ConvoyRow::KIND, ConvoyRow::CODE),
         (EnsureRow::KIND, EnsureRow::CODE),
     ];
-    assert_eq!(kinds, [("Message", KindCode(1)), ("AgentSession", KindCode(3)), ("Convoy", KindCode(5)), ("Ensure", KindCode(9))]);
+    assert_eq!(
+        kinds,
+        [
+            ("Message", KindCode::new("ms")),
+            ("AgentSession", KindCode::new("as")),
+            ("Convoy", KindCode::new("cv")),
+            ("Ensure", KindCode::new("en"))
+        ]
+    );
 }
 
 /// `name`'s row at `home`, encoded and decoded through the schema codec, and the row a home
@@ -89,7 +97,7 @@ fn a_rows_edge_moves_since_only_with_the_label() {
     let (edge, kept) = row.edge(&event, home.get("c").expect("exists").state().clone()).expect("edge");
     assert_eq!(kept.since, Timestamp(1), "a data-only edge keeps since");
     let parts = edge.into_parts();
-    assert_eq!((root_sets(&parts), parts.rows.len(), parts.from.code), (vec![], 1, 1), "one resolution row, no root field");
+    assert_eq!((root_sets(&parts), parts.rows.len(), parts.from.code), (vec![], 1, Code::new("op")), "one resolution row, no root field");
     assert_eq!(parts.appends.len(), 1, "the event");
 
     let row = ConvoyRow { state: kept, ..row };

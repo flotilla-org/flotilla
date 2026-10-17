@@ -1315,14 +1315,14 @@ fn message_value(resource: &Resource<Message>) -> Value {
             "Awaiting",
             json!({ "envelope": envelope, "receiver": { "session": int(session_number(receiver)), "host": receiver.host } }),
         ),
-        MessageState::Settled => variant("Settled", envelope),
-        MessageState::Dropped { reason, dropped_receiver: receiver, at, watermark } => variant(
+        MessageState::Settled { .. } => variant("Settled", envelope),
+        MessageState::Dropped { reason, receiver, watermark } => variant(
             "Dropped",
             json!({
                 "reason": constant(reason_name(reason)),
                 "envelope": envelope,
                 "receiver": int(receiver.as_ref().map_or(0, session_number)),
-                "at": int(ticks(*at)),
+                "at": int(ticks(resource.events().iter().last().expect("a dropped message has its drop event").record.at)),
                 "watermark": int(watermark.map_or(0, ticks)),
                 "bound": watermark.is_some(),
                 "receipt": false,

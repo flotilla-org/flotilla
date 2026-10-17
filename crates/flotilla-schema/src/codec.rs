@@ -44,8 +44,8 @@ pub enum DecodeError {
     Type { column: String, expected: &'static str, found: &'static str },
     #[error("column {column}: stored value {value} is outside the field's range")]
     OutOfRange { column: String, value: i64 },
-    #[error("column {column}: unknown code {code}")]
-    Code { column: String, code: i64 },
+    #[error("column {column}: unknown code {code:?}")]
+    Code { column: String, code: String },
     /// A reference whose stored identity is of another kind than the field's `Ref<K>`.
     #[error("column {column}: reference to kind {found}, expected kind {expected}")]
     RefKind { column: String, expected: KindCode, found: KindCode },

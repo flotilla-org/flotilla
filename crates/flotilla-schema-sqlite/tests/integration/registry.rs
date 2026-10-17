@@ -3,13 +3,13 @@ use flotilla_schema::{Kind, KindRegistry, RegistryError, Stored};
 use crate::fixtures::MessageRow as Message;
 
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Convoy", code = 1)]
+#[store(kind = "Convoy", code = "ms")]
 struct SameCode {
     name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Message", code = 2)]
+#[store(kind = "Message", code = "k2")]
 struct SameName {
     body: String,
 }

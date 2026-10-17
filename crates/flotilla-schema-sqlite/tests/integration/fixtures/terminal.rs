@@ -30,7 +30,7 @@ use super::{
 
 /// A minimal target kind for `TerminalSession::vessel`.
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Vessel", code = 7)]
+#[store(kind = "Vessel", code = "ve")]
 pub struct Vessel {
     pub name: String,
 }
@@ -61,7 +61,7 @@ pub struct TerminalRequest {
 #[derive(Debug, Clone, PartialEq, Stored)]
 #[store(
     kind = "TerminalSession",
-    code = 6,
+    code = "ts",
     index(name = "by_vessel", eq(vessel), order(ordinal)),
     index(name = "live_by_pool", eq(pool), when(state in [Requested, Realised]))
 )]
@@ -88,9 +88,9 @@ pub struct TerminalSession {
 
 #[derive(Debug, Clone, PartialEq, Stored)]
 pub enum TerminalSource {
-    #[store(code = 1)]
+    #[store(code = "c1")]
     Tool { command: String },
-    #[store(code = 2)]
+    #[store(code = "c2")]
     Agent {
         #[store(intern)]
         selector: String,

@@ -1,4 +1,4 @@
-//! The engine's Message (`flotilla_state_machines::machines::message::MessageRow`, kind code 1):
+//! The engine's Message (`flotilla_state_machines::machines::message::MessageRow`, kind code `ms`):
 //! generators, and the worlds that let each edge pass its gate.
 
 use flotilla_schema::{Edge, Records, State, Timestamp};
@@ -18,8 +18,8 @@ use super::{
 };
 
 /// Covering indexes: the label is digit 0 (base 4), a drop's reason digit 1 (base 5) and whether
-/// it kept a receiver digit 2 (base 2), so every reason is reached with and without one; the
-/// expectation cycles in base 3.
+/// a settlement or a drop kept a receiver digit 2 (base 2), so every reason is reached with and
+/// without one; the expectation cycles in base 3.
 pub const COVERING: usize = 80;
 
 pub fn receiver(tc: &TestCase) -> Receiver {
@@ -53,11 +53,10 @@ pub fn state_value(tc: &TestCase, pick: Pick) -> MessageState {
     match pick.digit(tc, 4, 1) {
         0 => MessageState::Pending,
         1 => MessageState::Awaiting { receiver: receiver(tc) },
-        2 => MessageState::Settled,
+        2 => MessageState::Settled { receiver: (pick.digit(tc, 2, 20) == 0).then(|| receiver(tc)) },
         _ => MessageState::Dropped {
             reason: reason(tc, pick),
-            dropped_receiver: (pick.digit(tc, 2, 20) == 0).then(|| receiver(tc)),
-            at: timestamp(tc),
+            receiver: (pick.digit(tc, 2, 20) == 0).then(|| receiver(tc)),
             watermark: tc.draw(gs::booleans()).then(|| timestamp(tc)),
         },
     }

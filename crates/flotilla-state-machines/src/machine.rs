@@ -16,7 +16,7 @@ use std::{
     marker::PhantomData,
 };
 
-use flotilla_schema::CodeEnum;
+use flotilla_schema::{Code, CodeEnum};
 
 use crate::{code::changed, Coded, Edge, EdgeArg, Handle, StateValue};
 
@@ -245,9 +245,9 @@ pub enum DefError {
     DeadState(&'static str),
     /// Two labels share a code. The macros' `Stored` derive refuses this at
     /// compile time; a hand-written code enum can still reach it.
-    DuplicateStateCode(i64),
+    DuplicateStateCode(Code),
     /// Two edge kinds share a code; as [`DefError::DuplicateStateCode`].
-    DuplicateEdgeCode(i64),
+    DuplicateEdgeCode(Code),
 }
 
 impl fmt::Display for DefError {

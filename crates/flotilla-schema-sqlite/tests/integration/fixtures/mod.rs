@@ -257,7 +257,7 @@ pub fn reference<K>(tc: &TestCase) -> Ref<K> {
 }
 
 pub fn identity(tc: &TestCase) -> Identity {
-    Identity { kind: KindCode(tc.draw(gs::integers::<u32>())), name: name(tc), home: home(tc) }
+    Identity { kind: KindCode::new(tc.draw(gs::sampled_from(vec!["a", "k1", "zz_9", "abcdefgh"]))), name: name(tc), home: home(tc) }
 }
 
 pub fn timestamp(tc: &TestCase) -> Timestamp {

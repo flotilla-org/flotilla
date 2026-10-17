@@ -106,7 +106,7 @@ fn equal_interned_strings_share_one_row() {
     assert_eq!(rows, 1);
     let distinct: i64 = conn
         .query_row(
-            "SELECT count(DISTINCT m.sender) + count(DISTINCT r.change_request_service) + count(DISTINCT e.writer) \
+            "SELECT count(DISTINCT m.sender) + count(DISTINCT r.service) + count(DISTINCT e.writer) \
              FROM referral m JOIN referral_edges e ON e.owner = m.id JOIN referral_references r ON r.owner = m.id",
             [],
             |row| row.get(0),
@@ -116,7 +116,7 @@ fn equal_interned_strings_share_one_row() {
     let same: i64 = conn
         .query_row(
             "SELECT count(*) FROM referral m JOIN referral_edges e ON e.owner = m.id JOIN referral_references r ON r.owner = m.id \
-             WHERE m.sender = r.change_request_service AND m.sender = e.writer",
+             WHERE m.sender = r.service AND m.sender = e.writer",
             [],
             |row| row.get(0),
         )
