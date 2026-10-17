@@ -125,18 +125,7 @@ pub fn live_project_convoys_query(projects: impl IntoIterator<Item = String>) ->
     use flotilla_store::StoreQuery;
     StoreQuery {
         field_values: BTreeMap::from([("spec.project_ref".into(), projects.into_iter().collect())]),
-        any_of: Some(vec![
-            StoreQuery {
-                field_values: BTreeMap::from([(
-                    "status.phase".into(),
-                    ["Pending", "Active", "Interrupted", "Landing", "Anchored"].map(String::from).to_vec(),
-                )]),
-                ..Default::default()
-            },
-            StoreQuery { missing_fields: BTreeSet::from(["status.phase".into()]), ..Default::default() },
-        ]),
-        include_replicas: true,
-        ..Default::default()
+        ..flotilla_store::live_convoys_query()
     }
 }
 

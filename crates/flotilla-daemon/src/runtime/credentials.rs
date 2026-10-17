@@ -571,8 +571,15 @@ pub(super) async fn reconcile_credential_refresh_attention(
     namespace: &str,
     errors: &[CredentialRefreshError],
 ) -> Result<(), String> {
-    let backend = daemon.resource_backend();
-    record_credential_refresh_dispositions(&backend, namespace, errors).await?;
+    reconcile_credential_refresh_attention_in(&daemon.resource_backend(), namespace, errors).await
+}
+
+pub(super) async fn reconcile_credential_refresh_attention_in(
+    backend: &ResourceBackend,
+    namespace: &str,
+    errors: &[CredentialRefreshError],
+) -> Result<(), String> {
+    record_credential_refresh_dispositions(backend, namespace, errors).await?;
     let demands = backend.using::<Demand>(namespace);
     let existing = demands.list().await.map_err(|error| error.to_string())?;
     if errors.is_empty()
@@ -581,7 +588,8 @@ pub(super) async fn reconcile_credential_refresh_attention(
         return Ok(());
     }
     let vessels = backend.using::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?;
-    let convoys = backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?;
+    let convoys =
+        backend.query_declared::<Convoy>(namespace, &flotilla_store::live_convoys_query()).await.map_err(|error| error.to_string())?;
     let convoys = convoys.items.into_iter().map(|source| (source.object.metadata.name.clone(), source.object)).collect::<BTreeMap<_, _>>();
     let mut desired = BTreeMap::new();
     let mut still_failing = BTreeSet::new();

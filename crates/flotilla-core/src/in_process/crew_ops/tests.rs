@@ -218,3 +218,25 @@ mod sender_contract;
 mod supervision;
 
 mod read_queries;
+
+// Retained terminal history must not be decoded during legacy adoption.
+#[tokio::test]
+async fn legacy_adoption_reads_only_live_convoys() {
+    use flotilla_store_testkit::{measure_reads, ReadOperation};
+    let (crew, backend, _, _temp) = fixture(CrewWorkPhase::Working).await;
+
+    flotilla_store_testkit::fixtures::seed_convoy_history()
+        .backend(&backend)
+        .namespace("flotilla")
+        .landed(300)
+        .active(10)
+        .call()
+        .await
+        .expect("convoy history");
+
+    let (result, reads) = measure_reads(crew.adopt_legacy_convoy_queues_once("flotilla", None)).await;
+    result.expect("adopt");
+    reads.of(&backend).assert_no_lists("legacy adoption");
+    // Two queries each read the 10 Active rows plus the fixture's live "crew" convoy.
+    assert_eq!(reads.of(&backend).objects("Convoy", ReadOperation::Query), 22);
+}

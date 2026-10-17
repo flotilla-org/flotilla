@@ -176,7 +176,8 @@ async fn legacy_pending_brief_is_adopted_once_before_withdrawal() {
     );
     convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("stored legacy queue");
     for _ in 0..2 {
-        crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("adoption");
+        crew.adopt_legacy_convoy_queues_once("flotilla", None).await.expect("adoption");
+        crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("follow-up");
     }
     let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
     assert_eq!(messages.len(), 1);
@@ -1198,4 +1199,26 @@ fn assert_escalation_refused(
     assert!(matches!(result, flotilla_protocol::CommandValue::CrewEscalationRefused { rung, .. } if *rung == expected_rung));
     assert_eq!(after, before);
     assert!(records.is_empty());
+}
+
+// Owner ruling in #3430: retained terminal convoys never resume legacy briefs.
+#[tokio::test]
+async fn terminal_legacy_brief_is_ignored() {
+    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let convoy = convoys.get("crew").await.expect("convoy");
+    let mut status = convoy.status.expect("status");
+    status.phase = ConvoyPhase::Landed;
+    status.turn_deliveries.entry("operator".into()).or_default().pending_brief = Some(
+        serde_json::from_value(serde_json::json!({
+            "vessel": "work", "role": "coder", "content": "ignore terminal intent", "queued_at": "2026-10-01T00:00:00Z",
+            "sender": {"kind": "operator-resume", "principal": {"namespace": "flotilla", "name": "alice"}}
+        }))
+        .expect("legacy brief"),
+    );
+    convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("terminal queue");
+    crew.adopt_legacy_convoy_queues_once("flotilla", None).await.expect("adoption");
+    crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("reconcile");
+    assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items.is_empty());
+    assert_eq!(convoys.get("crew").await.expect("terminal").status, Some(status));
 }

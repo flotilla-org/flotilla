@@ -367,31 +367,27 @@ impl EnsurePass<'_> {
         name: &str,
         scope: EnsureConvoyScope,
     ) -> Result<Vec<ReadResourceObject<ResourceConvoy>>, String> {
-        // Deliberately query current state for each ensure rather than caching
-        // across admissions in the pass. This costs O(ensures * convoys); revisit
-        // with a pass-local index if fleet size warrants it.
-        let sources = match scope {
-            EnsureConvoyScope::Local => self
-                .resource_backend
-                .using::<ResourceConvoy>(namespace)
-                .list()
-                .await
-                .map_err(|error| error.to_string())?
-                .items
-                .into_iter()
-                .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
-                .collect(),
-            EnsureConvoyScope::IncludingReplicas => {
-                self.resource_backend.including_replicas::<ResourceConvoy>(namespace).list().await.map_err(|error| error.to_string())?.items
-            }
-        };
-        Ok(sources
-            .into_iter()
-            .filter(|source| {
-                source.object.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(String::as_str) == Some(name)
-                    && source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
+        let mut query = flotilla_store::live_convoys_query();
+        // Add the ensure selector without replacing any inherited live predicates.
+        query.fields.insert(format!("metadata.annotations.\"{ENSURED_FROM_ANNOTATION}\""), name.into());
+        query.include_replicas = matches!(scope, EnsureConvoyScope::IncludingReplicas);
+        self.resource_backend
+            .query_declared::<ResourceConvoy>(namespace, &query)
+            .await
+            .map(|rows| rows.items)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn ensured_convoy_generations(&self, namespace: &str, name: &str) -> Result<Vec<ResourceObject<ResourceConvoy>>, String> {
+        self.resource_backend
+            .using::<ResourceConvoy>(namespace)
+            .query_declared(&flotilla_store::StoreQuery {
+                fields: BTreeMap::from([(format!("metadata.annotations.\"{ENSURED_FROM_ANNOTATION}\""), name.into())]),
+                ..Default::default()
             })
-            .collect())
+            .await
+            .map(|rows| rows.items.into_iter().map(|source| source.object).collect())
+            .map_err(|error| error.to_string())
     }
 
     /// Explicitly retire a drifted running generation and admit its successor.
@@ -566,15 +562,7 @@ impl EnsurePass<'_> {
             return Ok(None);
         }
 
-        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let mut generations = convoys
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .items
-            .into_iter()
-            .filter(|convoy| convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name))
-            .collect::<Vec<_>>();
+        let mut generations = self.ensured_convoy_generations(namespace, &ensure.metadata.name).await?;
         generations.sort_by_key(|convoy| convoy.spec.generation);
 
         let consecutive_failures = generations
@@ -1306,6 +1294,65 @@ mod tests {
                 Err("backing still live".into())
             }
         }
+    }
+
+    // Both live scopes and local generation history decode only their indexed matches.
+    #[tokio::test]
+    async fn ensured_convoys_read_only_matching_rows() {
+        use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt};
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+        let convoys = backend.using::<ResourceConvoy>("test");
+        for index in 0..312 {
+            let name = format!("c-{index}");
+            let created = convoys
+                .create(
+                    &InputMeta::builder()
+                        .name(name.clone())
+                        .annotations(BTreeMap::from([(
+                            ENSURED_FROM_ANNOTATION.into(),
+                            if index == 0 || index >= 310 { "wanted" } else { "other" }.into(),
+                        )]))
+                        .build(),
+                    &ConvoySpec::builder().workflow_ref("workflow".into()).build(),
+                )
+                .await
+                .expect("convoy");
+            if index != 311 {
+                convoys
+                    .update_status(
+                        &name,
+                        &created.metadata.resource_version,
+                        &ConvoyStatus { phase: if index < 300 { ConvoyPhase::Landed } else { ConvoyPhase::Active }, ..Default::default() },
+                    )
+                    .await
+                    .expect("status");
+            }
+        }
+        let mut replica = convoys.list().await.expect("local fixture");
+        for object in &mut replica.items {
+            object.metadata.name = format!("replica-{}", object.metadata.name);
+        }
+        backend
+            .replica_writer::<ResourceConvoy>(flotilla_protocol::NodeId::new("remote"), "test")
+            .replace(&replica, Utc::now())
+            .await
+            .expect("replicas");
+        let clock = Arc::new(VirtualClock::new(Utc::now()));
+        let controller = EnsureReconciler::builder().resource_backend(backend.clone()).clock(clock).build();
+        let admission = Admission::builder().backend(backend.clone()).build();
+        for scope in [EnsureConvoyScope::Local, EnsureConvoyScope::IncludingReplicas] {
+            let (rows, reads) = measure_reads(controller.pass(&admission).active_ensured_convoys("test", "wanted", scope)).await;
+            let expected = if matches!(scope, EnsureConvoyScope::Local) { 2 } else { 4 };
+            assert_eq!(rows.expect("query").len(), expected);
+            assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&expected));
+        }
+        let (rows, reads) =
+            measure_reads(controller.pass(&admission).active_ensured_convoys("test", "absent", EnsureConvoyScope::IncludingReplicas)).await;
+        assert!(rows.expect("empty query").is_empty());
+        assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&0));
+        let (rows, reads) = measure_reads(controller.pass(&admission).ensured_convoy_generations("test", "wanted")).await;
+        assert_eq!(rows.expect("local generations").len(), 3);
+        assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&3));
     }
 
     async fn fixture() -> (EnsureReconciler, Admission, Arc<VirtualClock>) {

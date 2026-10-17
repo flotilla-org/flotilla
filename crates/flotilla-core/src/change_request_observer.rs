@@ -175,14 +175,16 @@ impl ChangeRequestRefresher {
     }
 
     async fn reconcile_convoy_demands(&self, namespace: &str, demands: &mut HashMap<ChangeRequestKey, uuid::Uuid>) -> Result<(), String> {
-        let convoys = self.inner.backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?;
+        let convoys = self
+            .inner
+            .backend
+            .query_declared::<Convoy>(namespace, &flotilla_store::live_convoys_query())
+            .await
+            .map_err(|error| error.to_string())?;
         let forges = self.forges(namespace).await?;
         let mut wanted = HashSet::new();
         let mut owners = HashMap::new();
         for copy in convoys.items {
-            if copy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-                continue;
-            }
             for row in convoy_subject_rows(&copy.object, &ReferenceContext::default()) {
                 if row.subject.kind != ConvoySubjectKind::ChangeRequest {
                     continue;
@@ -992,6 +994,33 @@ mod tests {
     use crate::testkits::cr_name;
     use flotilla_change_request::observation::parse_gh_observation;
     use flotilla_protocol::Subject as ConvoySubject;
+
+    // Convoy demand discovery decodes live inventory only, regardless of retained history.
+    #[tokio::test]
+    async fn convoy_demands_read_only_live_convoys() {
+        use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt};
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+
+        flotilla_store_testkit::fixtures::seed_convoy_history()
+            .backend(&backend)
+            .namespace("flotilla")
+            .landed(300)
+            .active(10)
+            .call()
+            .await
+            .expect("convoy history");
+
+        let refresher = ChangeRequestRefresher::new(
+            "fleet".into(),
+            backend.clone(),
+            "node".into(),
+            Arc::new(UnavailableSource),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let (result, reads) = measure_reads(refresher.reconcile_convoy_demands("flotilla", &mut HashMap::new())).await;
+        result.expect("reconcile");
+        assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&10));
+    }
 
     struct UnavailableSource;
 

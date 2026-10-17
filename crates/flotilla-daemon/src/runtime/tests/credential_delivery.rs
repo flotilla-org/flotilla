@@ -1014,3 +1014,29 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
     assert!(finish["fields"]["duration_ms"].as_f64().expect("duration") >= 38_650.0);
     runtime.shutdown();
 }
+
+// Credential attention ignores terminal convoy history before decoding it.
+#[tokio::test]
+async fn credential_attention_reads_only_live_convoys() {
+    use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt};
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    flotilla_store_testkit::fixtures::seed_convoy_history()
+        .backend(&backend)
+        .namespace("flotilla")
+        .landed(300)
+        .active(10)
+        .call()
+        .await
+        .expect("convoy history");
+
+    let failure = CredentialRefreshError {
+        environment_ref: "missing".into(),
+        credential_name: Some("github-app".into()),
+        message: "unavailable".into(),
+        should_surface: true,
+    };
+    let (result, reads) =
+        measure_reads(super::super::credentials::reconcile_credential_refresh_attention_in(&backend, "flotilla", &[failure])).await;
+    result.expect("attention");
+    assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&10));
+}
