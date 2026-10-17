@@ -98,7 +98,9 @@ an unencrypted PKCS#8 PEM private key with `--private-key-file`. Pin both absolu
 paths in the signer's existing invocation alongside `--identity` and
 `--expected-team-id`; keep the currently deployed identity, team and entitlements.
 The key must be a regular file (no symlinks), owned by the effective signing user,
-with mode exactly 0600; the signer refuses otherwise, before network access.
+with mode exactly 0600; its parent directory must be owned by the signing user
+and not group/world-writable. The signer refuses otherwise, before network access,
+and checks the certificate subject against the pinned identity/team before signing.
 No signing operation uses a keychain. `/usr/bin/codesign` remains the public-key
 verification tool for strict validity, authority, team and entitlements.
 
@@ -122,6 +124,7 @@ After installing OpenSSL below, convert that selected identity (OpenSSL prompts
 for the export password; do not put it in command history):
 
 ```sh
+umask 077
 cd "$HOME/.config/flotilla/darwin-sign"
 chmod 0600 export.p12
 /opt/homebrew/opt/openssl@3/bin/openssl pkcs12 -in export.p12 -nocerts -nodes -out exported-key.pem

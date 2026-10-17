@@ -399,10 +399,15 @@ def run_command(arguments, description, capture=False):
 def validate_private_key(path):
     try:
         metadata = Path(path).lstat()
+        parent = Path(path).parent.stat()
     except OSError as error:
         raise SigningError(f"cannot inspect private key file {path}: {error}") from error
     if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != os.geteuid():
         raise SigningError("private key must be a regular file owned by the signing user with mode 0600")
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_mode & 0o022:
+        raise SigningError("private key directory must be owned by the signing user and not group/world-writable")
+    # The trusted directory prevents other users replacing the key between this
+    # check and the signing tools opening it; the owner must not replace it mid-run.
 
 
 def read_certificate(path):
@@ -414,6 +419,30 @@ def read_certificate(path):
     return pem, sha256(certificate)
 
 
+def validate_certificate_identity(path, identity, team_id):
+    subject = run_command(
+        [
+            OPENSSL,
+            "x509",
+            "-in",
+            str(path),
+            "-noout",
+            "-subject",
+            "-nameopt",
+            "sep_multiline,sname,utf8,esc_ctrl,esc_msb",
+        ],
+        "read signing certificate subject",
+        capture=True,
+    ).stdout
+    fields = {}
+    for line in subject.splitlines():
+        name, separator, value = line.strip().partition("=")
+        if separator:
+            fields.setdefault(name.strip(), []).append(value.strip())
+    if fields.get("CN") != [identity] or fields.get("OU") != [team_id]:
+        raise SigningError("signing certificate subject does not match the pinned identity/team")
+
+
 def sign_payloads(stage, identity, expected_team_id, entitlements, expected_entitlements, certificate, private_key):
     paths = sorted(stage.glob("lib/*.dylib")) + [stage / path for path in REQUIRED_BINARIES]
     records = []
@@ -423,13 +452,19 @@ def sign_payloads(stage, identity, expected_team_id, entitlements, expected_enti
         run_command(
             [
                 RCODESIGN,
-                "--config-file", "/dev/null",
+                "--config-file",
+                "/dev/null",
                 "sign",
-                "--pem-source", str(certificate),
-                "--pem-source", str(private_key),
-                "--code-signature-flags", "runtime",
-                "--timestamp-url", "none",
-                "--entitlements-xml-file", str(entitlements),
+                "--pem-source",
+                str(certificate),
+                "--pem-source",
+                str(private_key),
+                "--code-signature-flags",
+                "runtime",
+                "--timestamp-url",
+                "none",
+                "--entitlements-xml-file",
+                str(entitlements),
                 str(path),
             ],
             f"rcodesign {relative}",
@@ -520,10 +555,24 @@ def build_archive(stage):
 def cms_sign(attestation_path, signature_path, certificate, private_key):
     run_command(
         [
-            OPENSSL, "cms", "-sign", "-binary", "-md", "sha256",
-            "-signer", str(certificate), "-inkey", str(private_key),
-            "-passin", "pass:",
-            "-outform", "DER", "-in", str(attestation_path), "-out", str(signature_path),
+            OPENSSL,
+            "cms",
+            "-sign",
+            "-binary",
+            "-md",
+            "sha256",
+            "-signer",
+            str(certificate),
+            "-inkey",
+            str(private_key),
+            "-passin",
+            "pass:",
+            "-outform",
+            "DER",
+            "-in",
+            str(attestation_path),
+            "-out",
+            str(signature_path),
         ],
         "CMS attestation signing",
     )
@@ -549,6 +598,7 @@ def main():
     args = parse_args()
     validate_private_key(args.private_key_file)
     certificate_pem, certificate_sha256 = read_certificate(args.certificate_file)
+    validate_certificate_identity(args.certificate_file, args.identity, args.expected_team_id)
     if not GENERATION_PATTERN.fullmatch(args.generation):
         raise SigningError("generation has an invalid format")
     if not OWNER_PATTERN.fullmatch(args.output_owner):

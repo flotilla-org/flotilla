@@ -54,6 +54,27 @@ class DarwinSignTests(unittest.TestCase):
                 with self.assertRaises(self.signer.SigningError):
                     self.signer.validate_private_key(invalid)
 
+    def test_private_key_directory_policy(self):
+        # The key directory must belong to the signer and disallow writes by
+        # other users, so they cannot swap the key after its permission check.
+        for mode in (0o700, 0o755, 0o770, 0o777, 0o722):
+            self.root.chmod(mode)
+            with self.subTest(mode=oct(mode)):
+                if mode & 0o022:
+                    with self.assertRaisesRegex(self.signer.SigningError, 'directory'):
+                        self.signer.validate_private_key(self.key)
+                else:
+                    self.signer.validate_private_key(self.key)
+        self.root.chmod(0o700)
+        metadata = list(self.root.stat())
+        metadata[4] = os.geteuid() + 1
+        original_stat = Path.stat
+        def stat_path(path, **kwargs):
+            return os.stat_result(metadata) if path == self.root else original_stat(path, **kwargs)
+        with patch.object(Path, 'stat', stat_path):
+            with self.assertRaisesRegex(self.signer.SigningError, 'directory'):
+                self.signer.validate_private_key(self.key)
+
     def test_unsafe_key_refused_before_other_inputs(self):
         # The command refuses an unsafe key before reading tokens or contacting
         # a registry, even when all other configured paths are absent.
@@ -146,6 +167,12 @@ elif '--display' in args:
                         LAB_FLEET_FINALIZE_TESTING='1', LAB_FLEET_FINALIZE_OPENSSL=openssl):
             signer = load('lab-darwin-sign')
             finalizer = load('lab-fleet-finalize-darwin')
+        # The certificate must match both pins before any payload signing starts.
+        signer.validate_certificate_identity(cert, 'Test Darwin Signing', 'TESTTEAM')
+        for identity, team in (('Other Identity', 'TESTTEAM'), ('Test Darwin Signing', 'OTHER')):
+            with self.subTest(identity=identity, team=team):
+                with self.assertRaisesRegex(signer.SigningError, 'pinned identity/team'):
+                    signer.validate_certificate_identity(cert, identity, team)
         signer.validate_private_key(self.key)
         signer.cms_sign(attestation, signature, cert, self.key)
         pem, digest = signer.read_certificate(cert)
