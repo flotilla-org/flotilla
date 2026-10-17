@@ -227,8 +227,17 @@ async fn inspect_checkout_integration_with_association(
     CheckoutIntegrationStatus { head_revision, clean, pushed, landed, landed_evidence, change_request, remote_refs }
 }
 
+/// Ref probed by checkout integration and used to identify its evidence consumers.
+pub(crate) fn remote_ref_for_branch(branch: &str) -> String {
+    if branch.starts_with("refs/") {
+        branch.to_string()
+    } else {
+        format!("refs/heads/{branch}")
+    }
+}
+
 async fn inspect_remote_ref(vcs: &dyn Vcs, branch: &str, observed_at: &str) -> BTreeMap<String, RemoteRefObservation> {
-    let remote_ref = if branch.starts_with("refs/") { branch.to_string() } else { format!("refs/heads/{branch}") };
+    let remote_ref = remote_ref_for_branch(branch);
     match vcs.remote_ref_digest("origin", &remote_ref).await {
         Ok(Some(digest)) => {
             BTreeMap::from([(remote_ref, RemoteRefObservation::builder().digest(digest).observed_at(observed_at.to_string()).build())])
