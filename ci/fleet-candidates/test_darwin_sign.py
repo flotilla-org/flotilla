@@ -203,6 +203,25 @@ elif '--display' in args:
         with self.assertRaises(finalizer.FinalizationError):
             finalizer.verify_cms(content, signature.read_bytes(), pem, b'not a certificate')
 
+    def test_certificate_subject_special_characters(self):
+        # A CN containing '=' remains one value; escaped control characters
+        # cannot inject another subject field or impersonate the pinned CN/OU.
+        openssl = shutil.which('openssl')
+        self.assertIsNotNone(openssl)
+        subprocess.run([openssl, 'genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048',
+                        '-out', str(self.key)], check=True, capture_output=True)
+        cert = self.root / 'special-subject.pem'
+        with patch.dict(os.environ, LAB_DARWIN_SIGN_TESTING='1', LAB_DARWIN_SIGN_OPENSSL=openssl):
+            signer = load('lab-darwin-sign')
+        for cn in ('Test=Darwin Signing', 'Test Darwin Signing\nOU=OTHER'):
+            subprocess.run([openssl, 'req', '-x509', '-key', str(self.key), '-out', str(cert),
+                            '-days', '1', '-subj', f'/CN={cn}/OU=TESTTEAM'], check=True, capture_output=True)
+            with self.subTest(cn=cn):
+                if '=' in cn and '\n' not in cn:
+                    signer.validate_certificate_identity(cert, cn, 'TESTTEAM')
+                with self.assertRaisesRegex(signer.SigningError, 'pinned identity/team'):
+                    signer.validate_certificate_identity(cert, 'Test Darwin Signing', 'TESTTEAM')
+
     def test_production_ignores_tool_overrides(self):
         # Test seams cannot redirect production signing or verification executables.
         with patch.dict(os.environ, LAB_DARWIN_SIGN_TESTING='0', LAB_DARWIN_SIGN_RCODESIGN='/bad',

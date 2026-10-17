@@ -102,6 +102,15 @@ with mode exactly 0600; its parent directory must be owned by the signing user
 and not group/world-writable, and must not itself be a symlink. The signer refuses otherwise, before network access,
 and checks the certificate subject against the pinned identity/team and the
 key/certificate public-key match before any network access.
+The key must be unencrypted: `-passin pass:` deliberately supplies no password,
+so an encrypted PEM refuses during the OpenSSL key-pair preflight (typically an
+OpenSSL decrypt/password error). Use the owner export/conversion recipe below to
+produce the unencrypted PKCS#8 file; there is no unattended password prompt.
+Do not replace or modify the key/certificate files while a signing run is active.
+The permission check and the tools' later file opens leave an owner-controlled
+replacement window; pause submissions and wait for active runs before updating
+these files.
+
 No signing operation uses a keychain. `/usr/bin/codesign` remains the public-key
 verification tool for strict validity, authority, team and entitlements.
 
