@@ -1432,6 +1432,8 @@ pub struct InProcessDaemon {
     /// Admission cleanup and resource deletion share this lock with adoption.
     observed_checkout_reconciliation: Arc<Mutex<()>>,
     aggregator_projection_state: AggregatorProjectionState,
+    /// Project image-layer refusal state, retained across periodic reconciliations.
+    image_layer_refresh: Arc<Mutex<project_image_layers::LayerRefreshState>>,
     /// Provisioning namespace used by daemon-side resource operations (e.g.
     /// looking up the Convoy whose task is being marked complete). Set by the
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
@@ -2000,6 +2002,7 @@ impl InProcessDaemon {
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
             aggregator_projection_state: aggregator_projection_state.clone(),
+            image_layer_refresh: Default::default(),
             provisioning_namespace: Arc::clone(&provisioning_namespace),
             fleet: FleetService::new(
                 aggregator_projection_state.clone(),
@@ -4275,6 +4278,7 @@ impl InProcessDaemon {
 
     fn project_service(&self) -> project_ops::ProjectService<'_> {
         project_ops::ProjectService {
+            image_layer_refresh: Arc::clone(&self.image_layer_refresh),
             resource_backend: &self.resource_backend,
             observed_resource_backend: &self.observed_resource_backend,
             clock: &self.clock,
@@ -4910,6 +4914,11 @@ impl InProcessDaemon {
 
     pub fn forge_budget_rows(&self) -> Vec<flotilla_protocol::ForgeBudgetRow> {
         self.forge_budgets.rows(self.host_name().as_str())
+    }
+
+    /// Current advisory project source refusals for the host heartbeat.
+    pub async fn project_image_layer_conditions(&self) -> Vec<flotilla_resources::HostCondition> {
+        self.image_layer_refresh.lock().await.conditions()
     }
 
     pub async fn fleet_health_internal(&self) -> Result<FleetHealthResponse, String> {

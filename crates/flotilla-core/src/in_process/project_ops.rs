@@ -261,6 +261,7 @@ impl ProjectOperations for InProcessDaemon {
 }
 
 pub(super) struct ProjectService<'a> {
+    pub(super) image_layer_refresh: Arc<tokio::sync::Mutex<super::project_image_layers::LayerRefreshState>>,
     pub(super) resource_backend: &'a ResourceBackend,
     pub(super) observed_resource_backend: &'a ResourceBackend,
     pub(super) clock: &'a Arc<dyn Clock>,
@@ -1782,6 +1783,7 @@ mod tests {
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let namespace = std::sync::RwLock::new("flotilla".to_string());
             let service = ProjectService {
+                image_layer_refresh: Default::default(),
                 resource_backend: &backend,
                 observed_resource_backend: &observed,
                 clock: &clock,
@@ -1928,6 +1930,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
         let service = ProjectService {
+            image_layer_refresh: Default::default(),
             resource_backend: &backend,
             observed_resource_backend: &observed,
             clock: &clock,
