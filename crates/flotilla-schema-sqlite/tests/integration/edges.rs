@@ -7,14 +7,15 @@ use std::{
 };
 
 use flotilla_schema::{
-    Edge, EdgeError, EdgeEvent, Frozen, Kind, Position, Records, Row, RowChange, RowOp, State, TableRole, Timestamp, Value,
+    Cause, Change, Edge, EdgeError, EdgeEvent, Event, Frozen, Kind, Named, Position, Records, Row, State, Step, TableRole, TableSet,
+    Timestamp, Value,
 };
 use flotilla_schema_sqlite::{Applied, ResourceId, Snapshot, Stamp, Store, StoreError};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
 use crate::fixtures::{
-    registry, store,
+    origin, registry, store,
     synthetic::{
         Deliverable, DeliverableState, DossierEdge, DossierEvent, DossierState, Evidence, PlacementSnapshot, PromiseKind, PromiseSource,
     },
@@ -36,9 +37,84 @@ fn interned(conn: &Connection) -> u64 {
     conn.query_row("SELECT (SELECT count(*) FROM strings) + (SELECT count(*) FROM resource_identity)", [], |row| row.get(0)).expect("count")
 }
 
-/// Applies `edge` and returns the change it logged and the rows SQLite counted as written,
+/// What one change of an effect addresses, in the kind's table numbering: the table, the row's full
+/// key, and the columns it writes with their values (all of a put or appended row's, none for a
+/// removal).
+#[derive(Debug)]
+struct Touch {
+    table: usize,
+    key: Vec<Value>,
+    columns: Vec<(usize, Value)>,
+}
+
+/// The table and full key a row path addresses.
+fn row_of(set: &TableSet, path: &[Step]) -> (usize, Vec<Value>) {
+    let (mut table, mut key) = (0, Vec::new());
+    for step in path {
+        table = set.tables.iter().position(|candidate| candidate.parent == Some(table) && candidate.field == step.field).expect("a table");
+        key.extend(own_key(set, table, &step.key));
+    }
+    (table, key)
+}
+
+fn own_key(set: &TableSet, table: usize, named: &Named) -> Vec<Value> {
+    let table = &set.tables[table];
+    table.key[table.key.len() - table.own_key..].iter().map(|column| named.get(&column.name).cloned().expect("an own key column")).collect()
+}
+
+/// `named` as (column index, value) of `table`'s data columns, nulls filled in over `range`.
+fn columns(set: &TableSet, table: usize, range: Range<usize>, named: &Named) -> Vec<(usize, Value)> {
+    let columns = &set.tables[table].columns;
+    for name in named.keys() {
+        assert!(columns[range.clone()].iter().any(|column| &column.name == name), "{name} is a column of the change");
+    }
+    range.map(|index| (index, named.get(&columns[index].name).cloned().unwrap_or(Value::Null))).collect()
+}
+
+/// What `change` writes, by the descriptor's names: the test's own reading of an effect.
+fn touch(set: &TableSet, change: &Change, sequence: i64) -> Touch {
+    let child = |parent: usize, field: &str| {
+        set.tables.iter().position(|table| table.parent == Some(parent) && table.field == field).expect("a collection")
+    };
+    match change {
+        Change::Set { row, field, values } | Change::State { row, field, values } => {
+            let (table, key) = row_of(set, row);
+            let fields = &set.tables[table].fields;
+            let range = |name: &str| fields.iter().find(|candidate| candidate.name == name).expect("a field").columns.clone();
+            let mut span = range(field);
+            if matches!(change, Change::State { .. }) {
+                for datum in fields.iter().filter(|datum| datum.datum_of.as_deref() == Some(field.as_str())) {
+                    span = span.start.min(datum.columns.start)..span.end.max(datum.columns.end);
+                }
+            }
+            Touch { table, key, columns: columns(set, table, span, values) }
+        }
+        Change::Put { row, collection, key, values } => {
+            let (parent, mut full) = row_of(set, row);
+            let table = child(parent, collection);
+            full.extend(own_key(set, table, key));
+            Touch { table, key: full, columns: columns(set, table, 0..set.tables[table].columns.len(), values) }
+        }
+        Change::Remove { row, collection, key } => {
+            let (parent, mut full) = row_of(set, row);
+            let table = child(parent, collection);
+            full.extend(own_key(set, table, key));
+            Touch { table, key: full, columns: Vec::new() }
+        }
+        Change::Append { row, records, position, values } => {
+            let (parent, mut full) = row_of(set, row);
+            let table = child(parent, records);
+            full.push(Value::Int(i64::from(*position)));
+            let mut columns = columns(set, table, 1..set.tables[table].columns.len(), values);
+            columns.insert(0, (0, Value::Int(sequence)));
+            Touch { table, key: full, columns }
+        }
+    }
+}
+
+/// Applies `edge` and returns the event it logged and the rows SQLite counted as written,
 /// excluding new `strings` and `resource_identity` rows.
-fn apply_counted<K: Kind>(store: Store, current: Stamp, edge: Edge<K>) -> (Store, Stamp, RowChange, u64) {
+fn apply_counted<K: Kind>(store: Store, current: Stamp, edge: Edge<K>) -> (Store, Stamp, Event, u64) {
     let conn = store.into_connection();
     let before = (conn.total_changes(), interned(&conn));
     let mut store = Store::open(conn, LOCAL, registry()).expect("reopen");
@@ -48,16 +124,15 @@ fn apply_counted<K: Kind>(store: Store, current: Stamp, edge: Edge<K>) -> (Store
     write.commit().expect("commit");
     let conn = store.into_connection();
     let written = conn.total_changes() - before.0 - (interned(&conn) - before.1);
-    assert_eq!(changes.len(), 1, "one change per edge");
+    assert_eq!(changes.len(), 1, "one entry per edge");
     (Store::open(conn, LOCAL, registry()).expect("reopen"), stamp, changes.remove(0), written)
 }
 
 fn touches_only_declared_rows<K: Fixture>(tc: &TestCase) {
     let set = K::table_set();
-    let table = |name: &str| set.tables.iter().position(|table| table.name == name).expect("a table of the kind");
     let mut store = store();
     let mut write = store.write().expect("write");
-    let mut stamp = write.insert("r", &K::generate(tc, Pick::Draw)).expect("insert");
+    let mut stamp = write.insert("r", &K::generate(tc, Pick::Draw), &origin()).expect("insert");
     write.commit().expect("commit");
     for _ in 0..tc.draw(gs::integers::<usize>().min_value(1).max_value(4)) {
         let current = store.read().expect("read").load::<K>(stamp.id).expect("load").expect("present");
@@ -69,51 +144,62 @@ fn touches_only_declared_rows<K: Fixture>(tc: &TestCase) {
         assert_eq!((change.home_seq, after.version), (next.version, next.version));
         let stamped = Value::Int(i64::try_from(next.version).expect("stored"));
 
-        // The logged ops name exactly the rows that changed, and hold their new values.
+        // The logged changes name exactly the rows that changed, and hold their new values.
         let (old, new) = (by_key(&before), by_key(&after));
         let (mut inserted, mut updated, mut deleted) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
         let mut set_rows: BTreeMap<(usize, Vec<Value>), Vec<Range<usize>>> = BTreeMap::new();
         let (mut root_state_set, mut root_other_sets) = (false, 0);
-        for op in &change.ops {
-            match op {
-                RowOp::PutObject { .. } => {}
-                RowOp::Insert { table: name, key, values } => {
-                    let index = table(name);
-                    assert!(!old[index].contains_key(key), "{name} {key:?} existed before its insert");
-                    assert_eq!(new[index].get(key), Some(values), "{name} {key:?} holds the logged values");
-                    if matches!(set.tables[index].role, TableRole::Records | TableRole::History) {
-                        assert_eq!(values[0], stamped, "{name} row stamped with the edge's version");
+        let sequence = i64::try_from(next.version).expect("stored");
+        assert!(matches!(change.cause, Cause::Edge { .. }));
+        for logged in &change.effect.changes {
+            let Touch { table: index, key, columns } = touch(&set, logged, sequence);
+            let name = &set.tables[index].name;
+            let values: Vec<Value> = columns.iter().map(|(_, value)| value.clone()).collect();
+            match logged {
+                Change::Append { .. } => {
+                    assert!(matches!(set.tables[index].role, TableRole::Records | TableRole::History));
+                    assert!(!old[index].contains_key(&key), "{name} {key:?} existed before its append");
+                    assert_eq!(new[index].get(&key), Some(&values), "{name} {key:?} holds the logged values, stamped");
+                    assert_eq!(values[0], stamped);
+                    inserted.insert((index, key));
+                }
+                Change::Put { .. } => {
+                    // A collection row of state data, or a spec collection's row nested in a row the
+                    // edge appends.
+                    let nested = set.tables[index].role == TableRole::Child && !old[index].contains_key(&key);
+                    assert!(
+                        set.tables[index].role == TableRole::State || nested,
+                        "{name}: an edge puts rows of state data or appended rows"
+                    );
+                    assert_eq!(new[index].get(&key), Some(&values), "{name} {key:?} holds the logged values");
+                    match old[index].get(&key) {
+                        Some(before) => {
+                            assert_ne!(before, &values, "{name} {key:?} changed");
+                            updated.insert((index, key));
+                        }
+                        None => {
+                            inserted.insert((index, key));
+                        }
                     }
-                    inserted.insert((index, key.clone()));
                 }
-                RowOp::Update { table: name, key, values } => {
-                    let index = table(name);
-                    assert_eq!(set.tables[index].role, TableRole::State, "{name}: an edge updates rows of state data only");
-                    assert!(old[index].contains_key(key) && old[index][key] != *values, "{name} {key:?} changed");
-                    assert_eq!(new[index].get(key), Some(values), "{name} {key:?} holds the logged values");
-                    updated.insert((index, key.clone()));
+                Change::Remove { .. } => {
+                    assert_eq!(set.tables[index].role, TableRole::State, "{name}: an edge removes rows of state data only");
+                    assert!(old[index].contains_key(&key) && !new[index].contains_key(&key), "{name} {key:?} went");
+                    deleted.insert((index, key));
                 }
-                RowOp::Delete { table: name, key } => {
-                    let index = table(name);
-                    assert_eq!(set.tables[index].role, TableRole::State, "{name}: an edge deletes rows of state data only");
-                    assert!(old[index].contains_key(key) && !new[index].contains_key(key), "{name} {key:?} went");
-                    deleted.insert((index, key.clone()));
-                }
-                RowOp::Set { table: name, key, field, values } => {
-                    let index = table(name);
-                    let declared = set.tables[index].fields.iter().find(|candidate| &candidate.name == field).expect("declared");
+                Change::Set { field, .. } | Change::State { field, .. } => {
+                    let state = matches!(logged, Change::State { .. });
                     if index == 0 {
-                        if declared.state {
+                        if state {
                             root_state_set = true;
                         } else {
                             root_other_sets += 1;
                         }
                     }
-                    let columns = declared.columns.clone();
-                    assert_eq!(&new[index][key][columns.clone()], &values[..], "{name}.{field} holds the logged values");
-                    set_rows.entry((index, key.clone())).or_default().push(columns);
+                    let range = columns.first().map_or(0, |(column, _)| *column)..columns.last().map_or(0, |(column, _)| column + 1);
+                    assert_eq!(&new[index][&key][range.clone()], &values[..], "{name}.{field} holds the logged values");
+                    set_rows.entry((index, key)).or_default().push(range);
                 }
-                other => panic!("an edge only appends, sets and edits state data rows: {other:?}"),
             }
         }
         for (index, (old, new)) in old.iter().zip(&new).enumerate() {
@@ -140,10 +226,9 @@ fn touches_only_declared_rows<K: Fixture>(tc: &TestCase) {
                 }
             }
         }
-        // One statement per appended row, per row edit and per set field of a records row; the
-        // root's state fields set together by one statement (or, when the edge sets none, the
-        // version alone), and each of its other set fields by one; then the home and identity
-        // sequences and the change log.
+        // One statement per appended row, per row edit and per set field or state of a records
+        // row; the root's state as one unit by one statement, and each of its other set fields by
+        // one; then the home and identity sequences and the log entry.
         let root = usize::from(root_state_set) + root_other_sets;
         let record_sets = set_rows.iter().filter(|((index, _), _)| *index != 0).map(|(_, columns)| columns.len()).sum::<usize>();
         let statements = inserted.len() + updated.len() + deleted.len() + record_sets + root.max(1) + 3;
@@ -152,14 +237,14 @@ fn touches_only_declared_rows<K: Fixture>(tc: &TestCase) {
     }
 }
 
-// Behaviour (#3320 ruling 1, #3373 ruling 2): an edge write touches exactly its declared rows:
-// every row it appends (event, declared appends and the rows nested in them) is new, holds the
-// logged values and, in a records or history table, the edge's version; every row of state data
-// it inserts, updates or deletes is one that differs; every other row that changed is one a logged
-// `Set` names, and only within that field's columns, which hold the logged values; no other row
-// appears or disappears. SQLite counts one row write per op (the root's state fields in one
-// statement), plus the home sequence, identity sequence and change-log rows. The engine kinds'
-// edges are the engine's, drawn over every edge their stored states allow.
+// Behaviour (#3320 ruling 1, #3373 ruling 2, #3392 G8): an edge write touches exactly its declared
+// rows, as its one log entry names them: every row it appends (declared appends and the rows nested
+// in them) is new, holds the logged values and, in a records or history table, the edge's version;
+// every row of state data it puts or removes is one that differs; every other row that changed is
+// one a logged `Set` or `State` names, and only within those columns, which hold the logged values;
+// no other row appears or disappears. SQLite counts one row write per change (the root's state as
+// one statement), plus the home sequence, identity sequence and log rows. The engine kinds' edges
+// are the engine's, drawn over every edge their stored states allow.
 #[hegel::test(test_cases = 60)]
 fn an_edge_touches_exactly_its_declared_rows(tc: TestCase) {
     touches_only_declared_rows::<MessageRow>(&tc);
@@ -220,7 +305,7 @@ fn deliverables_move_and_take_evidence_through_edges() {
     first.evidence.append(0, evidence("e0"));
     deliverables.append(0, first);
     deliverables.append(0, deliverable());
-    let inserted = write.insert("c", &Dossier { deliverables, ..Dossier::sample(0) }).expect("insert");
+    let inserted = write.insert("c", &Dossier { deliverables, ..Dossier::sample(0) }, &origin()).expect("insert");
 
     let submit = staying_open(DossierEdge::Submit { deliverable: 0 })
         .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(0), Deliverable::EVIDENCE, &evidence("e1")))
@@ -272,24 +357,24 @@ fn deliverables_move_and_take_evidence_through_edges() {
 fn edges_are_owner_checked_and_optimistic() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let stamp = write.insert("c", &Dossier::sample(0)).expect("insert");
+    let stamp = write.insert("c", &Dossier::sample(0), &origin()).expect("insert");
     let edge = deliver;
     let moved = write.apply_edge(stamp, edge()).expect("edge");
     assert!(matches!(write.apply_edge(stamp, edge()), Err(StoreError::Conflict { .. })));
-    write.delete::<Dossier>(moved).expect("delete");
+    write.delete::<Dossier>(moved, &origin()).expect("delete");
     assert!(matches!(write.apply_edge(moved, edge()), Err(StoreError::NotFound { .. })));
     write.commit().expect("commit");
 
     let mut remote = Store::open(Connection::open_in_memory().expect("db"), "remote", registry()).expect("open");
     let mut write = remote.write().expect("write");
-    write.insert("far", &Dossier::sample(0)).expect("insert");
+    write.insert("far", &Dossier::sample(0), &origin()).expect("insert");
     write.commit().expect("commit");
     let change = remote.read().expect("read").changes_since("remote", 0, 1).expect("log").remove(0);
     let mut write = store.write().expect("write");
     let Applied::Applied(far) = write.apply(&change).expect("apply") else { panic!("applied") };
     // A stale stamp is `Conflict` even when the edge is also wrong in another way (here, an
     // append under a records row that does not exist): retrying callers re-read on `Conflict`.
-    let current = write.insert("stale", &Dossier::sample(0)).expect("insert");
+    let current = write.insert("stale", &Dossier::sample(0), &origin()).expect("insert");
     let both_wrong = || {
         staying_open(DossierEdge::Submit { deliverable: 9 })
             .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence("e")))
@@ -307,7 +392,7 @@ fn edges_are_owner_checked_and_optimistic() {
 fn every_edge_writes_the_state_and_moves_the_version() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let inserted = write.insert("c", &Dossier::sample(0)).expect("insert");
+    let inserted = write.insert("c", &Dossier::sample(0), &origin()).expect("insert");
     write.commit().expect("commit");
     let unchanged = || staying_open(DossierEdge::Promise { deliverable: 0 }).expect("edge");
     let mut current = inserted;
@@ -319,22 +404,23 @@ fn every_edge_writes_the_state_and_moves_the_version() {
         write.commit().expect("commit");
         assert_eq!(snapshot(&mut store, moved.id).version, moved.version);
         let change = store.read().expect("read").changes(moved.id, current.version, 10).expect("log").remove(0);
-        let state_set = change.ops.iter().any(|op| matches!(op, RowOp::Set { table, field, .. } if table == "dossier" && field == "state"));
+        let state_set =
+            matches!(change.effect.changes.first(), Some(Change::State { row, field, .. }) if row.is_empty() && field == "state");
         assert!(state_set, "{label:?}");
         assert_eq!(load(&mut store, moved.id).state.value, label);
         current = moved;
     }
 }
 
-// Behaviour (DESIGN change log, self-contained changes): an edge that sets a frozen field carries
-// the object as a `PutObject`, even one the store already holds, so its change applies to a
-// replica holding only the resource's earlier state; an edge setting it to `None` carries none.
+// Behaviour (#3392 G8, self-contained events): an edge that sets a frozen field carries the object
+// in its effect, even one the store already holds, so its entry applies to a replica holding only
+// the resource's earlier state; an edge setting it to `None` carries none.
 #[test]
 fn edges_carry_the_objects_they_set() {
     let mut source = store();
     let mut write = source.write().expect("write");
-    write.insert("a", &Dossier { placement: Some(placement()), ..Dossier::sample(0) }).expect("insert a");
-    let b = write.insert("b", &Dossier::sample(0)).expect("insert b");
+    write.insert("a", &Dossier { placement: Some(placement()), ..Dossier::sample(0) }, &origin()).expect("insert a");
+    let b = write.insert("b", &Dossier::sample(0), &origin()).expect("insert b");
     let placed = staying_open(DossierEdge::Promise { deliverable: 0 })
         .and_then(|edge| edge.set(Dossier::PLACEMENT, &Some(placement())))
         .expect("edge");
@@ -343,10 +429,9 @@ fn edges_carry_the_objects_they_set() {
     let b = write.apply_edge(b, cleared).expect("edge");
     write.commit().expect("commit");
     let changes = source.read().expect("read").changes(b.id, 0, 10).expect("log");
-    let puts: Vec<usize> =
-        changes.iter().map(|change| change.ops.iter().filter(|op| matches!(op, RowOp::PutObject { .. })).count()).collect();
+    let puts: Vec<usize> = changes.iter().map(|change| change.effect.objects.len()).collect();
     assert_eq!(puts, [1, 1, 0], "the insert's workflow, the edge's placement, none for clearing it");
-    assert!(matches!(changes[1].ops[0], RowOp::PutObject { hash, .. } if hash == placement().hash()), "objects first");
+    assert!(changes[1].effect.objects.contains_key(&placement().hash()));
 
     let mut replica = Store::open(Connection::open_in_memory().expect("db"), "replica", registry()).expect("open");
     let mut write = replica.write().expect("write");

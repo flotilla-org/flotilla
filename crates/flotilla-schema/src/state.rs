@@ -104,9 +104,9 @@ pub enum RowEdit {
     Delete { key: Vec<Value> },
 }
 
-/// What differs between two values of one label-plus-data state (#3373 ruling 2): the column
-/// datums whose columns differ, with their new values, and the rows of collection datums that
-/// differ, never a whole collection. Generated `StateData::delta` code fills it in, one datum at a
+/// What an edge writes between two values of one label-plus-data state (#3373 ruling 2, #3392
+/// A3): every column datum, with its new values, and the rows of collection datums that differ,
+/// never a whole collection. Generated `StateData::delta` code fills it in, one datum at a
 /// time; [`Edge::transition`](crate::Edge::transition) turns it into an edge's writes.
 #[doc(hidden)]
 #[derive(Debug, Default)]
@@ -120,14 +120,14 @@ type Encode<F> = fn(&F, &mut Encoder) -> Result<(), EncodeError>;
 type EncodeAbsent = fn(&mut Encoder) -> Result<(), EncodeError>;
 
 impl StateDelta {
-    /// A column datum `name`: `previous` and `next` are `None` under a label that lacks it, when
-    /// its columns are null. Recorded with `next`'s values when the encoded columns differ.
+    /// A column datum `name`: `previous` is unused, since the state is written as one unit, and
+    /// `next` is `None` under a label that lacks the datum, when its columns are null.
     pub fn column<F>(
         &mut self,
         name: &'static str,
         encode: Encode<F>,
         absent: EncodeAbsent,
-        previous: Option<&F>,
+        _previous: Option<&F>,
         next: Option<&F>,
     ) -> Result<(), EncodeError> {
         let encoded = |value: Option<&F>| {
@@ -137,13 +137,10 @@ impl StateDelta {
             })
             .map_err(|error| error.at(name))
         };
-        let before = encoded(previous)?.tables.swap_remove(0).swap_remove(0).values;
         let mut after = encoded(next)?;
         let values = after.tables.swap_remove(0).swap_remove(0).values;
-        if values != before {
-            self.keep_objects(&values, &mut after.objects);
-            self.sets.push((name, values));
-        }
+        self.keep_objects(&values, &mut after.objects);
+        self.sets.push((name, values));
         Ok(())
     }
 

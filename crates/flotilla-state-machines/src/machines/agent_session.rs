@@ -230,7 +230,7 @@ fn gate_end(h: &mut Handle<'_, AgentSession>, edge: &End) -> Result<(), AgentSes
 /// The stored AgentSession (kind code 3): the state, the edge log and the
 /// receipts. The session's name is its identity, so it has no spec columns.
 #[derive(Clone, Debug, PartialEq, Stored)]
-#[store(kind = "AgentSession", code = 3)]
+#[store(kind = "AgentSession", code = 3, edges = AgentSessionEdgeKind)]
 pub struct AgentSessionRow {
     #[store(state)]
     pub state: State<AgentSessionState>,

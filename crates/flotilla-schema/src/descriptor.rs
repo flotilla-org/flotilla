@@ -29,6 +29,9 @@ pub struct TableSet {
     pub code: KindCode,
     pub tables: Vec<Table>,
     pub indexes: Vec<Index>,
+    /// The codes of the kind's edges (`#[store(edges = E)]`), ascending: the only `edge` codes
+    /// its log entries may carry. Empty for a kind that declares none, which takes no edge.
+    pub edges: Vec<i64>,
 }
 
 /// How a table's rows may change through the owner's write.
@@ -68,6 +71,12 @@ pub struct Table {
     /// the unit an edge sets (`Edge::set`), and the columns a spec edit may not change (`state`).
     /// Empty for tables of primitive and enum elements, which have no named fields.
     pub fields: Vec<FieldColumns>,
+    /// Earlier names of this table's `field` (`#[store(alias = "old")]` on it or on a field
+    /// enclosing it in its parent row): a log entry written under one still names this table.
+    pub field_aliases: Vec<String>,
+    /// Earlier names of columns, as `(old, current)`: a renamed field's columns keep their
+    /// names under the field's alias, so a log entry written under one still decodes.
+    pub aliases: Vec<(String, String)>,
 }
 
 /// One column-shaped field of a row: a range of [`Table::columns`].
@@ -83,6 +92,8 @@ pub struct FieldColumns {
     /// The label field and its datums are set by one statement, so the per-label CHECK holds
     /// after it.
     pub datum_of: Option<String>,
+    /// Earlier names of the field (`#[store(alias = "old")]`).
+    pub aliases: Vec<String>,
 }
 
 impl FieldColumns {
@@ -295,6 +306,14 @@ pub enum DescriptorError {
     MissingStamp { kind: String, table: String },
     #[error("kind {kind}: index {index}: {problem}")]
     Index { kind: String, index: String, problem: IndexProblem },
+    /// An alias (`#[store(alias = "old")]`) that names something else of its table or row too: a
+    /// current column, field or table field, or another alias, so an old name would be ambiguous.
+    #[error("kind {kind}: table {table}: alias {alias} names something else too")]
+    AliasClash { kind: String, table: String, alias: String },
+    /// A kind declaring edges (`#[store(edges = E)]`) has exactly one state at its root, whose
+    /// labels an edge's `from` and `to` name.
+    #[error("kind {kind} declares edges but has {states} root states, not one")]
+    EdgeState { kind: String, states: usize },
 }
 
 impl TableSet {
@@ -340,8 +359,48 @@ impl TableSet {
                     return Err(DescriptorError::DuplicateColumn { kind: kind(), table: table.name.clone(), column: column.name.clone() });
                 }
             }
+            let clash = |alias: &str| DescriptorError::AliasClash { kind: kind(), table: table.name.clone(), alias: alias.to_owned() };
+            let mut old = BTreeSet::new();
+            for (alias, _) in &table.aliases {
+                if columns.contains(alias.as_str()) || !old.insert(alias.as_str()) {
+                    return Err(clash(alias));
+                }
+            }
+            let fields: BTreeSet<&str> = table.fields.iter().map(|field| field.name.as_str()).collect();
+            let mut old = BTreeSet::new();
+            for alias in table.fields.iter().flat_map(|field| &field.aliases) {
+                if fields.contains(alias.as_str()) || !old.insert(alias.as_str()) {
+                    return Err(clash(alias));
+                }
+            }
+            let index = self.tables.iter().position(|candidate| std::ptr::eq(candidate, table));
+            let children: Vec<&Table> = self.tables.iter().filter(|child| child.parent.is_some() && child.parent == index).collect();
+            let mut old = BTreeSet::new();
+            for alias in children.iter().flat_map(|child| &child.field_aliases) {
+                if children.iter().any(|child| &child.field == alias) || !old.insert(alias.as_str()) {
+                    return Err(clash(alias));
+                }
+            }
+        }
+        if !self.edges.is_empty() {
+            let states = self.tables[0].fields.iter().filter(|field| field.is_label()).count();
+            if states != 1 {
+                return Err(DescriptorError::EdgeState { kind: kind(), states });
+            }
         }
         Ok(())
+    }
+
+    /// The root's state field, whose labels an edge's `from` and `to` name, and its label codes:
+    /// `None` unless the kind has exactly one root state.
+    pub fn edge_state(&self) -> Option<(&FieldColumns, &[i64])> {
+        let root = &self.tables[0];
+        let mut labels = root.fields.iter().filter(|field| field.is_label());
+        let (field, None) = (labels.next()?, labels.next()) else { return None };
+        match &root.columns[field.columns.start].ty {
+            ColumnType::Code(codes) => Some((field, codes)),
+            _ => None,
+        }
     }
 
     fn validate_index(&self, index: &Index) -> Result<(), IndexProblem> {

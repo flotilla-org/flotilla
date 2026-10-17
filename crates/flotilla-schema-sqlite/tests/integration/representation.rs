@@ -3,7 +3,7 @@ use flotilla_schema::{EncodeError, Kind, Ref};
 use flotilla_schema_sqlite::StoreError;
 
 use crate::fixtures::{
-    agent_session, store,
+    agent_session, origin, store,
     synthetic::{AgentName, Reference},
     AgentSessionRow, Referral, LOCAL,
 };
@@ -19,11 +19,14 @@ fn u64_above_i64_max_is_refused() {
     let mut store = store();
     let mut write = store.write().expect("write");
     assert!(matches!(
-        write.insert("max", &referral(u64::MAX)),
+        write.insert("max", &referral(u64::MAX), &origin()),
         Err(StoreError::Encode(EncodeError::OutOfRange { column, value })) if column == "seq" && value == u64::MAX
     ));
-    assert!(matches!(write.insert("over", &referral(i64::MAX as u64 + 1)), Err(StoreError::Encode(EncodeError::OutOfRange { .. }))));
-    let stamp = write.insert("edge", &referral(i64::MAX as u64)).expect("i64::MAX fits");
+    assert!(matches!(
+        write.insert("over", &referral(i64::MAX as u64 + 1), &origin()),
+        Err(StoreError::Encode(EncodeError::OutOfRange { .. }))
+    ));
+    let stamp = write.insert("edge", &referral(i64::MAX as u64), &origin()).expect("i64::MAX fits");
     write.commit().expect("commit");
     let mut read = store.read().expect("read");
     assert_eq!(read.load::<Referral>(stamp.id).expect("load").expect("present").value.seq, i64::MAX as u64);
@@ -37,8 +40,8 @@ fn timestamps_truncate_to_microseconds() {
     let mut write = store.write().expect("write");
     let after = DateTime::from_timestamp(1_700_000_000, 123_456_789).expect("in range");
     let before = DateTime::from_timestamp(-1, 999_999_999).expect("in range");
-    let late = write.insert("late", &Referral { sent_at: Some(after), ..referral(1) }).expect("insert");
-    let early = write.insert("early", &Referral { sent_at: Some(before), ..referral(1) }).expect("insert");
+    let late = write.insert("late", &Referral { sent_at: Some(after), ..referral(1) }, &origin()).expect("insert");
+    let early = write.insert("early", &Referral { sent_at: Some(before), ..referral(1) }, &origin()).expect("insert");
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
@@ -61,11 +64,11 @@ fn references_to_missing_targets_create_their_identity() {
     let mut store = store();
     let mut write = store.write().expect("write");
     let value = Referral { session: Ref::new("later", LOCAL), in_reply_to: Some(Ref::new("gone", "elsewhere")), ..Referral::sample() };
-    let stamp = write.insert("m", &value).expect("insert");
+    let stamp = write.insert("m", &value, &origin()).expect("insert");
     let session = write.resolve(AgentSessionRow::CODE, "later", LOCAL).expect("resolve").expect("identity created by the reference");
     let reply = write.resolve(Referral::CODE, "gone", "elsewhere").expect("resolve").expect("identity created by the reference");
     assert_eq!(write.load::<Referral>(reply).expect("load"), None, "an identity is not a resource");
-    let target = write.insert("later", &agent_session::sample()).expect("target inserted after the reference");
+    let target = write.insert("later", &agent_session::sample(), &origin()).expect("target inserted after the reference");
     assert_eq!(target.id, session);
     write.commit().expect("commit");
 
@@ -88,7 +91,7 @@ fn equal_interned_strings_share_one_row() {
     let reference = Reference::ChangeRequest { service: "carol".into(), scope: "s".into(), number: 1, revision: "r".into() };
     for name in ["a", "b"] {
         let value = Referral { sender: AgentName("carol".into()), references: vec![reference.clone()], ..Referral::sample() };
-        write.insert(name, &value).expect("insert");
+        write.insert(name, &value, &origin()).expect("insert");
     }
     write.commit().expect("commit");
     let conn = store.into_connection();

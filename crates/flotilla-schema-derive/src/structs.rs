@@ -28,12 +28,13 @@ pub(crate) fn expand(input: &DeriveInput, fields: &FieldsNamed, type_attrs: Type
             check_kind_name(kind)?;
             let indexes = Indexes::parse(&type_attrs.indexes, &fields)?;
             let handles = handles(input, &fields, true)?;
-            let kind = kind_impls(input, &fields, kind, code, &indexes);
+            let kind = kind_impls(input, &fields, kind, code, &indexes, type_attrs.edges.as_ref());
             Ok(quote!(#kind #handles))
         }
         (Some(kind), None) => Err(syn::Error::new_spanned(kind, "a kind needs a stable `code = N`")),
         (None, Some((_, span))) => Err(syn::Error::new(span, "`code` on a struct needs `kind = \"Name\"`")),
         (None, None) => {
+            refuse_edges(&type_attrs)?;
             let indexes = Indexes::parse(&type_attrs.indexes, &fields)?;
             let handles = handles(input, &fields, false)?;
             let part = part_impls(input, &fields, &indexes);
@@ -142,7 +143,14 @@ fn element_impl(input: &DeriveInput, fields: &[Field<'_>], indexes: TokenStream)
 /// lead back through `Message`'s own field bounds. Concrete fields are still checked through the
 /// `Element` supertrait. Declared indexes join the descriptor after the root's layout, and each
 /// gets a query constructor.
-fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u32, indexes: &Indexes<'_, '_>) -> TokenStream {
+fn kind_impls(
+    input: &DeriveInput,
+    fields: &[Field<'_>],
+    kind: &LitStr,
+    code: u32,
+    indexes: &Indexes<'_, '_>,
+    edges: Option<&syn::Path>,
+) -> TokenStream {
     let schema = schema();
     let ident = &input.ident;
     let element = element_impl(input, fields, TokenStream::new());
@@ -151,6 +159,7 @@ fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u3
     let Generics { impl_generics, ty_generics, where_clause } = Generics::new(&input.generics, generic);
     let index_layout = indexes.layout();
     let constructors = indexes.constructors(input);
+    let edges = edges.map(|edges| quote!(layout.edges(<#edges as #schema::CodeEnum>::CODES);));
     quote! {
         #element
 
@@ -163,6 +172,7 @@ fn kind_impls(input: &DeriveInput, fields: &[Field<'_>], kind: &LitStr, code: u3
                 let mut layout = #schema::Layout::root(<Self as #schema::Kind>::KIND, <Self as #schema::Kind>::CODE);
                 <Self as #schema::Element>::layout_row(&mut layout);
                 #index_layout
+                #edges
                 layout.finish()
             }
         }
@@ -252,12 +262,17 @@ fn part_impls(input: &DeriveInput, fields: &[Field<'_>], indexes: &Indexes<'_, '
 /// It is a `Column` (and an `Element`), and `Intern` when it wraps a `String`.
 pub(crate) fn newtype(input: &DeriveInput, fields: &FieldsUnnamed, type_attrs: TypeAttrs) -> syn::Result<TokenStream> {
     refuse_labels(&type_attrs)?;
+    refuse_edges(&type_attrs)?;
     let field = &fields.unnamed[0];
-    if let Some(attr) = attrs::field_attr(&field.attrs)? {
+    let field_attrs = attrs::field_attrs(&field.attrs)?;
+    if let Some(attr) = field_attrs.shape {
         return Err(refuse(
             &field.ty,
             format_args!("a newtype's field takes no storage attribute; put `{}` on the field that holds the newtype", attr.name()),
         ));
+    }
+    if let Some(alias) = field_attrs.alias {
+        return Err(refuse(alias, "a newtype's field has no name of its own; put `alias` on the field that holds the newtype"));
     }
     if shape::classify(None, &field.ty, &input.ident)? != FieldShape::Column {
         return Err(refuse(&field.ty, "a newtype wraps a column type"));
@@ -335,6 +350,13 @@ pub(crate) fn newtype(input: &DeriveInput, fields: &FieldsUnnamed, type_attrs: T
 }
 
 /// `labels` names a machine's label enum, so it belongs on the state enum, not a struct.
+fn refuse_edges(type_attrs: &TypeAttrs) -> syn::Result<()> {
+    match &type_attrs.edges {
+        Some(edges) => Err(refuse(edges, "`edges` belongs on a kind, whose log entries it constrains")),
+        None => Ok(()),
+    }
+}
+
 fn refuse_labels(type_attrs: &TypeAttrs) -> syn::Result<()> {
     match &type_attrs.labels {
         Some(labels) => Err(refuse(labels, "`labels` belongs on an enum whose variants are a machine's labels, not a struct")),

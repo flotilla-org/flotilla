@@ -196,6 +196,7 @@ fn a_label_state_is_one_label_column_and_shared_data() {
         columns,
         state,
         datum_of: datum_of.map(str::to_owned),
+        aliases: Vec::new(),
     };
     assert_eq!(
         root.fields,
@@ -323,12 +324,12 @@ fn open(assignees: &[&str], notes: &[(&str, &str)], priority: u8, owner: Option<
     }
 }
 
-// Behaviour (#3373 rulings 2 and 3): a transition writes the label and its `since` (the event's
-// `at`) only when the label changes, each column datum only when its columns differ (nulled when
-// the next label lacks it), and each collection datum row by row: a delete per removed key, an
-// update per changed value and an insert per new key, never the unchanged rows. It appends no
-// row for the event (the event is its log entry's header) and names the label it leaves, for the
-// store to check.
+// Behaviour (#3373 rulings 2 and 3, #3392 A3): a transition writes the state as one unit, its
+// label, `since` (the event's `at` on a label change, the previous `since` otherwise) and every
+// column datum (null when the next label lacks it), and each collection datum row by row: a delete
+// per removed key, an update per changed value and an insert per new key, never the unchanged
+// rows. It appends no row for the event (the event is its log entry's header) and names the label
+// it leaves, for the store to check.
 #[test]
 fn transitions_write_exactly_the_data_that_differs() {
     let previous = State::new(open(&["x", "y"], &[("k", "1"), ("m", "2")], 1, Some("ann")), Timestamp(5));
@@ -348,13 +349,14 @@ fn transitions_write_exactly_the_data_that_differs() {
         sets,
         [
             set("state", vec![Value::Int(3), Value::Int(9)]),
+            set("priority", vec![Value::Int(1)]),
             set("owner", vec![Value::Null]),
             set("hold", vec![Value::Null, Value::Null, Value::Null]),
             set("reason", vec![Value::Text("done".into())]),
             set("closed_by", vec![Value::Str("bo".into())]),
             set("signature", vec![Value::Str("bo".into()), Value::Int(9)]),
         ],
-        "priority is unchanged"
+        "an unchanged priority too: the state is one unit"
     );
     let text = |text: &str| Value::Text(text.into());
     let row = |table, edit| EdgeRow { under: RowPath::Root, table, edit };
@@ -374,13 +376,16 @@ fn transitions_write_exactly_the_data_that_differs() {
     let (edge, next) = transition(&previous, open(&["x", "y"], &[("k", "1"), ("m", "2"), ("n", "4")], 1, Some("ann")), 11);
     assert_eq!(next.since, Timestamp(5), "since is the time the label was entered");
     let parts = edge.into_parts();
-    assert_eq!(parts.sets, []);
+    let fields: Vec<&str> = parts.sets.iter().map(|set| set.field).collect();
+    let every = ["state", "priority", "owner", "hold", "reason", "closed_by", "signature"];
+    assert_eq!(fields, every, "the whole state, its label unchanged, the data its label lacks null");
+    assert_eq!(parts.sets[0], set("state", vec![Value::Int(2), Value::Int(5)]));
     assert_eq!(parts.rows, [row("notes", RowEdit::Insert { key: vec![text("n")], values: vec![text("4")] })]);
 
     // Into a label carrying nothing: every datum is nulled and every row deleted.
     let parts = transition(&previous, TicketState::Draft, 12).0.into_parts();
     let fields: Vec<&str> = parts.sets.iter().map(|set| set.field).collect();
-    assert_eq!(fields, ["state", "priority", "owner", "hold"], "the hold's flag goes from 0 to null");
+    assert_eq!(fields, every, "the hold's flag goes from 0 to null");
     assert_eq!(parts.rows.len(), 4);
     assert!(parts.rows.iter().all(|row| matches!(row.edit, RowEdit::Delete { .. })));
 }
@@ -443,11 +448,11 @@ fn applied(mut rows: Rows, parts: &EdgeParts) -> Rows {
     rows
 }
 
-// Behaviour (#3373 ruling 2, completeness and minimality without a backend): for any two states
-// (labels equal or not, collections growing, shrinking and changing), applying a transition's sets
-// and row edits to the previous value's rows gives the next value's rows, apart from the appended
-// event; every set field's columns differ between the two, no field is set twice, and the label
-// field is set exactly when the label changes. Since moves only then.
+// Behaviour (#3373 ruling 2, #3392 A3, completeness without a backend): for any two states (labels
+// equal or not, collections growing, shrinking and changing), applying a transition's sets and row
+// edits to the previous value's rows gives the next value's rows; every set field holds the next
+// value's columns, no field is set twice, and the label field and every column datum are set.
+// Since moves only on a label change.
 #[hegel::test]
 fn transitions_apply_to_exactly_the_next_rows(tc: TestCase) {
     let before = ticket(&tc);
@@ -462,13 +467,13 @@ fn transitions_apply_to_exactly_the_next_rows(tc: TestCase) {
     let set = Ticket::table_set();
     for EdgeSet { field, values, .. } in &parts.sets {
         let columns = set.tables[0].fields.iter().find(|candidate| candidate.name == *field).expect("a field").columns.clone();
-        assert_ne!(&old.tables[0][0].values[columns.clone()], &values[..], "{field} is set only when it differs");
         assert_eq!(&new.tables[0][0].values[columns], &values[..]);
     }
     let fields: BTreeSet<&str> = parts.sets.iter().map(|set| set.field).collect();
     assert_eq!(fields.len(), parts.sets.len(), "each field once");
     let moved = before.state.value.label() != state.value.label();
-    assert_eq!(fields.contains("state"), moved, "the label field is written exactly on a label change");
+    let state_fields: BTreeSet<&str> = set.tables[0].fields.iter().filter(|field| field.state).map(|field| field.name.as_str()).collect();
+    assert_eq!(fields, state_fields, "the state is written as one unit");
     assert_eq!(state.since, if moved { Timestamp(at) } else { before.state.since });
     assert_eq!(applied(old, &parts), new);
 }

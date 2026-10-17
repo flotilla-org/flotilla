@@ -87,7 +87,7 @@ pub type TicketEvent = EdgeEvent<TicketLabel, TicketEdgeName, Payload<String>>;
 /// Open tickets of a queue: an index predicate on a label-plus-data state, its code taken from
 /// `TicketLabel`.
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Ticket", code = 8, index(name = "open_by_queue", eq(queue), when(state in [Open])))]
+#[store(kind = "Ticket", code = 8, edges = TicketEdgeName, index(name = "open_by_queue", eq(queue), when(state in [Open])))]
 pub struct Ticket {
     #[store(intern)]
     pub queue: String,

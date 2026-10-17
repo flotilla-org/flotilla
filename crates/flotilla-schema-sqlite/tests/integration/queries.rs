@@ -8,8 +8,8 @@ use flotilla_state_machines::machines::{convoy::ConvoyState, lifecycle::Lifecycl
 use hegel::{generators as gs, TestCase};
 
 use crate::fixtures::{
-    convoy, ensure, message, store, terminal, AgentSessionRow, ConvoyRow, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession,
-    Vessel, LOCAL,
+    convoy, ensure, message, origin, store, terminal, AgentSessionRow, ConvoyRow, EnsureRow, Fixture, MessageRow, Pick, Referral,
+    TerminalSession, Vessel, LOCAL,
 };
 
 /// Every id of `query`, page by page with `limit`. Each page holds at most `limit` ids, a page
@@ -107,7 +107,7 @@ fn index_pages_and_scans_match_the_model(tc: TestCase) {
         match tc.draw(gs::integers::<u8>().max_value(4)) {
             0 | 1 => {
                 let value = drawn_message(&tc);
-                let stamp = write.insert(&format!("m{names}"), &value).expect("insert");
+                let stamp = write.insert(&format!("m{names}"), &value, &origin()).expect("insert");
                 names += 1;
                 model.insert(stamp.id, value);
             }
@@ -116,7 +116,7 @@ fn index_pages_and_scans_match_the_model(tc: TestCase) {
                 let current = write.load::<MessageRow>(id).expect("load").expect("present");
                 if op == 2 {
                     let next = MessageRow { state: current.value.state.clone(), ..drawn_message(&tc) };
-                    write.update(&current, &next).expect("update");
+                    write.update(&current, &next, &origin()).expect("update");
                     model.insert(id, next);
                 } else if op == 3 {
                     // An edge moves the state, and with it membership of the state-filtered indexes.
@@ -125,7 +125,7 @@ fn index_pages_and_scans_match_the_model(tc: TestCase) {
                         model.insert(id, next);
                     }
                 } else {
-                    write.delete::<MessageRow>(current.stamp()).expect("delete");
+                    write.delete::<MessageRow>(current.stamp(), &origin()).expect("delete");
                     model.remove(&id);
                 }
             }
@@ -160,19 +160,19 @@ fn reference_indexes_match_the_model(tc: TestCase) {
         match tc.draw(gs::integers::<u8>().max_value(3)) {
             op if op < 2 || ids.is_empty() => {
                 let value = drawn_referral(&tc);
-                model.insert(write.insert(&format!("m{n}"), &value).expect("insert").id, value.stored());
+                model.insert(write.insert(&format!("m{n}"), &value, &origin()).expect("insert").id, value.stored());
             }
             2 => {
                 let id = ids[tc.draw(gs::integers::<usize>().max_value(ids.len() - 1))];
                 let current = write.load::<Referral>(id).expect("load").expect("present");
                 let next = Referral { phase: current.value.phase, ..drawn_referral(&tc) };
-                write.update(&current, &next).expect("update");
+                write.update(&current, &next, &origin()).expect("update");
                 model.insert(id, next.stored());
             }
             _ => {
                 let id = ids[tc.draw(gs::integers::<usize>().max_value(ids.len() - 1))];
                 let current = write.load::<Referral>(id).expect("load").expect("present");
-                write.delete::<Referral>(current.stamp()).expect("delete");
+                write.delete::<Referral>(current.stamp(), &origin()).expect("delete");
                 model.remove(&id);
             }
         }
@@ -204,7 +204,7 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
     let mut write = store.write().expect("write");
     for n in 0..tc.draw(gs::integers::<usize>().max_value(8)) {
         let convoy = ConvoyRow { project: pick(&["p0", "p1"]), ..convoy::generate(&tc, Pick::Draw) };
-        convoys.insert(write.insert(&format!("c{n}"), &convoy).expect("insert").id, convoy);
+        convoys.insert(write.insert(&format!("c{n}"), &convoy, &origin()).expect("insert").id, convoy);
     }
     for n in 0..tc.draw(gs::integers::<usize>().max_value(8)) {
         let session = TerminalSession {
@@ -213,11 +213,11 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
             pool: pick(&["blue", "green"]),
             ..terminal::generate(&tc, Pick::Draw)
         };
-        sessions.insert(write.insert(&format!("t{n}"), &session).expect("insert").id, session);
+        sessions.insert(write.insert(&format!("t{n}"), &session, &origin()).expect("insert").id, session);
     }
     for n in 0..tc.draw(gs::integers::<usize>().max_value(6)) {
         let ensure = EnsureRow { inbox: pick(&["i0", "i1"]), ..ensure::generate(&tc, Pick::Draw) };
-        ensures.insert(write.insert(&format!("e{n}"), &ensure).expect("insert").id, ensure);
+        ensures.insert(write.insert(&format!("e{n}"), &ensure, &origin()).expect("insert").id, ensure);
     }
     write.commit().expect("commit");
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
@@ -243,7 +243,7 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
 fn insert_messages(store: &mut Store, count: usize, value: impl Fn(usize) -> MessageRow) {
     let mut write = store.write().expect("write");
     for n in 0..count {
-        write.insert(&format!("m{n}"), &value(n)).expect("insert");
+        write.insert(&format!("m{n}"), &value(n), &origin()).expect("insert");
     }
     write.commit().expect("commit");
 }
@@ -279,8 +279,8 @@ fn cursors_are_bound_to_their_query() {
     let mut store = store();
     insert_messages(&mut store, 3, |n| MessageRow { deadline: Some(Timestamp(n as i64)), ..message::sample() });
     let mut write = store.write().expect("write");
-    write.insert("c", &convoy::sample()).expect("insert");
-    write.insert("c2", &convoy::sample()).expect("insert");
+    write.insert("c", &convoy::sample(), &origin()).expect("insert");
+    write.insert("c2", &convoy::sample(), &origin()).expect("insert");
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
@@ -323,7 +323,7 @@ fn page_boundaries_inside_a_run_of_equal_order_values() {
     let mut ids = Vec::new();
     let mut write = store.write().expect("write");
     for (n, seq) in seqs.iter().enumerate() {
-        ids.push((*seq, write.insert(&format!("m{n}"), &Referral { seq: *seq, ..Referral::sample() }).expect("insert").id));
+        ids.push((*seq, write.insert(&format!("m{n}"), &Referral { seq: *seq, ..Referral::sample() }, &origin()).expect("insert").id));
     }
     write.commit().expect("commit");
     ids.sort();

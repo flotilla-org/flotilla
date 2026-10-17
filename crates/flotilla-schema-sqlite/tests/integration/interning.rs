@@ -1,6 +1,6 @@
 use flotilla_schema::Kind;
 
-use crate::fixtures::{message, store, MessageRow, Referral, LOCAL};
+use crate::fixtures::{message, origin, store, MessageRow, Referral, LOCAL};
 
 fn message() -> MessageRow {
     message::sample()
@@ -14,12 +14,12 @@ fn message() -> MessageRow {
 fn ids_from_a_rolled_back_transaction_are_evicted() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    write.insert("first", &message()).expect("insert");
+    write.insert("first", &message(), &origin()).expect("insert");
     drop(write);
 
     let mut write = store.write().expect("write");
-    let second = write.insert("second", &message()).expect("insert");
-    let first = write.insert("first", &message()).expect("insert the rolled-back name again");
+    let second = write.insert("second", &message(), &origin()).expect("insert");
+    let first = write.insert("first", &message(), &origin()).expect("insert the rolled-back name again");
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
@@ -36,8 +36,8 @@ fn ids_from_a_refused_write_are_evicted() {
     let mut store = store();
     let mut write = store.write().expect("write");
     let refused = Referral { seq: u64::MAX, ..Referral::sample() };
-    assert!(write.insert("first", &refused).is_err());
-    let first = write.insert("first", &Referral::sample()).expect("insert");
+    assert!(write.insert("first", &refused, &origin()).is_err());
+    let first = write.insert("first", &Referral::sample(), &origin()).expect("insert");
     write.commit().expect("commit");
     let mut read = store.read().expect("read");
     assert_eq!(read.load::<Referral>(first.id).expect("load").expect("present").name, "first");

@@ -4,13 +4,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{quote_ident, Edge, EdgeEvent, Kind, Labelled, Position, Row, RowChange, RowOp, State, TableRole, Timestamp, Value};
+use flotilla_schema::{
+    quote_ident, Cause, Change, Edge, EdgeEvent, Event, Kind, Labelled, Position, Row, State, TableRole, Timestamp, Value,
+};
 use flotilla_schema_sqlite::{Applied, ResourceId, Snapshot, Stamp, Store, StoreError};
 use hegel::{generators as gs, TestCase};
 use rusqlite::{Connection, ErrorCode};
 
 use crate::fixtures::{
-    registry, store,
+    origin, registry, store,
     synthetic::{Deliverable, DossierEdge, DossierEvent, DossierState, Evidence},
     ticket::{next_value, state_value, transition, Hold, Signature, Ticket, TicketEdgeName, TicketLabel, TicketState},
     Dossier, Fixture, Payload, Pick, LOCAL,
@@ -29,9 +31,9 @@ fn interned(conn: &Connection) -> u64 {
     conn.query_row("SELECT (SELECT count(*) FROM strings) + (SELECT count(*) FROM resource_identity)", [], |row| row.get(0)).expect("count")
 }
 
-/// Applies `edge` in its own transaction; returns the change it logged and the rows SQLite counted
+/// Applies `edge` in its own transaction; returns the event it logged and the rows SQLite counted
 /// as written, excluding new `strings` and `resource_identity` rows.
-fn apply_counted(store: Store, current: Stamp, edge: Edge<Ticket>) -> (Store, Stamp, RowChange, u64) {
+fn apply_counted(store: Store, current: Stamp, edge: Edge<Ticket>) -> (Store, Stamp, Event, u64) {
     let conn = store.into_connection();
     let before = (conn.total_changes(), interned(&conn));
     let mut store = Store::open(conn, LOCAL, registry()).expect("reopen");
@@ -41,7 +43,7 @@ fn apply_counted(store: Store, current: Stamp, edge: Edge<Ticket>) -> (Store, St
     write.commit().expect("commit");
     let conn = store.into_connection();
     let written = conn.total_changes() - before.0 - (interned(&conn) - before.1);
-    assert_eq!(changes.len(), 1, "one change per edge");
+    assert_eq!(changes.len(), 1, "one entry per edge");
     (Store::open(conn, LOCAL, registry()).expect("reopen"), stamp, changes.remove(0), written)
 }
 
@@ -81,23 +83,21 @@ fn edge(previous: &State<TicketState>, next: TicketState, at: i64) -> Edge<Ticke
     Edge::transition(Ticket::STATE, previous, &next, &event(from, to, at)).expect("edge")
 }
 
-// Behaviour (#3373 rulings 2 and 3, touched rows): every transition logs exactly the rows and
-// columns that differ between the stored value before and after it, and the store writes nothing
-// else. The root's state fields that are logged (`Set`) are exactly those with a differing column,
-// holding the new values; the label field is among them exactly when the label changes, and
-// `since` then becomes the event's `at` and otherwise stays. Each state data table's logged
-// inserts, updates and deletes are exactly the keys added, changed and removed, never an unchanged
-// row; the only other op is the event's insert, stamped with the edge's version. SQLite counts one
-// row write per row op, one for the root (the one state statement, or the version alone), the
-// event, and the home sequence, identity sequence and change log. Transitions are drawn on every
-// label pair, collections growing, shrinking and changing.
+// Behaviour (#3373 rulings 2 and 3, #3392 A3, touched rows): every transition logs its state as one
+// unit and exactly the collection rows that differ, and the store writes nothing else. The root's
+// one `State` change holds the new values of the label, `since` and every column datum; `since`
+// becomes the event's `at` when the label changes and otherwise stays, and the entry's header
+// names the labels it leaves and enters. Each state data table's logged removals, replaced rows
+// and added rows are exactly the keys removed, changed and added, never an unchanged row. SQLite
+// counts one row write per row change, one for the root's state statement, and the home sequence,
+// identity sequence and log rows. Transitions are drawn on every label pair, collections growing,
+// shrinking and changing.
 #[hegel::test(test_cases = 60)]
-fn a_transition_logs_exactly_the_rows_and_columns_that_differ(tc: TestCase) {
+fn a_transition_logs_its_state_and_exactly_the_rows_that_differ(tc: TestCase) {
     let set = Ticket::table_set();
-    let table = |name: &str| set.tables.iter().position(|table| table.name == name).expect("a table of the kind");
     let mut store = store();
     let mut write = store.write().expect("write");
-    let mut stamp = write.insert("t", &Ticket::generate(&tc, Pick::Draw)).expect("insert");
+    let mut stamp = write.insert("t", &Ticket::generate(&tc, Pick::Draw), &origin()).expect("insert");
     write.commit().expect("commit");
     for _ in 0..tc.draw(gs::integers::<usize>().min_value(1).max_value(5)) {
         let current = store.read().expect("read").load::<Ticket>(stamp.id).expect("load").expect("present");
@@ -110,85 +110,78 @@ fn a_transition_logs_exactly_the_rows_and_columns_that_differ(tc: TestCase) {
         let (old_root, new_root) = (&before.rows.tables[0][0].values, &after.rows.tables[0][0].values);
         let field = |name: &str| root.fields.iter().find(|field| field.name == name).expect("a field").columns.clone();
 
-        let mut logged_fields = BTreeSet::new();
-        let mut events = Vec::new();
-        let mut logged_rows: BTreeMap<usize, Vec<&RowOp>> = BTreeMap::new();
-        for op in &change.ops {
-            match op {
-                RowOp::Set { table: name, key, field: logged, values } => {
-                    assert_eq!((name.as_str(), key.as_slice()), ("ticket", &[][..]), "only the root's fields are set");
-                    assert_eq!(&new_root[field(logged)], &values[..], "{logged} holds the logged values");
-                    assert!(logged_fields.insert(logged.clone()), "{logged} set once");
-                }
-                RowOp::Insert { table: name, values, .. } if name == "ticket_edges" => events.push(values.clone()),
-                RowOp::Insert { table: name, .. } | RowOp::Update { table: name, .. } | RowOp::Delete { table: name, .. } => {
-                    let index = table(name);
-                    assert_eq!(set.tables[index].role, TableRole::State, "{name}");
-                    logged_rows.entry(index).or_default().push(op);
-                }
-                other => panic!("a transition writes no {other:?}"),
-            }
+        let Change::State { row, field: logged, values } = &change.effect.changes[0] else { panic!("the state first: {change:?}") };
+        assert_eq!((row.as_slice(), logged.as_str()), (&[][..], "state"));
+        let state_columns: Vec<usize> = root.fields.iter().filter(|field| field.state).flat_map(|field| field.columns.clone()).collect();
+        for column in &state_columns {
+            let name = &root.columns[*column].name;
+            assert_eq!(values.get(name).unwrap_or(&Value::Null), &new_root[*column], "{name} as one unit");
         }
-        let differing: BTreeSet<String> = root
-            .fields
-            .iter()
-            .filter(|field| old_root[field.columns.clone()] != new_root[field.columns.clone()])
-            .map(|field| field.name.clone())
-            .collect();
-        assert_eq!(logged_fields, differing, "the logged fields are exactly those that differ");
-        assert!(differing.iter().all(|name| root.fields.iter().any(|field| &field.name == name && field.state)), "only state moves");
+        assert!(values.keys().all(|name| state_columns.iter().any(|column| &root.columns[*column].name == name)));
+        assert_eq!(
+            root.columns
+                .iter()
+                .enumerate()
+                .filter(|(column, _)| old_root[*column] != new_root[*column] && !state_columns.contains(column))
+                .count(),
+            0,
+            "only state moves"
+        );
 
-        let stamped = Value::Int(i64::try_from(next.version).expect("stored"));
-        assert_eq!(events.len(), 1, "one event");
-        assert_eq!(events[0][0], stamped);
-        let [_, _, Value::Int(from), Value::Int(to), _, Value::Int(at), _] = events[0][..] else { panic!("event header {:?}", events[0]) };
+        let Cause::Edge { from, to, .. } = change.cause else { panic!("an edge: {change:?}") };
         let label = field("state").start;
-        assert_eq!((old_root[label].clone(), new_root[label].clone()), (Value::Int(from), Value::Int(to)), "the event names the move");
+        assert_eq!((old_root[label].clone(), new_root[label].clone()), (Value::Int(from), Value::Int(to)), "the entry names the move");
         let since = new_root[label + 1].clone();
-        assert_eq!(since, if from == to { old_root[label + 1].clone() } else { Value::Int(at) }, "since moves only with the label");
-        assert_eq!(logged_fields.contains("state"), from != to);
+        assert_eq!(
+            since,
+            if from == to { old_root[label + 1].clone() } else { Value::Int(change.at.micros()) },
+            "since moves with the label"
+        );
 
-        let mut row_ops = 0;
+        let mut row_changes = 0;
         for (index, table_set) in set.tables.iter().enumerate().filter(|(_, table)| table.role == TableRole::State) {
             let (old, new) = (by_key(&before.rows.tables[index]), by_key(&after.rows.tables[index]));
             let mut expected: Vec<String> = Vec::new();
-            expected.extend(old.keys().filter(|key| !new.contains_key(*key)).map(|key| format!("delete {key:?}")));
+            expected.extend(old.keys().filter(|key| !new.contains_key(*key)).map(|key| format!("remove {key:?}")));
             expected.extend(
                 new.iter()
                     .filter(|(key, values)| old.get(*key).is_some_and(|old| old != *values))
-                    .map(|(key, values)| format!("update {key:?} {values:?}")),
+                    .map(|(key, values)| format!("put {key:?} {values:?}")),
             );
-            expected
-                .extend(new.iter().filter(|(key, _)| !old.contains_key(*key)).map(|(key, values)| format!("insert {key:?} {values:?}")));
-            let logged: Vec<String> = logged_rows
-                .get(&index)
-                .into_iter()
-                .flatten()
-                .map(|op| match op {
-                    RowOp::Delete { key, .. } => format!("delete {key:?}"),
-                    RowOp::Update { key, values, .. } => format!("update {key:?} {values:?}"),
-                    RowOp::Insert { key, values, .. } => format!("insert {key:?} {values:?}"),
-                    _ => unreachable!(),
+            expected.extend(new.iter().filter(|(key, _)| !old.contains_key(*key)).map(|(key, values)| format!("put {key:?} {values:?}")));
+            let own = |key: &flotilla_schema::Named| vec![key.values().next().cloned().expect("one key column")];
+            let data = |values: &flotilla_schema::Named| {
+                table_set.columns.iter().map(|column| values.get(&column.name).cloned().unwrap_or(Value::Null)).collect::<Vec<_>>()
+            };
+            let logged: Vec<String> = change.effect.changes[1..]
+                .iter()
+                .filter_map(|logged| match logged {
+                    Change::Remove { collection, key, .. } if *collection == table_set.field => Some(format!("remove {:?}", own(key))),
+                    Change::Put { collection, key, values, .. } if *collection == table_set.field => {
+                        Some(format!("put {:?} {:?}", own(key), data(values)))
+                    }
+                    _ => None,
                 })
                 .collect();
-            assert_eq!(logged, expected, "{}: exactly the rows that differ, deletes, updates, then inserts", table_set.name);
-            row_ops += logged.len();
+            assert_eq!(logged, expected, "{}: exactly the rows that differ, removals, replacements, then additions", table_set.name);
+            row_changes += logged.len();
         }
-        assert_eq!(written, row_ops as u64 + 1 + 1 + 3, "rows written by {change:?}");
+        assert_eq!(change.effect.changes.len(), 1 + row_changes, "nothing else: {change:?}");
+        assert_eq!(written, row_changes as u64 + 1 + 3, "rows written by {change:?}");
         stamp = next;
     }
 }
 
 // Behaviour (#3373 ruling 1, round trip): a ticket evolves by drawn transitions (every label pair,
 // collections growing, shrinking and changing) and spec edits; after each, `load_snapshot`
-// decodes to the model, and replaying the store's change log into another database reproduces the
+// decodes to the model, and replaying the store's log into another database reproduces the
 // same rows (snapshots equal, although the databases number their strings differently).
 #[hegel::test(test_cases = 60)]
 fn transitions_round_trip_and_replay(tc: TestCase) {
     let mut source = store();
     let mut write = source.write().expect("write");
     let first = Ticket::generate(&tc, Pick::Draw);
-    let mut stamp = write.insert("t", &first).expect("insert");
+    let mut stamp = write.insert("t", &first, &origin()).expect("insert");
     write.commit().expect("commit");
     let mut model = first.stamped(None, stamp.version);
     for _ in 0..tc.draw(gs::integers::<usize>().min_value(1).max_value(6)) {
@@ -197,7 +190,7 @@ fn transitions_round_trip_and_replay(tc: TestCase) {
         assert_eq!(current.value, model);
         if tc.draw(gs::integers::<u8>().max_value(3)) == 0 {
             let next = current.value.evolve(&tc, Pick::Draw);
-            stamp = write.update(&current, &next).expect("a spec edit keeps the state");
+            stamp = write.update(&current, &next, &origin()).expect("a spec edit keeps the state");
             model = next;
         } else {
             let (edge, next) = current.value.edge(&tc, Pick::Draw).expect("a ticket always has an edge");
@@ -210,7 +203,7 @@ fn transitions_round_trip_and_replay(tc: TestCase) {
 
     let mut replica = Store::open(Connection::open_in_memory().expect("db"), "replica", registry()).expect("open");
     let mut write = replica.write().expect("write");
-    write.insert("pre", &ticket(closed())).expect("a local ticket interns its strings first");
+    write.insert("pre", &ticket(closed()), &origin()).expect("a local ticket interns its strings first");
     for change in source.read().expect("read").changes_since(LOCAL, 0, 100).expect("log") {
         assert!(matches!(write.apply(&change).expect("apply"), Applied::Applied(_)));
     }
@@ -237,7 +230,7 @@ fn evidence() -> Evidence {
 fn edge_refusals_come_in_a_fixed_order() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let inserted = write.insert("t", &ticket(open(&["a"], 1))).expect("insert");
+    let inserted = write.insert("t", &ticket(open(&["a"], 1)), &origin()).expect("insert");
     let current = State::new(open(&["a"], 1), Timestamp(1));
     let moved = write.apply_edge(inserted, edge(&current, open(&["a", "b"], 1), 2)).expect("a data-only edge");
 
@@ -260,7 +253,7 @@ fn edge_refusals_come_in_a_fixed_order() {
     );
 
     // An edge built whole, leaving the wrong label and appending under a missing deliverable.
-    let dossier = write.insert("c", &Dossier::sample(0)).expect("insert");
+    let dossier = write.insert("c", &Dossier::sample(0), &origin()).expect("insert");
     let delivered = State::new(DossierState::Delivered, Timestamp(6));
     let both =
         Edge::new(Dossier::STATE, &delivered, &dossier_event(DossierEdge::Deliver, DossierState::Delivered, DossierState::Delivered))
@@ -278,7 +271,7 @@ fn edge_refusals_come_in_a_fixed_order() {
 
     let mut remote = Store::open(Connection::open_in_memory().expect("db"), "remote", registry()).expect("open");
     let mut remote_write = remote.write().expect("write");
-    remote_write.insert("far", &ticket(open(&[], 0))).expect("insert");
+    remote_write.insert("far", &ticket(open(&[], 0)), &origin()).expect("insert");
     remote_write.commit().expect("commit");
     let change = remote.read().expect("read").changes_since("remote", 0, 1).expect("log").remove(0);
     let mut write = store.write().expect("write");
@@ -287,13 +280,13 @@ fn edge_refusals_come_in_a_fixed_order() {
     assert!(matches!(write.apply_edge(stale_far, wrong_from()), Err(StoreError::NotHome { .. })), "ownership before everything");
 }
 
-// Behaviour (#3373 ruling 5): a refused edge writes nothing (no row, no sequence, no change-log
+// Behaviour (#3373 ruling 5): a refused edge writes nothing (no row, no sequence, no log
 // entry) and leaves the transaction usable: the next edge in it applies and commits.
 #[test]
 fn a_refused_edge_writes_nothing_and_the_transaction_goes_on() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let inserted = write.insert("t", &ticket(open(&["a"], 1))).expect("insert");
+    let inserted = write.insert("t", &ticket(open(&["a"], 1)), &origin()).expect("insert");
     write.commit().expect("commit");
     let before = snapshot(&mut store, inserted.id);
 
@@ -323,7 +316,7 @@ fn a_refused_edge_writes_nothing_and_the_transaction_goes_on() {
 fn spec_edits_never_move_state_data() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let stamp = write.insert("t", &ticket(open(&["a"], 1))).expect("insert");
+    let stamp = write.insert("t", &ticket(open(&["a"], 1)), &origin()).expect("insert");
     let current = write.load::<Ticket>(stamp.id).expect("load").expect("present");
     for (next, table, column) in [
         (open(&["a", "b"], 1), "ticket_assignees", None),
@@ -331,7 +324,7 @@ fn spec_edits_never_move_state_data() {
         (open(&["a"], 0), "ticket", Some("priority".to_owned())),
     ] {
         let edited = Ticket { state: State::new(next, Timestamp(1)), ..current.value.clone() };
-        let refused = write.update(&current, &edited);
+        let refused = write.update(&current, &edited, &origin());
         assert!(
             matches!(&refused, Err(StoreError::NotThroughEdge { table: refused, column: refused_column }) if refused == table && *refused_column == column),
             "{refused:?}"
@@ -359,8 +352,8 @@ fn refused_by_check(conn: &Connection, sql: &str) -> bool {
 fn a_label_and_its_data_change_in_one_statement() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let stamp = write.insert("t", &ticket(open(&[], 1))).expect("insert");
-    let draft = write.insert("d", &ticket(TicketState::Draft)).expect("insert");
+    let stamp = write.insert("t", &ticket(open(&[], 1)), &origin()).expect("insert");
+    let draft = write.insert("d", &ticket(TicketState::Draft), &origin()).expect("insert");
     write.commit().expect("commit");
     let conn = store.into_connection();
     let by = |id: ResourceId| format!("WHERE {} = {}", quote_ident("id"), id.0);
@@ -385,12 +378,12 @@ fn a_label_and_its_data_change_in_one_statement() {
 // Behaviour (coordinator addition, flattened data): a flattened datum is one field of the state:
 // an optional one's flag and columns move together when it appears, changes or goes (its flag 0
 // for `None` under a label carrying it, null under one lacking it), and a required one is written
-// whole when its label is entered. Each logged `Set` names the datum alone.
+// whole when its label is entered. Each is logged with the rest of the state, as one unit.
 #[test]
 fn a_flattened_datum_moves_as_one_field() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let mut stamp = write.insert("t", &ticket(open(&["a"], 1))).expect("insert");
+    let mut stamp = write.insert("t", &ticket(open(&["a"], 1)), &origin()).expect("insert");
     let mut state = State::new(open(&["a"], 1), Timestamp(1));
     let held = TicketState::Open {
         assignees: ["a".to_owned()].into(),
@@ -399,33 +392,47 @@ fn a_flattened_datum_moves_as_one_field() {
         owner: None,
         hold: Some(Hold { by: "bo".into(), until: Timestamp(7) }),
     };
+    // The state as one unit (#3392 A3): the hold's columns among the label's, by name.
+    let text = |text: &str| Value::Text(text.into());
     for (next, at, expected) in [
-        (held, 3, vec![("hold", vec![Value::Int(1), Value::Text("bo".into()), Value::Int(7)])]),
-        (open(&["a"], 1), 4, vec![("hold", vec![Value::Int(0), Value::Null, Value::Null])]),
+        (
+            held,
+            3,
+            vec![
+                ("state", Value::Int(2)),
+                ("state_since", Value::Int(1)),
+                ("priority", Value::Int(1)),
+                ("hold_present", Value::Int(1)),
+                ("hold_by", text("bo")),
+                ("hold_until", Value::Int(7)),
+            ],
+        ),
+        (
+            open(&["a"], 1),
+            4,
+            vec![("state", Value::Int(2)), ("state_since", Value::Int(1)), ("priority", Value::Int(1)), ("hold_present", Value::Int(0))],
+        ),
         (
             closed(),
             5,
             vec![
-                ("state", vec![Value::Int(3), Value::Int(5)]),
-                ("priority", vec![Value::Int(0)]),
-                ("hold", vec![Value::Null, Value::Null, Value::Null]),
-                ("reason", vec![Value::Text("done".into())]),
-                ("closed_by", vec![Value::Str("ann".into())]),
-                ("signature", vec![Value::Str("ann".into()), Value::Int(2)]),
+                ("state", Value::Int(3)),
+                ("state_since", Value::Int(5)),
+                ("priority", Value::Int(0)),
+                ("reason", text("done")),
+                ("closed_by", Value::Str("ann".into())),
+                ("signature_who", Value::Str("ann".into())),
+                ("signature_at", Value::Int(2)),
             ],
         ),
     ] {
         let built = edge(&state, next, at);
         let moved = write.apply_edge(stamp, built).expect("edge");
         let change = write.changes(stamp.id, stamp.version, 10).expect("log").remove(0);
-        let sets: Vec<(&str, Vec<Value>)> = change
-            .ops
-            .iter()
-            .filter_map(|op| match op {
-                RowOp::Set { field, values, .. } => Some((field.as_str(), values.clone())),
-                _ => None,
-            })
-            .collect();
+        let Change::State { values, .. } = &change.effect.changes[0] else { panic!("the state first: {change:?}") };
+        let sets: Vec<(&str, Value)> = values.iter().map(|(name, value)| (name.as_str(), value.clone())).collect();
+        let mut expected = expected;
+        expected.sort();
         assert_eq!(sets, expected);
         stamp = moved;
         state = write.load::<Ticket>(stamp.id).expect("load").expect("present").value.state;
@@ -440,11 +447,11 @@ fn a_flattened_datum_moves_as_one_field() {
 fn an_index_on_the_state_follows_transitions() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let a = write.insert("a", &ticket(open(&["x"], 1))).expect("insert");
-    write.insert("b", &ticket(closed())).expect("insert");
-    write.insert("c", &ticket(TicketState::Draft)).expect("insert");
-    let d = write.insert("d", &ticket(open(&[], 0))).expect("insert");
-    write.insert("e", &Ticket { queue: "other".into(), ..ticket(open(&[], 0)) }).expect("insert");
+    let a = write.insert("a", &ticket(open(&["x"], 1)), &origin()).expect("insert");
+    write.insert("b", &ticket(closed()), &origin()).expect("insert");
+    write.insert("c", &ticket(TicketState::Draft), &origin()).expect("insert");
+    let d = write.insert("d", &ticket(open(&[], 0)), &origin()).expect("insert");
+    write.insert("e", &Ticket { queue: "other".into(), ..ticket(open(&[], 0)) }, &origin()).expect("insert");
     let ids =
         |write: &mut flotilla_schema_sqlite::Write<'_>| write.page(&Ticket::open_by_queue(&"q".to_owned()), None, 10).expect("page").ids;
     assert_eq!(ids(&mut write), [a.id, d.id]);
@@ -461,7 +468,7 @@ fn every_label_pair_round_trips(tc: TestCase) {
     let mut store = store();
     let first = state_value(&tc, Pick::Draw);
     let mut write = store.write().expect("write");
-    let mut stamp = write.insert("t", &ticket(first.clone())).expect("insert");
+    let mut stamp = write.insert("t", &ticket(first.clone()), &origin()).expect("insert");
     let mut state = State::new(first, Timestamp(1));
     for _ in 0..4 {
         let (edge, next, _) = transition(&tc, Pick::Draw, &state, next_value(&tc, Pick::Draw, &state.value));

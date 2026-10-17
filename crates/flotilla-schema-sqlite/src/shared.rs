@@ -61,32 +61,55 @@ CREATE INDEX IF NOT EXISTS log_about ON log (about, at) WHERE about IS NOT NULL;
 /// literal SQL (a unit test there checks).
 pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("log_append", LOG_APPEND),
-    ("log_taken", LOG_TAKEN),
+    ("log_cause", LOG_CAUSE),
+    ("log_by_resource", LOG_BY_RESOURCE),
+    ("log_by_home", LOG_BY_HOME),
+    ("log_about_first", LOG_ABOUT_FIRST),
+    ("log_about_after", LOG_ABOUT_AFTER),
+    ("log_expunge", LOG_EXPUNGE),
     ("string_id", STRING_ID),
     ("string_insert", STRING_INSERT),
     ("identity_resolve", IDENTITY_RESOLVE),
     ("identity_insert", IDENTITY_INSERT),
     ("identity_of", IDENTITY_OF),
+    ("identity_delete", IDENTITY_DELETE),
     ("sequence_next", SEQUENCE_NEXT),
     ("object_put", OBJECT_PUT),
     ("identity_seq", IDENTITY_SEQ),
     ("identity_set_seq", IDENTITY_SET_SEQ),
     ("sequence_raise", SEQUENCE_RAISE),
     ("object_exists", OBJECT_EXISTS),
-    ("log_by_resource", LOG_BY_RESOURCE),
-    ("log_by_home", LOG_BY_HOME),
     ("sequence_last", SEQUENCE_LAST),
     ("object_bytes", OBJECT_BYTES),
 ];
 
-pub(crate) const LOG_APPEND: &str = "INSERT INTO change_log (home, home_seq, resource_id, change) VALUES (?1, ?2, ?3, ?4)";
-pub(crate) const LOG_TAKEN: &str = "SELECT 1 FROM change_log WHERE home = ?1 AND home_seq = ?2";
+pub(crate) const LOG_APPEND: &str =
+    "INSERT INTO log (home, home_seq, resource, prev_seq, cause, edge, \"from\", \"to\", about, writer, at, \
+                                     payload, effect) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
+pub(crate) const LOG_CAUSE: &str = "SELECT cause FROM log WHERE home = ?1 AND home_seq = ?2";
+/// The columns an entry is read back with, in `LogRow` order: its strings through `strings`' primary key.
+macro_rules! log_select {
+    ($($rest:literal),*) => {
+        concat!(
+            "SELECT l.rowid, l.home_seq, l.resource, l.prev_seq, l.cause, l.edge, l.\"from\", l.\"to\", l.about, ",
+            "(SELECT s FROM strings WHERE id = l.writer), l.at, l.payload, l.effect, (SELECT s FROM strings WHERE id = l.home) ",
+            "FROM log AS l ",
+            $($rest),*
+        )
+    };
+}
+pub(crate) const LOG_BY_RESOURCE: &str = log_select!("WHERE l.resource = ?1 AND l.home_seq > ?2 ORDER BY l.home_seq LIMIT ?3");
+pub(crate) const LOG_BY_HOME: &str = log_select!("WHERE l.home = ?1 AND l.home_seq > ?2 ORDER BY l.home_seq LIMIT ?3");
+pub(crate) const LOG_ABOUT_FIRST: &str = log_select!("WHERE l.about = ?1 ORDER BY l.at, l.rowid LIMIT ?2");
+pub(crate) const LOG_ABOUT_AFTER: &str = log_select!("WHERE l.about = ?1 AND (l.at, l.rowid) > (?2, ?3) ORDER BY l.at, l.rowid LIMIT ?4");
+pub(crate) const LOG_EXPUNGE: &str = "DELETE FROM log WHERE resource = ?1";
 pub(crate) const STRING_ID: &str = "SELECT id FROM strings WHERE s = ?1";
 pub(crate) const STRING_INSERT: &str = "INSERT INTO strings (s) VALUES (?1)";
 pub(crate) const IDENTITY_RESOLVE: &str = "SELECT id FROM resource_identity WHERE kind = ?1 AND name = ?2 AND home = ?3";
 pub(crate) const IDENTITY_INSERT: &str = "INSERT INTO resource_identity (kind, name, home) VALUES (?1, ?2, ?3)";
 pub(crate) const IDENTITY_OF: &str =
     "SELECT i.kind, n.s, h.s FROM resource_identity i JOIN strings n ON n.id = i.name JOIN strings h ON h.id = i.home WHERE i.id = ?1";
+pub(crate) const IDENTITY_DELETE: &str = "DELETE FROM resource_identity WHERE id = ?1";
 pub(crate) const SEQUENCE_NEXT: &str =
     "INSERT INTO home_sequence (home, last) VALUES (?1, 1) ON CONFLICT (home) DO UPDATE SET last = last + 1 RETURNING last";
 pub(crate) const OBJECT_PUT: &str = "INSERT OR IGNORE INTO objects (hash, bytes) VALUES (?1, ?2)";
@@ -95,9 +118,6 @@ pub(crate) const IDENTITY_SET_SEQ: &str = "UPDATE resource_identity SET seq = ?1
 pub(crate) const SEQUENCE_RAISE: &str =
     "INSERT INTO home_sequence (home, last) VALUES (?1, ?2) ON CONFLICT (home) DO UPDATE SET last = max(last, excluded.last)";
 pub(crate) const OBJECT_EXISTS: &str = "SELECT 1 FROM objects WHERE hash = ?1";
-pub(crate) const LOG_BY_RESOURCE: &str =
-    "SELECT change FROM change_log WHERE resource_id = ?1 AND home_seq > ?2 ORDER BY home_seq LIMIT ?3";
-pub(crate) const LOG_BY_HOME: &str = "SELECT change FROM change_log WHERE home = ?1 AND home_seq > ?2 ORDER BY home_seq LIMIT ?3";
 pub(crate) const SEQUENCE_LAST: &str = "SELECT last FROM home_sequence WHERE home = ?1";
 pub(crate) const OBJECT_BYTES: &str = "SELECT bytes FROM objects WHERE hash = ?1";
 

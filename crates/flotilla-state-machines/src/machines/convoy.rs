@@ -433,7 +433,7 @@ fn readmit(_: &mut Handle<'_, Convoy>, state: ConvoyState, readmit: &Readmit) ->
 /// columns and its promise definitions as a child table, the state, and the
 /// edge log. Indexed for a project's open convoys.
 #[derive(Clone, Debug, PartialEq, Stored)]
-#[store(kind = "Convoy", code = 5, index(name = "open_by_project", eq(project), when(state in [Open])))]
+#[store(kind = "Convoy", code = 5, edges = ConvoyEdgeKind, index(name = "open_by_project", eq(project), when(state in [Open])))]
 pub struct ConvoyRow {
     /// An address: plain interned text until `flotilla-address` is adopted.
     #[store(intern)]

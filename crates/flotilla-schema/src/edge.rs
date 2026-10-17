@@ -23,10 +23,10 @@
 //!
 //! A state carrying data (a label-plus-data enum, `#[store(labels = L)]`) moves through
 //! [`Edge::transition`], which takes the previous and the next state value (#3373 ruling 2): it
-//! writes the label and its `since` only when the label changes, each column datum only when its
-//! columns differ, and each collection datum row by row (an insert per new key, an update per
-//! changed value, a delete per removed key), never the whole collection. Data a label change leaves
-//! behind is nulled, or its rows deleted. Every edge also names the label it leaves (`from`), which
+//! writes the state as one unit, its label, `since` and every column datum (#3392 A3), and each
+//! collection datum row by row (an insert per new key, an update per changed value, a delete per
+//! removed key), never the whole collection. Data a label change leaves behind is nulled, or its
+//! rows deleted. Every edge also names the label it leaves (`from`), which
 //! the backend checks against the stored label inside the write (#3373 ruling 5).
 
 use std::{collections::BTreeMap, fmt, marker::PhantomData};
@@ -323,11 +323,10 @@ pub struct Edge<K> {
 impl<K> Edge<K> {
     /// An edge that moves the kind's `state` from `previous` to `next`, logged as `event` (#3373
     /// rulings 2 and 3, #3392 G8). The event must leave `previous`'s label and
-    /// enter `next`'s. When the label changes, the label and its `since` are written, and `next`'s
-    /// `since` must be the event's `at`; otherwise neither is written and `next` keeps `previous`'s
-    /// `since`. Each datum of the state is written only where it differs: a column datum's columns
-    /// when they differ (nulled when `next`'s label lacks it), and a collection datum's rows one at
-    /// a time. `previous` must be the state stored at the stamp the edge is applied under: the
+    /// enter `next`'s. When the label changes, `next`'s `since` must be the event's `at`; otherwise
+    /// `next` keeps `previous`'s `since`. The state is written as one unit (#3392 A3): its label,
+    /// `since` and every column datum (null when `next`'s label lacks it); a collection datum's
+    /// rows are written one at a time, only where they differ. `previous` must be the state stored at the stamp the edge is applied under: the
     /// backend checks the stored label and version, and derives nothing from the stored data.
     pub fn transition<S: StateData, E: CodeEnum, P: Cbor>(
         state: StateOf<K, State<S>>,
@@ -350,10 +349,8 @@ impl<K> Edge<K> {
             return Err(EdgeError::Since { field: field.to_owned(), expected: since, found: next.since });
         }
         let mut edge = Edge::empty(field, event)?;
-        if moved {
-            let values = vec![Value::Int(label), Value::Int(event.at.micros())];
-            edge.parts.sets.push(EdgeSet { row: RowPath::Root, field, values });
-        }
+        let values = vec![Value::Int(label), Value::Int(since.micros())];
+        edge.parts.sets.push(EdgeSet { row: RowPath::Root, field, values });
         let mut delta = StateDelta::default();
         S::delta(&previous.value, &next.value, &mut delta).map_err(|error| error.at(field))?;
         for (datum, values) in delta.sets {

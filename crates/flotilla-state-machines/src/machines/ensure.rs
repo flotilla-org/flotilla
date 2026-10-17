@@ -482,7 +482,7 @@ fn gate_retire(h: &mut Handle<'_, Ensure>, edge: &Retire) -> Result<(), EnsureRe
 /// the state, the edge log and the attempts. Indexed by inbox, the read a
 /// binding change makes.
 #[derive(Clone, Debug, PartialEq, Stored)]
-#[store(kind = "Ensure", code = 9, index(name = "by_inbox", eq(inbox)))]
+#[store(kind = "Ensure", code = 9, edges = EnsureEdgeKind, index(name = "by_inbox", eq(inbox)))]
 pub struct EnsureRow {
     /// An address: plain interned text until `flotilla-address` is adopted.
     #[store(intern)]

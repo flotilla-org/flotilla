@@ -36,6 +36,7 @@ use super::{
 #[store(
     kind = "Referral",
     code = 10,
+    edges = ReferralEdge,
     index(name = "by_session", eq(session), order(seq)),
     index(name = "by_reply", eq(in_reply_to), when(in_reply_to is_some))
 )]
@@ -261,7 +262,7 @@ impl Fixture for Referral {
 /// A synthetic convoy-like kind: frozen documents, inputs, and deliverables whose evidence is
 /// records too, changing only through declared edges (#3320 ruling 2).
 #[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Dossier", code = 11)]
+#[store(kind = "Dossier", code = 11, edges = DossierEdgeName)]
 pub struct Dossier {
     #[store(frozen)]
     pub workflow: Frozen<WorkflowSnapshot>,

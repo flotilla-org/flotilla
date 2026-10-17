@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_schema::{Edge, Frozen, Records, Ref, State, StateOf, Stored, Timestamp};
 use flotilla_state_machines::{
     machines::lifecycle::{
-        Absence, GiveUp, Lifecycle, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld, Observed, Realisation, Realise,
-        Release, Teardown, Vanish,
+        Absence, GiveUp, Lifecycle, LifecycleEdgeKind, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld, Observed,
+        Realisation, Realise, Release, Teardown, Vanish,
     },
     Attempt, MachineRow, Resource, RowParts,
 };
@@ -62,6 +62,7 @@ pub struct TerminalRequest {
 #[store(
     kind = "TerminalSession",
     code = 6,
+    edges = LifecycleEdgeKind,
     index(name = "by_vessel", eq(vessel), order(ordinal)),
     index(name = "live_by_pool", eq(pool), when(state in [Requested, Realised]))
 )]

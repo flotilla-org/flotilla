@@ -33,7 +33,7 @@ pub mod ticket;
 use std::fmt::Debug;
 
 use chrono::{DateTime, Utc};
-use flotilla_schema::{Edge, EdgeEvent, Identity, Kind, KindCode, KindRegistry, Position, Records, Ref, Timestamp};
+use flotilla_schema::{Edge, EdgeEvent, Identity, Kind, KindCode, KindRegistry, Origin, Position, Records, Ref, Timestamp};
 use flotilla_schema_sqlite::Store;
 pub use flotilla_state_machines::machines::{agent_session::AgentSessionRow, convoy::ConvoyRow, ensure::EnsureRow, message::MessageRow};
 use hegel::{generators as gs, TestCase};
@@ -66,6 +66,11 @@ pub struct GateRead {
 /// `args` with up to two drawn gate reads.
 pub fn payload<A>(tc: &TestCase, pick: Pick, args: A) -> Payload<A> {
     Payload { args, reads: list(tc, pick, 2, |_| GateRead { observed: identity(tc), version: seq(tc) }) }
+}
+
+/// The writer and time of the fixtures' creates, spec edits, deletes and expunges.
+pub fn origin() -> Origin {
+    Origin::new("fixture", Timestamp(1))
 }
 
 /// An edge event from `from` to `to`, with a drawn writer and time.

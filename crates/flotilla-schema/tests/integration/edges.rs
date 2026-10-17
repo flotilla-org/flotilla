@@ -94,7 +94,7 @@ fn ident() -> Ident {
 #[test]
 fn rows_record_their_column_shaped_fields() {
     let set = Session::table_set();
-    let field = |name: &str, columns, state| FieldColumns { name: name.into(), columns, state, datum_of: None };
+    let field = |name: &str, columns, state| FieldColumns { name: name.into(), columns, state, datum_of: None, aliases: Vec::new() };
     assert_eq!(
         set.tables[0].fields,
         [field("realised", 0..3, false), field("phase", 3..5, true), field("input", 5..7, false), field("doc", 7..8, false)]

@@ -530,6 +530,7 @@ fn drop_message(h: &mut Handle<'_, Message>, state: MessageState, drop: &DropMes
 #[store(
     kind = "Message",
     code = 1,
+    edges = MessageEdgeKind,
     index(name = "open_by_inbox", eq(inbox), when(state in [Pending, Awaiting])),
     index(name = "deadline", order(deadline), when(state in [Pending, Awaiting], deadline is_some))
 )]

@@ -76,9 +76,9 @@ fn root_sets(parts: &EdgeParts) -> Vec<&'static str> {
     parts.sets.iter().filter(|set| set.row == RowPath::Root).map(|set| set.field).collect()
 }
 
-// The stored edge for an applied edge writes the label and its since only when the label
-// changes, since then being the event's time, and otherwise keeps the stored since; the event is
-// the home's, and it leaves the stored label.
+// The stored edge for an applied edge writes the state as one unit (#3392 A3): its label, its
+// since (the event's time when the label changes, the stored since otherwise) and its column
+// data; the event is the home's, and it leaves the stored label.
 #[test]
 fn a_rows_edge_moves_since_only_with_the_label() {
     let mut home = Home::<Convoy>::new("home").expect("valid");
@@ -91,7 +91,12 @@ fn a_rows_edge_moves_since_only_with_the_label() {
     let (edge, kept) = row.edge(&event, home.get("c").expect("exists").state().clone()).expect("edge");
     assert_eq!(kept.since, Timestamp(1), "a data-only edge keeps since");
     let parts = edge.into_parts();
-    assert_eq!((root_sets(&parts), parts.rows.len(), parts.from.code), (vec![], 1, 1), "one resolution row, no root field");
+    assert_eq!(
+        (root_sets(&parts), parts.rows.len(), parts.from.code),
+        (vec!["state", "reason"], 1, 1),
+        "the whole state, one resolution row"
+    );
+    assert_eq!(parts.sets[0].values[1], flotilla_schema::Value::Int(1), "the stored since");
     assert_eq!(parts.appends.len(), 0, "the event is the entry's header, not a row");
     assert_eq!((parts.event.edge, parts.event.from, parts.event.to, parts.event.at), (event.edge.code(), 1, 1, Timestamp(5)));
     assert_eq!(parts.event.payload::<EdgePayload<ConvoyEdge>>().expect("payload"), event.payload);
@@ -101,5 +106,5 @@ fn a_rows_edge_moves_since_only_with_the_label() {
     let (edge, delivered) = row.edge(&event, home.get("c").expect("exists").state().clone()).expect("edge");
     assert_eq!(delivered, State::new(home.get("c").expect("exists").state().clone(), Timestamp(8)), "a label change moves since");
     let parts = edge.into_parts();
-    assert_eq!((root_sets(&parts), parts.rows.len()), (vec!["state"], 0), "the label and since, no data changed");
+    assert_eq!((root_sets(&parts), parts.rows.len()), (vec!["state", "reason"], 0), "the whole state, no row changed");
 }

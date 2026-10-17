@@ -6,7 +6,7 @@ use hegel::TestCase;
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, ErrorCode};
 
 use crate::fixtures::{
-    registry, store, AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession, Ticket,
+    origin, registry, store, AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession, Ticket,
 };
 
 /// A stored value of the column's type that satisfies its own column constraint and foreign key,
@@ -63,7 +63,7 @@ fn refused_by_check(conn: &Connection, table: &Table, key: &[SqlValue], column: 
 
 fn insert_covering<K: Fixture>(write: &mut Write<'_>, tc: &TestCase) {
     for index in 0..K::COVERING {
-        write.insert(&format!("r{index}"), &K::generate(tc, Pick::Cover(index))).expect("insert");
+        write.insert(&format!("r{index}"), &K::generate(tc, Pick::Cover(index)), &origin()).expect("insert");
     }
 }
 
@@ -179,8 +179,7 @@ fn record_stamps_are_never_null(tc: TestCase) {
         }
     }
     assert_eq!(
-        checked, 13,
-        "every engine kind's edges, the session's receipts, the Ensure's and the terminal session's attempts, the ticket's and \
-         referral's edges, and the dossier's deliverables, evidence and edges"
+        checked, 5,
+        "the session's receipts, the Ensure's and the terminal session's attempts, and the dossier's deliverables and evidence"
     );
 }
