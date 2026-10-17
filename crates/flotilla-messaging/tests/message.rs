@@ -575,7 +575,7 @@ async fn delivery_receiver_reads_are_bounded() {
     use flotilla_resources::{Convoy, ConvoySpec};
     use flotilla_store_testkit::ReadCountsBackendExt;
     let mut counts = Vec::new();
-    for n in [0, 10, 200] {
+    for (n, max_reads) in [(0, 3), (10, 30), (200, 410)] {
         let memory = InMemoryBackend::default().with_read_counts();
         let backend = ResourceBackend::new(memory.clone());
         backend
@@ -598,9 +598,10 @@ async fn delivery_receiver_reads_are_bounded() {
         };
         let before = memory.read_snapshot();
         inbox.reconcile_delivery(&transport, at(20)).await.expect("delivery pass");
-        let delta = memory.read_snapshot().since(&before);
-        let calls = delta.calls_by_kind();
-        eprintln!("delivery measurement: active={n}, reads={}, by_kind={calls:?}", calls.values().sum::<usize>());
+        let calls = memory.read_snapshot().since(&before).calls_by_kind();
+        // Preserve the measured whole-pass read budget without noisy output.
+        let reads = calls.values().sum::<usize>();
+        assert!(reads <= max_reads, "active={n}: {reads} reads exceed the {max_reads}-read pass budget: {calls:?}");
         counts.push(["Convoy", "TerminalSession", "ConvoyEnsure"].map(|kind| calls.get(kind).copied().unwrap_or_default()));
         assert!(transport.submissions.lock().expect("submissions").is_empty());
         for message in backend.using::<Message>("flotilla").list().await.expect("messages").items {

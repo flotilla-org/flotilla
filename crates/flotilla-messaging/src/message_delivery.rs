@@ -77,7 +77,6 @@ impl MessageInbox {
         let messages = self.messages.query(&MessageQuery::active()).await?;
         let next = messages
             .iter()
-            .filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
             .flat_map(|message| {
                 let status = message.status.as_ref();
                 let submission = status.and_then(|status| status.submission.as_ref());

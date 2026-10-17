@@ -4,6 +4,7 @@ Measured in the crew vessel on 2026-10-17. Baseline is the assignment checkout
 before the scheduling change, with only measurement/test instrumentation added.
 Both runs use the default unoptimized Cargo test profile, default TMPDIR,
 production controller cadences, and no concurrent builds during measurement.
+The reports below describe the initial implementation at `d78d3c180`.
 This is a small vessel comparison, not the operator's feta d1-n1000 check.
 
 ## Commands
@@ -29,7 +30,8 @@ not be used to reinterpret these rows.
 cargo test -p flotilla-messaging --locked --test message delivery_receiver_reads_are_bounded -- --nocapture
 ```
 
-A real in-memory store with its read observer counts all adapter read calls,
+The test retains these counts as upper-bound assertions rather than printing
+measurement scaffolding. A real in-memory store with its read observer counts all adapter read calls,
 including empty queries, across one entire `reconcile_delivery` call. Each
 active record addresses a distinct unresolved role. Fixtures are fully admitted
 before the counter snapshot; no unrelated background controllers run.
@@ -84,6 +86,14 @@ Both mutations were reverted before the local gate.
 Active counts are point samples at the load driver's sampling cadence, not an
 exact high-water mark. Before samples: 0, 6, 2, 4, 7, 7, 3, 1.
 After samples: 0, 3, 2, 8, 14, 14, 2, 4.
+
+`Message queue peak` is now constant at one **by construction**: it denotes one
+namespace dirty bit, rather than the old queued-message-name count. Similarly,
+`resync_enqueued` now counts namespace wakes, not Message objects. These metrics
+are not like-for-like queue measurements; the controller regression directly
+checks pass counts. Active-message samples used one temporary active query per
+home per sample; the sampling query and print were removed after collecting
+these reports. Future load runs do not print active-message samples.
 
 The queue no longer accumulates message names, and resync scheduling is constant
 in message count. This small unoptimized run **does not demonstrate improved

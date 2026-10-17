@@ -331,17 +331,6 @@ impl FleetTarget for InProcessFleet {
     }
 
     async fn sample(&self) -> Result<TargetSample, String> {
-        for (index, home) in self.homes.iter().enumerate() {
-            let active = home
-                .daemon
-                .resource_backend()
-                .using::<Message>(NAMESPACE)
-                .query(&flotilla_store::MessageQuery::active())
-                .await
-                .map_err(|error| error.to_string())?
-                .len();
-            eprintln!("delivery active messages: home={index} active={active}");
-        }
         let homes = self
             .homes
             .iter()

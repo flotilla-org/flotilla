@@ -1168,6 +1168,20 @@ async fn codex_idle_hook_confirms_held_submission() {
 // at the scheduling seam; absent receivers avoid terminal subprocesses.
 #[tokio::test(start_paused = true)]
 async fn message_resync_coalesces_active_messages() {
+    async fn wait_for_passes(metrics: &flotilla_store::load_metrics::ControllerLoadMetrics, minimum: u64) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                // Paused time advances only after runnable tasks drain, so this
+                // also lets finite watch/write follow-ups reach quiescence.
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                if metrics.snapshot().reconcile.count() >= minimum {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("controller must complete the expected passes within one virtual second");
+    }
     for n in [0, 1, 10, 100] {
         let temp = TempDir::new().expect("tempdir");
         fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-resync\"\n").expect("daemon config");
@@ -1209,14 +1223,10 @@ async fn message_resync_coalesces_active_messages() {
         let heartbeat = Arc::new(AtomicU64::new(0));
         let controller = super::super::message::MessageController { state, namespace: NAMESPACE.into() };
         let task = tokio::spawn(controller.run(Duration::from_secs(60), heartbeat, Arc::clone(&metrics)));
-        for _ in 0..1000 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_passes(&metrics, 1).await;
         let before = metrics.snapshot().reconcile.count();
         tokio::time::advance(Duration::from_secs(60)).await;
-        for _ in 0..1000 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_passes(&metrics, before + 1).await;
         let passes = metrics.snapshot().reconcile.count() - before;
         assert_eq!(passes, 1, "active={n}: resync must run one inbox pass");
         // New-message watches must still wake an idle inbox, including after
@@ -1238,9 +1248,7 @@ async fn message_resync_coalesces_active_messages() {
                 .await
                 .expect("new admission");
         }
-        for _ in 0..1000 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_passes(&metrics, before + 1).await;
         let passes = metrics.snapshot().reconcile.count() - before;
         assert!(passes > 0, "active={n}: new admissions must wake delivery");
         // Every interleaved admission must have reached a delivery pass, even

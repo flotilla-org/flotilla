@@ -63,6 +63,8 @@ impl MessageController {
         drop(wake);
         let inbox = self.state.daemon.message_inbox(&self.namespace).await;
         let transport = TerminalControllerRuntime { state: Arc::clone(&self.state) };
+        // Durable batch intent makes passes safe to cancel and rerun after
+        // watch failure; recovery observes held submissions without retyping.
         tokio::select! {
             result = run_delivery(&inbox, &transport, receiver, resync_interval, heartbeat, metrics) => result,
             result = watches.join_next() => {
@@ -111,11 +113,18 @@ async fn run_delivery(
         metrics.wakes.increment();
         metrics.queue_peak.observe(1);
         let started = tokio::time::Instant::now();
-        if let Err(error) = inbox.reconcile_delivery(transport, Utc::now()).await {
-            metrics.failures.increment();
-            return Err(error);
+        let result = async {
+            inbox.reconcile_delivery(transport, Utc::now()).await?;
+            inbox.next_delivery_wake(Utc::now()).await
         }
-        next = inbox.next_delivery_wake(Utc::now()).await?.map(|delay| tokio::time::Instant::now() + delay);
+        .await;
+        match result {
+            Ok(delay) => next = delay.map(|delay| tokio::time::Instant::now() + delay),
+            Err(error) => {
+                metrics.failures.increment();
+                return Err(error);
+            }
+        }
         metrics.reconcile.record(started.elapsed());
     }
 }
