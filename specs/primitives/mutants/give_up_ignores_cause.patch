@@ -1,0 +1,11 @@
+--- a/machines/lifecycle.qnt
++++ b/machines/lifecycle.qnt
+@@ -39,7 +39,7 @@
+           | _ => Refused(WrongState)
+         }
+       | GiveUp(o) => match s {
+-          | Requested(h) => if (exhausted(h) and lastCauseIs(h, o.cause)) Moved(GaveUp(o.cause)) else Refused(MissingEvidence)
++          | Requested(h) => if (exhausted(h)) Moved(GaveUp(o.cause)) else Refused(MissingEvidence)
+           | _ => Refused(WrongState)
+         }
+     }
