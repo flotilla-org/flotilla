@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::tasks::AGGREGATOR_CONTROLLER;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
 
@@ -945,7 +946,7 @@ async fn capability_regression_keeps_live_forge_observer() {
     // Exhausted forge-refresh scheduling explicitly withdraws an otherwise
     // live daemon; unrelated adapter faults alone do not do so.
     health.report_restart_budget_exhausted(RestartBudgetExhausted {
-        controller: "aggregator",
+        controller: AGGREGATOR_CONTROLLER,
         error: ResourceError::other("refresh loop failed"),
         attempts: 10,
     });

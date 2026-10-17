@@ -30,7 +30,7 @@ use tracing::{error, warn};
 
 use super::discovery::LocalProvisioningProfile;
 use super::seed::{ensure_host_exists, migrate_live_placement_policies};
-use super::tasks::{spawn_periodic_task, PeriodicTaskStart, CONVOY_ENSURE_CONDITION_TYPE};
+use super::tasks::{spawn_periodic_task, PeriodicTaskStart, AGGREGATOR_CONTROLLER, CONVOY_ENSURE_CONDITION_TYPE};
 use crate::{
     blob_store::TieredBlobStore, resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name,
     supervisor::RestartBudgetExhausted,
@@ -116,7 +116,7 @@ impl RuntimeHealth {
             ))
             .observed_at(Utc::now())
             // Only the aggregator schedules forge refresh; actuator-controller failure does not stop reads.
-            .blocks_forge_observation(exhausted.controller == "aggregator")
+            .blocks_forge_observation(exhausted.controller == AGGREGATOR_CONTROLLER)
             .build();
         self.failures.lock().expect("runtime health lock poisoned").insert(condition_type, condition);
     }

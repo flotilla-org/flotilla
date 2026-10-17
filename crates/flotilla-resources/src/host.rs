@@ -418,6 +418,7 @@ pub const LOCAL_ROWS_MISSING_REASON: &str = "LocalRowsMissing";
 /// `True` means the named subsystem is healthy. `False` surfaces a diagnostic;
 /// by default it also makes the host unavailable for placement until a later
 /// observation clears it, unless `blocks_readiness` marks it advisory.
+///
 /// # Example
 ///
 /// New condition authors must decide whether to withdraw forge observation.
