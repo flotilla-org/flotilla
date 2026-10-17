@@ -92,6 +92,7 @@ fn the_enumeration_covers_every_kind_and_index() {
         "log_about_first",
         "log_about_after",
         "log_expunge",
+        "log_expunged_after",
         "identity_delete",
         "message select",
         "message update version",

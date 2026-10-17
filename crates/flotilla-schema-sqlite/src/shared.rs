@@ -67,6 +67,7 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("log_about_first", LOG_ABOUT_FIRST),
     ("log_about_after", LOG_ABOUT_AFTER),
     ("log_expunge", LOG_EXPUNGE),
+    ("log_expunged_after", LOG_EXPUNGED_AFTER),
     ("string_id", STRING_ID),
     ("string_insert", STRING_INSERT),
     ("identity_resolve", IDENTITY_RESOLVE),
@@ -103,6 +104,9 @@ pub(crate) const LOG_BY_HOME: &str = log_select!("WHERE l.home = ?1 AND l.home_s
 pub(crate) const LOG_ABOUT_FIRST: &str = log_select!("WHERE l.about = ?1 ORDER BY l.at, l.rowid LIMIT ?2");
 pub(crate) const LOG_ABOUT_AFTER: &str = log_select!("WHERE l.about = ?1 AND (l.at, l.rowid) > (?2, ?3) ORDER BY l.at, l.rowid LIMIT ?4");
 pub(crate) const LOG_EXPUNGE: &str = "DELETE FROM log WHERE resource = ?1";
+/// A home's expunge entries after a sequence: the tombstones an event of an unknown identity is
+/// checked against.
+pub(crate) const LOG_EXPUNGED_AFTER: &str = "SELECT effect FROM log WHERE home = ?1 AND home_seq > ?2 AND cause = 'expunge'";
 pub(crate) const STRING_ID: &str = "SELECT id FROM strings WHERE s = ?1";
 pub(crate) const STRING_INSERT: &str = "INSERT INTO strings (s) VALUES (?1)";
 pub(crate) const IDENTITY_RESOLVE: &str = "SELECT id FROM resource_identity WHERE kind = ?1 AND name = ?2 AND home = ?3";

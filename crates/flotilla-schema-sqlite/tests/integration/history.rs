@@ -107,7 +107,9 @@ fn an_engine_edge_entry_holds_its_recorded_reads(tc: TestCase) {
 // history: its entries, then its identity, in one transaction, leaving one `expunge` entry that
 // names the identity by kind, name and home and references no identity row. A replica applying
 // the log does the same, an expunge applied again is a duplicate, and a replica that never held
-// the resource (its entries were gone before it read the log) logs the expunge alone.
+// the resource (its entries were gone before it read the log) logs the expunge alone. A late copy
+// of an old entry, at a replica or arriving after the expunge at a fresh one, meets the expunge
+// entry as a tombstone and is a duplicate: an expunged resource never returns.
 #[test]
 fn a_delete_keeps_history_and_an_expunge_removes_it() {
     let mut source = store();
@@ -151,16 +153,28 @@ fn a_delete_keeps_history_and_an_expunge_removes_it() {
     assert_eq!(target.read().expect("read").resolve(MessageRow::CODE, "m", LOCAL).expect("resolve"), None);
     assert_eq!(log(&mut target, LOCAL), log(&mut source, LOCAL), "the replica's log is the home's");
     assert_eq!(replay(&mut source, &mut target, seen), [Applied::Duplicate(None)], "a replayed expunge is a duplicate");
+    // Late duplicates of the expunged resource's old entries meet its expunge entry, the tombstone
+    // that outlives its identity: each is a duplicate, and nothing is recreated.
+    let mut write = target.write().expect("write");
+    for entry in &history {
+        assert_eq!(write.apply(entry).expect("a late duplicate"), Applied::Duplicate(None), "{entry:?}");
+    }
+    assert_eq!(write.resolve(MessageRow::CODE, "m", LOCAL).expect("resolve"), None, "no expunged resource returns");
+    write.commit().expect("commit");
 
     let mut fresh = replica();
     let applied = replay(&mut source, &mut fresh, 0);
-    assert_eq!(applied.last(), Some(&Applied::Expunged));
+    assert_eq!(applied.last(), Some(&Applied::Expunged), "never held, the expunge is logged alone");
     assert_eq!(log(&mut fresh, LOCAL), log(&mut source, LOCAL));
+    let mut write = fresh.write().expect("write");
+    assert_eq!(write.apply(&history[0]).expect("an old create after the expunge"), Applied::Duplicate(None));
+    assert_eq!(write.resolve(MessageRow::CODE, "m", LOCAL).expect("resolve"), None);
+    write.commit().expect("commit");
 }
 
 // Behaviour (#3392 A1): an expunge removes only a deleted resource's history (`Live` otherwise),
-// and not while another resource's row references it (`Referenced`); a refused expunge writes
-// nothing and leaves the transaction usable.
+// only at its home (`NotHome`), and not while another resource's row references it
+// (`Referenced`); a refused expunge writes nothing and leaves the transaction usable.
 #[test]
 fn an_expunge_refuses_live_and_referenced_resources() {
     let mut store = store();
@@ -175,6 +189,19 @@ fn an_expunge_refuses_live_and_referenced_resources() {
     assert!(matches!(refused, Err(StoreError::Referenced { id }) if id == session.id), "{refused:?}");
     assert_eq!(write.changes_since(LOCAL, 0, 100).expect("log"), before, "a refused expunge writes nothing");
     assert_eq!(write.resolve(AgentSessionRow::CODE, "session", LOCAL).expect("resolve"), Some(session.id));
+    write.commit().expect("commit");
+
+    let mut remote = Store::open(Connection::open_in_memory().expect("db"), "remote", registry()).expect("open remote");
+    let mut write = remote.write().expect("write");
+    let far = write.insert("far", &message::sample(), &origin()).expect("insert");
+    write.delete::<MessageRow>(far, &origin()).expect("delete");
+    write.commit().expect("commit");
+    let mut write = store.write().expect("write");
+    for entry in remote.read().expect("read").changes_since("remote", 0, 10).expect("log") {
+        write.apply(&entry).expect("apply");
+    }
+    let id = write.resolve(MessageRow::CODE, "far", "remote").expect("resolve").expect("present");
+    assert!(matches!(write.expunge::<MessageRow>(id, &origin()), Err(StoreError::NotHome { .. })), "only the home expunges");
     write.commit().expect("commit");
 }
 

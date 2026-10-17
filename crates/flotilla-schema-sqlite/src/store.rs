@@ -24,8 +24,8 @@ use crate::{
     query::{page_limit, Cursor, Page},
     shared::{
         schema_ddl, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_ABOUT_AFTER,
-        LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT,
-        SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS, STRING_ID, STRING_INSERT,
+        LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE, LOG_EXPUNGED_AFTER, OBJECT_BYTES, OBJECT_EXISTS,
+        OBJECT_PUT, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS, STRING_ID, STRING_INSERT,
     },
     sql::{KindSql, TableSql},
 };
@@ -433,7 +433,8 @@ impl Write<'_> {
     /// (`UnknownKind`), the home must not be this store's (`OwnHome`), and an event at or below
     /// the identity's sequence is `Duplicate` and changes nothing, so replaying a log is
     /// idempotent. The identity's sequence survives a delete, so a replayed event never
-    /// resurrects a deleted resource. An event whose `prev_seq` is not the identity's sequence
+    /// resurrects a deleted resource; an expunged identity's entry stays as its tombstone, so an
+    /// event of an unknown identity older than a logged expunge of it is a `Duplicate` too. An event whose `prev_seq` is not the identity's sequence
     /// follows one this store has not applied: it is a `Gap`, and the caller fetches the missing
     /// events first. An edge's codes are checked against the kind as the writer checks them.
     /// Otherwise the effect is lowered and executed exactly as a local write's is, objects
@@ -1145,6 +1146,11 @@ impl Ctx<'_> {
         if event.cause == Cause::Expunge {
             return self.apply_expunge(event, known, current, sequence);
         }
+        // An expunged identity has no row to hold its sequence, but its expunge entry stays: an
+        // event older than it is a late duplicate, never a new resource.
+        if known.is_none() && self.expunged_after(&identity, sequence)? {
+            return Ok(Applied::Duplicate(None));
+        }
         if event.prev_seq != current {
             return Err(StoreError::Gap { expected: current, found: event.prev_seq });
         }
@@ -1175,6 +1181,19 @@ impl Ctx<'_> {
         let home = self.intern(&event.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
         Ok(Applied::Applied(Stamp { id, version: event.home_seq }))
+    }
+
+    /// Whether this store logged an expunge of `identity` after `sequence` of its home.
+    fn expunged_after(&mut self, identity: &Identity, sequence: i64) -> Result<bool, StoreError> {
+        let Some(home) = self.string_id(&identity.home)? else { return Ok(false) };
+        let mut statement = self.conn.prepare_cached(LOG_EXPUNGED_AFTER)?;
+        let effects = statement.query_map(params![home, sequence], |row| row.get::<_, Vec<u8>>(0))?;
+        for effect in effects {
+            if Effect::decode(&effect?)?.expunged.as_ref() == Some(identity) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Another home's expunge: the identity's entries and identity go, if this store holds them,
