@@ -228,8 +228,8 @@ impl Kind for Authority {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConvoyRefusal {
     NoPromises,
-    /// Admission read the request's project and found none (#3392 G1). The
-    /// spec's admission has no world read; see the PR's spec question.
+    /// Admission read the request's project and found none (#3392 G1); the
+    /// spec's `projectKnown` is that read.
     UnknownProject,
     /// The spec refuses negative quota counts. Counts here are unsigned, so
     /// neither admission nor readmission produces this.
