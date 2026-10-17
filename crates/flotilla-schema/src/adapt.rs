@@ -512,7 +512,10 @@ fn decode_records<T: Element>(d: &mut Decoder) -> Result<Records<T>, DecodeError
             let version = u64::decode(d).map_err(|error| error.at(RECORD_VERSION))?.ok_or_else(|| DecodeError::missing(RECORD_VERSION))?;
             Ok((version, T::decode_row(d)?))
         })? {
-            records.append(version, record);
+            // `pos` was checked against `records.len()` and fits a u32, so there is room.
+            records
+                .append(version, record)
+                .map_err(|_| DecodeError::OutOfRange { column: "pos".to_owned(), value: i64::from(u32::MAX) })?;
         }
         Ok(records)
     })

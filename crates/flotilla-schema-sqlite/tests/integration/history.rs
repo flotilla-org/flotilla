@@ -414,7 +414,7 @@ fn renamed_fields_read_entries_written_under_their_aliases() {
     };
     let mut old = open(LOCAL, |kinds| kinds.register::<Before>().expect("register"));
     let mut notes = Records::new();
-    notes.append(0, OldNote { text: "first".into() });
+    notes.append(0, OldNote { text: "first".into() }).expect("room");
     let value = Before { title: "t".into(), who: Person { name: "ann".into() }, tags: vec!["a".into(), "b".into()], notes };
     let mut write = old.write().expect("write");
     write.insert("n", &value, &origin()).expect("insert");

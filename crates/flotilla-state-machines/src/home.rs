@@ -11,7 +11,7 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use flotilla_schema::{EdgeEvent, Records, State, Timestamp};
+use flotilla_schema::{EdgeEvent, Records, RecordsFull, State, Timestamp};
 
 use crate::{
     Admission, DefError, Edge, EdgeEventOf, EdgeKind, EdgePayload, Fault, Handle, InputRead, Judged, Label, Machine, MachineDef,
@@ -167,6 +167,8 @@ pub enum WriteError<M: Machine> {
     Refused(M::Refusal),
     /// A declaration fault; see [`Fault`].
     Fault(Fault<Label<M>, EdgeKind<M>>),
+    /// One of the resource's record tables has used every position.
+    Full(RecordsFull),
 }
 
 impl<M: Machine> WriteError<M> {
@@ -194,6 +196,7 @@ impl<M: Machine> PartialEq for WriteError<M> {
             (WriteError::Unknown(a), WriteError::Unknown(b)) | (WriteError::Exists(a), WriteError::Exists(b)) => a == b,
             (WriteError::Refused(a), WriteError::Refused(b)) => a == b,
             (WriteError::Fault(a), WriteError::Fault(b)) => a == b,
+            (WriteError::Full(a), WriteError::Full(b)) => a == b,
             _ => false,
         }
     }
@@ -206,6 +209,7 @@ impl<M: Machine> fmt::Debug for WriteError<M> {
             WriteError::Exists(name) => f.debug_tuple("Exists").field(name).finish(),
             WriteError::Refused(refusal) => f.debug_tuple("Refused").field(refusal).finish(),
             WriteError::Fault(fault) => f.debug_tuple("Fault").field(fault).finish(),
+            WriteError::Full(full) => f.debug_tuple("Full").field(full).finish(),
         }
     }
 }
@@ -286,6 +290,8 @@ impl<M: Machine> Home<M> {
     /// rises, and the returned event (whose payload holds the edge and the
     /// gate's and effect's reads) is appended to its edge events, stamped with
     /// the new version. [`Resource::stored_edge`] gives the stored edge persisting it.
+    /// A resource whose edge log has used every position refuses with
+    /// [`WriteError::Full`] and is left unchanged.
     pub fn apply(
         &mut self,
         name: &str,
@@ -301,13 +307,16 @@ impl<M: Machine> Home<M> {
         // The step borrowed the resource immutably; this second lookup of the
         // same name under `&mut self` cannot miss.
         let resource = self.resources.get_mut(name).ok_or_else(|| WriteError::Unknown(name.to_string()))?;
+        if resource.events.is_full() {
+            return Err(WriteError::Full(RecordsFull));
+        }
         let from = resource.label();
         let to = next.label();
         let since = if from == to { resource.state.since } else { now };
         resource.version = resource.version.next();
         resource.state = State::new(next, since);
         let event = EdgeEvent { edge: edge.kind(), from, to, writer: self.writer.clone(), at: now, payload: EdgePayload { edge, reads } };
-        Ok(&resource.events.append(resource.version.0, event).record)
+        Ok(&resource.events.append(resource.version.0, event).map_err(WriteError::Full)?.record)
     }
 
     /// Runs a judgement over one resource; see [`Resource::judge`].

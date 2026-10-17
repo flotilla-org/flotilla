@@ -8,6 +8,7 @@ use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, ErrorCode
 
 use crate::fixtures::{
     origin, registry, store, AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Ticket,
+    Vessel,
 };
 
 /// A stored value of the column's type that satisfies its own column constraint and foreign key,
@@ -78,6 +79,7 @@ fn insert_all(write: &mut Write<'_>, tc: &TestCase) {
     insert_covering::<Resource<Convoy>>(write, tc);
     insert_covering::<Resource<Ensure>>(write, tc);
     insert_covering::<TerminalSession>(write, tc);
+    insert_covering::<Resource<Vessel>>(write, tc);
     insert_covering::<Ticket>(write, tc);
     insert_covering::<Referral>(write, tc);
     insert_covering::<Dossier>(write, tc);

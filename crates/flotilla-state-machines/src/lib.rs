@@ -1,4 +1,4 @@
-//! The storage-free state-machine engine of ADR 0064.
+//! The backend-free state-machine engine of ADR 0064.
 //!
 //! A machine is declared once with ordinary Rust: a state enum whose variants
 //! carry their named data, an enum of edges whose variants each wrap their own
@@ -39,11 +39,17 @@
 //! Every machine's stored kind is its [`Resource`] (#3392 ruling D5): the
 //! storage derive targets the machine's spec, which names the kind, its code,
 //! indexes and state, and its state; the resource supplies the edge log and
-//! records, and the store its name and version. Message, AgentSession, Convoy
-//! and Ensure declare their specs here, and a lifecycle kind's request is its
-//! spec wherever it is declared. Nothing here touches a backend, replication or a
-//! wire encoding. The only workspace crate this one reaches is `flotilla-schema`,
-//! and no production crate depends on this one yet (`ci/build-graph/check.py`).
+//! records, and the store its name and version. Message, AgentSession, Convoy,
+//! Vessel and Ensure declare their specs here, listed under their permanent
+//! codes by the production registry ([`kinds`]), and any other lifecycle
+//! kind's request is its spec wherever it is declared. A reference to a
+//! definitions-class kind or to anything outside the store is an address
+//! (`flotilla_schema::Address`), whose existence admission reads through the
+//! recording [`Admission`] handle; a reference to a record in the store is a
+//! `flotilla_schema::Ref` (kind, name and home). Nothing here touches a
+//! backend, replication or a wire encoding. The only workspace crate this one
+//! reaches is `flotilla-schema` (and `flotilla-address` through it), and no
+//! production crate depends on this one yet (`ci/build-graph/check.py`).
 
 pub mod attempt;
 mod code;
@@ -63,4 +69,4 @@ pub use machine::{
 };
 pub use read::{Admission, Handle, InputRead, Judged, Kind, Ref, Source, Table, Version};
 pub use record::{EdgeEventOf, EdgePayload, Transport};
-pub use stored::StoredState;
+pub use stored::{kinds, StoredState};

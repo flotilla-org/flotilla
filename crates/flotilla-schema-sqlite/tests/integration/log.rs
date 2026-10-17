@@ -15,7 +15,7 @@ use flotilla_state_machines::machines::message::MessageSpec;
 use crate::fixtures::{
     message as messages, origin, registry, store,
     synthetic::{workflow, InputValue},
-    AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Ticket, LOCAL,
+    AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Ticket, Vessel, LOCAL,
 };
 
 const REPLICA: &str = "replica";
@@ -104,6 +104,7 @@ fn slots() -> Vec<(KindCode, String)> {
         Resource::<Convoy>::CODE,
         Resource::<Ensure>::CODE,
         TerminalSession::CODE,
+        Resource::<Vessel>::CODE,
         Ticket::CODE,
         Referral::CODE,
         Dossier::CODE,
@@ -172,6 +173,7 @@ fn the_log_replays_into_another_store(tc: TestCase) {
             Ticket::CODE => step::<Ticket>(&tc, &mut write, live, name, last),
             Referral::CODE => step::<Referral>(&tc, &mut write, live, name, last),
             Dossier::CODE => step::<Dossier>(&tc, &mut write, live, name, last),
+            Resource::<Vessel>::CODE => step::<Resource<Vessel>>(&tc, &mut write, live, name, last),
             _ => step::<TerminalSession>(&tc, &mut write, live, name, last),
         }
         if tc.draw(gs::booleans()) {
@@ -448,6 +450,7 @@ fn a_snapshot_plus_its_tail_is_the_newest_snapshot(tc: TestCase) {
     snapshot_plus_tail::<Resource<Convoy>>(&tc);
     snapshot_plus_tail::<Resource<Ensure>>(&tc);
     snapshot_plus_tail::<TerminalSession>(&tc);
+    snapshot_plus_tail::<Resource<Vessel>>(&tc);
     snapshot_plus_tail::<Ticket>(&tc);
     snapshot_plus_tail::<Referral>(&tc);
     snapshot_plus_tail::<Dossier>(&tc);

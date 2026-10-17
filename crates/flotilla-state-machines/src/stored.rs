@@ -17,11 +17,31 @@
 
 use flotilla_schema::{
     adapt::{Adapter, AsColumns},
-    Cbor, CodeEnum, ColumnOf, DecodeError, Decoder, Edge, EdgeError, Element, EncodeError, Encoder, Identity, Kind, KindCode, KindSpec,
-    Labelled, Layout, Records, State, StateData, StateOf, TableSet,
+    Cbor, CodeEnum, ColumnOf, DecodeError, Decoder, Edge, EdgeError, Element, EncodeError, Encoder, Identity, Kind, KindCode, KindRegistry,
+    KindSpec, Labelled, Layout, Records, RegistryError, State, StateData, StateOf, TableSet,
 };
 
-use crate::{EdgeEventOf, EdgeKind, EdgePayload, Label, Machine, Resource, Version};
+use crate::{
+    machines::{agent_session::AgentSession, convoy::Convoy, ensure::Ensure, message::Message, vessel::Vessel},
+    EdgeEventOf, EdgeKind, EdgePayload, Label, Machine, Resource, Version,
+};
+
+/// The production kind registry (#3373 ruling 6): every stored kind the engine
+/// declares, each under the code it holds for good. Codes are stored with every
+/// identity and change, so a production code is allocated once, here, and never
+/// reused or moved; a kind declared elsewhere (a lifecycle kind's request beside
+/// its owner) registers into this registry under a new code. Test kinds are
+/// registered beside these, so the registry refuses any test kind that takes a
+/// production code.
+pub fn kinds() -> Result<KindRegistry, RegistryError> {
+    let mut registry = KindRegistry::new();
+    registry.register::<Resource<Message>>()?;
+    registry.register::<Resource<AgentSession>>()?;
+    registry.register::<Resource<Convoy>>()?;
+    registry.register::<Resource<Vessel>>()?;
+    registry.register::<Resource<Ensure>>()?;
+    Ok(registry)
+}
 
 /// Machine `M`'s state as stored: the value and the time its label was entered.
 pub type StoredState<M> = State<<M as Machine>::State>;

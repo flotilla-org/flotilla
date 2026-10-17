@@ -5,8 +5,8 @@
 //! the attempt tally while Requested); its history, attempts among its edges, is its log entries;
 //! the request's columns are this test kind's own,
 //! transcribed from the #3208 §4.3 sketch:
-//! - `vessel` is a reference to the `Vessel` kind (a target kind of the test registry), so a
-//!   lifecycle row also exercises references to kinds and their identity rows;
+//! - `vessel` is a reference to the engine's stored `Vessel` kind, so a lifecycle row also
+//!   exercises references to kinds and their identity rows;
 //! - an agent source's brief is frozen inside a data enum variant: a hash column guarded by the
 //!   variant's CHECK;
 //! - labels are a set: a child table whose key is the value itself.
@@ -19,6 +19,7 @@ use flotilla_state_machines::{
         Absence, Attempted, GiveUp, Lifecycle, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld, Observed, Realisation,
         Realise, Release, Teardown, Vanish,
     },
+    machines::vessel::Vessel,
     Resource,
 };
 use hegel::{generators as gs, TestCase};
@@ -29,13 +30,6 @@ use super::{
     ensure::{cause, outcome, tally},
     key, list, name, reference, text, timestamp, Fixture, Pick,
 };
-
-/// A minimal target kind for `TerminalSession::vessel`.
-#[derive(Debug, Clone, PartialEq, Stored)]
-#[store(kind = "Vessel", code = "ve")]
-pub struct Vessel {
-    pub name: String,
-}
 
 /// The test lifecycle kind: its name, request and the default retry policy.
 pub struct Terminal;
@@ -61,7 +55,7 @@ pub type TerminalSession = Resource<Lifecycle<Terminal>>;
     index(name = "live_by_pool", eq(pool), when(state in [Requested, Realised]))
 )]
 pub struct TerminalRequest {
-    pub vessel: Ref<Vessel>,
+    pub vessel: Ref<Resource<Vessel>>,
     #[store(intern)]
     pub role: String,
     pub ordinal: u16,
@@ -151,10 +145,10 @@ fn boxed(world: MemoryLifecycleWorld) -> Box<dyn LifecycleWorld> {
     Box::new(world)
 }
 
-/// Every edge a live session may take: realising under an observed identity, releasing once torn
-/// down, vanishing when observed absent, an attempt of either outcome, and giving up with its last
-/// failure's cause.
-pub fn candidates(tc: &TestCase, session: &TerminalSession) -> Vec<Candidate<Lifecycle<Terminal>>> {
+/// Every edge a live lifecycle resource in `state` may take: realising under an observed identity,
+/// releasing once torn down, vanishing when observed absent, an attempt of either outcome, and
+/// giving up with its last failure's cause.
+pub fn candidates<K: LifecycleKind>(tc: &TestCase, state: &LifecycleState) -> Vec<Candidate<Lifecycle<K>>> {
     let now = timestamp(tc);
     let mut candidates = Vec::new();
     let (identity, observed) = (text(tc), flotilla_state_machines::Ref::<Realisation>::new(name(tc)));
@@ -170,7 +164,7 @@ pub fn candidates(tc: &TestCase, session: &TerminalSession) -> Vec<Candidate<Lif
     world.absences.put(&absent, true);
     candidates.push((Vanish { observed: absent }.into(), boxed(world), now));
     candidates.push((Attempted { outcome: outcome(tc, Pick::Draw) }.into(), boxed(MemoryLifecycleWorld::default()), now));
-    let last = match session.state() {
+    let last = match state {
         LifecycleState::Requested { last_failure, .. } => last_failure.as_ref().map(|failure| failure.cause.clone()),
         _ => None,
     };
@@ -193,7 +187,7 @@ impl Fixture for TerminalSession {
     }
 
     fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<TerminalSession>, TerminalSession)> {
-        engine::drive(tc, pick, self, candidates(tc, self))
+        engine::drive(tc, pick, self, candidates::<Terminal>(tc, self.state()))
     }
 
     fn stamped(&self, _before: Option<&TerminalSession>, _version: u64) -> TerminalSession {

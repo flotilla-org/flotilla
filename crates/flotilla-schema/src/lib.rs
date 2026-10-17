@@ -86,7 +86,7 @@ pub use history::{EdgeEvent, Labelled};
 pub use inline::{Cbor, INLINE_LIMITS};
 pub use layout::{snake_case, DatumColumns, Layout};
 pub use query::{interned_value, key_value, IndexQuery};
-pub use records::{Position, RecordRow, Records};
+pub use records::{Position, RecordRow, Records, RecordsFull};
 pub use reference::Ref;
 pub use registry::{KindRegistry, RegistryError};
 #[doc(hidden)]
