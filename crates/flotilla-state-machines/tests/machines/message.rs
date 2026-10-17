@@ -368,8 +368,10 @@ fn edge_events_round_trip_through_the_schema_codec() {
     assert_eq!(delivered.writer, "home");
 }
 
-// A payload's document is the edge's serde form: a reference is its name
-// alone, and every read keeps its kind, name and version (or absence).
+// A payload's document is the edge's serde form: its code and arguments, never
+// its variant name, so renaming an edge leaves stored payloads decodable; a
+// reference is its name alone, and every read keeps its kind, name and version
+// (or absence).
 #[test]
 fn payload_documents_name_references_and_keep_reads() {
     let reason = DropReason::Withdrawn { by: "ann".into(), authority: Ref::new("ops") };
@@ -382,7 +384,7 @@ fn payload_documents_name_references_and_keep_reads() {
     assert_eq!(
         json,
         serde_json::json!({
-            "edge": { "Drop": { "reason": { "Withdrawn": { "by": "ann", "authority": "ops" } } } },
+            "edge": [3, { "reason": { "Withdrawn": { "by": "ann", "authority": "ops" } } }],
             "reads": [
                 { "kind": "authority", "name": "ops", "version": 4 },
                 { "kind": "binding", "name": INBOX, "version": null },
@@ -390,4 +392,7 @@ fn payload_documents_name_references_and_keep_reads() {
         })
     );
     assert_eq!(serde_json::from_value::<EdgePayload<MessageEdge>>(json).expect("deserialises"), payload);
+    let unknown = serde_json::json!({ "edge": [9, {}], "reads": [] });
+    let refused = serde_json::from_value::<EdgePayload<MessageEdge>>(unknown).expect_err("no edge has code 9");
+    assert!(refused.to_string().contains("unknown MessageEdge code 9"), "{refused}");
 }
