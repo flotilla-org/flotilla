@@ -73,6 +73,7 @@ pub use edge::{
     AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf, RowPath,
     StateOf,
 };
+pub use flotilla_address::Address;
 pub use flotilla_schema_derive::Stored;
 pub use frozen::{Freezable, Frozen};
 pub use history::{EdgeEvent, Labelled};

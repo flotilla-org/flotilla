@@ -14,8 +14,8 @@ fn at(micros: i64) -> Timestamp {
 }
 
 fn home() -> Home<AgentSession> {
-    let mut home = Home::new("kiwi").expect("valid declaration");
-    home.create("s", ()).expect("created");
+    let mut home = Home::<AgentSession>::new("kiwi").expect("valid declaration");
+    home.create("s", (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("created");
     home
 }
 
@@ -91,7 +91,7 @@ fn mermaid_is_pinned() {
 fn create_makes_a_live_detached_session_once() {
     let mut h = home();
     assert_eq!(*state(&h), live(Channel::Detached));
-    assert_eq!(h.create("s", ()).err(), Some(WriteError::Exists("s".into())));
+    assert_eq!(h.create("s", (), &MemoryAgentSessionWorld::default(), Timestamp(0)).err(), Some(WriteError::Exists("s".into())));
     assert_eq!(h.apply("other", attach(), &channel(Some(true)), at(1)).err(), Some(WriteError::Unknown("other".into())));
 }
 

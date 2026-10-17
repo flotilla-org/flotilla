@@ -75,8 +75,8 @@ impl Conformance for LifecycleConformance {
     type Subject = Home<P>;
 
     fn create(_: &Value) -> Home<P> {
-        let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, ()).expect("created");
+        let mut home = Home::<P>::new("home").expect("valid declaration");
+        home.create(NAME, (), &MemoryLifecycleWorld::default(), tick(0)).expect("created");
         home
     }
 

@@ -90,7 +90,7 @@ use flotilla_state_machines::{
     Attempt, AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Receipt, Ref, Resource, Transport,
     WriteError,
 };
-use itf::{at, boolean, int, list, map_of, number, pairs, payload, set, set_of, show, slot, tag, text, variant};
+use itf::{address, at, boolean, int, list, map_of, number, pairs, payload, set, set_of, show, slot, tag, text, variant};
 use serde_json::{json, Value};
 
 /// Microseconds per model clock tick (ten minutes).
@@ -286,8 +286,8 @@ fn accept<M: Machine>(
 }
 
 /// A model step created this resource, so the Rust machine must admit it.
-fn create<M: Machine>(home: &mut Home<M>, name: &str, request: M::Request, step: &Step, tally: &mut Tally) {
-    if let Err(error) = home.create(name, request) {
+fn create<M: Machine>(home: &mut Home<M>, name: &str, request: M::Request, world: &M::World, step: &Step, tally: &mut Tally) {
+    if let Err(error) = home.create(name, request, world, step.tick()) {
         panic!("{step}: the model created {} {name}; Rust refused it: {error:?}", M::NAME);
     }
     tally.writes += 1;
@@ -508,9 +508,9 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
         match step.action() {
             // L::request and A::request share a name; the store that changed says which.
             "request" if slot_at(step.before, "::resources", 1).is_none() && slot_at(step.after, "::resources", 1).is_some() => {
-                create(&mut things, ONE, (), &step, tally);
+                create(&mut things, ONE, (), &MemoryLifecycleWorld::default(), &step, tally);
             }
-            "request" => create(&mut sessions, ONE, (), &step, tally),
+            "request" => create(&mut sessions, ONE, (), &MemoryAgentSessionWorld::default(), &step, tally),
             op @ ("realise" | "release" | "vanish") => lifecycle_step(&mut things, ONE, op, seen, matches, "model", now, &step, tally),
             // The scenario's `failed` flag: a failure that cannot be retried exhausts the attempts.
             "recordFailure" => {
@@ -641,12 +641,10 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
     let work = convoy_work(state);
     let spec = &work["spec"];
     ConvoyRequest {
-        project: text(&spec["project"]).into(),
+        project: address(&spec["project"]),
         promises: pairs(&spec["promises"])
             .iter()
-            .map(|pair| {
-                (PromiseId(small(&pair[0])), Promise { kind: text(&pair[1]["kind"]).into(), target: text(&pair[1]["target"]).into() })
-            })
+            .map(|pair| (PromiseId(small(&pair[0])), Promise { kind: text(&pair[1]["kind"]).into(), target: address(&pair[1]["target"]) }))
             .collect(),
         quota: quota(&work["quota"]),
         priority: Priority(small(&spec["priority"])),
@@ -700,7 +698,10 @@ fn convoy_world(authorised: bool) -> MemoryConvoyWorld {
 
 fn admit(home: &mut Home<Convoy>, step: &Step, id: i64, tally: &mut Tally) {
     let model = slot_at(step.after, "::convoys", id).expect("admitted convoy");
-    create(home, &id.to_string(), convoy_request(model), step, tally);
+    let request = convoy_request(model);
+    // The spec's admission reads no world: every project it names exists.
+    let world = MemoryConvoyWorld::default().with_project(&request.project);
+    create(home, &id.to_string(), request, &world, step, tally);
 }
 
 /// From the reached state: an Open convoy delivers only with no promise
@@ -993,7 +994,7 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
                     other => panic!("{step}: placed vessel {id} is {other:?}"),
                 };
                 fleet.placed.insert(id, Placed { request, evidence });
-                create(&mut fleet.vessels, &name, (), &step, tally);
+                create(&mut fleet.vessels, &name, (), &MemoryLifecycleWorld::default(), &step, tally);
             }
             "realise" => lifecycle_step(&mut fleet.vessels, &name, "realise", true, true, "vessel", now, &step, tally),
             // Gone returns the lease; the harness keeps it.
@@ -1149,11 +1150,13 @@ fn ensure_bind(trace: &Trace, tally: &mut Tally) {
         let fulfiller = Ref::<ensure::Fulfiller>::new(name.clone());
         match step.action() {
             // One failure exhausts a window: the spec gives up once `history - window >= 1`.
-            "request" => create(&mut home, ONE, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(1) }, &step, tally),
+            "request" => {
+                create(&mut home, ONE, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(1) }, &world, &step, tally)
+            }
             "record" => accept(&mut home, ONE, ensure::Record { fulfiller }, &world, now, &step, tally),
             "create" => {
                 accept(&mut home, ONE, ensure::Create { fulfiller }, &world, now, &step, tally);
-                create(&mut fulfillers, &name, (), &step, tally);
+                create(&mut fulfillers, &name, (), &MemoryLifecycleWorld::default(), &step, tally);
             }
             op @ ("realise" | "release" | "vanish") => lifecycle_step(&mut fulfillers, &name, op, true, true, "model", now, &step, tally),
             "bind" => accept(&mut home, ONE, ensure::Bind { fulfiller }, &world, now, &step, tally),
@@ -1367,12 +1370,12 @@ impl<'a> MessageReplay<'a> {
             // Both scenarios drop as undeliverable once `now - unboundAt > 1`.
             unbound_after: UNIT,
         };
-        let mut home = Home::new("home").expect("declaration");
-        home.create(ONE, spec).expect("message");
+        let mut home = Home::<Message>::new("home").expect("declaration");
+        home.create(ONE, spec, &MemoryMessageWorld::default(), Timestamp(0)).expect("message");
         let sessions = (feed == Feed::Inbox).then(|| {
-            let mut sessions = Home::new("consumer").expect("declaration");
+            let mut sessions = Home::<AgentSession>::new("consumer").expect("declaration");
             for (id, _) in entries(&trace.states[0], "::sessions") {
-                sessions.create(id.to_string(), ()).expect("session");
+                sessions.create(id.to_string(), (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("session");
             }
             sessions
         });

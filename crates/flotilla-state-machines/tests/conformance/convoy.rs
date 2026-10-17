@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 use crate::{
     graph::{self, bare, refusal, tick, Conformance, Report, Step},
-    itf::{boolean, int, map_of, normalise, number, pairs, payload, set_of, show, tag, text, variant},
+    itf::{address, boolean, int, map_of, normalise, number, pairs, payload, set_of, show, tag, text, variant},
 };
 
 const NAME: &str = "c";
@@ -47,10 +47,10 @@ fn quota_of(v: &Value) -> Quota {
 fn request_of(request: &Value) -> ConvoyRequest {
     let promises = pairs(&request["promises"])
         .iter()
-        .map(|p| (PromiseId(id(&p[0])), Promise { kind: text(&p[1]["kind"]).into(), target: text(&p[1]["target"]).into() }))
+        .map(|p| (PromiseId(id(&p[0])), Promise { kind: text(&p[1]["kind"]).into(), target: address(&p[1]["target"]) }))
         .collect();
     ConvoyRequest {
-        project: text(&request["project"]).into(),
+        project: address(&request["project"]),
         promises,
         quota: quota_of(&request["quota"]),
         priority: Priority(id(&request["priority"])),
@@ -62,8 +62,9 @@ fn quota_value(quota: &Quota) -> Value {
 }
 
 fn spec_value(spec: &ConvoySpec) -> Value {
-    let promises = spec.promises.iter().map(|(p, promise)| (int(p.0.into()), json!({ "kind": promise.kind, "target": promise.target })));
-    json!({ "project": spec.project, "promises": map_of(promises), "priority": int(spec.priority.0.into()) })
+    let promises =
+        spec.promises.iter().map(|(p, promise)| (int(p.0.into()), json!({ "kind": promise.kind, "target": promise.target.name() })));
+    json!({ "project": spec.project.name(), "promises": map_of(promises), "priority": int(spec.priority.0.into()) })
 }
 
 fn refusal_of(refusal: ConvoyRefusal) -> Value {
@@ -72,6 +73,8 @@ fn refusal_of(refusal: ConvoyRefusal) -> Value {
             return variant("PromisesOutstanding", set_of(ids.iter().map(|p| int(p.0.into()))));
         }
         ConvoyRefusal::NoPromises => "NoPromises",
+        // The spec's admission reads no world, so the harness world holds every project.
+        ConvoyRefusal::UnknownProject => "UnknownProject",
         ConvoyRefusal::InvalidQuota => "InvalidQuota",
         ConvoyRefusal::NotOpen => "NotOpen",
         ConvoyRefusal::UnknownPromise => "UnknownPromise",
@@ -111,6 +114,12 @@ fn admitted_request(work: &Value) -> ConvoyRequest {
     request_of(&request)
 }
 
+/// A world in which the request's project exists: the spec's admission reads
+/// no world, so every project it names is one the engine finds.
+fn projects(request: &ConvoyRequest) -> MemoryConvoyWorld {
+    MemoryConvoyWorld::default().with_project(&request.project)
+}
+
 struct ConvoyConformance;
 
 impl Conformance for ConvoyConformance {
@@ -120,8 +129,9 @@ impl Conformance for ConvoyConformance {
     type Subject = Home<Convoy>;
 
     fn create(state: &Value) -> Home<Convoy> {
-        let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, admitted_request(payload(state))).expect("admitted");
+        let mut home = Home::<Convoy>::new("home").expect("valid declaration");
+        let request = admitted_request(payload(state));
+        home.create(NAME, request.clone(), &projects(&request), tick(0)).expect("admitted");
         home
     }
 
@@ -170,14 +180,16 @@ fn check_admissions(nodes: &[Value], report: &mut Report) {
         let probe = payload(&node["probe"]);
         let (request, result) = (&probe["request"], &probe["result"]);
         let mut home = Home::<Convoy>::new("home").expect("valid declaration");
-        let rust = match home.create(NAME, request_of(request)) {
+        let request_value = request;
+        let request = request_of(request_value);
+        let rust = match home.create(NAME, request.clone(), &projects(&request), tick(0)) {
             Ok(_) => variant("Moved", ConvoyConformance::encode(&home)),
             Err(WriteError::Refused(r)) => variant("Refused", refusal_of(r)),
-            Err(other) => panic!("admission of {}: {other:?}", show(request)),
+            Err(other) => panic!("admission of {}: {other:?}", show(request_value)),
         };
         report.pairs += 1;
         if normalise(&rust) != normalise(result) {
-            report.disagreements.push(format!("admit {}: spec {}, rust {}", show(request), show(result), show(&rust)));
+            report.disagreements.push(format!("admit {}: spec {}, rust {}", show(request_value), show(result), show(&rust)));
         }
     }
 }

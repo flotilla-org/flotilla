@@ -5,8 +5,13 @@
 //! spec's `promises`, named `resolution` here so it does not clash with the
 //! spec's promise definitions in storage) and the quota in force travel with
 //! every label, and an abandoned convoy also carries its reason. The request's project, promises and priority never
-//! change, so they are the spec. Promise kinds and targets are opaque data;
-//! no promise kind is named here.
+//! change, so they are the spec. Promise kinds are opaque text; no promise
+//! kind is named here.
+//!
+//! The project is a definitions-class kind and a promise's target may be
+//! outside flotilla, so both are addresses (#3392 G1, ADR 0066): interned
+//! canonical text, never a foreign key. Admission reads the project through
+//! the recording admission handle and refuses one that does not exist.
 //!
 //! The identifiers placement shares with the convoy ([`ConvoyId`],
 //! [`VesselClass`], [`Priority`] and [`Quota`]) are defined here once.
@@ -18,12 +23,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Records, State, Stored, Timestamp};
+use flotilla_schema::{Address, Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    edges, states, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts, Source, Table,
-    Version, WrongState,
+    edges, states, Admission, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts, Source,
+    Table, Version, WrongState,
 };
 
 /// A convoy: the convoy resource's name at its home.
@@ -56,20 +61,21 @@ pub struct Priority(pub u32);
 /// Per-class caps on live vessels. Admission grants a cap, never a reservation.
 pub type Quota = BTreeMap<VesselClass, u32>;
 
-/// What the convoy promises: opaque kind and target data. Both are plain
-/// interned text until `flotilla-address` is adopted.
+/// What the convoy promises: an opaque kind, as interned text, and the
+/// target's address, which need not exist yet (a branch to be pushed, a
+/// change request to be opened).
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub struct Promise {
     #[store(intern)]
     pub kind: String,
-    #[store(intern)]
-    pub target: String,
+    pub target: Address,
 }
 
 /// The spec's `ConvoyRequest`: what a caller asks to admit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConvoyRequest {
-    pub project: String,
+    /// The project's address; admission refuses one that does not exist.
+    pub project: Address,
     pub promises: BTreeMap<PromiseId, Promise>,
     /// The quota admitted; it becomes the state's quota in force.
     pub quota: Quota,
@@ -79,7 +85,7 @@ pub struct ConvoyRequest {
 /// The part of the request that never changes after admission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConvoySpec {
-    pub project: String,
+    pub project: Address,
     pub promises: BTreeMap<PromiseId, Promise>,
     pub priority: Priority,
 }
@@ -228,6 +234,9 @@ impl Kind for Authority {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConvoyRefusal {
     NoPromises,
+    /// Admission read the request's project and found none (#3392 G1). The
+    /// spec's admission has no world read; see the PR's spec question.
+    UnknownProject,
     /// The spec refuses negative quota counts. Counts here are unsigned, so
     /// neither admission nor readmission produces this.
     InvalidQuota,
@@ -252,14 +261,37 @@ impl From<WrongState<ConvoyLabel, ConvoyEdgeKind>> for ConvoyRefusal {
     }
 }
 
-/// What convoy gates read.
-pub trait ConvoyWorld: Source<Authority> {}
-impl<T: Source<Authority> + ?Sized> ConvoyWorld for T {}
+/// A project, read by address for its existence alone: a definitions-class
+/// kind outside the new store.
+pub struct Project;
+impl Kind for Project {
+    const NAME: &'static str = "project";
+    type Value = ();
+}
+
+/// What convoy admission and gates read.
+pub trait ConvoyWorld: Source<Authority> + Source<Project> {}
+impl<T: Source<Authority> + Source<Project> + ?Sized> ConvoyWorld for T {}
 
 /// An in-memory convoy world, for tests, replay and conformance.
 #[derive(Default)]
 pub struct MemoryConvoyWorld {
     pub authority: Table<Authority>,
+    pub projects: Table<Project>,
+}
+
+impl MemoryConvoyWorld {
+    /// Makes `project` exist.
+    pub fn with_project(mut self, project: &Address) -> Self {
+        self.projects.put(&Ref::new(project.as_str()), ());
+        self
+    }
+}
+
+impl Source<Project> for MemoryConvoyWorld {
+    fn lookup(&self, reference: &Ref<Project>) -> Option<(Version, &())> {
+        self.projects.lookup(reference)
+    }
 }
 
 impl Source<Authority> for MemoryConvoyWorld {
@@ -321,10 +353,14 @@ impl Machine for Convoy {
     }
 
     /// Every convoy promises something: `deliver` would hold trivially over
-    /// none. Every promise starts Pending under the admitted quota.
-    fn admit(request: ConvoyRequest) -> Result<(ConvoySpec, ConvoyState), ConvoyRefusal> {
+    /// none. Its project must exist, read by address. Every promise starts
+    /// Pending under the admitted quota.
+    fn admit(admission: &mut Admission<'_, Convoy>, request: ConvoyRequest) -> Result<(ConvoySpec, ConvoyState), ConvoyRefusal> {
         if request.promises.is_empty() {
             return Err(ConvoyRefusal::NoPromises);
+        }
+        if admission.read(&Ref::<Project>::new(request.project.as_str())).is_none() {
+            return Err(ConvoyRefusal::UnknownProject);
         }
         let resolution = request.promises.keys().map(|id| (*id, PromiseState::Pending)).collect();
         let state = ConvoyState::Open { resolution, quota: request.quota };
@@ -435,9 +471,7 @@ fn readmit(_: &mut Handle<'_, Convoy>, state: ConvoyState, readmit: &Readmit) ->
 #[derive(Clone, Debug, PartialEq, Stored)]
 #[store(kind = "Convoy", code = 5, index(name = "open_by_project", eq(project), when(state in [Open])))]
 pub struct ConvoyRow {
-    /// An address: plain interned text until `flotilla-address` is adopted.
-    #[store(intern)]
-    pub project: String,
+    pub project: Address,
     #[store(child)]
     pub promises: BTreeMap<PromiseId, Promise>,
     pub priority: Priority,

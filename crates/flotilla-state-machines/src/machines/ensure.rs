@@ -21,8 +21,8 @@ use flotilla_schema::{Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attempt, edges, states, Attempt, AttemptPolicy, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref,
-    Resource, RowParts, Source, Table, Version, WrongState,
+    attempt, edges, states, Admission, Attempt, AttemptPolicy, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow,
+    Ref, Resource, RowParts, Source, Table, Version, WrongState,
 };
 
 /// Fulfiller references, in name order. Fulfiller names are addresses: plain
@@ -370,7 +370,7 @@ impl Machine for Ensure {
             .attempts_in([Unfulfilled])
     }
 
-    fn admit(spec: EnsureSpec) -> Result<(EnsureSpec, EnsureState), EnsureRefusal> {
+    fn admit(_: &mut Admission<'_, Ensure>, spec: EnsureSpec) -> Result<(EnsureSpec, EnsureState), EnsureRefusal> {
         Ok((spec, EnsureState::Unfulfilled { recorded: BTreeSet::new(), created: BTreeSet::new(), window: 0 }))
     }
 }

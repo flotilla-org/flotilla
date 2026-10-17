@@ -159,8 +159,8 @@ impl Composed {
         };
         match ledger.place(&self.id, evidence.host) {
             Ok(lease) => {
-                let mut home = Home::new("home").expect("valid declaration");
-                home.create(NAME, lease.request.clone()).expect("created");
+                let mut home = Home::<Lifecycle<VesselKind>>::new("home").expect("valid declaration");
+                home.create(NAME, lease.request.clone(), &MemoryLifecycleWorld::default(), tick(0)).expect("created");
                 self.ledger = ledger;
                 self.lifecycle = Some(home);
                 Step::Accepted

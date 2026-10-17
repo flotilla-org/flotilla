@@ -52,10 +52,10 @@ mod stored;
 
 pub use attempt::{Attempt, AttemptPolicy, Cause, CauseCategory, Outcome, Retry, Schedule};
 pub use code::{changed, Coded, Datum, Edge, EdgeArg, StateValue};
-pub use home::{Home, Resource, RowParts, WriteError};
+pub use home::{Created, Home, Resource, RowParts, WriteError};
 pub use machine::{
     Check, DeclaredEdge, DefError, Diagram, EdgeDef, EdgeKind, EndDef, Ended, Fault, Label, Machine, MachineDef, StepError, WrongState,
 };
-pub use read::{Handle, InputRead, Judged, Kind, Ref, Source, Table, Version, OWN_ATTEMPTS, OWN_RECEIPTS};
+pub use read::{Admission, Handle, InputRead, Judged, Kind, Ref, Source, Table, Version, OWN_ATTEMPTS, OWN_RECEIPTS};
 pub use record::{EdgeEventOf, EdgePayload, Receipt, Transport};
 pub use stored::{MachineRow, StoredState};

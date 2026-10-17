@@ -26,8 +26,8 @@ use flotilla_schema::{Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    edges, states, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts, Source, Table,
-    Transport, Version, WrongState,
+    edges, states, Admission, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts, Source,
+    Table, Transport, Version, WrongState,
 };
 
 /// What would settle the message. `Nothing` settles on delivery.
@@ -374,7 +374,7 @@ impl Machine for Message {
             .end(Dropped, "the message was dropped")
     }
 
-    fn admit(spec: MessageSpec) -> Result<(MessageSpec, MessageState), MessageRefusal> {
+    fn admit(_: &mut Admission<'_, Message>, spec: MessageSpec) -> Result<(MessageSpec, MessageState), MessageRefusal> {
         Ok((spec, MessageState::Pending))
     }
 }

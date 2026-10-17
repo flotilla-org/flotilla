@@ -4,6 +4,7 @@
 //! implement these traits without coherence conflicts.
 
 use chrono::{DateTime, Utc};
+use flotilla_address::Address;
 
 use crate::{
     codec::{DecodeError, Decoder, EncodeError, Encoder},
@@ -42,7 +43,7 @@ pub trait Columns: Sized {
     message = "`{Self}` is not a storage column: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
                flatten, state and code (fields and variants) and kind, code, index and labels (types)",
     label = "needs a column type or one of the storage attributes",
-    note = "column types are integers, bool, String, Vec<u8>, Timestamp, DateTime<Utc>, Option of a column, and enums and newtypes deriving Stored"
+    note = "column types are integers, bool, String, Vec<u8>, Timestamp, DateTime<Utc>, Address, Option of a column, and enums and newtypes deriving Stored"
 )]
 pub trait Column: Columns {}
 
@@ -265,7 +266,18 @@ scalar!(DateTime<Utc>, ColumnType::Timestamp, |this| Ok(Value::Int(Timestamp::fr
     other => Err(DecodeError::unexpected("integer", &other)),
 });
 
-// An untyped reference, for fields that may name any kind (an authority, an observed condition).
+// An address (ADR 0066 §5, #3392 G1): a reference to a definitions-class kind or to anything outside
+// the new store, which may not exist. Stored as its canonical text, interned, so equality is id
+// equality; decoding refuses text that is not canonical. Existence is a recorded gate read at
+// admission, never a foreign key.
+scalar!(Address, ColumnType::Interned, |this| Ok(Value::Str(this.as_str().to_owned())), |value| match value {
+    Value::Str(text) =>
+        text.parse::<Address>().map_err(|error| DecodeError::Address { column: String::new(), text, reason: error.to_string() }),
+    other => Err(DecodeError::unexpected("interned address", &other)),
+});
+
+// An untyped reference to a stored record of any kind in the new store. A reference to something
+// outside it, such as an authority or an observed condition, is an `Address`.
 scalar!(Identity, ColumnType::Ref, |this| Ok(Value::Ref(this.clone())), |value| match value {
     Value::Ref(identity) => Ok(identity),
     other => Err(DecodeError::unexpected("reference", &other)),

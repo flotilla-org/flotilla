@@ -3,13 +3,13 @@
 
 use std::collections::BTreeSet;
 
-use flotilla_schema::{Decoder, EdgeParts, Encoder, Kind, KindCode, RowPath, State, Timestamp};
+use flotilla_schema::{Address, Decoder, EdgeParts, Encoder, Kind, KindCode, RowPath, State, Timestamp};
 use flotilla_state_machines::{
     machines::{
-        agent_session::{AgentSession, AgentSessionRow},
+        agent_session::{AgentSession, AgentSessionRow, MemoryAgentSessionWorld},
         convoy::{Convoy, ConvoyRequest, ConvoyRow, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId, VesselClass},
         ensure::{Ensure, EnsureRow, EnsureSpec, MemoryEnsureWorld, Record},
-        message::{Expectation, Message, MessageRow, MessageSpec},
+        message::{Expectation, MemoryMessageWorld, Message, MessageRow, MessageSpec},
     },
     AttemptPolicy, Home, MachineRow, Ref, Version,
 };
@@ -25,6 +25,14 @@ fn kind_codes_are_pinned() {
         (EnsureRow::KIND, EnsureRow::CODE),
     ];
     assert_eq!(kinds, [("Message", KindCode(1)), ("AgentSession", KindCode(3)), ("Convoy", KindCode(5)), ("Ensure", KindCode(9))]);
+}
+
+fn project() -> Address {
+    Address::project("p").expect("project")
+}
+
+fn promise() -> Promise {
+    Promise { kind: "k".into(), target: Address::project("t").expect("target") }
 }
 
 /// `name`'s row at `home`, encoded and decoded through the schema codec, and the row a home
@@ -45,24 +53,26 @@ fn round_trip<R: MachineRow + PartialEq + std::fmt::Debug>(home: &Home<R::Machin
 fn rows_hold_their_resource() {
     let mut messages = Home::<Message>::new("home").expect("valid");
     let spec = MessageSpec { inbox: "i".into(), expectation: Expectation::Reply, deadline: Some(Timestamp(9)), unbound_after: 3 };
-    messages.create("m", spec.clone()).expect("created");
+    messages.create("m", spec.clone(), &MemoryMessageWorld::default(), Timestamp(0)).expect("created");
     let row: MessageRow = round_trip(&messages, "m", Timestamp(1));
     assert_eq!((row.spec(), row.state.since), (spec, Timestamp(1)));
 
     let mut sessions = Home::<AgentSession>::new("home").expect("valid");
-    sessions.create("s", ()).expect("created");
+    sessions.create("s", (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("created");
     round_trip::<AgentSessionRow>(&sessions, "s", Timestamp(2));
 
     let mut convoys = Home::<Convoy>::new("home").expect("valid");
-    let promises = [(PromiseId(0), Promise { kind: "k".into(), target: "t".into() })].into();
-    let request = ConvoyRequest { project: "p".into(), promises, quota: [(VesselClass(1), 2)].into(), priority: Priority(4) };
-    convoys.create("c", request).expect("created");
+    let promises = [(PromiseId(0), promise())].into();
+    let request = ConvoyRequest { project: project(), promises, quota: [(VesselClass(1), 2)].into(), priority: Priority(4) };
+    convoys.create("c", request, &MemoryConvoyWorld::default().with_project(&project()), Timestamp(0)).expect("created");
     convoys.apply("c", Keep { promise: PromiseId(0) }, &MemoryConvoyWorld::default(), Timestamp(3)).expect("kept");
     let row: ConvoyRow = round_trip(&convoys, "c", Timestamp(2));
     assert_eq!(row.edges.len(), 1);
 
     let mut ensures = Home::<Ensure>::new("home").expect("valid");
-    ensures.create("e", EnsureSpec { inbox: "i".into(), policy: AttemptPolicy::immediate(2) }).expect("created");
+    ensures
+        .create("e", EnsureSpec { inbox: "i".into(), policy: AttemptPolicy::immediate(2) }, &MemoryEnsureWorld::default(), Timestamp(0))
+        .expect("created");
     ensures.apply("e", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(4)).expect("recorded");
     ensures.record_attempt("e", flotilla_state_machines::Attempt::succeeded(Timestamp(5))).expect("attempt");
     let row: EnsureRow = round_trip(&ensures, "e", Timestamp(0));
@@ -80,9 +90,10 @@ fn root_sets(parts: &EdgeParts) -> Vec<&'static str> {
 #[test]
 fn a_rows_edge_moves_since_only_with_the_label() {
     let mut home = Home::<Convoy>::new("home").expect("valid");
-    let promises = [(PromiseId(0), Promise { kind: "k".into(), target: "t".into() })].into();
-    home.create("c", ConvoyRequest { project: "p".into(), promises, quota: [].into(), priority: Priority(1) }).expect("created");
-    let world = MemoryConvoyWorld::default();
+    let promises = [(PromiseId(0), promise())].into();
+    let world = MemoryConvoyWorld::default().with_project(&project());
+    home.create("c", ConvoyRequest { project: project(), promises, quota: [].into(), priority: Priority(1) }, &world, Timestamp(0))
+        .expect("created");
     let row = ConvoyRow::of(home.get("c").expect("exists"), Timestamp(1));
 
     let event = home.apply("c", Keep { promise: PromiseId(0) }, &world, Timestamp(5)).expect("kept").clone();

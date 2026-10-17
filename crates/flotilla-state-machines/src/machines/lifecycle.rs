@@ -20,8 +20,8 @@ use flotilla_schema::EdgeEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attempt, edges, states, AttemptPolicy, Cause, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table,
-    Version, WrongState,
+    attempt, edges, states, Admission, AttemptPolicy, Cause, EdgeDef, EdgePayload, Ended, Handle, Kind, Machine, MachineDef, Ref, Source,
+    Table, Version, WrongState,
 };
 
 /// One kind sharing the lifecycle: its name, request and retry policy.
@@ -253,7 +253,7 @@ impl<K: LifecycleKind> Machine for Lifecycle<K> {
     }
 
     /// Every request is admitted: the spec's `request` has no rule.
-    fn admit(request: K::Request) -> Result<(K::Request, LifecycleState), LifecycleRefusal> {
+    fn admit(_: &mut Admission<'_, Lifecycle<K>>, request: K::Request) -> Result<(K::Request, LifecycleState), LifecycleRefusal> {
         Ok((request, LifecycleState::Requested))
     }
 }
