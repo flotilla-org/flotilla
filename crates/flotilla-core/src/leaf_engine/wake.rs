@@ -516,6 +516,7 @@ impl ReconcilerWake {
                 self.subscriptions.inner.clock.now(),
             );
             if settlement.satisfied {
+                let now = self.subscriptions.inner.clock.now();
                 desired.push(LeafSubscriptionRow {
                     id: uuid::Uuid::nil(),
                     namespace: namespace.into(),
@@ -529,11 +530,11 @@ impl ReconcilerWake {
                     maker: LeafMaker::Controller {
                         resource_kind: "Convoy".into(),
                         name: Some(convoy.metadata.name.clone()),
-                        retry: ControllerRetry::retryable_at(None, Utc::now(), Utc::now()),
+                        retry: ControllerRetry::retryable_at(None, now, now),
                         ceiling: RetryCeiling::default(),
                     },
                     freshness_demand: None,
-                    created_at: Utc::now(),
+                    created_at: now,
                     episode_key: EpisodeKeyFields::default(),
                 });
             }

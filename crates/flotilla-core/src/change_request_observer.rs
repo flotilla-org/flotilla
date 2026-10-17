@@ -29,6 +29,12 @@ use tokio::{
 const RETAINED_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const HISTORY_REFRESH_INTERVAL_SECS: i64 = 60 * 60;
 
+// Deadline arithmetic on the judge path must remain total even for a cadence
+// outside chrono's duration range or an observation near its final timestamp.
+fn cadence_deadline(at: DateTime<Utc>, cadence: Duration) -> DateTime<Utc> {
+    chrono::Duration::from_std(cadence).ok().and_then(|cadence| at.checked_add_signed(cadence)).unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ChangeRequestRefreshCadence {
     pub state: Duration,
@@ -252,15 +258,15 @@ impl ChangeRequestRefresher {
         let (next, cadence) = active.get(subject).map_or_else(
             || {
                 let cadence = if freshness.is_some() { self.inner.cadence.freshness_demanded } else { self.inner.cadence.state };
-                (created_at + chrono::Duration::from_std(cadence).expect("cadence fits"), cadence)
+                (cadence_deadline(created_at, cadence), cadence)
             },
             |refresh| (refresh.next_refresh_at, refresh.scheduled_cadence),
         );
-        next + chrono::Duration::from_std(cadence).expect("cadence fits")
+        cadence_deadline(next, cadence)
     }
 
-    pub(crate) fn retry_cadence(&self) -> chrono::Duration {
-        chrono::Duration::from_std(self.inner.cadence.checks_pending).expect("cadence fits")
+    pub(crate) fn retry_grace_deadline(&self, retry_at: DateTime<Utc>) -> DateTime<Utc> {
+        cadence_deadline(retry_at, self.inner.cadence.checks_pending)
     }
 
     pub async fn observation_error(&self, subject: &ChangeRequestKey) -> Option<ObservationError> {
@@ -834,7 +840,7 @@ impl ChangeRequestRefresher {
 
     async fn wait_for_next(&self, subject: &ChangeRequestKey, delay: Duration, cadence: Duration) -> bool {
         let Some(wake) = self.inner.active.lock().await.get_mut(subject).map(|refresh| {
-            refresh.next_refresh_at = Utc::now() + chrono::Duration::from_std(delay).expect("refresh delay fits");
+            refresh.next_refresh_at = cadence_deadline(Utc::now(), delay);
             refresh.scheduled_cadence = cadence;
             Arc::clone(&refresh.wake)
         }) else {
@@ -1024,6 +1030,18 @@ mod tests {
         .expect("healthy observation"));
         refresher.refresh_once(&subject).await.expect("recovered observation");
         assert!(refresher.observation_error(&subject).await.is_none());
+    }
+
+    // Deadline conversion is small arithmetic glue. These cases cover zero,
+    // ordinary cadence, duration overflow, timestamp overflow, and the limit.
+    #[test]
+    fn cadence_deadline_saturates_at_chrono_limits() {
+        let at: DateTime<Utc> = "2026-10-17T00:00:00Z".parse().unwrap();
+        assert_eq!(cadence_deadline(at, Duration::ZERO), at);
+        assert_eq!(cadence_deadline(at, Duration::from_secs(60)), at + chrono::Duration::seconds(60));
+        assert_eq!(cadence_deadline(at, Duration::MAX), DateTime::<Utc>::MAX_UTC);
+        assert_eq!(cadence_deadline(DateTime::<Utc>::MAX_UTC, Duration::from_secs(1)), DateTime::<Utc>::MAX_UTC);
+        assert_eq!(cadence_deadline(DateTime::<Utc>::MAX_UTC, Duration::ZERO), DateTime::<Utc>::MAX_UTC);
     }
 
     struct CountingSource(Arc<AtomicUsize>);

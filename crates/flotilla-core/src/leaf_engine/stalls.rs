@@ -28,6 +28,10 @@ pub(crate) fn supervision_message_source(convoy: &str, index: usize) -> String {
 }
 // Bound silent turns, not their total runtime: long tool-using turns stay able.
 pub(super) const TURN_INACTIVITY_BOUND: chrono::Duration = chrono::Duration::minutes(15);
+// Bound missing loop progress, including a single long reconciliation. A
+// legitimate reconcile exceeding this bound is deliberately surfaced for
+// supervision; queue residence while other reconciliations progress is not.
+const CONVOY_CONTROLLER_PROGRESS_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(super) fn turn_inactivity_reason(
     status: &flotilla_resources::TerminalSessionStatus,
@@ -834,15 +838,21 @@ impl ReconcilerWake {
                                             .refresh_grace_deadline(&subject, row.freshness_demand, row.created_at)
                                             .await;
                                         let mut grace = self.subscriptions.inner.observer_grace.lock().await;
+                                        // Pin the first stale episode's deadline: repeatedly
+                                        // failed refreshes must not renew their own grace.
+                                        // Fresh evidence or row removal starts a new episode.
                                         let deadline = grace.entry((row.id, subject)).or_insert(proposed);
                                         // Explicit forge backoff still protects the maker. It
                                         // does not let ordinary repeated failures slide grace.
                                         if let Some(retry_at) = refresh_error.as_ref().and_then(ObservationError::retry_at) {
                                             *deadline =
-                                                (*deadline).max(retry_at + self.subscriptions.inner.change_requests.retry_cadence());
+                                                (*deadline).max(self.subscriptions.inner.change_requests.retry_grace_deadline(retry_at));
                                         }
                                         Some(*deadline)
                                     } else {
+                                        // A formerly resolvable address no longer names an
+                                        // observer; do not retain its old grace entry.
+                                        self.subscriptions.inner.observer_grace.lock().await.retain(|(id, _), _| *id != row.id);
                                         None
                                     };
                                     if deadline.is_some_and(|deadline| now < deadline) {
@@ -880,7 +890,7 @@ impl ReconcilerWake {
                                 .lock()
                                 .await
                                 .get(namespace)
-                                .and_then(|queue| queue.stall_reason(now, std::time::Duration::from_secs(60)))
+                                .and_then(|queue| queue.stall_reason(now, CONVOY_CONTROLLER_PROGRESS_BOUND))
                                 .map(|reason| format!("Convoy controller for {}: {reason}", name.as_deref().unwrap_or("unknown")))
                         } else {
                             retry.stall_reason(now, *ceiling)

@@ -6,7 +6,9 @@ use flotilla_store_memory::InMemoryBackend;
 #[tokio::test]
 async fn satisfied_landing_has_controller_dependency() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let wake = supervision_wake(&backend);
+    let mut wake = supervision_wake(&backend);
+    let now = Utc::now() + chrono::Duration::days(365);
+    wake.subscriptions = wake.subscriptions.with_clock(Arc::new(flotilla_store_testkit::VirtualClock::new(now)));
     let (queue, _receiver) = flotilla_store::controller::WorkQueueSender::channel();
     wake.subscriptions.inner.controller_queues.lock().await.insert("flotilla".into(), queue);
     create_convoy(
@@ -31,6 +33,21 @@ async fn satisfied_landing_has_controller_dependency() {
     wake.sync_rows("flotilla", &objects).await.unwrap();
     assert!(wake.subscriptions.rows().await.iter().any(|row| matches!(&row.maker,
         LeafMaker::Controller { resource_kind, name: Some(name), .. } if resource_kind == "Convoy" && name == "settled")));
+    // #3419: synthetic dependency timestamps follow the injected judge clock.
+    let row = wake
+        .subscriptions
+        .rows()
+        .await
+        .into_iter()
+        .find(|row| {
+            matches!(&row.maker,
+        LeafMaker::Controller { resource_kind, .. } if resource_kind == "Convoy")
+        })
+        .unwrap();
+    assert_eq!(row.created_at, now);
+    let LeafMaker::Controller { retry, .. } = row.maker else { unreachable!() };
+    assert_eq!(retry.first_failure_at, now);
+    assert_eq!(retry.next_attempt_at(), Some(now));
     wake.judge_stalls_at("flotilla", &objects, Utc::now() + chrono::Duration::hours(2)).await.unwrap();
     assert!(backend.using::<Convoy>("flotilla").get("settled").await.unwrap().status.unwrap().stalled.is_none());
 }
@@ -207,6 +224,20 @@ fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
                         assert!(stall.evidence.contains("observer behind scheduled refresh grace"));
                     }
                 }
+                // #3419: losing address resolution clears a pinned grace entry,
+                // even if the standing row has not yet been unsubscribed.
+                let original_leaf = {
+                    let mut rows = wake.subscriptions.inner.rows.lock().await;
+                    let row = rows.get_mut(&id).unwrap();
+                    let original = row.leaves[0].clone();
+                    row.leaves[0].address =
+                        LeafAddress::ChangeRequest { service: "unconfigured.invalid".into(), scope: "team/one".into(), number: 1 };
+                    original
+                };
+                let objects = HashMap::from([("forge".into(), convoys.get("forge").await.unwrap())]);
+                wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
+                assert!(wake.subscriptions.inner.observer_grace.lock().await.keys().all(|(row, _)| *row != id));
+                wake.subscriptions.inner.rows.lock().await.get_mut(&id).unwrap().leaves[0] = original_leaf;
                 observation.state = flotilla_resources::Observation::known(
                     flotilla_resources::ObservedChangeRequestState::Open,
                     start + chrono::Duration::seconds(age),

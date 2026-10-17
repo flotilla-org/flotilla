@@ -199,6 +199,10 @@ struct QueueProgress {
 }
 
 impl WorkQueueSender {
+    /// Queue progress uses wall time, like the production judge. A judge with
+    /// an injected virtual clock must compare against these recorded wall-time
+    /// instants (or advance relative to them); advancing only its clock does not
+    /// simulate progress in the real controller loop.
     pub fn channel() -> (Self, mpsc::UnboundedReceiver<String>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         (Self { sender, progress: Arc::default() }, receiver)
