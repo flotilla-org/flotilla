@@ -35,10 +35,13 @@ impl SharedForge {
         if token.is_empty() {
             return Err(format!("shared forge token {} is empty", token_path.display()));
         }
-        let forge = ForgejoClient::new(
-            Arc::clone(&self.http),
-            ForgejoIssueProviderConfig::new(self.config.service_url.clone(), None, ForgejoAuth { token, token_path }),
+        let mut config = ForgejoIssueProviderConfig::new(
+            self.config.service_url.clone(),
+            self.config.endpoint_url.as_ref().map(|endpoint| format!("{}/api/v1", endpoint.trim_end_matches('/'))),
+            ForgejoAuth { token, token_path },
         );
+        config.kind = self.config.kind;
+        let forge = ForgejoClient::new(Arc::clone(&self.http), config);
         let existing = forge
             .execute(
                 repository,
@@ -55,7 +58,7 @@ impl SharedForge {
         // One page suffices: a branch has at most one pull request here,
         // because a coder reuses the one it finds instead of opening another.
         if let Some(pull) = existing.as_array().into_iter().flatten().find(|pull| pull["head"]["ref"].as_str() == Some(branch)) {
-            return web_url(pull);
+            return web_url(&forge.config, repository, pull);
         }
         let created = forge
             .execute(
@@ -66,12 +69,13 @@ impl SharedForge {
                 Some(json!({"head": branch, "base": self.config.base_branch, "title": title, "body": body})),
             )
             .await?;
-        web_url(&created)
+        web_url(&forge.config, repository, &created)
     }
 }
 
-fn web_url(pull: &serde_json::Value) -> Result<String, String> {
-    pull["html_url"].as_str().map(str::to_string).ok_or_else(|| format!("shared forge pull request has no html_url: {pull}"))
+fn web_url(config: &ForgejoIssueProviderConfig, repository: &str, pull: &serde_json::Value) -> Result<String, String> {
+    let number = pull["number"].as_u64().ok_or_else(|| format!("shared forge pull request has no number: {pull}"))?;
+    Ok(config.change_request_url(repository, &number.to_string()))
 }
 
 #[cfg(test)]
@@ -103,11 +107,35 @@ mod tests {
         SharedForge::new(
             DummySharedForgeConfig {
                 service_url: fake.service_url("github"),
+                endpoint_url: None,
+                kind: flotilla_resources::ForgeKind::Forgejo,
                 token_path: token.path().to_string_lossy().into_owned(),
                 base_branch: "main".into(),
             },
             Arc::new(InProcessClient::new(Arc::clone(fake))),
         )
+    }
+
+    // A dummy crew submits a logical GitHub claim even though the shared
+    // Forgejo fake allocates the number. Resuming finds the same claim.
+    #[tokio::test]
+    async fn rehearsal_claim_uses_original_forge_url() {
+        let fake = fake();
+        let token = token_file(TOKEN);
+        let shared = SharedForge::new(
+            DummySharedForgeConfig {
+                service_url: "https://github.com".into(),
+                endpoint_url: Some(fake.service_url("github")),
+                kind: flotilla_resources::ForgeKind::Github,
+                token_path: token.path().to_string_lossy().into_owned(),
+                base_branch: "main".into(),
+            },
+            Arc::new(InProcessClient::new(Arc::clone(&fake))),
+        );
+        let first = shared.open("flotilla-org/flotilla", "dummy/branch", "title", "body").await.expect("open");
+        assert_eq!(first, "https://github.com/flotilla-org/flotilla/pull/1");
+        assert_eq!(shared.open("flotilla-org/flotilla", "dummy/branch", "title", "body").await.expect("resume"), first);
+        assert_eq!(fake.refusals().1, 0);
     }
 
     // Behaviour (#3374): crews on different hosts that open change requests on
@@ -167,6 +195,8 @@ mod tests {
         let missing = SharedForge::new(
             DummySharedForgeConfig {
                 service_url: fake.service_url("github"),
+                endpoint_url: None,
+                kind: flotilla_resources::ForgeKind::Forgejo,
                 token_path: "/nonexistent/token".into(),
                 base_branch: "main".into(),
             },

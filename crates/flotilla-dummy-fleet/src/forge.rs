@@ -242,6 +242,9 @@ impl Factory for DummyChangeRequestFactory {
         _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
+        if env.forge_override().is_some() {
+            return Err(vec![UnmetRequirement::MissingRemoteHost("local dummy forge (execution overridden)".into())]);
+        }
         let (owner, name, _) = env
             .find_remote_host(self.fleet.forge.host())
             .ok_or_else(|| vec![UnmetRequirement::MissingRemoteHost(self.fleet.forge.host().to_string())])?;

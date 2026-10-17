@@ -285,7 +285,7 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
     }
 
     async fn open_in_browser(&self, id: &str) -> Result<(), String> {
-        let url = format!("{}/{}/pulls/{id}", self.forge.config.service_url, self.repo_slug);
+        let url = self.forge.config.change_request_url(&self.repo_slug, id);
         #[cfg(target_os = "macos")]
         let (cmd, args): (&str, Vec<&str>) = ("open", vec![&url]);
         #[cfg(target_os = "windows")]

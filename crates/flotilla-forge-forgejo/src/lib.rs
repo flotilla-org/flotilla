@@ -18,6 +18,8 @@ pub struct ForgejoAuth {
 pub struct ForgejoIssueProviderConfig {
     pub service_url: String,
     pub api_base_url: String,
+    /// Logical URL syntax is independent of the selected transport adapter.
+    pub kind: flotilla_resources::ForgeKind,
     pub auth: ForgejoAuth,
 }
 
@@ -30,7 +32,14 @@ impl ForgejoIssueProviderConfig {
             .filter(|url| !url.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| format!("{service_url}/api/v1"));
-        Self { service_url, api_base_url, auth }
+        Self { service_url, api_base_url, auth, kind: flotilla_resources::ForgeKind::Forgejo }
+    }
+    pub fn change_request_url(&self, repository: &str, number: &str) -> String {
+        let segment = match self.kind {
+            flotilla_resources::ForgeKind::Github => "pull",
+            flotilla_resources::ForgeKind::Forgejo => "pulls",
+        };
+        format!("{}/{repository}/{segment}/{number}", self.service_url)
     }
 }
 

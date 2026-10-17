@@ -4016,6 +4016,7 @@ pub(super) async fn repository_provider_bag(
                 assertion,
                 EnvironmentAssertion::RemoteHost { .. }
                     | EnvironmentAssertion::OriginForge { .. }
+                    | EnvironmentAssertion::ForgeOverride { .. }
                     | EnvironmentAssertion::VcsCheckoutDetected { .. }
             )
         })
@@ -4040,10 +4041,18 @@ pub(super) async fn repository_provider_bag(
     let mut bag = host_bag.with(remote_assertion);
     if let Some(forge) = &forge {
         bag = bag.with(EnvironmentAssertion::origin_forge(forge.clone()));
+    }
+    // Resolve execution independently of the logical Forge, including builtin GitHub.
+    let daemon = config.load_daemon_config()?;
+    if let Some(binding) = daemon.forge_overrides.get(identity.service_url.trim_end_matches('/')) {
+        binding.validate()?;
+        return Ok(bag.with(EnvironmentAssertion::ForgeOverride { binding: binding.clone() }));
+    }
+    if let Some(forge) = &forge {
         if forge.kind == ForgeKind::Forgejo {
             // Read current intent on each request: provider leases compare the
             // resolved bag so a changed identity cannot reuse a stale credential.
-            if let Some(name) = config.load_daemon_config()?.credentials.forgejo.get(&forge.forge_id) {
+            if let Some(name) = daemon.credentials.forgejo.get(&forge.forge_id) {
                 let credential = resource_backend
                     .definitions::<CredentialSpec>(namespace)
                     .get(name)

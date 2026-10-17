@@ -114,15 +114,28 @@ pub struct DummyChangeRequestConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DummySharedForgeConfig {
-    /// Forgejo web root, as the forge's Forge record names it in `https_url`.
+    /// Logical forge web root; unchanged when rehearsal substitutes execution.
     #[serde(deserialize_with = "deserialize_https_url")]
     pub service_url: String,
+    /// Optional rehearsal endpoint; defaults to the logical service.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_optional_https_url")]
+    pub endpoint_url: Option<String>,
+    #[serde(default = "default_shared_forge_kind")]
+    pub kind: flotilla_resources::ForgeKind,
     /// Absolute path of the file holding the forge's API token.
     #[serde(deserialize_with = "deserialize_absolute_path")]
     pub token_path: String,
     /// Branch the change requests target.
     #[serde(default = "default_base_branch")]
     pub base_branch: String,
+}
+
+fn default_shared_forge_kind() -> flotilla_resources::ForgeKind {
+    flotilla_resources::ForgeKind::Forgejo
+}
+
+fn deserialize_optional_https_url<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    deserialize_https_url(deserializer).map(Some)
 }
 
 fn deserialize_https_url<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -178,6 +191,8 @@ mod tests {
             config.shared_forge,
             Some(DummySharedForgeConfig {
                 service_url: "https://fake-forge.rehearsal:3443/github".into(),
+                endpoint_url: None,
+                kind: flotilla_resources::ForgeKind::Forgejo,
                 token_path: "/etc/flotilla/github-token".into(),
                 base_branch: "main".into(),
             })

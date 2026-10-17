@@ -216,6 +216,31 @@ and the TUI fleet health pane. Override the near-expiry warning window
 warning_window_days = 14
 ```
 
+## Rehearsal forge execution
+
+A rehearsal fleet can keep copied forge identities and repository URLs while
+substituting the provider that serves them. Install the same host-local
+`daemon.toml` binding on every rehearsal daemon:
+
+```toml
+[forge_overrides."https://github.com"]
+provider = "forgejo"
+endpoint_url = "https://fake-forge.rehearsal:3443/github"
+token_path = "/etc/flotilla-rehearsal/tokens/github"
+```
+
+The key is the original canonical service URL, including an installation prefix
+when present, without a trailing slash. The binding selects the Forgejo adapter,
+HTTPS endpoint and absolute token file before ordinary provider/credential
+selection. Builtin GitHub needs no replacement Forge record. Repository keys,
+Forge definitions, Git remotes and issue sources retain their original values.
+Missing override credentials refuse provider construction rather than falling
+back to production credentials. Removing a binding restores ordinary discovery
+on subsequent provider resolution.
+
+See the [fake forge rehearsal guide](../crates/flotilla-fake-forge/README.md)
+for the installer, CA trust and dummy crew claim configuration.
+
 ## Daemon Forgejo identity
 
 Declare each host daemon's Forgejo credential explicitly in that host's
