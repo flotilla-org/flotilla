@@ -455,6 +455,17 @@ fn projection_parity_sequential_admissions(tc: hegel::TestCase) {
             apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &identity, &health)
                 .await
                 .expect("publish divergence");
+            // Projection lag blocks new admission, while existing convoys still
+            // need this live daemon to observe their forge completion evidence.
+            let host = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("host");
+            let status = host.status.expect("status");
+            assert!(!status.ready, "projection lag must still block admission");
+            assert!(status.heartbeat_is_fresh(Utc::now()), "observer loss must not be heartbeat expiry");
+            let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "test/repo".into() };
+            assert_eq!(
+                flotilla_core::forge_observation::source_owner(&backend, NAMESPACE, &source).await.expect("live forge observer"),
+                Some(backend.local_root().expect("local root")),
+            );
             let mut events = daemon.subscribe();
             let command_id = daemon
                 .execute(

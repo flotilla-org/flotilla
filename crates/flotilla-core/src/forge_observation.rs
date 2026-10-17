@@ -13,8 +13,8 @@ use flotilla_protocol::{
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     forge_read_name, normalize_issue_source, Clock, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus,
-    ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, InputMeta, IssueSourceResolution, Project, ReadWatchEvent, Repository,
-    ResourceError, ResourceProvenance, SystemClock,
+    ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, HostStatus, InputMeta, IssueSourceResolution, Project, ReadWatchEvent,
+    Repository, ResourceError, ResourceProvenance, SystemClock,
 };
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::ResourceBackend;
@@ -152,9 +152,23 @@ enum ObserverHealth {
     Unready,
 }
 
+// Projection lag is an admission blocker, not evidence that forge reads have
+// stopped working. In particular the sole observer must keep refreshing facts
+// so existing convoys can finish while the local projection catches up. Keep
+// explicit unready status and every other blocking condition authoritative.
+fn observer_ready(status: &HostStatus) -> bool {
+    if status.ready {
+        return true;
+    }
+    let mut blockers = status.conditions.iter().filter(|condition| condition.blocks_readiness()).peekable();
+    blockers.peek().is_some()
+        && blockers.all(|condition| condition.condition_type == "ProjectionParity" && condition.reason == "LocalRowsMissing")
+}
+
 /// Shared sources elect once, regardless of how many Projects bind them.
 /// Unknown host health preserves the preferred owner during startup; only
-/// unready/stale evidence or expiry of the startup grace permits fallback.
+/// observer-unready/stale evidence or expiry of the startup grace permits
+/// fallback. Projection-only admission degradation does not withdraw observation.
 pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<Option<NodeId>, String> {
     let mut source = canonical_source(source);
     for forge in backend.definitions::<flotilla_resources::Forge>(namespace).list().await.map_err(|e| e.to_string())? {
@@ -212,7 +226,7 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
         let heartbeat = host.object.status.as_ref().and_then(|status| status.heartbeat_at);
         let health = match host.object.status.as_ref() {
             None => unknown_health(host.object.metadata.creation_timestamp, now),
-            Some(status) if !status.ready => ObserverHealth::Unready,
+            Some(status) if !observer_ready(status) => ObserverHealth::Unready,
             Some(_) => match heartbeat {
                 Some(at) if now.signed_duration_since(at) < HEARTBEAT_MAX_AGE => ObserverHealth::Ready,
                 Some(_) => ObserverHealth::Unready,
@@ -1247,6 +1261,46 @@ mod tests {
         silent.items[0].metadata.creation_timestamp -= UNKNOWN_OWNER_GRACE + Duration::seconds(1);
         ready.replica_writer::<Host>(missing.local_root().unwrap(), "flotilla").replace(&silent, Utc::now()).await.unwrap();
         assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(ready.local_root().unwrap()));
+    }
+
+    // Only projection-only admission degradation may preserve an unready Host
+    // as observer. Unknown causes and mixed blocking faults remain authoritative.
+    #[hegel::test]
+    fn observer_readiness_preserves_explicit_faults(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Cover empty/duplicate projection reports, advisory and blocking
+        // unrelated conditions, and unknown projection types or reasons.
+        let ready = tc.draw(gs::booleans());
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+        let known_type = tc.draw(gs::booleans());
+        let known_reason = tc.draw(gs::booleans());
+        let other = tc.draw(gs::integers::<u8>().min_value(0).max_value(2));
+        let mut conditions = Vec::new();
+        for _ in 0..count {
+            conditions.push(
+                flotilla_resources::HostCondition::builder()
+                    .condition_type(if known_type { "ProjectionParity" } else { "Unknown" })
+                    .value(flotilla_resources::ConditionValue::False)
+                    .reason(if known_reason { "LocalRowsMissing" } else { "Unknown" })
+                    .message("lag")
+                    .observed_at(Utc::now())
+                    .build(),
+            );
+        }
+        if other != 0 {
+            conditions.push(
+                flotilla_resources::HostCondition::builder()
+                    .condition_type("CapabilityRegression")
+                    .value(flotilla_resources::ConditionValue::False)
+                    .reason("AgentAdaptersMissing")
+                    .message("missing adapter")
+                    .observed_at(Utc::now())
+                    .blocks_readiness(other == 2)
+                    .build(),
+            );
+        }
+        let status = HostStatus { ready, conditions, ..Default::default() };
+        assert_eq!(observer_ready(&status), ready || (count > 0 && known_type && known_reason && other != 2));
     }
 
     // Equal-heartbeat contradictions must not revive an explicitly unready
