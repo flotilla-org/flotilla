@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-07-13
+**Amended by:** [ADR 0067](0067-tables-describe-themselves-on-the-wire.md) (what a column means now crosses the wire as a self-describing table; layout still does not, and still never lives in the store)
 **Builds on:** ADR 0011 (the data plane this consumes), ADR 0005 (whose
 composition view model this houses consumer-side)
 
