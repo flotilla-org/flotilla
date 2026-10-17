@@ -151,6 +151,9 @@ binnacle's grid works by Position: it needs the count, the keys for a range of p
 - **The server sends:** the view's count; the rows in the window; changes as positions (inserted at, removed at, moved from and to, and content changed for rows in the window); count changes; and answers to "what is the position of key K?".
 - **The server keeps each live view as an in-memory ordered index** of its keys, a B-tree with subtree counts. It is built once from the store's ordered query, which an index can serve, and each change the view sees is one O(log n) update that yields its position. A 100,000-key view is a few megabytes and about 17 comparisons per change. The cost scales with the number of open views, not with the store. Positions are never stored per sort order: that would renumber rows on every insert for orders nobody is watching, and SQLite cannot find a key's position without counting.
 - **Append-ordered views,** such as the `log` by sequence, insert at the end, so their index is trivial.
+- **Every view message carries the sequence number it reflects,** as `rows` batches do (decision 16), so a client can line a window fetch up with later changes.
+- **A view lives as long as its subscription.** Unsubscribing or closing the connection drops its index. The server caps the number of live views per connection and refuses a subscription beyond the cap.
+- **A view the server cannot keep current is rebuilt.** When the store's stream for its table resyncs, the server rebuilds the index and sends the view's count and window afresh, as `resync` does for a table (decision 8).
 - **This is decision 10's "server-side position index"**, now the basis of live views rather than an optimisation added later. Decision 10's `?offset` and counts still serve GET.
 - **The plain table subscription and GET stay** for small tables, curl, scripts, agents and replication-style consumers. A small table can still be fetched whole and sorted by binnacle's in-memory source.
 
@@ -158,7 +161,7 @@ binnacle's grid works by Position: it needs the count, the keys for a range of p
 
 1. **Snapshot consistency.** Every GET page and every `rows` batch carries the sequence number it reflects, so a client that mixes paged fetches with a live stream knows which changes to apply.
 2. **Capabilities are described.** Field properties say whether a field can be sorted and which `where` operators it supports, so a viewer can disable a control up front rather than learn from a 400.
-3. **Ordering is specified.** Nulls sort first, and text sorts by Unicode code point (SQLite's `BINARY` ordering), so a browser sort and a server sort of the same table agree.
+3. **Ordering is specified.** Null is the lowest value: first in an ascending sort and last in a descending one, as in SQLite. Text sorts by Unicode code point, which is SQLite's `BINARY` ordering of UTF-8. A browser viewer compares by code point too, not by JavaScript's default UTF-16 code-unit order, which differs for characters outside the Basic Multilingual Plane. A browser sort and a server sort of the same table then agree.
 4. **Composite keys have one encoding:** the ADR 0063 deterministic CBOR of the key tuple. Equal keys always intern to the same binnacle Key.
 5. **A `count` message** carries a changed count, including corrections to an estimate (decision 10).
 6. **Units are meaning.** A field property gives a value's unit as a UCUM code (for example `By` for bytes, `s` for seconds), so a generic viewer can align and format values.
