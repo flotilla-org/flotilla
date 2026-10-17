@@ -129,6 +129,8 @@ impl IssuePollingHealth {
                 .message(message)
                 .observed_at(Utc::now())
                 .blocks_readiness(false)
+                // Budget backoff is source-scoped; it does not withdraw every forge on this host.
+                .blocks_forge_observation(false)
                 .build(),
         )
     }

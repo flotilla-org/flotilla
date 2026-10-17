@@ -92,6 +92,8 @@ async fn heartbeat_patch_preserves_independent_status_after_another_writer_updat
         .reason("DecodeFailed")
         .message("one record failed to decode")
         .observed_at(observed_at)
+        // This test admission condition does not disable forge reads.
+        .blocks_forge_observation(false)
         .build();
     let patch = HostStatusPatch::Heartbeat {
         description: None,

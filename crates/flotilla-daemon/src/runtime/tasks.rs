@@ -1,5 +1,8 @@
 //! Background task ownership, supervision, retention, and watch loops.
 
+/// Shared by supervision and the forge-observation health classification.
+pub(super) const AGGREGATOR_CONTROLLER: &str = "aggregator";
+
 use flotilla_daemon_api::daemon::DaemonHandle;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -897,7 +900,7 @@ pub(super) fn spawn_aggregator_task(
 ) -> JoinHandle<()> {
     let issue_polling = runtime_health.issue_polling.clone();
     tokio::spawn(async move {
-        supervise_controller("aggregator", supervision, runtime_health, move || {
+        supervise_controller(AGGREGATOR_CONTROLLER, supervision, runtime_health, move || {
             let daemon = Arc::clone(&daemon);
             let namespace = namespace.clone();
             let state = state.clone();

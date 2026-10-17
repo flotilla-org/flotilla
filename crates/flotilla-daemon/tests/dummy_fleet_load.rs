@@ -26,14 +26,17 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_config::{ConfigStore, DaemonConfig};
-use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::{forge_observation::NO_READY_FORGE_OBSERVER, in_process::InProcessDaemon};
 use flotilla_daemon::{
     dummy_fleet::{attach_dummy_fleet, install_dummy_fleet},
     runtime::{DaemonRuntime, RuntimeOptions},
@@ -67,6 +70,7 @@ struct HomeView {
     convoys: Mutex<HashMap<String, (String, ConvoyState)>>,
     /// Where each open convoy is: its phase and its crews' work phases.
     places: Mutex<HashMap<String, String>>,
+    observer_failure_sightings: AtomicU64,
     turn_delivery: LatencyHistogram,
     replication_lag: LatencyHistogram,
 }
@@ -186,6 +190,12 @@ async fn watch_convoys(backend: &ResourceBackend, view: Arc<HomeView>, admission
             let convoy = source.object;
             match source.provenance {
                 ResourceProvenance::Local => {
+                    if let Some(stalled) = convoy.status.as_ref().and_then(|status| status.stalled.as_ref()) {
+                        if stalled.evidence.contains(NO_READY_FORGE_OBSERVER) {
+                            view.observer_failure_sightings.fetch_add(1, Ordering::Relaxed);
+                            println!("observer_failure convoy={} evidence={}", convoy.metadata.name, stalled.evidence);
+                        }
+                    }
                     admissions.lock().expect("admissions").entry(convoy.metadata.name.clone()).or_insert_with(tokio::time::Instant::now);
                     let state = convoy.status.as_ref().map_or(ConvoyState::Open, |status| state_of(status.phase));
                     view.convoys.lock().expect("convoys").insert(convoy.spec.role.clone(), (convoy.metadata.name.clone(), state));
@@ -440,6 +450,23 @@ async fn load_baseline() {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 let open = fleet.homes.iter().map(|home| home.view.places.lock().expect("places").len()).sum::<usize>();
                 let database = fleet.homes.iter().filter_map(|home| database_bytes(&home.database)).sum::<u64>();
+                for (index, home) in fleet.homes.iter().enumerate() {
+                    let source = flotilla_protocol::IssueSource { service: catalog_forge_url(), scope: catalog::DUMMY_REPOSITORY.into() };
+                    let owner = flotilla_core::forge_observation::source_owner(&home.daemon.resource_backend(), NAMESPACE, &source).await;
+                    println!("observer home={index} owner={owner:?}");
+                    let hosts = home.daemon.resource_backend().using::<Host>(NAMESPACE).list().await.expect("liveness hosts");
+                    for host in hosts.items {
+                        if let Some(status) = host.status {
+                            println!(
+                                "liveness t={:.0}s home={index} ready={} heartbeat_age_ms={:?} conditions={:?}",
+                                began.elapsed().as_secs_f64(),
+                                status.ready,
+                                status.heartbeat_at.map(|at| (Utc::now() - at).num_milliseconds()),
+                                status.conditions,
+                            );
+                        }
+                    }
+                }
                 println!(
                     "progress t={:.0}s open={open} resident={} MiB database={} MiB",
                     began.elapsed().as_secs_f64(),
@@ -451,10 +478,13 @@ async fn load_baseline() {
     };
     let report = flotilla_load_driver::run(&*fleet, &plan).await.expect("load report");
     progress.abort();
+    let observer_failures: u64 = fleet.homes.iter().map(|home| home.view.observer_failure_sightings.load(Ordering::Relaxed)).sum();
+    println!("observer_failure_sightings={observer_failures}");
     let markdown = report.markdown();
     println!("{markdown}");
     if let Ok(prefix) = std::env::var("FLOTILLA_LOAD_REPORT") {
         std::fs::write(format!("{prefix}.md"), format!("Run started {started}.\n\n{markdown}")).expect("markdown report");
         std::fs::write(format!("{prefix}.json"), serde_json::to_string_pretty(&report).expect("json")).expect("json report");
     }
+    assert_eq!(observer_failures, 0, "load produced no-ready-forge-observer stall evidence; see observer_failure lines");
 }

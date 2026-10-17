@@ -13,8 +13,8 @@ use flotilla_protocol::{
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     forge_read_name, normalize_issue_source, Clock, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus,
-    ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, InputMeta, IssueSourceResolution, Project, ReadWatchEvent, Repository,
-    ResourceError, ResourceProvenance, SystemClock,
+    ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, HostStatus, InputMeta, IssueSourceResolution, Project, ReadWatchEvent,
+    Repository, ResourceError, ResourceProvenance, SystemClock,
 };
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::ResourceBackend;
@@ -29,6 +29,9 @@ pub(crate) const OWNER_LOCAL_INCREMENTAL_READ_ERROR: &str = "incremental forge r
 // Leave three seconds for store/routing work inside the daemon's five-second
 // interactive request deadline (server/request_dispatch.rs).
 pub const REMOTE_READ_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+/// Stable diagnostic shared with the load harness when no observer qualifies.
+pub const NO_READY_FORGE_OBSERVER: &str = "no ready forge observer";
+
 const HEARTBEAT_MAX_AGE: Duration = Duration::seconds(180);
 const UNKNOWN_OWNER_GRACE: Duration = Duration::seconds(180);
 const READ_FRESHNESS: Duration = Duration::seconds(60);
@@ -152,9 +155,16 @@ enum ObserverHealth {
     Unready,
 }
 
+// Admission readiness is independent of observation. Liveness is checked by
+// the election heartbeat limit; only explicit forge-affecting faults withdraw it.
+fn observer_ready(status: &HostStatus) -> bool {
+    !status.conditions.iter().any(|condition| condition.blocks_forge_observation())
+}
+
 /// Shared sources elect once, regardless of how many Projects bind them.
 /// Unknown host health preserves the preferred owner during startup; only
-/// unready/stale evidence or expiry of the startup grace permits fallback.
+/// observer-unready/stale evidence or expiry of the startup grace permits
+/// fallback. Admission readiness never withdraws forge observation.
 pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<Option<NodeId>, String> {
     let mut source = canonical_source(source);
     for forge in backend.definitions::<flotilla_resources::Forge>(namespace).list().await.map_err(|e| e.to_string())? {
@@ -212,7 +222,7 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
         let heartbeat = host.object.status.as_ref().and_then(|status| status.heartbeat_at);
         let health = match host.object.status.as_ref() {
             None => unknown_health(host.object.metadata.creation_timestamp, now),
-            Some(status) if !status.ready => ObserverHealth::Unready,
+            Some(status) if !observer_ready(status) => ObserverHealth::Unready,
             Some(_) => match heartbeat {
                 Some(at) if now.signed_duration_since(at) < HEARTBEAT_MAX_AGE => ObserverHealth::Ready,
                 Some(_) => ObserverHealth::Unready,
@@ -239,7 +249,7 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
         .into_iter()
         .find_map(|(root, (_, health))| (health == ObserverHealth::Ready).then_some(root))
         .map(Some)
-        .ok_or_else(|| "no ready forge observer".into())
+        .ok_or_else(|| NO_READY_FORGE_OBSERVER.into())
 }
 
 pub async fn owns_source(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<bool, String> {
@@ -1171,7 +1181,21 @@ mod tests {
                     .update_status(
                         "host",
                         &host.metadata.resource_version,
-                        &HostStatus { ready: false, heartbeat_at: Some(Utc::now()), ..Default::default() },
+                        &HostStatus {
+                            ready: true,
+                            heartbeat_at: Some(Utc::now()),
+                            conditions: vec![flotilla_resources::HostCondition::builder()
+                                .condition_type("ForgeObservation")
+                                .reason("Withdrawn")
+                                .message("deliberate handover during a read")
+                                .observed_at(Utc::now())
+                                .value(flotilla_resources::ConditionValue::False)
+                                .blocks_readiness(false)
+                                // Explicit withdrawal must work independently of placement readiness.
+                                .blocks_forge_observation(true)
+                                .build()],
+                            ..Default::default()
+                        },
                     )
                     .await
                     .unwrap();
@@ -1247,6 +1271,44 @@ mod tests {
         silent.items[0].metadata.creation_timestamp -= UNKNOWN_OWNER_GRACE + Duration::seconds(1);
         ready.replica_writer::<Host>(missing.local_root().unwrap(), "flotilla").replace(&silent, Utc::now()).await.unwrap();
         assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(ready.local_root().unwrap()));
+    }
+
+    // Admission readiness and condition names never affect observer eligibility.
+    // A false observation-blocking condition withdraws even an admission-ready host.
+    #[hegel::test]
+    fn observer_readiness_is_independent_of_admission(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let ready = tc.draw(gs::booleans());
+        // Empty, duplicate, arbitrary names, both classification bits and
+        // healthy/failed values; check after each appended condition.
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
+        let mut status = HostStatus { ready, ..Default::default() };
+        let mut withdrawn = false;
+        assert!(observer_ready(&status));
+        for _ in 0..count {
+            let admission = tc.draw(gs::booleans());
+            let observation = tc.draw(gs::booleans());
+            let value = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+            let value = [
+                flotilla_resources::ConditionValue::False,
+                flotilla_resources::ConditionValue::True,
+                flotilla_resources::ConditionValue::Unknown,
+            ][value];
+            let name = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+            withdrawn |= observation && value == flotilla_resources::ConditionValue::False;
+            status.conditions.push(
+                flotilla_resources::HostCondition::builder()
+                    .condition_type([flotilla_resources::PROJECTION_PARITY_CONDITION, "CapabilityRegression", "Unknown"][name])
+                    .reason("arbitrary")
+                    .message("test fault")
+                    .observed_at(Utc::now())
+                    .value(value)
+                    .blocks_readiness(admission)
+                    .blocks_forge_observation(observation)
+                    .build(),
+            );
+            assert_eq!(observer_ready(&status), !withdrawn);
+        }
     }
 
     // Equal-heartbeat contradictions must not revive an explicitly unready

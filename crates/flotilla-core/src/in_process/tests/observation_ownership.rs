@@ -22,7 +22,7 @@ use flotilla_protocol::ChangeRequest;
 
 // #2868: three daemons sharing a Project poll its source once per pass.
 // Nonowners obtain board facts through real resource replication; explicit
-// unready evidence elects one replacement, and recovery restores the home.
+// observation withdrawal elects one replacement, and recovery restores the home.
 struct CountingForgeRequests(AtomicUsize);
 #[async_trait]
 impl ChangeRequestTracker for CountingForgeRequests {
@@ -245,7 +245,21 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         .update_status(
             "host-0",
             &host.metadata.resource_version,
-            &HostStatus { ready: false, heartbeat_at: Some(Utc::now()), ..Default::default() },
+            &HostStatus {
+                ready: true,
+                heartbeat_at: Some(Utc::now()),
+                conditions: vec![flotilla_resources::HostCondition::builder()
+                    .condition_type("ForgeObservation")
+                    .reason("Withdrawn")
+                    .message("deliberate fleet observer handover")
+                    .observed_at(Utc::now())
+                    .value(flotilla_resources::ConditionValue::False)
+                    .blocks_readiness(false)
+                    // Explicit withdrawal must work independently of placement readiness.
+                    .blocks_forge_observation(true)
+                    .build()],
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
