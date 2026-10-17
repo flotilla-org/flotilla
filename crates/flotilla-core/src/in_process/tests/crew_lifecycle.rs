@@ -381,8 +381,11 @@ async fn landing_without_armed_exit_rows_stalls() {
 }
 
 #[tokio::test]
+// #3412: the real daemon keeps stale evidence unknown during observer grace,
+// then attributes unrecovered evidence to observer lag after its deadline.
 async fn stale_change_request_observation_stalls_landing_convoy() {
-    let (_daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(Utc::now()));
+    let (daemon, backend, _temp, watch) = super::support::stall_test_daemon_with_clock(clock.clone()).await;
     let repository = flotilla_resources::RepositoryKey("repo".into());
     let spec = ConvoySpec::builder()
         .workflow_ref("test".into())
@@ -457,9 +460,14 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
         )
         .await
         .expect("stale observation");
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("judge inside observer grace");
+    assert!(convoys.get("stale-observation").await.expect("convoy").status.expect("status").stalled.is_none());
+    clock.advance(chrono::Duration::hours(1));
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("judge expired observer grace");
     let stalled = wait_for_stall(&backend, "stale-observation", true).await.stalled.expect("stalled");
     assert!(matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Observed { .. })));
-    assert!(stalled.evidence.starts_with("stale"));
+    assert!(stalled.evidence.contains("stale"));
+    assert!(stalled.evidence.contains("observer behind scheduled refresh grace"));
     assert_eq!(stalled.source, flotilla_resources::StallEvidenceSource::Observation);
     watch.abort();
 }

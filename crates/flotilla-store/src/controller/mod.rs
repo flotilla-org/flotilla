@@ -188,21 +188,35 @@ pub trait SecondaryWatch: Send + Sync {
 #[derive(Clone)]
 pub struct WorkQueueSender {
     sender: mpsc::UnboundedSender<String>,
-    queued: Arc<StdMutex<HashSet<String>>>,
+    progress: Arc<StdMutex<QueueProgress>>,
+}
+
+#[derive(Default)]
+struct QueueProgress {
+    queued: HashSet<String>,
+    processing: Option<String>,
+    last_progress: Option<DateTime<Utc>>,
 }
 
 impl WorkQueueSender {
+    /// Queue progress uses wall time, like the production judge. A judge with
+    /// an injected virtual clock must compare against these recorded wall-time
+    /// instants (or advance relative to them); advancing only its clock does not
+    /// simulate progress in the real controller loop.
     pub fn channel() -> (Self, mpsc::UnboundedReceiver<String>) {
         let (sender, receiver) = mpsc::unbounded_channel();
-        (Self { sender, queued: Arc::new(StdMutex::new(HashSet::new())) }, receiver)
+        (Self { sender, progress: Arc::default() }, receiver)
     }
 
     /// Enqueue completes without suspension; the async signature keeps watch producers uniform.
     pub async fn send(&self, name: String) -> Result<(), mpsc::error::SendError<String>> {
-        let mut queued = self.queued.lock().expect("controller work queue lock poisoned");
-        if queued.insert(name.clone()) {
+        let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
+        if progress.queued.is_empty() && progress.processing.is_none() {
+            progress.last_progress = Some(Utc::now());
+        }
+        if progress.queued.insert(name.clone()) {
             if let Err(error) = self.sender.send(name.clone()) {
-                queued.remove(&name);
+                progress.queued.remove(&name);
                 return Err(error);
             }
         }
@@ -210,7 +224,35 @@ impl WorkQueueSender {
     }
 
     fn start(&self, name: &str) {
-        self.queued.lock().expect("controller work queue lock poisoned").remove(name);
+        let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
+        progress.queued.remove(name);
+        progress.processing = Some(name.into());
+        progress.last_progress = Some(Utc::now());
+    }
+
+    fn made_progress(&self) {
+        let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
+        progress.processing = None;
+        progress.last_progress = Some(Utc::now());
+    }
+
+    /// Queue age alone is not a failure: a busy loop making progress is able.
+    /// An idle loop owes nothing. Only outstanding work without loop progress
+    /// for the bound is evidence that the owning controller is stuck.
+    pub fn stall_reason(&self, now: DateTime<Utc>, bound: Duration) -> Option<String> {
+        let progress = self.progress.lock().expect("controller work queue lock poisoned");
+        if progress.queued.is_empty() && progress.processing.is_none() {
+            return None;
+        }
+        let age = now.signed_duration_since(progress.last_progress?);
+        (age >= chrono::Duration::from_std(bound).expect("controller bound fits")).then(|| {
+            format!(
+                "controller has made no progress for {}s; processing {}; {} queued",
+                age.num_seconds(),
+                progress.processing.as_deref().unwrap_or("no object"),
+                progress.queued.len()
+            )
+        })
     }
 }
 
@@ -772,6 +814,7 @@ impl<R: Reconciler> ControllerLoop<R> {
         let mut finalizer_failures = BTreeMap::<String, FinalizerFailure>::new();
 
         loop {
+            sender.made_progress();
             if let Some(heartbeat) = &heartbeat {
                 heartbeat.fetch_add(1, Ordering::Relaxed);
             }
@@ -1122,4 +1165,46 @@ pub async fn delete_lifecycle_owned_matching<T: Resource>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    // #3412: only outstanding work without progress can stall a controller.
+    // Generate duplicate queue entries, backlog sizes, and ages on both sides
+    // of the bound; check after every drain step and after the queue is idle.
+    #[hegel::test]
+    fn controller_queue_progress_distinguishes_idle_busy_and_stuck(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(30));
+        let age = tc.draw(gs::integers::<i64>().min_value(0).max_value(120));
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let (sender, mut receiver) = WorkQueueSender::channel();
+            let bound = Duration::from_secs(60);
+            assert!(sender.stall_reason(Utc::now() + chrono::Duration::hours(2), bound).is_none());
+            for index in 0..count {
+                sender.send(index.to_string()).await.unwrap();
+                sender.send(index.to_string()).await.unwrap();
+            }
+            let baseline = sender.progress.lock().unwrap().last_progress.unwrap();
+            for age in [0, 59, 60, 61, age] {
+                assert_eq!(sender.stall_reason(baseline + chrono::Duration::seconds(age), bound).is_some(), age >= 60);
+            }
+            for _ in 0..count {
+                let name = receiver.try_recv().unwrap();
+                sender.start(&name);
+                let baseline = sender.progress.lock().unwrap().last_progress.unwrap();
+                assert!(sender.stall_reason(baseline + chrono::Duration::seconds(59), bound).is_none());
+                assert!(sender
+                    .stall_reason(baseline + chrono::Duration::seconds(60), bound)
+                    .unwrap()
+                    .contains(&format!("processing {name}")));
+                sender.made_progress();
+                assert!(sender.stall_reason(Utc::now(), bound).is_none());
+            }
+            assert!(receiver.try_recv().is_err(), "duplicates are deduplicated");
+            assert!(sender.stall_reason(Utc::now() + chrono::Duration::hours(2), bound).is_none());
+        });
+    }
 }

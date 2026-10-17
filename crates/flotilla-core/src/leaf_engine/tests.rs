@@ -1586,3 +1586,5 @@ mod settlement;
 mod stalls_supervision;
 mod subscriptions;
 mod turn_delivery;
+
+mod landing_stalls;

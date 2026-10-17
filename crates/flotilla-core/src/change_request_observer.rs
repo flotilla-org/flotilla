@@ -29,6 +29,12 @@ use tokio::{
 const RETAINED_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const HISTORY_REFRESH_INTERVAL_SECS: i64 = 60 * 60;
 
+// Deadline arithmetic on the judge path must remain total even for a cadence
+// outside chrono's duration range or an observation near its final timestamp.
+fn cadence_deadline(at: DateTime<Utc>, cadence: Duration) -> DateTime<Utc> {
+    chrono::Duration::from_std(cadence).ok().and_then(|cadence| at.checked_add_signed(cadence)).unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ChangeRequestRefreshCadence {
     pub state: Duration,
@@ -52,6 +58,8 @@ struct ActiveRefresh {
     demands: HashMap<uuid::Uuid, Option<DateTime<Utc>>>,
     wake: Arc<Notify>,
     task: JoinHandle<()>,
+    next_refresh_at: DateTime<Utc>,
+    scheduled_cadence: Duration,
 }
 
 #[derive(Clone)]
@@ -237,6 +245,30 @@ impl ChangeRequestRefresher {
         self.inner.cadence.stale_after
     }
 
+    /// A consumer gets the observer's next scheduled refresh plus one cadence.
+    /// Missing local demand (for example a remote owner) starts with the ordinary
+    /// configured cadence; no judge-specific fixed delay is invented.
+    pub(crate) async fn refresh_grace_deadline(
+        &self,
+        subject: &ChangeRequestKey,
+        freshness: Option<DateTime<Utc>>,
+        created_at: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        let active = self.inner.active.lock().await;
+        let (next, cadence) = active.get(subject).map_or_else(
+            || {
+                let cadence = if freshness.is_some() { self.inner.cadence.freshness_demanded } else { self.inner.cadence.state };
+                (cadence_deadline(created_at, cadence), cadence)
+            },
+            |refresh| (refresh.next_refresh_at, refresh.scheduled_cadence),
+        );
+        cadence_deadline(next, cadence)
+    }
+
+    pub(crate) fn retry_grace_deadline(&self, retry_at: DateTime<Utc>) -> DateTime<Utc> {
+        cadence_deadline(retry_at, self.inner.cadence.checks_pending)
+    }
+
     pub async fn observation_error(&self, subject: &ChangeRequestKey) -> Option<ObservationError> {
         self.inner.observation_errors.lock().await.get(subject).cloned()
     }
@@ -303,6 +335,8 @@ impl ChangeRequestRefresher {
             let was_retained = refresh.demands.is_empty();
             refresh.demands.insert(subscription_id, freshness);
             if freshness.is_some() || was_retained {
+                refresh.next_refresh_at = Utc::now();
+                refresh.scheduled_cadence = self.inner.cadence.freshness_demanded;
                 refresh.wake.notify_one();
             }
             return Ok(());
@@ -310,8 +344,16 @@ impl ChangeRequestRefresher {
         let this = self.clone();
         let task_subject = subject.clone();
         let task = tokio::spawn(async move { this.refresh_loop(task_subject).await });
-        active
-            .insert(subject, ActiveRefresh { demands: HashMap::from([(subscription_id, freshness)]), wake: Arc::new(Notify::new()), task });
+        active.insert(
+            subject,
+            ActiveRefresh {
+                demands: HashMap::from([(subscription_id, freshness)]),
+                wake: Arc::new(Notify::new()),
+                task,
+                next_refresh_at: Utc::now(),
+                scheduled_cadence: self.inner.cadence.freshness_demanded,
+            },
+        );
         Ok(())
     }
 
@@ -485,7 +527,16 @@ impl ChangeRequestRefresher {
         let this = self.clone();
         let task_subject = subject.clone();
         let task = tokio::spawn(async move { this.refresh_loop(task_subject).await });
-        active.insert(subject, ActiveRefresh { demands: HashMap::new(), wake: Arc::new(Notify::new()), task });
+        active.insert(
+            subject,
+            ActiveRefresh {
+                demands: HashMap::new(),
+                wake: Arc::new(Notify::new()),
+                task,
+                next_refresh_at: Utc::now(),
+                scheduled_cadence: RETAINED_REFRESH_INTERVAL,
+            },
+        );
     }
 
     /// Capture links at admission, before a convoy can disappear. History is in
@@ -616,14 +667,24 @@ impl ChangeRequestRefresher {
             }
             match self.owns_record(&subject, true, true).await {
                 Ok(false) => {
-                    if !self.wait_for_next(&subject, self.refresh_delay(&subject, self.inner.cadence.state).await).await {
+                    if !self
+                        .wait_for_next(&subject, self.refresh_delay(&subject, self.inner.cadence.state).await, self.inner.cadence.state)
+                        .await
+                    {
                         break;
                     }
                     continue;
                 }
                 Err(error) => {
                     self.inner.observation_errors.lock().await.insert(subject.clone(), ObservationError::Failed(error));
-                    if !self.wait_for_next(&subject, self.refresh_delay(&subject, self.inner.cadence.checks_pending).await).await {
+                    if !self
+                        .wait_for_next(
+                            &subject,
+                            self.refresh_delay(&subject, self.inner.cadence.checks_pending).await,
+                            self.inner.cadence.checks_pending,
+                        )
+                        .await
+                    {
                         break;
                     }
                     continue;
@@ -664,7 +725,7 @@ impl ChangeRequestRefresher {
                     } else {
                         delay
                     };
-                    if !self.wait_for_next(&subject, delay).await {
+                    if !self.wait_for_next(&subject, delay, delay).await {
                         break;
                     }
                 }
@@ -678,7 +739,7 @@ impl ChangeRequestRefresher {
                         .and_then(|retry_at| retry_at.signed_duration_since(Utc::now()).to_std().ok())
                         .filter(|delay| !delay.is_zero())
                         .unwrap_or(ordinary_delay);
-                    if !self.wait_for_next(&subject, delay).await {
+                    if !self.wait_for_next(&subject, delay, ordinary_delay).await {
                         break;
                     }
                 }
@@ -777,8 +838,12 @@ impl ChangeRequestRefresher {
         }
     }
 
-    async fn wait_for_next(&self, subject: &ChangeRequestKey, delay: Duration) -> bool {
-        let Some(wake) = self.inner.active.lock().await.get(subject).map(|refresh| Arc::clone(&refresh.wake)) else {
+    async fn wait_for_next(&self, subject: &ChangeRequestKey, delay: Duration, cadence: Duration) -> bool {
+        let Some(wake) = self.inner.active.lock().await.get_mut(subject).map(|refresh| {
+            refresh.next_refresh_at = cadence_deadline(Utc::now(), delay);
+            refresh.scheduled_cadence = cadence;
+            Arc::clone(&refresh.wake)
+        }) else {
             return false;
         };
         tokio::select! {
@@ -965,6 +1030,18 @@ mod tests {
         .expect("healthy observation"));
         refresher.refresh_once(&subject).await.expect("recovered observation");
         assert!(refresher.observation_error(&subject).await.is_none());
+    }
+
+    // Deadline conversion is small arithmetic glue. These cases cover zero,
+    // ordinary cadence, duration overflow, timestamp overflow, and the limit.
+    #[test]
+    fn cadence_deadline_saturates_at_chrono_limits() {
+        let at: DateTime<Utc> = "2026-10-17T00:00:00Z".parse().unwrap();
+        assert_eq!(cadence_deadline(at, Duration::ZERO), at);
+        assert_eq!(cadence_deadline(at, Duration::from_secs(60)), at + chrono::Duration::seconds(60));
+        assert_eq!(cadence_deadline(at, Duration::MAX), DateTime::<Utc>::MAX_UTC);
+        assert_eq!(cadence_deadline(DateTime::<Utc>::MAX_UTC, Duration::from_secs(1)), DateTime::<Utc>::MAX_UTC);
+        assert_eq!(cadence_deadline(DateTime::<Utc>::MAX_UTC, Duration::ZERO), DateTime::<Utc>::MAX_UTC);
     }
 
     struct CountingSource(Arc<AtomicUsize>);
@@ -1577,11 +1654,21 @@ mod tests {
         refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.expect("initial demand");
         wait_for_calls(&calls, 1).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // #3412: grace follows the observer's scheduled refresh plus its own
+        // cadence; a new demand must replace the slow schedule with the fast one.
+        let now = Utc::now();
+        let deadline = refresher.refresh_grace_deadline(&subject, None, now).await;
+        assert!(deadline >= now + chrono::Duration::seconds(179));
+        assert!(deadline <= now + chrono::Duration::seconds(181));
 
         tokio::time::advance(Duration::from_secs(5)).await;
-        refresher.demand(uuid::Uuid::new_v4(), subject, Some(Utc::now())).await.expect("late freshness demand");
+        refresher.demand(uuid::Uuid::new_v4(), subject.clone(), Some(Utc::now())).await.expect("late freshness demand");
         wait_for_calls(&calls, 2).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "freshness demand must preempt the remaining 85-second sleep");
+        let now = Utc::now();
+        let deadline = refresher.refresh_grace_deadline(&subject, Some(now), now).await;
+        assert!(deadline >= now + chrono::Duration::seconds(19));
+        assert!(deadline <= now + chrono::Duration::seconds(21));
     }
 
     #[tokio::test]

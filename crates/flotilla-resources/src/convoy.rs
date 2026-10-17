@@ -2755,6 +2755,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
             }
         }
+        // Terminal state and its stall condition are one atomic write. The
+        // judge may never see this convoy again after settlement or teardown.
+        if status.phase.is_terminal() {
+            status.stalled = None;
+        }
     }
 }
 
