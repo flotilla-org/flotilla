@@ -609,8 +609,13 @@ impl CommandRunner for ProcessCommandRunner {
             let mut bytes = Vec::new();
             pipe.read_to_end(&mut bytes).await.map(|_| bytes)
         }
-        let stdout = tokio::spawn(drain(child.stdout.take().expect("piped stdout")));
-        let stderr = tokio::spawn(drain(child.stderr.take().expect("piped stderr")));
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        // JoinSet owns the pipe readers, so cancellation or an error aborts
+        // them rather than detaching a task holding an inherited pipe open.
+        let mut drains = tokio::task::JoinSet::new();
+        drains.spawn(async move { drain(stdout).await.map(|bytes| (true, bytes)) });
+        drains.spawn(async move { drain(stderr).await.map(|bytes| (false, bytes)) });
         let waited = tokio::time::timeout(timeout, child.wait()).await;
         let timed_out = waited.is_err();
         let status = match waited {
@@ -631,6 +636,7 @@ impl CommandRunner for ProcessCommandRunner {
                 }
                 #[cfg(not(unix))]
                 {
+                    // These platforms terminate immediately without TERM grace.
                     child.kill().await.map_err(|error| error.to_string())?;
                     child.wait().await.map_err(|error| error.to_string())?
                 }
@@ -640,11 +646,33 @@ impl CommandRunner for ProcessCommandRunner {
         {
             guard.0 = 0;
         }
-        let collect = |result: Result<std::io::Result<Vec<u8>>, tokio::task::JoinError>| {
-            result.map_err(|error| error.to_string())?.map_err(|error| error.to_string())
+        let collect = async {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            while let Some(result) = drains.join_next().await {
+                let (is_stdout, bytes) = result.map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+                if is_stdout {
+                    stdout = bytes;
+                } else {
+                    stderr = bytes;
+                }
+            }
+            Ok::<_, String>((stdout, stderr))
         };
-        let stdout = collect(stdout.await)?;
-        let stderr = collect(stderr.await)?;
+        // A daemonising helper may retain a pipe after the leader exits. Do
+        // not signal the old process group after reaping (its ID may have been
+        // reused). Bound collection separately and close our readers instead.
+        let (stdout, stderr) = match tokio::time::timeout(Duration::from_secs(5), collect).await {
+            Ok(result) => result?,
+            Err(_) => {
+                drains.shutdown().await;
+                return Err(if timed_out {
+                    command_timeout_message(cmd, timeout)
+                } else {
+                    format!("{cmd} output pipes remained open after process exit")
+                });
+            }
+        };
         if timed_out {
             Err(command_timeout_message(cmd, timeout))
         } else if status.success() {
@@ -1140,6 +1168,43 @@ mod tests {
         assert_eq!(result.unwrap_err(), command_timeout_message("sh", timeout));
         let pid: i32 = std::fs::read_to_string(pid_path).unwrap().trim().parse().unwrap();
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "TERM-ignoring writer must already be reaped");
+    }
+
+    // Glue: bounded execution preserves the public stdout-on-success and
+    // stderr-on-failure contract, regardless of pipe drain completion order.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_deadline_preserves_stdout_and_stderr_selection() {
+        for (code, expected) in [(0, Ok("out\n".to_string())), (3, Err("err\n".to_string()))] {
+            let script = format!("echo out; echo err >&2; exit {code}");
+            let actual = ProcessCommandRunner
+                .run_with_timeout("sh", &["-c", &script], Path::new("/"), &ChannelLabel::Default, Duration::from_secs(1))
+                .await;
+            assert_eq!(actual, expected);
+        }
+    }
+
+    // A helper holding stdout after the writer exits must not retain the
+    // caller's cache exclusion indefinitely. This exercises the local process
+    // boundary with a descendant that outlives its normally exiting leader.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_deadline_bounds_pipes_inherited_by_a_surviving_helper() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("helper-pid");
+        let args = ["-c", "sleep 30 & echo $! > \"$1\"; exit 0", "test", pid_path.to_str().unwrap()];
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            ProcessCommandRunner.run_with_timeout("sh", &args, directory.path(), &ChannelLabel::Default, Duration::from_secs(1)),
+        )
+        .await;
+        // The helper deliberately survives the leader; clean it up even when
+        // the regression assertion fails against the old unbounded drain.
+        if let Ok(pid) = std::fs::read_to_string(&pid_path).unwrap().trim().parse::<i32>() {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let error = result.expect("output collection must be bounded after the leader exits").unwrap_err();
+        assert!(error.contains("output pipes remained open after process exit"), "{error}");
     }
 
     // Dropping a graceful command (a deadline or a cancelled caller) must
