@@ -466,6 +466,8 @@ async fn default_placement_error_lists_each_refusal_and_failed_host_condition_re
                         .reason(condition_reason)
                         .message(condition_message)
                         .observed_at(Utc::now())
+                        // This test admission condition does not disable forge reads.
+                        .blocks_forge_observation(false)
                         .build()],
                     ..HostStatus::default()
                 },
@@ -509,6 +511,8 @@ async fn default_placement_accepts_a_host_with_an_authorship_collision() {
                     .message("Convoy/flotilla/standing-collision is authored at multiple roots")
                     .observed_at(Utc::now())
                     .blocks_readiness(false)
+                    // This test admission condition does not disable forge reads.
+                    .blocks_forge_observation(false)
                     .build()],
                 ..HostStatus::default()
             },

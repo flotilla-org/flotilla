@@ -951,6 +951,7 @@ pub fn validate_resource_document(document: &Value) -> Result<(), ResourceError>
     }
     dispatch_resource_kind!(registered.resource, validate_typed_spec(&decoded.spec))?;
     if let Some(status) = document.get("status").filter(|status| !status.is_null()) {
+        dispatch_resource_kind!(registered.resource, validate_observation_decisions(status))?;
         dispatch_resource_kind!(registered.resource, decode_typed_status(status))?;
     }
     Ok(())
@@ -971,6 +972,23 @@ pub fn decode_stored_resource_document(document: &Value) -> Result<(), ResourceE
     dispatch_resource_kind!(registered.resource, validate_typed_spec(spec))?;
     if let Some(status) = document.get("status").filter(|status| !status.is_null()) {
         dispatch_resource_kind!(registered.resource, decode_typed_status(status))?;
+    }
+    Ok(())
+}
+
+// New authoring must not use the deserialize-only compatibility default.
+// Persisted documents deliberately continue through decode_typed_status.
+fn validate_observation_decisions<T: Resource>(status: &Value) -> Result<(), ResourceError> {
+    if T::API_PATHS.kind == Host::API_PATHS.kind {
+        if let Some(conditions) = status.get("conditions").and_then(Value::as_array) {
+            for (index, condition) in conditions.iter().enumerate() {
+                if !condition.get("blocks_forge_observation").is_some_and(Value::is_boolean) {
+                    return Err(ResourceError::invalid(format!(
+                        "Host status.conditions[{index}].blocks_forge_observation requires an explicit boolean decision"
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1265,6 +1283,7 @@ async fn patch_status_typed<T: Resource>(
     status: Value,
     expected_resource_version: Option<&str>,
 ) -> Result<DynamicResourceObject, ResourceError> {
+    validate_observation_decisions::<T>(&status)?;
     let status = serde_json::from_value::<T::Status>(status)
         .map_err(|error| ResourceError::decode(format!("decode {} status: {error}", T::API_PATHS.kind)))?;
     let resolver = backend.using::<T>(namespace);
@@ -1629,6 +1648,47 @@ mod tests {
         Convoy, ConvoySpec, Demand, DemandAddressee, DemandKind, DemandSpec, HostSpec, InputMeta, PrincipalRef, Regard, RegardExpiryPolicy,
         RegardSource, RegardSpec,
     };
+
+    // Finite authoring contract: missing, null and string decisions are invalid;
+    // both boolean choices work. Stored legacy records remain readable.
+    #[tokio::test]
+    async fn authored_host_conditions_require_observation_decisions() {
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
+        backend
+            .using::<Host>("flotilla")
+            .create(&InputMeta::builder().name("test".to_string()).build(), &HostSpec::default())
+            .await
+            .unwrap();
+        let condition = flotilla_resources::HostCondition::builder()
+            .condition_type("Example")
+            .value(flotilla_resources::ConditionValue::False)
+            .reason("Example")
+            .message("test")
+            .observed_at(chrono::Utc::now())
+            .blocks_forge_observation(false)
+            .build();
+        let status = HostStatus { conditions: vec![condition], ..Default::default() };
+        for decision in [None, Some(Value::Null), Some(json!("false")), Some(json!(false)), Some(json!(true))] {
+            let valid = decision.as_ref().is_some_and(Value::is_boolean);
+            let mut value = serde_json::to_value(&status).unwrap();
+            let condition = value["conditions"][0].as_object_mut().unwrap();
+            match decision {
+                Some(decision) => {
+                    condition.insert("blocks_forge_observation".into(), decision);
+                }
+                None => {
+                    condition.remove("blocks_forge_observation");
+                }
+            }
+            let document = json!({"apiVersion": api_version(Host::API_PATHS), "kind": "Host", "metadata": {"name": "test"}, "spec": {}, "status": value});
+            assert_eq!(validate_resource_document(&document).is_ok(), valid);
+            if !document["status"]["conditions"][0].as_object().unwrap().contains_key("blocks_forge_observation") {
+                assert!(decode_stored_resource_document(&document).is_ok(), "legacy stored conditions must decode");
+            }
+            let result = patch_resource_status(&backend, "flotilla", "hosts", "test", value).await;
+            assert_eq!(result.is_ok(), valid);
+        }
+    }
 
     #[tokio::test]
     async fn replica_source_wire_provenance_comes_from_the_store() {

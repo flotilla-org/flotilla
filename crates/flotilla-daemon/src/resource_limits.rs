@@ -39,6 +39,8 @@ fn file_descriptor_pressure_condition_for(usage: FileDescriptorUsage, observed_a
                 usage.open, usage.soft_limit
             ))
             .observed_at(observed_at)
+            // Descriptor pressure is a warning, not a demonstrated forge failure; lag handover is #3414.
+            .blocks_forge_observation(false)
             .build(),
     )
 }

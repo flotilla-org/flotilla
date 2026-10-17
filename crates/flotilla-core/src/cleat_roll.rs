@@ -315,6 +315,8 @@ impl BuildAssessment {
                 .message(messages.join("; "))
                 .observed_at(observed_at)
                 .blocks_readiness(false)
+                // Cleat terminal build skew does not disable forge reads.
+                .blocks_forge_observation(false)
                 .build(),
         )
     }

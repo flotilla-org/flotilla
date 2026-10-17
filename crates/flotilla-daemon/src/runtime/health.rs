@@ -115,6 +115,8 @@ impl RuntimeHealth {
                 exhausted.controller, exhausted.attempts, exhausted.error
             ))
             .observed_at(Utc::now())
+            // Only the aggregator schedules forge refresh; actuator-controller failure does not stop reads.
+            .blocks_forge_observation(exhausted.controller == "aggregator")
             .build();
         self.failures.lock().expect("runtime health lock poisoned").insert(condition_type, condition);
     }
@@ -127,6 +129,8 @@ impl RuntimeHealth {
             .reason("HeartbeatStale")
             .message(format!("{name} controller loop made no progress for {elapsed:?}"))
             .observed_at(Utc::now())
+            // A stalled actuator reconcile does not stop the independent forge reader.
+            .blocks_forge_observation(false)
             .build();
         self.failures.lock().expect("runtime health lock poisoned").insert(condition_type, condition);
     }
@@ -154,6 +158,8 @@ impl RuntimeHealth {
             .reason("ReconciliationPassTimedOut")
             .message(format!("standing convoy ensure reconciliation exceeded its {timeout:?} pass timeout"))
             .observed_at(Utc::now())
+            // Admission scan backlog does not prevent existing forge reads.
+            .blocks_forge_observation(false)
             .build();
         self.failures.lock().expect("runtime health lock poisoned").insert(CONVOY_ENSURE_CONDITION_TYPE.to_string(), condition);
     }
@@ -184,6 +190,8 @@ impl RuntimeHealth {
                         ))
                         .observed_at(Utc::now())
                         .blocks_readiness(false)
+                        // Historical restarts do not disable a currently live forge reader.
+                        .blocks_forge_observation(false)
                         .build(),
                 ),
                 Ok(_) => None,
@@ -194,6 +202,8 @@ impl RuntimeHealth {
                         .reason("RestartHistoryUnavailable")
                         .message(error)
                         .observed_at(Utc::now())
+                        // Restart-history diagnostics are independent of forge I/O.
+                        .blocks_forge_observation(false)
                         .build(),
                 ),
             };
@@ -250,6 +260,8 @@ pub(super) fn assess_agent_adapter_capabilities(
             .reason("AgentAdaptersMissing")
             .message(format!("agent adapters from the last non-regressed daemon generation are missing: {}", missing.join(", ")))
             .observed_at(Utc::now())
+            // Missing agent adapters affect crew placement, not forge reads.
+            .blocks_forge_observation(false)
             .build(),
     );
     AgentAdapterCapabilityAssessment { baseline, regression }
@@ -342,6 +354,8 @@ pub(super) async fn projection_parity_condition(
             .reason(LOCAL_ROWS_MISSING_REASON)
             .message(message)
             .observed_at(now)
+            // Local projection lag blocks admission, not durable forge observation.
+            .blocks_forge_observation(false)
             .build(),
     ))
 }
@@ -394,6 +408,8 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
                 .reason("ProbeFailed")
                 .message(error)
                 .observed_at(Utc::now())
+                // An admission free-space probe failure does not establish forge-read failure.
+                .blocks_forge_observation(false)
                 .build(),
         );
     }
@@ -414,6 +430,8 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
                     .message(reason)
                     .observed_at(Utc::now())
                     .blocks_readiness(false)
+                    // A failed image build does not disable forge reads.
+                    .blocks_forge_observation(false)
                     .build(),
             );
         }
@@ -538,6 +556,8 @@ pub(super) async fn resolve_daemon_forgejo_credential_condition(
         ))
         .observed_at(Utc::now())
         .blocks_readiness(false)
+        // An unresolved mapping is source-specific; providers report their own credential errors.
+        .blocks_forge_observation(false)
         .build()))
 }
 
@@ -576,6 +596,8 @@ pub(super) async fn resource_authorship_collision_condition(
             ))
             .observed_at(Utc::now())
             .blocks_readiness(false)
+            // A home-bound actuator collision does not disable forge reads.
+            .blocks_forge_observation(false)
             .build(),
     ))
 }
@@ -625,6 +647,8 @@ pub(super) async fn resource_replication_content_condition(
                 if peers_without_cursors.len() == 1 { "has" } else { "have" },
             ))
             .observed_at(Utc::now())
+            // Replication bootstrap lag does not disable local reads; lag handover belongs to #3414.
+            .blocks_forge_observation(false)
             .build(),
     ))
 }
@@ -638,6 +662,21 @@ pub(super) fn resource_decode_quarantine_condition(
     if object_quarantines.is_empty() && event_quarantines.is_empty() {
         return None;
     }
+    let forge_kinds = [
+        Host::API_PATHS.kind,
+        Forge::API_PATHS.kind,
+        flotilla_resources::Project::API_PATHS.kind,
+        flotilla_resources::Repository::API_PATHS.kind,
+        flotilla_resources::ForgeRead::API_PATHS.kind,
+        flotilla_resources::ForgeReadHeartbeat::API_PATHS.kind,
+        flotilla_resources::Issue::API_PATHS.kind,
+        flotilla_resources::ChangeRequest::API_PATHS.kind,
+    ];
+    let observation_corruption = object_quarantines
+        .iter()
+        .map(|record| record.kind.as_str())
+        .chain(event_quarantines.iter().map(|record| record.kind.as_str()))
+        .any(|kind| forge_kinds.contains(&kind));
     let identities = object_quarantines
         .iter()
         .map(|quarantine| format!("{}/{}: {}", quarantine.kind, quarantine.name, quarantine.error))
@@ -687,6 +726,8 @@ pub(super) fn resource_decode_quarantine_condition(
             .reason(reason)
             .message(message)
             .observed_at(Utc::now())
+            // Only corrupt forge inputs/results disable observation; unrelated actuator records do not.
+            .blocks_forge_observation(observation_corruption)
             .build(),
     )
 }
@@ -726,6 +767,8 @@ pub(super) fn resource_field_ownership_condition(
             ))
             .observed_at(Utc::now())
             .blocks_readiness(false)
+            // Historical rejected writes do not disable current forge reads.
+            .blocks_forge_observation(false)
             .build(),
     )
 }

@@ -42,6 +42,8 @@ fn heartbeat(at: DateTime<Utc>, rss: u64) -> HostStatusPatch {
             .message("build failed")
             .observed_at(at)
             .blocks_readiness(false)
+            // This test admission condition does not disable forge reads.
+            .blocks_forge_observation(false)
             .build()],
         folded: Default::default(),
     }

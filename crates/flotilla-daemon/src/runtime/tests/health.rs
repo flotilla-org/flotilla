@@ -916,3 +916,79 @@ async fn daemon_reports_recent_abnormal_restart_frequency_in_fleet_health() {
 
     runtime.shutdown();
 }
+
+// Losing an agent adapter blocks placement, while the same live daemon can
+// still observe forges and finish the work already admitted.
+#[tokio::test]
+async fn capability_regression_keeps_live_forge_observer() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"capability-observer-test\"\n").expect("config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    let host_id = daemon.local_host_id().expect("local host").to_string();
+    let health = RuntimeHealth::default();
+    let previous = HostStatus { agent_adapter_baseline: Some(["codex".to_string()].into()), ..Default::default() };
+    let regression =
+        assess_agent_adapter_capabilities(Some(&previous), &BTreeSet::new(), &test_health_identity()).regression.expect("regression");
+    health.report_capability_regression(regression);
+    apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &manual_profile(&host_id, false), None, &test_health_identity(), &health)
+        .await
+        .expect("heartbeat");
+    let backend = daemon.resource_backend();
+    let status = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("host").status.expect("status");
+    assert!(!status.ready);
+    assert!(status.heartbeat_is_fresh(Utc::now()));
+    let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "test/repo".into() };
+    assert_eq!(
+        flotilla_core::forge_observation::source_owner(&backend, NAMESPACE, &source).await.expect("live forge observer"),
+        Some(backend.local_root().expect("root"))
+    );
+    // Exhausted forge-refresh scheduling explicitly withdraws an otherwise
+    // live daemon; unrelated adapter faults alone do not do so.
+    health.report_restart_budget_exhausted(RestartBudgetExhausted {
+        controller: "aggregator",
+        error: ResourceError::other("refresh loop failed"),
+        attempts: 10,
+    });
+    apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &manual_profile(&host_id, false), None, &test_health_identity(), &health)
+        .await
+        .expect("heartbeat with observation fault");
+    assert_eq!(
+        flotilla_core::forge_observation::source_owner(&backend, NAMESPACE, &source).await.unwrap_err(),
+        flotilla_core::forge_observation::NO_READY_FORGE_OBSERVER
+    );
+}
+
+// Quarantine of an unrelated actuator is admission-only; corrupt observation
+// inputs/results withdraw the forge reader. Exercise objects and event records.
+#[hegel::test]
+fn quarantine_withdraws_only_for_observation_records(tc: hegel::TestCase) {
+    let kind = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(8));
+    let event = tc.draw(hegel::generators::booleans());
+    let kinds = ["Convoy", "Host", "Forge", "Project", "Repository", "ForgeRead", "ForgeReadHeartbeat", "Issue", "ChangeRequest"];
+    let mut diagnostics = flotilla_resources::ResourceStoreDiagnostics::default();
+    if event {
+        diagnostics.event_decode_quarantines.push(
+            flotilla_resources::ResourceEventDecodeQuarantine::builder()
+                .kind(kinds[kind].to_string())
+                .namespace("flotilla".to_string())
+                .name("bad".to_string())
+                .event_version(1)
+                .error("decode failed".to_string())
+                .quarantined_at(Utc::now())
+                .build(),
+        );
+    } else {
+        diagnostics.decode_quarantines.push(
+            flotilla_resources::ResourceDecodeQuarantine::builder()
+                .kind(kinds[kind].to_string())
+                .namespace("flotilla".to_string())
+                .name("bad".to_string())
+                .error("decode failed".to_string())
+                .quarantined_at(Utc::now())
+                .build(),
+        );
+    }
+    let condition = resource_decode_quarantine_condition(Some(&diagnostics)).expect("quarantine condition");
+    assert!(condition.blocks_readiness());
+    assert_eq!(condition.blocks_forge_observation(), kind != 0);
+}

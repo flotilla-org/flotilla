@@ -418,8 +418,21 @@ pub const LOCAL_ROWS_MISSING_REASON: &str = "LocalRowsMissing";
 /// `True` means the named subsystem is healthy. `False` surfaces a diagnostic;
 /// by default it also makes the host unavailable for placement until a later
 /// observation clears it, unless `blocks_readiness` marks it advisory.
+/// New condition authors must decide whether to withdraw forge observation.
+/// This example deliberately omits that decision and must not compile.
+/// ```compile_fail
+/// use flotilla_resources::{ConditionValue, HostCondition};
+/// HostCondition::builder()
+///     .condition_type("Example")
+///     .value(ConditionValue::False)
+///     .reason("Failed")
+///     .message("example")
+///     .observed_at(chrono::Utc::now())
+///     .build();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
+#[serde(from = "StoredHostCondition")]
 pub struct HostCondition {
     #[serde(rename = "type")]
     pub condition_type: String,
@@ -434,11 +447,50 @@ pub struct HostCondition {
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     #[builder(default = true)]
     pub blocks_readiness: bool,
+    /// Whether a false condition prevents this host from observing forges.
+    /// Required by the builder independently of admission readiness.
+    pub blocks_forge_observation: bool,
 }
 
 impl HostCondition {
+    pub fn blocks_forge_observation(&self) -> bool {
+        self.blocks_forge_observation && self.value == ConditionValue::False
+    }
+
     pub fn blocks_readiness(&self) -> bool {
         self.blocks_readiness && self.value == ConditionValue::False
+    }
+}
+
+// ADR 0047, N→N+1 only: previous Host conditions lack an observation
+// decision. Preserve their old admission-blocking policy conservatively during
+// decoding, until their owner republishes an explicit classification. Remove
+// this record/from shim after one fleet roll; never default new builders.
+#[derive(Deserialize)]
+struct StoredHostCondition {
+    #[serde(rename = "type")]
+    condition_type: String,
+    value: ConditionValue,
+    reason: String,
+    message: String,
+    observed_at: DateTime<Utc>,
+    #[serde(default = "default_true")]
+    blocks_readiness: bool,
+    #[serde(default)]
+    blocks_forge_observation: Option<bool>,
+}
+
+impl From<StoredHostCondition> for HostCondition {
+    fn from(stored: StoredHostCondition) -> Self {
+        Self {
+            condition_type: stored.condition_type,
+            value: stored.value,
+            reason: stored.reason,
+            message: stored.message,
+            observed_at: stored.observed_at,
+            blocks_readiness: stored.blocks_readiness,
+            blocks_forge_observation: stored.blocks_forge_observation.unwrap_or(stored.blocks_readiness),
+        }
     }
 }
 
@@ -630,6 +682,8 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                                 .reason("InhibitorNotHeld")
                                 .message(format!("sleep inhibition required but not held ({message})"))
                                 .observed_at(*observed_at)
+                                // An awake daemon can observe forges without sleep inhibition; sleep is detected by heartbeat expiry.
+                                .blocks_forge_observation(false)
                                 .build(),
                         );
                     }
@@ -647,6 +701,33 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
 mod tests {
     use super::*;
 
+    // Stored N records lack the new decision. Decode conservatively, while
+    // every newly serialized record writes its explicit classification.
+    #[test]
+    fn previous_generation_condition_decodes_and_new_writes_are_explicit() {
+        let old = serde_json::json!({
+            "type": "CapabilityRegression", "value": "false",
+            "reason": "AgentAdaptersMissing", "message": "missing adapter",
+            "observed_at": "2026-10-17T00:00:00Z"
+        });
+        let legacy: HostCondition = serde_json::from_value(old.clone()).expect("previous condition");
+        assert!(legacy.blocks_forge_observation());
+        let mut advisory = old;
+        advisory["blocks_readiness"] = serde_json::json!(false);
+        assert!(!serde_json::from_value::<HostCondition>(advisory).expect("previous advisory").blocks_forge_observation());
+        let current = HostCondition::builder()
+            .condition_type("CapabilityRegression")
+            .value(ConditionValue::False)
+            .reason("AgentAdaptersMissing")
+            .message("missing adapter")
+            .observed_at(Utc::now())
+            .blocks_forge_observation(false)
+            .build();
+        let encoded = serde_json::to_value(&current).expect("new condition");
+        assert_eq!(encoded["blocks_forge_observation"], false);
+        assert!(!serde_json::from_value::<HostCondition>(encoded).expect("current round trip").blocks_forge_observation());
+    }
+
     #[test]
     fn failed_host_condition_makes_fresh_heartbeat_not_ready() {
         let now = Utc::now();
@@ -659,6 +740,8 @@ mod tests {
                 .reason("RestartBudgetExhausted")
                 .message("checkout controller stopped")
                 .observed_at(now)
+                // This test admission condition does not disable forge reads.
+                .blocks_forge_observation(false)
                 .build()],
             ..HostStatus::default()
         };
@@ -683,6 +766,8 @@ mod tests {
                 .message("record is authored at multiple roots")
                 .observed_at(now)
                 .blocks_readiness(false)
+                // This test admission condition does not disable forge reads.
+                .blocks_forge_observation(false)
                 .build()],
             ..HostStatus::default()
         };

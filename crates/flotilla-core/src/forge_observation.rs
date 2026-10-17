@@ -14,7 +14,7 @@ use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     forge_read_name, normalize_issue_source, Clock, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus,
     ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, HostStatus, InputMeta, IssueSourceResolution, Project, ReadWatchEvent,
-    Repository, ResourceError, ResourceProvenance, SystemClock, LOCAL_ROWS_MISSING_REASON, PROJECTION_PARITY_CONDITION,
+    Repository, ResourceError, ResourceProvenance, SystemClock,
 };
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::ResourceBackend;
@@ -155,24 +155,16 @@ enum ObserverHealth {
     Unready,
 }
 
-// Projection lag is an admission blocker, not evidence that forge reads have
-// stopped working. In particular the sole observer must keep refreshing facts
-// so existing convoys can finish while the local projection catches up. Keep
-// explicit unready status and every other blocking condition authoritative.
+// Admission readiness is independent of observation. Liveness is checked by
+// the election heartbeat limit; only explicit forge-affecting faults withdraw it.
 fn observer_ready(status: &HostStatus) -> bool {
-    if status.ready {
-        return true;
-    }
-    let mut blockers = status.conditions.iter().filter(|condition| condition.blocks_readiness()).peekable();
-    blockers.peek().is_some()
-        && blockers
-            .all(|condition| condition.condition_type == PROJECTION_PARITY_CONDITION && condition.reason == LOCAL_ROWS_MISSING_REASON)
+    !status.conditions.iter().any(|condition| condition.blocks_forge_observation())
 }
 
 /// Shared sources elect once, regardless of how many Projects bind them.
 /// Unknown host health preserves the preferred owner during startup; only
 /// observer-unready/stale evidence or expiry of the startup grace permits
-/// fallback. Projection-only admission degradation does not withdraw observation.
+/// fallback. Admission readiness never withdraws forge observation.
 pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<Option<NodeId>, String> {
     let mut source = canonical_source(source);
     for forge in backend.definitions::<flotilla_resources::Forge>(namespace).list().await.map_err(|e| e.to_string())? {
@@ -1189,7 +1181,21 @@ mod tests {
                     .update_status(
                         "host",
                         &host.metadata.resource_version,
-                        &HostStatus { ready: false, heartbeat_at: Some(Utc::now()), ..Default::default() },
+                        &HostStatus {
+                            ready: true,
+                            heartbeat_at: Some(Utc::now()),
+                            conditions: vec![flotilla_resources::HostCondition::builder()
+                                .condition_type("ForgeObservation")
+                                .reason("Withdrawn")
+                                .message("deliberate handover during a read")
+                                .observed_at(Utc::now())
+                                .value(flotilla_resources::ConditionValue::False)
+                                .blocks_readiness(false)
+                                // Explicit withdrawal must work independently of placement readiness.
+                                .blocks_forge_observation(true)
+                                .build()],
+                            ..Default::default()
+                        },
                     )
                     .await
                     .unwrap();
@@ -1267,44 +1273,42 @@ mod tests {
         assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(ready.local_root().unwrap()));
     }
 
-    // Only projection-only admission degradation may preserve an unready Host
-    // as observer. Unknown causes and mixed blocking faults remain authoritative.
+    // Admission readiness and condition names never affect observer eligibility.
+    // A false observation-blocking condition withdraws even an admission-ready host.
     #[hegel::test]
-    fn observer_readiness_preserves_explicit_faults(tc: hegel::TestCase) {
+    fn observer_readiness_is_independent_of_admission(tc: hegel::TestCase) {
         use hegel::generators as gs;
-        // Cover empty/duplicate projection reports, advisory and blocking
-        // unrelated conditions, and unknown projection types or reasons.
         let ready = tc.draw(gs::booleans());
-        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
-        let known_type = tc.draw(gs::booleans());
-        let known_reason = tc.draw(gs::booleans());
-        let other = tc.draw(gs::integers::<u8>().min_value(0).max_value(2));
-        let mut conditions = Vec::new();
+        // Empty, duplicate, arbitrary names, both classification bits and
+        // healthy/failed values; check after each appended condition.
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
+        let mut status = HostStatus { ready, ..Default::default() };
+        let mut withdrawn = false;
+        assert!(observer_ready(&status));
         for _ in 0..count {
-            conditions.push(
+            let admission = tc.draw(gs::booleans());
+            let observation = tc.draw(gs::booleans());
+            let value = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+            let value = [
+                flotilla_resources::ConditionValue::False,
+                flotilla_resources::ConditionValue::True,
+                flotilla_resources::ConditionValue::Unknown,
+            ][value];
+            let name = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+            withdrawn |= observation && value == flotilla_resources::ConditionValue::False;
+            status.conditions.push(
                 flotilla_resources::HostCondition::builder()
-                    .condition_type(if known_type { PROJECTION_PARITY_CONDITION } else { "Unknown" })
-                    .value(flotilla_resources::ConditionValue::False)
-                    .reason(if known_reason { LOCAL_ROWS_MISSING_REASON } else { "Unknown" })
-                    .message("lag")
+                    .condition_type([flotilla_resources::PROJECTION_PARITY_CONDITION, "CapabilityRegression", "Unknown"][name])
+                    .reason("arbitrary")
+                    .message("test fault")
                     .observed_at(Utc::now())
+                    .value(value)
+                    .blocks_readiness(admission)
+                    .blocks_forge_observation(observation)
                     .build(),
             );
+            assert_eq!(observer_ready(&status), !withdrawn);
         }
-        if other != 0 {
-            conditions.push(
-                flotilla_resources::HostCondition::builder()
-                    .condition_type("CapabilityRegression")
-                    .value(flotilla_resources::ConditionValue::False)
-                    .reason("AgentAdaptersMissing")
-                    .message("missing adapter")
-                    .observed_at(Utc::now())
-                    .blocks_readiness(other == 2)
-                    .build(),
-            );
-        }
-        let status = HostStatus { ready, conditions, ..Default::default() };
-        assert_eq!(observer_ready(&status), ready || (count > 0 && known_type && known_reason && other != 2));
     }
 
     // Equal-heartbeat contradictions must not revive an explicitly unready

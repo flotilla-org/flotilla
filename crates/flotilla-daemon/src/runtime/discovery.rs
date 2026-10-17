@@ -219,6 +219,8 @@ pub(super) async fn apply_agentless_ssh_observation(
                 .reason("Unreachable")
                 .message(error)
                 .observed_at(Utc::now())
+                // Agentless SSH and capacity faults do not affect the owning daemon forge reader.
+                .blocks_forge_observation(false)
                 .build()]
         })
         .unwrap_or_default();
@@ -230,6 +232,8 @@ pub(super) async fn apply_agentless_ssh_observation(
                 .reason("MeasurementUnavailable")
                 .message(format!("could not measure free space at {} over SSH", profile.repo_default_dir))
                 .observed_at(Utc::now())
+                // Agentless SSH and capacity faults do not affect the owning daemon forge reader.
+                .blocks_forge_observation(false)
                 .build(),
         );
     }
