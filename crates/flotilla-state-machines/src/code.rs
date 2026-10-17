@@ -244,6 +244,10 @@ macro_rules! edges {
                         match code.as_str() {
                             $( $code => {
                                 let arg: $arg = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                                // A stored payload is exactly [code, arguments]: anything after is refused.
+                                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                                    return Err(serde::de::Error::invalid_length(3, &self));
+                                }
                                 Ok($name::$variant(arg))
                             } )+
                             other => Err(serde::de::Error::custom(format_args!("unknown {} code {other:?}", stringify!($name)))),

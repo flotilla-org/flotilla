@@ -161,6 +161,7 @@ fn admission_reads_the_project_by_address() {
     let empty = MemoryConvoyWorld::default();
     assert_eq!(home.create("c", request(&[0], &[]), &empty, at()).err(), refused(ConvoyRefusal::UnknownProject));
     assert!(home.get("c").is_none(), "a refused admission creates nothing");
+    assert_eq!(home.log().last_sequence(), 0, "and writes nothing to the log");
     let other = MemoryConvoyWorld::default().with_project(&Address::project("elsewhere").expect("project"));
     assert_eq!(home.create("c", request(&[0], &[]), &other, at()).err(), refused(ConvoyRefusal::UnknownProject));
     let mut world = MemoryConvoyWorld::default();

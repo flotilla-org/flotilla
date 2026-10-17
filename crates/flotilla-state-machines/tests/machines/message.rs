@@ -1,7 +1,7 @@
 //! Message (spec `machines/message.qnt`; scenarios `inbox_delivery`, `message_race`;
 //! ADR 0064 "Inboxes").
 
-use flotilla_schema::{Address, Code, CodeEnum, Timestamp};
+use flotilla_schema::{Address, Code, CodeEnum, EdgeHeader, Origin, Timestamp};
 use flotilla_state_machines::{
     machines::message::{
         AppliedThrough, Binding, Condition, Deliver, DropMessage, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message,
@@ -397,4 +397,20 @@ fn payload_documents_name_references_and_keep_reads() {
     let unknown = serde_json::json!({ "edge": ["zz", {}], "reads": [] });
     let refused = serde_json::from_value::<EdgePayload<MessageEdge>>(unknown).expect_err("no edge has code zz");
     assert!(refused.to_string().contains("unknown MessageEdge code \"zz\""), "{refused}");
+    // A document is exactly [code, arguments]: a third element is refused, as JSON and as the
+    // stored CBOR.
+    let trailing = serde_json::json!({ "edge": ["dr", { "reason": "Expired" }, "junk"], "reads": [] });
+    let refused = serde_json::from_value::<EdgePayload<MessageEdge>>(trailing.clone()).expect_err("a third element");
+    assert!(refused.to_string().contains("invalid length 3, expected a MessageEdge as [code, arguments]"), "{refused}");
+    let stored = Origin::new("w", t(0)).with_payload(&trailing).expect("encodes").payload.expect("a payload");
+    let header = EdgeHeader {
+        edge: Code::new("dr"),
+        from: Code::new("pe"),
+        to: Code::new("dr"),
+        writer: "w".into(),
+        at: t(0),
+        payload: stored,
+        about: None,
+    };
+    assert!(header.payload::<EdgePayload<MessageEdge>>().is_err(), "a stored payload with a third element is refused");
 }

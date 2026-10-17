@@ -256,7 +256,9 @@ impl From<WrongState<ConvoyLabel, ConvoyEdgeKind>> for ConvoyRefusal {
 }
 
 /// A project, read by address for its existence alone: a definitions-class
-/// kind outside the new store.
+/// kind outside the new store. It is read under the address's canonical text
+/// (`project:flotilla`), never the bare project name, so a `Source<Project>`
+/// keys its projects by that text.
 pub struct Project;
 impl Kind for Project {
     const NAME: &'static str = "project";

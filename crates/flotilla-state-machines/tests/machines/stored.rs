@@ -15,7 +15,7 @@ use flotilla_state_machines::{
             Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyRequest, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId, VesselClass,
         },
         ensure::{Attempted, Ensure, EnsureSpec, MemoryEnsureWorld, Record},
-        lifecycle::{self, LifecycleState, MemoryLifecycleWorld, Observed, Realisation, Realise, Vanish},
+        lifecycle::{self, LifecycleLabel, LifecycleState, MemoryLifecycleWorld, Observed, Realisation, Realise, Vanish},
         message::{Expectation, MemoryMessageWorld, Message, MessageEdgeKind, MessageSpec},
         vessel::{live_leases, Vessel},
     },
@@ -248,4 +248,27 @@ fn a_resources_edge_moves_since_only_with_the_label() {
     assert_eq!(resource.stored_state(), &State::new(resource.state().clone(), Timestamp(8)), "a label change moves since");
     let parts = edge.into_parts();
     assert_eq!((root_sets(&parts), parts.rows.len()), (vec!["state", "reason"], 0), "the whole state, no row changed");
+}
+
+// `live_leases` and the `live_by_host` index agree on which vessels are live:
+// `LifecycleState::live` holds for exactly the labels the index's predicate
+// names, so the ledger's view and the index read the same vessels.
+#[test]
+fn live_leases_and_the_live_by_host_index_agree() {
+    let set = Resource::<Vessel>::table_set();
+    let index = set.indexes.iter().find(|index| index.name == "live_by_host").expect("declared");
+    let [flotilla_schema::Condition::In { column, codes }] = index.predicate.as_slice() else {
+        panic!("live_by_host is partial on the state: {:?}", index.predicate);
+    };
+    assert_eq!(column, "state");
+    let cause = flotilla_state_machines::Cause::new(flotilla_state_machines::CauseCategory::Transient, "lost");
+    let states = [
+        LifecycleState::requested(),
+        LifecycleState::Realised { identity: "vm".into() },
+        LifecycleState::Gone,
+        LifecycleState::GaveUp { cause },
+    ];
+    for state in states {
+        assert_eq!(state.live(), codes.contains(&<LifecycleLabel as CodeEnum>::code(state.label())), "{state:?}");
+    }
 }

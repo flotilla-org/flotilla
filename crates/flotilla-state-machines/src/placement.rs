@@ -245,7 +245,10 @@ impl Ledger {
     /// the ledger's leases are a view over the live Vessels, so it is rebuilt
     /// from them rather than kept. Refused when `id` is already known, or when
     /// the lease names an unknown host or does not fit the host's capacity
-    /// beside the leases already restored.
+    /// beside the leases already restored. A refusal leaves the ledger as it
+    /// was and names the vessel. What a restart does with such a vessel (a
+    /// host's capacity shrank, or the host is gone) is the startup caller's
+    /// decision, not the ledger's; see #3438.
     pub fn restore(&mut self, id: VesselId, lease: Lease) -> Result<(), LedgerError> {
         if self.vessels.contains_key(&id) {
             return Err(LedgerError::DuplicateRequest(id));
