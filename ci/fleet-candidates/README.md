@@ -91,6 +91,161 @@ derivatives, run pristine-runtime proofs, publish the complete cohort, copy it
 offsite, and only then write an immutable completed generation. It must not
 rebuild either project.
 
+## File-backed Darwin signing on comte (#3228)
+
+`lab-darwin-sign` reads a single PEM certificate with `--certificate-file` and
+an unencrypted PKCS#8 PEM private key with `--private-key-file`. Pin both absolute
+paths in the signer's existing invocation alongside `--identity` and
+`--expected-team-id`; keep the currently deployed identity, team and entitlements.
+The key must be a regular file (no symlinks), owned by the effective signing user,
+with mode exactly 0600; its parent directory must be owned by the signing user
+and not group/world-writable, and must not itself be a symlink. The signer refuses otherwise, before network access,
+and checks the certificate subject against the pinned identity/team and the
+key/certificate public-key match before any network access.
+The key must be unencrypted: `-passin pass:` deliberately supplies no password,
+so an encrypted PEM refuses during the OpenSSL key-pair preflight (typically an
+OpenSSL decrypt/password error). Use the owner export/conversion recipe below to
+produce the unencrypted PKCS#8 file; there is no unattended password prompt.
+Do not replace or modify the key/certificate files while a signing run is active.
+The permission check and the tools' later file opens leave an owner-controlled
+replacement window; pause submissions and wait for active runs before updating
+these files.
+
+No signing operation uses a keychain. `/usr/bin/codesign` remains the public-key
+verification tool for strict validity, authority, team and entitlements.
+
+The certificate file must contain **only the leaf certificate** (the finalizer
+pins that single certificate). Do not append intermediates to it. The pinned
+rcodesign 0.29.0 automatically registers the Apple intermediate/root chain from
+its bundled public Apple CA certificates when loading an Apple-issued signing
+certificate; it does not need a keychain lookup to obtain that chain. See the
+[pinned certificate-source implementation](https://github.com/indygreg/apple-platform-rs/blob/2312b1e5bd77322c019613e0ca624e222c6c6e08/apple-codesign/src/cli/certificate_source.rs#L103)
+and [chain registration](https://github.com/indygreg/apple-platform-rs/blob/2312b1e5bd77322c019613e0ca624e222c6c6e08/apple-codesign/src/signing_settings.rs#L357).
+
+### Owner: one-time export
+
+Do this locally on comte as the signing user. In Keychain Access, open the login
+keychain's **My Certificates**, select only the currently pinned Developer ID
+identity **including its private key**, and choose **File > Export Items**.
+Export to `$HOME/.config/flotilla/darwin-sign/export.p12`, using a temporary strong
+export password. This one-time step can prompt at the console; subsequent signing
+needs no GUI or unlocked keychain. Do not export all login-keychain identities.
+Create the destination before exporting:
+
+```sh
+umask 077
+mkdir -p "$HOME/.config/flotilla/darwin-sign"
+chmod 0700 "$HOME/.config/flotilla/darwin-sign"
+```
+
+After installing OpenSSL below, convert that selected identity (OpenSSL prompts
+for the export password; do not put it in command history):
+
+```sh
+umask 077
+cd "$HOME/.config/flotilla/darwin-sign"
+chmod 0600 export.p12
+/opt/homebrew/opt/openssl@3/bin/openssl pkcs12 -in export.p12 -nocerts -nodes -out exported-key.pem
+/opt/homebrew/opt/openssl@3/bin/openssl pkey -in exported-key.pem -out private-key.pem
+/opt/homebrew/opt/openssl@3/bin/openssl pkcs12 -in export.p12 -clcerts -nokeys -out exported-cert.pem
+/opt/homebrew/opt/openssl@3/bin/openssl x509 -in exported-cert.pem -out certificate.pem
+chmod 0600 private-key.pem
+chmod 0644 certificate.pem
+/opt/homebrew/opt/openssl@3/bin/openssl x509 -in certificate.pem -noout -subject -fingerprint -sha256
+/opt/homebrew/opt/openssl@3/bin/openssl pkey -in private-key.pem -pubout -out key-public.pem
+/opt/homebrew/opt/openssl@3/bin/openssl x509 -in certificate.pem -pubkey -noout > cert-public.pem
+cmp key-public.pem cert-public.pem
+rm export.p12 exported-key.pem exported-cert.pem key-public.pem cert-public.pem
+```
+
+If the export uses legacy PKCS#12 encryption, add `-legacy` to the two `pkcs12`
+commands. Confirm the subject matches the existing pinned identity/team and the
+certificate fingerprint matches raclette's existing pinned certificate. Stop on
+any mismatch; this change does not rotate the identity or certificate. Keep these
+files on comte, outside the checkout; never upload the private key or export.
+
+### Operator: install tools and deploy after merge
+
+Install apple-codesign 0.29.0 as the signing user, and Homebrew OpenSSL 3:
+
+```sh
+cargo install apple-codesign --version 0.29.0 --locked --root "$HOME/.local"
+brew install openssl@3
+"$HOME/.local/bin/rcodesign" --version
+/opt/homebrew/opt/openssl@3/bin/openssl version
+/opt/homebrew/opt/openssl@3/bin/openssl cms -help
+```
+
+The script pins `$HOME/.local/bin/rcodesign` and
+`/opt/homebrew/opt/openssl@3/bin/openssl`; it never falls back to macOS's LibreSSL
+`/usr/bin/openssl` or searches PATH. `rcodesign` gets only the explicit PEM files,
+hardened runtime, the existing entitlements, and `--timestamp-url none`; default
+config files and `RCODESIGN_*` environment configuration are disabled. See the
+[upstream signing documentation](https://gregoryszorc.com/docs/apple-codesign/0.29.0/apple_codesign_rcodesign_signing.html).
+
+Verify this exact OpenSSL binary's CMS support on comte before enabling the
+signer. This smoke test generates disposable test credentials, never using the
+Developer ID key:
+
+```sh
+set -eu
+sign_test_dir=$(mktemp -d)
+(
+  umask 077
+  cd "$sign_test_dir"
+  openssl_bin=/opt/homebrew/opt/openssl@3/bin/openssl
+  "$openssl_bin" req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=CMS-smoke-test -keyout key.pem -out cert.pem
+  printf 'CMS smoke test\n' > input
+  "$openssl_bin" cms -sign -binary -md sha256 -signer cert.pem -inkey key.pem -passin pass: -outform DER -in input -out signature.der
+  "$openssl_bin" cms -verify -binary -inform DER -in signature.der -content input -certfile cert.pem -noverify -signer signer.pem -out verified
+  cmp input verified
+  cmp cert.pem signer.pem
+)
+rm -r "$sign_test_dir"
+```
+
+Pause signing submissions, then from the reviewed merged checkout on comte:
+
+```sh
+install -m 0755 ci/fleet-candidates/lab-darwin-sign "$HOME/.local/libexec/lab-darwin-sign"
+install -m 0755 ci/fleet-candidates/generation_validation.py "$HOME/.local/libexec/generation_validation.py"
+```
+
+Add these arguments to the existing host-side signer invocation (including the
+invocation used by the installed launchd agent):
+
+```sh
+--certificate-file "$HOME/.config/flotilla/darwin-sign/certificate.pem" \
+--private-key-file "$HOME/.config/flotilla/darwin-sign/private-key.pem"
+```
+
+Keep the existing launchd agent and `lab-darwin-sign-submit` as optional serialized
+queue/result handling; they are host-installed tools outside this repository.
+They no longer provide GUI/keychain access. The same full signer command can run
+directly over SSH as the signing user, with its existing token files and pinned
+identity/team/entitlements plus these two file arguments. Resume submissions and
+sign a fresh generation over SSH, then run the unchanged
+`lab-fleet-finalize-darwin` with the existing pinned certificate and
+`--expected-identity`. Confirm its CMS verification and the signer's macOS
+verification checks pass before the next roll. Also inspect the embedded chain
+on a signed payload (set `SIGNED_PAYLOAD` to its extracted path):
+
+```sh
+chain_dir=$(mktemp -d)
+/usr/bin/codesign -d --extract-certificates "$chain_dir/embedded-" "$SIGNED_PAYLOAD"
+for certificate in "$chain_dir"/embedded-*; do
+  /opt/homebrew/opt/openssl@3/bin/openssl x509 -inform DER -in "$certificate" -noout -subject -issuer
+done
+rm -r "$chain_dir"
+```
+
+Confirm the embedded leaf is the pinned identity and its issuing Apple
+intermediate is present. Stop deployment if the chain is missing; do not append
+certificates to the pinned leaf file or change keychain access lists to work
+around it. No deployment or key export is
+performed by this PR. Rolling the script back also requires restoring its old
+invocation and reintroduces the keychain prompt.
+
 ## Installed generation retention
 
 After health confirmation, `fleet-install` retains `current`, `previous`, and

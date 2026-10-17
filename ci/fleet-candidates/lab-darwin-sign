@@ -9,6 +9,7 @@ import json
 import os
 import plistlib
 import re
+import stat
 import subprocess
 import sys
 import tarfile
@@ -40,7 +41,10 @@ OUTPUT_ARCHIVE = f"{OUTPUT_ROOT}.tar.gz"
 REQUIRED_BINARIES = ("bin/flotilla", "bin/flotillad", "bin/cleat")
 TESTING = os.environ.get("LAB_DARWIN_SIGN_TESTING") == "1"
 CODESIGN = os.environ.get("LAB_DARWIN_SIGN_CODESIGN", "/usr/bin/codesign") if TESTING else "/usr/bin/codesign"
-SECURITY = os.environ.get("LAB_DARWIN_SIGN_SECURITY", "/usr/bin/security") if TESTING else "/usr/bin/security"
+RCODESIGN_PATH = str(Path.home() / ".local/bin/rcodesign")
+RCODESIGN = os.environ.get("LAB_DARWIN_SIGN_RCODESIGN", RCODESIGN_PATH) if TESTING else RCODESIGN_PATH
+OPENSSL_PATH = "/opt/homebrew/opt/openssl@3/bin/openssl"
+OPENSSL = os.environ.get("LAB_DARWIN_SIGN_OPENSSL", OPENSSL_PATH) if TESTING else OPENSSL_PATH
 
 
 def sha256(content):
@@ -382,7 +386,9 @@ def extract_verified_candidate(archive_bytes, stage, generation, sources, protoc
 
 
 def run_command(arguments, description, capture=False):
-    result = subprocess.run(arguments, text=True, capture_output=capture)
+    # rcodesign configuration must not introduce another signing source.
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("RCODESIGN_")}
+    result = subprocess.run(arguments, text=True, capture_output=capture, env=environment)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip() if capture else ""
         suffix = f": {detail}" if detail else ""
@@ -390,16 +396,84 @@ def run_command(arguments, description, capture=False):
     return result
 
 
-def read_certificate(identity):
-    result = run_command(
-        [SECURITY, "find-certificate", "-c", identity, "-p"], "signing certificate lookup", capture=True
-    )
-    pem = result.stdout.encode()
-    certificate = certificate_der(pem, "signing certificate lookup")
+def validate_private_key(path):
+    try:
+        metadata = Path(path).lstat()
+        parent = Path(path).parent.lstat()
+    except OSError as error:
+        raise SigningError(f"cannot inspect private key file {path}: {error}") from error
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != os.geteuid():
+        raise SigningError("private key must be a regular file owned by the signing user with mode 0600")
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_mode & 0o022:
+        raise SigningError("private key directory must be owned by the signing user and not group/world-writable")
+    # The trusted directory prevents other users replacing the key between this
+    # check and the signing tools opening it; the owner must not replace it mid-run.
+
+
+def read_certificate(path):
+    try:
+        pem = Path(path).read_bytes()
+    except OSError as error:
+        raise SigningError(f"cannot read signing certificate {path}: {error}") from error
+    certificate = certificate_der(pem, "signing certificate file")
     return pem, sha256(certificate)
 
 
-def sign_payloads(stage, identity, expected_team_id, entitlements, expected_entitlements):
+def validate_certificate_identity(path, identity, team_id):
+    subject = run_command(
+        [
+            OPENSSL,
+            "x509",
+            "-in",
+            str(path),
+            "-noout",
+            "-subject",
+            "-nameopt",
+            "sep_multiline,sname,utf8,esc_ctrl,esc_msb",
+        ],
+        "read signing certificate subject",
+        capture=True,
+    ).stdout
+    fields = {}
+    for line in subject.splitlines():
+        name, separator, value = line.strip().partition("=")
+        if separator:
+            fields.setdefault(name.strip(), []).append(value.strip())
+    if fields.get("CN") != [identity] or fields.get("OU") != [team_id]:
+        raise SigningError("signing certificate subject does not match the pinned identity/team")
+
+
+def validate_signing_pair(certificate, private_key):
+    public_key = run_command(
+        [
+            OPENSSL,
+            "pkey",
+            "-in",
+            str(private_key),
+            "-passin",
+            "pass:",
+            "-pubout",
+        ],
+        "read signing key public component",
+        capture=True,
+    ).stdout
+    certificate_key = run_command(
+        [
+            OPENSSL,
+            "x509",
+            "-in",
+            str(certificate),
+            "-pubkey",
+            "-noout",
+        ],
+        "read certificate public key",
+        capture=True,
+    ).stdout
+    if not public_key.strip() or public_key != certificate_key:
+        raise SigningError("private key does not match the signing certificate")
+
+
+def sign_payloads(stage, identity, expected_team_id, entitlements, expected_entitlements, certificate, private_key):
     paths = sorted(stage.glob("lib/*.dylib")) + [stage / path for path in REQUIRED_BINARIES]
     records = []
     for path in paths:
@@ -407,18 +481,23 @@ def sign_payloads(stage, identity, expected_team_id, entitlements, expected_enti
         before = sha256(path.read_bytes())
         run_command(
             [
-                CODESIGN,
-                "--force",
-                "--options",
+                RCODESIGN,
+                "--config-file",
+                "/dev/null",
+                "sign",
+                "--pem-source",
+                str(certificate),
+                "--pem-source",
+                str(private_key),
+                "--code-signature-flags",
                 "runtime",
-                "--timestamp=none",
-                "--entitlements",
+                "--timestamp-url",
+                "none",
+                "--entitlements-xml-file",
                 str(entitlements),
-                "--sign",
-                identity,
                 str(path),
             ],
-            f"codesign {relative}",
+            f"rcodesign {relative}",
         )
         run_command([CODESIGN, "--verify", "--strict", "--verbose=2", str(path)], f"verify signature {relative}")
         description = run_command(
@@ -503,22 +582,26 @@ def build_archive(stage):
     return output.getvalue()
 
 
-def cms_sign(attestation_path, signature_path, identity):
+def cms_sign(attestation_path, signature_path, certificate, private_key):
     run_command(
         [
-            SECURITY,
+            OPENSSL,
             "cms",
-            "-S",
-            "-N",
-            identity,
-            "-u",
-            "9",
-            "-H",
-            "SHA256",
-            "-T",
-            "-i",
+            "-sign",
+            "-binary",
+            "-md",
+            "sha256",
+            "-signer",
+            str(certificate),
+            "-inkey",
+            str(private_key),
+            "-passin",
+            "pass:",
+            "-outform",
+            "DER",
+            "-in",
             str(attestation_path),
-            "-o",
+            "-out",
             str(signature_path),
         ],
         "CMS attestation signing",
@@ -533,6 +616,8 @@ def parse_args():
     parser.add_argument("--package-token-file", required=True)
     parser.add_argument("--package-username", required=True)
     parser.add_argument("--output-owner", required=True)
+    parser.add_argument("--certificate-file", required=True)
+    parser.add_argument("--private-key-file", required=True)
     parser.add_argument("--identity", required=True)
     parser.add_argument("--expected-team-id", required=True)
     parser.add_argument("--entitlements-file", required=True)
@@ -545,6 +630,10 @@ def main():
         raise SigningError("generation has an invalid format")
     if not OWNER_PATTERN.fullmatch(args.output_owner):
         raise SigningError("output owner has an invalid format")
+    validate_private_key(args.private_key_file)
+    certificate_pem, certificate_sha256 = read_certificate(args.certificate_file)
+    validate_certificate_identity(args.certificate_file, args.identity, args.expected_team_id)
+    validate_signing_pair(args.certificate_file, args.private_key_file)
     entitlements = Path(args.entitlements_file)
     try:
         entitlements_bytes = entitlements.read_bytes()
@@ -589,7 +678,6 @@ def main():
     if len(archive_bytes) != platform["size_bytes"] or sha256(archive_bytes) != platform["sha256"]:
         raise SigningError("Darwin candidate does not match the promoted generation")
 
-    certificate_pem, certificate_sha256 = read_certificate(args.identity)
     with tempfile.TemporaryDirectory(prefix="lab-darwin-sign-") as directory:
         stage = Path(directory) / OUTPUT_ROOT
         stage.mkdir()
@@ -597,7 +685,13 @@ def main():
             archive_bytes, stage, args.generation, sources, protocol
         )
         signed_payloads = sign_payloads(
-            stage, args.identity, args.expected_team_id, entitlements, expected_entitlements
+            stage,
+            args.identity,
+            args.expected_team_id,
+            entitlements,
+            expected_entitlements,
+            args.certificate_file,
+            args.private_key_file,
         )
         signed_manifest = {
             "schema_version": 1,
@@ -646,7 +740,7 @@ def main():
         attestation_path = Path(directory) / "attestation.json"
         signature_path = Path(directory) / "attestation.cms"
         attestation_path.write_bytes(attestation_bytes)
-        cms_sign(attestation_path, signature_path, args.identity)
+        cms_sign(attestation_path, signature_path, args.certificate_file, args.private_key_file)
         signature_bytes = signature_path.read_bytes()
         checksum_bytes = f"{sha256(signed_archive)}  {OUTPUT_ARCHIVE}\n".encode()
         marker = {
