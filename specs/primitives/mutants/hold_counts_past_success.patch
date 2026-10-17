@@ -1,0 +1,12 @@
+--- a/machines/ensure.qnt
++++ b/machines/ensure.qnt
+@@ -18,8 +18,7 @@
+   pure def bound(s: State): int = match s { | Fulfilled(f) => f.bound | _ => 0 }
+   // Only the suffix after the latest success in the current window counts.
+   pure def failureCount(w: Work): int = w.history.indices().filter(i =>
+-    i >= w.window and (match w.history[i].outcome { | Failed(_) => true | _ => false }) and
+-    not(w.history.indices().exists(j => j > i and (match w.history[j].outcome { | Succeeded => true | _ => false })))) .size()
++    i >= w.window and (match w.history[i].outcome { | Failed(_) => true | _ => false })) .size()
+   pure def exhausted(w: Work): bool = failureCount(w) >= MAX_FAILURES or
+     (w.history.length() > w.window and (match w.history[w.history.length() - 1].outcome {
+       | Failed(f) => not(f.retryable) | _ => false

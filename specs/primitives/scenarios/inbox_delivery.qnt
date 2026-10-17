@@ -58,16 +58,20 @@ module inbox_delivery {
     turns' = turns.set(who, turns.get(who) + 1),
     keepWorldExceptTurns,
   }
-  action publish(who: int): bool = {
-    nondet kind = Set("receipt", "reply", "failure", "keepalive").oneOf()
-    all {
-      canWrite,
-      (kind == "failure" or kind == "keepalive" or (turned.contains(who) and Set("receipt", "reply").contains(kind) and not(stream.rows.indices().exists(i => stream.rows[i].kind == kind and stream.rows[i].session == who)))),
-      stream' = S::publish(stream, { at: now, kind: kind, session: who }),
-      keepLastHeard,
-      keepWorldExceptSource,
-    }
+  action publishRow(who: int, kind: str): bool = all {
+    canWrite,
+    (kind == "failure" or kind == "keepalive" or (turned.contains(who) and Set("receipt", "reply").contains(kind) and not(stream.rows.indices().exists(i => stream.rows[i].kind == kind and stream.rows[i].session == who)))),
+    stream' = S::publish(stream, { at: now, kind: kind, session: who }),
+    keepLastHeard,
+    keepWorldExceptSource,
   }
+  action publish(who: int): bool = {
+    nondet kind = Set("reply", "failure", "keepalive").oneOf()
+    publishRow(who, kind)
+  }
+  // A receipt is a Receive edge on the consumer's session, about the message;
+  // its stream row is that log entry on its way to the message's home.
+  action receive(who: int): bool = all { A::receive(who, 1, "turn"), publishRow(who, "receipt") }
   action bind(who: int): bool = all {
     D::bind(bound == 0, A::live(A::sessions.get(who)), not(observedReceipt) or not(M::pending(M::messages.get(1)))),
     bound' = who,
@@ -131,6 +135,7 @@ module inbox_delivery {
       all { A::end(who, A::Completed, canWrite), M::unchanged, recordSessionEnd(who) },
       all { turn(who), M::unchanged, A::unchanged },
       all { publish(who), M::unchanged, A::unchanged },
+      all { receive(who), M::unchanged },
       all { bind(who), M::unchanged, A::unchanged },
       all { unbindEndedWorld(who), M::unchanged, A::unchanged },
       all { unbindSilentWorld(who), M::unchanged, A::unchanged },

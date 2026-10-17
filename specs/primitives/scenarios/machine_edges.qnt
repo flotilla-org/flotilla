@@ -9,6 +9,7 @@ module machine_edges {
     nondet seen = Set(false, true).oneOf()
     nondet reason = Set(A::Completed, A::Lost).oneOf()
     nondet matches = Set(false, true).oneOf()
+    nondet transport = Set("turn", "notify", "mute").oneOf()
     any {
       all { L::request(1), A::unchanged, keepWorld },
       all { A::request(1), L::unchanged, keepWorld },
@@ -19,6 +20,7 @@ module machine_edges {
       all { recordFailure, L::unchanged, A::unchanged },
       all { A::attach(1, seen), L::unchanged, keepWorld },
       all { A::detach(1, seen), L::unchanged, keepWorld },
+      all { A::receive(1, 1, transport), L::unchanged, keepWorld },
       all { A::end(1, reason, seen and matches), L::unchanged, keepWorld },
     }
   }
