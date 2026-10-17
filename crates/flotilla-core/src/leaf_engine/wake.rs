@@ -360,6 +360,8 @@ impl ReconcilerWake {
         let observed_change_requests =
             freshest_change_requests(&change_request_sources(change_request_list)).into_iter().collect::<BTreeMap<_, _>>();
         let vessel_sources = views.vessels.list().await.map_err(|error| error.to_string())?.items;
+        // Pruning bounds memory. Revision keys also invalidate proofs when a
+        // convoy leaves and re-enters Landing between these snapshots.
         views.final_settlements.lock().expect("settlement cache lock poisoned").retain(|name, _| {
             convoys
                 .get(name)
@@ -567,14 +569,13 @@ impl ReconcilerWake {
                 }
                 continue;
             }
-            let exit = match instantiate_exit(convoy, &forges) {
-                Ok(exit) => exit,
-                Err(error) => {
-                    tracing::warn!(convoy = %convoy.metadata.name, %error, "derive reconciler leaf subscriptions failed");
-                    continue;
-                }
-            };
-            let final_inputs = FinalSettlementInputs::new(convoy, &exit, &convoy_vessels, &checkouts, &observed_change_requests, &forges);
+            // Instantiation failure disables caching, but settlement still runs
+            // before deciding whether exit-table subscriptions can be derived.
+            let exit = instantiate_exit(convoy, &forges);
+            let final_inputs = exit
+                .as_ref()
+                .ok()
+                .and_then(|exit| FinalSettlementInputs::new(convoy, exit, &convoy_vessels, &checkouts, &observed_change_requests, &forges));
             let cached = final_inputs.as_ref().is_some_and(|inputs| {
                 views.final_settlements.lock().expect("settlement cache lock poisoned").get(&convoy.metadata.name) == Some(inputs)
             });
@@ -636,6 +637,13 @@ impl ReconcilerWake {
                     episode_key: EpisodeKeyFields::default(),
                 });
             }
+            let exit = match exit {
+                Ok(exit) => exit,
+                Err(error) => {
+                    tracing::warn!(convoy = %convoy.metadata.name, %error, "derive reconciler leaf subscriptions failed");
+                    continue;
+                }
+            };
             if let InstantiatedExit::Table(entries) = exit {
                 for entry in entries {
                     if !entry.leaves.is_empty() {
