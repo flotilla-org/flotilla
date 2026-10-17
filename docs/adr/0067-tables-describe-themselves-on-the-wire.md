@@ -100,6 +100,7 @@ Rejected: a separate table-streaming protocol beside the surface channel, which 
 
 - **Rows are paged by keyset** on the sort columns, then the primary key. The primary key breaks ties, so the order is total and stable.
 - **The cursor is an opaque token** encoding the last row's sort values and primary key. It holds natural keys only, so it stays valid across hosts and restarts. A cursor the server cannot honour gets `resync`.
+- **Rows that move between pages may be skipped or repeated.** If a row's sort value changes while a client pages, the keyset continues from the old position. This is the normal keyset trade-off and is accepted. A viewer that needs an exact picture subscribes to the stream instead.
 - **The derive's store-local `Cursor`** stays as the store's internal pager. The wire cursor is a separate type.
 - **binnacle's `u64` Keys are made on the client.** A server-backed Table Source interns each row's primary key through binnacle's `KeyInterner`. Keys never cross the wire.
 - **A request can choose its columns** (`?columns=`). The primary key always comes back. The `table` message lists only the columns sent. With no selection, every column comes back. Sorting by an unselected column still works, because the server builds the cursor from the row it read.
@@ -125,7 +126,7 @@ Every rendering is chosen by `Accept`, or `?format=` for browsers and curl, and 
 
 - **Filter:** `?where=<field-path> <operator> <literal>`, the ADR 0066 condition grammar without its address part, because the route names the table. Repeated `where` clauses are ANDed. An unknown column or a type mismatch is refused with 400.
 - **Sort:** `?sort=-state_since,name`, ascending unless prefixed with `-`. The primary key is appended as the tie-breaker.
-- **Filters are pushed down to the store,** as SQL on SQLite and as index-aware lookups in memory. A clause the store cannot push down is refused, never answered by listing and filtering.
+- **Filters are pushed down to the store,** as SQL on SQLite and as index-aware lookups in memory. A clause the store cannot push down is refused with its own error code, distinct from an unknown column or a type mismatch, never answered by listing and filtering.
 - **Drilling is a filter** on the parent key (decision 4).
 - `labelSelector` stays on today's resource routes. OR, IN and text search are additions to the grammar, not to the routes.
 
@@ -137,6 +138,11 @@ Every rendering is chosen by `Accept`, or `?format=` for browsers and curl, and 
 3. **The inspector:** a page served by flotillad, built on binnacle's web grid, with a table list, a grid, drilling by foreign key, and a declared-versus-observed diagram panel. binnacle#47's server-backed source is designed against these routes.
 4. The WebSocket carrier (#3249) reuses the same message vocabulary.
 
+### 14. Table routes inherit ADR 0065's access rules
+
+- **The table routes and the inspector sit behind ADR 0065's router.** They get its bearer token or browser cookie, its Host and Origin checks, and a TCP listener that binds loopback only and is off unless declared.
+- **They serve a caller no more than the resource routes already serve that caller.** Any redaction a kind applies on the resource routes applies to its tables too. Neither column selection nor resolving interned text may get around it.
+
 ## Consequences
 
 - ADR 0012's per-surface column registries shrink to layout and actions. What a column means comes from the server.
@@ -144,4 +150,6 @@ Every rendering is chosen by `Accept`, or `?format=` for browsers and curl, and 
 - The `result_set.rs` module rule that presentation never appears on the wire still holds: only meaning crosses.
 - flotilla-schema's role widens from storage to description. Storage renderings live in flotilla-schema-sqlite.
 - binnacle#47's server-backed Table Source has a fixed contract to implement: decisions 2, 8, 9 and 10.
+- flotilla-protocol gains a dependency on flotilla-schema (decision 7). The build-graph check and the CLAUDE.md crate table, which calls flotilla-protocol serde-only, change with the first PR that adds the dependency.
+- Decisions 3, 6, 7 and 11 build on the unmerged #3319 stack's descriptor, and decisions 8 to 10 refine #3249. If either design shifts, this ADR is the place to amend.
 - Outside data, such as GitHub issues, can use the builder or the describe-only derive and be served the same way.
