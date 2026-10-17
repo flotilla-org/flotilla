@@ -118,6 +118,8 @@ async fn run_delivery(
             inbox.next_delivery_wake(Utc::now()).await
         }
         .await;
+        // Include failed attempts, matching the object-controller histogram.
+        metrics.reconcile.record(started.elapsed());
         match result {
             Ok(delay) => next = delay.map(|delay| tokio::time::Instant::now() + delay),
             Err(error) => {
@@ -125,7 +127,6 @@ async fn run_delivery(
                 return Err(error);
             }
         }
-        metrics.reconcile.record(started.elapsed());
     }
 }
 
