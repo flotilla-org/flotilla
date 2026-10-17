@@ -99,6 +99,9 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "ticket_edges",
             "ticket_notes",
             "vessel",
+            "vessel_attempts",
+            "vessel_edges",
+            "vessel_shape",
         ]
     );
     for (name, strict) in &tables {

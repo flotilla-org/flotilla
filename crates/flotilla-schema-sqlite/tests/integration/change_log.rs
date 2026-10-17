@@ -13,7 +13,8 @@ use rusqlite::Connection;
 use crate::fixtures::{
     message as messages, registry, store,
     synthetic::{workflow, InputValue},
-    AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow as Message, Pick, Referral, TerminalSession, Ticket, LOCAL,
+    AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow as Message, Pick, Referral, TerminalSession, Ticket, VesselRow,
+    LOCAL,
 };
 
 const REPLICA: &str = "replica";
@@ -99,6 +100,7 @@ fn slots() -> Vec<(KindCode, String)> {
         ConvoyRow::CODE,
         EnsureRow::CODE,
         TerminalSession::CODE,
+        VesselRow::CODE,
         Ticket::CODE,
         Referral::CODE,
         Dossier::CODE,
@@ -167,6 +169,7 @@ fn the_change_log_replays_into_another_store(tc: TestCase) {
             Ticket::CODE => step::<Ticket>(&tc, &mut write, live, name, last),
             Referral::CODE => step::<Referral>(&tc, &mut write, live, name, last),
             Dossier::CODE => step::<Dossier>(&tc, &mut write, live, name, last),
+            VesselRow::CODE => step::<VesselRow>(&tc, &mut write, live, name, last),
             _ => step::<TerminalSession>(&tc, &mut write, live, name, last),
         }
         if tc.draw(gs::booleans()) {
@@ -452,6 +455,7 @@ fn a_snapshot_plus_its_tail_is_the_newest_snapshot(tc: TestCase) {
     snapshot_plus_tail::<ConvoyRow>(&tc);
     snapshot_plus_tail::<EnsureRow>(&tc);
     snapshot_plus_tail::<TerminalSession>(&tc);
+    snapshot_plus_tail::<VesselRow>(&tc);
     snapshot_plus_tail::<Ticket>(&tc);
     snapshot_plus_tail::<Referral>(&tc);
     snapshot_plus_tail::<Dossier>(&tc);

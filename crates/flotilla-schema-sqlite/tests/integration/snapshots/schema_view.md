@@ -19,7 +19,10 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 | `terminal_session_labels` | child | 2 | – | – | – |
 | `terminal_session_events` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
 | `terminal_session_attempts` | history | 8 | 4: `outcome` 4 | – | – |
-| `vessel` | root | 3 | – | – | – |
+| `vessel` | root | 11 | – | `vessel_shape` (child), `vessel_edges` (history), `vessel_attempts` (history) | `live_by_host` (host), `by_convoy` (convoy) |
+| `vessel_shape` | child | 3 | – | – | – |
+| `vessel_edges` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
+| `vessel_attempts` | history | 8 | 4: `outcome` 4 | – | – |
 | `ticket` | root | 15 | – | `ticket_assignees` (state data), `ticket_notes` (state data), `ticket_edges` (history) | `open_by_queue` (queue) |
 | `ticket_assignees` | state data | 2 | – | – | – |
 | `ticket_notes` | state data | 3 | – | – | – |
@@ -48,5 +51,6 @@ States with data (one label column, then data shared by name across the labels):
 - `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `reason`; data tables –
 - `convoy`.`state`: label `state` and `state_since`; data columns `reason`; data tables `convoy_resolution`, `convoy_quota`
 - `terminal_session`.`state`: label `state` and `state_since`; data columns `identity`, `cause_category`, `cause_detail`; data tables –
+- `vessel`.`state`: label `state` and `state_since`; data columns `identity`, `cause_category`, `cause_detail`; data tables –
 - `ticket`.`state`: label `state` and `state_since`; data columns `priority`, `owner`, `hold_present`, `hold_by`, `hold_until`, `reason`, `closed_by`, `signature_who`, `signature_at`; data tables `ticket_assignees`, `ticket_notes`
 - `ensure`.`state`: label `state` and `state_since`; data columns `window`, `bound`; data tables `ensure_recorded`, `ensure_created`

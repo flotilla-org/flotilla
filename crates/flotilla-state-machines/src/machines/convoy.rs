@@ -31,19 +31,10 @@ use crate::{
     Table, Version, WrongState,
 };
 
-/// A convoy: the convoy resource's name at its home.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ConvoyId(pub String);
-
-impl ConvoyId {
-    pub fn new(name: impl Into<String>) -> Self {
-        ConvoyId(name.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+/// A convoy: a reference to the convoy resource, by its name at its home
+/// (#3392 G3). Placement and vessels name convoys homed on other hosts, so the
+/// home is part of the reference.
+pub type ConvoyId = flotilla_schema::Ref<ConvoyRow>;
 
 /// A promise's key within one convoy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]

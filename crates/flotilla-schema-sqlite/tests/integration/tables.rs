@@ -18,7 +18,7 @@ use crate::fixtures::{
     engine::{step, NAME},
     ensure, message, registry, store,
     synthetic::{workflow, Deliverable, DeliverableState, Evidence, InputValue, PromiseKind, PromiseSource},
-    AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession, LOCAL,
+    AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession, VesselRow, LOCAL,
 };
 
 /// A record edge's event on an unfulfilled Ensure, as its log holds it.
@@ -59,7 +59,7 @@ fn deliverable(evidence: Vec<Evidence>) -> Deliverable {
 fn records<T>(rows: Vec<T>) -> Records<T> {
     let mut records = Records::new();
     for row in rows {
-        records.append(0, row);
+        records.append(0, row).expect("room");
     }
     records
 }
@@ -74,7 +74,7 @@ fn with_rows<T: Clone>(records: &Records<T>, f: impl FnOnce(&mut Vec<(u64, T)>))
     f(&mut rows);
     let mut rebuilt = Records::new();
     for (version, record) in rows {
-        rebuilt.append(version, record);
+        rebuilt.append(version, record).expect("room");
     }
     rebuilt
 }
@@ -349,6 +349,7 @@ fn deleting_a_resource_empties_every_table(tc: TestCase) {
     delete_cascades::<ConvoyRow>(&tc);
     delete_cascades::<EnsureRow>(&tc);
     delete_cascades::<TerminalSession>(&tc);
+    delete_cascades::<VesselRow>(&tc);
     delete_cascades::<Referral>(&tc);
     delete_cascades::<Dossier>(&tc);
 }

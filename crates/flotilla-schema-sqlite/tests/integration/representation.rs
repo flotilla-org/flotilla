@@ -96,7 +96,7 @@ fn equal_interned_strings_share_one_row() {
     let reference = Reference::ChangeRequest { service: "carol".into(), scope: "s".into(), number: 1, revision: "r".into() };
     for name in ["a", "b"] {
         let mut edges = Records::new();
-        edges.append(0, event.clone());
+        edges.append(0, event.clone()).expect("room");
         let value = Referral { sender: AgentName("carol".into()), references: vec![reference.clone()], edges, ..Referral::sample() };
         write.insert(name, &value).expect("insert");
     }

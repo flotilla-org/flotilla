@@ -39,7 +39,7 @@ CAPABILITY_FORBIDDEN = (
 # the schema crates below it and the build-feature anchors.
 SCHEMA_CRATES = ("flotilla-schema-derive", "flotilla-schema", "flotilla-schema-sqlite")
 SCHEMA_ALLOWED = ("flotilla-address", "flotilla-cbor")
-# ADR 0064, #3320 ruling 3: the state-machine engine is storage-free. In production it
+# ADR 0064, #3320 ruling 3: the state-machine engine is backend-free. In production it
 # reaches only flotilla-schema (its code enums, records, timestamps and edge events) and
 # what flotilla-schema may reach, and no production crate depends on it until the stack
 # that adds the composition-root switch names its dependents here.

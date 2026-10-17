@@ -12,9 +12,31 @@
 //! storage port, with the home deciding and `apply_edge` persisting in one
 //! transaction, is a later layer.
 
-use flotilla_schema::{Cbor, Edge, EdgeError, HistoryOf, Kind, Labelled, State, StateData, StateOf, Timestamp};
+use flotilla_schema::{
+    Cbor, Edge, EdgeError, HistoryOf, Kind, KindRegistry, Labelled, RegistryError, State, StateData, StateOf, Timestamp,
+};
 
-use crate::{EdgeEventOf, EdgePayload, Label, Machine, Resource, RowParts};
+use crate::{
+    machines::{agent_session::AgentSessionRow, convoy::ConvoyRow, ensure::EnsureRow, message::MessageRow, vessel::VesselRow},
+    EdgeEventOf, EdgePayload, Label, Machine, Resource, RowParts,
+};
+
+/// The production kind registry (#3373 ruling 6): every stored kind the engine
+/// declares, each under the code it holds for good. Codes are stored with every
+/// identity and change, so a production code is allocated once, here, and never
+/// reused or moved; a kind declared elsewhere (a lifecycle kind's row beside
+/// its request) registers into this registry under a new code. Test kinds are
+/// registered beside these, so the registry refuses any test kind that takes a
+/// production code.
+pub fn kinds() -> Result<KindRegistry, RegistryError> {
+    let mut registry = KindRegistry::new();
+    registry.register::<MessageRow>()?;
+    registry.register::<AgentSessionRow>()?;
+    registry.register::<ConvoyRow>()?;
+    registry.register::<VesselRow>()?;
+    registry.register::<EnsureRow>()?;
+    Ok(registry)
+}
 
 /// Machine `M`'s state as stored: the value and the time its label was entered.
 pub type StoredState<M> = State<<M as Machine>::State>;

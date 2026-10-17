@@ -1,4 +1,4 @@
-//! The storage-free state-machine engine of ADR 0064.
+//! The backend-free state-machine engine of ADR 0064.
 //!
 //! A machine is declared once with ordinary Rust: a state enum whose variants
 //! carry their named data, an enum of edges whose variants each wrap their own
@@ -35,10 +35,16 @@
 //! are the schema crate's label-plus-data states, and records and events are
 //! the schema crate's types, so the storage derive stores them as they are.
 //! Each machine declares its stored kind beside it ([`MachineRow`]): Message,
-//! AgentSession, Convoy and Ensure here, and a lifecycle kind's row wherever
-//! its request is declared. Nothing here touches a backend, replication or a
-//! wire encoding. The only workspace crate this one reaches is `flotilla-schema`,
-//! and no production crate depends on this one yet (`ci/build-graph/check.py`).
+//! AgentSession, Convoy, Vessel and Ensure here, listed under their permanent
+//! codes by the production registry ([`kinds`]), and any other lifecycle
+//! kind's row wherever its request is declared. A reference to a
+//! definitions-class kind or to anything outside the store is an address
+//! (`flotilla_schema::Address`), whose existence admission reads through the
+//! recording [`Admission`] handle; a reference to a record in the store is a
+//! `flotilla_schema::Ref` (kind, name and home). Nothing here touches a
+//! backend, replication or a wire encoding. The only workspace crate this one
+//! reaches is `flotilla-schema` (and `flotilla-address` through it), and no
+//! production crate depends on this one yet (`ci/build-graph/check.py`).
 
 pub mod attempt;
 mod code;
@@ -58,4 +64,4 @@ pub use machine::{
 };
 pub use read::{Admission, Handle, InputRead, Judged, Kind, Ref, Source, Table, Version, OWN_ATTEMPTS, OWN_RECEIPTS};
 pub use record::{EdgeEventOf, EdgePayload, Receipt, Transport};
-pub use stored::{MachineRow, StoredState};
+pub use stored::{kinds, MachineRow, StoredState};

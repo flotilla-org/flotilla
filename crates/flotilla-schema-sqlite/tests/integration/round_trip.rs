@@ -6,7 +6,7 @@ use flotilla_state_machines::{Coded, EdgeKind, MachineRow};
 use hegel::{generators as gs, TestCase};
 
 use crate::fixtures::{
-    store, AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession, Ticket, LOCAL,
+    store, AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession, Ticket, VesselRow, LOCAL,
 };
 
 /// Inserts `first`, then evolves it through `steps` writes: mostly generated edges, and a spec
@@ -98,6 +98,7 @@ fn ensure_evolves_by_edges_and_spec_edits(tc: TestCase) {
 #[hegel::test]
 fn terminal_session_evolves_by_edges_and_spec_edits(tc: TestCase) {
     drawn::<TerminalSession>(&tc);
+    drawn::<VesselRow>(&tc);
 }
 
 // Behaviour (#3373 ruling 4): the synthetic kinds evolve the same way: code-enum states written
@@ -126,6 +127,7 @@ fn every_variant_round_trips_and_switches_through_writes(tc: TestCase) {
     covering::<ConvoyRow>(&tc);
     covering::<EnsureRow>(&tc);
     covering::<TerminalSession>(&tc);
+    covering::<VesselRow>(&tc);
     covering::<Ticket>(&tc);
     covering::<Referral>(&tc);
     covering::<Dossier>(&tc);
@@ -163,4 +165,5 @@ fn engine_fixtures_reach_every_declared_edge(tc: TestCase) {
     assert_eq!(edges_reached::<ConvoyRow>(&tc), all_edges::<ConvoyRow>());
     assert_eq!(edges_reached::<EnsureRow>(&tc), all_edges::<EnsureRow>());
     assert_eq!(edges_reached::<TerminalSession>(&tc), all_edges::<TerminalSession>());
+    assert_eq!(edges_reached::<VesselRow>(&tc), all_edges::<VesselRow>());
 }

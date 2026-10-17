@@ -18,7 +18,7 @@ fn quota(pairs: &[(u32, u32)]) -> Quota {
 }
 
 fn convoy(n: u32) -> ConvoyId {
-    ConvoyId::new(format!("convoy-{n}"))
+    ConvoyId::new(format!("convoy-{n}"), "home")
 }
 
 fn vessel(n: u32) -> VesselId {

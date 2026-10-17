@@ -9,7 +9,7 @@ use hegel::{generators as gs, TestCase};
 
 use crate::fixtures::{
     convoy, ensure, message, store, terminal, AgentSessionRow, ConvoyRow, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession,
-    Vessel, LOCAL,
+    VesselRow, LOCAL,
 };
 
 /// Every id of `query`, page by page with `limit`. Each page holds at most `limit` ids, a page
@@ -232,7 +232,7 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
     }
     for vessel in ["v0", "v1", "v2"] {
         let want = expected(&sessions, |s: &TerminalSession| s.vessel.name == vessel, |s| s.ordinal);
-        assert_eq!(collect(&mut store, &TerminalSession::by_vessel(&Ref::<Vessel>::new(vessel, LOCAL)), limit), want);
+        assert_eq!(collect(&mut store, &TerminalSession::by_vessel(&Ref::<VesselRow>::new(vessel, LOCAL)), limit), want);
     }
     for pool in ["blue", "green", "red"] {
         let live = |s: &TerminalSession| matches!(s.state.value, LifecycleState::Requested | LifecycleState::Realised { .. });

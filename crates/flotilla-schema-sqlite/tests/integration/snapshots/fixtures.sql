@@ -308,8 +308,80 @@ CREATE INDEX "terminal_session_live_by_pool" ON "terminal_session" ("pool") WHER
 CREATE TABLE "vessel" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
-  "name" TEXT NOT NULL
+  "convoy" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
+  "class" INTEGER NOT NULL,
+  "priority" INTEGER NOT NULL,
+  "host" INTEGER NOT NULL,
+  "state" INTEGER NOT NULL CHECK ("state" IN (1, 2, 3, 4)),
+  "state_since" INTEGER NOT NULL,
+  "identity" TEXT,
+  "cause_category" INTEGER CHECK ("cause_category" IN (1, 2, 3, 4, 5)),
+  "cause_detail" TEXT,
+  CHECK (CASE WHEN "state" = 1
+      THEN "identity" IS NULL
+      AND "cause_category" IS NULL
+      AND "cause_detail" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 2
+      THEN "identity" IS NOT NULL
+      AND "cause_category" IS NULL
+      AND "cause_detail" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 3
+      THEN "identity" IS NULL
+      AND "cause_category" IS NULL
+      AND "cause_detail" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 4
+      THEN "cause_category" IS NOT NULL
+      AND "cause_detail" IS NOT NULL
+      AND "identity" IS NULL
+      END)
 ) STRICT;
+CREATE TABLE "vessel_shape" (
+  "owner" INTEGER NOT NULL,
+  "key" INTEGER NOT NULL,
+  "value" INTEGER NOT NULL,
+  PRIMARY KEY ("owner", "key"),
+  FOREIGN KEY ("owner") REFERENCES "vessel" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE "vessel_edges" (
+  "owner" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
+  "edge" INTEGER NOT NULL CHECK ("edge" IN (1, 2, 3, 4)),
+  "from" INTEGER NOT NULL CHECK ("from" IN (1, 2, 3, 4)),
+  "to" INTEGER NOT NULL CHECK ("to" IN (1, 2, 3, 4)),
+  "writer" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "at" INTEGER NOT NULL,
+  "payload" BLOB NOT NULL,
+  PRIMARY KEY ("owner", "pos"),
+  FOREIGN KEY ("owner") REFERENCES "vessel" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE TABLE "vessel_attempts" (
+  "owner" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
+  "at" INTEGER NOT NULL,
+  "outcome" INTEGER NOT NULL CHECK ("outcome" IN (1, 2)),
+  "outcome_failed_cause_category" INTEGER CHECK ("outcome_failed_cause_category" IN (1, 2, 3, 4, 5)),
+  "outcome_failed_cause_detail" TEXT,
+  "outcome_failed_retryable" INTEGER CHECK ("outcome_failed_retryable" IN (0, 1)),
+  PRIMARY KEY ("owner", "pos"),
+  FOREIGN KEY ("owner") REFERENCES "vessel" ("id") ON DELETE CASCADE,
+  CHECK (CASE WHEN "outcome" = 2
+      THEN "outcome_failed_cause_category" IS NOT NULL
+      AND "outcome_failed_cause_detail" IS NOT NULL
+      AND "outcome_failed_retryable" IS NOT NULL
+      ELSE "outcome_failed_cause_category" IS NULL
+      AND "outcome_failed_cause_detail" IS NULL
+      AND "outcome_failed_retryable" IS NULL
+      END)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX "vessel_by_convoy" ON "vessel" ("convoy");
+CREATE INDEX "vessel_edges_by_edge" ON "vessel_edges" ("edge", "at");
+CREATE INDEX "vessel_edges_by_time" ON "vessel_edges" ("at");
+CREATE INDEX "vessel_live_by_host" ON "vessel" ("host") WHERE "state" IN (1, 2);
 CREATE TABLE "ticket" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

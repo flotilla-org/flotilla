@@ -797,7 +797,7 @@ fn units_value(units: &Units) -> Value {
 
 fn placement_request(v: &Value) -> placement::Request {
     placement::Request {
-        convoy: ConvoyId::new(number(&v["convoy"]).to_string()),
+        convoy: ConvoyId::new(number(&v["convoy"]).to_string(), "home"),
         class: VesselClass(small(&v["class"])),
         shape: units(&v["shape"]),
         priority: Priority(small(&v["priority"])),
@@ -807,7 +807,7 @@ fn placement_request(v: &Value) -> placement::Request {
 /// The spec's vessel `Request`.
 fn request_value(request: &placement::Request) -> Value {
     json!({
-        "convoy": int(id_of(request.convoy.as_str())),
+        "convoy": int(id_of(&request.convoy.name)),
         "class": int(request.class.0.into()),
         "shape": units_value(&request.shape),
         "priority": int(request.priority.0.into()),
@@ -857,7 +857,7 @@ impl Fleet {
     fn sync_caps(&mut self, convoy: i64) {
         let name = convoy.to_string();
         let quota = self.convoys.get(&name).expect("admitted convoy").state().quota().clone();
-        self.ledger.set_caps(ConvoyId::new(name), quota);
+        self.ledger.set_caps(ConvoyId::new(name, "home"), quota);
     }
 
     /// The spec's `Waiting(Request) | Leased({ placement, lifecycle }) | Gone(Placement)`,
@@ -924,7 +924,7 @@ impl Fleet {
                 let evidence = trial.evidence(&vessel, host).expect("a waiting vessel's evidence");
                 let Ok(lease) = trial.place(&vessel, host).cloned() else { continue };
                 for convoy in [1, 2] {
-                    let convoy = ConvoyId::new(convoy.to_string());
+                    let convoy = ConvoyId::new(convoy.to_string(), "home");
                     for class in [VesselClass(0), VesselClass(1)] {
                         let (live, cap) = (trial.live(&convoy, class), trial.cap(&convoy, class));
                         assert!(live <= cap, "{step}: placing vessel {id} on {host:?} leases {live} of {convoy:?} {class:?}, cap {cap}");

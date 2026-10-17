@@ -10,7 +10,7 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use flotilla_schema::{EdgeEvent, Position, Records, Timestamp};
+use flotilla_schema::{EdgeEvent, Position, Records, RecordsFull, Timestamp};
 
 use crate::{
     Admission, Attempt, DefError, Edge, EdgeEventOf, EdgeKind, EdgePayload, Ended, Fault, Handle, InputRead, Judged, Label, Machine,
@@ -127,6 +127,8 @@ pub enum WriteError<M: Machine> {
     Refused(M::Refusal),
     /// A declaration fault; see [`Fault`].
     Fault(Fault<Label<M>, EdgeKind<M>>),
+    /// One of the resource's record tables has used every position.
+    Full(RecordsFull),
 }
 
 impl<M: Machine> WriteError<M> {
@@ -154,6 +156,7 @@ impl<M: Machine> PartialEq for WriteError<M> {
             (WriteError::Unknown(a), WriteError::Unknown(b)) | (WriteError::Exists(a), WriteError::Exists(b)) => a == b,
             (WriteError::Refused(a), WriteError::Refused(b)) => a == b,
             (WriteError::Fault(a), WriteError::Fault(b)) => a == b,
+            (WriteError::Full(a), WriteError::Full(b)) => a == b,
             _ => false,
         }
     }
@@ -166,6 +169,7 @@ impl<M: Machine> fmt::Debug for WriteError<M> {
             WriteError::Exists(name) => f.debug_tuple("Exists").field(name).finish(),
             WriteError::Refused(refusal) => f.debug_tuple("Refused").field(refusal).finish(),
             WriteError::Fault(fault) => f.debug_tuple("Fault").field(fault).finish(),
+            WriteError::Full(full) => f.debug_tuple("Full").field(full).finish(),
         }
     }
 }
@@ -254,7 +258,8 @@ impl<M: Machine> Home<M> {
     /// On success the resource holds the next state, its version rises, and
     /// the returned event (whose payload holds the edge and the gate's and
     /// effect's reads) is appended to its edge events, stamped with the new
-    /// version.
+    /// version. A resource whose edge log has used every position refuses
+    /// with [`WriteError::Full`] and is left unchanged.
     pub fn apply(
         &mut self,
         name: &str,
@@ -270,12 +275,15 @@ impl<M: Machine> Home<M> {
         // The step borrowed the resource immutably; this second lookup of the
         // same name under `&mut self` cannot miss.
         let resource = self.resources.get_mut(name).ok_or_else(|| WriteError::Unknown(name.to_string()))?;
+        if resource.events.is_full() {
+            return Err(WriteError::Full(RecordsFull));
+        }
         let from = resource.state.label();
         let to = next.label();
         resource.version = resource.version.next();
         resource.state = next;
         let event = EdgeEvent { edge: edge.kind(), from, to, writer: self.writer.clone(), at: now, payload: EdgePayload { edge, reads } };
-        Ok(&resource.events.append(resource.version.0, event).record)
+        Ok(&resource.events.append(resource.version.0, event).map_err(WriteError::Full)?.record)
     }
 
     /// Appends an attempt. Refused on an ended resource, with the end's
@@ -283,15 +291,21 @@ impl<M: Machine> Home<M> {
     pub fn record_attempt(&mut self, name: &str, attempt: Attempt) -> Result<Position, WriteError<M>> {
         let accepts = |definition: &MachineDef<M>, label| definition.accepts_attempts(label);
         let resource = self.writable(name, accepts)?;
+        if resource.attempts.is_full() {
+            return Err(WriteError::Full(RecordsFull));
+        }
         resource.version = resource.version.next();
-        Ok(resource.attempts.append(resource.version.0, attempt).position)
+        Ok(resource.attempts.append(resource.version.0, attempt).map_err(WriteError::Full)?.position)
     }
 
     /// Appends a receipt. Refused on an ended resource, with the end's reason.
     pub fn record_receipt(&mut self, name: &str, receipt: Receipt) -> Result<Position, WriteError<M>> {
         let resource = self.writable(name, any_label)?;
+        if resource.receipts.is_full() {
+            return Err(WriteError::Full(RecordsFull));
+        }
         resource.version = resource.version.next();
-        Ok(resource.receipts.append(resource.version.0, receipt).position)
+        Ok(resource.receipts.append(resource.version.0, receipt).map_err(WriteError::Full)?.position)
     }
 
     fn writable(&mut self, name: &str, accepts: impl Fn(&MachineDef<M>, Label<M>) -> bool) -> Result<&mut Resource<M>, WriteError<M>> {
