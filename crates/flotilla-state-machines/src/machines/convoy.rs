@@ -11,20 +11,18 @@
 //! The identifiers placement shares with the convoy ([`ConvoyId`],
 //! [`VesselClass`], [`Priority`] and [`Quota`]) are defined here once.
 //!
-//! The stored kind is [`ConvoyRow`] (code `cv`): the spec's project and priority
-//! as columns and its promise definitions as a child table, the state (with
+//! The stored kind is `Resource<Convoy>` (code `cv`), declared by
+//! [`ConvoySpec`]: the spec's project and priority as columns and its promise
+//! definitions as a child table, the state (with
 //! the resolution and quota as child tables of state data, which `keep`,
 //! `retract` and `readmit` change a row at a time), and the edge log.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Records, State, Stored, Timestamp};
+use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    edges, states, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts, Source, Table,
-    Version, WrongState,
-};
+use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Version, WrongState};
 
 /// A convoy: the convoy resource's name at its home.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -76,10 +74,15 @@ pub struct ConvoyRequest {
     pub priority: Priority,
 }
 
-/// The part of the request that never changes after admission.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The part of the request that never changes after admission. It declares
+/// the stored Convoy (kind code `cv`), indexed for a project's open convoys.
+#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+#[store(kind = "Convoy", code = "cv", state = ConvoyState, index(name = "open_by_project", eq(project), when(state in [Open])))]
 pub struct ConvoySpec {
+    /// An address: plain interned text until `flotilla-address` is adopted.
+    #[store(intern)]
     pub project: String,
+    #[store(child)]
     pub promises: BTreeMap<PromiseId, Promise>,
     pub priority: Priority,
 }
@@ -426,61 +429,5 @@ fn readmit(_: &mut Handle<'_, Convoy>, state: ConvoyState, readmit: &Readmit) ->
     match state {
         ConvoyState::Open { resolution, .. } => ConvoyState::Open { resolution, quota: readmit.quota.clone() },
         other => other,
-    }
-}
-
-/// The stored Convoy (kind code `cv`): the spec's project and priority as
-/// columns and its promise definitions as a child table, the state, and the
-/// edge log. Indexed for a project's open convoys.
-#[derive(Clone, Debug, PartialEq, Stored)]
-#[store(kind = "Convoy", code = "cv", index(name = "open_by_project", eq(project), when(state in [Open])))]
-pub struct ConvoyRow {
-    /// An address: plain interned text until `flotilla-address` is adopted.
-    #[store(intern)]
-    pub project: String,
-    #[store(child)]
-    pub promises: BTreeMap<PromiseId, Promise>,
-    pub priority: Priority,
-    #[store(state)]
-    pub state: State<ConvoyState>,
-    #[store(history)]
-    pub edges: Records<EdgeEventOf<Convoy>>,
-}
-
-impl ConvoyRow {
-    /// The part of the request that never changes.
-    pub fn spec(&self) -> ConvoySpec {
-        ConvoySpec { project: self.project.clone(), promises: self.promises.clone(), priority: self.priority }
-    }
-}
-
-impl MachineRow for ConvoyRow {
-    type Machine = Convoy;
-    const STATE_FIELD: flotilla_schema::StateOf<Self, State<ConvoyState>> = ConvoyRow::STATE;
-    const EDGE_LOG: flotilla_schema::HistoryOf<Self, EdgeEventOf<Convoy>> = ConvoyRow::EDGES;
-
-    fn of(resource: &Resource<Convoy>, since: Timestamp) -> ConvoyRow {
-        let spec = resource.spec().clone();
-        ConvoyRow {
-            project: spec.project,
-            promises: spec.promises,
-            priority: spec.priority,
-            state: State::new(resource.state().clone(), since),
-            edges: resource.events().clone(),
-        }
-    }
-
-    fn state(&self) -> &State<ConvoyState> {
-        &self.state
-    }
-
-    fn parts(&self) -> RowParts<Convoy> {
-        RowParts {
-            spec: self.spec(),
-            state: self.state.value.clone(),
-            events: self.edges.clone(),
-            attempts: Records::new(),
-            receipts: Records::new(),
-        }
     }
 }

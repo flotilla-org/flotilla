@@ -34,9 +34,12 @@
 //! State labels and edge kinds are `flotilla_schema` code enums, state enums
 //! are the schema crate's label-plus-data states, and records and events are
 //! the schema crate's types, so the storage derive stores them as they are.
-//! Each machine declares its stored kind beside it ([`MachineRow`]): Message,
-//! AgentSession, Convoy and Ensure here, and a lifecycle kind's row wherever
-//! its request is declared. Nothing here touches a backend, replication or a
+//! Every machine's stored kind is its [`Resource`] (#3392 ruling D5): the
+//! storage derive targets the machine's spec, which names the kind, its code,
+//! indexes and state, and its state; the resource supplies the edge log and
+//! records, and the store its name and version. Message, AgentSession, Convoy
+//! and Ensure declare their specs here, and a lifecycle kind's request is its
+//! spec wherever it is declared. Nothing here touches a backend, replication or a
 //! wire encoding. The only workspace crate this one reaches is `flotilla-schema`,
 //! and no production crate depends on this one yet (`ci/build-graph/check.py`).
 
@@ -52,10 +55,10 @@ mod stored;
 
 pub use attempt::{Attempt, AttemptPolicy, Cause, CauseCategory, Outcome, Retry, Schedule};
 pub use code::{changed, Coded, Datum, Edge, EdgeArg, StateValue};
-pub use home::{Home, Resource, RowParts, WriteError};
+pub use home::{Home, Resource, WriteError};
 pub use machine::{
     Check, DeclaredEdge, DefError, Diagram, EdgeDef, EdgeKind, EndDef, Ended, Fault, Label, Machine, MachineDef, StepError, WrongState,
 };
 pub use read::{Handle, InputRead, Judged, Kind, Ref, Source, Table, Version, OWN_ATTEMPTS, OWN_RECEIPTS};
 pub use record::{EdgeEventOf, EdgePayload, Receipt, Transport};
-pub use stored::{MachineRow, StoredState};
+pub use stored::StoredState;

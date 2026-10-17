@@ -2,11 +2,23 @@
 
 use std::{collections::BTreeSet, ops::Range};
 
-use crate::{code::Code, ddl::quote_ident, value::KindCode};
+use crate::{
+    code::Code,
+    ddl::{quote_ident, VIEW_SUFFIX},
+    value::KindCode,
+};
 
 /// Schema object names of the shared tables and their indexes; no kind table or index may take one.
-pub const SHARED_NAMES: &[&str] =
-    &["strings", "resource_identity", "resource_identity_by_home", "objects", "home_sequence", "change_log", "change_log_by_resource"];
+pub const SHARED_NAMES: &[&str] = &[
+    "strings",
+    "resource_identity",
+    "resource_identity_by_home",
+    "objects",
+    "home_sequence",
+    "change_log",
+    "change_log_by_resource",
+    "codes",
+];
 
 /// Column names the backend adds to a kind's root table.
 pub const RESERVED_ROOT_COLUMNS: &[&str] = &["id", "version"];
@@ -66,6 +78,9 @@ pub struct Table {
     pub guards: Vec<Guard>,
     /// The data enums expanded into this table's columns, outermost and nested.
     pub enums: Vec<Expansion>,
+    /// Each code column's codes with their Rust names, in column order (key columns included):
+    /// the rows of the `codes` table, which the readable views join (#3392 ruling D4).
+    pub codes: Vec<CodeNames>,
     /// The column-shaped fields of the struct whose rows this table holds, in declaration order:
     /// the unit an edge sets (`Edge::set`), and the columns a spec edit may not change (`state`).
     /// Empty for tables of primitive and enum elements, which have no named fields.
@@ -166,6 +181,13 @@ pub fn code_literal(code: Code) -> String {
 pub struct Expansion {
     pub tag: String,
     pub columns: Vec<String>,
+}
+
+/// One code column's codes and the Rust names of the variants that carry them, ascending by code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeNames {
+    pub column: String,
+    pub names: Vec<(Code, String)>,
 }
 
 fn conjunction(terms: impl Iterator<Item = String>, and: &str) -> String {
@@ -405,8 +427,10 @@ impl TableSet {
         Ok(())
     }
 
-    /// The names this kind takes in the backend's schema namespace: its tables, then its indexes.
+    /// The names this kind takes in the backend's schema namespace: its tables, then its indexes,
+    /// then its tables' readable views.
     pub fn object_names(&self) -> impl Iterator<Item = String> + '_ {
-        self.tables.iter().map(|table| table.name.clone()).chain(self.indexes.iter().map(Index::object_name))
+        let views = self.tables.iter().map(|table| format!("{}{VIEW_SUFFIX}", table.name));
+        self.tables.iter().map(|table| table.name.clone()).chain(self.indexes.iter().map(Index::object_name)).chain(views)
     }
 }

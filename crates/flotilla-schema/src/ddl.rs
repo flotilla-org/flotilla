@@ -1,11 +1,29 @@
-//! Deterministic DDL rendering: tables in pre-order, then indexes sorted by object name.
+//! Deterministic DDL rendering: tables in pre-order, then indexes sorted by object name, then the
+//! kind's rows of the shared `codes` table and one readable view per table (#3392 ruling D4).
 //!
 //! Identifiers come from Rust field names (never serde names) and are always quoted, so a field
 //! named like an SQL keyword still renders valid DDL.
+//!
+//! Stored codes are short (G7), so a table is read through its view: `<table>_view` has the
+//! table's columns in order, with each code column replaced by its variant's Rust name from
+//! `codes` and each interned column by its text from `strings`. A view holds no data, so a store
+//! opening an existing database drops and recreates it; it upserts the kind's `codes` rows and
+//! deletes any others, so an unchanged schema writes no row.
 
 use std::fmt::Write as _;
 
 use crate::descriptor::{code_literal, ColumnDef, ColumnType, Table, TableRole, TableSet};
+
+/// The shared table naming every code: one row per (kind, field, code), `name` the Rust name of
+/// the variant carrying it. `kind` is the kind code and `field` the code column: its name on the
+/// root table, `<table>.<column>` on a nested table, the table named without the root's prefix.
+pub const CODES_DDL: &str = "CREATE TABLE IF NOT EXISTS codes (
+  kind TEXT NOT NULL, field TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
+  PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
+";
+
+/// The suffix of a table's readable view: `<table>_view`.
+pub const VIEW_SUFFIX: &str = "_view";
 
 /// Whether statements may meet objects that already exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +63,86 @@ pub fn render_ddl_with(set: &TableSet, mode: DdlMode) -> String {
         }
         out.push_str(";\n");
     }
+    render_codes(&mut out, set, mode);
+    for table in &set.tables {
+        render_readable(&mut out, set, table, mode);
+    }
     out
+}
+
+/// The `codes` field of column `column` of `table`; see [`CODES_DDL`].
+pub fn code_field(set: &TableSet, table: &Table, column: &str) -> String {
+    if table.parent.is_none() {
+        return column.to_owned();
+    }
+    let root = &set.tables[0].name;
+    let local = table.name.strip_prefix(root.as_str()).and_then(|rest| rest.strip_prefix('_')).unwrap_or(&table.name);
+    format!("{local}.{column}")
+}
+
+/// A text value as an SQL string literal.
+fn text_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// The kind's rows of `codes`. Opening an existing database upserts them and deletes the
+/// kind's other rows, writing nothing when they are unchanged.
+fn render_codes(out: &mut String, set: &TableSet, mode: DdlMode) {
+    let kind = text_literal(set.code.as_str());
+    let rows: Vec<(String, String, String)> = set
+        .tables
+        .iter()
+        .flat_map(|table| table.codes.iter().map(move |codes| (table, codes)))
+        .flat_map(|(table, codes)| {
+            let field = text_literal(&code_field(set, table, &codes.column));
+            codes.names.iter().map(move |(code, name)| (field.clone(), code_literal(*code), text_literal(name)))
+        })
+        .collect();
+    if !rows.is_empty() {
+        let values: Vec<String> = rows.iter().map(|(field, code, name)| format!("({kind}, {field}, {code}, {name})")).collect();
+        let _ = write!(out, "INSERT INTO \"codes\" (\"kind\", \"field\", \"code\", \"name\") VALUES\n  {}", values.join(",\n  "));
+        if mode == DdlMode::IfNotExists {
+            out.push_str("\nON CONFLICT (\"kind\", \"field\", \"code\") DO UPDATE SET \"name\" = excluded.\"name\" WHERE \"name\" IS NOT excluded.\"name\"");
+        }
+        out.push_str(";\n");
+    }
+    if mode == DdlMode::IfNotExists {
+        let _ = write!(out, "DELETE FROM \"codes\" WHERE \"kind\" = {kind}");
+        if !rows.is_empty() {
+            let keys: Vec<String> = rows.iter().map(|(field, code, _)| format!("({field}, {code})")).collect();
+            let _ = write!(out, " AND (\"field\", \"code\") NOT IN (VALUES {})", keys.join(", "));
+        }
+        out.push_str(";\n");
+    }
+}
+
+/// `<table>_view`: the table's columns in order, code columns as their names and interned columns
+/// as their text.
+fn render_readable(out: &mut String, set: &TableSet, table: &Table, mode: DdlMode) {
+    let name = quote_ident(&format!("{}{VIEW_SUFFIX}", table.name));
+    let source = quote_ident(&table.name);
+    let mut lines: Vec<String> = match table.parent {
+        None => ["id", "version"].iter().map(|column| format!("{source}.{}", quote_ident(column))).collect(),
+        Some(_) => vec![format!("{source}.{}", quote_ident("owner"))],
+    };
+    for column in table.key.iter().chain(&table.columns) {
+        let value = format!("{source}.{}", quote_ident(&column.name));
+        let alias = quote_ident(&column.name);
+        let named = table.codes.iter().any(|codes| codes.column == column.name);
+        lines.push(match column.ty {
+            ColumnType::Code(_) if named => format!(
+                "(SELECT \"name\" FROM \"codes\" WHERE \"kind\" = {} AND \"field\" = {} AND \"code\" = {value}) AS {alias}",
+                text_literal(set.code.as_str()),
+                text_literal(&code_field(set, table, &column.name)),
+            ),
+            ColumnType::Interned => format!("(SELECT \"s\" FROM \"strings\" WHERE \"id\" = {value}) AS {alias}"),
+            _ => value,
+        });
+    }
+    if mode == DdlMode::IfNotExists {
+        let _ = writeln!(out, "DROP VIEW IF EXISTS {name};");
+    }
+    let _ = writeln!(out, "CREATE VIEW {name} AS SELECT\n  {}\nFROM {source};", lines.join(",\n  "));
 }
 
 fn render_table(out: &mut String, set: &TableSet, table: &Table, exists: &str) {
@@ -130,7 +227,7 @@ mod tests {
         let mut layout = Layout::root("Convoy", KindCode::new("k2"));
         layout.column("name", ColumnType::Interned, true);
         layout.column("done", ColumnType::Bool, true);
-        layout.column("phase", ColumnType::Code(codes(&["dr", "op", "sh"])), false);
+        layout.code("phase", &codes(&["dr", "op", "sh"]), &["Draft", "Open", "Shipped"], false);
         layout.column("workflow", ColumnType::Frozen, true);
         layout.table("deliverables", TableRole::Records, |layout| {
             layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
@@ -158,7 +255,8 @@ mod tests {
 
     // Behaviour (DESIGN DDL): STRICT tables in pre-order; the root keyed by its identity id; each
     // child keyed by owner plus its logical key, with a cascading FK to its parent's full key;
-    // per-type REFERENCES and CHECKs; indexes sorted by name after the tables.
+    // per-type REFERENCES and CHECKs; indexes sorted by name after the tables. Then (#3392 D4)
+    // the kind's `codes` rows, and one view per table naming its codes and interned strings.
     #[test]
     fn renders_tables_keys_and_indexes() {
         let expected = r#"CREATE TABLE "convoy" (
@@ -188,6 +286,31 @@ CREATE TABLE "convoy_deliverables_evidence" (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "convoy_by_name" ON "convoy" ("name");
 CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN ('dr', 'op') AND "phase" IS NOT NULL;
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('k2', 'phase', 'dr', 'Draft'),
+  ('k2', 'phase', 'op', 'Open'),
+  ('k2', 'phase', 'sh', 'Shipped');
+CREATE VIEW "convoy_view" AS SELECT
+  "convoy"."id",
+  "convoy"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy"."name") AS "name",
+  "convoy"."done",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'k2' AND "field" = 'phase' AND "code" = "convoy"."phase") AS "phase",
+  "convoy"."workflow"
+FROM "convoy";
+CREATE VIEW "convoy_deliverables_view" AS SELECT
+  "convoy_deliverables"."owner",
+  "convoy_deliverables"."pos",
+  "convoy_deliverables"."version",
+  "convoy_deliverables"."target"
+FROM "convoy_deliverables";
+CREATE VIEW "convoy_deliverables_evidence_view" AS SELECT
+  "convoy_deliverables_evidence"."owner",
+  "convoy_deliverables_evidence"."deliverables_pos",
+  "convoy_deliverables_evidence"."pos",
+  "convoy_deliverables_evidence"."version",
+  "convoy_deliverables_evidence"."value"
+FROM "convoy_deliverables_evidence";
 "#;
         let set = convoy().finish();
         set.validate().expect("valid descriptor");
@@ -200,6 +323,25 @@ CREATE INDEX "convoy_open" ON "convoy" ("name") WHERE "phase" IN ('dr', 'op') AN
         let ddl = render_ddl_with(&convoy().finish(), DdlMode::IfNotExists);
         assert_eq!(ddl.matches("CREATE TABLE IF NOT EXISTS ").count(), 3);
         assert_eq!(ddl.matches("CREATE INDEX IF NOT EXISTS ").count(), 2);
+        assert!(ddl.contains("ON CONFLICT (\"kind\", \"field\", \"code\") DO UPDATE"), "the kind's codes are upserted");
+        assert!(ddl.contains("DELETE FROM \"codes\" WHERE \"kind\" = 'k2' AND (\"field\", \"code\") NOT IN (VALUES ('phase', 'dr'), ('phase', 'op'), ('phase', 'sh'));"), "and only they are kept");
+        assert_eq!(ddl.matches("DROP VIEW IF EXISTS ").count(), 3, "views are recreated");
+        assert_eq!(ddl.matches("CREATE VIEW ").count(), 3);
+    }
+
+    // Behaviour (#3392 D4): a nested table's code columns are named `<table>.<column>` in
+    // `codes`, the table named without the root's prefix, so two tables' columns never collide.
+    #[test]
+    fn nested_code_fields_are_named_by_their_table() {
+        let mut layout = Layout::root("Note", KindCode::new("k1"));
+        layout.table("events", TableRole::History, |layout| {
+            layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
+            layout.column(RECORD_VERSION, ColumnType::Integer, true);
+            layout.code("edge", &codes(&["go"]), &["Go"], true);
+        });
+        let set = layout.finish();
+        assert_eq!(super::code_field(&set, &set.tables[1], "edge"), "events.edge");
+        assert!(render_ddl(&set).contains("('k1', 'events.edge', 'go', 'Go')"));
     }
 
     #[test]

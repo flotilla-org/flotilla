@@ -1,5 +1,5 @@
-//! `#[store(index(...))]` on a kind: the descriptor's `Index` on its root table and a typed query
-//! constructor. On a part struct: an `Index` on each table holding its rows (an edge log's
+//! `#[store(index(...))]` on a kind or a kind's spec: the descriptor's `Index` on its root table
+//! and a typed query constructor; on a spec, `state` names the holder's state field (#3392 D5). On a part struct: an `Index` on each table holding its rows (an edge log's
 //! `EdgeEvent`), with no constructor; reads of those tables are the history views' to define.
 //!
 //! ```text
@@ -58,10 +58,12 @@ struct Column<'f, 'a> {
 pub(crate) struct Indexes<'f, 'a> {
     indexes: Vec<(IndexAttr, Key<'f, 'a>)>,
     fields: &'f [Field<'a>],
+    /// A kind spec's `state = S`: `state in [...]` names the holder's state field, `State<S>`.
+    holder_state: Option<&'f Type>,
 }
 
 impl<'f, 'a> Indexes<'f, 'a> {
-    pub(crate) fn parse(bodies: &[TokenStream], fields: &'f [Field<'a>]) -> syn::Result<Indexes<'f, 'a>> {
+    pub(crate) fn parse(bodies: &[TokenStream], fields: &'f [Field<'a>], holder_state: Option<&'f Type>) -> syn::Result<Indexes<'f, 'a>> {
         let mut indexes = Vec::new();
         let mut names = BTreeSet::new();
         for body in bodies {
@@ -69,10 +71,10 @@ impl<'f, 'a> Indexes<'f, 'a> {
             if !names.insert(index.name.value()) {
                 return Err(refuse(&index.name, format_args!("index `{}` is declared twice", index.name.value())));
             }
-            let key = check(&index, fields)?;
+            let key = check(&index, fields, holder_state.is_some())?;
             indexes.push((index, key));
         }
-        Ok(Indexes { indexes, fields })
+        Ok(Indexes { indexes, fields, holder_state })
     }
 
     /// Statements for `table_set`, after the root's layout: one `layout.index(..)` per index.
@@ -84,10 +86,16 @@ impl<'f, 'a> Indexes<'f, 'a> {
             let order = order.iter().map(|column| &column.field.name);
             let predicate = index.when.iter().map(|condition| match condition {
                 Condition::In { field, variants } => {
-                    // `check` resolved this field and refused it unless it is a `State<E>` field.
-                    let field = find(self.fields, field).expect("checked");
-                    let column = &field.name;
-                    let state = shape::first_arg(field.ty).expect("checked State<E>");
+                    // `check` resolved this field and refused it unless it is a `State<E>` field,
+                    // or the holder's state of a kind spec.
+                    let (column, state) = match (self.holder_state, find(self.fields, field)) {
+                        (Some(state), _) if field.unraw() == HOLDER_STATE => (LitStr::new(HOLDER_STATE, field.span()), state),
+                        (_, field) => {
+                            let field = field.expect("checked");
+                            (field.name.clone(), shape::first_arg(field.ty).expect("checked State<E>"))
+                        }
+                    };
+                    let column = &column;
                     // The codes come from the state's label enum (the code enum itself, or a
                     // label-plus-data state's `labels` enum), never restated. Each code expression
                     // carries its variant's span, so a label the enum lacks is reported at the
@@ -134,7 +142,8 @@ impl<'f, 'a> Indexes<'f, 'a> {
         let schema = schema();
         let ident = &input.ident;
         let (_, ty_generics, _) = input.generics.split_for_impl();
-        let mut bounds = vec![quote!(#ident #ty_generics: #schema::Kind)];
+        let declares = if self.holder_state.is_some() { quote!(#schema::KindSpec) } else { quote!(#schema::Kind) };
+        let mut bounds = vec![quote!(#ident #ty_generics: #declares)];
         let mut functions = Vec::new();
         for (index, (eq, order)) in &self.indexes {
             for column in eq.iter().chain(order).filter(|column| !column.interned) {
@@ -167,7 +176,7 @@ impl<'f, 'a> Indexes<'f, 'a> {
                     let values = || -> ::core::result::Result<::std::vec::Vec<#schema::Value>, #schema::EncodeError> {
                         ::core::result::Result::Ok(::std::vec![#(#values),*])
                     };
-                    #schema::IndexQuery::new(#name, values())
+                    #schema::IndexQuery::new(<Self as #declares>::CODE, #name, values())
                 }
             });
         }
@@ -292,7 +301,10 @@ fn column<'f, 'a>(fields: &'f [Field<'a>], ident: &Ident) -> syn::Result<Column<
 /// An index's `eq` and `order` columns.
 type Key<'f, 'a> = (Vec<Column<'f, 'a>>, Vec<Column<'f, 'a>>);
 
-fn check<'f, 'a>(index: &IndexAttr, fields: &'f [Field<'a>]) -> syn::Result<Key<'f, 'a>> {
+/// The name a kind spec's indexes give the holder's state field.
+const HOLDER_STATE: &str = "state";
+
+fn check<'f, 'a>(index: &IndexAttr, fields: &'f [Field<'a>], holder_state: bool) -> syn::Result<Key<'f, 'a>> {
     if index.eq.is_empty() && index.order.is_empty() {
         return Err(refuse(&index.name, "an index needs at least one `eq` or `order` field"));
     }
@@ -321,9 +333,11 @@ fn check<'f, 'a>(index: &IndexAttr, fields: &'f [Field<'a>]) -> syn::Result<Key<
     for condition in &index.when {
         match condition {
             Condition::In { field: ident, variants } => {
-                let field = field(fields, ident)?;
-                if field.shape != FieldShape::State {
-                    return Err(refuse(ident, format_args!("`{ident} in [...]` needs a `#[store(state)]` field")));
+                if !(holder_state && ident.unraw() == HOLDER_STATE) {
+                    let field = field(fields, ident)?;
+                    if field.shape != FieldShape::State {
+                        return Err(refuse(ident, format_args!("`{ident} in [...]` needs a `#[store(state)]` field")));
+                    }
                 }
                 let mut seen = BTreeSet::new();
                 if let Some(variant) = variants.iter().find(|variant| !seen.insert(variant.to_string())) {

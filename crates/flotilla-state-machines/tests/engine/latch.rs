@@ -81,6 +81,9 @@ impl Machine for LatchMachine {
     type Edge = LatchEdge;
     type Refusal = LatchRefusal;
     type World = Table<Signal>;
+    // The latch exercises the writer's records, so its stored kind would keep both.
+    const RECORDS_ATTEMPTS: bool = true;
+    const RECORDS_RECEIPTS: bool = true;
 
     fn definition() -> MachineDef<Self> {
         use LatchLabel::*;

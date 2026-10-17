@@ -9,6 +9,7 @@
 //! State mapping, one to one: `Live { channel }` is `Live(channel)` and
 //! `Ended { reason }` is `Ended(reason)`, with the same constructor names.
 
+use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::agent_session::{
         AgentSession, AgentSessionRefusal, AgentSessionState, Attach, Channel, Detach, End, EndReason, MemoryAgentSessionWorld,
@@ -42,7 +43,7 @@ impl Conformance for SessionConformance {
 
     fn create(_: &Value) -> Home<AgentSession> {
         let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, ()).expect("created");
+        home.create(NAME, (), Timestamp(0)).expect("created");
         home
     }
 

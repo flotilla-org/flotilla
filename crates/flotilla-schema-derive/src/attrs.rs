@@ -7,7 +7,7 @@ use syn::{parenthesized, Attribute, LitStr};
 /// The closed attribute list, named by every refusal. `flotilla-schema` repeats this text in its
 /// trait diagnostics and a test there keeps the two equal.
 pub(crate) const SUPPORTED: &str = "the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-                                    flatten, state and code (fields and variants) and kind, code, index and labels (types)";
+                                    flatten, state and code (fields and variants) and kind, code, state, index and labels (types)";
 
 /// A refusal: names what was refused and the closed list.
 pub(crate) fn refuse(tokens: impl ToTokens, what: impl std::fmt::Display) -> syn::Error {
@@ -27,6 +27,10 @@ pub(crate) struct TypeAttrs {
     /// `labels = L`: the enum is a machine's state, label `L` plus data shared by name across the
     /// labels (#3373 ruling 1).
     pub labels: Option<syn::Path>,
+    /// `state = S` on a kind's spec: the kind is stored through a generic holder (the engine's
+    /// `Resource<M>`), which lays out the spec, then its state `S` as the field `state`, then
+    /// its records (#3392 ruling D5).
+    pub state: Option<syn::Type>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +84,7 @@ fn path_name(path: &syn::Path) -> String {
 }
 
 pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
-    let mut parsed = TypeAttrs { kind: None, code: None, indexes: Vec::new(), labels: None };
+    let mut parsed = TypeAttrs { kind: None, code: None, indexes: Vec::new(), labels: None, state: None };
     for attr in store_attrs(attrs) {
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
@@ -107,6 +111,12 @@ pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
                     let value: syn::Path = meta.value()?.parse()?;
                     if parsed.labels.replace(value).is_some() {
                         return Err(meta.error("`labels` is given twice"));
+                    }
+                }
+                "state" if meta.input.peek(syn::Token![=]) => {
+                    let value: syn::Type = meta.value()?.parse()?;
+                    if parsed.state.replace(value).is_some() {
+                        return Err(meta.error("`state` is given twice"));
                     }
                 }
                 _ if FieldAttr::parse(&name).is_some() => {

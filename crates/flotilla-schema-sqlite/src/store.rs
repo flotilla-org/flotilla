@@ -79,12 +79,13 @@ impl Snapshot {
         self.clone().into_value()
     }
 
-    /// Like [`Snapshot::decode`], without copying the rows.
+    /// Like [`Snapshot::decode`], without copying the rows. A holder kind takes the snapshot's
+    /// name and version ([`Kind::with_identity`]).
     pub fn into_value<K: Kind>(self) -> Result<K, StoreError> {
         if self.kind != K::CODE {
             return Err(DecodeError::WrongKind { expected: K::KIND.to_owned(), found: self.kind.to_string() }.into());
         }
-        Ok(Decoder::decode::<K>(self.rows)?)
+        Ok(Decoder::decode::<K>(self.rows)?.with_identity(&self.name, self.version))
     }
 }
 
@@ -236,7 +237,7 @@ impl Read<'_> {
     /// [`Page`] and [`Cursor`]. An `eq` argument naming a string or resource this store has never
     /// seen matches nothing, and the query creates nothing. A `limit` of 0 is refused and one above
     /// [`MAX_PAGE`] lowered to it.
-    pub fn page<K: Kind>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
+    pub fn page<K>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
         self.ctx().page(query, after, limit)
     }
 
@@ -343,7 +344,7 @@ impl Write<'_> {
     /// [`Page`] and [`Cursor`]. An `eq` argument naming a string or resource this store has never
     /// seen matches nothing, and the query creates nothing. A `limit` of 0 is refused and one above
     /// [`MAX_PAGE`] lowered to it.
-    pub fn page<K: Kind>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
+    pub fn page<K>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
         self.ctx().page(query, after, limit)
     }
 

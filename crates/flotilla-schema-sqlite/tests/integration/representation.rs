@@ -5,7 +5,7 @@ use flotilla_schema_sqlite::StoreError;
 use crate::fixtures::{
     agent_session, store,
     synthetic::{AgentName, Phase, Reference, ReferralEdge, ReferralEvent},
-    AgentSessionRow, Payload, Referral, LOCAL,
+    AgentSession, Payload, Referral, Resource, LOCAL,
 };
 
 fn referral(seq: u64) -> Referral {
@@ -62,7 +62,8 @@ fn references_to_missing_targets_create_their_identity() {
     let mut write = store.write().expect("write");
     let value = Referral { session: Ref::new("later", LOCAL), in_reply_to: Some(Ref::new("gone", "elsewhere")), ..Referral::sample() };
     let stamp = write.insert("m", &value).expect("insert");
-    let session = write.resolve(AgentSessionRow::CODE, "later", LOCAL).expect("resolve").expect("identity created by the reference");
+    let session =
+        write.resolve(Resource::<AgentSession>::CODE, "later", LOCAL).expect("resolve").expect("identity created by the reference");
     let reply = write.resolve(Referral::CODE, "gone", "elsewhere").expect("resolve").expect("identity created by the reference");
     assert_eq!(write.load::<Referral>(reply).expect("load"), None, "an identity is not a resource");
     let target = write.insert("later", &agent_session::sample()).expect("target inserted after the reference");

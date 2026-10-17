@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     appended, code_enum, event, floor, identity, list, name, payload, position, records, reference, replaced, seq, stamp, stamp_flat,
-    terminal::map, text, time, timestamp, AgentSessionRow, Fixture, Payload, Pick, SHAPES,
+    terminal::map, text, time, timestamp, AgentSession, Fixture, Payload, Pick, Resource, SHAPES,
 };
 
 /// A synthetic message-like kind: references, addressing and plain spec columns.
@@ -43,7 +43,7 @@ use super::{
 pub struct Referral {
     #[store(intern)]
     pub sender: AgentName,
-    pub session: Ref<AgentSessionRow>,
+    pub session: Ref<Resource<AgentSession>>,
     pub in_reply_to: Option<Ref<Referral>>,
     #[store(child)]
     pub references: Vec<Reference>,

@@ -41,7 +41,8 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         Data::Union(data) => Err(refuse(data.union_token, "unions cannot be stored")),
         Data::Enum(data) => enums::expand(input, data, type_attrs),
         Data::Struct(data) => match &data.fields {
-            Fields::Named(fields) if fields.named.is_empty() => Err(structs::refuse_empty(input)),
+            // A kind's spec may be empty: the holder stores the state and records.
+            Fields::Named(fields) if fields.named.is_empty() && type_attrs.state.is_none() => Err(structs::refuse_empty(input)),
             Fields::Named(fields) => structs::expand(input, fields, type_attrs),
             Fields::Unnamed(fields) if fields.unnamed.len() == 1 => structs::newtype(input, fields, type_attrs),
             Fields::Unnamed(fields) => Err(refuse(fields, "tuple structs with more than one field cannot be stored; use named fields")),
@@ -564,5 +565,45 @@ mod tests {
     fn newtypes_of_string_intern() {
         assert!(expanded(quote! { struct Name(String); }).contains(":: flotilla_schema :: Intern for Name"));
         assert!(!expanded(quote! { struct Count(u32); }).contains("Intern for"));
+    }
+
+    // Behaviour (#3392 ruling D5): a kind's spec (`state = S` beside `kind` and `code`) declares
+    // the kind a generic holder stores: it is a row (`Element`) and a `KindSpec` naming its state,
+    // with no `Kind` and no edge handles of its own; its indexes may name the holder's `state`, and
+    // their queries carry the spec's kind code. A spec may be empty.
+    #[test]
+    fn specs_declare_a_holders_kind() {
+        let spec = expanded(quote! {
+            #[store(kind = "Message", code = "ms", state = MessageState,
+                index(name = "open_by_inbox", eq(inbox), when(state in [Pending, Awaiting])))]
+            struct MessageSpec {
+                #[store(intern)] inbox: String,
+                deadline: Option<Timestamp>,
+            }
+        });
+        for expected in [
+            ":: flotilla_schema :: Element for MessageSpec",
+            ":: flotilla_schema :: KindSpec for MessageSpec",
+            "type State = MessageState ;",
+            "column : :: std :: string :: String :: from (\"state\")",
+            "< < MessageState as :: flotilla_schema :: Labelled > :: Label > :: Pending",
+            "IndexQuery :: new (< Self as :: flotilla_schema :: KindSpec > :: CODE",
+        ] {
+            assert!(spec.contains(expected), "missing {expected} in {spec}");
+        }
+        assert!(!spec.contains(":: flotilla_schema :: Kind for"), "the holder is the kind");
+        assert!(!spec.contains("const INBOX"), "no edge handles on a spec");
+        assert!(expanded(quote! { #[store(kind = "Session", code = "as", state = SessionState)] struct SessionSpec {} })
+            .contains("KindSpec for SessionSpec"));
+        for (case, problem) in [
+            (quote! { #[store(state = S)] struct A { a: u8 } }, "needs `kind"),
+            (quote! { #[store(kind = "A", code = "k1", state = S)] struct A { #[store(state)] s: State<S> } }, "no state field"),
+            (quote! { #[store(kind = "A", code = "k1", state = S)] struct A { state: u8 } }, "rename this field"),
+            (quote! { #[store(state = S)] enum A { #[store(code = "c1")] B } }, "spec struct"),
+            (quote! { #[store(kind = "A", code = "k1", index(name = "x", eq(a), when(state in [B])))] struct A { a: u8 } }, "not a field"),
+        ] {
+            let message = error(case.clone());
+            assert!(message.contains(SUPPORTED) && message.contains(problem), "{case}: {message}");
+        }
     }
 }

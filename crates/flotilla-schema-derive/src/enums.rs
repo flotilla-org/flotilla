@@ -14,7 +14,8 @@
 //! alone.
 //!
 //! A datum has one type and attribute in every variant carrying it, except that interned data may
-//! be any internable type (all are one `strings` id), and a datum may be `T` in one variant and
+//! be any internable type (all are one `strings` id; lane 4 of #3392 removes this exemption, ruling
+//! D3), and a datum may be `T` in one variant and
 //! `Option<T>` in another (#3392 ruling G5): one nullable column group, required
 //! by the CHECKs of the variants carrying `T`. A datum's table holds rows only while the variant
 //! carries it, and decoding refuses rows otherwise. A state's datum is unattributed (its columns),
@@ -25,7 +26,7 @@ use std::collections::BTreeMap;
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{DataEnum, DeriveInput, Fields, Ident};
+use syn::{ext::IdentExt, DataEnum, DeriveInput, Fields, Ident};
 
 use crate::{
     attrs::{self, refuse, refuse_at, TypeAttrs},
@@ -49,6 +50,9 @@ pub(crate) fn expand(input: &DeriveInput, data: &DataEnum, type_attrs: TypeAttrs
     }
     if let Some(index) = type_attrs.indexes.first() {
         return Err(refuse(index, "`index` belongs on a kind or a part struct"));
+    }
+    if let Some(state) = &type_attrs.state {
+        return Err(refuse(state, "`state = ..` belongs on a kind's spec struct"));
     }
     if data.variants.is_empty() {
         return Err(refuse(&input.ident, "an enum without variants has no values to store"));
@@ -78,7 +82,8 @@ pub(crate) fn expand(input: &DeriveInput, data: &DataEnum, type_attrs: TypeAttrs
         }
         variants.push(Variant { ident: &variant.ident, code, fields });
     }
-    let codes: Vec<String> = seen.into_keys().collect();
+    // Ascending by code, each with the Rust name of the variant carrying it.
+    let codes: Vec<(String, String)> = seen.into_iter().map(|(code, variant)| (code, variant.unraw().to_string())).collect();
     if let Some(labels) = labels {
         return labels_enum(input, labels, &variants, &codes);
     }
@@ -96,9 +101,15 @@ fn code_expr(code: &str) -> TokenStream {
 }
 
 /// `&[Code::new(..), ..]` of `codes`.
-fn codes_expr(codes: &[String]) -> TokenStream {
-    let codes = codes.iter().map(|code| code_expr(code));
+fn codes_expr(codes: &[(String, String)]) -> TokenStream {
+    let codes = codes.iter().map(|(code, _)| code_expr(code));
     quote!(&[#(#codes),*])
+}
+
+/// `&["Name", ..]`: the variant names of `codes`, in the same order.
+fn names_expr(codes: &[(String, String)]) -> TokenStream {
+    let names = codes.iter().map(|(_, name)| name);
+    quote!(&[#(#names),*])
 }
 
 /// Arms mapping each variant to its code.
@@ -115,7 +126,7 @@ fn code_arms(variants: &[Variant<'_>]) -> Vec<TokenStream> {
         .collect()
 }
 
-fn code_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[String]) -> TokenStream {
+fn code_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[(String, String)]) -> TokenStream {
     let schema = schema();
     let ident = &input.ident;
     let generics = Generics::new(&input.generics, []);
@@ -123,6 +134,7 @@ fn code_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[String]) ->
     let element = columns_element(ident, &generics);
     let arms = code_arms(variants);
     let all = codes_expr(codes);
+    let names = names_expr(codes);
     let decode_arms = variants.iter().map(|variant| {
         let (ident, code) = (variant.ident, &variant.code);
         quote!(#code => ::core::result::Result::Ok(Self::#ident))
@@ -133,7 +145,7 @@ fn code_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[String]) ->
             const TABLES: usize = 0;
 
             fn layout(layout: &mut #schema::Layout, name: &str, required: bool) {
-                layout.column(name, #schema::ColumnType::Code(<Self as #schema::CodeEnum>::CODES.to_vec()), required);
+                layout.code(name, <Self as #schema::CodeEnum>::CODES, <Self as #schema::CodeEnum>::NAMES, required);
             }
 
             fn encode(&self, e: &mut #schema::Encoder) -> ::core::result::Result<(), #schema::EncodeError> {
@@ -170,6 +182,7 @@ fn code_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[String]) ->
         #[automatically_derived]
         impl #impl_generics #schema::CodeEnum for #ident #ty_generics #where_clause {
             const CODES: &'static [#schema::Code] = #all;
+            const NAMES: &'static [&'static str] = #names;
 
             fn code(&self) -> #schema::Code {
                 match self {
@@ -192,6 +205,7 @@ fn code_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[String]) ->
         impl #impl_generics #schema::StateData for #ident #ty_generics #where_clause {
             const TABLES: usize = 0;
             const CODES: &'static [#schema::Code] = #all;
+            const NAMES: &'static [&'static str] = #names;
             const DATA: &'static [&'static str] = &[];
 
             fn code(&self) -> #schema::Code {
@@ -393,7 +407,10 @@ fn datums<'v, 'a>(variants: &'v [Variant<'a>], state: bool) -> syn::Result<Vec<D
                     let first = &datum.decls[0];
                     let (first_ty, first_shape, _) = declared(first.field);
                     // Every internable type is one `strings` id: interned data shares a column
-                    // whatever its Rust type (a name, or a reference kept as text).
+                    // whatever its Rust type (a name, or a reference kept as text). Temporary
+                    // (#3392 ruling D3): lane 4 (#3410) makes Message's inbox, receiver and
+                    // drop-reason references `Address`, so `DropReason`'s `by` has one type, and
+                    // then removes this exemption.
                     let interned = matches!(shape, FieldShape::Intern { .. });
                     if (first_ty != ty && !interned) || first_shape != shape {
                         let full = |field: &Field<'_>| {
@@ -463,7 +480,7 @@ fn construct_arms(variants: &[Variant<'_>], datums: &[Datum<'_, '_>]) -> Vec<Tok
         .collect()
 }
 
-fn data_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[String]) -> syn::Result<TokenStream> {
+fn data_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[(String, String)]) -> syn::Result<TokenStream> {
     let schema = schema();
     let ident = &input.ident;
     let datums = datums(variants, false)?;
@@ -474,6 +491,7 @@ fn data_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[String]) ->
     let tables = datums.iter().map(|datum| datum.field().tables());
     let arms = code_arms(variants);
     let all = codes_expr(codes);
+    let names = names_expr(codes);
 
     let layout = datums.iter().map(|datum| datum.layout(&quote!(name), |f| quote!(layout.scope(#f))));
     let guards = tag_guards(variants, &datums, &quote!(tag));
@@ -491,7 +509,7 @@ fn data_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[String]) ->
             fn layout(layout: &mut #schema::Layout, name: &str, required: bool) {
                 let tag = if name.is_empty() { "tag" } else { name };
                 const CODES: &[#schema::Code] = #all;
-                layout.column(tag, #schema::ColumnType::Code(CODES.to_vec()), required);
+                layout.code(tag, CODES, #names, required);
                 let datums: ::std::vec::Vec<#schema::DatumColumns> = ::std::vec![#(#layout),*];
                 #(#guards)*
                 layout.expansion(tag, &datums);
@@ -545,7 +563,7 @@ fn data_enum(input: &DeriveInput, variants: &[Variant<'_>], codes: &[String]) ->
 
 /// A machine's state enum (`#[store(labels = L)]`): `Labelled` with label `L`, and `StateData`,
 /// which `State<Self>` stores after the label column and `<field>_since`.
-fn labels_enum(input: &DeriveInput, labels: &syn::Path, variants: &[Variant<'_>], codes: &[String]) -> syn::Result<TokenStream> {
+fn labels_enum(input: &DeriveInput, labels: &syn::Path, variants: &[Variant<'_>], codes: &[(String, String)]) -> syn::Result<TokenStream> {
     let schema = schema();
     let ident = &input.ident;
     let datums = datums(variants, true)?;
@@ -556,6 +574,7 @@ fn labels_enum(input: &DeriveInput, labels: &syn::Path, variants: &[Variant<'_>]
     let tables = datums.iter().map(|datum| datum.field().tables());
     let arms = code_arms(variants);
     let all = codes_expr(codes);
+    let label_names = names_expr(codes);
     let label_arms = variants.iter().map(|variant| {
         let variant_ident = variant.ident;
         match variant.fields {
@@ -628,6 +647,7 @@ fn labels_enum(input: &DeriveInput, labels: &syn::Path, variants: &[Variant<'_>]
         impl #impl_generics #schema::StateData for #ident #ty_generics #where_clause {
             const TABLES: usize = 0 #(+ #tables)*;
             const CODES: &'static [#schema::Code] = #all;
+            const NAMES: &'static [&'static str] = #label_names;
             const DATA: &'static [&'static str] = &[#(#names),*];
 
             fn code(&self) -> #schema::Code {

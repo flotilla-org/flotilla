@@ -369,6 +369,7 @@ macro_rules! hand_coded {
 
         impl CodeEnum for $name {
             const CODES: &'static [Code] = &[$(Code::new($code)),+];
+            const NAMES: &'static [&'static str] = &[$(stringify!($variant)),+];
 
             fn code(&self) -> Code {
                 match self {

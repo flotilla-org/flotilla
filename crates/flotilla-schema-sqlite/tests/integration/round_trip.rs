@@ -2,11 +2,12 @@ use std::collections::BTreeSet;
 
 use flotilla_schema::CodeEnum;
 use flotilla_schema_sqlite::Store;
-use flotilla_state_machines::{Coded, EdgeKind, MachineRow};
+use flotilla_state_machines::{machines::lifecycle::Lifecycle, Coded, EdgeKind, Machine};
 use hegel::{generators as gs, TestCase};
 
+use crate::fixtures::terminal::Terminal;
 use crate::fixtures::{
-    store, AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession, Ticket, LOCAL,
+    store, AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Ticket, LOCAL,
 };
 
 /// Inserts `first`, then evolves it through `steps` writes: mostly generated edges, and a spec
@@ -18,7 +19,7 @@ fn evolve<K: Fixture>(tc: &TestCase, store: &mut Store, name: &str, first: &K, s
     let mut write = store.write().expect("write");
     let inserted = write.insert(name, first).expect("insert");
     write.commit().expect("commit");
-    let mut model = first.stamped(None, inserted.version).stored();
+    let mut model = first.stamped(None, inserted.version).stored().with_identity(name, inserted.version);
     let mut stamp = inserted;
     for step in 0..=steps {
         let mut read = store.read().expect("read");
@@ -38,7 +39,7 @@ fn evolve<K: Fixture>(tc: &TestCase, store: &mut Store, name: &str, first: &K, s
         match edge {
             Some((edge, next)) => {
                 stamp = write.apply_edge(current.stamp(), edge).expect("edge");
-                model = next.stamped(Some(&current.value), stamp.version).stored();
+                model = next.stamped(Some(&current.value), stamp.version).stored().with_identity(name, stamp.version);
             }
             None => {
                 let next = current.value.evolve(tc, pick(step));
@@ -46,7 +47,7 @@ fn evolve<K: Fixture>(tc: &TestCase, store: &mut Store, name: &str, first: &K, s
                 if next.stored() == current.value {
                     assert_eq!(stamp, current.stamp(), "an update with no row changes is a no-op");
                 }
-                model = next.stored();
+                model = next.stored().with_identity(name, stamp.version);
             }
         }
         write.commit().expect("commit");
@@ -77,22 +78,22 @@ fn covering<K: Fixture>(tc: &TestCase) {
 // The engine kinds' edges are the engine's own: applied by a home to the stored row's resource.
 #[hegel::test]
 fn message_evolves_by_edges_and_spec_edits(tc: TestCase) {
-    drawn::<MessageRow>(&tc);
+    drawn::<Resource<Message>>(&tc);
 }
 
 #[hegel::test]
 fn agent_session_evolves_by_edges_and_spec_edits(tc: TestCase) {
-    drawn::<AgentSessionRow>(&tc);
+    drawn::<Resource<AgentSession>>(&tc);
 }
 
 #[hegel::test]
 fn convoy_evolves_by_edges_and_spec_edits(tc: TestCase) {
-    drawn::<ConvoyRow>(&tc);
+    drawn::<Resource<Convoy>>(&tc);
 }
 
 #[hegel::test]
 fn ensure_evolves_by_edges_and_spec_edits(tc: TestCase) {
-    drawn::<EnsureRow>(&tc);
+    drawn::<Resource<Ensure>>(&tc);
 }
 
 #[hegel::test]
@@ -121,10 +122,10 @@ fn ticket_evolves_by_transitions_and_spec_edits(tc: TestCase) {
 // depth: the covering indexes reach each of them (see each fixture's `COVERING`).
 #[hegel::test]
 fn every_variant_round_trips_and_switches_through_writes(tc: TestCase) {
-    covering::<MessageRow>(&tc);
-    covering::<AgentSessionRow>(&tc);
-    covering::<ConvoyRow>(&tc);
-    covering::<EnsureRow>(&tc);
+    covering::<Resource<Message>>(&tc);
+    covering::<Resource<AgentSession>>(&tc);
+    covering::<Resource<Convoy>>(&tc);
+    covering::<Resource<Ensure>>(&tc);
     covering::<TerminalSession>(&tc);
     covering::<Ticket>(&tc);
     covering::<Referral>(&tc);
@@ -133,15 +134,17 @@ fn every_variant_round_trips_and_switches_through_writes(tc: TestCase) {
 
 /// The edge kinds the fixture's edges apply across its covering values, each led by every
 /// candidate in turn.
-fn edges_reached<K: Fixture + MachineRow>(tc: &TestCase) -> BTreeSet<&'static str> {
+fn edges_reached<M: Machine>(tc: &TestCase) -> BTreeSet<&'static str>
+where
+    Resource<M>: Fixture,
+{
     let mut reached = BTreeSet::new();
-    for index in 0..K::COVERING {
-        let row = K::generate(tc, Pick::Cover(index));
+    for index in 0..<Resource<M>>::COVERING {
+        let resource = Resource::<M>::generate(tc, Pick::Cover(index));
         for lead in 0..8 {
-            if let Some((_, next)) = Fixture::edge(&row, tc, Pick::Cover(lead)) {
-                let events = next.parts().events;
-                let edge = events.last().expect("the edge appended its event").record.edge;
-                let kind = EdgeKind::<K::Machine>::ALL.iter().find(|kind| kind.code() == edge.code()).expect("a declared kind");
+            if let Some((_, next)) = Fixture::edge(&resource, tc, Pick::Cover(lead)) {
+                let edge = next.events().last().expect("the edge appended its event").record.edge;
+                let kind = EdgeKind::<M>::ALL.iter().find(|kind| kind.code() == edge.code()).expect("a declared kind");
                 reached.insert(kind.name());
             }
         }
@@ -149,8 +152,8 @@ fn edges_reached<K: Fixture + MachineRow>(tc: &TestCase) -> BTreeSet<&'static st
     reached
 }
 
-fn all_edges<K: MachineRow>() -> BTreeSet<&'static str> {
-    EdgeKind::<K::Machine>::ALL.iter().map(|kind| kind.name()).collect()
+fn all_edges<M: Machine>() -> BTreeSet<&'static str> {
+    EdgeKind::<M>::ALL.iter().map(|kind| kind.name()).collect()
 }
 
 // Behaviour (#3319 engine kinds): the engine kinds' fixtures reach every edge their machine
@@ -158,9 +161,9 @@ fn all_edges<K: MachineRow>() -> BTreeSet<&'static str> {
 // test drawing edges runs over every real transition.
 #[hegel::test(test_cases = 5)]
 fn engine_fixtures_reach_every_declared_edge(tc: TestCase) {
-    assert_eq!(edges_reached::<MessageRow>(&tc), all_edges::<MessageRow>());
-    assert_eq!(edges_reached::<AgentSessionRow>(&tc), all_edges::<AgentSessionRow>());
-    assert_eq!(edges_reached::<ConvoyRow>(&tc), all_edges::<ConvoyRow>());
-    assert_eq!(edges_reached::<EnsureRow>(&tc), all_edges::<EnsureRow>());
-    assert_eq!(edges_reached::<TerminalSession>(&tc), all_edges::<TerminalSession>());
+    assert_eq!(edges_reached::<Message>(&tc), all_edges::<Message>());
+    assert_eq!(edges_reached::<AgentSession>(&tc), all_edges::<AgentSession>());
+    assert_eq!(edges_reached::<Convoy>(&tc), all_edges::<Convoy>());
+    assert_eq!(edges_reached::<Ensure>(&tc), all_edges::<Ensure>());
+    assert_eq!(edges_reached::<Lifecycle<Terminal>>(&tc), all_edges::<Lifecycle<Terminal>>());
 }

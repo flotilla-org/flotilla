@@ -213,6 +213,7 @@ impl<K: LifecycleKind> Machine for Lifecycle<K> {
     type Edge = LifecycleEdge;
     type Refusal = LifecycleRefusal;
     type World = dyn LifecycleWorld;
+    const RECORDS_ATTEMPTS: bool = true;
 
     fn definition() -> MachineDef<Self> {
         use LifecycleLabel::*;

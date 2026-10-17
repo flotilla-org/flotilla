@@ -7,7 +7,7 @@ use hegel::TestCase;
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, ErrorCode};
 
 use crate::fixtures::{
-    registry, store, AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession, Ticket,
+    registry, store, AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Pick, Referral, Resource, TerminalSession, Ticket,
 };
 
 /// A stored value of the column's type that satisfies its own column constraint and foreign key,
@@ -73,10 +73,10 @@ fn insert_covering<K: Fixture>(write: &mut Write<'_>, tc: &TestCase) {
 
 /// The covering values of every fixture kind.
 fn insert_all(write: &mut Write<'_>, tc: &TestCase) {
-    insert_covering::<MessageRow>(write, tc);
-    insert_covering::<AgentSessionRow>(write, tc);
-    insert_covering::<ConvoyRow>(write, tc);
-    insert_covering::<EnsureRow>(write, tc);
+    insert_covering::<Resource<Message>>(write, tc);
+    insert_covering::<Resource<AgentSession>>(write, tc);
+    insert_covering::<Resource<Convoy>>(write, tc);
+    insert_covering::<Resource<Ensure>>(write, tc);
     insert_covering::<TerminalSession>(write, tc);
     insert_covering::<Ticket>(write, tc);
     insert_covering::<Referral>(write, tc);

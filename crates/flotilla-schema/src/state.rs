@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     code::{code_value, decode_code},
     codec::{DecodeError, Decoder, EncodeError, Encoder},
-    descriptor::ColumnType,
     history::Labelled,
     layout::Layout,
     time::Timestamp,
@@ -53,7 +52,7 @@ impl<E: StateData> Columns for State<E> {
 
     fn layout(layout: &mut Layout, name: &str, required: bool) {
         layout.field(name, true, |layout| {
-            layout.column(name, ColumnType::Code(E::CODES.to_vec()), required);
+            layout.code(name, E::CODES, E::NAMES, required);
             Timestamp::layout(layout, &Layout::join(name, "since"), required);
         });
         E::layout_data(layout, name);

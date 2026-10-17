@@ -1,4 +1,4 @@
-error[E0277]: `Pair` cannot key a child table or an index: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, index and labels (types)
+error[E0277]: `Pair` cannot key a child table or an index: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, state, index and labels (types)
   --> tests/ui/map_multi_column_key.rs:12:10
    |
 12 | #[derive(Stored)]
@@ -21,7 +21,7 @@ help: the trait `KeyColumn` is not implemented for `Pair`
            and $N others
    = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: `Pair` cannot key a child table or an index: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, index and labels (types)
+error[E0277]: `Pair` cannot key a child table or an index: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, state, index and labels (types)
   --> tests/ui/map_multi_column_key.rs:14:8
    |
 14 | struct Ticket {
@@ -58,7 +58,7 @@ note: required by a bound in `Kind`
    | pub trait Kind: Element {
    |                 ^^^^^^^ required by this bound in `Kind`
 
-error[E0277]: `Pair` cannot key a child table or an index: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, index and labels (types)
+error[E0277]: `Pair` cannot key a child table or an index: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, state, index and labels (types)
   --> tests/ui/map_multi_column_key.rs:12:10
    |
 12 | #[derive(Stored)]
@@ -89,7 +89,7 @@ note: required for `Ticket` to implement `flotilla_schema::Element`
    |        ^^^^^^
    = help: consider manually implementing `flotilla_schema::Element` to avoid undesired bounds caused by "imperfect derives"
    = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
-note: required by a bound in `KIND`
+note: required by a bound in `flotilla_schema::Kind::KIND`
   --> src/traits.rs
    |
    | pub trait Kind: Element {

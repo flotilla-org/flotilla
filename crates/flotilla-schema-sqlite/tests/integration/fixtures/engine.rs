@@ -1,10 +1,10 @@
-//! Driving the engine for the engine kinds' fixtures: an edge on a stored row is one the engine
-//! applied, through `Home`, to the resource the row holds.
+//! Driving the engine for the engine kinds' fixtures: an edge on a stored resource is one the
+//! engine applied, through `Home`, to that resource.
 
 use std::borrow::Cow;
 
-use flotilla_schema::{Cbor, Edge, Labelled, StateData, Timestamp};
-use flotilla_state_machines::{Coded, EdgeEventOf, EdgePayload, Home, InputRead, Label, Machine, MachineRow, Version};
+use flotilla_schema::{Cbor, Edge, Kind, KindSpec, Labelled, State, StateData, Timestamp};
+use flotilla_state_machines::{Coded, EdgeEventOf, EdgePayload, Home, InputRead, Label, Machine, Resource, Version};
 use hegel::{generators as gs, TestCase};
 
 use super::{code_enum, list, name, timestamp, Pick};
@@ -16,15 +16,27 @@ pub const NAME: &str = "r";
 /// One edge to try, with the world that makes its gate pass and the time it is applied at.
 pub type Candidate<M> = (<M as Machine>::Edge, Box<<M as Machine>::World>, Timestamp);
 
+/// A generated resource: `spec` in `state`, with no records. Its name and version are the
+/// store's, which a load gives back ([`Kind::with_identity`]).
+pub fn resource<M: Machine>(spec: M::Spec, state: State<M::State>) -> Resource<M> {
+    Resource::stored(String::new(), spec, state, Version(0))
+}
+
 /// The first of `candidates` (rotated by `pick`, so every candidate leads in turn) that the engine
-/// applies to `row`'s resource, as the stored edge persisting it and the row it leads to; `None`
+/// applies to `resource`, as the stored edge persisting it and the resource it leads to; `None`
 /// when the engine refuses every candidate. Each candidate runs at a home of its own holding only
-/// the restored row, written by a drawn writer.
-pub fn drive<R>(tc: &TestCase, pick: Pick, row: &R, mut candidates: Vec<Candidate<R::Machine>>) -> Option<(Edge<R>, R)>
+/// the restored resource, written by a drawn writer.
+pub fn drive<M>(
+    tc: &TestCase,
+    pick: Pick,
+    resource: &Resource<M>,
+    mut candidates: Vec<Candidate<M>>,
+) -> Option<(Edge<Resource<M>>, Resource<M>)>
 where
-    R: MachineRow,
-    <R::Machine as Machine>::State: StateData + Labelled<Label = Label<R::Machine>>,
-    EdgePayload<<R::Machine as Machine>::Edge>: Cbor,
+    M: Machine,
+    M::Spec: KindSpec<State = M::State> + Clone,
+    M::State: StateData + Labelled<Label = Label<M>>,
+    EdgePayload<M::Edge>: Cbor,
 {
     if candidates.is_empty() {
         return None;
@@ -32,30 +44,32 @@ where
     let lead = pick.variant(tc, candidates.len(), |index| index);
     candidates.rotate_left(lead);
     let writer = name(tc);
-    candidates.into_iter().find_map(|(edge, world, now)| step(row, &writer, edge, &*world, now))
+    candidates.into_iter().find_map(|(edge, world, now)| step(resource, &writer, edge, &*world, now))
 }
 
-/// `edge` applied at `now` by a home writing as `writer` and holding only `row`'s resource, as the
-/// stored edge persisting it and the row it leads to; `None` when the engine refuses it.
-pub fn step<R>(
-    row: &R,
+/// `edge` applied at `now` by a home writing as `writer` and holding only `resource` (as
+/// [`NAME`]), as the stored edge persisting it and the resource it leads to; `None` when the
+/// engine refuses it.
+pub fn step<M>(
+    resource: &Resource<M>,
     writer: &str,
-    edge: impl Into<<R::Machine as Machine>::Edge>,
-    world: &<R::Machine as Machine>::World,
+    edge: impl Into<M::Edge>,
+    world: &M::World,
     now: Timestamp,
-) -> Option<(Edge<R>, R)>
+) -> Option<(Edge<Resource<M>>, Resource<M>)>
 where
-    R: MachineRow,
-    <R::Machine as Machine>::State: StateData + Labelled<Label = Label<R::Machine>>,
-    EdgePayload<<R::Machine as Machine>::Edge>: Cbor,
+    M: Machine,
+    M::Spec: KindSpec<State = M::State> + Clone,
+    M::State: StateData + Labelled<Label = Label<M>>,
+    EdgePayload<M::Edge>: Cbor,
 {
-    let mut home = Home::<R::Machine>::new(writer).expect("the machine's declaration validates");
-    home.restore(NAME, Version(1), row.parts()).unwrap_or_else(|_| panic!("an empty home takes the row"));
+    let mut home = Home::<M>::new(writer).expect("the machine's declaration validates");
+    let previous = resource.stored_state().clone();
+    let version = resource.version().0;
+    home.restore(resource.clone().with_identity(NAME, version)).unwrap_or_else(|_| panic!("an empty home takes the resource"));
     let event = home.apply(NAME, edge, world, now).ok()?.clone();
-    let resource = home.get(NAME).expect("restored");
-    let (edge, state) = row.edge(&event, resource.state().clone()).expect("an applied edge is storable");
-    let next = R::of(resource, state.since);
-    assert_eq!(next.state(), &state, "the row of the moved resource holds the edge's state");
+    let next = home.get(NAME).expect("restored").clone();
+    let edge = next.stored_edge(&previous, &event).expect("an applied edge is storable");
     Some((edge, next))
 }
 

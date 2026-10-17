@@ -197,7 +197,7 @@ impl Conformance for MessageConformance {
 
     fn create(state: &Value) -> Home<Message> {
         let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, spec_of(payload(state))).expect("created");
+        home.create(NAME, spec_of(payload(state)), Timestamp(0)).expect("created");
         home
     }
 

@@ -33,10 +33,10 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 | `ticket_assignees` | state data | 2 | – | – | – |
 | `ticket_notes` | state data | 3 | – | – | – |
 | `ticket_edges` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
-| `terminal_session` | root | 16 | 4: `source` 4 | `terminal_session_env` (child), `terminal_session_labels` (child), `terminal_session_events` (history), `terminal_session_attempts` (history) | `by_vessel` (vessel, ordinal), `live_by_pool` (pool) |
+| `terminal_session` | root | 16 | 4: `source` 4 | `terminal_session_env` (child), `terminal_session_labels` (child), `terminal_session_edges` (history), `terminal_session_attempts` (history) | `by_vessel` (vessel, ordinal), `live_by_pool` (pool) |
 | `terminal_session_env` | child | 3 | – | – | – |
 | `terminal_session_labels` | child | 2 | – | – | – |
-| `terminal_session_events` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
+| `terminal_session_edges` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
 | `terminal_session_attempts` | history | 8 | 4: `outcome` 4 | – | – |
 | `vessel` | root | 3 | – | – | – |
 

@@ -397,7 +397,7 @@ fn prefixed_placeholders(from: usize, count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_schema::{render_ddl, Code, ColumnType, KindCode, Layout, TableRole};
+    use flotilla_schema::{render_ddl, Code, ColumnType, KindCode, Layout, TableRole, CODES_DDL};
     use rusqlite::Connection;
 
     use super::KindSql;
@@ -412,7 +412,7 @@ mod tests {
         layout.column("id_text", ColumnType::Text, true);
         let set = layout.finish();
         let conn = Connection::open_in_memory().expect("open");
-        conn.execute_batch(&format!("{SHARED_DDL}{}", render_ddl(&set))).expect("ddl");
+        conn.execute_batch(&format!("{SHARED_DDL}{CODES_DDL}{}", render_ddl(&set))).expect("ddl");
         conn.execute_batch(
             "INSERT INTO strings (id, s) VALUES (1, 'first'), (2, 'second'), (3, 'n'), (4, 'h');
              INSERT INTO resource_identity (id, kind, name, home) VALUES (2, 1, 3, 4);

@@ -14,7 +14,7 @@
 
 use crate::{
     code::Code,
-    descriptor::{ColumnDef, ColumnType, Expansion, FieldColumns, Guard, Index, Table, TableRole, TableSet, When},
+    descriptor::{CodeNames, ColumnDef, ColumnType, Expansion, FieldColumns, Guard, Index, Table, TableRole, TableSet, When},
     value::KindCode,
 };
 
@@ -54,6 +54,7 @@ impl Layout {
             columns: Vec::new(),
             guards: Vec::new(),
             enums: Vec::new(),
+            codes: Vec::new(),
             fields: Vec::new(),
         };
         Layout {
@@ -98,6 +99,17 @@ impl Layout {
             None => !required,
         };
         table.columns.push(ColumnDef { name: name.to_owned(), ty, nullable });
+    }
+
+    /// Declares a code column: `codes` and the variants' Rust `names`, in the same order, become its
+    /// CHECK and its rows of the `codes` table.
+    pub fn code(&mut self, name: &str, codes: &[Code], names: &[&str], required: bool) {
+        debug_assert_eq!(codes.len(), names.len(), "one name per code");
+        let column = if name.is_empty() { "value" } else { name };
+        let table = self.frames.last().expect("layout has a current table").table;
+        let names = codes.iter().zip(names).map(|(code, name)| (*code, (*name).to_owned())).collect();
+        self.set.tables[table].codes.push(CodeNames { column: column.to_owned(), names });
+        self.column(name, ColumnType::Code(codes.to_vec()), required);
     }
 
     /// Declares the current table's own key: columns declared inside `f` become key columns.
@@ -182,6 +194,7 @@ impl Layout {
             columns: Vec::new(),
             guards: Vec::new(),
             enums: Vec::new(),
+            codes: Vec::new(),
             fields: Vec::new(),
         };
         self.set.tables.push(table);

@@ -43,7 +43,7 @@ fn world() -> MemoryConvoyWorld {
 
 fn convoy(request: ConvoyRequest) -> Home<Convoy> {
     let mut home = Home::new("home").expect("valid declaration");
-    home.create("c", request).expect("admitted");
+    home.create("c", request, Timestamp(0)).expect("admitted");
     home
 }
 
@@ -137,8 +137,8 @@ stateDiagram-v2
 #[test]
 fn admission_requires_a_promise() {
     let mut home: Home<Convoy> = Home::new("home").expect("valid");
-    assert_eq!(home.create("empty", request(&[], &[(0, 1)])).err(), refused(ConvoyRefusal::NoPromises));
-    let admitted = home.create("c", request(&[0, 1], &[(0, 1)])).expect("admitted");
+    assert_eq!(home.create("empty", request(&[], &[(0, 1)]), Timestamp(0)).err(), refused(ConvoyRefusal::NoPromises));
+    let admitted = home.create("c", request(&[0, 1], &[(0, 1)]), Timestamp(0)).expect("admitted");
     assert_eq!(admitted.state(), &ConvoyState::Open { resolution: promises(&[(0, Pending), (1, Pending)]), quota: quota(&[(0, 1)]) });
     assert_eq!((admitted.spec().promises.len(), admitted.spec().priority), (2, Priority(1)));
 }
@@ -263,7 +263,7 @@ fn an_authorised_edge_records_its_authority_read() {
 #[test]
 fn convoy_edge_events_round_trip_through_the_schema_codec() {
     let mut home = Home::<Convoy>::new("home").expect("valid");
-    home.create("c", request(&[0, 1], &[(0, 1), (3, 2)])).expect("admitted");
+    home.create("c", request(&[0, 1], &[(0, 1), (3, 2)]), Timestamp(0)).expect("admitted");
     let world = world();
     home.apply("c", readmit(&[(0, 2), (3, 2)], YES), &world, Timestamp(1)).expect("readmitted");
     home.apply("c", Keep { promise: PromiseId(0) }, &world, Timestamp(2)).expect("kept");

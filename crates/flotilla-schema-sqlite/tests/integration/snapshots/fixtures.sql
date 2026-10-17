@@ -12,6 +12,9 @@ CREATE TABLE change_log (
   resource_id INTEGER NOT NULL REFERENCES resource_identity(id), change BLOB NOT NULL,
   PRIMARY KEY (home, home_seq)) STRICT;
 CREATE INDEX change_log_by_resource ON change_log (resource_id, home_seq);
+CREATE TABLE codes (
+  kind TEXT NOT NULL, field TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
+  PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
 CREATE TABLE "agent_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -53,6 +56,50 @@ CREATE TABLE "agent_session_receipts" (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "agent_session_edges_by_edge" ON "agent_session_edges" ("edge", "at");
 CREATE INDEX "agent_session_edges_by_time" ON "agent_session_edges" ("at");
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('as', 'state', 'en', 'Ended'),
+  ('as', 'state', 'li', 'Live'),
+  ('as', 'channel', 'at', 'Attached'),
+  ('as', 'channel', 'de', 'Detached'),
+  ('as', 'reason', 'co', 'Completed'),
+  ('as', 'reason', 'lo', 'Lost'),
+  ('as', 'edges.edge', 'at', 'Attach'),
+  ('as', 'edges.edge', 'de', 'Detach'),
+  ('as', 'edges.edge', 'en', 'End'),
+  ('as', 'edges.from', 'en', 'Ended'),
+  ('as', 'edges.from', 'li', 'Live'),
+  ('as', 'edges.to', 'en', 'Ended'),
+  ('as', 'edges.to', 'li', 'Live'),
+  ('as', 'receipts.transport', 'mu', 'Mute'),
+  ('as', 'receipts.transport', 'no', 'Notify'),
+  ('as', 'receipts.transport', 'tu', 'Turn');
+CREATE VIEW "agent_session_view" AS SELECT
+  "agent_session"."id",
+  "agent_session"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'state' AND "code" = "agent_session"."state") AS "state",
+  "agent_session"."state_since",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'channel' AND "code" = "agent_session"."channel") AS "channel",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'reason' AND "code" = "agent_session"."reason") AS "reason"
+FROM "agent_session";
+CREATE VIEW "agent_session_edges_view" AS SELECT
+  "agent_session_edges"."owner",
+  "agent_session_edges"."pos",
+  "agent_session_edges"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'edges.edge' AND "code" = "agent_session_edges"."edge") AS "edge",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'edges.from' AND "code" = "agent_session_edges"."from") AS "from",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'edges.to' AND "code" = "agent_session_edges"."to") AS "to",
+  (SELECT "s" FROM "strings" WHERE "id" = "agent_session_edges"."writer") AS "writer",
+  "agent_session_edges"."at",
+  "agent_session_edges"."payload"
+FROM "agent_session_edges";
+CREATE VIEW "agent_session_receipts_view" AS SELECT
+  "agent_session_receipts"."owner",
+  "agent_session_receipts"."pos",
+  "agent_session_receipts"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "agent_session_receipts"."message") AS "message",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'receipts.transport' AND "code" = "agent_session_receipts"."transport") AS "transport",
+  "agent_session_receipts"."at"
+FROM "agent_session_receipts";
 CREATE TABLE "convoy" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -109,6 +156,60 @@ CREATE TABLE "convoy_edges" (
 CREATE INDEX "convoy_edges_by_edge" ON "convoy_edges" ("edge", "at");
 CREATE INDEX "convoy_edges_by_time" ON "convoy_edges" ("at");
 CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN ('op');
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('cv', 'state', 'ab', 'Abandoned'),
+  ('cv', 'state', 'de', 'Delivered'),
+  ('cv', 'state', 'op', 'Open'),
+  ('cv', 'resolution.value', 'ke', 'Kept'),
+  ('cv', 'resolution.value', 'pe', 'Pending'),
+  ('cv', 'resolution.value', 'rt', 'Retracted'),
+  ('cv', 'edges.edge', 'ab', 'Abandon'),
+  ('cv', 'edges.edge', 'de', 'Deliver'),
+  ('cv', 'edges.edge', 'ke', 'Keep'),
+  ('cv', 'edges.edge', 'ra', 'Readmit'),
+  ('cv', 'edges.edge', 'rt', 'Retract'),
+  ('cv', 'edges.from', 'ab', 'Abandoned'),
+  ('cv', 'edges.from', 'de', 'Delivered'),
+  ('cv', 'edges.from', 'op', 'Open'),
+  ('cv', 'edges.to', 'ab', 'Abandoned'),
+  ('cv', 'edges.to', 'de', 'Delivered'),
+  ('cv', 'edges.to', 'op', 'Open');
+CREATE VIEW "convoy_view" AS SELECT
+  "convoy"."id",
+  "convoy"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy"."project") AS "project",
+  "convoy"."priority",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'state' AND "code" = "convoy"."state") AS "state",
+  "convoy"."state_since",
+  "convoy"."reason"
+FROM "convoy";
+CREATE VIEW "convoy_promises_view" AS SELECT
+  "convoy_promises"."owner",
+  "convoy_promises"."key",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises"."kind") AS "kind",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises"."target") AS "target"
+FROM "convoy_promises";
+CREATE VIEW "convoy_resolution_view" AS SELECT
+  "convoy_resolution"."owner",
+  "convoy_resolution"."key",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'resolution.value' AND "code" = "convoy_resolution"."value") AS "value"
+FROM "convoy_resolution";
+CREATE VIEW "convoy_quota_view" AS SELECT
+  "convoy_quota"."owner",
+  "convoy_quota"."key",
+  "convoy_quota"."value"
+FROM "convoy_quota";
+CREATE VIEW "convoy_edges_view" AS SELECT
+  "convoy_edges"."owner",
+  "convoy_edges"."pos",
+  "convoy_edges"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'edges.edge' AND "code" = "convoy_edges"."edge") AS "edge",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'edges.from' AND "code" = "convoy_edges"."from") AS "from",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'edges.to' AND "code" = "convoy_edges"."to") AS "to",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_edges"."writer") AS "writer",
+  "convoy_edges"."at",
+  "convoy_edges"."payload"
+FROM "convoy_edges";
 CREATE TABLE "dossier" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -213,6 +314,93 @@ CREATE TABLE "dossier_edges" (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "dossier_edges_by_edge" ON "dossier_edges" ("edge", "at");
 CREATE INDEX "dossier_edges_by_time" ON "dossier_edges" ("at");
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('do', 'state', 'c1', 'Open'),
+  ('do', 'state', 'c2', 'Delivered'),
+  ('do', 'state', 'c3', 'Abandoned'),
+  ('do', 'inputs.tag', 'c1', 'Text'),
+  ('do', 'inputs.tag', 'c2', 'Number'),
+  ('do', 'inputs.tag', 'c3', 'List'),
+  ('do', 'inputs.tag', 'c4', 'Unset'),
+  ('do', 'deliverables.kind', 'c1', 'ChangeRequest'),
+  ('do', 'deliverables.kind', 'c2', 'Artifact'),
+  ('do', 'deliverables.source', 'c1', 'Workflow'),
+  ('do', 'deliverables.source', 'c2', 'Dispatcher'),
+  ('do', 'deliverables.state', 'c1', 'Open'),
+  ('do', 'deliverables.state', 'c2', 'Retracted'),
+  ('do', 'edges.edge', 'c1', 'Deliver'),
+  ('do', 'edges.edge', 'c2', 'Abandon'),
+  ('do', 'edges.edge', 'c3', 'Promise'),
+  ('do', 'edges.edge', 'c4', 'Submit'),
+  ('do', 'edges.edge', 'c5', 'Retract'),
+  ('do', 'edges.from', 'c1', 'Open'),
+  ('do', 'edges.from', 'c2', 'Delivered'),
+  ('do', 'edges.from', 'c3', 'Abandoned'),
+  ('do', 'edges.to', 'c1', 'Open'),
+  ('do', 'edges.to', 'c2', 'Delivered'),
+  ('do', 'edges.to', 'c3', 'Abandoned');
+CREATE VIEW "dossier_view" AS SELECT
+  "dossier"."id",
+  "dossier"."version",
+  "dossier"."workflow",
+  "dossier"."placement",
+  "dossier"."instruction",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'do' AND "field" = 'state' AND "code" = "dossier"."state") AS "state",
+  "dossier"."state_since"
+FROM "dossier";
+CREATE VIEW "dossier_inputs_view" AS SELECT
+  "dossier_inputs"."owner",
+  "dossier_inputs"."key",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'do' AND "field" = 'inputs.tag' AND "code" = "dossier_inputs"."tag") AS "tag",
+  "dossier_inputs"."value",
+  "dossier_inputs"."number"
+FROM "dossier_inputs";
+CREATE VIEW "dossier_inputs_items_view" AS SELECT
+  "dossier_inputs_items"."owner",
+  "dossier_inputs_items"."inputs_key",
+  "dossier_inputs_items"."pos",
+  "dossier_inputs_items"."value"
+FROM "dossier_inputs_items";
+CREATE VIEW "dossier_deliverables_view" AS SELECT
+  "dossier_deliverables"."owner",
+  "dossier_deliverables"."pos",
+  "dossier_deliverables"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "dossier_deliverables"."label") AS "label",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'do' AND "field" = 'deliverables.kind' AND "code" = "dossier_deliverables"."kind") AS "kind",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'do' AND "field" = 'deliverables.source' AND "code" = "dossier_deliverables"."source") AS "source",
+  (SELECT "s" FROM "strings" WHERE "id" = "dossier_deliverables"."source_step") AS "source_step",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'do' AND "field" = 'deliverables.state' AND "code" = "dossier_deliverables"."state") AS "state",
+  "dossier_deliverables"."state_since"
+FROM "dossier_deliverables";
+CREATE VIEW "dossier_deliverables_evidence_view" AS SELECT
+  "dossier_deliverables_evidence"."owner",
+  "dossier_deliverables_evidence"."deliverables_pos",
+  "dossier_deliverables_evidence"."pos",
+  "dossier_deliverables_evidence"."version",
+  "dossier_deliverables_evidence"."reference",
+  "dossier_deliverables_evidence"."submitted_at",
+  "dossier_deliverables_evidence"."verdict_accepted",
+  (SELECT "s" FROM "strings" WHERE "id" = "dossier_deliverables_evidence"."verdict_by") AS "verdict_by",
+  "dossier_deliverables_evidence"."verdict_at"
+FROM "dossier_deliverables_evidence";
+CREATE VIEW "dossier_deliverables_evidence_metadata_view" AS SELECT
+  "dossier_deliverables_evidence_metadata"."owner",
+  "dossier_deliverables_evidence_metadata"."deliverables_pos",
+  "dossier_deliverables_evidence_metadata"."evidence_pos",
+  "dossier_deliverables_evidence_metadata"."key",
+  "dossier_deliverables_evidence_metadata"."value"
+FROM "dossier_deliverables_evidence_metadata";
+CREATE VIEW "dossier_edges_view" AS SELECT
+  "dossier_edges"."owner",
+  "dossier_edges"."pos",
+  "dossier_edges"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'do' AND "field" = 'edges.edge' AND "code" = "dossier_edges"."edge") AS "edge",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'do' AND "field" = 'edges.from' AND "code" = "dossier_edges"."from") AS "from",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'do' AND "field" = 'edges.to' AND "code" = "dossier_edges"."to") AS "to",
+  (SELECT "s" FROM "strings" WHERE "id" = "dossier_edges"."writer") AS "writer",
+  "dossier_edges"."at",
+  "dossier_edges"."payload"
+FROM "dossier_edges";
 CREATE TABLE "ensure" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -292,6 +480,75 @@ CREATE TABLE "ensure_attempts" (
 CREATE INDEX "ensure_by_inbox" ON "ensure" ("inbox");
 CREATE INDEX "ensure_edges_by_edge" ON "ensure_edges" ("edge", "at");
 CREATE INDEX "ensure_edges_by_time" ON "ensure_edges" ("at");
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('en', 'state', 'fu', 'Fulfilled'),
+  ('en', 'state', 'he', 'Held'),
+  ('en', 'state', 'rt', 'Retired'),
+  ('en', 'state', 'un', 'Unfulfilled'),
+  ('en', 'edges.edge', 'bi', 'Bind'),
+  ('en', 'edges.edge', 'cr', 'Create'),
+  ('en', 'edges.edge', 'gu', 'GiveUp'),
+  ('en', 'edges.edge', 'rc', 'Record'),
+  ('en', 'edges.edge', 'rs', 'Resume'),
+  ('en', 'edges.edge', 'rt', 'Retire'),
+  ('en', 'edges.edge', 'ub', 'Unbind'),
+  ('en', 'edges.from', 'fu', 'Fulfilled'),
+  ('en', 'edges.from', 'he', 'Held'),
+  ('en', 'edges.from', 'rt', 'Retired'),
+  ('en', 'edges.from', 'un', 'Unfulfilled'),
+  ('en', 'edges.to', 'fu', 'Fulfilled'),
+  ('en', 'edges.to', 'he', 'Held'),
+  ('en', 'edges.to', 'rt', 'Retired'),
+  ('en', 'edges.to', 'un', 'Unfulfilled'),
+  ('en', 'attempts.outcome', 'fa', 'Failed'),
+  ('en', 'attempts.outcome', 'ok', 'Succeeded'),
+  ('en', 'attempts.outcome_cause_category', 'ex', 'External'),
+  ('en', 'attempts.outcome_cause_category', 'mc', 'Misconfigured'),
+  ('en', 'attempts.outcome_cause_category', 'mx', 'MissingCapability'),
+  ('en', 'attempts.outcome_cause_category', 'rf', 'Refused'),
+  ('en', 'attempts.outcome_cause_category', 'tr', 'Transient');
+CREATE VIEW "ensure_view" AS SELECT
+  "ensure"."id",
+  "ensure"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "ensure"."inbox") AS "inbox",
+  "ensure"."policy_max_failures",
+  "ensure"."policy_base",
+  "ensure"."policy_factor",
+  "ensure"."policy_cap",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'state' AND "code" = "ensure"."state") AS "state",
+  "ensure"."state_since",
+  "ensure"."window",
+  (SELECT "s" FROM "strings" WHERE "id" = "ensure"."bound") AS "bound"
+FROM "ensure";
+CREATE VIEW "ensure_recorded_view" AS SELECT
+  "ensure_recorded"."owner",
+  (SELECT "s" FROM "strings" WHERE "id" = "ensure_recorded"."value") AS "value"
+FROM "ensure_recorded";
+CREATE VIEW "ensure_created_view" AS SELECT
+  "ensure_created"."owner",
+  (SELECT "s" FROM "strings" WHERE "id" = "ensure_created"."value") AS "value"
+FROM "ensure_created";
+CREATE VIEW "ensure_edges_view" AS SELECT
+  "ensure_edges"."owner",
+  "ensure_edges"."pos",
+  "ensure_edges"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'edges.edge' AND "code" = "ensure_edges"."edge") AS "edge",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'edges.from' AND "code" = "ensure_edges"."from") AS "from",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'edges.to' AND "code" = "ensure_edges"."to") AS "to",
+  (SELECT "s" FROM "strings" WHERE "id" = "ensure_edges"."writer") AS "writer",
+  "ensure_edges"."at",
+  "ensure_edges"."payload"
+FROM "ensure_edges";
+CREATE VIEW "ensure_attempts_view" AS SELECT
+  "ensure_attempts"."owner",
+  "ensure_attempts"."pos",
+  "ensure_attempts"."version",
+  "ensure_attempts"."at",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'attempts.outcome' AND "code" = "ensure_attempts"."outcome") AS "outcome",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'attempts.outcome_cause_category' AND "code" = "ensure_attempts"."outcome_cause_category") AS "outcome_cause_category",
+  "ensure_attempts"."outcome_cause_detail",
+  "ensure_attempts"."outcome_retryable"
+FROM "ensure_attempts";
 CREATE TABLE "message" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -384,6 +641,58 @@ CREATE INDEX "message_deadline" ON "message" ("deadline") WHERE "state" IN ('pe'
 CREATE INDEX "message_edges_by_edge" ON "message_edges" ("edge", "at");
 CREATE INDEX "message_edges_by_time" ON "message_edges" ("at");
 CREATE INDEX "message_open_by_inbox" ON "message" ("inbox") WHERE "state" IN ('pe', 'aw');
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('ms', 'expectation', 'no', 'Nothing'),
+  ('ms', 'expectation', 'ou', 'Outcome'),
+  ('ms', 'expectation', 're', 'Reply'),
+  ('ms', 'state', 'aw', 'Awaiting'),
+  ('ms', 'state', 'dr', 'Dropped'),
+  ('ms', 'state', 'pe', 'Pending'),
+  ('ms', 'state', 'se', 'Settled'),
+  ('ms', 'reason', 'cu', 'ConsumerUnreachable'),
+  ('ms', 'reason', 'ex', 'Expired'),
+  ('ms', 'reason', 'su', 'Superseded'),
+  ('ms', 'reason', 'un', 'Undeliverable'),
+  ('ms', 'reason', 'wi', 'Withdrawn'),
+  ('ms', 'edges.edge', 'de', 'Deliver'),
+  ('ms', 'edges.edge', 'dr', 'Drop'),
+  ('ms', 'edges.edge', 'se', 'Settle'),
+  ('ms', 'edges.from', 'aw', 'Awaiting'),
+  ('ms', 'edges.from', 'dr', 'Dropped'),
+  ('ms', 'edges.from', 'pe', 'Pending'),
+  ('ms', 'edges.from', 'se', 'Settled'),
+  ('ms', 'edges.to', 'aw', 'Awaiting'),
+  ('ms', 'edges.to', 'dr', 'Dropped'),
+  ('ms', 'edges.to', 'pe', 'Pending'),
+  ('ms', 'edges.to', 'se', 'Settled');
+CREATE VIEW "message_view" AS SELECT
+  "message"."id",
+  "message"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "message"."inbox") AS "inbox",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'expectation' AND "code" = "message"."expectation") AS "expectation",
+  (SELECT "s" FROM "strings" WHERE "id" = "message"."expectation_condition") AS "expectation_condition",
+  "message"."deadline",
+  "message"."unbound_after",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'state' AND "code" = "message"."state") AS "state",
+  "message"."state_since",
+  (SELECT "s" FROM "strings" WHERE "id" = "message"."receiver_session") AS "receiver_session",
+  (SELECT "s" FROM "strings" WHERE "id" = "message"."receiver_host") AS "receiver_host",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'reason' AND "code" = "message"."reason") AS "reason",
+  (SELECT "s" FROM "strings" WHERE "id" = "message"."reason_by") AS "reason_by",
+  (SELECT "s" FROM "strings" WHERE "id" = "message"."reason_authority") AS "reason_authority",
+  "message"."watermark"
+FROM "message";
+CREATE VIEW "message_edges_view" AS SELECT
+  "message_edges"."owner",
+  "message_edges"."pos",
+  "message_edges"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'edges.edge' AND "code" = "message_edges"."edge") AS "edge",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'edges.from' AND "code" = "message_edges"."from") AS "from",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'edges.to' AND "code" = "message_edges"."to") AS "to",
+  (SELECT "s" FROM "strings" WHERE "id" = "message_edges"."writer") AS "writer",
+  "message_edges"."at",
+  "message_edges"."payload"
+FROM "message_edges";
 CREATE TABLE "referral" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -573,6 +882,85 @@ CREATE INDEX "referral_by_reply" ON "referral" ("in_reply_to") WHERE "in_reply_t
 CREATE INDEX "referral_by_session" ON "referral" ("session", "seq");
 CREATE INDEX "referral_edges_by_edge" ON "referral_edges" ("edge", "at");
 CREATE INDEX "referral_edges_by_time" ON "referral_edges" ("at");
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('rf', 'subject', 'c1', 'Convoy'),
+  ('rf', 'subject', 'c2', 'ChangeRequest'),
+  ('rf', 'subject', 'c3', 'Usage'),
+  ('rf', 'condition_address', 'c1', 'Convoy'),
+  ('rf', 'condition_address', 'c2', 'ChangeRequest'),
+  ('rf', 'condition_address', 'c3', 'Usage'),
+  ('rf', 'condition_operator', 'c1', 'Equal'),
+  ('rf', 'condition_operator', 'c2', 'LessThan'),
+  ('rf', 'condition_operator', 'c3', 'GreaterThan'),
+  ('rf', 'phase', 'c1', 'Draft'),
+  ('rf', 'phase', 'c2', 'Sent'),
+  ('rf', 'phase', 'c3', 'Read'),
+  ('rf', 'references.tag', 'c1', 'ChangeRequest'),
+  ('rf', 'references.tag', 'c2', 'Commit'),
+  ('rf', 'references.tag', 'c3', 'Ref'),
+  ('rf', 'references.tag', 'c4', 'Artifact'),
+  ('rf', 'references.tag', 'c5', 'Issue'),
+  ('rf', 'references.tag', 'c6', 'Comment'),
+  ('rf', 'references.tag', 'c7', 'ControlRecord'),
+  ('rf', 'edges.edge', 'c1', 'Send'),
+  ('rf', 'edges.edge', 'c2', 'Read'),
+  ('rf', 'edges.edge', 'c3', 'Amend'),
+  ('rf', 'edges.from', 'c1', 'Draft'),
+  ('rf', 'edges.from', 'c2', 'Sent'),
+  ('rf', 'edges.from', 'c3', 'Read'),
+  ('rf', 'edges.to', 'c1', 'Draft'),
+  ('rf', 'edges.to', 'c2', 'Sent'),
+  ('rf', 'edges.to', 'c3', 'Read');
+CREATE VIEW "referral_view" AS SELECT
+  "referral"."id",
+  "referral"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "referral"."sender") AS "sender",
+  "referral"."session",
+  "referral"."in_reply_to",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'rf' AND "field" = 'subject' AND "code" = "referral"."subject") AS "subject",
+  "referral"."subject_name",
+  (SELECT "s" FROM "strings" WHERE "id" = "referral"."subject_service") AS "subject_service",
+  "referral"."subject_number",
+  "referral"."subject_provider",
+  "referral"."subject_account",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'rf' AND "field" = 'condition_address' AND "code" = "referral"."condition_address") AS "condition_address",
+  "referral"."condition_address_name",
+  (SELECT "s" FROM "strings" WHERE "id" = "referral"."condition_address_service") AS "condition_address_service",
+  "referral"."condition_address_number",
+  "referral"."condition_address_provider",
+  "referral"."condition_address_account",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'rf' AND "field" = 'condition_operator' AND "code" = "referral"."condition_operator") AS "condition_operator",
+  "referral"."condition_literal",
+  "referral"."sent_at",
+  "referral"."seq",
+  "referral"."ordinal",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'rf' AND "field" = 'phase' AND "code" = "referral"."phase") AS "phase",
+  "referral"."phase_since"
+FROM "referral";
+CREATE VIEW "referral_references_view" AS SELECT
+  "referral_references"."owner",
+  "referral_references"."pos",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'rf' AND "field" = 'references.tag' AND "code" = "referral_references"."tag") AS "tag",
+  (SELECT "s" FROM "strings" WHERE "id" = "referral_references"."service") AS "service",
+  "referral_references"."scope",
+  "referral_references"."number",
+  "referral_references"."revision",
+  "referral_references"."repository",
+  "referral_references"."name",
+  "referral_references"."resource",
+  "referral_references"."id"
+FROM "referral_references";
+CREATE VIEW "referral_edges_view" AS SELECT
+  "referral_edges"."owner",
+  "referral_edges"."pos",
+  "referral_edges"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'rf' AND "field" = 'edges.edge' AND "code" = "referral_edges"."edge") AS "edge",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'rf' AND "field" = 'edges.from' AND "code" = "referral_edges"."from") AS "from",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'rf' AND "field" = 'edges.to' AND "code" = "referral_edges"."to") AS "to",
+  (SELECT "s" FROM "strings" WHERE "id" = "referral_edges"."writer") AS "writer",
+  "referral_edges"."at",
+  "referral_edges"."payload"
+FROM "referral_edges";
 CREATE TABLE "ticket" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -649,6 +1037,54 @@ CREATE TABLE "ticket_edges" (
 CREATE INDEX "ticket_edges_by_edge" ON "ticket_edges" ("edge", "at");
 CREATE INDEX "ticket_edges_by_time" ON "ticket_edges" ("at");
 CREATE INDEX "ticket_open_by_queue" ON "ticket" ("queue") WHERE "state" IN ('c2');
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('tk', 'state', 'c1', 'Draft'),
+  ('tk', 'state', 'c2', 'Open'),
+  ('tk', 'state', 'c3', 'Closed'),
+  ('tk', 'edges.edge', 'c1', 'Edit'),
+  ('tk', 'edges.edge', 'c2', 'Move'),
+  ('tk', 'edges.from', 'c1', 'Draft'),
+  ('tk', 'edges.from', 'c2', 'Open'),
+  ('tk', 'edges.from', 'c3', 'Closed'),
+  ('tk', 'edges.to', 'c1', 'Draft'),
+  ('tk', 'edges.to', 'c2', 'Open'),
+  ('tk', 'edges.to', 'c3', 'Closed');
+CREATE VIEW "ticket_view" AS SELECT
+  "ticket"."id",
+  "ticket"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "ticket"."queue") AS "queue",
+  "ticket"."title",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'tk' AND "field" = 'state' AND "code" = "ticket"."state") AS "state",
+  "ticket"."state_since",
+  "ticket"."priority",
+  (SELECT "s" FROM "strings" WHERE "id" = "ticket"."owner") AS "owner",
+  "ticket"."hold_by",
+  "ticket"."hold_until",
+  "ticket"."reason",
+  (SELECT "s" FROM "strings" WHERE "id" = "ticket"."closed_by") AS "closed_by",
+  (SELECT "s" FROM "strings" WHERE "id" = "ticket"."signature_who") AS "signature_who",
+  "ticket"."signature_at"
+FROM "ticket";
+CREATE VIEW "ticket_assignees_view" AS SELECT
+  "ticket_assignees"."owner",
+  "ticket_assignees"."value"
+FROM "ticket_assignees";
+CREATE VIEW "ticket_notes_view" AS SELECT
+  "ticket_notes"."owner",
+  "ticket_notes"."key",
+  "ticket_notes"."value"
+FROM "ticket_notes";
+CREATE VIEW "ticket_edges_view" AS SELECT
+  "ticket_edges"."owner",
+  "ticket_edges"."pos",
+  "ticket_edges"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'tk' AND "field" = 'edges.edge' AND "code" = "ticket_edges"."edge") AS "edge",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'tk' AND "field" = 'edges.from' AND "code" = "ticket_edges"."from") AS "from",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'tk' AND "field" = 'edges.to' AND "code" = "ticket_edges"."to") AS "to",
+  (SELECT "s" FROM "strings" WHERE "id" = "ticket_edges"."writer") AS "writer",
+  "ticket_edges"."at",
+  "ticket_edges"."payload"
+FROM "ticket_edges";
 CREATE TABLE "terminal_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -710,7 +1146,7 @@ CREATE TABLE "terminal_session_labels" (
   PRIMARY KEY ("owner", "value"),
   FOREIGN KEY ("owner") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "terminal_session_events" (
+CREATE TABLE "terminal_session_edges" (
   "owner" INTEGER NOT NULL,
   "pos" INTEGER NOT NULL,
   "version" INTEGER NOT NULL,
@@ -746,11 +1182,95 @@ CREATE TABLE "terminal_session_attempts" (
       END)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "terminal_session_by_vessel" ON "terminal_session" ("vessel", "ordinal");
-CREATE INDEX "terminal_session_events_by_edge" ON "terminal_session_events" ("edge", "at");
-CREATE INDEX "terminal_session_events_by_time" ON "terminal_session_events" ("at");
+CREATE INDEX "terminal_session_edges_by_edge" ON "terminal_session_edges" ("edge", "at");
+CREATE INDEX "terminal_session_edges_by_time" ON "terminal_session_edges" ("at");
 CREATE INDEX "terminal_session_live_by_pool" ON "terminal_session" ("pool") WHERE "state" IN ('rq', 'rl');
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('ts', 'source', 'c1', 'Tool'),
+  ('ts', 'source', 'c2', 'Agent'),
+  ('ts', 'state', 'go', 'Gone'),
+  ('ts', 'state', 'gu', 'GaveUp'),
+  ('ts', 'state', 'rl', 'Realised'),
+  ('ts', 'state', 'rq', 'Requested'),
+  ('ts', 'cause_category', 'ex', 'External'),
+  ('ts', 'cause_category', 'mc', 'Misconfigured'),
+  ('ts', 'cause_category', 'mx', 'MissingCapability'),
+  ('ts', 'cause_category', 'rf', 'Refused'),
+  ('ts', 'cause_category', 'tr', 'Transient'),
+  ('ts', 'edges.edge', 'gu', 'GiveUp'),
+  ('ts', 'edges.edge', 'rl', 'Realise'),
+  ('ts', 'edges.edge', 'rs', 'Release'),
+  ('ts', 'edges.edge', 'va', 'Vanish'),
+  ('ts', 'edges.from', 'go', 'Gone'),
+  ('ts', 'edges.from', 'gu', 'GaveUp'),
+  ('ts', 'edges.from', 'rl', 'Realised'),
+  ('ts', 'edges.from', 'rq', 'Requested'),
+  ('ts', 'edges.to', 'go', 'Gone'),
+  ('ts', 'edges.to', 'gu', 'GaveUp'),
+  ('ts', 'edges.to', 'rl', 'Realised'),
+  ('ts', 'edges.to', 'rq', 'Requested'),
+  ('ts', 'attempts.outcome', 'fa', 'Failed'),
+  ('ts', 'attempts.outcome', 'ok', 'Succeeded'),
+  ('ts', 'attempts.outcome_cause_category', 'ex', 'External'),
+  ('ts', 'attempts.outcome_cause_category', 'mc', 'Misconfigured'),
+  ('ts', 'attempts.outcome_cause_category', 'mx', 'MissingCapability'),
+  ('ts', 'attempts.outcome_cause_category', 'rf', 'Refused'),
+  ('ts', 'attempts.outcome_cause_category', 'tr', 'Transient');
+CREATE VIEW "terminal_session_view" AS SELECT
+  "terminal_session"."id",
+  "terminal_session"."version",
+  "terminal_session"."vessel",
+  (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."role") AS "role",
+  "terminal_session"."ordinal",
+  (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."pool") AS "pool",
+  "terminal_session"."cwd",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'source' AND "code" = "terminal_session"."source") AS "source",
+  "terminal_session"."source_command",
+  (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."source_selector") AS "source_selector",
+  "terminal_session"."source_brief",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'state' AND "code" = "terminal_session"."state") AS "state",
+  "terminal_session"."state_since",
+  "terminal_session"."identity",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'cause_category' AND "code" = "terminal_session"."cause_category") AS "cause_category",
+  "terminal_session"."cause_detail"
+FROM "terminal_session";
+CREATE VIEW "terminal_session_env_view" AS SELECT
+  "terminal_session_env"."owner",
+  "terminal_session_env"."key",
+  "terminal_session_env"."value"
+FROM "terminal_session_env";
+CREATE VIEW "terminal_session_labels_view" AS SELECT
+  "terminal_session_labels"."owner",
+  "terminal_session_labels"."value"
+FROM "terminal_session_labels";
+CREATE VIEW "terminal_session_edges_view" AS SELECT
+  "terminal_session_edges"."owner",
+  "terminal_session_edges"."pos",
+  "terminal_session_edges"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'edges.edge' AND "code" = "terminal_session_edges"."edge") AS "edge",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'edges.from' AND "code" = "terminal_session_edges"."from") AS "from",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'edges.to' AND "code" = "terminal_session_edges"."to") AS "to",
+  (SELECT "s" FROM "strings" WHERE "id" = "terminal_session_edges"."writer") AS "writer",
+  "terminal_session_edges"."at",
+  "terminal_session_edges"."payload"
+FROM "terminal_session_edges";
+CREATE VIEW "terminal_session_attempts_view" AS SELECT
+  "terminal_session_attempts"."owner",
+  "terminal_session_attempts"."pos",
+  "terminal_session_attempts"."version",
+  "terminal_session_attempts"."at",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'attempts.outcome' AND "code" = "terminal_session_attempts"."outcome") AS "outcome",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'attempts.outcome_cause_category' AND "code" = "terminal_session_attempts"."outcome_cause_category") AS "outcome_cause_category",
+  "terminal_session_attempts"."outcome_cause_detail",
+  "terminal_session_attempts"."outcome_retryable"
+FROM "terminal_session_attempts";
 CREATE TABLE "vessel" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
   "name" TEXT NOT NULL
 ) STRICT;
+CREATE VIEW "vessel_view" AS SELECT
+  "vessel"."id",
+  "vessel"."version",
+  "vessel"."name"
+FROM "vessel";

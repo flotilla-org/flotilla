@@ -33,6 +33,7 @@
 //! outcome, so the adaptor writes the fulfiller's name as the failure's cause
 //! detail and encodes the history from it.
 
+use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::ensure::{
         Bind, Create, Drain, Ensure, EnsureRefusal, EnsureSpec, EnsureState, Fulfiller, FulfillerPhase, FulfillerStatus, Fulfillers,
@@ -116,7 +117,7 @@ impl Conformance for EnsureConformance {
 
     fn create(_: &Value) -> Home<Ensure> {
         let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(1) }).expect("created");
+        home.create(NAME, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(1) }, Timestamp(0)).expect("created");
         home
     }
 

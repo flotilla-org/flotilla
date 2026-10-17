@@ -15,7 +15,7 @@ fn at(micros: i64) -> Timestamp {
 
 fn home() -> Home<Ensure> {
     let mut home = Home::new("kiwi").expect("valid declaration");
-    home.create("e", EnsureSpec { inbox: "inbox".into(), policy: AttemptPolicy::immediate(1) }).expect("created");
+    home.create("e", EnsureSpec { inbox: "inbox".into(), policy: AttemptPolicy::immediate(1) }, Timestamp(0)).expect("created");
     home
 }
 

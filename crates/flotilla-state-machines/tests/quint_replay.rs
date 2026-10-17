@@ -287,7 +287,7 @@ fn accept<M: Machine>(
 
 /// A model step created this resource, so the Rust machine must admit it.
 fn create<M: Machine>(home: &mut Home<M>, name: &str, request: M::Request, step: &Step, tally: &mut Tally) {
-    if let Err(error) = home.create(name, request) {
+    if let Err(error) = home.create(name, request, Timestamp(0)) {
         panic!("{step}: the model created {} {name}; Rust refused it: {error:?}", M::NAME);
     }
     tally.writes += 1;
@@ -1368,11 +1368,11 @@ impl<'a> MessageReplay<'a> {
             unbound_after: UNIT,
         };
         let mut home = Home::new("home").expect("declaration");
-        home.create(ONE, spec).expect("message");
+        home.create(ONE, spec, Timestamp(0)).expect("message");
         let sessions = (feed == Feed::Inbox).then(|| {
             let mut sessions = Home::new("consumer").expect("declaration");
             for (id, _) in entries(&trace.states[0], "::sessions") {
-                sessions.create(id.to_string(), ()).expect("session");
+                sessions.create(id.to_string(), (), Timestamp(0)).expect("session");
             }
             sessions
         });

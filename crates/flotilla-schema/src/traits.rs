@@ -19,7 +19,7 @@ use crate::{
 /// The closed attribute list, named by every refusal. The derive refuses with the same text.
 pub const SUPPORTED_ATTRIBUTES: &str =
     "the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, \
-                                        state and code (fields and variants) and kind, code, index and labels (types)";
+                                        state and code (fields and variants) and kind, code, state, index and labels (types)";
 
 /// Anything that lays out as zero or more columns of the current row, plus nested tables.
 #[doc(hidden)]
@@ -41,7 +41,7 @@ pub trait Columns: Sized {
 /// A type usable as a field with no attribute.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a storage column: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-               flatten, state and code (fields and variants) and kind, code, index and labels (types)",
+               flatten, state and code (fields and variants) and kind, code, state, index and labels (types)",
     label = "needs a column type or one of the storage attributes",
     note = "column types are integers, bool, String, Vec<u8>, Timestamp, DateTime<Utc>, Option of a column, and enums and newtypes deriving Stored"
 )]
@@ -50,7 +50,7 @@ pub trait Column: Columns {}
 /// A struct usable under `#[store(flatten)]`: it derives `Stored` and has no table fields.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-               flatten, state and code (fields and variants) and kind, code, index and labels (types)",
+               flatten, state and code (fields and variants) and kind, code, state, index and labels (types)",
     label = "flatten needs a struct deriving Stored with no table fields"
 )]
 pub trait Flat: Columns {}
@@ -61,7 +61,7 @@ pub trait Flat: Columns {}
 /// whose values span several columns or none.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot key a child table or an index: the storage derive supports only the attributes child, records, history, frozen, cbor, \
-               intern, flatten, state and code (fields and variants) and kind, code, index and labels (types)",
+               intern, flatten, state and code (fields and variants) and kind, code, state, index and labels (types)",
     label = "map keys, set values and index columns are single-column types: scalars, code enums, references and their newtypes"
 )]
 pub trait KeyColumn: Column {}
@@ -72,6 +72,9 @@ pub trait KeyColumn: Column {}
 pub trait CodeEnum: Column {
     /// Every variant's code, ascending.
     const CODES: &'static [Code];
+    /// The Rust name of the variant carrying each of [`CodeEnum::CODES`], in the same order: the
+    /// `codes` table's names, which only the readable views read.
+    const NAMES: &'static [&'static str];
     fn code(&self) -> Code;
 }
 
@@ -81,7 +84,7 @@ pub trait CodeEnum: Column {
 /// `State<S>` lays out the label column and `<field>_since`, and this trait the data after them.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be a state: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-               flatten, state and code (fields and variants) and kind, code, index and labels (types)",
+               flatten, state and code (fields and variants) and kind, code, state, index and labels (types)",
     label = "a state is a code enum, or an enum deriving Stored with #[store(labels = Label)]"
 )]
 #[doc(hidden)]
@@ -90,6 +93,8 @@ pub trait StateData: Labelled + Sized {
     const TABLES: usize;
     /// Every label's code, ascending: the variant codes.
     const CODES: &'static [Code];
+    /// The Rust name of each label, in the order of [`StateData::CODES`].
+    const NAMES: &'static [&'static str];
     /// The data's names in declaration order; empty for a code enum.
     const DATA: &'static [&'static str];
     /// The label's code, as stored.
@@ -110,7 +115,7 @@ pub trait StateData: Labelled + Sized {
 /// A `#[store(intern)]` target: stored as an id in `strings`.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be interned: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-               flatten, state and code (fields and variants) and kind, code, index and labels (types)",
+               flatten, state and code (fields and variants) and kind, code, state, index and labels (types)",
     label = "intern needs String or a newtype of String"
 )]
 pub trait Intern {
@@ -121,7 +126,7 @@ pub trait Intern {
 /// A table row: a struct deriving `Stored`, or a primitive/enum element of a collection.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a storage row: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, \
-               flatten, state and code (fields and variants) and kind, code, index and labels (types)",
+               flatten, state and code (fields and variants) and kind, code, state, index and labels (types)",
     label = "collection elements are structs, enums or newtypes deriving Stored, or column primitives"
 )]
 pub trait Element: Sized {
@@ -141,6 +146,34 @@ pub trait Kind: Element {
     const KIND: &'static str;
     const CODE: KindCode;
     fn table_set() -> TableSet;
+
+    /// The value loaded as resource `name` at `version`. The store keeps a resource's name (its
+    /// identity row) and version beside its rows; a holder kind that carries them (the engine's
+    /// `Resource<M>`, #3392 ruling D5) takes them here, and any other kind is unchanged.
+    fn with_identity(self, name: &str, version: u64) -> Self {
+        let _ = (name, version);
+        self
+    }
+}
+
+/// The spec of a kind stored through a generic holder: a struct deriving `Stored` with
+/// `#[store(kind = "Name", code = "..", state = S)]` (#3392 ruling D5). The holder (the engine's
+/// `Resource<M>`) is the stored kind: its root row is the spec's columns, then its state `S` as
+/// the field `state`, then its records, and it supplies the identity and version. The spec
+/// carries what is particular to the kind: its name and code, its interning and its indexes,
+/// whose `state in [...]` names the holder's state.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a kind's spec: a spec is a struct deriving Stored with #[store(kind = \"Name\", code = \"..\", state = State)]",
+    label = "not a kind's spec"
+)]
+pub trait KindSpec: Element {
+    const KIND: &'static str;
+    const CODE: KindCode;
+    /// The state the holder stores beside the spec.
+    type State: StateData;
+    /// Declares the kind's indexes on its root table: the holder calls this after laying out the
+    /// spec, the state and the records.
+    fn layout_indexes(layout: &mut Layout);
 }
 
 impl Intern for String {

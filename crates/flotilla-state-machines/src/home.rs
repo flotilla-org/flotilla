@@ -10,25 +10,55 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use flotilla_schema::{EdgeEvent, Position, Records, Timestamp};
+use flotilla_schema::{EdgeEvent, Position, Records, State, Timestamp};
 
 use crate::{
     Attempt, DefError, Edge, EdgeEventOf, EdgeKind, EdgePayload, Ended, Fault, Handle, Judged, Label, Machine, MachineDef, Receipt,
-    StateValue, StepError, Version, WrongState,
+    StateValue, StepError, StoredState, Version, WrongState,
 };
 
-/// One resource at its home: its spec, current state, version and records.
+/// One resource at its home: its name, spec, current state (with the time its label was entered),
+/// version and records. This is the stored kind (#3392 ruling D5): the derive lays out the spec
+/// and the state, the resource its records, and the store keeps the name and version.
 pub struct Resource<M: Machine> {
-    name: String,
-    spec: M::Spec,
-    state: M::State,
-    version: Version,
-    events: Records<EdgeEventOf<M>>,
-    attempts: Records<Attempt>,
-    receipts: Records<Receipt>,
+    pub(crate) name: String,
+    pub(crate) spec: M::Spec,
+    pub(crate) state: StoredState<M>,
+    pub(crate) version: Version,
+    pub(crate) events: Records<EdgeEventOf<M>>,
+    pub(crate) attempts: Records<Attempt>,
+    pub(crate) receipts: Records<Receipt>,
 }
 
 impl<M: Machine> Resource<M> {
+    /// A resource as storage holds it, with no records: what a store read or a test places at a
+    /// home ([`Home::restore`]). Only a home changes it afterwards.
+    pub fn stored(name: impl Into<String>, spec: M::Spec, state: StoredState<M>, version: Version) -> Self {
+        Resource { name: name.into(), spec, state, version, events: Records::new(), attempts: Records::new(), receipts: Records::new() }
+    }
+
+    pub fn with_events(self, events: Records<EdgeEventOf<M>>) -> Self {
+        Resource { events, ..self }
+    }
+
+    pub fn with_attempts(self, attempts: Records<Attempt>) -> Self {
+        Resource { attempts, ..self }
+    }
+
+    pub fn with_receipts(self, receipts: Records<Receipt>) -> Self {
+        Resource { receipts, ..self }
+    }
+
+    /// The same resource with another spec: a spec edit, as storage applies one.
+    pub fn with_spec(self, spec: M::Spec) -> Self {
+        Resource { spec, ..self }
+    }
+
+    /// The same resource in another stored state, as storage holds one.
+    pub fn with_state(self, state: StoredState<M>) -> Self {
+        Resource { state, ..self }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -39,12 +69,23 @@ impl<M: Machine> Resource<M> {
 
     /// The current state: what gates read and the next edge changes.
     pub fn state(&self) -> &M::State {
+        &self.state.value
+    }
+
+    /// When the current state's label was entered: the creation time, or the time of the edge
+    /// that entered it. An edge that keeps the label keeps it.
+    pub fn since(&self) -> Timestamp {
+        self.state.since
+    }
+
+    /// The state as stored: the value and [`Resource::since`].
+    pub fn stored_state(&self) -> &StoredState<M> {
         &self.state
     }
 
     /// The current state's label.
     pub fn label(&self) -> Label<M> {
-        self.state.label()
+        self.state.value.label()
     }
 
     /// Rises on every accepted write: an edge or a record.
@@ -75,6 +116,34 @@ impl<M: Machine> Resource<M> {
     }
 }
 
+impl<M: Machine> Clone for Resource<M>
+where
+    M::Spec: Clone,
+{
+    fn clone(&self) -> Self {
+        Resource {
+            name: self.name.clone(),
+            spec: self.spec.clone(),
+            state: self.state.clone(),
+            version: self.version,
+            events: self.events.clone(),
+            attempts: self.attempts.clone(),
+            receipts: self.receipts.clone(),
+        }
+    }
+}
+
+impl<M: Machine> PartialEq for Resource<M>
+where
+    M::Spec: PartialEq,
+    EdgeEventOf<M>: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        (&self.name, &self.spec, &self.state, self.version, &self.events, &self.attempts, &self.receipts)
+            == (&other.name, &other.spec, &other.state, other.version, &other.events, &other.attempts, &other.receipts)
+    }
+}
+
 impl<M: Machine> fmt::Debug for Resource<M>
 where
     M::Spec: fmt::Debug,
@@ -83,23 +152,14 @@ where
         f.debug_struct("Resource")
             .field("name", &self.name)
             .field("spec", &self.spec)
-            .field("state", &self.state)
+            .field("state", &self.state.value)
+            .field("since", &self.state.since)
             .field("version", &self.version)
             .field("events", &self.events.len())
             .field("attempts", &self.attempts.len())
             .field("receipts", &self.receipts.len())
             .finish()
     }
-}
-
-/// What a stored row holds of one resource, apart from its name and version:
-/// see [`Home::restore`] and [`MachineRow::parts`](crate::MachineRow::parts).
-pub struct RowParts<M: Machine> {
-    pub spec: M::Spec,
-    pub state: M::State,
-    pub events: Records<EdgeEventOf<M>>,
-    pub attempts: Records<Attempt>,
-    pub receipts: Records<Receipt>,
 }
 
 /// Why a write did not happen.
@@ -187,9 +247,10 @@ impl<M: Machine> Home<M> {
         self.resources.values()
     }
 
-    /// Admits `request` and creates the resource in the state admission
-    /// returns, which must carry the declared initial label.
-    pub fn create(&mut self, name: impl Into<String>, request: M::Request) -> Result<&Resource<M>, WriteError<M>> {
+    /// Admits `request` at `now` and creates the resource in the state
+    /// admission returns, which must carry the declared initial label, entered
+    /// at `now`.
+    pub fn create(&mut self, name: impl Into<String>, request: M::Request, now: Timestamp) -> Result<&Resource<M>, WriteError<M>> {
         let name = name.into();
         if self.resources.contains_key(&name) {
             return Err(WriteError::Exists(name));
@@ -198,38 +259,28 @@ impl<M: Machine> Home<M> {
         if state.label() != self.definition.initial() {
             return Err(WriteError::Fault(Fault::Initial { state: state.label() }));
         }
-        let resource = Resource {
-            events: Records::new(),
-            attempts: Records::new(),
-            receipts: Records::new(),
-            name: name.clone(),
-            spec,
-            state,
-            version: Version(1),
-        };
+        let resource = Resource::stored(name.clone(), spec, State::new(state, now), Version(1));
         Ok(self.resources.entry(name).or_insert(resource))
     }
 
     /// Places a resource read from storage at this home, as stored: its spec,
-    /// state and records, at `version`. Nothing is checked against the
-    /// declaration: the row holds what earlier writes left. The storage port
-    /// (a later layer) is its caller; tests use it to apply an edge to a
-    /// stored row.
-    pub fn restore(&mut self, name: impl Into<String>, version: Version, parts: RowParts<M>) -> Result<&Resource<M>, WriteError<M>> {
-        let name = name.into();
-        if self.resources.contains_key(&name) {
-            return Err(WriteError::Exists(name));
+    /// state and records, at its version. Nothing is checked against the
+    /// declaration: the resource holds what earlier writes left. The storage
+    /// port (a later layer) is its caller; tests use it to apply an edge to a
+    /// stored resource.
+    pub fn restore(&mut self, resource: Resource<M>) -> Result<&Resource<M>, WriteError<M>> {
+        if self.resources.contains_key(&resource.name) {
+            return Err(WriteError::Exists(resource.name));
         }
-        let RowParts { spec, state, events, attempts, receipts } = parts;
-        let resource = Resource { name: name.clone(), spec, state, version, events, attempts, receipts };
-        Ok(self.resources.entry(name).or_insert(resource))
+        Ok(self.resources.entry(resource.name.clone()).or_insert(resource))
     }
 
     /// Applies `edge` at `now`, reading `world` through the recording handle.
-    /// On success the resource holds the next state, its version rises, and
-    /// the returned event (whose payload holds the edge and the gate's and
-    /// effect's reads) is appended to its edge events, stamped with the new
-    /// version.
+    /// On success the resource holds the next state, entered at `now` when the
+    /// label changes (otherwise at the time the label was entered), its version
+    /// rises, and the returned event (whose payload holds the edge and the
+    /// gate's and effect's reads) is appended to its edge events, stamped with
+    /// the new version. [`Resource::stored_edge`] gives the stored edge persisting it.
     pub fn apply(
         &mut self,
         name: &str,
@@ -245,10 +296,11 @@ impl<M: Machine> Home<M> {
         // The step borrowed the resource immutably; this second lookup of the
         // same name under `&mut self` cannot miss.
         let resource = self.resources.get_mut(name).ok_or_else(|| WriteError::Unknown(name.to_string()))?;
-        let from = resource.state.label();
+        let from = resource.label();
         let to = next.label();
+        let since = if from == to { resource.state.since } else { now };
         resource.version = resource.version.next();
-        resource.state = next;
+        resource.state = State::new(next, since);
         let event = EdgeEvent { edge: edge.kind(), from, to, writer: self.writer.clone(), at: now, payload: EdgePayload { edge, reads } };
         Ok(&resource.events.append(resource.version.0, event).record)
     }
@@ -271,7 +323,7 @@ impl<M: Machine> Home<M> {
 
     fn writable(&mut self, name: &str, accepts: impl Fn(&MachineDef<M>, Label<M>) -> bool) -> Result<&mut Resource<M>, WriteError<M>> {
         let resource = self.resources.get_mut(name).ok_or_else(|| WriteError::Unknown(name.to_string()))?;
-        let label = resource.state.label();
+        let label = resource.label();
         if let Some(reason) = self.definition.end_reason(label) {
             return Err(WriteError::Refused(Ended { state: label, reason }.into()));
         }
@@ -294,7 +346,8 @@ impl<M: Machine> Home<M> {
     }
 }
 
-/// Receipts are accepted under every label but an end.
+/// Receipts are accepted under every label but an end, where the stored kind
+/// keeps them ([`Machine::RECORDS_RECEIPTS`]).
 fn any_label<M: Machine>(_: &MachineDef<M>, _: Label<M>) -> bool {
-    true
+    M::RECORDS_RECEIPTS
 }

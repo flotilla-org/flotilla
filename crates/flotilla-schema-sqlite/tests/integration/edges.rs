@@ -18,7 +18,7 @@ use crate::fixtures::{
     synthetic::{
         Deliverable, DeliverableState, DossierEdge, DossierEvent, DossierState, Evidence, PlacementSnapshot, PromiseKind, PromiseSource,
     },
-    AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Payload, Pick, Referral, TerminalSession, LOCAL,
+    AgentSession, Convoy, Dossier, Ensure, Fixture, Message, Payload, Pick, Referral, Resource, TerminalSession, LOCAL,
 };
 
 fn snapshot(store: &mut Store, id: ResourceId) -> Snapshot {
@@ -162,10 +162,10 @@ fn touches_only_declared_rows<K: Fixture>(tc: &TestCase) {
 // edges are the engine's, drawn over every edge their stored states allow.
 #[hegel::test(test_cases = 60)]
 fn an_edge_touches_exactly_its_declared_rows(tc: TestCase) {
-    touches_only_declared_rows::<MessageRow>(&tc);
-    touches_only_declared_rows::<AgentSessionRow>(&tc);
-    touches_only_declared_rows::<ConvoyRow>(&tc);
-    touches_only_declared_rows::<EnsureRow>(&tc);
+    touches_only_declared_rows::<Resource<Message>>(&tc);
+    touches_only_declared_rows::<Resource<AgentSession>>(&tc);
+    touches_only_declared_rows::<Resource<Convoy>>(&tc);
+    touches_only_declared_rows::<Resource<Ensure>>(&tc);
     touches_only_declared_rows::<TerminalSession>(&tc);
     touches_only_declared_rows::<Referral>(&tc);
     touches_only_declared_rows::<Dossier>(&tc);

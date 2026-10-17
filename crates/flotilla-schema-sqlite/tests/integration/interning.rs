@@ -1,8 +1,8 @@
 use flotilla_schema::Kind;
 
-use crate::fixtures::{message, store, MessageRow, Referral, LOCAL};
+use crate::fixtures::{message, store, Message, Referral, Resource, LOCAL};
 
-fn message() -> MessageRow {
+fn message() -> Resource<Message> {
     message::sample()
 }
 
@@ -23,10 +23,10 @@ fn ids_from_a_rolled_back_transaction_are_evicted() {
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
-    assert_eq!(read.resolve(MessageRow::CODE, "first", LOCAL).expect("resolve"), Some(first.id));
-    assert_eq!(read.resolve(MessageRow::CODE, "second", LOCAL).expect("resolve"), Some(second.id));
-    assert_eq!(read.load::<MessageRow>(first.id).expect("load").expect("present").name, "first");
-    assert_eq!(read.load::<MessageRow>(second.id).expect("load").expect("present").name, "second");
+    assert_eq!(read.resolve(Resource::<Message>::CODE, "first", LOCAL).expect("resolve"), Some(first.id));
+    assert_eq!(read.resolve(Resource::<Message>::CODE, "second", LOCAL).expect("resolve"), Some(second.id));
+    assert_eq!(read.load::<Resource<Message>>(first.id).expect("load").expect("present").name, "first");
+    assert_eq!(read.load::<Resource<Message>>(second.id).expect("load").expect("present").name, "second");
 }
 
 // Behaviour: a write refused inside a transaction rewinds the ids it created with its savepoint,

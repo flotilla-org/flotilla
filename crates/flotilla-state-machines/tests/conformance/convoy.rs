@@ -19,6 +19,7 @@
 //! The immutable [`ConvoySpec`] (project, promises, priority) is the spec's
 //! `ConvoySpec` field for field.
 
+use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::convoy::{
         Abandon, Convoy, ConvoyRefusal, ConvoyRequest, ConvoySpec, ConvoyState, Deliver, Keep, MemoryConvoyWorld, Priority, Promise,
@@ -121,7 +122,7 @@ impl Conformance for ConvoyConformance {
 
     fn create(state: &Value) -> Home<Convoy> {
         let mut home = Home::new("home").expect("valid declaration");
-        home.create(NAME, admitted_request(payload(state))).expect("admitted");
+        home.create(NAME, admitted_request(payload(state)), Timestamp(0)).expect("admitted");
         home
     }
 
@@ -170,7 +171,7 @@ fn check_admissions(nodes: &[Value], report: &mut Report) {
         let probe = payload(&node["probe"]);
         let (request, result) = (&probe["request"], &probe["result"]);
         let mut home = Home::<Convoy>::new("home").expect("valid declaration");
-        let rust = match home.create(NAME, request_of(request)) {
+        let rust = match home.create(NAME, request_of(request), Timestamp(0)) {
             Ok(_) => variant("Moved", ConvoyConformance::encode(&home)),
             Err(WriteError::Refused(r)) => variant("Refused", refusal_of(r)),
             Err(other) => panic!("admission of {}: {other:?}", show(request)),

@@ -1,20 +1,20 @@
-//! The engine's Message (`flotilla_state_machines::machines::message::MessageRow`, kind code `ms`):
+//! The engine's Message (`Resource<Message>`, declared by `MessageSpec`, kind code `ms`):
 //! generators, and the worlds that let each edge pass its gate.
 
-use flotilla_schema::{Edge, Records, State, Timestamp};
+use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::message::{
-        Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageEdge, MessageState, MessageWorld, Receiver,
-        Settle, Settlement, Supersedes,
+        Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageEdge, MessageSpec, MessageState, MessageWorld,
+        Receiver, Settle, Settlement, Supersedes,
     },
-    Ref, Transport,
+    Ref, Resource, Transport,
 };
 use hegel::{generators as gs, TestCase};
 
 use super::{
     code_enum,
-    engine::{self, after, Candidate, NAME},
-    name, records, stamp_flat, timestamp, Fixture, MessageRow, Pick,
+    engine::{self, after, resource, Candidate, NAME},
+    name, records, stamp_flat, timestamp, Fixture, Pick,
 };
 
 /// Covering indexes: the label is digit 0 (base 4), a drop's reason digit 1 (base 5) and whether
@@ -73,27 +73,34 @@ fn edges(tc: &TestCase, pick: Pick) -> Vec<MessageEdge> {
     edges
 }
 
-pub fn generate(tc: &TestCase, pick: Pick) -> MessageRow {
-    MessageRow {
+/// The envelope, drawn or covered.
+pub fn spec(tc: &TestCase, pick: Pick) -> MessageSpec {
+    MessageSpec {
         inbox: name(tc),
         expectation: expectation(tc, pick),
         deadline: pick.some(tc, 8).then(|| timestamp(tc)),
         unbound_after: tc.draw(gs::integers::<i64>()),
-        state: State::new(state_value(tc, pick), timestamp(tc)),
-        edges: records(tc, pick, 3, |pick| engine::event::<Message>(tc, pick, &edges(tc, pick))),
     }
 }
 
-/// A fixed message for example tests: expecting a reply, no deadline, Pending, no history.
-pub fn sample() -> MessageRow {
-    MessageRow {
-        inbox: "inbox".into(),
-        expectation: Expectation::Reply,
-        deadline: None,
-        unbound_after: 0,
-        state: State::new(MessageState::Pending, Timestamp(0)),
-        edges: Records::new(),
-    }
+pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Message> {
+    resource(spec(tc, pick), State::new(state_value(tc, pick), timestamp(tc)))
+        .with_events(records(tc, pick, 3, |pick| engine::event::<Message>(tc, pick, &edges(tc, pick))))
+}
+
+/// A fixed envelope for example tests: expecting a reply in `inbox`, no deadline.
+pub fn sample_spec() -> MessageSpec {
+    MessageSpec { inbox: "inbox".into(), expectation: Expectation::Reply, deadline: None, unbound_after: 0 }
+}
+
+/// A fixed message for example tests: [`sample_spec`], Pending, no history.
+pub fn sample() -> Resource<Message> {
+    resource(sample_spec(), State::new(MessageState::Pending, Timestamp(0)))
+}
+
+/// [`sample`] in another inbox.
+pub fn sample_in(inbox: impl Into<String>) -> Resource<Message> {
+    sample().with_spec(MessageSpec { inbox: inbox.into(), ..sample_spec() })
 }
 
 fn boxed(world: MemoryMessageWorld) -> Box<dyn MessageWorld> {
@@ -103,7 +110,8 @@ fn boxed(world: MemoryMessageWorld) -> Box<dyn MessageWorld> {
 /// Every edge the message's state may take, each with the evidence its gate reads: a delivery
 /// with its receipt, a settlement by reply or by the outcome condition, and a drop for each
 /// reason (an expiry just past the deadline, with the consumer stream applied past it).
-pub fn candidates(tc: &TestCase, row: &MessageRow) -> Vec<Candidate<Message>> {
+pub fn candidates(tc: &TestCase, message: &Resource<Message>) -> Vec<Candidate<Message>> {
+    let spec = message.spec();
     let now = timestamp(tc);
     fn own<K: flotilla_state_machines::Kind>() -> Ref<K> {
         Ref::new(NAME)
@@ -118,7 +126,7 @@ pub fn candidates(tc: &TestCase, row: &MessageRow) -> Vec<Candidate<Message>> {
     let mut world = MemoryMessageWorld::default();
     world.reply.put(&own(), ());
     candidates.push((Settle { by: Settlement::Answered }.into(), boxed(world), now));
-    if let Expectation::Outcome { condition } = &row.expectation {
+    if let Expectation::Outcome { condition } = &spec.expectation {
         let mut world = MemoryMessageWorld::default();
         world.condition.put(condition, true);
         candidates.push((Settle { by: Settlement::OutcomeObserved }.into(), boxed(world), now));
@@ -137,10 +145,10 @@ pub fn candidates(tc: &TestCase, row: &MessageRow) -> Vec<Candidate<Message>> {
     let mut world = MemoryMessageWorld::default();
     world.supersession.put(&newer, Supersedes { older: NAME.into() });
     candidates.push((DropMessage { reason: DropReason::Superseded { by: newer } }.into(), boxed(world), now));
-    if let Some(deadline) = row.deadline {
+    if let Some(deadline) = spec.deadline {
         let past = after(deadline, tc.draw(gs::integers::<i64>().min_value(1).max_value(3)));
         let mut world = MemoryMessageWorld::default();
-        world.applied_through.put(&Ref::new(row.inbox.clone()), after(past, 1));
+        world.applied_through.put(&Ref::new(spec.inbox.clone()), after(past, 1));
         candidates.push((DropMessage { reason: DropReason::Expired }.into(), boxed(world), past));
     }
     let mut world = MemoryMessageWorld::default();
@@ -149,28 +157,28 @@ pub fn candidates(tc: &TestCase, row: &MessageRow) -> Vec<Candidate<Message>> {
     candidates
 }
 
-/// The edge the engine applies to `row` first among its candidates, led by `pick`.
-pub fn edge(tc: &TestCase, pick: Pick, row: &MessageRow) -> Option<(Edge<MessageRow>, MessageRow)> {
-    engine::drive(tc, pick, row, candidates(tc, row))
+/// The edge the engine applies to `message` first among its candidates, led by `pick`.
+pub fn edge(tc: &TestCase, pick: Pick, message: &Resource<Message>) -> Option<(Edge<Resource<Message>>, Resource<Message>)> {
+    engine::drive(tc, pick, message, candidates(tc, message))
 }
 
-impl Fixture for MessageRow {
+impl Fixture for Resource<Message> {
     const COVERING: usize = COVERING;
 
-    fn generate(tc: &TestCase, pick: Pick) -> MessageRow {
+    fn generate(tc: &TestCase, pick: Pick) -> Resource<Message> {
         generate(tc, pick)
     }
 
     /// The envelope drawn afresh; the state and edge log kept.
-    fn evolve(&self, tc: &TestCase, pick: Pick) -> MessageRow {
-        MessageRow { state: self.state.clone(), edges: self.edges.clone(), ..generate(tc, pick) }
+    fn evolve(&self, tc: &TestCase, pick: Pick) -> Resource<Message> {
+        self.clone().with_spec(spec(tc, pick))
     }
 
-    fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<MessageRow>, MessageRow)> {
+    fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<Resource<Message>>, Resource<Message>)> {
         edge(tc, pick, self)
     }
 
-    fn stamped(&self, before: Option<&MessageRow>, version: u64) -> MessageRow {
-        MessageRow { edges: stamp_flat(&self.edges, before.map(|before| &before.edges), version), ..self.clone() }
+    fn stamped(&self, before: Option<&Resource<Message>>, version: u64) -> Resource<Message> {
+        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version))
     }
 }

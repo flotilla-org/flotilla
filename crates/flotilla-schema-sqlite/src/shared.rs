@@ -1,6 +1,6 @@
 //! The shared tables every kind's tables reference.
 
-use flotilla_schema::{render_ddl_with, DdlMode, KindRegistry};
+use flotilla_schema::{render_ddl_with, DdlMode, KindRegistry, CODES_DDL};
 
 /// `strings` interns names and interned columns; `resource_identity` holds every resource's
 /// (kind, name, home), with homes filtered through `resource_identity_by_home`, and its `seq`:
@@ -73,11 +73,13 @@ pub(crate) const LOG_BY_HOME: &str = "SELECT change FROM change_log WHERE home =
 pub(crate) const SEQUENCE_LAST: &str = "SELECT last FROM home_sequence WHERE home = ?1";
 pub(crate) const OBJECT_BYTES: &str = "SELECT bytes FROM objects WHERE hash = ?1";
 
-/// The whole schema a store with these kinds holds: shared tables, then each kind in code order.
+/// The whole schema a store with these kinds holds: shared tables and `codes`, then each kind in
+/// code order, with its `codes` rows and readable views.
 pub fn schema_ddl(kinds: &KindRegistry, mode: DdlMode) -> String {
+    let shared = format!("{SHARED_DDL}{CODES_DDL}");
     let mut ddl = match mode {
-        DdlMode::IfNotExists => SHARED_DDL.to_owned(),
-        DdlMode::Create => SHARED_DDL.replace(" IF NOT EXISTS", ""),
+        DdlMode::IfNotExists => shared,
+        DdlMode::Create => shared.replace(" IF NOT EXISTS", ""),
     };
     for set in kinds.iter() {
         ddl.push_str(&render_ddl_with(set, mode));

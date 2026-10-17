@@ -18,19 +18,17 @@
 //! watermark an expiry relied on. A drop's time is the state's `since`
 //! (#3392 rulings G4 and G5).
 //!
-//! The stored kind is [`MessageRow`] (code `ms`): the envelope as columns, the
-//! state, and the edge log. A message records no attempts or receipts; the
-//! consumer's receipts are its session's.
+//! The stored kind is `Resource<Message>` (code `ms`), declared by
+//! [`MessageSpec`]: the envelope as columns, the state, and the edge log. A
+//! message records no attempts or receipts; the consumer's receipts are its
+//! session's.
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{Records, State, Stored, Timestamp};
+use flotilla_schema::{Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    edges, states, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts, Source, Table,
-    Transport, Version, WrongState,
-};
+use crate::{edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Transport, Version, WrongState};
 
 /// What would settle the message. `Nothing` settles on delivery.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
@@ -47,9 +45,20 @@ pub enum Expectation {
     },
 }
 
-/// The message as sent: the spec's envelope. Immutable.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The message as sent: the spec's envelope. Immutable. It declares the stored
+/// Message (kind code `ms`), indexed for an inbox's open messages and for open
+/// messages by deadline, the expiry sweep's read.
+#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+#[store(
+    kind = "Message",
+    code = "ms",
+    state = MessageState,
+    index(name = "open_by_inbox", eq(inbox), when(state in [Pending, Awaiting])),
+    index(name = "deadline", order(deadline), when(state in [Pending, Awaiting], deadline is_some))
+)]
 pub struct MessageSpec {
+    /// An address: plain interned text until `flotilla-address` is adopted.
+    #[store(intern)]
     pub inbox: String,
     pub expectation: Expectation,
     pub deadline: Option<Timestamp>,
@@ -525,71 +534,4 @@ fn drop_message(h: &mut Handle<'_, Message>, state: MessageState, drop: &DropMes
         _ => None,
     };
     MessageState::Dropped { reason: drop.reason.clone(), receiver: state.receiver().cloned(), watermark }
-}
-
-/// The stored Message (kind code `ms`): the envelope's fields as columns, the
-/// state, and the edge log. Indexed for an inbox's open messages and for
-/// open messages by deadline, the expiry sweep's read.
-#[derive(Clone, Debug, PartialEq, Stored)]
-#[store(
-    kind = "Message",
-    code = "ms",
-    index(name = "open_by_inbox", eq(inbox), when(state in [Pending, Awaiting])),
-    index(name = "deadline", order(deadline), when(state in [Pending, Awaiting], deadline is_some))
-)]
-pub struct MessageRow {
-    /// An address: plain interned text until `flotilla-address` is adopted.
-    #[store(intern)]
-    pub inbox: String,
-    pub expectation: Expectation,
-    pub deadline: Option<Timestamp>,
-    pub unbound_after: i64,
-    #[store(state)]
-    pub state: State<MessageState>,
-    #[store(history)]
-    pub edges: Records<EdgeEventOf<Message>>,
-}
-
-impl MessageRow {
-    /// The immutable envelope.
-    pub fn spec(&self) -> MessageSpec {
-        MessageSpec {
-            inbox: self.inbox.clone(),
-            expectation: self.expectation.clone(),
-            deadline: self.deadline,
-            unbound_after: self.unbound_after,
-        }
-    }
-}
-
-impl MachineRow for MessageRow {
-    type Machine = Message;
-    const STATE_FIELD: flotilla_schema::StateOf<Self, State<MessageState>> = MessageRow::STATE;
-    const EDGE_LOG: flotilla_schema::HistoryOf<Self, EdgeEventOf<Message>> = MessageRow::EDGES;
-
-    fn of(resource: &Resource<Message>, since: Timestamp) -> MessageRow {
-        let spec = resource.spec().clone();
-        MessageRow {
-            inbox: spec.inbox,
-            expectation: spec.expectation,
-            deadline: spec.deadline,
-            unbound_after: spec.unbound_after,
-            state: State::new(resource.state().clone(), since),
-            edges: resource.events().clone(),
-        }
-    }
-
-    fn state(&self) -> &State<MessageState> {
-        &self.state
-    }
-
-    fn parts(&self) -> RowParts<Message> {
-        RowParts {
-            spec: self.spec(),
-            state: self.state.value.clone(),
-            events: self.edges.clone(),
-            attempts: Records::new(),
-            receipts: Records::new(),
-        }
-    }
 }
