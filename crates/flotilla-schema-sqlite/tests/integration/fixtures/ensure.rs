@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 use flotilla_schema::{Edge, Records, State, Timestamp};
 use flotilla_state_machines::{
     machines::ensure::{
-        Authority, Bind, Create, Ensure, EnsureEdge, EnsureState, EnsureWorld, Fulfiller, FulfillerPhase, FulfillerStatus, GiveUp,
-        MemoryEnsureWorld, Record, Resume, Retire, Teardown, Unbind, UnbindReason,
+        Authority, Bind, Create, Ensure, EnsureState, EnsureWorld, Fulfiller, FulfillerPhase, FulfillerStatus, GiveUp, MemoryEnsureWorld,
+        Record, Resume, Retire, Teardown, Unbind, UnbindReason,
     },
     Attempt, AttemptPolicy, Cause, CauseCategory, Ref,
 };
@@ -62,25 +62,11 @@ pub fn policy(tc: &TestCase) -> AttemptPolicy {
     }
 }
 
-fn edges(tc: &TestCase) -> Vec<EnsureEdge> {
-    let fulfiller = || Ref::new(name(tc));
-    vec![
-        Record { fulfiller: fulfiller() }.into(),
-        Create { fulfiller: fulfiller() }.into(),
-        Bind { fulfiller: fulfiller() }.into(),
-        Unbind { reason: UnbindReason::Replaced, fulfiller: fulfiller() }.into(),
-        GiveUp.into(),
-        Resume { by: name(tc), authority: Ref::new(name(tc)) }.into(),
-        Retire { by: name(tc), authority: Ref::new(name(tc)), teardown: Ref::new(name(tc)) }.into(),
-    ]
-}
-
 pub fn generate(tc: &TestCase, pick: Pick) -> EnsureRow {
     EnsureRow {
         inbox: name(tc),
         policy: policy(tc),
         state: State::new(state_value(tc, pick), timestamp(tc)),
-        edges: records(tc, pick, 2, |pick| engine::event::<Ensure>(tc, pick, &edges(tc))),
         attempts: records(tc, pick.nth(2), 3, |pick| attempt(tc, pick)),
     }
 }
@@ -91,7 +77,6 @@ pub fn sample() -> EnsureRow {
         inbox: "inbox".into(),
         policy: AttemptPolicy::immediate(1),
         state: State::new(EnsureState::Unfulfilled { recorded: BTreeSet::new(), created: BTreeSet::new(), window: 0 }, Timestamp(0)),
-        edges: Records::new(),
         attempts: Records::new(),
     }
 }
@@ -153,10 +138,6 @@ impl Fixture for EnsureRow {
     }
 
     fn stamped(&self, before: Option<&EnsureRow>, version: u64) -> EnsureRow {
-        EnsureRow {
-            edges: stamp_flat(&self.edges, before.map(|before| &before.edges), version),
-            attempts: stamp_flat(&self.attempts, before.map(|before| &before.attempts), version),
-            ..self.clone()
-        }
+        EnsureRow { attempts: stamp_flat(&self.attempts, before.map(|before| &before.attempts), version), ..self.clone() }
     }
 }

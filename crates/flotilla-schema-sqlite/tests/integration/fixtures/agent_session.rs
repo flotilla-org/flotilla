@@ -4,8 +4,7 @@
 use flotilla_schema::{Edge, Records, State, Timestamp};
 use flotilla_state_machines::{
     machines::agent_session::{
-        AgentSession, AgentSessionEdge, AgentSessionState, AgentSessionWorld, Attach, Channel, Detach, End, EndReason,
-        MemoryAgentSessionWorld,
+        AgentSession, AgentSessionState, AgentSessionWorld, Attach, Channel, Detach, End, EndReason, MemoryAgentSessionWorld,
     },
     Receipt, Ref, Transport,
 };
@@ -29,16 +28,6 @@ pub fn state_value(tc: &TestCase, pick: Pick) -> AgentSessionState {
     }
 }
 
-fn edges(tc: &TestCase) -> Vec<AgentSessionEdge> {
-    let observed = || Ref::new(name(tc));
-    vec![
-        Attach { observed: observed() }.into(),
-        Detach { observed: observed() }.into(),
-        End { reason: EndReason::Completed, observed: Ref::new(name(tc)) }.into(),
-        End { reason: EndReason::Lost, observed: Ref::new(name(tc)) }.into(),
-    ]
-}
-
 pub fn receipt(tc: &TestCase, pick: Pick) -> Receipt {
     Receipt { message: name(tc), transport: code_enum(tc, pick, &[Transport::Turn, Transport::Notify, Transport::Mute]), at: timestamp(tc) }
 }
@@ -46,18 +35,13 @@ pub fn receipt(tc: &TestCase, pick: Pick) -> Receipt {
 pub fn generate(tc: &TestCase, pick: Pick) -> AgentSessionRow {
     AgentSessionRow {
         state: State::new(state_value(tc, pick), timestamp(tc)),
-        edges: records(tc, pick, 2, |pick| engine::event::<AgentSession>(tc, pick, &edges(tc))),
         receipts: records(tc, pick.nth(1), 2, |pick| receipt(tc, pick)),
     }
 }
 
 /// A live, detached session with no history.
 pub fn sample() -> AgentSessionRow {
-    AgentSessionRow {
-        state: State::new(AgentSessionState::Live { channel: Channel::Detached }, Timestamp(0)),
-        edges: Records::new(),
-        receipts: Records::new(),
-    }
+    AgentSessionRow { state: State::new(AgentSessionState::Live { channel: Channel::Detached }, Timestamp(0)), receipts: Records::new() }
 }
 
 fn boxed(world: MemoryAgentSessionWorld) -> Box<dyn AgentSessionWorld> {
@@ -102,10 +86,6 @@ impl Fixture for AgentSessionRow {
     }
 
     fn stamped(&self, before: Option<&AgentSessionRow>, version: u64) -> AgentSessionRow {
-        AgentSessionRow {
-            edges: stamp_flat(&self.edges, before.map(|before| &before.edges), version),
-            receipts: stamp_flat(&self.receipts, before.map(|before| &before.receipts), version),
-            ..self.clone()
-        }
+        AgentSessionRow { receipts: stamp_flat(&self.receipts, before.map(|before| &before.receipts), version), ..self.clone() }
     }
 }

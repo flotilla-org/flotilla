@@ -115,6 +115,11 @@ def _():
     decode_ms_per_mb = 7.4  # five-pass JSON decode
     heartbeat_wal_bytes = 91 * KB  # per Host status write today
     heartbeat_interval_s = 5
+    # One per-home log entry per durable write (#3392 G8): a Message edge's effect and payload
+    # measure 166-224 B (flotilla-schema-sqlite `bench`, 2026-10-17); with the header columns and
+    # the two index entries, ~300 B. Nothing trims the log (G9): an entry goes only when its
+    # resource is expunged, after the archive holds it.
+    log_entry_bytes = 300
     convoys_finished_per_day_per_running = 0.5  # turnover estimate
     match_fraction = 0.05  # share of events a filtered client subscribes to
     # Compact resident form: frozen workflow snapshots shared by content hash,
@@ -136,6 +141,7 @@ def _():
         heartbeat_wal_bytes,
         host_bytes,
         live_convoy_compact,
+        log_entry_bytes,
         match_fraction,
         session_bytes,
         session_compact,
@@ -269,6 +275,26 @@ def _(heartbeat_interval_s, heartbeat_wal_bytes, hosts, mo):
 
         With today's ~91 KB of WAL per Host status write, `hosts` = {hosts.value} heartbeating every {heartbeat_interval_s} s
         writes **{wal_per_day / GB:,.1f} GB of WAL per day**. Heartbeats belong in observations (latest only, not durable history).
+        """
+    )
+    return
+
+
+@app.cell
+def _(change_events, history_window_days, log_entry_bytes, mo):
+    GB = 1024**3
+    log_per_day = change_events.value * 86_400 * log_entry_bytes
+    retained = log_per_day * history_window_days.value
+    budget_rate = 10 * GB / (86_400 * history_window_days.value * log_entry_bytes)
+    mo.md(
+        f"""
+        ## Log growth
+
+        If every one of `change_events` = {change_events.value:,}/s were a durable write, the per-home log would grow by
+        **{log_per_day / GB:,.1f} GB per day** at ~{log_entry_bytes} B per entry, and hold
+        **{retained / GB:,.0f} GB** over `history_window` ({history_window_days.value} days) before archive and expunge.
+        The 10 GB disk budget holds about **{budget_rate:,.0f} durable writes/s** sustained over that window;
+        observations and heartbeats (latest only) must stay out of the log.
         """
     )
     return

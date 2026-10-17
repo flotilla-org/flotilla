@@ -4,41 +4,33 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
-| `message` | root | 22 | 8: `expectation` 2, `reason` 6 | `message_edges` (history) | `open_by_inbox` (inbox), `deadline` (deadline) |
-| `message_edges` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
-| `agent_session` | root | 6 | – | `agent_session_edges` (history), `agent_session_receipts` (history) | – |
-| `agent_session_edges` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
+| `message` | root | 22 | 8: `expectation` 2, `reason` 6 | – | `open_by_inbox` (inbox), `deadline` (deadline) |
+| `agent_session` | root | 6 | – | `agent_session_receipts` (history) | – |
 | `agent_session_receipts` | history | 6 | – | – | – |
-| `convoy` | root | 7 | – | `convoy_promises` (child), `convoy_resolution` (state data), `convoy_quota` (state data), `convoy_edges` (history) | `open_by_project` (project) |
+| `convoy` | root | 7 | – | `convoy_promises` (child), `convoy_resolution` (state data), `convoy_quota` (state data) | `open_by_project` (project) |
 | `convoy_promises` | child | 4 | – | – | – |
 | `convoy_resolution` | state data | 3 | – | – | – |
 | `convoy_quota` | state data | 3 | – | – | – |
-| `convoy_edges` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
-| `terminal_session` | root | 16 | 4: `source` 4 | `terminal_session_env` (child), `terminal_session_labels` (child), `terminal_session_events` (history), `terminal_session_attempts` (history) | `by_vessel` (vessel, ordinal), `live_by_pool` (pool) |
+| `terminal_session` | root | 16 | 4: `source` 4 | `terminal_session_env` (child), `terminal_session_labels` (child), `terminal_session_attempts` (history) | `by_vessel` (vessel, ordinal), `live_by_pool` (pool) |
 | `terminal_session_env` | child | 3 | – | – | – |
 | `terminal_session_labels` | child | 2 | – | – | – |
-| `terminal_session_events` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
 | `terminal_session_attempts` | history | 8 | 4: `outcome` 4 | – | – |
 | `vessel` | root | 3 | – | – | – |
-| `ticket` | root | 15 | – | `ticket_assignees` (state data), `ticket_notes` (state data), `ticket_edges` (history) | `open_by_queue` (queue) |
+| `ticket` | root | 15 | – | `ticket_assignees` (state data), `ticket_notes` (state data) | `open_by_queue` (queue) |
 | `ticket_assignees` | state data | 2 | – | – | – |
 | `ticket_notes` | state data | 3 | – | – | – |
-| `ticket_edges` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
-| `ensure` | root | 11 | – | `ensure_recorded` (state data), `ensure_created` (state data), `ensure_edges` (history), `ensure_attempts` (history) | `by_inbox` (inbox) |
+| `ensure` | root | 11 | – | `ensure_recorded` (state data), `ensure_created` (state data), `ensure_attempts` (history) | `by_inbox` (inbox) |
 | `ensure_recorded` | state data | 2 | – | – | – |
 | `ensure_created` | state data | 2 | – | – | – |
-| `ensure_edges` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
 | `ensure_attempts` | history | 8 | 4: `outcome` 4 | – | – |
-| `referral` | root | 25 | 12: `condition_address` 6, `subject` 6 | `referral_references` (child), `referral_edges` (history) | `by_session` (session, seq), `by_reply` (in_reply_to) |
+| `referral` | root | 25 | 12: `condition_address` 6, `subject` 6 | `referral_references` (child) | `by_session` (session, seq), `by_reply` (in_reply_to) |
 | `referral_references` | child | 24 | 22: `tag` 22 | – | – |
-| `referral_edges` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
-| `dossier` | root | 7 | – | `dossier_inputs` (child), `dossier_deliverables` (records), `dossier_edges` (history) | – |
+| `dossier` | root | 7 | – | `dossier_inputs` (child), `dossier_deliverables` (records) | – |
 | `dossier_inputs` | child | 5 | 3: `tag` 3 | `dossier_inputs_list_items` (child) | – |
 | `dossier_inputs_list_items` | child | 4 | – | – | – |
 | `dossier_deliverables` | records | 9 | 2: `source` 2 | `dossier_deliverables_evidence` (records) | – |
 | `dossier_deliverables_evidence` | records | 10 | – | `dossier_deliverables_evidence_metadata` (child) | – |
 | `dossier_deliverables_evidence_metadata` | child | 5 | – | – | – |
-| `dossier_edges` | history | 9 | – | – | `by_edge` (edge, at), `by_time` (at) |
 
 Tables wider than 30 columns:
 - none

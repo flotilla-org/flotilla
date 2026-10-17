@@ -1,17 +1,17 @@
-//! The change log: every write's row operations, and `apply` of another home's changes.
+//! The per-home log (#3392 G8): every write's event, and `apply` of another home's events.
 
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use flotilla_schema::{Hash, Kind, KindCode, RowChange, RowOp, TableRole, Value};
+use flotilla_schema::{Cause, Change, Effect, Event, Hash, Kind, KindCode, Named, Value};
 use flotilla_schema_sqlite::{Applied, Malformed, ResourceId, Snapshot, Stamp, Store, StoreError, StoreOptions, Write};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
 use crate::fixtures::{
-    message as messages, registry, store,
+    message as messages, origin, registry, store,
     synthetic::{workflow, InputValue},
     AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow as Message, Pick, Referral, TerminalSession, Ticket, LOCAL,
 };
@@ -22,8 +22,8 @@ fn replica() -> Store {
     Store::open(Connection::open_in_memory().expect("in-memory database"), REPLICA, registry()).expect("open replica")
 }
 
-/// The one change a write logged after sequence `before`.
-fn logged(write: &mut Write<'_>, before: u64) -> RowChange {
+/// The one event a write logged after sequence `before`.
+fn logged(write: &mut Write<'_>, before: u64) -> Event {
     let mut changes = write.changes_since(LOCAL, before, 10).expect("changes");
     assert_eq!(changes.len(), 1, "one log row per write: {changes:?}");
     changes.remove(0)
@@ -46,46 +46,49 @@ fn step<K: Fixture>(tc: &TestCase, write: &mut Write<'_>, live: &mut Option<Stam
             *live = Some(next);
             let change = logged(write, *last);
             assert_eq!(change.home_seq, next.version);
-            assert!(change.ops.iter().any(|op| matches!(op, RowOp::Insert { .. })), "an edge appends its event");
+            assert!(matches!(change.cause, Cause::Edge { .. }), "{change:?}");
+            assert!(matches!(change.effect.changes.first(), Some(Change::State { .. })), "an edge writes its state first");
+            assert!(change.payload.is_some(), "an edge's entry holds its document");
             change
         }
         (None, None) => {
-            let stamp = write.insert(name, &K::generate(tc, Pick::Draw)).expect("insert");
+            let stamp = write.insert(name, &K::generate(tc, Pick::Draw), &origin()).expect("insert");
             *live = Some(stamp);
             let change = logged(write, *last);
-            assert!(matches!(&change.ops[..], [.., RowOp::Insert { .. }]));
+            assert_eq!(change.cause, Cause::Create);
             assert_eq!(change.home_seq, stamp.version);
             change
         }
         (Some(stamp), None) if tc.draw(gs::booleans()) => {
             let current = write.load::<K>(stamp.id).expect("load").expect("present");
-            let next = write.update(&current, &current.value.evolve(tc, Pick::Draw)).expect("update");
+            let next = write.update(&current, &current.value.evolve(tc, Pick::Draw), &origin()).expect("update");
             *live = Some(next);
             if next == stamp {
                 assert_eq!(write.changes_since(LOCAL, *last, 10).expect("changes"), [], "a no-op logs nothing");
                 return;
             }
             let change = logged(write, *last);
-            assert_eq!(change.home_seq, next.version);
+            assert_eq!((change.cause, change.home_seq), (Cause::Edit, next.version));
             change
         }
         (Some(stamp), None) => {
-            write.delete::<K>(stamp).expect("delete");
+            write.delete::<K>(stamp, &origin()).expect("delete");
             *live = None;
             let change = logged(write, *last);
-            assert_eq!(change.ops, [RowOp::DeleteResource]);
+            assert_eq!((change.cause, change.effect.clone()), (Cause::Delete, Effect::default()));
             change
         }
     };
     assert_eq!((change.kind, change.name.as_str(), change.home.as_str()), (K::CODE, name, LOCAL));
     assert!(change.home_seq > *last);
-    // Every records or history row the write appended is stamped with its sequence.
-    let set = K::table_set();
-    for op in &change.ops {
-        let RowOp::Insert { table, values, .. } = op else { continue };
-        let role = set.tables.iter().find(|candidate| &candidate.name == table).expect("a table of the kind").role;
-        if matches!(role, TableRole::Records | TableRole::History) {
-            assert_eq!(values[0], Value::Int(i64::try_from(change.home_seq).expect("stored")), "{table} row stamped");
+    // Every write class records its writer and time: an edge its event's, the others their origin's.
+    if !matches!(change.cause, Cause::Edge { .. }) {
+        assert_eq!((change.writer.as_str(), change.at), (origin().writer.as_str(), origin().at));
+    }
+    // An appended row's stamp is the entry's sequence, never a value of the effect.
+    for change in &change.effect.changes {
+        if let Change::Append { values, .. } = change {
+            assert!(!values.contains_key("version"), "{values:?}");
         }
     }
     *last = change.home_seq;
@@ -138,18 +141,18 @@ fn string_id(store: Store, string: &str) -> (Store, i64) {
     (Store::open(conn, &home, registry()).expect("reopen"), id)
 }
 
-// Behaviour (DESIGN change log, completeness): every write appends exactly one change at its
-// version (a no-op none), and replaying a store's log in home order through `apply` into a store
-// with a different home reproduces every resource: equal snapshots (version, name, home, rows,
-// objects) although the two databases number strings and identities differently. The target
-// relays the same log and the same home sequence. Replaying again is idempotent: every change is
-// a `Duplicate` and nothing moves. Writes span every fixture kind, the engine kinds (whose
-// transitions edit state data row by row) and the synthetic ones, two names each, with
-// inserts, generated edges (events, records and history appended, fields set), spec edits,
-// deletes and re-inserts, over several transactions. Every records and history row a change
-// inserts carries the change's sequence.
+// Behaviour (#3392 G8, completeness): every write appends exactly one event at its version (a
+// no-op none), with its cause (create, edit, edge or delete), writer and time, and replaying a
+// store's log in home order through `apply` into a store with a different home reproduces every
+// resource: equal snapshots (version, name, home, rows, objects) although the two databases number
+// strings and identities differently. The target relays the same log and the same home sequence.
+// Replaying again is idempotent: every event is a `Duplicate` and nothing moves. Writes span every
+// fixture kind, the engine kinds (whose transitions edit state data row by row) and the synthetic
+// ones, two names each, with inserts, generated edges (states set as one unit, records and history
+// appended, fields set), spec edits, deletes and re-inserts, over several transactions. Appended
+// rows carry no stamp in the effect: the entry's sequence is their stamp.
 #[hegel::test]
-fn the_change_log_replays_into_another_store(tc: TestCase) {
+fn the_log_replays_into_another_store(tc: TestCase) {
     let mut source = store();
     let mut live: Vec<Option<Stamp>> = vec![None; slots().len()];
     let mut last = 0;
@@ -179,7 +182,7 @@ fn the_change_log_replays_into_another_store(tc: TestCase) {
     // The target interns its own strings and identities first, so its local ids differ.
     let mut target = replica();
     let mut write = target.write().expect("write");
-    write.insert("pre", &messages::sample()).expect("pre-existing local resource");
+    write.insert("pre", &messages::sample(), &origin()).expect("pre-existing local resource");
     write.commit().expect("commit");
 
     let results = replay(&mut source, &mut target);
@@ -208,7 +211,7 @@ fn the_change_log_replays_into_another_store(tc: TestCase) {
     assert_eq!(before, after);
 }
 
-fn first_change(store: &mut Store, home: &str) -> RowChange {
+fn first_change(store: &mut Store, home: &str) -> Event {
     store.read().expect("read").changes_since(home, 0, 1).expect("log").remove(0)
 }
 
@@ -219,9 +222,9 @@ fn first_change(store: &mut Store, home: &str) -> RowChange {
 fn apply_writes_other_homes_and_generated_writes_do_not() {
     let mut remote = Store::open(Connection::open_in_memory().expect("db"), "remote", registry()).expect("open remote");
     let mut write = remote.write().expect("write");
-    let stamp = write.insert("far", &messages::sample()).expect("insert");
+    let stamp = write.insert("far", &messages::sample(), &origin()).expect("insert");
     let current = write.load::<Message>(stamp.id).expect("load").expect("present");
-    write.update(&current, &Message { inbox: "edited".into(), ..messages::sample() }).expect("update");
+    write.update(&current, &Message { inbox: "edited".into(), ..messages::sample() }, &origin()).expect("update");
     write.commit().expect("commit");
     let changes = remote.read().expect("read").changes_since("remote", 0, 10).expect("log");
 
@@ -234,51 +237,50 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
     let current = write.load::<Message>(id).expect("load").expect("present");
     assert_eq!((current.version, current.value.inbox.as_str()), (changes[1].home_seq, "edited"));
     let next = Message { inbox: "local edit".into(), ..current.value.clone() };
-    assert!(matches!(write.update(&current, &next), Err(StoreError::NotHome { .. })));
-    assert!(matches!(write.delete::<Message>(current.stamp()), Err(StoreError::NotHome { .. })));
+    assert!(matches!(write.update(&current, &next, &origin()), Err(StoreError::NotHome { .. })));
+    assert!(matches!(write.delete::<Message>(current.stamp(), &origin()), Err(StoreError::NotHome { .. })));
 
-    let own = RowChange { home: LOCAL.into(), name: "mine".into(), ..changes[0].clone() };
+    let own = Event { home: LOCAL.into(), name: "mine".into(), ..changes[0].clone() };
     assert!(matches!(write.apply(&own), Err(StoreError::OwnHome { home }) if home == LOCAL));
     assert_eq!(write.resolve(Message::CODE, "mine", LOCAL).expect("resolve"), None, "a refused apply writes nothing");
-    let unknown = RowChange { kind: KindCode(999), ..changes[0].clone() };
+    let unknown = Event { kind: KindCode(999), ..changes[0].clone() };
     assert!(matches!(write.apply(&unknown), Err(StoreError::UnknownKind { code: KindCode(999) })));
     write.commit().expect("commit");
 }
 
-// Behaviour (DESIGN change log, self-contained changes): a change carries a `PutObject` for every
-// object it sets (any object of an inserted row, a changed object column of an updated row), even
-// one an earlier write already stored; an update leaving a frozen column alone carries none. So a
-// resource's changes apply into a store that never saw another resource's writes. A change whose
-// rows name an object it neither carries nor finds is refused with `MissingObject`, not a
-// foreign-key failure, and writes nothing.
+// Behaviour (#3392 G8, self-contained events): an effect carries every object it sets (any object
+// of an added row, a changed object field), even one an earlier write already stored; an edit
+// leaving a frozen field alone carries none. So a resource's events apply into a store that never
+// saw another resource's writes. An effect naming an object it neither carries nor finds is
+// refused with `MissingObject`, not a foreign-key failure, and writes nothing.
 #[test]
 fn every_change_carries_the_objects_its_rows_name() {
     let mut source = store();
     let mut write = source.write().expect("write");
-    write.insert("a", &Dossier::sample(0)).expect("insert a");
-    let b = write.insert("b", &Dossier::sample(0)).expect("insert b");
+    write.insert("a", &Dossier::sample(0), &origin()).expect("insert a");
+    let b = write.insert("b", &Dossier::sample(0), &origin()).expect("insert b");
     let current = write.load::<Dossier>(b.id).expect("load").expect("present");
     let root = Dossier { instruction: Some("go".into()), ..Dossier::sample(0) };
-    let b = write.update(&current, &root).expect("root update");
+    let b = write.update(&current, &root, &origin()).expect("root update");
     let current = write.load::<Dossier>(b.id).expect("load").expect("present");
     let child = Dossier { inputs: [("k".to_owned(), InputValue::Text { value: "v".into() })].into(), ..root };
-    let b = write.update(&current, &child).expect("child update");
+    let b = write.update(&current, &child, &origin()).expect("child update");
     let current = write.load::<Dossier>(b.id).expect("load").expect("present");
-    write.update(&current, &Dossier { workflow: workflow(1), ..child }).expect("frozen column update");
+    write.update(&current, &Dossier { workflow: workflow(1), ..child }, &origin()).expect("frozen column update");
     write.commit().expect("commit");
     let changes = source.read().expect("read").changes_since(LOCAL, 0, 10).expect("log");
-    let puts = |change: &RowChange| change.ops.iter().filter(|op| matches!(op, RowOp::PutObject { .. })).count();
+    let puts = |change: &Event| change.effect.objects.len();
     assert_eq!(
         changes.iter().map(puts).collect::<Vec<_>>(),
         [1, 1, 0, 0, 1],
         "two inserts, a root update keeping the snapshot, a child update, a root update replacing it"
     );
-    let RowOp::PutObject { hash, bytes } = &changes[1].ops[0] else { panic!("object first: {:?}", changes[1]) };
+    let (hash, bytes) = changes[1].effect.objects.first_key_value().expect("an object");
     assert_eq!(Hash::of(bytes), *hash);
 
     let mut target = replica();
     let mut write = target.write().expect("write");
-    let stripped = RowChange { ops: changes[1].ops[1..].to_vec(), ..changes[1].clone() };
+    let stripped = Event { effect: Effect { objects: Default::default(), ..changes[1].effect.clone() }, ..changes[1].clone() };
     assert!(matches!(write.apply(&stripped), Err(StoreError::MissingObject { hash: missing }) if missing == *hash));
     assert_eq!(write.resolve(Dossier::CODE, "b", LOCAL).expect("resolve"), None, "a refused apply writes nothing");
     for change in &changes[1..] {
@@ -289,16 +291,16 @@ fn every_change_carries_the_objects_its_rows_name() {
     assert_eq!(write.load_snapshot(id).expect("snapshot"), newest);
 }
 
-// Behaviour (DESIGN change log): `apply` verifies each `PutObject` against its hash and refuses
+// Behaviour (#3392 G8): `apply` verifies each carried object against its hash and refuses
 // tampered bytes, leaving nothing behind.
 #[test]
 fn a_tampered_object_is_refused() {
     let mut source = store();
     let mut write = source.write().expect("write");
-    write.insert("c", &Dossier::sample(1)).expect("insert");
+    write.insert("c", &Dossier::sample(1), &origin()).expect("insert");
     write.commit().expect("commit");
     let mut change = first_change(&mut source, LOCAL);
-    let Some(RowOp::PutObject { bytes, .. }) = change.ops.first_mut() else { panic!("object first: {change:?}") };
+    let bytes = change.effect.objects.values_mut().next().expect("an object");
     bytes[0] ^= 1;
 
     let mut target = replica();
@@ -307,27 +309,40 @@ fn a_tampered_object_is_refused() {
     assert_eq!(write.resolve(Dossier::CODE, "c", LOCAL).expect("resolve"), None);
 }
 
-// Behaviour: `apply` refuses ops that do not fit the kind: an unknown table, a row whose values
-// do not match the table's columns, and a root row deleted by row rather than `DeleteResource`.
+// Behaviour (#3392 G8): `apply` refuses an effect that does not fit the kind: a collection the
+// kind does not declare, a field its row does not declare, a column its field does not declare,
+// a key missing its own columns, and a delete carrying changes. Each writes nothing.
 #[test]
-fn malformed_changes_are_refused() {
+fn malformed_events_are_refused() {
     let mut source = store();
     let mut write = source.write().expect("write");
-    write.insert("m", &messages::sample()).expect("insert");
+    write.insert("m", &messages::sample(), &origin()).expect("insert");
     write.commit().expect("commit");
     let change = first_change(&mut source, LOCAL);
-    let root = Message::table_set().tables[0].name.clone();
-    let with = |op: RowOp| RowChange { ops: vec![op], ..change.clone() };
+    let with = |extra: Change| {
+        let mut effect = change.effect.clone();
+        effect.changes.push(extra);
+        Event { effect, ..change.clone() }
+    };
+    let text = |text: &str| Value::Text(text.into());
+    let named = |pairs: &[(&str, Value)]| pairs.iter().map(|(name, value)| ((*name).to_owned(), value.clone())).collect::<Named>();
     let mut target = replica();
     let mut write = target.write().expect("write");
-    let unknown = with(RowOp::Insert { table: "nope".into(), key: vec![], values: vec![] });
-    assert!(matches!(write.apply(&unknown), Err(StoreError::MalformedChange(Malformed::UnknownTable { .. }))));
-    let short = with(RowOp::Insert { table: root.clone(), key: vec![], values: vec![Value::Null] });
-    assert!(matches!(write.apply(&short), Err(StoreError::MalformedChange(Malformed::Shape { .. }))));
-    write.apply(&change).expect("the real insert applies");
-    let root_delete =
-        RowChange { home_seq: change.home_seq + 1, prev_seq: change.home_seq, ..with(RowOp::Delete { table: root, key: vec![] }) };
-    assert!(matches!(write.apply(&root_delete), Err(StoreError::MalformedChange(Malformed::RootDelete { .. }))));
+    let unknown = with(Change::Put { row: vec![], collection: "nope".into(), key: Named::new(), values: Named::new() });
+    assert!(matches!(write.apply(&unknown), Err(StoreError::MalformedEvent(Malformed::UnknownTable { .. }))));
+    let field = with(Change::Set { row: vec![], field: "nope".into(), values: Named::new() });
+    assert!(matches!(write.apply(&field), Err(StoreError::MalformedEvent(Malformed::UnknownField { .. }))));
+    let column = with(Change::Set { row: vec![], field: "inbox".into(), values: named(&[("nope", text("x"))]) });
+    assert!(matches!(write.apply(&column), Err(StoreError::MalformedEvent(Malformed::UnknownColumn { .. }))), "{:?}", write.apply(&column));
+    assert_eq!(write.resolve(Message::CODE, "m", LOCAL).expect("resolve"), None, "a refused apply writes nothing");
+    write.apply(&change).expect("the real create applies");
+    let delete = Event {
+        home_seq: change.home_seq + 1,
+        prev_seq: change.home_seq,
+        cause: Cause::Delete,
+        ..with(Change::Remove { row: vec![], collection: "nope".into(), key: Named::new() })
+    };
+    assert!(matches!(write.apply(&delete), Err(StoreError::MalformedEvent(Malformed::Shape { .. }))));
 }
 
 static FILES: AtomicUsize = AtomicUsize::new(0);
@@ -338,7 +353,7 @@ struct TempDb(PathBuf);
 impl TempDb {
     fn new() -> TempDb {
         let n = FILES.fetch_add(1, Ordering::Relaxed);
-        TempDb(std::env::temp_dir().join(format!("flotilla-schema-change-log-{}-{n}.sqlite", std::process::id())))
+        TempDb(std::env::temp_dir().join(format!("flotilla-schema-log-{}-{n}.sqlite", std::process::id())))
     }
 
     fn open(&self) -> Store {
@@ -352,7 +367,7 @@ impl Drop for TempDb {
     }
 }
 
-// Behaviour (DESIGN shared tables): the home sequence never depends on `change_log` rows, so
+// Behaviour (DESIGN shared tables): the home sequence never depends on `log` rows, so
 // deleting the oldest and the newest log rows, and reopening the store on the same file, never
 // lets a sequence repeat.
 #[test]
@@ -360,19 +375,17 @@ fn sequences_never_repeat_after_log_rows_are_deleted() {
     let db = TempDb::new();
     let mut store = db.open();
     let mut write = store.write().expect("write");
-    let versions: Vec<u64> = (0..4).map(|n| write.insert(&format!("m{n}"), &messages::sample()).expect("insert").version).collect();
+    let versions: Vec<u64> =
+        (0..4).map(|n| write.insert(&format!("m{n}"), &messages::sample(), &origin()).expect("insert").version).collect();
     write.commit().expect("commit");
     let conn = store.into_connection();
-    conn.execute(
-        "DELETE FROM change_log WHERE home_seq IN ((SELECT min(home_seq) FROM change_log), (SELECT max(home_seq) FROM change_log))",
-        [],
-    )
-    .expect("delete log rows");
+    conn.execute("DELETE FROM log WHERE home_seq IN ((SELECT min(home_seq) FROM log), (SELECT max(home_seq) FROM log))", [])
+        .expect("delete log rows");
     drop(conn);
 
     let mut store = db.open();
     let mut write = store.write().expect("write");
-    let next = write.insert("m9", &messages::sample()).expect("insert after reopen");
+    let next = write.insert("m9", &messages::sample(), &origin()).expect("insert after reopen");
     assert!(next.version > versions[3], "{} after {}", next.version, versions[3]);
     assert_eq!(
         write.changes_since(LOCAL, 0, 10).expect("log").iter().map(|change| change.home_seq).collect::<Vec<_>>(),
@@ -381,29 +394,10 @@ fn sequences_never_repeat_after_log_rows_are_deleted() {
     write.commit().expect("commit");
 }
 
-/// A change that recreates a snapshot's rows: the objects it carries, then every row in table
-/// pre-order. Test-only: replicas are seeded this way in the snapshot-plus-tail law below.
-fn seed(snapshot: &Snapshot) -> RowChange {
-    let set = registry().get(snapshot.kind).expect("registered").clone();
-    let mut ops: Vec<RowOp> =
-        snapshot.rows.objects.iter().map(|(hash, bytes)| RowOp::PutObject { hash: *hash, bytes: bytes.clone() }).collect();
-    for (table, rows) in set.tables.iter().zip(&snapshot.rows.tables) {
-        ops.extend(rows.iter().map(|row| RowOp::Insert { table: table.name.clone(), key: row.key.clone(), values: row.values.clone() }));
-    }
-    RowChange {
-        kind: snapshot.kind,
-        name: snapshot.name.clone(),
-        home: snapshot.home.clone(),
-        home_seq: snapshot.version,
-        prev_seq: 0,
-        ops,
-    }
-}
-
 fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
     let mut source = store();
     let mut write = source.write().expect("write");
-    let mut stamp = write.insert("r", &K::generate(tc, Pick::Draw)).expect("insert");
+    let mut stamp = write.insert("r", &K::generate(tc, Pick::Draw), &origin()).expect("insert");
     write.commit().expect("commit");
     let updates = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
     let at = tc.draw(gs::integers::<usize>().min_value(0).max_value(updates));
@@ -418,7 +412,7 @@ fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
             let edge = if tc.draw(gs::booleans()) { current.value.edge(tc, Pick::Draw) } else { None };
             stamp = match edge {
                 Some((edge, _)) => write.apply_edge(stamp, edge).expect("edge"),
-                None => write.update(&current, &current.value.evolve(tc, Pick::Draw)).expect("update"),
+                None => write.update(&current, &current.value.evolve(tc, Pick::Draw), &origin()).expect("update"),
             };
             write.commit().expect("commit");
         }
@@ -427,7 +421,7 @@ fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
 
     let mut target = replica();
     let mut write = target.write().expect("write");
-    write.apply(&seed(&taken)).expect("seed");
+    write.restore(&taken).expect("seed");
     let mut after = taken.version;
     loop {
         let tail = source.read().expect("read").changes(stamp.id, after, 2).expect("tail");
@@ -442,9 +436,9 @@ fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
     assert_eq!(write.load_snapshot(id).expect("snapshot"), newest);
 }
 
-// Behaviour (#3208 snapshot plus tail): a replica holding only a resource's snapshot at version v
-// (its rows and the objects they name), plus that resource's logged changes after v (read by
-// `changes`, paged two at a time), holds the newest snapshot: each tail change carries its objects.
+// Behaviour (#3208 snapshot plus tail, #3392): a replica holding only a resource's snapshot at
+// version v (its rows and the objects they name), plus that resource's logged events after v (read
+// by `changes`, paged two at a time), holds the newest snapshot: each tail event carries its objects.
 #[hegel::test]
 fn a_snapshot_plus_its_tail_is_the_newest_snapshot(tc: TestCase) {
     snapshot_plus_tail::<Message>(&tc);
@@ -458,7 +452,7 @@ fn a_snapshot_plus_its_tail_is_the_newest_snapshot(tc: TestCase) {
 }
 
 /// Every change of `store` homed at `home`, in home order.
-fn log(store: &mut Store, home: &str) -> Vec<RowChange> {
+fn log(store: &mut Store, home: &str) -> Vec<Event> {
     store.read().expect("read").changes_since(home, 0, 100).expect("log")
 }
 
@@ -469,25 +463,25 @@ fn message(inbox: &str) -> Message {
 /// Inserts `name`, then rewrites its inbox once per entry of `bodies`, in one transaction.
 fn write_history(store: &mut Store, name: &str, bodies: &[&str]) {
     let mut write = store.write().expect("write");
-    let mut stamp = write.insert(name, &message("first")).expect("insert");
+    let mut stamp = write.insert(name, &message("first"), &origin()).expect("insert");
     for body in bodies {
         let current = write.load::<Message>(stamp.id).expect("load").expect("present");
-        stamp = write.update(&current, &message(body)).expect("update");
+        stamp = write.update(&current, &message(body), &origin()).expect("update");
     }
     write.commit().expect("commit");
 }
 
-// Behaviour (#3338 review, tombstone): the identity's sequence outlives a delete, so after every
-// log row of a deleted resource is trimmed, replaying its old insert and update is still a
-// `Duplicate` and the resource stays deleted.
+// Behaviour (#3338 review, tombstone): the identity's sequence outlives a delete, so even with every
+// log row of a deleted resource removed underneath the store, replaying its old create and edit is
+// still a `Duplicate` and the resource stays deleted.
 #[test]
-fn trimming_the_log_never_resurrects_a_deleted_resource() {
+fn removed_log_rows_never_resurrect_a_deleted_resource() {
     let mut source = store();
     write_history(&mut source, "m", &["second"]);
     let mut write = source.write().expect("write");
     let id = write.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
     let current = write.load::<Message>(id).expect("load").expect("present");
-    write.delete::<Message>(current.stamp()).expect("delete");
+    write.delete::<Message>(current.stamp(), &origin()).expect("delete");
     write.commit().expect("commit");
     let changes = log(&mut source, LOCAL);
 
@@ -498,7 +492,7 @@ fn trimming_the_log_never_resurrects_a_deleted_resource() {
     }
     write.commit().expect("commit");
     let conn = target.into_connection();
-    assert_eq!(conn.execute("DELETE FROM change_log", []).expect("trim"), 3);
+    assert_eq!(conn.execute("DELETE FROM log", []).expect("remove"), 3);
     let mut target = Store::open(conn, REPLICA, registry()).expect("reopen");
     let mut write = target.write().expect("write");
     for change in &changes {
@@ -518,8 +512,8 @@ fn a_skipped_change_is_a_gap() {
     let mut write = source.write().expect("write");
     let id = write.resolve(Message::CODE, "m", LOCAL).expect("resolve").expect("present");
     let current = write.load::<Message>(id).expect("load").expect("present");
-    write.delete::<Message>(current.stamp()).expect("delete");
-    write.insert("m", &message("again")).expect("insert again");
+    write.delete::<Message>(current.stamp(), &origin()).expect("delete");
+    write.insert("m", &message("again"), &origin()).expect("insert again");
     write.commit().expect("commit");
     let changes = log(&mut source, LOCAL);
     let prev: Vec<u64> = changes.iter().map(|change| change.prev_seq).collect();
@@ -546,28 +540,20 @@ fn a_skipped_change_is_a_gap() {
     assert_eq!(target.read().expect("read").load_snapshot(id).expect("snapshot"), expected);
 }
 
-// Behaviour (#3338 review, typed refusals before any statement): a row naming an object the change
-// puts only later is `Malformed::ObjectOrder`; a root insert for a resource whose root row exists
-// is `Exists`. Neither writes anything.
+// Behaviour (#3338 review, typed refusals before any statement): a create for a resource whose
+// root row exists is `Exists`, and writes nothing.
 #[test]
-fn misordered_objects_and_duplicate_root_inserts_are_refused() {
+fn duplicate_creates_are_refused() {
     let mut source = store();
     let mut write = source.write().expect("write");
-    write.insert("c", &Dossier::sample(0)).expect("insert");
+    write.insert("c", &Dossier::sample(0), &origin()).expect("insert");
     write.commit().expect("commit");
     let insert = first_change(&mut source, LOCAL);
-    let mut ops = insert.ops.clone();
-    let put = ops.remove(0);
-    assert!(matches!(put, RowOp::PutObject { .. }));
-    ops.push(put);
-    let late = RowChange { ops, ..insert.clone() };
 
     let mut target = replica();
     let mut write = target.write().expect("write");
-    assert!(matches!(write.apply(&late), Err(StoreError::MalformedChange(Malformed::ObjectOrder { .. }))));
-    assert_eq!(write.resolve(Dossier::CODE, "c", LOCAL).expect("resolve"), None);
     write.apply(&insert).expect("insert");
-    let again = RowChange { home_seq: insert.home_seq + 1, prev_seq: insert.home_seq, ..insert.clone() };
+    let again = Event { home_seq: insert.home_seq + 1, prev_seq: insert.home_seq, ..insert.clone() };
     assert!(matches!(write.apply(&again), Err(StoreError::Exists { name, .. }) if name == "c"));
     let id = write.resolve(Dossier::CODE, "c", LOCAL).expect("resolve").expect("present");
     assert_eq!(write.load::<Dossier>(id).expect("load").expect("present").version, insert.home_seq);
@@ -597,7 +583,7 @@ fn a_refused_apply_leaves_no_cached_identity() {
     let Applied::Applied(a_stamp) = write.apply(&a[0]).expect("a") else { panic!("a applies") };
     assert_ne!(a_stamp.id, b_stamp.id);
     // A never-seen identity whose first change is not an insert: no gap (0), but nothing to update.
-    let headless = RowChange { prev_seq: 0, ..c[1].clone() };
+    let headless = Event { prev_seq: 0, ..c[1].clone() };
     assert!(matches!(write.apply(&headless), Err(StoreError::NotFound { .. })));
     write.commit().expect("commit");
 
@@ -637,16 +623,16 @@ fn change_pages_respect_their_limit() {
 fn a_reused_home_sequence_is_refused() {
     let mut source = store();
     let mut write = source.write().expect("write");
-    write.insert("a", &message("a")).expect("insert");
+    write.insert("a", &message("a"), &origin()).expect("insert");
     write.commit().expect("commit");
     let change = first_change(&mut source, LOCAL);
     let mut target = replica();
     let mut write = target.write().expect("write");
     assert!(matches!(write.apply(&change), Ok(Applied::Applied(_))));
-    let reused = RowChange { name: "b".into(), ..change.clone() };
+    let reused = Event { name: "b".into(), ..change.clone() };
     let refused = write.apply(&reused);
     assert!(
-        matches!(&refused, Err(StoreError::MalformedChange(Malformed::ReusedSequence { home_seq, .. })) if *home_seq == change.home_seq),
+        matches!(&refused, Err(StoreError::MalformedEvent(Malformed::ReusedSequence { home_seq, .. })) if *home_seq == change.home_seq),
         "{refused:?}"
     );
     assert_eq!(write.resolve(Message::CODE, "b", LOCAL).expect("resolve"), None);
@@ -661,7 +647,9 @@ fn change_pages_respect_their_byte_budget() {
     let mut source = store();
     write_history(&mut source, "m", &["second", "third"]);
     let changes = log(&mut source, LOCAL);
-    let sizes: Vec<usize> = changes.iter().map(|change| change.encode().expect("encode").len()).collect();
+    // An entry's size is its stored effect and payload.
+    let sizes: Vec<usize> =
+        changes.iter().map(|change| change.effect.encode().expect("encode").len() + change.payload.as_ref().map_or(0, Vec::len)).collect();
     let with_budget = |store: Store, bytes: usize| {
         let options = StoreOptions { change_page_bytes: bytes, ..StoreOptions::default() };
         Store::open_with(store.into_connection(), LOCAL, registry(), options).expect("reopen")
@@ -707,8 +695,8 @@ fn refusals_and_duplicates_create_no_rows() {
     let (mut target, before) = row_counts(replica());
     let mut write = target.write().expect("write");
     assert!(matches!(write.apply(&changes[1]), Err(StoreError::Gap { expected: 0, .. })));
-    let zero = RowChange { home_seq: 0, ..changes[0].clone() };
-    assert!(matches!(write.apply(&zero), Err(StoreError::MalformedChange(Malformed::Sequence { home_seq: 0 }))));
+    let zero = Event { home_seq: 0, ..changes[0].clone() };
+    assert!(matches!(write.apply(&zero), Err(StoreError::MalformedEvent(Malformed::Sequence { home_seq: 0 }))));
     write.commit().expect("commit");
     let (mut target, after) = row_counts(target);
     assert_eq!(after, before, "a refused never-seen name writes no row, not even one rolled back");
@@ -717,9 +705,9 @@ fn refusals_and_duplicates_create_no_rows() {
     for change in &changes {
         write.apply(change).expect("apply");
     }
-    let stale = RowChange { prev_seq: 999, ..changes[1].clone() };
+    let stale = Event { prev_seq: 999, ..changes[1].clone() };
     assert!(matches!(write.apply(&stale).expect("duplicate"), Applied::Duplicate(_)));
-    let stale_first = RowChange { prev_seq: 7, ..changes[0].clone() };
+    let stale_first = Event { prev_seq: 7, ..changes[0].clone() };
     assert!(matches!(write.apply(&stale_first).expect("duplicate"), Applied::Duplicate(_)));
     write.commit().expect("commit");
 }

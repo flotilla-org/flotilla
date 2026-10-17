@@ -1,4 +1,4 @@
-error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, index and labels (types)
+error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state, alias and code (fields and variants) and kind, code, index, labels and edges (types)
  --> tests/ui/flatten_non_flat.rs:9:10
   |
 9 | #[derive(Stored)]
@@ -11,7 +11,7 @@ help: the trait `Flat` is not implemented for `Inbox`
   | ^^^^^^^^^^^^
   = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, index and labels (types)
+error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state, alias and code (fields and variants) and kind, code, index, labels and edges (types)
   --> tests/ui/flatten_non_flat.rs:11:8
    |
 11 | struct Ticket {
@@ -44,7 +44,7 @@ note: required by a bound in `Kind`
    |                 ^^^^^^^ required by this bound in `Kind`
    = note: this error originates in the derive macro `Stored` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state and code (fields and variants) and kind, code, index and labels (types)
+error[E0277]: `Inbox` cannot be flattened: the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state, alias and code (fields and variants) and kind, code, index, labels and edges (types)
   --> tests/ui/flatten_non_flat.rs:9:10
    |
  9 | #[derive(Stored)]

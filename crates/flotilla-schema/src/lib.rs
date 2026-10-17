@@ -43,11 +43,11 @@ extern crate self as flotilla_schema;
 
 #[doc(hidden)]
 pub mod adapt;
-mod change;
 mod codec;
 mod ddl;
 mod descriptor;
 mod edge;
+mod event;
 mod frozen;
 mod history;
 mod inline;
@@ -62,7 +62,6 @@ mod traits;
 mod value;
 mod view;
 
-pub use change::{ChangeError, RowChange, RowOp, CHANGE_LIMITS};
 pub use codec::{DecodeError, Decoder, EncodeError, Encoder};
 pub use ddl::{quote_ident, render_ddl, render_ddl_with, DdlMode};
 pub use descriptor::{
@@ -70,9 +69,10 @@ pub use descriptor::{
     RECORD_VERSION, RESERVED_CHILD_COLUMNS, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES,
 };
 pub use edge::{
-    AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf, RowPath,
-    StateOf,
+    AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeHeader, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf,
+    RowPath, StateOf,
 };
+pub use event::{Cause, Change, Effect, Event, EventError, Named, Origin, Step, LOG_LIMITS};
 pub use flotilla_schema_derive::Stored;
 pub use frozen::{Freezable, Frozen};
 pub use history::{EdgeEvent, Labelled};

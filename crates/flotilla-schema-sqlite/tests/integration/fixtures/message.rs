@@ -1,11 +1,11 @@
 //! The engine's Message (`flotilla_state_machines::machines::message::MessageRow`, kind code 1):
 //! generators, and the worlds that let each edge pass its gate.
 
-use flotilla_schema::{Edge, Records, State, Timestamp};
+use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::message::{
-        Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageEdge, MessageState, MessageWorld, Receiver,
-        Settle, Settlement, Supersedes,
+        Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageState, MessageWorld, Receiver, Settle,
+        Settlement, Supersedes,
     },
     Ref, Transport,
 };
@@ -14,7 +14,7 @@ use hegel::{generators as gs, TestCase};
 use super::{
     code_enum,
     engine::{self, after, Candidate, NAME},
-    name, records, stamp_flat, timestamp, Fixture, MessageRow, Pick,
+    name, timestamp, Fixture, MessageRow, Pick,
 };
 
 /// Covering indexes: the label is digit 0 (base 4), a drop's reason digit 1 (base 5) and whether
@@ -63,17 +63,6 @@ pub fn state_value(tc: &TestCase, pick: Pick) -> MessageState {
     }
 }
 
-/// One edge of every kind and argument variant, for generated history.
-fn edges(tc: &TestCase, pick: Pick) -> Vec<MessageEdge> {
-    let mut edges = vec![
-        Deliver { receiver: receiver(tc), transport: transport(tc, pick) }.into(),
-        Settle { by: Settlement::Answered }.into(),
-        Settle { by: Settlement::OutcomeObserved }.into(),
-    ];
-    edges.extend((0..5).map(|n| MessageEdge::from(DropMessage { reason: reason(tc, Pick::Cover(n * 4)) })));
-    edges
-}
-
 pub fn generate(tc: &TestCase, pick: Pick) -> MessageRow {
     MessageRow {
         inbox: name(tc),
@@ -81,7 +70,6 @@ pub fn generate(tc: &TestCase, pick: Pick) -> MessageRow {
         deadline: pick.some(tc, 8).then(|| timestamp(tc)),
         unbound_after: tc.draw(gs::integers::<i64>()),
         state: State::new(state_value(tc, pick), timestamp(tc)),
-        edges: records(tc, pick, 3, |pick| engine::event::<Message>(tc, pick, &edges(tc, pick))),
     }
 }
 
@@ -93,7 +81,6 @@ pub fn sample() -> MessageRow {
         deadline: None,
         unbound_after: 0,
         state: State::new(MessageState::Pending, Timestamp(0)),
-        edges: Records::new(),
     }
 }
 
@@ -162,16 +149,16 @@ impl Fixture for MessageRow {
         generate(tc, pick)
     }
 
-    /// The envelope drawn afresh; the state and edge log kept.
+    /// The envelope drawn afresh; the state kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> MessageRow {
-        MessageRow { state: self.state.clone(), edges: self.edges.clone(), ..generate(tc, pick) }
+        MessageRow { state: self.state.clone(), ..generate(tc, pick) }
     }
 
     fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<MessageRow>, MessageRow)> {
         edge(tc, pick, self)
     }
 
-    fn stamped(&self, before: Option<&MessageRow>, version: u64) -> MessageRow {
-        MessageRow { edges: stamp_flat(&self.edges, before.map(|before| &before.edges), version), ..self.clone() }
+    fn stamped(&self, _before: Option<&MessageRow>, _version: u64) -> MessageRow {
+        self.clone()
     }
 }

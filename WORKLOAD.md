@@ -95,6 +95,13 @@ The checks:
   `running_convoys`.
 - **Delivery, naive** (one store read per event per watcher) = `change_events` x
   `view_clients` = 50k / 5M store reads per second. Target: zero.
+- **Log growth** (#3392: one per-home log entry per durable write, ~300 B with its header and
+  index entries, from a Message edge's measured 166-224 B of effect and payload; nothing trims
+  the log, and entries go only on expunge after archiving): if every `change_events` write were
+  durable, ~24 GB / ~240 GB per day, and ~170 GB / ~1.7 TB over `history_window`. **Fails** the
+  10 GB disk budget unless durable writes stay near 60/s sustained over the window: observations
+  and heartbeats (latest only) stay out of the log, and finished resources archive and expunge
+  on time.
 - **Heartbeat WAL at today's amplification** (~91 KB per Host status write, every 5 s) =
   ~75 GB / ~750 GB per day. Heartbeats are observations: latest value only, not durable
   history.

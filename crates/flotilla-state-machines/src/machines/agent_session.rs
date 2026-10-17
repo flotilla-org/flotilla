@@ -13,8 +13,8 @@ use flotilla_schema::{Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    edges, states, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Receipt, Ref, Resource, RowParts, Source,
-    Table, Version, WrongState,
+    edges, states, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Receipt, Ref, Resource, RowParts, Source, Table, Version,
+    WrongState,
 };
 
 /// Whether a channel to a Live session is attached (spec `Channel`).
@@ -230,12 +230,10 @@ fn gate_end(h: &mut Handle<'_, AgentSession>, edge: &End) -> Result<(), AgentSes
 /// The stored AgentSession (kind code 3): the state, the edge log and the
 /// receipts. The session's name is its identity, so it has no spec columns.
 #[derive(Clone, Debug, PartialEq, Stored)]
-#[store(kind = "AgentSession", code = 3)]
+#[store(kind = "AgentSession", code = 3, edges = AgentSessionEdgeKind)]
 pub struct AgentSessionRow {
     #[store(state)]
     pub state: State<AgentSessionState>,
-    #[store(history)]
-    pub edges: Records<EdgeEventOf<AgentSession>>,
     #[store(history)]
     pub receipts: Records<Receipt>,
 }
@@ -243,14 +241,9 @@ pub struct AgentSessionRow {
 impl MachineRow for AgentSessionRow {
     type Machine = AgentSession;
     const STATE_FIELD: flotilla_schema::StateOf<Self, State<AgentSessionState>> = AgentSessionRow::STATE;
-    const EDGE_LOG: flotilla_schema::HistoryOf<Self, EdgeEventOf<AgentSession>> = AgentSessionRow::EDGES;
 
     fn of(resource: &Resource<AgentSession>, since: Timestamp) -> AgentSessionRow {
-        AgentSessionRow {
-            state: State::new(resource.state().clone(), since),
-            edges: resource.events().clone(),
-            receipts: resource.receipts().clone(),
-        }
+        AgentSessionRow { state: State::new(resource.state().clone(), since), receipts: resource.receipts().clone() }
     }
 
     fn state(&self) -> &State<AgentSessionState> {
@@ -261,7 +254,7 @@ impl MachineRow for AgentSessionRow {
         RowParts {
             spec: (),
             state: self.state.value.clone(),
-            events: self.edges.clone(),
+            events: Records::new(),
             attempts: Records::new(),
             receipts: self.receipts.clone(),
         }

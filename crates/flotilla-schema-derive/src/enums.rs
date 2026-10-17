@@ -49,6 +49,9 @@ pub(crate) fn expand(input: &DeriveInput, data: &DataEnum, type_attrs: TypeAttrs
     if let Some(index) = type_attrs.indexes.first() {
         return Err(refuse(index, "`index` belongs on a kind or a part struct"));
     }
+    if let Some(edges) = &type_attrs.edges {
+        return Err(refuse(edges, "`edges` belongs on a kind, whose log entries it constrains"));
+    }
     if data.variants.is_empty() {
         return Err(refuse(&input.ident, "an enum without variants has no values to store"));
     }

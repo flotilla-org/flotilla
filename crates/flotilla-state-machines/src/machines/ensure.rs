@@ -21,8 +21,8 @@ use flotilla_schema::{Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attempt, edges, states, Attempt, AttemptPolicy, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref,
-    Resource, RowParts, Source, Table, Version, WrongState,
+    attempt, edges, states, Attempt, AttemptPolicy, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref, Resource, RowParts,
+    Source, Table, Version, WrongState,
 };
 
 /// Fulfiller references, in name order. Fulfiller names are addresses: plain
@@ -482,7 +482,7 @@ fn gate_retire(h: &mut Handle<'_, Ensure>, edge: &Retire) -> Result<(), EnsureRe
 /// the state, the edge log and the attempts. Indexed by inbox, the read a
 /// binding change makes.
 #[derive(Clone, Debug, PartialEq, Stored)]
-#[store(kind = "Ensure", code = 9, index(name = "by_inbox", eq(inbox)))]
+#[store(kind = "Ensure", code = 9, edges = EnsureEdgeKind, index(name = "by_inbox", eq(inbox)))]
 pub struct EnsureRow {
     /// An address: plain interned text until `flotilla-address` is adopted.
     #[store(intern)]
@@ -491,8 +491,6 @@ pub struct EnsureRow {
     pub policy: AttemptPolicy,
     #[store(state)]
     pub state: State<EnsureState>,
-    #[store(history)]
-    pub edges: Records<EdgeEventOf<Ensure>>,
     #[store(history)]
     pub attempts: Records<Attempt>,
 }
@@ -506,7 +504,6 @@ impl EnsureRow {
 impl MachineRow for EnsureRow {
     type Machine = Ensure;
     const STATE_FIELD: flotilla_schema::StateOf<Self, State<EnsureState>> = EnsureRow::STATE;
-    const EDGE_LOG: flotilla_schema::HistoryOf<Self, EdgeEventOf<Ensure>> = EnsureRow::EDGES;
 
     fn of(resource: &Resource<Ensure>, since: Timestamp) -> EnsureRow {
         let spec = resource.spec().clone();
@@ -514,7 +511,6 @@ impl MachineRow for EnsureRow {
             inbox: spec.inbox,
             policy: spec.policy,
             state: State::new(resource.state().clone(), since),
-            edges: resource.events().clone(),
             attempts: resource.attempts().clone(),
         }
     }
@@ -527,7 +523,7 @@ impl MachineRow for EnsureRow {
         RowParts {
             spec: self.spec(),
             state: self.state.value.clone(),
-            events: self.edges.clone(),
+            events: Records::new(),
             attempts: self.attempts.clone(),
             receipts: Records::new(),
         }

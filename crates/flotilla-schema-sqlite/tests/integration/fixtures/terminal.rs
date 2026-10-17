@@ -1,7 +1,7 @@
 //! `TerminalSession`: a lifecycle kind (`flotilla_state_machines::machines::lifecycle`) with a
 //! concrete request, declared here because a lifecycle kind's stored row belongs to whoever owns
-//! its request (#3319). The engine supplies the storable state (`LifecycleState`) and history
-//! (`LifecycleEvent`, `Attempt`); the request's columns are this test kind's own, transcribed from
+//! its request (#3319). The engine supplies the storable state (`LifecycleState`) and attempt
+//! history (`Attempt`); the request's columns are this test kind's own, transcribed from
 //! the #3208 §4.3 sketch:
 //! - `vessel` is a reference to the `Vessel` kind (a target kind of the test registry), so a
 //!   lifecycle row also exercises references to kinds and their identity rows;
@@ -11,13 +11,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{Edge, Frozen, HistoryOf, Records, Ref, State, StateOf, Stored, Timestamp};
+use flotilla_schema::{Edge, Frozen, Records, Ref, State, StateOf, Stored, Timestamp};
 use flotilla_state_machines::{
     machines::lifecycle::{
-        Absence, GiveUp, Lifecycle, LifecycleEdge, LifecycleEvent, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld,
-        Observed, Realisation, Realise, Release, Teardown, Vanish,
+        Absence, GiveUp, Lifecycle, LifecycleEdgeKind, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld, Observed,
+        Realisation, Realise, Release, Teardown, Vanish,
     },
-    Attempt, EdgeEventOf, MachineRow, Resource, RowParts,
+    Attempt, MachineRow, Resource, RowParts,
 };
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
@@ -62,6 +62,7 @@ pub struct TerminalRequest {
 #[store(
     kind = "TerminalSession",
     code = 6,
+    edges = LifecycleEdgeKind,
     index(name = "by_vessel", eq(vessel), order(ordinal)),
     index(name = "live_by_pool", eq(pool), when(state in [Requested, Realised]))
 )]
@@ -80,8 +81,6 @@ pub struct TerminalSession {
     pub labels: BTreeSet<String>,
     #[store(state)]
     pub state: State<LifecycleState>,
-    #[store(history)]
-    pub events: Records<LifecycleEvent>,
     #[store(history)]
     pub attempts: Records<Attempt>,
 }
@@ -123,7 +122,6 @@ impl TerminalSession {
 impl MachineRow for TerminalSession {
     type Machine = Lifecycle<Terminal>;
     const STATE_FIELD: StateOf<Self, State<LifecycleState>> = TerminalSession::STATE;
-    const EDGE_LOG: HistoryOf<Self, EdgeEventOf<Lifecycle<Terminal>>> = TerminalSession::EVENTS;
 
     fn of(resource: &Resource<Lifecycle<Terminal>>, since: Timestamp) -> TerminalSession {
         let TerminalRequest { vessel, role, ordinal, pool, cwd, source, env, labels } = resource.spec().clone();
@@ -137,7 +135,6 @@ impl MachineRow for TerminalSession {
             env,
             labels,
             state: State::new(resource.state().clone(), since),
-            events: resource.events().clone(),
             attempts: resource.attempts().clone(),
         }
     }
@@ -150,7 +147,7 @@ impl MachineRow for TerminalSession {
         RowParts {
             spec: self.request(),
             state: self.state.value.clone(),
-            events: self.events.clone(),
+            events: Records::new(),
             attempts: self.attempts.clone(),
             receipts: Records::new(),
         }
@@ -167,15 +164,6 @@ pub fn state_value(tc: &TestCase, pick: Pick) -> LifecycleState {
         2 => LifecycleState::Gone,
         _ => LifecycleState::GaveUp { cause: cause(tc, pick) },
     }
-}
-
-fn edges(tc: &TestCase, pick: Pick) -> Vec<LifecycleEdge> {
-    vec![
-        Realise { identity: text(tc), observed: flotilla_state_machines::Ref::new(name(tc)) }.into(),
-        Release { teardown: flotilla_state_machines::Ref::new(name(tc)) }.into(),
-        Vanish { observed: flotilla_state_machines::Ref::new(name(tc)) }.into(),
-        GiveUp { cause: cause(tc, pick) }.into(),
-    ]
 }
 
 /// Drawn keys collide (and so dedupe); covering keys are distinct.
@@ -209,7 +197,6 @@ pub fn generate(tc: &TestCase, pick: Pick) -> TerminalSession {
         env: map(tc, pick, 3, |_| text(tc)),
         labels: list(tc, pick, 3, |_| key(tc)).into_iter().collect(),
         state: State::new(state_value(tc, pick), timestamp(tc)),
-        events: records(tc, pick, 3, |pick| engine::event::<Lifecycle<Terminal>>(tc, pick, &edges(tc, pick))),
         attempts: records(tc, pick.nth(1), 3, |pick| attempt(tc, pick)),
     }
 }
@@ -252,9 +239,9 @@ impl Fixture for TerminalSession {
         generate(tc, pick)
     }
 
-    /// The request drawn afresh; the state, events and attempts kept.
+    /// The request drawn afresh; the state and attempts kept.
     fn evolve(&self, tc: &TestCase, pick: Pick) -> TerminalSession {
-        TerminalSession { state: self.state.clone(), events: self.events.clone(), attempts: self.attempts.clone(), ..generate(tc, pick) }
+        TerminalSession { state: self.state.clone(), attempts: self.attempts.clone(), ..generate(tc, pick) }
     }
 
     fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<TerminalSession>, TerminalSession)> {
@@ -262,10 +249,6 @@ impl Fixture for TerminalSession {
     }
 
     fn stamped(&self, before: Option<&TerminalSession>, version: u64) -> TerminalSession {
-        TerminalSession {
-            events: stamp_flat(&self.events, before.map(|before| &before.events), version),
-            attempts: stamp_flat(&self.attempts, before.map(|before| &before.attempts), version),
-            ..self.clone()
-        }
+        TerminalSession { attempts: stamp_flat(&self.attempts, before.map(|before| &before.attempts), version), ..self.clone() }
     }
 }

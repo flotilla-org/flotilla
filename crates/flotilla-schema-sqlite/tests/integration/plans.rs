@@ -6,10 +6,9 @@
 //! foreign-key enforcement; every foreign key the runtime can trigger points at a primary key or
 //! at a child table whose primary key starts with the referencing columns.
 
-use flotilla_schema::quote_ident;
 use rusqlite::{types::Value as SqlValue, Connection};
 
-use crate::fixtures::{registry, store};
+use crate::fixtures::store;
 
 /// The detail column of each plan row.
 fn plan(conn: &Connection, sql: &str) -> Vec<String> {
@@ -40,6 +39,14 @@ fn every_prepared_statement_searches_by_key() {
     for (label, sql) in &statements {
         let rows = plan(&conn, sql);
         let mut problems = Vec::new();
+        // Removing an identity checks every foreign key that references it, and a child table's
+        // reference column has no index of its own, so the check scans that table. Only an
+        // expunge removes an identity, once per resource; `identity_removal_checks_references`
+        // pins which tables it scans.
+        let rows: Vec<String> = match label.as_str() {
+            "identity_delete" => rows.into_iter().filter(|row| !row.starts_with("SCAN")).collect(),
+            _ => rows,
+        };
         if rows.iter().any(|row| row.split_whitespace().any(|word| word == "SCAN")) {
             problems.push("scans");
         }
@@ -79,18 +86,23 @@ fn the_enumeration_covers_every_kind_and_index() {
     let labels: Vec<&str> = statements.iter().map(|(label, _)| label.as_str()).collect();
     for expected in [
         "string_id",
+        "log_append",
         "log_by_home",
+        "log_by_resource",
+        "log_about_first",
+        "log_about_after",
+        "log_expunge",
+        "log_expunged_after",
+        "identity_delete",
         "message select",
-        "message_edges select",
-        "message_edges insert",
         "message update version",
         "message set state",
         "message set receiver",
         "message set state state",
         "message label state",
-        "message_edges last position",
         "agent_session_receipts insert",
-        "convoy_resolution update",
+        "agent_session_receipts last position",
+        "convoy_resolution upsert",
         "convoy_quota insert",
         "convoy_quota delete",
         "convoy label state",
@@ -117,7 +129,7 @@ fn the_enumeration_covers_every_kind_and_index() {
         "ticket set reason",
         "ticket label state",
         "ticket_assignees insert",
-        "ticket_notes update",
+        "ticket_notes upsert",
         "ticket_notes delete",
         "index ticket_open_by_queue first",
     ] {
@@ -125,72 +137,53 @@ fn the_enumeration_covers_every_kind_and_index() {
     }
     assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 9);
     assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 9);
-    assert!(!labels.iter().any(|label| label.starts_with("message_edges set ")), "history rows are never set");
+    assert!(!labels.iter().any(|label| label.starts_with("agent_session_receipts set ")), "history rows are never set");
+    assert!(!labels.iter().any(|label| label.contains("_edges")), "no kind has an edge-log table");
     assert!(
         !labels.iter().any(|label| label.starts_with("convoy_promises ") && label.ends_with(" last position")),
         "spec collections take no positions from edges"
     );
     assert!(
-        !labels.iter().any(|label| label.starts_with("ensure_recorded ") && label.ends_with(" update")),
-        "a set's rows are inserted and deleted, never updated"
+        !labels.iter().any(|label| label.ends_with(" update")),
+        "rows change field by field (`set`) or are put by key (`upsert`), never updated whole"
     );
 }
 
-// Behaviour (#3320 ruling of 2026-10-15): an edge log's indexes serve the reads history answers.
-// Events of one edge in a time range, and every event in a time range across resources, each
-// search their own index in its order: no scan and no temporary sort. (One resource's log in order
-// is its primary key, which loading already searches.) The reads have no query API yet, so the
-// statements are rendered here from the descriptor.
+// Behaviour (#3392 A1): removing an identity (an expunge) checks each foreign key referencing it:
+// root rows and root reference columns by key or declared index, the log by its own indexes, and
+// child tables' reference columns, which have no index, by a scan of that table. The scanned tables
+// are pinned here, so a new unindexed reference column is a decision rather than a surprise.
 #[test]
-fn edge_log_indexes_serve_history_reads() {
-    let (conn, _) = statements();
-    let mut planned = Vec::new();
-    for set in registry().iter() {
-        for index in set.indexes.iter().filter(|index| index.table != set.tables[0].name) {
-            let table = set.tables.iter().find(|table| table.name == index.table).expect("the index's table");
-            let key: Vec<String> =
-                ["owner"].into_iter().chain(table.key.iter().map(|column| column.name.as_str())).map(quote_ident).collect();
-            let order: Vec<String> = index.order.iter().map(|column| quote_ident(column)).collect();
-            let mut terms: Vec<String> = index.eq.iter().map(|column| format!("{} = ?", quote_ident(column))).collect();
-            terms.push(format!("{} >= ? AND {} < ?", order[0], order[0]));
-            let sql = format!(
-                "SELECT {} FROM {} WHERE {} ORDER BY {}, {} LIMIT ?",
-                key.join(", "),
-                quote_ident(&table.name),
-                terms.join(" AND "),
-                order.join(", "),
-                key.join(", ")
-            );
-            let rows = plan(&conn, &sql);
-            let own = format!("USING COVERING INDEX {} (", index.object_name());
-            assert!(
-                rows.iter().any(|row| row.starts_with("SEARCH") && row.contains(&own))
-                    && !rows.iter().any(|row| row.contains("SCAN") || row.contains("TEMP B-TREE")),
-                "{sql}: {rows:?}"
-            );
-            planned.push(index.object_name());
-        }
-    }
-    planned.sort();
-    assert_eq!(
-        planned,
-        [
-            "agent_session_edges_by_edge",
-            "agent_session_edges_by_time",
-            "convoy_edges_by_edge",
-            "convoy_edges_by_time",
-            "dossier_edges_by_edge",
-            "dossier_edges_by_time",
-            "ensure_edges_by_edge",
-            "ensure_edges_by_time",
-            "message_edges_by_edge",
-            "message_edges_by_time",
-            "referral_edges_by_edge",
-            "referral_edges_by_time",
-            "terminal_session_events_by_edge",
-            "terminal_session_events_by_time",
-            "ticket_edges_by_edge",
-            "ticket_edges_by_time",
-        ]
+fn identity_removal_checks_references() {
+    let (conn, statements) = statements();
+    let sql = &statements.iter().find(|(label, _)| label == "identity_delete").expect("a shared statement").1;
+    let rows = plan(&conn, sql);
+    let mut scanned: Vec<&str> = rows.iter().filter_map(|row| row.strip_prefix("SCAN ")).collect();
+    scanned.dedup();
+    assert_eq!(scanned, ["referral_references"], "{rows:?}");
+    assert!(
+        rows.iter().any(|row| row.contains("log_about (about=?)")) && rows.iter().any(|row| row.contains("log_by_resource (resource=?)"))
     );
+}
+
+// Behaviour (#3392 G8, G11): the log's reads each search their own index in its order, with no scan
+// and no temporary sort: a resource's history by `log_by_resource`, a home's entries by the primary
+// key, the entries about a master by the partial `log_about`, and the expunge's removal of a
+// resource's entries by `log_by_resource`.
+#[test]
+fn log_reads_search_their_own_index() {
+    let (conn, statements) = statements();
+    let expected = [
+        ("log_by_resource", "USING INDEX log_by_resource (resource=? AND home_seq>?)"),
+        ("log_by_home", "USING INDEX sqlite_autoindex_log_1 (home=? AND home_seq>?)"),
+        ("log_about_first", "USING INDEX log_about (about=?)"),
+        ("log_about_after", "USING INDEX log_about (about=? AND at>?)"),
+        ("log_expunge", "USING COVERING INDEX log_by_resource (resource=?)"),
+    ];
+    for (label, index) in expected {
+        let sql = &statements.iter().find(|(candidate, _)| candidate == label).expect("a shared statement").1;
+        let rows = plan(&conn, sql);
+        assert!(rows.iter().any(|row| row.starts_with("SEARCH") && row.contains(index)), "{label}: {rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("SCAN") || row.contains("TEMP B-TREE")), "{label}: {rows:?}");
+    }
 }
