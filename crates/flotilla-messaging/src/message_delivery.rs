@@ -1,5 +1,8 @@
 // Receiver-side batching and durable transport accounting.
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{btree_map::Entry, BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -10,10 +13,12 @@ use crate::{
         delivery_acceptance_evidence, delivery_demand, delivery_demand_name, delivery_retry_backoff, delivery_retry_exhausted,
         DELIVERY_HOLD_FOR, DELIVERY_MAX_ATTEMPTS,
     },
-    message_expectation_open, message_supersedes, ControllerRetry, ControllerRetryDisposition, Demand, DemandStatusPatch, InputMeta,
-    Message, MessageExpectation, MessageInbox, MessagePhase, MessageQuery, MessageReceiverSnapshot, MessageReference, MessageRelation,
-    MessageSpec, MessageStatus, MessageStatusPatch, MessageSubmission, ReadResourceObject, ResolvedMessageReceiver, ResourceError,
-    ResourceObject, ResourceProvenance, StatusPatch, TerminalSession, TerminalSessionPhase,
+    message_expectation_open, message_supersedes,
+    role_routing::topic_receiver_addresses,
+    ControllerRetry, ControllerRetryDisposition, Demand, DemandStatusPatch, InputMeta, Message, MessageExpectation, MessageInbox,
+    MessagePhase, MessageQuery, MessageReceiverSnapshot, MessageReference, MessageRelation, MessageSpec, MessageStatus, MessageStatusPatch,
+    MessageSubmission, ReadResourceObject, ResolvedMessageReceiver, ResourceError, ResourceObject, ResourceProvenance, StatusPatch,
+    TerminalSession, TerminalSessionPhase,
 };
 
 // Bound adapter calls independently of admission.
@@ -135,6 +140,9 @@ impl MessageInbox {
         // Reuse a receiver lookup within this pass, never across passes: holder
         // evidence must refresh even while a submission is held.
         let mut resolved_receivers: BTreeMap<(String, String), Option<ReadResourceObject<TerminalSession>>> = BTreeMap::new();
+        // Legacy receipts predate role_address. Freeze their recorded crew rows
+        // on first correlation, then reuse them for every reply in this pass.
+        let mut legacy_holders = BTreeMap::new();
         for message in &messages {
             let phase = message.status.as_ref().map_or(MessagePhase::Accepted, |status| status.phase);
             if phase.is_terminal() {
@@ -186,7 +194,7 @@ impl MessageInbox {
                     {
                         if reply.object.spec.in_reply_to.as_deref() == Some(message.metadata.name.as_str())
                             && reply.object.spec.receiver == message.spec.sender
-                            && self.reply_sender_matches(message, &reply.object.spec.sender).await?
+                            && self.reply_sender_matches(message, &reply.object.spec.sender, &mut legacy_holders).await?
                         {
                             answered = true;
                             break;
@@ -250,7 +258,7 @@ impl MessageInbox {
                 None => self.wait(message, MessagePhase::Accepted, "receiver role has no current holder", now).await?,
             }
         }
-        let member_names: std::collections::BTreeSet<_> = messages
+        let member_names: BTreeSet<_> = messages
             .iter()
             .flat_map(|message| {
                 message
@@ -319,15 +327,13 @@ impl MessageInbox {
     // Freeze only addressed holders. Topics expand to declared subscriber roles;
     // sender exclusion and holder precedence still run against the frozen batch.
     async fn load_delivery_receivers(&self, messages: &[ResourceObject<Message>]) -> Result<MessageReceiverSnapshot, ResourceError> {
-        let mut addresses = std::collections::BTreeSet::new();
+        let mut addresses = BTreeSet::new();
         let topics = messages
             .iter()
             .filter(|message| message.spec.receiver.starts_with("topic:"))
             .map(|message| message.spec.receiver.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        for topic in topics {
-            addresses.extend(crate::role_routing::topic_receiver_addresses(&self.backend, &self.namespace, topic).await?);
-        }
+            .collect::<BTreeSet<_>>();
+        addresses.extend(topic_receiver_addresses(&self.backend, &self.namespace, &topics.into_iter().collect::<Vec<_>>()).await?);
         for message in messages {
             if message.spec.receiver.starts_with("topic:") {
                 continue;
@@ -386,7 +392,12 @@ impl MessageInbox {
         }
     }
 
-    async fn reply_sender_matches(&self, message: &ResourceObject<Message>, sender: &str) -> Result<bool, ResourceError> {
+    async fn reply_sender_matches(
+        &self,
+        message: &ResourceObject<Message>,
+        sender: &str,
+        legacy_holders: &mut BTreeMap<String, Vec<ReadResourceObject<TerminalSession>>>,
+    ) -> Result<bool, ResourceError> {
         if sender == message.spec.receiver {
             return Ok(true);
         }
@@ -411,18 +422,25 @@ impl MessageInbox {
         }
         // N→N+1 fallback: find the recorded incarnation directly, without
         // requiring its old convoy to remain the current project-role holder.
-        let holders = self
-            .backend
-            .query_declared::<TerminalSession>(
-                &self.namespace,
-                &crate::StoreQuery {
-                    fields: BTreeMap::from([("status.crew.id".into(), receiver.crew_id.clone())]),
-                    include_replicas: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
-        Ok(holders.items.iter().any(|holder| {
+        // Unlike routing holders frozen at pass start, compatibility-only rows
+        // are read on first correlation. Cache even empty results for the pass.
+        let holders = match legacy_holders.entry(receiver.crew_id.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(
+                self.backend
+                    .query_declared::<TerminalSession>(
+                        &self.namespace,
+                        &crate::StoreQuery {
+                            fields: BTreeMap::from([("status.crew.id".into(), receiver.crew_id.clone())]),
+                            include_replicas: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await?
+                    .items,
+            ),
+        };
+        Ok(holders.iter().any(|holder| {
             let labels = &holder.object.metadata.labels;
             holder.object.status.as_ref().is_some_and(|status| {
                 status.crew.as_ref().is_some_and(|crew| crew.id == receiver.crew_id)
@@ -819,7 +837,7 @@ impl MessageInbox {
                 })
             })
             .collect();
-        let mut retained = std::collections::BTreeSet::new();
+        let mut retained = BTreeSet::new();
         if !active.is_empty() {
             let loaded;
             let receivers = match receivers {

@@ -1960,8 +1960,9 @@ async fn charter_updates_coalesce_to_latest_revision_once() {
 async fn topic_receipt_and_reply_use_the_ancestor_holders_address() {
     use flotilla_resources::*;
     use flotilla_store::*;
+    use flotilla_store_testkit::ReadCountsBackendExt;
     for adopted in [false, true] {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
         routing_project(&backend, "root", None).await;
         routing_project(&backend, "child", Some("root")).await;
         routing_holder(&backend, "root", "one").await;
@@ -1999,6 +2000,10 @@ async fn topic_receipt_and_reply_use_the_ancestor_holders_address() {
             .body("needs ruling".into())
             .expectation(MessageExpectation::Reply)
             .build();
+        // Admission rejects malformed topics before they can poison a pass.
+        let mut invalid = intent.clone();
+        invalid.receiver = "topic:child".into();
+        assert!(inbox.accept(&InputMeta::builder().name("invalid-topic".into()).build(), &invalid, at(10)).await.is_err());
         inbox.accept(&InputMeta::builder().name("topic-stall".into()).build(), &intent, at(10)).await.expect("accept");
         let transport = FakeMessageTransport {
             submissions: Default::default(),
@@ -2007,7 +2012,13 @@ async fn topic_receipt_and_reply_use_the_ancestor_holders_address() {
             accepted: Default::default(),
             working: Default::default(),
         };
+        let before = backend.read_snapshot();
         inbox.reconcile_delivery(&transport, at(11)).await.expect("delivery");
+        // Topic delivery loads its standing declaration and holder exactly once.
+        let reads = backend.read_snapshot().since(&before).objects_by_kind();
+        for kind in ["ConvoyEnsure", "Convoy", "TerminalSession"] {
+            assert_eq!(reads.get(kind), Some(&1), "topic receiver rows: {reads:?}");
+        }
         let messages = backend.using::<Message>("flotilla");
         let delivered = messages.get("topic-stall").await.expect("message");
         let receiver = delivered.status.expect("status").resolved_receiver.expect("receipt");
@@ -2772,7 +2783,10 @@ fn concurrent_partial_admissions_preserve_one_acceptance_order() {
 // incarnation after its standing-role declaration has disappeared.
 #[tokio::test]
 async fn legacy_project_role_reply_uses_recorded_incarnation() {
-    let (backend, inbox) = delivery_inbox().await;
+    use flotilla_store_testkit::ReadCountsBackendExt;
+    let (backend, _) = delivery_inbox().await;
+    let backend = backend.with_read_counts();
+    let inbox = flotilla_messaging::MessageInbox::new(backend.clone(), "flotilla");
     let messages = backend.using::<Message>("flotilla");
     for index in 0..3 {
         messages.delete(&format!("message-{index}")).await.expect("remove fixture messages");
@@ -2805,6 +2819,11 @@ async fn legacy_project_role_reply_uses_recorded_incarnation() {
     reply.sender = "flotilla/convoy/work/coder".into();
     reply.receiver = request.sender;
     reply.in_reply_to = Some("legacy-request".into());
+    for index in 0..3 {
+        let mut wrong = reply.clone();
+        wrong.sender = format!("flotilla/wrong-{index}/work/coder");
+        inbox.accept(&InputMeta::builder().name(format!("bad-reply-{index}")).build(), &wrong, at(11)).await.expect("wrong sender");
+    }
     inbox.accept(&InputMeta::builder().name("legacy-reply".into()).build(), &reply, at(11)).await.expect("reply");
     let transport = FakeMessageTransport {
         submissions: Default::default(),
@@ -2813,6 +2832,12 @@ async fn legacy_project_role_reply_uses_recorded_incarnation() {
         accepted: Default::default(),
         working: Default::default(),
     };
+    let before = backend.read_snapshot();
     inbox.reconcile_delivery(&transport, at(20)).await.expect("correlation");
+    // One empty adopted-role query plus one recorded-crew query, reused across
+    // every correlated reply, including rejected senders.
+    let reads = backend.read_snapshot().since(&before);
+    assert_eq!(reads.calls_by_kind().get("TerminalSession"), Some(&2));
+    assert_eq!(reads.objects_by_kind().get("TerminalSession"), Some(&1));
     assert_eq!(messages.get("legacy-request").await.expect("request").status.expect("status").phase, MessagePhase::Answered);
 }
