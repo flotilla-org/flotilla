@@ -563,15 +563,22 @@ pub(super) async fn set_host_credential_expiry(backend: &ResourceBackend, host_r
 }
 
 pub(super) async fn stall_test_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir, tokio::task::JoinHandle<()>) {
+    stall_test_daemon_with_clock(Arc::new(flotilla_resources::SystemClock)).await
+}
+
+pub(super) async fn stall_test_daemon_with_clock(
+    clock: Arc<dyn flotilla_resources::Clock>,
+) -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir, tokio::task::JoinHandle<()>) {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"stall-test\"\n").expect("daemon config");
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let daemon = InProcessDaemon::new_with_resource_backend(
+    let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("test-host"),
         backend.clone(),
+        clock,
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;

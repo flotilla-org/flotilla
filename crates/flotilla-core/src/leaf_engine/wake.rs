@@ -237,6 +237,7 @@ impl ReconcilerWake {
     }
 
     pub(super) async fn run(&self, namespace: String, sender: WorkQueueSender) -> Result<(), String> {
+        self.subscriptions.inner.controller_queues.lock().await.insert(namespace.clone(), sender.clone());
         let cell = self.views(&namespace).await?;
         let views = cell.get().expect("initialized views");
         let mut convoy_watch = views.convoys.subscribe();
@@ -500,6 +501,41 @@ impl ReconcilerWake {
                     });
                 }
                 continue;
+            }
+            // Use the same settlement evaluator as the controller. This includes
+            // claim exits and Merged finality, rather than inferring satisfaction
+            // from an empty subscription set.
+            let settlement = flotilla_resources::evaluate_landing_settlement(
+                convoy,
+                &select_convoy_children(convoy, &vessel_sources).into_iter().map(|(name, object)| (name, object.clone())).collect(),
+                &checkouts.into_iter().map(|(name, object)| (name, object.clone())).collect(),
+                &observed_change_requests,
+                &forges,
+                self.subscriptions.change_request_stale_after(),
+                flotilla_resources::LANDING_EVIDENCE_TTL,
+                self.subscriptions.inner.clock.now(),
+            );
+            if settlement.satisfied {
+                desired.push(LeafSubscriptionRow {
+                    id: uuid::Uuid::nil(),
+                    namespace: namespace.into(),
+                    leaves: vec![Leaf {
+                        address: LeafAddress::Convoy { name: convoy.metadata.name.clone() },
+                        field_path: ".status.phase".into(),
+                        operator: LeafOperator::Equal,
+                        literal: "Landed".into(),
+                    }],
+                    watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
+                    maker: LeafMaker::Controller {
+                        resource_kind: "Convoy".into(),
+                        name: Some(convoy.metadata.name.clone()),
+                        retry: ControllerRetry::retryable_at(None, Utc::now(), Utc::now()),
+                        ceiling: RetryCeiling::default(),
+                    },
+                    freshness_demand: None,
+                    created_at: Utc::now(),
+                    episode_key: EpisodeKeyFields::default(),
+                });
             }
             let exit = match instantiate_exit(convoy, &forges) {
                 Ok(exit) => exit,

@@ -1388,12 +1388,13 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
         },
     );
     let wake = ReconcilerWake::new(table);
-    for at in [now, retry_at - chrono::Duration::nanoseconds(1), retry_at] {
+    let deadline = retry_at + chrono::Duration::seconds(15);
+    for at in [now, retry_at, deadline - chrono::Duration::nanoseconds(1), deadline] {
         let convoy = convoys.get("cooldown").await.expect("convoy");
         wake.judge_stalls_at("flotilla", &HashMap::from([("cooldown".into(), convoy)]), at).await.expect("judge");
         let status = convoys.get("cooldown").await.expect("convoy").status.expect("status");
         assert_eq!(status.phase, ConvoyPhase::Landing, "missing merge evidence must never land");
-        assert_eq!(status.stalled.is_some(), at >= retry_at, "only the expired unrecovered wait can stall");
+        assert_eq!(status.stalled.is_some(), at >= deadline, "only the expired refresh plus cadence can stall");
     }
 }
 

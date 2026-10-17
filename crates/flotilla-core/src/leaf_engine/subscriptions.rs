@@ -127,6 +127,7 @@ impl LeafSubscriptionTable {
     pub(super) async fn forget_firings(&self, id: uuid::Uuid) {
         self.inner.last_firings.lock().await.retain(|(subscription_id, _), _| *subscription_id != id);
         self.inner.unable_since.lock().await.remove(&id);
+        self.inner.observer_grace.lock().await.retain(|(row, _), _| *row != id);
         self.inner.stale_attention_reported.lock().await.remove(&id);
     }
 

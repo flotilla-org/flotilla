@@ -405,7 +405,16 @@ impl ReconcilerWake {
             let mut able = false;
             let mut unknown = false;
             let mut actionable_rows = 0;
+            let settlement_satisfied = convoy_rows.iter().any(|row| {
+                matches!(&row.maker,
+                LeafMaker::Controller { resource_kind, .. } if resource_kind == "Convoy")
+            });
             'rows: for row in convoy_rows {
+                // Once settlement is satisfied only the controller can write Landed.
+                // The observer and actor rows no longer describe outstanding work.
+                if settlement_satisfied && !matches!(row.maker, LeafMaker::Controller { .. }) {
+                    continue;
+                }
                 if row.leaves.iter().any(|leaf| {
                     let LeafAddress::Work { work, .. } = &leaf.address else { return false };
                     let Some(role) = leaf.field_path.strip_prefix(".crew.").and_then(|field| field.strip_suffix(".phase")) else {
@@ -784,53 +793,99 @@ impl ReconcilerWake {
                                     .max_by_key(|status| status.state.observed_at);
                                 let has_value = observation.is_some_and(|status| match leaf.field_path.as_str() {
                                     ".state" => status.state.value.is_some(),
+                                    ".ready" => status.state.value.is_some() && status.checks.value.is_some(),
                                     ".head-sha" => status.head_sha.value.is_some(),
                                     ".checks" => status.checks.value.is_some(),
                                     ".review.actionable-at-head" => status.review.actionable_at_head.value.is_some(),
                                     ".mergeable" => status.mergeable.value.is_some(),
                                     _ => false,
                                 });
-                                let fresh = has_value
-                                    && observation.is_some_and(|status| {
-                                        let at = match leaf.field_path.as_str() {
-                                            ".head-sha" => status.head_sha.observed_at,
-                                            ".checks" => status.checks.observed_at,
-                                            ".review.actionable-at-head" => status.review.actionable_at_head.observed_at,
-                                            ".mergeable" => status.mergeable.observed_at,
-                                            _ => status.state.observed_at,
-                                        };
-                                        row.freshness_demand.is_none_or(|demand| at >= demand)
-                                            && now.signed_duration_since(at)
-                                                < chrono::Duration::from_std(self.subscriptions.change_request_stale_after())
-                                                    .expect("duration fits")
-                                    });
+                                let merged = observation.is_some_and(|status| {
+                                    status.state.value == Some(flotilla_resources::ObservedChangeRequestState::Merged)
+                                });
+                                let final_settlement = merged && matches!(leaf.field_path.as_str(), ".state" | ".ready");
+                                let fresh = final_settlement
+                                    || (has_value
+                                        && observation.is_some_and(|status| {
+                                            let at = match leaf.field_path.as_str() {
+                                                ".ready" => status.state.observed_at.min(status.checks.observed_at),
+                                                ".head-sha" => status.head_sha.observed_at,
+                                                ".checks" => status.checks.observed_at,
+                                                ".review.actionable-at-head" => status.review.actionable_at_head.observed_at,
+                                                ".mergeable" => status.mergeable.observed_at,
+                                                _ => status.state.observed_at,
+                                            };
+                                            row.freshness_demand.is_none_or(|demand| at >= demand)
+                                                && now.signed_duration_since(at)
+                                                    < chrono::Duration::from_std(self.subscriptions.change_request_stale_after())
+                                                        .expect("duration fits")
+                                        }));
                                 if !fresh {
-                                    let refresh_error = match address.and_then(|address| ChangeRequestKey::new(namespace, address)) {
-                                        Ok(subject) => self.subscriptions.change_request_observation_error(&subject).await,
-                                        Err(error) => Some(ObservationError::Failed(error)),
+                                    let subject = address.and_then(|address| ChangeRequestKey::new(namespace, address));
+                                    let refresh_error = match &subject {
+                                        Ok(subject) => self.subscriptions.change_request_observation_error(subject).await,
+                                        Err(error) => Some(ObservationError::Failed(error.clone())),
                                     };
-                                    if refresh_error.as_ref().and_then(ObservationError::retry_at).is_some_and(|retry_at| retry_at > now) {
-                                        // A known forge retry deadline keeps the observed
-                                        // maker pending; missing evidence is not a crew stall.
-                                        // Deliberately defer every leaf in this row until
-                                        // its observed maker can be judged with fresh evidence.
+                                    let deadline = if let Ok(subject) = subject {
+                                        let proposed = self
+                                            .subscriptions
+                                            .inner
+                                            .change_requests
+                                            .refresh_grace_deadline(&subject, row.freshness_demand, row.created_at)
+                                            .await;
+                                        let mut grace = self.subscriptions.inner.observer_grace.lock().await;
+                                        let deadline = grace.entry((row.id, subject)).or_insert(proposed);
+                                        // Explicit forge backoff still protects the maker. It
+                                        // does not let ordinary repeated failures slide grace.
+                                        if let Some(retry_at) = refresh_error.as_ref().and_then(ObservationError::retry_at) {
+                                            *deadline =
+                                                (*deadline).max(retry_at + self.subscriptions.inner.change_requests.retry_cadence());
+                                        }
+                                        Some(*deadline)
+                                    } else {
+                                        None
+                                    };
+                                    if deadline.is_some_and(|deadline| now < deadline) {
                                         unknown = true;
                                         continue 'rows;
                                     }
-                                    reason = Some(match (observation.is_some(), has_value, refresh_error) {
-                                        (true, true, Some(error)) => format!("stale; refresh failed: {error}"),
-                                        (true, true, None) => "stale".into(),
-                                        (_, _, Some(error)) => error.to_string(),
-                                        _ => "not refreshed".into(),
+                                    let lag = deadline.map_or(String::new(), |deadline| {
+                                        format!(
+                                            "; observer behind scheduled refresh grace by {}s (deadline {deadline})",
+                                            now.signed_duration_since(deadline).num_seconds()
+                                        )
                                     });
+                                    reason = Some(format!(
+                                        "change_request observer: {}{lag}",
+                                        match (observation.is_some(), has_value, refresh_error) {
+                                            (true, true, Some(error)) => format!("stale; refresh failed: {error}"),
+                                            (true, true, None) => "stale".into(),
+                                            (_, _, Some(error)) => error.to_string(),
+                                            _ => "not refreshed".into(),
+                                        }
+                                    ));
                                     break;
+                                } else if let Ok(subject) = address.and_then(|address| ChangeRequestKey::new(namespace, address)) {
+                                    self.subscriptions.inner.observer_grace.lock().await.remove(&(row.id, subject));
                                 }
                             }
                         }
                         reason.map_or(Ok(()), |reason| Err((reason, StallEvidenceSource::Observation)))
                     }
-                    LeafMaker::Controller { retry, ceiling, .. } => {
-                        retry.stall_reason(now, *ceiling).map_or(Ok(()), |reason| Err((reason, StallEvidenceSource::LeafEngine)))
+                    LeafMaker::Controller { resource_kind, name, retry, ceiling } => {
+                        let reason = if resource_kind == "Convoy" {
+                            self.subscriptions
+                                .inner
+                                .controller_queues
+                                .lock()
+                                .await
+                                .get(namespace)
+                                .and_then(|queue| queue.stall_reason(now, std::time::Duration::from_secs(60)))
+                                .map(|reason| format!("Convoy controller for {}: {reason}", name.as_deref().unwrap_or("unknown")))
+                        } else {
+                            retry.stall_reason(now, *ceiling)
+                        };
+                        reason.map_or(Ok(()), |reason| Err((reason, StallEvidenceSource::LeafEngine)))
                     }
                 };
                 match judgement {
