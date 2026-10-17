@@ -3,7 +3,9 @@ module convoy {
   type PromiseId = int
   type VesselClass = int
   type Promise = { kind: str, target: str }
-  type ConvoyRequest = { project: str, promises: PromiseId -> Promise, quota: VesselClass -> int, priority: int }
+  // projectKnown is admission's recorded read of the project address, like
+  // `authorised` on Readmit: the project need not be a resource here.
+  type ConvoyRequest = { project: str, projectKnown: bool, promises: PromiseId -> Promise, quota: VesselClass -> int, priority: int }
   // What admission fixes for the convoy's life; the quota in force is work state.
   type ConvoySpec = { project: str, promises: PromiseId -> Promise, priority: int }
   type PromiseState = Pending | Kept | Retracted
@@ -12,12 +14,13 @@ module convoy {
   type Event = Keep(PromiseId) | AcceptRetraction({ promise: PromiseId, authorised: bool })
     | Deliver | Abandon({ authorised: bool, reason: str })
     | Readmit({ quota: VesselClass -> int, authorised: bool })
-  type Refusal = NoPromises | InvalidQuota | NotOpen | UnknownPromise | PromiseSettled
+  type Refusal = NoPromises | UnknownProject | InvalidQuota | NotOpen | UnknownPromise | PromiseSettled
     | PromisesOutstanding(Set[PromiseId]) | Unauthorised | QuotaNotIncrease
   type Next = Moved(State) | Refused(Refusal)
   pure def validQuota(q: VesselClass -> int): bool = q.keys().forall(c => q.get(c) >= 0)
   pure def admit(r: ConvoyRequest): Next =
     if (r.promises.keys().size() == 0) Refused(NoPromises)
+    else if (not(r.projectKnown)) Refused(UnknownProject)
     else if (not(validQuota(r.quota))) Refused(InvalidQuota)
     else Moved(Open({ spec: { project: r.project, promises: r.promises, priority: r.priority },
       promises: r.promises.keys().mapBy(_ => Pending), quota: r.quota }))

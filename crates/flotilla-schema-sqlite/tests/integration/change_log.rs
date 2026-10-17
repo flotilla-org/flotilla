@@ -11,9 +11,10 @@ use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
 use crate::fixtures::{
-    message as messages, registry, store,
+    addr, message as messages, registry, store,
     synthetic::{workflow, InputValue},
-    AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow as Message, Pick, Referral, TerminalSession, Ticket, LOCAL,
+    AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow as Message, Pick, Referral, TerminalSession, Ticket, VesselRow,
+    LOCAL,
 };
 
 const REPLICA: &str = "replica";
@@ -99,6 +100,7 @@ fn slots() -> Vec<(KindCode, String)> {
         ConvoyRow::CODE,
         EnsureRow::CODE,
         TerminalSession::CODE,
+        VesselRow::CODE,
         Ticket::CODE,
         Referral::CODE,
         Dossier::CODE,
@@ -167,6 +169,7 @@ fn the_change_log_replays_into_another_store(tc: TestCase) {
             Ticket::CODE => step::<Ticket>(&tc, &mut write, live, name, last),
             Referral::CODE => step::<Referral>(&tc, &mut write, live, name, last),
             Dossier::CODE => step::<Dossier>(&tc, &mut write, live, name, last),
+            VesselRow::CODE => step::<VesselRow>(&tc, &mut write, live, name, last),
             _ => step::<TerminalSession>(&tc, &mut write, live, name, last),
         }
         if tc.draw(gs::booleans()) {
@@ -221,7 +224,7 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
     let mut write = remote.write().expect("write");
     let stamp = write.insert("far", &messages::sample()).expect("insert");
     let current = write.load::<Message>(stamp.id).expect("load").expect("present");
-    write.update(&current, &Message { inbox: "edited".into(), ..messages::sample() }).expect("update");
+    write.update(&current, &Message { inbox: addr("edited"), ..messages::sample() }).expect("update");
     write.commit().expect("commit");
     let changes = remote.read().expect("read").changes_since("remote", 0, 10).expect("log");
 
@@ -232,8 +235,8 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
     }
     let id = write.resolve(Message::CODE, "far", "remote").expect("resolve").expect("present");
     let current = write.load::<Message>(id).expect("load").expect("present");
-    assert_eq!((current.version, current.value.inbox.as_str()), (changes[1].home_seq, "edited"));
-    let next = Message { inbox: "local edit".into(), ..current.value.clone() };
+    assert_eq!((current.version, current.value.inbox.name()), (changes[1].home_seq, "edited"));
+    let next = Message { inbox: addr("local edit"), ..current.value.clone() };
     assert!(matches!(write.update(&current, &next), Err(StoreError::NotHome { .. })));
     assert!(matches!(write.delete::<Message>(current.stamp()), Err(StoreError::NotHome { .. })));
 
@@ -452,6 +455,7 @@ fn a_snapshot_plus_its_tail_is_the_newest_snapshot(tc: TestCase) {
     snapshot_plus_tail::<ConvoyRow>(&tc);
     snapshot_plus_tail::<EnsureRow>(&tc);
     snapshot_plus_tail::<TerminalSession>(&tc);
+    snapshot_plus_tail::<VesselRow>(&tc);
     snapshot_plus_tail::<Ticket>(&tc);
     snapshot_plus_tail::<Referral>(&tc);
     snapshot_plus_tail::<Dossier>(&tc);
@@ -463,7 +467,7 @@ fn log(store: &mut Store, home: &str) -> Vec<RowChange> {
 }
 
 fn message(inbox: &str) -> Message {
-    Message { inbox: inbox.into(), ..messages::sample() }
+    Message { inbox: addr(inbox), ..messages::sample() }
 }
 
 /// Inserts `name`, then rewrites its inbox once per entry of `bodies`, in one transaction.

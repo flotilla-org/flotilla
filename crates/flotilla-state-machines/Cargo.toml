@@ -3,7 +3,7 @@ name = "flotilla-state-machines"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
-description = "Storage-free gated state machines (ADR 0064): declarations, the single writer, records and judgements"
+description = "Backend-free gated state machines (ADR 0064): declarations, stored kinds, the single writer, records and judgements"
 
 # ci/build-graph/check.py: this crate reaches only flotilla-schema and what
 # flotilla-schema may reach, and no production crate depends on it until the

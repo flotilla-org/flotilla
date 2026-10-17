@@ -44,21 +44,28 @@ pub struct Records<R> {
     rows: Vec<RecordRow<R>>,
 }
 
+/// Every position of a record table is taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a record table holds at most u32::MAX + 1 rows")]
+pub struct RecordsFull;
+
 impl<R> Records<R> {
     pub fn new() -> Records<R> {
         Records { rows: Vec::new() }
     }
 
     /// Appends `record` at the next position, stamped with `version`, and returns the new row.
-    ///
-    /// # Panics
-    ///
-    /// When every `u32` position is taken: positions would repeat past it, and `u32::MAX` rows on
-    /// one resource is far beyond any archive window.
-    pub fn append(&mut self, version: u64, record: R) -> &RecordRow<R> {
-        let position = Position(u32::try_from(self.rows.len()).expect("a record table holds at most u32::MAX + 1 rows"));
+    /// Refuses with [`RecordsFull`] once every `u32` position is taken, since positions would
+    /// repeat past it; `u32::MAX` rows on one resource is far beyond any archive window.
+    pub fn append(&mut self, version: u64, record: R) -> Result<&RecordRow<R>, RecordsFull> {
+        let position = Position(u32::try_from(self.rows.len()).map_err(|_| RecordsFull)?);
         self.rows.push(RecordRow { position, version, record });
-        &self.rows[self.rows.len() - 1]
+        Ok(&self.rows[self.rows.len() - 1])
+    }
+
+    /// Whether every position is taken, so the next [`Records::append`] would refuse.
+    pub fn is_full(&self) -> bool {
+        u32::try_from(self.rows.len()).is_err()
     }
 
     pub fn rows(&self) -> &[RecordRow<R>] {
@@ -122,8 +129,8 @@ mod tests {
     #[test]
     fn positions_are_dense_and_rows_keep_their_version() {
         let mut records = Records::new();
-        assert_eq!(records.append(7, "a").position, Position(0));
-        assert_eq!(records.append(9, "b"), &RecordRow { position: Position(1), version: 9, record: "b" });
+        assert_eq!(records.append(7, "a").expect("room").position, Position(0));
+        assert_eq!(records.append(9, "b"), Ok(&RecordRow { position: Position(1), version: 9, record: "b" }));
         assert_eq!(
             (records.len(), records.get(Position(0)).map(|row| row.version), records.last().map(|row| row.record)),
             (2, Some(7), Some("b"))

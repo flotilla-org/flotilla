@@ -117,7 +117,7 @@ impl Machine for LatchMachine {
             .attempts_in([Armed])
     }
 
-    fn admit(spent: bool) -> Result<(bool, Latch), LatchRefusal> {
+    fn admit(_: &mut flotilla_state_machines::Admission<'_, Self>, spent: bool) -> Result<(bool, Latch), LatchRefusal> {
         Ok((spent, Latch::Armed { shots: 0 }))
     }
 }

@@ -17,12 +17,12 @@
 
 use std::collections::BTreeSet;
 
-use flotilla_schema::{Records, State, Stored, Timestamp};
+use flotilla_schema::{Address, Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attempt, edges, states, Attempt, AttemptPolicy, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Ref,
-    Resource, RowParts, Source, Table, Version, WrongState,
+    attempt, edges, states, Admission, Attempt, AttemptPolicy, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow,
+    Ref, Resource, RowParts, Source, Table, Version, WrongState,
 };
 
 /// Fulfiller references, in name order. Fulfiller names are addresses: plain
@@ -112,9 +112,9 @@ impl EnsureState {
 /// What an Ensure keeps bound, and how its attempts are judged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnsureSpec {
-    /// The inbox whose [`Drain`] a bind waits on. An address: plain interned
-    /// text until `flotilla-address` is adopted.
-    pub inbox: String,
+    /// The inbox whose [`Drain`] a bind waits on: the address a Message names
+    /// (ruling D3), read by its canonical text.
+    pub inbox: Address,
     pub policy: AttemptPolicy,
 }
 
@@ -370,7 +370,7 @@ impl Machine for Ensure {
             .attempts_in([Unfulfilled])
     }
 
-    fn admit(spec: EnsureSpec) -> Result<(EnsureSpec, EnsureState), EnsureRefusal> {
+    fn admit(_: &mut Admission<'_, Ensure>, spec: EnsureSpec) -> Result<(EnsureSpec, EnsureState), EnsureRefusal> {
         Ok((spec, EnsureState::Unfulfilled { recorded: BTreeSet::new(), created: BTreeSet::new(), window: 0 }))
     }
 }
@@ -411,7 +411,7 @@ fn gate_bind(h: &mut Handle<'_, Ensure>, edge: &Bind) -> Result<(), EnsureRefusa
         return Err(EnsureRefusal::NotRecorded);
     }
     let ready = h.read(&edge.fulfiller).is_some_and(|status| status.phase == FulfillerPhase::Realised && status.can_receive);
-    let drain = Ref::<Drain>::new(h.spec().inbox.clone());
+    let drain = Ref::<Drain>::new(h.spec().inbox.as_str());
     if ready && h.read(&drain) == Some(&true) {
         Ok(())
     } else {
@@ -484,9 +484,7 @@ fn gate_retire(h: &mut Handle<'_, Ensure>, edge: &Retire) -> Result<(), EnsureRe
 #[derive(Clone, Debug, PartialEq, Stored)]
 #[store(kind = "Ensure", code = 9, index(name = "by_inbox", eq(inbox)))]
 pub struct EnsureRow {
-    /// An address: plain interned text until `flotilla-address` is adopted.
-    #[store(intern)]
-    pub inbox: String,
+    pub inbox: Address,
     #[store(flatten)]
     pub policy: AttemptPolicy,
     #[store(state)]

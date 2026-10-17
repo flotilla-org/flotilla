@@ -9,13 +9,22 @@ use flotilla_state_machines::{
     Attempt, AttemptPolicy, Cause, CauseCategory, Coded, Diagram, Home, Machine, Ref, WriteError,
 };
 
+/// The inbox every test Ensure names, as canonical address text.
+const INBOX: &str = "project:p/role:r";
+
 fn at(micros: i64) -> Timestamp {
     Timestamp::from_micros(micros)
 }
 
 fn home() -> Home<Ensure> {
-    let mut home = Home::new("kiwi").expect("valid declaration");
-    home.create("e", EnsureSpec { inbox: "inbox".into(), policy: AttemptPolicy::immediate(1) }).expect("created");
+    let mut home = Home::<Ensure>::new("kiwi").expect("valid declaration");
+    home.create(
+        "e",
+        EnsureSpec { inbox: INBOX.parse().expect("canonical inbox"), policy: AttemptPolicy::immediate(1) },
+        &MemoryEnsureWorld::default(),
+        Timestamp(0),
+    )
+    .expect("created");
     home
 }
 
@@ -61,7 +70,7 @@ fn bound_home() -> (Home<Ensure>, MemoryEnsureWorld) {
     let mut world = MemoryEnsureWorld::default();
     h.apply("e", Record { fulfiller: f("a") }, &world, at(1)).expect("recorded");
     world.fulfillers.put(&f("a"), status(FulfillerPhase::Realised, true));
-    world.drains.put(&Ref::<Drain>::new("inbox"), true);
+    world.drains.put(&Ref::<Drain>::new(INBOX), true);
     h.apply("e", Bind { fulfiller: f("a") }, &world, at(2)).expect("bound");
     (h, world)
 }
@@ -155,7 +164,7 @@ fn bind_needs_a_realised_receiving_fulfiller_and_a_drained_inbox() {
     let mut h = home();
     let mut world = MemoryEnsureWorld::default();
     world.fulfillers.put(&f("a"), status(FulfillerPhase::Realised, true));
-    world.drains.put(&Ref::<Drain>::new("inbox"), true);
+    world.drains.put(&Ref::<Drain>::new(INBOX), true);
     assert_eq!(h.apply("e", Bind { fulfiller: f("a") }, &world, at(1)).err(), refused(EnsureRefusal::NotRecorded));
     h.apply("e", Record { fulfiller: f("a") }, &world, at(1)).expect("recorded");
     for (phase, can_receive, drained) in [
@@ -166,7 +175,7 @@ fn bind_needs_a_realised_receiving_fulfiller_and_a_drained_inbox() {
     ] {
         let mut world = MemoryEnsureWorld::default();
         world.fulfillers.put(&f("a"), status(phase, can_receive));
-        world.drains.put(&Ref::<Drain>::new("inbox"), drained);
+        world.drains.put(&Ref::<Drain>::new(INBOX), drained);
         assert_eq!(h.apply("e", Bind { fulfiller: f("a") }, &world, at(2)).err(), refused(EnsureRefusal::MissingEvidence));
     }
     assert_eq!(h.apply("e", Bind { fulfiller: f("b") }, &world, at(2)).err(), refused(EnsureRefusal::NotRecorded));

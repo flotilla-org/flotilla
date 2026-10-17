@@ -13,8 +13,8 @@ use flotilla_schema::{Records, State, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    edges, states, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Receipt, Ref, Resource, RowParts, Source,
-    Table, Version, WrongState,
+    edges, states, Admission, EdgeDef, EdgeEventOf, Ended, Handle, Kind, Machine, MachineDef, MachineRow, Receipt, Ref, Resource, RowParts,
+    Source, Table, Version, WrongState,
 };
 
 /// Whether a channel to a Live session is attached (spec `Channel`).
@@ -188,7 +188,7 @@ impl Machine for AgentSession {
             .end(Ended, "the session has ended")
     }
 
-    fn admit(_: ()) -> Result<((), AgentSessionState), AgentSessionRefusal> {
+    fn admit(_: &mut Admission<'_, AgentSession>, _: ()) -> Result<((), AgentSessionState), AgentSessionRefusal> {
         Ok(((), AgentSessionState::Live { channel: Channel::Detached }))
     }
 }

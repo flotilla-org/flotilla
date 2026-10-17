@@ -42,7 +42,7 @@ class BuildGraphContract(unittest.TestCase):
 
     def state_machines_error(self, target):
         return (f"{STATE_MACHINES}: must not depend on {target}, directly or transitively; the engine depends only "
-                "on flotilla-schema and what it may reach (flotilla-schema-derive, flotilla-cbor and "
+                "on flotilla-schema and what it may reach (flotilla-schema-derive, flotilla-address, flotilla-cbor and "
                 "flotilla-build-features anchors)")
 
     def test_state_machines_may_reach_the_schema_crate(self):
@@ -113,17 +113,18 @@ class BuildGraphContract(unittest.TestCase):
         self.assertEqual([layer(name) for name in SCHEMA_CRATES], ["base", "base", "native"])
         self.assertEqual(violations(graph(
             package("flotilla-schema-derive", normal=("flotilla-build-features",)),
-            package("flotilla-schema", normal=("flotilla-schema-derive", "flotilla-cbor", "flotilla-build-features-base")),
+            package("flotilla-schema", normal=("flotilla-schema-derive", "flotilla-address", "flotilla-cbor",
+                                               "flotilla-build-features-base")),
             package("flotilla-schema-sqlite", normal=("flotilla-schema", "flotilla-cbor", "flotilla-build-features-sqlite"),
                     build=("flotilla-build-features",), dev=("flotilla-resources",)),
-            package("flotilla-cbor"), package("flotilla-resources"),
+            package("flotilla-address"), package("flotilla-cbor"), package("flotilla-resources"),
             package("flotilla-build-features"), package("flotilla-build-features-base", normal=("flotilla-build-features",)),
             package("flotilla-build-features-sqlite", normal=("flotilla-build-features",)),
         )), [])
 
     def schema_error(self, schema, target):
         return (f"{schema}: must not depend on {target}, directly or transitively; schema crates depend only "
-                "on flotilla-cbor, lower schema crates and flotilla-build-features anchors")
+                "on flotilla-address, flotilla-cbor, lower schema crates and flotilla-build-features anchors")
 
     def test_schema_crates_refuse_other_workspace_crates(self):
         # Explicit finite generator: every schema crate, each forbidden family named by #3320,

@@ -1,7 +1,7 @@
 //! Message (spec `machines/message.qnt`; scenarios `inbox_delivery`, `message_race`;
 //! ADR 0064 "Inboxes").
 
-use flotilla_schema::{CodeEnum, Decoder, Encoder, Position, Timestamp, Value};
+use flotilla_schema::{Address, CodeEnum, Decoder, Encoder, Position, Timestamp, Value};
 use flotilla_state_machines::{
     machines::message::{
         AppliedThrough, Binding, Condition, Deliver, DropMessage, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message,
@@ -17,22 +17,36 @@ fn t(micros: i64) -> Timestamp {
     Timestamp::from_micros(micros)
 }
 
-fn condition() -> Ref<Condition> {
-    Ref::new("build-green")
+/// A test address: the project-rooted address of `name`.
+fn a(name: &str) -> Address {
+    Address::project(name).expect("valid name")
+}
+
+fn inbox() -> Address {
+    INBOX.parse().expect("canonical inbox")
+}
+
+fn condition() -> Address {
+    a("build-green")
+}
+
+/// The world's record for `condition()`, read by its canonical text.
+fn condition_ref() -> Ref<Condition> {
+    Ref::new(condition().as_str())
 }
 
 fn spec(expectation: Expectation, deadline: Option<i64>) -> MessageSpec {
-    MessageSpec { inbox: INBOX.into(), expectation, deadline: deadline.map(t), unbound_after: 10 }
+    MessageSpec { inbox: inbox(), expectation, deadline: deadline.map(t), unbound_after: 10 }
 }
 
 fn home(spec: MessageSpec) -> Home<Message> {
-    let mut home = Home::new("home").expect("valid declaration");
-    home.create("m", spec).expect("created");
+    let mut home = Home::<Message>::new("home").expect("valid declaration");
+    home.create("m", spec, &MemoryMessageWorld::default(), Timestamp(0)).expect("created");
     home
 }
 
 fn session(name: &str) -> Receiver {
-    Receiver { session: name.into(), host: "consumer".into() }
+    Receiver { session: a(name), host: a("consumer") }
 }
 
 fn deliver(name: &str, transport: Transport) -> Deliver {
@@ -42,7 +56,7 @@ fn deliver(name: &str, transport: Transport) -> Deliver {
 fn receipt(world: &mut MemoryMessageWorld, session: &str, transport: Transport) {
     let own = Ref::<Receipts>::new("m");
     let mut receipts = world.receipts.lookup(&own).map(|(_, by_session)| by_session.clone()).unwrap_or_default();
-    receipts.insert(session.into(), transport);
+    receipts.insert(a(session), transport);
     world.receipts.put(&own, receipts);
 }
 
@@ -59,7 +73,7 @@ fn state(home: &Home<Message>) -> &MessageState {
 }
 
 fn bound(world: &mut MemoryMessageWorld) {
-    world.binding.put(&Ref::new(INBOX), InboxBinding::Bound { session: "s1".into() });
+    world.binding.put(&Ref::new(INBOX), InboxBinding::Bound { session: a("s1") });
 }
 
 /// A message expecting a reply, delivered to `s1`.
@@ -125,7 +139,7 @@ fn deliver_needs_the_receivers_receipt() {
 fn deliver_records_one_receiver_and_awaits() {
     let mut home = home(spec(Expectation::Reply, None));
     let mut world = MemoryMessageWorld::default();
-    world.binding.put(&Ref::new(INBOX), InboxBinding::Bound { session: "replacement".into() });
+    world.binding.put(&Ref::new(INBOX), InboxBinding::Bound { session: a("replacement") });
     receipt(&mut world, "old", Transport::Mute);
     home.apply("m", deliver("old", Transport::Mute), &world, t(1)).expect("delivered");
     receipt(&mut world, "replacement", Transport::Turn);
@@ -187,9 +201,9 @@ fn an_observed_outcome_settles_from_pending() {
 
     let mut outcome = home(spec(Expectation::Outcome { condition: condition() }, None));
     assert_eq!(outcome.apply("m", observed(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
-    world.condition.put(&condition(), false);
+    world.condition.put(&condition_ref(), false);
     assert_eq!(outcome.apply("m", observed(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
-    world.condition.put(&condition(), true);
+    world.condition.put(&condition_ref(), true);
     outcome.apply("m", observed(), &world, t(2)).expect("settled");
     assert_eq!(*state(&outcome), MessageState::Settled);
 }
@@ -199,12 +213,13 @@ fn an_observed_outcome_settles_from_pending() {
 fn supersession_must_name_this_message() {
     let mut home = home(spec(Expectation::Reply, None));
     let mut world = MemoryMessageWorld::default();
-    let by: Ref<Supersession> = Ref::new("m2");
-    let superseded = || drop(DropReason::Superseded { by: Ref::new("m2") });
+    let by = a("m2");
+    let supersession: Ref<Supersession> = Ref::new(by.as_str());
+    let superseded = || drop(DropReason::Superseded { by: a("m2") });
     assert_eq!(home.apply("m", superseded(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
-    world.supersession.put(&by, Supersedes { older: "other".into() });
+    world.supersession.put(&supersession, Supersedes { older: "other".into() });
     assert_eq!(home.apply("m", superseded(), &world, t(1)).err(), refused(MessageRefusal::MissingEvidence));
-    world.supersession.put(&by, Supersedes { older: "m".into() });
+    world.supersession.put(&supersession, Supersedes { older: "m".into() });
     home.apply("m", superseded(), &world, t(1)).expect("dropped");
     assert_eq!(
         *state(&home),
@@ -218,11 +233,11 @@ fn supersession_must_name_this_message() {
 #[test]
 fn deliberate_drops_need_authority() {
     let mut world = MemoryMessageWorld::default();
-    world.authority.put(&Ref::new("no"), false);
-    world.authority.put(&Ref::new("yes"), true);
+    world.authority.put(&Ref::new(a("no").as_str()), false);
+    world.authority.put(&Ref::new(a("yes").as_str()), true);
     receipt(&mut world, "s1", Transport::Turn);
-    let withdrawn = |a: &str| drop(DropReason::Withdrawn { by: "sender".into(), authority: Ref::new(a) });
-    let unreachable = |a: &str| drop(DropReason::ConsumerUnreachable { by: "supervisor".into(), authority: Ref::new(a) });
+    let withdrawn = |x: &str| drop(DropReason::Withdrawn { by: a("sender"), authority: a(x) });
+    let unreachable = |x: &str| drop(DropReason::ConsumerUnreachable { by: a("supervisor"), authority: a(x) });
     for (reason, delivered) in [(withdrawn as fn(&str) -> DropMessage, false), (unreachable, true)] {
         let mut home = home(spec(Expectation::Reply, None));
         if delivered {
@@ -253,9 +268,9 @@ fn expiry_needs_a_passed_deadline_and_no_expected_evidence() {
     world.reply.put(&Ref::new("m"), ());
     assert_eq!(reply.apply("m", drop(DropReason::Expired), &world, t(6)).err(), refused(MessageRefusal::ExpectationMet));
     let mut outcome = home(spec(Expectation::Outcome { condition: condition() }, Some(5)));
-    world.condition.put(&condition(), true);
+    world.condition.put(&condition_ref(), true);
     assert_eq!(outcome.apply("m", drop(DropReason::Expired), &world, t(6)).err(), refused(MessageRefusal::ExpectationMet));
-    world.condition.put(&condition(), false);
+    world.condition.put(&condition_ref(), false);
     outcome.apply("m", drop(DropReason::Expired), &world, t(6)).expect("expired");
     assert_eq!(*state(&outcome), MessageState::Dropped { reason: DropReason::Expired, dropped_receiver: None, at: t(6), watermark: None });
     let reads = &outcome.get("m").expect("exists").events().last().expect("dropped").record.payload.reads;
@@ -368,13 +383,15 @@ fn edge_events_round_trip_through_the_schema_codec() {
     assert_eq!(delivered.writer, "home");
 }
 
-// A payload's document is the edge's serde form: a reference is its name
-// alone, and every read keeps its kind, name and version (or absence).
+// A payload's document is the edge's serde form: its code and arguments, never
+// its variant name, so renaming an edge leaves stored payloads decodable; an
+// address is its canonical text, and every read keeps its kind, name and version
+// (or absence).
 #[test]
 fn payload_documents_name_references_and_keep_reads() {
-    let reason = DropReason::Withdrawn { by: "ann".into(), authority: Ref::new("ops") };
+    let reason = DropReason::Withdrawn { by: a("ann"), authority: a("ops") };
     let reads = vec![
-        InputRead { kind: "authority".into(), name: "ops".into(), version: Some(Version(4)) },
+        InputRead { kind: "authority".into(), name: "project:ops".into(), version: Some(Version(4)) },
         InputRead { kind: "binding".into(), name: INBOX.into(), version: None },
     ];
     let payload = EdgePayload { edge: MessageEdge::from(drop(reason)), reads };
@@ -382,12 +399,15 @@ fn payload_documents_name_references_and_keep_reads() {
     assert_eq!(
         json,
         serde_json::json!({
-            "edge": { "Drop": { "reason": { "Withdrawn": { "by": "ann", "authority": "ops" } } } },
+            "edge": [3, { "reason": { "Withdrawn": { "by": "project:ann", "authority": "project:ops" } } }],
             "reads": [
-                { "kind": "authority", "name": "ops", "version": 4 },
+                { "kind": "authority", "name": "project:ops", "version": 4 },
                 { "kind": "binding", "name": INBOX, "version": null },
             ],
         })
     );
     assert_eq!(serde_json::from_value::<EdgePayload<MessageEdge>>(json).expect("deserialises"), payload);
+    let unknown = serde_json::json!({ "edge": [9, {}], "reads": [] });
+    let refused = serde_json::from_value::<EdgePayload<MessageEdge>>(unknown).expect_err("no edge has code 9");
+    assert!(refused.to_string().contains("unknown MessageEdge code 9"), "{refused}");
 }

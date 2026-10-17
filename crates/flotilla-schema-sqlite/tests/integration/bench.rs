@@ -25,7 +25,7 @@ use flotilla_state_machines::{
 };
 use rusqlite::Connection;
 
-use crate::fixtures::{engine::NAME, message, registry, MessageRow, LOCAL};
+use crate::fixtures::{addr, engine::NAME, message, registry, MessageRow, LOCAL};
 
 const MESSAGES: usize = 10_000;
 const INBOXES: usize = 100;
@@ -54,7 +54,7 @@ fn open(batch: usize) -> (Database, Store) {
 }
 
 fn value(n: usize) -> MessageRow {
-    MessageRow { inbox: format!("inbox-{}", n % INBOXES), ..message::sample() }
+    MessageRow { inbox: addr(&format!("inbox-{}", n % INBOXES)), ..message::sample() }
 }
 
 /// The messages' stamps.
@@ -73,7 +73,7 @@ fn seed(store: &mut Store) -> Vec<Stamp> {
 /// Message `n`'s two events, as the engine applies them: its delivery to a session (the gate
 /// reads the session's receipt) and its settlement on the reply (the gate reads the reply).
 fn events(n: usize) -> [Edge<MessageRow>; 2] {
-    let session = format!("session-{}", n % 50);
+    let session = addr(&format!("session-{}", n % 50));
     let mut world = MemoryMessageWorld::default();
     world.receipts.put(&Ref::new(NAME), [(session.clone(), Transport::Turn)].into());
     world.reply.put(&Ref::new(NAME), ());
@@ -82,7 +82,7 @@ fn events(n: usize) -> [Edge<MessageRow>; 2] {
     let row = value(n);
     home.restore(NAME, Version(1), row.parts()).unwrap_or_else(|_| panic!("an empty home"));
     let at = Timestamp(n as i64);
-    let deliver = Deliver { receiver: Receiver { session, host: "consumer".into() }, transport: Transport::Turn };
+    let deliver = Deliver { receiver: Receiver { session, host: addr("consumer") }, transport: Transport::Turn };
     let event = home.apply(NAME, deliver, &*world, at).unwrap_or_else(|_| panic!("delivered")).clone();
     let (first, state) = row.edge(&event, home.get(NAME).expect("present").state().clone()).expect("edge");
     let delivered = MessageRow { state, ..row };

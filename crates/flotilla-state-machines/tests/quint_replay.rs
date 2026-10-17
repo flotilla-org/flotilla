@@ -69,7 +69,7 @@ use std::{
     time::Instant,
 };
 
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Address, Timestamp};
 use flotilla_state_machines::{
     machines::{
         agent_session::{
@@ -90,7 +90,7 @@ use flotilla_state_machines::{
     Attempt, AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Receipt, Ref, Resource, Transport,
     WriteError,
 };
-use itf::{at, boolean, int, list, map_of, number, pairs, payload, set, set_of, show, slot, tag, text, variant};
+use itf::{address, address_of, at, boolean, int, list, map_of, number, pairs, payload, set, set_of, show, slot, tag, text, variant};
 use serde_json::{json, Value};
 
 /// Microseconds per model clock tick (ten minutes).
@@ -128,6 +128,26 @@ fn cause(detail: &str) -> Cause {
 /// The authorised party's reference; its value is the model's `authorised` flag.
 fn owner<K: Kind>() -> Ref<K> {
     Ref::new("owner")
+}
+
+/// A message's authorised party, as an address; gates read it by its text.
+fn owner_address() -> Address {
+    address_of("owner")
+}
+
+/// The inbox a replayed message or Ensure names, as an address.
+fn inbox() -> Address {
+    address_of(INBOX)
+}
+
+/// The superseding message, as a drop reason names it.
+fn newer() -> Address {
+    address_of("newer")
+}
+
+/// An outcome condition, as an expectation names it.
+fn outcome_condition() -> Address {
+    address_of("outcome")
 }
 
 /// A sum value without a payload, as ITF encodes it.
@@ -286,8 +306,8 @@ fn accept<M: Machine>(
 }
 
 /// A model step created this resource, so the Rust machine must admit it.
-fn create<M: Machine>(home: &mut Home<M>, name: &str, request: M::Request, step: &Step, tally: &mut Tally) {
-    if let Err(error) = home.create(name, request) {
+fn create<M: Machine>(home: &mut Home<M>, name: &str, request: M::Request, world: &M::World, step: &Step, tally: &mut Tally) {
+    if let Err(error) = home.create(name, request, world, step.tick()) {
         panic!("{step}: the model created {} {name}; Rust refused it: {error:?}", M::NAME);
     }
     tally.writes += 1;
@@ -508,9 +528,9 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
         match step.action() {
             // L::request and A::request share a name; the store that changed says which.
             "request" if slot_at(step.before, "::resources", 1).is_none() && slot_at(step.after, "::resources", 1).is_some() => {
-                create(&mut things, ONE, (), &step, tally);
+                create(&mut things, ONE, (), &MemoryLifecycleWorld::default(), &step, tally);
             }
-            "request" => create(&mut sessions, ONE, (), &step, tally),
+            "request" => create(&mut sessions, ONE, (), &MemoryAgentSessionWorld::default(), &step, tally),
             op @ ("realise" | "release" | "vanish") => lifecycle_step(&mut things, ONE, op, seen, matches, "model", now, &step, tally),
             // The scenario's `failed` flag: a failure that cannot be retried exhausts the attempts.
             "recordFailure" => {
@@ -641,12 +661,10 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
     let work = convoy_work(state);
     let spec = &work["spec"];
     ConvoyRequest {
-        project: text(&spec["project"]).into(),
+        project: address(&spec["project"]),
         promises: pairs(&spec["promises"])
             .iter()
-            .map(|pair| {
-                (PromiseId(small(&pair[0])), Promise { kind: text(&pair[1]["kind"]).into(), target: text(&pair[1]["target"]).into() })
-            })
+            .map(|pair| (PromiseId(small(&pair[0])), Promise { kind: text(&pair[1]["kind"]).into(), target: address(&pair[1]["target"]) }))
             .collect(),
         quota: quota(&work["quota"]),
         priority: Priority(small(&spec["priority"])),
@@ -669,9 +687,9 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
     let work = |promises: &convoy::Resolution, quota: &Quota| {
         json!({
             "spec": {
-                "project": spec.project,
+                "project": spec.project.name(),
                 "promises": map_of(spec.promises.iter().map(|(id, promise)| {
-                    (int(id.0.into()), json!({ "kind": promise.kind, "target": promise.target }))
+                    (int(id.0.into()), json!({ "kind": promise.kind, "target": promise.target.name() }))
                 })),
                 "priority": int(spec.priority.0.into()),
             },
@@ -700,7 +718,10 @@ fn convoy_world(authorised: bool) -> MemoryConvoyWorld {
 
 fn admit(home: &mut Home<Convoy>, step: &Step, id: i64, tally: &mut Tally) {
     let model = slot_at(step.after, "::convoys", id).expect("admitted convoy");
-    create(home, &id.to_string(), convoy_request(model), step, tally);
+    let request = convoy_request(model);
+    // The model admitted it, so its project was known.
+    let world = MemoryConvoyWorld::default().with_project(&request.project);
+    create(home, &id.to_string(), request, &world, step, tally);
 }
 
 /// From the reached state: an Open convoy delivers only with no promise
@@ -796,7 +817,7 @@ fn units_value(units: &Units) -> Value {
 
 fn placement_request(v: &Value) -> placement::Request {
     placement::Request {
-        convoy: ConvoyId::new(number(&v["convoy"]).to_string()),
+        convoy: ConvoyId::new(number(&v["convoy"]).to_string(), "home"),
         class: VesselClass(small(&v["class"])),
         shape: units(&v["shape"]),
         priority: Priority(small(&v["priority"])),
@@ -806,7 +827,7 @@ fn placement_request(v: &Value) -> placement::Request {
 /// The spec's vessel `Request`.
 fn request_value(request: &placement::Request) -> Value {
     json!({
-        "convoy": int(id_of(request.convoy.as_str())),
+        "convoy": int(id_of(&request.convoy.name)),
         "class": int(request.class.0.into()),
         "shape": units_value(&request.shape),
         "priority": int(request.priority.0.into()),
@@ -856,7 +877,7 @@ impl Fleet {
     fn sync_caps(&mut self, convoy: i64) {
         let name = convoy.to_string();
         let quota = self.convoys.get(&name).expect("admitted convoy").state().quota().clone();
-        self.ledger.set_caps(ConvoyId::new(name), quota);
+        self.ledger.set_caps(ConvoyId::new(name, "home"), quota);
     }
 
     /// The spec's `Waiting(Request) | Leased({ placement, lifecycle }) | Gone(Placement)`,
@@ -923,7 +944,7 @@ impl Fleet {
                 let evidence = trial.evidence(&vessel, host).expect("a waiting vessel's evidence");
                 let Ok(lease) = trial.place(&vessel, host).cloned() else { continue };
                 for convoy in [1, 2] {
-                    let convoy = ConvoyId::new(convoy.to_string());
+                    let convoy = ConvoyId::new(convoy.to_string(), "home");
                     for class in [VesselClass(0), VesselClass(1)] {
                         let (live, cap) = (trial.live(&convoy, class), trial.cap(&convoy, class));
                         assert!(live <= cap, "{step}: placing vessel {id} on {host:?} leases {live} of {convoy:?} {class:?}, cap {cap}");
@@ -993,7 +1014,7 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
                     other => panic!("{step}: placed vessel {id} is {other:?}"),
                 };
                 fleet.placed.insert(id, Placed { request, evidence });
-                create(&mut fleet.vessels, &name, (), &step, tally);
+                create(&mut fleet.vessels, &name, (), &MemoryLifecycleWorld::default(), &step, tally);
             }
             "realise" => lifecycle_step(&mut fleet.vessels, &name, "realise", true, true, "vessel", now, &step, tally),
             // Gone returns the lease; the harness keeps it.
@@ -1035,7 +1056,7 @@ fn ensure_world(fulfillers: &Fulfillers, authorised: bool) -> MemoryEnsureWorld 
     for resource in fulfillers.resources() {
         world.fulfillers.put(&Ref::new(resource.name()), FulfillerStatus { phase: phase(resource.state()), can_receive: true });
     }
-    world.drains.put(&Ref::new(INBOX), true);
+    world.drains.put(&Ref::new(inbox().as_str()), true);
     world.authorities.put(&owner(), authorised);
     world.teardowns.put(&Ref::new("fulfillers"), true);
     world
@@ -1149,11 +1170,11 @@ fn ensure_bind(trace: &Trace, tally: &mut Tally) {
         let fulfiller = Ref::<ensure::Fulfiller>::new(name.clone());
         match step.action() {
             // One failure exhausts a window: the spec gives up once `history - window >= 1`.
-            "request" => create(&mut home, ONE, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(1) }, &step, tally),
+            "request" => create(&mut home, ONE, EnsureSpec { inbox: inbox(), policy: AttemptPolicy::immediate(1) }, &world, &step, tally),
             "record" => accept(&mut home, ONE, ensure::Record { fulfiller }, &world, now, &step, tally),
             "create" => {
                 accept(&mut home, ONE, ensure::Create { fulfiller }, &world, now, &step, tally);
-                create(&mut fulfillers, &name, (), &step, tally);
+                create(&mut fulfillers, &name, (), &MemoryLifecycleWorld::default(), &step, tally);
             }
             op @ ("realise" | "release" | "vanish") => lifecycle_step(&mut fulfillers, &name, op, true, true, "model", now, &step, tally),
             "bind" => accept(&mut home, ONE, ensure::Bind { fulfiller }, &world, now, &step, tally),
@@ -1251,9 +1272,9 @@ fn drop_reason(v: &Value) -> DropReason {
     match tag(v) {
         "Undeliverable" => DropReason::Undeliverable,
         "Expired" => DropReason::Expired,
-        "Superseded" => DropReason::Superseded { by: Ref::new("newer") },
-        "Withdrawn" => DropReason::Withdrawn { by: "owner".into(), authority: owner() },
-        "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: "owner".into(), authority: owner() },
+        "Superseded" => DropReason::Superseded { by: newer() },
+        "Withdrawn" => DropReason::Withdrawn { by: owner_address(), authority: owner_address() },
+        "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: owner_address(), authority: owner_address() },
         other => panic!("drop reason {other}"),
     }
 }
@@ -1269,7 +1290,7 @@ fn reason_name(reason: &DropReason) -> &'static str {
 }
 
 fn session_number(receiver: &message::Receiver) -> i64 {
-    id_of(&receiver.session)
+    id_of(receiver.session.name())
 }
 
 /// The spec's `Envelope = { expectation, hasDeadline, deadline }`, from the
@@ -1313,7 +1334,7 @@ fn message_value(resource: &Resource<Message>) -> Value {
         MessageState::Pending => variant("Pending", envelope),
         MessageState::Awaiting { receiver } => variant(
             "Awaiting",
-            json!({ "envelope": envelope, "receiver": { "session": int(session_number(receiver)), "host": receiver.host } }),
+            json!({ "envelope": envelope, "receiver": { "session": int(session_number(receiver)), "host": receiver.host.name() } }),
         ),
         MessageState::Settled => variant("Settled", envelope),
         MessageState::Dropped { reason, dropped_receiver: receiver, at, watermark } => variant(
@@ -1332,7 +1353,10 @@ fn message_value(resource: &Resource<Message>) -> Value {
 }
 
 fn deliver(session: i64) -> message::Deliver {
-    message::Deliver { receiver: message::Receiver { session: session.to_string(), host: "consumer".into() }, transport: Transport::Turn }
+    message::Deliver {
+        receiver: message::Receiver { session: address_of(&session.to_string()), host: address_of("consumer") },
+        transport: Transport::Turn,
+    }
 }
 
 struct MessageReplay<'a> {
@@ -1356,23 +1380,23 @@ impl<'a> MessageReplay<'a> {
         let expectation = tag(&envelope["expectation"]);
         let deadline = boolean(&envelope["hasDeadline"]).then(|| number(&envelope["deadline"]));
         let spec = MessageSpec {
-            inbox: INBOX.into(),
+            inbox: inbox(),
             expectation: match expectation {
                 "Nothing" => Expectation::Nothing,
                 "Reply" => Expectation::Reply,
-                "Outcome" => Expectation::Outcome { condition: Ref::new("outcome") },
+                "Outcome" => Expectation::Outcome { condition: outcome_condition() },
                 other => panic!("expectation {other}"),
             },
             deadline: deadline.map(moment),
             // Both scenarios drop as undeliverable once `now - unboundAt > 1`.
             unbound_after: UNIT,
         };
-        let mut home = Home::new("home").expect("declaration");
-        home.create(ONE, spec).expect("message");
+        let mut home = Home::<Message>::new("home").expect("declaration");
+        home.create(ONE, spec, &MemoryMessageWorld::default(), Timestamp(0)).expect("message");
         let sessions = (feed == Feed::Inbox).then(|| {
-            let mut sessions = Home::new("consumer").expect("declaration");
+            let mut sessions = Home::<AgentSession>::new("consumer").expect("declaration");
             for (id, _) in entries(&trace.states[0], "::sessions") {
-                sessions.create(id.to_string(), ()).expect("session");
+                sessions.create(id.to_string(), (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("session");
             }
             sessions
         });
@@ -1385,27 +1409,29 @@ impl<'a> MessageReplay<'a> {
         let stream = Stream::of(self.feed.stream(state));
         let mut world = MemoryMessageWorld::default();
         let own = Ref::new(ONE);
-        world.receipts.put(&own, stream.sessions("receipt").iter().map(|session| (session.to_string(), Transport::Turn)).collect());
+        world
+            .receipts
+            .put(&own, stream.sessions("receipt").iter().map(|session| (address_of(&session.to_string()), Transport::Turn)).collect());
         if stream.any("reply") {
             world.reply.put(&Ref::new(ONE), ());
         }
-        world.condition.put(&Ref::new("outcome"), stream.any("outcome"));
+        world.condition.put(&Ref::new(outcome_condition().as_str()), stream.any("outcome"));
         if stream.any("failure") {
             world.delivery_failure.put(&Ref::new(ONE), ());
         }
-        world.applied_through.put(&Ref::new(INBOX), moment(stream.watermark()));
+        world.applied_through.put(&Ref::new(inbox().as_str()), moment(stream.watermark()));
         let binding = match self.feed {
-            Feed::Race => InboxBinding::Bound { session: "1".into() },
+            Feed::Race => InboxBinding::Bound { session: address_of("1") },
             Feed::Inbox => match number(&state["bound"]) {
                 0 => InboxBinding::Unbound { since: moment(number(&state["unboundAt"])) },
-                session => InboxBinding::Bound { session: session.to_string() },
+                session => InboxBinding::Bound { session: address_of(&session.to_string()) },
             },
         };
-        world.binding.put(&Ref::new(INBOX), binding);
+        world.binding.put(&Ref::new(inbox().as_str()), binding);
         let evidence = witness || self.feed == Feed::Race;
-        world.authority.put(&owner(), evidence);
+        world.authority.put(&Ref::new(owner_address().as_str()), evidence);
         if evidence {
-            world.supersession.put(&Ref::new("newer"), message::Supersedes { older: ONE.into() });
+            world.supersession.put(&Ref::new(newer().as_str()), message::Supersedes { older: ONE.into() });
         }
         world
     }
@@ -1514,7 +1540,7 @@ impl<'a> MessageReplay<'a> {
                 deliver(1).into(),
                 message::Settle { by: message::Settlement::Answered }.into(),
                 message::Settle { by: message::Settlement::OutcomeObserved }.into(),
-                message::DropMessage { reason: DropReason::Withdrawn { by: "owner".into(), authority: owner() } }.into(),
+                message::DropMessage { reason: DropReason::Withdrawn { by: owner_address(), authority: owner_address() } }.into(),
                 message::DropMessage { reason: DropReason::Expired }.into(),
                 message::DropMessage { reason: DropReason::Undeliverable }.into(),
             ];

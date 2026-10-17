@@ -113,6 +113,8 @@ fn the_enumeration_covers_every_kind_and_index() {
         "index referral_by_reply after",
         "index referral_by_session first",
         "vessel scan",
+        "index vessel_live_by_host first",
+        "index vessel_by_convoy after",
         "ticket set state state",
         "ticket set reason",
         "ticket label state",
@@ -123,7 +125,7 @@ fn the_enumeration_covers_every_kind_and_index() {
     ] {
         assert!(labels.contains(&expected), "missing {expected}");
     }
-    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 9);
+    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 11);
     assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 9);
     assert!(!labels.iter().any(|label| label.starts_with("message_edges set ")), "history rows are never set");
     assert!(
@@ -191,6 +193,8 @@ fn edge_log_indexes_serve_history_reads() {
             "terminal_session_events_by_time",
             "ticket_edges_by_edge",
             "ticket_edges_by_time",
+            "vessel_edges_by_edge",
+            "vessel_edges_by_time",
         ]
     );
 }

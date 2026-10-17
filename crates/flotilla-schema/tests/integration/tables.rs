@@ -132,7 +132,7 @@ fn up_to<T>(tc: &TestCase, max: usize, mut f: impl FnMut() -> T) -> Vec<T> {
 fn records<T>(tc: &TestCase, max: usize, mut f: impl FnMut() -> T) -> Records<T> {
     let mut records = Records::new();
     for record in up_to(tc, max, &mut f) {
-        records.append(tc.draw(gs::integers::<u64>().max_value(i64::MAX as u64)), record);
+        records.append(tc.draw(gs::integers::<u64>().max_value(i64::MAX as u64)), record).expect("room");
     }
     records
 }
@@ -288,7 +288,7 @@ fn decode_refuses_rows_the_value_cannot_hold() {
     let rows = Encoder::encode(&value).expect("encode");
 
     let mut deliverables = Records::new();
-    deliverables.append(3, Deliverable { label: "d".into(), evidence: Records::new() });
+    deliverables.append(3, Deliverable { label: "d".into(), evidence: Records::new() }).expect("room");
     let with_record = Plan { deliverables, ..value.clone() };
     let record_rows = Encoder::encode(&with_record).expect("encode");
     assert_eq!(record_rows.tables[7][0].values[0], Value::Int(3), "the stamp is the first value");
@@ -303,7 +303,7 @@ fn decode_refuses_rows_the_value_cannot_hold() {
     negative.tables[7][0].values[0] = Value::Int(-1);
     assert_eq!(Decoder::decode::<Plan>(negative), Err(DecodeError::OutOfRange { column: "deliverables_version".into(), value: -1 }));
     let mut deliverables = Records::new();
-    deliverables.append(u64::MAX, Deliverable { label: "d".into(), evidence: Records::new() });
+    deliverables.append(u64::MAX, Deliverable { label: "d".into(), evidence: Records::new() }).expect("room");
     let unstorable = Encoder::encode(&Plan { deliverables, ..value.clone() });
     assert_eq!(unstorable.map(|_| ()), Err(EncodeError::OutOfRange { column: "deliverables_version".into(), value: u64::MAX }));
 

@@ -14,7 +14,7 @@ use flotilla_state_machines::{
 use hegel::{generators as gs, TestCase};
 
 use super::{
-    code_enum,
+    address, code_enum,
     engine::{self, Candidate},
     name, records, stamp_flat, text, timestamp, ConvoyRow, Fixture, Pick,
 };
@@ -71,8 +71,8 @@ fn edges(tc: &TestCase) -> Vec<ConvoyEdge> {
 
 pub fn generate(tc: &TestCase, pick: Pick) -> ConvoyRow {
     ConvoyRow {
-        project: name(tc),
-        promises: map(tc, pick.nth(2), 2, |pick, n| (PromiseId(small(tc, pick, n)), Promise { kind: name(tc), target: name(tc) })),
+        project: address(tc),
+        promises: map(tc, pick.nth(2), 2, |pick, n| (PromiseId(small(tc, pick, n)), Promise { kind: name(tc), target: address(tc) })),
         priority: Priority(tc.draw(gs::integers::<u32>())),
         state: State::new(state_value(tc, pick), timestamp(tc)),
         edges: records(tc, pick, 2, |pick| engine::event::<Convoy>(tc, pick, &edges(tc))),
@@ -83,8 +83,8 @@ pub fn generate(tc: &TestCase, pick: Pick) -> ConvoyRow {
 pub fn sample() -> ConvoyRow {
     let promise = PromiseId(0);
     ConvoyRow {
-        project: "p".into(),
-        promises: [(promise, Promise { kind: "change".into(), target: "main".into() })].into(),
+        project: "project:p".parse().expect("address"),
+        promises: [(promise, Promise { kind: "change".into(), target: "forge:github/repo:o%2Fr/cr:1".parse().expect("address") })].into(),
         priority: Priority(1),
         state: State::new(
             ConvoyState::Open { resolution: [(promise, PromiseState::Pending)].into(), quota: [(VesselClass(0), 1)].into() },

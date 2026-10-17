@@ -1,8 +1,9 @@
 //! Fixture kinds and helpers.
 //!
 //! The stored kinds are the engine's machine declarations (#3319, #3373 ruling 4): Message,
-//! AgentSession, Convoy and Ensure from `flotilla_state_machines::machines`, and `TerminalSession`,
-//! a lifecycle kind whose row is declared here, beside its request (`terminal`). Their edges are
+//! AgentSession, Convoy, Vessel and Ensure from `flotilla_state_machines::machines`, registered
+//! through the engine's production registry, and `TerminalSession`, a lifecycle kind whose row is
+//! declared here, beside its request (`terminal`). Their edges are
 //! real transitions: each fixture's [`Fixture::edge`] builds a home holding the stored row, a world
 //! that makes a drawn edge pass its gate, applies the edge through the engine, and turns the result
 //! into the stored edge ([`engine::drive`]). Every stored transition is one the engine's rules
@@ -29,20 +30,23 @@ pub mod message;
 pub mod synthetic;
 pub mod terminal;
 pub mod ticket;
+pub mod vessel;
 
 use std::fmt::Debug;
 
 use chrono::{DateTime, Utc};
-use flotilla_schema::{Edge, EdgeEvent, Identity, Kind, KindCode, KindRegistry, Position, Records, Ref, Timestamp};
+use flotilla_schema::{Address, Edge, EdgeEvent, Identity, Kind, KindCode, KindRegistry, Position, Records, Ref, Timestamp};
 use flotilla_schema_sqlite::Store;
-pub use flotilla_state_machines::machines::{agent_session::AgentSessionRow, convoy::ConvoyRow, ensure::EnsureRow, message::MessageRow};
+pub use flotilla_state_machines::machines::{
+    agent_session::AgentSessionRow, convoy::ConvoyRow, ensure::EnsureRow, message::MessageRow, vessel::VesselRow,
+};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 pub use self::{
     synthetic::{Dossier, Referral},
-    terminal::{TerminalSession, Vessel},
+    terminal::TerminalSession,
     ticket::Ticket,
 };
 
@@ -94,15 +98,11 @@ pub trait Fixture: Kind + Clone + PartialEq + Debug {
     fn stamped(&self, before: Option<&Self>, version: u64) -> Self;
 }
 
+/// The production registry plus the test kinds, which therefore cannot take a production code.
 pub fn registry() -> KindRegistry {
-    let mut registry = KindRegistry::new();
-    registry.register::<MessageRow>().expect("fixture kinds register");
-    registry.register::<AgentSessionRow>().expect("fixture kinds register");
-    registry.register::<ConvoyRow>().expect("fixture kinds register");
+    let mut registry = flotilla_state_machines::kinds().expect("production kinds register");
     registry.register::<TerminalSession>().expect("fixture kinds register");
-    registry.register::<Vessel>().expect("fixture kinds register");
     registry.register::<Ticket>().expect("fixture kinds register");
-    registry.register::<EnsureRow>().expect("fixture kinds register");
     registry.register::<Referral>().expect("fixture kinds register");
     registry.register::<Dossier>().expect("fixture kinds register");
     registry
@@ -182,7 +182,7 @@ pub fn version(tc: &TestCase) -> u64 {
 pub fn records<T>(tc: &TestCase, pick: Pick, max: usize, element: impl FnMut(Pick) -> T) -> Records<T> {
     let mut records = Records::new();
     for record in list(tc, pick, max, element) {
-        records.append(version(tc), record);
+        records.append(version(tc), record).expect("room");
     }
     records
 }
@@ -190,7 +190,7 @@ pub fn records<T>(tc: &TestCase, pick: Pick, max: usize, element: impl FnMut(Pic
 /// `records` with `record` appended, stamped arbitrarily.
 pub fn appended<T: Clone>(tc: &TestCase, records: &Records<T>, record: T) -> Records<T> {
     let mut next = records.clone();
-    next.append(version(tc), record);
+    next.append(version(tc), record).expect("room");
     next
 }
 
@@ -199,7 +199,7 @@ pub fn appended<T: Clone>(tc: &TestCase, records: &Records<T>, record: T) -> Rec
 pub fn replaced<T: Clone>(records: &Records<T>, position: Position, mut f: impl FnMut(&T) -> T) -> Records<T> {
     let mut next = Records::new();
     for row in records {
-        next.append(row.version, if row.position == position { f(&row.record) } else { row.record.clone() });
+        next.append(row.version, if row.position == position { f(&row.record) } else { row.record.clone() }).expect("room");
     }
     next
 }
@@ -216,7 +216,9 @@ pub fn stamp<T>(records: &Records<T>, before: Option<&Records<T>>, version: u64,
     let mut stamped = Records::new();
     for row in records {
         let previous = before.and_then(|before| before.get(row.position));
-        stamped.append(previous.map_or(version, |_| row.version), inner(&row.record, previous.map(|previous| &previous.record)));
+        stamped
+            .append(previous.map_or(version, |_| row.version), inner(&row.record, previous.map(|previous| &previous.record)))
+            .expect("room");
     }
     stamped
 }
@@ -240,6 +242,23 @@ pub fn seq(tc: &TestCase) -> u64 {
 /// Interned values collide often, so equal strings share `strings` rows.
 pub fn name(tc: &TestCase) -> String {
     tc.draw(gs::sampled_from(vec!["alice".to_owned(), "bob".to_owned(), String::new(), "ünïcødé".to_owned()]))
+}
+
+/// The project-rooted address of `name`, for hand-written rows.
+pub fn addr(name: &str) -> Address {
+    Address::project(name).expect("valid name")
+}
+
+/// Addresses (#3392 G1) from a small set, so equal addresses share one interned string: a
+/// project, a role inbox under it (its value escaped), and a change request outside flotilla.
+pub fn address(tc: &TestCase) -> Address {
+    let text = tc.draw(gs::sampled_from(vec![
+        "project:alice",
+        "project:bob",
+        "project:alice/role:co%20der",
+        "forge:github/repo:flotilla-org%2Fflotilla/cr:42",
+    ]));
+    text.parse().expect("canonical fixture address")
 }
 
 /// Map keys and set values from a small alphabet, so they collide and dedupe.

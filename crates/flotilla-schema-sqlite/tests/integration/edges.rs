@@ -18,7 +18,7 @@ use crate::fixtures::{
     synthetic::{
         Deliverable, DeliverableState, DossierEdge, DossierEvent, DossierState, Evidence, PlacementSnapshot, PromiseKind, PromiseSource,
     },
-    AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Payload, Pick, Referral, TerminalSession, LOCAL,
+    AgentSessionRow, ConvoyRow, Dossier, EnsureRow, Fixture, MessageRow, Payload, Pick, Referral, TerminalSession, VesselRow, LOCAL,
 };
 
 fn snapshot(store: &mut Store, id: ResourceId) -> Snapshot {
@@ -167,6 +167,7 @@ fn an_edge_touches_exactly_its_declared_rows(tc: TestCase) {
     touches_only_declared_rows::<ConvoyRow>(&tc);
     touches_only_declared_rows::<EnsureRow>(&tc);
     touches_only_declared_rows::<TerminalSession>(&tc);
+    touches_only_declared_rows::<VesselRow>(&tc);
     touches_only_declared_rows::<Referral>(&tc);
     touches_only_declared_rows::<Dossier>(&tc);
 }
@@ -218,9 +219,9 @@ fn deliverables_move_and_take_evidence_through_edges() {
     let mut write = store.write().expect("write");
     let mut deliverables = Records::new();
     let mut first = deliverable();
-    first.evidence.append(0, evidence("e0"));
-    deliverables.append(0, first);
-    deliverables.append(0, deliverable());
+    first.evidence.append(0, evidence("e0")).expect("room");
+    deliverables.append(0, first).expect("room");
+    deliverables.append(0, deliverable()).expect("room");
     let inserted = write.insert("c", &Dossier { deliverables, ..Dossier::sample(0) }).expect("insert");
 
     let submit = staying_open(DossierEdge::Submit { deliverable: 0 })

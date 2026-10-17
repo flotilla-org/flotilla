@@ -3,10 +3,10 @@ use hegel::{generators as gs, TestCase};
 
 use chrono::{DateTime, Duration};
 
-use crate::fixtures::{floor, message as messages, store, MessageRow as Message, Referral};
+use crate::fixtures::{addr, floor, message as messages, store, MessageRow as Message, Referral};
 
 fn message(inbox: &str) -> Message {
-    Message { inbox: inbox.into(), unbound_after: 1, ..messages::sample() }
+    Message { inbox: addr(inbox), unbound_after: 1, ..messages::sample() }
 }
 
 // Behaviour (ADR 0064, #3320 sequencing): every write takes the home's next sequence, so the
@@ -128,8 +128,8 @@ fn a_refused_write_does_not_spoil_its_batch() {
 
     let mut read = store.read().expect("read");
     let a = read.load::<Message>(first.id).expect("load a").expect("a present");
-    assert_eq!((a.value.inbox.as_str(), a.version), ("second", moved.version));
-    assert_eq!(read.load::<Message>(other.id).expect("load b").expect("b present").value.inbox, "other");
+    assert_eq!((a.value.inbox.name(), a.version), ("second", moved.version));
+    assert_eq!(read.load::<Message>(other.id).expect("load b").expect("b present").value.inbox.name(), "other");
 }
 
 // Behaviour: identity rows outlive their resource, so a write to a deleted resource is

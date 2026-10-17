@@ -14,14 +14,16 @@
 
 use std::collections::BTreeMap;
 
+use flotilla_schema::Stored;
+
 use crate::machines::convoy::{ConvoyId, Priority, Quota, VesselClass};
 
 /// A host that capacity is leased on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
 pub struct Host(pub u32);
 
 /// One capacity dimension, such as cores or memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
 pub struct Dimension(pub u32);
 
 /// Units by capacity dimension: a request's shape, or a host's capacity.

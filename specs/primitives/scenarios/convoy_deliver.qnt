@@ -12,7 +12,7 @@ module convoy_deliver {
     nondet reason = Set("", "decision").oneOf()
     any {
       all {
-        C::admitRequest(id, { project: "project", promises: promises.mapBy(_ => { kind: "opaque", target: "target" }), quota: Map(0 -> 1, 1 -> 1), priority: id }),
+        C::admitRequest(id, { project: "project", projectKnown: true, promises: promises.mapBy(_ => { kind: "opaque", target: "target" }), quota: Map(0 -> 1, 1 -> 1), priority: id }),
         keepWorld,
       },
       all { C::keep(id, p), keepWorld },

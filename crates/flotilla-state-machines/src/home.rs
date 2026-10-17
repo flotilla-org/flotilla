@@ -10,11 +10,11 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use flotilla_schema::{EdgeEvent, Position, Records, Timestamp};
+use flotilla_schema::{EdgeEvent, Position, Records, RecordsFull, Timestamp};
 
 use crate::{
-    Attempt, DefError, Edge, EdgeEventOf, EdgeKind, EdgePayload, Ended, Fault, Handle, Judged, Label, Machine, MachineDef, Receipt,
-    StateValue, StepError, Version, WrongState,
+    Admission, Attempt, DefError, Edge, EdgeEventOf, EdgeKind, EdgePayload, Ended, Fault, Handle, InputRead, Judged, Label, Machine,
+    MachineDef, Receipt, StateValue, StepError, Version, WrongState,
 };
 
 /// One resource at its home: its spec, current state, version and records.
@@ -102,6 +102,21 @@ pub struct RowParts<M: Machine> {
     pub receipts: Records<Receipt>,
 }
 
+/// A created resource and the reads its admission relied on.
+pub struct Created<'a, M: Machine> {
+    pub resource: &'a Resource<M>,
+    pub reads: Vec<InputRead>,
+}
+
+impl<M: Machine> fmt::Debug for Created<'_, M>
+where
+    M::Spec: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Created").field("resource", &self.resource).field("reads", &self.reads).finish()
+    }
+}
+
 /// Why a write did not happen.
 pub enum WriteError<M: Machine> {
     /// No resource of that name at this home.
@@ -112,6 +127,8 @@ pub enum WriteError<M: Machine> {
     Refused(M::Refusal),
     /// A declaration fault; see [`Fault`].
     Fault(Fault<Label<M>, EdgeKind<M>>),
+    /// One of the resource's record tables has used every position.
+    Full(RecordsFull),
 }
 
 impl<M: Machine> WriteError<M> {
@@ -139,6 +156,7 @@ impl<M: Machine> PartialEq for WriteError<M> {
             (WriteError::Unknown(a), WriteError::Unknown(b)) | (WriteError::Exists(a), WriteError::Exists(b)) => a == b,
             (WriteError::Refused(a), WriteError::Refused(b)) => a == b,
             (WriteError::Fault(a), WriteError::Fault(b)) => a == b,
+            (WriteError::Full(a), WriteError::Full(b)) => a == b,
             _ => false,
         }
     }
@@ -151,6 +169,7 @@ impl<M: Machine> fmt::Debug for WriteError<M> {
             WriteError::Exists(name) => f.debug_tuple("Exists").field(name).finish(),
             WriteError::Refused(refusal) => f.debug_tuple("Refused").field(refusal).finish(),
             WriteError::Fault(fault) => f.debug_tuple("Fault").field(fault).finish(),
+            WriteError::Full(full) => f.debug_tuple("Full").field(full).finish(),
         }
     }
 }
@@ -187,14 +206,23 @@ impl<M: Machine> Home<M> {
         self.resources.values()
     }
 
-    /// Admits `request` and creates the resource in the state admission
-    /// returns, which must carry the declared initial label.
-    pub fn create(&mut self, name: impl Into<String>, request: M::Request) -> Result<&Resource<M>, WriteError<M>> {
+    /// Admits `request` at `now`, reading `world` through the recording
+    /// admission handle, and creates the resource in the state admission
+    /// returns, which must carry the declared initial label. Returns the
+    /// resource and the reads admission relied on, for the create's event.
+    pub fn create(
+        &mut self,
+        name: impl Into<String>,
+        request: M::Request,
+        world: &M::World,
+        now: Timestamp,
+    ) -> Result<Created<'_, M>, WriteError<M>> {
         let name = name.into();
         if self.resources.contains_key(&name) {
             return Err(WriteError::Exists(name));
         }
-        let (spec, state) = M::admit(request).map_err(WriteError::Refused)?;
+        let mut admission = Admission::new(world, now);
+        let (spec, state) = M::admit(&mut admission, request).map_err(WriteError::Refused)?;
         if state.label() != self.definition.initial() {
             return Err(WriteError::Fault(Fault::Initial { state: state.label() }));
         }
@@ -207,7 +235,8 @@ impl<M: Machine> Home<M> {
             state,
             version: Version(1),
         };
-        Ok(self.resources.entry(name).or_insert(resource))
+        let reads = admission.into_reads();
+        Ok(Created { resource: self.resources.entry(name).or_insert(resource), reads })
     }
 
     /// Places a resource read from storage at this home, as stored: its spec,
@@ -229,7 +258,8 @@ impl<M: Machine> Home<M> {
     /// On success the resource holds the next state, its version rises, and
     /// the returned event (whose payload holds the edge and the gate's and
     /// effect's reads) is appended to its edge events, stamped with the new
-    /// version.
+    /// version. A resource whose edge log has used every position refuses
+    /// with [`WriteError::Full`] and is left unchanged.
     pub fn apply(
         &mut self,
         name: &str,
@@ -245,12 +275,15 @@ impl<M: Machine> Home<M> {
         // The step borrowed the resource immutably; this second lookup of the
         // same name under `&mut self` cannot miss.
         let resource = self.resources.get_mut(name).ok_or_else(|| WriteError::Unknown(name.to_string()))?;
+        if resource.events.is_full() {
+            return Err(WriteError::Full(RecordsFull));
+        }
         let from = resource.state.label();
         let to = next.label();
         resource.version = resource.version.next();
         resource.state = next;
         let event = EdgeEvent { edge: edge.kind(), from, to, writer: self.writer.clone(), at: now, payload: EdgePayload { edge, reads } };
-        Ok(&resource.events.append(resource.version.0, event).record)
+        Ok(&resource.events.append(resource.version.0, event).map_err(WriteError::Full)?.record)
     }
 
     /// Appends an attempt. Refused on an ended resource, with the end's
@@ -258,15 +291,21 @@ impl<M: Machine> Home<M> {
     pub fn record_attempt(&mut self, name: &str, attempt: Attempt) -> Result<Position, WriteError<M>> {
         let accepts = |definition: &MachineDef<M>, label| definition.accepts_attempts(label);
         let resource = self.writable(name, accepts)?;
+        if resource.attempts.is_full() {
+            return Err(WriteError::Full(RecordsFull));
+        }
         resource.version = resource.version.next();
-        Ok(resource.attempts.append(resource.version.0, attempt).position)
+        Ok(resource.attempts.append(resource.version.0, attempt).map_err(WriteError::Full)?.position)
     }
 
     /// Appends a receipt. Refused on an ended resource, with the end's reason.
     pub fn record_receipt(&mut self, name: &str, receipt: Receipt) -> Result<Position, WriteError<M>> {
         let resource = self.writable(name, any_label)?;
+        if resource.receipts.is_full() {
+            return Err(WriteError::Full(RecordsFull));
+        }
         resource.version = resource.version.next();
-        Ok(resource.receipts.append(resource.version.0, receipt).position)
+        Ok(resource.receipts.append(resource.version.0, receipt).map_err(WriteError::Full)?.position)
     }
 
     fn writable(&mut self, name: &str, accepts: impl Fn(&MachineDef<M>, Label<M>) -> bool) -> Result<&mut Resource<M>, WriteError<M>> {

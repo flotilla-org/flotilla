@@ -3,7 +3,7 @@ use std::{env, fs, path::Path};
 use flotilla_schema::{render_view, DdlMode};
 use flotilla_schema_sqlite::{schema_ddl, Store};
 
-use crate::fixtures::{message, registry, store, MessageRow, LOCAL};
+use crate::fixtures::{addr, message, registry, store, MessageRow, LOCAL};
 
 // Behaviour (#3320 DDL snapshot): the fixtures' DDL is deterministic and checked in. Any diff
 // fails; `UPDATE_DDL_SNAPSHOT=1` rewrites the snapshot for review.
@@ -46,7 +46,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
     let message = MessageRow { deadline: Some(flotilla_schema::Timestamp(3)), unbound_after: 4, ..message::sample() };
     let stamp = write.insert("m", &message).expect("insert");
     let current = write.load::<MessageRow>(stamp.id).expect("load").expect("present");
-    write.update(&current, &MessageRow { inbox: "c".into(), ..message }).expect("update");
+    write.update(&current, &MessageRow { inbox: addr("c"), ..message }).expect("update");
     write.commit().expect("commit");
 
     let conn = store.into_connection();
@@ -99,6 +99,9 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "ticket_edges",
             "ticket_notes",
             "vessel",
+            "vessel_attempts",
+            "vessel_edges",
+            "vessel_shape",
         ]
     );
     for (name, strict) in &tables {
@@ -115,7 +118,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
 fn reopening_keeps_tables_and_rows() {
     let mut store = store();
     let mut write = store.write().expect("write");
-    let message = MessageRow { inbox: "kept".into(), ..message::sample() };
+    let message = MessageRow { inbox: addr("kept"), ..message::sample() };
     let stamp = write.insert("m", &message).expect("insert");
     write.commit().expect("commit");
     let mut store = Store::open(store.into_connection(), LOCAL, registry()).expect("reopen");

@@ -2,14 +2,14 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{IndexQuery, Kind, Ref, State, Timestamp};
+use flotilla_schema::{Address, IndexQuery, Kind, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{Cursor, Page, ResourceId, Store, StoreError, MAX_PAGE};
 use flotilla_state_machines::machines::{convoy::ConvoyState, lifecycle::LifecycleState, message::MessageState};
 use hegel::{generators as gs, TestCase};
 
 use crate::fixtures::{
-    convoy, ensure, message, store, terminal, AgentSessionRow, ConvoyRow, EnsureRow, Fixture, MessageRow, Pick, Referral, TerminalSession,
-    Vessel, LOCAL,
+    addr, convoy, ensure, message, store, terminal, AgentSessionRow, ConvoyRow, EnsureRow, Fixture, MessageRow, Pick, Referral,
+    TerminalSession, VesselRow, LOCAL,
 };
 
 /// Every id of `query`, page by page with `limit`. Each page holds at most `limit` ids, a page
@@ -65,7 +65,7 @@ fn small_time(tc: &TestCase) -> Timestamp {
 /// broken by id) and shared inboxes occur, in every label.
 fn drawn_message(tc: &TestCase) -> MessageRow {
     MessageRow {
-        inbox: tc.draw(gs::sampled_from(vec!["i0".to_owned(), "i1".to_owned()])),
+        inbox: addr(&tc.draw(gs::sampled_from(vec!["i0".to_owned(), "i1".to_owned()]))),
         deadline: tc.draw(gs::booleans()).then(|| small_time(tc)),
         state: State::new(message::state_value(tc, Pick::Draw), Timestamp(0)),
         ..message::generate(tc, Pick::Draw)
@@ -80,8 +80,8 @@ fn open(message: &MessageRow) -> bool {
 fn check_messages(tc: &TestCase, store: &mut Store, model: &BTreeMap<ResourceId, MessageRow>) {
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(4));
     for inbox in ["i0", "i1"] {
-        let want = expected(model, |m| open(m) && m.inbox == inbox, |_| ());
-        assert_eq!(collect(store, &MessageRow::open_by_inbox(&inbox.to_owned()), limit), want, "open_by_inbox {inbox}");
+        let want = expected(model, |m| open(m) && m.inbox == addr(inbox), |_| ());
+        assert_eq!(collect(store, &MessageRow::open_by_inbox(&addr(inbox)), limit), want, "open_by_inbox {inbox}");
     }
     let want = expected(model, |m| open(m) && m.deadline.is_some(), |m| m.deadline.map(Timestamp::micros));
     assert_eq!(collect(store, &MessageRow::deadline(), limit), want, "deadline");
@@ -192,6 +192,10 @@ fn reference_indexes_match_the_model(tc: TestCase) {
     assert_eq!(scan_all::<Referral>(&mut store, LOCAL, limit), all, "scan skips identities without a row");
 }
 
+fn project(name: &str) -> Address {
+    Address::project(name).expect("project address")
+}
+
 // Behaviour (DESIGN queries): the other engine kinds' indexes, an interned `eq` under a label
 // predicate (Convoy's open convoys of a project, a terminal session pool's live sessions), a
 // reference `eq` ordered by a spec column (a vessel's sessions) and a bare interned `eq` (an
@@ -203,7 +207,7 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
     let pick = |names: &[&str]| tc.draw(gs::sampled_from(names.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>()));
     let mut write = store.write().expect("write");
     for n in 0..tc.draw(gs::integers::<usize>().max_value(8)) {
-        let convoy = ConvoyRow { project: pick(&["p0", "p1"]), ..convoy::generate(&tc, Pick::Draw) };
+        let convoy = ConvoyRow { project: project(&pick(&["p0", "p1"])), ..convoy::generate(&tc, Pick::Draw) };
         convoys.insert(write.insert(&format!("c{n}"), &convoy).expect("insert").id, convoy);
     }
     for n in 0..tc.draw(gs::integers::<usize>().max_value(8)) {
@@ -216,18 +220,19 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
         sessions.insert(write.insert(&format!("t{n}"), &session).expect("insert").id, session);
     }
     for n in 0..tc.draw(gs::integers::<usize>().max_value(6)) {
-        let ensure = EnsureRow { inbox: pick(&["i0", "i1"]), ..ensure::generate(&tc, Pick::Draw) };
+        let ensure = EnsureRow { inbox: addr(&pick(&["i0", "i1"])), ..ensure::generate(&tc, Pick::Draw) };
         ensures.insert(write.insert(&format!("e{n}"), &ensure).expect("insert").id, ensure);
     }
     write.commit().expect("commit");
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
     for project in ["p0", "p1", "p2"] {
+        let project = self::project(project);
         let want = expected(&convoys, |c: &ConvoyRow| matches!(c.state.value, ConvoyState::Open { .. }) && c.project == project, |_| ());
-        assert_eq!(collect(&mut store, &ConvoyRow::open_by_project(&project.to_owned()), limit), want);
+        assert_eq!(collect(&mut store, &ConvoyRow::open_by_project(&project), limit), want);
     }
     for vessel in ["v0", "v1", "v2"] {
         let want = expected(&sessions, |s: &TerminalSession| s.vessel.name == vessel, |s| s.ordinal);
-        assert_eq!(collect(&mut store, &TerminalSession::by_vessel(&Ref::<Vessel>::new(vessel, LOCAL)), limit), want);
+        assert_eq!(collect(&mut store, &TerminalSession::by_vessel(&Ref::<VesselRow>::new(vessel, LOCAL)), limit), want);
     }
     for pool in ["blue", "green", "red"] {
         let live = |s: &TerminalSession| matches!(s.state.value, LifecycleState::Requested | LifecycleState::Realised { .. });
@@ -235,8 +240,8 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
         assert_eq!(collect(&mut store, &TerminalSession::live_by_pool(&pool.to_owned()), limit), want);
     }
     for inbox in ["i0", "i1", "i2"] {
-        let want = expected(&ensures, |e: &EnsureRow| e.inbox == inbox, |_| ());
-        assert_eq!(collect(&mut store, &EnsureRow::by_inbox(&inbox.to_owned()), limit), want);
+        let want = expected(&ensures, |e: &EnsureRow| e.inbox == addr(inbox), |_| ());
+        assert_eq!(collect(&mut store, &EnsureRow::by_inbox(&addr(inbox)), limit), want);
     }
 }
 
@@ -256,7 +261,7 @@ fn unknown_arguments_give_an_empty_page_and_create_nothing() {
     let mut store = store();
     insert_messages(&mut store, 2, |_| message::sample());
     let mut read = store.read().expect("read");
-    let page = read.page(&MessageRow::open_by_inbox(&"never".to_owned()), None, 10).expect("page");
+    let page = read.page(&MessageRow::open_by_inbox(&addr("never")), None, 10).expect("page");
     assert_eq!(page, Page { ids: vec![], next: None });
     let page = read.page(&Referral::by_session(&Ref::new("never", LOCAL)), None, 10).expect("page");
     assert!(page.ids.is_empty());
@@ -268,7 +273,7 @@ fn unknown_arguments_give_an_empty_page_and_create_nothing() {
     drop(read);
     let conn = store.into_connection();
     let created: i64 =
-        conn.query_row("SELECT count(*) FROM strings WHERE s IN ('never', 'unseen-pool')", [], |row| row.get(0)).expect("count");
+        conn.query_row("SELECT count(*) FROM strings WHERE s IN ('project:never', 'unseen-pool')", [], |row| row.get(0)).expect("count");
     assert_eq!(created, 0, "the queries interned nothing");
 }
 
@@ -284,14 +289,14 @@ fn cursors_are_bound_to_their_query() {
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
-    let inbox = MessageRow::open_by_inbox(&"inbox".to_owned());
+    let inbox = MessageRow::open_by_inbox(&addr("inbox"));
     let cursor = read.page(&inbox, None, 1).expect("page").next.expect("more follow");
     assert_eq!(read.page(&inbox, Some(&cursor), 5).expect("continue").ids.len(), 2);
-    let other_inbox = MessageRow::open_by_inbox(&"other".to_owned());
+    let other_inbox = MessageRow::open_by_inbox(&addr("other"));
     assert!(matches!(read.page(&other_inbox, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
     let deadline = MessageRow::deadline();
     assert!(matches!(read.page(&deadline, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
-    let convoy_cursor = read.page(&ConvoyRow::open_by_project(&"p".to_owned()), None, 1).expect("page").next.expect("more");
+    let convoy_cursor = read.page(&ConvoyRow::open_by_project(&project("p")), None, 1).expect("page").next.expect("more");
     assert!(matches!(read.page(&inbox, Some(&convoy_cursor), 5), Err(StoreError::CursorMismatch { .. })));
 }
 
@@ -302,7 +307,7 @@ fn limits_are_required_and_capped() {
     let mut store = store();
     insert_messages(&mut store, MAX_PAGE as usize + 1, |_| message::sample());
     let mut read = store.read().expect("read");
-    let inbox = MessageRow::open_by_inbox(&"inbox".to_owned());
+    let inbox = MessageRow::open_by_inbox(&addr("inbox"));
     assert!(matches!(read.page(&inbox, None, 0), Err(StoreError::ZeroLimit)));
     assert!(matches!(read.scan::<MessageRow>(LOCAL, None, 0), Err(StoreError::ZeroLimit)));
     let page = read.page(&inbox, None, u32::MAX).expect("page");

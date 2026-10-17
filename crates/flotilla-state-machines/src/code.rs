@@ -175,8 +175,9 @@ macro_rules! states {
 /// belongs to one variant. The kind enum is named after `=>`, its names are
 /// the snake_case variant names, and its codes are the literals given here:
 /// the kind derives `flotilla_schema::Stored` as a code enum with those codes.
-/// The edge enum derives serde's `Serialize` and `Deserialize`, so it can be
-/// an [`EdgePayload`](crate::EdgePayload)'s document, and every argument
+/// The edge enum implements serde's `Serialize` and `Deserialize` as
+/// `[code, arguments]`, so it can be an [`EdgePayload`](crate::EdgePayload)'s
+/// document whose shape does not depend on variant names, and every argument
 /// struct must implement both too. The expansion uses strum's, the schema
 /// crate's and serde's derives, so the calling crate depends on `strum`,
 /// `flotilla-schema` and `serde`.
@@ -189,7 +190,7 @@ macro_rules! edges {
         }
     ) => {
         $(#[$meta])*
-        #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, strum::EnumDiscriminants)]
+        #[derive(Clone, Debug, PartialEq, Eq, strum::EnumDiscriminants)]
         #[strum_discriminants(
             name($kind),
             derive(PartialOrd, Ord, Hash, strum::IntoStaticStr, strum::VariantArray, ::flotilla_schema::Stored),
@@ -210,6 +211,45 @@ macro_rules! edges {
             type Kind = $kind;
             fn kind(&self) -> $kind {
                 self.into()
+            }
+        }
+
+        // Serde sees the edge as `[code, arguments]`: its stable code, never its variant name, so
+        // renaming an edge changes no stored payload (#3373 ruling 6).
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeTuple;
+                let mut tuple = serializer.serialize_tuple(2)?;
+                match self {
+                    $( $name::$variant(arg) => {
+                        tuple.serialize_element(&($code as i64))?;
+                        tuple.serialize_element(arg)?;
+                    } )+
+                }
+                tuple.end()
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct Visitor;
+                impl<'de> serde::de::Visitor<'de> for Visitor {
+                    type Value = $name;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str(concat!("a ", stringify!($name), " as [code, arguments]"))
+                    }
+                    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<$name, A::Error> {
+                        let code: i64 = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                        match code {
+                            $( $code => {
+                                let arg: $arg = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                                Ok($name::$variant(arg))
+                            } )+
+                            other => Err(serde::de::Error::custom(format_args!("unknown {} code {other}", stringify!($name)))),
+                        }
+                    }
+                }
+                deserializer.deserialize_tuple(2, Visitor)
             }
         }
 
