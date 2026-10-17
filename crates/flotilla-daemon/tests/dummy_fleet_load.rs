@@ -33,7 +33,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_config::{ConfigStore, DaemonConfig};
-use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::{forge_observation::NO_READY_FORGE_OBSERVER, in_process::InProcessDaemon};
 use flotilla_daemon::{
     dummy_fleet::{attach_dummy_fleet, install_dummy_fleet},
     runtime::{DaemonRuntime, RuntimeOptions},
@@ -188,7 +188,7 @@ async fn watch_convoys(backend: &ResourceBackend, view: Arc<HomeView>, admission
             match source.provenance {
                 ResourceProvenance::Local => {
                     if let Some(stalled) = convoy.status.as_ref().and_then(|status| status.stalled.as_ref()) {
-                        if stalled.evidence.contains("no ready forge observer") {
+                        if stalled.evidence.contains(NO_READY_FORGE_OBSERVER) {
                             view.observer_failure_sightings.fetch_add(1, Ordering::Relaxed);
                             println!("observer_failure convoy={} evidence={}", convoy.metadata.name, stalled.evidence);
                         }
@@ -437,11 +437,12 @@ async fn load_baseline() {
                 for (index, home) in fleet.homes.iter().enumerate() {
                     let source = flotilla_protocol::IssueSource { service: catalog_forge_url(), scope: catalog::DUMMY_REPOSITORY.into() };
                     let owner = flotilla_core::forge_observation::source_owner(&home.daemon.resource_backend(), NAMESPACE, &source).await;
+                    println!("observer home={index} owner={owner:?}");
                     let hosts = home.daemon.resource_backend().using::<Host>(NAMESPACE).list().await.expect("liveness hosts");
                     for host in hosts.items {
                         if let Some(status) = host.status {
                             println!(
-                                "liveness t={:.0}s home={index} ready={} heartbeat_age_ms={:?} observer_owner={owner:?} conditions={:?}",
+                                "liveness t={:.0}s home={index} ready={} heartbeat_age_ms={:?} conditions={:?}",
                                 began.elapsed().as_secs_f64(),
                                 status.ready,
                                 status.heartbeat_at.map(|at| (Utc::now() - at).num_milliseconds()),

@@ -21,7 +21,7 @@ use flotilla_resources::Resource;
 use flotilla_resources::{
     ConditionValue, Convoy, CredentialExpiry, FoldedHostObservations, Forge, FulfilmentFacts, Host, HostCondition, HostStatus,
     HostStatusPatch, ManifestRoot, ReplicationClass, ResourceError, SystemClock, Vessel, AGENT_ADAPTERS_CAPABILITY,
-    CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
+    CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, LOCAL_ROWS_MISSING_REASON, PROJECTION_PARITY_CONDITION,
 };
 use flotilla_store::{home_bound_authorship_collisions, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use serde_json::json;
@@ -136,14 +136,13 @@ impl RuntimeHealth {
     }
 
     pub(super) fn report_projection_parity(&self, condition: Option<HostCondition>) {
-        const CONDITION_TYPE: &str = "ProjectionParity";
         let mut failures = self.failures.lock().expect("runtime health lock poisoned");
         match condition {
             Some(condition) => {
-                failures.insert(CONDITION_TYPE.to_string(), condition);
+                failures.insert(PROJECTION_PARITY_CONDITION.to_string(), condition);
             }
             None => {
-                failures.remove(CONDITION_TYPE);
+                failures.remove(PROJECTION_PARITY_CONDITION);
             }
         }
     }
@@ -338,9 +337,9 @@ pub(super) async fn projection_parity_condition(
     );
     Ok(Some(
         HostCondition::builder()
-            .condition_type("ProjectionParity")
+            .condition_type(PROJECTION_PARITY_CONDITION)
             .value(ConditionValue::False)
-            .reason("LocalRowsMissing")
+            .reason(LOCAL_ROWS_MISSING_REASON)
             .message(message)
             .observed_at(now)
             .build(),

@@ -14,7 +14,7 @@ use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     forge_read_name, normalize_issue_source, Clock, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus,
     ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, HostStatus, InputMeta, IssueSourceResolution, Project, ReadWatchEvent,
-    Repository, ResourceError, ResourceProvenance, SystemClock,
+    Repository, ResourceError, ResourceProvenance, SystemClock, LOCAL_ROWS_MISSING_REASON, PROJECTION_PARITY_CONDITION,
 };
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::ResourceBackend;
@@ -29,6 +29,9 @@ pub(crate) const OWNER_LOCAL_INCREMENTAL_READ_ERROR: &str = "incremental forge r
 // Leave three seconds for store/routing work inside the daemon's five-second
 // interactive request deadline (server/request_dispatch.rs).
 pub const REMOTE_READ_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+/// Stable diagnostic shared with the load harness when no observer qualifies.
+pub const NO_READY_FORGE_OBSERVER: &str = "no ready forge observer";
+
 const HEARTBEAT_MAX_AGE: Duration = Duration::seconds(180);
 const UNKNOWN_OWNER_GRACE: Duration = Duration::seconds(180);
 const READ_FRESHNESS: Duration = Duration::seconds(60);
@@ -162,7 +165,8 @@ fn observer_ready(status: &HostStatus) -> bool {
     }
     let mut blockers = status.conditions.iter().filter(|condition| condition.blocks_readiness()).peekable();
     blockers.peek().is_some()
-        && blockers.all(|condition| condition.condition_type == "ProjectionParity" && condition.reason == "LocalRowsMissing")
+        && blockers
+            .all(|condition| condition.condition_type == PROJECTION_PARITY_CONDITION && condition.reason == LOCAL_ROWS_MISSING_REASON)
 }
 
 /// Shared sources elect once, regardless of how many Projects bind them.
@@ -253,7 +257,7 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
         .into_iter()
         .find_map(|(root, (_, health))| (health == ObserverHealth::Ready).then_some(root))
         .map(Some)
-        .ok_or_else(|| "no ready forge observer".into())
+        .ok_or_else(|| NO_READY_FORGE_OBSERVER.into())
 }
 
 pub async fn owns_source(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<bool, String> {
@@ -1279,9 +1283,9 @@ mod tests {
         for _ in 0..count {
             conditions.push(
                 flotilla_resources::HostCondition::builder()
-                    .condition_type(if known_type { "ProjectionParity" } else { "Unknown" })
+                    .condition_type(if known_type { PROJECTION_PARITY_CONDITION } else { "Unknown" })
                     .value(flotilla_resources::ConditionValue::False)
-                    .reason(if known_reason { "LocalRowsMissing" } else { "Unknown" })
+                    .reason(if known_reason { LOCAL_ROWS_MISSING_REASON } else { "Unknown" })
                     .message("lag")
                     .observed_at(Utc::now())
                     .build(),

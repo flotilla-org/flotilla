@@ -408,6 +408,11 @@ mod build_parallelism_tests {
     }
 }
 
+/// Admission degradation that does not withdraw a live forge observer.
+pub const PROJECTION_PARITY_CONDITION: &str = "ProjectionParity";
+/// The local convoy projection has not caught up with durable rows.
+pub const LOCAL_ROWS_MISSING_REASON: &str = "LocalRowsMissing";
+
 /// A daemon-owned liveness invariant published on its [`Host`] resource.
 ///
 /// `True` means the named subsystem is healthy. `False` surfaces a diagnostic;

@@ -77,7 +77,7 @@ replicas, equal-timestamp unready evidence and agentless exclusion.
 ## Load diagnostics
 
 The load harness prints stored `ready`, `heartbeat_age_ms`, elected
-`observer_owner`, and conditions every 30 seconds. It also counts observed
+observer per home, and conditions every 30 seconds. It also counts observed
 `no ready forge observer` convoy stall evidence, prints each sighting and a final
 `observer_failure_sightings` count, and fails the baseline if that count is
 nonzero. Preserve stdout as well as the load-driver JSON/Markdown reports.
