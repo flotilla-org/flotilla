@@ -9,10 +9,10 @@ use flotilla_state_machines::{
     machines::{
         agent_session::AgentSession,
         convoy::{Convoy, ConvoyRequest, Deliver, Keep, MemoryConvoyWorld, Priority, Promise, PromiseId, VesselClass},
-        ensure::{Ensure, EnsureSpec, MemoryEnsureWorld, Record},
+        ensure::{Attempted, Ensure, EnsureSpec, MemoryEnsureWorld, Record},
         message::{Expectation, Message, MessageSpec},
     },
-    AttemptPolicy, EdgePayload, Home, Label, Machine, Ref, Resource,
+    AttemptPolicy, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource,
 };
 
 // Kind codes are stored with every identity and change, so they are pinned.
@@ -52,11 +52,11 @@ where
     assert_eq!(decoded, resource);
     let mut restored = Home::<M>::new("other").expect("valid");
     restored.restore(decoded).unwrap_or_else(|_| panic!("an empty home"));
-    assert_eq!(restored.get(name), Some(&resource), "restore keeps spec, state and records");
+    assert_eq!(restored.get(name), Some(&resource), "restore keeps spec, state and edge log");
     resource
 }
 
-// A resource as stored holds its spec, state (with its since) and records as they are: it
+// A resource as stored holds its spec, state (with its since) and edge log as they are: it
 // survives the schema codec, and a home restoring it holds the same resource.
 #[test]
 fn resources_survive_the_codec() {
@@ -81,24 +81,20 @@ fn resources_survive_the_codec() {
     let mut ensures = Home::<Ensure>::new("home").expect("valid");
     ensures.create("e", EnsureSpec { inbox: "i".into(), policy: AttemptPolicy::immediate(2) }, Timestamp(0)).expect("created");
     ensures.apply("e", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(4)).expect("recorded");
-    ensures.record_attempt("e", flotilla_state_machines::Attempt::succeeded(Timestamp(5))).expect("attempt");
+    let attempt = Attempted { fulfiller: Ref::new("f"), outcome: Outcome::Succeeded };
+    ensures.apply("e", attempt, &MemoryEnsureWorld::default(), Timestamp(5)).expect("attempted");
     let ensure = round_trip(&ensures, "e");
-    assert_eq!((ensure.events().len(), ensure.attempts().len()), (1, 1));
+    assert_eq!(ensure.events().len(), 2, "the attempt is an edge in the log");
     assert_eq!(ensure.state().recorded(), &BTreeSet::from([Ref::new("f")]));
 }
 
-// Only kinds that keep attempts or receipts have the tables, and record them: a message has an
-// edge log alone, so the home refuses an attempt on it.
+// Attempts and receipts are edges (R4): every kind's history is its edge log alone.
 #[test]
-fn records_are_kept_only_where_the_kind_stores_them() {
+fn the_edge_log_is_the_only_history() {
     let tables = |set: flotilla_schema::TableSet| set.tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
     assert_eq!(tables(Resource::<Message>::table_set()), ["message", "message_edges"]);
-    assert_eq!(tables(Resource::<AgentSession>::table_set()), ["agent_session", "agent_session_edges", "agent_session_receipts"]);
-    assert_eq!(tables(Resource::<Ensure>::table_set()), ["ensure", "ensure_recorded", "ensure_created", "ensure_edges", "ensure_attempts"]);
-    let mut messages = Home::<Message>::new("home").expect("valid");
-    let spec = MessageSpec { inbox: "i".into(), expectation: Expectation::Reply, deadline: None, unbound_after: 0 };
-    messages.create("m", spec, Timestamp(1)).expect("created");
-    assert!(messages.record_attempt("m", flotilla_state_machines::Attempt::succeeded(Timestamp(2))).is_err());
+    assert_eq!(tables(Resource::<AgentSession>::table_set()), ["agent_session", "agent_session_edges"]);
+    assert_eq!(tables(Resource::<Ensure>::table_set()), ["ensure", "ensure_recorded", "ensure_created", "ensure_edges"]);
 }
 
 fn root_sets(parts: &EdgeParts) -> Vec<&'static str> {

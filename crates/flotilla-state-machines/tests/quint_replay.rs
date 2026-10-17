@@ -2,9 +2,9 @@
 //!
 //! `specs/primitives/check.sh` simulates the six scenarios in
 //! `specs/primitives/scenarios/` and writes one ITF file per trace; nothing
-//! here is a stored fixture. Each trace drives the real single writers
-//! ([`Home::apply`], [`Home::record_attempt`] and [`Home::record_receipt`])
-//! and the placement [`Ledger`].
+//! here is a stored fixture. Each trace drives the real single writer
+//! ([`Home::apply`]: attempts and receipts are edges too) and the placement
+//! [`Ledger`].
 //!
 //! The model only takes enabled steps: a machine operation in a trace is one
 //! the spec accepted, and every other step (`unchanged`, a tick, a stream or
@@ -16,11 +16,12 @@
 //! After every step the replay compares state values. A machine's state is a
 //! value, as in the specs, so each Rust resource's [`Resource::state`] (with
 //! its immutable spec where the model's state carries request data, and its
-//! attempts where the model's `history` is attempts) is rendered in the
-//! spec's ITF shape and compared with the model's store, slot for slot.
-//! Nothing reads edge events to answer what a state is; the message replay
-//! reads them only to audit that each accepted edge left one event and that
-//! nothing delivered twice.
+//! `Attempted` log entries where the model's `history` is attempts) is
+//! rendered in the spec's ITF shape and compared with the model's store, slot
+//! for slot. Otherwise nothing reads edge events to answer what a state is;
+//! the message replay reads them to audit that each accepted edge left one
+//! event and that nothing delivered twice, and reads the sessions' `Receive`
+//! entries about the message as its receipts.
 //!
 //! Model integers name resources (`1` is the resource named "1"), model ticks
 //! are [`UNIT`] microseconds, and opaque strings map to themselves. The
@@ -37,11 +38,17 @@
 //!   exactly the spec's `bound`, so `bound` renders as "a watermark is
 //!   recorded". The spec's `receipt` is false on every drop it can reach (an
 //!   undeliverable drop is refused with a receipt), and Rust has no field.
-//! - **Ensure `history`.** The model's history lists the fulfiller each
-//!   failure named; Rust's history is the Ensure's attempt records, and the
-//!   replay records that fulfiller as each failure's cause detail. Rust never
-//!   refuses `HistoryFull` (attempts are unbounded), and the model never takes
-//!   a step it refuses, so this changes no replayed step.
+//! - **Ensure `history` and `window`.** Rust keeps the window's tally in the
+//!   state; the history is the Ensure's `Attempted` log entries and the window
+//!   the number before the last `Resume` entry. Rendering checks the tally
+//!   against the window's outcomes.
+//! - **Lifecycle attempts.** As for Ensure, the model's `Requested(history)`
+//!   is the resource's `Attempted` log entries, and Rust keeps their tally in
+//!   Requested; rendering checks it.
+//! - **Receipts.** In `inbox_delivery` a receipt is a session's `Receive`
+//!   edge about the message, and its stream row is that entry on its way to
+//!   the message's home: the message reads the entries whose row has applied.
+//!   `message_race` has no sessions, so its receipt rows are the evidence.
 //! - **Vessels.** A vessel is a placement at the [`Ledger`] plus a lifecycle
 //!   resource. The ledger forgets a vessel when it returns the lease, so the
 //!   harness keeps each returned lease to render the model's `Gone(placement)`.
@@ -73,13 +80,13 @@ use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
         agent_session::{
-            AgentSession, AgentSessionRefusal, AgentSessionState, Attach, Channel, Detach, End, EndReason, MemoryAgentSessionWorld,
+            AgentSession, AgentSessionEdge, AgentSessionState, Attach, Channel, Detach, End, EndReason, MemoryAgentSessionWorld, Receive,
         },
         convoy::{
             self, Convoy, ConvoyEdge, ConvoyId, ConvoyRequest, ConvoyState, MemoryConvoyWorld, Priority, Promise, PromiseId, PromiseState,
             Quota, VesselClass,
         },
-        ensure::{self, Ensure, EnsureSpec, EnsureState, FulfillerPhase, FulfillerStatus, MemoryEnsureWorld, UnbindReason},
+        ensure::{self, Ensure, EnsureEdge, EnsureSpec, EnsureState, FulfillerPhase, FulfillerStatus, MemoryEnsureWorld, UnbindReason},
         lifecycle::{self, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed},
         message::{
             self, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message, MessageEdge, MessageEdgeKind, MessageSpec,
@@ -87,8 +94,7 @@ use flotilla_state_machines::{
         },
     },
     placement::{self, Dimension, Evidence, Host, Lease, Ledger, LedgerError, Units, VesselId},
-    Attempt, AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Receipt, Ref, Resource, Transport,
-    WriteError,
+    AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Ref, Resource, Transport, WriteError,
 };
 use itf::{at, boolean, int, list, map_of, number, pairs, payload, set, set_of, show, slot, tag, text, variant};
 use serde_json::{json, Value};
@@ -128,6 +134,32 @@ fn cause(detail: &str) -> Cause {
 /// The authorised party's reference; its value is the model's `authorised` flag.
 fn owner<K: Kind>() -> Ref<K> {
     Ref::new("owner")
+}
+
+/// A receipt's transport, as the scenarios name it.
+fn transport(name: &str) -> Transport {
+    match name {
+        "turn" => Transport::Turn,
+        "notify" => Transport::Notify,
+        "mute" => Transport::Mute,
+        other => panic!("transport {other}"),
+    }
+}
+
+/// The `Receive` entries about `message` in each session's log, by session:
+/// the receipts the message's gates read (G11), with each one's transport.
+fn receipts_about(sessions: &Home<AgentSession>, message: &str) -> BTreeMap<String, Vec<Transport>> {
+    let mut about = BTreeMap::new();
+    for session in sessions.resources() {
+        for row in session.events().iter() {
+            let edge = &row.record.payload.edge;
+            if sessions.definition().master(edge).as_deref() == Some(message) {
+                let AgentSessionEdge::Receive(receive) = edge else { panic!("only a receipt is about a message") };
+                about.entry(session.name().to_string()).or_insert_with(Vec::new).push(receive.transport);
+            }
+        }
+    }
+    about
 }
 
 /// A sum value without a payload, as ITF encodes it.
@@ -312,12 +344,12 @@ fn ended<M: Machine>(home: &Home<M>, name: &str) -> bool {
     home.get(name).is_some_and(|resource| home.definition().end_reason(resource.label()).is_some())
 }
 
-fn shape<M: Machine>(resource: &Resource<M>) -> (M::State, u64, usize, usize, usize) {
-    (resource.state().clone(), resource.version().0, resource.events().len(), resource.attempts().len(), resource.receipts().len())
+fn shape<M: Machine>(resource: &Resource<M>) -> (M::State, u64, usize) {
+    (resource.state().clone(), resource.version().0, resource.events().len())
 }
 
-/// An ended resource refuses every edge, attempt and receipt with its end's
-/// reason, and none of them changes it.
+/// An ended resource refuses every edge, attempts and receipts among them,
+/// with its end's reason, and none of them changes it.
 fn assert_end_refuses<M: Machine>(
     home: &mut Home<M>,
     name: &str,
@@ -340,11 +372,6 @@ fn assert_end_refuses<M: Machine>(
         }
         tally.refusals += 1;
     }
-    let attempt = home.record_attempt(name, Attempt::succeeded(now)).map_err(|error| error.refusal().cloned());
-    assert_eq!(attempt, Err(Some(ended.clone())), "{step}: ended {} {name} refuses attempts", M::NAME);
-    let receipt = home.record_receipt(name, Receipt { message: ONE.into(), transport: Transport::Turn, at: now });
-    assert_eq!(receipt.map_err(|error| error.refusal().cloned()), Err(Some(ended)), "{step}: ended {} {name} refuses receipts", M::NAME);
-    tally.refusals += 2;
     assert_eq!(shape(home.get(name).expect("ended resource")), before, "{step}: refusals changed {} {name}", M::NAME);
 }
 
@@ -352,11 +379,15 @@ fn assert_end_refuses<M: Machine>(
 // Lifecycle (spec `machines/lifecycle.qnt`)
 
 /// The lifecycle kinds the scenarios model, each with an opaque request.
-/// `machine_edges` exercises the shared machine on a clone.
+/// `machine_edges` exercises the shared machine on a clone, which gives up
+/// after the model's `MAX_FAILURES`.
 struct CloneKind;
 impl LifecycleKind for CloneKind {
     const NAME: &'static str = "Clone";
     type Request = ();
+    fn policy() -> AttemptPolicy {
+        AttemptPolicy::immediate(2)
+    }
 }
 
 /// `ensure_bind`'s fulfillers: terminal sessions an Ensure keeps bound.
@@ -373,10 +404,42 @@ impl LifecycleKind for VesselKind {
     type Request = ();
 }
 
-/// The spec's `Requested | Realised(str) | Gone | GaveUp(str)`.
-fn lifecycle_value(state: &LifecycleState) -> Value {
-    match state {
-        LifecycleState::Requested => constant("Requested"),
+/// The spec's `AttemptOutcome` for a lifecycle attempt.
+fn lifecycle_outcome_value(outcome: &Outcome) -> Value {
+    match outcome {
+        Outcome::Succeeded => constant("Succeeded"),
+        Outcome::Failed { cause, retryable } => variant("Failed", json!({ "retryable": retryable, "cause": cause.detail })),
+    }
+}
+
+/// The spec's `Requested(List[AttemptOutcome]) | Realised(str) | Gone | GaveUp(str)`,
+/// with Requested's history the resource's `Attempted` log entries. Checks
+/// the Requested tally against them.
+fn lifecycle_value<K: LifecycleKind>(resource: &Resource<Lifecycle<K>>) -> Value {
+    match resource.state() {
+        LifecycleState::Requested { failures, last_failure } => {
+            let attempts: Vec<&Outcome> = resource
+                .events()
+                .iter()
+                .filter_map(|row| match &row.record.payload.edge {
+                    LifecycleEdge::Attempted(attempted) => Some(&attempted.outcome),
+                    _ => None,
+                })
+                .collect();
+            let since_success = attempts.iter().rev().take_while(|o| matches!(o, Outcome::Failed { .. })).count();
+            assert_eq!(*failures as usize, since_success, "{}: the tally counts the failures since the last success", resource.name());
+            let last = attempts.last().and_then(|o| match o {
+                Outcome::Failed { cause, retryable } => Some((cause, *retryable)),
+                Outcome::Succeeded => None,
+            });
+            assert_eq!(
+                last_failure.as_ref().map(|f| (&f.cause, f.retryable)),
+                last,
+                "{}: the tally keeps the last failure",
+                resource.name()
+            );
+            variant("Requested", Value::Array(attempts.into_iter().map(lifecycle_outcome_value).collect()))
+        }
         LifecycleState::Realised { identity } => variant("Realised", json!(identity)),
         LifecycleState::Gone => constant("Gone"),
         LifecycleState::GaveUp { cause } => variant("GaveUp", json!(cause.detail)),
@@ -447,6 +510,7 @@ fn lifecycle_end_refuses<K: LifecycleKind>(
         lifecycle::Release { teardown: Ref::new("witness") }.into(),
         lifecycle::Vanish { observed: Ref::new("witness") }.into(),
         lifecycle::GiveUp { cause: cause("failure") }.into(),
+        lifecycle::Attempted { outcome: Outcome::Succeeded }.into(),
     ];
     assert_end_refuses(home, name, probes, &world, now, step, tally);
 }
@@ -475,7 +539,7 @@ fn end_reason_name(reason: EndReason) -> &'static str {
     }
 }
 
-/// Every Ended session refuses attach, detach, either end and every record
+/// Every Ended session refuses attach, detach, either end and a receipt
 /// with `AlreadyEnded`, even with every observation present, and stays unchanged.
 fn sessions_end_refuse(sessions: &mut Home<AgentSession>, now: Timestamp, step: &Step, tally: &mut Tally) {
     let mut world = MemoryAgentSessionWorld::default();
@@ -490,6 +554,7 @@ fn sessions_end_refuse(sessions: &mut Home<AgentSession>, now: Timestamp, step: 
             Detach { observed: Ref::new("absent") }.into(),
             End { reason: EndReason::Completed, observed: Ref::new("completed") }.into(),
             End { reason: EndReason::Lost, observed: Ref::new("lost") }.into(),
+            Receive { message: ONE.into(), transport: Transport::Turn }.into(),
         ];
         assert_end_refuses(sessions, name, probes, &world, now, step, tally);
     }
@@ -512,13 +577,19 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
             }
             "request" => create(&mut sessions, ONE, (), &step, tally),
             op @ ("realise" | "release" | "vanish") => lifecycle_step(&mut things, ONE, op, seen, matches, "model", now, &step, tally),
-            // The scenario's `failed` flag: a failure that cannot be retried exhausts the attempts.
-            "recordFailure" => {
-                things.record_attempt(ONE, Attempt::failed(now, cause("failure"), false)).unwrap_or_else(|e| panic!("{step}: {e:?}"));
-                tally.writes += 1;
+            "attempt" => {
+                let outcome = match tag(step.pick("outcome")) {
+                    "Succeeded" => Outcome::Succeeded,
+                    "Failed" => {
+                        let failed = payload(step.pick("outcome"));
+                        Outcome::Failed { cause: cause(text(&failed["cause"])), retryable: boolean(&failed["retryable"]) }
+                    }
+                    other => panic!("{step}: attempt outcome {other}"),
+                };
+                accept(&mut things, ONE, lifecycle::Attempted { outcome }, &MemoryLifecycleWorld::default(), now, &step, tally);
             }
             "giveUp" => {
-                let edge = lifecycle::GiveUp { cause: cause(if matches { "failure" } else { "other" }) };
+                let edge = lifecycle::GiveUp { cause: cause(text(step.pick("cause"))) };
                 accept(&mut things, ONE, edge, &MemoryLifecycleWorld::default(), now, &step, tally);
             }
             "attach" => {
@@ -550,9 +621,13 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
                 }
                 accept(&mut sessions, ONE, End { reason, observed }, &world, now, &step, tally);
             }
+            "receive" => {
+                let receive = Receive { message: ONE.into(), transport: transport(text(step.pick("transport"))) };
+                accept(&mut sessions, ONE, receive, &MemoryAgentSessionWorld::default(), now, &step, tally);
+            }
             other => panic!("{step}: machine_edges operation {other}"),
         }
-        check_store(&things, store(step.after, "::resources"), |r| lifecycle_value(r.state()), &step, "lifecycle");
+        check_store(&things, store(step.after, "::resources"), lifecycle_value, &step, "lifecycle");
         check_store(&sessions, store(step.after, "::sessions"), |r| session_value(r.state()), &step, "session");
         if ended(&things, ONE) {
             lifecycle_end_refuses(&mut things, ONE, "model", now, &step, tally);
@@ -863,13 +938,15 @@ impl Fleet {
     /// from the ledger, the vessel's lifecycle resource and a returned lease.
     fn vessel_value(&self, id: i64, step: &Step) -> Option<Value> {
         let name = id.to_string();
-        let life = self.vessels.get(&name).map(Resource::state);
+        let resource = self.vessels.get(&name);
+        let life = resource.map(Resource::state);
         match (self.ledger.vessel(&VesselId::new(name)), self.returned.get(&id), life) {
             (None, None, None) => None,
             (Some(placement::Vessel::Waiting(request)), None, None) => Some(variant("Waiting", request_value(request))),
-            (Some(placement::Vessel::Leased(lease)), None, Some(life)) if !life.gone() => {
-                Some(variant("Leased", json!({ "placement": lease_value(lease), "lifecycle": lifecycle_value(life) })))
-            }
+            (Some(placement::Vessel::Leased(lease)), None, Some(life)) if !life.gone() => Some(variant(
+                "Leased",
+                json!({ "placement": lease_value(lease), "lifecycle": lifecycle_value(resource.expect("a leased vessel's lifecycle")) }),
+            )),
             (None, Some(lease), Some(LifecycleState::Gone)) => Some(variant("Gone", lease_value(lease))),
             (held, returned, life) => {
                 panic!("{step}: vessel {id} is inconsistent: ledger {held:?}, returned {returned:?}, lifecycle {life:?}")
@@ -1020,7 +1097,7 @@ type Fulfillers = Home<Lifecycle<TerminalSession>>;
 
 fn phase(state: &LifecycleState) -> FulfillerPhase {
     match state {
-        LifecycleState::Requested => FulfillerPhase::Requested,
+        LifecycleState::Requested { .. } => FulfillerPhase::Requested,
         LifecycleState::Realised { .. } => FulfillerPhase::Realised,
         LifecycleState::Gone => FulfillerPhase::Gone,
         LifecycleState::GaveUp { .. } => FulfillerPhase::GaveUp,
@@ -1052,20 +1129,44 @@ fn fulfiller_set(fulfillers: &ensure::Fulfillers) -> Value {
     set_of(fulfillers.iter().map(|fulfiller| int(id_of(fulfiller.name()))))
 }
 
+/// The spec's `AttemptOutcome`.
+fn outcome_value(outcome: &Outcome) -> Value {
+    match outcome {
+        Outcome::Succeeded => constant("Succeeded"),
+        Outcome::Failed { retryable, .. } => variant("Failed", json!({ "retryable": retryable })),
+    }
+}
+
 /// The spec's `Unfulfilled(Work) | Fulfilled({ work, bound }) | Held(Work) | Retired(Work)`
-/// with `Work = { recorded, created, history, window }`: the state's data, and
-/// the history as the Ensure's attempts, each failure naming its fulfiller.
+/// with `Work = { recorded, created, history, window }`: the state's data,
+/// the history as the Ensure's `Attempted` entries, and the window as how
+/// many came before the last `Resume`. The state's tally must agree with
+/// the window's outcomes.
 fn ensure_value(resource: &Resource<Ensure>) -> Value {
-    let history = resource.attempts().iter().map(|row| match &row.record.outcome {
-        Outcome::Failed { cause, .. } => int(id_of(&cause.detail)),
-        Outcome::Succeeded => panic!("{}: the scenario records only failures", resource.name()),
-    });
+    let mut history = Vec::new();
+    let mut window = 0;
+    for row in resource.events().iter() {
+        match &row.record.payload.edge {
+            EnsureEdge::Attempted(attempted) => history.push(attempted),
+            EnsureEdge::Resume(_) => window = history.len(),
+            _ => {}
+        }
+    }
     let state = resource.state();
+    let current = &history[window..];
+    let since_success = current.iter().rev().take_while(|a| matches!(a.outcome, Outcome::Failed { .. })).count();
+    assert_eq!(state.failures() as usize, since_success, "{}: the tally counts the window's failures", resource.name());
+    let last_retryable = current.last().and_then(|a| match a.outcome {
+        Outcome::Failed { retryable, .. } => Some(retryable),
+        Outcome::Succeeded => None,
+    });
+    assert_eq!(state.last_failure().map(|f| f.retryable), last_retryable, "{}: the tally keeps the last failure", resource.name());
+    let history = history.iter().map(|a| json!({ "id": int(id_of(a.fulfiller.name())), "outcome": outcome_value(&a.outcome) }));
     let work = json!({
         "recorded": fulfiller_set(state.recorded()),
         "created": fulfiller_set(state.created()),
         "history": Value::Array(history.collect()),
-        "window": int(i64::from(state.window())),
+        "window": int(window as i64),
     });
     match state {
         EnsureState::Unfulfilled { .. } => variant("Unfulfilled", work),
@@ -1089,7 +1190,8 @@ fn probe_ensure(home: &mut Home<Ensure>, fulfillers: &Fulfillers, state: &Value,
             ensure::Create { fulfiller: fulfiller(2) }.into(),
             ensure::Bind { fulfiller: fulfiller(1) }.into(),
             ensure::Unbind { reason: UnbindReason::Gone, fulfiller: fulfiller(1) }.into(),
-            ensure::GiveUp.into(),
+            ensure::Hold.into(),
+            ensure::Attempted { fulfiller: fulfiller(1), outcome: Outcome::Succeeded }.into(),
             ensure::Resume { by: "owner".into(), authority: owner() }.into(),
             ensure::Retire { by: "owner".into(), authority: owner(), teardown: Ref::new("fulfillers") }.into(),
         ];
@@ -1102,6 +1204,15 @@ fn probe_ensure(home: &mut Home<Ensure>, fulfillers: &Fulfillers, state: &Value,
     assert!(!would_accept(home, ONE, resume, &refused, now, tally), "{step}: resumes without authority");
     let retire = ensure::Retire { by: "owner".into(), authority: owner(), teardown: Ref::new("fulfillers") };
     assert!(!would_accept(home, ONE, retire, &refused, now, tally), "{step}: retires without authority");
+    // `heldAfterWindowFailure`: a hold the Rust gate would allow follows a
+    // failure in the current window.
+    if would_accept(home, ONE, ensure::Hold, &world, now, tally) {
+        let work = ensure_work(model);
+        let history = list(&work["history"]);
+        let window = usize::try_from(number(&work["window"])).expect("window");
+        let last = history.get(window..).and_then(<[Value]>::last);
+        assert!(last.is_some_and(|attempt| tag(&attempt["outcome"]) == "Failed"), "{step}: holds without a failure in the window");
+    }
     let recorded: BTreeSet<i64> = set(&ensure_work(model)["recorded"]).iter().map(number).collect();
     for id in [1, 2] {
         if would_accept(home, ONE, ensure::Create { fulfiller: fulfiller(id) }, &world, now, tally) {
@@ -1148,8 +1259,8 @@ fn ensure_bind(trace: &Trace, tally: &mut Tally) {
         let world = ensure_world(&fulfillers, step.yes("auth"));
         let fulfiller = Ref::<ensure::Fulfiller>::new(name.clone());
         match step.action() {
-            // One failure exhausts a window: the spec gives up once `history - window >= 1`.
-            "request" => create(&mut home, ONE, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(1) }, &step, tally),
+            // The spec's `MAX_FAILURES = 2`.
+            "request" => create(&mut home, ONE, EnsureSpec { inbox: INBOX.into(), policy: AttemptPolicy::immediate(2) }, &step, tally),
             "record" => accept(&mut home, ONE, ensure::Record { fulfiller }, &world, now, &step, tally),
             "create" => {
                 accept(&mut home, ONE, ensure::Create { fulfiller }, &world, now, &step, tally);
@@ -1158,13 +1269,17 @@ fn ensure_bind(trace: &Trace, tally: &mut Tally) {
             op @ ("realise" | "release" | "vanish") => lifecycle_step(&mut fulfillers, &name, op, true, true, "model", now, &step, tally),
             "bind" => accept(&mut home, ONE, ensure::Bind { fulfiller }, &world, now, &step, tally),
             "unbind" => accept(&mut home, ONE, ensure::Unbind { reason: UnbindReason::Gone, fulfiller }, &world, now, &step, tally),
-            // The spec's `Fail({ id: who })`: the failure names its fulfiller as its cause.
-            "recordFailure" => {
-                home.record_attempt(ONE, Attempt::failed(now, cause(&name), true))
-                    .unwrap_or_else(|error| panic!("{step}: the model recorded a failure; Rust refused: {error:?}"));
-                tally.writes += 1;
+            "attempt" => {
+                let outcome = match tag(step.pick("outcome")) {
+                    "Succeeded" => Outcome::Succeeded,
+                    "Failed" => {
+                        Outcome::Failed { cause: cause("failure"), retryable: boolean(&payload(step.pick("outcome"))["retryable"]) }
+                    }
+                    other => panic!("{step}: attempt outcome {other}"),
+                };
+                accept(&mut home, ONE, ensure::Attempted { fulfiller, outcome }, &world, now, &step, tally);
             }
-            "giveUp" => accept(&mut home, ONE, ensure::GiveUp, &world, now, &step, tally),
+            "hold" => accept(&mut home, ONE, ensure::Hold, &world, now, &step, tally),
             "resume" => accept(&mut home, ONE, ensure::Resume { by: "owner".into(), authority: owner() }, &world, now, &step, tally),
             "retire" => {
                 let edge = ensure::Retire { by: "owner".into(), authority: owner(), teardown: Ref::new("fulfillers") };
@@ -1175,7 +1290,7 @@ fn ensure_bind(trace: &Trace, tally: &mut Tally) {
             other => panic!("{step}: ensure_bind operation {other}"),
         }
         check_store(&home, store(step.after, "::ensures"), ensure_value, &step, "Ensure");
-        check_store(&fulfillers, store(step.after, "::resources"), |r| lifecycle_value(r.state()), &step, "fulfiller");
+        check_store(&fulfillers, store(step.after, "::resources"), lifecycle_value, &step, "fulfiller");
         for id in [1, 2] {
             if ended(&fulfillers, &id.to_string()) {
                 lifecycle_end_refuses(&mut fulfillers, &id.to_string(), "model", now, &step, tally);
@@ -1304,8 +1419,8 @@ fn without_unset_deadline(v: &Value) -> Value {
 }
 
 /// The spec's `Pending(Envelope) | Awaiting({ envelope, receiver }) |
-/// Settled(Envelope) | Dropped(Drop)`: the spec's envelope and the state's
-/// data. A drop's `bound` is whether it recorded a watermark, and its
+/// Settled({ envelope, receiver }) | Dropped(Drop)`: the spec's envelope and
+/// the state's data, with receiver 0 for none. A drop's `bound` is whether it recorded a watermark, and its
 /// `receipt` is false (see the module doc).
 fn message_value(resource: &Resource<Message>) -> Value {
     let envelope = envelope_value(resource.spec());
@@ -1315,14 +1430,15 @@ fn message_value(resource: &Resource<Message>) -> Value {
             "Awaiting",
             json!({ "envelope": envelope, "receiver": { "session": int(session_number(receiver)), "host": receiver.host } }),
         ),
-        MessageState::Settled { .. } => variant("Settled", envelope),
+        MessageState::Settled { receiver } => {
+            variant("Settled", json!({ "envelope": envelope, "receiver": int(receiver.as_ref().map_or(0, session_number)) }))
+        }
         MessageState::Dropped { reason, receiver, watermark } => variant(
             "Dropped",
             json!({
                 "reason": constant(reason_name(reason)),
                 "envelope": envelope,
                 "receiver": int(receiver.as_ref().map_or(0, session_number)),
-                "at": int(ticks(resource.events().iter().last().expect("a dropped message has its drop event").record.at)),
                 "watermark": int(watermark.map_or(0, ticks)),
                 "bound": watermark.is_some(),
                 "receipt": false,
@@ -1344,7 +1460,7 @@ struct MessageReplay<'a> {
     deadline: Option<i64>,
     /// Accepted message edges so far.
     edges: usize,
-    /// Receipts each session should hold.
+    /// Receipts about the message each session's log should hold.
     receipts: BTreeMap<String, usize>,
 }
 
@@ -1385,7 +1501,24 @@ impl<'a> MessageReplay<'a> {
         let stream = Stream::of(self.feed.stream(state));
         let mut world = MemoryMessageWorld::default();
         let own = Ref::new(ONE);
-        world.receipts.put(&own, stream.sessions("receipt").iter().map(|session| (session.to_string(), Transport::Turn)).collect());
+        let applied = stream.sessions("receipt");
+        let receipts = match &self.sessions {
+            // The entries about the message whose rows the message's home has applied.
+            Some(sessions) => {
+                let about = receipts_about(sessions, ONE);
+                applied
+                    .iter()
+                    .map(|session| {
+                        let name = session.to_string();
+                        let entries =
+                            about.get(&name).unwrap_or_else(|| panic!("receipt row from session {name} without its Receive entry"));
+                        (name, entries[0])
+                    })
+                    .collect()
+            }
+            None => applied.iter().map(|session| (session.to_string(), Transport::Turn)).collect(),
+        };
+        world.receipts.put(&own, receipts);
         if stream.any("reply") {
             world.reply.put(&Ref::new(ONE), ());
         }
@@ -1450,22 +1583,14 @@ impl<'a> MessageReplay<'a> {
                 accept(sessions, &who.to_string(), End { reason: EndReason::Completed, observed }, &ends, now, step, tally);
                 None
             }
-            // The consumer records a receipt on its session when it publishes one;
-            // an ended session refuses it, while the row still reaches the stream
-            // the message home reads.
-            (Feed::Inbox, "publish") if text(step.pick("kind")) == "receipt" => {
+            // A receipt is the consumer session's Receive edge about the message;
+            // its row then travels the stream to the message's home.
+            (Feed::Inbox, "receive") => {
                 let name = who.to_string();
-                let live = slot_at(step.before, "::sessions", who).is_some_and(|s| tag(s) == "Live");
                 let sessions = self.sessions.as_mut().expect("sessions");
-                let result = sessions.record_receipt(&name, Receipt { message: ONE.into(), transport: Transport::Turn, at: now });
-                match (live, result) {
-                    (true, Ok(_)) => {
-                        *self.receipts.entry(name).or_default() += 1;
-                        tally.writes += 1;
-                    }
-                    (false, Err(WriteError::Refused(AgentSessionRefusal::AlreadyEnded))) => tally.refusals += 1,
-                    (live, result) => panic!("{step}: receipt on session {who} (live: {live}) answered {result:?}"),
-                }
+                let receive = Receive { message: ONE.into(), transport: Transport::Turn };
+                accept(sessions, &name, receive, &MemoryAgentSessionWorld::default(), now, step, tally);
+                *self.receipts.entry(name).or_default() += 1;
                 None
             }
             (
@@ -1484,10 +1609,9 @@ impl<'a> MessageReplay<'a> {
         self.probe(step, tally);
         if let Some(sessions) = self.sessions.as_mut() {
             check_store(sessions, store(step.after, "::sessions"), |r| session_value(r.state()), step, "session");
-            for (name, expected) in &self.receipts {
-                let session = sessions.get(name).expect("session");
-                assert_eq!(session.receipts().len(), *expected, "{step}: receipts on session {name}");
-            }
+            let about = receipts_about(sessions, ONE);
+            let counts: BTreeMap<String, usize> = about.iter().map(|(name, entries)| (name.clone(), entries.len())).collect();
+            assert_eq!(counts, self.receipts, "{step}: receipts about the message, by session");
             sessions_end_refuse(sessions, moment(number(&step.after["now"])), step, tally);
         }
     }

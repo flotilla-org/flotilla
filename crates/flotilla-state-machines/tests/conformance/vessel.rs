@@ -238,7 +238,7 @@ impl Conformance for VesselConformance {
         match (v.ledger.vessel(&v.id), v.lifecycle_state(), &v.released) {
             (Some(Vessel::Waiting(request)), None, None) => variant("Waiting", request_value(request)),
             (Some(Vessel::Leased(lease)), Some(lifecycle), None) => {
-                variant("Leased", json!({ "placement": placement_value(lease), "lifecycle": encode_state(lifecycle) }))
+                variant("Leased", json!({ "placement": placement_value(lease), "lifecycle": encode_state(lifecycle, &[]) }))
             }
             (None, Some(LifecycleState::Gone), Some(lease)) => variant("Gone", placement_value(lease)),
             (vessel, lifecycle, released) => {

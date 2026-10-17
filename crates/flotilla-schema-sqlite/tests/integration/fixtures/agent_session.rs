@@ -5,9 +5,9 @@ use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::agent_session::{
         AgentSession, AgentSessionEdge, AgentSessionSpec, AgentSessionState, AgentSessionWorld, Attach, Channel, Detach, End, EndReason,
-        MemoryAgentSessionWorld,
+        MemoryAgentSessionWorld, Receive,
     },
-    Receipt, Ref, Resource, Transport,
+    Ref, Resource, Transport,
 };
 use hegel::TestCase;
 
@@ -29,24 +29,25 @@ pub fn state_value(tc: &TestCase, pick: Pick) -> AgentSessionState {
     }
 }
 
-fn edges(tc: &TestCase) -> Vec<AgentSessionEdge> {
+/// A receipt for a drawn message, by each transport in turn.
+pub fn receive(tc: &TestCase, pick: Pick) -> Receive {
+    Receive { message: name(tc), transport: code_enum(tc, pick, &[Transport::Turn, Transport::Notify, Transport::Mute]) }
+}
+
+fn edges(tc: &TestCase, pick: Pick) -> Vec<AgentSessionEdge> {
     let observed = || Ref::new(name(tc));
     vec![
         Attach { observed: observed() }.into(),
         Detach { observed: observed() }.into(),
         End { reason: EndReason::Completed, observed: Ref::new(name(tc)) }.into(),
         End { reason: EndReason::Lost, observed: Ref::new(name(tc)) }.into(),
+        receive(tc, pick).into(),
     ]
-}
-
-pub fn receipt(tc: &TestCase, pick: Pick) -> Receipt {
-    Receipt { message: name(tc), transport: code_enum(tc, pick, &[Transport::Turn, Transport::Notify, Transport::Mute]), at: timestamp(tc) }
 }
 
 pub fn generate(tc: &TestCase, pick: Pick) -> Resource<AgentSession> {
     resource(AgentSessionSpec {}, State::new(state_value(tc, pick), timestamp(tc)))
-        .with_events(records(tc, pick, 2, |pick| engine::event::<AgentSession>(tc, pick, &edges(tc))))
-        .with_receipts(records(tc, pick.nth(1), 2, |pick| receipt(tc, pick)))
+        .with_events(records(tc, pick, 2, |pick| engine::event::<AgentSession>(tc, pick, &edges(tc, pick))))
 }
 
 /// A live, detached session with no history.
@@ -58,9 +59,9 @@ fn boxed(world: MemoryAgentSessionWorld) -> Box<dyn AgentSessionWorld> {
     Box::new(world)
 }
 
-/// Every edge a live session may take: attaching or detaching on an observed channel, and ending
-/// for each reason as observed.
-pub fn candidates(tc: &TestCase) -> Vec<Candidate<AgentSession>> {
+/// Every edge a live session may take: attaching or detaching on an observed channel, a receipt,
+/// and ending for each reason as observed.
+pub fn candidates(tc: &TestCase, pick: Pick) -> Vec<Candidate<AgentSession>> {
     let now = timestamp(tc);
     let mut candidates = Vec::new();
     for present in [true, false] {
@@ -76,6 +77,7 @@ pub fn candidates(tc: &TestCase) -> Vec<Candidate<AgentSession>> {
         world.ends.put(&observed, reason);
         candidates.push((End { reason, observed }.into(), boxed(world), now));
     }
+    candidates.push((receive(tc, pick).into(), boxed(MemoryAgentSessionWorld::default()), now));
     candidates
 }
 
@@ -92,14 +94,10 @@ impl Fixture for Resource<AgentSession> {
     }
 
     fn edge(&self, tc: &TestCase, pick: Pick) -> Option<(Edge<Resource<AgentSession>>, Resource<AgentSession>)> {
-        engine::drive(tc, pick, self, candidates(tc))
+        engine::drive(tc, pick, self, candidates(tc, pick))
     }
 
     fn stamped(&self, before: Option<&Resource<AgentSession>>, version: u64) -> Resource<AgentSession> {
-        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version)).with_receipts(stamp_flat(
-            self.receipts(),
-            before.map(|before| before.receipts()),
-            version,
-        ))
+        self.clone().with_events(stamp_flat(self.events(), before.map(|before| before.events()), version))
     }
 }

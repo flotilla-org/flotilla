@@ -4,49 +4,40 @@
 //! end check, the from-label, the gate, the effect), replaces the current
 //! state with the effect's result and appends the edge event in the same
 //! write. Refusals return to the caller and record nothing: no row, no
-//! version change. Records on an ended resource are refused. Reactions to an
+//! version change. Every write is an edge: attempts and receipts too (R4).
+//! Reactions to an
 //! event (teardown, dead letters, follow-up messages) belong to subscribers
 //! outside the engine.
 
 use std::{collections::BTreeMap, fmt};
 
-use flotilla_schema::{EdgeEvent, Position, Records, State, Timestamp};
+use flotilla_schema::{EdgeEvent, Records, State, Timestamp};
 
 use crate::{
-    Attempt, DefError, Edge, EdgeEventOf, EdgeKind, EdgePayload, Ended, Fault, Handle, Judged, Label, Machine, MachineDef, Receipt,
-    StateValue, StepError, StoredState, Version, WrongState,
+    DefError, Edge, EdgeEventOf, EdgeKind, EdgePayload, Fault, Handle, Judged, Label, Machine, MachineDef, StateValue, StepError,
+    StoredState, Version,
 };
 
 /// One resource at its home: its name, spec, current state (with the time its label was entered),
-/// version and records. This is the stored kind (#3392 ruling D5): the derive lays out the spec
-/// and the state, the resource its records, and the store keeps the name and version.
+/// version and edge events. This is the stored kind (#3392 ruling D5): the derive lays out the spec
+/// and the state, the resource its edge log, and the store keeps the name and version.
 pub struct Resource<M: Machine> {
     pub(crate) name: String,
     pub(crate) spec: M::Spec,
     pub(crate) state: StoredState<M>,
     pub(crate) version: Version,
     pub(crate) events: Records<EdgeEventOf<M>>,
-    pub(crate) attempts: Records<Attempt>,
-    pub(crate) receipts: Records<Receipt>,
 }
 
 impl<M: Machine> Resource<M> {
-    /// A resource as storage holds it, with no records: what a store read or a test places at a
+    /// A resource as storage holds it, with no edge events: what a store read or a test places at a
     /// home ([`Home::restore`]). Only a home changes it afterwards.
     pub fn stored(name: impl Into<String>, spec: M::Spec, state: StoredState<M>, version: Version) -> Self {
-        Resource { name: name.into(), spec, state, version, events: Records::new(), attempts: Records::new(), receipts: Records::new() }
+        Resource { name: name.into(), spec, state, version, events: Records::new() }
     }
 
     pub fn with_events(self, events: Records<EdgeEventOf<M>>) -> Self {
         Resource { events, ..self }
-    }
-
-    pub fn with_attempts(self, attempts: Records<Attempt>) -> Self {
-        Resource { attempts, ..self }
-    }
-
-    pub fn with_receipts(self, receipts: Records<Receipt>) -> Self {
-        Resource { receipts, ..self }
     }
 
     /// The same resource with another spec: a spec edit, as storage applies one.
@@ -88,24 +79,17 @@ impl<M: Machine> Resource<M> {
         self.state.value.label()
     }
 
-    /// Rises on every accepted write: an edge or a record.
+    /// Rises on every accepted edge.
     pub fn version(&self) -> Version {
         self.version
     }
 
-    /// The history of applied edges, for showing and auditing what happened.
-    /// No gate, effect or judgement reads it: the current state is the answer
-    /// to what is true now.
+    /// The history of applied edges, attempts and receipts among them, for
+    /// showing and auditing what happened. No gate, effect or judgement of
+    /// this resource reads it: the current state is the answer to what is
+    /// true now.
     pub fn events(&self) -> &Records<EdgeEventOf<M>> {
         &self.events
-    }
-
-    pub fn attempts(&self) -> &Records<Attempt> {
-        &self.attempts
-    }
-
-    pub fn receipts(&self) -> &Records<Receipt> {
-        &self.receipts
     }
 
     /// Runs a judgement through a recording handle. The resource is unchanged.
@@ -127,8 +111,6 @@ where
             state: self.state.clone(),
             version: self.version,
             events: self.events.clone(),
-            attempts: self.attempts.clone(),
-            receipts: self.receipts.clone(),
         }
     }
 }
@@ -139,8 +121,8 @@ where
     EdgeEventOf<M>: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        (&self.name, &self.spec, &self.state, self.version, &self.events, &self.attempts, &self.receipts)
-            == (&other.name, &other.spec, &other.state, other.version, &other.events, &other.attempts, &other.receipts)
+        (&self.name, &self.spec, &self.state, self.version, &self.events)
+            == (&other.name, &other.spec, &other.state, other.version, &other.events)
     }
 }
 
@@ -156,8 +138,6 @@ where
             .field("since", &self.state.since)
             .field("version", &self.version)
             .field("events", &self.events.len())
-            .field("attempts", &self.attempts.len())
-            .field("receipts", &self.receipts.len())
             .finish()
     }
 }
@@ -264,7 +244,7 @@ impl<M: Machine> Home<M> {
     }
 
     /// Places a resource read from storage at this home, as stored: its spec,
-    /// state and records, at its version. Nothing is checked against the
+    /// state and edge events, at its version. Nothing is checked against the
     /// declaration: the resource holds what earlier writes left. The storage
     /// port (a later layer) is its caller; tests use it to apply an edge to a
     /// stored resource.
@@ -305,34 +285,6 @@ impl<M: Machine> Home<M> {
         Ok(&resource.events.append(resource.version.0, event).record)
     }
 
-    /// Appends an attempt. Refused on an ended resource, with the end's
-    /// reason, and in a state the machine does not record attempts in.
-    pub fn record_attempt(&mut self, name: &str, attempt: Attempt) -> Result<Position, WriteError<M>> {
-        let accepts = |definition: &MachineDef<M>, label| definition.accepts_attempts(label);
-        let resource = self.writable(name, accepts)?;
-        resource.version = resource.version.next();
-        Ok(resource.attempts.append(resource.version.0, attempt).position)
-    }
-
-    /// Appends a receipt. Refused on an ended resource, with the end's reason.
-    pub fn record_receipt(&mut self, name: &str, receipt: Receipt) -> Result<Position, WriteError<M>> {
-        let resource = self.writable(name, any_label)?;
-        resource.version = resource.version.next();
-        Ok(resource.receipts.append(resource.version.0, receipt).position)
-    }
-
-    fn writable(&mut self, name: &str, accepts: impl Fn(&MachineDef<M>, Label<M>) -> bool) -> Result<&mut Resource<M>, WriteError<M>> {
-        let resource = self.resources.get_mut(name).ok_or_else(|| WriteError::Unknown(name.to_string()))?;
-        let label = resource.label();
-        if let Some(reason) = self.definition.end_reason(label) {
-            return Err(WriteError::Refused(Ended { state: label, reason }.into()));
-        }
-        if !accepts(&self.definition, label) {
-            return Err(WriteError::Refused(WrongState { state: label, edge: None }.into()));
-        }
-        Ok(resource)
-    }
-
     /// Runs a judgement over one resource; see [`Resource::judge`].
     pub fn judge<T>(
         &self,
@@ -344,10 +296,4 @@ impl<M: Machine> Home<M> {
         let resource = self.get(name).ok_or_else(|| WriteError::Unknown(name.to_string()))?;
         Ok(resource.judge(world, now, judgement))
     }
-}
-
-/// Receipts are accepted under every label but an end, where the stored kind
-/// keeps them ([`Machine::RECORDS_RECEIPTS`]).
-fn any_label<M: Machine>(_: &MachineDef<M>, _: Label<M>) -> bool {
-    M::RECORDS_RECEIPTS
 }

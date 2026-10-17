@@ -18,14 +18,16 @@
 //! [`Home`] is the single writer. It applies an edge in a fixed order (the end
 //! check, the from-label, the gate, the effect), stores the next state,
 //! appends the edge event with its reads, and returns refusals without
-//! recording them. Records (edge events, attempts and receipts) are
-//! append-only `flotilla_schema::Records`, keyed by owner and position, and
-//! an ended resource refuses them. An edge event is a
-//! `flotilla_schema::EdgeEvent` ([`EdgeEventOf`]) whose document is an
-//! [`EdgePayload`]: the edge's arguments and its reads. Edge events are
-//! history, for showing and auditing what happened; nothing that decides
-//! reads them. Retry counts, schedules and
-//! giving up are judgements over attempts ([`attempt::retry`]).
+//! recording them. Every write is an edge (R4): an attempt is an edge on the
+//! resource that made it, and a receipt is a session's `Receive` edge, whose
+//! master ([`EdgeDef::about`]) is the message it is for. Edge events are
+//! append-only `flotilla_schema::Records`, keyed by owner and position. An
+//! edge event is a `flotilla_schema::EdgeEvent` ([`EdgeEventOf`]) whose
+//! document is an [`EdgePayload`]: the edge's arguments and its reads. Edge
+//! events are history, for showing and auditing what happened; nothing that
+//! decides reads its own resource's events. Retry counts, schedules and
+//! exhaustion are judgements over the attempt tally an attempt edge leaves in
+//! the state ([`attempt::retry`]).
 //!
 //! Time is `flotilla_schema::Timestamp` (microseconds), always supplied by the
 //! caller. The engine never reads a clock, link age or any other liveness
@@ -53,12 +55,12 @@ mod read;
 mod record;
 mod stored;
 
-pub use attempt::{Attempt, AttemptPolicy, Cause, CauseCategory, Outcome, Retry, Schedule};
+pub use attempt::{AttemptPolicy, Cause, CauseCategory, Failure, Outcome, Retry, Schedule};
 pub use code::{changed, Coded, Datum, Edge, EdgeArg, StateValue};
 pub use home::{Home, Resource, WriteError};
 pub use machine::{
     Check, DeclaredEdge, DefError, Diagram, EdgeDef, EdgeKind, EndDef, Ended, Fault, Label, Machine, MachineDef, StepError, WrongState,
 };
-pub use read::{Handle, InputRead, Judged, Kind, Ref, Source, Table, Version, OWN_ATTEMPTS, OWN_RECEIPTS};
-pub use record::{EdgeEventOf, EdgePayload, Receipt, Transport};
+pub use read::{Handle, InputRead, Judged, Kind, Ref, Source, Table, Version};
+pub use record::{EdgeEventOf, EdgePayload, Transport};
 pub use stored::StoredState;
