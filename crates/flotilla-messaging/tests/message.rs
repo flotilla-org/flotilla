@@ -575,7 +575,7 @@ async fn delivery_receiver_reads_are_bounded() {
     use flotilla_resources::{Convoy, ConvoySpec};
     use flotilla_store_testkit::ReadCountsBackendExt;
     let mut counts = Vec::new();
-    for n in [0, 10, 200] {
+    for (n, max_reads) in [(0, 3), (10, 30), (200, 410)] {
         let memory = InMemoryBackend::default().with_read_counts();
         let backend = ResourceBackend::new(memory.clone());
         backend
@@ -599,6 +599,9 @@ async fn delivery_receiver_reads_are_bounded() {
         let before = memory.read_snapshot();
         inbox.reconcile_delivery(&transport, at(20)).await.expect("delivery pass");
         let calls = memory.read_snapshot().since(&before).calls_by_kind();
+        // Preserve the measured whole-pass read budget without noisy output.
+        let reads = calls.values().sum::<usize>();
+        assert!(reads <= max_reads, "active={n}: {reads} reads exceed the {max_reads}-read pass budget: {calls:?}");
         counts.push(["Convoy", "TerminalSession", "ConvoyEnsure"].map(|kind| calls.get(kind).copied().unwrap_or_default()));
         assert!(transport.submissions.lock().expect("submissions").is_empty());
         for message in backend.using::<Message>("flotilla").list().await.expect("messages").items {
@@ -2641,4 +2644,105 @@ async fn message_query_phase_classification_matches_model() {
             assert!(messages.query(&MessageQuery::AuditBefore { before: at(21) }).await.expect("deleted audit entry").is_empty());
         }
     }
+}
+
+// The inbox owns the earliest future delivery deadline, regardless of record
+// name or insertion order. Empty and terminal-only inboxes have no timer.
+#[hegel::test]
+fn inbox_delivery_deadline_is_earliest(tc: hegel::TestCase) {
+    let delays: Vec<i64> = (0..tc.draw(gs::integers::<usize>().min_value(1).max_value(12)))
+        .map(|_| tc.draw(gs::integers::<i64>().min_value(1).max_value(120)))
+        .collect();
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let inbox = MessageInbox::new(backend.clone(), "flotilla");
+        assert_eq!(inbox.next_delivery_wake(at(10)).await.unwrap(), None);
+        for (i, delay) in delays.iter().enumerate() {
+            let mut intent = spec(None, MessageExpectation::Reply);
+            intent.deadline = Some(at(10 + delay));
+            inbox.accept(&InputMeta::builder().name(format!("deadline-{i}")).build(), &intent, at(10)).await.unwrap();
+        }
+        assert_eq!(
+            inbox.next_delivery_wake(at(10)).await.unwrap(),
+            Some(std::time::Duration::from_secs(*delays.iter().min().unwrap() as u64))
+        );
+        for i in 0..delays.len() {
+            flotilla_store::apply_status_patch(
+                &backend.using::<Message>("flotilla"),
+                &format!("deadline-{i}"),
+                &MessageStatusPatch::Finish { phase: MessagePhase::Expired, reason: "closed".into(), at: at(11) },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(inbox.next_delivery_wake(at(10)).await.unwrap(), None);
+    });
+}
+
+// Separate inbox handles share a store, but not their process-local admission
+// locks. Recovery racing the original admission must converge on one order.
+#[test]
+fn concurrent_partial_admissions_preserve_one_acceptance_order() {
+    use flotilla_store::{ReadObserver, ReadOperation};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Barrier,
+    };
+
+    #[derive(Debug)]
+    struct ConcurrentAdmissionReads {
+        armed: AtomicBool,
+        arrivals: AtomicUsize,
+        barrier: Barrier,
+    }
+    impl ReadObserver for ConcurrentAdmissionReads {
+        fn read(&self, kind: &str, operation: ReadOperation, _: usize) {
+            if self.armed.load(Ordering::SeqCst)
+                && kind == "Message"
+                && operation == ReadOperation::Query
+                && self.arrivals.fetch_add(1, Ordering::SeqCst) < 2
+            {
+                // Message queries notify after releasing the store lock. Both
+                // real admissions have now read the same interrupted intent.
+                self.barrier.wait();
+            }
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    let observer =
+        Arc::new(ConcurrentAdmissionReads { armed: AtomicBool::new(false), arrivals: AtomicUsize::new(0), barrier: Barrier::new(2) });
+    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_observer(observer.clone()));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    let meta = InputMeta::builder().name("racing-admission".into()).build();
+    let intent = spec(None, MessageExpectation::Reply);
+    runtime.block_on(backend.using::<Message>("flotilla").create(&meta, &intent)).expect("interrupted admission");
+    observer.armed.store(true, Ordering::SeqCst);
+    let results = std::thread::scope(|scope| {
+        let tasks: Vec<_> = (0..2)
+            .map(|_| {
+                let inbox = MessageInbox::new(backend.clone(), "flotilla");
+                let meta = &meta;
+                let intent = &intent;
+                scope.spawn(move || {
+                    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(inbox.accept(
+                        meta,
+                        intent,
+                        at(10),
+                    ))
+                })
+            })
+            .collect();
+        tasks.into_iter().map(|task| task.join().expect("admission thread")).collect::<Vec<_>>()
+    });
+    let admitted: Vec<_> = results
+        .into_iter()
+        .map(|result| match result.expect("both admissions succeed") {
+            MessageAdmission::Accepted(message) => message,
+            other => panic!("unexpected admission {other:?}"),
+        })
+        .collect();
+    assert_eq!(admitted[0].status, admitted[1].status);
+    assert!(admitted[0].status.as_ref().expect("admitted").accepted_sequence.is_some());
 }

@@ -12,49 +12,21 @@ use futures::StreamExt;
 use super::state::ControllerRuntimeState;
 use super::terminal::{deliver_guarded_and_confirm, PendingTerminalDelivery, TerminalControllerRuntime};
 
-/// Dependency events wake one inbox pass, not one timer per pending record.
-/// Federated watches include references and holders authored on other hosts.
-pub(super) struct MessageDependencyWatch<R: Resource>(std::marker::PhantomData<R>);
-
-impl<R: Resource> MessageDependencyWatch<R> {
-    pub(super) fn boxed() -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = flotilla_resources::Message>> {
-        Box::new(Self(std::marker::PhantomData))
+/// Forward dependency changes without reading the inbox. A watch channel holds
+/// one dirty bit for the namespace, including changes made during a pass.
+async fn watch_delivery<R: Resource>(
+    backend: ResourceBackend,
+    namespace: String,
+    wake: tokio::sync::watch::Sender<()>,
+) -> Result<(), ResourceError> {
+    let mut events = backend.including_replicas::<R>(&namespace).watch().await?;
+    // A restart/relist must repair changes missed while the watch was down.
+    wake.send_replace(());
+    while let Some(event) = events.next().await {
+        event?;
+        wake.send_replace(());
     }
-}
-
-impl<R: Resource> flotilla_store::controller::SecondaryWatch for MessageDependencyWatch<R> {
-    type Primary = flotilla_resources::Message;
-    fn clone_box(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = Self::Primary>> {
-        Self::boxed()
-    }
-    fn spawn(
-        self: Box<Self>,
-        backend: ResourceBackend,
-        namespace: String,
-        sender: flotilla_store::controller::WorkQueueSender,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
-        Box::pin(async move {
-            let resolver = backend.including_replicas::<R>(&namespace);
-            let mut watch = resolver.watch().await?;
-            loop {
-                if let Some(message) = backend
-                    .using::<flotilla_resources::Message>(&namespace)
-                    .query(&flotilla_store::MessageQuery::active())
-                    .await?
-                    .into_iter()
-                    .filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
-                    .min_by(|left, right| left.metadata.name.cmp(&right.metadata.name))
-                {
-                    sender.send(message.metadata.name).await.map_err(|_| ResourceError::other("Message controller queue closed"))?;
-                }
-                match watch.next().await {
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => return Err(error),
-                    None => return Ok(()),
-                }
-            }
-        })
-    }
+    Err(ResourceError::other("Message dependency watch closed"))
 }
 
 pub(super) struct MessageController {
@@ -62,79 +34,103 @@ pub(super) struct MessageController {
     pub(super) namespace: String,
 }
 
-impl flotilla_store::controller::Reconciler for MessageController {
-    type Resource = flotilla_resources::Message;
-    type Prepared = Option<std::time::Duration>;
-    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
-        if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-            let batch = obj.status.as_ref().and_then(|status| status.submission.as_ref()).map(|submission| submission.batch_id.as_str());
-            let tracked = batch.is_some_and(|batch| {
-                self.state
-                    .terminal_deliveries
-                    .lock()
-                    .expect("terminal deliveries lock poisoned")
-                    .values()
-                    .any(|delivery| delivery.message_batch.as_deref() == Some(batch))
-            });
-            if tracked {
-                flotilla_messaging::MessageTransport::release_closed(&TerminalControllerRuntime { state: Arc::clone(&self.state) }, &[])
-                    .await;
-            }
-            return Ok(None);
+impl MessageController {
+    pub(super) async fn run(
+        self,
+        resync_interval: std::time::Duration,
+        heartbeat: Arc<std::sync::atomic::AtomicU64>,
+        metrics: Arc<flotilla_store::load_metrics::ControllerLoadMetrics>,
+    ) -> Result<(), ResourceError> {
+        let backend = self.state.daemon.resource_backend();
+        let (wake, receiver) = tokio::sync::watch::channel(());
+        // JoinSet aborts every watch on cancellation, failure, or supervision
+        // restart; no detached producer can survive the inbox loop.
+        let mut watches = tokio::task::JoinSet::new();
+        macro_rules! watch {
+            ($kind:ty) => {
+                watches.spawn(watch_delivery::<$kind>(backend.clone(), self.namespace.clone(), wake.clone()));
+            };
         }
+        watch!(flotilla_resources::Message);
+        watch!(TerminalSession);
+        watch!(flotilla_resources::Convoy);
+        watch!(flotilla_resources::ConvoyEnsure);
+        watch!(flotilla_resources::ChangeRequest);
+        watch!(flotilla_resources::Issue);
+        watch!(flotilla_resources::Artifact);
+        watch!(flotilla_resources::Usage);
+        watch!(flotilla_resources::Vessel);
+        drop(wake);
         let inbox = self.state.daemon.message_inbox(&self.namespace).await;
-        inbox.reconcile_delivery(&TerminalControllerRuntime { state: Arc::clone(&self.state) }, Utc::now()).await?;
-        let messages = self
-            .state
-            .daemon
-            .resource_backend()
-            .using::<flotilla_resources::Message>(&self.namespace)
-            .query(&flotilla_store::MessageQuery::active())
-            .await?;
-        let active: Vec<_> =
-            messages.iter().filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal())).collect();
-        // Only the lexicographically first active record owns the inbox deadline.
-        if active.iter().map(|message| message.metadata.name.as_str()).min() != Some(obj.metadata.name.as_str()) {
-            return Ok(None);
+        let transport = TerminalControllerRuntime { state: Arc::clone(&self.state) };
+        // Durable batch intent makes passes safe to cancel and rerun after
+        // watch failure; recovery observes held submissions without retyping.
+        tokio::select! {
+            result = run_delivery(&inbox, &transport, receiver, resync_interval, heartbeat, metrics) => result,
+            result = watches.join_next() => {
+                match result {
+                    Some(Ok(result)) => result,
+                    Some(Err(error)) => Err(ResourceError::other(format!("Message watch task failed: {error}"))),
+                    None => Err(ResourceError::other("Message dependency watches closed")),
+                }
+            }
         }
-        let now = Utc::now();
-        let next = active
-            .iter()
-            .flat_map(|message| {
-                let status = message.status.as_ref();
-                let submission = status.and_then(|status| status.submission.as_ref());
-                [
-                    message.spec.deadline.filter(|deadline| *deadline > now),
-                    status.and_then(|status| status.retry.as_ref()).and_then(|retry| retry.next_attempt_at()).filter(|due| *due > now),
-                    submission
-                        .map(|submission| submission.started_at + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR)
-                        .filter(|due| *due > now),
-                    submission
-                        .and_then(|submission| submission.working_since)
-                        .map(|since| since + flotilla_resources::delivery_hold::DELIVERY_WORKING_DEBOUNCE_FOR)
-                        .filter(|due| *due > now),
-                ]
-                .into_iter()
-                .flatten()
+    }
+}
+
+/// Schedule the inbox as one unit, rather than reconciling it once per message.
+/// Mark the dirty bit seen BEFORE the pass so writes racing the pass get a
+/// follow-up. The single deadline is replaced after every pass, never spawned.
+async fn run_delivery(
+    inbox: &flotilla_messaging::MessageInbox,
+    transport: &dyn flotilla_messaging::MessageTransport,
+    mut wake: tokio::sync::watch::Receiver<()>,
+    resync_interval: std::time::Duration,
+    heartbeat: Arc<std::sync::atomic::AtomicU64>,
+    metrics: Arc<flotilla_store::load_metrics::ControllerLoadMetrics>,
+) -> Result<(), ResourceError> {
+    let mut resync = tokio::time::interval(resync_interval);
+    resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next = None;
+    loop {
+        heartbeat.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tokio::select! {
+            result = wake.changed() => {
+                result.map_err(|_| ResourceError::other("Message inbox wake channel closed"))?;
+            }
+            _ = resync.tick() => {
+                metrics.resyncs.increment();
+                metrics.resync_enqueued.increment();
+            }
+            _ = async {
+                match next {
+                    Some(due) => tokio::time::sleep_until(due).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => { metrics.requeues.increment(); }
+        }
+        wake.borrow_and_update();
+        metrics.wakes.increment();
+        metrics.queue_peak.observe(1);
+        let started = tokio::time::Instant::now();
+        let result = async {
+            inbox.reconcile_delivery(transport, Utc::now()).await.inspect_err(|error| {
+                tracing::warn!(controller = "Message", phase = "delivery", %error, "message inbox pass failed");
+            })?;
+            inbox.next_delivery_wake(Utc::now()).await.inspect_err(|error| {
+                tracing::warn!(controller = "Message", phase = "deadline", %error, "message inbox pass failed");
             })
-            .min();
-        Ok(next.and_then(|due| (due - now).to_std().ok()))
-    }
-    fn reconcile(
-        &self,
-        _: &ResourceObject<Self::Resource>,
-        next: &Self::Prepared,
-        _: chrono::DateTime<Utc>,
-    ) -> flotilla_store::controller::ReconcileOutcome<Self::Resource> {
-        let mut outcome = flotilla_store::controller::ReconcileOutcome::new(None);
-        outcome.requeue_after = *next;
-        outcome
-    }
-    async fn run_finalizer(&self, _: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
-        Ok(())
-    }
-    fn finalizer_name(&self) -> Option<&'static str> {
-        None
+        }
+        .await;
+        // Include failed attempts, matching the object-controller histogram.
+        metrics.reconcile.record(started.elapsed());
+        match result {
+            Ok(delay) => next = delay.map(|delay| tokio::time::Instant::now() + delay),
+            Err(error) => {
+                metrics.failures.increment();
+                return Err(error);
+            }
+        }
     }
 }
 

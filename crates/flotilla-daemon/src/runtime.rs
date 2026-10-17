@@ -54,7 +54,7 @@ use self::health::{
     apply_host_heartbeat_with_credentials, spawn_controller_loop_watchdog, spawn_projection_parity_task, DaemonHealthIdentity,
     RuntimeHealth,
 };
-use self::message::{MessageController, MessageDependencyWatch};
+use self::message::MessageController;
 use self::ports::{
     ChainedForgeDefaultBranchResolver, DaemonConvoyTeardownRuntime, GhForgeDefaultBranchResolver, RoutingCheckoutRuntime,
     RoutingCloneRuntime, RuntimeOperatorReconciler,
@@ -827,25 +827,30 @@ fn spawn_controller_loops(
                 )
             }
         }),
-        controller!(flotilla_resources::Message, {
+        {
             let state = Arc::clone(&state);
-            move |_backend: ResourceBackend, namespace: String| {
-                (
-                    vec![
-                        MessageDependencyWatch::<flotilla_resources::Message>::boxed(),
-                        MessageDependencyWatch::<TerminalSession>::boxed(),
-                        MessageDependencyWatch::<Convoy>::boxed(),
-                        MessageDependencyWatch::<flotilla_resources::ConvoyEnsure>::boxed(),
-                        MessageDependencyWatch::<ChangeRequest>::boxed(),
-                        MessageDependencyWatch::<flotilla_resources::Issue>::boxed(),
-                        MessageDependencyWatch::<flotilla_resources::Artifact>::boxed(),
-                        MessageDependencyWatch::<flotilla_resources::Usage>::boxed(),
-                        MessageDependencyWatch::<Vessel>::boxed(),
-                    ],
-                    MessageController { state: Arc::clone(&state), namespace },
-                )
-            }
-        }),
+            let health = runtime_health.clone();
+            spawn_resource_controller::<flotilla_resources::Message, _, _>(
+                backend.clone(),
+                namespace_string.clone(),
+                supervision.clone(),
+                runtime_health.clone(),
+                move |_backend, namespace| {
+                    let controller = MessageController { state: Arc::clone(&state), namespace };
+                    let heartbeat = Arc::new(AtomicU64::new(0));
+                    let health = health.clone();
+                    let metrics = state.controller_metrics.for_kind("Message");
+                    async move {
+                        let watchdog =
+                            spawn_controller_loop_watchdog("Message", Arc::clone(&heartbeat), controller_resync_interval, health.clone());
+                        let result = controller.run(controller_resync_interval, heartbeat, metrics).await;
+                        watchdog.abort();
+                        health.clear_controller_loop_stall("Message");
+                        result
+                    }
+                },
+            )
+        },
         controller!(TerminalSession, {
             let state = Arc::clone(&state);
             move |backend: ResourceBackend, namespace_string: String| {

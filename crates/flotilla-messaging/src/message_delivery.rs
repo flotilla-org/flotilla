@@ -71,6 +71,33 @@ pub trait MessageTransport: Send + Sync {
 }
 
 impl MessageInbox {
+    /// The namespace owns one replaceable deadline for delivery retries,
+    /// expiry, hold escalation and acceptance debounce.
+    pub async fn next_delivery_wake(&self, now: DateTime<Utc>) -> Result<Option<Duration>, ResourceError> {
+        let messages = self.messages.query(&MessageQuery::active()).await?;
+        let next = messages
+            .iter()
+            .flat_map(|message| {
+                let status = message.status.as_ref();
+                let submission = status.and_then(|status| status.submission.as_ref());
+                [
+                    message.spec.deadline.filter(|deadline| *deadline > now),
+                    status.and_then(|status| status.retry.as_ref()).and_then(|retry| retry.next_attempt_at()).filter(|due| *due > now),
+                    submission
+                        .map(|submission| submission.started_at + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR)
+                        .filter(|due| *due > now),
+                    submission
+                        .and_then(|submission| submission.working_since)
+                        .map(|since| since + flotilla_resources::delivery_hold::DELIVERY_WORKING_DEBOUNCE_FOR)
+                        .filter(|due| *due > now),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .min();
+        Ok(next.and_then(|due| (due - now).to_std().ok()))
+    }
+
     /// A pass with active Messages observes holders, including held submissions.
     /// Idle passes skip receiver reads but still repair abandoned gates. Admission and
     /// delivery serialize separately; admission never waits on transport I/O.
@@ -722,8 +749,12 @@ impl MessageInbox {
         if current.status.as_ref().is_some_and(|current| current.phase.is_terminal()) {
             return Ok(());
         }
-        if current.status.as_ref() != Some(status) {
-            self.messages.update_status(&message.metadata.name, &current.metadata.resource_version, status).await?;
+        let mut status = status.clone();
+        // Admission can finish after this pass captured a status-less intent.
+        // Delivery must never clear an order assigned since that snapshot.
+        status.accepted_sequence = current.status.as_ref().and_then(|current| current.accepted_sequence).or(status.accepted_sequence);
+        if current.status.as_ref() != Some(&status) {
+            self.messages.update_status(&message.metadata.name, &current.metadata.resource_version, &status).await?;
         }
         Ok(())
     }
@@ -905,6 +936,33 @@ async fn release(transport: &dyn MessageTransport, batch: &MessageBatch) {
 #[cfg(test)]
 mod framing_tests {
     use super::*;
+
+    // A pass can hold a snapshot from before admission finishes. Its later
+    // status write must preserve the immutable order assigned in the meantime.
+    #[tokio::test]
+    async fn stale_delivery_snapshot_preserves_completed_admission() {
+        let backend = crate::ResourceBackend::new(flotilla_store_testkit::memory_backend());
+        let inbox = MessageInbox::new(backend.clone(), "project");
+        let stored = backend.using::<Message>("project");
+        let mut intent = messages().remove(0);
+        intent.receiver = "project/convoy/work/coder".into();
+        let meta = InputMeta::builder().name("admission-race".into()).build();
+        let snapshot = stored.create(&meta, &intent).await.expect("partial intent");
+        let mut proposed = status_for(&snapshot);
+        proposed.phase = MessagePhase::Deliverable;
+        let admitted = match inbox.accept(&meta, &intent, Utc::now()).await.expect("finish admission") {
+            crate::MessageAdmission::Accepted(message) => message,
+            other => panic!("unexpected admission {other:?}"),
+        };
+        assert!(admitted.status.as_ref().expect("admitted status").accepted_sequence.is_some());
+        inbox.write(&snapshot, &proposed).await.expect("stale pass must preserve admission order");
+        let current = stored.get(&meta.name).await.expect("current message");
+        assert_eq!(
+            current.status.as_ref().expect("status").accepted_sequence,
+            admitted.status.as_ref().expect("admitted status").accepted_sequence
+        );
+        assert_eq!(current.status.expect("status").phase, MessagePhase::Deliverable);
+    }
 
     fn messages() -> Vec<MessageSpec> {
         vec![
