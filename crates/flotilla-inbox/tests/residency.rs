@@ -353,3 +353,163 @@ async fn watch_attributes_dense_lifecycle_once_per_page() {
     assert_eq!(reads.resource_history_pages, 0);
     assert_eq!(reads.terminal_loads, 0);
 }
+
+// A deterministic interleaving at the source-log boundary: the real SQLite
+// consumer writer commits after stamping and before the Message transaction.
+struct InterleavedLog {
+    inner: StoreLog,
+    competing_store: Option<Arc<Mutex<Store>>>,
+}
+impl flotilla_state_machines::Log<Message> for InterleavedLog {
+    fn create(
+        &mut self,
+        writer: &str,
+        at: flotilla_schema::Timestamp,
+        resource: &flotilla_state_machines::Resource<Message>,
+        reads: &[flotilla_state_machines::InputRead],
+    ) -> Result<flotilla_state_machines::Version, flotilla_state_machines::LogError> {
+        if let Some(store) = self.competing_store.take() {
+            let _other = SessionPort::new("competing", StoreLog::new(store));
+        }
+        self.inner.create(writer, at, resource, reads)
+    }
+    fn edge(
+        &mut self,
+        previous: &flotilla_state_machines::StoredState<Message>,
+        next: &flotilla_state_machines::Resource<Message>,
+        event: &flotilla_state_machines::EdgeEventOf<Message>,
+    ) -> Result<flotilla_state_machines::Version, flotilla_state_machines::LogError> {
+        self.inner.edge(previous, next, event)
+    }
+}
+impl InboxLog for InterleavedLog {
+    type PendingCursor = <StoreLog as InboxLog>::PendingCursor;
+    fn sequence(&mut self) -> Result<u64, Error> {
+        self.inner.sequence()
+    }
+    fn load(&mut self, name: &str) -> Result<Option<flotilla_state_machines::Resource<Message>>, Error> {
+        self.inner.load(name)
+    }
+    fn scan(&mut self, after: Option<i64>) -> Result<flotilla_inbox::ScanPage, Error> {
+        self.inner.scan(after)
+    }
+    fn pending(
+        &mut self,
+        inbox: &flotilla_schema::Address,
+        after: Option<&Self::PendingCursor>,
+    ) -> Result<(Vec<String>, Option<Self::PendingCursor>), Error> {
+        self.inner.pending(inbox, after)
+    }
+    fn receipts(&mut self, name: &str) -> Result<std::collections::BTreeMap<Receiver, Transport>, Error> {
+        self.inner.receipts(name)
+    }
+    fn changes_since(&mut self, after: Cursor) -> Result<flotilla_inbox::ChangePage, Error> {
+        self.inner.changes_since(after)
+    }
+    fn receipt(&mut self, inbox: &flotilla_schema::Address, message: &str, consumer: &Receiver, transport: Transport) -> Result<(), Error> {
+        self.inner.receipt(inbox, message, consumer, transport)
+    }
+    fn next_name(&mut self) -> Result<String, Error> {
+        self.inner.next_name()
+    }
+}
+
+// Behaviour: a competing home write between admission preparation and commit
+// causes a bounded retry, never a mismatched stored admission or duplicate Message.
+#[tokio::test]
+async fn admission_retries_competing_home_writer() {
+    let store = database();
+    let log = InterleavedLog { inner: StoreLog::new(store.clone()), competing_store: Some(store) };
+    let backend = EngineInbox::open("test", log, Arc::new(Evidence::default()), Arc::new(Supervisors)).expect("open");
+    let message = backend.enqueue(spec()).await.expect("retry admission");
+    let resource = backend.get_async(&message).await.expect("get").expect("message");
+    assert_eq!(resource.spec().admitted_seq, 2);
+    assert_eq!(resource.version().0, 2);
+}
+
+// Behaviour: absent observation callbacks return an error without poisoning the
+// writer. The next valid snapshot can still admit a message.
+#[tokio::test]
+async fn missing_snapshot_is_recoverable() {
+    struct Intermittent(std::sync::atomic::AtomicBool);
+    impl flotilla_inbox::Observations for Intermittent {
+        fn now(&self) -> flotilla_schema::Timestamp {
+            flotilla_schema::Timestamp(10)
+        }
+        fn with_snapshot(&self, read: &mut dyn FnMut(&MemoryMessageWorld)) {
+            if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                read(&MemoryMessageWorld::default());
+            }
+        }
+    }
+    let backend =
+        MemoryInbox::open("test", MemoryInboxLog::default(), Arc::new(Intermittent(false.into())), Arc::new(Supervisors)).expect("open");
+    assert!(matches!(backend.enqueue(spec()).await, Err(Error::Storage(_))));
+    backend.enqueue(spec()).await.expect("writer is not poisoned");
+}
+
+// Behaviour: switching to cold coverage mid-stream preserves the admission
+// boundary, including a concurrent later enqueue, without skips or duplicates.
+#[tokio::test]
+async fn pending_handoff_preserves_admission_boundary() {
+    let (backend, _) = backend(database(), Arc::new(Evidence::default()), 32 * 1024);
+    backend.bind(inbox(), consumer("a")).await.expect("bind");
+    let mut expected = Vec::new();
+    for _ in 0..2 {
+        expected.push(backend.enqueue(spec()).await.expect("warm"));
+    }
+    assert!(backend.residency_blocking().pending_index_complete);
+    let mut pending = backend.pending(&inbox(), &consumer("a"), &Rules::default()).await.expect("pending");
+    let mut actual = vec![pending.next().await.expect("first").expect("item").message];
+    let mut large = spec();
+    large.body = MessageBody::text("x".repeat(64 * 1024)).expect("body");
+    expected.push(backend.enqueue(large).await.expect("overflow"));
+    assert!(!backend.residency_blocking().pending_index_complete);
+    while let Some(item) = pending.next().await {
+        actual.push(item.expect("item").message);
+    }
+    assert_eq!(actual, expected);
+}
+
+// Behaviour: cold bind examines the full pending backlog when none has receipts;
+// this documents its linear indexed-read cost without terminal/history reads.
+#[tokio::test]
+async fn cold_bind_backlog_cost() {
+    let (backend, log) = backend(database(), Arc::new(Evidence::default()), 2048);
+    for _ in 0..1024 {
+        backend.enqueue(spec()).await.expect("backlog");
+    }
+    log.reset_read_counts();
+    let started = std::time::Instant::now();
+    backend.bind(inbox(), consumer("a")).await.expect("bind");
+    let reads = log.read_counts();
+    eprintln!("cold bind 1024: {:?}; {reads:?}", started.elapsed());
+    assert_eq!(reads.resource_loads, 2048);
+    assert_eq!(reads.pending_pages, 32);
+    assert_eq!(reads.about_pages, 1024);
+    assert_eq!(reads.terminal_loads + reads.resource_history_pages + reads.scan_pages, 0);
+}
+
+// Behaviour: restart scans terminal history in bounded pages but retains none
+// of its bodies. Measure startup separately from the resident byte budget.
+#[tokio::test]
+async fn terminal_backlog_restart_cost() {
+    let store = database();
+    let evidence = Arc::new(Evidence::default());
+    let (backend, _) = backend(store.clone(), evidence.clone(), 2048);
+    backend.bind(inbox(), consumer("a")).await.expect("bind");
+    for _ in 0..2048 {
+        let message = backend.enqueue(spec()).await.expect("enqueue");
+        backend.receive(&consumer("a"), &message, Transport::Turn).await.expect("receipt");
+        backend.deliver(&message, Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("terminal");
+    }
+    drop(backend);
+    let log = StoreLog::new(store);
+    let started = std::time::Instant::now();
+    let reopened = SqliteInbox::open_with_budget("test", log.clone(), evidence, Arc::new(Supervisors), 2048).expect("restart");
+    eprintln!("terminal restart 2048: {:?}; {:?}", started.elapsed(), log.read_counts());
+    assert_eq!(log.read_counts().scan_pages, 64);
+    assert_eq!(log.read_counts().about_pages, 0);
+    assert_eq!(reopened.residency_blocking().open_messages, 0);
+    assert_eq!(reopened.residency_blocking().accounted_bytes, 0);
+}

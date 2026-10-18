@@ -24,6 +24,10 @@ use crate::{
     Change, ChangeKind, ConsumerLog, Cursor, Error, InboxLog, ReceiptScope,
 };
 
+/// Inbox-local SQLite adapter for Message and its consumer machines. The
+/// generic Log implementation shares consumer persistence, while its Message
+/// admission check remains scoped here rather than changing the engine/schema
+/// contracts for every machine.
 #[derive(Clone)]
 pub struct StoreLog {
     store: Arc<Mutex<Store>>,

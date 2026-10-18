@@ -18,7 +18,7 @@ mod resident;
 pub mod sqlite;
 mod storage;
 pub use resident::{Residency, RESIDENT_BUDGET};
-pub use storage::{InboxLog, MemoryInboxLog};
+pub use storage::{ChangePage, InboxLog, MemoryInboxLog, ScanPage};
 
 /// Opaque canonical address assigned by the backend; usable as a subject.
 pub type MessageId = String;
@@ -167,14 +167,23 @@ pub trait InboxBackend: Send + Sync {
     async fn watch(&self, inbox: &Address, after: Option<Cursor>) -> Result<Watch, Error>;
 }
 
+const DEAD_LETTER_PREFIX: &str = "project:inbox/role:dead-letter-";
+
 struct GateWorld {
+    names: BTreeSet<String>,
     base: MemoryMessageWorld,
     receipts: Option<(String, Version, BTreeMap<Receiver, Transport>)>,
     binding: Option<(String, Version, InboxBinding)>,
     sent: BTreeSet<String>,
 }
+impl GateWorld {
+    fn check<K: flotilla_state_machines::Kind>(&self, reference: &Ref<K>) {
+        debug_assert!(self.names.contains(reference.name()), "undeclared Message gate read: {}", reference.name());
+    }
+}
 impl Source<Receipts> for GateWorld {
     fn lookup(&self, reference: &Ref<Receipts>) -> Option<(Version, &BTreeMap<Receiver, Transport>)> {
+        self.check(reference);
         match &self.receipts {
             Some((name, version, receipts)) if name == reference.name() => Some((*version, receipts)),
             _ => self.base.receipts.lookup(reference),
@@ -183,6 +192,7 @@ impl Source<Receipts> for GateWorld {
 }
 impl Source<Binding> for GateWorld {
     fn lookup(&self, reference: &Ref<Binding>) -> Option<(Version, &InboxBinding)> {
+        self.check(reference);
         match &self.binding {
             Some((name, version, binding)) if name == reference.name() => Some((*version, binding)),
             _ => self.base.binding.lookup(reference),
@@ -192,7 +202,7 @@ impl Source<Binding> for GateWorld {
 macro_rules! observed_sources {
     ($($kind:ty => $field:ident),+ $(,)?) => { $(
         impl Source<$kind> for GateWorld {
-            fn lookup(&self, reference: &Ref<$kind>) -> Option<(Version, &<$kind as flotilla_state_machines::Kind>::Value)> { self.base.$field.lookup(reference) }
+            fn lookup(&self, reference: &Ref<$kind>) -> Option<(Version, &<$kind as flotilla_state_machines::Kind>::Value)> { self.check(reference); self.base.$field.lookup(reference) }
         }
     )+ };
 }
@@ -201,6 +211,7 @@ DeliveryFailure => delivery_failure, Supersession => supersession, Authority => 
 
 impl Source<Sent> for GateWorld {
     fn lookup(&self, reference: &Ref<Sent>) -> Option<(Version, &())> {
+        self.check(reference);
         if self.sent.contains(reference.name()) {
             Some((Version(1), &()))
         } else {
@@ -216,7 +227,7 @@ struct GateInputs {
     sent: BTreeSet<String>,
 }
 impl GateInputs {
-    fn run<T>(self, observations: &dyn Observations, operation: impl FnOnce(&GateWorld) -> T) -> T {
+    fn run<T>(self, observations: &dyn Observations, operation: impl FnOnce(&GateWorld) -> T) -> Result<T, Error> {
         let mut snapshot = None;
         observations.with_snapshot(&mut |base| {
             let names = || self.names.iter().map(String::as_str);
@@ -232,7 +243,7 @@ impl GateInputs {
                 sent: base.sent.select(names()),
             });
         });
-        let base = snapshot.expect("one consistent observation snapshot");
+        let base = snapshot.ok_or_else(|| Error::Storage("missing consistent observation snapshot".into()))?;
         let mut receipts = self.receipts;
         if let Some((name, version, rows)) = &mut receipts {
             if let Some((observed_version, observed)) = base.receipts.lookup(&Ref::new(name.as_str())) {
@@ -242,7 +253,7 @@ impl GateInputs {
                 version.0 = version.0.saturating_add(observed_version.0);
             }
         }
-        operation(&GateWorld { base, receipts, binding: self.binding, sent: self.sent })
+        Ok(operation(&GateWorld { names: self.names, base, receipts, binding: self.binding, sent: self.sent }))
     }
 }
 
@@ -562,7 +573,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             let blocked = state.home.get(&name).is_some_and(|resource| *resource.state() == MessageState::Pending)
                 && self.world(state, Some(&name)).run(self.observations.as_ref(), |world| {
                     world.lookup(&Ref::<Receipts>::new(&name)).is_some_and(|(_, rows)| !rows.is_empty())
-                });
+                })?;
             Self::trim(state);
             if blocked {
                 return Ok(true);
@@ -599,7 +610,8 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
 
     // MESSAGE_READ_SET: the Message declaration's lookup keys come from this
     // resource/spec, admission references and the explicit Drop payload below.
-    // Extend this set with any new gate read (covered by shared Quint replay).
+    // Extend this set with any new gate read; GateWorld asserts membership in
+    // debug/test builds, including reads whose observed value is absent.
     fn world(&self, state: &State<L>, message: Option<&str>) -> GateInputs {
         let mut world = GateInputs { names: BTreeSet::new(), receipts: None, binding: None, sent: BTreeSet::new() };
         if let Some(name) = message {
@@ -652,8 +664,20 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             Some(name) => name,
             None => state.home.log_mut().next_name()?,
         };
-        spec.admitted_seq = state.home.log_mut().sequence()? + 1;
-        world.run(self.observations.as_ref(), |world| state.home.create(&name, spec, world, now).map(|_| ()))?;
+        // Other users of the same Store/home may commit between sequence() and
+        // create(). A refused create leaves Home unchanged; retry once with a
+        // fresh sequence when the source advanced, preserving the same name.
+        world.run(self.observations.as_ref(), |world| {
+            for attempt in 0..2 {
+                spec.admitted_seq = state.home.log_mut().sequence()? + 1;
+                match state.home.create(&name, spec.clone(), world, now).map(|_| ()) {
+                    Ok(()) => return Ok(()),
+                    Err(WriteError::Log(_)) if attempt == 0 && state.home.log_mut().sequence()? >= spec.admitted_seq => continue,
+                    Err(error) => return Err(Error::Message(error)),
+                }
+            }
+            unreachable!("bounded admission attempts return on last iteration")
+        })??;
         state.touched.insert(name.clone());
         // Pending has no self edge: its version remains its admission sequence
         // until it leaves this index. Numeric keys preserve arrival order.
@@ -714,7 +738,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
                 _ => {}
             }
         }
-        world.run(self.observations.as_ref(), |world| state.home.apply(message, edge, world, self.observations.now()))?;
+        world.run(self.observations.as_ref(), |world| state.home.apply(message, edge, world, self.observations.now()))??;
         let resource = state.home.get(message).expect("applied resource");
         let inbox = resource.spec().inbox.clone();
         let next = resource.state().clone();
@@ -730,7 +754,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         Ok(())
     }
     fn dead_letter(&self, state: &mut State<L>, message: &str) -> Result<(), Error> {
-        let name = format!("project:inbox/role:dead-letter-{}", message.rsplit(':').next().expect("message address"));
+        let name = format!("{DEAD_LETTER_PREFIX}{}", message.rsplit(':').next().expect("message address"));
         if state.home.get(&name).is_some() || state.home.log_mut().load(&name)?.is_some() {
             return Ok(());
         }
@@ -826,9 +850,9 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
                             let resource = state.home.get(&name).expect("pending candidate");
                             let allowed = backend.world(state, Some(&name)).run(backend.observations.as_ref(), |world| {
                                 resource.judge(world, backend.observations.now(), |h| pending_for(h, &query_consumer)).value
-                            });
+                            })?;
                             if allowed {
-                                let mode = if name.starts_with("project:inbox/role:dead-letter-") {
+                                let mode = if name.starts_with(DEAD_LETTER_PREFIX) {
                                     Transport::Notify
                                 } else {
                                     query_rules.choose(resource.spec())
@@ -940,5 +964,32 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
                 }
             },
         )))
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod read_set_tests {
+    use super::*;
+
+    // Behaviour: adding a gate lookup without declaring its snapshot key fails
+    // loudly in debug/test builds instead of silently substituting absence.
+    #[test]
+    #[should_panic(expected = "undeclared Message gate read")]
+    fn undeclared_gate_read_is_rejected() {
+        struct Evidence;
+        impl Observations for Evidence {
+            fn now(&self) -> Timestamp {
+                Timestamp(0)
+            }
+            fn with_snapshot(&self, read: &mut dyn FnMut(&MemoryMessageWorld)) {
+                read(&MemoryMessageWorld::default());
+            }
+        }
+        let inputs = GateInputs { names: BTreeSet::new(), receipts: None, binding: None, sent: BTreeSet::new() };
+        inputs
+            .run(&Evidence, |world| {
+                let _ = world.lookup(&Ref::<Condition>::new("undeclared"));
+            })
+            .expect("snapshot");
     }
 }

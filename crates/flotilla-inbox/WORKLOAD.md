@@ -14,7 +14,9 @@ values leave immediately. Missing open values are fetched by key. Pending-index
 coverage starts complete; the first budget eviction invalidates that coverage,
 drops the resident index, and routes pending queries to the declared store index
 for the rest of that backend instance. This conservative cover check cannot
-return an incomplete list as complete. Restart rebuilds cover if it fits.
+return an incomplete list as complete. This is a permanent warm-to-cold
+throughput cliff for that instance even after the backlog drains; coverage is
+not automatically rebuilt. Restart rebuilds cover if it fits.
 
 | Access | Default | Cold path / cost |
 |---|---|---|
@@ -31,6 +33,10 @@ Admission order is the create's home sequence on the row, not the mutable last
 version or a store-local id. `pending_by_inbox(inbox, admitted_seq) WHERE Pending`
 replaces `open_by_inbox`; no mixed or Awaiting index is maintained. A log refuses
 zero/mismatched admission values. The writer overwrites any caller value.
+Other consumer writers may advance the same home sequence between stamping and
+create; a refused create leaves Home unchanged and the adapter retries once
+with the new sequence. Sustained contention after that bounded retry returns
+an error; it never persists an incorrect order.
 
 For a cold Pending page, the API-level cost is 1 index read + up to 32 typed
 candidate loads, then resolve/load and receipt `about` pages for each item not
@@ -38,6 +44,14 @@ already resident. The low-budget 6,000-item measurement below performs 12,000
 typed loads, 188 index pages and 6,000 empty receipt pages, with no terminal loads
 or resource-history reads. Indexed cold reads deliberately trade CPU/latency for
 a fixed resident footprint; they are not advertised as zero-read delivery.
+
+Cold bind is O(inbox Pending backlog) in the no-receipt case: it loads each
+candidate and its receipt page under the writer lock/one worker, so unrelated
+operations wait for that pass. A receipt hit exits early and the subsequent wait
+releases the worker/lock. Receipts also come from external observation evidence,
+so a new SQLite receipt index alone cannot replace that gate lookup. No new
+schema/index is introduced; reducing this cold-bind latency needs a separately
+justified read shape and, if necessary, owner schema look-over.
 
 Warm delivery reads no resource/receipt history. `delivery_reads_no_terminal_history`
 checks both warm and forced-cold delivery after 96 Settled/Dropped messages;
@@ -155,6 +169,16 @@ to isolate replica allocations (`resident_allocations`, separate process allocat
 - Enqueue 6,000: 3,661 ms; stream all 6,000 cold pending items: 2,218 ms.
 - Cold reads: 12,000 typed loads, 188 Pending pages, 6,000 receipt pages,
   **zero terminal loads, startup scans or resource-history pages**.
+
+A cold bind with 1,024 pending messages and a 2 KiB budget took 235 ms:
+32 Pending pages, 2,048 typed loads (index-page decoding plus keyed candidates),
+1,024 empty receipt pages, and zero terminal/history/scan reads. Its regression
+guard fixes these counts to expose the linear cost. Restart over 2,048 terminal
+messages took 87 ms, 64 startup scan pages (each decoding up to 32 bodies), zero
+receipt pages, and retained zero messages/bytes. These use development-profile
+in-memory SQLite and warm source caches; real disk I/O and a ceiling-sized
+500,000-message restart are not measured by these numbers. Startup cost still
+grows with stored history even though retained memory does not.
 
 A dense watch replay of one create/receipt/edge lifecycle, repeated 1,000 times
 (3,000 changes), took 295 ms with page-local attribution reuse and zero resource
