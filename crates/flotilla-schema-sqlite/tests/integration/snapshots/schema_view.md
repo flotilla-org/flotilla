@@ -18,7 +18,7 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 | `ensure` | root | 15 | – | `ensure_recorded` (state data), `ensure_created` (state data) | `by_inbox` (inbox) |
 | `ensure_recorded` | state data | 2 | – | – | – |
 | `ensure_created` | state data | 2 | – | – | – |
-| `message` | root | 22 | 5: `expectation` 2, `reason` 3 | `message_references` (child) | `open_by_inbox` (inbox), `deadline` (deadline), `by_reply` (in_reply_to), `by_supersedes` (supersedes) |
+| `message` | root | 22 | 5: `expectation` 2, `reason` 3 | `message_references` (child) | `open_by_inbox` (inbox), `pending_by_inbox` (inbox), `deadline` (deadline), `by_reply` (in_reply_to), `by_supersedes` (supersedes) |
 | `message_references` | child | 5 | – | – | – |
 | `referral` | root | 24 | 12: `subject` 6, `condition_address` 6 | `referral_references` (child) | `by_session` (session, seq), `by_reply` (in_reply_to) |
 | `referral_references` | child | 11 | 9: `tag` 9 | – | `repository_ref` (repository), `resource_ref` (resource) |

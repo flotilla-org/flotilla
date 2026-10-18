@@ -135,7 +135,7 @@ pub fn sent(message: &MessageRef) -> Ref<Sent> {
 }
 
 /// The message as sent: the spec's envelope. Immutable. It declares the stored
-/// Message (kind code `ms`), indexed for an inbox's open messages, for open
+/// Message (kind code `ms`), indexed for an inbox's open and pending messages, for open
 /// messages by deadline (the expiry sweep's read), and by the message each
 /// replies to or supersedes, which also keeps an expunge's foreign-key checks
 /// off a table scan.
@@ -145,6 +145,7 @@ pub fn sent(message: &MessageRef) -> Ref<Sent> {
     code = "ms",
     state = MessageState,
     index(name = "open_by_inbox", eq(inbox), when(state in [Pending, Awaiting])),
+    index(name = "pending_by_inbox", eq(inbox), when(state in [Pending])),
     index(name = "deadline", order(deadline), when(state in [Pending, Awaiting], deadline is_some)),
     index(name = "by_reply", eq(in_reply_to), when(in_reply_to is_some)),
     index(name = "by_supersedes", eq(supersedes), when(supersedes is_some))

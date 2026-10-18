@@ -517,6 +517,7 @@ CREATE INDEX "message_by_reply" ON "message" ("in_reply_to") WHERE "in_reply_to"
 CREATE INDEX "message_by_supersedes" ON "message" ("supersedes") WHERE "supersedes" IS NOT NULL;
 CREATE INDEX "message_deadline" ON "message" ("deadline") WHERE "state" IN ('pe', 'aw') AND "deadline" IS NOT NULL;
 CREATE INDEX "message_open_by_inbox" ON "message" ("inbox") WHERE "state" IN ('pe', 'aw');
+CREATE INDEX "message_pending_by_inbox" ON "message" ("inbox") WHERE "state" IN ('pe');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ms', 'relation', 'de', 'Dependee'),
   ('ms', 'relation', 'dy', 'Dependency'),
