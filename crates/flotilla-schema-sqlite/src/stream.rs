@@ -233,7 +233,8 @@ impl Service {
         Ok(Self { store: Mutex::new(store), source, watermarks })
     }
     pub fn serve(&self, after: Option<u64>, now: Timestamp, sink: impl FnMut(&[u8]) -> Result<(), StoreError>) -> Result<u64, StoreError> {
-        // Wait for earlier writers before taking the read snapshot. Release the writer
+        // Wait for any writer currently holding the mutex before taking the read snapshot;
+        // this is not a FIFO guarantee for queued writers. Release the writer lock
         // before delivery: a slow peer holds only this round's read-only connection.
         self.with_store(|_| Ok(()))?;
         let mut reader = Store::open_reader(&self.source.path, &self.source.home, self.source.kinds.clone())?;

@@ -21,17 +21,18 @@ Its chunked response sends a snapshot when needed, tails ordered frames, and sen
 keepalives. Peers request `once=true` rounds every five seconds, with a 15-second network
 read/write deadline. There is no peer-count semaphore or encoded tail cache: each round opens
 one read-only WAL connection, reads `changes_since` pages, encodes them, and closes the
-connection. A brief writer barrier before the read cut orders the home's time after earlier
-transactions; the writer lock is released before delivery. The outgoing channel holds at
-most two frames; the frame limit is the log profile's 16 MiB plus 1 KiB envelope room.
+connection. A brief writer barrier before the read cut waits for the transaction currently
+holding the mutex; it does not impose FIFO order on queued writers. The writer lock is
+released before delivery. The outgoing channel holds at most two frames; the frame limit is the log profile's 16 MiB plus 1 KiB envelope room.
 
 The follower stages each HTTP round in an automatically deleted temporary file, validating
 frame bounds as bytes arrive. Only after a complete response ending in a keepalive does it
 acquire the store mutex and replay that local file in one transaction. A disconnect discards
 the staging file without changing rows or progress. Disk staging avoids buffering a complete
 snapshot in memory. Its disk cost is one round per connected home; snapshots can be much
-larger than tails. The network never waits inside `with_store`. Resident committed watermarks
-have a separate lock, so gates can read the old safe watermark during both network stalls and
+larger than tails. There is no whole-round byte cap: provision temporary disk for the largest
+home snapshot at each simultaneously active peer (see the workload note below). The network
+never waits inside `with_store`. Resident committed watermarks have a separate lock, so gates can read the old safe watermark during both network stalls and
 snapshot installation. Pending lookup overlays are periodically cleared during large
 transactions; uncommitted SQLite rows remain authoritative.
 
