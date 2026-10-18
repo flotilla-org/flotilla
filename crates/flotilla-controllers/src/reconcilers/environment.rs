@@ -3,12 +3,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits};
 use flotilla_resources::{
-    DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentStatusPatch, Host, ImageBuildPhase,
+    Checkout, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentStatusPatch, Host, ImageBuildPhase,
     ImageDelivery, ResourceError, ResourceObject,
 };
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler},
-    ResourceBackend, TypedResolver,
+    ResourceBackend, StoreQuery, TypedResolver,
 };
 
 #[async_trait]
@@ -232,6 +232,13 @@ where
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         if !self.actuates(obj).await? {
             return Ok(());
+        }
+        // A checkout finalizer still needs this environment's command runner.
+        // Convoy/vessel deletion requests race across controllers: destroying
+        // the backing first leaves the checkout permanently unable to finalize.
+        let query = StoreQuery { fields: [("spec.env_ref".into(), obj.metadata.name.clone())].into(), ..StoreQuery::default() };
+        if !self.backend.query_declared::<Checkout>(&self.namespace, &query).await?.items.is_empty() {
+            return Err(ResourceError::FinalizerPending);
         }
         if let Some(container_id) = obj.status.as_ref().and_then(|status| status.docker_container_id.as_deref()) {
             self.docker.destroy(&obj.metadata.name, container_id).await.map_err(ResourceError::other)?;
