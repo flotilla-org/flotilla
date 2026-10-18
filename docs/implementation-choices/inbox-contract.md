@@ -49,7 +49,7 @@ store is rejected before Receive rather than allowing its event to reuse the
 inbox's unchanged cursor. Publication also enforces strictly increasing cursors.
 Repeated Drop keeps the machine's Ended refusal, even when it repairs a pending
 reaction: it never records a second Message edge. Construction uses fallible open;
-synchronous registration/inspection are setup/diagnostic only, with async worker
+synchronous register_blocking/get_blocking are setup/diagnostic only, with async worker
 variants available for runtime callers. Poisoning the writer requires reopening.
 
 Quint parsing, graph traversal, replay helpers and Message value/evidence mapping

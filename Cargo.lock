@@ -2241,6 +2241,7 @@ dependencies = [
  "hegeltest",
  "rusqlite",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

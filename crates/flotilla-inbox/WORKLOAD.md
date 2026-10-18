@@ -22,7 +22,9 @@ consumer adapters are outside this issue.
 - Watch: a shared resident delta journal, indexed by inbox and cursor, globally
   bounded to 65,536 changes. Each watcher holds one cursor and one item; there
   is no queue per watcher and no store read per watcher/event. Lagging readers
-  receive CursorExpired and must obtain a fresh pending baseline.
+  receive CursorExpired and must obtain a fresh pending baseline. Both initial
+  resume refusals and lagging-stream expiry emit a tracing warning with the
+  requested cursor and expired-through position.
 - Startup: SQLite scans resources and logs in pages of 256, recovering messages,
   consumer receipts and journal positions. Historical watch values are typed
   reads from a temporary in-memory store populated with recorded effects; this
@@ -88,7 +90,7 @@ also refuses any non-increasing cursor. Foreign-store ports need a replication
 boundary, which is outside this local backend. Memory assigns its own journal
 positions and does not require its consumer MemoryLogs to share a sequence.
 
-Construction is fallible through open. Synchronous register/get are setup and
+Construction is fallible through open. Synchronous register_blocking/get_blocking are setup and
 diagnostic operations, used outside concurrent runtime work; runtime callers use
 register_async/get_async through the bounded blocking worker. A poisoned writer
 is fatal: reopen from durable state instead of resuming a possibly interrupted

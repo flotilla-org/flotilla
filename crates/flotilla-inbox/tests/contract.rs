@@ -18,13 +18,13 @@ impl Factory for Memory {
         backend: &Self::Backend,
         message: &str,
     ) -> flotilla_state_machines::Resource<flotilla_state_machines::machines::message::Message> {
-        backend.get(message).expect("message")
+        backend.get_blocking(message).expect("message")
     }
     fn create(&self) -> Harness<Self::Backend> {
         let evidence = Arc::new(Evidence::default());
         let backend = EngineInbox::open("test", MemoryInboxLog::default(), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
         for name in ["a", "b"] {
-            backend.register(consumer(name), SessionPort::new(name, MemoryLog::<AgentSession>::new()));
+            backend.register_blocking(consumer(name), SessionPort::new(name, MemoryLog::<AgentSession>::new()));
         }
         Harness { backend, evidence }
     }
@@ -38,7 +38,7 @@ impl Factory for Sqlite {
         backend: &Self::Backend,
         message: &str,
     ) -> flotilla_state_machines::Resource<flotilla_state_machines::machines::message::Message> {
-        backend.get(message).expect("message")
+        backend.get_blocking(message).expect("message")
     }
     fn create(&self) -> Harness<Self::Backend> {
         let store = Arc::new(Mutex::new(
@@ -48,7 +48,7 @@ impl Factory for Sqlite {
         let evidence = Arc::new(Evidence::default());
         let backend = EngineInbox::open("test", StoreLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
         for name in ["a", "b"] {
-            backend.register(consumer(name), SessionPort::new(name, StoreLog::new(store.clone())));
+            backend.register_blocking(consumer(name), SessionPort::new(name, StoreLog::new(store.clone())));
         }
         Harness { backend, evidence }
     }
@@ -77,7 +77,7 @@ async fn sqlite_recovers_receipts_and_watch_positions() {
     ));
     let evidence = Arc::new(Evidence::default());
     let backend = SqliteInbox::open("test", StoreLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
-    backend.register(consumer("a"), SessionPort::new("a", StoreLog::new(store.clone())));
+    backend.register_blocking(consumer("a"), SessionPort::new("a", StoreLog::new(store.clone())));
     backend.bind(inbox(), consumer("a")).await.expect("bind");
     let message = backend.enqueue(spec()).await.expect("enqueue");
     let mut watch = backend.watch(&inbox(), Some(Cursor(0))).await.expect("watch");
@@ -180,7 +180,7 @@ async fn sqlite_rejects_consumer_in_another_store() {
     let foreign = make_store();
     let backend =
         SqliteInbox::open("test", StoreLog::new(local.clone()), Arc::new(Evidence::default()), Arc::new(Supervisors)).expect("open inbox");
-    backend.register(consumer("a"), SessionPort::new("a", StoreLog::new(foreign.clone())));
+    backend.register_blocking(consumer("a"), SessionPort::new("a", StoreLog::new(foreign.clone())));
     let message = backend.enqueue(spec()).await.expect("enqueue");
     let before = foreign.lock().expect("store").read().expect("read").last_sequence("test").expect("sequence");
     assert!(matches!(backend.receive(&consumer("a"), &message, flotilla_state_machines::Transport::Turn).await, Err(Error::Consumer(_))));
@@ -216,7 +216,7 @@ async fn sqlite_recovers_historical_message_states() {
     ));
     let evidence = Arc::new(Evidence::default());
     let backend = SqliteInbox::open("test", StoreLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open");
-    backend.register(consumer("a"), SessionPort::new("a", StoreLog::new(store.clone())));
+    backend.register_blocking(consumer("a"), SessionPort::new("a", StoreLog::new(store.clone())));
     backend.bind(inbox(), consumer("a")).await.expect("bind");
     let mut envelope = spec();
     envelope.expectation = Expectation::Reply;

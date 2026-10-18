@@ -18,6 +18,8 @@ pub mod sqlite;
 
 /// Opaque canonical address assigned by the backend; usable as a subject.
 pub type MessageId = String;
+/// Maximum retained changes across all inboxes (about 6.5 seconds at 10,000/s).
+/// Older cursors fail explicitly; subscribers must establish a fresh baseline.
 pub const WATCH_HISTORY: usize = 65_536;
 pub type PendingStream = Pin<Box<dyn Stream<Item = Result<Pending, Error>> + Send>>;
 pub type Watch = Pin<Box<dyn Stream<Item = Result<Change, Error>> + Send>>;
@@ -369,13 +371,13 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
     /// Synchronous setup-only registration. Runtime callers use register_async.
     /// A poisoned writer lock is fatal; recovering an uncertain writer requires
     /// reopening from the durable log rather than continuing after a panic.
-    pub fn register(&self, consumer: Receiver, port: impl ConsumerPort + 'static) {
+    pub fn register_blocking(&self, consumer: Receiver, port: impl ConsumerPort + 'static) {
         self.state.lock().expect("inbox writer").consumers.insert(consumer, Box::new(port));
     }
 
     /// Synchronous diagnostic snapshot; call outside runtime operations or on
     /// a blocking thread. Async runtime callers use get_async.
-    pub fn get(&self, message: &str) -> Option<Resource<Message>> {
+    pub fn get_blocking(&self, message: &str) -> Option<Resource<Message>> {
         self.state.lock().expect("inbox writer").home.get(message).cloned()
     }
 
@@ -682,6 +684,7 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
             .access(move |_, state| {
                 let cursor = after.unwrap_or(Cursor(state.sequence));
                 if cursor < state.expired {
+                    tracing::warn!(cursor = cursor.0, expired_through = state.expired.0, "inbox watch cursor expired");
                     Err(Error::CursorExpired)
                 } else if cursor.0 > state.sequence {
                     Err(Error::CursorAhead)
@@ -704,6 +707,7 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
                 let next = backend
                     .access(move |_, state| {
                         if cursor < state.expired {
+                            tracing::warn!(cursor = cursor.0, expired_through = state.expired.0, "inbox watch cursor expired");
                             return Err(Error::CursorExpired);
                         }
                         Ok(state
