@@ -18,7 +18,8 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 | `ensure` | root | 15 | – | `ensure_recorded` (state data), `ensure_created` (state data) | `by_inbox` (inbox) |
 | `ensure_recorded` | state data | 2 | – | – | – |
 | `ensure_created` | state data | 2 | – | – | – |
-| `message` | root | 15 | 5: `expectation` 2, `reason` 3 | – | `open_by_inbox` (inbox), `deadline` (deadline) |
+| `message` | root | 22 | 5: `expectation` 2, `reason` 3 | `message_references` (child) | `open_by_inbox` (inbox), `deadline` (deadline), `by_reply` (in_reply_to), `by_supersedes` (supersedes) |
+| `message_references` | child | 5 | – | – | – |
 | `referral` | root | 24 | 12: `subject` 6, `condition_address` 6 | `referral_references` (child) | `by_session` (session, seq), `by_reply` (in_reply_to) |
 | `referral_references` | child | 11 | 9: `tag` 9 | – | `repository_ref` (repository), `resource_ref` (resource) |
 | `ticket` | root | 14 | – | `ticket_assignees` (state data), `ticket_notes` (state data) | `open_by_queue` (queue) |
@@ -37,7 +38,7 @@ States with data (one label column, then data shared by name across the labels):
 - `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `reason`; data tables –
 - `convoy`.`state`: label `state` and `state_since`; data columns `reason`; data tables `convoy_resolution`, `convoy_quota`
 - `ensure`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `bound`; data tables `ensure_recorded`, `ensure_created`
-- `message`.`state`: label `state` and `state_since`; data columns `receiver_session`, `receiver_host`, `reason`, `reason_by`, `reason_authority`, `watermark`; data tables –
+- `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `reason`, `reason_by`, `reason_authority`, `watermark`; data tables –
 - `ticket`.`state`: label `state` and `state_since`; data columns `priority`, `owner`, `hold_by`, `hold_until`, `reason`, `closed_by`, `signature_who`, `signature_at`; data tables `ticket_assignees`, `ticket_notes`
 - `terminal_session`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `cause_category`, `cause_detail`; data tables –
 - `vessel`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `cause_category`, `cause_detail`; data tables –
@@ -56,12 +57,15 @@ Interned column domains:
 | `ensure` | `bound` | `rn` |
 | `ensure_recorded` | `value` | `rn` |
 | `ensure_created` | `value` | `rn` |
+| `message` | `sender` | `ad` |
 | `message` | `inbox` | `ad` |
 | `message` | `expectation_condition` | `ad` |
-| `message` | `receiver_session` | `sn` |
+| `message` | `delivery_condition` | `ad` |
+| `message` | `receiver_id` | `rn` |
 | `message` | `receiver_host` | `hm` |
 | `message` | `reason_by` | `ad` |
 | `message` | `reason_authority` | `ad` |
+| `message_references` | `address` | `ad` |
 | `referral` | `sender` | `ag` |
 | `referral` | `subject_service` | `sv` |
 | `referral` | `condition_address_service` | `sv` |

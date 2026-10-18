@@ -81,8 +81,10 @@ impl Cause {
 }
 
 /// Who wrote a create, spec edit, delete or expunge, when, and why: an edge carries the same in
-/// its event. `payload` is an inline CBOR document explaining the write, such as a create's
-/// admission request.
+/// its event. `payload` is an inline CBOR document explaining the write, such as the reads a
+/// create's admission relied on. It never repeats the value written: a create's effect already
+/// sets every field and carries every object, so a frozen document is stored at most twice, in
+/// `objects` and in that effect (#3424 ruling 4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Origin {
     pub writer: String,

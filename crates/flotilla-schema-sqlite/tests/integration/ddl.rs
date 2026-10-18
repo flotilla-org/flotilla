@@ -3,7 +3,7 @@ use std::{env, fs, path::Path};
 use flotilla_schema::{render_view, DdlMode, Kind, Timestamp};
 use flotilla_schema_sqlite::{schema_ddl, Store};
 use flotilla_state_machines::{
-    machines::message::{Deliver, MemoryMessageWorld, MessageSpec, MessageWorld, Receiver},
+    machines::message::{Deliver, MemoryMessageWorld, MessageSpec, MessageWorld},
     Ref, Transport,
 };
 
@@ -82,6 +82,7 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "home_sequence",
             "log",
             "message",
+            "message_references",
             "objects",
             "referral",
             "referral_references",
@@ -155,8 +156,8 @@ fn the_log_view_names_edges_and_labels_by_the_entrys_kind() {
     let resource = message::sample();
     let stamp = write.insert(engine::NAME, &resource, &origin()).expect("insert");
     let mut world = MemoryMessageWorld::default();
-    world.receipts.put(&Ref::new(engine::NAME), [("s".to_owned(), Transport::Turn)].into());
-    let deliver = Deliver { receiver: Receiver { session: "s".into(), host: "h".into() }, transport: Transport::Turn };
+    world.receipts.put(&Ref::new(engine::NAME), [(message::agent("s", "h"), Transport::Turn)].into());
+    let deliver = Deliver { receiver: message::agent("s", "h"), transport: Transport::Turn };
     let world: Box<dyn MessageWorld> = Box::new(world);
     let (edge, _) = engine::step(&resource, "deliverer", deliver, &*world, Timestamp(4)).expect("delivered");
     write.apply_edge(stamp, edge).expect("edge");

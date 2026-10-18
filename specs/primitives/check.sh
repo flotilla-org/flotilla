@@ -13,7 +13,7 @@ jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
 mkdir -p build
 quint test tests/stream_properties.qnt --backend typescript
 run=$(mktemp -d "$PWD/build/fast.XXXXXX")
-for scenario in convoy_deliver ensure_bind inbox_delivery message_race machine_edges admission_placement; do
+for scenario in convoy_deliver ensure_bind inbox_delivery message_race controller_delivery machine_edges admission_placement; do
   # Assignment coverage is mandatory even for branches unreachable at depth one.
   # Simulation/typecheck alone can silently lose an unassigned world variable.
   quint verify "scenarios/$scenario.qnt" --invariant safety --max-steps 1 > "$run/$scenario.frames.log" 2>&1

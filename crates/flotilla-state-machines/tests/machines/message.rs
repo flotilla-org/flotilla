@@ -1,15 +1,23 @@
 //! Message (spec `machines/message.qnt`; scenarios `inbox_delivery`, `message_race`;
 //! ADR 0064 "Inboxes").
 
-use flotilla_schema::{Address, Code, CodeEnum, EdgeHeader, Origin, Timestamp};
+use flotilla_schema::{Address, Cause, Cbor, Code, CodeEnum, EdgeHeader, Effect, Event, KindCode, Origin, Timestamp};
 use flotilla_state_machines::{
-    machines::message::{
-        AppliedThrough, Binding, Condition, Deliver, DropMessage, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message,
-        MessageEdge, MessageEdgeKind, MessageLabel, MessageRefusal, MessageSpec, MessageState, Receipts, Receiver, Settle, Settlement,
-        Supersedes, Supersession,
+    edges,
+    machines::{
+        agent_session::{AgentSessionEdge, Receive},
+        consumer::{Consumer, ConsumerKind},
+        message::{
+            pending_for, sent, AppliedThrough, Binding, Condition, Deliver, DropMessage, DropReason, Expectation, InboxBinding,
+            MemoryMessageWorld, Message, MessageBody, MessageEdge, MessageEdgeKind, MessageLabel, MessageRef, MessageReference,
+            MessageRefusal, MessageSpec, MessageState, ReceiptLog, Receipts, Receiver, Relation, Settle, Settlement, Supersedes,
+            Supersession,
+        },
     },
-    Coded, Diagram, EdgePayload, Home, InputRead, Kind, Machine, Ref, Source, Transport, Version, WriteError,
+    states, Admission, Coded, Diagram, EdgeDef, EdgePayload, Ended, Home, InputRead, Kind, Machine, MachineDef, Ref, Source, Table,
+    Transport, Version, WriteError, WrongState,
 };
+use serde::{Deserialize, Serialize};
 
 const INBOX: &str = "project:p/role:r";
 
@@ -36,7 +44,13 @@ fn condition_ref() -> Ref<Condition> {
 }
 
 fn spec(expectation: Expectation, deadline: Option<i64>) -> MessageSpec {
-    MessageSpec { inbox: inbox(), expectation, deadline: deadline.map(t), unbound_after: 10 }
+    let body = MessageBody::text("hello").expect("small body");
+    MessageSpec {
+        expectation,
+        deadline: deadline.map(t),
+        unbound_after: 10,
+        ..MessageSpec::new(a("sender"), inbox(), Relation::Peer, body)
+    }
 }
 
 fn home(spec: MessageSpec) -> Home<Message> {
@@ -46,7 +60,7 @@ fn home(spec: MessageSpec) -> Home<Message> {
 }
 
 fn session(name: &str) -> Receiver {
-    Receiver { session: name.into(), host: "consumer".into() }
+    Receiver { kind: ConsumerKind::AgentSession, id: name.into(), host: "consumer".into() }
 }
 
 fn deliver(name: &str, transport: Transport) -> Deliver {
@@ -56,7 +70,7 @@ fn deliver(name: &str, transport: Transport) -> Deliver {
 fn receipt(world: &mut MemoryMessageWorld, session: &str, transport: Transport) {
     let own = Ref::<Receipts>::new("m");
     let mut receipts = world.receipts.lookup(&own).map(|(_, by_session)| by_session.clone()).unwrap_or_default();
-    receipts.insert(session.into(), transport);
+    receipts.insert(self::session(session), transport);
     world.receipts.put(&own, receipts);
 }
 
@@ -73,7 +87,7 @@ fn state(home: &Home<Message>) -> &MessageState {
 }
 
 fn bound(world: &mut MemoryMessageWorld) {
-    world.binding.put(&Ref::new(INBOX), InboxBinding::Bound { session: "s1".into() });
+    world.binding.put(&Ref::new(INBOX), InboxBinding::Bound { consumers: [session("s1")].into() });
 }
 
 /// A message expecting a reply, delivered to `s1`.
@@ -142,7 +156,7 @@ fn deliver_needs_the_receivers_receipt() {
 fn deliver_records_one_receiver_and_awaits() {
     let mut home = home(spec(Expectation::Reply, None));
     let mut world = MemoryMessageWorld::default();
-    world.binding.put(&Ref::new(INBOX), InboxBinding::Bound { session: "replacement".into() });
+    world.binding.put(&Ref::new(INBOX), InboxBinding::Bound { consumers: [session("replacement")].into() });
     receipt(&mut world, "old", Transport::Mute);
     home.apply("m", deliver("old", Transport::Mute), &world, t(1)).expect("delivered");
     receipt(&mut world, "replacement", Transport::Turn);
@@ -413,4 +427,266 @@ fn payload_documents_name_references_and_keep_reads() {
         about: None,
     };
     assert!(header.payload::<EdgePayload<MessageEdge>>().is_err(), "a stored payload with a third element is refused");
+}
+
+/// A reference to `name` at `revision`, the subject or not.
+fn reference(name: &str, revision: &str, subject: bool) -> MessageReference {
+    MessageReference { address: a(name), revision: revision.into(), subject }
+}
+
+// Admission (#3424 rulings 8 and 10): at most one reference is the subject, every revision is
+// non-empty, and the messages a new one replies to and supersedes exist. Each of those is read
+// through the recording handle, so the create carries the reads it relied on, cross-home
+// identities included; a refused admission creates nothing.
+#[test]
+fn admission_checks_references_and_reads_the_messages_named() {
+    let create = |spec: MessageSpec, world: &MemoryMessageWorld| {
+        let mut home = Home::<Message>::new("home").expect("valid declaration");
+        home.create("m", spec, world, t(0)).map(|created| created.reads)
+    };
+    let base = spec(Expectation::Reply, None);
+    let world = MemoryMessageWorld::default();
+    let two_subjects = MessageSpec { references: vec![reference("a", "1", true), reference("b", "2", true)], ..base.clone() };
+    assert_eq!(create(two_subjects, &world).err(), refused(MessageRefusal::SubjectsConflict));
+    let empty = MessageSpec { references: vec![reference("a", "1", true), reference("b", "", false)], ..base.clone() };
+    assert_eq!(create(empty, &world).err(), refused(MessageRefusal::EmptyRevision));
+    let one_subject = MessageSpec { references: vec![reference("a", "1", true), reference("b", "2", false)], ..base.clone() };
+    assert_eq!(one_subject.subject(), Some(&reference("a", "1", true)));
+    assert_eq!(create(one_subject, &world), Ok(Vec::new()), "references need no reads");
+
+    let earlier = MessageRef::new("earlier", "elsewhere");
+    let older = MessageRef::new("older", "home");
+    let reply = MessageSpec { in_reply_to: Some(earlier.clone()), supersedes: Some(older.clone()), ..base };
+    assert_eq!(create(reply.clone(), &world).err(), refused(MessageRefusal::UnknownMessage));
+    let world = MemoryMessageWorld::default().with_sent(&earlier);
+    assert_eq!(create(reply.clone(), &world).err(), refused(MessageRefusal::UnknownMessage), "the superseded message too");
+    let world = world.with_sent(&older);
+    let reads = create(reply, &world).expect("admitted");
+    let names: Vec<_> = reads.iter().map(|read| (read.kind.as_ref(), read.name.as_str(), read.version.is_some())).collect();
+    assert_eq!(names, [("message", "earlier@elsewhere", true), ("message", "older@home", true)]);
+    assert_eq!(sent(&earlier), Ref::new("earlier@elsewhere"));
+}
+
+/// A replicated spec with two subjects (admitted elsewhere, or by an older writer) names none.
+#[test]
+fn a_second_subject_reads_as_no_subject() {
+    let spec = MessageSpec { references: vec![reference("a", "1", true), reference("b", "2", true)], ..spec(Expectation::Nothing, None) };
+    assert_eq!(spec.subject(), None);
+}
+
+// A delivery condition observed not to hold lets the turn-rules role withdraw the message
+// (#3424 ruling 9; spec `hasCondition and conditionFailed`): without authority, the withdrawal
+// needs the envelope's condition read false. A condition unobserved or holding is no evidence,
+// and a message without one is withdrawn only by authority.
+#[test]
+fn a_lapsed_delivery_condition_withdraws_the_message() {
+    let wanted = a("still-wanted");
+    let turn_rules = DropReason::Withdrawn { by: a("turn-rules"), authority: wanted.clone() };
+    let mut without = home(spec(Expectation::Reply, None));
+    let mut world = MemoryMessageWorld::default();
+    world.condition.put(&Ref::new(wanted.as_str()), false);
+    assert_eq!(without.apply("m", drop(turn_rules.clone()), &world, t(1)).err(), refused(MessageRefusal::Unauthorised));
+
+    let mut home = home(MessageSpec { delivery_condition: Some(wanted.clone()), ..spec(Expectation::Reply, None) });
+    let mut world = MemoryMessageWorld::default();
+    assert_eq!(home.apply("m", drop(turn_rules.clone()), &world, t(1)).err(), refused(MessageRefusal::Unauthorised), "unobserved");
+    world.condition.put(&Ref::new(wanted.as_str()), true);
+    assert_eq!(home.apply("m", drop(turn_rules.clone()), &world, t(1)).err(), refused(MessageRefusal::Unauthorised), "still holds");
+    world.condition.put(&Ref::new(wanted.as_str()), false);
+    let event = home.apply("m", drop(turn_rules.clone()), &world, t(2)).expect("withdrawn");
+    let reads: Vec<_> = event.payload.reads.iter().map(|read| (read.kind.as_ref(), read.name.as_str())).collect();
+    assert!(reads.contains(&(<Condition as Kind>::NAME, wanted.as_str())), "{reads:?}");
+    assert_eq!(*state(&home), MessageState::Dropped { reason: turn_rules, receiver: None, watermark: None });
+}
+
+// A shared inbox binds a set of consumers (#3424 ruling 3). The message is pending for each bound
+// consumer until that consumer's receipt; the first deliver the home accepts claims it for every
+// one of them; undeliverable needs nobody bound, so one consumer still bound refuses it.
+#[test]
+fn a_shared_inbox_is_pending_for_each_consumer_until_its_receipt() {
+    let agent = session("s1");
+    let controller = Receiver { kind: ConsumerKind::Controller, id: "approve".into(), host: "consumer".into() };
+    let stranger = session("s9");
+    let mut home = home(spec(Expectation::Reply, None));
+    let mut world = MemoryMessageWorld::default();
+    world.binding.put(&Ref::new(INBOX), InboxBinding::Bound { consumers: [agent.clone(), controller.clone()].into() });
+    let pending = |home: &Home<Message>, world: &MemoryMessageWorld, who: &Receiver| {
+        home.judge("m", world, t(1), |h| pending_for(h, who)).expect("exists").value
+    };
+    assert!(pending(&home, &world, &agent) && pending(&home, &world, &controller));
+    assert!(!pending(&home, &world, &stranger), "not bound, so not pending for it");
+    assert_eq!(home.apply("m", drop(DropReason::Undeliverable), &world, t(99)).err(), refused(MessageRefusal::MissingEvidence));
+
+    let own = Ref::<Receipts>::new("m");
+    world.receipts.put(&own, [(controller.clone(), Transport::Turn)].into());
+    assert!(!pending(&home, &world, &controller), "the controller has its receipt");
+    assert!(pending(&home, &world, &agent), "the agent has none yet");
+    world.receipts.put(&own, [(controller.clone(), Transport::Turn), (agent.clone(), Transport::Turn)].into());
+    home.apply("m", Deliver { receiver: controller.clone(), transport: Transport::Turn }, &world, t(2)).expect("claimed");
+    assert_eq!(
+        home.apply("m", deliver("s1", Transport::Turn), &world, t(3)).err(),
+        refused(MessageRefusal::WrongState),
+        "the first accepted deliver claims it"
+    );
+    assert!(!pending(&home, &world, &agent), "claimed: pending for nobody");
+    assert_eq!(*state(&home), MessageState::Awaiting { receiver: controller });
+}
+
+// A deterministic controller consuming an inbox through its own resource (#3424 ruling 2): a
+// running probe that takes a message by a `Receive` edge about it, or retires.
+states! {
+    enum ProbeState => ProbeLabel {
+        Running = "ru",
+        Retired = "re",
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ProbeReceive {
+    message: String,
+    transport: Transport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Retire {
+    why: String,
+}
+
+edges! {
+    enum ProbeEdge => ProbeEdgeKind {
+        Receive(ProbeReceive) = "rv",
+        Retire(Retire) = "rt",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProbeRefusal;
+
+impl From<Ended<ProbeLabel>> for ProbeRefusal {
+    fn from(_: Ended<ProbeLabel>) -> Self {
+        ProbeRefusal
+    }
+}
+
+impl From<WrongState<ProbeLabel, ProbeEdgeKind>> for ProbeRefusal {
+    fn from(_: WrongState<ProbeLabel, ProbeEdgeKind>) -> Self {
+        ProbeRefusal
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default, flotilla_schema::Stored)]
+#[store(kind = "Probe", code = "pb", state = ProbeState)]
+struct ProbeSpec {}
+
+struct Probe;
+
+impl Machine for Probe {
+    const NAME: &'static str = "Probe";
+    type Request = ();
+    type Spec = ProbeSpec;
+    type State = ProbeState;
+    type Edge = ProbeEdge;
+    type Refusal = ProbeRefusal;
+    type World = Table<Receipts>;
+
+    fn definition() -> MachineDef<Self> {
+        use ProbeLabel::*;
+        MachineDef::new(Running)
+            .edge(
+                EdgeDef::<Self, ProbeReceive>::new()
+                    .from([Running])
+                    .to([Running])
+                    .about(|receive| &receive.message)
+                    .ungated("the controller took the message")
+                    .effect(|_, state, _| state),
+            )
+            .edge(
+                EdgeDef::<Self, Retire>::new()
+                    .from([Running])
+                    .to([Retired])
+                    .ungated("retiring needs no evidence")
+                    .effect(|_, _, _| ProbeState::Retired),
+            )
+            .end(Retired, "the probe retired")
+    }
+
+    fn admit(_: &mut Admission<'_, Probe>, _: ()) -> Result<(ProbeSpec, ProbeState), ProbeRefusal> {
+        Ok((ProbeSpec {}, ProbeState::Running))
+    }
+}
+
+impl Consumer for Probe {
+    const CONSUMER: ConsumerKind = ConsumerKind::Controller;
+    const RECEIVE: ProbeEdgeKind = ProbeEdgeKind::Receive;
+
+    fn receipt(edge: &ProbeEdge) -> Option<(&str, Transport)> {
+        match edge {
+            ProbeEdge::Receive(receive) => Some((&receive.message, receive.transport)),
+            ProbeEdge::Retire(_) => None,
+        }
+    }
+}
+
+/// A log entry of `kind`'s resource `name` at `home`: edge `edge`, whose payload is `payload`.
+fn entry(kind: &str, name: &str, home: &str, edge: &str, payload: &impl Cbor) -> Event {
+    Event {
+        kind: KindCode::new(kind),
+        name: name.into(),
+        home: home.into(),
+        home_seq: 1,
+        prev_seq: 0,
+        cause: Cause::Edge { edge: Code::new(edge), from: Code::new("ru"), to: Code::new("ru") },
+        writer: "w".into(),
+        at: t(1),
+        about: None,
+        payload: Origin::new("w", t(1)).with_payload(payload).expect("encodes").payload,
+        effect: Effect::default(),
+    }
+}
+
+// The receipt reader accepts any consumer kind that declares a `Receive` (#3424 ruling 2): an
+// agent session's from the start, a controller's once its kind is added, each naming the
+// consumer by kind, the entry's resource and its home. Entries of a kind not accepted, and the
+// accepted kinds' other edges, are no receipts, and their payloads are never decoded as one: a
+// retirement whose payload is not even the probe's edge document is skipped, not refused.
+#[test]
+fn the_receipt_reader_takes_every_accepted_consumer_kinds_receive() {
+    let session = entry(
+        "as",
+        "s1",
+        "kiwi",
+        "rv",
+        &EdgePayload { edge: AgentSessionEdge::Receive(Receive { message: "m".into(), transport: Transport::Turn }), reads: vec![] },
+    );
+    let probe = entry(
+        "pb",
+        "approve",
+        "rata",
+        "rv",
+        &EdgePayload { edge: ProbeEdge::Receive(ProbeReceive { message: "m".into(), transport: Transport::Notify }), reads: vec![] },
+    );
+    let retired = entry("pb", "approve", "rata", "rt", &"not an edge document".to_owned());
+    let other = entry(
+        "pb",
+        "other",
+        "rata",
+        "rv",
+        &EdgePayload { edge: ProbeEdge::Receive(ProbeReceive { message: "n".into(), transport: Transport::Turn }), reads: vec![] },
+    );
+    let entries = [session, probe, retired, other];
+    let agent = Receiver { kind: ConsumerKind::AgentSession, id: "s1".into(), host: "kiwi".into() };
+    let controller = Receiver { kind: ConsumerKind::Controller, id: "approve".into(), host: "rata".into() };
+
+    let mut sessions_only = ReceiptLog::new();
+    sessions_only.insert("m", &entries).expect("the probe's entries are skipped");
+    let found = sessions_only.lookup(&Ref::new("m")).map(|(version, receipts)| (version, receipts.clone()));
+    assert_eq!(found, Some((Version(1), [(agent.clone(), Transport::Turn)].into())));
+
+    let mut both = ReceiptLog::new().consumer::<Probe>();
+    both.insert("m", &entries).expect("a retirement is not decoded");
+    let found = both.lookup(&Ref::new("m")).map(|(version, receipts)| (version, receipts.clone()));
+    assert_eq!(found, Some((Version(2), [(agent, Transport::Turn), (controller, Transport::Notify)].into())));
+
+    let broken = entry("pb", "approve", "rata", "rv", &"not an edge document".to_owned());
+    assert!(ReceiptLog::new().consumer::<Probe>().insert("m", [&broken]).is_err(), "a Receive that does not decode is refused");
 }

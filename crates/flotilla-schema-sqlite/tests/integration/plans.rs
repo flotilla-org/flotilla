@@ -112,6 +112,8 @@ fn the_enumeration_covers_every_kind_and_index() {
         "index terminal_session_by_vessel after",
         "index terminal_session_live_by_pool first",
         "index referral_by_reply after",
+        "index message_by_reply after",
+        "index message_by_supersedes after",
         "index referral_by_session first",
         "vessel scan",
         "index vessel_live_by_host first",
@@ -126,7 +128,7 @@ fn the_enumeration_covers_every_kind_and_index() {
     ] {
         assert!(labels.contains(&expected), "missing {expected}");
     }
-    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 11);
+    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 13);
     assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 9);
     assert!(!labels.iter().any(|label| label.contains("_edges")), "no kind has an edge-log table");
     assert!(

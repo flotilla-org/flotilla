@@ -7,7 +7,7 @@ use flotilla_schema_sqlite::{Loaded, Stamp, Store, StoreError};
 use flotilla_state_machines::{
     machines::{
         ensure::{EnsureSpec, EnsureState, MemoryEnsureWorld, Record},
-        message::{Deliver, MemoryMessageWorld, MessageState, MessageWorld, Receiver, Settle, Settlement},
+        message::{Deliver, MemoryMessageWorld, MessageState, MessageWorld, Settle, Settlement},
     },
     Ref, Transport,
 };
@@ -175,7 +175,7 @@ fn writes_touch_only_their_rows() {
     let (mut store, _) = rows_written(store, |_| {});
     // The strings the edges write are interned first, so no `strings` row is counted below.
     for (n, (session, host)) in [("s", "h"), ("w", "w")].into_iter().enumerate() {
-        let awaiting = MessageState::Awaiting { receiver: Receiver { session: session.into(), host: host.into() } };
+        let awaiting = MessageState::Awaiting { receiver: message::agent(session, host) };
         let mut write = store.write().expect("pre-intern");
         write
             .insert(
@@ -190,10 +190,10 @@ fn writes_touch_only_their_rows() {
     let dossier_current = insert(&mut store, "d", &dossier);
 
     let mut world = MemoryMessageWorld::default();
-    world.receipts.put(&Ref::new(NAME), [("s".to_owned(), Transport::Turn)].into());
+    world.receipts.put(&Ref::new(NAME), [(message::agent("s", "h"), Transport::Turn)].into());
     world.reply.put(&Ref::new(NAME), ());
     let world: Box<dyn MessageWorld> = Box::new(world);
-    let deliver = Deliver { receiver: Receiver { session: "s".into(), host: "h".into() }, transport: Transport::Turn };
+    let deliver = Deliver { receiver: message::agent("s", "h"), transport: Transport::Turn };
     let (edge, delivered) = step(&current.value, "w", deliver, &*world, Timestamp(5)).expect("delivered");
     let (mut store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
     assert_eq!(written, 4, "the state with the version, the home and identity sequences and the log entry");

@@ -2,6 +2,7 @@
 //! each declared once. Role names and promise kinds never appear here.
 
 pub mod agent_session;
+pub mod consumer;
 pub mod convoy;
 pub mod ensure;
 pub mod lifecycle;

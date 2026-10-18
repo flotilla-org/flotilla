@@ -1,6 +1,6 @@
 //! Quint ITF trace replay through the engine (#3220, #3319).
 //!
-//! `specs/primitives/check.sh` simulates the six scenarios in
+//! `specs/primitives/check.sh` simulates the seven scenarios in
 //! `specs/primitives/scenarios/` and writes one ITF file per trace; nothing
 //! here is a stored fixture. Each trace drives the real single writer
 //! ([`Home::apply`]: attempts and receipts are edges too) and the placement
@@ -31,8 +31,9 @@
 //!   `deadline` integer even when `hasDeadline` is false; Rust's
 //!   `deadline: Option<Timestamp>` has none. Both sides compare it as 0 then.
 //! - **Message drop `receiver`.** The model's drop keeps the receiver's
-//!   session only; Rust keeps the whole [`message::Receiver`]. The rendering
-//!   keeps its session (0 for none), and Awaiting compares session and host.
+//!   consumer number only; Rust keeps the whole [`message::Receiver`]. The
+//!   rendering keeps its id as that number (0 for none), and Awaiting compares
+//!   consumer and host.
 //! - **Message drop `bound` and `receipt`.** Rust stores the applied
 //!   watermark only for an expiry that a bound consumer constrained, which is
 //!   exactly the spec's `bound`, so `bound` renders as "a watermark is
@@ -48,7 +49,11 @@
 //! - **Receipts.** In `inbox_delivery` a receipt is a session's `Receive`
 //!   edge about the message, and its stream row is that entry on its way to
 //!   the message's home: the message reads the entries whose row has applied.
-//!   `message_race` has no sessions, so its receipt rows are the evidence.
+//!   `message_race` has no sessions, so its receipt rows are the evidence. In
+//!   `controller_delivery` the agent's receipts are its session's entries, as
+//!   in `inbox_delivery`; the controller's kind has no Rust machine yet, so its
+//!   receipt rows are the evidence, read as a [`ConsumerKind::Controller`]
+//!   receiver's, and the model's controller store is not compared.
 //! - **Vessels.** A vessel is a placement at the [`Ledger`] plus a lifecycle
 //!   resource. The ledger forgets a vessel when it returns the lease, so the
 //!   harness keeps each returned lease to render the model's `Gone(placement)`.
@@ -82,6 +87,7 @@ use flotilla_state_machines::{
         agent_session::{
             AgentSession, AgentSessionEdge, AgentSessionState, Attach, Channel, Detach, End, EndReason, MemoryAgentSessionWorld, Receive,
         },
+        consumer::ConsumerKind,
         convoy::{
             self, Convoy, ConvoyEdge, ConvoyId, ConvoyRequest, ConvoyState, MemoryConvoyWorld, Priority, Promise, PromiseId, PromiseState,
             Quota, VesselClass,
@@ -89,8 +95,8 @@ use flotilla_state_machines::{
         ensure::{self, Ensure, EnsureEdge, EnsureSpec, EnsureState, FulfillerPhase, FulfillerStatus, MemoryEnsureWorld, UnbindReason},
         lifecycle::{self, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed},
         message::{
-            self, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message, MessageEdge, MessageEdgeKind, MessageSpec,
-            MessageState,
+            self, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message, MessageBody, MessageEdge, MessageEdgeKind,
+            MessageSpec, MessageState, Relation,
         },
     },
     placement::{self, Dimension, Evidence, Host, Lease, Ledger, LedgerError, Units, VesselId},
@@ -99,6 +105,10 @@ use flotilla_state_machines::{
 use itf::{address, at, boolean, int, list, map_of, number, pairs, payload, set, set_of, show, slot, tag, text, variant};
 use serde_json::{json, Value};
 
+/// The delivery condition of `controller_delivery`'s envelope, and the
+/// turn-rules role that withdraws a message once it lapses.
+const DELIVERY: &str = "project:still-wanted";
+const TURN_RULES: &str = "project:fleet/role:turn-rules";
 /// Microseconds per model clock tick (ten minutes).
 const UNIT: i64 = 600_000_000;
 /// The inbox every replayed message and Ensure names, as the world keys it:
@@ -1319,20 +1329,55 @@ fn ensure_bind(trace: &Trace, tally: &mut Tally) {
 // ---------------------------------------------------------------------------
 // inbox_delivery and message_race: one Message against a consumer stream
 
-/// The two message scenarios differ in their consumer stream and evidence.
+/// The three message scenarios differ in their consumers, stream and evidence.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Feed {
     /// Two consumer sessions, a binding that changes, no authority.
     Inbox,
     /// One always-bound consumer; supersession and authority both hold.
     Race,
+    /// Agent session 1 and controller 2 bound together; a delivery condition
+    /// that may lapse, no authority.
+    Controller,
 }
+
+/// The controller of `controller_delivery`.
+const ROBOT: i64 = 2;
 
 impl Feed {
     fn stream(self, state: &Value) -> &Value {
         match self {
-            Feed::Inbox => &state["stream"],
+            Feed::Inbox | Feed::Controller => &state["stream"],
             Feed::Race => &state["source"],
+        }
+    }
+
+    /// Whether the scenario's consumer sessions are AgentSession resources.
+    fn sessions(self) -> bool {
+        self != Feed::Race
+    }
+
+    /// The consumer the model numbers `who`.
+    fn receiver(self, who: i64) -> message::Receiver {
+        match self {
+            Feed::Controller if who == ROBOT => {
+                message::Receiver { kind: ConsumerKind::Controller, id: who.to_string(), host: "consumer".into() }
+            }
+            _ => consumer(who.to_string()),
+        }
+    }
+
+    /// The bound consumers in `state`, or the time the last one left.
+    fn binding(self, state: &Value) -> InboxBinding {
+        let bound: BTreeSet<i64> = match self {
+            Feed::Race => [1].into(),
+            Feed::Inbox => [number(&state["bound"])].into_iter().filter(|who| *who != 0).collect(),
+            Feed::Controller => set(&state["bound"]).iter().map(number).collect(),
+        };
+        if bound.is_empty() {
+            InboxBinding::Unbound { since: moment(number(&state["unboundAt"])) }
+        } else {
+            InboxBinding::Bound { consumers: bound.into_iter().map(|who| self.receiver(who)).collect() }
         }
     }
 }
@@ -1400,11 +1445,22 @@ fn reason_name(reason: &DropReason) -> &'static str {
 }
 
 fn session_number(receiver: &message::Receiver) -> i64 {
-    id_of(&receiver.session)
+    id_of(&receiver.id)
 }
 
-/// The spec's `Envelope = { expectation, hasDeadline, deadline }`, from the
-/// message's spec. Without a deadline Rust has no value, so it renders 0.
+/// The consumer named by session `id`: an agent session on the consumer host.
+fn consumer(id: impl Into<String>) -> message::Receiver {
+    message::Receiver { kind: ConsumerKind::AgentSession, id: id.into(), host: "consumer".into() }
+}
+
+/// A message to the scenarios' inbox, expecting nothing; each replay sets the rest.
+fn message_spec() -> MessageSpec {
+    let body = MessageBody::text("turn").expect("small body");
+    MessageSpec::new(at_address("project:sender"), at_address(INBOX), Relation::Peer, body)
+}
+
+/// The spec's `Envelope = { expectation, hasDeadline, deadline, hasCondition }`,
+/// from the message's spec. Without a deadline Rust has no value, so it renders 0.
 fn envelope_value(spec: &MessageSpec) -> Value {
     let expectation = match spec.expectation {
         Expectation::Nothing => "Nothing",
@@ -1415,6 +1471,7 @@ fn envelope_value(spec: &MessageSpec) -> Value {
         "expectation": constant(expectation),
         "hasDeadline": spec.deadline.is_some(),
         "deadline": int(spec.deadline.map_or(0, ticks)),
+        "hasCondition": spec.delivery_condition.is_some(),
     })
 }
 
@@ -1444,7 +1501,7 @@ fn message_value(resource: &Resource<Message>) -> Value {
         MessageState::Pending => variant("Pending", envelope),
         MessageState::Awaiting { receiver } => variant(
             "Awaiting",
-            json!({ "envelope": envelope, "receiver": { "session": int(session_number(receiver)), "host": receiver.host } }),
+            json!({ "envelope": envelope, "receiver": { "consumer": int(session_number(receiver)), "host": receiver.host } }),
         ),
         MessageState::Settled { receiver } => {
             variant("Settled", json!({ "envelope": envelope, "receiver": int(receiver.as_ref().map_or(0, session_number)) }))
@@ -1463,14 +1520,19 @@ fn message_value(resource: &Resource<Message>) -> Value {
     }
 }
 
-fn deliver(session: i64) -> message::Deliver {
-    message::Deliver { receiver: message::Receiver { session: session.to_string(), host: "consumer".into() }, transport: Transport::Turn }
+fn deliver(receiver: message::Receiver) -> message::Deliver {
+    message::Deliver { receiver, transport: Transport::Turn }
+}
+
+/// The turn-rules role's withdrawal of a message whose delivery condition lapsed.
+fn withdrawn_by_turn_rules() -> DropReason {
+    DropReason::Withdrawn { by: at_address(TURN_RULES), authority: at_address(DELIVERY) }
 }
 
 struct MessageReplay<'a> {
     feed: Feed,
     home: Home<Message>,
-    /// The consumer sessions (inbox_delivery only).
+    /// The consumer sessions (not in message_race).
     sessions: Option<Home<AgentSession>>,
     expectation: &'a str,
     deadline: Option<i64>,
@@ -1487,6 +1549,7 @@ impl<'a> MessageReplay<'a> {
         let envelope = payload(initial);
         let expectation = tag(&envelope["expectation"]);
         let deadline = boolean(&envelope["hasDeadline"]).then(|| number(&envelope["deadline"]));
+        let condition = boolean(&envelope["hasCondition"]).then(|| at_address(DELIVERY));
         let spec = MessageSpec {
             inbox: at_address(INBOX),
             expectation: match expectation {
@@ -1496,12 +1559,14 @@ impl<'a> MessageReplay<'a> {
                 other => panic!("expectation {other}"),
             },
             deadline: deadline.map(moment),
-            // Both scenarios drop as undeliverable once `now - unboundAt > 1`.
+            // The scenarios drop as undeliverable once `now - unboundAt > 1`.
             unbound_after: UNIT,
+            delivery_condition: condition,
+            ..message_spec()
         };
         let mut home = Home::<Message>::new("home").expect("declaration");
         home.create(ONE, spec, &MemoryMessageWorld::default(), Timestamp(0)).expect("message");
-        let sessions = (feed == Feed::Inbox).then(|| {
+        let sessions = feed.sessions().then(|| {
             let mut sessions = Home::<AgentSession>::new("consumer").expect("declaration");
             for (id, _) in entries(&trace.states[0], "::sessions") {
                 sessions.create(id.to_string(), (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("session");
@@ -1520,19 +1585,23 @@ impl<'a> MessageReplay<'a> {
         let applied = stream.sessions("receipt");
         let receipts = match &self.sessions {
             // The entries about the message whose rows the message's home has applied.
+            // A controller's rows stand for its entries: its kind has no machine here.
             Some(sessions) => {
                 let about = receipts_about(sessions, ONE);
                 applied
                     .iter()
-                    .map(|session| {
-                        let name = session.to_string();
+                    .map(|who| {
+                        let receiver = self.feed.receiver(*who);
+                        if receiver.kind == ConsumerKind::Controller {
+                            return (receiver, Transport::Turn);
+                        }
                         let entries =
-                            about.get(&name).unwrap_or_else(|| panic!("receipt row from session {name} without its Receive entry"));
-                        (name, entries[0])
+                            about.get(&receiver.id).unwrap_or_else(|| panic!("receipt row from session {who} without its Receive entry"));
+                        (receiver, entries[0])
                     })
                     .collect()
             }
-            None => applied.iter().map(|session| (session.to_string(), Transport::Turn)).collect(),
+            None => applied.iter().map(|who| (self.feed.receiver(*who), Transport::Turn)).collect(),
         };
         world.receipts.put(&own, receipts);
         if stream.any("reply") {
@@ -1543,14 +1612,10 @@ impl<'a> MessageReplay<'a> {
             world.delivery_failure.put(&Ref::new(ONE), ());
         }
         world.applied_through.put(&Ref::new(INBOX), moment(stream.watermark()));
-        let binding = match self.feed {
-            Feed::Race => InboxBinding::Bound { session: "1".into() },
-            Feed::Inbox => match number(&state["bound"]) {
-                0 => InboxBinding::Unbound { since: moment(number(&state["unboundAt"])) },
-                session => InboxBinding::Bound { session: session.to_string() },
-            },
-        };
-        world.binding.put(&Ref::new(INBOX), binding);
+        world.binding.put(&Ref::new(INBOX), self.feed.binding(state));
+        if self.feed == Feed::Controller {
+            world.condition.put(&Ref::new(DELIVERY), boolean(&state["conditionHolds"]));
+        }
         let evidence = witness || self.feed == Feed::Race;
         world.authority.put(&owner(), evidence);
         if evidence {
@@ -1563,12 +1628,12 @@ impl<'a> MessageReplay<'a> {
         tally.steps += 1;
         let now = moment(number(&step.before["now"]));
         let who = match self.feed {
-            Feed::Inbox => step.chosen("who"),
+            Feed::Inbox | Feed::Controller => step.chosen("who"),
             Feed::Race => 1,
         };
         let world = self.world(step.before, false);
         let edge: Option<MessageEdge> = match (self.feed, step.action()) {
-            (_, "deliver") => Some(deliver(who).into()),
+            (_, "deliver") => Some(deliver(self.feed.receiver(who)).into()),
             (_, "settle") => Some(
                 message::Settle {
                     by: if self.expectation == "Reply" { message::Settlement::Answered } else { message::Settlement::OutcomeObserved },
@@ -1582,7 +1647,11 @@ impl<'a> MessageReplay<'a> {
                 if self.feed == Feed::Race {
                     assert_eq!(step.pick("reason"), reason, "{step}: the model records the reason it chose");
                 }
-                Some(message::DropMessage { reason: drop_reason(reason) }.into())
+                let reason = match (self.feed, tag(reason)) {
+                    (Feed::Controller, "Withdrawn") => withdrawn_by_turn_rules(),
+                    _ => drop_reason(reason),
+                };
+                Some(message::DropMessage { reason }.into())
             }
             (Feed::Inbox, "end") => {
                 // The model's `end` is observed exactly when its end row reached the
@@ -1599,10 +1668,18 @@ impl<'a> MessageReplay<'a> {
                 accept(sessions, &who.to_string(), End { reason: EndReason::Completed, observed }, &ends, now, step, tally);
                 None
             }
+            (Feed::Controller, "endAgent") => {
+                let observed = Ref::new("1");
+                let mut ends = MemoryAgentSessionWorld::default();
+                ends.ends.put(&observed, EndReason::Completed);
+                let sessions = self.sessions.as_mut().expect("sessions");
+                accept(sessions, "1", End { reason: EndReason::Completed, observed }, &ends, now, step, tally);
+                None
+            }
             // A receipt is the consumer session's Receive edge about the message;
             // its row then travels the stream to the message's home.
-            (Feed::Inbox, "receive") => {
-                let name = who.to_string();
+            (Feed::Inbox, "receive") | (Feed::Controller, "receiveAgent") => {
+                let name = if self.feed == Feed::Controller { "1".to_owned() } else { who.to_string() };
                 let sessions = self.sessions.as_mut().expect("sessions");
                 let receive = Receive { message: ONE.into(), transport: Transport::Turn };
                 accept(sessions, &name, receive, &MemoryAgentSessionWorld::default(), now, step, tally);
@@ -1614,7 +1691,8 @@ impl<'a> MessageReplay<'a> {
                 "turn" | "publish" | "bind" | "unbindEndedWorld" | "unbindSilentWorld" | "applySource" | "applyHome" | "disconnect"
                 | "connect" | "die" | "recover" | "tick",
             )
-            | (Feed::Race, "publish" | "applySource" | "disconnect" | "connect" | "tick") => None,
+            | (Feed::Race, "publish" | "applySource" | "disconnect" | "connect" | "tick")
+            | (Feed::Controller, "take" | "receiveRobot" | "bringAbout" | "retireRobot" | "applyStream" | "tick" | "lapse") => None,
             (_, other) => panic!("{step}: message operation {other}"),
         };
         if let Some(edge) = edge {
@@ -1651,7 +1729,7 @@ impl<'a> MessageReplay<'a> {
         let now = moment(number(&state["now"]));
         if ended(&self.home, ONE) {
             let probes = vec![
-                deliver(1).into(),
+                deliver(consumer("1")).into(),
                 message::Settle { by: message::Settlement::Answered }.into(),
                 message::Settle { by: message::Settlement::OutcomeObserved }.into(),
                 message::DropMessage { reason: DropReason::Withdrawn { by: at_address(OWNER), authority: at_address(OWNER) } }.into(),
@@ -1674,10 +1752,7 @@ impl<'a> MessageReplay<'a> {
         if would_accept(&self.home, ONE, message::DropMessage { reason: DropReason::Expired }, &world, now, tally) {
             let deadline = self.deadline.unwrap_or_else(|| panic!("{step}: expired without a deadline"));
             assert!(now > moment(deadline), "{step}: expired before the deadline");
-            let bound = match self.feed {
-                Feed::Race => true,
-                Feed::Inbox => number(&state["bound"]) != 0 || current.receiver().is_some(),
-            };
+            let bound = matches!(self.feed.binding(state), InboxBinding::Bound { .. }) || current.receiver().is_some();
             if bound {
                 assert!(stream.watermark() > deadline, "{step}: expired before the consumer's stream passed the deadline");
             }
@@ -1691,20 +1766,39 @@ impl<'a> MessageReplay<'a> {
                 assert!(!in_time, "{step}: expiry beat evidence written before the deadline");
             }
         }
-        // `receiverTurned`: a receipt exists only after the consumer's turn.
-        if self.feed == Feed::Inbox {
-            let turned: BTreeSet<i64> = set(&state["turned"]).iter().map(number).collect();
+        // `receiverTurned`, `receiverTookIt`: a receipt exists only after the
+        // consumer's turn, or the controller's run.
+        let took = match self.feed {
+            Feed::Inbox => Some(&state["turned"]),
+            Feed::Controller => Some(&state["took"]),
+            Feed::Race => None,
+        };
+        if let Some(took) = took {
+            let took: BTreeSet<i64> = set(took).iter().map(number).collect();
             for who in [1, 2] {
-                if would_accept(&self.home, ONE, deliver(who), &world, now, tally) {
-                    assert!(turned.contains(&who), "{step}: delivers to session {who}, which had no turn");
+                if would_accept(&self.home, ONE, deliver(self.feed.receiver(who)), &world, now, tally) {
+                    assert!(took.contains(&who), "{step}: delivers to consumer {who}, which had not taken it");
                 }
             }
+        }
+        // `withdrawnAfterLapse`: the turn-rules role withdraws only a lapsed message.
+        if self.feed == Feed::Controller
+            && would_accept(&self.home, ONE, message::DropMessage { reason: withdrawn_by_turn_rules() }, &world, now, tally)
+        {
+            assert!(!boolean(&state["conditionHolds"]), "{step}: withdrawn while its delivery condition holds");
         }
     }
 }
 
 fn inbox_delivery(trace: &Trace, tally: &mut Tally) {
     let mut replay = MessageReplay::new(trace, Feed::Inbox);
+    for step in trace.steps() {
+        replay.step(&step, tally);
+    }
+}
+
+fn controller_delivery(trace: &Trace, tally: &mut Tally) {
+    let mut replay = MessageReplay::new(trace, Feed::Controller);
     for step in trace.steps() {
         replay.step(&step, tally);
     }
@@ -1735,15 +1829,16 @@ type Scenario = fn(&Trace, &mut Tally);
 fn replay_quint_itf_traces() {
     let directory =
         std::env::var("QUINT_TRACE_DIR").expect("QUINT_TRACE_DIR names a directory of ITF traces from specs/primitives/check.sh");
-    let scenarios: [(&str, Scenario); 6] = [
+    let scenarios: [(&str, Scenario); 7] = [
         ("convoy_deliver", convoy_deliver),
         ("ensure_bind", ensure_bind),
         ("inbox_delivery", inbox_delivery),
         ("message_race", message_race),
+        ("controller_delivery", controller_delivery),
         ("machine_edges", machine_edges),
         ("admission_placement", admission_placement),
     ];
-    let mut tallies = [Tally::default(); 6];
+    let mut tallies = [Tally::default(); 7];
     let mut paths: Vec<_> = fs::read_dir(Path::new(&directory))
         .unwrap_or_else(|error| panic!("read {directory}: {error}"))
         .map(|entry| entry.expect("entry").path())

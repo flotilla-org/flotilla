@@ -1,11 +1,15 @@
 //! The engine's Message (`Resource<Message>`, declared by `MessageSpec`, kind code `ms`):
 //! generators, and the worlds that let each edge pass its gate.
 
-use flotilla_schema::{Address, Edge, State, Timestamp};
+use flotilla_schema::{Address, Edge, Frozen, State, Timestamp};
 use flotilla_state_machines::{
-    machines::message::{
-        Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageSpec, MessageState, MessageWorld, Receiver,
-        Settle, Settlement, Supersedes,
+    machines::{
+        consumer::ConsumerKind,
+        convoy::{ConvoyRequest, Priority, Promise, PromiseId, VesselClass},
+        message::{
+            Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageBody, MessageReference, MessageSpec,
+            MessageState, MessageWorld, Receiver, Relation, RequestBody, Settle, Settlement, Supersedes,
+        },
     },
     Ref, Resource, Transport,
 };
@@ -14,7 +18,7 @@ use hegel::{generators as gs, TestCase};
 use super::{
     addr, address, code_enum,
     engine::{self, after, resource, Candidate, NAME},
-    name, timestamp, Fixture, Pick,
+    list, name, reference, text, timestamp, Fixture, Pick,
 };
 
 /// Covering indexes: the label is digit 0 (base 4), a drop's reason digit 1 (base 5) and whether
@@ -23,7 +27,36 @@ use super::{
 pub const COVERING: usize = 80;
 
 pub fn receiver(tc: &TestCase) -> Receiver {
-    Receiver { session: name(tc), host: name(tc) }
+    let kind = code_enum(tc, Pick::Draw, &[ConsumerKind::AgentSession, ConsumerKind::Controller]);
+    Receiver { kind, id: name(tc), host: name(tc) }
+}
+
+/// Agent session `id` on `host`, as a receiver.
+pub fn agent(id: &str, host: &str) -> Receiver {
+    Receiver { kind: ConsumerKind::AgentSession, id: id.into(), host: host.into() }
+}
+
+/// Prose or a convoy request, each in turn when covering.
+pub fn body(tc: &TestCase, pick: Pick) -> Frozen<MessageBody> {
+    let body = match pick.variant(tc, 2, |index| index) {
+        0 => MessageBody::Text(text(tc)),
+        _ => MessageBody::Request(RequestBody::Convoy(ConvoyRequest {
+            project: address(tc),
+            promises: [(PromiseId(0), Promise { kind: name(tc), target: address(tc) })].into(),
+            quota: [(VesselClass(1), 2)].into(),
+            priority: Priority(3),
+        })),
+    };
+    Frozen::new(body).expect("a fixture body freezes")
+}
+
+/// Up to three references, the first of them the subject when drawn so: at most one subject.
+pub fn references(tc: &TestCase, pick: Pick) -> Vec<MessageReference> {
+    let mut first = true;
+    list(tc, pick, 3, |_| {
+        let subject = std::mem::take(&mut first) && tc.draw(gs::booleans());
+        MessageReference { address: address(tc), revision: text(tc), subject }
+    })
 }
 
 fn transport(tc: &TestCase, pick: Pick) -> Transport {
@@ -65,10 +98,17 @@ pub fn state_value(tc: &TestCase, pick: Pick) -> MessageState {
 /// The envelope, drawn or covered.
 pub fn spec(tc: &TestCase, pick: Pick) -> MessageSpec {
     MessageSpec {
+        sender: address(tc),
         inbox: address(tc),
+        relation: code_enum(tc, pick, &[Relation::Supervisor, Relation::Peer, Relation::Dependency, Relation::Dependee, Relation::System]),
+        body: body(tc, pick),
+        references: references(tc, pick),
+        in_reply_to: pick.some(tc, 8).then(|| reference(tc)),
+        supersedes: pick.some(tc, 4).then(|| reference(tc)),
         expectation: expectation(tc, pick),
         deadline: pick.some(tc, 8).then(|| timestamp(tc)),
         unbound_after: tc.draw(gs::integers::<i64>()),
+        delivery_condition: pick.some(tc, 12).then(|| address(tc)),
     }
 }
 
@@ -76,9 +116,11 @@ pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Message> {
     resource(spec(tc, pick), State::new(state_value(tc, pick), timestamp(tc)))
 }
 
-/// A fixed envelope for example tests: expecting a reply in `inbox`, no deadline.
+/// A fixed envelope for example tests: prose from `sender`, expecting a reply in `inbox`, no
+/// references, deadline or delivery condition.
 pub fn sample_spec() -> MessageSpec {
-    MessageSpec { inbox: addr("inbox"), expectation: Expectation::Reply, deadline: None, unbound_after: 0 }
+    let body = MessageBody::text("hello").expect("small body");
+    MessageSpec { expectation: Expectation::Reply, ..MessageSpec::new(addr("sender"), addr("inbox"), Relation::Peer, body) }
 }
 
 /// A fixed message for example tests: [`sample_spec`], Pending, no history.
@@ -108,7 +150,7 @@ pub fn candidates(tc: &TestCase, message: &Resource<Message>) -> Vec<Candidate<M
 
     let (receiver, transport) = (receiver(tc), transport(tc, Pick::Draw));
     let mut world = MemoryMessageWorld::default();
-    world.receipts.put(&own(), [(receiver.session.clone(), transport)].into());
+    world.receipts.put(&own(), [(receiver.clone(), transport)].into());
     candidates.push((Deliver { receiver, transport }.into(), boxed(world), now));
 
     let mut world = MemoryMessageWorld::default();
