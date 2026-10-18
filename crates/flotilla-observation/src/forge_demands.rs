@@ -1,10 +1,9 @@
-#[cfg(test)]
-use flotilla_store_memory::InMemoryBackend;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::IssueRef;
 use flotilla_resources::{ForgeRead, ForgeReadHeartbeat, ForgeReadRequest, ForgeReadSpec, RepositorySpec};
+use flotilla_store::ResourceBackend;
 use futures::StreamExt;
 
 use crate::{
@@ -12,15 +11,13 @@ use crate::{
     sources::{ChangeRequestQueryPort, IssueQueryPort},
 };
 
-use flotilla_store::ResourceBackend;
-use std::sync::Arc;
-
 /// Services forge demands through host-owned provider resolution ports.
 pub struct ForgeDemandService {
     backend: ResourceBackend,
     change_requests: Arc<dyn ChangeRequestQueryPort>,
     issues: Arc<dyn IssueQueryPort>,
 }
+
 impl ForgeDemandService {
     pub fn new(backend: ResourceBackend, change_requests: Arc<dyn ChangeRequestQueryPort>, issues: Arc<dyn IssueQueryPort>) -> Self {
         Self { backend, change_requests, issues }
@@ -99,14 +96,10 @@ impl ForgeDemandService {
             | ForgeReadRequest::MergedBranches { .. } => unreachable!(),
         }
     }
+
     /// Schedule tracker observations without waiting for the forge or coupling
     /// board freshness to the availability of dispatch readiness evidence.
-    pub(crate) async fn service_change_request_demand(
-        &self,
-        namespace: &str,
-        spec: &flotilla_resources::ForgeReadSpec,
-    ) -> Result<(), String> {
-        use flotilla_resources::ForgeReadRequest;
+    async fn service_change_request_demand(&self, namespace: &str, spec: &ForgeReadSpec) -> Result<(), String> {
         let repository = RepositorySpec::remote(format!("{}/{}", spec.source.service.trim_end_matches('/'), spec.source.scope))?;
         let provider = self.change_requests.discover_repository_change_request(namespace, &repository).await?;
         let provider = provider.for_background_refresh().unwrap_or(provider);
@@ -117,10 +110,16 @@ impl ForgeDemandService {
             ForgeReadRequest::ChangeRequests { limit } => provider.list_change_requests(*limit).await.map(|_| ()),
             ForgeReadRequest::ChangeRequest { id } => provider.get_change_request(id).await.map(|_| ()),
             ForgeReadRequest::MergedBranches { limit } => provider.list_merged_branch_names(*limit).await.map(|_| ()),
-            _ => Ok(()),
+            ForgeReadRequest::Board
+            | ForgeReadRequest::Query { .. }
+            | ForgeReadRequest::Issue { .. }
+            | ForgeReadRequest::Changes { .. }
+            | ForgeReadRequest::Mission { .. }
+            | ForgeReadRequest::DispatchFacts { .. } => unreachable!("issue demands are serviced through the issue query port"),
         }
     }
 }
+
 // Previous-generation incremental demands remain decodable but are not serviced
 // or renewed. Remove this shim one fleet roll after #2997 ships.
 fn live_demand(spec: ForgeReadSpec, renewed_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<ForgeReadSpec> {
@@ -135,6 +134,7 @@ mod tests {
     use flotilla_protocol::IssueSource;
     use flotilla_resources::{ForgeReadHeartbeatSpec, ForgeReadSpec, InputMeta, Resource};
     use flotilla_store::ResourceBackend;
+    use flotilla_store_memory::InMemoryBackend;
     use flotilla_store_testkit::ReadCountsBackendExt;
 
     use super::*;
