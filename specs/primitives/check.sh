@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fast safety, full-graph conformance and generated ITF replay against
-# flotilla-state-machines. Generated files stay beneath build/.
+# flotilla-state-machines, plus Message race replay through InboxBackend.
+# Generated files stay beneath build/.
 set -euo pipefail
 # Expanded typed compositions exceed the JVM's default parser stack.
 export JVM_ARGS="${JVM_ARGS:--Xmx3g -Xss16m}"
@@ -34,6 +35,10 @@ python3 conformance/test_dump2json.py
 # Workspace CI runs the crate's fmt, Clippy and unit tests; these two need Quint's output.
 QUINT_TRACE_DIR="$run" QUINT_GRAPH_DIR="$run/graphs" cargo test -p flotilla-state-machines --locked \
   --test conformance --test quint_replay -- --ignored --nocapture 2>&1 | tee "$run/engine.log"
+# Backends share the trace mapping but replay only the Message race; full-graph
+# conformance remains with the engine above.
+QUINT_TRACE_DIR="$run" cargo test -p flotilla-inbox --locked \
+  --test contract message_race_traces -- --ignored --nocapture 2>&1 | tee "$run/inbox.log"
 ./mutants/check.sh
 
 python3 ./runner-contract-test.py

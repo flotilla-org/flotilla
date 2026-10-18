@@ -552,7 +552,7 @@ impl<T> MessageWorld for T where
 }
 
 /// An in-memory message world, for tests, replay and conformance.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MemoryMessageWorld {
     pub receipts: Table<Receipts>,
     pub binding: Table<Binding>,

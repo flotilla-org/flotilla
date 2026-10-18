@@ -57,17 +57,17 @@ use flotilla_state_machines::{
         consumer::ConsumerKind,
         message::{
             AppliedThrough, Binding, Condition, Deliver, DeliveryFailure, DropMessage, DropReason, Expectation, InboxBinding,
-            MemoryMessageWorld, Message, MessageBody, MessageRefusal, MessageSpec, MessageState, Receipts, Receiver, Relation, Reply,
-            Settle, Settlement, Supersedes, Supersession,
+            MemoryMessageWorld, Message, MessageBody, MessageRefusal, MessageSpec, Receipts, Receiver, Relation, Reply, Settle, Settlement,
+            Supersedes, Supersession,
         },
     },
     Home, Ref, Transport, WriteError,
 };
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
-    graph::{self, bare, refusal, tick, Conformance, Report, Step, UNIT},
-    itf::{boolean, int, number, payload, tag, text, variant},
+    graph::{self, refusal, tick, Conformance, Report, Step, UNIT},
+    itf::{boolean, number, payload, tag, text},
 };
 
 const NAME: &str = "m";
@@ -88,10 +88,6 @@ fn at(text: &str) -> Address {
 /// The receiver session for spec session number `n`.
 fn session(n: i64) -> String {
     format!("s{n}")
-}
-
-fn session_number(receiver: &Receiver) -> i64 {
-    receiver.id.trim_start_matches('s').parse().expect("conformance session name")
 }
 
 fn spec_of(envelope: &Value) -> MessageSpec {
@@ -122,25 +118,6 @@ fn bound() -> InboxBinding {
 }
 
 /// An engine time in model ticks.
-fn ticks(time: Timestamp) -> i64 {
-    time.micros() / UNIT
-}
-
-fn envelope_of(spec: &MessageSpec) -> Value {
-    let expectation = match spec.expectation {
-        Expectation::Nothing => "Nothing",
-        Expectation::Reply => "Reply",
-        Expectation::Outcome { .. } => "Outcome",
-    };
-    let deadline = spec.deadline.map_or(HARNESS_DEADLINE, ticks);
-    json!({
-        "expectation": bare(expectation),
-        "hasDeadline": spec.deadline.is_some(),
-        "deadline": int(deadline),
-        "hasCondition": spec.delivery_condition.is_some(),
-    })
-}
-
 fn outcome<T>(result: Result<T, WriteError<Message>>) -> Step {
     let name = match result {
         Ok(_) => return Step::Accepted,
@@ -294,39 +271,10 @@ impl Conformance for MessageConformance {
     }
 
     fn encode(home: &Home<Message>) -> Value {
-        let m = home.get(NAME).expect("exists");
-        let envelope = envelope_of(m.spec());
-        match m.state() {
-            MessageState::Pending => variant("Pending", envelope),
-            MessageState::Settled { receiver } => {
-                let receiver = int(receiver.as_ref().map_or(0, session_number));
-                variant("Settled", json!({ "envelope": envelope, "receiver": receiver }))
-            }
-            MessageState::Awaiting { receiver } => {
-                let receiver = json!({ "consumer": int(session_number(receiver)), "host": receiver.host });
-                variant("Awaiting", json!({ "envelope": envelope, "receiver": receiver }))
-            }
-            MessageState::Dropped { reason, receiver, watermark } => {
-                let reason = match reason {
-                    DropReason::Undeliverable => "Undeliverable",
-                    DropReason::Expired => "Expired",
-                    DropReason::Superseded { .. } => "Superseded",
-                    DropReason::Withdrawn { .. } => "Withdrawn",
-                    DropReason::ConsumerUnreachable { .. } => "ConsumerUnreachable",
-                };
-                variant(
-                    "Dropped",
-                    json!({
-                        "reason": bare(reason),
-                        "envelope": envelope,
-                        "receiver": int(receiver.as_ref().map_or(0, session_number)),
-                        "watermark": int(watermark.map_or(0, ticks)),
-                        "bound": watermark.is_some(),
-                        "receipt": false,
-                    }),
-                )
-            }
-        }
+        flotilla_quint_testkit::message::message_value_at(home.get(NAME).expect("exists"), UNIT, HARNESS_DEADLINE, |receiver| Receiver {
+            id: receiver.id.strip_prefix('s').expect("graph session id").into(),
+            ..receiver.clone()
+        })
     }
 
     fn version(home: &Home<Message>) -> u64 {

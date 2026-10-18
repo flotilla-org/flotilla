@@ -24,7 +24,7 @@
 //! entries about the message as its receipts.
 //!
 //! Model integers name resources (`1` is the resource named "1"), model ticks
-//! are [`UNIT`] microseconds, and opaque strings map to themselves. The
+//! are 600,000,000 microseconds, and opaque strings map to themselves. The
 //! remaining differences, each as small as the engine allows:
 //!
 //! - **Message envelope without a deadline.** The model's envelope keeps a
@@ -71,8 +71,12 @@
 //! The scenarios' negative picks (`auth`, `seen` or `matches` false, an empty
 //! reason) are never taken steps, so they are probed too: Rust must refuse them.
 
-#[path = "common/itf.rs"]
-mod itf;
+use flotilla_quint_testkit::message::MessageSubject;
+use flotilla_quint_testkit::{
+    itf,
+    replay::{at_address, constant, id_of, moment, same, slot_at, store, Step, Stream, Trace, INBOX, OWNER},
+};
+const ONE: &str = "1";
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -81,7 +85,7 @@ use std::{
     time::Instant,
 };
 
-use flotilla_schema::{Address, Timestamp};
+use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
         agent_session::{
@@ -94,53 +98,16 @@ use flotilla_state_machines::{
         },
         ensure::{self, Ensure, EnsureEdge, EnsureSpec, EnsureState, FulfillerPhase, FulfillerStatus, MemoryEnsureWorld, UnbindReason},
         lifecycle::{self, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed},
-        message::{
-            self, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message, MessageBody, MessageEdge, MessageEdgeKind,
-            MessageSpec, MessageState, Relation,
-        },
+        message::{self, DropReason, InboxBinding, MemoryMessageWorld, Message, MessageEdge, MessageEdgeKind, MessageSpec, MessageState},
     },
     placement::{self, Dimension, Evidence, Host, Lease, Ledger, LedgerError, Units, VesselId},
     AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Ref, Resource, Transport, Version, WriteError,
 };
-use itf::{address, at, boolean, int, list, map_of, number, pairs, payload, set, set_of, show, slot, tag, text, variant};
+use itf::{address, boolean, int, list, map_of, number, pairs, payload, set, set_of, slot, tag, text, variant};
 use serde_json::{json, Value};
-
-/// The delivery condition of `controller_delivery`'s envelope, and the
-/// turn-rules role that withdraws a message once it lapses.
-const DELIVERY: &str = "project:still-wanted";
-const TURN_RULES: &str = "project:fleet/role:turn-rules";
-/// Microseconds per model clock tick (ten minutes).
-const UNIT: i64 = 600_000_000;
-/// The inbox every replayed message and Ensure names, as the world keys it:
-/// the canonical text of [`inbox`].
-const INBOX: &str = "project:inbox";
-/// The authorised party, the superseding message and the outcome condition, as
-/// the world keys them: each address's canonical text.
-const OWNER: &str = "project:owner";
-const NEWER: &str = "project:newer";
-const OUTCOME: &str = "project:outcome";
-/// The one message (id 1) of the message scenarios, and the one Ensure (id 1)
-/// of `ensure_bind`: every resource is named by its model id.
-const ONE: &str = "1";
-
-fn moment(ticks: i64) -> Timestamp {
-    Timestamp::from_micros(ticks * UNIT)
-}
-
-/// A replayed time in model ticks. Every time the replay supplies is whole.
-fn ticks(time: Timestamp) -> i64 {
-    let micros = time.micros();
-    assert_eq!(micros % UNIT, 0, "{time} is not a whole model tick");
-    micros / UNIT
-}
 
 fn small(v: &Value) -> u32 {
     u32::try_from(number(v)).expect("small non-negative model integer")
-}
-
-/// A resource name as the model integer it stands for.
-fn id_of(name: &str) -> i64 {
-    name.parse().unwrap_or_else(|_| panic!("resource name {name} is not a model id"))
 }
 
 fn cause(detail: &str) -> Cause {
@@ -150,11 +117,6 @@ fn cause(detail: &str) -> Cause {
 /// The authorised party's reference; its value is the model's `authorised` flag.
 fn owner<K: Kind>() -> Ref<K> {
     Ref::new(OWNER)
-}
-
-/// A canonical address; the world is keyed by its text.
-fn at_address(text: &str) -> Address {
-    text.parse().unwrap_or_else(|error| panic!("{text} as an address: {error}"))
 }
 
 /// A receipt's transport, as the scenarios name it.
@@ -183,78 +145,8 @@ fn receipts_about(sessions: &Home<AgentSession>, message: &str) -> BTreeMap<Stri
     about
 }
 
-/// A sum value without a payload, as ITF encodes it.
-fn constant(name: &str) -> Value {
-    variant(name, itf::unit())
-}
-
 // ---------------------------------------------------------------------------
 // Traces
-
-/// One trace file's states.
-struct Trace<'a> {
-    file: &'a str,
-    states: &'a [Value],
-}
-
-/// One model step: the state it starts in and the state it reaches.
-#[derive(Clone, Copy)]
-struct Step<'a> {
-    file: &'a str,
-    index: usize,
-    before: &'a Value,
-    after: &'a Value,
-}
-
-impl<'a> Trace<'a> {
-    fn steps(&self) -> impl Iterator<Item = Step<'a>> + 'a {
-        let file = self.file;
-        self.states.windows(2).enumerate().map(move |(i, pair)| Step { file, index: i + 1, before: &pair[0], after: &pair[1] })
-    }
-}
-
-impl<'a> Step<'a> {
-    fn action(&self) -> &'a str {
-        text(&self.after["mbt::actionTaken"])
-    }
-
-    fn pick(&self, key: &str) -> &'a Value {
-        let picked = &self.after["mbt::nondetPicks"][key];
-        assert_eq!(tag(picked), "Some", "{self}: no pick for {key}");
-        payload(picked)
-    }
-
-    fn chosen(&self, key: &str) -> i64 {
-        number(self.pick(key))
-    }
-
-    fn yes(&self, key: &str) -> bool {
-        boolean(self.pick(key))
-    }
-
-    /// A model time for scenarios without a clock: one tick per step.
-    fn tick(&self) -> Timestamp {
-        moment(i64::try_from(self.index).expect("step index"))
-    }
-}
-
-impl fmt::Display for Step<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} step {} ({})", self.file, self.index, self.action())
-    }
-}
-
-/// The imported store whose qualified name ends in `suffix`, e.g. `::convoys`.
-fn store<'v>(state: &'v Value, suffix: &str) -> &'v Value {
-    let mut found = state.as_object().expect("ITF state").iter().filter(|(name, _)| name.ends_with(suffix));
-    let (_, value) = found.next().unwrap_or_else(|| panic!("no store ending in {suffix}"));
-    assert!(found.next().is_none(), "one store ending in {suffix}");
-    value
-}
-
-fn slot_at<'v>(state: &'v Value, suffix: &str, id: i64) -> Option<&'v Value> {
-    slot(at(store(state, suffix), id))
-}
 
 fn entries<'v>(state: &'v Value, suffix: &str) -> impl Iterator<Item = (i64, Option<&'v Value>)> {
     pairs(store(state, suffix)).iter().map(|pair| (number(&pair[0]), slot(&pair[1])))
@@ -262,11 +154,6 @@ fn entries<'v>(state: &'v Value, suffix: &str) -> impl Iterator<Item = (i64, Opt
 
 // ---------------------------------------------------------------------------
 // Value comparison
-
-/// Rust and the model hold the same value, up to set and map order.
-fn same(rust: &Value, model: &Value, step: &Step, what: &str) {
-    assert!(itf::normalise(rust) == itf::normalise(model), "{step}: {what} differs\n   Rust: {}\n  model: {}", show(rust), show(model));
-}
 
 /// A model store (`id -> Absent | Present(State)`) rendered from Rust: each
 /// of the model's ids, with `render`'s value for that id, or `Absent`.
@@ -1327,15 +1214,13 @@ fn ensure_bind(trace: &Trace, tally: &mut Tally) {
 }
 
 // ---------------------------------------------------------------------------
-// inbox_delivery and message_race: one Message against a consumer stream
+// inbox_delivery and controller_delivery: Message and consumer session stores
 
-/// The three message scenarios differ in their consumers, stream and evidence.
+/// These engine compositions differ in their consumers, stream and evidence.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Feed {
     /// Two consumer sessions, a binding that changes, no authority.
     Inbox,
-    /// One always-bound consumer; supersession and authority both hold.
-    Race,
     /// Agent session 1 and controller 2 bound together; a delivery condition
     /// that may lapse, no authority.
     Controller,
@@ -1348,13 +1233,12 @@ impl Feed {
     fn stream(self, state: &Value) -> &Value {
         match self {
             Feed::Inbox | Feed::Controller => &state["stream"],
-            Feed::Race => &state["source"],
         }
     }
 
     /// Whether the scenario's consumer sessions are AgentSession resources.
     fn sessions(self) -> bool {
-        self != Feed::Race
+        true
     }
 
     /// The consumer the model numbers `who`.
@@ -1370,7 +1254,6 @@ impl Feed {
     /// The bound consumers in `state`, or the time the last one left.
     fn binding(self, state: &Value) -> InboxBinding {
         let bound: BTreeSet<i64> = match self {
-            Feed::Race => [1].into(),
             Feed::Inbox => [number(&state["bound"])].into_iter().filter(|who| *who != 0).collect(),
             Feed::Controller => set(&state["bound"]).iter().map(number).collect(),
         };
@@ -1382,157 +1265,14 @@ impl Feed {
     }
 }
 
-/// One stream row: when, what kind, and which session wrote it.
-struct Row {
-    at: i64,
-    kind: String,
-    session: i64,
-}
-
-/// A consumer stream (`world/stream.qnt`): rows in order and the applied prefix.
-struct Stream {
-    rows: Vec<Row>,
-    applied: usize,
-}
-
-impl Stream {
-    fn of(v: &Value) -> Self {
-        let rows = list(&v["rows"]).iter().map(|row| Row {
-            at: number(&row["at"]),
-            kind: text(&row["kind"]).into(),
-            session: number(&row["session"]),
-        });
-        Stream { rows: rows.collect(), applied: usize::try_from(number(&v["applied"])).expect("applied prefix") }
-    }
-
-    fn seen(&self) -> &[Row] {
-        &self.rows[..self.applied]
-    }
-
-    fn sessions(&self, kind: &str) -> BTreeSet<i64> {
-        self.seen().iter().filter(|row| row.kind == kind).map(|row| row.session).collect()
-    }
-
-    fn any(&self, kind: &str) -> bool {
-        self.seen().iter().any(|row| row.kind == kind)
-    }
-
-    /// `S::watermark`: the newest applied keepalive, else zero.
-    fn watermark(&self) -> i64 {
-        self.seen().iter().filter(|row| row.kind == "keepalive").map(|row| row.at).fold(0, i64::max)
-    }
-}
-
-fn drop_reason(v: &Value) -> DropReason {
-    match tag(v) {
-        "Undeliverable" => DropReason::Undeliverable,
-        "Expired" => DropReason::Expired,
-        "Superseded" => DropReason::Superseded { by: at_address(NEWER) },
-        "Withdrawn" => DropReason::Withdrawn { by: at_address(OWNER), authority: at_address(OWNER) },
-        "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: at_address(OWNER), authority: at_address(OWNER) },
-        other => panic!("drop reason {other}"),
-    }
-}
-
-fn reason_name(reason: &DropReason) -> &'static str {
-    match reason {
-        DropReason::Undeliverable => "Undeliverable",
-        DropReason::Expired => "Expired",
-        DropReason::Superseded { .. } => "Superseded",
-        DropReason::Withdrawn { .. } => "Withdrawn",
-        DropReason::ConsumerUnreachable { .. } => "ConsumerUnreachable",
-    }
-}
-
-fn session_number(receiver: &message::Receiver) -> i64 {
-    id_of(&receiver.id)
-}
-
-/// The consumer named by session `id`: an agent session on the consumer host.
-fn consumer(id: impl Into<String>) -> message::Receiver {
-    message::Receiver { kind: ConsumerKind::AgentSession, id: id.into(), host: "consumer".into() }
-}
-
-/// A message to the scenarios' inbox, expecting nothing; each replay sets the rest.
-fn message_spec() -> MessageSpec {
-    let body = MessageBody::text("turn").expect("small body");
-    MessageSpec::new(at_address("project:sender"), at_address(INBOX), Relation::Peer, body)
-}
-
-/// The spec's `Envelope = { expectation, hasDeadline, deadline, hasCondition }`,
-/// from the message's spec. Without a deadline Rust has no value, so it renders 0.
-fn envelope_value(spec: &MessageSpec) -> Value {
-    let expectation = match spec.expectation {
-        Expectation::Nothing => "Nothing",
-        Expectation::Reply => "Reply",
-        Expectation::Outcome { .. } => "Outcome",
-    };
-    json!({
-        "expectation": constant(expectation),
-        "hasDeadline": spec.deadline.is_some(),
-        "deadline": int(spec.deadline.map_or(0, ticks)),
-        "hasCondition": spec.delivery_condition.is_some(),
-    })
-}
-
-/// The model's message store with each deadline-less envelope's unused
-/// `deadline` read as 0, as [`envelope_value`] renders it.
-fn without_unset_deadline(v: &Value) -> Value {
-    match v {
-        Value::Object(fields) => {
-            let mut fields: serde_json::Map<String, Value> = fields.iter().map(|(k, v)| (k.clone(), without_unset_deadline(v))).collect();
-            if fields.get("hasDeadline") == Some(&Value::Bool(false)) {
-                fields.insert("deadline".into(), int(0));
-            }
-            Value::Object(fields)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(without_unset_deadline).collect()),
-        other => other.clone(),
-    }
-}
-
-/// The spec's `Pending(Envelope) | Awaiting({ envelope, receiver }) |
-/// Settled({ envelope, receiver }) | Dropped(Drop)`: the spec's envelope and
-/// the state's data, with receiver 0 for none. A drop's `bound` is whether it recorded a watermark, and its
-/// `receipt` is false (see the module doc).
-fn message_value(resource: &Resource<Message>) -> Value {
-    let envelope = envelope_value(resource.spec());
-    match resource.state() {
-        MessageState::Pending => variant("Pending", envelope),
-        MessageState::Awaiting { receiver } => variant(
-            "Awaiting",
-            json!({ "envelope": envelope, "receiver": { "consumer": int(session_number(receiver)), "host": receiver.host } }),
-        ),
-        MessageState::Settled { receiver } => {
-            variant("Settled", json!({ "envelope": envelope, "receiver": int(receiver.as_ref().map_or(0, session_number)) }))
-        }
-        MessageState::Dropped { reason, receiver, watermark } => variant(
-            "Dropped",
-            json!({
-                "reason": constant(reason_name(reason)),
-                "envelope": envelope,
-                "receiver": int(receiver.as_ref().map_or(0, session_number)),
-                "watermark": int(watermark.map_or(0, ticks)),
-                "bound": watermark.is_some(),
-                "receipt": false,
-            }),
-        ),
-    }
-}
-
-fn deliver(receiver: message::Receiver) -> message::Deliver {
-    message::Deliver { receiver, transport: Transport::Turn }
-}
-
-/// The turn-rules role's withdrawal of a message whose delivery condition lapsed.
-fn withdrawn_by_turn_rules() -> DropReason {
-    DropReason::Withdrawn { by: at_address(TURN_RULES), authority: at_address(DELIVERY) }
-}
+use flotilla_quint_testkit::message::{
+    consumer, deliver, drop_reason, message_value, spec_from_envelope, withdrawn_by_turn_rules, without_unset_deadline,
+};
 
 struct MessageReplay<'a> {
     feed: Feed,
     home: Home<Message>,
-    /// The consumer sessions (not in message_race).
+    /// The consumer sessions of this engine composition.
     sessions: Option<Home<AgentSession>>,
     expectation: &'a str,
     deadline: Option<i64>,
@@ -1549,21 +1289,7 @@ impl<'a> MessageReplay<'a> {
         let envelope = payload(initial);
         let expectation = tag(&envelope["expectation"]);
         let deadline = boolean(&envelope["hasDeadline"]).then(|| number(&envelope["deadline"]));
-        let condition = boolean(&envelope["hasCondition"]).then(|| at_address(DELIVERY));
-        let spec = MessageSpec {
-            inbox: at_address(INBOX),
-            expectation: match expectation {
-                "Nothing" => Expectation::Nothing,
-                "Reply" => Expectation::Reply,
-                "Outcome" => Expectation::Outcome { condition: at_address(OUTCOME) },
-                other => panic!("expectation {other}"),
-            },
-            deadline: deadline.map(moment),
-            // The scenarios drop as undeliverable once `now - unboundAt > 1`.
-            unbound_after: UNIT,
-            delivery_condition: condition,
-            ..message_spec()
-        };
+        let spec = spec_from_envelope(envelope);
         let mut home = Home::<Message>::new("home").expect("declaration");
         home.create(ONE, spec, &MemoryMessageWorld::default(), Timestamp(0)).expect("message");
         let sessions = feed.sessions().then(|| {
@@ -1580,8 +1306,6 @@ impl<'a> MessageReplay<'a> {
     /// and a supersession whatever the scenario says, for end probes.
     fn world(&self, state: &Value, witness: bool) -> MemoryMessageWorld {
         let stream = Stream::of(self.feed.stream(state));
-        let mut world = MemoryMessageWorld::default();
-        let own = Ref::new(ONE);
         let applied = stream.sessions("receipt");
         let receipts = match &self.sessions {
             // The entries about the message whose rows the message's home has applied.
@@ -1603,25 +1327,8 @@ impl<'a> MessageReplay<'a> {
             }
             None => applied.iter().map(|who| (self.feed.receiver(*who), Transport::Turn)).collect(),
         };
-        world.receipts.put(&own, receipts);
-        if stream.any("reply") {
-            world.reply.put(&Ref::new(ONE), ());
-        }
-        world.condition.put(&Ref::new(OUTCOME), stream.any("outcome"));
-        if stream.any("failure") {
-            world.delivery_failure.put(&Ref::new(ONE), ());
-        }
-        world.applied_through.put(&Ref::new(INBOX), moment(stream.watermark()));
-        world.binding.put(&Ref::new(INBOX), self.feed.binding(state));
-        if self.feed == Feed::Controller {
-            world.condition.put(&Ref::new(DELIVERY), boolean(&state["conditionHolds"]));
-        }
-        let evidence = witness || self.feed == Feed::Race;
-        world.authority.put(&owner(), evidence);
-        if evidence {
-            world.supersession.put(&Ref::new(NEWER), message::Supersedes { older: ONE.into() });
-        }
-        world
+        let condition = (self.feed == Feed::Controller).then(|| boolean(&state["conditionHolds"]));
+        flotilla_quint_testkit::message::observed_world(ONE, &stream, self.feed.binding(state), receipts, condition, witness)
     }
 
     fn step(&mut self, step: &Step, tally: &mut Tally) {
@@ -1629,7 +1336,6 @@ impl<'a> MessageReplay<'a> {
         let now = moment(number(&step.before["now"]));
         let who = match self.feed {
             Feed::Inbox | Feed::Controller => step.chosen("who"),
-            Feed::Race => 1,
         };
         let world = self.world(step.before, false);
         let edge: Option<MessageEdge> = match (self.feed, step.action()) {
@@ -1644,9 +1350,6 @@ impl<'a> MessageReplay<'a> {
                 let model = slot_at(step.after, "::messages", 1).expect("message");
                 assert_eq!(tag(model), "Dropped", "{step}: a drop drops");
                 let reason = &payload(model)["reason"];
-                if self.feed == Feed::Race {
-                    assert_eq!(step.pick("reason"), reason, "{step}: the model records the reason it chose");
-                }
                 let reason = match (self.feed, tag(reason)) {
                     (Feed::Controller, "Withdrawn") => withdrawn_by_turn_rules(),
                     _ => drop_reason(reason),
@@ -1691,7 +1394,6 @@ impl<'a> MessageReplay<'a> {
                 "turn" | "publish" | "bind" | "unbindEndedWorld" | "unbindSilentWorld" | "applySource" | "applyHome" | "disconnect"
                 | "connect" | "die" | "recover" | "tick",
             )
-            | (Feed::Race, "publish" | "applySource" | "disconnect" | "connect" | "tick")
             | (Feed::Controller, "take" | "receiveRobot" | "bringAbout" | "retireRobot" | "applyStream" | "tick" | "lapse") => None,
             (_, other) => panic!("{step}: message operation {other}"),
         };
@@ -1756,22 +1458,12 @@ impl<'a> MessageReplay<'a> {
             if bound {
                 assert!(stream.watermark() > deadline, "{step}: expired before the consumer's stream passed the deadline");
             }
-            if self.feed == Feed::Race {
-                let evidence = match self.expectation {
-                    "Reply" => Some("reply"),
-                    "Outcome" => Some("outcome"),
-                    _ => None,
-                };
-                let in_time = stream.rows.iter().any(|row| Some(row.kind.as_str()) == evidence && row.at <= deadline);
-                assert!(!in_time, "{step}: expiry beat evidence written before the deadline");
-            }
         }
         // `receiverTurned`, `receiverTookIt`: a receipt exists only after the
         // consumer's turn, or the controller's run.
         let took = match self.feed {
             Feed::Inbox => Some(&state["turned"]),
             Feed::Controller => Some(&state["took"]),
-            Feed::Race => None,
         };
         if let Some(took) = took {
             let took: BTreeSet<i64> = set(took).iter().map(number).collect();
@@ -1804,11 +1496,9 @@ fn controller_delivery(trace: &Trace, tally: &mut Tally) {
     }
 }
 
-fn message_race(trace: &Trace, tally: &mut Tally) {
-    let mut replay = MessageReplay::new(trace, Feed::Race);
-    for step in trace.steps() {
-        replay.step(&step, tally);
-    }
+fn message_race<S: flotilla_quint_testkit::message::MessageSubject>(trace: &Trace, tally: &mut Tally) {
+    tally.writes += flotilla_quint_testkit::message::replay_race::<S>(trace);
+    tally.steps += trace.states.len().saturating_sub(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1833,7 +1523,7 @@ fn replay_quint_itf_traces() {
         ("convoy_deliver", convoy_deliver),
         ("ensure_bind", ensure_bind),
         ("inbox_delivery", inbox_delivery),
-        ("message_race", message_race),
+        ("message_race", message_race::<BareMessage>),
         ("controller_delivery", controller_delivery),
         ("machine_edges", machine_edges),
         ("admission_placement", admission_placement),
@@ -1867,5 +1557,41 @@ fn replay_quint_itf_traces() {
     eprintln!("{:>20}: {total} in {:.1?}", "replayed", started.elapsed());
     for ((name, _), tally) in scenarios.iter().zip(&tallies) {
         assert!(tally.traces > 0, "{name} supplied no traces in {directory}");
+    }
+}
+
+struct BareMessage {
+    home: Home<Message>,
+    world: MemoryMessageWorld,
+    now: Timestamp,
+}
+impl MessageSubject for BareMessage {
+    fn create(spec: MessageSpec) -> Self {
+        let mut home = Home::<Message>::new("home").expect("declaration");
+        home.create("1", spec, &MemoryMessageWorld::default(), Timestamp(0)).expect("admission");
+        Self { home, world: MemoryMessageWorld::default(), now: Timestamp(0) }
+    }
+    fn name(&self) -> &str {
+        "1"
+    }
+    fn bind(&mut self) {}
+    fn pending(&mut self) -> bool {
+        self.home
+            .judge("1", &self.world, self.now, |handle| flotilla_state_machines::machines::message::pending_for(handle, &self.receiver()))
+            .expect("message")
+            .value
+    }
+    fn observe(&mut self, world: MemoryMessageWorld, now: Timestamp) {
+        self.world = world;
+        self.now = now;
+    }
+    fn apply(&mut self, edge: MessageEdge) {
+        self.home.apply("1", edge, &self.world, self.now).expect("model edge accepted");
+    }
+    fn expire(&mut self) -> bool {
+        self.home.apply("1", message::DropMessage { reason: DropReason::Expired }, &self.world, self.now).is_ok()
+    }
+    fn resource(&self) -> Resource<Message> {
+        self.home.get("1").expect("message").clone()
     }
 }

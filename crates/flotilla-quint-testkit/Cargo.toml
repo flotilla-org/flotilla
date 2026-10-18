@@ -1,0 +1,14 @@
+[package]
+name = "flotilla-quint-testkit"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Dev-only shared Quint ITF, graph conformance and scenario replay machinery"
+
+[dependencies]
+flotilla-schema = { path = "../flotilla-schema" }
+flotilla-state-machines = { path = "../flotilla-state-machines" }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

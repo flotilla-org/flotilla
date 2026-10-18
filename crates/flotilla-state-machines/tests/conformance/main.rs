@@ -23,10 +23,7 @@
 //! and no spec state is projected before comparison. Each adaptor's module doc lists the field mapping and every
 //! remaining encoding choice.
 
-#[path = "../common/itf.rs"]
-mod itf;
-
-mod graph;
+use flotilla_quint_testkit::{graph, itf};
 
 mod agent_session;
 mod convoy;

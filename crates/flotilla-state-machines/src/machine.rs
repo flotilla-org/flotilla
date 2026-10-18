@@ -69,9 +69,11 @@ pub struct WrongState<L, K> {
     pub edge: K,
 }
 
-type GateFn<M> = dyn Fn(&mut Handle<'_, M>, &<M as Machine>::Edge) -> Option<Result<(), <M as Machine>::Refusal>>;
-type EffectFn<M> = dyn Fn(&mut Handle<'_, M>, <M as Machine>::State, &<M as Machine>::Edge) -> Option<<M as Machine>::State>;
-type MasterFn<M> = dyn Fn(&<M as Machine>::Edge) -> Option<String>;
+// Definitions capture only function pointers. Preserve their Send/Sync property
+// when erased, so declaration ownership can move between execution contexts.
+type GateFn<M> = dyn Fn(&mut Handle<'_, M>, &<M as Machine>::Edge) -> Option<Result<(), <M as Machine>::Refusal>> + Send + Sync;
+type EffectFn<M> = dyn Fn(&mut Handle<'_, M>, <M as Machine>::State, &<M as Machine>::Edge) -> Option<<M as Machine>::State> + Send + Sync;
+type MasterFn<M> = dyn Fn(&<M as Machine>::Edge) -> Option<String> + Send + Sync;
 
 /// What an edge checks before it moves.
 pub enum Check<M: Machine> {
