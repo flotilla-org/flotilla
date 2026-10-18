@@ -28,6 +28,7 @@ pub(crate) struct Field<'a> {
     /// The earlier column name below the enclosing prefix (`#[store(alias = "old")]`), formed as
     /// `name` is.
     pub alias: Option<LitStr>,
+    pub domain: Option<LitStr>,
 }
 
 impl<'a> Field<'a> {
@@ -47,7 +48,17 @@ impl<'a> Field<'a> {
             Some(variant) => format_ident!("__store_{}_{}", variant, plain),
             None => format_ident!("__store_{}", plain),
         };
-        Ok(Field { ident, local, name: LitStr::new(&name, ident.span()), ty: &field.ty, vis: &field.vis, shape, state_datum: false, alias })
+        Ok(Field {
+            ident,
+            local,
+            name: LitStr::new(&name, ident.span()),
+            ty: &field.ty,
+            vis: &field.vis,
+            shape,
+            state_datum: false,
+            alias,
+            domain: attrs.domain,
+        })
     }
 
     /// The adapter type implementing `Adapter<FieldTy>` for this field's attribute.
@@ -138,7 +149,11 @@ impl<'a> Field<'a> {
 
     fn layout_columns(&self, prefix: &TokenStream, required: &TokenStream) -> TokenStream {
         let (schema, via, name) = (schema(), self.via(), &self.name);
-        quote!(#via::layout(layout, &#schema::Layout::join(#prefix, #name), #required);)
+        let domain = match &self.domain {
+            Some(domain) => quote!(::core::option::Option::Some(const { #schema::Code::new(#domain) })),
+            None => quote!(::core::option::Option::None),
+        };
+        quote!(#via::layout(layout, &#schema::Layout::join(#prefix, #name), #required, #domain);)
     }
 
     /// `layout` inside the field's alias scope, when it has an earlier name.

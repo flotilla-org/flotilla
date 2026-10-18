@@ -36,7 +36,7 @@ struct Ticket {
     desk: Ref<Desk>,
     seq: u64,
     parent: Option<Ref<Ticket>>,
-    #[store(intern)]
+    #[store(intern = "pl")]
     pool: Pool,
     due: Option<i64>,
     #[store(state)]

@@ -100,15 +100,15 @@ pub trait EdgeArg: Clone + Debug + Sized + 'static {
 /// datum once, shared by name across the labels that carry it. Each datum
 /// takes its storage form in the input: no attribute (its own columns),
 /// `#[store(child)]` (a `BTreeMap` or `BTreeSet`, spelled out, changed row by
-/// row), `#[store(intern)]` or `#[store(flatten)]`; a datum has one type and
-/// form in every label carrying it. The expansion uses strum's and the schema
+/// row), `#[store(intern = "wr")]` or `#[store(flatten)]`; a datum has one type and
+/// form in every label carrying it, or one domain for interned data. The expansion uses strum's and the schema
 /// crate's derives, so the calling crate depends on `strum` and
 /// `flotilla-schema`, and every datum type must be `Clone + Debug + Eq +
 /// 'static` and storable in its form.
 ///
 /// ```
 /// flotilla_state_machines::states! {
-///     pub enum Door => DoorLabel { Shut = "sh", Open { #[store(intern)] by: String } = "op" }
+///     pub enum Door => DoorLabel { Shut = "sh", Open { #[store(intern = "wr")] by: String } = "op" }
 /// }
 /// use flotilla_schema::CodeEnum;
 /// use flotilla_state_machines::{Coded, StateValue};

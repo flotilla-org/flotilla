@@ -12,20 +12,22 @@ use std::{
 };
 
 use flotilla_schema::{
-    Cause, Change, Code, ColumnType, DdlMode, DecodeError, Decoder, Edge, EdgeParts, EdgeRow, Effect, Encoder, Event, Hash, Identity,
-    IndexQuery, Kind, KindCode, KindRegistry, Named, Origin, Row, RowEdit, RowPath, Rows, TableRole, Timestamp, Value,
+    Cause, Change, Code, ColumnDef, ColumnType, DdlMode, DecodeError, Decoder, Edge, EdgeParts, EdgeRow, Effect, Encoder, Event, Hash,
+    Identity, IndexQuery, Kind, KindCode, KindRegistry, Named, Origin, Row, RowEdit, RowPath, Rows, TableRole, Timestamp, Value,
+    HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
 };
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{
-    cache::TwoGen,
+    cache::{StringKey, StringKeyRef, TwoGen},
     effect::{named, Op},
     error::{Malformed, StoreError},
     query::{page_limit, Cursor, Page},
     shared::{
-        schema_ddl, sync_views, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ,
-        LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE, LOG_EXPUNGED_AFTER,
-        OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS, STRING_ID, STRING_INSERT,
+        has_string_domain, schema_ddl, sync_views, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ,
+        IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE,
+        LOG_EXPUNGED_AFTER, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS,
+        STRING_ID, STRING_INSERT,
     },
     sql::{KindSql, TableSql},
 };
@@ -119,7 +121,7 @@ struct Runtime {
     home: String,
     kinds: KindRegistry,
     sql: BTreeMap<KindCode, KindSql>,
-    strings: TwoGen<String, i64>,
+    strings: TwoGen<StringKey, i64>,
     identities: TwoGen<Identity, ResourceId>,
     ids: TwoGen<ResourceId, Identity>,
 }
@@ -137,6 +139,9 @@ impl Store {
         conn.set_prepared_statement_cache_capacity(options.statement_cache);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(&schema_ddl(&kinds, DdlMode::IfNotExists))?;
+        if !has_string_domain(&tx)? {
+            return Err(StoreError::LegacyDictionarySchema);
+        }
         sync_views(&tx, &kinds)?;
         tx.commit()?;
         let sql = kinds.iter().map(|set| (set.code, KindSql::render(set))).collect();
@@ -150,6 +155,14 @@ impl Store {
             change_page_bytes: options.change_page_bytes,
         };
         Ok(Store { conn, runtime })
+    }
+
+    /// Audits every registered interned column, including child keys, and the shared identity,
+    /// sequence and log columns against its declared domain. This diagnostic scans those tables;
+    /// it is explicit rather than part of the per-event path. Missing dictionary rows also fail.
+    /// Foreign keys alone cannot detect an id from the wrong domain.
+    pub fn audit_domains(&self) -> Result<(), StoreError> {
+        crate::audit::audit_domains(&self.conn, &self.runtime.kinds)
     }
 
     pub fn home(&self) -> &str {
@@ -264,14 +277,14 @@ impl Read<'_> {
 /// records insertion order so a failed write's entries can be rewound with its savepoint.
 #[derive(Default)]
 struct Pending {
-    strings: HashMap<String, i64>,
+    strings: HashMap<StringKey, i64>,
     identities: HashMap<Identity, ResourceId>,
     ids: HashMap<ResourceId, Identity>,
     journal: Vec<Journal>,
 }
 
 enum Journal {
-    String(String),
+    String(StringKey),
     Identity(Identity, ResourceId),
 }
 
@@ -586,13 +599,13 @@ impl Ctx<'_> {
         self.runtime.sql.get(&code).ok_or(StoreError::UnknownKind { code })
     }
 
-    fn remember_string(&mut self, string: &str, id: i64) {
+    fn remember_string(&mut self, domain: Code, string: &str, id: i64) {
         match &mut self.pending {
             Some(pending) => {
-                pending.strings.insert(string.to_owned(), id);
-                pending.journal.push(Journal::String(string.to_owned()));
+                pending.strings.insert(StringKey::new(domain, string), id);
+                pending.journal.push(Journal::String(StringKey::new(domain, string)));
             }
-            None => self.runtime.strings.insert(string.to_owned(), id),
+            None => self.runtime.strings.insert(StringKey::new(domain, string), id),
         }
     }
 
@@ -610,25 +623,27 @@ impl Ctx<'_> {
         }
     }
 
-    pub(crate) fn string_id(&mut self, string: &str) -> Result<Option<i64>, StoreError> {
-        let cached = self.pending.as_ref().and_then(|pending| pending.strings.get(string).copied());
-        if let Some(id) = cached.or_else(|| self.runtime.strings.get(string)) {
+    pub(crate) fn string_id(&mut self, domain: Code, string: &str) -> Result<Option<i64>, StoreError> {
+        let key = (domain, string);
+        let key: &dyn StringKeyRef = &key;
+        let cached = self.pending.as_ref().and_then(|pending| pending.strings.get(key).copied());
+        if let Some(id) = cached.or_else(|| self.runtime.strings.get(key)) {
             return Ok(Some(id));
         }
-        let id = self.conn.prepare_cached(STRING_ID)?.query_row([string], |row| row.get::<_, i64>(0)).optional()?;
+        let id = self.conn.prepare_cached(STRING_ID)?.query_row(params![domain.as_str(), string], |row| row.get::<_, i64>(0)).optional()?;
         if let Some(id) = id {
-            self.remember_string(string, id);
+            self.remember_string(domain, string, id);
         }
         Ok(id)
     }
 
-    fn intern(&mut self, string: &str) -> Result<i64, StoreError> {
-        if let Some(id) = self.string_id(string)? {
+    fn intern(&mut self, domain: Code, string: &str) -> Result<i64, StoreError> {
+        if let Some(id) = self.string_id(domain, string)? {
             return Ok(id);
         }
-        self.conn.prepare_cached(STRING_INSERT)?.execute([string])?;
+        self.conn.prepare_cached(STRING_INSERT)?.execute(params![domain.as_str(), string])?;
         let id = self.conn.last_insert_rowid();
-        self.remember_string(string, id);
+        self.remember_string(domain, string, id);
         Ok(id)
     }
 
@@ -637,7 +652,9 @@ impl Ctx<'_> {
         if let Some(id) = cached.or_else(|| self.runtime.identities.get(identity)) {
             return Ok(Some(id));
         }
-        let (Some(name), Some(home)) = (self.string_id(&identity.name)?, self.string_id(&identity.home)?) else {
+        let (Some(name), Some(home)) =
+            (self.string_id(RESOURCE_NAME_DOMAIN, &identity.name)?, self.string_id(HOME_DOMAIN, &identity.home)?)
+        else {
             return Ok(None);
         };
         let id = self
@@ -656,8 +673,8 @@ impl Ctx<'_> {
         if let Some(id) = self.resolve(identity)? {
             return Ok(id);
         }
-        let name = self.intern(&identity.name)?;
-        let home = self.intern(&identity.home)?;
+        let name = self.intern(RESOURCE_NAME_DOMAIN, &identity.name)?;
+        let home = self.intern(HOME_DOMAIN, &identity.home)?;
         self.conn.prepare_cached(IDENTITY_INSERT)?.execute(params![identity.kind.as_str(), name, home])?;
         let id = ResourceId(self.conn.last_insert_rowid());
         self.remember_identity(identity, id);
@@ -703,27 +720,42 @@ impl Ctx<'_> {
     /// Returns it as stored and as a version.
     fn next_sequence(&mut self) -> Result<(i64, u64), StoreError> {
         let home = self.runtime.home.clone();
-        let home = self.intern(&home)?;
+        let home = self.intern(HOME_DOMAIN, &home)?;
         let last: i64 = self.conn.prepare_cached(SEQUENCE_NEXT)?.query_row([home], |row| row.get(0))?;
         let version = u64::try_from(last).map_err(|_| StoreError::Corrupt { table: "home_sequence".into(), column: "last".into() })?;
         Ok((last, version))
     }
 
     /// Maps a logical value to its stored form, interning strings and creating identities.
-    fn param(&mut self, value: &Value) -> Result<SqlValue, StoreError> {
+    fn param(&mut self, code: KindCode, table: usize, column: &ColumnDef, value: &Value) -> Result<SqlValue, StoreError> {
         Ok(match value {
             Value::Null => SqlValue::Null,
             Value::Int(int) => SqlValue::Integer(*int),
             Value::Text(text) => SqlValue::Text(text.clone()),
             Value::Blob(bytes) => SqlValue::Blob(bytes.clone()),
-            Value::Str(string) => SqlValue::Integer(self.intern(string)?),
+            Value::Str(string) => {
+                let domain = self.intern_domain(code, table, column)?;
+                SqlValue::Integer(self.intern(domain, string)?)
+            }
             Value::Ref(identity) => SqlValue::Integer(self.ensure_identity(identity)?.0),
             Value::Object(hash) => SqlValue::Blob(hash.0.to_vec()),
         })
     }
 
-    fn params(&mut self, values: &[Value]) -> Result<Vec<SqlValue>, StoreError> {
-        values.iter().map(|value| self.param(value)).collect()
+    /// Logical interned values must lower through an actual interned schema column.
+    pub(crate) fn intern_domain(&self, code: KindCode, table: usize, column: &ColumnDef) -> Result<Code, StoreError> {
+        match column.ty {
+            ColumnType::Interned(domain) => Ok(domain),
+            _ => Err(StoreError::Corrupt { table: self.sql(code)?.tables[table].name.clone(), column: column.name.clone() }),
+        }
+    }
+
+    fn params(&mut self, code: KindCode, table: usize, start: usize, values: &[Value]) -> Result<Vec<SqlValue>, StoreError> {
+        let columns = self.sql(code)?.tables[table].columns.clone();
+        let Some(columns) = columns.get(start..).and_then(|columns| columns.get(..values.len())) else {
+            return Err(Malformed::Shape { table: self.sql(code)?.tables[table].name.clone() }.into());
+        };
+        columns.iter().zip(values).map(|(column, value)| self.param(code, table, column, value)).collect()
     }
 
     /// Stores an event's objects, each verified against its hash; equal content shares one row.
@@ -1024,7 +1056,7 @@ impl Ctx<'_> {
         parent_key: &[Value],
     ) -> Result<Option<Option<i64>>, StoreError> {
         let mut params = vec![SqlValue::Integer(id.0)];
-        params.extend(self.params(parent_key)?);
+        params.extend(self.params(code, table, 0, parent_key)?);
         let sql = &self.sql(code)?.tables[table].last_position;
         Ok(self.conn.prepare_cached(sql)?.query_row(params_from_iter(params), |row| row.get::<_, Option<i64>>(0)).optional()?)
     }
@@ -1147,7 +1179,7 @@ impl Ctx<'_> {
         // Duplicates and gaps are per identity, but a home numbers each event once: a sequence
         // already logged for another resource is the sender's error, refused before any write.
         // The one exception is a replayed expunge, whose identity is gone.
-        if let Some(home) = self.string_id(&event.home)? {
+        if let Some(home) = self.string_id(HOME_DOMAIN, &event.home)? {
             let logged: Option<String> =
                 self.conn.prepare_cached(LOG_CAUSE)?.query_row(params![home, sequence], |row| row.get(0)).optional()?;
             match logged {
@@ -1191,14 +1223,14 @@ impl Ctx<'_> {
         if !self.record(event.kind, id, &event.home, header, event.prev_seq, (&event.effect, &bytes), sequence, stored)? {
             return Err(StoreError::NotFound { id });
         }
-        let home = self.intern(&event.home)?;
+        let home = self.intern(HOME_DOMAIN, &event.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
         Ok(Applied::Applied(Stamp { id, version: event.home_seq }))
     }
 
     /// Whether this store logged an expunge of `identity` after `sequence` of its home.
     fn expunged_after(&mut self, identity: &Identity, sequence: i64) -> Result<bool, StoreError> {
-        let Some(home) = self.string_id(&identity.home)? else { return Ok(false) };
+        let Some(home) = self.string_id(HOME_DOMAIN, &identity.home)? else { return Ok(false) };
         let mut statement = self.conn.prepare_cached(LOG_EXPUNGED_AFTER)?;
         let effects = statement.query_map(params![home, sequence], |row| row.get::<_, Vec<u8>>(0))?;
         for effect in effects {
@@ -1231,7 +1263,7 @@ impl Ctx<'_> {
             Header { cause: Cause::Expunge, writer: event.writer.clone(), at: event.at, about: None, payload: event.payload.clone() };
         let bytes = event.effect.encode()?;
         self.append_log(&event.home, None, header, event.prev_seq, sequence, &bytes)?;
-        let home = self.intern(&event.home)?;
+        let home = self.intern(HOME_DOMAIN, &event.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
         Ok(Applied::Expunged)
     }
@@ -1266,7 +1298,7 @@ impl Ctx<'_> {
         self.check_objects(&ops, &snapshot.rows.objects)?;
         self.execute(snapshot.kind, id, &ops, sequence, None)?;
         self.set_identity_seq(id, sequence)?;
-        let home = self.intern(&snapshot.home)?;
+        let home = self.intern(HOME_DOMAIN, &snapshot.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
         Ok(Stamp { id, version: snapshot.version })
     }
@@ -1292,8 +1324,8 @@ impl Ctx<'_> {
         sequence: i64,
         effect: &[u8],
     ) -> Result<(), StoreError> {
-        let home = self.intern(home)?;
-        let writer = self.intern(&header.writer)?;
+        let home = self.intern(HOME_DOMAIN, home)?;
+        let writer = self.intern(WRITER_DOMAIN, &header.writer)?;
         let about = header.about.as_ref().map(|about| self.ensure_identity(about)).transpose()?.map(|id| id.0);
         let (edge, from, to) = match header.cause {
             Cause::Edge { edge, from, to } => (Some(edge), Some(from), Some(to)),
@@ -1346,36 +1378,38 @@ impl Ctx<'_> {
             match op {
                 Op::Root { values } => {
                     let mut params = vec![SqlValue::Integer(id.0), SqlValue::Integer(sequence)];
-                    params.extend(self.params(values)?);
+                    params.extend(self.params(code, 0, 0, values)?);
                     let sql = &self.sql(code)?.tables[0].insert;
                     self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
                     expected = moved;
                 }
                 Op::Insert { table, key, values } => {
                     let mut params = vec![SqlValue::Integer(id.0)];
-                    params.extend(self.params(key)?);
-                    params.extend(self.params(values)?);
+                    params.extend(self.params(code, *table, 0, key)?);
+                    params.extend(self.params(code, *table, self.sql(code)?.tables[*table].key_len, values)?);
                     let sql = &self.sql(code)?.tables[*table].insert;
                     self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
                 }
                 Op::Put { table, key, values } => {
                     let mut params = vec![SqlValue::Integer(id.0)];
-                    params.extend(self.params(key)?);
-                    params.extend(self.params(values)?);
+                    params.extend(self.params(code, *table, 0, key)?);
+                    params.extend(self.params(code, *table, self.sql(code)?.tables[*table].key_len, values)?);
                     let sql = &self.sql(code)?.tables[*table].upsert;
                     self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
                 }
                 Op::Set { table, key, field, values } => {
+                    let target = &self.sql(code)?.tables[*table];
+                    let start = target.key_len + target.fields[*field].columns.start;
                     let mut params = Vec::new();
                     if *table == 0 {
                         let Some(expected) = expected else { return Ok(false) };
                         params.push(SqlValue::Integer(sequence));
-                        params.extend(self.params(values)?);
+                        params.extend(self.params(code, *table, start, values)?);
                         params.extend([SqlValue::Integer(id.0), SqlValue::Integer(expected)]);
                     } else {
-                        params.extend(self.params(values)?);
+                        params.extend(self.params(code, *table, start, values)?);
                         params.push(SqlValue::Integer(id.0));
-                        params.extend(self.params(key)?);
+                        params.extend(self.params(code, *table, 0, key)?);
                     }
                     let sql = self.sql(code)?.tables[*table].fields[*field].update.clone();
                     if !self.row_written(code, &sql, params, *table, key)? {
@@ -1394,15 +1428,18 @@ impl Ctx<'_> {
                     } else {
                         None
                     };
-                    for values in members {
+                    for (member, values) in members.iter().enumerate() {
                         params.push(SqlValue::Integer(1));
-                        params.extend(self.params(values)?);
+                        let target = &self.sql(code)?.tables[*table];
+                        let field = target.groups[*group].fields[member];
+                        let start = target.key_len + target.fields[field].columns.start;
+                        params.extend(self.params(code, *table, start, values)?);
                     }
                     match check {
                         Some(expected) => params.extend([SqlValue::Integer(id.0), SqlValue::Integer(expected)]),
                         None => {
                             params.push(SqlValue::Integer(id.0));
-                            params.extend(self.params(key)?);
+                            params.extend(self.params(code, *table, 0, key)?);
                         }
                     }
                     let sql = self.sql(code)?.tables[*table].groups[*group].update.clone();
@@ -1418,7 +1455,7 @@ impl Ctx<'_> {
                         return Err(Malformed::RootDelete { table: self.sql(code)?.tables[0].name.clone() }.into());
                     }
                     let mut params = vec![SqlValue::Integer(id.0)];
-                    params.extend(self.params(key)?);
+                    params.extend(self.params(code, *table, 0, key)?);
                     let sql = &self.sql(code)?.tables[*table].delete;
                     self.conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
                 }
@@ -1457,7 +1494,7 @@ impl Ctx<'_> {
     /// Logged events homed at `home` after `after`, in home order, by the primary key.
     fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
         let limit = page_limit(limit)?;
-        let Some(home) = self.string_id(home)? else { return Ok(Vec::new()) };
+        let Some(home) = self.string_id(HOME_DOMAIN, home)? else { return Ok(Vec::new()) };
         let after = i64::try_from(after).unwrap_or(i64::MAX);
         self.events(LOG_BY_HOME, params![home, after, limit]).map(|events| events.into_iter().map(|(_, event)| event).collect())
     }
@@ -1533,7 +1570,7 @@ impl Ctx<'_> {
 
     /// The highest sequence taken (this home) or applied (another home) for `home`; 0 when none.
     fn last_sequence(&mut self, home: &str) -> Result<u64, StoreError> {
-        let Some(home) = self.string_id(home)? else { return Ok(0) };
+        let Some(home) = self.string_id(HOME_DOMAIN, home)? else { return Ok(0) };
         let last: Option<i64> = self.conn.prepare_cached(SEQUENCE_LAST)?.query_row([home], |row| row.get(0)).optional()?;
         last.map_or(Ok(0), |last| {
             u64::try_from(last).map_err(|_| StoreError::Corrupt { table: "home_sequence".into(), column: "last".into() })
@@ -1615,7 +1652,7 @@ impl Ctx<'_> {
                 (_, SqlValue::Null) => Value::Null,
                 (ColumnType::Text | ColumnType::Code(_), SqlValue::Text(text)) => Value::Text(text),
                 (ColumnType::Blob | ColumnType::Cbor, SqlValue::Blob(bytes)) => Value::Blob(bytes),
-                (ColumnType::Interned, SqlValue::Text(text)) => Value::Str(text),
+                (ColumnType::Interned(_), SqlValue::Text(text)) => Value::Str(text),
                 (ColumnType::Ref, SqlValue::Integer(id)) => Value::Ref(self.identity_of(ResourceId(id))?.ok_or_else(corrupt)?),
                 (ColumnType::Frozen, SqlValue::Blob(bytes)) => {
                     let hash = Hash(bytes.try_into().map_err(|_| corrupt())?);

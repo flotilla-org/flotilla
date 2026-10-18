@@ -36,7 +36,7 @@ pub struct Hold {
 /// Who closed a ticket, and when: a required flattened datum, one interned column among its own.
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 pub struct Signature {
-    #[store(intern)]
+    #[store(intern = "wr")]
     pub who: String,
     pub at: Timestamp,
 }
@@ -53,7 +53,7 @@ pub enum TicketState {
         #[store(child)]
         notes: BTreeMap<String, String>,
         priority: u8,
-        #[store(intern)]
+        #[store(intern = "wr")]
         owner: Option<String>,
         #[store(flatten)]
         hold: Option<Hold>,
@@ -66,7 +66,7 @@ pub enum TicketState {
         notes: BTreeMap<String, String>,
         priority: u8,
         reason: String,
-        #[store(intern)]
+        #[store(intern = "wr")]
         closed_by: String,
         #[store(flatten)]
         signature: Signature,
@@ -89,7 +89,7 @@ pub type TicketEvent = EdgeEvent<TicketLabel, TicketEdgeName, Payload<String>>;
 #[derive(Debug, Clone, PartialEq, Stored)]
 #[store(kind = "Ticket", code = "tk", edges = TicketEdgeName, index(name = "open_by_queue", eq(queue), when(state in [Open])))]
 pub struct Ticket {
-    #[store(intern)]
+    #[store(intern = "qu")]
     pub queue: String,
     pub title: String,
     #[store(state)]

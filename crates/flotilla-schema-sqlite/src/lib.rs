@@ -33,6 +33,7 @@
 //! rendered DDL; opening the previous generation's schema belongs to the post-cut-over form of
 //! ADR 0047.
 
+mod audit;
 mod cache;
 mod effect;
 mod error;
@@ -41,6 +42,7 @@ mod shared;
 mod sql;
 mod store;
 
+pub use audit::audit_domains;
 pub use error::{Malformed, StoreError};
 pub use query::{Cursor, Page, MAX_PAGE};
 pub use shared::schema_ddl;

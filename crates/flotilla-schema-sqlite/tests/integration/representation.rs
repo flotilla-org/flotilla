@@ -83,10 +83,10 @@ fn references_to_missing_targets_create_their_identity() {
     assert_eq!(stored, (session.0, reply.0));
 }
 
-// Behaviour (#3320 interning): equal interned strings share one `strings` row, whichever field,
-// variant, table or resource holds them.
+// Behaviour (#3320 interning): equal interned strings share one row per domain across resources;
+// agent names and service names are different sorts even when their text is equal.
 #[test]
-fn equal_interned_strings_share_one_row() {
+fn equal_interned_strings_share_one_row_per_domain() {
     let mut store = store();
     let mut write = store.write().expect("write");
     let reference = Reference::ChangeRequest { service: "carol".into(), scope: "s".into(), number: 1, revision: "r".into() };
@@ -97,7 +97,7 @@ fn equal_interned_strings_share_one_row() {
     write.commit().expect("commit");
     let conn = store.into_connection();
     let rows: i64 = conn.query_row("SELECT count(*) FROM strings WHERE s = 'carol'", [], |row| row.get(0)).expect("count");
-    assert_eq!(rows, 1);
+    assert_eq!(rows, 2);
     let distinct: i64 = conn
         .query_row(
             "SELECT count(DISTINCT m.sender) + count(DISTINCT r.service) \
@@ -106,11 +106,11 @@ fn equal_interned_strings_share_one_row() {
             |row| row.get(0),
         )
         .expect("count");
-    assert_eq!(distinct, 2, "every column of every row names the one row");
+    assert_eq!(distinct, 2, "each column shares its domain row across resources");
     let same: i64 = conn
         .query_row("SELECT count(*) FROM referral m JOIN referral_references r ON r.owner = m.id WHERE m.sender = r.service", [], |row| {
             row.get(0)
         })
         .expect("count");
-    assert_eq!(same, 2);
+    assert_eq!(same, 0, "agent and service domains have different ids");
 }

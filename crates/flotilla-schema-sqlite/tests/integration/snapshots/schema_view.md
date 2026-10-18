@@ -41,3 +41,35 @@ States with data (one label column, then data shared by name across the labels):
 - `ticket`.`state`: label `state` and `state_since`; data columns `priority`, `owner`, `hold_by`, `hold_until`, `reason`, `closed_by`, `signature_who`, `signature_at`; data tables `ticket_assignees`, `ticket_notes`
 - `terminal_session`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `cause_category`, `cause_detail`; data tables –
 - `vessel`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `cause_category`, `cause_detail`; data tables –
+
+Interned column domains:
+
+| Table | Column | Domain |
+|---|---|---|
+| `convoy` | `project` | `ad` |
+| `convoy_promises` | `kind` | `pk` |
+| `convoy_promises` | `target` | `ad` |
+| `dossier_deliverables` | `label` | `lb` |
+| `dossier_deliverables` | `source_step` | `st` |
+| `dossier_deliverables_evidence` | `verdict_by` | `wr` |
+| `ensure` | `inbox` | `ad` |
+| `ensure` | `bound` | `rn` |
+| `ensure_recorded` | `value` | `rn` |
+| `ensure_created` | `value` | `rn` |
+| `message` | `inbox` | `ad` |
+| `message` | `expectation_condition` | `ad` |
+| `message` | `receiver_session` | `sn` |
+| `message` | `receiver_host` | `hm` |
+| `message` | `reason_by` | `ad` |
+| `message` | `reason_authority` | `ad` |
+| `referral` | `sender` | `ag` |
+| `referral` | `subject_service` | `sv` |
+| `referral` | `condition_address_service` | `sv` |
+| `referral_references` | `service` | `sv` |
+| `ticket` | `queue` | `qu` |
+| `ticket` | `owner` | `wr` |
+| `ticket` | `closed_by` | `wr` |
+| `ticket` | `signature_who` | `wr` |
+| `terminal_session` | `role` | `rl` |
+| `terminal_session` | `pool` | `pl` |
+| `terminal_session` | `source_selector` | `sl` |

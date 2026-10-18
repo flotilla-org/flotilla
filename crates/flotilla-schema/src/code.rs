@@ -25,6 +25,15 @@ pub struct Code {
     bytes: [u8; Code::MAX],
 }
 
+/// Canonical addresses, including condition and authority addresses.
+pub const ADDRESS_DOMAIN: Code = Code::new("ad");
+/// Resource names, including engine name-only references.
+pub const RESOURCE_NAME_DOMAIN: Code = Code::new("rn");
+/// Home and host names.
+pub const HOME_DOMAIN: Code = Code::new("hm");
+/// Writer/principal names.
+pub const WRITER_DOMAIN: Code = Code::new("wr");
+
 /// Why a text is not a code.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{text:?} is not a code: {problem}")]

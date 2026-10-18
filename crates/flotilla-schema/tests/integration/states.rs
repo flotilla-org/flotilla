@@ -33,7 +33,7 @@ struct Hold {
 /// Who closed a ticket, and when: a required flattened datum.
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 struct Signature {
-    #[store(intern)]
+    #[store(intern = "wr")]
     who: String,
     at: Timestamp,
 }
@@ -50,7 +50,7 @@ enum TicketState {
         #[store(child)]
         notes: BTreeMap<String, String>,
         priority: u8,
-        #[store(intern)]
+        #[store(intern = "wr")]
         owner: Option<String>,
         #[store(flatten)]
         hold: Option<Hold>,
@@ -62,7 +62,7 @@ enum TicketState {
         #[store(child)]
         notes: BTreeMap<String, String>,
         priority: u8,
-        #[store(intern)]
+        #[store(intern = "wr")]
         owner: String,
         #[store(flatten)]
         hold: Hold,
@@ -85,7 +85,7 @@ type TicketEvent = EdgeEvent<TicketLabel, TicketEdge, String>;
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 #[store(kind = "Ticket", code = "k8", index(name = "live_by_queue", eq(queue), when(state in [Open, Closed])))]
 struct Ticket {
-    #[store(intern)]
+    #[store(intern = "qu")]
     queue: String,
     title: String,
     #[store(state)]
@@ -184,16 +184,16 @@ fn a_label_state_is_one_label_column_and_shared_data() {
     assert_eq!(
         columns,
         [
-            column("queue", ColumnType::Interned, false),
+            column("queue", ColumnType::Interned(flotilla_schema::Code::new("qu")), false),
             column("title", ColumnType::Text, false),
             column("state", ColumnType::Code(vec![Code::new("c1"), Code::new("c2"), Code::new("c3")]), false),
             column("state_since", ColumnType::Timestamp, false),
             column("priority", ColumnType::Integer, true),
-            column("owner", ColumnType::Interned, true),
+            column("owner", ColumnType::Interned(flotilla_schema::Code::new("wr")), true),
             column("hold_by", ColumnType::Text, true),
             column("hold_until", ColumnType::Timestamp, true),
             column("reason", ColumnType::Text, true),
-            column("signature_who", ColumnType::Interned, true),
+            column("signature_who", ColumnType::Interned(flotilla_schema::Code::new("wr")), true),
             column("signature_at", ColumnType::Timestamp, true),
         ]
     );
@@ -514,7 +514,7 @@ fn the_view_shows_label_states_as_state_data() {
         "{view}"
     );
     assert!(view.contains("| `ticket_notes` | state data | 3 | – | – | – |"), "{view}");
-    assert!(view.ends_with(
+    assert!(view.contains(
         "States with data (one label column, then data shared by name across the labels):\n\
          - `ticket`.`state`: label `state` and `state_since`; data columns `priority`, `owner`, `hold_by`, `hold_until`, `reason`, \
          `signature_who`, `signature_at`; \

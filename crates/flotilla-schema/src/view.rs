@@ -66,9 +66,15 @@ pub fn render_view<'a>(sets: impl IntoIterator<Item = &'a TableSet>) -> String {
     let mut out = String::from("| Table | Role | Columns | From enum expansion | Child tables | Indexes |\n|---|---|--:|---|---|---|\n");
     let mut wide = Vec::new();
     let mut states = Vec::new();
+    let mut domains = Vec::new();
     for set in sets {
         for (position, table) in set.tables.iter().enumerate() {
             let count = column_count(table);
+            for column in table.key.iter().chain(&table.columns) {
+                if let crate::ColumnType::Interned(domain) = column.ty {
+                    domains.push(format!("| `{}` | `{}` | `{domain}` |", table.name, column.name));
+                }
+            }
             let enums = enum_columns(table);
             let expanded: usize = enums.iter().map(|(_, count)| count).sum();
             let enums_text = if enums.is_empty() {
@@ -124,6 +130,11 @@ pub fn render_view<'a>(sets: impl IntoIterator<Item = &'a TableSet>) -> String {
     if !states.is_empty() {
         out.push_str("\nStates with data (one label column, then data shared by name across the labels):\n");
         out.push_str(&states.join("\n"));
+        out.push('\n');
+    }
+    if !domains.is_empty() {
+        out.push_str("\nInterned column domains:\n\n| Table | Column | Domain |\n|---|---|---|\n");
+        out.push_str(&domains.join("\n"));
         out.push('\n');
     }
     out

@@ -51,7 +51,7 @@ states! {
             #[store(child)] created: BTreeSet<Ref<Fulfiller>>,
             failures: u32,
             #[store(flatten)] last_failure: Option<Failure>,
-            #[store(intern)] bound: Ref<Fulfiller>,
+            #[store(intern = "rn")] bound: Ref<Fulfiller>,
         } = "fu",
         Held {
             #[store(child)] recorded: BTreeSet<Ref<Fulfiller>>,

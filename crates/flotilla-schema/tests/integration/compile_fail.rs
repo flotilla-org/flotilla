@@ -1,7 +1,7 @@
 // Behaviour (#3320 compile-fail): the refusals made by the field bounds fail to compile with a
 // diagnostic naming the closed attribute list: a nested struct without an attribute (`Column`),
 // `flatten` of a kind (`Flat`), `intern` on a non-string (`Intern`) and a multi-column map key
-// (`KeyColumn`). The derive's own refusals are unit tests (`refusals_name_the_closed_list` in
+// (`KeyColumn`), plus a shared-column domain mismatch. Other derive refusals are unit tests (`refusals_name_the_closed_list` in
 // `flotilla-schema-derive`). The expected stderr files are reviewed snapshots for the pinned
 // toolchain; `TRYBUILD=overwrite` rewrites them.
 #[test]
@@ -25,5 +25,5 @@ fn refusal_snapshots_name_the_closed_list() {
         assert!(stderr.contains(&list), "{} does not name the attribute list", path.display());
         checked += 1;
     }
-    assert_eq!(checked, 4);
+    assert_eq!(checked, 5);
 }

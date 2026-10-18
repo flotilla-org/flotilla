@@ -41,7 +41,7 @@ use super::{
     index(name = "by_reply", eq(in_reply_to), when(in_reply_to is_some))
 )]
 pub struct Referral {
-    #[store(intern)]
+    #[store(intern = "ag")]
     pub sender: AgentName,
     pub session: Ref<Resource<AgentSession>>,
     pub in_reply_to: Option<Ref<Referral>>,
@@ -86,7 +86,7 @@ pub enum ReferralEdge {
 pub enum Reference {
     #[store(code = "c1")]
     ChangeRequest {
-        #[store(intern)]
+        #[store(intern = "sv")]
         service: String,
         scope: String,
         number: u64,
@@ -100,7 +100,7 @@ pub enum Reference {
     Artifact { resource: Identity, revision: String },
     #[store(code = "c5")]
     Issue {
-        #[store(intern)]
+        #[store(intern = "sv")]
         service: String,
         scope: String,
         number: u64,
@@ -108,7 +108,7 @@ pub enum Reference {
     },
     #[store(code = "c6")]
     Comment {
-        #[store(intern)]
+        #[store(intern = "sv")]
         service: String,
         scope: String,
         id: String,
@@ -132,7 +132,7 @@ pub enum LeafAddress {
     Convoy { name: String },
     #[store(code = "c2")]
     ChangeRequest {
-        #[store(intern)]
+        #[store(intern = "sv")]
         service: String,
         number: u64,
     },
@@ -348,7 +348,7 @@ pub enum InputValue {
 
 #[derive(Debug, Clone, PartialEq, Stored)]
 pub struct Deliverable {
-    #[store(intern)]
+    #[store(intern = "lb")]
     pub label: String,
     pub kind: PromiseKind,
     pub source: PromiseSource,
@@ -370,7 +370,7 @@ pub enum PromiseKind {
 pub enum PromiseSource {
     #[store(code = "c1")]
     Workflow {
-        #[store(intern)]
+        #[store(intern = "st")]
         step: String,
     },
     #[store(code = "c2")]
@@ -390,7 +390,7 @@ pub struct Evidence {
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 pub struct Verdict {
     pub accepted: bool,
-    #[store(intern)]
+    #[store(intern = "wr")]
     pub by: String,
     pub at: Timestamp,
 }

@@ -84,7 +84,7 @@ mod tests {
             quote! { struct A { #[store(history)] a: Vec<String> } },
             quote! { struct A { #[store(frozen)] a: String } },
             quote! { struct A { #[store(state)] a: String } },
-            quote! { struct A { #[store(intern)] a: Vec<String> } },
+            quote! { struct A { #[store(intern = "tx")] a: Vec<String> } },
             quote! { struct A { #[store(flatten)] a: BTreeMap<String, String> } },
             quote! { struct A { a: Vec<String> } },
             quote! { struct A { a: std::collections::BTreeMap<String, String> } },
@@ -116,7 +116,7 @@ mod tests {
             quote! { enum A { #[store(code = "c1")] B, #[store(code = "c1")] C } },
             quote! { enum A { #[store(code = "c1")] Ab { c: String }, #[store(code = "c2")] AB { c: u32 } } },
             quote! { enum A { #[store(code = "c1")] Ab { c: String }, #[store(code = "c2")] AB { c: Option<u32> } } },
-            quote! { enum A { #[store(code = "c1")] Ab { #[store(intern)] c: String }, #[store(code = "c2")] AB { c: Option<String> } } },
+            quote! { enum A { #[store(code = "c1")] Ab { #[store(intern = "tx")] c: String }, #[store(code = "c2")] AB { c: Option<String> } } },
             quote! { enum A { #[store(code = "c1")] B { a: String }, #[store(code = "c1")] C } },
             quote! { enum A { #[store(code = "c1")] B { a: String }, C { b: i64 } } },
             quote! { enum A {} },
@@ -127,7 +127,7 @@ mod tests {
             quote! { struct A { #[store(child)] a: Vec<Self> } },
             quote! { struct A { #[store(records)] a: Records<A> } },
             quote! { struct A { #[store(frozen)] a: Option<Option<Frozen<Doc>>> } },
-            quote! { struct A(#[store(intern)] String); },
+            quote! { struct A(#[store(intern = "tx")] String); },
             quote! { struct A(Vec<String>); },
             quote! { struct A(Option<Box<A>>); },
         ];
@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn a_datum_may_be_t_in_one_variant_and_an_option_in_another() {
         for case in [
-            quote! { enum A { #[store(code = "b")] B { #[store(intern)] a: String }, #[store(code = "c")] C { #[store(intern)] a: Option<String> } } },
+            quote! { enum A { #[store(code = "b")] B { #[store(intern = "tx")] a: String }, #[store(code = "c")] C { #[store(intern = "tx")] a: Option<String> } } },
             quote! { #[store(labels = L)] enum A { #[store(code = "b")] B { #[store(flatten)] a: P }, #[store(code = "c")] C { #[store(flatten)] a: Option<P> } } },
         ] {
             let expanded = expanded(case.clone());
@@ -185,7 +185,7 @@ mod tests {
     fn label_state_refusals_name_the_closed_list() {
         let cases = [
             quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { a: String }, #[store(code = "c2")] C { a: u32 } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { a: String }, #[store(code = "c2")] C { #[store(intern)] a: String } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { a: String }, #[store(code = "c2")] C { #[store(intern = "tx")] a: String } } },
             quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(flatten)] a: P }, #[store(code = "c2")] C { #[store(flatten)] a: Option<Q> } } },
             quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(flatten)] a: P }, #[store(code = "c2")] C { a: P } } },
             quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(child)] a: BTreeSet<String> }, #[store(code = "c2")] C { #[store(child)] a: BTreeMap<String, String> } } },
@@ -215,14 +215,12 @@ mod tests {
         assert!(mismatch.contains("`a` is declared as `String` in `B` and as `u32` in `C`"), "{mismatch}");
         assert!(mismatch.contains("or is `T` in some and `Option<T>` in others"), "{mismatch}");
         assert!(error(quote! { #[store(labels = L, labels = M)] enum A { #[store(code = "c1")] B } }).contains("twice"));
-        // #3392 ruling D3: interned data of different Rust types does not share a column, in a
-        // data enum or a state.
+        // #3422: interned data of different Rust types can share a column when its domain agrees.
         for case in [
-            quote! { enum A { #[store(code = "c1")] B { #[store(intern)] a: String }, #[store(code = "c2")] C { #[store(intern)] a: Name } } },
-            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(intern)] a: String }, #[store(code = "c2")] C { #[store(intern)] a: Name } } },
+            quote! { enum A { #[store(code = "c1")] B { #[store(intern = "tx")] a: String }, #[store(code = "c2")] C { #[store(intern = "tx")] a: Name } } },
+            quote! { #[store(labels = L)] enum A { #[store(code = "c1")] B { #[store(intern = "tx")] a: String }, #[store(code = "c2")] C { #[store(intern = "tx")] a: Name } } },
         ] {
-            let interned = error(case.clone());
-            assert!(interned.contains("`a` is declared as `String` in `B` and as `Name` in `C`"), "{case}: {interned}");
+            let _ = expanded(case);
         }
     }
 
@@ -241,7 +239,7 @@ mod tests {
                 #[store(code = "c1")] Draft,
                 #[store(code = "c2")] Open {
                     #[store(child)] assignees: BTreeSet<String>,
-                    #[store(intern)] owner: Option<String>,
+                    #[store(intern = "wr")] owner: Option<String>,
                     #[store(flatten)] hold: Option<Hold>,
                     #[store(flatten)] signature: Signature,
                 },
@@ -292,14 +290,14 @@ mod tests {
                 struct A {
                     a: Ref<B>,
                     b: Option<u64>,
-                    #[store(intern)] c: String,
+                    #[store(intern = "tx")] c: String,
                     #[store(state)] s: State<Phase>,
                     d: Leaf,
                     #[store(child)] e: Vec<String>,
                     #[store(flatten)] f: Option<Leaf>,
                     g: Identity,
                     h: Option<::flotilla_schema::Ref<B>>,
-                    #[store(intern)] i: Option<Name>,
+                    #[store(intern = "tx")] i: Option<Name>,
                 }
             }
         };
@@ -351,7 +349,7 @@ mod tests {
                 inbox: Ref<Inbox>,
                 seq: u64,
                 reply: Option<Ref<Message>>,
-                #[store(intern)] sender: Name,
+                #[store(intern = "ag")] sender: Name,
                 #[store(state)] state: State<MessageState>,
             }
         });
@@ -435,8 +433,8 @@ mod tests {
     fn attributes_select_adapters_and_bounds() {
         let expanded = expanded(quote! {
             struct Part {
-                #[store(intern)] a: String,
-                #[store(intern)] b: Option<Name>,
+                #[store(intern = "tx")] a: String,
+                #[store(intern = "tx")] b: Option<Name>,
                 #[store(flatten)] c: Leaf,
                 #[store(flatten)] d: Option<Leaf>,
                 #[store(state)] e: State<Phase>,
@@ -482,8 +480,9 @@ mod tests {
         let early = "const { :: flotilla_schema :: Code :: new (\"early\") }";
         let late = "const { :: flotilla_schema :: Code :: new (\"late\") }";
         assert!(code.contains(&format!("const CODES : & 'static [:: flotilla_schema :: Code] = & [{early} , {late}]")), "{code}");
-        let data =
-            expanded(quote! { enum Edge { #[store(code = "dr")] DropIt { #[store(intern)] by: String }, #[store(code = "go")] Go } });
+        let data = expanded(
+            quote! { enum Edge { #[store(code = "dr")] DropIt { #[store(intern = "wr")] by: String }, #[store(code = "go")] Go } },
+        );
         assert!(data.contains("\"by\"") && !data.contains("drop_it"), "{data}");
         assert!(
             data.contains(
@@ -586,7 +585,7 @@ mod tests {
             #[store(kind = "Message", code = "ms", state = MessageState,
                 index(name = "open_by_inbox", eq(inbox), when(state in [Pending, Awaiting])))]
             struct MessageSpec {
-                #[store(intern)] inbox: String,
+                #[store(intern = "ad")] inbox: String,
                 deadline: Option<Timestamp>,
             }
         });
@@ -613,6 +612,34 @@ mod tests {
         ] {
             let message = error(case.clone());
             assert!(message.contains(SUPPORTED) && message.contains(problem), "{case}: {message}");
+        }
+    }
+    // Behaviour (#3422): explicit short domain codes are required, and a shared datum must
+    // agree on its domain in ordinary enums and label states, regardless of Rust type.
+    #[test]
+    fn intern_domains_are_required_validated_and_agreed() {
+        for domain in ["", " ", "UP", "1a", "é", "a-b", "abcdefghi"] {
+            let case = quote! { struct A { #[store(intern = #domain)] a: String } };
+            assert!(error(case).contains("a code is short text"));
+        }
+        assert!(error(quote! { struct A { #[store(intern)] a: String } }).contains("intern"));
+        for labels in [quote! {}, quote! { #[store(labels = L)] }] {
+            let mismatch = quote! {
+                #labels enum A {
+                    #[store(code = "b")] B { #[store(intern = "ad")] a: String },
+                    #[store(code = "c")] C { #[store(intern = "wr")] a: Name },
+                }
+            };
+            assert!(error(mismatch).contains("same intern domain"));
+            // Both boundaries of the existing Code grammar are valid; domains are not a closed list.
+            for domain in ["a", "a_123456"] {
+                let _ = expanded(quote! {
+                    #labels enum A {
+                        #[store(code = "b")] B { #[store(intern = #domain)] a: String },
+                        #[store(code = "c")] C { #[store(intern = #domain)] a: Option<Name> },
+                    }
+                });
+            }
         }
     }
 }

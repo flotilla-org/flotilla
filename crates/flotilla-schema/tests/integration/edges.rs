@@ -55,7 +55,7 @@ fn event<I>(edge: LifecycleEdge, to: Phase, identity: Option<I>) -> LifecycleEve
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 struct Note {
-    #[store(intern)]
+    #[store(intern = "wr")]
     by: String,
     #[store(records)]
     replies: Records<String>,

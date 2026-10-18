@@ -1,7 +1,7 @@
 //! Field adapters: how generated code lays out, encodes and decodes one field for its attribute.
 //!
 //! A field's storage depends on its attribute as well as its type (`String` is text, but
-//! `#[store(intern)] String` is a `strings` id), so generated code goes through an adapter chosen
+//! `#[store(intern = "wr")] String` is a `strings` id), so generated code goes through an adapter chosen
 //! by the attribute rather than through the type's own [`Columns`]. Each adapter has the shape of
 //! `Columns` with the field type as a parameter.
 
@@ -16,13 +16,16 @@ use crate::{
     records::Records,
     traits::{Columns, Element, Flat, Intern, KeyColumn},
     value::Value,
+    Code,
 };
 
 /// `Columns` for a field of type `F`, as stored under one attribute.
 #[doc(hidden)]
 pub trait Adapter<F> {
     const TABLES: usize;
-    fn layout(layout: &mut Layout, name: &str, required: bool);
+    /// Explicit intern annotations supply their domain; other shapes use `None` and their
+    /// type's own layout (including intrinsic domains on addresses and name-only references).
+    fn layout(layout: &mut Layout, name: &str, required: bool, domain: Option<Code>);
     fn encode(value: &F, e: &mut Encoder) -> Result<(), EncodeError>;
     fn encode_absent(e: &mut Encoder) -> Result<(), EncodeError>;
     fn decode(d: &mut Decoder) -> Result<Option<F>, DecodeError>;
@@ -36,7 +39,7 @@ pub struct AsColumns;
 impl<F: Columns> Adapter<F> for AsColumns {
     const TABLES: usize = F::TABLES;
 
-    fn layout(layout: &mut Layout, name: &str, required: bool) {
+    fn layout(layout: &mut Layout, name: &str, required: bool, _domain: Option<Code>) {
         F::layout(layout, name, required);
     }
 
@@ -57,15 +60,15 @@ impl<F: Columns> Adapter<F> for AsColumns {
     }
 }
 
-/// `#[store(intern)]` on `String` or a newtype of it: an id in `strings`.
+/// `#[store(intern = "domain")]` on `String` or a newtype of it: an id in `strings`.
 #[doc(hidden)]
 pub struct AsInterned;
 
 impl<F: Intern> Adapter<F> for AsInterned {
     const TABLES: usize = 0;
 
-    fn layout(layout: &mut Layout, name: &str, required: bool) {
-        layout.column(name, ColumnType::Interned, required);
+    fn layout(layout: &mut Layout, name: &str, required: bool, domain: Option<Code>) {
+        layout.column(name, ColumnType::Interned(domain.expect("interned columns declare a domain")), required);
     }
 
     fn encode(value: &F, e: &mut Encoder) -> Result<(), EncodeError> {
@@ -91,15 +94,15 @@ impl<F: Intern> Adapter<F> for AsInterned {
     }
 }
 
-/// `#[store(intern)] Option<T>`: a nullable `strings` id.
+/// `#[store(intern = "wr")] Option<T>`: a nullable `strings` id.
 #[doc(hidden)]
 pub struct AsOptionalInterned;
 
 impl<T: Intern> Adapter<Option<T>> for AsOptionalInterned {
     const TABLES: usize = 0;
 
-    fn layout(layout: &mut Layout, name: &str, _required: bool) {
-        layout.column(name, ColumnType::Interned, false);
+    fn layout(layout: &mut Layout, name: &str, _required: bool, domain: Option<Code>) {
+        layout.column(name, ColumnType::Interned(domain.expect("interned columns declare a domain")), false);
     }
 
     fn encode(value: &Option<T>, e: &mut Encoder) -> Result<(), EncodeError> {
@@ -131,7 +134,7 @@ pub struct AsOptionalFlat;
 impl<T: Flat> Adapter<Option<T>> for AsOptionalFlat {
     const TABLES: usize = T::TABLES;
 
-    fn layout(layout: &mut Layout, name: &str, _required: bool) {
+    fn layout(layout: &mut Layout, name: &str, _required: bool, _domain: Option<Code>) {
         layout.optional(|layout| T::layout(layout, name, true));
     }
 
@@ -170,7 +173,7 @@ pub struct AsFrozen;
 impl<T: Freezable> Adapter<Frozen<T>> for AsFrozen {
     const TABLES: usize = 0;
 
-    fn layout(layout: &mut Layout, name: &str, required: bool) {
+    fn layout(layout: &mut Layout, name: &str, required: bool, _domain: Option<Code>) {
         layout.column(name, ColumnType::Frozen, required);
     }
 
@@ -205,7 +208,7 @@ impl<T: Freezable> Adapter<Option<Frozen<T>>> for AsOptionalFrozen {
     const TABLES: usize = 0;
 
     // Always nullable: `None` is a stored NULL, whatever the enclosing field's requirement.
-    fn layout(layout: &mut Layout, name: &str, _required: bool) {
+    fn layout(layout: &mut Layout, name: &str, _required: bool, _domain: Option<Code>) {
         layout.column(name, ColumnType::Frozen, false);
     }
 
@@ -238,7 +241,7 @@ pub struct AsCbor;
 impl<T: Cbor> Adapter<T> for AsCbor {
     const TABLES: usize = 0;
 
-    fn layout(layout: &mut Layout, name: &str, required: bool) {
+    fn layout(layout: &mut Layout, name: &str, required: bool, _domain: Option<Code>) {
         layout.column(name, ColumnType::Cbor, required);
     }
 
@@ -279,7 +282,7 @@ pub struct AsChild;
 impl<T: Element> Adapter<Vec<T>> for AsChild {
     const TABLES: usize = 1 + T::TABLES;
 
-    fn layout(layout: &mut Layout, name: &str, _required: bool) {
+    fn layout(layout: &mut Layout, name: &str, _required: bool, _domain: Option<Code>) {
         layout_list::<T>(layout, name, TableRole::Child);
     }
 
@@ -311,7 +314,7 @@ macro_rules! keyed_tables {
         impl<K: KeyColumn + Ord, V: Element> Adapter<BTreeMap<K, V>> for $adapter {
             const TABLES: usize = 1 + V::TABLES;
 
-            fn layout(layout: &mut Layout, name: &str, _required: bool) {
+            fn layout(layout: &mut Layout, name: &str, _required: bool, _domain: Option<Code>) {
                 layout.table(name, $role, |layout| {
                     layout.key(|layout| K::layout(layout, "key", true));
                     V::layout_row(layout);
@@ -352,7 +355,7 @@ macro_rules! keyed_tables {
         impl<K: KeyColumn + Ord> Adapter<BTreeSet<K>> for $adapter {
             const TABLES: usize = 1;
 
-            fn layout(layout: &mut Layout, name: &str, _required: bool) {
+            fn layout(layout: &mut Layout, name: &str, _required: bool, _domain: Option<Code>) {
                 layout.table(name, $role, |layout| layout.key(|layout| K::layout(layout, "value", true)));
             }
 
@@ -403,7 +406,7 @@ macro_rules! records_adapter {
         impl<T: Element> Adapter<Records<T>> for $adapter {
             const TABLES: usize = 1 + T::TABLES;
 
-            fn layout(layout: &mut Layout, name: &str, _required: bool) {
+            fn layout(layout: &mut Layout, name: &str, _required: bool, _domain: Option<Code>) {
                 layout.table(name, $role, |layout| {
                     layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
                     layout.column(RECORD_VERSION, ColumnType::Integer, true);

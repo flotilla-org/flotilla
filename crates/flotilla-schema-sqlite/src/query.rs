@@ -1,6 +1,6 @@
 //! Index pages and the startup scan: the only listings, each keyset-paged and limited.
 
-use flotilla_schema::{IndexQuery, Kind, KindCode, Value};
+use flotilla_schema::{ColumnDef, IndexQuery, Kind, KindCode, Value, HOME_DOMAIN};
 use rusqlite::{params, params_from_iter, types::Value as SqlValue};
 
 use crate::{
@@ -54,13 +54,16 @@ pub(crate) fn page_limit(limit: u32) -> Result<i64, StoreError> {
 impl Ctx<'_> {
     /// An `eq` argument as stored, without creating anything: `None` when an interned string or
     /// identity has no local id, which no row can then hold.
-    fn lookup(&mut self, value: &Value) -> Result<Option<SqlValue>, StoreError> {
+    fn lookup(&mut self, kind: KindCode, column: &ColumnDef, value: &Value) -> Result<Option<SqlValue>, StoreError> {
         Ok(match value {
             Value::Null => None,
             Value::Int(int) => Some(SqlValue::Integer(*int)),
             Value::Text(text) => Some(SqlValue::Text(text.clone())),
             Value::Blob(bytes) => Some(SqlValue::Blob(bytes.clone())),
-            Value::Str(string) => self.string_id(string)?.map(SqlValue::Integer),
+            Value::Str(string) => {
+                let domain = self.intern_domain(kind, 0, column)?;
+                self.string_id(domain, string)?.map(SqlValue::Integer)
+            }
             Value::Ref(identity) => self.resolve(identity)?.map(|id| SqlValue::Integer(id.0)),
             Value::Object(hash) => Some(SqlValue::Blob(hash.0.to_vec())),
         })
@@ -84,8 +87,9 @@ impl Ctx<'_> {
             }
         }
         let mut params = Vec::with_capacity(eq.len() + order + 2);
-        for value in eq {
-            match self.lookup(value)? {
+        let columns = self.sql(kind)?.indexes[query.index()].eq_columns.clone();
+        for (column, value) in columns.iter().zip(eq) {
+            match self.lookup(kind, column, value)? {
                 Some(param) => params.push(param),
                 None => return Ok(Page::empty()),
             }
@@ -119,7 +123,7 @@ impl Ctx<'_> {
     pub(crate) fn scan<K: Kind>(&mut self, home: &str, after: Option<ResourceId>, limit: u32) -> Result<Page<ResourceId>, StoreError> {
         let limit = page_limit(limit)?;
         self.sql(K::CODE)?;
-        let Some(home) = self.string_id(home)? else { return Ok(Page::empty()) };
+        let Some(home) = self.string_id(HOME_DOMAIN, home)? else { return Ok(Page::empty()) };
         let after = after.map_or(i64::MIN, |id| id.0);
         let mut ids: Vec<ResourceId> = self
             .conn

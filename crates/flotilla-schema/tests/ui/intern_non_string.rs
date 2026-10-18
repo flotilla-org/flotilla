@@ -3,7 +3,7 @@ use flotilla_schema::Stored;
 #[derive(Stored)]
 #[store(kind = "Ticket", code = "k1")]
 struct Ticket {
-    #[store(intern)]
+    #[store(intern = "tx")]
     count: u32,
 }
 
