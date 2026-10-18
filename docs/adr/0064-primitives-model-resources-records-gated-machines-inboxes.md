@@ -196,8 +196,29 @@ How Checkouts and lends behave:
 **Replication.**
 - **One sequence per home.** Its value is a resource's `version`. Each write appends one event to the home's log in home order (#3392 G8), and the stream carries events. Replicas apply each event's effect through the same lowering as the home's own write, append the event to their copy of the home's log, and do not re-run machines. A replica catches up on a resource from its snapshot plus the resource's events after it.
 - **Encoding and liveness.** The stream is CBOR (ADR 0063). Its keepalive is the link-liveness signal.
-- **Subscriptions.** Every host holds the identity row (kind, name, home) of every live resource. Full rows travel by subscription to coarse scopes: a project, a time window, or "related to host H". The old per-kind rules become default subscriptions.
-- **Misses** are routed to the home or the archive. Gates make a home subscribe to any input they need, and never query remotely. Subscription maintenance must never dominate: subscriptions are tagged once at write time and fanned out by a bitmap lookup.
+- **Whole-home replication** ([#3463 owner ruling, 2026-10-18](https://github.com/flotilla-org/flotilla/issues/3463#issuecomment-6252080381), superseding #3213 ruling 2). Every host follows every other home's whole log and therefore holds every resource and its identity. Each home's log is the partition. Per-item scope subscriptions are withdrawn.
+- **Coarse topic.** Each event reserves one open coarse topic code, chosen by the home's write transaction, for later partitioning by whole topics on whole homes. Nothing filters on it yet.
+- **Misses** that the local copy cannot serve are routed to the home, marked remote with their age. Gates read only local inputs and never query remotely.
+- **Observation consumers.** Fine-grained filtered views belong to read-only observation subscriptions, such as `pm connect`, rather than replication. They are out of scope, as are partial replication by topic and archives beyond the history window.
+
+**#3463 implementation** (schema [approved 2026-10-18](https://github.com/flotilla-org/flotilla/pull/3465#issuecomment-6252741558)).
+The [stream design/workload note](../implementation-choices/change-stream.md) records the
+reserved log topic, per-home applied watermark (`home_seq`, applied time), and resume floor.
+Only expunge raises that floor, atomically with the log deletion it covers. Store startup
+installs these tables and synchronizes their readable views. Snapshot/tail/resume and
+keepalives use framed CBOR through a listener-independent service on the resource HTTP API;
+follower progress and rows commit together. Missing progress reads as zero/epoch. Gates use
+local applied time, never remote reads or link health. Surface misses route once to the home
+and are marked remote with age. The old replicator remains for old kinds. Kind migrations
+install their new-store registry; #3317 is first. Fine-grained observation consumers, topic
+filtering, archives and retiring old replication are deferred. Quint specs are unchanged.
+**First shape and expiry:** replicate-everything is sized for a home lab of a few hosts,
+including laptops that disconnect, not WORKLOAD's target or ceiling. The workload note sizes
+bandwidth, offline catch-up, snapshot and temporary disk for that shape; measurements remain
+open in #3425. It expires when hubs such as a desktop and cloud host should hold everything
+while spokes such as laptops hold enough to work offline. At larger scales, partition writes
+with replicated read layers. Those later shapes are out of scope. No lazy store open or
+followers run before the first registered kind is installed; until then both routes return 503.
 
 **Liveness.** Liveness is judged from the observer host's link. Observations are written only when they change. Heartbeat-only writes go away.
 
@@ -248,6 +269,6 @@ There is no double-write path and no long-lived branch.
 - **ADR 0055 and #1394 are amended.** ADR 0055's address forms become typed segment lists, and its `principal:` form becomes a declared role. The #1394 ruling ([ADR 0058, dispatch](0058-dispatch-four-queues-one-global-decider.md)) moves from whole-convoy admission to admission with a capacity budget: growth within the budget goes to placement, and growth beyond it is a new request.
 - **Crews on any host.** Crew members can be on any host and can be replaced without stranding messages. Handoffs, resumes and nudges are messages, and no convoy transition is involved.
 - **The importer is the largest hand-written piece.** After the cut-over, ADR 0047 is enforced by a checked-in schema snapshot and explicit migration steps, and the golden corpus becomes a SQLite file.
-- **Peer merge goes away.** The Plane-A peer-merge layer (`crates/flotilla-daemon/src/peer/`) stays bugfix-only and is deleted by this work, because subscription-based replication supersedes it.
+- **Peer merge goes away.** The Plane-A peer-merge layer (`crates/flotilla-daemon/src/peer/`) stays bugfix-only and is deleted by this work, because whole-home log replication supersedes it.
 - **CLAUDE.md changes at the cut-over roll.** Its "Development Phase" rules (serde aliases and defaults, the JSON golden corpus) change to the schema-snapshot form in the same roll.
 - **Interactions are model-checked in Quint.** The exploratory specs (#3214) found the races ruled above. Minimal per-machine specs, replayed as traces against the engine (#3220), gate the implementation, which is split into PR stacks (#3215).

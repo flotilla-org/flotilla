@@ -117,6 +117,27 @@ The checks:
   ~75 GB / ~750 GB per day. Heartbeats are observations: latest value only, not durable
   history.
 
+## Whole-home change stream (#3463)
+
+Every host follows every other home's whole log. One coarse topic code is stored inline
+per event for later whole-topic partitioning; nothing filters on it yet. Keepalives and
+applied watermarks remain latest observations outside the durable log.
+
+This first implementation targets a home lab of a few hosts, including disconnected laptops,
+not the target or ceiling below. The [workload note](docs/implementation-choices/change-stream.md)
+sizes three hosts at an assumed aggregate 10 events/s and 1 KiB/event: approximately 6.7 KiB/s
+received and sent per host, with per-peer SQL page reads and encoding. A one-day laptop outage
+requires roughly 563 MiB of remote catch-up under those assumptions; a combined illustrative
+30,000-body dataset plus frozen objects needs about 159 MiB for a fresh snapshot. Receiver
+rounds stage to temporary disk before atomic apply. Full copies still accumulate about
+844 MiB/day of aggregate log data per host before indexes; measure actual widths and growth
+(#3425). These are planning assumptions, not benchmark results.
+
+This shape expires when the topology needs hubs and spokes: a desktop and a cloud host may
+replicate everything while laptops retain enough to work offline. Larger scales may partition
+writes with replicated read layers. Those later shapes are out of scope; this implementation
+makes no claim to serve the WORKLOAD target or ceiling.
+
 ## Usage
 
 | Operation | Arrival | Rate | Work per operation | Latency | Staleness tolerated |

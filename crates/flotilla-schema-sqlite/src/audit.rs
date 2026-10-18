@@ -29,6 +29,8 @@ pub fn audit_domains(conn: &Connection, kinds: &KindRegistry) -> Result<(), Stor
         ("resource_identity", "name", RESOURCE_NAME_DOMAIN),
         ("resource_identity", "home", HOME_DOMAIN),
         ("home_sequence", "home", HOME_DOMAIN),
+        ("stream_history", "home", HOME_DOMAIN),
+        ("stream_watermark", "home", HOME_DOMAIN),
         ("log", "home", HOME_DOMAIN),
         ("log", "writer", WRITER_DOMAIN),
     ] {

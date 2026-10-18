@@ -11,6 +11,7 @@ mod checkout_providers;
 mod credential_admission;
 mod credential_handoff;
 mod crew_lifecycle;
+mod decided_store;
 mod dispatch_board;
 mod host_admission;
 mod host_events;

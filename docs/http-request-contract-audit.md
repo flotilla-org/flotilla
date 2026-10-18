@@ -31,3 +31,14 @@ Docker process contract coverage belongs with that implementation; there is no
 remaining replication HTTP image caller or contract to claim here.
 
 CLAUDE.md now requires enforcing stand-ins or recorded replay for outbound HTTP; arbitrary-request mocks alone are insufficient. The exemptions above identify compatibility gaps explicitly, rather than treating response-only mocks as service contracts.
+
+
+### ADR 0064 change stream (#3463)
+
+`server/change_stream.rs` uses the forwarded Unix resource HTTP API. Its strict in-process
+stand-in enforces GET and the change-stream path and delivers fragmented CBOR frames through
+the real reqwest client. Duplex I/O covers the listener-independent HTTP response adapter.
+The same protocol source/follower is exercised over in-memory delivery with two and three
+registered stores. Point-read requests use the production `read_record` path, encode query parameters, and
+cover present/absent remote results and a local hit after replication. A paused HTTP download
+proves gates, another home's apply, and outgoing serving remain available before keepalive.

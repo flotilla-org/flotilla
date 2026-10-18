@@ -16,6 +16,8 @@ use flotilla_schema::{
     Identity, IndexQuery, Kind, KindCode, KindRegistry, Named, Origin, Row, RowEdit, RowPath, Rows, TableRole, Timestamp, Value,
     HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
 };
+use serde::{Deserialize, Serialize};
+
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{
@@ -24,10 +26,10 @@ use crate::{
     error::{Malformed, StoreError},
     query::{page_limit, Cursor, Page},
     shared::{
-        has_string_domain, schema_ddl, sync_views, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ,
-        IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE,
-        LOG_EXPUNGED_AFTER, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS,
-        STRING_ID, STRING_INSERT,
+        has_string_domain, schema_ddl, sync_views, FLOOR_GET, FLOOR_RAISE, HOME_IDS_RESET, HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET,
+        IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_ABOUT_AFTER,
+        LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE, LOG_EXPUNGED_AFTER, OBJECT_BYTES, OBJECT_EXISTS,
+        OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS, STRING_ID, STRING_INSERT, WATERMARK_PUT,
     },
     sql::{KindSql, TableSql},
 };
@@ -67,7 +69,7 @@ impl<K> Loaded<K> {
 
 /// A resource's stored rows, independent of local ids: snapshots of one resource in two
 /// databases compare equal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub kind: KindCode,
     pub name: String,
@@ -118,6 +120,7 @@ pub struct Store {
 
 struct Runtime {
     change_page_bytes: usize,
+    watermarks: crate::stream::Watermarks,
     home: String,
     kinds: KindRegistry,
     sql: BTreeMap<KindCode, KindSql>,
@@ -144,8 +147,25 @@ impl Store {
         }
         sync_views(&tx, &kinds)?;
         tx.commit()?;
+        Self::from_connection(conn, home, kinds, options)
+    }
+
+    pub(crate) fn open_reader(path: &std::path::Path, home: &str, kinds: KindRegistry) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::from_connection(conn, home, kinds, StoreOptions::default())
+    }
+
+    fn from_connection(conn: Connection, home: &str, kinds: KindRegistry, options: StoreOptions) -> Result<Self, StoreError> {
         let sql = kinds.iter().map(|set| (set.code, KindSql::render(set))).collect();
+        let watermarks = {
+            let mut statement = conn.prepare(crate::shared::WATERMARK_STARTUP)?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, crate::stream::Watermark { home_seq: row.get(1)?, applied_through: Timestamp(row.get(2)?) }))
+            })?;
+            rows.collect::<Result<HashMap<_, _>, _>>()?
+        };
         let runtime = Runtime {
+            watermarks: std::sync::Arc::new(std::sync::RwLock::new(watermarks)),
             home: home.to_owned(),
             kinds,
             sql,
@@ -163,6 +183,15 @@ impl Store {
     /// Foreign keys alone cannot detect an id from the wrong domain.
     pub fn audit_domains(&self) -> Result<(), StoreError> {
         crate::audit::audit_domains(&self.conn, &self.runtime.kinds)
+    }
+
+    pub(crate) fn watermarks(&self) -> crate::stream::Watermarks {
+        std::sync::Arc::clone(&self.runtime.watermarks)
+    }
+
+    /// Committed local gate input, independent of the store transaction lock.
+    pub fn applied_watermark(&self, home: &str) -> crate::stream::Watermark {
+        crate::stream::watermark(&self.runtime.watermarks, home)
     }
 
     pub fn home(&self) -> &str {
@@ -209,6 +238,28 @@ pub struct Read<'s> {
 }
 
 impl Read<'_> {
+    /// Applied prefix, or zero/epoch for an unseen home.
+    pub fn watermark(&mut self, home: &str) -> Result<crate::stream::Watermark, StoreError> {
+        self.ctx().watermark(home)
+    }
+    /// Minimum servable cursor, or zero for an unseen home. Only expunge raises it.
+    pub fn resume_floor(&mut self, home: &str) -> Result<u64, StoreError> {
+        self.ctx().resume_floor(home)
+    }
+    /// Bounded identity scan, including deleted resources, through the home/kind index.
+    pub fn identity_page(
+        &mut self,
+        home: &str,
+        kind: KindCode,
+        after: Option<ResourceId>,
+        limit: u32,
+    ) -> Result<Vec<ResourceId>, StoreError> {
+        self.ctx().identity_page(home, kind, after, limit)
+    }
+    pub fn identity(&mut self, id: ResourceId) -> Result<Option<(Identity, u64)>, StoreError> {
+        let mut ctx = self.ctx();
+        ctx.identity_of(id)?.map(|identity| Ok((identity, ctx.identity_seq(id)?))).transpose()
+    }
     fn ctx(&mut self) -> Ctx<'_> {
         // A read transaction sees only committed rows, so its ids go straight into the caches.
         Ctx { conn: &self.tx, runtime: &mut *self.runtime, pending: None }
@@ -226,6 +277,11 @@ impl Read<'_> {
 
     pub fn load_snapshot(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
         self.ctx().snapshot(id)
+    }
+    /// Streams one logical row at a time, including its objects, without materializing an
+    /// entire resource's append-only tables. Returns false for an identity without a body.
+    pub fn visit_snapshot(&mut self, id: ResourceId, emit: impl FnMut(Snapshot) -> Result<(), StoreError>) -> Result<bool, StoreError> {
+        self.ctx().visit_snapshot(id, emit)
     }
 
     /// Up to `limit` logged events of resource `id` after `after`, in sequence order: the tail that
@@ -277,6 +333,7 @@ impl Read<'_> {
 /// records insertion order so a failed write's entries can be rewound with its savepoint.
 #[derive(Default)]
 struct Pending {
+    watermarks: HashMap<String, crate::stream::Watermark>,
     strings: HashMap<StringKey, i64>,
     identities: HashMap<Identity, ResourceId>,
     ids: HashMap<ResourceId, Identity>,
@@ -284,14 +341,23 @@ struct Pending {
 }
 
 enum Journal {
+    Watermark(String, Option<crate::stream::Watermark>),
     String(StringKey),
     Identity(Identity, ResourceId),
 }
 
 impl Pending {
     fn rewind(&mut self, mark: usize) {
-        for entry in self.journal.drain(mark..) {
+        for entry in self.journal.drain(mark..).rev() {
             match entry {
+                Journal::Watermark(home, previous) => match previous {
+                    Some(mark) => {
+                        self.watermarks.insert(home, mark);
+                    }
+                    None => {
+                        self.watermarks.remove(&home);
+                    }
+                },
                 Journal::String(string) => {
                     self.strings.remove(&string);
                 }
@@ -311,6 +377,158 @@ pub struct Write<'s> {
 }
 
 impl Write<'_> {
+    /// Installs the next snapshot row. The home snapshot transaction encloses all chunks.
+    pub fn restore_chunk(&mut self, chunk: &Snapshot) -> Result<(), StoreError> {
+        self.guarded(|ctx| {
+            let count = ctx.sql(chunk.kind)?.tables.len();
+            if chunk.rows.tables.len() != count || chunk.rows.tables.iter().map(Vec::len).sum::<usize>() != 1 {
+                return Err(StoreError::Stream("snapshot chunk must contain exactly one row".into()));
+            }
+            if !chunk.rows.tables[0].is_empty() {
+                ctx.restore(chunk)?;
+                return Ok(());
+            }
+            let identity = Identity { kind: chunk.kind, name: chunk.name.clone(), home: chunk.home.clone() };
+            if identity.home == ctx.runtime.home {
+                return Err(StoreError::OwnHome { home: identity.home });
+            }
+            let id = ctx.resolve(&identity)?.ok_or_else(|| StoreError::Stream("snapshot child precedes root".into()))?;
+            if ctx.identity_seq(id)? != chunk.version {
+                return Err(StoreError::Stream("snapshot chunk version changed".into()));
+            }
+            let sequence = i64::try_from(chunk.version).map_err(|_| Malformed::Sequence { home_seq: chunk.version })?;
+            let mut ops = Vec::new();
+            for (table, rows) in chunk.rows.tables.iter().enumerate() {
+                for row in rows {
+                    ops.push(Op::Insert { table, key: row.key.clone(), values: row.values.clone() });
+                }
+            }
+            ctx.put_objects(&chunk.rows.objects)?;
+            ctx.check_objects(&ops, &chunk.rows.objects)?;
+            ctx.execute(chunk.kind, id, &ops, sequence, Some(sequence))?;
+            Ok(())
+        })
+    }
+    pub(crate) fn stream_watermark(&mut self, home: &str) -> Result<crate::stream::Watermark, StoreError> {
+        self.ctx().watermark(home)
+    }
+
+    /// Advances only a completely applied prefix; regression and progress ahead of rows fail.
+    pub fn advance_watermark(&mut self, home: &str, mark: crate::stream::Watermark) -> Result<(), StoreError> {
+        self.guarded(|ctx| {
+            if home == ctx.runtime.home {
+                return Err(StoreError::OwnHome { home: home.to_owned() });
+            }
+            let current = ctx.watermark(home)?;
+            if mark.home_seq < current.home_seq
+                || mark.applied_through < current.applied_through
+                || mark.home_seq > ctx.last_sequence(home)?
+            {
+                return Err(StoreError::Stream("watermark regressed or exceeds applied rows".into()));
+            }
+            let home_name = home.to_owned();
+            let home = ctx.intern(HOME_DOMAIN, home)?;
+            let seq = i64::try_from(mark.home_seq).map_err(|_| Malformed::Sequence { home_seq: mark.home_seq })?;
+            if mark.home_seq > current.home_seq {
+                let logged = ctx.conn.prepare_cached(LOG_CAUSE)?.query_row(params![home, seq], |_| Ok(())).optional()?.is_some();
+                if mark.home_seq != current.home_seq + 1 || !logged {
+                    return Err(StoreError::Stream("watermark would skip an unapplied prefix".into()));
+                }
+            }
+            ctx.conn.prepare_cached(WATERMARK_PUT)?.execute(params![home, seq, mark.applied_through.micros()])?;
+            ctx.remember_watermark(home_name, mark);
+            Ok(())
+        })
+    }
+    /// Starts replacement of another home's snapshot, atomically with its installation.
+    pub fn reset_replica(&mut self, home: &str) -> Result<(), StoreError> {
+        self.guarded(|ctx| {
+            if home == ctx.runtime.home {
+                return Err(StoreError::OwnHome { home: home.into() });
+            }
+            let kinds: Vec<_> = ctx.runtime.kinds.iter().map(|set| set.code).collect();
+            for kind in kinds {
+                let mut after = None;
+                loop {
+                    let ids = ctx.identity_page(home, kind, after, crate::MAX_PAGE)?;
+                    if ids.is_empty() {
+                        break;
+                    }
+                    for id in &ids {
+                        let sql = ctx.sql(kind)?;
+                        let version: Option<i64> =
+                            ctx.conn.prepare_cached(&sql.root_version)?.query_row([id.0], |row| row.get(0)).optional()?;
+                        if let Some(version) = version {
+                            ctx.conn.prepare_cached(&sql.root_delete)?.execute(params![id.0, version])?;
+                        }
+                    }
+                    after = ids.last().copied();
+                }
+            }
+            if let Some(home) = ctx.string_id(HOME_DOMAIN, home)? {
+                for sql in [HOME_LOG_CLEAR, HOME_IDS_RESET, HOME_SEQ_RESET, HOME_MARK_RESET] {
+                    ctx.conn.prepare_cached(sql)?.execute([home])?;
+                }
+            }
+            ctx.remember_watermark(home.to_owned(), crate::stream::Watermark::ZERO);
+            Ok(())
+        })
+    }
+    /// Seeds an identity without a live body (including retained deletion tombstones).
+    pub fn restore_identity(&mut self, identity: &Identity, home_seq: u64) -> Result<(), StoreError> {
+        self.guarded(|ctx| {
+            if identity.home == ctx.runtime.home {
+                return Err(StoreError::OwnHome { home: identity.home.clone() });
+            }
+            ctx.sql(identity.kind)?;
+            let id = ctx.ensure_identity(identity)?;
+            let seq = i64::try_from(home_seq).map_err(|_| Malformed::Sequence { home_seq })?;
+            ctx.set_identity_seq(id, seq)
+        })
+    }
+    /// Commits the snapshot cut even if its last event was an expunge or it was empty.
+    pub fn finish_snapshot(&mut self, home: &str, home_seq: u64) -> Result<(), StoreError> {
+        self.guarded(|ctx| {
+            if home == ctx.runtime.home {
+                return Err(StoreError::OwnHome { home: home.into() });
+            }
+            // Identities that the replacement did not write remain at zero. Remove obsolete
+            // unreferenced identities too; retain referenced placeholders while other homes lag.
+            let kinds: Vec<_> = ctx.runtime.kinds.iter().map(|set| set.code).collect();
+            for kind in kinds {
+                let mut after = None;
+                loop {
+                    let ids = ctx.identity_page(home, kind, after, crate::MAX_PAGE)?;
+                    if ids.is_empty() {
+                        break;
+                    }
+                    after = ids.last().copied();
+                    for id in ids {
+                        if ctx.identity_seq(id)? == 0 {
+                            if let Some(identity) = ctx.identity_of(id)? {
+                                match ctx.remove_identity(id, &identity) {
+                                    Err(StoreError::Referenced { .. }) => {}
+                                    result => result?,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let current = ctx.watermark(home)?;
+            if home_seq < current.home_seq {
+                return Err(StoreError::Stream("snapshot cut regressed".into()));
+            }
+            let home_name = home.to_owned();
+            let home = ctx.intern(HOME_DOMAIN, home)?;
+            let seq = i64::try_from(home_seq).map_err(|_| Malformed::Sequence { home_seq })?;
+            ctx.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, seq])?;
+            let mark = crate::stream::Watermark { home_seq, ..current };
+            ctx.conn.prepare_cached(WATERMARK_PUT)?.execute(params![home, seq, mark.applied_through.micros()])?;
+            ctx.remember_watermark(home_name, mark);
+            Ok(())
+        })
+    }
     fn ctx(&mut self) -> Ctx<'_> {
         Ctx { conn: &self.tx, runtime: &mut *self.runtime, pending: Some(&mut self.pending) }
     }
@@ -318,6 +536,15 @@ impl Write<'_> {
     /// Runs one write inside a savepoint, so a refused write leaves the transaction (and the id
     /// overlay) as it was and later writes in the same transaction still commit.
     fn guarded<R>(&mut self, op: impl FnOnce(&mut Ctx<'_>) -> Result<R, StoreError>) -> Result<R, StoreError> {
+        // These are optional ID lookup caches, not transaction state. A large streamed
+        // snapshot must not retain one cache/journal entry for every row until commit.
+        // SQLite remains the source of truth inside this transaction; marks stay pending.
+        if self.pending.journal.len() >= 4096 {
+            self.pending.strings.clear();
+            self.pending.identities.clear();
+            self.pending.ids.clear();
+            self.pending.journal.clear();
+        }
         let mark = self.pending.journal.len();
         let savepoint = self.tx.savepoint()?;
         let result = op(&mut Ctx { conn: &savepoint, runtime: &mut *self.runtime, pending: Some(&mut self.pending) });
@@ -476,7 +703,8 @@ impl Write<'_> {
 
     pub fn commit(self) -> Result<(), StoreError> {
         self.tx.commit()?;
-        let Pending { strings, identities, ids, .. } = self.pending;
+        let Pending { strings, identities, ids, watermarks, .. } = self.pending;
+        self.runtime.watermarks.write().unwrap_or_else(std::sync::PoisonError::into_inner).extend(watermarks);
         for (string, id) in strings {
             self.runtime.strings.insert(string, id);
         }
@@ -528,6 +756,7 @@ pub struct AboutPage {
 
 /// An entry's header columns.
 struct Header {
+    topic: Code,
     cause: Cause,
     writer: String,
     at: Timestamp,
@@ -537,6 +766,7 @@ struct Header {
 
 /// One `log` row as read back, in the shared select's column order.
 struct LogRow {
+    topic: String,
     rowid: i64,
     home_seq: i64,
     resource: Option<i64>,
@@ -556,6 +786,7 @@ struct LogRow {
 impl LogRow {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogRow> {
         Ok(LogRow {
+            topic: row.get(14)?,
             rowid: row.get(0)?,
             home_seq: row.get(1)?,
             resource: row.get(2)?,
@@ -595,6 +826,33 @@ pub(crate) struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    fn remember_watermark(&mut self, home: String, mark: crate::stream::Watermark) {
+        if let Some(pending) = &mut self.pending {
+            let previous = pending.watermarks.insert(home.clone(), mark);
+            pending.journal.push(Journal::Watermark(home, previous));
+        }
+    }
+    fn watermark(&mut self, home: &str) -> Result<crate::stream::Watermark, StoreError> {
+        Ok(self
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.watermarks.get(home))
+            .copied()
+            .unwrap_or_else(|| crate::stream::watermark(&self.runtime.watermarks, home)))
+    }
+
+    fn resume_floor(&mut self, home: &str) -> Result<u64, StoreError> {
+        let Some(home) = self.string_id(HOME_DOMAIN, home)? else { return Ok(0) };
+        Ok(self.conn.prepare_cached(FLOOR_GET)?.query_row([home], |row| row.get(0)).optional()?.unwrap_or(0))
+    }
+    fn identity_page(&mut self, home: &str, kind: KindCode, after: Option<ResourceId>, limit: u32) -> Result<Vec<ResourceId>, StoreError> {
+        let limit = page_limit(limit)?;
+        let Some(home) = self.string_id(HOME_DOMAIN, home)? else { return Ok(Vec::new()) };
+        let mut statement = self.conn.prepare_cached(IDENTITIES_PAGE)?;
+        let rows = statement
+            .query_map(params![home, kind.as_str(), after.map_or(0, |id| id.0), limit], |row| row.get::<_, i64>(0).map(ResourceId))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
     pub(crate) fn sql(&self, code: KindCode) -> Result<&KindSql, StoreError> {
         self.runtime.sql.get(&code).ok_or(StoreError::UnknownKind { code })
     }
@@ -804,7 +1062,14 @@ impl Ctx<'_> {
         }
         let hashes: BTreeSet<Hash> = rows.tables.iter().flatten().flat_map(|row| set_objects(None, row)).collect();
         let effect = Effect { changes, objects: carried(hashes, rows.objects)?, expunged: None };
-        let header = Header { cause: Cause::Create, writer: origin.writer, at: origin.at, about: None, payload: origin.payload };
+        let header = Header {
+            topic: Code::new("all"),
+            cause: Cause::Create,
+            writer: origin.writer,
+            at: origin.at,
+            about: None,
+            payload: origin.payload,
+        };
         self.write_local(K::CODE, id, header, effect, (sequence, version), None)?;
         Ok(Stamp { id, version })
     }
@@ -877,7 +1142,14 @@ impl Ctx<'_> {
         let hashes = changed.chain(root).flat_map(|(before, after)| set_objects(before, after)).collect();
         let effect = Effect { changes, objects: carried(hashes, new_objects)?, expunged: None };
         let (sequence, version) = self.next_sequence()?;
-        let header = Header { cause: Cause::Edit, writer: origin.writer, at: origin.at, about: None, payload: origin.payload };
+        let header = Header {
+            topic: Code::new("all"),
+            cause: Cause::Edit,
+            writer: origin.writer,
+            at: origin.at,
+            about: None,
+            payload: origin.payload,
+        };
         if !self.write_local(K::CODE, current.id, header, effect, (sequence, version), Some(expected))? {
             return Err(self.stale::<K>(current));
         }
@@ -1019,7 +1291,8 @@ impl Ctx<'_> {
         }
         let (sequence, version) = self.next_sequence()?;
         let cause = Cause::Edge { edge: event.edge, from: event.from, to: event.to };
-        let header = Header { cause, writer: event.writer, at: event.at, about: event.about, payload: Some(event.payload) };
+        let header =
+            Header { topic: Code::new("all"), cause, writer: event.writer, at: event.at, about: event.about, payload: Some(event.payload) };
         let effect = Effect { changes, objects, expunged: None };
         if !self.write_local(K::CODE, current.id, header, effect, (sequence, version), Some(expected))? {
             return Err(self.stale::<K>(current));
@@ -1065,7 +1338,14 @@ impl Ctx<'_> {
         self.owned::<K>(current.id)?;
         let expected = expected_version(current)?;
         let (sequence, version) = self.next_sequence()?;
-        let header = Header { cause: Cause::Delete, writer: origin.writer, at: origin.at, about: None, payload: origin.payload };
+        let header = Header {
+            topic: Code::new("all"),
+            cause: Cause::Delete,
+            writer: origin.writer,
+            at: origin.at,
+            about: None,
+            payload: origin.payload,
+        };
         if !self.write_local(K::CODE, current.id, header, Effect::default(), (sequence, version), Some(expected))? {
             return Err(self.stale::<K>(current));
         }
@@ -1081,7 +1361,14 @@ impl Ctx<'_> {
         }
         let (sequence, version) = self.next_sequence()?;
         let prev_seq = self.identity_seq(id)?;
-        let header = Header { cause: Cause::Expunge, writer: origin.writer, at: origin.at, about: None, payload: origin.payload };
+        let header = Header {
+            topic: Code::new("all"),
+            cause: Cause::Expunge,
+            writer: origin.writer,
+            at: origin.at,
+            about: None,
+            payload: origin.payload,
+        };
         self.remove_identity(id, &identity)?;
         let effect = Effect { expunged: Some(identity.clone()), ..Effect::default() };
         let bytes = effect.encode()?;
@@ -1092,6 +1379,11 @@ impl Ctx<'_> {
     /// Deletes an identity's log entries, then the identity: entries about it keep their rows,
     /// their `about` set to null. A row of another resource still referencing it is `Referenced`.
     fn remove_identity(&mut self, id: ResourceId, identity: &Identity) -> Result<(), StoreError> {
+        let removed: Option<i64> = self.conn.prepare_cached(REMOVED_MAX)?.query_row([id.0], |row| row.get(0))?;
+        if let Some(removed) = removed {
+            let home = self.intern(HOME_DOMAIN, &identity.home)?;
+            self.conn.prepare_cached(FLOOR_RAISE)?.execute(params![home, removed])?;
+        }
         self.conn.prepare_cached(LOG_EXPUNGE)?.execute([id.0])?;
         match self.conn.prepare_cached(IDENTITY_DELETE)?.execute([id.0]) {
             Err(rusqlite::Error::SqliteFailure(error, _)) if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY => {
@@ -1214,6 +1506,7 @@ impl Ctx<'_> {
         }
         let bytes = event.effect.encode()?;
         let header = Header {
+            topic: event.topic,
             cause: event.cause,
             writer: event.writer.clone(),
             at: event.at,
@@ -1259,8 +1552,14 @@ impl Ctx<'_> {
             }
             self.remove_identity(id, &identity)?;
         }
-        let header =
-            Header { cause: Cause::Expunge, writer: event.writer.clone(), at: event.at, about: None, payload: event.payload.clone() };
+        let header = Header {
+            topic: event.topic,
+            cause: Cause::Expunge,
+            writer: event.writer.clone(),
+            at: event.at,
+            about: None,
+            payload: event.payload.clone(),
+        };
         let bytes = event.effect.encode()?;
         self.append_log(&event.home, None, header, event.prev_seq, sequence, &bytes)?;
         let home = self.intern(HOME_DOMAIN, &event.home)?;
@@ -1346,7 +1645,8 @@ impl Ctx<'_> {
             writer,
             header.at.micros(),
             header.payload,
-            effect
+            effect,
+            header.topic.as_str()
         ])?;
         Ok(())
     }
@@ -1553,6 +1853,7 @@ impl Ctx<'_> {
         let about = row.about.map(|id| self.identity_of(ResourceId(id))?.ok_or_else(|| corrupt("about"))).transpose()?;
         let sequence = |value: i64, column: &str| u64::try_from(value).map_err(|_| corrupt(column));
         let event = Event {
+            topic: Code::parse(&row.topic).map_err(|_| corrupt("topic"))?,
             kind: identity.kind,
             name: identity.name,
             home: row.home,
@@ -1598,6 +1899,32 @@ impl Ctx<'_> {
         let (name, home, version) = (snapshot.name.clone(), snapshot.home.clone(), snapshot.version);
         let value = snapshot.into_value::<K>()?;
         Ok(Some(Loaded { id, name, home, version, value }))
+    }
+
+    fn visit_snapshot(&mut self, id: ResourceId, mut emit: impl FnMut(Snapshot) -> Result<(), StoreError>) -> Result<bool, StoreError> {
+        let Some(identity) = self.identity_of(id)? else { return Ok(false) };
+        let version = self.identity_seq(id)?;
+        let tables = self.sql(identity.kind)?.tables.len();
+        let mut live = false;
+        let conn = self.conn;
+        for table in 0..tables {
+            let select = self.sql(identity.kind)?.tables[table].select.clone();
+            let columns = self.sql(identity.kind)?.tables[table].columns.len();
+            let mut statement = conn.prepare_cached(&select)?;
+            let mut raw = statement.query([id.0])?;
+            while let Some(row) = raw.next()? {
+                live = true;
+                let start = usize::from(table == 0);
+                let values = (start..columns + start).map(|column| row.get::<_, SqlValue>(column)).collect::<Result<Vec<_>, _>>()?;
+                let mut rows = Rows::with_tables(tables);
+                rows.tables[table].push(self.logical_row(identity.kind, table, values, &mut rows.objects)?);
+                emit(Snapshot { kind: identity.kind, name: identity.name.clone(), home: identity.home.clone(), version, rows })?;
+            }
+            if table == 0 && !live {
+                return Ok(false);
+            }
+        }
+        Ok(live)
     }
 
     /// The root row and every child row of one resource, each read by primary key.

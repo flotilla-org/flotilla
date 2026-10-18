@@ -143,16 +143,17 @@ impl Value {
 
 /// One row of one table. The key excludes the owner id: the root row's key is empty, and a child
 /// row's key is its parent's key followed by its own key values.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Row {
     pub key: Vec<Value>,
     pub values: Vec<Value>,
 }
 
 /// Every row of one resource, per table in pre-order, plus the frozen objects its rows name.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rows {
     pub tables: Vec<Vec<Row>>,
+    #[serde(with = "crate::event::objects")]
     pub objects: BTreeMap<Hash, Vec<u8>>,
 }
 

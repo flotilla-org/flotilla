@@ -18,6 +18,8 @@ mod renames;
 mod representation;
 mod round_trip;
 mod states;
+mod stream;
+mod stream_schema;
 mod tables;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;

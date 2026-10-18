@@ -97,6 +97,8 @@ fn audit_detects_wrong_domains_in_kind_and_shared_columns() {
         ("resource_identity", "name"),
         ("resource_identity", "home"),
         ("home_sequence", "home"),
+        ("stream_history", "home"),
+        ("stream_watermark", "home"),
         ("log", "home"),
         ("log", "writer"),
     ] {
@@ -108,6 +110,13 @@ fn audit_detects_wrong_domains_in_kind_and_shared_columns() {
         write.commit().expect("commit");
         store.audit_domains().expect("valid domains");
         let conn = store.into_connection();
+        if table == "stream_history" {
+            conn.execute("INSERT INTO stream_history(home,home_seq) SELECT id,0 FROM strings WHERE domain='hm'", []).expect("history");
+        }
+        if table == "stream_watermark" {
+            conn.execute("INSERT INTO stream_watermark(home,home_seq,applied_through) SELECT id,0,0 FROM strings WHERE domain='hm'", [])
+                .expect("watermark");
+        }
         conn.execute("INSERT INTO strings(domain,s) VALUES ('wrong','x')", []).expect("wrong domain");
         // Foreign keys remain enabled: the injected dictionary id exists, so FK checks
         // succeed even though its domain disagrees with the referencing column.

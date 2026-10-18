@@ -610,14 +610,25 @@ impl PeerRuntime {
                 replication_options,
             );
 
+            let mut decided_followers: HashMap<NodeId, (u64, tokio_util::task::AbortOnDropHandle<()>)> = HashMap::new();
             while let Some(event) = peer_connected_rx.recv().await {
                 match event {
                     PeerConnectionEvent::Connected(notice) => {
                         debug!(peer = %notice.peer, generation = notice.generation, "starting peer resource replication");
+                        if decided_followers.get(&notice.peer).is_none_or(|(generation, _)| *generation < notice.generation) {
+                            if let (Ok(service), Some(socket)) = (outbound_daemon.decided_store(), notice.resource_socket_path.clone()) {
+                                let task = super::change_stream::follow(service, notice.peer.as_str().to_owned(), socket);
+                                decided_followers
+                                    .insert(notice.peer.clone(), (notice.generation, tokio_util::task::AbortOnDropHandle::new(task)));
+                            }
+                        }
                         peer_replicators.peer_connected(notice.peer.clone(), notice.generation, notice.resource_socket_path).await;
                         send_link_state(&outbound_daemon, &outbound_peer_manager, &notice.peer, notice.generation).await;
                     }
                     PeerConnectionEvent::Disconnected { peer, generation } => {
+                        if decided_followers.get(&peer).is_some_and(|(current, _)| *current == generation) {
+                            decided_followers.remove(&peer);
+                        }
                         peer_replicators.peer_disconnected(&peer, generation);
                     }
                 }

@@ -1385,6 +1385,7 @@ impl flotilla_vcs::vcs::CheckoutVcsResolver for InProcessDaemon {
 use flotilla_projections::dispatch_board::DispatchBoardInputs;
 
 pub struct InProcessDaemon {
+    decided_store: std::sync::Mutex<Option<Arc<flotilla_schema_sqlite::stream::Service>>>,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
     event_source: Arc<BroadcastEventSink>,
@@ -1998,6 +1999,7 @@ impl InProcessDaemon {
             daemon_socket_path: RwLock::new(None),
             clock: Arc::clone(&clock),
             regard_lifecycle: Arc::clone(&regard_lifecycle),
+            decided_store: Default::default(),
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
@@ -2778,6 +2780,30 @@ impl InProcessDaemon {
 
     pub async fn aggregator_projection_state(&self) -> AggregatorProjectionState {
         self.aggregator_projection_state.clone()
+    }
+
+    /// Installs the registered ADR 0064 store during composition, before peer tasks start.
+    /// Kind migrations supply their registry without coupling this layer to machine kinds.
+    pub fn install_decided_store(&self, service: Arc<flotilla_schema_sqlite::stream::Service>) -> Result<(), String> {
+        if !service.with_store(|store| Ok(store.kinds().iter().next().is_some())).map_err(|error| error.to_string())? {
+            return Err("decided store has no registered kinds".into());
+        }
+        let mut slot = self.decided_store.lock().map_err(|_| "decided-store lock poisoned".to_owned())?;
+        if slot.is_some() {
+            return Err("decided store is already open".into());
+        }
+        *slot = Some(service);
+        Ok(())
+    }
+
+    /// Present only after the first kind migration installs its registered store.
+    pub fn decided_store(&self) -> Result<Arc<flotilla_schema_sqlite::stream::Service>, String> {
+        self.decided_store
+            .lock()
+            .map_err(|_| "decided-store lock poisoned".to_owned())?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "decided store unavailable".to_owned())
     }
 
     pub fn resource_backend(&self) -> ResourceBackend {

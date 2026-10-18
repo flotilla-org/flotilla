@@ -1,5 +1,6 @@
 use flotilla_store_sqlite::SqliteBackend;
 mod caller;
+pub mod change_stream;
 mod client_connection;
 mod environment_connection;
 pub mod environment_sockets;

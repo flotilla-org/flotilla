@@ -92,6 +92,7 @@ fn sequence(tc: &TestCase) -> u64 {
 #[hegel::test]
 fn events_round_trip_through_cbor(tc: TestCase) {
     let event = Event {
+        topic: flotilla_schema::Code::new("all"),
         kind: KindCode::new(tc.draw(gs::sampled_from(vec!["a", "k1", "zz_9", "abcdefgh"]))),
         name: name(&tc),
         home: name(&tc),

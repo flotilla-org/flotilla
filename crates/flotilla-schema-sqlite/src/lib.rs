@@ -42,6 +42,8 @@ mod shared;
 mod sql;
 mod store;
 
+pub mod stream;
+
 pub use audit::audit_domains;
 pub use error::{Malformed, StoreError};
 pub use query::{Cursor, Page, MAX_PAGE};
