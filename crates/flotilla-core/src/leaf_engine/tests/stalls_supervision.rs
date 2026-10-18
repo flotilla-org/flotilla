@@ -1725,3 +1725,48 @@ async fn a_launched_role_that_declares_a_promise_owes_a_report() {
     }
     assert!(convoys.get("stalled-work").await.unwrap().status.unwrap().stalled.is_some());
 }
+
+// Resolving an explicit stall with guidance assigns a report even if the role
+// was only launched before stalling. Silence after that resume must be judged.
+#[tokio::test]
+async fn resumed_explicit_stall_without_claim_still_owes_a_report() {
+    let (backend, wake, _) = idle_nudge_scenario().await;
+    wake.subscriptions.inner.rows.lock().await.clear();
+    update_convoy(&backend, "stalled-work", |status| {
+        let member = &mut status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0];
+        member.promises.clear();
+        member.completion_conditions.clear();
+        let at = Utc::now();
+        flotilla_resources::ConvoyStatusPatch::MarkCrewStalled {
+            convoy: "stalled-work".into(),
+            vessel: "work".into(),
+            role: "coder".into(),
+            at,
+            reason: flotilla_resources::StallReason::Decision,
+            proposed_disposition: None,
+            message: "Need guidance".into(),
+        }
+        .apply(status);
+        assert!(!status.crew_work["work"]["coder"].task_assigned);
+        flotilla_resources::ConvoyStatusPatch::ResumeCrewWork {
+            vessel: "work".into(),
+            role: "coder".into(),
+            resumed_at: at,
+            prompt: "Continue with this guidance".into(),
+            brief_id: None,
+            intent: ResumeIntent::Reopen,
+        }
+        .apply(status);
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+        assert!(status.crew_work["work"]["coder"].task_assigned);
+    })
+    .await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.expect("convoy"))]);
+    wake.sync_rows("flotilla", &objects).await.expect("sync");
+    let now = Utc::now();
+    for second in [0, 60, 120, 180, 900, 1800] {
+        observe_actor(&backend, &wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
+    }
+    assert!(convoys.get("stalled-work").await.unwrap().status.unwrap().stalled.is_some());
+}
