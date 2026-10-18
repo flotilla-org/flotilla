@@ -6,7 +6,7 @@
 //! written to disk.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -40,12 +40,11 @@ impl DummyCheckouts {
         self.lock().retain(|(owner, _), _| owner != environment);
     }
 
-    pub(crate) fn remaining_for(&self, convoy: &str) -> Vec<String> {
+    pub(crate) fn remaining_for(&self, convoy: &str, environments: &HashSet<String>) -> Vec<String> {
         let prefix = format!("dummy/{convoy}/");
-        let environment_prefix = format!("env-{convoy}-");
         self.lock()
             .iter()
-            .filter(|((environment, _), branch)| environment.starts_with(&environment_prefix) || branch.starts_with(&prefix))
+            .filter(|((environment, _), branch)| environments.contains(environment) || branch.starts_with(&prefix))
             .map(|((environment, path), _)| format!("live checkout {environment}:{}", path.display()))
             .collect()
     }
@@ -234,10 +233,34 @@ mod cleanup_tests {
         let checkouts = DummyCheckouts::default();
         checkouts.lock().insert(("one".into(), "/workspace/one".into()), "dummy/convoy-a/main".into());
         checkouts.lock().insert(("two".into(), "/workspace/two".into()), "dummy/convoy-b/main".into());
-        assert_eq!(checkouts.remaining_for("convoy-a").len(), 1);
+        assert_eq!(checkouts.remaining_for("convoy-a", &HashSet::new()).len(), 1);
         checkouts.destroy_environment("one");
         checkouts.destroy_environment("one");
-        assert!(checkouts.remaining_for("convoy-a").is_empty());
-        assert_eq!(checkouts.remaining_for("convoy-b").len(), 1);
+        assert!(checkouts.remaining_for("convoy-a", &HashSet::new()).is_empty());
+        assert_eq!(checkouts.remaining_for("convoy-b", &HashSet::new()).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use flotilla_config::dummy_fleet::DummyFleetConfig;
+    use hegel::generators as gs;
+
+    use super::*;
+
+    // Hyphenated convoy names can be prefixes of other names. Cleanup must
+    // identify their exact catalogue environments, even on non-dummy branches.
+    #[hegel::test]
+    fn cleanup_distinguishes_convoys_whose_names_extend_each_other(tc: hegel::TestCase) {
+        let number = tc.draw(gs::integers::<u32>().min_value(0).max_value(100_000));
+        let convoy = format!("load-{number}");
+        let other = format!("{convoy}-2");
+        let fleet = DummyFleet::new(DummyFleetConfig::default());
+        fleet.checkouts.lock().insert((format!("env-{convoy}-implement"), "/own".into()), "main".into());
+        fleet.checkouts.lock().insert((format!("env-{other}-implement"), "/other".into()), "main".into());
+        let remaining = fleet.remaining_for(&convoy);
+        assert_eq!(remaining.len(), 1, "{remaining:?}");
+        assert!(remaining[0].ends_with(":/own"));
+        assert_eq!(fleet.remaining_for(&other).len(), 1);
     }
 }

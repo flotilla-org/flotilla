@@ -27,6 +27,9 @@
 //! holds that much memory, so a plan the host cannot hold reports how far it
 //! got. Progress lines every 30 s survive a run the host kills.
 //!
+//! Dirty-run JSON includes the full tracked `git diff HEAD`; inspect it before
+//! sharing a report, or run from a clean commit to omit the diff.
+//!
 //! This is its own test target: it reads the process's resident memory, which
 //! other tests in a shared binary would distort.
 
@@ -460,12 +463,8 @@ fn dummy_fleet_settings() -> String {
     )
 }
 
-// Behaviour (#3206): the driver keeps convoys of every mix running against the
-// current control plane through the dummy fleet, and each delivers.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn load_driver_smoke() {
-    let fleet = InProcessFleet::start(1, &dummy_fleet_settings()).await;
-    let plan = LoadPlan {
+fn smoke_plan() -> LoadPlan {
+    LoadPlan {
         running: 10,
         warmup_ended: 0,
         drain: Duration::from_secs(180),
@@ -477,7 +476,15 @@ async fn load_driver_smoke() {
         tick: Duration::from_millis(200),
         series_every: Duration::from_secs(5),
         ..LoadPlan::default()
-    };
+    }
+}
+
+// Behaviour (#3206): the driver keeps convoys of every mix running against the
+// current control plane through the dummy fleet, and each delivers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn load_driver_smoke() {
+    let fleet = InProcessFleet::start(1, &dummy_fleet_settings()).await;
+    let plan = smoke_plan();
     let report = flotilla_load_driver::run(&fleet, &plan).await.expect("load report");
     eprintln!("{}", report.markdown());
     assert!(report.ramp.reached, "{:?}", report.ramp);
@@ -526,6 +533,8 @@ async fn load_baseline() {
     };
     // Capture source identity before the run, so a later checkout change does
     // not relabel a measurement. Preserve dirty patches in the JSON report.
+    // Deliberate harness/build identity tooling: the Git boundary permits this
+    // test target to invoke Git directly, rather than going through VCS adapters.
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git").args(args).output().expect("source identity");
         assert!(output.status.success(), "git source identity failed");
@@ -613,19 +622,9 @@ async fn receiver_snapshot_decode_measurement() {
     use flotilla_store_testkit::ReadCountsBackendExt;
 
     let fleet = InProcessFleet::start(1, &dummy_fleet_settings()).await;
-    let plan = LoadPlan {
-        running: 10,
-        warmup_ended: 0,
-        drain: Duration::from_secs(180),
-        ramp_per_second: 6.0,
-        dispatch_concurrency: 6,
-        window: Duration::from_secs(25),
-        max_ramp: Duration::from_secs(30),
-        convoy_deadline: Duration::from_secs(120),
-        tick: Duration::from_millis(200),
-        series_every: Duration::from_secs(5),
-        ..LoadPlan::default()
-    };
+    // This probe freezes active crew records for decoder comparisons. Reuse
+    // the small fleet settings while deliberately leaving its tail open.
+    let plan = LoadPlan { drain: Duration::ZERO, ..smoke_plan() };
     let report = flotilla_load_driver::run(&fleet, &plan).await.expect("load report");
     assert!(report.ramp.reached, "{:?}", report.ramp);
     assert!(report.window.delivered >= 3, "{:?}", report.window);

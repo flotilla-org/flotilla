@@ -1,7 +1,7 @@
 //! The fleet hub shared by every dummy provider a daemon installs.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock, Weak,
@@ -16,7 +16,7 @@ use flotilla_protocol::{commands::CommandValue, query::CrewCommandContext, Comma
 use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
 use tokio::sync::{broadcast::error::RecvError, oneshot};
 
-use crate::{forge::DummyForge, shared_forge::SharedForge, terminal::DummySessions, vcs::DummyCheckouts};
+use crate::{catalog::CrewMix, forge::DummyForge, shared_forge::SharedForge, terminal::DummySessions, vcs::DummyCheckouts};
 
 /// How a dummy crew reaches its daemon: the same commands a real crew sends
 /// through `flotilla crew …`, without a socket or a process.
@@ -49,6 +49,7 @@ pub struct DummyFleet {
     pub(crate) checkouts: DummyCheckouts,
     port: OnceLock<Arc<dyn CrewCommandPort>>,
     counters: Counters,
+    vessel_names: BTreeSet<String>,
     command_error_samples: Mutex<Vec<String>>,
 }
 
@@ -66,7 +67,13 @@ impl DummyFleet {
 
     fn build(config: DummyFleetConfig, http: Option<Arc<dyn HttpClient>>) -> Arc<Self> {
         let shared_forge = config.shared_forge.clone().zip(http).map(|(shared, http)| Arc::new(SharedForge::new(shared, http)));
+        let vessel_names = CrewMix::ALL
+            .into_iter()
+            .flat_map(|mix| mix.workflow(config.agent.long_runner_turns).vessels)
+            .map(|vessel| vessel.name)
+            .collect();
         Arc::new(Self {
+            vessel_names,
             forge: DummyForge::new(&config),
             shared_forge,
             sessions: DummySessions::default(),
@@ -135,7 +142,10 @@ impl DummyFleet {
     /// Provider-side artifacts survive resource deletion if teardown is broken.
     pub fn remaining_for(&self, convoy: &str) -> Vec<String> {
         let mut remaining = self.sessions.remaining_for(convoy);
-        remaining.extend(self.checkouts.remaining_for(convoy));
+        // The catalogue defines complete environment identities. Prefix matching
+        // cannot separate a convoy from another whose name extends it with '-'.
+        let environments = self.vessel_names.iter().map(|vessel| format!("env-{convoy}-{vessel}")).collect::<HashSet<_>>();
+        remaining.extend(self.checkouts.remaining_for(convoy, &environments));
         remaining
     }
 

@@ -114,6 +114,9 @@ async fn run_delivery(
                 }
             } => { metrics.requeues.increment(); }
         }
+        // Dirty-bit and timestamp updates are independent: a wake racing this
+        // pair may be timed against this pass instead of its follow-up. This
+        // affects metric attribution only; the watch still schedules that pass.
         wake.borrow_and_update();
         let waited = queued.lock().expect("Message wake time").take().map_or(std::time::Duration::ZERO, |at| at.elapsed());
         metrics.queue_wait.record(waited);
