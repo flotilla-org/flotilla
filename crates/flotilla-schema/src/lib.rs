@@ -65,7 +65,7 @@ mod view;
 
 #[doc(hidden)]
 pub use code::{code_value, decode_code};
-pub use code::{Code, CodeError};
+pub use code::{Code, CodeError, ADDRESS_DOMAIN, HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN};
 pub use codec::{DecodeError, Decoder, EncodeError, Encoder};
 pub use ddl::{
     code_field, quote_ident, render_ddl, render_ddl_with, render_views, DdlMode, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD, VIEW_SUFFIX,

@@ -214,3 +214,8 @@ pub(crate) fn sync_views(conn: &Connection, kinds: &KindRegistry) -> rusqlite::R
     }
     Ok(())
 }
+
+/// Startup-only metadata guard: fail clearly before a pre-domain dictionary reaches a writer.
+pub(crate) fn has_string_domain(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS (SELECT 1 FROM pragma_table_info('strings') WHERE name = 'domain')", [], |row| row.get(0))
+}

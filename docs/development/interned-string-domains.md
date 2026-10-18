@@ -20,6 +20,9 @@ remain ids in `resource_identity`, whose `name` and `home` refer to `rn` and `hm
 dictionary rows. Logical codec values and replicated documents still carry text;
 domains come from the receiving schema, never local ids or sender-supplied tags.
 
+This intentionally supersedes #3392 ruling D3's temporary Rust-type restriction:
+the #3422 contract replaces it with agreement on the semantic domain. Both String
+and its internable newtypes use the same `Value::Str` logical representation.
 A column shared by variants must agree on its intern domain. Different Rust
 string newtypes may share that column when their domains agree, including `T`
 versus `Option<U>`. Each variant retains its own codec. Non-interned data still
@@ -68,8 +71,20 @@ Shared tables have these additional declarations:
 including child keys, and the five shared columns above. It refuses missing
 string rows or ids whose dictionary domain disagrees with the declaration,
 naming the table and column as `StoreError::Corrupt`. Nullable columns may be
-null. Run this diagnostic when inspecting store integrity: it scans the relevant
-tables and is deliberately outside the per-event/read path. Ordinary foreign-key
+null. The standalone `audit_domains(&Connection, &KindRegistry)` accepts a read-only
+connection. For an engine store, operators can run:
+
+```sh
+cargo run -p flotilla-schema-sqlite --locked --example audit_domains -- /path/to/store.db
+```
+
+The example uses SQLite's read-only open flag, does not create missing databases
+or rewrite schemas, prints success, and exits nonzero with the corruption error
+on failure. It registers the engine's production kinds; applications adding kinds
+must register those too when calling the standalone function to audit them.
+`Store::audit_domains()` delegates to the same function with its full registry.
+The diagnostic scans the relevant tables and is deliberately outside the
+per-event/read path. Ordinary foreign-key
 checks alone cannot detect ids from a different domain. Writes, cache keys,
 index arguments, snapshots and replay all derive their sort from the same schema.
 
@@ -96,7 +111,13 @@ existing single-writer transaction. Reads by dictionary id retain their primary
 key lookup. There are no additional network or durable-store crossings.
 
 The committed two-generation string cache retains its configured entry bound;
-keys now include a `Code` and owned text. Pending keys live only for their write
+keys now include a `Code` and owned text. Lookups use a borrowed composite view
+through std::HashMap's `Borrow` contract, so pending/committed hits allocate no
+string, and old-generation promotion moves the existing owned key. The allocation
+regression test measures a warm public scan with a 16 KiB home. Shared column
+descriptors are reference-counted immutable slices: a lowering call takes one
+handle and zips the relevant columns with values, rather than looking up the
+kind for every value. Pending keys live only for their write
 transaction and rewind with failed-write savepoints. The dictionary continues
 to retain strings indefinitely; retention remains separate work.
 
@@ -113,6 +134,8 @@ sorts, exercising misses, rollback, restart and replication.
 
 This is the baseline before the new store cut-over, as specified by #3422. No other package depends on
 `flotilla-schema-sqlite` in this checkout; it has not replaced the live store.
+A store missing `strings.domain` is refused at open (and by the standalone audit)
+with `StoreError::LegacyDictionarySchema` before any writer or domain query runs.
 This change provides no old-dictionary migration. ADR 0047's compatibility rule
 applies when these tables are deployed. Resource serialization, out-of-repo
 resource authors and Quint specifications do not change.

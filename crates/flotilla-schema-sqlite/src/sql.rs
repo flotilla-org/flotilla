@@ -1,7 +1,7 @@
 //! Per-kind statements, rendered once from the descriptor when the store opens. Every statement
 //! addresses rows by primary key: the root by `id`, child rows by `owner` plus their key.
 
-use std::{collections::BTreeMap, ops::Range};
+use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
 use flotilla_schema::{quote_ident, Code, ColumnDef, ColumnType, FieldColumns, Index, Table, TableRole, TableSet};
 
@@ -12,7 +12,7 @@ pub(crate) struct TableSql {
     /// The field this table stores (empty for the root): how an edge names it.
     pub field: String,
     /// Key columns (excluding the owner), then data columns.
-    pub columns: Vec<ColumnDef>,
+    pub columns: Arc<[ColumnDef]>,
     pub key_len: usize,
     /// How many trailing key columns are this table's own key.
     pub own_key: usize,
@@ -95,7 +95,7 @@ pub(crate) struct IndexSql {
     /// The schema object name, `<table>_<name>`.
     pub object: String,
     pub order: usize,
-    pub eq_domains: Vec<Option<Code>>,
+    pub eq_columns: Arc<[ColumnDef]>,
     /// The first page: parameters are the eq values, then the limit.
     pub first: String,
     /// A later page: eq values, the cursor's order values and id, then the limit.
@@ -223,13 +223,10 @@ impl IndexSql {
         };
         let select = format!("SELECT \"id\"{} FROM {table} WHERE", prefixed(&order));
         IndexSql {
-            eq_domains: index
+            eq_columns: index
                 .eq
                 .iter()
-                .map(|name| match root.columns.iter().find(|column| &column.name == name).expect("validated eq column").ty {
-                    ColumnType::Interned(domain) => Some(domain),
-                    _ => None,
-                })
+                .map(|name| root.columns.iter().find(|column| &column.name == name).expect("validated eq column").clone())
                 .collect(),
             object: index.object_name(),
             order: order.len(),
@@ -329,7 +326,7 @@ impl TableSql {
             own_key: table.own_key,
             field_aliases: table.field_aliases.clone(),
             aliases: table.aliases.iter().cloned().collect(),
-            columns,
+            columns: columns.into(),
             insert,
             upsert,
             delete,

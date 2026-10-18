@@ -109,11 +109,69 @@ fn audit_detects_wrong_domains_in_kind_and_shared_columns() {
         store.audit_domains().expect("valid domains");
         let conn = store.into_connection();
         conn.execute("INSERT INTO strings(domain,s) VALUES ('wrong','x')", []).expect("wrong domain");
-        // Disable foreign-key update checks only for shared parent keys; all resulting references
-        // still use existing dictionary ids, which is the gap the domain audit covers.
-        conn.pragma_update(None, "foreign_keys", false).expect("disable");
+        // Foreign keys remain enabled: the injected dictionary id exists, so FK checks
+        // succeed even though its domain disagrees with the referencing column.
         conn.execute(&format!("UPDATE {table} SET {column} = (SELECT id FROM strings WHERE domain='wrong')"), []).expect("corrupt");
         let store = open(conn, "local");
-        assert!(matches!(store.audit_domains(), Err(StoreError::Corrupt { .. })), "{table}.{column}");
+        assert!(
+            matches!(store.audit_domains(), Err(StoreError::Corrupt { table: found_table, column: found_column }) if found_table == table && found_column == column),
+            "{table}.{column}"
+        );
     }
+}
+
+// Behaviour (review #8): a query for text present only in the other domain is empty and cannot
+// create a dictionary row, both before and after warming caches and reopening the connection.
+#[hegel::test]
+fn queries_never_intern_text_seen_only_in_another_domain(tc: TestCase) {
+    let text = tc.draw(gs::text().alphabet("abé '").max_size(4));
+    let other = format!("{text}!");
+    let mut store = open(Connection::open_in_memory().expect("connection"), "local");
+    let value = Pair { writer: text.clone(), address: other.clone(), optional: None, watchers: BTreeSet::new() };
+    let mut write = store.write().expect("write");
+    write.insert("pair", &value, &origin(&text)).expect("insert");
+    write.commit().expect("commit");
+    let conn = store.into_connection();
+    let before: i64 = conn.query_row("SELECT count(*) FROM strings", [], |row| row.get(0)).expect("count");
+    let mut store = open(conn, "local");
+    for _ in 0..2 {
+        let mut read = store.read().expect("read");
+        assert!(read.page(&Pair::by_address(&text), None, 10).expect("other domain").ids.is_empty());
+        assert!(read.page(&Pair::by_writer(&other), None, 10).expect("other domain").ids.is_empty());
+        assert_eq!(read.page(&Pair::by_writer(&text), None, 10).expect("own domain").ids.len(), 1);
+        assert_eq!(read.page(&Pair::by_address(&other), None, 10).expect("own domain").ids.len(), 1);
+    }
+    let conn = store.into_connection();
+    let after: i64 = conn.query_row("SELECT count(*) FROM strings", [], |row| row.get(0)).expect("count");
+    assert_eq!(after, before, "lookup never interns the missing pair");
+}
+
+// Behaviour (review #6): opening an old text-only dictionary fails at the schema boundary,
+// before an insert/query can produce an opaque missing-column error. No migration is implied.
+#[test]
+fn a_pre_domain_dictionary_is_refused_at_open() {
+    let conn = Connection::open_in_memory().expect("connection");
+    conn.execute_batch(
+        "CREATE TABLE strings (id INTEGER PRIMARY KEY, s TEXT NOT NULL UNIQUE) STRICT; INSERT INTO strings(s) VALUES ('old');",
+    )
+    .expect("old baseline");
+    assert!(matches!(flotilla_schema_sqlite::audit_domains(&conn, &registry()), Err(StoreError::LegacyDictionarySchema)));
+    assert!(matches!(Store::open(conn, "local", registry()), Err(StoreError::LegacyDictionarySchema)));
+}
+
+// Behaviour (review #5): the standalone audit works with a read-only connection and leaves the
+// database unchanged. The same production function is used by the operator example.
+#[test]
+fn the_standalone_audit_needs_no_write_access() {
+    let mut store = open(Connection::open_in_memory().expect("connection"), "local");
+    let mut write = store.write().expect("write");
+    write
+        .insert("pair", &Pair { writer: "w".into(), address: "a".into(), optional: None, watchers: BTreeSet::new() }, &origin("w"))
+        .expect("insert");
+    write.commit().expect("commit");
+    let conn = store.into_connection();
+    conn.pragma_update(None, "query_only", true).expect("read-only enforcement");
+    let changes = conn.total_changes();
+    flotilla_schema_sqlite::audit_domains(&conn, &registry()).expect("audit");
+    assert_eq!(conn.total_changes(), changes);
 }

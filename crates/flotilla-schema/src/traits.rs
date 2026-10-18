@@ -305,7 +305,7 @@ scalar!(DateTime<Utc>, ColumnType::Timestamp, |this| Ok(Value::Int(Timestamp::fr
 // the new store, which may not exist. Stored as its canonical text, interned, so equality is id
 // equality; decoding refuses text that is not canonical. Existence is a recorded gate read at
 // admission, never a foreign key.
-scalar!(Address, ColumnType::Interned(crate::Code::new("ad")), |this| Ok(Value::Str(this.as_str().to_owned())), |value| match value {
+scalar!(Address, ColumnType::Interned(crate::ADDRESS_DOMAIN), |this| Ok(Value::Str(this.as_str().to_owned())), |value| match value {
     Value::Str(text) =>
         text.parse::<Address>().map_err(|error| DecodeError::Address { column: String::new(), text, reason: error.to_string() }),
     other => Err(DecodeError::unexpected("interned address", &other)),
