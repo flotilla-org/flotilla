@@ -10,7 +10,8 @@ use crate::target::{HomeSample, TargetSample};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LoadReport {
-    /// Complete plan and target-specific settings, including revision and host load.
+    /// `run` records the complete plan. The caller adds target-specific settings,
+    /// revision/dirty source identity and host load (the daemon load harness does this).
     pub metadata: BTreeMap<String, String>,
     pub timeline: Vec<String>,
     pub drain_seconds: f64,

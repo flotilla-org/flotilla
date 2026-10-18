@@ -22,6 +22,10 @@ struct ScriptedFleet {
     homes: usize,
     dispatch_delay: Duration,
     audit_errors: Vec<String>,
+    failing_audits: Vec<u64>,
+    audits: AtomicU64,
+    failing_dispatches: u64,
+    dispatch_times: Mutex<Vec<Instant>>,
     outcome: fn(CrewMix) -> Option<(ConvoyState, Duration)>,
     convoys: Mutex<HashMap<String, Dispatched>>,
     dispatches: AtomicU64,
@@ -46,6 +50,10 @@ impl ScriptedFleet {
             homes,
             dispatch_delay: Duration::ZERO,
             audit_errors: vec![],
+            failing_audits: vec![],
+            audits: AtomicU64::new(0),
+            failing_dispatches: 0,
+            dispatch_times: Mutex::default(),
             outcome,
             convoys: Mutex::default(),
             dispatches: AtomicU64::new(0),
@@ -84,8 +92,9 @@ impl FleetTarget for ScriptedFleet {
     }
 
     async fn dispatch(&self, home: usize, name: &str, mix: CrewMix) -> Result<(), String> {
-        self.dispatches.fetch_add(1, Ordering::SeqCst);
-        if self.refuse_dispatches {
+        let attempt = self.dispatches.fetch_add(1, Ordering::SeqCst);
+        self.dispatch_times.lock().expect("dispatch times").push(Instant::now());
+        if self.refuse_dispatches || attempt < self.failing_dispatches {
             return Err("admission refused".into());
         }
         tokio::time::sleep(self.dispatch_delay).await;
@@ -124,6 +133,10 @@ impl FleetTarget for ScriptedFleet {
     }
 
     async fn audit(&self) -> Result<Vec<String>, String> {
+        let call = self.audits.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.failing_audits.contains(&call) {
+            return Err("audit unavailable".into());
+        }
         Ok(self.audit_errors.clone())
     }
 
@@ -267,17 +280,24 @@ async fn a_failing_closing_sample_falls_back_to_the_last_window_sample() {
     assert!(report.target_errors.samples.iter().any(|error| error.contains("closing sample")), "{:?}", report.target_errors);
 }
 
-// Behaviour: a run in which no dispatch was ever admitted is an error, not a
-// report of an empty window.
+// A run with every admission refused still preserves the report and marks
+// correctness failed, including the admission errors and window evidence.
 #[tokio::test(start_paused = true)]
-async fn a_run_with_no_admitted_convoy_is_an_error() {
+async fn a_run_with_no_admitted_convoy_preserves_its_failure_report() {
     let mut fleet = ScriptedFleet::new(1, |_| None);
     fleet.refuse_dispatches = true;
     let mut plan = plan(3);
     plan.max_ramp = Duration::from_secs(5);
     plan.window = Duration::from_secs(5);
-    let error = run(&fleet, &plan).await.expect_err("nothing was admitted");
-    assert!(error.contains("no dispatch was admitted") && error.contains("admission refused"), "{error}");
+    let report = run(&fleet, &plan).await.expect("even a wholly refused run reports");
+    assert_eq!(report.dispatch.admitted, 0);
+    assert!(report.dispatch.errors > 0);
+    assert!(report
+        .correctness_errors
+        .iter()
+        .any(|error| error.contains("no dispatch was admitted") && error.contains("admission refused")));
+    assert_eq!(report.window.seconds, 5.0);
+    assert!(!report.series.is_empty());
 }
 
 // Scheduled admission latency includes time spent behind the concurrency cap;
@@ -382,4 +402,53 @@ async fn reports_preserve_controller_wait_busy_time_and_run_identity() {
     let json = serde_json::to_value(&report).expect("JSON report");
     assert_eq!(json["metadata"]["commit"], "recorded-revision");
     assert_eq!(json["home_metrics"][0]["controllers"]["Convoy"]["busy_fraction"], 0.3);
+}
+
+// Transient audit failures are retried without losing the measurement. A final
+// unavailable audit cannot prove cleanup, and preserves the last known leaks.
+#[tokio::test(start_paused = true)]
+async fn audit_errors_preserve_reports_and_do_not_certify_unobserved_cleanup() {
+    for failures in [vec![1], (1..=10).collect(), (2..=10).collect()] {
+        let mut fleet = ScriptedFleet::new(1, |_| Some((ConvoyState::Delivered, Duration::from_millis(100))));
+        fleet.failing_audits = failures.clone();
+        if failures[0] == 2 {
+            fleet.audit_errors = vec!["live session remains".into()];
+        }
+        let mut plan = plan(1);
+        plan.window = Duration::from_millis(100);
+        plan.drain = Duration::from_millis(300);
+        let report = run(&fleet, &plan).await.expect("audit outages preserve reports");
+        assert!(report.total.delivered > 0);
+        assert!(report.target_errors.samples.iter().any(|error| error.contains("audit unavailable")));
+        if failures.len() == 1 {
+            assert!(report.correctness_errors.is_empty(), "{report:?}");
+            assert_eq!(report.target_errors.count, 1);
+        } else {
+            assert!(report.correctness_errors.iter().any(|error| error.contains("final cleanup audit unavailable")));
+            assert_eq!(report.drain_seconds, 0.3);
+            if failures[0] == 2 {
+                assert!(report.correctness_errors.iter().any(|error| error.contains("live session remains")));
+            }
+        }
+    }
+}
+
+// A failed admission reschedules exactly one slot at the ramp rate. Its
+// successful replacement keeps that due time for admission/convoy latency.
+#[tokio::test(start_paused = true)]
+async fn a_refused_dispatch_reschedules_its_due_slot() {
+    let mut fleet = ScriptedFleet::new(1, |_| Some((ConvoyState::Delivered, Duration::from_secs(1))));
+    fleet.failing_dispatches = 1;
+    let mut plan = plan(1);
+    plan.ramp_per_second = 2.0;
+    plan.window = Duration::from_millis(200);
+    let report = run(&fleet, &plan).await.expect("replacement admission");
+    assert_eq!((report.dispatch.dispatched, report.dispatch.admitted, report.dispatch.errors), (2, 1, 1));
+    assert_eq!(report.total.delivered, 1);
+    assert!(report.correctness_errors.is_empty());
+    let times = fleet.dispatch_times.lock().expect("attempts");
+    assert!(times[1].duration_since(times[0]) >= Duration::from_millis(500));
+    assert!(report.dispatch.backlog.max_micros < 200_000);
+    assert!(report.dispatch.admission.max_micros < 200_000);
+    assert!(report.total.convoy_latency.max_micros < 1_300_000);
 }

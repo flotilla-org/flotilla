@@ -2,7 +2,7 @@
 //! that ends, abandon those past their deadline, and measure a window.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     time::Duration,
 };
 
@@ -14,7 +14,7 @@ use tokio::time::Instant;
 use crate::{
     plan::LoadPlan,
     report::{summary, window_metrics, DispatchSummary, LoadReport, MixSummary, RampSummary, SeriesPoint, TargetErrors, WindowSummary},
-    target::{ConvoyState, FleetTarget, TargetSample},
+    target::{ConvoyObservation, ConvoyState, FleetTarget, TargetSample},
 };
 
 struct Dispatched {
@@ -101,6 +101,80 @@ fn note_error(count: &mut u64, samples: &mut Vec<String>, error: String) {
     }
 }
 
+fn merge_errors(count: &mut u64, samples: &mut Vec<String>, errors: TargetErrors) {
+    *count += errors.count;
+    for error in errors.samples {
+        if samples.len() < ERROR_SAMPLES && !samples.contains(&error) {
+            samples.push(error);
+        }
+    }
+}
+
+#[derive(Default)]
+struct Progress {
+    open: HashMap<String, Dispatched>,
+    deadline_abandoned: HashSet<String>,
+    evidence: Evidence,
+    total_outcomes: Outcomes,
+    window_outcomes: Outcomes,
+    ended_total: u64,
+    delivered_total: u64,
+}
+
+impl Progress {
+    fn observe(&mut self, observation: &ConvoyObservation, now: Instant, plan: &LoadPlan, measuring: bool) -> bool {
+        let Some(dispatch) = self.open.get(&observation.name) else { return false };
+        self.evidence.observe(observation, dispatch.at, now, plan);
+        if !observation.state.ended() {
+            return false;
+        }
+        let dispatch = self.open.remove(&observation.name).expect("observed admission");
+        // The terminal observation has been checked. Do not retain or
+        // re-evaluate its progress on every subsequent tick.
+        self.evidence.last.remove(&observation.name);
+        self.ended_total += 1;
+        self.delivered_total += u64::from(observation.state == ConvoyState::Delivered);
+        let by_deadline = self.deadline_abandoned.remove(&observation.name);
+        let latency = now.duration_since(dispatch.at);
+        self.total_outcomes.record(dispatch.mix, observation.state, latency, by_deadline);
+        if measuring {
+            self.window_outcomes.record(dispatch.mix, observation.state, latency, by_deadline);
+        }
+        true
+    }
+
+    /// Observe and settle known admissions, then abandon overdue work. This is
+    /// identical during ramp, measurement and drain; callers own replacement.
+    async fn tick(&mut self, target: &dyn FleetTarget, plan: &LoadPlan, measuring: bool) -> (usize, TargetErrors) {
+        let now = Instant::now();
+        let mut ended = 0;
+        let mut errors = TargetErrors::default();
+        for home in 0..target.homes() {
+            let observations = match target.convoys(home).await {
+                Ok(observations) => observations,
+                Err(error) => {
+                    note_error(&mut errors.count, &mut errors.samples, format!("observe home {home}: {error}"));
+                    continue;
+                }
+            };
+            for observation in observations {
+                ended += usize::from(self.observe(&observation, now, plan, measuring));
+            }
+        }
+        for (name, dispatch) in &self.open {
+            if now.duration_since(dispatch.at) >= plan.convoy_deadline && !self.deadline_abandoned.contains(name) {
+                match target.abandon(dispatch.home, name, "load driver: open past the convoy deadline").await {
+                    Ok(()) => {
+                        self.deadline_abandoned.insert(name.clone());
+                    }
+                    Err(error) => note_error(&mut errors.count, &mut errors.samples, format!("abandon {name}: {error}")),
+                }
+            }
+        }
+        (ended, errors)
+    }
+}
+
 /// Run warm-up, a measurement window, then stop admissions and drain.
 pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport, String> {
     if plan.running == 0
@@ -119,9 +193,8 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
     let spacing = Duration::from_secs_f64(1.0 / plan.ramp_per_second);
     let mut due = (1..=plan.running).map(|i| started + spacing.mul_f64(i as f64)).collect::<VecDeque<_>>();
     let mut next_due = started + spacing.mul_f64(plan.running as f64);
-    let mut open = HashMap::<String, Dispatched>::new();
+    let mut progress = Progress::default();
     let mut admitting = FuturesUnordered::<futures::future::BoxFuture<'_, (String, usize, CrewMix, Instant, Result<(), String>)>>::new();
-    let mut deadline_abandoned = HashSet::<String>::new();
     let mut next_index = 0u64;
     let mut dispatched = 0u64;
     let mut dispatch_errors = 0u64;
@@ -132,13 +205,8 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
     let mut target_errors = 0u64;
     let mut target_error_samples = Vec::new();
     let mut failing_ticks = 0u32;
-    let mut evidence = Evidence::default();
-    let mut total_outcomes = Outcomes::default();
     let backlog = LatencyHistogram::default();
     let admission = LatencyHistogram::default();
-    let mut window_outcomes = Outcomes::default();
-    let mut ended_total = 0u64;
-    let mut delivered_total = 0u64;
     let mut peak_running = 0usize;
     let mut ramp_end: Option<Instant> = None;
     let mut warmup_ended_at_window = 0;
@@ -157,7 +225,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
                     Ok(()) => {
                         admission.record(began.elapsed());
                         admitted += 1;
-                        open.insert(name, Dispatched { home, mix, at: began });
+                        progress.open.insert(name, Dispatched { home, mix, at: began });
                     }
                     Err(error) => {
                         note_error(&mut dispatch_errors, &mut error_samples, error);
@@ -172,51 +240,13 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
         let now = Instant::now();
         let errors_before = target_errors;
 
-        // Settle convoys that ended. A target lists every convoy it holds, so
-        // one that ends before its admission resolves here settles on the
-        // tick after it does.
-        for home in 0..homes {
-            let observations = match target.convoys(home).await {
-                Ok(observations) => observations,
-                Err(error) => {
-                    note_error(&mut target_errors, &mut target_error_samples, format!("observe home {home}: {error}"));
-                    continue;
-                }
-            };
-            for observation in observations {
-                if let Some(at) = open.get(&observation.name).map(|d| d.at).or_else(|| evidence.last.get(&observation.name).map(|e| e.2)) {
-                    evidence.observe(&observation, at, now, plan);
-                }
-                if !observation.state.ended() {
-                    continue;
-                }
-                let Some(dispatch) = open.remove(&observation.name) else { continue };
-                next_due = next_due.max(now) + spacing;
-                due.push_back(next_due);
-                ended_total += 1;
-                delivered_total += u64::from(observation.state == ConvoyState::Delivered);
-                let by_deadline = deadline_abandoned.remove(&observation.name);
-                total_outcomes.record(dispatch.mix, observation.state, now.duration_since(dispatch.at), by_deadline);
-                if window_start.is_some() {
-                    window_outcomes.record(dispatch.mix, observation.state, now.duration_since(dispatch.at), by_deadline);
-                }
-            }
-        }
-
-        // Abandon convoys past their deadline, once each; a failed abandon is
-        // retried on the next tick.
-        let overdue = open
-            .iter()
-            .filter(|(name, dispatch)| now.duration_since(dispatch.at) >= plan.convoy_deadline && !deadline_abandoned.contains(*name))
-            .map(|(name, dispatch)| (name.clone(), dispatch.home))
-            .collect::<Vec<_>>();
-        for (name, home) in overdue {
-            match target.abandon(home, &name, "load driver: open past the convoy deadline").await {
-                Ok(()) => {
-                    deadline_abandoned.insert(name);
-                }
-                Err(error) => note_error(&mut target_errors, &mut target_error_samples, format!("abandon {name}: {error}")),
-            }
+        let (ended, errors) = progress.tick(target, plan, window_start.is_some()).await;
+        merge_errors(&mut target_errors, &mut target_error_samples, errors);
+        // Only the admitting phase replaces completed slots. Drain shares all
+        // observation, outcome and deadline handling without scheduling work.
+        for _ in 0..ended {
+            next_due = next_due.max(now) + spacing;
+            due.push_back(next_due);
         }
 
         if target_errors > errors_before {
@@ -228,7 +258,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
             failing_ticks = 0;
         }
 
-        let running = open.len();
+        let running = progress.open.len();
         peak_running = peak_running.max(running);
         if now >= next_series {
             let sample = target.sample().await.ok();
@@ -239,8 +269,8 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
             series.push(SeriesPoint {
                 seconds: now.duration_since(started).as_secs_f64(),
                 running,
-                delivered: delivered_total,
-                ended: ended_total,
+                delivered: progress.delivered_total,
+                ended: progress.ended_total,
                 resident_bytes,
             });
             next_series = now + plan.series_every;
@@ -248,12 +278,13 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
 
         // Start the window once the plan's convoys are open, or at the ramp deadline.
         if window_start.is_none()
-            && ((running >= plan.running && ended_total >= plan.warmup_ended as u64) || now.duration_since(started) >= plan.max_ramp)
+            && ((running >= plan.running && progress.ended_total >= plan.warmup_ended as u64)
+                || now.duration_since(started) >= plan.max_ramp)
         {
             match target.sample().await {
                 Ok(sample) => {
                     ramp_end = Some(now);
-                    warmup_ended_at_window = ended_total;
+                    warmup_ended_at_window = progress.ended_total;
                     window_start = Some((now, sample));
                 }
                 Err(error) => note_error(&mut target_errors, &mut target_error_samples, format!("sample: {error}")),
@@ -268,7 +299,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
         // The due queue preserves scheduled admissions behind concurrency limits.
         // Replacement slots are scheduled only when the previous work ends.
         while due.front().is_some_and(|at| *at <= now)
-            && open.len() + admitting.len() < plan.running
+            && progress.open.len() + admitting.len() < plan.running
             && admitting.len() < plan.dispatch_concurrency
         {
             let began = due.pop_front().expect("due dispatch");
@@ -316,8 +347,9 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
         note_error(&mut target_errors, &mut target_error_samples, format!("open breakdown: {error}"));
         BTreeMap::new()
     });
-    let open_ages_at_end = evidence.describe(&open, Instant::now());
+    let open_ages_at_end = progress.evidence.describe(&progress.open, Instant::now());
     let drain_began = Instant::now();
+    let mut last_audit = Vec::new();
     // In-flight admissions are not cancelled at the boundary: every successful
     // admission belongs to the run and must be observed through cleanup.
     loop {
@@ -326,63 +358,51 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
                 Ok(()) => {
                     admission.record(began.elapsed());
                     admitted += 1;
-                    open.insert(name, Dispatched { home, mix, at: began });
+                    progress.open.insert(name, Dispatched { home, mix, at: began });
                 }
                 Err(error) => note_error(&mut dispatch_errors, &mut error_samples, error),
             }
         }
-        let now = Instant::now();
-        for home in 0..homes {
-            match target.convoys(home).await {
-                Ok(observations) => {
-                    for observation in observations {
-                        if let Some(dispatch) = open.get(&observation.name) {
-                            evidence.observe(&observation, dispatch.at, now, plan);
-                        }
-                        if observation.state.ended() {
-                            if let Some(dispatch) = open.remove(&observation.name) {
-                                total_outcomes.record(
-                                    dispatch.mix,
-                                    observation.state,
-                                    now.duration_since(dispatch.at),
-                                    deadline_abandoned.remove(&observation.name),
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(error) => note_error(&mut target_errors, &mut target_error_samples, format!("drain observe: {error}")),
+        let (_, errors) = progress.tick(target, plan, false).await;
+        merge_errors(&mut target_errors, &mut target_error_samples, errors);
+        let audit_succeeded = match target.audit().await {
+            Ok(audit) => {
+                last_audit = audit;
+                true
             }
-        }
-        for (name, dispatch) in &open {
-            if now.duration_since(dispatch.at) >= plan.convoy_deadline && !deadline_abandoned.contains(name) {
-                match target.abandon(dispatch.home, name, "load driver: open past the convoy deadline").await {
-                    Ok(()) => {
-                        deadline_abandoned.insert(name.clone());
-                    }
-                    Err(error) => note_error(&mut target_errors, &mut target_error_samples, format!("drain abandon {name}: {error}")),
-                }
+            Err(error) => {
+                note_error(&mut target_errors, &mut target_error_samples, format!("audit: {error}"));
+                false
             }
-        }
-        let audit = target.audit().await?;
-        if (open.is_empty() && admitting.is_empty() && audit.is_empty()) || drain_began.elapsed() >= plan.drain {
-            evidence.errors.extend(audit);
+        };
+        if (progress.open.is_empty() && admitting.is_empty() && audit_succeeded && last_audit.is_empty())
+            || drain_began.elapsed() >= plan.drain
+        {
+            progress.evidence.errors.extend(last_audit);
+            if !audit_succeeded {
+                progress.evidence.errors.insert("final cleanup audit unavailable".into());
+            }
             break;
         }
         tokio::time::sleep(plan.tick).await;
     }
     if admitted == 0 {
-        return Err(format!("no dispatch was admitted ({dispatch_errors} failed): {error_samples:?}"));
+        progress.evidence.errors.insert(format!("no dispatch was admitted ({dispatch_errors} failed): {error_samples:?}"));
     }
     if !admitting.is_empty() {
-        evidence.errors.insert(format!("{} admissions unresolved after drain", admitting.len()));
+        progress.evidence.errors.insert(format!("{} admissions unresolved after drain", admitting.len()));
     }
-    for name in open.keys() {
-        if !evidence.last.get(name).is_some_and(|(observation, _, _)| observation.stall.as_ref().is_some_and(|e| !e.trim().is_empty())) {
-            evidence.errors.insert(format!("{name}: unfinished without stall evidence"));
+    for name in progress.open.keys() {
+        if !progress
+            .evidence
+            .last
+            .get(name)
+            .is_some_and(|(observation, _, _)| observation.stall.as_ref().is_some_and(|e| !e.trim().is_empty()))
+        {
+            progress.evidence.errors.insert(format!("{name}: unfinished without stall evidence"));
         }
     }
-    let unfinished = evidence.describe(&open, Instant::now());
+    let unfinished = progress.evidence.describe(&progress.open, Instant::now());
     if plan.dump_unfinished {
         for line in &unfinished {
             eprintln!("unfinished {line}");
@@ -392,10 +412,10 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
     metadata.insert("plan".into(), format!("{plan:?}"));
     Ok(LoadReport {
         metadata,
-        timeline: evidence.timeline,
+        timeline: progress.evidence.timeline,
         drain_seconds: drain_began.elapsed().as_secs_f64(),
-        total: total_outcomes.summary(started.elapsed().as_secs_f64()),
-        correctness_errors: evidence.errors.into_iter().collect(),
+        total: progress.total_outcomes.summary(started.elapsed().as_secs_f64()),
+        correctness_errors: progress.evidence.errors.into_iter().collect(),
         unfinished,
         open_ages_at_end,
         running: plan.running,
@@ -419,7 +439,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
             error_samples,
         },
         target_errors: TargetErrors { count: target_errors, samples: target_error_samples },
-        window: window_outcomes.summary(window.as_secs_f64()),
+        window: progress.window_outcomes.summary(window.as_secs_f64()),
         home_metrics: window_metrics(&start_sample, &end_sample, window),
         resident_bytes: end_sample.resident_bytes,
         open_at_end,
@@ -430,12 +450,12 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
 /// Progress is measured from semantic observations, never store revisions or heartbeats.
 #[derive(Default)]
 struct Evidence {
-    last: BTreeMap<String, (crate::ConvoyObservation, Instant, Instant)>,
-    errors: std::collections::BTreeSet<String>,
+    last: BTreeMap<String, (ConvoyObservation, Instant, Instant)>,
+    errors: BTreeSet<String>,
     timeline: Vec<String>,
 }
 impl Evidence {
-    fn observe(&mut self, observation: &crate::ConvoyObservation, scheduled: Instant, now: Instant, plan: &LoadPlan) {
+    fn observe(&mut self, observation: &ConvoyObservation, scheduled: Instant, now: Instant, plan: &LoadPlan) {
         let changed = self.last.get(&observation.name).is_none_or(|entry| entry.0 != *observation);
         let entry = self.last.entry(observation.name.clone()).or_insert_with(|| (observation.clone(), scheduled, scheduled));
         if changed {
@@ -492,7 +512,46 @@ mod evidence_tests {
     use hegel::generators as gs;
 
     use super::*;
-    use crate::ConvoyObservation;
+
+    // Progress retains only live admissions. Generated turnover covers 1–200
+    // terminal deliveries, repeated observations and an interleaved open convoy.
+    #[hegel::test]
+    fn terminal_progress_is_pruned_after_it_is_checked(tc: hegel::TestCase) {
+        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(200));
+        let at = Instant::now();
+        let plan = LoadPlan::default();
+        let mut progress = Progress::default();
+        let sentinel = ConvoyObservation {
+            name: "sentinel".into(),
+            state: ConvoyState::Open,
+            progress: "working".into(),
+            stall: None,
+            expects_stall: false,
+            expected_end: ConvoyState::Delivered,
+        };
+        progress.open.insert(sentinel.name.clone(), Dispatched { home: 0, mix: CrewMix::Coder, at });
+        progress.observe(&sentinel, at, &plan, true);
+        for index in 0..count {
+            let name = format!("load-{index}");
+            progress.open.insert(name.clone(), Dispatched { home: 0, mix: CrewMix::Coder, at });
+            let mut observation = ConvoyObservation {
+                name,
+                state: ConvoyState::Open,
+                progress: "working".into(),
+                stall: None,
+                expects_stall: false,
+                expected_end: ConvoyState::Delivered,
+            };
+            assert!(!progress.observe(&observation, at, &plan, true));
+            assert_eq!(progress.evidence.last.len(), 2);
+            observation.state = ConvoyState::Delivered;
+            assert!(progress.observe(&observation, at, &plan, true));
+            assert_eq!(progress.evidence.last.len(), 1);
+            assert_eq!(progress.evidence.last.len(), progress.open.len());
+            assert!(!progress.observe(&observation, at, &plan, true));
+            assert_eq!(progress.ended_total, (index + 1) as u64);
+        }
+    }
 
     // Every combination of terminal/open, expected/unexpected stall, empty/
     // nonempty evidence and time at/beyond the inactivity bound is checked.

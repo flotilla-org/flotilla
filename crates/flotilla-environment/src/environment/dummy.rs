@@ -158,16 +158,20 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
     }
 
     async fn destroy(&self, container_id: &str) -> Result<(), String> {
-        let mut destroyed = Vec::new();
-        self.handles().retain(|id, handle| {
-            let remove = handle.container_name == container_id || id.as_str() == container_id;
-            if remove {
-                destroyed.push(Arc::clone(handle));
-            }
-            !remove
-        });
+        let destroyed = self
+            .handles()
+            .iter()
+            .filter(|(id, handle)| handle.container_name == container_id || id.as_str() == container_id)
+            .map(|(_, handle)| Arc::clone(handle))
+            .collect::<Vec<_>>();
         for handle in destroyed {
             handle.destroy().await?;
+            // Keep failed handles discoverable for retry. Do not remove a new
+            // handle if provisioning has already replaced the destroyed one.
+            let mut handles = self.handles();
+            if handles.get(&handle.id).is_some_and(|current| Arc::ptr_eq(current, &handle)) {
+                handles.remove(&handle.id);
+            }
         }
         Ok(())
     }

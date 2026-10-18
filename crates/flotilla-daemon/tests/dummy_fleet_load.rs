@@ -387,7 +387,14 @@ impl FleetTarget for InProcessFleet {
                 .expect("convoys")
                 .values()
                 .filter(|(_, o)| o.state.ended())
-                .map(|(resource, _)| resource.clone())
+                .map(|(resource, observation)| {
+                    // Progress evidence is retired at the terminal observation;
+                    // the final audit still checks for a later terminal stall.
+                    if let Some(stall) = &observation.stall {
+                        errors.push(format!("{resource}: terminal convoy retains a stall: {stall}"));
+                    }
+                    resource.clone()
+                })
                 .collect::<HashSet<_>>();
             for convoy in &ended {
                 errors.extend(home.fleet.remaining_for(convoy).into_iter().map(|artifact| format!("{convoy}: {artifact}")));

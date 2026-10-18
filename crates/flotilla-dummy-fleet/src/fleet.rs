@@ -90,7 +90,16 @@ impl DummyFleet {
 
     pub(crate) async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
         let port = self.port.get().ok_or("dummy fleet is not attached to a daemon")?;
-        let command = format!("{action:?}");
+        // Keep only a static command kind across the ownership boundary. Format
+        // diagnostics only for retained failures; successful commands allocate no diagnostic strings.
+        let command = match &action {
+            CommandAction::CrewPromise { .. } => "CrewPromise",
+            CommandAction::CrewComplete { .. } => "CrewComplete",
+            CommandAction::CrewHandoff { .. } => "CrewHandoff",
+            CommandAction::CrewStall { .. } => "CrewStall",
+            CommandAction::CrewFail { .. } => "CrewFail",
+            _ => "dummy crew command",
+        };
         let result = port.execute(action).await;
         match &result {
             Ok(CommandValue::Error { .. }) | Err(_) => {

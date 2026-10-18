@@ -216,7 +216,11 @@ impl Factory for DummyVcsFactory {
         if env.find_env_var(DUMMY_FLEET_ENV).is_none() {
             return Err(vec![UnmetRequirement::MissingEnvVar(DUMMY_FLEET_ENV.into())]);
         }
-        let environment = env.find_env_var("FLOTILLA_ENVIRONMENT_ID").unwrap_or_default().to_string();
+        let environment = env
+            .find_env_var("FLOTILLA_ENVIRONMENT_ID")
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| vec![UnmetRequirement::MissingEnvVar("FLOTILLA_ENVIRONMENT_ID".into())])?
+            .to_string();
         Ok(Arc::new(DummyVcs { fleet: Arc::clone(&self.fleet), environment, root: repo_root.as_path().to_path_buf() }))
     }
 }

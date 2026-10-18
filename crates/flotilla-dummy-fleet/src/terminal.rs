@@ -240,10 +240,11 @@ impl Factory for DummyTerminalPoolFactory {
         if env.find_env_var(DUMMY_FLEET_ENV).is_none() {
             return Err(vec![UnmetRequirement::MissingEnvVar(DUMMY_FLEET_ENV.into())]);
         }
-        Ok(Arc::new(DummyTerminalPool {
-            fleet: Arc::clone(&self.fleet),
-            environment: env.find_env_var("FLOTILLA_ENVIRONMENT_ID").unwrap_or_default().into(),
-        }))
+        let environment = env
+            .find_env_var("FLOTILLA_ENVIRONMENT_ID")
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| vec![UnmetRequirement::MissingEnvVar("FLOTILLA_ENVIRONMENT_ID".into())])?;
+        Ok(Arc::new(DummyTerminalPool { fleet: Arc::clone(&self.fleet), environment: environment.into() }))
     }
 }
 
