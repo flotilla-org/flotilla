@@ -20,7 +20,7 @@ use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::run_output;
 use flotilla_provider_runtime::CommandRunner;
 
-use crate::mission_fields;
+use flotilla_issue_tracker::mission_fields;
 
 const INCREMENTAL_PAGE_SIZE: usize = 100;
 
@@ -487,7 +487,7 @@ fn board_check_state(checks: &serde_json::Value) -> String {
 }
 
 #[async_trait]
-impl super::IssueProvider for GitHubIssueProvider {
+impl flotilla_issue_tracker::IssueProvider for GitHubIssueProvider {
     fn supports(&self, source: &IssueSource) -> bool {
         is_github_source(source)
     }
@@ -697,11 +697,11 @@ mod tests {
     use flotilla_replay_testkit::testing::MockRunner;
     use flotilla_replay_testkit::Masks;
 
-    use crate::testing::assert_provider_contract;
-    use crate::testing::build_api_and_runner;
-    use crate::testing::fixture_path;
-    use crate::testing::repo_root_for_recording;
-    use crate::IssueProvider;
+    use crate::issue_tracker::testing::assert_provider_contract;
+    use crate::issue_tracker::testing::build_api_and_runner;
+    use crate::issue_tracker::testing::fixture_path;
+    use crate::issue_tracker::testing::repo_root_for_recording;
+    use flotilla_issue_tracker::IssueProvider;
 
     #[test]
     fn parses_issue_title_and_assignees_from_existing_rest_response() {
@@ -1183,3 +1183,7 @@ mod tests {
 #[cfg(test)]
 #[path = "github_board_tests.rs"]
 mod board_tests;
+
+#[cfg(test)]
+#[path = "issue_tracker_testing.rs"]
+pub(crate) mod testing;

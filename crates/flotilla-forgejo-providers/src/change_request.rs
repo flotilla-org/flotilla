@@ -14,8 +14,8 @@ use flotilla_resources::{
     ChangeRequestReviewObservation, ChangeRequestStatus as ObservedStatus, Observation, ObservedChangeRequestState, ObservedReviewDecision,
 };
 
-use super::ChangeRequestAdmission;
-use super::ChangeRequestTracker;
+use flotilla_change_request::ChangeRequestAdmission;
+use flotilla_change_request::ChangeRequestTracker;
 
 pub struct ForgejoChangeRequestProvider {
     runner: Arc<dyn CommandRunner>,
@@ -119,7 +119,7 @@ impl ForgejoChangeRequestProvider {
         }
     }
 
-    async fn read_review_decision(&self, number: u64) -> Result<Option<ObservedReviewDecision>, String> {
+    async fn read_review_decision(&self, number: u64) -> Result<Option<ObservedReviewDecision>, ObservationError> {
         const PAGE_SIZE: usize = 50;
         const MAX_PAGES: usize = 100;
         let mut reviews = Vec::new();
@@ -132,9 +132,7 @@ impl ForgejoChangeRequestProvider {
                 None,
             )?;
             let response = http_execute!(self.forge.http, request)?;
-            if !response.status().is_success() {
-                return Err(format!("Forgejo HTTP {}: {}", response.status(), String::from_utf8_lossy(response.body())));
-            }
+            crate::observation::check_response(&self.forge.config.service_url, response.status(), response.headers(), response.body())?;
             // Forgejo counts all returned reviews, including stale and
             // dismissed ones. If a proxy strips the header, an empty page
             // still terminates the scan safely.
@@ -150,7 +148,7 @@ impl ForgejoChangeRequestProvider {
                 return Ok(review_decision(&reviews));
             }
         }
-        Err(format!("Forgejo review page limit ({MAX_PAGES}) reached for pull request {number}"))
+        Err(format!("Forgejo review page limit ({MAX_PAGES}) reached for pull request {number}").into())
     }
 
     fn parse(&self, value: &serde_json::Value) -> Option<(String, ChangeRequest)> {
@@ -214,16 +212,20 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
     async fn observe_bound(
         &self,
         numbers: &[u64],
-        _crew_logins: &super::CrewGithubLoginsByRequest,
-    ) -> Result<super::BoundObservations, ObservationError> {
+        _crew_logins: &flotilla_change_request::CrewGithubLoginsByRequest,
+    ) -> Result<flotilla_change_request::BoundObservations, ObservationError> {
         let mut statuses = std::collections::HashMap::new();
         for number in numbers {
-            let result = match self.forge.execute(&self.repo_slug, reqwest::Method::GET, &format!("pulls/{number}"), &[], None).await {
+            let result = match crate::observation::execute(&self.forge, &self.repo_slug, &format!("pulls/{number}"), &[]).await {
                 Ok(value) => {
                     let mut status = self.observed_status(&value);
                     let observed_at = Utc::now();
                     status.review_decision = match self.read_review_decision(*number).await {
                         Ok(value) => Observation { value, observed_at },
+                        Err(error @ ObservationError::RateLimited { .. }) => {
+                            statuses.insert(*number, Err(error));
+                            continue;
+                        }
                         Err(error) => {
                             tracing::warn!(number, %error, "Forgejo review decision unavailable");
                             Observation::unknown(observed_at)
@@ -231,7 +233,7 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
                     };
                     Ok(status)
                 }
-                Err(error) => Err(error.into()),
+                Err(error) => Err(error),
             };
             statuses.insert(*number, result);
         }
@@ -245,16 +247,13 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
         // Search to an empty page instead of treating the first 100 requests
         // (or a short page from a server-side limit) as proof of absence.
         for page in 1..=100 {
-            let value = self
-                .forge
-                .execute(
-                    &self.repo_slug,
-                    reqwest::Method::GET,
-                    "pulls",
-                    &[("state", "all".into()), ("limit", "50".into()), ("page", page.to_string())],
-                    None,
-                )
-                .await?;
+            let value = crate::observation::execute(
+                &self.forge,
+                &self.repo_slug,
+                "pulls",
+                &[("state", "all".into()), ("limit", "50".into()), ("page", page.to_string())],
+            )
+            .await?;
             let items = value.as_array().ok_or("Forgejo pull request list response was not an array")?;
             if let Some(request) = items.iter().filter_map(|value| self.parse(value)).find(|(_, request)| request.branch == branch) {
                 return Ok(Some(request));
@@ -272,7 +271,7 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
     }
 
     async fn get_change_request_for_admission(&self, id: &str) -> Result<ChangeRequestAdmission, ObservationError> {
-        let value = self.forge.execute(&self.repo_slug, reqwest::Method::GET, &format!("pulls/{id}"), &[], None).await?;
+        let value = crate::observation::execute(&self.forge, &self.repo_slug, &format!("pulls/{id}"), &[]).await?;
         let (id, change_request) = self.parse(&value).ok_or_else(|| format!("malformed Forgejo pull request {id}"))?;
         Ok(ChangeRequestAdmission { id, change_request, base_ref: value["base"]["ref"].as_str().map(str::to_string) })
     }
@@ -344,8 +343,77 @@ mod tests {
     use flotilla_replay_testkit::testing::MockRunner;
     use flotilla_replay_testkit::Masks;
 
-    use crate::branch_lookup_observer::BranchLookupObserver;
-    use crate::testing::fixture_path;
+    use crate::change_request::testing::fixture_path;
+    use flotilla_change_request::branch_lookup_observer::BranchLookupObserver;
+
+    // HTTP boundary fault injection: every request must first pass the strict fake.
+    struct ThrottledForge {
+        inner: InProcessClient,
+        header: &'static str,
+        value: &'static str,
+        reviews_only: bool,
+    }
+
+    #[async_trait]
+    impl HttpClient for ThrottledForge {
+        async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
+            let throttle = !self.reviews_only || request.url().path().ends_with("/reviews");
+            let response = self.inner.execute(request, label).await?;
+            assert!(response.status().is_success(), "request must satisfy fake Forgejo: {response:?}");
+            if !throttle {
+                return Ok(response);
+            }
+            Ok(http::Response::builder()
+                .status(429)
+                .header(self.header, self.value)
+                .body(bytes::Bytes::from_static(b"rate limit exceeded"))
+                .expect("rate-limit response"))
+        }
+    }
+
+    // #3480: observation paths preserve the server's retry deadline as a typed error.
+    // A finite HTTP scenario covers reset, relative retry, missing/invalid metadata;
+    // no concurrency or population boundary affects response classification.
+    #[tokio::test]
+    async fn fake_forge_rate_limits_preserve_typed_retry_deadlines() {
+        for (header, value, expected) in [
+            ("x-ratelimit-reset", "1893456000", Some(1893456000)),
+            ("retry-after", "60", None),
+            ("x-ratelimit-reset", "invalid", None),
+            ("unrelated", "0", None),
+        ] {
+            let (fake, _clock, mut provider) = empty_fake();
+            let repo = RepoRef::new("lab", "team", "repo");
+            fake.create_pull(
+                &repo,
+                NewPull { title: "Work".into(), head: "work".into(), base: "main".into(), body: String::new(), user: None, draft: false },
+            )
+            .expect("pull");
+            provider.forge.http =
+                Arc::new(ThrottledForge { inner: InProcessClient::new(fake.clone()), header, value, reviews_only: false });
+            let before = Utc::now();
+            let lookup = provider.find_change_request_by_branch("work").await.expect_err("throttled lookup");
+            let admission = provider.get_change_request_for_admission("1").await.expect_err("throttled admission");
+            let mut observed = provider.observe_bound(&[1], &Default::default()).await.expect("per-request outcomes");
+            let bound = observed.remove(&1).expect("bound outcome").expect_err("throttled observation");
+            for error in [lookup, admission, bound] {
+                let ObservationError::RateLimited { retry_at, .. } = error else { panic!("lost typed rate-limit error: {error:?}") };
+                if let Some(expected) = expected {
+                    assert_eq!(retry_at.map(|date| date.timestamp()), Some(expected));
+                } else if header == "retry-after" {
+                    let retry_at = retry_at.expect("relative retry deadline");
+                    assert!(retry_at >= before + chrono::Duration::seconds(60));
+                    assert!(retry_at <= Utc::now() + chrono::Duration::seconds(60));
+                } else {
+                    assert_eq!(retry_at, None);
+                }
+            }
+            provider.forge.http = Arc::new(ThrottledForge { inner: InProcessClient::new(fake.clone()), header, value, reviews_only: true });
+            let mut observed = provider.observe_bound(&[1], &Default::default()).await.expect("per-request outcomes");
+            assert!(matches!(observed.remove(&1), Some(Err(ObservationError::RateLimited { .. }))), "review throttling must remain typed");
+            assert_no_refusals(&fake);
+        }
+    }
 
     // Boundary double: Forgejo HTTP requests, including the body update.
     struct LinkHttp {
@@ -540,7 +608,7 @@ mod tests {
             responses: Mutex::new(VecDeque::from([json_response(&serde_json::json!({"invalid": true}))])),
             urls: Mutex::new(Vec::new()),
         });
-        assert!(provider(http).read_review_decision(7).await.expect_err("malformed reviews").contains("not an array"));
+        assert!(provider(http).read_review_decision(7).await.expect_err("malformed reviews").to_string().contains("not an array"));
     }
 
     #[tokio::test]
@@ -584,7 +652,7 @@ mod tests {
         let http =
             Arc::new(MockHttp { responses: Mutex::new((0..101).map(|_| json_response(&page)).collect()), urls: Mutex::new(Vec::new()) });
         let provider = provider(http.clone());
-        assert!(provider.read_review_decision(7).await.expect_err("page limit").contains("page limit"));
+        assert!(provider.read_review_decision(7).await.expect_err("page limit").to_string().contains("page limit"));
         assert_eq!(http.urls.lock().expect("urls").len(), 100);
     }
 
@@ -1282,3 +1350,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "change_request_testing.rs"]
+pub(crate) mod testing;

@@ -1,8 +1,10 @@
 use flotilla_ai_utility::factories::claude::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory};
-use flotilla_change_request::factories::{forgejo::ForgejoChangeRequestFactory, github::GitHubChangeRequestFactory};
 use flotilla_cloud_agent::factories::{claude::ClaudeCodingAgentFactory, codex::CodexCodingAgentFactory, cursor::CursorCodingAgentFactory};
 use flotilla_environment::factories::{docker, host_direct};
-use flotilla_issue_tracker::factories::{forgejo::ForgejoIssueProviderFactory, github::GitHubIssueProviderFactory};
+use flotilla_forgejo_providers::factories::change_request::ForgejoChangeRequestFactory;
+use flotilla_forgejo_providers::factories::issue_tracker::ForgejoIssueProviderFactory;
+use flotilla_github_providers::factories::change_request::GitHubChangeRequestFactory;
+use flotilla_github_providers::factories::issue_tracker::GitHubIssueProviderFactory;
 
 use super::FactoryRegistry;
 use flotilla_terminal::factories::{cleat::CleatTerminalPoolFactory, passthrough::PassthroughTerminalPoolFactory};

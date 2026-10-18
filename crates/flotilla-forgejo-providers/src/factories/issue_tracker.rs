@@ -14,8 +14,8 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ReqwestHttpClient;
 
-use crate::forgejo::ForgejoIssueProvider;
-use crate::IssueProvider;
+use crate::issue_tracker::ForgejoIssueProvider;
+use flotilla_issue_tracker::IssueProvider;
 
 // ---------------------------------------------------------------------------
 // ForgejoIssueProviderFactory
@@ -63,7 +63,7 @@ mod tests {
     use flotilla_replay_testkit::testing::MockRunner;
 
     use super::ForgejoIssueProviderFactory;
-    use crate::testing::TestConfig;
+    use crate::issue_tracker::testing::TestConfig;
 
     fn write_token(base: &std::path::Path, name: &str) {
         std::fs::create_dir_all(base).expect("create config parent");

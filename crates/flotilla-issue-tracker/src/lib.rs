@@ -1,10 +1,5 @@
-//! Source-addressed issue providers, the GitHub dispatch-board reader and their discovery factories.
-pub mod factories;
-pub mod forgejo;
-pub mod github;
+//! Forge-neutral source-addressed issue providers and mission-field decoding.
 pub mod mission_fields;
-#[cfg(test)]
-mod testing;
 
 use std::sync::Arc;
 

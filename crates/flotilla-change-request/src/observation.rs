@@ -16,7 +16,7 @@ use flotilla_resources::{
     ObservedReviewDecision,
 };
 
-pub(crate) const DEFAULT_REVIEW_BOT_LOGIN: &str = "claude";
+pub const DEFAULT_REVIEW_BOT_LOGIN: &str = "claude";
 
 /// One change request observed in one namespace: the observers' key.
 ///
@@ -187,7 +187,7 @@ pub(crate) fn parse_gh_observation_with_crew_identity(
     Ok(parse_gh_observation_value_with_crew_identity(&value, observed_at, review_bot_login, operator_login, crew_logins))
 }
 
-pub(crate) fn parse_gh_observation_value_with_crew_identity(
+pub fn parse_gh_observation_value_with_crew_identity(
     value: &serde_json::Value,
     observed_at: DateTime<Utc>,
     review_bot_login: &str,

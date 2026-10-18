@@ -14,8 +14,8 @@ use flotilla_forge_github::github::GhApiClient;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 
-use crate::github::GitHubChangeRequest;
-use crate::ChangeRequestTracker;
+use crate::change_request::GitHubChangeRequest;
+use flotilla_change_request::ChangeRequestTracker;
 
 // ---------------------------------------------------------------------------
 // GitHubChangeRequestFactory
@@ -77,7 +77,7 @@ mod tests {
     use flotilla_replay_testkit::testing::MockRunner;
 
     use super::GitHubChangeRequestFactory;
-    use crate::testing::TestConfig;
+    use crate::change_request::testing::TestConfig;
 
     fn bag_with_gh_and_github_remote() -> EnvironmentBag {
         EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")).with(EnvironmentAssertion::remote_host(

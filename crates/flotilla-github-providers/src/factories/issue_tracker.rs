@@ -13,8 +13,8 @@ use flotilla_forge_github::github::GhApiClient;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 
-use crate::github::GitHubIssueProvider;
-use crate::IssueProvider;
+use crate::issue_tracker::GitHubIssueProvider;
+use flotilla_issue_tracker::IssueProvider;
 
 // ---------------------------------------------------------------------------
 // GitHubIssueProviderFactory
@@ -67,7 +67,7 @@ mod tests {
     use flotilla_replay_testkit::testing::MockRunner;
 
     use super::GitHubIssueProviderFactory;
-    use crate::testing::{CwdRecordingRunner, TestConfig};
+    use crate::issue_tracker::testing::{CwdRecordingRunner, TestConfig};
 
     fn bag_with_gh_and_github_remote() -> EnvironmentBag {
         EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")).with(EnvironmentAssertion::remote_host(

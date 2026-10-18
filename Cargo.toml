@@ -10,6 +10,8 @@ members = [
     "crates/flotilla-capability-contract",
     "crates/flotilla-cbor",
     "crates/flotilla-change-request",
+    "crates/flotilla-github-providers",
+    "crates/flotilla-forgejo-providers",
     "crates/flotilla-charter",
     "crates/flotilla-client",
     "crates/flotilla-ai-utility",

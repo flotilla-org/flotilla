@@ -35,6 +35,7 @@ futures = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
+flotilla-github-providers = { path = "../flotilla-github-providers" }
 flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }

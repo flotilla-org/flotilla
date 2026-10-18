@@ -105,6 +105,8 @@ The step-4 survey found core and store code with no home in the target crates. O
 - Release binaries carry no test code.
 - More crates, and more ports to maintain. The build-graph check makes the direction of dependencies a CI failure rather than a review comment.
 
+Provider implementations live in one crate per forge (`flotilla-github-providers` and `flotilla-forgejo-providers`), apart from their forge-neutral traits (#3480).
+
 ## Recorded for later
 
 - An implementation label on providers, with picking the best when none is specified (for example libgit2 versus gitoxide).
