@@ -36,6 +36,20 @@ pub struct DummyVcs {
 pub(crate) struct DummyCheckouts(Mutex<HashMap<(String, PathBuf), String>>);
 
 impl DummyCheckouts {
+    pub(crate) fn destroy_environment(&self, environment: &str) {
+        self.lock().retain(|(owner, _), _| owner != environment);
+    }
+
+    pub(crate) fn remaining_for(&self, convoy: &str) -> Vec<String> {
+        let prefix = format!("dummy/{convoy}/");
+        let environment_prefix = format!("env-{convoy}-");
+        self.lock()
+            .iter()
+            .filter(|((environment, _), branch)| environment.starts_with(&environment_prefix) || branch.starts_with(&prefix))
+            .map(|((environment, path), _)| format!("live checkout {environment}:{}", path.display()))
+            .collect()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, PathBuf), String>> {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -204,5 +218,22 @@ impl Factory for DummyVcsFactory {
         }
         let environment = env.find_env_var("FLOTILLA_ENVIRONMENT_ID").unwrap_or_default().to_string();
         Ok(Arc::new(DummyVcs { fleet: Arc::clone(&self.fleet), environment, root: repo_root.as_path().to_path_buf() }))
+    }
+}
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    // Destroying one container removes all its checkouts while preserving others.
+    #[test]
+    fn environment_destruction_removes_only_its_checkouts() {
+        let checkouts = DummyCheckouts::default();
+        checkouts.lock().insert(("one".into(), "/workspace/one".into()), "dummy/convoy-a/main".into());
+        checkouts.lock().insert(("two".into(), "/workspace/two".into()), "dummy/convoy-b/main".into());
+        assert_eq!(checkouts.remaining_for("convoy-a").len(), 1);
+        checkouts.destroy_environment("one");
+        checkouts.destroy_environment("one");
+        assert!(checkouts.remaining_for("convoy-a").is_empty());
+        assert_eq!(checkouts.remaining_for("convoy-b").len(), 1);
     }
 }

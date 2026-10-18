@@ -28,6 +28,13 @@ impl ConvoyState {
 pub struct ConvoyObservation {
     pub name: String,
     pub state: ConvoyState,
+    /// Stable description of phase and crew states; exclude heartbeats and timestamps.
+    pub progress: String,
+    /// Evidence for a stall, if present. Empty evidence is a correctness failure.
+    pub stall: Option<String>,
+    /// Whether this script deliberately causes a stall.
+    pub expects_stall: bool,
+    pub expected_end: ConvoyState,
 }
 
 /// One home's load metrics, cumulative since it started.
@@ -59,10 +66,15 @@ pub trait FleetTarget: Send + Sync {
     /// Admit a convoy of `mix` named `name` at `home`. Returns once admitted.
     async fn dispatch(&self, home: usize, name: &str, mix: CrewMix) -> Result<(), String>;
     /// Every convoy the home holds that the driver dispatched there. Called
-    /// every tick, so it should read maintained state, not the store.
+    /// every tick, so it should read maintained state, not the store. A target
+    /// may prepend buffered semantic changes in observation order, so a short
+    /// lived stall or crew transition between ticks remains visible.
     async fn convoys(&self, home: usize) -> Result<Vec<ConvoyObservation>, String>;
     /// An authorised party's decision to abandon a convoy.
     async fn abandon(&self, home: usize, name: &str, reason: &str) -> Result<(), String>;
+    /// Final cleanup evidence for ended convoys, and crew command errors.
+    /// Return one diagnostic for each remaining session, vessel or checkout.
+    async fn audit(&self) -> Result<Vec<String>, String>;
     async fn sample(&self) -> Result<TargetSample, String>;
     /// Open convoys counted by where they are, in the target's own terms
     /// (for example `Active · coder Working`), to explain a run's tail.

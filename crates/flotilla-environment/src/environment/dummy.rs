@@ -16,7 +16,10 @@
 use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -48,15 +51,24 @@ pub struct DummyEnvironmentBehaviour {
     pub failure_rate: f64,
 }
 
+/// In-process providers model resources that a real container destroys with it.
+pub type DummyEnvironmentCleanup = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub struct DummyEnvironmentProvider {
     behaviour: DummyEnvironmentBehaviour,
+    cleanup: Option<DummyEnvironmentCleanup>,
     owner: Arc<()>,
     handles: Mutex<HashMap<EnvironmentId, Arc<DummyEnvironment>>>,
 }
 
 impl DummyEnvironmentProvider {
     pub fn new(behaviour: DummyEnvironmentBehaviour) -> Self {
-        Self { behaviour, owner: Arc::new(()), handles: Mutex::new(HashMap::new()) }
+        Self { behaviour, cleanup: None, owner: Arc::new(()), handles: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn with_cleanup(mut self, cleanup: DummyEnvironmentCleanup) -> Self {
+        self.cleanup = Some(cleanup);
+        self
     }
 
     fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<EnvironmentId, Arc<DummyEnvironment>>> {
@@ -109,6 +121,7 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
 
     async fn provision(&self, id: EnvironmentId, prepared: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String> {
         let image = prepared.get::<String>(&self.owner)?.clone();
+        self.handles().retain(|_, handle| !handle.destroyed.load(Ordering::Acquire));
         if let Some(existing) = self.handles().get(&id) {
             return Ok(Arc::clone(existing) as EnvironmentHandle);
         }
@@ -129,16 +142,33 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
             environment,
             runner: Arc::new(DummyCommandRunner::default()),
             id: id.clone(),
+            destroyed: AtomicBool::new(false),
+            cleanup: self.cleanup.clone(),
         });
         Ok(Arc::clone(self.handles().entry(id).or_insert(handle)) as EnvironmentHandle)
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
-        Ok(self.handles().values().map(|handle| Arc::clone(handle) as EnvironmentHandle).collect())
+        Ok(self
+            .handles()
+            .values()
+            .filter(|handle| !handle.destroyed.load(Ordering::Acquire))
+            .map(|handle| Arc::clone(handle) as EnvironmentHandle)
+            .collect())
     }
 
     async fn destroy(&self, container_id: &str) -> Result<(), String> {
-        self.handles().retain(|id, handle| handle.container_name != container_id && id.as_str() != container_id);
+        let mut destroyed = Vec::new();
+        self.handles().retain(|id, handle| {
+            let remove = handle.container_name == container_id || id.as_str() == container_id;
+            if remove {
+                destroyed.push(Arc::clone(handle));
+            }
+            !remove
+        });
+        for handle in destroyed {
+            handle.destroy().await?;
+        }
         Ok(())
     }
 }
@@ -172,6 +202,8 @@ impl LocalImageCache for DummyEnvironmentProvider {
 }
 
 struct DummyEnvironment {
+    destroyed: AtomicBool,
+    cleanup: Option<DummyEnvironmentCleanup>,
     id: EnvironmentId,
     image: ImageId,
     local_image_id: String,
@@ -199,7 +231,7 @@ impl ProvisionedEnvironment for DummyEnvironment {
         self.mounts.clone()
     }
     async fn status(&self) -> Result<EnvironmentStatus, String> {
-        Ok(EnvironmentStatus::Running)
+        Ok(if self.destroyed.load(Ordering::Acquire) { EnvironmentStatus::Stopped } else { EnvironmentStatus::Running })
     }
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
         Ok(self.environment.clone())
@@ -208,6 +240,11 @@ impl ProvisionedEnvironment for DummyEnvironment {
         Arc::clone(&self.runner) as Arc<dyn CommandRunner>
     }
     async fn destroy(&self) -> Result<(), String> {
+        if !self.destroyed.swap(true, Ordering::AcqRel) {
+            if let Some(cleanup) = &self.cleanup {
+                cleanup(self.id.as_str());
+            }
+        }
         Ok(())
     }
 }
@@ -426,6 +463,24 @@ mod tests {
                 ProvisionOpts { tokens: vec![("CREW".into(), "coder".into())], ..Default::default() },
             )
             .await
+    }
+
+    // Destroying a dummy container destroys its in-process child resources
+    // once, by environment identity, including when addressed by container ID.
+    #[tokio::test]
+    async fn destroying_an_environment_cleans_up_its_in_process_children() {
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&removed);
+        let provider = DummyEnvironmentProvider::new(DummyEnvironmentBehaviour::default())
+            .with_cleanup(Arc::new(move |id| captured.lock().expect("removed").push(id.to_string())));
+        let one = provision(&provider, "one").await.expect("one");
+        provision(&provider, "two").await.expect("two");
+        one.destroy().await.expect("destroy active handle");
+        assert_eq!(one.status().await.expect("status"), EnvironmentStatus::Stopped);
+        provider.destroy("flotilla-dummy-one").await.expect("destroy one");
+        provider.destroy("one").await.expect("idempotent destroy");
+        assert_eq!(*removed.lock().expect("removed"), vec!["one"]);
+        assert_eq!(provider.list().await.expect("surviving environments").len(), 1);
     }
 
     #[test]

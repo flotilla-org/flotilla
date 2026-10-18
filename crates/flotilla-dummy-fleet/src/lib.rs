@@ -44,11 +44,19 @@ impl DummyFleet {
     /// refuses everything outside the dummy fleet.
     pub fn install(self: &Arc<Self>, factories: &mut FactoryRegistry) {
         let environment = &self.config.environment;
-        factories.environment_providers.push(Box::new(DummyEnvironmentFactory::new(DummyEnvironmentBehaviour {
+        let weak = Arc::downgrade(self);
+        let provider = DummyEnvironmentFactory::new(DummyEnvironmentBehaviour {
             seed: self.config.seed,
             realise_delay: Duration::from_millis(environment.realise_delay_ms),
             failure_rate: environment.failure_rate,
-        })));
+        })
+        .with_cleanup(Arc::new(move |id| {
+            if let Some(fleet) = weak.upgrade() {
+                fleet.sessions.destroy_environment(id);
+                fleet.checkouts.destroy_environment(id);
+            }
+        }));
+        factories.environment_providers.push(Box::new(provider));
         factories.change_requests.insert(0, Box::new(forge::DummyChangeRequestFactory { fleet: Arc::clone(self) }));
         factories.vcs.insert(0, Box::new(vcs::DummyVcsFactory { fleet: Arc::clone(self) }));
         factories.terminal_pools.push(Box::new(terminal::DummyTerminalPoolFactory { fleet: Arc::clone(self) }));

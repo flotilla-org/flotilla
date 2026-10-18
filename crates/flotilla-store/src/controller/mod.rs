@@ -193,7 +193,7 @@ pub struct WorkQueueSender {
 
 #[derive(Default)]
 struct QueueProgress {
-    queued: HashSet<String>,
+    queued: BTreeMap<String, Instant>,
     processing: Option<String>,
     last_progress: Option<DateTime<Utc>>,
 }
@@ -214,7 +214,8 @@ impl WorkQueueSender {
         if progress.queued.is_empty() && progress.processing.is_none() {
             progress.last_progress = Some(Utc::now());
         }
-        if progress.queued.insert(name.clone()) {
+        if !progress.queued.contains_key(&name) {
+            progress.queued.insert(name.clone(), Instant::now());
             if let Err(error) = self.sender.send(name.clone()) {
                 progress.queued.remove(&name);
                 return Err(error);
@@ -223,11 +224,12 @@ impl WorkQueueSender {
         Ok(())
     }
 
-    fn start(&self, name: &str) {
+    fn start(&self, name: &str) -> Duration {
         let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
-        progress.queued.remove(name);
+        let wait = progress.queued.remove(name).map_or(Duration::ZERO, |at| at.elapsed());
         progress.processing = Some(name.into());
         progress.last_progress = Some(Utc::now());
+        wait
     }
 
     fn made_progress(&self) {
@@ -822,7 +824,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                 metrics.wakes.increment();
                 metrics.queue_peak.observe(pending.len() as u64 + 1);
                 let woke_at = Instant::now();
-                sender.start(&name);
+                metrics.queue_wait.record(sender.start(&name));
+                let _busy = metrics.busy();
                 let object = match primary.get(&name).await {
                     Ok(object) => object,
                     Err(ResourceError::NotFound { .. }) => {
@@ -1102,12 +1105,14 @@ impl<R: Reconciler> ControllerLoop<R> {
                     pending.push_front(name);
                 }
                 _ = resync.tick() => {
+                    let _busy = metrics.busy();
                     let live_names = Self::resync_all(&primary, &sender).await?;
                     metrics.resyncs.increment();
                     metrics.resync_enqueued.add(live_names.len() as u64);
                     finalizer_failures.retain(|name, _| live_names.contains(name));
                 }
                 Some(exited) = watch_exited_rx.recv() => {
+                    let _busy = metrics.busy();
                     match exited {
                         WatchExited::Primary(result) => {
                             Self::accept_restartable_watch_exit(result)?;
@@ -1174,6 +1179,24 @@ mod progress_tests {
     // #3412: only outstanding work without progress can stall a controller.
     // Generate duplicate queue entries, backlog sizes, and ages on both sides
     // of the bound; check after every drain step and after the queue is idle.
+    // A duplicate wake preserves the earliest enqueue instant, including time
+    // in the channel before the controller moves names to its local queue.
+    #[tokio::test(start_paused = true)]
+    async fn queue_wait_includes_channel_delay_and_preserves_first_wake() {
+        let (sender, mut receiver) = WorkQueueSender::channel();
+        sender.send("one".into()).await.expect("wake");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        sender.send("one".into()).await.expect("coalesced wake");
+        let name = receiver.recv().await.expect("name");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(sender.start(&name), Duration::from_secs(3));
+        assert!(receiver.try_recv().is_err());
+        sender.made_progress();
+        sender.send(name.clone()).await.expect("next wake");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(sender.start(&name), Duration::from_secs(1));
+    }
+
     #[hegel::test]
     fn controller_queue_progress_distinguishes_idle_busy_and_stuck(tc: hegel::TestCase) {
         use hegel::generators as gs;

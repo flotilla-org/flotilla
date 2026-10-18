@@ -20,6 +20,8 @@ type Dispatched = (usize, CrewMix, Instant, Option<ConvoyState>);
 /// An in-memory fleet: each mix ends in a fixed state after a fixed time.
 struct ScriptedFleet {
     homes: usize,
+    dispatch_delay: Duration,
+    audit_errors: Vec<String>,
     outcome: fn(CrewMix) -> Option<(ConvoyState, Duration)>,
     convoys: Mutex<HashMap<String, Dispatched>>,
     dispatches: AtomicU64,
@@ -42,6 +44,8 @@ impl ScriptedFleet {
     fn new(homes: usize, outcome: fn(CrewMix) -> Option<(ConvoyState, Duration)>) -> Self {
         Self {
             homes,
+            dispatch_delay: Duration::ZERO,
+            audit_errors: vec![],
             outcome,
             convoys: Mutex::default(),
             dispatches: AtomicU64::new(0),
@@ -84,6 +88,7 @@ impl FleetTarget for ScriptedFleet {
         if self.refuse_dispatches {
             return Err("admission refused".into());
         }
+        tokio::time::sleep(self.dispatch_delay).await;
         let mut convoys = self.convoys.lock().expect("convoys");
         assert!(convoys.insert(name.into(), (home, mix, Instant::now(), None)).is_none(), "names are unique");
         let open = convoys.values().filter(|(_, mix, at, decided)| !self.state(*mix, *at, *decided).ended()).count() as u64;
@@ -97,7 +102,14 @@ impl FleetTarget for ScriptedFleet {
         Ok(convoys
             .iter()
             .filter(|(_, (at_home, ..))| *at_home == home)
-            .map(|(name, (_, mix, at, decided))| ConvoyObservation { name: name.clone(), state: self.state(*mix, *at, *decided) })
+            .map(|(name, (_, mix, at, decided))| ConvoyObservation {
+                name: name.clone(),
+                state: self.state(*mix, *at, *decided),
+                progress: String::new(),
+                stall: None,
+                expects_stall: false,
+                expected_end: ConvoyState::Delivered,
+            })
             .collect())
     }
 
@@ -109,6 +121,10 @@ impl FleetTarget for ScriptedFleet {
         let convoy = convoys.get_mut(name).ok_or("unknown convoy")?;
         convoy.3 = Some(ConvoyState::Abandoned);
         Ok(())
+    }
+
+    async fn audit(&self) -> Result<Vec<String>, String> {
+        Ok(self.audit_errors.clone())
     }
 
     async fn sample(&self) -> Result<TargetSample, String> {
@@ -123,6 +139,8 @@ impl FleetTarget for ScriptedFleet {
 fn plan(running: usize) -> LoadPlan {
     LoadPlan {
         running,
+        warmup_ended: 0,
+        drain: Duration::from_secs(35),
         ramp_per_second: 50.0,
         dispatch_concurrency: 8,
         window: Duration::from_secs(60),
@@ -260,4 +278,108 @@ async fn a_run_with_no_admitted_convoy_is_an_error() {
     plan.window = Duration::from_secs(5);
     let error = run(&fleet, &plan).await.expect_err("nothing was admitted");
     assert!(error.contains("no dispatch was admitted") && error.contains("admission refused"), "{error}");
+}
+
+// Scheduled admission latency includes time spent behind the concurrency cap;
+// drain finishes admissions and work that were still running at window close.
+#[tokio::test(start_paused = true)]
+async fn scheduled_latency_and_drain_include_queued_admissions() {
+    let mut fleet = ScriptedFleet::new(1, |_| Some((ConvoyState::Delivered, Duration::from_secs(4))));
+    fleet.dispatch_delay = Duration::from_secs(2);
+    let mut plan = plan(3);
+    plan.dispatch_concurrency = 1;
+    plan.max_ramp = Duration::from_secs(1);
+    plan.window = Duration::from_secs(2);
+    let report = run(&fleet, &plan).await.expect("report");
+    assert!(report.dispatch.backlog.max_micros >= 1_900_000, "{:?}", report.dispatch);
+    assert!(report.dispatch.admission.max_micros >= 3_900_000, "{:?}", report.dispatch);
+    assert_eq!(report.dispatch.scheduled_waiting_at_window_end, 1);
+    assert!(report.dispatch.oldest_scheduled_wait_seconds >= 2.0);
+    assert_eq!(report.total.delivered, report.dispatch.dispatched);
+    assert!(report.total.delivered > report.window.delivered);
+    assert!(report.drain_seconds >= 3.0);
+    assert!(report.correctness_errors.is_empty(), "{:?}", report.correctness_errors);
+    assert!(report.unfinished.is_empty());
+    assert!(!report.open_ages_at_end.is_empty());
+    assert!(report.markdown().contains("age="));
+}
+
+// Warm-up must end the requested number of convoys before measuring; window
+// counters exclude those warm-up outcomes. A hung tail is a correctness error.
+#[tokio::test(start_paused = true)]
+async fn warmup_precedes_window_and_a_hung_tail_fails_correctness() {
+    let fleet = ScriptedFleet::new(1, |_| Some((ConvoyState::Delivered, Duration::from_secs(4))));
+    let mut plan = plan(2);
+    plan.warmup_ended = 2;
+    plan.window = Duration::from_secs(1);
+    let report = run(&fleet, &plan).await.expect("report");
+    assert!(report.ramp.seconds >= 4.0);
+    assert!(report.ramp.warmup_reached);
+    assert!(report.ramp.warmup_ended >= 2);
+    assert!(report.total.delivered >= report.window.delivered + 2);
+    let fleet = ScriptedFleet::new(1, |_| None);
+    plan.max_ramp = Duration::from_secs(2);
+    plan.drain = Duration::from_secs(3);
+    plan.unchanged_bound = Duration::from_secs(1);
+    let report = run(&fleet, &plan).await.expect("a bad run still reports");
+    assert!(report.correctness_errors.iter().any(|e| e.contains("unchanged")));
+    assert!(report.correctness_errors.iter().any(|e| e.contains("unfinished without stall evidence")));
+    assert_eq!(report.unfinished.len(), 2);
+}
+
+// Crew command errors and cleanup leaks must fail correctness even when every
+// convoy delivered. The report must still preserve the successful outcomes.
+#[tokio::test(start_paused = true)]
+async fn successful_delivery_does_not_hide_command_errors_or_cleanup_leaks() {
+    let mut fleet = ScriptedFleet::new(1, |_| Some((ConvoyState::Delivered, Duration::from_secs(1))));
+    fleet.audit_errors = vec!["crew command error".into(), "live session".into(), "vessel remains".into(), "checkout remains".into()];
+    let mut plan = plan(1);
+    plan.window = Duration::from_secs(2);
+    plan.drain = Duration::from_secs(3);
+    let report = run(&fleet, &plan).await.expect("a failing run still reports");
+    assert_eq!(report.total.delivered, report.dispatch.admitted);
+    for error in &fleet.audit_errors {
+        assert!(report.correctness_errors.contains(error), "{report:?}");
+    }
+    assert_eq!(report.drain_seconds, 3.0);
+}
+
+// Reports preserve interval queue latency and busy fraction, and identify the
+// source/settings in Markdown as well as JSON. No performance threshold is a gate.
+#[tokio::test(start_paused = true)]
+async fn reports_preserve_controller_wait_busy_time_and_run_identity() {
+    use flotilla_store::load_metrics::ControllerLoadMetrics;
+
+    let metrics = ControllerLoadMetrics::default();
+    let sample = || TargetSample {
+        homes: vec![crate::HomeSample { controllers: [("Convoy".into(), metrics.snapshot())].into(), ..Default::default() }],
+        ..Default::default()
+    };
+    let start = sample();
+    metrics.queue_wait.record(Duration::from_secs(2));
+    let guard = metrics.busy();
+    tokio::time::advance(Duration::from_secs(3)).await;
+    drop(guard);
+    tokio::time::advance(Duration::from_secs(7)).await;
+    let homes = crate::report::window_metrics(&start, &sample(), Duration::from_secs(10));
+    let controller = &homes[0].controllers["Convoy"];
+    assert_eq!(controller.busy_fraction, 0.3);
+    assert_eq!(controller.queue_wait.count, 1);
+    assert_eq!(controller.queue_wait.max_micros, 2_000_000);
+
+    let fleet = ScriptedFleet::new(1, |_| Some((ConvoyState::Delivered, Duration::from_secs(1))));
+    let mut plan = plan(1);
+    plan.window = Duration::from_secs(1);
+    let mut report = run(&fleet, &plan).await.expect("report");
+    report.metadata.insert("commit".into(), "recorded-revision".into());
+    report.metadata.insert("host_load_start".into(), "0.1 0.2 0.3".into());
+    report.metadata.insert("host_load_end".into(), "0.4 0.5 0.6".into());
+    report.home_metrics = homes;
+    let markdown = report.markdown();
+    for evidence in ["recorded-revision", "0.1 0.2 0.3", "0.4 0.5 0.6", "drain:", "30.0%", "Queue wait"] {
+        assert!(markdown.contains(evidence), "missing {evidence}: {markdown}");
+    }
+    let json = serde_json::to_value(&report).expect("JSON report");
+    assert_eq!(json["metadata"]["commit"], "recorded-revision");
+    assert_eq!(json["home_metrics"][0]["controllers"]["Convoy"]["busy_fraction"], 0.3);
 }

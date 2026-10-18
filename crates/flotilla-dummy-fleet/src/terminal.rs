@@ -33,6 +33,8 @@ pub const DUMMY_TERMINAL_POOL: &str = "dummy";
 
 pub(crate) struct DummySession {
     role: String,
+    convoy: Option<String>,
+    environment: String,
     command: String,
     cwd: ExecutionEnvironmentPath,
     working: AtomicBool,
@@ -66,8 +68,27 @@ impl DummySession {
 pub(crate) struct DummySessions(Mutex<HashMap<String, Arc<DummySession>>>);
 
 impl DummySessions {
+    pub(crate) fn destroy_environment(&self, environment: &str) {
+        self.lock().retain(|_, session| {
+            if session.environment == environment {
+                session.stop();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<DummySession>>> {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn remaining_for(&self, convoy: &str) -> Vec<String> {
+        self.lock()
+            .iter()
+            .filter(|(_, session)| session.convoy.as_deref() == Some(convoy))
+            .map(|(name, _)| format!("live session {name}"))
+            .collect()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -81,6 +102,7 @@ impl DummySessions {
 
 pub struct DummyTerminalPool {
     fleet: Arc<DummyFleet>,
+    environment: String,
 }
 
 impl DummyTerminalPool {
@@ -96,6 +118,8 @@ impl DummyTerminalPool {
         let (sender, receiver) = mpsc::unbounded_channel();
         let session = Arc::new(DummySession {
             role: identity.as_ref().map_or_else(|| "tool".to_string(), |identity| identity.role.clone()),
+            environment: self.environment.clone(),
+            convoy: identity.as_ref().map(|identity| identity.convoy.clone()),
             command: command.into(),
             cwd: cwd.clone(),
             // A launched crew works on its launch prompt before it first idles.
@@ -216,7 +240,10 @@ impl Factory for DummyTerminalPoolFactory {
         if env.find_env_var(DUMMY_FLEET_ENV).is_none() {
             return Err(vec![UnmetRequirement::MissingEnvVar(DUMMY_FLEET_ENV.into())]);
         }
-        Ok(Arc::new(DummyTerminalPool { fleet: Arc::clone(&self.fleet) }))
+        Ok(Arc::new(DummyTerminalPool {
+            fleet: Arc::clone(&self.fleet),
+            environment: env.find_env_var("FLOTILLA_ENVIRONMENT_ID").unwrap_or_default().into(),
+        }))
     }
 }
 
@@ -296,6 +323,24 @@ mod tests {
             self.attention.lock().expect("attention").push((session.to_string(), working));
             Ok(())
         }
+    }
+
+    // Container destruction removes in-process sessions only in that environment,
+    // including idle tool sessions; killing another environment is not cleanup.
+    #[tokio::test]
+    async fn environment_destruction_removes_only_its_sessions() {
+        let fleet = DummyFleet::new(DummyFleetConfig::default());
+        let one = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "one".into() };
+        let two = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "two".into() };
+        let path = ExecutionEnvironmentPath::new("/workspace");
+        one.launch("one-session", "shell", &path, &vec![]).expect("one");
+        two.launch("two-session", "shell", &path, &vec![]).expect("two");
+        assert_eq!(fleet.snapshot().live_sessions, 2);
+        fleet.sessions.destroy_environment("one");
+        fleet.sessions.destroy_environment("one");
+        assert_eq!(fleet.snapshot().live_sessions, 1);
+        assert!(fleet.sessions.get("one-session").is_none());
+        assert!(fleet.sessions.get("two-session").is_some());
     }
 
     fn launch_environment(script: &CrewScript) -> TerminalEnvVars {
@@ -387,7 +432,7 @@ mod tests {
                 attention: Default::default(),
             });
             fleet.attach(Arc::clone(&port) as Arc<dyn CrewCommandPort>).expect("attach");
-            let pool = DummyTerminalPool { fleet: Arc::clone(&fleet) };
+            let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
             let adapter = DummyAgentAdapter::new(1);
             let screen =
                 || async { adapter.classify_screen_attention(&pool.capture_screen(SESSION).await.expect("screen").expect("session")) };
@@ -496,7 +541,7 @@ mod tests {
             attention: Default::default(),
         });
         fleet.attach(Arc::clone(&port) as Arc<dyn CrewCommandPort>).expect("attach");
-        let pool = DummyTerminalPool { fleet: Arc::clone(&fleet) };
+        let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
         let script = CrewScript::Coder { reviewer: None, repository: "flotilla-org/flotilla".into() };
         pool.ensure_session(
             SESSION,

@@ -1,6 +1,6 @@
 //! Durable Message reconciliation and terminal transport.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -18,12 +18,15 @@ async fn watch_delivery<R: Resource>(
     backend: ResourceBackend,
     namespace: String,
     wake: tokio::sync::watch::Sender<()>,
+    queued: Arc<Mutex<Option<tokio::time::Instant>>>,
 ) -> Result<(), ResourceError> {
     let mut events = backend.including_replicas::<R>(&namespace).watch().await?;
     // A restart/relist must repair changes missed while the watch was down.
+    queued.lock().expect("Message wake time").get_or_insert_with(tokio::time::Instant::now);
     wake.send_replace(());
     while let Some(event) = events.next().await {
         event?;
+        queued.lock().expect("Message wake time").get_or_insert_with(tokio::time::Instant::now);
         wake.send_replace(());
     }
     Err(ResourceError::other("Message dependency watch closed"))
@@ -42,13 +45,14 @@ impl MessageController {
         metrics: Arc<flotilla_store::load_metrics::ControllerLoadMetrics>,
     ) -> Result<(), ResourceError> {
         let backend = self.state.daemon.resource_backend();
+        let queued = Arc::new(Mutex::new(None));
         let (wake, receiver) = tokio::sync::watch::channel(());
         // JoinSet aborts every watch on cancellation, failure, or supervision
         // restart; no detached producer can survive the inbox loop.
         let mut watches = tokio::task::JoinSet::new();
         macro_rules! watch {
             ($kind:ty) => {
-                watches.spawn(watch_delivery::<$kind>(backend.clone(), self.namespace.clone(), wake.clone()));
+                watches.spawn(watch_delivery::<$kind>(backend.clone(), self.namespace.clone(), wake.clone(), Arc::clone(&queued)));
             };
         }
         watch!(flotilla_resources::Message);
@@ -66,7 +70,7 @@ impl MessageController {
         // Durable batch intent makes passes safe to cancel and rerun after
         // watch failure; recovery observes held submissions without retyping.
         tokio::select! {
-            result = run_delivery(&inbox, &transport, receiver, resync_interval, heartbeat, metrics) => result,
+            result = run_delivery(&inbox, &transport, receiver, queued, resync_interval, heartbeat, metrics) => result,
             result = watches.join_next() => {
                 match result {
                     Some(Ok(result)) => result,
@@ -85,6 +89,7 @@ async fn run_delivery(
     inbox: &flotilla_messaging::MessageInbox,
     transport: &dyn flotilla_messaging::MessageTransport,
     mut wake: tokio::sync::watch::Receiver<()>,
+    queued: Arc<Mutex<Option<tokio::time::Instant>>>,
     resync_interval: std::time::Duration,
     heartbeat: Arc<std::sync::atomic::AtomicU64>,
     metrics: Arc<flotilla_store::load_metrics::ControllerLoadMetrics>,
@@ -110,8 +115,11 @@ async fn run_delivery(
             } => { metrics.requeues.increment(); }
         }
         wake.borrow_and_update();
+        let waited = queued.lock().expect("Message wake time").take().map_or(std::time::Duration::ZERO, |at| at.elapsed());
+        metrics.queue_wait.record(waited);
         metrics.wakes.increment();
         metrics.queue_peak.observe(1);
+        let _busy = metrics.busy();
         let started = tokio::time::Instant::now();
         let result = async {
             inbox.reconcile_delivery(transport, Utc::now()).await.inspect_err(|error| {

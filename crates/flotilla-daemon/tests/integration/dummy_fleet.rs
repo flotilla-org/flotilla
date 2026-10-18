@@ -41,6 +41,10 @@ impl DummyDaemon {
     /// A daemon whose `daemon.toml` enables the dummy fleet with these agent
     /// and environment settings, started through the composition-root switch.
     async fn start(agent: &str, environment: &str) -> Self {
+        Self::start_with_resync(agent, environment, Duration::from_millis(200)).await
+    }
+
+    async fn start_with_resync(agent: &str, environment: &str, resync: Duration) -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_dir = dir.path().join("config");
         std::fs::create_dir_all(&config_dir).expect("config dir");
@@ -66,7 +70,7 @@ impl DummyDaemon {
         let options = RuntimeOptions {
             namespace: NAMESPACE.into(),
             heartbeat_interval: Duration::from_secs(5),
-            controller_resync_interval: Duration::from_millis(200),
+            controller_resync_interval: resync,
             ..RuntimeOptions::default()
         };
         let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
@@ -294,6 +298,9 @@ async fn a_failing_crew_proposes_failure_and_its_supervisor_fails_the_convoy() {
     let failed = fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Fail)).await;
     assert!(!matches!(failed, CommandValue::Error { .. }), "{failed:?}");
     fleet.wait_for_crew("failing", CrewWorkPhase::Failed).await;
+    // A supervisor's failure decision ends the convoy, not just the crew.
+    let ended = fleet.wait_for_phase("failing", ConvoyPhase::Failed).await;
+    assert!(ended.status.as_ref().expect("status").stalled.is_none(), "terminal convoys have no stall");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -383,4 +390,13 @@ async fn an_eager_supervisor_waits_for_work_and_lands_after_answering() {
     assert_eq!(snapshot.crews_completed, 2, "{snapshot:?}");
     assert_eq!(snapshot.turns_received, 2, "the task and answer are delivered: {snapshot:?}");
     assert_eq!(snapshot.crews_stalled, 0, "{snapshot:?}");
+}
+
+// A missed event must not be hidden by the scenario harness's 200ms resync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_coder_lands_at_the_production_resync_interval() {
+    let fleet = DummyDaemon::start_with_resync(SCENARIO_AGENT, "", RuntimeOptions::default().controller_resync_interval).await;
+    fleet.dispatch("production-resync", CrewMix::Coder).await;
+    fleet.wait_for_phase("production-resync", ConvoyPhase::Landed).await;
+    assert_eq!(fleet.fleet.snapshot().command_errors, 0, "{:?}", fleet.fleet.command_error_samples());
 }

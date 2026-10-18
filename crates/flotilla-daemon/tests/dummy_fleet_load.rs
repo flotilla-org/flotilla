@@ -8,10 +8,17 @@
 //! default and measures a configured run:
 //!
 //! ```sh
-//! FLOTILLA_LOAD_RUNNING=1000 FLOTILLA_LOAD_DAEMONS=1 FLOTILLA_LOAD_WINDOW_SECS=300 \
+//! FLOTILLA_LOAD_RUNNING=1000 FLOTILLA_LOAD_DAEMONS=1 FLOTILLA_LOAD_WINDOW_SECS=1800 \
 //! FLOTILLA_LOAD_REPORT=/tmp/load-1000 \
 //!   cargo test --release -p flotilla-daemon --locked --test dummy_fleet_load load_baseline -- --ignored --nocapture
 //! ```
+//!
+//! `FLOTILLA_LOAD_WARMUP_ENDED` defaults to the running count; `MAX_RAMP_SECS`
+//! bounds warm-up too. `FLOTILLA_LOAD_DRAIN_SECS` (900) stops admissions then
+//! waits for outcomes and cleanup. `FLOTILLA_LOAD_UNCHANGED_SECS` (600) bounds
+//! progress independently of production stall timers. `FLOTILLA_LOAD_TIMELINE=true`
+//! logs semantic changes and retains them in JSON; `FLOTILLA_LOAD_DUMP_UNFINISHED`
+//! (true) prints the post-drain tail. Both Markdown and JSON retain tail ages.
 //!
 //! `FLOTILLA_LOAD_TRACE=1` records controller errors/restarts and slow Message
 //! receipt timestamps, including the durable submission instant, to stderr.
@@ -46,13 +53,13 @@ use flotilla_daemon_testkit::server::{spawn_in_memory_request_mesh_with_replicat
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_dummy_fleet::{
     catalog::{self, CrewMix, DUMMY_PLACEMENT_POLICY},
-    CrewCommandPort, DaemonCommandPort,
+    CrewCommandPort, DaemonCommandPort, DummyFleet,
 };
 use flotilla_load_driver::{ConvoyObservation, ConvoyState, FleetTarget, HomeSample, LoadPlan, TargetSample};
 use flotilla_protocol::{commands::CommandValue, CommandAction, HostName};
 use flotilla_resources::{
-    Convoy, ConvoyPhase, Forge, Host, InputMeta, Message, PlacementPolicy, ReadWatchEvent, Repository, ResourceProvenance, WatchEvent,
-    WatchStart, WorkflowTemplate,
+    Checkout, Convoy, ConvoyPhase, Forge, Host, InputMeta, Message, PlacementPolicy, ReadWatchEvent, Repository, ResourceProvenance,
+    TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
 };
 use flotilla_store::{
     load_metrics::{LatencyHistogram, ReplicationLoadMetrics},
@@ -67,9 +74,10 @@ const NAMESPACE: &str = "flotilla";
 /// latencies of turn delivery and of convoys replicated here.
 #[derive(Default)]
 struct HomeView {
-    convoys: Mutex<HashMap<String, (String, ConvoyState)>>,
+    convoys: Mutex<HashMap<String, (String, ConvoyObservation)>>,
     /// Where each open convoy is: its phase and its crews' work phases.
     places: Mutex<HashMap<String, String>>,
+    changes: Mutex<Vec<ConvoyObservation>>,
     observer_failure_sightings: AtomicU64,
     turn_delivery: LatencyHistogram,
     replication_lag: LatencyHistogram,
@@ -81,6 +89,7 @@ type Admissions = Arc<Mutex<HashMap<String, tokio::time::Instant>>>;
 
 struct Home {
     daemon: Arc<InProcessDaemon>,
+    fleet: Arc<DummyFleet>,
     runtime: DaemonRuntime,
     store: SqliteBackend,
     database: PathBuf,
@@ -138,7 +147,7 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, adm
     watch_convoys(&backend, Arc::clone(&view), admissions).await;
     watch_messages(&backend, Arc::clone(&view)).await;
     let port = DaemonCommandPort::new(&(Arc::clone(&daemon) as Arc<dyn DaemonHandle>));
-    Home { daemon, runtime, store, database, port, replication: Arc::default(), view }
+    Home { daemon, fleet, runtime, store, database, port, replication: Arc::default(), view }
 }
 
 async fn seed(backend: &ResourceBackend, forge_service_url: &str) {
@@ -198,7 +207,21 @@ async fn watch_convoys(backend: &ResourceBackend, view: Arc<HomeView>, admission
                     }
                     admissions.lock().expect("admissions").entry(convoy.metadata.name.clone()).or_insert_with(tokio::time::Instant::now);
                     let state = convoy.status.as_ref().map_or(ConvoyState::Open, |status| state_of(status.phase));
-                    view.convoys.lock().expect("convoys").insert(convoy.spec.role.clone(), (convoy.metadata.name.clone(), state));
+                    let observation = ConvoyObservation {
+                        name: convoy.spec.role.clone(),
+                        state,
+                        progress: format!("resource={} {}", convoy.metadata.name, place_of(&convoy)),
+                        stall: convoy.status.as_ref().and_then(|status| status.stalled.as_ref()).map(|stall| stall.evidence.clone()),
+                        expects_stall: false,
+                        expected_end: ConvoyState::Delivered,
+                    };
+                    {
+                        let mut convoys = view.convoys.lock().expect("convoys");
+                        if convoys.get(&convoy.spec.role).is_none_or(|(_, previous)| *previous != observation) {
+                            view.changes.lock().expect("changes").push(observation.clone());
+                        }
+                        convoys.insert(convoy.spec.role.clone(), (convoy.metadata.name.clone(), observation));
+                    }
                     let mut places = view.places.lock().expect("places");
                     if state.ended() {
                         places.remove(&convoy.spec.role);
@@ -324,7 +347,9 @@ impl FleetTarget for InProcessFleet {
 
     async fn convoys(&self, home: usize) -> Result<Vec<ConvoyObservation>, String> {
         let convoys = self.homes[home].view.convoys.lock().expect("convoys");
-        Ok(convoys.iter().map(|(name, (_, state))| ConvoyObservation { name: name.clone(), state: *state }).collect())
+        let mut observations = std::mem::take(&mut *self.homes[home].view.changes.lock().expect("changes"));
+        observations.extend(convoys.values().map(|(_, observation)| observation.clone()));
+        Ok(observations)
     }
 
     async fn abandon(&self, home: usize, name: &str, reason: &str) -> Result<(), String> {
@@ -346,6 +371,48 @@ impl FleetTarget for InProcessFleet {
             }
         }
         Ok(breakdown)
+    }
+
+    async fn audit(&self) -> Result<Vec<String>, String> {
+        let mut errors = Vec::new();
+        for home in &self.homes {
+            let snapshot = home.fleet.snapshot();
+            if snapshot.command_errors != 0 {
+                errors.push(format!("crew command errors: {} {:?}", snapshot.command_errors, home.fleet.command_error_samples()));
+            }
+            let ended = home
+                .view
+                .convoys
+                .lock()
+                .expect("convoys")
+                .values()
+                .filter(|(_, o)| o.state.ended())
+                .map(|(resource, _)| resource.clone())
+                .collect::<HashSet<_>>();
+            for convoy in &ended {
+                errors.extend(home.fleet.remaining_for(convoy).into_iter().map(|artifact| format!("{convoy}: {artifact}")));
+            }
+            let backend = home.daemon.resource_backend();
+            for vessel in backend.clone().using::<Vessel>(NAMESPACE).list().await.map_err(|e| e.to_string())?.items {
+                if ended.contains(&vessel.spec.convoy_ref) {
+                    errors.push(format!("{}: vessel {} remains", vessel.spec.convoy_ref, vessel.metadata.name));
+                }
+            }
+            for terminal in backend.clone().using::<TerminalSession>(NAMESPACE).list().await.map_err(|e| e.to_string())?.items {
+                if let Some(convoy) = terminal.metadata.labels.get("flotilla.work/convoy").filter(|c| ended.contains(*c)) {
+                    errors.push(format!("{convoy}: session {} remains", terminal.metadata.name));
+                }
+            }
+            for checkout in backend.using::<Checkout>(NAMESPACE).list().await.map_err(|e| e.to_string())?.items {
+                if let Some(convoy) = checkout.metadata.labels.get("flotilla.work/convoy").filter(|c| ended.contains(*c)) {
+                    errors.push(format!(
+                        "{convoy}: checkout {} remains: status={:?} deletion={:?} finalizers={:?}",
+                        checkout.metadata.name, checkout.status, checkout.metadata.deletion_timestamp, checkout.metadata.finalizers
+                    ));
+                }
+            }
+        }
+        Ok(errors)
     }
 
     async fn sample(&self) -> Result<TargetSample, String> {
@@ -392,7 +459,9 @@ fn dummy_fleet_settings() -> String {
 async fn load_driver_smoke() {
     let fleet = InProcessFleet::start(1, &dummy_fleet_settings()).await;
     let plan = LoadPlan {
-        running: 6,
+        running: 10,
+        warmup_ended: 0,
+        drain: Duration::from_secs(180),
         ramp_per_second: 6.0,
         dispatch_concurrency: 6,
         window: Duration::from_secs(25),
@@ -406,7 +475,11 @@ async fn load_driver_smoke() {
     eprintln!("{}", report.markdown());
     assert!(report.ramp.reached, "{:?}", report.ramp);
     assert_eq!(report.dispatch.errors, 0, "{:?}", report.dispatch.error_samples);
-    assert!(report.window.delivered >= 3, "{:?}", report.window);
+    assert!(report.correctness_errors.is_empty(), "{:?}", report.correctness_errors);
+    assert_eq!(report.total.delivered, report.dispatch.admitted, "every admitted convoy delivers");
+    for mix in CrewMix::ALL {
+        assert!(report.total.by_mix.get(&format!("{mix:?}")).is_some_and(|outcome| outcome.delivered > 0), "{mix:?}: {:?}", report.total);
+    }
     assert_eq!((report.window.failed, report.window.abandoned), (0, 0), "{:?}", report.window);
     let home = &report.home_metrics[0];
     assert!(home.store.as_ref().is_some_and(|store| store.write_execution.count > 0), "the store records writes");
@@ -432,14 +505,30 @@ async fn load_baseline() {
         running: env_or("FLOTILLA_LOAD_RUNNING", 100),
         ramp_per_second: env_or("FLOTILLA_LOAD_RAMP_PER_SECOND", 20.0),
         dispatch_concurrency: env_or("FLOTILLA_LOAD_DISPATCH_CONCURRENCY", 16),
-        window: Duration::from_secs(env_or("FLOTILLA_LOAD_WINDOW_SECS", 120)),
+        window: Duration::from_secs(env_or("FLOTILLA_LOAD_WINDOW_SECS", 1800)),
+        warmup_ended: env_or("FLOTILLA_LOAD_WARMUP_ENDED", env_or("FLOTILLA_LOAD_RUNNING", 100)),
+        drain: Duration::from_secs(env_or("FLOTILLA_LOAD_DRAIN_SECS", 900)),
+        unchanged_bound: Duration::from_secs(env_or("FLOTILLA_LOAD_UNCHANGED_SECS", 600)),
+        timeline: env_or("FLOTILLA_LOAD_TIMELINE", false),
+        dump_unfinished: env_or("FLOTILLA_LOAD_DUMP_UNFINISHED", true),
         max_ramp: Duration::from_secs(env_or("FLOTILLA_LOAD_MAX_RAMP_SECS", 900)),
-        convoy_deadline: Duration::from_secs(env_or("FLOTILLA_LOAD_DEADLINE_SECS", 900)),
+        convoy_deadline: Duration::from_secs(env_or("FLOTILLA_LOAD_DEADLINE_SECS", 1800)),
         tick: Duration::from_millis(env_or("FLOTILLA_LOAD_TICK_MS", 500)),
         series_every: Duration::from_secs(env_or("FLOTILLA_LOAD_SERIES_SECS", 15)),
         ..LoadPlan::default()
     };
+    // Capture source identity before the run, so a later checkout change does
+    // not relabel a measurement. Preserve dirty patches in the JSON report.
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git").args(args).output().expect("source identity");
+        assert!(output.status.success(), "git source identity failed");
+        String::from_utf8(output.stdout).expect("git UTF-8").trim().to_string()
+    };
+    let revision = git(&["rev-parse", "HEAD"]);
+    let source_diff = git(&["diff", "HEAD"]);
+    let source_status = git(&["status", "--porcelain"]);
     let started = Utc::now();
+    let load_start = std::fs::read_to_string("/proc/loadavg").unwrap_or_else(|_| "unavailable".into());
     let fleet = Arc::new(fleet);
     // Progress survives a run the host kills: open convoys, memory and store size.
     let progress = {
@@ -476,8 +565,21 @@ async fn load_baseline() {
             }
         })
     };
-    let report = flotilla_load_driver::run(&*fleet, &plan).await.expect("load report");
+    let mut report = flotilla_load_driver::run(&*fleet, &plan).await.expect("load report");
     progress.abort();
+    report.metadata.insert("started_utc".into(), started.to_string());
+    report.metadata.insert("commit".into(), revision);
+    report.metadata.insert("source_status".into(), source_status);
+    report.metadata.insert("source_diff".into(), source_diff);
+    report.metadata.insert("dummy_fleet".into(), dummy_fleet_settings());
+    report.metadata.insert("effective_dummy_config".into(), format!("{:?}", fleet.homes[0].fleet.config()));
+    report.metadata.insert("host_load_start".into(), load_start.trim().into());
+    report
+        .metadata
+        .insert("host_load_end".into(), std::fs::read_to_string("/proc/loadavg").unwrap_or_else(|_| "unavailable".into()).trim().into());
+    report.metadata.insert("trace".into(), std::env::var_os("FLOTILLA_LOAD_TRACE").is_some().to_string());
+    report.metadata.insert("report_prefix".into(), std::env::var("FLOTILLA_LOAD_REPORT").unwrap_or_default());
+    report.metadata.insert("max_resident_bytes".into(), format!("{:?}", fleet.memory_limit));
     let observer_failures: u64 = fleet.homes.iter().map(|home| home.view.observer_failure_sightings.load(Ordering::Relaxed)).sum();
     println!("observer_failure_sightings={observer_failures}");
     let markdown = report.markdown();
@@ -486,6 +588,10 @@ async fn load_baseline() {
         std::fs::write(format!("{prefix}.md"), format!("Run started {started}.\n\n{markdown}")).expect("markdown report");
         std::fs::write(format!("{prefix}.json"), serde_json::to_string_pretty(&report).expect("json")).expect("json report");
     }
+    assert!(report.correctness_errors.is_empty(), "{:?}", report.correctness_errors);
+    assert_eq!(report.total.delivered, report.dispatch.admitted, "every admitted convoy delivers");
+    assert_eq!(report.dispatch.errors, 0, "{:?}", report.dispatch);
+    assert_eq!(report.total.failed + report.total.abandoned, 0, "all load scripts should deliver: {:?}", report.total);
     assert_eq!(observer_failures, 0, "load produced no-ready-forge-observer stall evidence; see observer_failure lines");
 }
 
@@ -501,7 +607,9 @@ async fn receiver_snapshot_decode_measurement() {
 
     let fleet = InProcessFleet::start(1, &dummy_fleet_settings()).await;
     let plan = LoadPlan {
-        running: 6,
+        running: 10,
+        warmup_ended: 0,
+        drain: Duration::from_secs(180),
         ramp_per_second: 6.0,
         dispatch_concurrency: 6,
         window: Duration::from_secs(25),

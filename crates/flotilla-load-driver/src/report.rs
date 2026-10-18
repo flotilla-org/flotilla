@@ -10,6 +10,14 @@ use crate::target::{HomeSample, TargetSample};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LoadReport {
+    /// Complete plan and target-specific settings, including revision and host load.
+    pub metadata: BTreeMap<String, String>,
+    pub timeline: Vec<String>,
+    pub drain_seconds: f64,
+    pub total: WindowSummary,
+    pub correctness_errors: Vec<String>,
+    pub unfinished: Vec<String>,
+    pub open_ages_at_end: Vec<String>,
     pub running: usize,
     pub homes: usize,
     pub mix: Vec<(String, u32)>,
@@ -31,14 +39,20 @@ pub struct RampSummary {
     pub reached: bool,
     pub seconds: f64,
     pub peak_running: usize,
+    pub warmup_ended: u64,
+    pub warmup_reached: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DispatchSummary {
     pub dispatched: u64,
+    pub admitted: u64,
+    pub scheduled_waiting_at_window_end: usize,
+    pub oldest_scheduled_wait_seconds: f64,
     pub errors: u64,
     /// Time from dispatch until the target admitted the convoy.
     pub admission: LatencySummary,
+    pub backlog: LatencySummary,
     pub error_samples: Vec<String>,
 }
 
@@ -103,6 +117,8 @@ pub struct ControllerReport {
     pub resync_enqueued_per_second: f64,
     pub failures: u64,
     pub reconcile: LatencySummary,
+    pub queue_wait: LatencySummary,
+    pub busy_fraction: f64,
     pub queue_peak: u64,
 }
 
@@ -167,6 +183,8 @@ pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration
                         resync_enqueued_per_second: per_second(phase.resync_enqueued, seconds),
                         failures: phase.failures,
                         reconcile: phase.reconcile.summary(),
+                        queue_wait: phase.queue_wait.summary(),
+                        busy_fraction: if seconds > 0.0 { phase.busy_micros as f64 / (seconds * 1_000_000.0) } else { 0.0 },
                         queue_peak: phase.queue_peak,
                     };
                     (kind.clone(), report)
@@ -228,6 +246,23 @@ impl LoadReport {
     /// are p50 / p90 / p99 / max.
     pub fn markdown(&self) -> String {
         let mut out = String::new();
+        let mut header = self.metadata.clone();
+        if header.get("source_diff").is_some_and(|diff| !diff.is_empty()) {
+            header.insert("source_diff".into(), "dirty patch retained in JSON report".into());
+        }
+        let _ = writeln!(out, "Run settings:\n\n```json\n{}\n```", serde_json::to_string_pretty(&header).expect("settings serialize"));
+        let _ = writeln!(
+            out,
+            "\nDrain: {:.1}s. Total ended: {} delivered / {} failed / {} closed. Correctness errors: {:?}\n",
+            self.drain_seconds, self.total.delivered, self.total.failed, self.total.abandoned, self.correctness_errors
+        );
+        for convoy in &self.open_ages_at_end {
+            let _ = writeln!(out, "Window tail: {convoy}  ");
+        }
+        for convoy in &self.unfinished {
+            let _ = writeln!(out, "After drain: {convoy}  ");
+        }
+
         let mix = self.mix.iter().map(|(mix, weight)| format!("{mix}×{weight}")).collect::<Vec<_>>().join(", ");
         let _ = writeln!(out, "**{} running convoys on {} daemon(s)**, mix {mix}.", self.running, self.homes);
         let _ = writeln!(
@@ -246,11 +281,19 @@ impl LoadReport {
             "| Abandoned / failed in window | {} / {} ({} at the deadline) |",
             window.abandoned, window.failed, window.abandoned_by_deadline
         );
-        let _ = writeln!(out, "| Dispatch → delivered | {} |", latency(&window.convoy_latency));
+        let _ = writeln!(out, "| Scheduled dispatch → delivered (whole run, including drain) | {} |", latency(&self.total.convoy_latency));
+        let _ = writeln!(out, "| Scheduled dispatch → delivered (ends inside window) | {} |", latency(&window.convoy_latency));
         for (mix, summary) in &window.by_mix {
             let _ = writeln!(out, "| — {mix} | {} |", latency(&summary.latency));
         }
+        let _ = writeln!(out, "| Dispatch behind schedule | {} |", latency(&self.dispatch.backlog));
         let _ = writeln!(out, "| Admission | {} |", latency(&self.dispatch.admission));
+        let _ = writeln!(out, "| Warm-up ended / reached | {} / {} |", self.ramp.warmup_ended, self.ramp.warmup_reached);
+        let _ = writeln!(
+            out,
+            "| Scheduled admissions waiting at window close | {} (oldest {:.1}s late) |",
+            self.dispatch.scheduled_waiting_at_window_end, self.dispatch.oldest_scheduled_wait_seconds
+        );
         let _ = writeln!(out, "| Dispatch errors | {} of {} |", self.dispatch.errors, self.dispatch.dispatched);
         if self.target_errors.count > 0 {
             let _ = writeln!(out, "| Target errors (retried) | {} |", self.target_errors.count);
@@ -285,17 +328,19 @@ impl LoadReport {
             }
             let _ = writeln!(
                 out,
-                "\n| Controller | Wakes/s | Requeues/s (coalesced) | Resync enqueued/s | Reconcile | Queue peak | Failures |\n|---|---|---|---|---|---|---|"
+                "\n| Controller | Wakes/s | Requeues/s (coalesced) | Resync enqueued/s | Reconcile | Queue wait | Busy | Queue peak | Failures |\n|---|---|---|---|---|---|---|---|---|"
             );
             for (kind, controller) in &home.controllers {
                 let _ = writeln!(
                     out,
-                    "| {kind} | {:.1} | {:.1} ({}) | {:.1} | {} | {} | {} |",
+                    "| {kind} | {:.1} | {:.1} ({}) | {:.1} | {} | {} | {:.1}% | {} | {} |",
                     controller.wakes_per_second,
                     controller.requeues_per_second,
                     controller.requeues_coalesced,
                     controller.resync_enqueued_per_second,
                     latency(&controller.reconcile),
+                    latency(&controller.queue_wait),
+                    controller.busy_fraction * 100.0,
                     controller.queue_peak,
                     controller.failures
                 );

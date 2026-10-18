@@ -245,6 +245,8 @@ pub struct ControllerLoadMetrics {
     pub wakes: Counter,
     /// Prepare plus reconcile and its writes, per reconciled object.
     pub reconcile: LatencyHistogram,
+    pub queue_wait: LatencyHistogram,
+    busy: Mutex<BusyTime>,
     /// Reconciles that asked to run again after a delay, and requeues
     /// absorbed because one was already scheduled for the object.
     pub requeues: Counter,
@@ -257,10 +259,41 @@ pub struct ControllerLoadMetrics {
     pub queue_peak: Peak,
 }
 
+#[derive(Debug, Default)]
+struct BusyTime {
+    elapsed: Duration,
+    active: Option<tokio::time::Instant>,
+}
+
+/// Counts all work, including reads, finalizers and failed attempts. Dropping
+/// on cancellation closes the interval; snapshots include a running interval.
+pub struct ControllerBusyGuard<'a>(&'a ControllerLoadMetrics);
+impl Drop for ControllerBusyGuard<'_> {
+    fn drop(&mut self) {
+        let mut busy = self.0.busy.lock().expect("busy time");
+        if let Some(at) = busy.active.take() {
+            busy.elapsed += at.elapsed();
+        }
+    }
+}
+
 impl ControllerLoadMetrics {
+    pub fn busy(&self) -> ControllerBusyGuard<'_> {
+        let mut busy = self.busy.lock().expect("busy time");
+        assert!(busy.active.is_none(), "one loop per controller metrics object");
+        busy.active = Some(tokio::time::Instant::now());
+        ControllerBusyGuard(self)
+    }
+
+    fn busy_micros(&self) -> u64 {
+        let busy = self.busy.lock().expect("busy time");
+        u64::try_from((busy.elapsed + busy.active.map_or(Duration::ZERO, |at| at.elapsed())).as_micros()).unwrap_or(u64::MAX)
+    }
     pub fn snapshot(&self) -> ControllerLoadSnapshot {
         ControllerLoadSnapshot {
             wakes: self.wakes.get(),
+            queue_wait: self.queue_wait.snapshot(),
+            busy_micros: self.busy_micros(),
             reconcile: self.reconcile.snapshot(),
             requeues: self.requeues.get(),
             requeues_coalesced: self.requeues_coalesced.get(),
@@ -275,6 +308,8 @@ impl ControllerLoadMetrics {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControllerLoadSnapshot {
     pub wakes: u64,
+    pub queue_wait: HistogramSnapshot,
+    pub busy_micros: u64,
     pub reconcile: HistogramSnapshot,
     pub requeues: u64,
     pub requeues_coalesced: u64,
@@ -288,6 +323,8 @@ impl ControllerLoadSnapshot {
     pub fn since(&self, earlier: &Self) -> Self {
         Self {
             wakes: self.wakes.saturating_sub(earlier.wakes),
+            queue_wait: self.queue_wait.since(&earlier.queue_wait),
+            busy_micros: self.busy_micros.saturating_sub(earlier.busy_micros),
             reconcile: self.reconcile.since(&earlier.reconcile),
             requeues: self.requeues.saturating_sub(earlier.requeues),
             requeues_coalesced: self.requeues_coalesced.saturating_sub(earlier.requeues_coalesced),
@@ -444,5 +481,29 @@ mod tests {
         assert_eq!(snapshot["Vessel"].resyncs, 1);
         let later = registry.snapshot();
         assert_eq!(later["Convoy"].since(&snapshot["Convoy"]).wakes, 0);
+    }
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+
+    // Snapshots clip active work at both window boundaries; idle time is excluded,
+    // including after a cancelled/failed reconcile drops its guard.
+    #[tokio::test(start_paused = true)]
+    async fn busy_fraction_clips_work_crossing_the_window() {
+        let metrics = ControllerLoadMetrics::default();
+        let guard = metrics.busy();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let start = metrics.snapshot();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let end = metrics.snapshot();
+        assert_eq!(end.since(&start).busy_micros, 3_000_000);
+        drop(guard);
+        tokio::time::advance(Duration::from_secs(7)).await;
+        assert_eq!(metrics.snapshot().since(&end).busy_micros, 0);
+        let _guard = metrics.busy();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(metrics.snapshot().since(&end).busy_micros, 1_000_000);
     }
 }
