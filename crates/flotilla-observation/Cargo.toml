@@ -1,0 +1,57 @@
+[package]
+name = "flotilla-observation"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+uuid = { workspace = true, features = ["v4"] }
+flotilla-address = { path = "../flotilla-address" }
+flotilla-change-request = { path = "../flotilla-change-request" }
+flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-store = { path = "../flotilla-store" }
+async-trait = { workspace = true }
+bon = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+flotilla-store-http = { path = "../flotilla-store-http" }
+flotilla-manifest = { path = "../flotilla-manifest" }
+flotilla-tls = { path = "../flotilla-tls" }
+flotilla-forgejo-providers = { path = "../flotilla-forgejo-providers" }
+flotilla-forge-forgejo = { path = "../flotilla-forge-forgejo" }
+flotilla-fake-forge = { path = "../flotilla-fake-forge" }
+flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
+reqwest = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+flotilla-store-memory = { path = "../flotilla-store-memory" }
+flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
+tokio = { workspace = true, features = ["test-util"] }
+hegeltest = { workspace = true }
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-signing = { path = "../flotilla-build-features-signing" }
+flotilla-build-features-sqlite = { path = "../flotilla-build-features-sqlite" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

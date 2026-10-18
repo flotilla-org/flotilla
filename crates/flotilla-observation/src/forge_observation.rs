@@ -4,7 +4,6 @@ use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration as St
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use flotilla_change_request::{BoundObservations, ChangeRequestAdmission, ChangeRequestTracker, CrewGithubLoginsByRequest};
-use flotilla_forge_github::github::{classified_rate_error, rate_limit_reset};
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
@@ -24,7 +23,7 @@ use tokio::sync::Mutex;
 
 use flotilla_protocol::ChangeRequest;
 
-pub(crate) const OWNER_LOCAL_INCREMENTAL_READ_ERROR: &str = "incremental forge reads are owner-local";
+pub const OWNER_LOCAL_INCREMENTAL_READ_ERROR: &str = "incremental forge reads are owner-local";
 
 // Leave three seconds for store/routing work inside the daemon's five-second
 // interactive request deadline (server/request_dispatch.rs).
@@ -35,7 +34,7 @@ pub const NO_READY_FORGE_OBSERVER: &str = "no ready forge observer";
 const HEARTBEAT_MAX_AGE: Duration = Duration::seconds(180);
 const UNKNOWN_OWNER_GRACE: Duration = Duration::seconds(180);
 const READ_FRESHNESS: Duration = Duration::seconds(60);
-pub(crate) const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+pub const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 pub(crate) const DEMAND_MAX_AGE: Duration = Duration::seconds(180);
 const DEMAND_RETENTION: Duration = Duration::seconds(3600);
 const STATUS_WRITE_ATTEMPTS: usize = 8;
@@ -45,6 +44,7 @@ const READ_HEARTBEAT_MAX_AGE: Duration = Duration::seconds(900);
 type ReadLock = Arc<Mutex<Option<LocalRead>>>;
 
 struct LocalRead {
+    error: Option<ObservationError>,
     status: ForgeReadStatus,
     content_at: DateTime<Utc>,
 }
@@ -252,7 +252,7 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
         .ok_or_else(|| NO_READY_FORGE_OBSERVER.into())
 }
 
-pub async fn owns_source(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<bool, String> {
+pub(crate) async fn owns_source(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<bool, String> {
     match source_owner(backend, namespace, source).await? {
         Some(owner) => Ok(owner == backend.local_root().map_err(|e| e.to_string())?),
         None => Ok(true),
@@ -272,8 +272,7 @@ impl ForgeReads {
     pub fn new(backend: ResourceBackend, namespace: String) -> Self {
         Self { backend, namespace, touch_demand: true, allow_stale: false, locks: Default::default(), clock: Arc::new(SystemClock) }
     }
-    #[cfg(test)]
-    pub(crate) fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
     }
@@ -282,6 +281,14 @@ impl ForgeReads {
         T: Serialize + DeserializeOwned,
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<T, String>> + Send,
+    {
+        self.read_typed(source, request, || async { load().await.map_err(ObservationError::from) }).await.map_err(|error| error.to_string())
+    }
+    pub async fn read_typed<T, F, Fut>(&self, source: &IssueSource, request: ForgeReadRequest, load: F) -> Result<T, ObservationError>
+    where
+        T: Serialize + DeserializeOwned,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<T, ObservationError>> + Send,
     {
         let source = canonical_source(source);
         // Incremental cursors change every poll and belong to the owner's
@@ -309,7 +316,7 @@ impl ForgeReads {
             Err(ResourceError::NotFound { .. }) => {
                 records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.map_err(|e| e.to_string())?
             }
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(e.to_string().into()),
         };
         self.touch_heartbeat(&name, current.spec.demanded_at, now).await?;
         let published = self.published_status(&name).await?;
@@ -332,9 +339,15 @@ impl ForgeReads {
                 previous
             };
             let previous = if owner { previous } else { expire_status(previous, self.clock.now()) };
-            return previous
-                .ok_or_else(|| "forge observation pending at source owner".to_string())
-                .and_then(|status| decode(status, self.allow_stale, &request));
+            let status = previous.ok_or_else(|| ObservationError::from("forge observation pending at source owner"))?;
+            // Keep the adapter's full typed diagnostic on local cache hits. Replicated
+            // answers carry the existing diagnostic and retry fields, without a schema change.
+            if !self.allow_stale || status.value.is_none() {
+                if let Some(error) = local.as_ref().filter(|local| local.status == status).and_then(|local| local.error.clone()) {
+                    return Err(error);
+                }
+            }
+            return decode_typed(status, self.allow_stale, &request);
         }
         // The shared per-request lock coalesces local work. Do not persist a
         // transient pending claim: cancellation or handoff must leave the last
@@ -345,13 +358,13 @@ impl ForgeReads {
             return Err("forge observer changed during read".into());
         }
         let completed_at = self.clock.now();
-        let (value, observed_at, error, retry_at) = match result {
+        let (value, observed_at, error, retry_at) = match &result {
             Ok(value) => (Some(serde_json::to_value(value).map_err(|e| e.to_string())?), Some(completed_at), None, None),
             Err(error) => (
                 previous.as_ref().and_then(|s| s.value.clone()),
                 previous.as_ref().and_then(|s| s.observed_at),
-                Some(error.clone()),
-                rate_limit_reset(&error),
+                Some(error.to_string()),
+                error.retry_at(),
             ),
         };
         let status = ForgeReadStatus {
@@ -370,8 +383,11 @@ impl ForgeReads {
             published.expect("unchanged content has a published status").attempted_at
         };
         self.publish_heartbeat(&name, content_at, &status, changed).await?;
-        *local = Some(LocalRead { status: status.clone(), content_at });
-        decode(status, self.allow_stale, &request)
+        *local = Some(LocalRead { error: result.as_ref().err().cloned(), status: status.clone(), content_at });
+        match result {
+            Err(error) if !self.allow_stale || status.value.is_none() => Err(error),
+            _ => decode_typed(status, self.allow_stale, &request),
+        }
     }
     async fn wait_for_status(&self, name: &str) -> Result<Option<ForgeReadStatus>, String> {
         // Subscribe before rechecking status. Answers published before the
@@ -419,7 +435,7 @@ impl ForgeReads {
         }
         Ok(expire_status(Some(status), self.clock.now()))
     }
-    pub(crate) async fn status(&self, name: &str) -> Result<Option<ForgeReadStatus>, String> {
+    pub async fn status(&self, name: &str) -> Result<Option<ForgeReadStatus>, String> {
         let lock = self.locks.lock().await.entry(name.to_owned()).or_default().clone();
         let local = lock.lock().await;
         let published = self.published_status(name).await?;
@@ -497,6 +513,18 @@ impl ForgeReads {
         unreachable!("status writes have a bounded nonempty retry loop")
     }
 }
+fn decode_typed<T: DeserializeOwned>(
+    status: ForgeReadStatus,
+    allow_stale: bool,
+    request: &ForgeReadRequest,
+) -> Result<T, ObservationError> {
+    let retry_at = status.retry_at;
+    decode(status, allow_stale, request).map_err(|detail| match retry_at {
+        Some(at) => ObservationError::RateLimited { budget: "forge read".into(), retry_at: Some(at), detail },
+        None => ObservationError::Failed(detail),
+    })
+}
+
 fn decode<T: DeserializeOwned>(status: ForgeReadStatus, allow_stale: bool, request: &ForgeReadRequest) -> Result<T, String> {
     if !allow_stale {
         if let Some(error) = &status.error {
@@ -630,11 +658,10 @@ impl ChangeRequestTracker for ObservedChangeRequestTracker {
     }
     async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
         self.reads
-            .read(&self.source, ForgeReadRequest::Branch { branch: branch.into() }, || async {
-                self.inner.find_change_request_by_branch(branch).await.map_err(|e| e.to_string())
+            .read_typed(&self.source, ForgeReadRequest::Branch { branch: branch.into() }, || {
+                self.inner.find_change_request_by_branch(branch)
             })
             .await
-            .map_err(classified_rate_error)
     }
     async fn find_change_request_by_branch_for_admission(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
         self.inner.find_change_request_by_branch_for_admission(branch).await
@@ -1333,5 +1360,67 @@ mod tests {
         let now = Utc::now();
         assert_eq!(unknown_health(now - Duration::seconds(age), now) == ObserverHealth::Unknown, age < UNKNOWN_OWNER_GRACE.num_seconds());
         assert!(unknown_health(now - UNKNOWN_OWNER_GRACE, now) == ObserverHealth::Unready);
+    }
+}
+
+#[cfg(test)]
+mod forgejo_tests {
+    use super::*;
+    use flotilla_fake_forge::{recorded::ManualClock, FakeForge, ForgeSettings, InProcessClient};
+    use flotilla_forge_forgejo::{ForgejoAuth, ForgejoIssueProviderConfig};
+    use flotilla_forgejo_providers::change_request::ForgejoChangeRequestProvider;
+    use flotilla_provider_runtime::{ChannelLabel, HttpClient};
+    use flotilla_replay_testkit::testing::MockRunner;
+    use flotilla_store_memory::InMemoryBackend;
+
+    // HTTP boundary: the strict Forgejo fake validates the request before a quota response is injected.
+    struct ThrottledForge(InProcessClient);
+    #[async_trait]
+    impl HttpClient for ThrottledForge {
+        async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
+            let response = self.0.execute(request, label).await?;
+            assert!(response.status().is_success(), "request must satisfy Forgejo's HTTP contract");
+            Ok(http::Response::builder()
+                .status(429)
+                .header("x-ratelimit-reset", "1893456000")
+                .body(bytes::Bytes::from_static(b"rate limit exceeded"))
+                .expect("quota response"))
+        }
+    }
+
+    // #3300: Forgejo's typed quota deadline is recorded just like any other provider's,
+    // survives a cache hit, and suppresses further HTTP reads until that deadline.
+    // One example suffices for this adapter-to-store glue; cooldown boundaries have property coverage.
+    #[tokio::test]
+    async fn forgejo_rate_limit_records_retry_time_without_github_parsing() {
+        let clock = Arc::new(ManualClock::new("2026-10-16T12:00:00Z".parse().expect("time")));
+        let fake = Arc::new(FakeForge::new("https://forgejo.example", clock));
+        fake.add_forge("lab", ForgeSettings { token: "test-token".into(), login: "bot".into() }).expect("forge");
+        let source = IssueSource { service: fake.service_url("lab"), scope: "team/repo".into() };
+        let provider = ForgejoChangeRequestProvider::new(
+            Arc::new(ThrottledForge(InProcessClient::new(fake))),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new(
+                source.service.clone(),
+                None,
+                ForgejoAuth { token: "test-token".into(), token_path: "unused".into() },
+            ),
+            source.scope.clone(),
+        );
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("owner"));
+        let reads = ForgeReads::new(backend, "flotilla".into());
+        let request = ForgeReadRequest::Branch { branch: "work".into() };
+        let error = reads.read_typed(&source, request.clone(), || provider.find_change_request_by_branch("work")).await.expect_err("quota");
+        let expected = DateTime::from_timestamp(1893456000, 0).expect("deadline");
+        assert_eq!(error.retry_at(), Some(expected));
+        let status = reads.status(&forge_read_name(&source, &request)).await.expect("read status").expect("published");
+        assert_eq!(status.retry_at, Some(expected));
+        assert_eq!(status.error.as_deref(), Some(error.to_string().as_str()));
+        let cached = reads
+            .read_typed::<Option<(String, ChangeRequest)>, _, _>(&source, request, || async { panic!("quota must suppress HTTP") })
+            .await
+            .expect_err("cached quota");
+        assert_eq!(cached, error);
+        assert_eq!(cached.retry_at(), Some(expected));
     }
 }

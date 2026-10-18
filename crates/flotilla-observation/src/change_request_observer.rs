@@ -78,7 +78,6 @@ struct ChangeRequestRefresherInner {
     subject_locks: Mutex<HashMap<ChangeRequestKey, Weak<Mutex<()>>>>,
     relay_healthy: std::sync::atomic::AtomicBool,
     relay_wake: Notify,
-    #[cfg(test)]
     grace_schedule_reads: std::sync::atomic::AtomicUsize,
 }
 
@@ -102,7 +101,6 @@ impl ChangeRequestRefresher {
                 subject_locks: Mutex::new(HashMap::new()),
                 relay_healthy: std::sync::atomic::AtomicBool::new(false),
                 relay_wake: Notify::new(),
-                #[cfg(test)]
                 grace_schedule_reads: Default::default(),
             }),
         }
@@ -254,13 +252,12 @@ impl ChangeRequestRefresher {
     /// A consumer gets the observer's next scheduled refresh plus one cadence.
     /// Missing local demand (for example a remote owner) starts with the ordinary
     /// configured cadence; no judge-specific fixed delay is invented.
-    pub(crate) async fn refresh_grace_deadline(
+    pub async fn refresh_grace_deadline(
         &self,
         subject: &ChangeRequestKey,
         freshness: Option<DateTime<Utc>>,
         created_at: DateTime<Utc>,
     ) -> DateTime<Utc> {
-        #[cfg(test)]
         self.inner.grace_schedule_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let active = self.inner.active.lock().await;
         let (next, cadence) = active.get(subject).map_or_else(
@@ -273,12 +270,12 @@ impl ChangeRequestRefresher {
         cadence_deadline(next, cadence)
     }
 
-    #[cfg(test)]
-    pub(crate) fn grace_schedule_reads(&self) -> usize {
+    /// Number of grace schedule lookups, for observation diagnostics.
+    pub fn grace_schedule_reads(&self) -> usize {
         self.inner.grace_schedule_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub(crate) fn retry_grace_deadline(&self, retry_at: DateTime<Utc>) -> DateTime<Utc> {
+    pub fn retry_grace_deadline(&self, retry_at: DateTime<Utc>) -> DateTime<Utc> {
         cadence_deadline(retry_at, self.inner.cadence.checks_pending)
     }
 
@@ -655,7 +652,7 @@ impl ChangeRequestRefresher {
         }
     }
 
-    #[cfg(test)]
+    /// Number of currently retained observation demands.
     pub async fn active_demands(&self) -> usize {
         self.inner.active.lock().await.values().map(|refresh| refresh.demands.len()).sum()
     }
@@ -980,7 +977,6 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use flotilla_forge_github::github::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource};
     use flotilla_manifest::{
         entity,
         projection::{project_catalog, CatalogInput, SubjectCatalogInput},
@@ -991,7 +987,12 @@ mod tests {
     use flotilla_store::{ResourceBackend, TypedResolver};
 
     use super::*;
-    use crate::testkits::cr_name;
+    fn cr_name(service: &str, scope: &str, number: u64) -> String {
+        flotilla_resources::address::record_name(
+            &flotilla_resources::address::stored_change_request_address(service, scope, number, &[]).expect("address"),
+        )
+        .expect("record name")
+    }
     use flotilla_change_request::observation::parse_gh_observation;
     use flotilla_protocol::Subject as ConvoySubject;
 
@@ -1040,13 +1041,10 @@ mod tests {
                 self.0.lock().await.clone()
             }
         }
-        let error = {
-            let limit = GithubRateLimit {
-                kind: GithubRateLimitKind::Secondary,
-                retry_source: GithubRetrySource::RetryAfter,
-                retry_at: Some("2026-10-03T12:00:00Z".parse().expect("deadline")),
-            };
-            limit.observation_error("GraphQL".into())
+        let error = ObservationError::RateLimited {
+            budget: "GraphQL".into(),
+            retry_at: Some("2026-10-03T12:00:00Z".parse().expect("deadline")),
+            detail: "rate limited".into(),
         };
         let source = Arc::new(RecoveringSource(Mutex::new(Err(error.clone()))));
         let refresher = ChangeRequestRefresher::new(

@@ -286,7 +286,7 @@ async fn diagnostics_retain_the_last_firing_for_an_armed_reconciler_row() {
         backend.clone(),
         "authority".to_string(),
         Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) }),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let table = LeafSubscriptionTable::new(backend, broadcast_test_sink(event_tx), refresher);
     let id = uuid::Uuid::new_v4();
@@ -343,7 +343,7 @@ async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires()
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
     let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
-    let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
+    let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
         state: Duration::from_millis(20),
         checks_pending: Duration::from_millis(20),
         freshness_demanded: Duration::from_millis(20),

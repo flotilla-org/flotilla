@@ -40,6 +40,7 @@ absolute-paths-allowed-crates = [
     "flotilla_commands",
     "flotilla_controllers",
     "flotilla_core",
+    "flotilla_observation",
     "flotilla_executor",
     "flotilla_environment",
     "flotilla_fake_forge",

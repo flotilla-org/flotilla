@@ -464,7 +464,7 @@ fn projection_parity_sequential_admissions(tc: hegel::TestCase) {
             assert!(status.heartbeat_is_fresh(Utc::now()), "observer loss must not be heartbeat expiry");
             let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "test/repo".into() };
             assert_eq!(
-                flotilla_core::forge_observation::source_owner(&backend, NAMESPACE, &source).await.expect("live forge observer"),
+                flotilla_observation::forge_observation::source_owner(&backend, NAMESPACE, &source).await.expect("live forge observer"),
                 Some(backend.local_root().expect("local root")),
             );
             let mut events = daemon.subscribe();
@@ -940,7 +940,7 @@ async fn capability_regression_keeps_live_forge_observer() {
     assert!(status.heartbeat_is_fresh(Utc::now()));
     let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "test/repo".into() };
     assert_eq!(
-        flotilla_core::forge_observation::source_owner(&backend, NAMESPACE, &source).await.expect("live forge observer"),
+        flotilla_observation::forge_observation::source_owner(&backend, NAMESPACE, &source).await.expect("live forge observer"),
         Some(backend.local_root().expect("root"))
     );
     // Exhausted forge-refresh scheduling explicitly withdraws an otherwise
@@ -954,8 +954,8 @@ async fn capability_regression_keeps_live_forge_observer() {
         .await
         .expect("heartbeat with observation fault");
     assert_eq!(
-        flotilla_core::forge_observation::source_owner(&backend, NAMESPACE, &source).await.unwrap_err(),
-        flotilla_core::forge_observation::NO_READY_FORGE_OBSERVER
+        flotilla_observation::forge_observation::source_owner(&backend, NAMESPACE, &source).await.unwrap_err(),
+        flotilla_observation::forge_observation::NO_READY_FORGE_OBSERVER
     );
 }
 

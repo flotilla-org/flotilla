@@ -46,7 +46,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_config::{ConfigStore, DaemonConfig};
-use flotilla_core::{forge_observation::NO_READY_FORGE_OBSERVER, in_process::InProcessDaemon};
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::{
     dummy_fleet::{attach_dummy_fleet, install_dummy_fleet},
     runtime::{DaemonRuntime, RuntimeOptions},
@@ -59,6 +59,7 @@ use flotilla_dummy_fleet::{
     CrewCommandPort, DaemonCommandPort, DummyFleet,
 };
 use flotilla_load_driver::{ConvoyObservation, ConvoyState, FleetTarget, HomeSample, LoadPlan, TargetSample};
+use flotilla_observation::forge_observation::NO_READY_FORGE_OBSERVER;
 use flotilla_protocol::{commands::CommandValue, CommandAction, HostName};
 use flotilla_resources::{
     Checkout, Convoy, ConvoyPhase, Forge, Host, InputMeta, Message, PlacementPolicy, ReadWatchEvent, Repository, ResourceProvenance,
@@ -557,7 +558,8 @@ async fn load_baseline() {
                 let database = fleet.homes.iter().filter_map(|home| database_bytes(&home.database)).sum::<u64>();
                 for (index, home) in fleet.homes.iter().enumerate() {
                     let source = flotilla_protocol::IssueSource { service: catalog_forge_url(), scope: catalog::DUMMY_REPOSITORY.into() };
-                    let owner = flotilla_core::forge_observation::source_owner(&home.daemon.resource_backend(), NAMESPACE, &source).await;
+                    let owner =
+                        flotilla_observation::forge_observation::source_owner(&home.daemon.resource_backend(), NAMESPACE, &source).await;
                     println!("observer home={index} owner={owner:?}");
                     let hosts = home.daemon.resource_backend().using::<Host>(NAMESPACE).list().await.expect("liveness hosts");
                     for host in hosts.items {

@@ -20,7 +20,7 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use super::subscriptions::LeafWatchRecovery;
 use super::{LeafSubscriptionRow, LeafSubscriptionTable, LeafSubscriptionTableInner, LeafWatcher};
-use crate::issue_observer::IssueKey;
+use flotilla_observation::issue_observer::IssueKey;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ObjectKind {

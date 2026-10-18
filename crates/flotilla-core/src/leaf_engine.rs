@@ -20,7 +20,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{
+use flotilla_observation::{
     change_request_observer::ChangeRequestRefresher,
     issue_observer::{IssueKey, IssueObservationSource, IssueRefreshCadence, IssueRefresher},
 };

@@ -44,7 +44,7 @@ pub(super) mod tests {
       // racing both 300s deadlines and replacing it with a tracker timeout.
     #[tokio::test(start_paused = true)]
     async fn layered_deadlines_preserve_observation_timeout_and_recover() {
-        use crate::forge_observation::ForgeReads;
+        use flotilla_observation::forge_observation::ForgeReads;
         use flotilla_resources::Clock;
         use flotilla_store::ResourceBackend;
         use flotilla_store_memory::InMemoryBackend;
@@ -82,7 +82,7 @@ pub(super) mod tests {
             .await
             .expect_err("cold cache");
         started.await.unwrap();
-        tokio::time::advance(crate::forge_observation::LOAD_TIMEOUT - Duration::from_secs(1)).await;
+        tokio::time::advance(flotilla_observation::forge_observation::LOAD_TIMEOUT - Duration::from_secs(1)).await;
         for _ in 0..32 {
             tokio::task::yield_now().await;
         }

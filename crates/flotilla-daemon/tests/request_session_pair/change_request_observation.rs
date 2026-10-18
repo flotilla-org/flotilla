@@ -1,5 +1,5 @@
 use flotilla_change_request::observation::{ChangeRequestKey, ChangeRequestObservationSource};
-use flotilla_core::change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher};
+use flotilla_observation::change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
@@ -102,7 +102,7 @@ async fn remote_change_request_scenario(existing: ExistingRecord, late_watcher: 
     .await
     .unwrap();
     eventually(Duration::from_secs(5), Duration::from_millis(10), "source owner replicated", || async {
-        flotilla_core::forge_observation::source_owner(&requester.resource_backend(), "flotilla", &source).await
+        flotilla_observation::forge_observation::source_owner(&requester.resource_backend(), "flotilla", &source).await
             == Ok(Some(owner.node_id().clone()))
     })
     .await;

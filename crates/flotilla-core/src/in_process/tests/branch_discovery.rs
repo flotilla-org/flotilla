@@ -232,9 +232,9 @@ async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
 async fn checkout_creation_does_not_reuse_cached_branch_absence() {
     let fixture = rest_admission_fixture([RestAdmissionReply::Absent; 2], RestAdmissionLookup::Branch).await;
     let provider = Arc::new(FakeChangeRequest::new());
-    let observed = Arc::new(crate::forge_observation::ObservedChangeRequestTracker {
+    let observed = Arc::new(flotilla_observation::forge_observation::ObservedChangeRequestTracker {
         inner: provider.clone(),
-        reads: crate::forge_observation::ForgeReads::new(fixture.daemon.resource_backend(), "flotilla".into()),
+        reads: flotilla_observation::forge_observation::ForgeReads::new(fixture.daemon.resource_backend(), "flotilla".into()),
         source: flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "team/repo0".into() },
     });
     fixture.daemon.convoy_admission.repository_change_requests.write().await.get_mut(&fixture.keys[0]).expect("provider").provider =

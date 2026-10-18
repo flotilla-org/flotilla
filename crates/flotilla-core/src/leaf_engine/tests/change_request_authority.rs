@@ -47,7 +47,7 @@ async fn usage_leaf_fires_from_the_named_window_in_the_replicated_resource_path(
         backend.clone(),
         "test-host".to_string(),
         Arc::new(UnavailableChangeRequests),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let table = LeafSubscriptionTable::new(backend, broadcast_test_sink(event_tx.clone()), refresher);
     let mut events = event_tx.subscribe();
@@ -206,7 +206,7 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
         .expect("replicate CR evidence");
 
     let (event_tx, _) = broadcast::channel(16);
-    let cadence = crate::change_request_observer::ChangeRequestRefreshCadence::default();
+    let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default();
     let refresher = ChangeRequestRefresher::new(
         "fleet".to_string(),
         authority.clone(),
@@ -248,7 +248,7 @@ async fn replayed_real_merge_observation_unblocks_wait_and_releases_demand() {
     let fixture = format!("{}/src/leaf_engine/fixtures/cr_observation_merge.yaml", env!("CARGO_MANIFEST_DIR"));
     let session = Session::replaying(fixture, Masks::new());
     let source = Arc::new(observation::GhChangeRequestObservationSource::new(test_runner(&session)));
-    let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
+    let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
         state: Duration::from_secs(60),
         checks_pending: Duration::from_secs(5),
         freshness_demanded: Duration::from_secs(2),
@@ -284,7 +284,7 @@ async fn unsubscribe_stops_change_request_observation_and_freshness_tightens_cad
     let (event_tx, _) = broadcast::channel(16);
     let calls = Arc::new(AtomicUsize::new(0));
     let source = Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) });
-    let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
+    let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
         state: Duration::from_secs(60),
         checks_pending: Duration::from_secs(20),
         freshness_demanded: Duration::from_secs(5),
@@ -382,7 +382,7 @@ async fn replica_reading_evaluator_fires_from_authority_change_request_record() 
         reader.clone(),
         "kiwi".to_string(),
         Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let (event_tx, _) = broadcast::channel(16);
     let table = LeafSubscriptionTable::new(reader, broadcast_test_sink(event_tx.clone()), refresher);
@@ -420,7 +420,7 @@ async fn foreign_change_request_authority_does_not_fetch_or_write_status() {
         .await
         .expect("create foreign-owned record");
     let calls = Arc::new(AtomicUsize::new(0));
-    let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
+    let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
         state: Duration::from_secs(1),
         checks_pending: Duration::from_secs(1),
         freshness_demanded: Duration::from_secs(1),
@@ -457,7 +457,7 @@ async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
         flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2051, &[]).expect("address"),
     )
     .expect("key");
-    let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
+    let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
         state: Duration::from_millis(20),
         checks_pending: Duration::from_millis(20),
         freshness_demanded: Duration::from_millis(20),
@@ -585,7 +585,7 @@ async fn former_owner_evaluates_fresher_takeover_replica() {
         former_owner.clone(),
         "former".to_string(),
         Arc::new(UnavailableChangeRequests),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let keeper_id = uuid::Uuid::new_v4();
     refresher
@@ -708,7 +708,7 @@ async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
         former.clone(),
         "former".to_string(),
         Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
-        crate::change_request_observer::ChangeRequestRefreshCadence {
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
             state: Duration::from_millis(20),
             checks_pending: Duration::from_millis(20),
             freshness_demanded: Duration::from_millis(20),
@@ -782,7 +782,7 @@ async fn stale_replicated_change_request_is_claimed_by_demanding_host() {
         .await
         .expect("replicate owner record");
     let calls = Arc::new(AtomicUsize::new(0));
-    let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
+    let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
         state: Duration::from_millis(20),
         checks_pending: Duration::from_millis(20),
         freshness_demanded: Duration::from_millis(20),
@@ -853,7 +853,7 @@ async fn observed_issue_change_fires_wait_leaf() {
         backend.clone(),
         "authority".into(),
         Arc::new(UnavailableChangeRequests),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher);
     let connection = uuid::Uuid::new_v4();
@@ -927,7 +927,7 @@ async fn issue_leaf_uses_issue_refresher_staleness() {
         backend.clone(),
         "cr-owner".into(),
         Arc::new(UnavailableChangeRequests),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let issues = IssueRefresher::new(
         backend.clone(),
@@ -992,7 +992,7 @@ async fn mixed_case_repository_leaf_reads_the_record_the_observer_writes() {
         backend.clone(),
         "authority".to_string(),
         source,
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let table = LeafSubscriptionTable::new(backend, broadcast_test_sink(event_tx.clone()), refresher);
     let mut events = event_tx.subscribe();
@@ -1044,7 +1044,7 @@ async fn host_and_forge_id_spellings_are_one_observation_subject() {
         backend.clone(),
         "authority".to_string(),
         source.clone(),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let table = LeafSubscriptionTable::new(backend, broadcast_test_sink(event_tx.clone()), refresher);
     let mut events = event_tx.subscribe();

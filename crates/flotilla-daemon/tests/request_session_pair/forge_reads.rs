@@ -1,6 +1,6 @@
 use super::*;
-use flotilla_core::forge_observation::{source_owner, ForgeReads};
 use flotilla_discovery_testkit::FakeIssueProvider;
+use flotilla_observation::forge_observation::{source_owner, ForgeReads};
 use flotilla_resources::{
     forge_read_name, ForgeRead, ForgeReadHeartbeat, ForgeReadRequest, ForgeReadSpec, IssueSourceBindingSpec, Project, ProjectSpec,
 };

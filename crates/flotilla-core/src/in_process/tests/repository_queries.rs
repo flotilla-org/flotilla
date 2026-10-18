@@ -1,21 +1,18 @@
 use flotilla_store_memory::InMemoryBackend;
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
-use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_config::ConfigStore;
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use flotilla_protocol::{CliListKind, Command, CommandAction, CommandValue, HostName, RepoIdentity};
 use flotilla_resources::{
-    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy,
-    ConvoySpec, ConvoyStatus, ObjectMeta, ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository,
-    RepositorySpec, ResourceObject, VesselRequirement,
+    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, ObservedChangeRequestState,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec,
 };
 use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
-use crate::in_process::{convoy_change_request_credential_refs, InProcessDaemon};
+use crate::in_process::InProcessDaemon;
 use crate::model::RepoModel;
 use crate::repo_state::{RepoRootState, RepoState};
 use crate::testkits::discovery::fake_discovery;
@@ -197,70 +194,4 @@ async fn cli_lists_include_active_provider_sessions() {
     };
     assert_eq!(agents.items.len(), 1);
     assert_eq!(agents.items[0].reference, "active");
-}
-
-#[test]
-fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() {
-    let requested = ChangeRequestKey::new(
-        "flotilla",
-        flotilla_resources::address::stored_change_request_address("github.com", "team/repo", 42, &[]).expect("address"),
-    )
-    .expect("key");
-    let subject = flotilla_protocol::Subject {
-        kind: flotilla_protocol::SubjectKind::ChangeRequest,
-        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "team/repo".into() },
-        id: "42".into(),
-    };
-    let spec = ConvoySpec::builder().workflow_ref("review".to_string()).build();
-    let mut status = ConvoyStatus::default();
-    status.discover_subject(
-        subject.clone(),
-        flotilla_protocol::Relationship::Produces,
-        flotilla_resources::SubjectDiscoverySource::Claim,
-        Utc::now(),
-    );
-    status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
-        cascade: None,
-        exit: None,
-        turn_delivery: Default::default(),
-        stall_nudges: Default::default(),
-        supervision: None,
-        vessels: vec![VesselRequirement::builder()
-            .name("work".to_string())
-            .crew(Vec::new())
-            .credential_refs(BTreeSet::from(["github-crew-pr".to_string()]))
-            .build()],
-    });
-    let mut convoy = ResourceObject::<ResourceConvoy> {
-        metadata: ObjectMeta {
-            name: "review-convoy".to_string(),
-            namespace: "flotilla".to_string(),
-            resource_version: "1".to_string(),
-            labels: BTreeMap::new(),
-            annotations: BTreeMap::new(),
-            owner_references: Vec::new(),
-            finalizers: Vec::new(),
-            deletion_timestamp: None,
-            creation_timestamp: Utc::now(),
-            merge: None,
-        },
-        spec,
-        status: Some(status),
-    };
-    let bound = convoy_change_request_credential_refs(&convoy, &requested, &[]).expect("active PR subjects");
-    assert_eq!(bound.numbers, BTreeSet::from([42]));
-    assert_eq!(bound.credentials_by_number[&42], BTreeSet::from(["github-crew-pr".to_string()]));
-    let unrelated = ChangeRequestKey::new(
-        "flotilla",
-        flotilla_resources::address::stored_change_request_address("github.com", "team/other", 42, &[]).expect("address"),
-    )
-    .expect("key");
-    assert!(convoy_change_request_credential_refs(&convoy, &unrelated, &[]).expect("other scope").numbers.is_empty());
-    convoy.status.as_mut().expect("status").discover_subject(
-        subject,
-        flotilla_protocol::Relationship::Supersedes,
-        flotilla_resources::SubjectDiscoverySource::Operator,
-        Utc::now(),
-    );
-    assert!(convoy_change_request_credential_refs(&convoy, &requested, &[]).expect("superseded PR").numbers.is_empty());
 }

@@ -41,13 +41,13 @@ use super::stalls::*;
 use super::subscriptions::*;
 use super::wake::*;
 use super::*;
-use crate::change_request_observer::ChangeRequestRefresher;
-use crate::issue_observer::IssueRefreshCadence;
-use crate::issue_observer::IssueRefresher;
 use crate::testkits::cr_name;
 use crate::testkits::replay::test_runner;
 use crate::testkits::replay::Masks;
 use crate::testkits::replay::Session;
+use flotilla_observation::change_request_observer::ChangeRequestRefresher;
+use flotilla_observation::issue_observer::IssueRefreshCadence;
+use flotilla_observation::issue_observer::IssueRefresher;
 use flotilla_protocol_testkit::event_sink::broadcast_test_sink;
 
 #[derive(Clone)]
@@ -236,7 +236,7 @@ fn supervision_wake_with_limit(backend: &ResourceBackend, limit: u32) -> Reconci
         backend.clone(),
         "test-host".into(),
         Arc::new(UnavailableChangeRequests),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     ReconcilerWake::new(LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, limit))
 }
@@ -633,7 +633,7 @@ async fn assert_leaf_subscription_contract(backend: ResourceBackend) {
         backend.clone(),
         "test-host".to_string(),
         Arc::new(UnavailableChangeRequests),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx.clone()), refresher);
     let connection_id = uuid::Uuid::new_v4();
@@ -1404,7 +1404,7 @@ async fn assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates
         backend.clone(),
         "authority".to_string(),
         Arc::new(UnavailableChangeRequests),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher);
     let actuator = Arc::new(RecordingTurnDelivery::default());
