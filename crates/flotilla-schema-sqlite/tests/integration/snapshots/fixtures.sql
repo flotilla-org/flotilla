@@ -423,6 +423,7 @@ CREATE TABLE "message" (
   "version" INTEGER NOT NULL,
   "sender" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "inbox" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "admitted_seq" INTEGER NOT NULL,
   "relation" TEXT NOT NULL CHECK ("relation" IN ('de', 'dy', 'pe', 'su', 'sy')),
   "body" BLOB NOT NULL REFERENCES "objects" ("hash"),
   "in_reply_to" INTEGER REFERENCES "resource_identity" ("id"),
@@ -516,8 +517,7 @@ CREATE TABLE "message_references" (
 CREATE INDEX "message_by_reply" ON "message" ("in_reply_to") WHERE "in_reply_to" IS NOT NULL;
 CREATE INDEX "message_by_supersedes" ON "message" ("supersedes") WHERE "supersedes" IS NOT NULL;
 CREATE INDEX "message_deadline" ON "message" ("deadline") WHERE "state" IN ('pe', 'aw') AND "deadline" IS NOT NULL;
-CREATE INDEX "message_open_by_inbox" ON "message" ("inbox") WHERE "state" IN ('pe', 'aw');
-CREATE INDEX "message_pending_by_inbox" ON "message" ("inbox") WHERE "state" IN ('pe');
+CREATE INDEX "message_pending_by_inbox" ON "message" ("inbox", "admitted_seq") WHERE "state" IN ('pe');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ms', 'relation', 'de', 'Dependee'),
   ('ms', 'relation', 'dy', 'Dependency'),
@@ -550,6 +550,7 @@ CREATE VIEW "message_view" AS SELECT
   "message"."version",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."sender") AS "sender",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."inbox") AS "inbox",
+  "message"."admitted_seq",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'relation' AND "code" = "message"."relation") AS "relation",
   "message"."body",
   "message"."in_reply_to",

@@ -104,8 +104,6 @@ fn the_enumeration_covers_every_kind_and_index() {
         "dossier_deliverables last position",
         "dossier_deliverables_evidence last position",
         "referral set subject",
-        "index message_open_by_inbox first",
-        "index message_open_by_inbox after",
         "index message_pending_by_inbox first",
         "index message_pending_by_inbox after",
         "index message_deadline first",
@@ -130,7 +128,7 @@ fn the_enumeration_covers_every_kind_and_index() {
     ] {
         assert!(labels.contains(&expected), "missing {expected}");
     }
-    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 14);
+    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 2 * 13);
     assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 9);
     assert!(!labels.iter().any(|label| label.contains("_edges")), "no kind has an edge-log table");
     assert!(

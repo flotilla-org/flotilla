@@ -135,7 +135,7 @@ pub fn sent(message: &MessageRef) -> Ref<Sent> {
 }
 
 /// The message as sent: the spec's envelope. Immutable. It declares the stored
-/// Message (kind code `ms`), indexed for an inbox's open and pending messages, for open
+/// Message (kind code `ms`), indexed for an inbox's pending messages in admission order, for open
 /// messages by deadline (the expiry sweep's read), and by the message each
 /// replies to or supersedes, which also keeps an expunge's foreign-key checks
 /// off a table scan.
@@ -144,8 +144,7 @@ pub fn sent(message: &MessageRef) -> Ref<Sent> {
     kind = "Message",
     code = "ms",
     state = MessageState,
-    index(name = "open_by_inbox", eq(inbox), when(state in [Pending, Awaiting])),
-    index(name = "pending_by_inbox", eq(inbox), when(state in [Pending])),
+    index(name = "pending_by_inbox", eq(inbox), order(admitted_seq), when(state in [Pending])),
     index(name = "deadline", order(deadline), when(state in [Pending, Awaiting], deadline is_some)),
     index(name = "by_reply", eq(in_reply_to), when(in_reply_to is_some)),
     index(name = "by_supersedes", eq(supersedes), when(supersedes is_some))
@@ -155,6 +154,11 @@ pub struct MessageSpec {
     /// fleet roles too (#3424 ruling 6).
     pub sender: Address,
     pub inbox: Address,
+    /// Immutable admission order assigned by the home writer before the create
+    /// write, and preserved by replication. Never a store-local resource id.
+    /// Zero is the unassigned constructor value; the inbox storage adapter will
+    /// stamp this with the create's home sequence in the bounded-replica phase.
+    pub admitted_seq: u64,
     pub relation: Relation,
     #[store(frozen)]
     pub body: Frozen<MessageBody>,
@@ -181,6 +185,7 @@ impl MessageSpec {
         MessageSpec {
             sender,
             inbox,
+            admitted_seq: 0,
             relation,
             body,
             references: Vec::new(),
