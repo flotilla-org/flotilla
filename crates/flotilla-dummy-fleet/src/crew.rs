@@ -109,6 +109,9 @@ impl CrewScript {
 // Dummy scripts use vessel:role for a peer in another vessel. Ordinary role
 // names and already-qualified addresses pass through to production routing.
 fn script_handoff_target(convoy: &str, target: &str) -> String {
+    if target.contains('/') {
+        return target.to_string();
+    }
     match target.split_once(':') {
         Some((vessel, role)) => format!("{convoy}/{vessel}/{role}"),
         None => target.to_string(),
@@ -463,6 +466,7 @@ mod tests {
             ("supervise:governor", "convoy/supervise/governor"),
             ("coder", "coder"),
             ("project/convoy/work/coder", "project/convoy/work/coder"),
+            ("project:fleet/convoy:test/role:coder", "project:fleet/convoy:test/role:coder"),
         ] {
             assert_eq!(script_handoff_target("convoy", target), expected);
         }
