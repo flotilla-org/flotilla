@@ -19,6 +19,10 @@ use flotilla_provider_runtime::ObservationError;
 use flotilla_change_request::observation::parse_gh_observation_value_with_crew_identity;
 use flotilla_change_request::observation::DEFAULT_REVIEW_BOT_LOGIN;
 
+#[cfg(test)]
+#[path = "change_request_testing.rs"]
+pub(crate) mod testing;
+
 fn execution_root() -> &'static Path {
     Path::new("/")
 }
@@ -1253,7 +1257,3 @@ mod tests {
         assert_eq!(runner.remaining(), 0);
     }
 }
-
-#[cfg(test)]
-#[path = "change_request_testing.rs"]
-pub(crate) mod testing;

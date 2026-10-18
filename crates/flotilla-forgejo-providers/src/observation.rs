@@ -46,25 +46,28 @@ fn diagnostic_excerpt(body: &[u8]) -> String {
 }
 
 fn retry_deadline(headers: &reqwest::header::HeaderMap, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    // Interpret X-RateLimit-Reset, when supplied by the server or its proxy, as
-    // Unix epoch seconds (not a relative duration). Retry-After can instead be
-    // delta seconds or an HTTP date. Preserve expired server timestamps: consumers
-    // use their ordinary retry cadence rather than inventing a new forge deadline.
+    // Retry-After is the server's explicit instruction for this response, so it
+    // takes precedence. Fall back to X-RateLimit-Reset as Unix epoch seconds.
+    // Preserve expired server timestamps: consumers use their ordinary retry
+    // cadence rather than inventing a new forge deadline.
     headers
-        .get("x-ratelimit-reset")
+        .get("retry-after")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok())
-        .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+        .and_then(|value| {
+            value
+                .parse::<i64>()
+                .ok()
+                .filter(|seconds| *seconds >= 0)
+                .and_then(chrono::Duration::try_seconds)
+                .and_then(|delay| now.checked_add_signed(delay))
+                .or_else(|| DateTime::parse_from_rfc2822(value).ok().map(|date| date.with_timezone(&Utc)))
+        })
         .or_else(|| {
-            headers.get("retry-after").and_then(|value| value.to_str().ok()).and_then(|value| {
-                value
-                    .parse::<i64>()
-                    .ok()
-                    .filter(|seconds| *seconds >= 0)
-                    .and_then(chrono::Duration::try_seconds)
-                    .and_then(|delay| now.checked_add_signed(delay))
-                    .or_else(|| DateTime::parse_from_rfc2822(value).ok().map(|date| date.with_timezone(&Utc)))
-            })
+            headers
+                .get("x-ratelimit-reset")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<i64>().ok())
+                .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
         })
 }
 
@@ -91,7 +94,8 @@ mod tests {
             (vec![("x-ratelimit-reset", "invalid")], None),
             (vec![("retry-after", "invalid")], None),
             (vec![], None),
-            (vec![("x-ratelimit-reset", "1893456000"), ("retry-after", "60")], Some(1_893_456_000)),
+            (vec![("x-ratelimit-reset", "1893456000"), ("retry-after", "60")], Some(1_800_000_060)),
+            (vec![("x-ratelimit-reset", "1893456000"), ("retry-after", "invalid")], Some(1_893_456_000)),
             (vec![("x-ratelimit-reset", "invalid"), ("retry-after", "60")], Some(1_800_000_060)),
         ] {
             let mut map = HeaderMap::new();
