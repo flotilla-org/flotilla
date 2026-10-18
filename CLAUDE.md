@@ -147,8 +147,10 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-ai-utility` | AI utility trait, Claude API/CLI implementations and factories |
 | `flotilla-cloud-agent` | Cloud session provider trait, Claude/Codex/Cursor implementations, factories and detectors |
 | `flotilla-forge-forgejo` | Shared Forgejo HTTP client, authentication values and discovery-time credential resolution |
-| `flotilla-change-request` | Change-request tracker and observation-source traits, GitHub/Forgejo implementations, branch-absence observer and factories |
-| `flotilla-issue-tracker` | Source-addressed issue-provider trait, GitHub/Forgejo implementations, GitHub dispatch-board reader, mission-field decoding and factories |
+| `flotilla-github-providers` | GitHub change-request tracker, issue provider, dispatch-board reader and factories |
+| `flotilla-forgejo-providers` | Forgejo change-request tracker, issue provider and factories |
+| `flotilla-change-request` | Forge-neutral change-request tracker and observation-source traits, observation decoding and branch-absence observer |
+| `flotilla-issue-tracker` | Forge-neutral source-addressed issue-provider trait, mission-field decoding and provider contract |
 | `flotilla-agent` | Agent harness adapters and registry, crew brief rendering, hook parsing and installation, agent state store, process-exit receipts |
 | `flotilla-dummy-fleet` | Load-testing dummies installed behind `daemon.toml` `[dummy_fleet]`: scripted crews in an in-process terminal pool and agent adapter, a dummy VCS, a dummy forge's change-request tracker, and the workflow/policy catalog (#3206); the dummy environment provider lives in `flotilla-environment` |
 | `flotilla-fake-forge` | Rehearsal-only fake Forgejo service (#3374): one shared in-memory forge behind the strict Forgejo API the providers use, an HTTPS admin API for scenario drivers, seed generation and the in-process `HttpClient` the provider contract tests run against |
@@ -255,8 +257,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 Provider traits live in their type crates:
 
 - **Vcs** (`crates/flotilla-vcs/src/vcs.rs`, `crates/flotilla-vcs/src/providers/git.rs`, `crates/flotilla-vcs/src/providers/git_worktree.rs`)
-- **ChangeRequestTracker** (`crates/flotilla-change-request/src/lib.rs`, `crates/flotilla-change-request/src/github.rs`, `crates/flotilla-change-request/src/forgejo.rs`)
-- **IssueProvider** (`crates/flotilla-issue-tracker/src/lib.rs`, `crates/flotilla-issue-tracker/src/github.rs`, `crates/flotilla-issue-tracker/src/forgejo.rs`)
+- **ChangeRequestTracker** (`crates/flotilla-change-request/src/lib.rs`, `crates/flotilla-github-providers/src/change_request.rs`, `crates/flotilla-forgejo-providers/src/change_request.rs`)
+- **IssueProvider** (`crates/flotilla-issue-tracker/src/lib.rs`, `crates/flotilla-github-providers/src/issue_tracker.rs`, `crates/flotilla-forgejo-providers/src/issue_tracker.rs`)
 - **CloudAgentService** (`crates/flotilla-cloud-agent/src/claude.rs`, `crates/flotilla-cloud-agent/src/codex.rs`, `crates/flotilla-cloud-agent/src/cursor.rs`)
 - **AiUtility** (`crates/flotilla-ai-utility/src/claude_api.rs`, `crates/flotilla-ai-utility/src/claude_cli.rs`)
 - **TerminalPool** (`crates/flotilla-terminal/src/cleat.rs`, `crates/flotilla-terminal/src/passthrough.rs`)

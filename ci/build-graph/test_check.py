@@ -440,9 +440,9 @@ class BuildGraphContract(unittest.TestCase):
                             package("adapter", normal=(target,)), package(target),
                         )), [f"flotilla-change-request: must not depend on {target}, directly or transitively"])
         self.assertEqual(violations(graph(
-            package("flotilla-change-request", normal=("flotilla-forge-github", "flotilla-forge-forgejo")),
+            package("flotilla-change-request", normal=("flotilla-protocol",)),
             package("flotilla-core", normal=("flotilla-change-request",)),
-            package("flotilla-forge-github"), package("flotilla-forge-forgejo"),
+            package("flotilla-protocol"),
         )), [])
 
     def test_issue_tracker_is_native_and_independent(self):
@@ -458,10 +458,32 @@ class BuildGraphContract(unittest.TestCase):
                             package("adapter", normal=(target,)), package(target),
                         )), [f"flotilla-issue-tracker: must not depend on {target}, directly or transitively"])
         self.assertEqual(violations(graph(
-            package("flotilla-issue-tracker", normal=("flotilla-forge-github", "flotilla-forge-forgejo")),
+            package("flotilla-issue-tracker", normal=("flotilla-protocol",)),
             package("flotilla-core", normal=("flotilla-issue-tracker",)),
-            package("flotilla-forge-github"), package("flotilla-forge-forgejo"),
+            package("flotilla-protocol"),
         )), [])
+
+    def test_forge_traits_cannot_reach_forge_clients_or_providers(self):
+        # #3480: trait users must never inherit a forge implementation.
+        for component in ("flotilla-change-request", "flotilla-issue-tracker"):
+            for target in ("flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-github-providers", "flotilla-forgejo-providers"):
+                self.assert_boundary(component, target)
+
+    def test_forge_providers_cannot_reach_orchestration(self):
+        # #3480: forge providers stay below capabilities and composition.
+        for component in ("flotilla-github-providers", "flotilla-forgejo-providers"):
+            for target in ("flotilla-executor", "flotilla-projections", "flotilla-core", "flotilla-daemon", "flotilla-messaging"):
+                self.assert_boundary(component, target)
+
+    def assert_boundary(self, component, target):
+        for kind in ("normal", "build"):
+            for middle in (target, "adapter"):
+                with self.subTest(component=component, target=target, kind=kind, middle=middle):
+                    self.assertEqual(violations(graph(
+                        package(component, **{kind: (middle,)}),
+                        package("adapter", normal=(target,)), package(target),
+                    )), [f"{component}: must not depend on {target}, directly or transitively"])
+        self.assertEqual(violations(graph(package(component, dev=(target,)), package(target))), [])
 
     def test_agent_is_native_and_independent(self):
         # Issue #2749 / ADR 0060: agent harness adapters build on vcs and terminal, never composition or storage.

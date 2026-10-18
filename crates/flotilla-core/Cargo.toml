@@ -67,6 +67,8 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 libc = { workspace = true }
 
 [dev-dependencies]
+flotilla-forgejo-providers = { path = "../flotilla-forgejo-providers" }
+flotilla-github-providers = { path = "../flotilla-github-providers" }
 flotilla-store-http = { path = "../flotilla-store-http" }
 flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }

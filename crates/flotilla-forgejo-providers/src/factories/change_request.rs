@@ -14,8 +14,8 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ReqwestHttpClient;
 
-use crate::forgejo::ForgejoChangeRequestProvider;
-use crate::ChangeRequestTracker;
+use crate::change_request::ForgejoChangeRequestProvider;
+use flotilla_change_request::ChangeRequestTracker;
 
 pub struct ForgejoChangeRequestFactory;
 

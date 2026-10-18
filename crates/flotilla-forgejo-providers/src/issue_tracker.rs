@@ -101,7 +101,7 @@ fn browser_open_command(url: &str) -> (&'static str, Vec<String>) {
 }
 
 #[async_trait]
-impl super::IssueProvider for ForgejoIssueProvider {
+impl flotilla_issue_tracker::IssueProvider for ForgejoIssueProvider {
     fn supports(&self, source: &IssueSource) -> bool {
         is_forgejo_source(source, &self.forge.config.service_url)
     }
@@ -196,9 +196,9 @@ mod tests {
     use flotilla_replay_testkit::testing::MockRunner;
     use flotilla_replay_testkit::Masks;
 
-    use crate::testing::assert_provider_contract;
-    use crate::testing::fixture_path;
-    use crate::IssueProvider;
+    use crate::issue_tracker::testing::assert_provider_contract;
+    use crate::issue_tracker::testing::fixture_path;
+    use flotilla_issue_tracker::IssueProvider;
 
     #[test]
     fn parses_issue_title_and_assignees_from_existing_rest_response() {
@@ -587,3 +587,7 @@ mod tests {
         assert_eq!(runner.calls(), vec![(expected_cmd.into(), expected_args)]);
     }
 }
+
+#[cfg(test)]
+#[path = "issue_tracker_testing.rs"]
+pub(crate) mod testing;

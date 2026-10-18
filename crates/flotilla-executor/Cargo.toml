@@ -36,6 +36,7 @@ tokio-util = { workspace = true, features = ["rt"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
+flotilla-github-providers = { path = "../flotilla-github-providers" }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
 flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }

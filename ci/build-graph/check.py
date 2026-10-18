@@ -100,6 +100,15 @@ def violations(metadata):
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store", *sorted(CAPABILITY_CRATES)):
             if component in packages and target in packages and reaches(component, target):
                 errors.append(f"{component}: must not depend on {target}, directly or transitively")
+    # #3480: forge-neutral contracts and forge-specific adapters have separate graphs.
+    for component in ("flotilla-change-request", "flotilla-issue-tracker"):
+        for target in ("flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-github-providers", "flotilla-forgejo-providers"):
+            if component in packages and target in packages and reaches(component, target):
+                errors.append(f"{component}: must not depend on {target}, directly or transitively")
+    for component in ("flotilla-github-providers", "flotilla-forgejo-providers"):
+        for target in sorted(CAPABILITY_CRATES | {"flotilla-core", "flotilla-daemon", "flotilla-projections", "flotilla-messaging"}):
+            if component in packages and target in packages and reaches(component, target):
+                errors.append(f"{component}: must not depend on {target}, directly or transitively")
     for capability in sorted(CAPABILITY_CRATES & packages.keys()):
         for target in (*CAPABILITY_FORBIDDEN, *sorted(CAPABILITY_CRATES - {capability})):
             if target in packages and reaches(capability, target):

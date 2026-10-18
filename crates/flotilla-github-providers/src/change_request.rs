@@ -16,8 +16,12 @@ use flotilla_provider_runtime::run_output;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ObservationError;
 
-use crate::observation::parse_gh_observation_value_with_crew_identity;
-use crate::observation::DEFAULT_REVIEW_BOT_LOGIN;
+use flotilla_change_request::observation::parse_gh_observation_value_with_crew_identity;
+use flotilla_change_request::observation::DEFAULT_REVIEW_BOT_LOGIN;
+
+#[cfg(test)]
+#[path = "change_request_testing.rs"]
+pub(crate) mod testing;
 
 fn execution_root() -> &'static Path {
     Path::new("/")
@@ -155,8 +159,8 @@ impl GitHubChangeRequest {
     async fn observe_changed(
         &self,
         numbers: &[u64],
-        crew_logins: &super::CrewGithubLoginsByRequest,
-    ) -> Result<super::BoundObservations, ObservationError> {
+        crew_logins: &flotilla_change_request::CrewGithubLoginsByRequest,
+    ) -> Result<flotilla_change_request::BoundObservations, ObservationError> {
         if numbers.is_empty() {
             return Ok(HashMap::new());
         }
@@ -375,12 +379,12 @@ impl GitHubChangeRequest {
 }
 
 #[async_trait]
-impl super::ChangeRequestTracker for GitHubChangeRequest {
+impl flotilla_change_request::ChangeRequestTracker for GitHubChangeRequest {
     async fn observe_bound(
         &self,
         numbers: &[u64],
-        crew_logins: &super::CrewGithubLoginsByRequest,
-    ) -> Result<super::BoundObservations, ObservationError> {
+        crew_logins: &flotilla_change_request::CrewGithubLoginsByRequest,
+    ) -> Result<flotilla_change_request::BoundObservations, ObservationError> {
         let Some(poll) = &self.poll else {
             return self.observe_changed(numbers, crew_logins).await;
         };
@@ -493,14 +497,17 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         Ok(self.gh_pr_to_change_request(&pr))
     }
 
-    async fn get_change_request_for_admission(&self, id: &str) -> Result<super::ChangeRequestAdmission, ObservationError> {
+    async fn get_change_request_for_admission(
+        &self,
+        id: &str,
+    ) -> Result<flotilla_change_request::ChangeRequestAdmission, ObservationError> {
         let endpoint = format!("repos/{}/pulls/{}", self.repo_slug, id);
         let response = self.api.get_classified_with_headers(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await?;
         let body = response.body;
         let value: serde_json::Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
         let pull_request = Self::parse_pull_request(&value).ok_or("malformed pull request")?;
         let (id, change_request) = self.gh_pr_to_change_request(&pull_request);
-        Ok(super::ChangeRequestAdmission { id, change_request, base_ref: pull_request.base_ref_name })
+        Ok(flotilla_change_request::ChangeRequestAdmission { id, change_request, base_ref: pull_request.base_ref_name })
     }
 
     async fn update_body(&self, id: &str, body: &str) -> Result<(), String> {
@@ -559,8 +566,8 @@ mod tests {
     use flotilla_replay_testkit as replay;
     use flotilla_replay_testkit::testing::MockRunner;
 
-    use crate::testing::fixture_path;
-    use crate::ChangeRequestTracker;
+    use crate::change_request::testing::fixture_path;
+    use flotilla_change_request::ChangeRequestTracker;
 
     fn branch_lookup_page(items: serde_json::Value, has_next: bool) -> String {
         let link = if has_next { "Link: <https://api.github.com/repos/team/one/pulls?page=2>; rel=\"next\"\r\n" } else { "" };

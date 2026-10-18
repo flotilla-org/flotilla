@@ -30,6 +30,8 @@ absolute-paths-allowed-crates = [
     "flotilla_build_features",
     "flotilla_capability_contract",
     "flotilla_cbor",
+    "flotilla_github_providers",
+    "flotilla_forgejo_providers",
     "flotilla_change_request",
     "flotilla_charter",
     "flotilla_client",

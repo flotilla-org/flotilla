@@ -1438,8 +1438,6 @@ name = "flotilla-change-request"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bon",
- "bytes",
  "chrono",
  "flotilla-build-features",
  "flotilla-build-features-async",
@@ -1449,23 +1447,13 @@ dependencies = [
  "flotilla-build-features-os",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
- "flotilla-discovery-api",
- "flotilla-fake-forge",
- "flotilla-forge-forgejo",
- "flotilla-forge-github",
- "flotilla-paths",
  "flotilla-protocol",
  "flotilla-provider-runtime",
- "flotilla-replay-testkit",
  "flotilla-resources",
  "hegeltest",
- "http",
- "reqwest 0.13.2",
  "serde_json",
- "tempfile",
  "tokio",
  "tracing",
- "urlencoding",
 ]
 
 [[package]]
@@ -1702,6 +1690,8 @@ dependencies = [
  "flotilla-executor",
  "flotilla-forge-forgejo",
  "flotilla-forge-github",
+ "flotilla-forgejo-providers",
+ "flotilla-github-providers",
  "flotilla-issue-tracker",
  "flotilla-manifest",
  "flotilla-messaging",
@@ -1953,6 +1943,8 @@ dependencies = [
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-environment",
+ "flotilla-forgejo-providers",
+ "flotilla-github-providers",
  "flotilla-issue-tracker",
  "flotilla-paths",
  "flotilla-protocol",
@@ -2111,6 +2103,7 @@ dependencies = [
  "flotilla-discovery-testkit",
  "flotilla-environment",
  "flotilla-forge-github",
+ "flotilla-github-providers",
  "flotilla-issue-tracker",
  "flotilla-paths",
  "flotilla-protocol",
@@ -2230,6 +2223,77 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-forgejo-providers"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "dirs",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-http",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-change-request",
+ "flotilla-config",
+ "flotilla-discovery-api",
+ "flotilla-fake-forge",
+ "flotilla-forge-forgejo",
+ "flotilla-issue-tracker",
+ "flotilla-paths",
+ "flotilla-protocol",
+ "flotilla-provider-runtime",
+ "flotilla-replay-testkit",
+ "flotilla-resources",
+ "hegeltest",
+ "http",
+ "reqwest 0.13.2",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "flotilla-github-providers"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bon",
+ "bytes",
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-http",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-change-request",
+ "flotilla-discovery-api",
+ "flotilla-forge-github",
+ "flotilla-issue-tracker",
+ "flotilla-paths",
+ "flotilla-protocol",
+ "flotilla-provider-runtime",
+ "flotilla-replay-testkit",
+ "flotilla-resources",
+ "hegeltest",
+ "http",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
+ "urlencoding",
+]
+
+[[package]]
 name = "flotilla-inbox"
 version = "0.1.0"
 dependencies = [
@@ -2268,9 +2332,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bon",
- "bytes",
  "chrono",
- "dirs",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -2279,25 +2341,13 @@ dependencies = [
  "flotilla-build-features-os",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
- "flotilla-config",
- "flotilla-discovery-api",
- "flotilla-fake-forge",
- "flotilla-forge-forgejo",
- "flotilla-forge-github",
- "flotilla-paths",
  "flotilla-protocol",
- "flotilla-provider-runtime",
- "flotilla-replay-testkit",
  "futures",
  "hegeltest",
- "http",
- "reqwest 0.13.2",
  "serde_json",
- "tempfile",
  "tokio",
  "tracing",
  "url",
- "urlencoding",
 ]
 
 [[package]]
@@ -2446,6 +2496,7 @@ dependencies = [
  "flotilla-config",
  "flotilla-daemon-api",
  "flotilla-forge-github",
+ "flotilla-github-providers",
  "flotilla-issue-tracker",
  "flotilla-manifest",
  "flotilla-protocol",

@@ -945,7 +945,7 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use flotilla_daemon_api::event_sink::BroadcastEventSink;
     use flotilla_forge_github::github::GhApiClient;
-    use flotilla_issue_tracker::github::GitHubIssueProvider;
+    use flotilla_github_providers::issue_tracker::GitHubIssueProvider;
     use flotilla_protocol::issue_query::IssueResultPage;
     use flotilla_protocol::issue_query::READY_ISSUE_LABEL;
     use flotilla_protocol::result_set::ConvoyIssueRow;

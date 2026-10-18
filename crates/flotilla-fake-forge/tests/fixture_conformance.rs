@@ -45,12 +45,12 @@ struct Interaction {
 /// Every recorded Forgejo fixture and the world it shows.
 fn fixtures() -> Vec<(PathBuf, RecordedWorld)> {
     let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().expect("crates directory").to_path_buf();
-    let change_requests = crates.join("flotilla-change-request/src/fixtures");
+    let change_requests = crates.join("flotilla-forgejo-providers/src/fixtures/change_request");
     vec![
         (change_requests.join("forgejo_pulls.yaml"), RecordedWorld::LabFlotillaWithoutOpenPulls),
         (change_requests.join("forgejo_ghostty_governor.yaml"), RecordedWorld::GhosttyOpsBeforePulls),
         (change_requests.join("forgejo_head_filter_capability.yaml"), RecordedWorld::GhosttyOpsWithMergedPulls),
-        (crates.join("flotilla-issue-tracker/src/fixtures/forgejo_issues.yaml"), RecordedWorld::ZellijIssues),
+        (crates.join("flotilla-forgejo-providers/src/fixtures/issue_tracker/forgejo_issues.yaml"), RecordedWorld::ZellijIssues),
     ]
 }
 
@@ -236,7 +236,7 @@ async fn fake_reproduces_every_recorded_forgejo_answer() {
 fn every_forgejo_fixture_has_a_recorded_world() {
     let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().expect("crates directory").to_path_buf();
     let covered: Vec<PathBuf> = fixtures().into_iter().map(|(path, _)| path).collect();
-    for dir in ["flotilla-change-request/src/fixtures", "flotilla-issue-tracker/src/fixtures"] {
+    for dir in ["flotilla-forgejo-providers/src/fixtures/change_request", "flotilla-forgejo-providers/src/fixtures/issue_tracker"] {
         for entry in std::fs::read_dir(crates.join(dir)).expect("fixture directory") {
             let path = entry.expect("fixture entry").path();
             if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("forgejo_")) {

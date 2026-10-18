@@ -1,8 +1,5 @@
-//! Change-request trackers, forge observation sources and their discovery factories.
+//! Forge-neutral change-request trackers, observation sources and branch lookup.
 pub mod branch_lookup_observer;
-pub mod factories;
-pub mod forgejo;
-pub mod github;
 pub mod observation;
 
 use std::collections::{BTreeMap, HashMap};

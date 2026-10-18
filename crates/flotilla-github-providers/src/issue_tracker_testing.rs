@@ -1,5 +1,4 @@
-//! Private test collaborators. The shared discovery testkit's fakes implement
-//! the non-test build of this crate's traits, so unit tests use local doubles.
+//! Provider test configuration, replay paths and boundary collaborators.
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -13,14 +12,14 @@ use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 use flotilla_replay_testkit as replay;
 
 // The shared contract resolves the trait through its parent module.
-use crate::IssueProvider;
+use flotilla_issue_tracker::IssueProvider;
 
-#[path = "provider_contract.rs"]
+#[path = "../../flotilla-issue-tracker/src/provider_contract.rs"]
 mod provider_contract;
 pub use provider_contract::assert_provider_contract;
 
 pub fn fixture_path(name: &str) -> String {
-    format!("{}/src/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
+    format!("{}/src/fixtures/issue_tracker/{}", env!("CARGO_MANIFEST_DIR"), name)
 }
 
 pub fn repo_root_for_recording() -> PathBuf {

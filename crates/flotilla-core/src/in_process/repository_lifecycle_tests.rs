@@ -18,7 +18,7 @@ use flotilla_discovery_api::Factory;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
-use flotilla_issue_tracker::factories::github::GitHubIssueProviderFactory;
+use flotilla_github_providers::factories::issue_tracker::GitHubIssueProviderFactory;
 
 struct CountingVcsFactory {
     inner: FakeVcsFactory,
@@ -395,7 +395,7 @@ async fn project_issue_binding_uses_source_forge_instead_of_mirror_transport() {
         CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Forge, ForgeKind, ForgeSpec,
     };
 
-    use flotilla_issue_tracker::factories::forgejo::ForgejoIssueProviderFactory;
+    use flotilla_forgejo_providers::factories::issue_tracker::ForgejoIssueProviderFactory;
 
     let temp = tempfile::tempdir().expect("config");
     let config_dir = temp.path().join("config");
