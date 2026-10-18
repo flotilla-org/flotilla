@@ -91,3 +91,10 @@ if ((failures > 0)); then
   exit 1
 fi
 echo "platform-changes classification tests passed"
+
+check "inbox backend runs Quint" pull_request false "crates/flotilla-inbox/src/lib.rs" "" \
+  "windows=false macos=false quint=true "
+check "inbox testkit runs Quint" pull_request false "crates/flotilla-inbox-testkit/src/lib.rs" "" \
+  "windows=false macos=false quint=true "
+check "inbox runner runs Quint" pull_request false "ci/inbox-contract/check.sh" "" \
+  "windows=false macos=false quint=true "

@@ -84,6 +84,20 @@ class BuildGraphContract(unittest.TestCase):
                             package(dependent, **{kind: (STATE_MACHINES,)}), package(STATE_MACHINES),
                         )), [])
 
+    def test_inbox_is_an_isolated_engine_dependent(self):
+        # #3316: both the backend and its dev-only contract suite may use the
+        # engine, but live delivery cannot reach the backend yet.
+        self.assertEqual(violations(graph(
+            package("flotilla-inbox", normal=(STATE_MACHINES,)),
+            package("flotilla-inbox-testkit", normal=("flotilla-inbox", STATE_MACHINES)),
+            package(STATE_MACHINES),
+        )), [])
+        for kind in ("normal", "build"):
+            self.assertEqual(violations(graph(
+                package("flotilla-daemon", **{kind: ("flotilla-inbox",)}),
+                package("flotilla-inbox"),
+            )), ["flotilla-daemon: production dependency on flotilla-inbox before the Message switch"])
+
     def test_messaging_reads_store_in_c_free_base(self):
         # Messaging is below capabilities, with resource-only receiver resolution.
         self.assertIn("flotilla-messaging", C_FREE_BASE)

@@ -170,6 +170,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-projections` | Surface read models, host/fleet views, dispatch board, query actions, durable/observed aggregation and demand-backed issue materialization; reads host inputs through ports |
 | `flotilla-resources` | Resource kinds, lifecycle authority, typed list/watch shapes and shared pure helpers, including convoy-address selection, terminal delivery/attention evidence, unmet-expectation explanations and landing-evidence freshness; no storage dependencies |
 | `flotilla-state-machines` | ADR 0064 engine: machine declarations whose states are values, with typed edge dispatch and stable codes, gated edges at a single writer, judgements and typed reads through a recording handle, and each machine's stored kind; uses `flotilla-schema`'s records, time, codes and edge events, reaches no other workspace crate, and has no production dependents yet |
+| `flotilla-inbox` | Async InboxBackend contract over the Message engine, memory and SQLite implementations; no production callers until #3317 |
+| `flotilla-inbox-testkit` | Dev-only shared inbox scenarios, generated claim interleavings and Message spec replay, generic over backend factories |
 | `flotilla-messaging` | Resource-backed inbox admission, delivery, retention, conditions and receiver/role routing |
 | `flotilla-store` | Object-safe `Store`, typed resolvers, replica/watch machinery, store queries, generic request snapshots and merged definition-catalog reads, and the generic controller runtime || `flotilla-store-memory` | In-memory storage and observed replicas; no native persistence dependencies |
 | `flotilla-store-sqlite` | SQLite persistence, schema, transactions and decode quarantine |

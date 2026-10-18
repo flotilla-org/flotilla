@@ -113,3 +113,11 @@ The step-4 survey found core and store code with no home in the target crates. O
 - A message broker for large installs.
 - An event-sourced store backend.
 - An in-environment flotilla agent for library operations.
+
+### Inbox engine boundary (#3316)
+
+`flotilla-inbox` depends on `flotilla-state-machines` and the schema stack. Its
+`InboxBackend` trait has memory and SQLite implementations, exercised by the
+dev-only `flotilla-inbox-testkit`. No production crate depends on either new
+crate until the Message switch in #3317; `ci/build-graph/check.py` enforces that
+isolation. Existing `flotilla-messaging` and daemon delivery remain unchanged.

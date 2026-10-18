@@ -2227,6 +2227,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-inbox"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bon",
+ "flotilla-build-features-async",
+ "flotilla-inbox-testkit",
+ "flotilla-schema",
+ "flotilla-schema-sqlite",
+ "flotilla-state-machines",
+ "futures",
+ "hegeltest",
+ "rusqlite",
+ "tokio",
+]
+
+[[package]]
+name = "flotilla-inbox-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "flotilla-build-features-async",
+ "flotilla-inbox",
+ "flotilla-schema",
+ "flotilla-state-machines",
+ "futures",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "flotilla-issue-tracker"
 version = "0.1.0"
 dependencies = [

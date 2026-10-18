@@ -177,6 +177,15 @@ pub struct Table<K: Kind> {
     clock: Version,
 }
 
+impl<K: Kind> Clone for Table<K>
+where
+    K::Value: Clone,
+{
+    fn clone(&self) -> Self {
+        Self { rows: self.rows.clone(), clock: self.clock }
+    }
+}
+
 impl<K: Kind> Default for Table<K> {
     fn default() -> Self {
         Table { rows: BTreeMap::new(), clock: Version::default() }
