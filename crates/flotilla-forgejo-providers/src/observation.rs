@@ -96,6 +96,8 @@ mod tests {
             (vec![], None),
             (vec![("x-ratelimit-reset", "1893456000"), ("retry-after", "60")], Some(1_800_000_060)),
             (vec![("x-ratelimit-reset", "1893456000"), ("retry-after", "invalid")], Some(1_893_456_000)),
+            (vec![("x-ratelimit-reset", "1893456000"), ("retry-after", "-1")], Some(1_893_456_000)),
+            (vec![("x-ratelimit-reset", "1893456000"), ("retry-after", "9223372036854775807")], Some(1_893_456_000)),
             (vec![("x-ratelimit-reset", "invalid"), ("retry-after", "60")], Some(1_800_000_060)),
         ] {
             let mut map = HeaderMap::new();
