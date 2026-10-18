@@ -172,7 +172,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-state-machines` | ADR 0064 engine: machine declarations whose states are values, with typed edge dispatch and stable codes, gated edges at a single writer, judgements and typed reads through a recording handle, and each machine's stored kind; uses `flotilla-schema`'s records, time, codes and edge events, reaches no other workspace crate, and has no production dependents yet |
 | `flotilla-inbox` | Async InboxBackend contract over the Message engine, memory and SQLite implementations; no production callers until #3317 |
 | `flotilla-inbox-testkit` | Dev-only shared inbox scenarios, generated claim interleavings and Message race adapter, generic over backend factories |
-| `flotilla-quint-testkit` | Dev-only shared ITF parser, graph walker, scenario replay and Message trace mapping for engine and inbox adapters |
+| `flotilla-quint-testkit` | Dev-only shared ITF parser, graph walker, trace/stream helpers and Message race mapping for engine and inbox adapters |
 | `flotilla-messaging` | Resource-backed inbox admission, delivery, retention, conditions and receiver/role routing |
 | `flotilla-store` | Object-safe `Store`, typed resolvers, replica/watch machinery, store queries, generic request snapshots and merged definition-catalog reads, and the generic controller runtime || `flotilla-store-memory` | In-memory storage and observed replicas; no native persistence dependencies |
 | `flotilla-store-sqlite` | SQLite persistence, schema, transactions and decode quarantine |

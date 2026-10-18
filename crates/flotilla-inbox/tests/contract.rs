@@ -64,9 +64,10 @@ async fn sqlite_contract() {
 }
 
 // Behaviour: SQLite recovery reads the actual Receive entries about a message;
-// a receipt remains deliverable after reopening, and cursors never repeat.
+// a receipt remains deliverable after reopening, old cursors expire, and a
+// fresh live tail observes only post-restart changes.
 #[tokio::test]
-async fn sqlite_recovers_receipts_and_watch_positions() {
+async fn sqlite_recovers_receipts_and_expires_old_cursors() {
     use flotilla_inbox::{Cursor, InboxBackend};
     use flotilla_inbox_testkit::{inbox, spec};
     use flotilla_state_machines::{machines::message::Deliver, Transport};
@@ -83,14 +84,20 @@ async fn sqlite_recovers_receipts_and_watch_positions() {
     let mut watch = backend.watch(&inbox(), Some(Cursor(0))).await.expect("watch");
     let created = watch.next().await.expect("create").expect("event");
     backend.receive(&consumer("a"), &message, Transport::Turn).await.expect("receive");
+    let receipt = watch.next().await.expect("receipt").expect("event");
     drop(watch);
     drop(backend);
     let backend = SqliteInbox::open("test", StoreLog::new(store), evidence, Arc::new(Supervisors)).expect("recover");
-    let mut resumed = backend.watch(&inbox(), Some(created.cursor)).await.expect("resume");
-    let receipt = resumed.next().await.expect("receipt").expect("event");
-    assert!(receipt.cursor > created.cursor);
+    for cursor in [created.cursor, receipt.cursor] {
+        assert!(matches!(backend.watch(&inbox(), Some(cursor)).await, Err(flotilla_inbox::Error::CursorExpired)));
+    }
+    let mut live = backend.watch(&inbox(), None).await.expect("fresh live tail");
     backend.deliver(&message, Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("recovered receipt");
-    assert!(resumed.next().await.expect("delivery").expect("event").cursor > receipt.cursor);
+    let delivered = live.next().await.expect("delivery").expect("event");
+    assert!(delivered.cursor > receipt.cursor);
+    let mut resumed = backend.watch(&inbox(), Some(delivered.cursor)).await.expect("post-restart cursor remains valid");
+    let next = backend.enqueue(spec()).await.expect("enqueue after cursor");
+    assert_eq!(resumed.next().await.expect("new event").expect("change").message, next);
 }
 
 // Behaviour: the shared first-claim invariant holds after every step of a
@@ -197,45 +204,4 @@ async fn sqlite_rejects_consumer_in_another_store() {
     backend.receive(&consumer("a"), &message, flotilla_state_machines::Transport::Turn).await.expect("same store receipt");
     let receipt = watch.next().await.expect("receipt").expect("change");
     assert!(receipt.cursor > created.cursor, "a receipt never overwrites its creation event");
-}
-
-// Behaviour: reopening preserves each historical state at its own watch cursor,
-// rather than replaying the final state or interpreting Message edges again.
-#[tokio::test]
-async fn sqlite_recovers_historical_message_states() {
-    use flotilla_inbox::{ChangeKind, Cursor, InboxBackend};
-    use flotilla_inbox_testkit::{inbox, spec};
-    use flotilla_state_machines::{
-        machines::message::{Deliver, Expectation},
-        Transport,
-    };
-    use futures::StreamExt;
-    let store = Arc::new(Mutex::new(
-        Store::open(Connection::open_in_memory().expect("SQLite"), "test", flotilla_state_machines::kinds().expect("registry"))
-            .expect("store"),
-    ));
-    let evidence = Arc::new(Evidence::default());
-    let backend = SqliteInbox::open("test", StoreLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open");
-    backend.register_blocking(consumer("a"), SessionPort::new("a", StoreLog::new(store.clone())));
-    backend.bind(inbox(), consumer("a")).await.expect("bind");
-    let mut envelope = spec();
-    envelope.expectation = Expectation::Reply;
-    let message = backend.enqueue(envelope).await.expect("enqueue");
-    backend.receive(&consumer("a"), &message, Transport::Turn).await.expect("receipt");
-    backend.deliver(&message, Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("deliver");
-    let mut live = backend.watch(&inbox(), Some(Cursor(0))).await.expect("history");
-    let mut expected = Vec::new();
-    for _ in 0..3 {
-        expected.push(live.next().await.expect("event").expect("change"));
-    }
-    assert!(matches!(expected[0].kind, ChangeKind::Message(flotilla_state_machines::machines::message::MessageState::Pending)));
-    assert!(matches!(expected[2].kind, ChangeKind::Message(flotilla_state_machines::machines::message::MessageState::Awaiting { .. })));
-    drop(live);
-    drop(backend);
-    let reopened = SqliteInbox::open("test", StoreLog::new(store), evidence, Arc::new(Supervisors)).expect("recover");
-    let mut recovered = reopened.watch(&inbox(), Some(Cursor(0))).await.expect("history");
-    for before in expected {
-        let after = recovered.next().await.expect("event").expect("change");
-        assert_eq!(after, before);
-    }
 }

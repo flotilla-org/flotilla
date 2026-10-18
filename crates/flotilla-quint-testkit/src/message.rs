@@ -17,7 +17,7 @@ use flotilla_state_machines::{
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-pub(crate) fn drop_reason(v: &Value) -> DropReason {
+pub fn drop_reason(v: &Value) -> DropReason {
     match tag(v) {
         "Undeliverable" => DropReason::Undeliverable,
         "Expired" => DropReason::Expired,
@@ -28,7 +28,7 @@ pub(crate) fn drop_reason(v: &Value) -> DropReason {
     }
 }
 
-pub(crate) fn reason_name(reason: &DropReason) -> &'static str {
+pub fn reason_name(reason: &DropReason) -> &'static str {
     match reason {
         DropReason::Undeliverable => "Undeliverable",
         DropReason::Expired => "Expired",
@@ -38,17 +38,17 @@ pub(crate) fn reason_name(reason: &DropReason) -> &'static str {
     }
 }
 
-pub(crate) fn session_number(receiver: &message::Receiver) -> i64 {
+pub fn session_number(receiver: &message::Receiver) -> i64 {
     id_of(&receiver.id)
 }
 
 /// The consumer named by session `id`: an agent session on the consumer host.
-pub(crate) fn consumer(id: impl Into<String>) -> message::Receiver {
+pub fn consumer(id: impl Into<String>) -> message::Receiver {
     message::Receiver { kind: ConsumerKind::AgentSession, id: id.into(), host: "consumer".into() }
 }
 
 /// A message to the scenarios' inbox, expecting nothing; each replay sets the rest.
-pub(crate) fn message_spec() -> MessageSpec {
+pub fn message_spec() -> MessageSpec {
     let body = MessageBody::text("turn").expect("small body");
     MessageSpec::new(at_address("project:sender"), at_address(INBOX), Relation::Peer, body)
 }
@@ -67,7 +67,7 @@ pub fn envelope_value_at(spec: &MessageSpec, unit: i64, missing_deadline: i64) -
 
 /// The model's message store with each deadline-less envelope's unused
 /// `deadline` read as 0, as [`envelope_value_at`] renders it.
-pub(crate) fn without_unset_deadline(v: &Value) -> Value {
+pub fn without_unset_deadline(v: &Value) -> Value {
     match v {
         Value::Object(fields) => {
             let mut fields: serde_json::Map<String, Value> = fields.iter().map(|(k, v)| (k.clone(), without_unset_deadline(v))).collect();
@@ -85,7 +85,7 @@ pub(crate) fn without_unset_deadline(v: &Value) -> Value {
 /// Settled({ envelope, receiver }) | Dropped(Drop)`: the spec's envelope and
 /// the state's data, with receiver 0 for none. A drop's `bound` is whether it recorded a watermark, and its
 /// `receipt` is false (see the module doc).
-pub(crate) fn message_value(resource: &Resource<Message>) -> Value {
+pub fn message_value(resource: &Resource<Message>) -> Value {
     message_value_at(resource, UNIT, 0, Clone::clone)
 }
 
@@ -120,12 +120,12 @@ pub fn message_value_at(
     }
 }
 
-pub(crate) fn deliver(receiver: message::Receiver) -> message::Deliver {
+pub fn deliver(receiver: message::Receiver) -> message::Deliver {
     message::Deliver { receiver, transport: Transport::Turn }
 }
 
 /// The turn-rules role's withdrawal of a message whose delivery condition lapsed.
-pub(crate) fn withdrawn_by_turn_rules() -> DropReason {
+pub fn withdrawn_by_turn_rules() -> DropReason {
     DropReason::Withdrawn { by: at_address(TURN_RULES), authority: at_address(DELIVERY) }
 }
 
@@ -145,10 +145,12 @@ pub trait MessageSubject {
     fn observe(&mut self, world: MemoryMessageWorld, now: Timestamp);
     fn pending(&mut self) -> bool;
     fn apply(&mut self, edge: MessageEdge);
+    /// Probe expiry; a refused probe must leave the resource unchanged.
+    fn expire(&mut self) -> bool;
     fn resource(&self) -> Resource<Message>;
 }
 
-pub(crate) fn spec_from_envelope(envelope: &Value) -> MessageSpec {
+pub fn spec_from_envelope(envelope: &Value) -> MessageSpec {
     MessageSpec {
         expectation: match tag(&envelope["expectation"]) {
             "Nothing" => Expectation::Nothing,
@@ -163,7 +165,7 @@ pub(crate) fn spec_from_envelope(envelope: &Value) -> MessageSpec {
     }
 }
 
-pub(crate) fn observed_world(
+pub fn observed_world(
     name: &str,
     stream: &Stream,
     binding: InboxBinding,
@@ -199,6 +201,7 @@ pub fn replay_race<S: MessageSubject>(trace: &Trace<'_>) -> usize {
     assert_eq!(tag(initial), "Pending");
     let spec = spec_from_envelope(payload(initial));
     let expectation = spec.expectation.clone();
+    let deadline = spec.deadline;
     let mut subject = S::create(spec);
     subject.bind();
     let mut writes = 0;
@@ -218,6 +221,19 @@ pub fn replay_race<S: MessageSubject>(trace: &Trace<'_>) -> usize {
         subject.observe(world, moment(number(&step.before["now"])));
         let expected_pending = *subject.resource().state() == MessageState::Pending && !stream.any("receipt");
         assert_eq!(subject.pending(), expected_pending, "{step}: pending follows binding and receipts");
+        if let Some(deadline) = deadline {
+            let evidence = match expectation {
+                Expectation::Reply => Some("reply"),
+                Expectation::Outcome { .. } => Some("outcome"),
+                Expectation::Nothing => None,
+            };
+            // Inspect every written row, even those not yet applied at home.
+            // Probe the real subject, including when the model chose another edge.
+            let in_time = stream.rows.iter().any(|row| Some(row.kind.as_str()) == evidence && moment(row.at) <= deadline);
+            if in_time {
+                assert!(!subject.expire(), "{step}: expiry beat evidence written before the deadline");
+            }
+        }
         let edge: Option<MessageEdge> = match step.action() {
             "deliver" => Some(deliver(receiver).into()),
             "settle" => Some(

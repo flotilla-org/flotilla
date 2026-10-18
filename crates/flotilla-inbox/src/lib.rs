@@ -268,6 +268,8 @@ struct State<L: InboxLog> {
     journal: BTreeMap<Address, BTreeMap<Cursor, Change>>,
     retained: VecDeque<(Address, Cursor)>,
     expired: Cursor,
+    // Pre-restart cursors cannot resume the new in-memory watch journal.
+    restart_through: Option<Cursor>,
     sequence: u64,
     observation_version: u64,
 }
@@ -320,6 +322,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             journal: BTreeMap::new(),
             retained: VecDeque::new(),
             expired: recovery.expired,
+            restart_through: (recovery.sequence > 0).then_some(Cursor(recovery.sequence)),
             sequence: recovery.sequence,
             observation_version: recovery.sequence,
         };
@@ -683,8 +686,8 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
         let after = self
             .access(move |_, state| {
                 let cursor = after.unwrap_or(Cursor(state.sequence));
-                if cursor < state.expired {
-                    tracing::warn!(cursor = cursor.0, expired_through = state.expired.0, "inbox watch cursor expired");
+                if cursor < state.expired || (after.is_some() && state.restart_through.is_some_and(|last| cursor <= last)) {
+                    tracing::warn!(cursor = cursor.0, expired_through = state.expired.0, restart_through = ?state.restart_through, "inbox watch cursor expired");
                     Err(Error::CursorExpired)
                 } else if cursor.0 > state.sequence {
                     Err(Error::CursorAhead)

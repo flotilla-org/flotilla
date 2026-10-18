@@ -1,6 +1,6 @@
 //! Store-backed engine log, promoted from schema-sqlite's Home integration test.
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
 };
 
@@ -15,9 +15,8 @@ use flotilla_state_machines::{
     },
     EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, Version,
 };
-use rusqlite::Connection;
 
-use crate::{Change, ChangeKind, ConsumerLog, Cursor, Error, InboxLog, ReceiptScope, Recovery};
+use crate::{ConsumerLog, Cursor, Error, InboxLog, ReceiptScope, Recovery};
 
 #[derive(Clone)]
 pub struct StoreLog {
@@ -104,12 +103,6 @@ impl InboxLog for StoreLog {
     }
     fn recover(&mut self) -> Result<Recovery, Error> {
         let mut store = self.store.lock().expect("store writer");
-        // Reapply recorded effects through the store's generic replication
-        // path. Historical states are then typed reads, never inferred from
-        // machine edges or replaced by the resource's final state.
-        let mut history =
-            Store::open(Connection::open_in_memory().map_err(storage)?, "inbox-recovery", store.kinds().clone()).map_err(storage)?;
-        let mut historical = history.write().map_err(storage)?;
         let mut read = store.read().map_err(storage)?;
         let mut messages = BTreeMap::new();
         let mut after = None;
@@ -126,8 +119,6 @@ impl InboxLog for StoreLog {
             }
         }
         let sequence = read.last_sequence(&self.home).map_err(storage)?;
-        let mut changes = VecDeque::new();
-        let mut expired = Cursor(0);
         let mut receipts: BTreeMap<String, BTreeMap<Receiver, flotilla_state_machines::Transport>> = BTreeMap::new();
         let mut cursor = 0;
         loop {
@@ -137,37 +128,16 @@ impl InboxLog for StoreLog {
             }
             for entry in page {
                 cursor = entry.home_seq;
-                historical.apply(&entry).map_err(storage)?;
-                let (name, kind) = if entry.kind == Resource::<Message>::CODE {
-                    if !messages.contains_key(&entry.name) {
-                        continue;
-                    }
-                    let id = historical
-                        .resolve(Resource::<Message>::CODE, &entry.name, &entry.home)
-                        .map_err(storage)?
-                        .ok_or_else(|| Error::Storage("historical message identity missing".into()))?;
-                    let Some(resource) = historical.load::<Resource<Message>>(id).map_err(storage)? else { continue };
-                    (entry.name.clone(), ChangeKind::Message(resource.value.state().clone()))
-                } else {
-                    let Some(master) = &entry.about else { continue };
-                    if master.kind != Resource::<Message>::CODE || master.home != self.home {
-                        continue;
-                    }
-                    let Some(decode) = self.decoders.get(&entry.kind) else { continue };
-                    let Some((consumer, transport)) = decode(&entry)? else { continue };
-                    receipts.entry(master.name.clone()).or_default().insert(consumer.clone(), transport);
-                    (master.name.clone(), ChangeKind::Receipt { consumer, transport })
-                };
-                if let Some(resource) = messages.get(&name) {
-                    changes.push_back((resource.spec().inbox.clone(), Change { cursor: Cursor(cursor), message: name, kind }));
-                    if changes.len() > crate::WATCH_HISTORY {
-                        expired = changes.pop_front().expect("bounded recovery journal").1.cursor;
-                    }
+                let Some(master) = &entry.about else { continue };
+                if master.kind != Resource::<Message>::CODE || master.home != self.home {
+                    continue;
                 }
+                let Some(decode) = self.decoders.get(&entry.kind) else { continue };
+                let Some((consumer, transport)) = decode(&entry)? else { continue };
+                receipts.entry(master.name.clone()).or_default().insert(consumer, transport);
             }
         }
-        historical.commit().map_err(storage)?;
-        Ok(Recovery { messages: messages.into_values().collect(), receipts, changes: changes.into(), sequence, expired })
+        Ok(Recovery { messages: messages.into_values().collect(), receipts, changes: Vec::new(), sequence, expired: Cursor(0) })
     }
 
     fn next_name(&mut self) -> Result<String, Error> {

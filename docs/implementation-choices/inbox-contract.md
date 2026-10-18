@@ -52,14 +52,17 @@ reaction: it never records a second Message edge. Construction uses fallible ope
 synchronous register_blocking/get_blocking are setup/diagnostic only, with async worker
 variants available for runtime callers. Poisoning the writer requires reopening.
 
-Quint parsing, graph traversal, replay helpers and Message value/evidence mapping
-live once in the dev-only flotilla-quint-testkit. The engine adapter retains
-full-graph conformance; inbox adapters replay only message_race through the
-backend trait. Both run from specs/primitives/check.sh in the existing Quint
-job, without a separate runner or workflow change.
+Quint parsing, graph traversal, trace/step/stream types, small helpers and the
+Message mapping/race replay live once in dev-only flotilla-quint-testkit. The
+engine's other scenario replays stay in its integration test. Shared race replay
+probes expiry against evidence written by the deadline, including rows not yet
+applied at the home, through both real adapters. Full-graph conformance remains
+with the engine; backends replay only message_race. Both run from
+specs/primitives/check.sh in the existing Quint job.
 
-SQLite watch recovery reads historical typed state by applying recorded store
-effects into a temporary in-memory store, using the same registry. It does not
-interpret Message edges. This adds a temporary full-history store at startup;
-the resident query model, watch journal and worker permits are replaced by
+SQLite recovery loads current Message state and consumer receipts, then starts
+an empty watch journal. Every pre-restart cursor expires, including the last
+committed cursor. A fresh live tail precedes reading a pending baseline;
+post-restart cursors resume normally. No historical store replay is needed.
+The resident query model, watch journal and worker permits are replaced by
 #3466 before production use.

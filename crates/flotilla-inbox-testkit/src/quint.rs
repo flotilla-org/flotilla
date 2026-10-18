@@ -78,6 +78,11 @@ impl<F: Factory + Default> MessageSubject for Subject<F> {
             })
             .expect("model edge accepted");
     }
+    fn expire(&mut self) -> bool {
+        self.runtime
+            .block_on(self.harness.backend.drop(&self.message, flotilla_state_machines::machines::message::DropReason::Expired))
+            .is_ok()
+    }
     fn resource(&self) -> Resource<Message> {
         self.factory.inspect(&self.harness.backend, &self.message)
     }

@@ -25,13 +25,13 @@ consumer adapters are outside this issue.
   receive CursorExpired and must obtain a fresh pending baseline. Both initial
   resume refusals and lagging-stream expiry emit a tracing warning with the
   requested cursor and expired-through position.
-- Startup: SQLite scans resources and logs in pages of 256, recovering messages,
-  consumer receipts and journal positions. Historical watch values are typed
-  reads from a temporary in-memory store populated with recorded effects; this
-  temporarily duplicates stored history during startup. The resident model is
-  replaced in #3466 before production use. Bindings are local observations: the
-  composition root rebinds consumers after restart; unbound time starts at
-  recovery, never retroactively before it.
+- Startup: SQLite scans current resources and receipt logs in pages of 256,
+  recovering current messages and consumer receipts. It starts an empty watch
+  journal: every pre-restart cursor (including the last one) is CursorExpired.
+  Establish a live tail without a cursor, then obtain a pending baseline. No
+  historical states or second Store are reconstructed. Bindings are local
+  observations: the composition root rebinds consumers after restart; unbound
+  time starts at recovery, never retroactively before it.
 
 ## Ownership, budgets and bounds
 
