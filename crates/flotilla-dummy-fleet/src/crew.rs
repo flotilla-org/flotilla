@@ -187,9 +187,20 @@ impl Crew {
             Some(Ending::Failed) => self.fleet.count(Counter::CrewsFailed),
             None => {}
         }
-        // A finished crew stays idle in its session until teardown kills it.
-        self.mark(false).await;
-        while self.turns.recv().await.is_some() {}
+        // Completion leaves the conversation alive. A handoff can reopen Done
+        // work, so consume the delivered turn and report again after acting on it.
+        // Keep completion counters per script, rather than per follow-up report.
+        if matches!(ending, Some(Ending::Completed)) {
+            while self.next_turn().await.is_some() {
+                // Report this follow-up without repeating the original completion message or URL.
+                if self.complete(None).await.is_none() {
+                    break;
+                }
+            }
+        } else {
+            self.mark(false).await;
+            while self.turns.recv().await.is_some() {}
+        }
     }
 
     /// Fail or stall at the configured rates before doing any work.

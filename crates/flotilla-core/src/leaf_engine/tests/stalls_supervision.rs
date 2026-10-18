@@ -681,7 +681,7 @@ async fn unavailable_governor_preserves_consumed_bosun_rung() {
     let convoys = backend.using::<Convoy>("flotilla");
     let source = convoys.get("stalled-work").await.expect("source");
     let mut status = source.status.expect("status");
-    status.crew_work.get_mut("work").expect("crew").insert("bosun".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build());
+    status.crew_work.get_mut("work").expect("crew").insert("bosun".into(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build());
     convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("bosun available");
     let now = Utc::now();
     let objects = convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
@@ -1601,4 +1601,51 @@ async fn replica_only_convoy_in_caller_snapshot_is_not_judged() {
     wake.judge_stalls_at("flotilla", &objects, Utc::now()).await.expect("judge obsolete caller map");
     assert!(delivery.requests.lock().expect("requests").is_empty(), "a replica must never emit a supervision turn");
     assert!(convoys.get("stalled-work").await.is_err(), "judging must not recreate local authority");
+}
+
+// #3439: Working is an outstanding report even without a declared claim.
+// Pending (available) and Done roles owe nothing and must remain exempt.
+#[tokio::test]
+async fn claim_less_working_crew_stalls_with_actor_evidence() {
+    for (phase, attention) in [
+        (CrewWorkPhase::Working, TerminalAttentionState::Idle),
+        (CrewWorkPhase::Working, TerminalAttentionState::Working),
+        (CrewWorkPhase::Pending, TerminalAttentionState::Idle),
+        (CrewWorkPhase::Done, TerminalAttentionState::Idle),
+        (CrewWorkPhase::HandedBack, TerminalAttentionState::Idle),
+    ] {
+        let (backend, wake, delivery) = idle_nudge_scenario().await;
+        wake.subscriptions.inner.rows.lock().await.clear();
+        update_convoy(&backend, "stalled-work", |status| {
+            let member = &mut status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0];
+            member.promises.clear();
+            member.completion_conditions.clear();
+            status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = phase;
+        })
+        .await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.expect("convoy"))]);
+        wake.sync_rows("flotilla", &objects).await.expect("sync rows");
+        let now = Utc::now();
+        for second in [0, 60, 120, 180, 900, 1800] {
+            observe_actor(&backend, &wake, attention, now + chrono::Duration::seconds(second)).await;
+            if second == 0 || (attention == TerminalAttentionState::Working && second < 900) {
+                assert!(
+                    convoys.get("stalled-work").await.expect("convoy").status.expect("status").stalled.is_none(),
+                    "fresh work and the idle grace must remain able/unknown"
+                );
+            }
+        }
+        let status = convoys.get("stalled-work").await.expect("convoy").status.expect("status");
+        assert_eq!(status.stalled.is_some(), phase == CrewWorkPhase::Working, "{phase:?}: {status:?}");
+        if let Some(stalled) = status.stalled {
+            assert!(!stalled.evidence.is_empty());
+            assert!(!stalled.leaves.is_empty());
+            if attention == TerminalAttentionState::Working {
+                assert!(stalled.evidence.contains("turn inactivity bound exceeded"));
+            } else {
+                assert!(!delivery.requests.lock().expect("deliveries").is_empty(), "idle work follows the normal nudge ladder");
+            }
+        }
+    }
 }

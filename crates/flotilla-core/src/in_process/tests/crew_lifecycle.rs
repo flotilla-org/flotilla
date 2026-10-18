@@ -493,7 +493,7 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
                 )]),
                 crew_work: BTreeMap::from([(
                     "work".into(),
-                    BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                    BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build())]),
                 )]),
                 ..Default::default()
             },

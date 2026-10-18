@@ -309,3 +309,67 @@ async fn a_stalled_crew_resumes_on_supervision_and_lands() {
     assert!(!matches!(resumed, CommandValue::Error { .. }), "{resumed:?}");
     fleet.wait_for_phase("stalled", ConvoyPhase::Landed).await;
 }
+
+// #3439: force the handoff-after-Done ordering without racing the scripts.
+// A zero-task long runner finishes first; its aide then hands back work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
+    let fleet = DummyDaemon::start(SCENARIO_AGENT, "").await;
+    let workflows = fleet.backend().using::<WorkflowTemplate>(NAMESPACE);
+    let workflow = workflows.get(CrewMix::LongRunner.workflow_name()).await.expect("workflow");
+    workflows
+        .update(
+            &InputMeta::builder().name(workflow.metadata.name.clone()).build(),
+            &workflow.metadata.resource_version,
+            &CrewMix::LongRunner.workflow(0),
+        )
+        .await
+        .expect("zero-task governor");
+    fleet.dispatch("late-handoff", CrewMix::LongRunner).await;
+    let convoy = fleet
+        .wait_for("late-handoff", "finished governor and available aide", |convoy| {
+            convoy.status.as_ref().is_some_and(|status| {
+                status.crew_work.get("govern").is_some_and(|crew| {
+                    crew.get("governor").is_some_and(|work| work.phase == CrewWorkPhase::Done)
+                        && crew.get("aide").is_some_and(|work| work.phase == CrewWorkPhase::Pending)
+                })
+            })
+        })
+        .await;
+    let session = fleet
+        .backend()
+        .using::<flotilla_resources::TerminalSession>(NAMESPACE)
+        .list()
+        .await
+        .expect("sessions")
+        .items
+        .into_iter()
+        .find(|session| session.spec.role == "governor")
+        .expect("governor session");
+    let flotilla_resources::TerminalSessionSource::Agent { context: session_context, .. } = session.spec.source else { panic!("agent") };
+    let context = flotilla_protocol::query::CrewCommandContext {
+        namespace: Some(NAMESPACE.into()),
+        convoy: Some(convoy.metadata.name.clone()),
+        vessel_ref: Some(session_context.vessel_ref),
+        role: Some("aide".into()),
+        ..Default::default()
+    };
+    let before = fleet.fleet.snapshot();
+    let handed_off = fleet
+        .execute(CommandAction::CrewHandoff {
+            context: context.clone(),
+            target: "governor".into(),
+            message: "Done.".into(),
+            carries: Vec::new(),
+        })
+        .await;
+    assert_eq!(handed_off, CommandValue::Ok);
+    fleet.execute(CommandAction::CrewComplete { context, message: None, disposition: None, decision_ledger_ref: None, force: false }).await;
+    let landed = fleet.wait_for_phase("late-handoff", ConvoyPhase::Landed).await;
+    assert_eq!(fleet.fleet.snapshot().turns_received, before.turns_received + 1, "the reopened governor receives the handoff turn");
+    assert!(
+        landed.status.expect("status").crew_work["govern"]["governor"].finished_at
+            > convoy.status.expect("status").crew_work["govern"]["governor"].finished_at,
+        "the governor reports again after the handoff"
+    );
+}

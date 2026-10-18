@@ -564,7 +564,7 @@ async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restart
 // workflow declares no claims. Resolving the crew phase removes that obligation.
 #[tokio::test]
 async fn promise_less_crew_stall_survives_judge_ticks() {
-    for resolved in [CrewWorkPhase::Working, CrewWorkPhase::Done, CrewWorkPhase::Failed, CrewWorkPhase::HandedBack] {
+    for resolved in [CrewWorkPhase::Pending, CrewWorkPhase::Done, CrewWorkPhase::Failed, CrewWorkPhase::HandedBack] {
         let (backend, wake, _) = project_supervision_case(&[]).await;
         wake.subscriptions.inner.rows.lock().await.clear();
         let now = Utc::now();
