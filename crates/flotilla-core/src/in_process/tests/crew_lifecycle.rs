@@ -474,7 +474,8 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
 
 #[tokio::test]
 async fn idle_standing_role_without_obligation_never_stalls_convoy() {
-    let (_daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(Utc::now()));
+    let (daemon, backend, _temp, watch) = super::support::stall_test_daemon_with_clock(clock.clone()).await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys.create(&test_meta("standing"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
     convoys
@@ -493,7 +494,7 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
                 )]),
                 crew_work: BTreeMap::from([(
                     "work".into(),
-                    BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build())]),
+                    BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
                 )]),
                 ..Default::default()
             },
@@ -540,7 +541,9 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
             .await
             .expect("attention");
     }
-    tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("initial judgement");
+    clock.advance(chrono::Duration::hours(1));
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("past idle grace");
     assert!(convoys.get("standing").await.expect("convoy").status.expect("status").stalled.is_none());
     watch.abort();
 }

@@ -277,13 +277,13 @@ impl Crew {
     }
 
     async fn hand_off(&mut self, target: &str, message: &str) -> Option<CommandValue> {
-        self.persist(CommandAction::CrewHandoff {
-            context: self.identity.context(),
-            target: target.into(),
-            message: message.into(),
-            carries: Vec::new(),
-        })
-        .await
+        // Dummy scripts use vessel:role for a peer in another vessel.
+        let target = match target.split_once(':') {
+            Some((vessel, role)) => format!("{}/{vessel}/{role}", self.identity.convoy),
+            None => target.to_string(),
+        };
+        self.persist(CommandAction::CrewHandoff { context: self.identity.context(), target, message: message.into(), carries: Vec::new() })
+            .await
     }
 
     /// Send a command the script needs, as a real crew would: retry a refusal

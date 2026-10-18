@@ -1603,7 +1603,7 @@ async fn replica_only_convoy_in_caller_snapshot_is_not_judged() {
     assert!(convoys.get("stalled-work").await.is_err(), "judging must not recreate local authority");
 }
 
-// #3439: Working is an outstanding report even without a declared claim.
+// #3439: a handoff is an outstanding report even without a declared claim.
 // Pending (available) and Done roles owe nothing and must remain exempt.
 #[tokio::test]
 async fn claim_less_working_crew_stalls_with_actor_evidence() {
@@ -1620,6 +1620,15 @@ async fn claim_less_working_crew_stalls_with_actor_evidence() {
             let member = &mut status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0];
             member.promises.clear();
             member.completion_conditions.clear();
+            status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = CrewWorkPhase::Done;
+            flotilla_resources::ConvoyStatusPatch::HandoffCrewWork {
+                vessel: "work".into(),
+                sender_role: "coder".into(),
+                target_role: "coder".into(),
+                handed_off_at: Utc::now(),
+                message: "Follow-up task".into(),
+            }
+            .apply(status);
             status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = phase;
         })
         .await;
@@ -1648,4 +1657,71 @@ async fn claim_less_working_crew_stalls_with_actor_evidence() {
             }
         }
     }
+}
+
+// Launching a claim-less standing role makes it Working, but does not assign
+// a task. Even repeated idle observations beyond grace must create no actor row.
+#[tokio::test]
+async fn freshly_launched_claim_less_role_stays_unjudged() {
+    let (backend, wake, _) = idle_nudge_scenario().await;
+    wake.subscriptions.inner.rows.lock().await.clear();
+    update_convoy(&backend, "stalled-work", |status| {
+        let member = &mut status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0];
+        member.promises.clear();
+        member.completion_conditions.clear();
+        status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().phase = CrewWorkPhase::Pending;
+        flotilla_resources::ConvoyStatusPatch::WorkRunning {
+            work: "work".into(),
+            started_at: Utc::now(),
+            launched_roles: ["coder".into()].into(),
+        }
+        .apply(status);
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    })
+    .await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.expect("convoy"))]);
+    wake.sync_rows("flotilla", &objects).await.expect("sync");
+    assert!(
+        wake.subscriptions.inner.rows.lock().await.values().all(|row| !matches!(row.maker, LeafMaker::Actor { .. })),
+        "launch alone must not arm an actor obligation"
+    );
+    let now = Utc::now();
+    for second in [0, 60, 120, 1800] {
+        observe_actor(&backend, &wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
+        assert!(convoys.get("stalled-work").await.unwrap().status.unwrap().stalled.is_none());
+    }
+}
+
+// A crew that declares its own promise owes a report even without a workflow
+// claim or follow-up task. Narrowing launch eligibility must retain this case.
+#[tokio::test]
+async fn a_launched_role_that_declares_a_promise_owes_a_report() {
+    let (backend, wake, _) = idle_nudge_scenario().await;
+    wake.subscriptions.inner.rows.lock().await.clear();
+    update_convoy(&backend, "stalled-work", |status| {
+        let member = &mut status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0];
+        member.promises.clear();
+        member.completion_conditions.clear();
+        flotilla_resources::ConvoyStatusPatch::Promise {
+            vessel: "work".into(),
+            role: "coder".into(),
+            operation: flotilla_resources::promises::PromiseOperation::Declare {
+                id: "pr".into(),
+                kind: flotilla_resources::promises::PromiseKind::Pr,
+                source: flotilla_resources::promises::PromiseSource::Crew,
+            },
+        }
+        .apply(status);
+    })
+    .await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.expect("convoy"))]);
+    wake.sync_rows("flotilla", &objects).await.expect("sync");
+    assert!(wake.subscriptions.inner.rows.lock().await.values().any(|row| matches!(row.maker, LeafMaker::Actor { .. })));
+    let now = Utc::now();
+    for second in [0, 60, 120, 180, 900, 1800] {
+        observe_actor(&backend, &wake, TerminalAttentionState::Idle, now + chrono::Duration::seconds(second)).await;
+    }
+    assert!(convoys.get("stalled-work").await.unwrap().status.unwrap().stalled.is_some());
 }
