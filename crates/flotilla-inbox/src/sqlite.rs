@@ -4,17 +4,18 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use flotilla_schema::{Cause, Cbor, Identity, Kind, KindSpec, Labelled, Origin, StateData, Timestamp};
+use flotilla_schema::{Cbor, Identity, Kind, KindSpec, Labelled, Origin, StateData, Timestamp};
 use flotilla_schema_sqlite::{Stamp, Store};
 use flotilla_state_machines::{
     edge_event,
     machines::{
         agent_session::AgentSession,
         consumer::{Consumer, Receiver},
-        message::{Expectation, Message, MessageEdge, MessageState},
+        message::Message,
     },
     EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, Version,
 };
+use rusqlite::Connection;
 
 use crate::{Change, ChangeKind, ConsumerLog, Cursor, Error, InboxLog, ReceiptScope, Recovery};
 
@@ -103,6 +104,12 @@ impl InboxLog for StoreLog {
     }
     fn recover(&mut self) -> Result<Recovery, Error> {
         let mut store = self.store.lock().expect("store writer");
+        // Reapply recorded effects through the store's generic replication
+        // path. Historical states are then typed reads, never inferred from
+        // machine edges or replaced by the resource's final state.
+        let mut history =
+            Store::open(Connection::open_in_memory().map_err(storage)?, "inbox-recovery", store.kinds().clone()).map_err(storage)?;
+        let mut historical = history.write().map_err(storage)?;
         let mut read = store.read().map_err(storage)?;
         let mut messages = BTreeMap::new();
         let mut after = None;
@@ -122,7 +129,6 @@ impl InboxLog for StoreLog {
         let mut changes = VecDeque::new();
         let mut expired = Cursor(0);
         let mut receipts: BTreeMap<String, BTreeMap<Receiver, flotilla_state_machines::Transport>> = BTreeMap::new();
-        let mut states = BTreeMap::new();
         let mut cursor = 0;
         loop {
             let page = read.changes_since(&self.home, cursor, 256).map_err(storage)?;
@@ -131,23 +137,17 @@ impl InboxLog for StoreLog {
             }
             for entry in page {
                 cursor = entry.home_seq;
+                historical.apply(&entry).map_err(storage)?;
                 let (name, kind) = if entry.kind == Resource::<Message>::CODE {
-                    let Some(resource) = messages.get(&entry.name) else { continue };
-                    let previous = states.entry(entry.name.clone()).or_insert(MessageState::Pending);
-                    let next = match edge_event::<Message>(&entry).map_err(storage)? {
-                        None if matches!(entry.cause, Cause::Create) => MessageState::Pending,
-                        None => continue,
-                        Some(event) => match event.payload.edge {
-                            MessageEdge::Deliver(deliver) => match resource.spec().expectation {
-                                Expectation::Nothing => MessageState::Settled { receiver: Some(deliver.receiver) },
-                                _ => MessageState::Awaiting { receiver: deliver.receiver },
-                            },
-                            MessageEdge::Settle(_) => MessageState::Settled { receiver: previous.receiver().cloned() },
-                            MessageEdge::Drop(_) => resource.state().clone(),
-                        },
-                    };
-                    *previous = next.clone();
-                    (entry.name.clone(), ChangeKind::Message(next))
+                    if !messages.contains_key(&entry.name) {
+                        continue;
+                    }
+                    let id = historical
+                        .resolve(Resource::<Message>::CODE, &entry.name, &entry.home)
+                        .map_err(storage)?
+                        .ok_or_else(|| Error::Storage("historical message identity missing".into()))?;
+                    let Some(resource) = historical.load::<Resource<Message>>(id).map_err(storage)? else { continue };
+                    (entry.name.clone(), ChangeKind::Message(resource.value.state().clone()))
                 } else {
                     let Some(master) = &entry.about else { continue };
                     if master.kind != Resource::<Message>::CODE || master.home != self.home {
@@ -166,6 +166,7 @@ impl InboxLog for StoreLog {
                 }
             }
         }
+        historical.commit().map_err(storage)?;
         Ok(Recovery { messages: messages.into_values().collect(), receipts, changes: changes.into(), sequence, expired })
     }
 

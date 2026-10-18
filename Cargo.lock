@@ -2250,6 +2250,7 @@ dependencies = [
  "async-trait",
  "flotilla-build-features-async",
  "flotilla-inbox",
+ "flotilla-quint-testkit",
  "flotilla-schema",
  "flotilla-state-machines",
  "futures",
@@ -2530,6 +2531,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-quint-testkit"
+version = "0.1.0"
+dependencies = [
+ "flotilla-schema",
+ "flotilla-state-machines",
+ "serde_json",
+]
+
+[[package]]
 name = "flotilla-relay"
 version = "0.1.0"
 dependencies = [
@@ -2721,6 +2731,7 @@ dependencies = [
 name = "flotilla-state-machines"
 version = "0.1.0"
 dependencies = [
+ "flotilla-quint-testkit",
  "flotilla-schema",
  "hegeltest",
  "serde",

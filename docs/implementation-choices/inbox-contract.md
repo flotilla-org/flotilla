@@ -51,3 +51,15 @@ Repeated Drop keeps the machine's Ended refusal, even when it repairs a pending
 reaction: it never records a second Message edge. Construction uses fallible open;
 synchronous registration/inspection are setup/diagnostic only, with async worker
 variants available for runtime callers. Poisoning the writer requires reopening.
+
+Quint parsing, graph traversal, replay helpers and Message value/evidence mapping
+live once in the dev-only flotilla-quint-testkit. The engine adapter retains
+full-graph conformance; inbox adapters replay only message_race through the
+backend trait. Both run from specs/primitives/check.sh in the existing Quint
+job, without a separate runner or workflow change.
+
+SQLite watch recovery reads historical typed state by applying recorded store
+effects into a temporary in-memory store, using the same registry. It does not
+interpret Message edges. This adds a temporary full-history store at startup;
+the resident query model, watch journal and worker permits are replaced by
+#3466 before production use.

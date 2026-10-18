@@ -24,7 +24,10 @@ consumer adapters are outside this issue.
   is no queue per watcher and no store read per watcher/event. Lagging readers
   receive CursorExpired and must obtain a fresh pending baseline.
 - Startup: SQLite scans resources and logs in pages of 256, recovering messages,
-  consumer receipts and journal positions. Bindings are local observations: the
+  consumer receipts and journal positions. Historical watch values are typed
+  reads from a temporary in-memory store populated with recorded effects; this
+  temporarily duplicates stored history during startup. The resident model is
+  replaced in #3466 before production use. Bindings are local observations: the
   composition root rebinds consumers after restart; unbound time starts at
   recovery, never retroactively before it.
 

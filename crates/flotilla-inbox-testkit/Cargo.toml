@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
 serde_json = { workspace = true }
 flotilla-schema = { path = "../flotilla-schema" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }

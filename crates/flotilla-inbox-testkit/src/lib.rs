@@ -460,7 +460,7 @@ pub async fn generated_claim<F: Factory>(factory: &F, operations: &[usize]) {
     }
 }
 
-pub mod conformance;
+pub mod quint;
 
 /// Behaviour: pending messages arrive oldest first, including when generated
 /// names cross a decimal digit boundary. Reading Turn items does not reorder them.

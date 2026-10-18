@@ -89,8 +89,9 @@ class BuildGraphContract(unittest.TestCase):
         # engine, but live delivery cannot reach the backend yet.
         self.assertEqual(violations(graph(
             package("flotilla-inbox", normal=(STATE_MACHINES,)),
-            package("flotilla-inbox-testkit", normal=("flotilla-inbox", STATE_MACHINES)),
-            package(STATE_MACHINES),
+            package("flotilla-inbox-testkit", normal=("flotilla-inbox", "flotilla-quint-testkit", STATE_MACHINES)),
+            package("flotilla-quint-testkit", normal=(STATE_MACHINES,)),
+            package(STATE_MACHINES, dev=("flotilla-quint-testkit",)),
         )), [])
         for kind in ("normal", "build"):
             self.assertEqual(violations(graph(

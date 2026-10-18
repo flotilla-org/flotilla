@@ -64,6 +64,7 @@ absolute-paths-allowed-crates = [
     "flotilla_messaging",
     "flotilla_inbox",
     "flotilla_inbox_testkit",
+    "flotilla_quint_testkit",
     "flotilla_schema",
     "flotilla_schema_sqlite",
     "flotilla_state_machines",

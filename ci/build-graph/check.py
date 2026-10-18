@@ -45,7 +45,7 @@ SCHEMA_ALLOWED = ("flotilla-address", "flotilla-cbor")
 # that adds the composition-root switch names its dependents here.
 STATE_MACHINES = "flotilla-state-machines"
 STATE_MACHINES_ALLOWED = ("flotilla-schema", "flotilla-schema-derive", *SCHEMA_ALLOWED)
-STATE_MACHINE_DEPENDENTS = frozenset({"flotilla-inbox", "flotilla-inbox-testkit"})
+STATE_MACHINE_DEPENDENTS = frozenset({"flotilla-inbox", "flotilla-inbox-testkit", "flotilla-quint-testkit"})
 # Known C packages and compiler drivers catch new anchors that reach them.
 # This is a metadata deny list, not build-script analysis: crates invoking a
 # compiler without these drivers need an explicit entry when introduced.

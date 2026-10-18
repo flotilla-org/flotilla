@@ -70,7 +70,7 @@ pub struct WrongState<L, K> {
 }
 
 // Definitions capture only function pointers. Preserve their Send/Sync property
-// when erased, so an inbox can move its Home to a blocking writer thread.
+// when erased, so declaration ownership can move between execution contexts.
 type GateFn<M> = dyn Fn(&mut Handle<'_, M>, &<M as Machine>::Edge) -> Option<Result<(), <M as Machine>::Refusal>> + Send + Sync;
 type EffectFn<M> = dyn Fn(&mut Handle<'_, M>, <M as Machine>::State, &<M as Machine>::Edge) -> Option<<M as Machine>::State> + Send + Sync;
 type MasterFn<M> = dyn Fn(&<M as Machine>::Edge) -> Option<String> + Send + Sync;
