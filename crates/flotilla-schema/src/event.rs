@@ -214,6 +214,9 @@ impl Effect {
 /// another home: the resource it changed, the home sequence it took, the header and the effect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
+    /// Reserved coarse partition code, explicitly recorded at write time.
+    #[serde(rename = "q", default = "whole_log_topic")]
+    pub topic: Code,
     #[serde(rename = "k")]
     pub kind: KindCode,
     #[serde(rename = "n")]
@@ -275,7 +278,7 @@ impl EventError {
 }
 
 /// Objects as an array of `{h: hash, b: bytes}`, in hash order.
-mod objects {
+pub(crate) mod objects {
     use std::collections::BTreeMap;
 
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -313,4 +316,9 @@ mod optional_bytes {
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error> {
         Option::<flotilla_cbor::Bytes>::deserialize(deserializer).map(|bytes| bytes.map(|bytes| bytes.0))
     }
+}
+
+/// Default for pre-stream stored entries (remove after one production roll).
+pub fn whole_log_topic() -> Code {
+    Code::new("all")
 }

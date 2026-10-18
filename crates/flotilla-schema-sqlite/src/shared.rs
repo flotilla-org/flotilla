@@ -33,10 +33,7 @@ use rusqlite::{Connection, OptionalExtension};
 ///
 /// No database created by an earlier generation of these tables exists: the first production
 /// generation is the baseline, and ADR 0047's N→N+1 rule applies from then.
-macro_rules! shared_ddl {
-    ($topic:literal) => {
-        concat!(
-            "\
+pub(crate) const SHARED_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS strings (
   id INTEGER PRIMARY KEY,
   domain TEXT NOT NULL CHECK (length(domain) > 0),
@@ -59,25 +56,21 @@ CREATE TABLE IF NOT EXISTS log (
   about INTEGER REFERENCES resource_identity(id) ON DELETE SET NULL,
   writer INTEGER NOT NULL REFERENCES strings(id), at INTEGER NOT NULL,
   payload BLOB, effect BLOB NOT NULL,
-",
-            $topic,
-            "  PRIMARY KEY (home, home_seq),
+  topic TEXT NOT NULL DEFAULT 'all' CHECK (length(topic) BETWEEN 1 AND 8 AND topic NOT GLOB '*[^a-z0-9_]*' AND substr(topic, 1, 1) GLOB '[a-z]'),
+  PRIMARY KEY (home, home_seq),
   CHECK ((resource IS NULL) = (cause = 'expunge')),
   CHECK (CASE WHEN cause = 'edge' THEN edge IS NOT NULL AND \"from\" IS NOT NULL AND \"to\" IS NOT NULL
     ELSE edge IS NULL AND \"from\" IS NULL AND \"to\" IS NULL AND about IS NULL END)) STRICT;
 CREATE INDEX IF NOT EXISTS log_by_resource ON log (resource, home_seq);
 CREATE INDEX IF NOT EXISTS log_about ON log (about, at) WHERE about IS NOT NULL;
 CREATE INDEX IF NOT EXISTS log_expunges ON log (home, home_seq) WHERE cause = 'expunge';
-"
-        )
-    };
-}
-
-pub(crate) const SHARED_DDL: &str = shared_ddl!("");
-/// Review-only extension; runtime schema creation continues to use `SHARED_DDL`.
-pub(crate) const STREAM_SHARED_DDL: &str = shared_ddl!(
-    "  topic TEXT NOT NULL DEFAULT 'all' CHECK (length(topic) BETWEEN 1 AND 8 AND topic NOT GLOB '*[^a-z0-9_]*' AND substr(topic, 1, 1) GLOB '[a-z]'),\n"
-);
+CREATE TABLE IF NOT EXISTS stream_watermark (
+  home INTEGER PRIMARY KEY REFERENCES strings(id), home_seq INTEGER NOT NULL CHECK (home_seq >= 0), applied_through INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stream_history (
+  home INTEGER PRIMARY KEY REFERENCES strings(id), home_seq INTEGER NOT NULL CHECK (home_seq >= 0)
+) STRICT, WITHOUT ROWID;
+";
 
 /// The readable view of `log` (#3392 D4): each entry with its home, writer and resource named by
 /// their text, its kind's code, and its edge and labels named through `codes` by the entry's kind
@@ -85,15 +78,6 @@ pub(crate) const STREAM_SHARED_DDL: &str = shared_ddl!(
 /// master as `kind:name@home`. An expunge entry's resource is gone, so its kind and name are null:
 /// its effect names the identity. The payload and effect stay CBOR.
 pub(crate) fn log_view() -> String {
-    render_log_view(false)
-}
-
-/// Review-only log view including the reserved coarse topic code.
-pub(crate) fn stream_log_view() -> String {
-    render_log_view(true)
-}
-
-fn render_log_view(with_topic: bool) -> String {
     let named = |id: &str| format!("(SELECT \"s\" FROM \"strings\" WHERE \"id\" = {id})");
     let code = |field: &str, column: &str| {
         format!(
@@ -107,7 +91,7 @@ fn render_log_view(with_topic: bool) -> String {
         named("\"a\".\"name\""),
         named("\"a\".\"home\"")
     );
-    let mut columns = vec![
+    let columns = [
         format!("{} AS \"home\"", named("\"l\".\"home\"")),
         "\"l\".\"home_seq\"".to_owned(),
         "\"i\".\"kind\"".to_owned(),
@@ -122,10 +106,8 @@ fn render_log_view(with_topic: bool) -> String {
         "\"l\".\"at\"".to_owned(),
         "\"l\".\"payload\"".to_owned(),
         "\"l\".\"effect\"".to_owned(),
+        "\"l\".\"topic\"".to_owned(),
     ];
-    if with_topic {
-        columns.push("\"l\".\"topic\"".to_owned());
-    }
     format!(
         "CREATE VIEW \"{LOG_VIEW}\" AS SELECT\n  {}\nFROM \"log\" AS \"l\" LEFT JOIN \"resource_identity\" AS \"i\" ON \"i\".\"id\" = \"l\".\"resource\"",
         columns.join(",\n  ")
@@ -139,6 +121,15 @@ pub(crate) const LOG_VIEW: &str = "log_view";
 /// them for the query-plan tests, so a statement added here is covered; `store.rs` prepares no
 /// literal SQL (a unit test there checks).
 pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
+    ("home_mark_reset", HOME_MARK_RESET),
+    ("home_seq_reset", HOME_SEQ_RESET),
+    ("home_ids_reset", HOME_IDS_RESET),
+    ("home_log_clear", HOME_LOG_CLEAR),
+    ("identities_page", IDENTITIES_PAGE),
+    ("removed_max", REMOVED_MAX),
+    ("floor_raise", FLOOR_RAISE),
+    ("floor_get", FLOOR_GET),
+    ("watermark_put", WATERMARK_PUT),
     ("log_append", LOG_APPEND),
     ("log_cause", LOG_CAUSE),
     ("log_by_resource", LOG_BY_RESOURCE),
@@ -165,14 +156,14 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
 
 pub(crate) const LOG_APPEND: &str =
     "INSERT INTO log (home, home_seq, resource, prev_seq, cause, edge, \"from\", \"to\", about, writer, at, \
-                                     payload, effect) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
+                                     payload, effect, topic) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
 pub(crate) const LOG_CAUSE: &str = "SELECT cause FROM log WHERE home = ?1 AND home_seq = ?2";
 /// The columns an entry is read back with, in `LogRow` order: its strings through `strings`' primary key.
 macro_rules! log_select {
     ($($rest:literal),*) => {
         concat!(
             "SELECT l.rowid, l.home_seq, l.resource, l.prev_seq, l.cause, l.edge, l.\"from\", l.\"to\", l.about, ",
-            "(SELECT s FROM strings WHERE id = l.writer), l.at, l.payload, l.effect, (SELECT s FROM strings WHERE id = l.home) ",
+            "(SELECT s FROM strings WHERE id = l.writer), l.at, l.payload, l.effect, (SELECT s FROM strings WHERE id = l.home), l.topic ",
             "FROM log AS l ",
             $($rest),*
         )
@@ -227,6 +218,10 @@ pub(crate) fn render_schema(kinds: &KindRegistry, mode: DdlMode, shared: &str, l
     if mode == DdlMode::Create {
         ddl.push_str(log_view);
         ddl.push_str(";\n");
+        for (_, view) in progress_views() {
+            ddl.push_str(&view);
+            ddl.push_str(";\n");
+        }
     }
     ddl
 }
@@ -237,7 +232,7 @@ pub(crate) fn render_schema(kinds: &KindRegistry, mode: DdlMode, shared: &str, l
 /// connections re-prepare on.
 pub(crate) fn sync_views(conn: &Connection, kinds: &KindRegistry) -> rusqlite::Result<()> {
     let log = (LOG_VIEW.to_owned(), log_view());
-    for (name, sql) in kinds.iter().flat_map(render_views).chain([log]) {
+    for (name, sql) in kinds.iter().flat_map(render_views).chain([log]).chain(progress_views()) {
         let stored: Option<String> = conn.query_row(VIEW_SQL, [&name], |row| row.get(0)).optional()?;
         if stored.as_deref() != Some(sql.as_str()) {
             conn.execute_batch(&format!("DROP VIEW IF EXISTS {};\n{sql};", quote_ident(&name)))?;
@@ -250,3 +245,34 @@ pub(crate) fn sync_views(conn: &Connection, kinds: &KindRegistry) -> rusqlite::R
 pub(crate) fn has_string_domain(conn: &Connection) -> rusqlite::Result<bool> {
     conn.query_row("SELECT EXISTS (SELECT 1 FROM pragma_table_info('strings') WHERE name = 'domain')", [], |row| row.get(0))
 }
+
+/// Shared progress views use the same sync-on-open policy as kind views.
+fn progress_views() -> Vec<(String, String)> {
+    [("stream_watermark", "home_seq, applied_through"), ("stream_history", "home_seq")]
+        .into_iter()
+        .map(|(table, columns)| {
+            (
+                format!("{table}_view"),
+                format!("CREATE VIEW {table}_view AS SELECT (SELECT s FROM strings WHERE id = home) AS home, {columns} FROM {table}"),
+            )
+        })
+        .collect()
+}
+
+pub(crate) const WATERMARK_PUT: &str = "INSERT INTO stream_watermark (home, home_seq, applied_through) VALUES (?1, ?2, ?3) ON CONFLICT(home) DO UPDATE SET home_seq = excluded.home_seq, applied_through = excluded.applied_through";
+pub(crate) const FLOOR_GET: &str = "SELECT home_seq FROM stream_history WHERE home = ?1";
+pub(crate) const FLOOR_RAISE: &str = "INSERT INTO stream_history (home, home_seq) VALUES (?1, ?2) ON CONFLICT(home) DO UPDATE SET home_seq = max(home_seq, excluded.home_seq)";
+pub(crate) const REMOVED_MAX: &str = "SELECT max(home_seq) FROM log WHERE resource = ?1";
+pub(crate) const IDENTITIES_PAGE: &str = "SELECT id FROM resource_identity WHERE home = ?1 AND kind = ?2 AND id > ?3 ORDER BY id LIMIT ?4";
+pub(crate) const HOME_LOG_CLEAR: &str = "DELETE FROM log WHERE home = ?1";
+pub(crate) const HOME_IDS_RESET: &str = "UPDATE resource_identity SET seq = 0 WHERE home = ?1";
+pub(crate) const HOME_SEQ_RESET: &str = "DELETE FROM home_sequence WHERE home = ?1";
+pub(crate) const HOME_MARK_RESET: &str = "DELETE FROM stream_watermark WHERE home = ?1";
+
+/// Startup-only resident input load; runtime reads use the committed in-memory map.
+pub(crate) const WATERMARK_STARTUP: &str =
+    "SELECT s.s, w.home_seq, w.applied_through FROM stream_watermark w JOIN strings s ON s.id = w.home";
+
+/// Startup-only load of the home-owned cursor for resident transport notification.
+pub(crate) const LOCAL_SEQUENCE_STARTUP: &str =
+    "SELECT h.last FROM home_sequence h JOIN strings s ON s.id = h.home WHERE s.domain = 'hm' AND s.s = ?1";

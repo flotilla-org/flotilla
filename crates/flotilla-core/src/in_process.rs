@@ -1385,6 +1385,9 @@ impl flotilla_vcs::vcs::CheckoutVcsResolver for InProcessDaemon {
 use flotilla_projections::dispatch_board::DispatchBoardInputs;
 
 pub struct InProcessDaemon {
+    decided_store: std::sync::Mutex<Option<Arc<flotilla_schema_sqlite::stream::Service>>>,
+    decided_inbound_slots: Arc<tokio::sync::Semaphore>,
+    decided_outbound_slots: Arc<tokio::sync::Semaphore>,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
     event_source: Arc<BroadcastEventSink>,
@@ -1998,6 +2001,9 @@ impl InProcessDaemon {
             daemon_socket_path: RwLock::new(None),
             clock: Arc::clone(&clock),
             regard_lifecycle: Arc::clone(&regard_lifecycle),
+            decided_store: Default::default(),
+            decided_inbound_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            decided_outbound_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
@@ -2778,6 +2784,42 @@ impl InProcessDaemon {
 
     pub async fn aggregator_projection_state(&self) -> AggregatorProjectionState {
         self.aggregator_projection_state.clone()
+    }
+
+    /// Independent input/output round budgets avoid mutual backpressure deadlocks while
+    /// bounding frame memory. Permits cover one round, so all homes make fair progress.
+    pub fn decided_stream_limits(&self) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+        (Arc::clone(&self.decided_inbound_slots), Arc::clone(&self.decided_outbound_slots))
+    }
+
+    /// Installs the registered ADR 0064 store during composition, before peer tasks start.
+    /// Kind migrations supply their registry without coupling this layer to machine kinds.
+    pub fn install_decided_store(&self, service: Arc<flotilla_schema_sqlite::stream::Service>) -> Result<(), String> {
+        let mut slot = self.decided_store.lock().map_err(|_| "decided-store lock poisoned".to_owned())?;
+        if slot.is_some() {
+            return Err("decided store is already open".into());
+        }
+        *slot = Some(service);
+        Ok(())
+    }
+
+    /// The ADR 0064 store, shared by local writers, stream followers and HTTP serving.
+    /// Opened lazily beside the old resource store while kinds migrate independently.
+    pub fn decided_store(&self) -> Result<Arc<flotilla_schema_sqlite::stream::Service>, String> {
+        let mut slot = self.decided_store.lock().map_err(|_| "decided-store lock poisoned".to_owned())?;
+        if let Some(service) = &*slot {
+            return Ok(Arc::clone(service));
+        }
+        let service = Arc::new(
+            flotilla_schema_sqlite::stream::Service::open(
+                &self.config.state_dir().as_path().join("decided.sqlite"),
+                self.node_id.as_str(),
+                Default::default(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        *slot = Some(Arc::clone(&service));
+        Ok(service)
     }
 
     pub fn resource_backend(&self) -> ResourceBackend {

@@ -201,14 +201,19 @@ How Checkouts and lends behave:
 - **Misses** that the local copy cannot serve are routed to the home, marked remote with their age. Gates read only local inputs and never query remotely.
 - **Observation consumers.** Fine-grained filtered views belong to read-only observation subscriptions, such as `pm connect`, rather than replication. They are out of scope, as are partial replication by topic and archives beyond the history window.
 
-**#3463 schema checkpoint (revised proposal, not yet implemented).** The
-[change-stream schema proposal](../implementation-choices/change-stream.md) records the
-log's reserved coarse topic, the per-home applied-time watermark and the resume floor.
-Schema tests execute the proposal with foreign keys enabled and read every view; store
-startup does not install it. The same home expunge transaction advances the resume floor
-and removes retained events. After owner approval, #3463 implements snapshot then tail,
-resume/resnapshot, keepalives, local watermark inputs, routed misses and the resource HTTP
-seam. The old replicator stays until its old kinds move. Quint remains unchanged.
+**#3463 implementation** (schema [approved 2026-10-18](https://github.com/flotilla-org/flotilla/pull/3465#issuecomment-6252741558)).
+The [stream design/workload note](../implementation-choices/change-stream.md) records the
+reserved log topic, per-home applied watermark (`home_seq`, applied time), and resume floor.
+Only expunge raises that floor, atomically with the log deletion it covers. Store startup
+installs these tables and synchronizes their readable views. Snapshot/tail/resume and
+keepalives use framed CBOR through a listener-independent service on the resource HTTP API;
+follower progress and rows commit together. Missing progress reads as zero/epoch. Gates use
+local applied time, never remote reads or link health. Surface misses route once to the home
+and are marked remote with age. The old replicator remains for old kinds. Kind migrations
+install their new-store registry; #3317 is first. Fine-grained observation consumers, topic
+filtering, archives and retiring old replication are deferred. Quint specs are unchanged.
+**No budget-fit claim:** full-log bandwidth/storage depends on aggregate durable-rate and
+snapshot measurements (#3425); the independent-per-home ceiling exceeds the stated budget.
 
 **Liveness.** Liveness is judged from the observer host's link. Observations are written only when they change. Heartbeat-only writes go away.
 
@@ -259,6 +264,6 @@ There is no double-write path and no long-lived branch.
 - **ADR 0055 and #1394 are amended.** ADR 0055's address forms become typed segment lists, and its `principal:` form becomes a declared role. The #1394 ruling ([ADR 0058, dispatch](0058-dispatch-four-queues-one-global-decider.md)) moves from whole-convoy admission to admission with a capacity budget: growth within the budget goes to placement, and growth beyond it is a new request.
 - **Crews on any host.** Crew members can be on any host and can be replaced without stranding messages. Handoffs, resumes and nudges are messages, and no convoy transition is involved.
 - **The importer is the largest hand-written piece.** After the cut-over, ADR 0047 is enforced by a checked-in schema snapshot and explicit migration steps, and the golden corpus becomes a SQLite file.
-- **Peer merge goes away.** The Plane-A peer-merge layer (`crates/flotilla-daemon/src/peer/`) stays bugfix-only and is deleted by this work, because subscription-based replication supersedes it.
+- **Peer merge goes away.** The Plane-A peer-merge layer (`crates/flotilla-daemon/src/peer/`) stays bugfix-only and is deleted by this work, because whole-home log replication supersedes it.
 - **CLAUDE.md changes at the cut-over roll.** Its "Development Phase" rules (serde aliases and defaults, the JSON golden corpus) change to the schema-snapshot form in the same roll.
 - **Interactions are model-checked in Quint.** The exploratory specs (#3214) found the races ruled above. Minimal per-machine specs, replayed as traces against the engine (#3220), gate the implementation, which is split into PR stacks (#3215).

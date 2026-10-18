@@ -117,7 +117,7 @@ The checks:
   ~75 GB / ~750 GB per day. Heartbeats are observations: latest value only, not durable
   history.
 
-## Proposed whole-home change stream (#3463 schema checkpoint)
+## Whole-home change stream (#3463)
 
 Every host follows every other home's whole log. One coarse topic code is stored inline
 per event for later whole-topic partitioning; nothing filters on it yet. Keepalives and
@@ -136,7 +136,7 @@ Joining snapshots contain all homes' unique identities/bodies and referenced obj
 transferred in bounded pages. The root's ~9.5 GB typed full dataset estimate is already
 above the resident budget; do not buffer a whole snapshot, or multiply an already shared
 fleet dataset by host count. The workload note records independent-home and shared-dataset
-bounds. No bandwidth, memory or disk budget-fit claim is made by this schema checkpoint.
+bounds. No bandwidth, memory or disk budget-fit claim is made by the implementation.
 
 ## Usage
 

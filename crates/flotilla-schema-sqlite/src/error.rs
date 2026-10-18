@@ -4,6 +4,8 @@ use crate::store::ResourceId;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("change stream: {0}")]
+    Stream(String),
     /// The new store's pre-domain baseline has no migration path; reject it at open.
     #[error("strings table has no domain column: pre-domain dictionaries are unsupported; open a new domain-tagged store")]
     LegacyDictionarySchema,

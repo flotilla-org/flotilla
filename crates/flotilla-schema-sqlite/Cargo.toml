@@ -6,16 +6,18 @@ license.workspace = true
 description = "The rusqlite runtime for flotilla-schema: shared tables, generated statements, interning and identities"
 
 [dependencies]
+serde = { workspace = true }
+flotilla-cbor = { path = "../flotilla-cbor" }
 flotilla-schema = { path = "../flotilla-schema" }
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
 thiserror = "2"
 
 [dev-dependencies]
+tempfile = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # The engine's machine declarations are the integration tests' stored kinds (#3319); dev-only.
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 hegeltest = { workspace = true }
-serde = { workspace = true }
 
 [lints]
 workspace = true

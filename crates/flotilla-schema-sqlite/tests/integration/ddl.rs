@@ -87,6 +87,8 @@ fn every_table_is_strict_and_foreign_keys_hold() {
             "referral",
             "referral_references",
             "resource_identity",
+            "stream_history",
+            "stream_watermark",
             "strings",
             "terminal_session",
             "terminal_session_env",
@@ -143,7 +145,7 @@ fn readable_views_name_codes_and_strings() {
     assert_eq!(edge, "Drop");
     let views: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type = 'view'", [], |row| row.get(0)).expect("views");
     let tables: usize = registry().iter().map(|set| set.tables.len()).sum();
-    assert_eq!(views, tables as i64 + 1, "one view per kind table, and the log's");
+    assert_eq!(views, tables as i64 + 3, "one view per kind table, and the log's");
 }
 
 // Behaviour (#3392 D4, lane 3): `log_view` names each entry's home, kind, resource and writer, and

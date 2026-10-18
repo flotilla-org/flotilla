@@ -49,6 +49,46 @@ pub(super) async fn serve_resource_http_with_daemon(
     }
 
     let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
+    if path == flotilla_schema_sqlite::stream::PATH || path == flotilla_schema_sqlite::stream::RECORD_PATH {
+        let Some(daemon) = &daemon else {
+            return write_error(&mut stream, 503, "decided store unavailable").await;
+        };
+        let service = match daemon.decided_store() {
+            Ok(service) => service,
+            Err(error) => return write_error(&mut stream, 503, &error).await,
+        };
+        let query: BTreeMap<_, _> = url::form_urlencoded::parse(raw_query.as_bytes()).into_owned().collect();
+        if path == flotilla_schema_sqlite::stream::RECORD_PATH {
+            let (Some(kind), Some(name)) = (query.get("kind"), query.get("name")) else {
+                return write_error(&mut stream, 400, "record requires kind and name").await;
+            };
+            return super::change_stream::record(
+                &mut stream,
+                service,
+                kind,
+                name,
+                flotilla_schema::Timestamp::from_datetime(&daemon.clock().now()),
+                daemon.decided_stream_limits().1,
+            )
+            .await;
+        }
+        let after = match query.get("after") {
+            Some(value) => match value.parse::<u64>() {
+                Ok(after) => Some(after),
+                Err(_) => return write_error(&mut stream, 400, "invalid home cursor").await,
+            },
+            None => None,
+        };
+        return super::change_stream::serve(
+            &mut stream,
+            service,
+            after,
+            daemon.clock_for_scenarios(),
+            daemon.decided_stream_limits().1,
+            query.get("once").is_some_and(|value| value == "true"),
+        )
+        .await;
+    }
     let observed_path = path == "/observed" || path.starts_with("/observed/");
     let additional_stores = if daemon.is_some() && !observed_path { vec!["/observed"] } else { Vec::new() };
     let (path, backend) = if observed_path {

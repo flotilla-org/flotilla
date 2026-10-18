@@ -1,7 +1,7 @@
 use std::{env, fs, path::Path};
 
 use flotilla_schema::{quote_ident, DdlMode, KindRegistry};
-use flotilla_schema_sqlite::stream_schema::{stream_schema_ddl, WHOLE_LOG_TOPIC};
+use flotilla_schema_sqlite::schema_ddl;
 use rusqlite::Connection;
 
 use crate::fixtures::registry;
@@ -11,7 +11,7 @@ use crate::fixtures::registry;
 #[test]
 fn proposed_stream_ddl_matches_snapshot() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/snapshots/stream.sql");
-    let ddl = stream_schema_ddl(&KindRegistry::new(), DdlMode::Create);
+    let ddl = schema_ddl(&KindRegistry::new(), DdlMode::Create);
     if env::var_os("UPDATE_DDL_SNAPSHOT").is_some_and(|value| value == "1") {
         fs::write(path, ddl).expect("write proposed schema snapshot for owner review");
         return;
@@ -28,7 +28,7 @@ fn proposed_stream_ddl_executes_and_every_view_is_readable() {
     let enabled: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0)).expect("foreign keys");
     assert!(enabled);
     let kinds = registry();
-    conn.execute_batch(&stream_schema_ddl(&kinds, DdlMode::Create)).expect("execute complete proposed DDL");
+    conn.execute_batch(&schema_ddl(&kinds, DdlMode::Create)).expect("execute complete proposed DDL");
     let views: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_schema WHERE type = 'view' ORDER BY name")
         .expect("list views")
@@ -36,7 +36,10 @@ fn proposed_stream_ddl_executes_and_every_view_is_readable() {
         .expect("query views")
         .collect::<Result<_, _>>()
         .expect("view names");
-    assert_eq!(views.len(), kinds.iter().map(|set| set.tables.len()).sum::<usize>() + 3);
+    let mut expected: Vec<_> = kinds.iter().flat_map(|set| set.tables.iter().map(|table| format!("{}_view", table.name))).collect();
+    expected.extend(["log_view", "stream_history_view", "stream_watermark_view"].map(str::to_owned));
+    expected.sort();
+    assert_eq!(views, expected);
     for view in views {
         let mut select = conn.prepare(&format!("SELECT * FROM {}", quote_ident(&view))).expect("prepare view read");
         assert!(select.query([]).expect("read view").next().expect("view result").is_none(), "new view {view} should be empty");
@@ -47,9 +50,9 @@ fn proposed_stream_ddl_executes_and_every_view_is_readable() {
     let topic_default: String = conn
         .query_row("SELECT dflt_value FROM pragma_table_info('log') WHERE name = 'topic'", [], |row| row.get(0))
         .expect("reserved topic column");
-    assert_eq!(topic_default, format!("'{}'", WHOLE_LOG_TOPIC));
+    assert_eq!(topic_default, "'all'");
     let schema_version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0)).expect("schema version");
-    conn.execute_batch(&stream_schema_ddl(&kinds, DdlMode::IfNotExists)).expect("reapply proposed DDL");
+    conn.execute_batch(&schema_ddl(&kinds, DdlMode::IfNotExists)).expect("reapply proposed DDL");
     let reopened: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0)).expect("reopened schema version");
     assert_eq!(reopened, schema_version, "idempotent DDL does not change the schema");
 }

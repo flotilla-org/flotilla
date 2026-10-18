@@ -630,6 +630,7 @@ impl Consumer for Probe {
 /// A log entry of `kind`'s resource `name` at `home`: edge `edge`, whose payload is `payload`.
 fn entry(kind: &str, name: &str, home: &str, edge: &str, payload: &impl Cbor) -> Event {
     Event {
+        topic: flotilla_schema::Code::new("all"),
         kind: KindCode::new(kind),
         name: name.into(),
         home: home.into(),

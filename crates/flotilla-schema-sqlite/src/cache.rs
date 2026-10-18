@@ -68,6 +68,11 @@ pub(crate) struct TwoGen<K, V> {
 }
 
 impl<K: Eq + Hash, V: Clone> TwoGen<K, V> {
+    pub(crate) fn clear(&mut self) {
+        self.young.clear();
+        self.old.clear();
+    }
+
     pub(crate) fn new(capacity: usize) -> TwoGen<K, V> {
         TwoGen { young: HashMap::new(), old: HashMap::new(), capacity: capacity.max(1) }
     }
