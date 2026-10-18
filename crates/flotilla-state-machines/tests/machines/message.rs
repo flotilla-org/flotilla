@@ -690,3 +690,30 @@ fn the_receipt_reader_takes_every_accepted_consumer_kinds_receive() {
     let broken = entry("pb", "approve", "rata", "rv", &"not an edge document".to_owned());
     assert!(ReceiptLog::new().consumer::<Probe>().insert("m", [&broken]).is_err(), "a Receive that does not decode is refused");
 }
+
+// A second receipt from one consumer replaces its transport but still counts in the version: the
+// version is the number of receipt entries about the message, so it grows with every appended
+// entry and a gate that read the first receipt sees the second as a change.
+#[test]
+fn a_replaced_receipt_still_advances_the_version() {
+    let receive = |transport| {
+        entry(
+            "as",
+            "s1",
+            "kiwi",
+            "rv",
+            &EdgePayload { edge: AgentSessionEdge::Receive(Receive { message: "m".into(), transport }), reads: vec![] },
+        )
+    };
+    let (first, second) = (receive(Transport::Notify), receive(Transport::Turn));
+    let agent = Receiver { kind: ConsumerKind::AgentSession, id: "s1".into(), host: "kiwi".into() };
+
+    let mut log = ReceiptLog::new();
+    log.insert("m", [&first]).expect("decodes");
+    let found = log.lookup(&Ref::new("m")).map(|(version, receipts)| (version, receipts.clone()));
+    assert_eq!(found, Some((Version(1), [(agent.clone(), Transport::Notify)].into())));
+
+    log.insert("m", [&first, &second]).expect("decodes");
+    let found = log.lookup(&Ref::new("m")).map(|(version, receipts)| (version, receipts.clone()));
+    assert_eq!(found, Some((Version(2), [(agent, Transport::Turn)].into())), "one consumer, two entries");
+}
