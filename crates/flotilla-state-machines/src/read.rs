@@ -177,15 +177,6 @@ pub struct Table<K: Kind> {
     clock: Version,
 }
 
-impl<K: Kind> Clone for Table<K>
-where
-    K::Value: Clone,
-{
-    fn clone(&self) -> Self {
-        Self { rows: self.rows.clone(), clock: self.clock }
-    }
-}
-
 impl<K: Kind> Default for Table<K> {
     fn default() -> Self {
         Table { rows: BTreeMap::new(), clock: Version::default() }
@@ -195,6 +186,16 @@ impl<K: Kind> Default for Table<K> {
 impl<K: Kind> Table<K> {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Copies only the declared read set, preserving versions. Gate snapshots
+    /// use this instead of cloning a whole observation table.
+    pub fn select<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Self
+    where
+        K::Value: Clone,
+    {
+        let rows = names.into_iter().filter_map(|name| self.rows.get(name).map(|row| (name.to_owned(), row.clone()))).collect();
+        Self { rows, clock: self.clock }
     }
 
     /// Writes `value`; its version is newer than any this table has issued.

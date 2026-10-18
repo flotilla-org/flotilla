@@ -1,10 +1,10 @@
 # Bounded inbox replica: revised schema review before implementation
 
-Status: awaiting the second owner look-over under #3466 / PR #3467. This is
-still the schema-first phase, not the bounded-replica implementation. Runtime
-inbox paths, the InboxBackend trait, shared acceptance suite and Quint specs are
-unchanged. This proposal incorporates the owner's first look-over: replace the
-mixed open index and carry admission order explicitly on the row.
+Status: historical schema proposal, approved by the owner on 2026-10-18 in
+PR #3467. Runtime implementation now follows the approved schema; the current
+[implementation record](inbox-contract.md) and component workload supersede the
+proposal-stage assumptions below. The remaining text preserves the reviewed
+schema, ordering invariant and candidate walk.
 
 ## Proposed schema
 
@@ -113,8 +113,7 @@ Revisit or remove this index when pending semantics or its ordering requirement
 changes, or measured write/storage costs exceed the workload budget. It neither
 sets resident retention duration nor trims stored data.
 
-## Review requested
+## Review outcome
 
-Look over the required admission column and the replacement ordered Pending
-index before runtime code uses them. Keep the PR draft until the full #3466
-implementation and acceptance evidence are ready.
+The owner approved the admission column and replacement ordered Pending index
+in PR #3467 comment 6255738431. The runtime phase implements that approved shape.

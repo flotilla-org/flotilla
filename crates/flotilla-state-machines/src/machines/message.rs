@@ -156,8 +156,8 @@ pub struct MessageSpec {
     pub inbox: Address,
     /// Immutable admission order assigned by the home writer before the create
     /// write, and preserved by replication. Never a store-local resource id.
-    /// Zero is the unassigned constructor value; the inbox storage adapter will
-    /// stamp this with the create's home sequence in the bounded-replica phase.
+    /// Zero is the unassigned constructor value; the inbox writer stamps this
+    /// before create and its log refuses a zero or mismatched sequence.
     pub admitted_seq: u64,
     pub relation: Relation,
     #[store(frozen)]
@@ -558,7 +558,7 @@ impl<T> MessageWorld for T where
 }
 
 /// An in-memory message world, for tests, replay and conformance.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct MemoryMessageWorld {
     pub receipts: Table<Receipts>,
     pub binding: Table<Binding>,

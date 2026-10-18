@@ -47,8 +47,8 @@ impl Observations for Evidence {
     fn now(&self) -> Timestamp {
         Timestamp(self.clock.load(Ordering::SeqCst))
     }
-    fn snapshot(&self) -> MemoryMessageWorld {
-        self.world.lock().expect("evidence").clone()
+    fn with_snapshot(&self, read: &mut dyn FnMut(&MemoryMessageWorld)) {
+        read(&self.world.lock().expect("evidence"));
     }
 }
 

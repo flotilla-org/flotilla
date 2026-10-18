@@ -103,7 +103,7 @@ fn check_messages(tc: &TestCase, store: &mut Store, model: &BTreeMap<ResourceId,
     assert_eq!(scan_all::<Resource<Message>>(store, "elsewhere", limit), Vec::<ResourceId>::new());
 }
 
-// Behaviour (owner look-over #3467): Pending order is the numeric, home-assigned admission
+// Behaviour: Pending order is the numeric, home-assigned admission
 // sequence carried by the row, even when replicas assign different local ids and other homes
 // share the inbox. Paging must preserve each home's order across 9/10 and 99/100 local ids.
 #[hegel::test(test_cases = 12)]
@@ -119,6 +119,8 @@ fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
         for admitted_seq in 1..=12 {
             let value = message::sample().with_spec(MessageSpec { admitted_seq, ..message::sample_spec() });
             let stamp = write.insert(&format!("message-{admitted_seq}"), &value, &origin()).expect("insert");
+            // Each fixture insert consumes one home sequence; this checks the
+            // source allocation assumption before testing replication/order.
             assert_eq!(stamp.version, admitted_seq, "fixture uses the create's home sequence");
             snapshots.push(write.load_snapshot(stamp.id).expect("snapshot").expect("present"));
         }

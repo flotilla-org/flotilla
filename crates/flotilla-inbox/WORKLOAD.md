@@ -1,97 +1,167 @@
-# Workload model: inbox contract
+# Workload model: inbox bounded replica
 
-Inherits maturity, deployment tiers, message, running_convoys, change_events,
-retention and budgets from the root [workload model](../../WORKLOAD.md).
+Inherits deployment tiers, messages, convoys, changes and budgets from the root
+[workload](../../WORKLOAD.md). The sizing case is one large daemon: 10,000
+running convoys, about 500,000 messages (50/convoy), 2 KB mean bodies, 500 view
+clients and 10,000 burst changes/s. The daemon's total resident budget is 1 GB.
+This crate still has no production callers until #3317.
 
-## Operations and locality
+## Query cover and operations
 
-This is the isolated engine-dependent contract from #3316, with no production
-callers until #3317. Operations are local to one home; replication and remote
-consumer adapters are outside this issue.
+`Home<Message>` is a **bounded filtered replica**, not the store. A single writer
+pushes accepted changes into resident open values and their indexes. Terminal
+values leave immediately. Missing open values are fetched by key. Pending-index
+coverage starts complete; the first budget eviction invalidates that coverage,
+drops the resident index, and routes pending queries to the declared store index
+for the rest of that backend instance. This conservative cover check cannot
+return an incomplete list as complete. Restart rebuilds cover if it fits.
 
-- Enqueue and edges: one engine decision and one committed log write. SQLite
-  also reads its home sequence for the watch cursor. Consumer Receive is one
-  write through the consumer's injected resource port.
-- Gates: keyed resident message, binding and receipt lookups, plus an injected
-  snapshot of observed evidence. No durable-store read serves a gate. The
-  observation adapter must keep its snapshot resident.
-- Pending: an inbox index ordered by numeric admission sequence, then per-consumer receipt lookup and rule evaluation.
-  Results are a pull stream, materializing at most one message at a time.
-  Notify and Mute write their receipt when that item is read; Turn is explicitly
-  acknowledged after transport. Reading does not accept the Message Deliver edge.
-- Watch: a shared resident delta journal, indexed by inbox and cursor, globally
-  bounded to 65,536 changes. Each watcher holds one cursor and one item; there
-  is no queue per watcher and no store read per watcher/event. Lagging readers
-  receive CursorExpired and must obtain a fresh pending baseline. Both initial
-  resume refusals and lagging-stream expiry emit a tracing warning with the
-  requested cursor and expired-through position.
-- Startup: SQLite scans current resources and receipt logs in pages of 256,
-  recovering current messages and consumer receipts. It starts an empty watch
-  journal: every pre-restart cursor (including the last one) is CursorExpired.
-  Establish a live tail without a cursor, then obtain a pending baseline. No
-  historical states or second Store are reconstructed. Bindings are local
-  observations: the composition root rebinds consumers after restart; unbound
-  time starts at recovery, never retroactively before it.
+| Access | Default | Cold path / cost |
+|---|---|---|
+| enqueue | resident admission/evidence; one committed create | sequence read to stamp `admitted_seq`; SQLite rechecks inside the write transaction |
+| receive/deliver/settle/drop | keyed resident open value, local bindings/receipts, selective observed evidence | `resolve` + typed `load`; open receipts through paged `about`; no scan or unrelated resource history |
+| pending | per-inbox resident BTree range in immutable admission order | `page(pending_by_inbox)` in 32-id pages; load at most 32 candidates one at a time for names, then keyed load/receipts for each consumed item |
+| bind | same pending index/route; inspect observed receipts until a match | cold path uses declared Pending pages and keyed open loads; waits outside writer until Deliver |
+| unbind | local binding observation | no store read |
+| get diagnostic | resident key | current terminal/open value by `resolve` + `load`; terminal value discarded afterwards |
+| watch | source log, `changes_since` | up to 16 source entries/page, 16 KiB decoded buffer; Message edges/receipts attribute inbox using resolve + the first `changes` entry, never the current terminal body |
+| restart | store startup scan, 32 resources/page | load each current resource; retain only open values; recover their receipts with `about`; finish Undeliverable reactions one source at a time |
 
-## Ownership, budgets and bounds
+Admission order is the create's home sequence on the row, not the mutable last
+version or a store-local id. `pending_by_inbox(inbox, admitted_seq) WHERE Pending`
+replaces `open_by_inbox`; no mixed or Awaiting index is maintained. A log refuses
+zero/mismatched admission values. The writer overwrites any caller value.
 
-One writer lock spans decision and persistence. Blocking work runs on Tokio's
-blocking pool behind 64 permits: callers wait before entering that pool. One
-operation executes at a time. A binding waits outside that writer until observed
-receipts of pending messages have their Deliver. Watches register notification
-before reading to avoid lost wakeups. Cancellation drops a watch; there is no
-server-side watcher registration to clean up.
+For a cold Pending page, the API-level cost is 1 index read + up to 32 typed
+candidate loads, then resolve/load and receipt `about` pages for each item not
+already resident. The low-budget 6,000-item measurement below performs 12,000
+typed loads, 188 index pages and 6,000 empty receipt pages, with no terminal loads
+or resource-history reads. Indexed cold reads deliberately trade CPU/latency for
+a fixed resident footprint; they are not advertised as zero-read delivery.
 
-At the root ceiling of 10,000 changes/s, the journal bridges about 6.5 seconds
-if every change belongs to this backend. The 65,536 entries are shared: at 500
-clients, memory is O(retained changes + clients), not O(changes * clients).
-Pending and watch advance through BTree ranges rather than rescanning history
-per item. Terminal messages leave the pending index immediately.
+Warm delivery reads no resource/receipt history. `delivery_reads_no_terminal_history`
+checks both warm and forced-cold delivery after 96 Settled/Dropped messages;
+it refuses terminal loads, scans, resource-history reads and watch reads.
+The warm case additionally refuses resource and receipt reads entirely.
 
-Home and MemoryLog retain resources/history for the lifetime of this backend.
-This is a deliberately smaller **query model: full resident reference backend**,
-not the daemon's retention implementation. At 50 messages per convoy this is
-50,000 / 500,000 resources at target / ceiling. With the root's 2 KB message and
-2x typed-memory factor that is about 200 MB / 2 GB before indexes, exceeding the
-daemon's 1 GB budget at the ceiling. Its expiry is **before #3317 installs a
-production caller**: use a compact open-message view, indexed cold reads for
-terminal records, and the root archive policy. Neither public result needs to
-change: pending and watch already stream, and cursor expiry is explicit. The
-build-graph guard enforces the no-production-caller assumption.
+## Resident size model and budget
 
-## Implementation choices
+`resident.rs` implements conservative charges for owned data, BTree node slack
+and duplicate index keys. Frozen bodies are charged per resident handle even
+when their Arcs share storage. The budget is **128 MiB** for the dynamic replica,
+including local binding observations and registered consumer keys. This is a
+share of, not a replacement for, the root daemon budget. Fixed engine definition,
+mutex/Arc/type headers are constant (allow 16 KiB); backing-store caches, injected
+observation owners and consumer-port implementations have their own ownership.
+The engine neither copies nor retains those collaborators' worlds/history.
 
-A whole-kind scan per wake was rejected: at the ceiling it would inspect
-500,000 messages per wake. A queue per watcher was rejected: 500 slow clients
-would multiply the backlog. Re-querying SQLite per watcher/event was rejected
-against the root zero-read delivery target. The shared inbox index and bounded
-cursor journal serve those operations from resident state instead.
+| Structure | Charge / lifetime |
+|---|---|
+| open `Resource<Message>` | Rust header + 1,024 B map/node/key allowance + 8×name length, sender address and 2×inbox address; body canonical bytes + typed text capacity (or typed request maps/strings); reference Vec capacity, revision capacities, cross-home reference strings, condition addresses and receiver |
+| address | Rust header + 8×canonical length + 128 B per segment (canonical/decoded text, Vec slack and artifact subject) |
+| receipt map | 128 B header/node allowance + each receiver's header, id/host capacities and 96 B node slack; evicted with its open message |
+| pending index, LRU, charge map | accounted conservatively in each resource's key/node allowance; empty inbox entries are removed; all pending-index keys are dropped on cover invalidation |
+| local binding | address + binding header + 128 B node allowance + receiver charges; default never-bound inboxes need no entry |
+| registered consumer key | receiver charge + 64 B for map/port handle; port internals are caller-owned dependencies |
+| gate evidence | selective snapshot of at most the named message/inbox/condition/authority/supersession/reference keys; versions preserved; released after that operation, no whole-table Clone |
 
-Foreign implementations lower operations themselves through InboxBackend,
-without inheriting these storage/index choices. Cursors are home-local exclusive
-positions; retention expires them explicitly. Rules are caller values and
-create no stored schema. Message and consumer records retain their existing
-schema and N-to-N+1 rules.
+For the measured distinct 2 KB messages, the charge is about 7.7 KB each including
+metadata; holding all 500,000 would be about 3.8 GB and is rejected. At the ceiling,
+charged dynamic resident bytes are **at most 134,217,728**, regardless of retained
+terminal/history counts. With the root's roughly 36,000 live vessels, allocating
+one binding per vessel plus one per convoy gives about 46,000 bindings. At an
+illustrative 2 KB/binding and 256 B/consumer key, controls use about 101 MB,
+leaving roughly 33 MB for about 4,000 such open records. Actual address lengths,
+receipt fanout and typed requests change that split; these are explicit estimates,
+not extra limits on resource cardinality. Larger records simply stay cold.
 
-## Local measurement
+Every access reconciles changed resources and evicts least-recently-used open
+values until charges fit. Terminal values and their receipts are removed even
+when the cache has room. Irreducible local controls cannot be forgotten safely:
+a new binding or consumer registration that alone exceeds the budget is refused
+before mutation (`Storage`; setup-only blocking registration fails fast).
+Existing observations remain intact. No resource or log entry is deleted.
 
-A local development-profile sample on 2026-10-18 enqueued 1,000 distinct 2 KB
-bodies into SQLite's in-memory database in 595 ms, then streamed their pending
-items in 16 ms. This includes the blocking-worker hop and does not measure
-filesystem/fsync latency. It supports the indexed pending path and worker-queue
-cost; it does not claim the full resident reference model fits the daemon's
-ceiling. The retention expiry above remains explicit.
+`residency_blocking` reports budget, accounted bytes, open count, pending cover,
+and **oldest/newest resident state-entry timestamps**. The covered time span is
+measured, not fixed at seven days or a chosen number of seconds. There is no
+resident history window and no history trimming.
 
-## Consumer log scope and diagnostics
+## Store and transient ownership
 
-SQLite Receive ports must identify the exact Store and home shared by the inbox.
-That scope and the receiver home are checked before committing Receive; publication
-also refuses any non-increasing cursor. Foreign-store ports need a replication
-boundary, which is outside this local backend. Memory assigns its own journal
-positions and does not require its consumer MemoryLogs to share a sequence.
+MemoryInboxLog is the memory implementation's authoritative storage, retaining
+rows and its one event log with admission/pending/about indexes. Its storage
+bytes grow with retained data, like an in-memory SQLite database; this test
+backend is not a way to fit unbounded durable history inside daemon RAM.
+The bounded read replica has the same budget in both backends. Production
+composition uses a disk Store; native SQLite pages/log data are not Rust replica
+allocations. Archive/expunge policy and disk growth remain outside #3466.
 
-Construction is fallible through open. Synchronous register_blocking/get_blocking are setup and
-diagnostic operations, used outside concurrent runtime work; runtime callers use
-register_async/get_async through the bounded blocking worker. A poisoned writer
-is fatal: reopen from durable state instead of resuming a possibly interrupted
-consumer or persistence operation.
+SQLite's existing bounded two-generation caches (65,536 entries/generation each
+for strings, identities and reverse ids, 512 prepared statements) are unchanged.
+At illustrative 128 B/entry, the three two-generation caches cost about 48 MiB
+plus string payloads; budget roughly 100 MiB for normal short names. This is
+separate source-layer memory, not a second full decoded resource replica.
+
+Startup holds at most 32 current resources before trimming each value. With a
+1 MiB frozen-body limit and canonical + decoded text, that is about 64 MiB of
+body transient space, plus metadata. Runtime cold Pending pages retain only 32
+names, not 32 bodies. A gate holds only one resource's evidence/read set, and a
+watch holds one cursor and at most 16 KiB of decoded changes (a first oversized
+change is returned alone). At 500 clients, decoded buffers cost at most about
+8 MiB plus small cursors/handles; delivered items belong to their callers. Unusually large metadata/evidence fanout must be budgeted by its
+composition owner rather than hidden behind a whole-world clone.
+
+## Watch and concurrency choices
+
+There is no copied 65,536-entry journal. Both implementations read their source
+log. SQLite decodes a Message edge's recorded state effect, so old cursors report
+the state at that event rather than the resource's latest terminal state.
+Lag and restart alone do not expire a cursor. A real missing source sequence
+(e.g. the store's existing expunge) returns CursorExpired; ahead returns
+CursorAhead. This issue adds no trimming and stores no extra watch history.
+
+Log-backed watch intentionally crosses into storage. With 500 clients and
+10,000 source changes/s, a fully caught-up client set could examine 5 million
+source entries/s; this replaces the earlier resident-journal zero-read choice
+at the issue owner's explicit direction. Pages of at most 16 entries and a 16 KiB decoded-byte cap bound subscriber
+memory; sparse inboxes advance their source cursor past unrelated entries. This
+amortizes log calls for dense histories, while key/create-event attribution is
+still per relevant edge or receipt. Any future batched/shared-tail optimization must
+preserve log authority and a byte budget, not reinstate a second retained journal.
+The source log's explicit cursor gaps are the recovery backstop.
+
+An async writer mutex serializes admission **before** one blocking worker is
+submitted; the standard state mutex protects that decision and persistence.
+There is no 64-permit worker pool or permits-per-durable-rate arithmetic.
+Concurrent callers wait in their own futures, not in an unbounded blocking-pool
+queue. Bind waits and watch notification waits occur outside the writer.
+Notification is enabled before reading so concurrent commits cannot lose a wake.
+Consumer ports commit to this exact Store/home before publication. Observed
+evidence supplies one consistent borrowed snapshot from which only named values
+are copied, preserving recorded versions; engine tables no longer implement Clone.
+
+## Measurements and expiry
+
+2026-10-18, development profile, in-memory SQLite, one blocking writer, distinct
+2 KB text bodies, 512 KiB replica budget and 128-entry/generation source caches
+to isolate replica allocations (`resident_allocations`, separate process allocator):
+
+- 2,000 / 4,000 / 6,000 open messages: 517,017 accounted bytes, 67 resident values.
+- Total live Rust allocations: 675,150 / 664,174 / 698,302 B. The source rows/log
+  are in SQLite native memory and excluded from this Rust allocation count.
+- Enqueue 6,000: 3,661 ms; stream all 6,000 cold pending items: 2,218 ms.
+- Cold reads: 12,000 typed loads, 188 Pending pages, 6,000 receipt pages,
+  **zero terminal loads, startup scans or resource-history pages**.
+
+These are diagnostic CPU/worker measurements, not fsync latency or a promise of
+10,000 durable writes/s. The root's disk write budget is a different constraint.
+
+Revisit this shape when cold Pending throughput or log-backed watch fanout misses
+the deployment's latency/CPU budget, when control observations approach their
+128 MiB share, when root cardinalities/addresses grow, or when one resource's
+metadata/evidence dominates transient memory. Eviction already handles a larger
+open set without a contract migration. A persistent per-inbox cover or shared
+bounded log reader may improve cold cost, but needs measured justification.
+#3317 is no longer the expiry of a full-resident reference query model: that
+model and its copied watch journal have been removed before the production switch.

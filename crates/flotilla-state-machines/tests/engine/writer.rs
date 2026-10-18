@@ -5,7 +5,7 @@
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     attempt::retry, AttemptPolicy, Cause, CauseCategory, DefError, EdgeDef, Fault, Home, InputRead, Machine, MachineDef, Outcome, Ref,
-    Resource, Retry, Schedule, StateValue, Table, Version, WriteError,
+    Resource, Retry, Schedule, Source, StateValue, Table, Version, WriteError,
 };
 use hegel::generators as gs;
 
@@ -430,4 +430,42 @@ fn the_writer_follows_its_rules_over_any_sequence(tc: hegel::TestCase) {
         assert_eq!(judged.value, model.expected_retry(&policy), "{op:?}");
         assert!(judged.reads.is_empty(), "a retry judgement reads only the state");
     }
+}
+
+// Behaviour: evicting a read replica value preserves its authoritative log and
+// restores the same version before the next edge. Glue: one evict/restore cycle.
+#[test]
+fn eviction_preserves_the_log_and_restore_version() {
+    let mut home = latch();
+    let version = home.get("l").expect("latch").version();
+    let count = home.log().history("l", Version(0), usize::MAX).len();
+    let resource = home.evict("l").expect("evicted value");
+    assert!(home.get("l").is_none());
+    assert_eq!(home.log().history("l", Version(0), usize::MAX).len(), count);
+    home.restore(resource).expect("restore");
+    assert_eq!(home.get("l").expect("restored").version(), version);
+    home.apply("l", note(), &Table::new(), at(1)).expect("next edge");
+    assert_eq!(home.get("l").expect("latch").version(), Version(version.0 + 1));
+}
+
+// Behaviour: a selective observation snapshot preserves values and exact read
+// versions, omits unread keys, and stays immutable when its source changes.
+#[hegel::test]
+fn selective_snapshot_preserves_recorded_versions(tc: hegel::TestCase) {
+    // Repeated writes and colliding names ensure selected versions need not be 1.
+    let count = tc.draw(gs::integers::<usize>().min_value(2).max_value(30));
+    let mut table = Table::<Signal>::new();
+    let selected = Ref::new("selected");
+    let ignored = Ref::new("ignored");
+    for _ in 0..count {
+        table.put(&ignored, tc.draw(gs::booleans()));
+        table.put(&selected, tc.draw(gs::booleans()));
+    }
+    let snapshot = table.select(["selected", "missing"]);
+    let original = table.lookup(&selected).map(|(version, value)| (version, *value));
+    assert_eq!(snapshot.lookup(&selected).map(|(version, value)| (version, *value)), original);
+    assert!(snapshot.lookup(&ignored).is_none());
+    assert!(snapshot.lookup(&Ref::new("missing")).is_none());
+    table.put(&selected, !original.expect("selected present").1);
+    assert_eq!(snapshot.lookup(&selected).map(|(version, value)| (version, *value)), original);
 }
