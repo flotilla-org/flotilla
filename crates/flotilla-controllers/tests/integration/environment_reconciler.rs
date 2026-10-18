@@ -505,3 +505,62 @@ async fn retired_build_reference_fails_the_environment() {
         Some(EnvironmentStatusPatch::MarkFailed { message }) if message.contains("previous-generation image build; relaunch the vessel")
     ));
 }
+
+// Environment teardown must preserve the runner while a checkout still needs
+// it for cleanup, including a checkout whose deletion/finalizer is in flight.
+// The same contract runs on the in-memory and production SQLite stores.
+#[tokio::test]
+async fn environment_cleanup_waits_for_referencing_checkout_finalizers() {
+    use flotilla_resources::{Checkout, CheckoutSpec, FreshCloneCheckoutSpec, RepositoryKey};
+    use flotilla_store_sqlite::SqliteBackend;
+
+    let directory = tempfile::tempdir().expect("SQLite test store");
+    let sqlite = SqliteBackend::open_async(directory.path().join("environment-cleanup.sqlite")).await.expect("SQLite");
+    for backend in [ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()), ResourceBackend::new(sqlite)] {
+        let environments = backend.clone().using::<Environment>("flotilla");
+        let environment = environments
+            .create(
+                &InputMeta::builder().name("env-cleanup".into()).build(),
+                &EnvironmentSpec {
+                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".into(), repo_default_dir: "/workspace".into() }),
+                    docker: None,
+                },
+            )
+            .await
+            .expect("environment");
+        let checkouts = backend.clone().using::<Checkout>("flotilla");
+        let spec = |environment: &str| {
+            CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                source_clone_ref: None,
+                repo_ref: RepositoryKey("repo".into()),
+                env_ref: environment.into(),
+                r#ref: "main".into(),
+                base_ref: None,
+                target_path: "/workspace".into(),
+                url: "https://example.com/o/r".into(),
+            })
+        };
+        checkouts
+            .create(&InputMeta::builder().name("own".into()).finalizers(vec!["test-cleanup".into()]).build(), &spec("env-cleanup"))
+            .await
+            .expect("own checkout");
+        checkouts.create(&InputMeta::builder().name("other".into()).build(), &spec("env-other")).await.expect("unrelated checkout");
+        // Stands in for the provider/container destruction boundary.
+        let runtime = Arc::new(RecordingDockerRuntime::default());
+        let reconciler = EnvironmentReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+        assert!(matches!(reconciler.run_finalizer(&environment).await, Err(ResourceError::FinalizerPending)));
+        checkouts.delete("own").await.expect("begin checkout cleanup");
+        let checkout = checkouts.get("own").await.expect("checkout finalizer retains its record");
+        assert!(checkout.metadata.deletion_timestamp.is_some());
+        assert!(matches!(reconciler.run_finalizer(&environment).await, Err(ResourceError::FinalizerPending)));
+        assert!(runtime.cleaned.lock().expect("cleanup log").is_empty());
+        let metadata = InputMeta::from(&checkout.metadata).without_finalizer("test-cleanup");
+        checkouts.update(&metadata, &checkout.metadata.resource_version, &checkout.spec).await.expect("finish checkout finalizer");
+        match checkouts.delete("own").await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+            other => panic!("checkout delete: {other:?}"),
+        }
+        reconciler.run_finalizer(&environment).await.expect("no checkout still needs the environment");
+        assert_eq!(*runtime.cleaned.lock().expect("cleanup log"), ["env-cleanup"]);
+    }
+}

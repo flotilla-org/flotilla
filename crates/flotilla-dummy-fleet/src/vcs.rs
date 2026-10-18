@@ -6,7 +6,7 @@
 //! written to disk.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -36,6 +36,19 @@ pub struct DummyVcs {
 pub(crate) struct DummyCheckouts(Mutex<HashMap<(String, PathBuf), String>>);
 
 impl DummyCheckouts {
+    pub(crate) fn destroy_environment(&self, environment: &str) {
+        self.lock().retain(|(owner, _), _| owner != environment);
+    }
+
+    pub(crate) fn remaining_for(&self, convoy: &str, environments: &HashSet<String>) -> Vec<String> {
+        let prefix = format!("dummy/{convoy}/");
+        self.lock()
+            .iter()
+            .filter(|((environment, _), branch)| environments.contains(environment) || branch.starts_with(&prefix))
+            .map(|((environment, path), _)| format!("live checkout {environment}:{}", path.display()))
+            .collect()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, PathBuf), String>> {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -202,7 +215,52 @@ impl Factory for DummyVcsFactory {
         if env.find_env_var(DUMMY_FLEET_ENV).is_none() {
             return Err(vec![UnmetRequirement::MissingEnvVar(DUMMY_FLEET_ENV.into())]);
         }
-        let environment = env.find_env_var("FLOTILLA_ENVIRONMENT_ID").unwrap_or_default().to_string();
+        let environment = env
+            .find_env_var("FLOTILLA_ENVIRONMENT_ID")
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| vec![UnmetRequirement::MissingEnvVar("FLOTILLA_ENVIRONMENT_ID".into())])?
+            .to_string();
         Ok(Arc::new(DummyVcs { fleet: Arc::clone(&self.fleet), environment, root: repo_root.as_path().to_path_buf() }))
+    }
+}
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    // Destroying one container removes all its checkouts while preserving others.
+    #[test]
+    fn environment_destruction_removes_only_its_checkouts() {
+        let checkouts = DummyCheckouts::default();
+        checkouts.lock().insert(("one".into(), "/workspace/one".into()), "dummy/convoy-a/main".into());
+        checkouts.lock().insert(("two".into(), "/workspace/two".into()), "dummy/convoy-b/main".into());
+        assert_eq!(checkouts.remaining_for("convoy-a", &HashSet::new()).len(), 1);
+        checkouts.destroy_environment("one");
+        checkouts.destroy_environment("one");
+        assert!(checkouts.remaining_for("convoy-a", &HashSet::new()).is_empty());
+        assert_eq!(checkouts.remaining_for("convoy-b", &HashSet::new()).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use flotilla_config::dummy_fleet::DummyFleetConfig;
+    use hegel::generators as gs;
+
+    use super::*;
+
+    // Hyphenated convoy names can be prefixes of other names. Cleanup must
+    // identify their exact catalogue environments, even on non-dummy branches.
+    #[hegel::test]
+    fn cleanup_distinguishes_convoys_whose_names_extend_each_other(tc: hegel::TestCase) {
+        let number = tc.draw(gs::integers::<u32>().min_value(0).max_value(100_000));
+        let convoy = format!("load-{number}");
+        let other = format!("{convoy}-2");
+        let fleet = DummyFleet::new(DummyFleetConfig::default());
+        fleet.checkouts.lock().insert((format!("env-{convoy}-implement"), "/own".into()), "main".into());
+        fleet.checkouts.lock().insert((format!("env-{other}-implement"), "/other".into()), "main".into());
+        let remaining = fleet.remaining_for(&convoy);
+        assert_eq!(remaining.len(), 1, "{remaining:?}");
+        assert!(remaining[0].ends_with(":/own"));
+        assert_eq!(fleet.remaining_for(&other).len(), 1);
     }
 }

@@ -1,7 +1,7 @@
 //! The fleet hub shared by every dummy provider a daemon installs.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock, Weak,
@@ -12,17 +12,23 @@ use std::{
 use async_trait::async_trait;
 use flotilla_config::dummy_fleet::DummyFleetConfig;
 use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_protocol::{commands::CommandValue, Command, CommandAction, DaemonEvent};
+use flotilla_protocol::{commands::CommandValue, query::CrewCommandContext, Command, CommandAction, DaemonEvent};
 use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
 use tokio::sync::{broadcast::error::RecvError, oneshot};
 
-use crate::{forge::DummyForge, shared_forge::SharedForge, terminal::DummySessions, vcs::DummyCheckouts};
+use crate::{catalog::CrewMix, forge::DummyForge, shared_forge::SharedForge, terminal::DummySessions, vcs::DummyCheckouts};
 
 /// How a dummy crew reaches its daemon: the same commands a real crew sends
 /// through `flotilla crew …`, without a socket or a process.
 #[async_trait]
 pub trait CrewCommandPort: Send + Sync {
     async fn execute(&self, action: CommandAction) -> Result<CommandValue, String>;
+
+    /// Observe settlement before attempting completion, as a real crew checks
+    /// its submitted promises. Boundary doubles without a store are ready.
+    async fn completion_ready(&self, _context: &CrewCommandContext) -> Result<bool, String> {
+        Ok(true)
+    }
 
     /// Report the crew working or idle in its terminal session, as a real
     /// harness's hooks do. Ports without a hook path ignore it; the session's
@@ -43,6 +49,8 @@ pub struct DummyFleet {
     pub(crate) checkouts: DummyCheckouts,
     port: OnceLock<Arc<dyn CrewCommandPort>>,
     counters: Counters,
+    vessel_names: BTreeSet<String>,
+    command_error_samples: Mutex<Vec<String>>,
 }
 
 impl DummyFleet {
@@ -59,7 +67,13 @@ impl DummyFleet {
 
     fn build(config: DummyFleetConfig, http: Option<Arc<dyn HttpClient>>) -> Arc<Self> {
         let shared_forge = config.shared_forge.clone().zip(http).map(|(shared, http)| Arc::new(SharedForge::new(shared, http)));
+        let vessel_names = CrewMix::ALL
+            .into_iter()
+            .flat_map(|mix| mix.workflow(config.agent.long_runner_turns).vessels)
+            .map(|vessel| vessel.name)
+            .collect();
         Arc::new(Self {
+            vessel_names,
             forge: DummyForge::new(&config),
             shared_forge,
             sessions: DummySessions::default(),
@@ -67,6 +81,7 @@ impl DummyFleet {
             config,
             port: OnceLock::new(),
             counters: Counters::default(),
+            command_error_samples: Mutex::default(),
         })
     }
 
@@ -82,15 +97,35 @@ impl DummyFleet {
 
     pub(crate) async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
         let port = self.port.get().ok_or("dummy fleet is not attached to a daemon")?;
+        // Keep only a static command kind across the ownership boundary. Format
+        // diagnostics only for retained failures; successful commands allocate no diagnostic strings.
+        let command = match &action {
+            CommandAction::CrewPromise { .. } => "CrewPromise",
+            CommandAction::CrewComplete { .. } => "CrewComplete",
+            CommandAction::CrewHandoff { .. } => "CrewHandoff",
+            CommandAction::CrewStall { .. } => "CrewStall",
+            CommandAction::CrewFail { .. } => "CrewFail",
+            _ => "dummy crew command",
+        };
         let result = port.execute(action).await;
         match &result {
-            Ok(CommandValue::Error { .. }) | Err(_) => self.count(Counter::CommandErrors),
+            Ok(CommandValue::Error { .. }) | Err(_) => {
+                self.count(Counter::CommandErrors);
+                let mut samples = self.command_error_samples.lock().expect("command errors");
+                if samples.len() < 5 {
+                    samples.push(format!("{command}: {result:?}"));
+                }
+            }
             Ok(_) => {}
         }
         match result {
             Ok(CommandValue::Error { message }) => Err(message),
             result => result,
         }
+    }
+
+    pub(crate) async fn completion_ready(&self, context: &CrewCommandContext) -> Result<bool, String> {
+        self.port.get().ok_or("dummy fleet is not attached to a daemon")?.completion_ready(context).await
     }
 
     pub(crate) async fn report_attention(&self, namespace: &str, session: &str, working: bool) {
@@ -102,6 +137,21 @@ impl DummyFleet {
 
     pub(crate) fn count(&self, counter: Counter) {
         self.counters.get(counter).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Provider-side artifacts survive resource deletion if teardown is broken.
+    pub fn remaining_for(&self, convoy: &str) -> Vec<String> {
+        let mut remaining = self.sessions.remaining_for(convoy);
+        // The catalogue defines complete environment identities. Prefix matching
+        // cannot separate a convoy from another whose name extends it with '-'.
+        let environments = self.vessel_names.iter().map(|vessel| format!("env-{convoy}-{vessel}")).collect::<HashSet<_>>();
+        remaining.extend(self.checkouts.remaining_for(convoy, &environments));
+        remaining
+    }
+
+    /// Bounded diagnostic evidence for command errors, retained for load reports.
+    pub fn command_error_samples(&self) -> Vec<String> {
+        self.command_error_samples.lock().expect("command errors").clone()
     }
 
     pub fn snapshot(&self) -> DummyFleetSnapshot {

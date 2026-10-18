@@ -380,6 +380,24 @@ impl Crew {
     async fn complete(&mut self, message: Option<String>) -> Option<Ending> {
         let mut backoff = Duration::from_secs(1);
         loop {
+            // Do not repeatedly claim completion while a submitted promise is
+            // still open. Refusals are command errors, not a polling interface.
+            // Promises that never settle surface through harness inactivity/stall
+            // checks; waiting here deliberately does not create a command error.
+            match self.fleet.completion_ready(&self.identity.context()).await {
+                Ok(false) => {
+                    self.idle_for(backoff).await;
+                    backoff = (backoff * 2).min(MAX_COMPLETION_BACKOFF);
+                    continue;
+                }
+                Ok(true) => {}
+                Err(error) => {
+                    tracing::warn!(crew = %self.identity.subject(), %error, "dummy crew settlement observation failed");
+                    self.idle_for(backoff).await;
+                    backoff = (backoff * 2).min(MAX_COMPLETION_BACKOFF);
+                    continue;
+                }
+            }
             let action = CommandAction::CrewComplete {
                 context: self.identity.context(),
                 message: message.clone(),

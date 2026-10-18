@@ -44,16 +44,64 @@ impl DummyFleet {
     /// refuses everything outside the dummy fleet.
     pub fn install(self: &Arc<Self>, factories: &mut FactoryRegistry) {
         let environment = &self.config.environment;
-        factories.environment_providers.push(Box::new(DummyEnvironmentFactory::new(DummyEnvironmentBehaviour {
+        let weak = Arc::downgrade(self);
+        let provider = DummyEnvironmentFactory::new(DummyEnvironmentBehaviour {
             seed: self.config.seed,
             realise_delay: Duration::from_millis(environment.realise_delay_ms),
             failure_rate: environment.failure_rate,
-        })));
+        })
+        .with_cleanup(Arc::new(move |id| {
+            if let Some(fleet) = weak.upgrade() {
+                fleet.sessions.destroy_environment(id);
+                fleet.checkouts.destroy_environment(id);
+            }
+        }));
+        factories.environment_providers.push(Box::new(provider));
         factories.change_requests.insert(0, Box::new(forge::DummyChangeRequestFactory { fleet: Arc::clone(self) }));
         factories.vcs.insert(0, Box::new(vcs::DummyVcsFactory { fleet: Arc::clone(self) }));
         factories.terminal_pools.push(Box::new(terminal::DummyTerminalPoolFactory { fleet: Arc::clone(self) }));
         factories
             .agent_adapters
             .push(Arc::new(adapter::DummyAgentAdapterFactory { long_runner_turns: self.config.agent.long_runner_turns }));
+    }
+}
+
+#[cfg(test)]
+mod factory_identity_tests {
+    use flotilla_config::{dummy_fleet::DummyFleetConfig, ConfigStore};
+    use flotilla_discovery_api::{EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement};
+    use flotilla_environment::environment::dummy::DummyCommandRunner;
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use flotilla_provider_runtime::CommandRunner;
+
+    use super::*;
+
+    // Missing and empty identities must be refused at discovery; otherwise
+    // environment-scoped destruction cannot find the provider's artifacts.
+    #[tokio::test]
+    async fn terminal_and_vcs_factories_require_a_nonempty_environment_identity() {
+        let fleet = DummyFleet::new(DummyFleetConfig::default());
+        let terminal = terminal::DummyTerminalPoolFactory { fleet: Arc::clone(&fleet) };
+        let vcs = vcs::DummyVcsFactory { fleet };
+        let directory = tempfile::tempdir().expect("configuration");
+        let config = ConfigStore::with_base(directory.path().to_path_buf());
+        let root = ExecutionEnvironmentPath::new("/workspace");
+        let runner: Arc<dyn CommandRunner> = Arc::new(DummyCommandRunner::default());
+        for identity in [None, Some(""), Some("env-one")] {
+            let mut bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var(DUMMY_FLEET_ENV, "1"));
+            if let Some(identity) = identity {
+                bag = bag.with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", identity));
+            }
+            let terminal_result = terminal.probe(&bag, &config, &root, Arc::clone(&runner)).await;
+            let vcs_result = vcs.probe(&bag, &config, &root, Arc::clone(&runner)).await;
+            if identity == Some("env-one") {
+                assert!(terminal_result.is_ok());
+                assert!(vcs_result.is_ok());
+            } else {
+                for errors in [terminal_result.err().expect("terminal refusal"), vcs_result.err().expect("VCS refusal")] {
+                    assert!(matches!(errors.as_slice(), [UnmetRequirement::MissingEnvVar(name)] if name == "FLOTILLA_ENVIRONMENT_ID"));
+                }
+            }
+        }
     }
 }
