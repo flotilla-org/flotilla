@@ -616,9 +616,8 @@ impl PeerRuntime {
                     PeerConnectionEvent::Connected(notice) => {
                         debug!(peer = %notice.peer, generation = notice.generation, "starting peer resource replication");
                         if decided_followers.get(&notice.peer).is_none_or(|(generation, _)| *generation < notice.generation) {
-                            if let Some(socket) = notice.resource_socket_path.clone() {
-                                let task =
-                                    super::change_stream::follow(Arc::clone(&outbound_daemon), notice.peer.as_str().to_owned(), socket);
+                            if let (Ok(service), Some(socket)) = (outbound_daemon.decided_store(), notice.resource_socket_path.clone()) {
+                                let task = super::change_stream::follow(service, notice.peer.as_str().to_owned(), socket);
                                 decided_followers
                                     .insert(notice.peer.clone(), (notice.generation, tokio_util::task::AbortOnDropHandle::new(task)));
                             }

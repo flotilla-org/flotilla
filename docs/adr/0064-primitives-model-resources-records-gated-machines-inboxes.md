@@ -212,8 +212,13 @@ local applied time, never remote reads or link health. Surface misses route once
 and are marked remote with age. The old replicator remains for old kinds. Kind migrations
 install their new-store registry; #3317 is first. Fine-grained observation consumers, topic
 filtering, archives and retiring old replication are deferred. Quint specs are unchanged.
-**No budget-fit claim:** full-log bandwidth/storage depends on aggregate durable-rate and
-snapshot measurements (#3425); the independent-per-home ceiling exceeds the stated budget.
+**First shape and expiry:** replicate-everything is sized for a home lab of a few hosts,
+including laptops that disconnect, not WORKLOAD's target or ceiling. The workload note sizes
+bandwidth, offline catch-up, snapshot and temporary disk for that shape; measurements remain
+open in #3425. It expires when hubs such as a desktop and cloud host should hold everything
+while spokes such as laptops hold enough to work offline. At larger scales, partition writes
+with replicated read layers. Those later shapes are out of scope. No lazy store open or
+followers run before the first registered kind is installed; until then both routes return 503.
 
 **Liveness.** Liveness is judged from the observer host's link. Observations are written only when they change. Heartbeat-only writes go away.
 

@@ -119,11 +119,8 @@ pub struct Store {
 }
 
 struct Runtime {
-    local_sequence: u64,
-    local_commit: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
-    read_only: bool,
     change_page_bytes: usize,
-    watermarks: HashMap<String, crate::stream::Watermark>,
+    watermarks: crate::stream::Watermarks,
     home: String,
     kinds: KindRegistry,
     sql: BTreeMap<KindCode, KindSql>,
@@ -155,9 +152,7 @@ impl Store {
 
     pub(crate) fn open_reader(path: &std::path::Path, home: &str, kinds: KindRegistry) -> Result<Self, StoreError> {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let mut store = Self::from_connection(conn, home, kinds, StoreOptions::default())?;
-        store.runtime.read_only = true;
-        Ok(store)
+        Self::from_connection(conn, home, kinds, StoreOptions::default())
     }
 
     fn from_connection(conn: Connection, home: &str, kinds: KindRegistry, options: StoreOptions) -> Result<Self, StoreError> {
@@ -169,13 +164,8 @@ impl Store {
             })?;
             rows.collect::<Result<HashMap<_, _>, _>>()?
         };
-        let local_sequence =
-            conn.prepare(crate::shared::LOCAL_SEQUENCE_STARTUP)?.query_row([home], |row| row.get(0)).optional()?.unwrap_or(0);
         let runtime = Runtime {
-            local_sequence,
-            local_commit: None,
-            read_only: false,
-            watermarks,
+            watermarks: std::sync::Arc::new(std::sync::RwLock::new(watermarks)),
             home: home.to_owned(),
             kinds,
             sql,
@@ -195,16 +185,13 @@ impl Store {
         crate::audit::audit_domains(&self.conn, &self.runtime.kinds)
     }
 
-    pub(crate) fn local_sequence(&self) -> u64 {
-        self.runtime.local_sequence
-    }
-    pub(crate) fn on_local_commit(&mut self, observer: std::sync::Arc<dyn Fn(u64) + Send + Sync>) {
-        self.runtime.local_commit = Some(observer);
+    pub(crate) fn watermarks(&self) -> crate::stream::Watermarks {
+        std::sync::Arc::clone(&self.runtime.watermarks)
     }
 
-    /// Committed local gate input, read without opening a transaction or touching SQLite.
+    /// Committed local gate input, independent of the store transaction lock.
     pub fn applied_watermark(&self, home: &str) -> crate::stream::Watermark {
-        self.runtime.watermarks.get(home).copied().unwrap_or(crate::stream::Watermark::ZERO)
+        crate::stream::watermark(&self.runtime.watermarks, home)
     }
 
     pub fn home(&self) -> &str {
@@ -240,12 +227,6 @@ impl Store {
 
     /// Begins a deferred read transaction, for consistent loads across tables.
     pub fn read(&mut self) -> Result<Read<'_>, StoreError> {
-        // Other connections may expunge/reuse IDs between WAL read snapshots. Dictionary
-        // strings are immutable, but identity caches must be scoped to this read transaction.
-        if self.runtime.read_only {
-            self.runtime.ids.clear();
-            self.runtime.identities.clear();
-        }
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         Ok(Read { tx, runtime: &mut self.runtime })
     }
@@ -352,7 +333,6 @@ impl Read<'_> {
 /// records insertion order so a failed write's entries can be rewound with its savepoint.
 #[derive(Default)]
 struct Pending {
-    local_sequence: Option<u64>,
     watermarks: HashMap<String, crate::stream::Watermark>,
     strings: HashMap<StringKey, i64>,
     identities: HashMap<Identity, ResourceId>,
@@ -361,7 +341,6 @@ struct Pending {
 }
 
 enum Journal {
-    LocalSequence(Option<u64>),
     Watermark(String, Option<crate::stream::Watermark>),
     String(StringKey),
     Identity(Identity, ResourceId),
@@ -371,7 +350,6 @@ impl Pending {
     fn rewind(&mut self, mark: usize) {
         for entry in self.journal.drain(mark..).rev() {
             match entry {
-                Journal::LocalSequence(previous) => self.local_sequence = previous,
                 Journal::Watermark(home, previous) => match previous {
                     Some(mark) => {
                         self.watermarks.insert(home, mark);
@@ -725,14 +703,8 @@ impl Write<'_> {
 
     pub fn commit(self) -> Result<(), StoreError> {
         self.tx.commit()?;
-        let Pending { strings, identities, ids, watermarks, local_sequence, .. } = self.pending;
-        self.runtime.watermarks.extend(watermarks);
-        if let Some(sequence) = local_sequence {
-            self.runtime.local_sequence = sequence;
-            if let Some(observer) = &self.runtime.local_commit {
-                observer(sequence);
-            }
-        }
+        let Pending { strings, identities, ids, watermarks, .. } = self.pending;
+        self.runtime.watermarks.write().unwrap_or_else(std::sync::PoisonError::into_inner).extend(watermarks);
         for (string, id) in strings {
             self.runtime.strings.insert(string, id);
         }
@@ -865,10 +837,10 @@ impl Ctx<'_> {
             .pending
             .as_ref()
             .and_then(|pending| pending.watermarks.get(home))
-            .or_else(|| self.runtime.watermarks.get(home))
             .copied()
-            .unwrap_or(crate::stream::Watermark::ZERO))
+            .unwrap_or_else(|| crate::stream::watermark(&self.runtime.watermarks, home)))
     }
+
     fn resume_floor(&mut self, home: &str) -> Result<u64, StoreError> {
         let Some(home) = self.string_id(HOME_DOMAIN, home)? else { return Ok(0) };
         Ok(self.conn.prepare_cached(FLOOR_GET)?.query_row([home], |row| row.get(0)).optional()?.unwrap_or(0))
@@ -1009,10 +981,6 @@ impl Ctx<'_> {
         let home = self.intern(HOME_DOMAIN, &home)?;
         let last: i64 = self.conn.prepare_cached(SEQUENCE_NEXT)?.query_row([home], |row| row.get(0))?;
         let version = u64::try_from(last).map_err(|_| StoreError::Corrupt { table: "home_sequence".into(), column: "last".into() })?;
-        if let Some(pending) = &mut self.pending {
-            pending.journal.push(Journal::LocalSequence(pending.local_sequence));
-            pending.local_sequence = Some(version);
-        }
         Ok((last, version))
     }
 

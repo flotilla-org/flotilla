@@ -6,11 +6,8 @@
 use flotilla_schema::{Event, Identity, Timestamp, LOG_LIMITS};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    collections::HashMap,
+    sync::{Arc, Mutex, RwLock},
 };
 
 use crate::{Snapshot, Store, StoreError, MAX_PAGE};
@@ -190,25 +187,6 @@ pub struct ReadResult {
     pub age_micros: i64,
 }
 
-/// Surfaces may route one miss to its home. Gates use Read::watermark/local loads directly
-/// and never take a transport parameter. A remote result is not silently installed locally.
-pub fn read_or_route(
-    local: &mut Store,
-    identity: &Identity,
-    now: Timestamp,
-    mut query_home: impl FnMut(&Identity) -> Result<(Option<Snapshot>, Timestamp), StoreError>,
-) -> Result<ReadResult, StoreError> {
-    let mut read = local.read()?;
-    if let Some(id) = read.resolve(identity.kind, &identity.name, &identity.home)? {
-        if let Some(value) = read.load_snapshot(id)? {
-            return Ok(ReadResult { value: Some(value), remote: false, age_micros: 0 });
-        }
-    }
-    drop(read);
-    let (value, served_at) = query_home(identity)?;
-    Ok(ReadResult { value, remote: true, age_micros: now.since(served_at).max(0) })
-}
-
 impl flotilla_cbor::Message for Frame {
     const TYPES: &'static [&'static str] = &["Read", "Begin", "Resource", "Tombstone", "End", "Change", "Keepalive"];
 }
@@ -223,29 +201,25 @@ pub const FRAMING: flotilla_cbor::Framing = flotilla_cbor::Framing::new(
     flotilla_cbor::Limits { max_message: LOG_LIMITS.max_message + 1024, max_depth: LOG_LIMITS.max_depth + 4, ..LOG_LIMITS },
 );
 
+pub(crate) type Watermarks = Arc<RwLock<HashMap<String, Watermark>>>;
+
+pub(crate) fn watermark(marks: &Watermarks, home: &str) -> Watermark {
+    marks.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(home).copied().unwrap_or(Watermark::ZERO)
+}
+
 /// Listener-independent store service. The daemon's HTTP adapter supplies the transport and
 /// injected home time. All production writes, gates and followers share this same store.
 pub struct Service {
     store: Mutex<Store>,
-    source: Option<Source>,
-    tail: Mutex<TailCache>,
-    position: Arc<AtomicU64>,
+    source: Source,
+    watermarks: Watermarks,
 }
 impl Service {
-    pub fn new(mut store: Store) -> Self {
-        let position = Arc::new(AtomicU64::new(store.local_sequence()));
-        let signal = Arc::clone(&position);
-        store.on_local_commit(Arc::new(move |sequence| signal.store(sequence, Ordering::Release)));
-        Self { store: Mutex::new(store), source: None, tail: Mutex::new(TailCache::default()), position }
-    }
-    /// Resident home cursor for transport wake/poll decisions; no SQLite crossing.
-    pub fn local_sequence(&self) -> u64 {
-        self.position.load(Ordering::Acquire)
-    }
-    /// Resident committed input for gates; no SQL or network read.
+    /// Gates read committed progress independently of database writers and network delivery.
     pub fn watermark(&self, home: &str) -> Result<Watermark, StoreError> {
-        self.with_store(|store| Ok(store.applied_watermark(home)))
+        Ok(watermark(&self.watermarks, home))
     }
+    /// Only synchronous local work belongs here; never wait on a network inside this closure.
     pub fn with_store<T>(&self, op: impl FnOnce(&mut Store) -> Result<T, StoreError>) -> Result<T, StoreError> {
         let mut store = self.store.lock().map_err(|_| StoreError::Stream("store lock poisoned".into()))?;
         op(&mut store)
@@ -253,123 +227,23 @@ impl Service {
     pub fn open(path: &std::path::Path, home: &str, kinds: flotilla_schema::KindRegistry) -> Result<Self, StoreError> {
         let conn = rusqlite::Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        let source = Some(Source { path: path.to_owned(), home: home.to_owned(), kinds: kinds.clone(), readers: Mutex::new(Vec::new()) });
-        let mut service = Self::new(Store::open(conn, home, kinds)?);
-        service.source = source;
-        Ok(service)
+        let source = Source { path: path.to_owned(), home: home.to_owned(), kinds: kinds.clone() };
+        let store = Store::open(conn, home, kinds)?;
+        let watermarks = store.watermarks();
+        Ok(Self { store: Mutex::new(store), source, watermarks })
     }
     pub fn serve(&self, after: Option<u64>, now: Timestamp, sink: impl FnMut(&[u8]) -> Result<(), StoreError>) -> Result<u64, StoreError> {
-        if let Some(source) = &self.source {
-            // Keepalive time was captured before this barrier. Wait for earlier writer
-            // transactions, then release the writer before any network backpressure.
-            self.with_store(|_| Ok(()))?;
-            let position = self.local_sequence();
-            let resident = {
-                let cache = self.tail.lock().map_err(|_| StoreError::Stream("tail cache poisoned".into()))?;
-                after.filter(|cursor| cache.covers(*cursor, position)).map(|cursor| {
-                    cache.rows.iter().filter(|(seq, _)| *seq > cursor).map(|(_, frame)| Arc::clone(frame)).collect::<Vec<_>>()
-                })
-            };
-            if let Some(frames) = resident {
-                let mut sink = sink;
-                for frame in frames {
-                    sink(&frame)?;
-                }
-                sink(
-                    &Frame::Keepalive { home: source.home.clone(), watermark: Watermark { home_seq: position, applied_through: now } }
-                        .encode()?,
-                )?;
-                return Ok(position);
-            }
-            let mut reader = source
-                .readers
-                .lock()
-                .map_err(|_| StoreError::Stream("reader pool poisoned".into()))?
-                .pop()
-                .map(Ok)
-                .unwrap_or_else(|| Store::open_reader(&source.path, &source.home, source.kinds.clone()))?;
-            let result = self.serve_cached(&mut reader, after, now, sink);
-            let mut readers = source.readers.lock().map_err(|_| StoreError::Stream("reader pool poisoned".into()))?;
-            // Retain at most the daemon's four concurrent outgoing rounds. Standalone
-            // callers may exceed that concurrency; their extra readers close on return.
-            if readers.len() < 4 {
-                readers.push(reader);
-            }
-            result
-        } else {
-            self.with_store(|store| serve(store, after, now, sink))
-        }
+        // Wait for earlier writers before taking the read snapshot. Release the writer
+        // before delivery: a slow peer holds only this round's read-only connection.
+        self.with_store(|_| Ok(()))?;
+        let mut reader = Store::open_reader(&self.source.path, &self.source.home, self.source.kinds.clone())?;
+        serve(&mut reader, after, now, sink)
     }
-
-    fn serve_cached(
-        &self,
-        store: &mut Store,
-        after: Option<u64>,
-        now: Timestamp,
-        mut sink: impl FnMut(&[u8]) -> Result<(), StoreError>,
-    ) -> Result<u64, StoreError> {
-        let home = store.home().to_owned();
-        let mut read = store.read()?;
-        let floor = read.resume_floor(&home)?;
-        let last = read.last_sequence(&home)?;
-        let Some(cursor) = after.filter(|cursor| *cursor >= floor && *cursor <= last) else {
-            drop(read);
-            return serve(store, after, now, sink);
-        };
-        let mut cache = self.tail.lock().map_err(|_| StoreError::Stream("tail cache poisoned".into()))?;
-        if cache.home_seq.is_none() {
-            cache.home_seq = Some(last);
-        }
-        let mut at = cache.home_seq.unwrap_or(last).max(floor);
-        while at < last {
-            let events = read.changes_since(&home, at, MAX_PAGE)?;
-            if events.is_empty() {
-                break;
-            }
-            for event in events {
-                at = event.home_seq;
-                let bytes = Arc::new(Frame::Change(Box::new(event)).encode()?);
-                cache.bytes += bytes.len();
-                cache.rows.push_back((at, bytes));
-                while cache.bytes > LOG_LIMITS.max_message && cache.rows.len() > 1 {
-                    if let Some((_, old)) = cache.rows.pop_front() {
-                        cache.bytes -= old.len();
-                    }
-                }
-            }
-        }
-        if at == last {
-            cache.floor = floor;
-        }
-        cache.home_seq = Some(at);
-        while cache.rows.front().is_some_and(|(seq, _)| *seq <= floor) {
-            if let Some((_, old)) = cache.rows.pop_front() {
-                cache.bytes -= old.len();
-            }
-        }
-        let covered = cache.covers(cursor, last);
-        if !covered {
-            drop(cache);
-            drop(read);
-            return serve(store, after, now, sink);
-        }
-        let frames: Vec<_> = cache.rows.iter().filter(|(seq, _)| *seq > cursor).map(|(_, bytes)| Arc::clone(bytes)).collect();
-        drop(cache);
-        drop(read);
-        for frame in frames {
-            sink(&frame)?;
-        }
-        sink(&Frame::Keepalive { home, watermark: Watermark { home_seq: last, applied_through: now } }.encode()?)?;
-        Ok(last)
-    }
-
     pub fn query(&self, kind: flotilla_schema::KindCode, name: &str, now: Timestamp) -> Result<Vec<u8>, StoreError> {
-        self.with_store(|store| {
-            let home = store.home().to_owned();
-            let mut read = store.read()?;
-            let value = read.resolve(kind, name, &home)?.map(|id| read.load_snapshot(id)).transpose()?.flatten();
-            Frame::Read { home, value, served_at: now }.encode()
-        })
+        let mut store = Store::open_reader(&self.source.path, &self.source.home, self.source.kinds.clone())?;
+        let mut read = store.read()?;
+        let value = read.resolve(kind, name, &self.source.home)?.map(|id| read.load_snapshot(id)).transpose()?.flatten();
+        Frame::Read { home: self.source.home.clone(), value, served_at: now }.encode()
     }
 }
 
@@ -377,24 +251,4 @@ struct Source {
     path: std::path::PathBuf,
     home: String,
     kinds: flotilla_schema::KindRegistry,
-    readers: Mutex<Vec<Store>>,
-}
-
-/// One bounded resident tail, shared by every follower. Cold/resume misses read the log;
-/// steady-state events are decoded/encoded once, not once per peer.
-#[derive(Default)]
-struct TailCache {
-    floor: u64,
-    home_seq: Option<u64>,
-    rows: VecDeque<(u64, Arc<Vec<u8>>)>,
-    bytes: usize,
-}
-
-impl TailCache {
-    fn covers(&self, cursor: u64, position: u64) -> bool {
-        self.home_seq == Some(position)
-            && cursor >= self.floor
-            && cursor <= position
-            && (cursor == position || self.rows.front().is_some_and(|(seq, _)| cursor >= seq.saturating_sub(1)))
-    }
 }

@@ -18,33 +18,33 @@ round transactionally. A disconnected round rolls back to its last committed pre
 The listener-independent `Service` owns the new store. The daemon exposes
 `GET /apis/flotilla.work/v1/change-stream[?after=<home_seq>]` on the existing resource HTTP API.
 Its chunked response sends a snapshot when needed, tails ordered frames, and sends idle
-keepalives. Peers request `once=true` rounds, which long-poll a resident committed home cursor
-at 100 ms (one fifth of the root's 500 ms delivery budget), with an idle keepalive after five
-seconds (root host cadence) and a 15-second I/O deadline (three cadences). No polling step
-reads SQLite or writes an observation. There are two queued frames per round, with four
-inbound and four outbound rounds permitted per daemon; permits release between rounds for
-fairness. Frames allow the log profile’s 16 MiB body plus 1 KiB for the enclosing stream envelope. Input/output budgets are independent to
-avoid cyclic backpressure. Queues plus active codec buffers can use roughly 512 MiB at their
-maxima before model/SQLite caches; this is a bound, not a whole-daemon budget-fit claim.
+keepalives. Peers request `once=true` rounds every five seconds, with a 15-second network
+read/write deadline. There is no peer-count semaphore or encoded tail cache: each round opens
+one read-only WAL connection, reads `changes_since` pages, encodes them, and closes the
+connection. A brief writer barrier before the read cut orders the home's time after earlier
+transactions; the writer lock is released before delivery. The outgoing channel holds at
+most two frames; the frame limit is the log profile's 16 MiB plus 1 KiB envelope room.
 
-Production readers use pooled read-only WAL connections. A brief writer barrier before the
-read cut keeps a timed keepalive behind earlier transactions, then the writer lock is released
-before any network backpressure. Identity caches are cleared between WAL read transactions
-so an expunged/reused local ID cannot name an old resource. A shared 16 MiB encoded tail
-serves recent followers without decoding/encoding each event again. Cold/resume misses read
-bounded log pages. Pending lookup overlays are periodically cleared during large snapshot
+The follower stages each HTTP round in an automatically deleted temporary file, validating
+frame bounds as bytes arrive. Only after a complete response ending in a keepalive does it
+acquire the store mutex and replay that local file in one transaction. A disconnect discards
+the staging file without changing rows or progress. Disk staging avoids buffering a complete
+snapshot in memory. Its disk cost is one round per connected home; snapshots can be much
+larger than tails. The network never waits inside `with_store`. Resident committed watermarks
+have a separate lock, so gates can read the old safe watermark during both network stalls and
+snapshot installation. Pending lookup overlays are periodically cleared during large
 transactions; uncommitted SQLite rows remain authoritative.
+
 `GET /apis/flotilla.work/v1/record?kind=<code>&name=<encoded-name>` serves one home point read;
-`read_record` routes one local miss there, marking it remote with its home-time age. A gate
-reads `Read::watermark` locally and receives no remote transport capability.
+production `read_record` routes one local miss there and marks it remote with its home-time
+age. Gates receive no remote transport capability.
 
 Peer connection generations own their follower tasks over the existing forwarded resource
 sockets; displacement/disconnect cancels the matching task. Failed links resume from committed
-progress. No old replicator paths or peer-merge logic change. The core opens the decided store
-beside the old store; kind migrations install the registered Service before starting peer tasks
-through `install_decided_store`. The default registry is empty until kinds move (#3317), keeping
-the existing no-production-machine-dependency transition guard intact. In-memory tests use
-registered real/test kinds with the same source, follower, wire codec and local inputs.
+progress. The old replicator is unchanged. No decided store is opened lazily: before a kind
+migration installs its registered Service with `install_decided_store`, both routes answer
+503 and no followers start. #3317 installs the first kind before peer tasks start and verifies
+the complete production path. Tests exercise the generic mechanism before that integration.
 
 ## Readable table views
 
@@ -103,76 +103,54 @@ resource version. No baseline column renames are proposed in this checkpoint.
   coalesced only if crash recovery restores a conservative watermark. Floor metadata must be
   durable in the same commit as history loss; it cannot be asynchronously coalesced.
 
-## Workload note and candidate walk
+## Workload note: first home-lab shape and its expiry
 
-Reference: root WORKLOAD.md (hosts 3/50/500, change events <10/1,000/10,000 per second).
-These are arithmetic bounds, not benchmark results. The rate of durable stream events,
-encoded event bytes, distribution of writes over homes, and overlap of per-home resource
-populations need measurements with the ADR 0064 plans (#3425). No budget-fit claim follows
-from the current estimates.
+This first shape is for a few home-lab hosts, including laptops that disconnect. It is not
+sized for WORKLOAD.md's 50-host target or 500-host ceiling. Assume three homes, an aggregate
+sustained 10 durable events/s, and 1 KiB encoded per event, evenly distributed. Each host
+receives about 6.7 KiB/s and sends about 6.7 KiB/s; the whole mesh delivers 20 events/s.
+At a 100 events/s aggregate burst those figures rise tenfold. These are explicit planning
+assumptions, not measurements or a claim that event widths are always 1 KiB. A large frozen
+document may make an individual event much larger; observations do not enter this log.
 
-**Bandwidth per host.** Let H be hosts, R the rate of durable writes at each home, and B the
-encoded event size. With evenly distributed writes, every host receives (H−1) × R × B bytes/s
-and its own home sends the same amount; total mesh deliveries are H × (H−1) × R per second.
-Replication never re-originates a copied event as a new local write.
+Per write the extra storage is one inline topic code; serving does O(H−1) deliveries, SQL
+page reads, and CBOR encoding for the peers. Each host holds H−1 progress cursors and opens
+one reader per active outgoing round. At three hosts that means two upstream cursors and
+normally two outgoing readers, with no resource-dependent subscriptions. Five-second idle
+rounds add 0.4 incoming keepalives/s per host. There is no fleet-wide peer queue: every direct
+home can make progress independently, while SQLite serializes local apply transactions.
 
-Root scale rates describe one large daemon. Conservatively, if every home produces that
-rate, target ingress is 49 × 1,000 = 49,000 events/s and ceiling ingress is 499 × 10,000 =
-4.99 million events/s per host. Using 300 B/event as an explicit wire-size assumption (the
-root's ~300 B durable-entry estimate includes local header/index costs and is **not** a CBOR
-measurement), that is 14.7 MB/s at target and 1.497 GB/s (~12 Gbit/s) at ceiling, in each
-direction before transport overhead. At 1 KiB/event the ceiling is 5.11 GB/s (~40.9 Gbit/s).
-If 10,000 events/s is instead the **whole mesh's** burst budget, ingress is at most
-10,000 × B (3 MB/s at 300 B), not 499 times that. Measure aggregate durable write rate before
-selecting the deployment interpretation; observations are not durable log writes.
+A laptop offline for a day misses about 576,000 remote events under the sustained example:
+roughly 563 MiB of wire data at 1 KiB/event, plus framing and transport overhead. If an
+expunge raises the floor beyond its cursor, it receives a fresh snapshot instead. There is
+no archive/history retention scheduler in this issue; expunge is the only floor advance.
+Every full replica retains all three homes' durable logs and bodies, so disk use grows with
+aggregate writes. At 10 events/s and 1 KiB/event the mesh's log alone adds about 844 MiB/day
+per host before SQLite/index overhead. This must be measured and managed even at home-lab scale.
 
-At the root disk-budget rate of 59 durable writes/s **per home**, 500 homes produce 29,500
-entries/s. Every full replica retains ~5.35 TB of 300-byte entries over seven days, before
-extra replication overhead; ingress from the other 499 homes is ~8.83 MB/s. The existing
-10 GB daemon store budget does not fit that independent-per-home scenario. Removing per-item
-metadata avoids its extra write/index amplification but does not solve full-log storage cost.
-The topic is one inline scalar per log entry, with no separate rows or indexes.
+**Joining snapshot.** For an illustrative combined dataset of 30,000 unique resource bodies
+and identities at 2 KiB each plus 100 MiB of referenced frozen objects, the join is about
+159 MiB across the homes, not three times that already combined dataset. At 10 Mbit/s it
+takes roughly 2.2 minutes before protocol/disk overhead. Current bodies are sent once at
+consistent per-home cuts; old event history is not part of the snapshot. The receiver needs
+temporary disk for each concurrent round plus its durable copy; it never holds the complete
+snapshot in RAM. A stalled receive leaves the old watermark available and unchanged.
+Frame/page buffers remain bounded, but memory and disk scale with simultaneously active peers.
+Measure actual event widths, snapshot objects, recovery time and disk growth (#3425).
 
-**Joining snapshot.** Every joining host receives all identities and bodies from all homes,
-plus referenced frozen objects (deduplicated by hash), paged at consistent per-home cuts.
-Its bytes are the sum of each home's unique snapshot; replicated copies are not sent again
-as independent ownership. The root's stored-body estimate is ~9.5 GB typed at ceiling for
-one full dataset including its history (about 4.75 GB stored under the root's 2x assumption),
-already above the 1 GB resident-state budget. It is a lower bound for snapshots that also
-include kinds omitted from that estimate, and is not a measured CBOR snapshot size.
-
-If each of 500 homes owns an independent ceiling-sized dataset, the corresponding total is
-~2.375 TB stored (~4.75 TB typed); if the root dataset is shared across those homes, it remains
-~4.75 GB stored. Do not multiply an already replicated dataset by host count. As a separate
-live example, one cohort has 10,000 convoys + 36,000 vessels + 36,000 terminals + 500,000
-messages = 582,000 identities. An assumed 128 B/identity adds ~74.5 MB before retained
-identities and definitions; these sizes/counts are not measured wire widths. Current-state
-snapshots need not transmit the old event log; the tail starts at each snapshot's cut.
-
-**Execution shape.** Per local write: one event and one coarse code, then O(H−1) deliveries.
-Each host has at most H−1 upstream home cursors (499 at ceiling), with no resource-dependent
-replication bookkeeping. Reject whole-store polling: bounded snapshot then ordered event
-pages avoids repeated decoding of unchanged state. Tail delivery uses resident bounded
-buffers, not one store read per follower per event; shared encoded batches can be reused.
-Restart and resume may read bounded log pages. Backpressure disconnects a slow follower to
-resume or resnapshot instead of growing an unbounded queue. Snapshot pages are bounded by
-bytes and rows, so memory use is independent of total dataset size. Watermarks are resident
-local inputs, promoted only after commit and rebuilt at startup. Bandwidth, disk and snapshot duration require measurements before claiming
-production-budget compliance.
-
-**Evolution and boundary.** Topic codes are open and never reused. Stored data follows the
-pre-production baseline in `shared.rs`, then ADR 0047 after cutover. Transport will be ADR
-0063 CBOR with strings, never local IDs. Keep the future HTTP handler listener-independent,
-leave old replication intact, and mark routed reads remote with their age. Partial replication
-by whole topics, filtered observation consumers and archives remain deferred.
+**Expiry condition.** Replace replicate-everything when the topology needs hubs and spokes:
+hubs such as a desktop and a cloud host replicate everything, while spokes such as laptops
+hold enough state to work offline. At larger scales, partition writes and replicate read
+layers. Those shapes, placement policy, selective replication, topic filtering, archives,
+and filtered observation consumers are out of scope. The current open topic codes reserve
+room for later partitioning without implementing it now.
 
 ## Verification
 
 Two/three-store scenarios cover snapshot/tail/resume, expunge-floor rollback and resnapshot,
-whole-home identity/body distribution, stalled and invalid watermarks, non-default topic
-preservation and routed misses. Hegel generates partition/resume sequences and snapshot row
-shapes across all nine fixture kinds, including frozen objects and nested records. WAL writer/read concurrency, pooled ID reuse, shared-tail delivery and snapshots crossing
-identity-page/cache bounds are also covered. The real
+whole-home identity/body distribution, stalled and invalid watermarks, and non-default topic
+preservation. Hegel generates partition/resume sequences and snapshot row
+shapes across all nine fixture kinds, including frozen objects and nested records. WAL writer/read concurrency and snapshots crossing identity-page/cache bounds are also covered. The real
 Unix HTTP client is tested against a strict in-process request stand-in; duplex I/O tests the
 listener-independent response adapter. SQL tests execute the DDL with foreign keys and read
 every view. Rust conformance exercises the unchanged stream module's prefix watermark rule;

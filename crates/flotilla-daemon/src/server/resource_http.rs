@@ -68,7 +68,6 @@ pub(super) async fn serve_resource_http_with_daemon(
                 kind,
                 name,
                 flotilla_schema::Timestamp::from_datetime(&daemon.clock().now()),
-                daemon.decided_stream_limits().1,
             )
             .await;
         }
@@ -84,7 +83,6 @@ pub(super) async fn serve_resource_http_with_daemon(
             service,
             after,
             daemon.clock_for_scenarios(),
-            daemon.decided_stream_limits().1,
             query.get("once").is_some_and(|value| value == "true"),
         )
         .await;
@@ -380,6 +378,7 @@ fn reason(status: u16) -> &'static str {
         409 => "Conflict",
         410 => "Gone",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         422 => "Unprocessable Entity",
         _ => "Internal Server Error",
     }

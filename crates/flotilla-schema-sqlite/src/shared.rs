@@ -272,7 +272,3 @@ pub(crate) const HOME_MARK_RESET: &str = "DELETE FROM stream_watermark WHERE hom
 /// Startup-only resident input load; runtime reads use the committed in-memory map.
 pub(crate) const WATERMARK_STARTUP: &str =
     "SELECT s.s, w.home_seq, w.applied_through FROM stream_watermark w JOIN strings s ON s.id = w.home";
-
-/// Startup-only load of the home-owned cursor for resident transport notification.
-pub(crate) const LOCAL_SEQUENCE_STARTUP: &str =
-    "SELECT h.last FROM home_sequence h JOIN strings s ON s.id = h.home WHERE s.domain = 'hm' AND s.s = ?1";

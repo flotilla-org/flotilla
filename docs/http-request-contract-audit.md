@@ -39,4 +39,6 @@ CLAUDE.md now requires enforcing stand-ins or recorded replay for outbound HTTP;
 stand-in enforces GET and the change-stream path and delivers fragmented CBOR frames through
 the real reqwest client. Duplex I/O covers the listener-independent HTTP response adapter.
 The same protocol source/follower is exercised over in-memory delivery with two and three
-registered stores. Point-read requests use the `record` route and encode query parameters.
+registered stores. Point-read requests use the production `read_record` path, encode query parameters, and
+cover present/absent remote results and a local hit after replication. A paused HTTP download
+proves gates, another home's apply, and outgoing serving remain available before keepalive.

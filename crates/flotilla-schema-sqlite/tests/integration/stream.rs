@@ -1,4 +1,4 @@
-use flotilla_schema::{Code, Identity, Kind, Timestamp};
+use flotilla_schema::{Code, Kind, Timestamp};
 use flotilla_schema_sqlite::{
     stream::{self, Follower, Frame, Watermark},
     Store, StoreError,
@@ -131,9 +131,8 @@ fn stalled_stream_and_invalid_watermarks_do_not_advance() {
 }
 
 // The reserved code is supplied explicitly for writes and preserved on apply and CBOR replay.
-// A surface miss performs exactly one home query, marks the result remote and reports age.
 #[test]
-fn topic_round_trip_and_routed_miss() {
+fn topic_round_trip() {
     let mut a = store("a");
     let mut b = store("b");
     insert(&mut a, "m");
@@ -143,22 +142,6 @@ fn topic_round_trip_and_routed_miss() {
     write.apply(&event).expect("apply");
     write.commit().expect("commit");
     assert_eq!(b.read().expect("read").changes_since("a", 0, 1).expect("event")[0], event);
-    let mut c = store("c");
-    let identity = Identity { kind: Resource::<Message>::CODE, name: "m".into(), home: "a".into() };
-    let mut calls = 0;
-    let result = stream::read_or_route(&mut c, &identity, Timestamp(12), |identity| {
-        calls += 1;
-        let mut read = a.read()?;
-        let id = read.resolve(identity.kind, &identity.name, &identity.home)?.expect("id");
-        Ok((read.load_snapshot(id)?, Timestamp(9)))
-    })
-    .expect("remote");
-    assert_eq!(calls, 1);
-    assert!(result.remote);
-    assert_eq!(result.age_micros, 3);
-    assert!(result.value.is_some());
-    let result = stream::read_or_route(&mut b, &identity, Timestamp(12), |_| panic!("local read must not route")).expect("local");
-    assert!(!result.remote);
 }
 
 // Differential conformance with unchanged world/stream.qnt: watermark is the maximum applied
@@ -329,81 +312,6 @@ fn wal_snapshot_does_not_hold_the_writer_mutex() {
     assert!(!names.iter().any(|name| name == "later"));
 }
 
-// A pooled WAL reader must not carry an old local ID into the next snapshot after expunge
-// reuses it. The tail cache also delivers identical authoritative events to two followers.
-#[test]
-fn pooled_readers_and_shared_tail_survive_expunge_and_id_reuse() {
-    use flotilla_schema_sqlite::stream::Service;
-    let dir = tempfile::tempdir().expect("dir");
-    let source = Service::open(&dir.path().join("store.sqlite"), "a", registry()).expect("service");
-    let old = source.with_store(|store| Ok(insert(store, "old"))).expect("seed");
-    let mut first = store("b");
-    let mut second = store("c");
-    Follower::new(&mut first).receive("a", |sink| source.serve(None, Timestamp(1), sink).map(|_| ())).expect("snapshot");
-    source.serve(Some(1), Timestamp(1), |_| Ok(())).expect("prime resident tail");
-    source
-        .with_store(|store| {
-            let mut write = store.write()?;
-            write.delete::<Resource<Message>>(old, &origin())?;
-            write.expunge::<Resource<Message>>(old.id, &origin())?;
-            write.commit()?;
-            let new = insert(store, "new");
-            assert_eq!(new.id, old.id);
-            Ok(())
-        })
-        .expect("expunge/reuse");
-    for replica in [&mut first, &mut second] {
-        Follower::new(replica).receive("a", |sink| source.serve(None, Timestamp(4), sink).map(|_| ())).expect("new snapshot");
-        assert!(present(replica, "a", "new"));
-        assert!(!present(replica, "a", "old"));
-    }
-    source
-        .with_store(|store| {
-            insert(store, "tail");
-            Ok(())
-        })
-        .expect("new write");
-    for replica in [&mut first, &mut second] {
-        Follower::new(replica).receive("a", |sink| source.serve(Some(4), Timestamp(5), sink).map(|_| ())).expect("shared tail");
-        assert!(present(replica, "a", "tail"));
-        assert_eq!(replica.applied_watermark("a").home_seq, 5);
-    }
-}
-
-// Transport wake decisions track only committed own-home writes. Rollback and applying
-// another home's copied events do not publish new local work or cause replication loops.
-#[test]
-fn resident_home_cursor_changes_only_on_local_commit() {
-    use flotilla_schema_sqlite::stream::Service;
-    let service = Service::new(store("a"));
-    service
-        .with_store(|store| {
-            let mut write = store.write()?;
-            write.insert("rolledback", &message::sample_in(addr("inbox")), &origin())?;
-            Ok(())
-        })
-        .expect("rollback");
-    assert_eq!(service.local_sequence(), 0);
-    service
-        .with_store(|store| {
-            insert(store, "local");
-            Ok(())
-        })
-        .expect("commit");
-    assert_eq!(service.local_sequence(), 1);
-    let mut remote = store("remote");
-    insert(&mut remote, "remote");
-    let event = remote.read().expect("read").changes_since("remote", 0, 1).expect("event").remove(0);
-    service
-        .with_store(|store| {
-            let mut write = store.write()?;
-            write.apply(&event)?;
-            write.commit()
-        })
-        .expect("copy");
-    assert_eq!(service.local_sequence(), 1);
-}
-
 // A recreated home may have a lower sequence than its followers. Replace the stale copy
 // with a snapshot rather than retrying the impossible cursor forever, then resume normally.
 #[test]
@@ -425,42 +333,36 @@ fn cursor_ahead_of_reset_home_gets_fresh_snapshot() {
     assert!(present(&mut b, "a", "tail"));
 }
 
-// A lagging follower must read the durable log after the shared byte-bounded tail evicts
-// its next event. The newer follower still uses that tail; both reach exactly the same prefix.
+// Gates retain access to committed progress while a writer holds the store lock. They see
+// the old safe prefix during an install, and the new prefix only after the apply commits.
 #[test]
-fn byte_eviction_falls_back_to_log_without_a_gap() {
+fn watermark_is_independent_of_the_store_lock() {
     use flotilla_schema_sqlite::stream::Service;
-    use flotilla_state_machines::machines::message::MessageBody;
+    use std::{
+        sync::{mpsc, Arc},
+        time::Duration,
+    };
     let dir = tempfile::tempdir().expect("dir");
-    let source = Service::open(&dir.path().join("store.sqlite"), "a", registry()).expect("service");
-    source.serve(Some(0), Timestamp(0), |_| Ok(())).expect("prime empty cache");
-    let mut lagging = store("b");
-    let mut fresh = store("c");
-    source
-        .with_store(|store| {
-            let mut spec = message::sample_spec();
-            spec.body = MessageBody::text("x".repeat(64 * 1024)).expect("body");
-            let value = message::sample().with_spec(spec);
-            let mut write = store.write()?;
-            for i in 0..300 {
-                write.insert(&format!("large{i}"), &value, &origin())?;
-            }
-            write.commit()
+    let service = Arc::new(Service::open(&dir.path().join("store.sqlite"), "b", registry()).expect("service"));
+    let (entered, ready) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let writer = Arc::clone(&service);
+    let task = std::thread::spawn(move || {
+        writer.with_store(|replica| {
+            entered.send(()).expect("entered");
+            wait.recv().expect("release");
+            let mut a = store("a");
+            sync(&mut a, replica, None, 17)
         })
-        .expect("large log");
-    let mut bytes = 0;
-    source
-        .serve(Some(0), Timestamp(1), |frame| {
-            bytes += frame.len();
-            Ok(())
-        })
-        .expect("fill and evict");
-    assert!(bytes > flotilla_schema::LOG_LIMITS.max_message, "force byte eviction");
-    for replica in [&mut lagging, &mut fresh] {
-        Follower::new(replica).receive("a", |sink| source.serve(Some(0), Timestamp(2), sink).map(|_| ())).expect("fallback log");
-        assert_eq!(mark(replica, "a").home_seq, 300);
-        for i in 0..300 {
-            assert!(present(replica, "a", &format!("large{i}")));
-        }
-    }
+    });
+    ready.recv_timeout(Duration::from_secs(2)).expect("writer acquired lock");
+    let (tx, rx) = mpsc::channel();
+    let gate = Arc::clone(&service);
+    let read = std::thread::spawn(move || tx.send(gate.watermark("a")).expect("gate result"));
+    let before = rx.recv_timeout(Duration::from_secs(2));
+    release.send(()).expect("release writer");
+    task.join().expect("writer task").expect("apply");
+    read.join().expect("gate task");
+    assert_eq!(before.expect("gate must not wait for store").expect("watermark"), Watermark::ZERO);
+    assert_eq!(service.watermark("a").expect("published").applied_through, Timestamp(17));
 }

@@ -123,20 +123,20 @@ Every host follows every other home's whole log. One coarse topic code is stored
 per event for later whole-topic partitioning; nothing filters on it yet. Keepalives and
 applied watermarks remain latest observations outside the durable log.
 
-Full-log replication adds dominant network and replica-storage work. The
-[workload note](docs/implementation-choices/change-stream.md) derives ingress per host as
-(H−1) × home durable writes/s × encoded event bytes. If every one of 500 homes independently
-produces 10,000 events/s, each host receives 4.99 million events/s (~1.497 GB/s at an assumed,
-not measured, 300 B/event). If 10,000 events/s is the aggregate mesh budget, ingress is at
-most ~3 MB/s at that size. At 59 durable writes/s independently per home, full replication
-of 500 homes retains ~5.35 TB of 300-byte entries over seven days per host, exceeding the
-10 GB disk budget. These alternatives need aggregate durable-rate measurements (#3425).
+This first implementation targets a home lab of a few hosts, including disconnected laptops,
+not the target or ceiling below. The [workload note](docs/implementation-choices/change-stream.md)
+sizes three hosts at an assumed aggregate 10 events/s and 1 KiB/event: approximately 6.7 KiB/s
+received and sent per host, with per-peer SQL page reads and encoding. A one-day laptop outage
+requires roughly 563 MiB of remote catch-up under those assumptions; a combined illustrative
+30,000-body dataset plus frozen objects needs about 159 MiB for a fresh snapshot. Receiver
+rounds stage to temporary disk before atomic apply. Full copies still accumulate about
+844 MiB/day of aggregate log data per host before indexes; measure actual widths and growth
+(#3425). These are planning assumptions, not benchmark results.
 
-Joining snapshots contain all homes' unique identities/bodies and referenced objects,
-transferred in bounded pages. The root's ~9.5 GB typed full dataset estimate is already
-above the resident budget; do not buffer a whole snapshot, or multiply an already shared
-fleet dataset by host count. The workload note records independent-home and shared-dataset
-bounds. No bandwidth, memory or disk budget-fit claim is made by the implementation.
+This shape expires when the topology needs hubs and spokes: a desktop and a cloud host may
+replicate everything while laptops retain enough to work offline. Larger scales may partition
+writes with replicated read layers. Those later shapes are out of scope; this implementation
+makes no claim to serve the WORKLOAD target or ceiling.
 
 ## Usage
 
