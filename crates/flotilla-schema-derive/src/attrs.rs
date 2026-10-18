@@ -41,6 +41,7 @@ pub(crate) struct TypeAttrs {
 pub(crate) struct FieldAttrs {
     pub shape: Option<FieldAttr>,
     pub alias: Option<LitStr>,
+    pub domain: Option<LitStr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,7 +148,7 @@ pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
 }
 
 pub(crate) fn field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
-    let mut found = FieldAttrs { shape: None, alias: None };
+    let mut found = FieldAttrs { shape: None, alias: None, domain: None };
     for attr in store_attrs(attrs) {
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
@@ -169,7 +170,14 @@ pub(crate) fn field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
                 };
                 return Err(refuse(&meta.path, what));
             };
-            if !meta.input.is_empty() && !meta.input.peek(syn::Token![,]) {
+            if parsed == FieldAttr::Intern {
+                let value: LitStr = meta
+                    .value()
+                    .and_then(|input| input.parse())
+                    .map_err(|_| refuse(&meta.path, "`intern` requires a domain, such as `intern = \"ad\"`"))?;
+                code(&value)?;
+                found.domain = Some(value);
+            } else if !meta.input.is_empty() && !meta.input.peek(syn::Token![,]) {
                 return Err(refuse(&meta.path, format_args!("`{name}` takes no arguments")));
             }
             if let Some(previous) = found.shape.replace(parsed) {

@@ -1,4 +1,9 @@
-CREATE TABLE strings (id INTEGER PRIMARY KEY, s TEXT NOT NULL UNIQUE) STRICT;
+CREATE TABLE strings (
+  id INTEGER PRIMARY KEY,
+  domain TEXT NOT NULL CHECK (length(domain) > 0),
+  s TEXT NOT NULL,
+  UNIQUE (domain, s)
+) STRICT;
 CREATE TABLE resource_identity (
   id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
   name INTEGER NOT NULL REFERENCES strings(id), home INTEGER NOT NULL REFERENCES strings(id),

@@ -176,7 +176,15 @@ fn writes_touch_only_their_rows() {
     // The strings the edges write are interned first, so no `strings` row is counted below.
     for (n, (session, host)) in [("s", "h"), ("w", "w")].into_iter().enumerate() {
         let awaiting = MessageState::Awaiting { receiver: Receiver { session: session.into(), host: host.into() } };
-        insert(&mut store, &format!("pre{n}"), &message::sample().with_state(State::new(awaiting, Timestamp(0))));
+        let mut write = store.write().expect("pre-intern");
+        write
+            .insert(
+                &format!("pre{n}"),
+                &message::sample().with_state(State::new(awaiting, Timestamp(0))),
+                &flotilla_schema::Origin::new("w", Timestamp(0)),
+            )
+            .expect("pre-intern writer and receiver domains");
+        write.commit().expect("commit");
     }
     let current = insert(&mut store, "m", &message::sample());
     let dossier_current = insert(&mut store, "d", &dossier);

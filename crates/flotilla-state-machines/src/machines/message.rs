@@ -78,9 +78,9 @@ pub struct MessageSpec {
 /// person through a surface, or a controller) is ruled in #3424.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub struct Receiver {
-    #[store(intern)]
+    #[store(intern = "sn")]
     pub session: String,
-    #[store(intern)]
+    #[store(intern = "hm")]
     pub host: String,
 }
 

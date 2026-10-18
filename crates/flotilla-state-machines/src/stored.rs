@@ -61,7 +61,7 @@ where
 
     fn layout_row(layout: &mut Layout) {
         <M::Spec as Element>::layout_row(layout);
-        <AsColumns as Adapter<StoredState<M>>>::layout(layout, "state", true);
+        <AsColumns as Adapter<StoredState<M>>>::layout(layout, "state", true, None);
     }
 
     fn encode_row(&self, e: &mut Encoder) -> Result<(), EncodeError> {

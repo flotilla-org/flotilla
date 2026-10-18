@@ -3,6 +3,7 @@
 mod bench;
 mod checks;
 mod ddl;
+mod domains;
 mod edges;
 mod fixtures;
 mod history;

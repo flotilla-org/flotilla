@@ -168,7 +168,7 @@ fn readable(set: &TableSet, table: &Table) -> (String, String) {
                 text_literal(set.code.as_str()),
                 text_literal(&code_field(set, table, &column.name)),
             ),
-            ColumnType::Interned => format!("(SELECT \"s\" FROM \"strings\" WHERE \"id\" = {value}) AS {alias}"),
+            ColumnType::Interned(_) => format!("(SELECT \"s\" FROM \"strings\" WHERE \"id\" = {value}) AS {alias}"),
             _ => value,
         });
     }
@@ -225,7 +225,7 @@ fn column(column: &ColumnDef) -> String {
         out.push_str(" NOT NULL");
     }
     match &column.ty {
-        ColumnType::Interned => out.push_str(" REFERENCES \"strings\" (\"id\")"),
+        ColumnType::Interned(_) => out.push_str(" REFERENCES \"strings\" (\"id\")"),
         ColumnType::Ref => out.push_str(" REFERENCES \"resource_identity\" (\"id\")"),
         ColumnType::Frozen => out.push_str(" REFERENCES \"objects\" (\"hash\")"),
         ColumnType::Bool => {
@@ -256,7 +256,7 @@ mod tests {
 
     fn convoy() -> Layout {
         let mut layout = Layout::root("Convoy", KindCode::new("k2"));
-        layout.column("name", ColumnType::Interned, true);
+        layout.column("name", ColumnType::Interned(Code::new("tx")), true);
         layout.column("done", ColumnType::Bool, true);
         layout.code("phase", &codes(&["dr", "op", "sh"]), &["Draft", "Open", "Shipped"], false);
         layout.column("workflow", ColumnType::Frozen, true);
@@ -480,7 +480,7 @@ FROM "convoy_deliverables_evidence";
             layout.column("due", ColumnType::Timestamp, false);
             layout.column("seq", ColumnType::Integer, true);
             layout.column("owner", ColumnType::Ref, true);
-            layout.column("label", ColumnType::Interned, true);
+            layout.column("label", ColumnType::Interned(Code::new("tx")), true);
             layout.table("events", TableRole::History, |layout| {
                 layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
                 layout.column(RECORD_VERSION, ColumnType::Integer, true);

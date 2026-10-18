@@ -56,10 +56,10 @@ pub type TerminalSession = Resource<Lifecycle<Terminal>>;
 )]
 pub struct TerminalRequest {
     pub vessel: Ref<Resource<Vessel>>,
-    #[store(intern)]
+    #[store(intern = "rl")]
     pub role: String,
     pub ordinal: u16,
-    #[store(intern)]
+    #[store(intern = "pl")]
     pub pool: String,
     pub cwd: String,
     pub source: TerminalSource,
@@ -75,7 +75,7 @@ pub enum TerminalSource {
     Tool { command: String },
     #[store(code = "c2")]
     Agent {
-        #[store(intern)]
+        #[store(intern = "sl")]
         selector: String,
         #[store(frozen)]
         brief: Frozen<Brief>,

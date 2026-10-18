@@ -57,7 +57,7 @@ pub type Quota = BTreeMap<VesselClass, u32>;
 /// change request to be opened).
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub struct Promise {
-    #[store(intern)]
+    #[store(intern = "pk")]
     pub kind: String,
     pub target: Address,
 }

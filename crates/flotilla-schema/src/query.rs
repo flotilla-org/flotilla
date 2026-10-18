@@ -71,7 +71,7 @@ pub fn key_value<T: KeyColumn + Element>(value: &T) -> Result<Value, EncodeError
     Ok(values.pop().unwrap_or(Value::Null))
 }
 
-/// Encodes one `eq` argument of an `#[store(intern)]` field.
+/// Encodes one `eq` argument of an `#[store(intern = "tx")]` field.
 #[doc(hidden)]
 pub fn interned_value<T: Intern>(value: &T) -> Value {
     Value::Str(value.as_str().to_owned())

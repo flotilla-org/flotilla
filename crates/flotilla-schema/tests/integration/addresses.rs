@@ -36,10 +36,13 @@ fn address_fields_are_interned_columns() {
     let set = Placard::table_set();
     let root = &set.tables[0];
     let column = |name: &str| root.columns.iter().find(|column| column.name == name).expect(name);
-    assert_eq!((column("project").ty.clone(), column("project").nullable), (ColumnType::Interned, false));
-    assert_eq!((column("subject").ty.clone(), column("subject").nullable), (ColumnType::Interned, true));
+    assert_eq!((column("project").ty.clone(), column("project").nullable), (ColumnType::Interned(flotilla_schema::Code::new("ad")), false));
+    assert_eq!((column("subject").ty.clone(), column("subject").nullable), (ColumnType::Interned(flotilla_schema::Code::new("ad")), true));
     let watchers = set.tables.iter().find(|table| table.name == "placard_watchers").expect("child table");
-    assert_eq!(watchers.key.iter().map(|column| column.ty.clone()).collect::<Vec<_>>(), [ColumnType::Interned]);
+    assert_eq!(
+        watchers.key.iter().map(|column| column.ty.clone()).collect::<Vec<_>>(),
+        [ColumnType::Interned(flotilla_schema::Code::new("ad"))]
+    );
 }
 
 // Property: every address round-trips through its logical row as its canonical text, so two

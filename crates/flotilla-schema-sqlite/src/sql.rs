@@ -95,6 +95,7 @@ pub(crate) struct IndexSql {
     /// The schema object name, `<table>_<name>`.
     pub object: String,
     pub order: usize,
+    pub eq_domains: Vec<Option<Code>>,
     /// The first page: parameters are the eq values, then the limit.
     pub first: String,
     /// A later page: eq values, the cursor's order values and id, then the limit.
@@ -107,7 +108,7 @@ pub(crate) struct IndexSql {
 fn select_expr(table: &str, column: &ColumnDef) -> String {
     let name = format!("{table}.{}", quote_ident(&column.name));
     match column.ty {
-        ColumnType::Interned => format!("(SELECT \"strings\".\"s\" FROM \"strings\" WHERE \"strings\".\"id\" = {name})"),
+        ColumnType::Interned(_) => format!("(SELECT \"strings\".\"s\" FROM \"strings\" WHERE \"strings\".\"id\" = {name})"),
         _ => name,
     }
 }
@@ -222,6 +223,14 @@ impl IndexSql {
         };
         let select = format!("SELECT \"id\"{} FROM {table} WHERE", prefixed(&order));
         IndexSql {
+            eq_domains: index
+                .eq
+                .iter()
+                .map(|name| match root.columns.iter().find(|column| &column.name == name).expect("validated eq column").ty {
+                    ColumnType::Interned(domain) => Some(domain),
+                    _ => None,
+                })
+                .collect(),
             object: index.object_name(),
             order: order.len(),
             first: format!("{select} {} {}", first.join(" AND "), limit(next)),
@@ -236,7 +245,9 @@ fn lowest(ty: &ColumnType) -> &'static str {
     match ty {
         ColumnType::Text | ColumnType::Code(_) => "''",
         ColumnType::Blob | ColumnType::Frozen | ColumnType::Cbor => "x''",
-        ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp | ColumnType::Interned | ColumnType::Ref => "-9223372036854775808",
+        ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp | ColumnType::Interned(_) | ColumnType::Ref => {
+            "-9223372036854775808"
+        }
     }
 }
 
@@ -441,13 +452,13 @@ mod tests {
     #[test]
     fn interned_columns_named_like_strings_columns_read_their_own_string() {
         let mut layout = Layout::root("Note", KindCode::new("k1"));
-        layout.column("s", ColumnType::Interned, true);
+        layout.column("s", ColumnType::Interned(Code::new("tx")), true);
         layout.column("id_text", ColumnType::Text, true);
         let set = layout.finish();
         let conn = Connection::open_in_memory().expect("open");
         conn.execute_batch(&format!("{SHARED_DDL}{CODES_DDL}{}", render_ddl(&set))).expect("ddl");
         conn.execute_batch(
-            "INSERT INTO strings (id, s) VALUES (1, 'first'), (2, 'second'), (3, 'n'), (4, 'h');
+            "INSERT INTO strings (id, domain, s) VALUES (1, 'tx', 'first'), (2, 'tx', 'second'), (3, 'rn', 'n'), (4, 'hm', 'h');
              INSERT INTO resource_identity (id, kind, name, home) VALUES (2, 1, 3, 4);
              INSERT INTO note (id, version, s, id_text) VALUES (2, 1, 1, 'x');",
         )
@@ -462,7 +473,7 @@ mod tests {
     #[test]
     fn statements_address_rows_by_primary_key() {
         let mut layout = Layout::root("Convoy", KindCode::new("k2"));
-        layout.column("name", ColumnType::Interned, true);
+        layout.column("name", ColumnType::Interned(Code::new("tx")), true);
         layout.table("steps", TableRole::Child, |layout| {
             layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
             layout.column("label", ColumnType::Text, true);

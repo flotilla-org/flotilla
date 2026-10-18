@@ -112,7 +112,7 @@ impl<K: Kind> Columns for Ref<K> {
     const TABLES: usize = 0;
 
     fn layout(layout: &mut Layout, name: &str, required: bool) {
-        <AsInterned as Adapter<Ref<K>>>::layout(layout, name, required);
+        <AsInterned as Adapter<Ref<K>>>::layout(layout, name, required, Some(flotilla_schema::Code::new("rn")));
     }
 
     fn encode(&self, e: &mut Encoder) -> Result<(), EncodeError> {

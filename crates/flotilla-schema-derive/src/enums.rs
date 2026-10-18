@@ -13,8 +13,8 @@
 //! `L`, code for code, its label column is the state field, and its datums are named by the datum
 //! alone.
 //!
-//! A datum has one type and attribute in every variant carrying it (#3392 ruling D3: interned data
-//! of different Rust types does not share a column either), except that a datum may be `T` in one
+//! A datum has one type and attribute in every variant carrying it. Interned data shares by its
+//! declared domain instead of its Rust type (#3422). A datum may be `T` in one
 //! variant and `Option<T>` in another (#3392 ruling G5): one nullable column group, required by the
 //! CHECKs of the variants carrying `T`. A datum's table holds rows only while the variant
 //! carries it, and decoding refuses rows otherwise. A state's datum is unattributed (its columns),
@@ -408,7 +408,14 @@ fn datums<'v, 'a>(variants: &'v [Variant<'a>], state: bool) -> syn::Result<Vec<D
                 Some(datum) => {
                     let first = &datum.decls[0];
                     let (first_ty, first_shape, _) = declared(first.field);
-                    if first_ty != ty || first_shape != shape {
+                    if first.field.domain.as_ref().map(|d| d.value()) != field.domain.as_ref().map(|d| d.value()) {
+                        return Err(refuse(
+                            field.ident,
+                            format_args!("shared datum `{name}` must declare the same intern domain in every variant"),
+                        ));
+                    }
+                    let interned = matches!(shape, FieldShape::Intern { .. });
+                    if (!interned && first_ty != ty) || first_shape != shape {
                         let full = |field: &Field<'_>| {
                             let ty = field.ty;
                             quote!(#ty).to_string()

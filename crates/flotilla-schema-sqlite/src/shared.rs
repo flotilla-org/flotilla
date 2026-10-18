@@ -34,7 +34,12 @@ use rusqlite::{Connection, OptionalExtension};
 /// No database created by an earlier generation of these tables exists: the first production
 /// generation is the baseline, and ADR 0047's N→N+1 rule applies from then.
 pub(crate) const SHARED_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS strings (id INTEGER PRIMARY KEY, s TEXT NOT NULL UNIQUE) STRICT;
+CREATE TABLE IF NOT EXISTS strings (
+  id INTEGER PRIMARY KEY,
+  domain TEXT NOT NULL CHECK (length(domain) > 0),
+  s TEXT NOT NULL,
+  UNIQUE (domain, s)
+) STRICT;
 CREATE TABLE IF NOT EXISTS resource_identity (
   id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
   name INTEGER NOT NULL REFERENCES strings(id), home INTEGER NOT NULL REFERENCES strings(id),
@@ -155,8 +160,8 @@ pub(crate) const LOG_EXPUNGE: &str = "DELETE FROM log WHERE resource = ?1";
 /// A home's expunge entries after a sequence: the tombstones an event of an unknown identity is
 /// checked against.
 pub(crate) const LOG_EXPUNGED_AFTER: &str = "SELECT effect FROM log WHERE home = ?1 AND home_seq > ?2 AND cause = 'expunge'";
-pub(crate) const STRING_ID: &str = "SELECT id FROM strings WHERE s = ?1";
-pub(crate) const STRING_INSERT: &str = "INSERT INTO strings (s) VALUES (?1)";
+pub(crate) const STRING_ID: &str = "SELECT id FROM strings WHERE domain = ?1 AND s = ?2";
+pub(crate) const STRING_INSERT: &str = "INSERT INTO strings (domain, s) VALUES (?1, ?2)";
 pub(crate) const IDENTITY_RESOLVE: &str = "SELECT id FROM resource_identity WHERE kind = ?1 AND name = ?2 AND home = ?3";
 pub(crate) const IDENTITY_INSERT: &str = "INSERT INTO resource_identity (kind, name, home) VALUES (?1, ?2, ?3)";
 pub(crate) const IDENTITY_OF: &str =

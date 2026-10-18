@@ -239,8 +239,8 @@ pub enum ColumnType {
     Timestamp,
     /// A stable enum code (short text), restricted to the listed codes.
     Code(Vec<Code>),
-    /// An id in `strings`.
-    Interned,
+    /// An id in `strings`, whose row must carry this domain.
+    Interned(Code),
     /// An id in `resource_identity`.
     Ref,
     /// A hash in `objects`.
@@ -470,7 +470,7 @@ impl TableSet {
             |name: &str| index.predicate.iter().any(|condition| matches!(condition, Condition::NotNull { column } if column == name));
         for name in &index.order {
             let def = column(name)?;
-            if matches!(def.ty, ColumnType::Interned | ColumnType::Ref) {
+            if matches!(def.ty, ColumnType::Interned(_) | ColumnType::Ref) {
                 return Err(IndexProblem::SurrogateOrder(name.clone()));
             }
             if def.nullable && !required(name) {

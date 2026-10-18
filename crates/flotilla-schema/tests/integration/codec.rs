@@ -42,7 +42,7 @@ enum Event {
     #[store(code = "c1")]
     Dropped {
         reason: Reason,
-        #[store(intern)]
+        #[store(intern = "wr")]
         by: Option<Name>,
     },
     #[store(code = "c2")]
@@ -52,7 +52,7 @@ enum Event {
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
 #[store(kind = "Ticket", code = "k4")]
 struct Ticket {
-    #[store(intern)]
+    #[store(intern = "wr")]
     holder: Name,
     title: Name,
     #[store(flatten)]
@@ -155,7 +155,7 @@ fn derived_columns_follow_the_naming_rules() {
     assert_eq!(
         shape,
         [
-            ("holder", &ColumnType::Interned, false),
+            ("holder", &ColumnType::Interned(flotilla_schema::Code::new("wr")), false),
             ("title", &ColumnType::Text, false),
             ("cause_phase", &code, true),
             ("cause_detail", &ColumnType::Text, true),
@@ -166,7 +166,7 @@ fn derived_columns_follow_the_naming_rules() {
             ("event_reason_cause_phase", &code, true),
             ("event_reason_cause_detail", &ColumnType::Text, true),
             ("event_reason_to", &ColumnType::Ref, true),
-            ("event_by", &ColumnType::Interned, true),
+            ("event_by", &ColumnType::Interned(flotilla_schema::Code::new("wr")), true),
             ("event_note", &ColumnType::Text, true),
             ("event_authority", &ColumnType::Ref, true),
             ("parent", &ColumnType::Ref, true),
@@ -278,4 +278,34 @@ fn a_datum_column_named_like_a_sibling_field_is_refused() {
         Err(flotilla_schema::DescriptorError::DuplicateColumn { kind: "Clash".into(), table: "clash".into(), column: "shape_side".into() });
     assert_eq!(Clash::table_set().validate(), refused);
     assert!(flotilla_schema::KindRegistry::new().register::<Clash>().is_err());
+}
+
+// Behaviour (#3422): different string newtypes share one column when their declared domain
+// agrees, including required/optional declarations. Each variant keeps its own Rust decoder.
+#[test]
+fn a_shared_intern_domain_accepts_distinct_rust_types() {
+    #[derive(Debug, Clone, PartialEq, Stored)]
+    struct Name(String);
+    #[derive(Debug, Clone, PartialEq, Stored)]
+    enum Shared {
+        #[store(code = "a")]
+        A {
+            #[store(intern = "wr")]
+            value: String,
+        },
+        #[store(code = "b")]
+        B {
+            #[store(intern = "wr")]
+            value: Option<Name>,
+        },
+    }
+    #[derive(Debug, Clone, PartialEq, Stored)]
+    #[store(kind = "SharedDomain", code = "sd")]
+    struct Holder {
+        value: Shared,
+    }
+    for value in [Shared::A { value: "".into() }, Shared::B { value: Some(Name("é".into())) }, Shared::B { value: None }] {
+        let holder = Holder { value };
+        assert_eq!(Decoder::decode::<Holder>(Encoder::encode(&holder).expect("encode")).expect("decode"), holder);
+    }
 }

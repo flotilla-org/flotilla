@@ -1,0 +1,5 @@
+error: shared datum `value` must declare the same intern domain in every variant; the storage derive supports only the attributes child, records, history, frozen, cbor, intern, flatten, state, alias and code (fields and variants) and kind, code, state, index, labels and edges (types)
+ --> tests/ui/intern_domain_mismatch.rs:8:33
+  |
+8 |     B { #[store(intern = "wr")] value: String },
+  |                                 ^^^^^
