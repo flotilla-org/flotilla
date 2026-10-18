@@ -38,6 +38,8 @@ pub(super) async fn serve<W: AsyncWrite + Unpin>(
         let at = Timestamp::from_datetime(&clock.now());
         let task =
             tokio::task::spawn_blocking(move || source.serve(cursor, at, |frame| tx.blocking_send(frame.to_vec()).map_err(transport)));
+        // A writer error drops rx. The blocking worker may finish its current read/encode,
+        // then exits when blocking_send observes the closed, two-frame bounded channel.
         while let Some(frame) = rx.recv().await {
             let chunk = async {
                 writer.write_all(format!("{:x}\r\n", frame.len()).as_bytes()).await?;

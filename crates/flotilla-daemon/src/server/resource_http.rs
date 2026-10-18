@@ -377,9 +377,9 @@ fn reason(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         409 => "Conflict",
         410 => "Gone",
+        422 => "Unprocessable Entity",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
-        422 => "Unprocessable Entity",
         _ => "Internal Server Error",
     }
 }
