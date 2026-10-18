@@ -391,6 +391,9 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         Ok(())
     }
 
+    // Successful load keeps the value in Home while this operation holds the
+    // writer lock. Callers may immediately get/expect it; never trim between
+    // load and its last use. Trim runs after the decision/result is owned.
     fn load(state: &mut State<L>, name: &str) -> Result<bool, Error> {
         state.touched.insert(name.to_owned());
         if state.home.get(name).is_some() {
@@ -483,6 +486,10 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
     /// Synchronous setup-only registration. Runtime callers use register_async.
     /// A poisoned writer lock is fatal; recovering an uncertain writer requires
     /// reopening from the durable log rather than continuing after a panic.
+    ///
+    /// # Panics
+    /// Panics if the writer lock is poisoned or consumer keys exceed the
+    /// resident budget. Use register_async for a returned budget error.
     pub fn register_blocking(&self, consumer: Receiver, port: impl ConsumerPort + 'static) {
         let mut state = self.state.lock().expect("inbox writer");
         Self::register(&mut state, consumer, Box::new(port)).expect("consumer keys fit resident budget");
@@ -566,6 +573,10 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
 
     /// Synchronous diagnostic snapshot; call outside runtime operations or on
     /// a blocking thread. Async runtime callers use get_async.
+    ///
+    /// # Panics
+    /// Panics on a poisoned writer lock, a storage read/receipt error, or invalid
+    /// stored admission/restore data. Use get_async for returned read errors.
     pub fn get_blocking(&self, message: &str) -> Option<Resource<Message>> {
         let mut state = self.state.lock().expect("inbox writer");
         let result = if Self::load(&mut state, message).expect("diagnostic store read") { state.home.get(message).cloned() } else { None };

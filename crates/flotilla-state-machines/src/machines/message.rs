@@ -139,6 +139,10 @@ pub fn sent(message: &MessageRef) -> Ref<Sent> {
 /// messages by deadline (the expiry sweep's read), and by the message each
 /// replies to or supersedes, which also keeps an expunge's foreign-key checks
 /// off a table scan.
+///
+/// When adding or changing spec fields, update the replica charge model in
+/// `flotilla-inbox/src/resident.rs::resource` and its allocator calibration
+/// workload; new fields do not necessarily make that accounting fail to compile.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(
     kind = "Message",
