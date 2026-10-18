@@ -498,7 +498,8 @@ impl ReconcilerWake {
                             });
                         // A launch is availability, not an assignment. A delivered task
                         // owes a report even without a workflow claim; a declared stall
-                        // remains an obligation until resolved.
+                        // remains an obligation until resolved. An initial brief alone
+                        // does not assign a report, including for non-standing roles.
                         if !owes_claim
                             && !(work.phase == CrewWorkPhase::Working && work.task_assigned)
                             && work.phase != CrewWorkPhase::Stalled

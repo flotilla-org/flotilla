@@ -106,6 +106,15 @@ impl CrewScript {
     }
 }
 
+// Dummy scripts use vessel:role for a peer in another vessel. Ordinary role
+// names and already-qualified addresses pass through to production routing.
+fn script_handoff_target(convoy: &str, target: &str) -> String {
+    match target.split_once(':') {
+        Some((vessel, role)) => format!("{convoy}/{vessel}/{role}"),
+        None => target.to_string(),
+    }
+}
+
 /// Who a crew is, from the environment its terminal session was launched with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CrewIdentity {
@@ -277,11 +286,7 @@ impl Crew {
     }
 
     async fn hand_off(&mut self, target: &str, message: &str) -> Option<CommandValue> {
-        // Dummy scripts use vessel:role for a peer in another vessel.
-        let target = match target.split_once(':') {
-            Some((vessel, role)) => format!("{}/{vessel}/{role}", self.identity.convoy),
-            None => target.to_string(),
-        };
+        let target = script_handoff_target(&self.identity.convoy, target);
         self.persist(CommandAction::CrewHandoff { context: self.identity.context(), target, message: message.into(), carries: Vec::new() })
             .await
     }
@@ -449,6 +454,19 @@ fn is_peer_turn(turn: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Glue: the script shorthand expands to the production convoy-relative
+    // address; local roles and fully qualified targets retain their spelling.
+    #[test]
+    fn script_handoff_targets_preserve_the_routing_address() {
+        for (target, expected) in [
+            ("supervise:governor", "convoy/supervise/governor"),
+            ("coder", "coder"),
+            ("project/convoy/work/coder", "project/convoy/work/coder"),
+        ] {
+            assert_eq!(script_handoff_target("convoy", target), expected);
+        }
+    }
 
     #[test]
     fn scripts_round_trip_through_their_brief_line() {
