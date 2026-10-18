@@ -115,10 +115,33 @@ pub trait Observations: Send + Sync {
     fn snapshot(&self) -> MemoryMessageWorld;
 }
 
-/// The consumer owns this boundary: it records Receive on its own resource.
-/// Register a port for each consumer, including deterministic controllers.
-/// Success means its edge has committed; failures must leave no receipt.
+/// Opaque identity of the Store and home in which a receipt will be committed.
+/// Obtain it from the consumer's log rather than constructing it independently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceiptScope {
+    pub(crate) store: usize,
+    pub(crate) home: String,
+}
+
+/// Identifies the log a consumer resource commits to. Memory logs need no
+/// shared scope: their watch cursors are assigned by the inbox itself.
+pub trait ConsumerLog {
+    fn receipt_scope(&self) -> Option<ReceiptScope>;
+}
+impl<M: flotilla_state_machines::Machine> ConsumerLog for MemoryLog<M> {
+    fn receipt_scope(&self) -> Option<ReceiptScope> {
+        None
+    }
+}
+
+/// Records Receive on the consumer's own resource. Success means that exact
+/// message and transport committed; failures must leave no receipt.
+/// SQLite ports must commit to the exact same Store and home as the inbox.
+/// The scope is checked before Receive; remote receipt replication is separate.
 pub trait ConsumerPort: Send {
+    fn receipt_scope(&self) -> Option<ReceiptScope> {
+        None
+    }
     fn receive(&mut self, message: &str, transport: Transport, now: Timestamp) -> Result<(), Error>;
 }
 
@@ -128,7 +151,7 @@ pub trait InboxBackend: Send + Sync {
     /// Wait for the already-observed receipts' deliver before adding a binding.
     async fn bind(&self, inbox: Address, consumer: Receiver) -> Result<(), Error>;
     async fn unbind(&self, inbox: &Address, consumer: &Receiver) -> Result<(), Error>;
-    /// Read the inbox: Notify and Mute record their receipts here immediately.
+    /// Read pending messages in admission order. Notify and Mute record their receipts on pull.
     /// Turn receipts are recorded explicitly after the adapter hands over a turn.
     async fn pending(&self, inbox: &Address, consumer: &Receiver, rules: &Rules) -> Result<PendingStream, Error>;
     async fn receive(&self, consumer: &Receiver, message: &str, transport: Transport) -> Result<(), Error>;
@@ -152,6 +175,9 @@ pub struct Recovery {
 }
 
 pub trait InboxLog: Log<Message> + Send {
+    fn consumer_scope(&self) -> Option<ReceiptScope> {
+        None
+    }
     fn recover(&mut self) -> Result<Recovery, Error> {
         Ok(Recovery { messages: Vec::new(), receipts: BTreeMap::new(), changes: Vec::new(), sequence: 0, expired: Cursor(0) })
     }
@@ -235,7 +261,8 @@ struct State<L: InboxLog> {
     bindings: BTreeMap<Address, InboxBinding>,
     receipts: BTreeMap<String, BTreeMap<Receiver, Transport>>,
     consumers: BTreeMap<Receiver, Box<dyn ConsumerPort>>,
-    inboxes: BTreeMap<Address, BTreeSet<String>>,
+    inboxes: BTreeMap<Address, BTreeMap<u64, String>>,
+    dead_letters: BTreeSet<String>,
     journal: BTreeMap<Address, BTreeMap<Cursor, Change>>,
     retained: VecDeque<(Address, Cursor)>,
     expired: Cursor,
@@ -272,11 +299,11 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
     pub fn open(writer: &str, mut log: L, observations: Arc<dyn Observations>, supervision: Arc<dyn Supervision>) -> Result<Self, Error> {
         let recovery = log.recover()?;
         let mut home = Home::with_log(writer, log).expect("Message declaration validates");
-        let mut inboxes: BTreeMap<Address, BTreeSet<String>> = BTreeMap::new();
+        let mut inboxes: BTreeMap<Address, BTreeMap<u64, String>> = BTreeMap::new();
         let mut bindings = BTreeMap::new();
         for resource in recovery.messages {
-            if matches!(resource.state(), MessageState::Pending | MessageState::Awaiting { .. }) {
-                inboxes.entry(resource.spec().inbox.clone()).or_default().insert(resource.name().to_owned());
+            if matches!(resource.state(), MessageState::Pending) {
+                inboxes.entry(resource.spec().inbox.clone()).or_default().insert(resource.version().0, resource.name().to_owned());
             }
             bindings.entry(resource.spec().inbox.clone()).or_insert(InboxBinding::Unbound { since: observations.now() });
             home.restore(resource)?;
@@ -287,6 +314,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             receipts: recovery.receipts,
             consumers: BTreeMap::new(),
             inboxes,
+            dead_letters: BTreeSet::new(),
             journal: BTreeMap::new(),
             retained: VecDeque::new(),
             expired: recovery.expired,
@@ -318,10 +346,6 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         Ok(backend)
     }
 
-    pub fn new(writer: &str, log: L, observations: Arc<dyn Observations>, supervision: Arc<dyn Supervision>) -> Self {
-        Self::open(writer, log, observations, supervision).expect("open inbox")
-    }
-
     async fn access<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&Self, &mut State<L>) -> Result<T, Error> + Send + 'static,
@@ -342,12 +366,30 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         .map_err(|error| Error::Storage(error.to_string()))?
     }
 
+    /// Synchronous setup-only registration. Runtime callers use register_async.
+    /// A poisoned writer lock is fatal; recovering an uncertain writer requires
+    /// reopening from the durable log rather than continuing after a panic.
     pub fn register(&self, consumer: Receiver, port: impl ConsumerPort + 'static) {
         self.state.lock().expect("inbox writer").consumers.insert(consumer, Box::new(port));
     }
 
+    /// Synchronous diagnostic snapshot; call outside runtime operations or on
+    /// a blocking thread. Async runtime callers use get_async.
     pub fn get(&self, message: &str) -> Option<Resource<Message>> {
         self.state.lock().expect("inbox writer").home.get(message).cloned()
+    }
+
+    pub async fn register_async(&self, consumer: Receiver, port: impl ConsumerPort + 'static) -> Result<(), Error> {
+        self.access(move |_, state| {
+            state.consumers.insert(consumer, Box::new(port));
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn get_async(&self, message: &str) -> Result<Option<Resource<Message>>, Error> {
+        let message = message.to_owned();
+        self.access(move |_, state| Ok(state.home.get(&message).cloned())).await
     }
 
     fn world(&self, state: &State<L>, message: Option<&str>) -> GateWorld {
@@ -371,7 +413,11 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
     }
 
     fn publish(state: &mut State<L>, inbox: Address, message: String, kind: ChangeKind) -> Result<(), Error> {
-        state.sequence = state.home.log_mut().sequence()?.unwrap_or(state.sequence + 1);
+        let next = state.home.log_mut().sequence()?.unwrap_or(state.sequence + 1);
+        if next <= state.sequence {
+            return Err(Error::Storage("home log did not advance the watch cursor".into()));
+        }
+        state.sequence = next;
         Self::retain(state, inbox, Change { cursor: Cursor(state.sequence), message, kind });
         Ok(())
     }
@@ -406,7 +452,10 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         };
         state.home.create(&name, spec, &world, now)?;
         state.bindings.entry(inbox.clone()).or_insert(InboxBinding::Unbound { since: now });
-        state.inboxes.entry(inbox.clone()).or_default().insert(name.clone());
+        // Pending has no self edge: its version remains its admission sequence
+        // until it leaves this index. Numeric keys preserve arrival order.
+        let admitted = state.home.get(&name).expect("admitted message").version().0;
+        state.inboxes.entry(inbox.clone()).or_default().insert(admitted, name.clone());
         Self::publish(state, inbox, name.clone(), ChangeKind::Message(MessageState::Pending))?;
         Ok(name)
     }
@@ -428,11 +477,14 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
                 Err(Error::Message(WriteError::Refused(MessageRefusal::IncorrectReceipt)))
             };
         }
-        state.consumers.get_mut(consumer).ok_or_else(|| Error::Consumer("consumer has no Receive port".into()))?.receive(
-            message,
-            transport,
-            self.observations.now(),
-        )?;
+        let required_scope = state.home.log().consumer_scope();
+        let port = state.consumers.get_mut(consumer).ok_or_else(|| Error::Consumer("consumer has no Receive port".into()))?;
+        if let Some(scope) = required_scope {
+            if consumer.host != scope.home || port.receipt_scope().as_ref() != Some(&scope) {
+                return Err(Error::Consumer("SQLite consumer must share the inbox Store and home".into()));
+            }
+        }
+        port.receive(message, transport, self.observations.now())?;
         state.receipts.entry(message.into()).or_default().insert(consumer.clone(), transport);
         state.observation_version += 1;
         Self::publish(state, inbox, message.into(), ChangeKind::Receipt { consumer: consumer.clone(), transport })?;
@@ -440,13 +492,16 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
     }
 
     fn apply_locked(&self, state: &mut State<L>, message: &str, edge: impl Into<MessageEdge>) -> Result<(), Error> {
+        let previous = state.home.get(message).map(|resource| resource.version().0);
         let world = self.world(state, Some(message));
         state.home.apply(message, edge, &world, self.observations.now())?;
         let resource = state.home.get(message).expect("applied resource");
         let inbox = resource.spec().inbox.clone();
         let next = resource.state().clone();
-        if matches!(next, MessageState::Settled { .. } | MessageState::Dropped { .. }) {
-            state.inboxes.get_mut(&inbox).expect("indexed inbox").remove(message);
+        if next != MessageState::Pending {
+            if let (Some(index), Some(previous)) = (state.inboxes.get_mut(&inbox), previous) {
+                index.remove(&previous);
+            }
         }
         Self::publish(state, inbox, message.into(), ChangeKind::Message(next))?;
         Ok(())
@@ -454,6 +509,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
     fn dead_letter(&self, state: &mut State<L>, message: &str) -> Result<(), Error> {
         let name = format!("project:inbox/role:dead-letter-{}", message.rsplit(':').next().expect("message address"));
         if state.home.get(&name).is_some() {
+            state.dead_letters.insert(name);
             return Ok(());
         }
         let resource = state.home.get(message).expect("dropped");
@@ -470,7 +526,8 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
                 revision: resource.version().0.to_string(),
                 subject: true,
             });
-            self.enqueue_named(state, spec, Some(name))?;
+            self.enqueue_named(state, spec, Some(name.clone()))?;
+            state.dead_letters.insert(name);
         }
         Ok(())
     }
@@ -490,7 +547,7 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
             let consumer = consumer.clone();
             let accepted = self
                 .access(move |backend, state| {
-                    let blocked = state.inboxes.get(&inbox).into_iter().flatten().any(|name| {
+                    let blocked = state.inboxes.get(&inbox).into_iter().flat_map(|index| index.values()).any(|name| {
                         let world = backend.world(state, Some(name));
                         world.lookup(&Ref::<Receipts>::new(name)).is_some_and(|(_, receipts)| !receipts.is_empty())
                             && state.home.get(name).is_some_and(|resource| *resource.state() == MessageState::Pending)
@@ -538,13 +595,13 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
         let consumer = consumer.clone();
         let rules = rules.clone();
         Ok(Box::pin(stream::unfold(
-            (backend, inbox, consumer, rules, None::<String>),
+            (backend, inbox, consumer, rules, None::<u64>),
             |(backend, inbox, consumer, rules, mut after)| async move {
                 loop {
                     let query_inbox = inbox.clone();
                     let query_consumer = consumer.clone();
                     let query_rules = rules.clone();
-                    let query_after = after.clone();
+                    let query_after = after;
                     let result = backend
                         .access(move |backend, state| {
                             let name = state
@@ -552,35 +609,32 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
                                 .get(&query_inbox)
                                 .and_then(|names| {
                                     names
-                                        .range::<String, _>((
+                                        .range::<u64, _>((
                                             query_after.as_ref().map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
                                             std::ops::Bound::Unbounded,
                                         ))
                                         .next()
                                 })
-                                .cloned();
-                            let Some(name) = name else { return Ok(None) };
+                                .map(|(position, name)| (*position, name.clone()));
+                            let Some((position, name)) = name else { return Ok(None) };
                             let resource = state.home.get(&name).expect("indexed message");
                             let world = backend.world(state, Some(&name));
                             if !resource.judge(&world, backend.observations.now(), |h| pending_for(h, &query_consumer)).value {
-                                return Ok(Some((name, None)));
+                                return Ok(Some((position, None)));
                             }
-                            let mode = if name.starts_with("project:inbox/role:dead-letter-") {
-                                Transport::Notify
-                            } else {
-                                query_rules.choose(resource.spec())
-                            };
+                            let mode =
+                                if state.dead_letters.contains(&name) { Transport::Notify } else { query_rules.choose(resource.spec()) };
                             let pending = Pending { message: name.clone(), spec: resource.spec().clone(), mode };
                             if mode != Transport::Turn {
                                 backend.receive_locked(state, &query_consumer, &name, mode)?;
                             }
-                            Ok(Some((name, Some(pending))))
+                            Ok(Some((position, Some(pending))))
                         })
                         .await;
                     match result {
                         Ok(None) => return None,
-                        Ok(Some((name, pending))) => {
-                            after = Some(name);
+                        Ok(Some((position, pending))) => {
+                            after = Some(position);
                             if let Some(pending) = pending {
                                 return Some((Ok(pending), (backend, inbox, consumer, rules, after)));
                             }

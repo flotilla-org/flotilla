@@ -10,7 +10,7 @@ For the two local implementations, one Home decides Message edges and its Log
 persists them. The SQLite StoreLog promotes the schema integration test's
 insert/apply-edge transaction boundary; no table or stored kind changes.
 
-A per-inbox BTree index serves pending reads. A globally bounded journal serves
+A per-inbox BTree index ordered by admission sequence serves pending reads. A globally bounded journal serves
 watch deltas. A separate channel per subscriber would multiply backlog by the
 root ceiling of 500 clients; scanning history per cursor would make successive
 pulls quadratic. The journal's indexed ranges and shared payloads avoid both.
@@ -31,8 +31,8 @@ Binding sets and gate evidence are home-local observations. Receipt ports must
 commit Receive on the named consumer's resource before reporting success. Mode
 rules are ordered, use conjunctive optional selectors, and default to Turn.
 Dead letters have deterministic identities derived from their source message,
-so recovery can finish a reaction interrupted after the source drop. Only these
-backend-generated identities force Notify; an ordinary system message still
+so recovery can finish a reaction interrupted after the source drop. An explicit reaction-provenance set, rebuilt from dropped sources on recovery,
+forces Notify for those dead letters; an ordinary system message still
 uses the caller's rules. The supervision port supplies the declared system role,
 leaving real system-sender mapping to #3317.
 
@@ -43,3 +43,11 @@ choice expires before the #3317 production switch. The open trait, streamed
 results, and explicit expired-cursor outcome allow compact open-state views,
 indexed cold reads and archival without a public contract migration. The
 contract and its conformance suite remain the acceptance boundary for that work.
+
+SQLite consumer ports identify their shared Store/home scope. A port on another
+store is rejected before Receive rather than allowing its event to reuse the
+inbox's unchanged cursor. Publication also enforces strictly increasing cursors.
+Repeated Drop keeps the machine's Ended refusal, even when it repairs a pending
+reaction: it never records a second Message edge. Construction uses fallible open;
+synchronous registration/inspection are setup/diagnostic only, with async worker
+variants available for runtime callers. Poisoning the writer requires reopening.

@@ -15,7 +15,7 @@ consumer adapters are outside this issue.
 - Gates: keyed resident message, binding and receipt lookups, plus an injected
   snapshot of observed evidence. No durable-store read serves a gate. The
   observation adapter must keep its snapshot resident.
-- Pending: an inbox index, then per-consumer receipt lookup and rule evaluation.
+- Pending: an inbox index ordered by numeric admission sequence, then per-consumer receipt lookup and rule evaluation.
   Results are a pull stream, materializing at most one message at a time.
   Notify and Mute write their receipt when that item is read; Turn is explicitly
   acknowledged after transport. Reading does not accept the Message Deliver edge.
@@ -76,3 +76,17 @@ items in 16 ms. This includes the blocking-worker hop and does not measure
 filesystem/fsync latency. It supports the indexed pending path and worker-queue
 cost; it does not claim the full resident reference model fits the daemon's
 ceiling. The retention expiry above remains explicit.
+
+## Consumer log scope and diagnostics
+
+SQLite Receive ports must identify the exact Store and home shared by the inbox.
+That scope and the receiver home are checked before committing Receive; publication
+also refuses any non-increasing cursor. Foreign-store ports need a replication
+boundary, which is outside this local backend. Memory assigns its own journal
+positions and does not require its consumer MemoryLogs to share a sequence.
+
+Construction is fallible through open. Synchronous register/get are setup and
+diagnostic operations, used outside concurrent runtime work; runtime callers use
+register_async/get_async through the bounded blocking worker. A poisoned writer
+is fatal: reopen from durable state instead of resuming a possibly interrupted
+consumer or persistence operation.

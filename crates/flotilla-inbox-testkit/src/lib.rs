@@ -82,7 +82,10 @@ impl<L: Log<AgentSession>> SessionPort<L> {
         self.home.get(&self.name).expect("session")
     }
 }
-impl<L: Log<AgentSession> + Send> ConsumerPort for SessionPort<L> {
+impl<L: Log<AgentSession> + Send + flotilla_inbox::ConsumerLog> ConsumerPort for SessionPort<L> {
+    fn receipt_scope(&self) -> Option<flotilla_inbox::ReceiptScope> {
+        self.home.log().receipt_scope()
+    }
     fn receive(&mut self, message: &str, transport: Transport, now: Timestamp) -> Result<(), Error> {
         self.home
             .apply(&self.name, Receive { message: message.into(), transport }, &MemoryAgentSessionWorld::default(), now)
@@ -168,6 +171,21 @@ pub async fn modes<F: Factory>(factory: &F) {
             .expect("pending items")
             .is_empty());
     }
+}
+
+/// Behaviour: ordinary system messages with a subject still use consumer
+/// rules; only backend reactions carry the forced Notify mode.
+pub async fn ordinary_system_mode<F: Factory>(factory: &F) {
+    let Harness { backend, .. } = factory.create();
+    backend.bind(inbox(), consumer("a")).await.expect("bind");
+    let mut envelope = spec();
+    envelope.sender = address("project:test/role:system");
+    envelope.relation = Relation::System;
+    envelope.references.push(MessageReference { address: inbox(), revision: "1".into(), subject: true });
+    backend.enqueue(envelope).await.expect("enqueue");
+    let rules = Rules(vec![Rule { sender: None, relation: None, expectation: None, mode: Transport::Mute }]);
+    let pending = backend.pending(&inbox(), &consumer("a"), &rules).await.expect("pending").try_collect::<Vec<_>>().await.expect("items");
+    assert_eq!(pending[0].mode, Transport::Mute, "a system envelope is not itself dead-letter provenance");
 }
 
 /// Behaviour: every drop reason needs exactly its engine evidence. Deadline,
@@ -324,10 +342,14 @@ pub async fn dead_letters<F: Factory>(factory: &F, self_supervisor: bool) {
     let message = backend.enqueue(envelope).await.expect("enqueue");
     evidence.clock.store(11, Ordering::SeqCst);
     backend.drop(&message, DropReason::Undeliverable).await.expect("drop");
+    let dropped_version = factory.inspect(&backend, &message).version();
+    refused(backend.drop(&message, DropReason::Undeliverable).await, MessageRefusal::Ended);
+    assert_eq!(factory.inspect(&backend, &message).version(), dropped_version, "a repeated drop records no new Message edge");
     let supervisor = address("project:test/role:supervisor");
     backend.bind(supervisor.clone(), consumer("a")).await.expect("bind supervisor");
+    let mute_all = Rules(vec![Rule { sender: None, relation: None, expectation: None, mode: Transport::Mute }]);
     let pending = backend
-        .pending(&supervisor, &consumer("a"), &Rules::default())
+        .pending(&supervisor, &consumer("a"), &mute_all)
         .await
         .expect("supervisor reads")
         .try_collect::<Vec<_>>()
@@ -371,7 +393,9 @@ pub async fn suite<F: Factory>(factory: &F) {
     claim(factory, true).await;
     claim(factory, false).await;
     binding_barrier(factory).await;
+    pending_arrival_order(factory).await;
     modes(factory).await;
+    ordinary_system_mode(factory).await;
     gates(factory).await;
     receipt_and_condition_gates(factory).await;
     admission(factory).await;
@@ -437,3 +461,23 @@ pub async fn generated_claim<F: Factory>(factory: &F, operations: &[usize]) {
 }
 
 pub mod conformance;
+
+/// Behaviour: pending messages arrive oldest first, including when generated
+/// names cross a decimal digit boundary. Reading Turn items does not reorder them.
+pub async fn pending_arrival_order<F: Factory>(factory: &F) {
+    let Harness { backend, .. } = factory.create();
+    backend.bind(inbox(), consumer("a")).await.expect("bind");
+    let mut expected = Vec::new();
+    for _ in 0..12 {
+        expected.push(backend.enqueue(spec()).await.expect("enqueue"));
+    }
+    let actual = backend
+        .pending(&inbox(), &consumer("a"), &Rules::default())
+        .await
+        .expect("pending")
+        .map_ok(|item| item.message)
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("items");
+    assert_eq!(actual, expected, "pending preserves admission order across message-9/message-10");
+}

@@ -22,7 +22,7 @@ impl Factory for Memory {
     }
     fn create(&self) -> Harness<Self::Backend> {
         let evidence = Arc::new(Evidence::default());
-        let backend = EngineInbox::new("test", MemoryInboxLog::default(), evidence.clone(), Arc::new(Supervisors));
+        let backend = EngineInbox::open("test", MemoryInboxLog::default(), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
         for name in ["a", "b"] {
             backend.register(consumer(name), SessionPort::new(name, MemoryLog::<AgentSession>::new()));
         }
@@ -46,7 +46,7 @@ impl Factory for Sqlite {
                 .expect("store"),
         ));
         let evidence = Arc::new(Evidence::default());
-        let backend = EngineInbox::new("test", StoreLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors));
+        let backend = EngineInbox::open("test", StoreLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
         for name in ["a", "b"] {
             backend.register(consumer(name), SessionPort::new(name, StoreLog::new(store.clone())));
         }
@@ -76,7 +76,7 @@ async fn sqlite_recovers_receipts_and_watch_positions() {
             .expect("store"),
     ));
     let evidence = Arc::new(Evidence::default());
-    let backend = SqliteInbox::new("test", StoreLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors));
+    let backend = SqliteInbox::open("test", StoreLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
     backend.register(consumer("a"), SessionPort::new("a", StoreLog::new(store.clone())));
     backend.bind(inbox(), consumer("a")).await.expect("bind");
     let message = backend.enqueue(spec()).await.expect("enqueue");
@@ -170,4 +170,39 @@ async fn watch_expiry_and_live_restart() {
     let next = harness.backend.enqueue(spec()).await.expect("new message");
     assert_eq!(live.next().await.expect("new event").expect("change").message, next);
     assert!(matches!(harness.backend.watch(&inbox(), Some(Cursor(u64::MAX))).await, Err(Error::CursorAhead)));
+}
+
+// Behaviour: SQLite refuses a port on another store before it commits Receive,
+// preserving the original creation event and its exclusive watch cursor.
+#[tokio::test]
+async fn sqlite_rejects_consumer_in_another_store() {
+    use flotilla_inbox::{Error, InboxBackend};
+    use flotilla_inbox_testkit::spec;
+    let make_store = || {
+        Arc::new(Mutex::new(
+            Store::open(Connection::open_in_memory().expect("SQLite"), "test", flotilla_state_machines::kinds().expect("registry"))
+                .expect("store"),
+        ))
+    };
+    let local = make_store();
+    let foreign = make_store();
+    let backend =
+        SqliteInbox::open("test", StoreLog::new(local.clone()), Arc::new(Evidence::default()), Arc::new(Supervisors)).expect("open inbox");
+    backend.register(consumer("a"), SessionPort::new("a", StoreLog::new(foreign.clone())));
+    let message = backend.enqueue(spec()).await.expect("enqueue");
+    let before = foreign.lock().expect("store").read().expect("read").last_sequence("test").expect("sequence");
+    assert!(matches!(backend.receive(&consumer("a"), &message, flotilla_state_machines::Transport::Turn).await, Err(Error::Consumer(_))));
+    assert_eq!(
+        foreign.lock().expect("store").read().expect("read").last_sequence("test").expect("sequence"),
+        before,
+        "refusal precedes the consumer write"
+    );
+    use futures::StreamExt;
+    let mut watch = backend.watch(&flotilla_inbox_testkit::inbox(), Some(flotilla_inbox::Cursor(0))).await.expect("watch");
+    let created = watch.next().await.expect("create").expect("change");
+    backend.register_async(consumer("a"), SessionPort::new("a", StoreLog::new(local))).await.expect("runtime registration");
+    assert!(backend.get_async(&message).await.expect("async snapshot").is_some());
+    backend.receive(&consumer("a"), &message, flotilla_state_machines::Transport::Turn).await.expect("same store receipt");
+    let receipt = watch.next().await.expect("receipt").expect("change");
+    assert!(receipt.cursor > created.cursor, "a receipt never overwrites its creation event");
 }

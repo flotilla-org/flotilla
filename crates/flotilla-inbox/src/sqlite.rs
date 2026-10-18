@@ -16,7 +16,7 @@ use flotilla_state_machines::{
     EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, Version,
 };
 
-use crate::{Change, ChangeKind, Cursor, Error, InboxLog, Recovery};
+use crate::{Change, ChangeKind, ConsumerLog, Cursor, Error, InboxLog, ReceiptScope, Recovery};
 
 #[derive(Clone)]
 pub struct StoreLog {
@@ -88,7 +88,16 @@ where
     }
 }
 
+impl ConsumerLog for StoreLog {
+    fn receipt_scope(&self) -> Option<ReceiptScope> {
+        Some(ReceiptScope { store: Arc::as_ptr(&self.store) as usize, home: self.home.clone() })
+    }
+}
+
 impl InboxLog for StoreLog {
+    fn consumer_scope(&self) -> Option<ReceiptScope> {
+        self.receipt_scope()
+    }
     fn sequence(&mut self) -> Result<Option<u64>, Error> {
         Ok(Some(self.store.lock().expect("store writer").read().map_err(storage)?.last_sequence(&self.home).map_err(storage)?))
     }
