@@ -17,11 +17,15 @@ use std::sync::Arc;
 
 /// Services forge demands through host-owned provider resolution ports.
 pub struct ForgeDemandService {
-    pub backend: ResourceBackend,
-    pub change_requests: Arc<dyn ChangeRequestQueryPort>,
-    pub issues: Arc<dyn IssueQueryPort>,
+    backend: ResourceBackend,
+    change_requests: Arc<dyn ChangeRequestQueryPort>,
+    issues: Arc<dyn IssueQueryPort>,
 }
 impl ForgeDemandService {
+    pub fn new(backend: ResourceBackend, change_requests: Arc<dyn ChangeRequestQueryPort>, issues: Arc<dyn IssueQueryPort>) -> Self {
+        Self { backend, change_requests, issues }
+    }
+
     /// Service remote demand without making the requesting host a forge caller.
     pub async fn refresh_forge_read_demands(&self, namespace: &str) -> Result<(), String> {
         let backend = self.backend.clone();
@@ -175,8 +179,7 @@ mod tests {
     async fn named_service_has_bounded_reads_and_ignores_idle_requests() {
         let counted = InMemoryBackend::default().with_read_counts();
         let backend = ResourceBackend::new(counted.clone());
-        let service =
-            ForgeDemandService { backend: backend.clone(), change_requests: Arc::new(NoProviders), issues: Arc::new(NoProviders) };
+        let service = ForgeDemandService::new(backend.clone(), Arc::new(NoProviders), Arc::new(NoProviders));
         for index in 0..200 {
             backend
                 .using::<ForgeRead>("flotilla")

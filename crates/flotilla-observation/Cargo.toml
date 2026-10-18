@@ -20,9 +20,9 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-futures = "0.3"
-tokio-util = { version = "0.7", features = ["rt"] }
+chrono = { workspace = true, default-features = false, features = ["clock"] }
+futures = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 flotilla-store-http = { path = "../flotilla-store-http" }
