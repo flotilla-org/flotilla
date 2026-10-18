@@ -485,18 +485,25 @@ impl ReconcilerWake {
                 }
                 for (vessel, crew) in &status.crew_work {
                     for (role, work) in crew {
-                        let owes_claim = status.workflow_snapshot.as_ref().is_some_and(|snapshot| {
-                            snapshot.vessels.iter().any(|requirement| {
-                                requirement.name == *vessel
-                                    && requirement.crew.iter().any(|member| {
-                                        member.role == *role && (!member.promises.is_empty() || !member.completion_conditions.is_empty())
-                                    })
-                            })
-                        });
-                        // Working owes a report for the current task, even without a
-                        // declared claim. Pending roles remain available; a declared
-                        // stall also creates an obligation until it is resolved.
-                        if !owes_claim && !matches!(work.phase, CrewWorkPhase::Working | CrewWorkPhase::Stalled) {
+                        let owes_promise = !flotilla_resources::promises::owned(status, vessel, role).is_empty();
+                        let owes_claim = owes_promise
+                            || status.workflow_snapshot.as_ref().is_some_and(|snapshot| {
+                                snapshot.vessels.iter().any(|requirement| {
+                                    requirement.name == *vessel
+                                        && requirement.crew.iter().any(|member| {
+                                            member.role == *role
+                                                && (!member.promises.is_empty() || !member.completion_conditions.is_empty())
+                                        })
+                                })
+                            });
+                        // A launch is availability, not an assignment. A delivered task
+                        // owes a report even without a workflow claim; a declared stall
+                        // remains an obligation until resolved. An initial brief alone
+                        // does not assign a report, including for non-standing roles.
+                        if !owes_claim
+                            && !(work.phase == CrewWorkPhase::Working && work.task_assigned)
+                            && work.phase != CrewWorkPhase::Stalled
+                        {
                             continue;
                         }
                         if status.stalled.as_ref().is_some_and(|stalled| {

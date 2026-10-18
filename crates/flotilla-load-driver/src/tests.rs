@@ -146,7 +146,7 @@ fn the_driver_holds_the_plan_and_counts_outcomes(tc: hegel::TestCase) {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime");
     runtime.block_on(async {
         let fleet = ScriptedFleet::new(homes, |mix| match mix {
-            CrewMix::Coder => Some((ConvoyState::Delivered, Duration::from_secs(5))),
+            CrewMix::Coder | CrewMix::CoderSupervisor => Some((ConvoyState::Delivered, Duration::from_secs(5))),
             CrewMix::CoderReviewer => Some((ConvoyState::Failed, Duration::from_secs(3))),
             CrewMix::LongRunner => None,
         });

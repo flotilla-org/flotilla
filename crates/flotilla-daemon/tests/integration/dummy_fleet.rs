@@ -373,3 +373,14 @@ async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
         "the governor reports again after the handoff"
     );
 }
+
+// The supervisor is eagerly launched with no claim, waits for a delivered
+// review task, answers it across vessels, and reports so the convoy can land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_eager_supervisor_waits_for_work_and_lands_after_answering() {
+    let fleet = DummyDaemon::start(SCENARIO_AGENT, "").await;
+    let snapshot = fleet.deliver("supervised-coder", CrewMix::CoderSupervisor).await;
+    assert_eq!(snapshot.crews_completed, 2, "{snapshot:?}");
+    assert_eq!(snapshot.turns_received, 2, "the task and answer are delivered: {snapshot:?}");
+    assert_eq!(snapshot.crews_stalled, 0, "{snapshot:?}");
+}

@@ -51,7 +51,7 @@ impl Default for LoadPlan {
     fn default() -> Self {
         Self {
             running: 100,
-            mix: vec![(CrewMix::Coder, 6), (CrewMix::CoderReviewer, 3), (CrewMix::LongRunner, 1)],
+            mix: vec![(CrewMix::Coder, 5), (CrewMix::CoderReviewer, 3), (CrewMix::LongRunner, 1), (CrewMix::CoderSupervisor, 1)],
             ramp_per_second: 20.0,
             dispatch_concurrency: 16,
             window: Duration::from_secs(120),

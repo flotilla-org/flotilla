@@ -1599,6 +1599,12 @@ impl WorkCompletionAuthority {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewWorkState {
+    /// A task was handed to this role after launch. Launch alone leaves a
+    /// claim-less standing role available, even though its phase is Working.
+    /// ADR 0047: remove this decoder default one fleet roll after deployment.
+    #[builder(default)]
+    #[serde(default)]
+    pub task_assigned: bool,
     /// Snapshot at claim time, before later deliveries can replace the latch.
     /// ADR 0047: remove this decoder default one fleet roll after deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2535,6 +2541,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 };
                 let target_was_done = crew.get(target_role).is_some_and(|state| state.phase == CrewWorkPhase::Done);
                 if let Some(target) = crew.get_mut(target_role) {
+                    target.task_assigned = true;
                     if matches!(target.phase, CrewWorkPhase::Pending | CrewWorkPhase::Done | CrewWorkPhase::HandedBack) {
                         // Hand-back continues the same crew process, preserving its original start.
                         target.phase = CrewWorkPhase::Working;
@@ -2593,6 +2600,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         state.resumed_at = None;
                         state.resume_brief_id = None;
                     }
+                    state.task_assigned = true;
                     state.phase = CrewWorkPhase::Working;
                     state.started_at.get_or_insert(*resumed_at);
                     state.finished_at = None;
@@ -2652,6 +2660,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     work.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.task_assigned = true;
                     state.phase = CrewWorkPhase::Working;
                     state.finished_at = None;
                     state.decision_ledger_digest = None;
@@ -4072,5 +4081,64 @@ mod admission_tests {
         }
         let initial = Convoy::initial_status(&meta).expect("valid admission metadata");
         assert_eq!(initial, present.then(|| ConvoyStatus { placement_decision: Some(decision), ..ConvoyStatus::default() }));
+    }
+}
+
+#[cfg(test)]
+mod task_assignment_tests {
+    use super::*;
+
+    // A launched role is available until a handoff, explicit resume, or workflow
+    // turn assigns work. Repeated launches preserve that assignment. Generated
+    // sequences cover duplicates, missing targets, and both launch/delivery orders.
+    #[hegel::test]
+    fn only_task_delivery_assigns_a_report(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let mut status = ConvoyStatus::default();
+        status
+            .crew_work
+            .insert("work".into(), BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build())]));
+        let at = DateTime::<Utc>::UNIX_EPOCH;
+        let mut assigned = false;
+        assert!(!status.crew_work["work"]["governor"].task_assigned);
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(12));
+        for _ in 0..count {
+            let operation = tc.draw(gs::integers::<u8>().min_value(0).max_value(3));
+            let missing = tc.draw(gs::booleans());
+            let role = if missing { "absent" } else { "governor" }.to_string();
+            let patch = match operation {
+                0 => ConvoyStatusPatch::WorkRunning { work: "work".into(), started_at: at, launched_roles: [role].into() },
+                1 => ConvoyStatusPatch::HandoffCrewWork {
+                    vessel: "work".into(),
+                    sender_role: "governor".into(),
+                    target_role: role,
+                    handed_off_at: at,
+                    message: "task".into(),
+                },
+                2 => ConvoyStatusPatch::ResumeCrewWork {
+                    vessel: "work".into(),
+                    role,
+                    resumed_at: at,
+                    prompt: "task".into(),
+                    brief_id: None,
+                    intent: ResumeIntent::Reopen,
+                },
+                _ => ConvoyStatusPatch::RecordTurnDelivery {
+                    source: "task".into(),
+                    vessel: "work".into(),
+                    role,
+                    prompt: "task".into(),
+                    episode: TurnDeliveryEpisode::builder()
+                        .subject_revision("revision".into())
+                        .evidence_at(at)
+                        .judged_claim_at(at)
+                        .outcome(TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, delivered_at: at })
+                        .build(),
+                },
+            };
+            assigned |= operation != 0 && !missing;
+            patch.apply(&mut status);
+            assert_eq!(status.crew_work["work"]["governor"].task_assigned, assigned);
+        }
     }
 }

@@ -4,6 +4,10 @@ These are the first measurements of today's control plane under the dummy fleet.
 
 Runs were taken on 2026-10-14.
 
+## Comparisons after #3454
+
+[PR #3456](https://github.com/flotilla-org/flotilla/pull/3456) changes the default catalog rotation from coder ×6, coder-reviewer ×3, long runner ×1 to coder ×5, coder-reviewer ×3, long runner ×1, coder-supervisor ×1. The new mix eagerly launches a claim-less governor in its own vessel; it waits for a coder's review handoff before answering and reporting. This adds a two-vessel exchange in place of one lone coder, so later load results use a different workload. The measurements below retain their original 6/3/1 mix.
+
 ## Reproduce
 
 ```sh

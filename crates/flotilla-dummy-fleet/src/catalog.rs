@@ -32,10 +32,12 @@ pub enum CrewMix {
     CoderReviewer,
     /// A governor-like long runner exchanging many turns with an aide.
     LongRunner,
+    /// An eagerly launched supervisor waits for a coder in another vessel.
+    CoderSupervisor,
 }
 
 impl CrewMix {
-    pub const ALL: [Self; 3] = [Self::Coder, Self::CoderReviewer, Self::LongRunner];
+    pub const ALL: [Self; 4] = [Self::Coder, Self::CoderReviewer, Self::LongRunner, Self::CoderSupervisor];
 
     /// WorkflowTemplate name for this mix.
     pub fn workflow_name(self) -> &'static str {
@@ -43,6 +45,7 @@ impl CrewMix {
             Self::Coder => "dummy-coder",
             Self::CoderReviewer => "dummy-coder-reviewer",
             Self::LongRunner => "dummy-long-runner",
+            Self::CoderSupervisor => "dummy-coder-supervisor",
         }
     }
 
@@ -57,6 +60,21 @@ impl CrewMix {
                     crew("reviewer", CrewScript::Responder { reply_to: "coder".into() }),
                 ],
             ),
+            Self::CoderSupervisor => {
+                return WorkflowTemplateSpec::builder()
+                    .exit(ExitDeclaration::standard_table())
+                    .vessels(vec![
+                        VesselRequirement::builder()
+                            .name("supervise".into())
+                            .crew(vec![crew("governor", CrewScript::Responder { reply_to: "implement:coder".into() })])
+                            .build(),
+                        VesselRequirement::builder()
+                            .name("implement".into())
+                            .crew(vec![crew("coder", CrewScript::Coder { reviewer: Some("supervise:governor".into()), repository })])
+                            .build(),
+                    ])
+                    .build();
+            }
             Self::LongRunner => (
                 "govern",
                 vec![
@@ -147,6 +165,20 @@ mod tests {
                 CrewScript::from_brief(prompt.as_deref().expect("prompt"), 1).expect("script parses");
             }
         }
+    }
+
+    // The standing supervisor must launch eagerly with no declared claim;
+    // otherwise the load mix would only exercise latent-role availability.
+    #[test]
+    fn supervisor_is_eager_and_claim_less() {
+        let workflow = CrewMix::CoderSupervisor.workflow(1);
+        let vessel = workflow.vessels.iter().find(|vessel| vessel.name == "supervise").expect("supervisor vessel");
+        assert!(vessel.starts_eagerly(0));
+        assert_eq!(vessel.crew[0].role, "governor");
+        assert!(vessel.crew[0].promises.is_empty());
+        assert!(vessel.crew[0].completion_conditions.is_empty());
+        let CrewSource::Agent { prompt: Some(prompt), .. } = &vessel.crew[0].source else { panic!("agent prompt") };
+        assert!(matches!(CrewScript::from_brief(prompt, 1).unwrap(), CrewScript::Responder { .. }));
     }
 
     #[test]

@@ -292,6 +292,7 @@ fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: 
 
 fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> CrewWorkState {
     CrewWorkState {
+        task_assigned: false,
         completion_turn: None,
         pending_follow_up: None,
         completion_authority: Default::default(),
