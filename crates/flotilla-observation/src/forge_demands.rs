@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::IssueRef;
+use flotilla_change_request::ChangeRequestTracker;
+use flotilla_issue_tracker::IssueProvider;
+use flotilla_protocol::{IssueRef, IssueSource};
 use flotilla_resources::{ForgeRead, ForgeReadHeartbeat, ForgeReadRequest, ForgeReadSpec, RepositorySpec};
 use flotilla_store::ResourceBackend;
 use futures::StreamExt;
@@ -67,56 +69,51 @@ impl ForgeDemandService {
     }
 
     async fn service_forge_read_spec(&self, namespace: &str, spec: ForgeReadSpec) -> Result<(), String> {
-        let backend = self.backend.clone();
-        if !owns_source(&backend, namespace, &spec.source).await? {
+        if !owns_source(&self.backend, namespace, &spec.source).await? {
             return Ok(());
         }
-        if matches!(
-            spec.request,
-            ForgeReadRequest::Branch { .. }
-                | ForgeReadRequest::ChangeRequests { .. }
-                | ForgeReadRequest::ChangeRequest { .. }
-                | ForgeReadRequest::MergedBranches { .. }
-        ) {
-            return self.service_change_request_demand(namespace, &spec).await;
-        }
-        let provider = self.issues.provider_for_source(&spec.source).await?;
-        let provider = provider.for_background_refresh().unwrap_or(provider);
-        let reference = |id| IssueRef { source: spec.source.clone(), id };
+        let source = &spec.source;
+        let reference = |id| IssueRef { source: source.clone(), id };
         match spec.request {
-            ForgeReadRequest::Board => provider.dispatch_board(&spec.source).await.map(|_| ()),
-            ForgeReadRequest::Query { params, page, count } => provider.query(&spec.source, &params, page, count).await.map(|_| ()),
-            ForgeReadRequest::Issue { id } => provider.fetch_by_id(&reference(id)).await.map(|_| ()),
-            ForgeReadRequest::Changes { since, count } => provider.list_changed_since(&spec.source, &since, count).await.map(|_| ()),
-            ForgeReadRequest::Mission { id } => provider.mission_fields(&reference(id)).await.map(|_| ()),
-            ForgeReadRequest::DispatchFacts { id } => provider.dispatch_facts(&reference(id)).await.map(|_| ()),
-            ForgeReadRequest::Branch { .. }
-            | ForgeReadRequest::ChangeRequests { .. }
-            | ForgeReadRequest::ChangeRequest { .. }
-            | ForgeReadRequest::MergedBranches { .. } => unreachable!(),
+            // Branch lookup returns ObservationError; the other demand reads already return String.
+            ForgeReadRequest::Branch { branch } => self
+                .change_request_provider(namespace, source)
+                .await?
+                .find_change_request_by_branch(&branch)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            ForgeReadRequest::ChangeRequests { limit } => {
+                self.change_request_provider(namespace, source).await?.list_change_requests(limit).await.map(|_| ())
+            }
+            ForgeReadRequest::ChangeRequest { id } => {
+                self.change_request_provider(namespace, source).await?.get_change_request(&id).await.map(|_| ())
+            }
+            ForgeReadRequest::MergedBranches { limit } => {
+                self.change_request_provider(namespace, source).await?.list_merged_branch_names(limit).await.map(|_| ())
+            }
+            ForgeReadRequest::Board => self.issue_provider(source).await?.dispatch_board(source).await.map(|_| ()),
+            ForgeReadRequest::Query { params, page, count } => {
+                self.issue_provider(source).await?.query(source, &params, page, count).await.map(|_| ())
+            }
+            ForgeReadRequest::Issue { id } => self.issue_provider(source).await?.fetch_by_id(&reference(id)).await.map(|_| ()),
+            ForgeReadRequest::Changes { since, count } => {
+                self.issue_provider(source).await?.list_changed_since(source, &since, count).await.map(|_| ())
+            }
+            ForgeReadRequest::Mission { id } => self.issue_provider(source).await?.mission_fields(&reference(id)).await.map(|_| ()),
+            ForgeReadRequest::DispatchFacts { id } => self.issue_provider(source).await?.dispatch_facts(&reference(id)).await.map(|_| ()),
         }
     }
 
-    /// Schedule tracker observations without waiting for the forge or coupling
-    /// board freshness to the availability of dispatch readiness evidence.
-    async fn service_change_request_demand(&self, namespace: &str, spec: &ForgeReadSpec) -> Result<(), String> {
-        let repository = RepositorySpec::remote(format!("{}/{}", spec.source.service.trim_end_matches('/'), spec.source.scope))?;
+    async fn change_request_provider(&self, namespace: &str, source: &IssueSource) -> Result<Arc<dyn ChangeRequestTracker>, String> {
+        let repository = RepositorySpec::remote(format!("{}/{}", source.service.trim_end_matches('/'), source.scope))?;
         let provider = self.change_requests.discover_repository_change_request(namespace, &repository).await?;
-        let provider = provider.for_background_refresh().unwrap_or(provider);
-        match &spec.request {
-            ForgeReadRequest::Branch { branch } => {
-                provider.find_change_request_by_branch(branch).await.map(|_| ()).map_err(|e| e.to_string())
-            }
-            ForgeReadRequest::ChangeRequests { limit } => provider.list_change_requests(*limit).await.map(|_| ()),
-            ForgeReadRequest::ChangeRequest { id } => provider.get_change_request(id).await.map(|_| ()),
-            ForgeReadRequest::MergedBranches { limit } => provider.list_merged_branch_names(*limit).await.map(|_| ()),
-            ForgeReadRequest::Board
-            | ForgeReadRequest::Query { .. }
-            | ForgeReadRequest::Issue { .. }
-            | ForgeReadRequest::Changes { .. }
-            | ForgeReadRequest::Mission { .. }
-            | ForgeReadRequest::DispatchFacts { .. } => unreachable!("issue demands are serviced through the issue query port"),
-        }
+        Ok(provider.for_background_refresh().unwrap_or(provider))
+    }
+
+    async fn issue_provider(&self, source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
+        let provider = self.issues.provider_for_source(source).await?;
+        Ok(provider.for_background_refresh().unwrap_or(provider))
     }
 }
 
