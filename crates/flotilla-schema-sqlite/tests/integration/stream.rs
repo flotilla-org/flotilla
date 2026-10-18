@@ -403,3 +403,64 @@ fn resident_home_cursor_changes_only_on_local_commit() {
         .expect("copy");
     assert_eq!(service.local_sequence(), 1);
 }
+
+// A recreated home may have a lower sequence than its followers. Replace the stale copy
+// with a snapshot rather than retrying the impossible cursor forever, then resume normally.
+#[test]
+fn cursor_ahead_of_reset_home_gets_fresh_snapshot() {
+    let mut a = store("a");
+    let mut b = store("b");
+    insert(&mut a, "old1");
+    insert(&mut a, "old2");
+    sync(&mut a, &mut b, None, 10).expect("old snapshot");
+    let mut replacement = store("a");
+    insert(&mut replacement, "replacement");
+    sync(&mut replacement, &mut b, Some(2), 11).expect("reset snapshot");
+    assert!(!present(&mut b, "a", "old1"));
+    assert!(!present(&mut b, "a", "old2"));
+    assert!(present(&mut b, "a", "replacement"));
+    assert_eq!(mark(&mut b, "a"), Watermark { home_seq: 1, applied_through: Timestamp(11) });
+    insert(&mut replacement, "tail");
+    sync(&mut replacement, &mut b, Some(1), 12).expect("resumed tail");
+    assert!(present(&mut b, "a", "tail"));
+}
+
+// A lagging follower must read the durable log after the shared byte-bounded tail evicts
+// its next event. The newer follower still uses that tail; both reach exactly the same prefix.
+#[test]
+fn byte_eviction_falls_back_to_log_without_a_gap() {
+    use flotilla_schema_sqlite::stream::Service;
+    use flotilla_state_machines::machines::message::MessageBody;
+    let dir = tempfile::tempdir().expect("dir");
+    let source = Service::open(&dir.path().join("store.sqlite"), "a", registry()).expect("service");
+    source.serve(Some(0), Timestamp(0), |_| Ok(())).expect("prime empty cache");
+    let mut lagging = store("b");
+    let mut fresh = store("c");
+    source
+        .with_store(|store| {
+            let mut spec = message::sample_spec();
+            spec.body = MessageBody::text("x".repeat(64 * 1024)).expect("body");
+            let value = message::sample().with_spec(spec);
+            let mut write = store.write()?;
+            for i in 0..300 {
+                write.insert(&format!("large{i}"), &value, &origin())?;
+            }
+            write.commit()
+        })
+        .expect("large log");
+    let mut bytes = 0;
+    source
+        .serve(Some(0), Timestamp(1), |frame| {
+            bytes += frame.len();
+            Ok(())
+        })
+        .expect("fill and evict");
+    assert!(bytes > flotilla_schema::LOG_LIMITS.max_message, "force byte eviction");
+    for replica in [&mut lagging, &mut fresh] {
+        Follower::new(replica).receive("a", |sink| source.serve(Some(0), Timestamp(2), sink).map(|_| ())).expect("fallback log");
+        assert_eq!(mark(replica, "a").home_seq, 300);
+        for i in 0..300 {
+            assert!(present(replica, "a", &format!("large{i}")));
+        }
+    }
+}

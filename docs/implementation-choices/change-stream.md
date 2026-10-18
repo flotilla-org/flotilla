@@ -90,7 +90,9 @@ resource version. No baseline column renames are proposed in this checkpoint.
   establishes its cut before publishing progress. A keepalive carries the home's time and
   prefix sequence; its observation transaction may advance time only after that prefix is
   fully committed locally. A stalled stream holds the watermark. A gate sees only the local
-  applied-time input, never link health or a remote query.
+  applied-time input, never link health or a remote query. Home clocks are trusted: a
+  clock ahead of real time can advance freshness prematurely, and the monotonic maximum
+  does not retract that time. Clock synchronization is an operational prerequisite.
 - **Monotonicity:** writer invariants reject decreasing home sequences or applied times and
   never restore a prefix ahead of committed rows. A same-sequence keepalive may advance time.
   No monotonicity trigger is proposed: the implementation must validate the combined

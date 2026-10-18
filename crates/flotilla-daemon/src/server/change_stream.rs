@@ -158,7 +158,9 @@ pub async fn read_record(
 /// returned task cancels this generation; failures retry from the last committed prefix.
 pub(super) fn follow(daemon: Arc<InProcessDaemon>, home: String, socket: PathBuf) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // ZERO alone cannot prove a completed empty snapshot after a restart.
         let mut baseline = Baseline::Unknown;
+        let mut failures: u64 = 0;
         loop {
             let result = match daemon.decided_store() {
                 Ok(service) => follow_connection(service, &home, &socket, daemon.decided_stream_limits().0, baseline).await,
@@ -166,9 +168,15 @@ pub(super) fn follow(daemon: Arc<InProcessDaemon>, home: String, socket: PathBuf
             };
             if result.is_ok() {
                 baseline = Baseline::Known;
+                failures = 0;
             }
             if let Err(error) = result {
-                tracing::debug!(%home, %error, "decided stream disconnected; resuming");
+                failures = failures.saturating_add(1);
+                if failures == 3 || failures.is_multiple_of(12) {
+                    tracing::warn!(%home, %error, failures, "decided stream repeatedly disconnected; resuming");
+                } else {
+                    tracing::debug!(%home, %error, "decided stream disconnected; resuming");
+                }
                 tokio::time::sleep(CADENCE).await;
             }
         }

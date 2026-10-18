@@ -67,7 +67,7 @@ impl Frame {
 
 /// One bounded-delivery round of a standing home stream. The transport repeats from the
 /// returned cursor, at its idle cadence, so idle rounds still emit a timed keepalive.
-/// `None` or a cursor below the expunge floor installs a fresh snapshot before tailing.
+/// `None`, a cursor below the expunge floor, or one ahead of a reset home installs a fresh snapshot before tailing.
 /// The sink is a backpressure boundary: an error stops delivery; no unbounded queue is built.
 pub fn serve(
     source: &mut Store,
@@ -80,11 +80,8 @@ pub fn serve(
     let mut read = source.read()?;
     let floor = read.resume_floor(&home)?;
     let last = read.last_sequence(&home)?;
-    if after.is_some_and(|seq| seq > last) {
-        return Err(StoreError::Stream("cursor is ahead of its home".into()));
-    }
     let emit = |frame: Frame, send: &mut dyn FnMut(&[u8]) -> Result<(), StoreError>| send(&frame.encode()?);
-    let mut cursor = match after.filter(|seq| *seq >= floor) {
+    let mut cursor = match after.filter(|seq| *seq >= floor && *seq <= last) {
         Some(cursor) => cursor,
         None => {
             emit(Frame::Begin { home: home.clone(), home_seq: last }, &mut send)?;
@@ -269,16 +266,9 @@ impl Service {
             let position = self.local_sequence();
             let resident = {
                 let cache = self.tail.lock().map_err(|_| StoreError::Stream("tail cache poisoned".into()))?;
-                after
-                    .filter(|cursor| {
-                        cache.home_seq == Some(position)
-                            && *cursor >= cache.floor
-                            && *cursor <= position
-                            && (*cursor == position || cache.rows.front().is_some_and(|(seq, _)| *cursor >= seq.saturating_sub(1)))
-                    })
-                    .map(|cursor| {
-                        cache.rows.iter().filter(|(seq, _)| *seq > cursor).map(|(_, frame)| Arc::clone(frame)).collect::<Vec<_>>()
-                    })
+                after.filter(|cursor| cache.covers(*cursor, position)).map(|cursor| {
+                    cache.rows.iter().filter(|(seq, _)| *seq > cursor).map(|(_, frame)| Arc::clone(frame)).collect::<Vec<_>>()
+                })
             };
             if let Some(frames) = resident {
                 let mut sink = sink;
@@ -299,7 +289,12 @@ impl Service {
                 .map(Ok)
                 .unwrap_or_else(|| Store::open_reader(&source.path, &source.home, source.kinds.clone()))?;
             let result = self.serve_cached(&mut reader, after, now, sink);
-            source.readers.lock().map_err(|_| StoreError::Stream("reader pool poisoned".into()))?.push(reader);
+            let mut readers = source.readers.lock().map_err(|_| StoreError::Stream("reader pool poisoned".into()))?;
+            // Retain at most the daemon's four concurrent outgoing rounds. Standalone
+            // callers may exceed that concurrency; their extra readers close on return.
+            if readers.len() < 4 {
+                readers.push(reader);
+            }
             result
         } else {
             self.with_store(|store| serve(store, after, now, sink))
@@ -352,7 +347,7 @@ impl Service {
                 cache.bytes -= old.len();
             }
         }
-        let covered = at == last && (cursor == last || cache.rows.front().is_some_and(|(seq, _)| cursor >= seq.saturating_sub(1)));
+        let covered = cache.covers(cursor, last);
         if !covered {
             drop(cache);
             drop(read);
@@ -393,4 +388,13 @@ struct TailCache {
     home_seq: Option<u64>,
     rows: VecDeque<(u64, Arc<Vec<u8>>)>,
     bytes: usize,
+}
+
+impl TailCache {
+    fn covers(&self, cursor: u64, position: u64) -> bool {
+        self.home_seq == Some(position)
+            && cursor >= self.floor
+            && cursor <= position
+            && (cursor == position || self.rows.front().is_some_and(|(seq, _)| cursor >= seq.saturating_sub(1)))
+    }
 }
