@@ -46,7 +46,7 @@ pub struct VesselClass(pub u32);
 
 /// A convoy's priority; its vessels' placement requests carry it. Higher
 /// places first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub struct Priority(pub u32);
 
 /// Per-class caps on live vessels. Admission grants a cap, never a reservation.
@@ -55,20 +55,24 @@ pub type Quota = BTreeMap<VesselClass, u32>;
 /// What the convoy promises: an opaque kind, as interned text, and the
 /// target's address, which need not exist yet (a branch to be pushed, a
 /// change request to be opened).
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 pub struct Promise {
     #[store(intern = "pk")]
     pub kind: String,
     pub target: Address,
 }
 
-/// The spec's `ConvoyRequest`: what a caller asks to admit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The spec's `ConvoyRequest`: what a caller asks to admit. It is also the
+/// typed body of a convoy request message to admission; serde sees its maps
+/// as lists of pairs, since a frozen document's map keys are text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyRequest {
     /// The project's address; admission refuses one that does not exist.
     pub project: Address,
+    #[serde(with = "pairs")]
     pub promises: BTreeMap<PromiseId, Promise>,
     /// The quota admitted; it becomes the state's quota in force.
+    #[serde(with = "pairs")]
     pub quota: Quota,
     pub priority: Priority,
 }

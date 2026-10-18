@@ -16,7 +16,9 @@ use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    edges, states, Admission, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Transport, Version, WrongState,
+    edges,
+    machines::consumer::{Consumer, ConsumerKind},
+    states, Admission, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, Ref, Source, Table, Transport, Version, WrongState,
 };
 
 /// Whether a channel to a Live session is attached (spec `Channel`).
@@ -217,6 +219,18 @@ impl Machine for AgentSession {
 
     fn admit(_: &mut Admission<'_, AgentSession>, _: ()) -> Result<(AgentSessionSpec, AgentSessionState), AgentSessionRefusal> {
         Ok((AgentSessionSpec {}, AgentSessionState::Live { channel: Channel::Detached }))
+    }
+}
+
+impl Consumer for AgentSession {
+    const CONSUMER: ConsumerKind = ConsumerKind::AgentSession;
+    const RECEIVE: AgentSessionEdgeKind = AgentSessionEdgeKind::Receive;
+
+    fn receipt(edge: &AgentSessionEdge) -> Option<(&str, Transport)> {
+        match edge {
+            AgentSessionEdge::Receive(receive) => Some((&receive.message, receive.transport)),
+            _ => None,
+        }
     }
 }
 

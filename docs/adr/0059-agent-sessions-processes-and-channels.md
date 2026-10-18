@@ -2,6 +2,7 @@
 
 **Status:** Accepted (owner grill, 2026-10-08; map #2912, recorded by #2913)
 **Date:** 2026-10-08
+**Amended:** 2026-10-18, §3 for shared inboxes (ADR 0064, #3424 ruling 3).
 **Amends:** ADR 0055 (delivery wording and "holder"), ADR 0028 (the delivery ladder), ADR 0010 (tool crew and the Crew definition), ADR 0054 ("role holders"), ADR 0031 (AttachableSet is retired, not split)
 **Relates to:** ADR 0047 (stored data stays decodable for one generation), ADR 0051 (presentation metadata and `pm connect`), #2872 (host loss and rehydration), #2894 (the held transport draft that prompted this)
 
@@ -71,6 +72,14 @@ session fills this role address, from when until when. Bindings keep history.
 A role address resolves to the AgentSession its current binding names. A role
 with no current binding is **unbound**, and Messages to it wait. More than one
 current binding for a role is refused.
+
+*Amended 2026-10-18 (ADR 0064, #3424 ruling 3):* an inbox may be shared, so a
+role's current bindings are a set of consumers (agent sessions and controllers
+now, people once the principals model adds their kind), and several current bindings for one
+role are allowed. A role resolves to every consumer currently bound. A Message
+is pending for each bound consumer that has no receipt for it, the first
+`deliver` the inbox's home accepts claims it, and a role is unbound only when
+nobody is bound.
 
 **Crew** means the AgentSessions working in or for a vessel, including a
 session whose agent loop runs elsewhere but works for that vessel. An

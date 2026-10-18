@@ -60,7 +60,9 @@ existing addresses. Every role is declared with a one-line purpose; a Message
 to an undeclared role is refused at send time with the reason. A person's own
 inbox is a declared role, replacing `principal:<name>`. Role names may be
 dynamic, such as `coder-pr45`, with the role type as an attribute of the
-**Inbox**.)*
+**Inbox**. A Message's sender is a declared role too: a person sends as their
+declared role, and each `system:<subsystem>` producer becomes a declared fleet
+role; there is no `system` address kind (#3424).)*
 
 **Resource**:
 A thing with its own identity that others refer to, which someone wants to
@@ -103,10 +105,17 @@ outlive any fulfiller: unsettled messages pass to a replacement consumer. The
 _Avoid_: mailbox, queue (bare).
 
 **Receipt**:
-A record on an **AgentSession** saying it received a given Message, with when,
-through which transport, and the evidence. The consumer's host writes it. The
-Inbox's home records the Message's `deliver` edge once it observes the receipt
-through replication (ADR 0064).
+A `Receive` edge on a consumer's own resource saying it received a given
+Message, with when and through which transport; its master is the Message. Every
+consumer kind writes one the same way: an **AgentSession**, or a controller's
+own resource. A person's receipt is their acknowledgement or response, through
+any **Surface**, by them or an agent acting for them; a surface loading the
+Message is not a receipt, and on a shared Inbox the first acknowledgement claims
+it. The person consumer kind comes with the principals model. The consumer's
+host writes it. The Inbox's home
+records the Message's `deliver` edge once it observes the receipt through
+replication, naming the receiver as a consumer identity: its kind, its
+resource's id and its host (ADR 0064, #3424).
 
 **Delivery Mode**:
 A consumer's choice of how a matching Message reaches it: `turn` (pushed),
@@ -460,10 +469,15 @@ binding names. With no current binding the role is *unbound*, and Messages to
 it wait. More than one current binding for a role is refused. Starting a new
 conversation for a role means a new AgentSession and a new binding (ADR 0059).
 Under ADR 0064 a Role Binding is the **consumer** relation on the role's
-**Inbox**. A consumer may be an AgentSession, a person through a **Surface**, or
-a deterministic controller. Convoy membership is a binding the convoy asserts.
+**Inbox**. A consumer may be an AgentSession, a person, or a deterministic
+controller. Convoy membership is a binding the convoy asserts.
 A consumer may consume several inboxes, and an inbox may have several
-consumers: the first to act on a Message claims it.
+consumers, so a role's current bindings are a set and "more than one current
+binding is refused" no longer holds (ADR 0059 §3, amended by #3424). A Message
+is pending for each bound consumer without a receipt for it; the first
+`deliver` the Inbox's home accepts claims it, and the role is unbound only when
+nobody is bound. A binding is not the receiver a receipt names: a binding
+changes, a receipt does not.
 _Avoid_: Holder, assignment.
 
 **AgentChannel**:

@@ -5,7 +5,8 @@
 use std::collections::BTreeSet;
 
 use flotilla_schema::{
-    Address, Cbor, Code, CodeEnum, Decoder, EdgeParts, Encoder, Kind, KindCode, KindSpec, Labelled, RowPath, State, StateData, Timestamp,
+    Address, Cbor, Code, CodeEnum, Decoder, EdgeParts, Encoder, Frozen, Kind, KindCode, KindSpec, Labelled, RowPath, State, StateData,
+    Timestamp,
 };
 use flotilla_state_machines::{
     kinds,
@@ -16,7 +17,10 @@ use flotilla_state_machines::{
         },
         ensure::{Attempted, Ensure, EnsureSpec, MemoryEnsureWorld, Record},
         lifecycle::{self, LifecycleLabel, LifecycleState, MemoryLifecycleWorld, Observed, Realisation, Realise, Vanish},
-        message::{Expectation, MemoryMessageWorld, Message, MessageEdgeKind, MessageSpec},
+        message::{
+            Expectation, MemoryMessageWorld, Message, MessageBody, MessageEdgeKind, MessageRef, MessageReference, MessageSpec, Relation,
+            RequestBody,
+        },
         vessel::{live_leases, Vessel},
     },
     placement::{Dimension, Host, Lease, Ledger, LedgerError, Request, VesselId},
@@ -83,13 +87,33 @@ where
 #[test]
 fn resources_survive_the_codec() {
     let mut messages = Home::<Message>::new("home").expect("valid");
+    let request = ConvoyRequest {
+        project: project(),
+        promises: [(PromiseId(0), promise())].into(),
+        quota: [(VesselClass(1), 2)].into(),
+        priority: Priority(4),
+    };
     let spec = MessageSpec {
-        inbox: Address::project("i").expect("inbox"),
+        references: vec![
+            MessageReference { address: Address::project("cr").expect("subject"), revision: "abc".into(), subject: true },
+            MessageReference { address: Address::project("doc").expect("reference"), revision: "def".into(), subject: false },
+        ],
+        in_reply_to: Some(MessageRef::new("earlier", "elsewhere")),
+        supersedes: Some(MessageRef::new("older", "home")),
         expectation: Expectation::Reply,
         deadline: Some(Timestamp(9)),
         unbound_after: 3,
+        delivery_condition: Some(Address::project("still-wanted").expect("condition")),
+        ..MessageSpec::new(
+            Address::project("sender").expect("sender"),
+            Address::project("i").expect("inbox"),
+            Relation::Supervisor,
+            Frozen::new(MessageBody::Request(RequestBody::Convoy(request))).expect("a request body freezes"),
+        )
     };
-    messages.create("m", spec.clone(), &MemoryMessageWorld::default(), Timestamp(1)).expect("created");
+    let world =
+        MemoryMessageWorld::default().with_sent(&MessageRef::new("earlier", "elsewhere")).with_sent(&MessageRef::new("older", "home"));
+    messages.create("m", spec.clone(), &world, Timestamp(1)).expect("created");
     let message = round_trip(&messages, "m");
     assert_eq!((message.spec(), message.since()), (&spec, Timestamp(1)));
 
@@ -198,7 +222,7 @@ fn the_host_ledger_is_rebuilt_from_live_vessels() {
 #[test]
 fn the_log_is_the_only_history() {
     let tables = |set: flotilla_schema::TableSet| set.tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
-    assert_eq!(tables(Resource::<Message>::table_set()), ["message"]);
+    assert_eq!(tables(Resource::<Message>::table_set()), ["message", "message_references"]);
     assert_eq!(tables(Resource::<AgentSession>::table_set()), ["agent_session"]);
     assert_eq!(tables(Resource::<Ensure>::table_set()), ["ensure", "ensure_recorded", "ensure_created"]);
     assert_eq!(tables(Resource::<Vessel>::table_set()), ["vessel", "vessel_shape"]);

@@ -1,16 +1,19 @@
 //! Message against `conformance/message.qnt`.
 //!
-//! The harness envelope `{expectation, hasDeadline, deadline}` is the
-//! message's spec: `Outcome` names a fixed condition, and the deadline is
-//! `deadline` model ticks when `hasDeadline`. Times map through [`tick`].
+//! The harness envelope `{expectation, hasDeadline, deadline, hasCondition}`
+//! is the message's spec: `Outcome` names a fixed condition, the deadline is
+//! `deadline` model ticks when `hasDeadline`, and `hasCondition` is a fixed
+//! delivery condition. Times map through [`tick`].
 //!
 //! Event mapping, each with a fresh [`MemoryMessageWorld`]:
 //! - `Deliver(Receipt{observed, receiverMatches, transportMatches, receiver})`:
-//!   the deliver edge names session `s<n>` by turn. Without `observed` no
-//!   receipt exists; otherwise the receipt comes from that session iff
-//!   `receiverMatches` (else another session), by turn iff `transportMatches`
-//!   (else by notification). The receipt is the session's `Receive` entry
-//!   about the message, read as the message's [`Receipts`].
+//!   the deliver edge names consumer `{consumer: n, host}` as the agent
+//!   session `s<n>` on that host, by turn. Without `observed` no receipt
+//!   exists; otherwise the receipt comes from that consumer iff
+//!   `receiverMatches` (else another consumer), by turn iff
+//!   `transportMatches` (else by notification). The receipt is the
+//!   consumer's `Receive` entry about the message, read as the message's
+//!   [`Receipts`].
 //! - `Settle(Answered{observed})`: a reply exists iff `observed`;
 //!   `Settle(OutcomeObserved{observed})`: the condition reads `observed`.
 //! - `DropMessage(evidence)` at `now`, with only the fields its reason reads:
@@ -19,12 +22,16 @@
 //!   `appliedThrough` is the inbox's `AppliedThrough` watermark; `met` is a
 //!   reply (Reply) or a holding condition (Outcome); `receipt` is a receipt
 //!   row; `failure` a `DeliveryFailure`; `supersedes` a `Supersession` naming
-//!   this message (else another); `authorised` the drop's `Authority`.
+//!   this message (else another); `authorised` the drop's `Authority`;
+//!   `conditionFailed` the delivery condition read `false` (a withdrawal
+//!   names the delivery condition as its authority when the envelope has
+//!   one, as the turn-rules role does, and the sender otherwise).
 //!
 //! State mapping: the envelope is the immutable [`MessageSpec`] (expectation,
-//! and the deadline as `hasDeadline` and `deadline`); `Pending` carries it,
-//! `Awaiting { receiver }` is `Awaiting({envelope, receiver})` with session
-//! `s<n>` as `n`, `Settled { receiver }` is `Settled({envelope,
+//! the deadline as `hasDeadline` and `deadline`, and the delivery condition as
+//! `hasCondition`); `Pending` carries it,
+//! `Awaiting { receiver }` is `Awaiting({envelope, receiver})` with consumer
+//! `s<n>` as `{consumer: n, host}`, `Settled { receiver }` is `Settled({envelope,
 //! receiver})` with 0 for none, and `Dropped { reason, receiver,
 //! watermark }` is the spec's whole drop record:
 //! - `reason` by constructor (the evidence references a reason carries in
@@ -46,10 +53,13 @@ use std::collections::BTreeMap;
 
 use flotilla_schema::{Address, Timestamp};
 use flotilla_state_machines::{
-    machines::message::{
-        AppliedThrough, Binding, Condition, Deliver, DeliveryFailure, DropMessage, DropReason, Expectation, InboxBinding,
-        MemoryMessageWorld, Message, MessageRefusal, MessageSpec, MessageState, Receipts, Receiver, Reply, Settle, Settlement, Supersedes,
-        Supersession,
+    machines::{
+        consumer::ConsumerKind,
+        message::{
+            AppliedThrough, Binding, Condition, Deliver, DeliveryFailure, DropMessage, DropReason, Expectation, InboxBinding,
+            MemoryMessageWorld, Message, MessageBody, MessageRefusal, MessageSpec, MessageState, Receipts, Receiver, Relation, Reply,
+            Settle, Settlement, Supersedes, Supersession,
+        },
     },
     Home, Ref, Transport, WriteError,
 };
@@ -63,6 +73,7 @@ use crate::{
 const NAME: &str = "m";
 const INBOX: &str = "project:p/role:r";
 const CONDITION: &str = "project:condition";
+const DELIVERY: &str = "project:still-wanted";
 const NEWER: &str = "project:newer";
 const SENDER: &str = "project:sender";
 const SUPERVISOR: &str = "project:supervisor";
@@ -80,7 +91,7 @@ fn session(n: i64) -> String {
 }
 
 fn session_number(receiver: &Receiver) -> i64 {
-    receiver.session.trim_start_matches('s').parse().expect("conformance session name")
+    receiver.id.trim_start_matches('s').parse().expect("conformance session name")
 }
 
 fn spec_of(envelope: &Value) -> MessageSpec {
@@ -95,7 +106,19 @@ fn spec_of(envelope: &Value) -> MessageSpec {
         expectation,
         deadline: boolean(&envelope["hasDeadline"]).then(|| tick(number(&envelope["deadline"]))),
         unbound_after: UNIT,
+        delivery_condition: boolean(&envelope["hasCondition"]).then(|| at(DELIVERY)),
+        ..MessageSpec::new(at(SENDER), at(INBOX), Relation::Peer, MessageBody::text("turn").expect("small body"))
     }
+}
+
+/// The consumer named by session `id`: an agent session on the consumer host.
+fn consumer(id: &str) -> Receiver {
+    Receiver { kind: ConsumerKind::AgentSession, id: id.into(), host: "consumer".into() }
+}
+
+/// The inbox's binding with consumer 1 bound.
+fn bound() -> InboxBinding {
+    InboxBinding::Bound { consumers: [consumer(&session(1))].into() }
 }
 
 /// An engine time in model ticks.
@@ -110,7 +133,12 @@ fn envelope_of(spec: &MessageSpec) -> Value {
         Expectation::Outcome { .. } => "Outcome",
     };
     let deadline = spec.deadline.map_or(HARNESS_DEADLINE, ticks);
-    json!({ "expectation": bare(expectation), "hasDeadline": spec.deadline.is_some(), "deadline": int(deadline) })
+    json!({
+        "expectation": bare(expectation),
+        "hasDeadline": spec.deadline.is_some(),
+        "deadline": int(deadline),
+        "hasCondition": spec.delivery_condition.is_some(),
+    })
 }
 
 fn outcome<T>(result: Result<T, WriteError<Message>>) -> Step {
@@ -126,6 +154,9 @@ fn outcome<T>(result: Result<T, WriteError<Message>>) -> Step {
             MessageRefusal::ExpectationMet => "ExpectationMet",
             MessageRefusal::ReceiptConfirmed => "ReceiptConfirmed",
             MessageRefusal::Unauthorised => "Unauthorised",
+            MessageRefusal::SubjectsConflict | MessageRefusal::EmptyRevision | MessageRefusal::UnknownMessage => {
+                panic!("an admission refusal from an edge: {r:?}")
+            }
         },
         Err(other) => return refusal(&format!("{other:?}")),
     };
@@ -133,18 +164,24 @@ fn outcome<T>(result: Result<T, WriteError<Message>>) -> Step {
 }
 
 fn put_receipt(world: &mut MemoryMessageWorld, session: &str, transport: Transport) {
-    world.receipts.put(&Ref::<Receipts>::new(NAME), BTreeMap::from([(session.to_string(), transport)]));
+    world.receipts.put(&Ref::<Receipts>::new(NAME), BTreeMap::from([(consumer(session), transport)]));
 }
 
-fn drop_reason_of(o: &Value) -> DropReason {
+fn drop_reason_of(spec: &MessageSpec, o: &Value) -> DropReason {
     match tag(&o["reason"]) {
         "Undeliverable" => DropReason::Undeliverable,
         "Expired" => DropReason::Expired,
         "Superseded" => DropReason::Superseded { by: at(NEWER) },
-        "Withdrawn" => DropReason::Withdrawn { by: at(SENDER), authority: at(SENDER) },
+        "Withdrawn" => DropReason::Withdrawn { by: at(SENDER), authority: withdrawal_authority(spec) },
         "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: at(SUPERVISOR), authority: at(SUPERVISOR) },
         other => panic!("drop reason {other}"),
     }
+}
+
+/// Who withdraws: the turn-rules role, naming the delivery condition, when the
+/// envelope has one; the sender otherwise.
+fn withdrawal_authority(spec: &MessageSpec) -> Address {
+    spec.delivery_condition.clone().unwrap_or_else(|| at(SENDER))
 }
 
 /// The drop's world: only the evidence its reason's rule reads.
@@ -154,7 +191,7 @@ fn drop_world(spec: &MessageSpec, o: &Value, now: Timestamp) -> Result<MemoryMes
     match tag(&o["reason"]) {
         "Expired" => {
             if boolean(&o["bound"]) {
-                world.binding.put(&binding, InboxBinding::Bound { session: session(1) });
+                world.binding.put(&binding, bound());
             }
             world.applied_through.put(&Ref::<AppliedThrough>::new(INBOX), tick(number(&o["appliedThrough"])));
             if boolean(&o["met"]) {
@@ -167,7 +204,7 @@ fn drop_world(spec: &MessageSpec, o: &Value, now: Timestamp) -> Result<MemoryMes
         }
         "Undeliverable" => {
             let state = if boolean(&o["bound"]) {
-                InboxBinding::Bound { session: session(1) }
+                bound()
             } else if boolean(&o["noConsumerPastThreshold"]) {
                 InboxBinding::Unbound { since: now.saturating_add(-2 * spec.unbound_after) }
             } else {
@@ -186,7 +223,10 @@ fn drop_world(spec: &MessageSpec, o: &Value, now: Timestamp) -> Result<MemoryMes
             world.supersession.put(&Ref::<Supersession>::new(NEWER), Supersedes { older: older.into() });
         }
         "Withdrawn" => {
-            world.authority.put(&Ref::new(SENDER), boolean(&o["authorised"]));
+            world.authority.put(&Ref::new(withdrawal_authority(spec).as_str()), boolean(&o["authorised"]));
+            if boolean(&o["conditionFailed"]) {
+                world.condition.put(&Ref::<Condition>::new(DELIVERY), false);
+            }
         }
         "ConsumerUnreachable" => {
             world.authority.put(&Ref::new(SUPERVISOR), boolean(&o["authorised"]));
@@ -213,8 +253,8 @@ impl Conformance for MessageConformance {
         let mut world = MemoryMessageWorld::default();
         match tag(event) {
             "Deliver" => {
-                let who = session(number(&o["receiver"]["session"]));
-                let receiver = Receiver { session: who.clone(), host: text(&o["receiver"]["host"]).into() };
+                let who = session(number(&o["receiver"]["consumer"]));
+                let receiver = Receiver { host: text(&o["receiver"]["host"]).into(), ..consumer(&who) };
                 if boolean(&o["observed"]) {
                     let from = if boolean(&o["receiverMatches"]) { who } else { "another".into() };
                     let transport = if boolean(&o["transportMatches"]) { Transport::Turn } else { Transport::Notify };
@@ -246,7 +286,8 @@ impl Conformance for MessageConformance {
                     Ok(world) => world,
                     Err(reason) => return Step::Unrealisable(reason),
                 };
-                outcome(home.apply(NAME, DropMessage { reason: drop_reason_of(o) }, &world, now))
+                let reason = drop_reason_of(spec, o);
+                outcome(home.apply(NAME, DropMessage { reason }, &world, now))
             }
             other => panic!("message event {other}"),
         }
@@ -262,7 +303,7 @@ impl Conformance for MessageConformance {
                 variant("Settled", json!({ "envelope": envelope, "receiver": receiver }))
             }
             MessageState::Awaiting { receiver } => {
-                let receiver = json!({ "session": int(session_number(receiver)), "host": receiver.host });
+                let receiver = json!({ "consumer": int(session_number(receiver)), "host": receiver.host });
                 variant("Awaiting", json!({ "envelope": envelope, "receiver": receiver }))
             }
             MessageState::Dropped { reason, receiver, watermark } => {

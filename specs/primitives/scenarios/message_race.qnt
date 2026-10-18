@@ -5,18 +5,18 @@ module message_race {
   var source: S::Stream
   var now: int
   pure val maxRows = 3
-  val current = match M::messages.get(1) { | Present(s) => s | Absent => M::Pending({ expectation: M::Reply, hasDeadline: true, deadline: 1 }) }
+  val current = match M::messages.get(1) { | Present(s) => s | Absent => M::Pending({ expectation: M::Reply, hasDeadline: true, deadline: 1, hasCondition: false }) }
   val expectation = M::envelope(current).expectation
   val met = (expectation == M::Outcome and S::seen(source, "outcome", 1)) or (expectation == M::Reply and S::seen(source, "reply", 1))
   val dropEvidence = { reason: M::Expired, now: now, bound: true, appliedThrough: S::watermark(source), met: met,
-    receipt: S::seen(source, "receipt", 1), noConsumerPastThreshold: false, failure: S::seen(source, "failure", 1), supersedes: true, authorised: true }
+    receipt: S::seen(source, "receipt", 1), noConsumerPastThreshold: false, failure: S::seen(source, "failure", 1), supersedes: true, authorised: true, conditionFailed: false }
   action keepSource = source' = source
   action keepClock = now' = now
   action keepWorld = all { keepSource, keepClock }
   action init = {
     nondet expected = Set(M::Nothing, M::Reply, M::Outcome).oneOf()
     nondet deadline = Set(false, true).oneOf()
-    all { M::initWith(1, { expectation: expected, hasDeadline: deadline, deadline: 1 }), source' = S::initial, now' = 0 }
+    all { M::initWith(1, { expectation: expected, hasDeadline: deadline, deadline: 1, hasCondition: false }), source' = S::initial, now' = 0 }
   }
   action publish: bool = {
     nondet kind = Set("outcome", "receipt", "reply", "failure", "keepalive").oneOf()
@@ -31,7 +31,7 @@ module message_race {
     nondet reason = M::dropReasons.oneOf()
     any {
       all {
-        M::deliver(1, { observed: S::seen(source, "receipt", 1), receiverMatches: true, transportMatches: true, receiver: { session: 1, host: "consumer" } }),
+        M::deliver(1, { observed: S::seen(source, "receipt", 1), receiverMatches: true, transportMatches: true, receiver: { consumer: 1, host: "consumer" } }),
         keepWorld,
       },
       all {

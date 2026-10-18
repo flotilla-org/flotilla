@@ -1,8 +1,12 @@
 // Pure typed rules, followed by this resource kind's store and named operations.
 module message {
   type Expectation = Nothing | Reply | Outcome
-  type Envelope = { expectation: Expectation, hasDeadline: bool, deadline: int }
-  type Receiver = { session: int, host: str }
+  // hasCondition: the envelope carries a delivery condition (#3424 ruling 9).
+  type Envelope = { expectation: Expectation, hasDeadline: bool, deadline: int, hasCondition: bool }
+  // A consumer identity, compared only for equality: which kind of consumer
+  // (agent session, controller) is the consumer modules'
+  // concern, never this machine's (#3424 rulings 1 and 2).
+  type Receiver = { consumer: int, host: str }
   type Delivery = { envelope: Envelope, receiver: Receiver }
   type DropReason = Undeliverable | Expired | Superseded | Withdrawn | ConsumerUnreachable
   pure val dropReasons = Set(Undeliverable, Expired, Superseded, Withdrawn, ConsumerUnreachable)
@@ -10,13 +14,18 @@ module message {
   // watermark and the binding only for an expiry, the receipt only for undeliverable.
   type Drop = { reason: DropReason, envelope: Envelope, receiver: int, watermark: int, bound: bool, receipt: bool }
   type State = Pending(Envelope) | Awaiting(Delivery) | Settled({ envelope: Envelope, receiver: int }) | Dropped(Drop)
-  // Evidence is read from versioned Receive entries whose about is this message.
+  // Evidence is read from versioned Receive entries whose about is this
+  // message, written by any consumer kind.
   // receiverMatches and transportMatches compare the recorded edge arguments.
   type Receipt = { observed: bool, receiverMatches: bool, transportMatches: bool, receiver: Receiver }
   type Settlement = Answered({ observed: bool }) | OutcomeObserved({ observed: bool })
   // receipt means a Receive entry about this message is present in the applied log.
+  // bound means at least one consumer is bound; noConsumerPastThreshold, that
+  // nobody has been bound past the threshold. conditionFailed means the
+  // envelope's delivery condition is observed not to hold.
   type DropEvidence = { reason: DropReason, now: int, bound: bool, appliedThrough: int,
-    met: bool, receipt: bool, noConsumerPastThreshold: bool, failure: bool, supersedes: bool, authorised: bool }
+    met: bool, receipt: bool, noConsumerPastThreshold: bool, failure: bool, supersedes: bool, authorised: bool,
+    conditionFailed: bool }
   type Event = Deliver(Receipt) | Settle(Settlement) | DropMessage(DropEvidence)
   type Refusal = Ended | WrongState | IncorrectReceipt | UnsupportedSettlement | MissingEvidence
     | PrefixBeforeDeadline | ExpectationMet | ReceiptConfirmed | Unauthorised
@@ -24,7 +33,7 @@ module message {
   pure def envelope(s: State): Envelope = match s {
     | Pending(e) => e | Awaiting(d) => d.envelope | Settled(d) => d.envelope | Dropped(d) => d.envelope
   }
-  pure def receiver(s: State): int = match s { | Awaiting(d) => d.receiver.session | Settled(d) => d.receiver | Dropped(d) => d.receiver | _ => 0 }
+  pure def receiver(s: State): int = match s { | Awaiting(d) => d.receiver.consumer | Settled(d) => d.receiver | Dropped(d) => d.receiver | _ => 0 }
   pure def ended(s: State): bool = match s { | Settled(_) => true | Dropped(_) => true | _ => false }
   pure def pending(slot: Slot): bool = match slot { | Present(s) => match s { | Pending(_) => true | _ => false } | _ => false }
   pure def step(s: State, event: Event): Next = match s {
@@ -34,7 +43,7 @@ module message {
       match event {
         | Deliver(r) => match s {
             | Pending(_) => if (not(r.observed and r.receiverMatches and r.transportMatches)) Refused(IncorrectReceipt)
-                else if (env.expectation == Nothing) Moved(Settled({ envelope: env, receiver: r.receiver.session }))
+                else if (env.expectation == Nothing) Moved(Settled({ envelope: env, receiver: r.receiver.consumer }))
                 else Moved(Awaiting({ envelope: env, receiver: r.receiver }))
             | _ => Refused(WrongState)
           }
@@ -59,7 +68,8 @@ module message {
                   | _ => Refused(WrongState)
                 }
               | Superseded => if (o.supersedes) Moved(s) else Refused(MissingEvidence)
-              | Withdrawn => if (o.authorised) Moved(s) else Refused(Unauthorised)
+              // The turn-rules role withdraws a message whose delivery condition no longer holds.
+              | Withdrawn => if (o.authorised or (env.hasCondition and o.conditionFailed)) Moved(s) else Refused(Unauthorised)
               | ConsumerUnreachable => if (o.authorised) Moved(s) else Refused(Unauthorised)
             }
             match refusal {

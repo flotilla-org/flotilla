@@ -414,14 +414,21 @@ FROM "ensure_created";
 CREATE TABLE "message" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "sender" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "inbox" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "relation" TEXT NOT NULL CHECK ("relation" IN ('de', 'dy', 'pe', 'su', 'sy')),
+  "body" BLOB NOT NULL REFERENCES "objects" ("hash"),
+  "in_reply_to" INTEGER REFERENCES "resource_identity" ("id"),
+  "supersedes" INTEGER REFERENCES "resource_identity" ("id"),
   "expectation" TEXT NOT NULL CHECK ("expectation" IN ('no', 'ou', 're')),
   "expectation_condition" INTEGER REFERENCES "strings" ("id"),
   "deadline" INTEGER,
   "unbound_after" INTEGER NOT NULL,
+  "delivery_condition" INTEGER REFERENCES "strings" ("id"),
   "state" TEXT NOT NULL CHECK ("state" IN ('aw', 'dr', 'pe', 'se')),
   "state_since" INTEGER NOT NULL,
-  "receiver_session" INTEGER REFERENCES "strings" ("id"),
+  "receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co')),
+  "receiver_id" INTEGER REFERENCES "strings" ("id"),
   "receiver_host" INTEGER REFERENCES "strings" ("id"),
   "reason" TEXT CHECK ("reason" IN ('cu', 'ex', 'su', 'un', 'wi')),
   "reason_by" INTEGER REFERENCES "strings" ("id"),
@@ -436,9 +443,11 @@ CREATE TABLE "message" (
   CHECK (CASE WHEN "expectation" = 'ou'
       THEN "expectation_condition" IS NOT NULL
       END),
-  CHECK (CASE WHEN "receiver_session" IS NOT NULL
-      THEN "receiver_host" IS NOT NULL
-      ELSE "receiver_host" IS NULL
+  CHECK (CASE WHEN "receiver_kind" IS NOT NULL
+      THEN "receiver_id" IS NOT NULL
+      AND "receiver_host" IS NOT NULL
+      ELSE "receiver_id" IS NULL
+      AND "receiver_host" IS NULL
       END),
   CHECK (CASE WHEN "reason" = 'un'
       THEN "reason_by" IS NULL
@@ -461,7 +470,8 @@ CREATE TABLE "message" (
       AND "reason_authority" IS NOT NULL
       END),
   CHECK (CASE WHEN "state" = 'pe'
-      THEN "receiver_session" IS NULL
+      THEN "receiver_kind" IS NULL
+      AND "receiver_id" IS NULL
       AND "receiver_host" IS NULL
       AND "reason" IS NULL
       AND "reason_by" IS NULL
@@ -469,7 +479,8 @@ CREATE TABLE "message" (
       AND "watermark" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'aw'
-      THEN "receiver_session" IS NOT NULL
+      THEN "receiver_kind" IS NOT NULL
+      AND "receiver_id" IS NOT NULL
       AND "receiver_host" IS NOT NULL
       AND "reason" IS NULL
       AND "reason_by" IS NULL
@@ -486,9 +497,25 @@ CREATE TABLE "message" (
       THEN "reason" IS NOT NULL
       END)
 ) STRICT;
+CREATE TABLE "message_references" (
+  "owner" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "address" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "revision" TEXT NOT NULL,
+  "subject" INTEGER NOT NULL CHECK ("subject" IN (0, 1)),
+  PRIMARY KEY ("owner", "pos"),
+  FOREIGN KEY ("owner") REFERENCES "message" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE INDEX "message_by_reply" ON "message" ("in_reply_to") WHERE "in_reply_to" IS NOT NULL;
+CREATE INDEX "message_by_supersedes" ON "message" ("supersedes") WHERE "supersedes" IS NOT NULL;
 CREATE INDEX "message_deadline" ON "message" ("deadline") WHERE "state" IN ('pe', 'aw') AND "deadline" IS NOT NULL;
 CREATE INDEX "message_open_by_inbox" ON "message" ("inbox") WHERE "state" IN ('pe', 'aw');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('ms', 'relation', 'de', 'Dependee'),
+  ('ms', 'relation', 'dy', 'Dependency'),
+  ('ms', 'relation', 'pe', 'Peer'),
+  ('ms', 'relation', 'su', 'Supervisor'),
+  ('ms', 'relation', 'sy', 'System'),
   ('ms', 'expectation', 'no', 'Nothing'),
   ('ms', 'expectation', 'ou', 'Outcome'),
   ('ms', 'expectation', 're', 'Reply'),
@@ -496,6 +523,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ms', 'state', 'dr', 'Dropped'),
   ('ms', 'state', 'pe', 'Pending'),
   ('ms', 'state', 'se', 'Settled'),
+  ('ms', 'receiver_kind', 'as', 'AgentSession'),
+  ('ms', 'receiver_kind', 'co', 'Controller'),
   ('ms', 'reason', 'cu', 'ConsumerUnreachable'),
   ('ms', 'reason', 'ex', 'Expired'),
   ('ms', 'reason', 'su', 'Superseded'),
@@ -511,20 +540,34 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "message_view" AS SELECT
   "message"."id",
   "message"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "message"."sender") AS "sender",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."inbox") AS "inbox",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'relation' AND "code" = "message"."relation") AS "relation",
+  "message"."body",
+  "message"."in_reply_to",
+  "message"."supersedes",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'expectation' AND "code" = "message"."expectation") AS "expectation",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."expectation_condition") AS "expectation_condition",
   "message"."deadline",
   "message"."unbound_after",
+  (SELECT "s" FROM "strings" WHERE "id" = "message"."delivery_condition") AS "delivery_condition",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'state' AND "code" = "message"."state") AS "state",
   "message"."state_since",
-  (SELECT "s" FROM "strings" WHERE "id" = "message"."receiver_session") AS "receiver_session",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'receiver_kind' AND "code" = "message"."receiver_kind") AS "receiver_kind",
+  (SELECT "s" FROM "strings" WHERE "id" = "message"."receiver_id") AS "receiver_id",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."receiver_host") AS "receiver_host",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'reason' AND "code" = "message"."reason") AS "reason",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."reason_by") AS "reason_by",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."reason_authority") AS "reason_authority",
   "message"."watermark"
 FROM "message";
+CREATE VIEW "message_references_view" AS SELECT
+  "message_references"."owner",
+  "message_references"."pos",
+  (SELECT "s" FROM "strings" WHERE "id" = "message_references"."address") AS "address",
+  "message_references"."revision",
+  "message_references"."subject"
+FROM "message_references";
 CREATE TABLE "referral" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

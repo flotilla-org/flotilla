@@ -16,13 +16,13 @@ module inbox_delivery {
   var replacedBeforeDrain: bool
   val ids = Set(1, 2)
   pure val maxRows = 2
-  val current = match M::messages.get(1) { | Present(s) => s | Absent => M::Pending({ expectation: M::Reply, hasDeadline: true, deadline: 1 }) }
+  val current = match M::messages.get(1) { | Present(s) => s | Absent => M::Pending({ expectation: M::Reply, hasDeadline: true, deadline: 1, hasCondition: false }) }
   val observedReceipt = ids.exists(i => S::seen(stream, "receipt", i))
   val observedReply = ids.exists(i => S::seen(stream, "reply", i))
   val replicaPending = if (homeStream.applied == 0) true else homeStream.rows[homeStream.applied - 1].kind == "Pending"
   val canWrite = alive and stream.rows.length() < maxRows
   val dropEvidence = { reason: M::Expired, now: now, bound: bound != 0, appliedThrough: S::watermark(stream), met: observedReply,
-    receipt: observedReceipt, noConsumerPastThreshold: bound == 0 and now - unboundAt > 1, failure: ids.exists(i => S::seen(stream, "failure", i)), supersedes: false, authorised: false }
+    receipt: observedReceipt, noConsumerPastThreshold: bound == 0 and now - unboundAt > 1, failure: ids.exists(i => S::seen(stream, "failure", i)), supersedes: false, authorised: false, conditionFailed: false }
   // Independent world variables stay explicit. These frames partition them;
   // operation helpers assign only the fields they change and compose the rest.
   action keepAlive = alive' = alive
@@ -48,7 +48,7 @@ module inbox_delivery {
     unboundAt' = 0, replacedBeforeDrain' = false,
   }
   action init = all {
-    M::initWith(1, { expectation: M::Reply, hasDeadline: true, deadline: 1 }),
+    M::initWith(1, { expectation: M::Reply, hasDeadline: true, deadline: 1, hasCondition: false }),
     A::initLive,
     initWorld,
   }
@@ -125,7 +125,7 @@ module inbox_delivery {
     nondet who = ids.oneOf()
     any {
       all {
-        M::deliver(1, { observed: S::seen(stream, "receipt", who), receiverMatches: true, transportMatches: true, receiver: { session: who, host: "consumer" } }),
+        M::deliver(1, { observed: S::seen(stream, "receipt", who), receiverMatches: true, transportMatches: true, receiver: { consumer: who, host: "consumer" } }),
         A::unchanged,
         recordHome("Awaiting"),
       },
@@ -157,7 +157,7 @@ module inbox_delivery {
   action deliverObserved = {
     nondet who = ids.oneOf()
     all {
-      M::deliver(1, { observed: S::seen(stream, "receipt", who), receiverMatches: true, transportMatches: true, receiver: { session: who, host: "consumer" } }),
+      M::deliver(1, { observed: S::seen(stream, "receipt", who), receiverMatches: true, transportMatches: true, receiver: { consumer: who, host: "consumer" } }),
       A::unchanged,
       recordHome("Awaiting"),
     }

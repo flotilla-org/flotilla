@@ -40,10 +40,9 @@ from the review evidence. The same table is included in PR #3452's description.
 | Code | Meaning |
 |---|---|
 | `ad` | Canonical address, including condition/authority addresses |
-| `rn` | Resource name, including engine name-only references |
+| `rn` | Resource name, including engine name-only references and a receipt's consumer id |
 | `hm` | Home/host name |
 | `wr` | Writer/principal name (including synthetic ticket owners/signatures) |
-| `sn` | Consumer session name |
 | `pk` | Promise kind |
 | `ag` | Synthetic agent name |
 | `sv` | Synthetic forge/service name |

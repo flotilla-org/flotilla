@@ -21,7 +21,7 @@ use std::{env, fs, path::PathBuf, process, time::Instant};
 use flotilla_schema::{Edge, Kind, Timestamp};
 use flotilla_schema_sqlite::{Stamp, Store};
 use flotilla_state_machines::{
-    machines::message::{Deliver, MemoryMessageWorld, Message, MessageWorld, Receiver, Settle, Settlement},
+    machines::message::{Deliver, MemoryMessageWorld, Message, MessageWorld, Settle, Settlement},
     Home, Ref, Resource, Transport,
 };
 use rusqlite::Connection;
@@ -76,14 +76,14 @@ fn seed(store: &mut Store) -> Vec<Stamp> {
 fn events(n: usize) -> [Edge<Resource<Message>>; 2] {
     let session = format!("session-{}", n % 50);
     let mut world = MemoryMessageWorld::default();
-    world.receipts.put(&Ref::new(NAME), [(session.clone(), Transport::Turn)].into());
+    world.receipts.put(&Ref::new(NAME), [(message::agent(&session, "consumer"), Transport::Turn)].into());
     world.reply.put(&Ref::new(NAME), ());
     let world: Box<dyn MessageWorld> = Box::new(world);
     let mut home = Home::<Message>::new(LOCAL).expect("valid");
     home.restore(value(n).with_identity(NAME, 1)).unwrap_or_else(|_| panic!("an empty home"));
     let at = Timestamp(n as i64);
     let pending = home.get(NAME).expect("present").stored_state().clone();
-    let deliver = Deliver { receiver: Receiver { session, host: "consumer".into() }, transport: Transport::Turn };
+    let deliver = Deliver { receiver: message::agent(&session, "consumer"), transport: Transport::Turn };
     let event = home.apply(NAME, deliver, &*world, at).unwrap_or_else(|_| panic!("delivered")).clone();
     let first = home.get(NAME).expect("present").stored_edge(&pending, &event).expect("edge");
     let delivered = home.get(NAME).expect("present").stored_state().clone();

@@ -9,7 +9,7 @@ use flotilla_schema::{Cbor, Identity, Kind, KindSpec, Labelled, Origin, StateDat
 use flotilla_schema_sqlite::{Stamp, Store};
 use flotilla_state_machines::{
     edge_event,
-    machines::message::{Deliver, MemoryMessageWorld, Message, MessageSpec, MessageState, Receiver, Settle, Settlement},
+    machines::message::{Deliver, MemoryMessageWorld, Message, MessageBody, MessageSpec, MessageState, Settle, Settlement},
     EdgeEventOf, EdgePayload, Home, InputRead, Label, Log, LogError, Machine, Ref, Resource, StoredState, Transport, Version, WriteError,
 };
 
@@ -66,14 +66,14 @@ fn at(micros: i64) -> Timestamp {
 fn world(names: &[&str]) -> MemoryMessageWorld {
     let mut world = MemoryMessageWorld::default();
     for name in names {
-        world.receipts.put(&Ref::new(*name), [("s".to_owned(), Transport::Turn)].into());
+        world.receipts.put(&Ref::new(*name), [(message::agent("s", "h"), Transport::Turn)].into());
         world.reply.put(&Ref::new(*name), ());
     }
     world
 }
 
 fn deliver() -> Deliver {
-    Deliver { receiver: Receiver { session: "s".into(), host: "h".into() }, transport: Transport::Turn }
+    Deliver { receiver: message::agent("s", "h"), transport: Transport::Turn }
 }
 
 /// `name` as the store holds it, with the store's name and version.
@@ -142,7 +142,7 @@ fn history_is_a_paged_range_over_the_log_that_decodes_to_the_homes_events() {
     assert_eq!(decoded[1..].iter().flatten().cloned().collect::<Vec<_>>(), events, "each edge's entry is the event the home returned");
     drop(read);
     let current = loaded::<Message>(&mut home, "a");
-    assert_eq!(current.state(), &MessageState::Settled { receiver: Some(Receiver { session: "s".into(), host: "h".into() }) });
+    assert_eq!(current.state(), &MessageState::Settled { receiver: Some(message::agent("s", "h")) });
 }
 
 // Behaviour (R2): the log's refusal is the write's. A write the store refuses (here, the stored
@@ -166,4 +166,38 @@ fn a_write_the_store_refuses_leaves_the_homes_resource_as_it_was() {
     let refused = home.apply("a", deliver(), &world, at(3));
     assert!(matches!(refused, Err(WriteError::Log(_))), "{refused:?}");
     assert_eq!(home.get("a"), Some(&before), "the refused write left the resource as it was");
+}
+
+/// How many times `needle` occurs in `bytes`.
+fn occurrences(bytes: &[u8], needle: &[u8]) -> usize {
+    bytes.windows(needle.len()).filter(|window| *window == needle).count()
+}
+
+// Behaviour (#3424 ruling 4): a message's body is stored at most twice, once in `objects` and once
+// among its create entry's effect objects. The create's payload is the reads admission relied on,
+// never the request, so the entry does not also copy the spec and its body.
+#[test]
+fn a_messages_body_is_stored_at_most_twice() {
+    let mut home = home();
+    let text = "a body worth storing once ".repeat(40);
+    let spec = MessageSpec { body: MessageBody::text(text.clone()).expect("a small body"), ..message::sample_spec() };
+    home.create("m", spec, &MemoryMessageWorld::default(), at(1)).expect("created");
+    let needle = text.as_bytes();
+
+    let mut store = std::mem::replace(&mut home.log_mut().store, store());
+    let entries = store.read().expect("read").changes_since(LOCAL, 0, 10).expect("log");
+    let [create] = entries.as_slice() else { panic!("one entry: {entries:?}") };
+    let payload = create.payload.as_deref().unwrap_or_default();
+    assert_eq!(occurrences(payload, needle), 0, "the payload is admission's reads, not the request");
+    assert_eq!(occurrences(&create.encode().expect("encodes"), needle), 1, "the effect carries the body once, as its object");
+
+    let conn = store.into_connection();
+    let objects: Vec<Vec<u8>> = conn
+        .prepare("SELECT bytes FROM objects")
+        .expect("prepare")
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(objects.iter().map(|bytes| occurrences(bytes, needle)).sum::<usize>(), 1, "one object row holds it");
 }

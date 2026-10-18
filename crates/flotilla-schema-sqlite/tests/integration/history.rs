@@ -10,11 +10,11 @@ use flotilla_state_machines::{
     machines::{
         agent_session::{MemoryAgentSessionWorld, Receive},
         message::{
-            AppliedThrough, Authority, Binding, Condition, Deliver, DeliveryFailure, MemoryMessageWorld, MessageEdge, ReceiptLog, Receipts,
-            Receiver, Reply, Supersession,
+            AppliedThrough, Authority, Binding, Condition, Deliver, DeliveryFailure, MemoryMessageWorld, MessageEdge, MessageRefusal,
+            ReceiptLog, Receipts, Reply, Sent, Supersession,
         },
     },
-    EdgePayload, Home, Kind as ReadKind, Ref, Source, Transport, Version,
+    EdgePayload, Home, Kind as ReadKind, Ref, Source, Transport, Version, WriteError,
 };
 use hegel::TestCase;
 use rusqlite::Connection;
@@ -468,7 +468,7 @@ macro_rules! from_memory {
     };
 }
 
-from_memory!(Binding, AppliedThrough, Reply, Condition, DeliveryFailure, Supersession, Authority);
+from_memory!(Binding, AppliedThrough, Reply, Condition, DeliveryFailure, Supersession, Authority, Sent);
 
 /// `store`'s message world: the receipts about message `m`, paged from the log.
 fn log_world(store: &mut Store, message: ResourceId) -> LogWorld {
@@ -491,7 +491,8 @@ fn log_world(store: &mut Store, message: ResourceId) -> LogWorld {
 // the log holds it as an entry about the message, and the message's Deliver gate reads those
 // entries: a receiver with no receipt by the transport is refused, and the receiver whose session
 // received it is delivered, the read recorded with the receipts' version (their count). Entries
-// about the message that are not receipts for it (here a dossier edge) are no receipts.
+// about the message that are not receipts for it (here a dossier edge) are no receipts. The
+// receiver's host is the receipt entry's home, so a deliver naming another host is refused.
 #[test]
 fn a_messages_delivery_gate_reads_the_receipts_about_it() {
     let mut store = store();
@@ -507,7 +508,7 @@ fn a_messages_delivery_gate_reads_the_receipts_about_it() {
 
     let mut home = Home::<Message>::new(LOCAL).expect("valid");
     home.restore(message::sample().with_identity("m", stored.version)).unwrap_or_else(|_| panic!("an empty home"));
-    let deliver = |session: &str, transport| Deliver { receiver: Receiver { session: session.into(), host: "h".into() }, transport };
+    let deliver = |session: &str, transport| Deliver { receiver: message::agent(session, LOCAL), transport };
     let world = log_world(&mut store, stored.id);
     assert_eq!(world.receipts.lookup(&Ref::new("m")), None, "no receipt yet: the dossier's entry is not one");
     assert!(home.apply("m", deliver("s", Transport::Turn), &world, Timestamp(3)).is_err(), "no receipt, no delivery");
@@ -526,4 +527,13 @@ fn a_messages_delivery_gate_reads_the_receipts_about_it() {
     let event = home.apply("m", deliver("s", Transport::Turn), &world, Timestamp(4)).expect("delivered");
     let read = event.payload.reads.iter().find(|read| read.kind == Receipts::NAME).expect("the receipts read");
     assert_eq!((read.name.as_str(), read.version), ("m", Some(Version(1))));
+
+    let host = Deliver { receiver: message::agent("s", "elsewhere"), transport: Transport::Turn };
+    let mut other = Home::<Message>::new(LOCAL).expect("valid");
+    other.restore(message::sample().with_identity("m", stored.version)).unwrap_or_else(|_| panic!("an empty home"));
+    assert_eq!(
+        other.apply("m", host, &world, Timestamp(4)).err(),
+        Some(WriteError::Refused(MessageRefusal::IncorrectReceipt)),
+        "the receiver's host is the receipt's home: a deliver naming another host has no receipt"
+    );
 }

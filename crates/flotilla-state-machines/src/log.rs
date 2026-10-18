@@ -28,8 +28,10 @@ use crate::{Coded, EdgeEventOf, EdgeKind, EdgePayload, InputRead, Label, Machine
 /// Persists a home's writes and gives each its sequence.
 pub trait Log<M: Machine> {
     /// Persists the creation of `resource` by `writer` at `at`, with the reads
-    /// its admission relied on, and returns its version. The resource's own
-    /// version is not yet set.
+    /// its admission relied on as the entry's payload, and returns its version.
+    /// The payload never copies the spec: the create's effect holds it, so a
+    /// frozen body is stored at most twice (#3424 ruling 4). The resource's
+    /// own version is not yet set.
     fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<M>, reads: &[InputRead]) -> Result<Version, LogError>;
 
     /// Persists `event`, which moved `next` out of `previous`, and returns the

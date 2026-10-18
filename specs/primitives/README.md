@@ -7,7 +7,7 @@ ADR 0064 and [the owner resolution](https://github.com/flotilla-org/flotilla/iss
 are fixed rules here. There are no design-option or mutant constants in the design.
 
 ```text
-machines/     Message, shared lifecycle, Convoy, Ensure, AgentSession
+machines/     Message, shared lifecycle, Convoy, Ensure, and the consumer kinds AgentSession and controller
 world/        per-home ordered streams, host death, clock, adapter acceptance
 scenarios/    compositions and their safety / conditional liveness properties
 mutants/      single-definition overrides; each must violate a property
@@ -69,10 +69,13 @@ consecutive failures since its last success to reach `MAX_FAILURES` (2 in the
 model), or its last failure to be non-retryable. The shared lifecycle's
 Requested carries its own attempt history under the same rule, with no
 windows: `GiveUp` needs that history exhausted and its last failure to have
-the cause given up with. A receipt is the consumer
-session's `Receive` edge, whose master is the message; the inbox scenario
-publishes its stream row with that edge, so the message reads the receipts
-about it.
+the cause given up with. A receipt is a consumer's `Receive` edge on its own
+resource, whose master is the message; the inbox scenario publishes its stream
+row with that edge, so the message reads the receipts about it. Message stays
+abstract over who consumes it: each consumer kind (an agent session, a
+controller) is its own module, and `controller_delivery` binds one of each to a
+shared inbox, where the first accepted deliver claims the message and a lapsed
+delivery condition lets the turn-rules role withdraw it.
 
 A gate's booleans represent **versioned local evidence**, not remote queries or
 link health. Bind receives realised/can-receive facts; expiry reads the applied
