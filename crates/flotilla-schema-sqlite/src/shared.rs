@@ -33,7 +33,10 @@ use rusqlite::{Connection, OptionalExtension};
 ///
 /// No database created by an earlier generation of these tables exists: the first production
 /// generation is the baseline, and ADR 0047's N→N+1 rule applies from then.
-pub(crate) const SHARED_DDL: &str = "\
+macro_rules! shared_ddl {
+    ($topic:literal) => {
+        concat!(
+            "\
 CREATE TABLE IF NOT EXISTS strings (
   id INTEGER PRIMARY KEY,
   domain TEXT NOT NULL CHECK (length(domain) > 0),
@@ -56,14 +59,25 @@ CREATE TABLE IF NOT EXISTS log (
   about INTEGER REFERENCES resource_identity(id) ON DELETE SET NULL,
   writer INTEGER NOT NULL REFERENCES strings(id), at INTEGER NOT NULL,
   payload BLOB, effect BLOB NOT NULL,
-  PRIMARY KEY (home, home_seq),
+",
+            $topic,
+            "  PRIMARY KEY (home, home_seq),
   CHECK ((resource IS NULL) = (cause = 'expunge')),
   CHECK (CASE WHEN cause = 'edge' THEN edge IS NOT NULL AND \"from\" IS NOT NULL AND \"to\" IS NOT NULL
     ELSE edge IS NULL AND \"from\" IS NULL AND \"to\" IS NULL AND about IS NULL END)) STRICT;
 CREATE INDEX IF NOT EXISTS log_by_resource ON log (resource, home_seq);
 CREATE INDEX IF NOT EXISTS log_about ON log (about, at) WHERE about IS NOT NULL;
 CREATE INDEX IF NOT EXISTS log_expunges ON log (home, home_seq) WHERE cause = 'expunge';
-";
+"
+        )
+    };
+}
+
+pub(crate) const SHARED_DDL: &str = shared_ddl!("");
+/// Review-only extension; runtime schema creation continues to use `SHARED_DDL`.
+pub(crate) const STREAM_SHARED_DDL: &str = shared_ddl!(
+    "  topic TEXT NOT NULL DEFAULT 'all' CHECK (length(topic) BETWEEN 1 AND 8 AND topic NOT GLOB '*[^a-z0-9_]*' AND substr(topic, 1, 1) GLOB '[a-z]'),\n"
+);
 
 /// The readable view of `log` (#3392 D4): each entry with its home, writer and resource named by
 /// their text, its kind's code, and its edge and labels named through `codes` by the entry's kind
@@ -71,6 +85,15 @@ CREATE INDEX IF NOT EXISTS log_expunges ON log (home, home_seq) WHERE cause = 'e
 /// master as `kind:name@home`. An expunge entry's resource is gone, so its kind and name are null:
 /// its effect names the identity. The payload and effect stay CBOR.
 pub(crate) fn log_view() -> String {
+    render_log_view(false)
+}
+
+/// Review-only log view including the reserved coarse topic code.
+pub(crate) fn stream_log_view() -> String {
+    render_log_view(true)
+}
+
+fn render_log_view(with_topic: bool) -> String {
     let named = |id: &str| format!("(SELECT \"s\" FROM \"strings\" WHERE \"id\" = {id})");
     let code = |field: &str, column: &str| {
         format!(
@@ -84,7 +107,7 @@ pub(crate) fn log_view() -> String {
         named("\"a\".\"name\""),
         named("\"a\".\"home\"")
     );
-    let columns = [
+    let mut columns = vec![
         format!("{} AS \"home\"", named("\"l\".\"home\"")),
         "\"l\".\"home_seq\"".to_owned(),
         "\"i\".\"kind\"".to_owned(),
@@ -100,6 +123,9 @@ pub(crate) fn log_view() -> String {
         "\"l\".\"payload\"".to_owned(),
         "\"l\".\"effect\"".to_owned(),
     ];
+    if with_topic {
+        columns.push("\"l\".\"topic\"".to_owned());
+    }
     format!(
         "CREATE VIEW \"{LOG_VIEW}\" AS SELECT\n  {}\nFROM \"log\" AS \"l\" LEFT JOIN \"resource_identity\" AS \"i\" ON \"i\".\"id\" = \"l\".\"resource\"",
         columns.join(",\n  ")
@@ -185,7 +211,12 @@ pub(crate) const VIEW_SQL: &str = "SELECT sql FROM sqlite_schema WHERE type = 'v
 /// code order, with its `codes` rows and readable views, then the readable `log_view`. Like the
 /// kinds' views, the `IfNotExists` form omits it: [`sync_views`] brings it up to date on open.
 pub fn schema_ddl(kinds: &KindRegistry, mode: DdlMode) -> String {
-    let shared = format!("{SHARED_DDL}{CODES_DDL}");
+    render_schema(kinds, mode, SHARED_DDL, &log_view())
+}
+
+/// Shared renderer for the runtime baseline and the isolated schema-review proposal.
+pub(crate) fn render_schema(kinds: &KindRegistry, mode: DdlMode, shared: &str, log_view: &str) -> String {
+    let shared = format!("{shared}{CODES_DDL}");
     let mut ddl = match mode {
         DdlMode::IfNotExists => shared,
         DdlMode::Create => shared.replace(" IF NOT EXISTS", ""),
@@ -194,7 +225,7 @@ pub fn schema_ddl(kinds: &KindRegistry, mode: DdlMode) -> String {
         ddl.push_str(&render_ddl_with(set, mode));
     }
     if mode == DdlMode::Create {
-        ddl.push_str(&log_view());
+        ddl.push_str(log_view);
         ddl.push_str(";\n");
     }
     ddl

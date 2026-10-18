@@ -196,18 +196,19 @@ How Checkouts and lends behave:
 **Replication.**
 - **One sequence per home.** Its value is a resource's `version`. Each write appends one event to the home's log in home order (#3392 G8), and the stream carries events. Replicas apply each event's effect through the same lowering as the home's own write, append the event to their copy of the home's log, and do not re-run machines. A replica catches up on a resource from its snapshot plus the resource's events after it.
 - **Encoding and liveness.** The stream is CBOR (ADR 0063). Its keepalive is the link-liveness signal.
-- **Subscriptions.** Every host holds the identity row (kind, name, home) of every live resource. Full rows travel by subscription to coarse scopes: a project, a time window, or "related to host H". The old per-kind rules become default subscriptions.
-- **Misses** are routed to the home or the archive. Gates make a home subscribe to any input they need, and never query remotely. Subscription maintenance must never dominate: subscriptions are tagged once at write time and fanned out by a bitmap lookup.
+- **Whole-home replication** ([#3463 owner ruling, 2026-10-18](https://github.com/flotilla-org/flotilla/issues/3463#issuecomment-6252080381), superseding #3213 ruling 2). Every host follows every other home's whole log and therefore holds every resource and its identity. Each home's log is the partition. Per-item scope subscriptions are withdrawn.
+- **Coarse topic.** Each event reserves one open coarse topic code, chosen by the home's write transaction, for later partitioning by whole topics on whole homes. Nothing filters on it yet.
+- **Misses** that the local copy cannot serve are routed to the home, marked remote with their age. Gates read only local inputs and never query remotely.
+- **Observation consumers.** Fine-grained filtered views belong to read-only observation subscriptions, such as `pm connect`, rather than replication. They are out of scope, as are partial replication by topic and archives beyond the history window.
 
-**#3463 schema checkpoint (proposed, not yet implemented).** The
+**#3463 schema checkpoint (revised proposal, not yet implemented).** The
 [change-stream schema proposal](../implementation-choices/change-stream.md) records the
-stored relation provenance, current scope membership, write-time change tags, subscriptions,
-per-home applied-time watermark and resume floor. Its generated DDL is review-only and is
-not installed by the store. After owner schema approval, #3463 implements snapshot then tail,
-resume/resnapshot, identity distribution, local watermark inputs, keepalives, routed misses
-and the resource HTTP seam. Project/time-window scopes, non-peer consumers, archives beyond
-the history window and retiring old replication remain deferred. Message relation derivation
-belongs to #3317. The Quint specs remain unchanged.
+log's reserved coarse topic, the per-home applied-time watermark and the resume floor.
+Schema tests execute the proposal with foreign keys enabled and read every view; store
+startup does not install it. The same home expunge transaction advances the resume floor
+and removes retained events. After owner approval, #3463 implements snapshot then tail,
+resume/resnapshot, keepalives, local watermark inputs, routed misses and the resource HTTP
+seam. The old replicator stays until its old kinds move. Quint remains unchanged.
 
 **Liveness.** Liveness is judged from the observer host's link. Observations are written only when they change. Heartbeat-only writes go away.
 

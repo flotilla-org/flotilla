@@ -1,102 +1,136 @@
 # Change stream schema checkpoint (#3463)
 
-Status: proposed, awaiting owner schema review. This PR is a checkpoint, not a working
-stream. `stream_schema` declares stored rows and renders DDL without installing tables or
-reading/writing them. No resource serialized shape changes; no out-of-repo authors need updates.
+Status: revised proposal awaiting owner schema review. The
+[owner ruling](https://github.com/flotilla-org/flotilla/issues/3463#issuecomment-6252080381)
+requires every host to follow every other home's whole log. Each home's log is the partition.
+Fine-grained filtered views belong to read-only observation consumers and are out of scope.
 
-## Readable table view
+`stream_schema` is a temporary review API: it renders a complete schema but store startup
+still uses the unchanged baseline. Only schema tests execute the proposal, with foreign keys
+enabled, and read every view. After approval, wire the proposal into the shared baseline,
+remove this temporary API, and implement the stream. No resource kind's serialized shape
+changes, and no out-of-repo resource authors need updates. Quint remains unchanged.
 
-All tables are STRICT and WITHOUT ROWID. No table exceeds 30 columns. None has child tables
-or expands a data-carrying enum. `disposition` is a single closed code column (`up`, `rm`);
-`scope_code` and `relation` are open codes, not enums. Each table has a SQL `_view` resolving
-local identity and string IDs. `stream.sql` is the generated DDL snapshot.
+## Readable table views
 
 | Table | Columns | Primary key | Other indexes |
 |---|---|---|---|
-| resource_relation | 4: resource, relation, host, via | all four | host/resource; via/resource |
-| resource_scope | 3: resource, scope_code, scope_key | all three | scope_code/scope_key/resource |
-| change_scope | 5: home, home_seq, scope_code, scope_key, disposition | first four | home/scope_code/scope_key/home_seq |
-| stream_subscription | 4: subscriber, home, scope_code, scope_key | all four | home/scope_code/scope_key/subscriber |
-| stream_watermark | 3: home, version, applied_through | home | none |
-| stream_history | 2: home, retained_after | home | none |
+| log (changed) | 14: home, home_seq, resource, prev_seq, cause, edge, from, to, about, writer, at, payload, effect, **topic** | home, home_seq | resource/home_seq; about/at (partial); home/home_seq for expunges (partial) |
+| stream_watermark (new) | 3: home, **home_seq**, applied_through | home | none |
+| stream_history (new) | 2: home, **home_seq** | home | none |
 
-`resource_relation.via` preserves each independent source of a relation: removing one vessel
-must not evict a resource still related through another vessel. A kind's derivation declares
-relation codes; Message's derivation remains #3317. `resource_scope` materializes the union of
-these reasons. `all` with an empty key means definitions everywhere; `host` keys name related
-hosts. Project/time keys later add codes and values, without columns or migrations.
+No table exceeds 30 columns. These tables have no child tables or enum-expanded columns.
+The log remains STRICT with its existing rowid; the two new tables are STRICT, WITHOUT ROWID.
+The existing log cause/edge/state columns keep their code representation and readable names.
+`topic` is an open scalar code (one to eight lowercase ASCII letters/digits/underscores,
+starting with a letter), displayed directly by `log_view`. Both new `_view`s resolve the
+home string and expose `home_seq`; applied time is INTEGER microseconds since the Unix epoch.
+`stream.sql` is the complete proposed shared DDL. Fixture kind DDL is unchanged.
 
-The write transaction derives relations and scope membership once, emits the event, and
-persists one change tag per key in the union of old/new membership. A departing key gets
-`rm`; a retained/entering key gets `up`. Entry sends a resource snapshot at that version;
-resume must reconstruct that snapshot from retained history rather than attach today's body
-to an older event. Removal evicts the body only. Global identity create/delete events are
-sent independently of body predicates, including on otherwise empty slices.
+The reserved topic is `all` for now. The event's originating write transaction chooses and
+stores it alongside the event, including deletes and expunges; followers preserve it verbatim.
+The proposal defaults it to `all`, and later topic codes require no column or CHECK-list change.
+No topic filter or extra index exists. After approval the Event/wire/log-append paths must
+carry the code explicitly. The schema checkpoint does not change those paths.
 
-Tags reference log entries, not live bodies; an expunge tag survives the identity it removes.
-Relation/membership rows cascade on identity expunge. Log cleanup cascades its tags. The home
-advances `retained_after` atomically before removing resumable history. Nothing in this PR
-adds compaction or archives. A cursor equal to the floor is servable; one below needs snapshot.
+All new progress uses `home_seq`, matching the log's partition key. A watermark names the
+latest completely applied prefix; a history row names the minimum servable resume cursor.
+The existing `home_sequence.last`, `resource_identity.seq` and kind-table `version` columns
+are unchanged baseline fields, not additional progress schemas; `version` remains the public
+resource version. No baseline column renames are proposed in this checkpoint.
 
-Subscriptions are a union of predicates, deduplicated by subscriber. Scope changes force a
-fresh snapshot; resuming a cursor under a different predicate set is forbidden. Snapshot
-completion must establish a consistent cut before a watermark is published. One receiving
-host combines its local gate requirements into this union; external view-client progress is
-connection-local, not written over the host's watermark.
+## Transactions and correctness invariants
 
-`stream_watermark` is latest observation state, outside the durable log. A keepalive carries
-home time and a version proving all earlier frames were applied. Filtered-out versions still
-advance the covered prefix. Stalls hold time; receipt alone never advances it. Scope expansion
-invalidates coverage until its snapshot is installed; gates must treat the input as unavailable
-while coverage is missing. Resets cannot claim a fresh timestamp before the snapshot commits.
-The implementation must reject regressing home time and sequence. No gate reads link health.
+- **Resume floor:** the home's existing expunge write transaction advances
+  `stream_history.home_seq` to at least the greatest home sequence of any log entry that the
+  expunge removes. That same SQLite transaction deletes those entries and appends the expunge
+  event. Commit publishes the deletion and floor together; rollback publishes neither. This
+  covers holes anywhere in a home's log, not only removal of a contiguous prefix. The minimum
+  floor is zero. A cursor equal to the floor can resume; one below requires a snapshot.
+  A future archive/compaction transaction must obey the same invariant, but adding it is out
+  of scope. Applied expunges that remove a follower's retained entries must conservatively
+  advance that copy's floor in their apply transaction too, if it serves that home's log.
+- **Applied watermark:** the follower's apply transaction commits rows and
+  `stream_watermark(home, home_seq, applied_through)` together. The snapshot-install transaction
+  establishes its cut before publishing progress. A keepalive carries the home's time and
+  prefix sequence; its observation transaction may advance time only after that prefix is
+  fully committed locally. A stalled stream holds the watermark. A gate sees only the local
+  applied-time input, never link health or a remote query.
+- **Monotonicity:** writer invariants reject decreasing home sequences or applied times and
+  never restore a prefix ahead of committed rows. A same-sequence keepalive may advance time.
+  No monotonicity trigger is proposed: the implementation must validate the combined
+  snapshot/apply/keepalive transaction, including the prefix's actual coverage, which a
+  scalar CHECK cannot establish. A reset/rebuild first makes the input unavailable and
+  establishes a new complete snapshot; it cannot publish a speculative timestamp.
+- **Observation state:** watermark updates never append durable events. Latest state may be
+  coalesced only if crash recovery restores a conservative watermark. Floor metadata must be
+  durable in the same commit as history loss; it cannot be asynchronously coalesced.
 
 ## Workload note and candidate walk
 
-Reference: root WORKLOAD.md (hosts 3/50/500, clients 2/50/500, events <10/1,000/10,000 per s).
-These are sizing calculations, not benchmark results. Runtime measurements follow approval.
+Reference: root WORKLOAD.md (hosts 3/50/500, change events <10/1,000/10,000 per second).
+These are arithmetic bounds, not benchmark results. The rate of durable stream events,
+encoded event bytes, distribution of writes over homes, and overlap of per-home resource
+populations need measurements with the ADR 0064 plans (#3425). No budget-fit claim follows
+from the current estimates.
 
-- Per write: O(derived relation changes + scope keys + matching subscribers). Derivation is
-  once per write; fan-out unions resident bitmap postings using the judgement-index mechanism,
-  with no subscriber predicate evaluation or durable-store read per delivery. Tags/membership
-  are persisted with the write, not once per recipient. Reject per-resource subscriptions:
-  maintaining them scales with resource/vessel churn and violates the ruling.
-- A home normally has two host predicates per host (definitions and that host's related set),
-  plus view-client predicates. At the ceiling, 500 hosts x 2 + 500 one-scope clients = 1,500
-  predicate rows per home, 1,000 recipients. Additional client scopes scale with scopes per
-  client, an unresolved cardinality, never with resources. 1,000-bit postings use 125 bytes per
-  scope key before overhead. Reject scanning all 1,500 predicates on every event.
-- At 10,000 events/s, broadcasting all definitions could require 10 million recipient
-  deliveries/s. This is an output cost, not 10 million store reads or predicate evaluations.
-  Runtime resources normally have fewer related hosts; that distribution is not specified.
-  With 500 view clients each matching the root's 5%, views alone can require 250,000
-  deliveries/s. Backpressure must disconnect slow consumers to resume/resnapshot, with bounded
-  frames and buffers. Root budgets do not establish bytes/event or relation-count bounds;
-  don't claim throughput from arithmetic alone.
-- Joining a host needs all live identities plus definitions and its related bodies, paged by
-  a fixed byte and row budget from one snapshot cut, then a tail. Worst case it relates to
-  everything. Root compact resident form is ~150 MB at the ceiling; full stored bodies plus
-  retained history approach ~9.5 GB typed and cannot be materialized as one snapshot buffer.
-  As a live lower-bound example, 10,000 convoys + 36,000 vessels + 36,000 terminals + 500,000
-  messages yield 582,000 identities. At an assumed 128 bytes/identity that's ~74.5 MB before
-  retained identities and definitions. Identity width and total definition count are named
-  gaps; page limits must bound memory independently of both. Reject full snapshot buffering.
-- Persistent tags add one row per scope key per durable log event. At the root's ~59 durable
-  writes/s/host over 7 days there are ~35.7 million log entries. Even one 40-byte tag adds
-  ~1.43 GB before SQLite/index overhead; relation fan-out multiplies it. This worsens the
-  already failing disk budget and must be measured under #3425 before claiming budget fit.
-- Store crossings: startup builds resident scope and subscription indexes; each local durable
-  write persists tags; attaching/resuming reads bounded snapshot/log pages. Fan-out after
-  warm-up and watermark reads by gates use resident state. Persisted latest watermark may be
-  coalesced, but a crash may only restore a conservative prefix, never move it ahead of rows.
-- Evolution: new shared metadata follows the pre-production schema baseline of `shared.rs`.
-  Codes are never reused. Post-cutover persisted changes follow ADR 0047. Transport will be
-  ADR 0063 CBOR with strings, no interned IDs. Keep HTTP routing behind a listener-independent
-  handler; leave old replication intact. These protocol/transport parts are not implemented
-  in this schema checkpoint, and Quint is unchanged.
+**Bandwidth per host.** Let H be hosts, R the rate of durable writes at each home, and B the
+encoded event size. With evenly distributed writes, every host receives (H−1) × R × B bytes/s
+and its own home sends the same amount; total mesh deliveries are H × (H−1) × R per second.
+Replication never re-originates a copied event as a new local write.
 
-## Review question
+Root scale rates describe one large daemon. Conservatively, if every home produces that
+rate, target ingress is 49 × 1,000 = 49,000 events/s and ceiling ingress is 499 × 10,000 =
+4.99 million events/s per host. Using 300 B/event as an explicit wire-size assumption (the
+root's ~300 B durable-entry estimate includes local header/index costs and is **not** a CBOR
+measurement), that is 14.7 MB/s at target and 1.497 GB/s (~12 Gbit/s) at ceiling, in each
+direction before transport overhead. At 1 KiB/event the ceiling is 5.11 GB/s (~40.9 Gbit/s).
+If 10,000 events/s is instead the **whole mesh's** burst budget, ingress is at most
+10,000 × B (3 MB/s at 300 B), not 499 times that. Measure aggregate durable write rate before
+selecting the deployment interpretation; observations are not durable log writes.
 
-Please review the six shared tables, especially provenance (`via`), per-change departures,
-and latest observation watermark storage. After approval, implement the stream, in-memory
-behavior suite, HTTP seam, routed misses, Quint conformance and ADR 0064 carry in this PR.
+At the root disk-budget rate of 59 durable writes/s **per home**, 500 homes produce 29,500
+entries/s. Every full replica retains ~5.35 TB of 300-byte entries over seven days, before
+extra replication overhead; ingress from the other 499 homes is ~8.83 MB/s. The existing
+10 GB daemon store budget does not fit that independent-per-home scenario. Removing per-item
+metadata avoids its extra write/index amplification but does not solve full-log storage cost.
+The topic is one inline scalar per log entry, with no separate rows or indexes.
+
+**Joining snapshot.** Every joining host receives all identities and bodies from all homes,
+plus referenced frozen objects (deduplicated by hash), paged at consistent per-home cuts.
+Its bytes are the sum of each home's unique snapshot; replicated copies are not sent again
+as independent ownership. The root's stored-body estimate is ~9.5 GB typed at ceiling for
+one full dataset including its history (about 4.75 GB stored under the root's 2x assumption),
+already above the 1 GB resident-state budget. It is a lower bound for snapshots that also
+include kinds omitted from that estimate, and is not a measured CBOR snapshot size.
+
+If each of 500 homes owns an independent ceiling-sized dataset, the corresponding total is
+~2.375 TB stored (~4.75 TB typed); if the root dataset is shared across those homes, it remains
+~4.75 GB stored. Do not multiply an already replicated dataset by host count. As a separate
+live example, one cohort has 10,000 convoys + 36,000 vessels + 36,000 terminals + 500,000
+messages = 582,000 identities. An assumed 128 B/identity adds ~74.5 MB before retained
+identities and definitions; these sizes/counts are not measured wire widths. Current-state
+snapshots need not transmit the old event log; the tail starts at each snapshot's cut.
+
+**Execution shape.** Per local write: one event and one coarse code, then O(H−1) deliveries.
+Each host has at most H−1 upstream home cursors (499 at ceiling), with no resource-dependent
+replication bookkeeping. Reject whole-store polling: bounded snapshot then ordered event
+pages avoids repeated decoding of unchanged state. Tail delivery uses resident bounded
+buffers, not one store read per follower per event; shared encoded batches can be reused.
+Restart and resume may read bounded log pages. Backpressure disconnects a slow follower to
+resume or resnapshot instead of growing an unbounded queue. Snapshot pages are bounded by
+bytes and rows, so memory use is independent of total dataset size. Watermarks are resident
+local inputs. Bandwidth, disk and snapshot duration require measurements before claiming
+production-budget compliance.
+
+**Evolution and boundary.** Topic codes are open and never reused. Stored data follows the
+pre-production baseline in `shared.rs`, then ADR 0047 after cutover. Transport will be ADR
+0063 CBOR with strings, never local IDs. Keep the future HTTP handler listener-independent,
+leave old replication intact, and mark routed reads remote with their age. Partial replication
+by whole topics, filtered observation consumers and archives remain deferred.
+
+## Owner checkpoint
+
+Please review the log topic, two progress tables and transaction invariants. After approval,
+implement snapshot/tail/resume, keepalives and local watermarks, the resource HTTP seam,
+routed misses, two/three-store behavior coverage and unchanged-spec Quint conformance.

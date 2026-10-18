@@ -117,20 +117,26 @@ The checks:
   ~75 GB / ~750 GB per day. Heartbeats are observations: latest value only, not durable
   history.
 
-## Proposed change-stream cost (#3463 schema checkpoint)
+## Proposed whole-home change stream (#3463 schema checkpoint)
 
-Write-time scope tagging adds one persisted row per distinct event scope key, not per
-subscriber. Fan-out uses resident scope-key postings. Standing subscriptions scale with
-hosts × scope predicates plus clients, never with resources. Identity snapshots are global;
-body snapshots are filtered and must be paged. Keepalives and applied watermarks remain
-latest observations outside the durable log.
+Every host follows every other home's whole log. One coarse topic code is stored inline
+per event for later whole-topic partitioning; nothing filters on it yet. Keepalives and
+applied watermarks remain latest observations outside the durable log.
 
-The [schema workload note](docs/implementation-choices/change-stream.md) calculates the
-fan-out, subscription, joining-snapshot and tag-storage costs at the ceiling. Tag storage is
-an additional dominant operation: even one assumed 40-byte tag per durable event adds
-~1.43 GB over seven days at 59 writes/s/host, before index overhead. The existing disk budget
-already fails; this proposal does not claim to fix it. Measure relation fan-out and tag/index
-bytes with the ADR 0064 load plans (#3425) before claiming budget fit.
+Full-log replication adds dominant network and replica-storage work. The
+[workload note](docs/implementation-choices/change-stream.md) derives ingress per host as
+(H−1) × home durable writes/s × encoded event bytes. If every one of 500 homes independently
+produces 10,000 events/s, each host receives 4.99 million events/s (~1.497 GB/s at an assumed,
+not measured, 300 B/event). If 10,000 events/s is the aggregate mesh budget, ingress is at
+most ~3 MB/s at that size. At 59 durable writes/s independently per home, full replication
+of 500 homes retains ~5.35 TB of 300-byte entries over seven days per host, exceeding the
+10 GB disk budget. These alternatives need aggregate durable-rate measurements (#3425).
+
+Joining snapshots contain all homes' unique identities/bodies and referenced objects,
+transferred in bounded pages. The root's ~9.5 GB typed full dataset estimate is already
+above the resident budget; do not buffer a whole snapshot, or multiply an already shared
+fleet dataset by host count. The workload note records independent-home and shared-dataset
+bounds. No bandwidth, memory or disk budget-fit claim is made by this schema checkpoint.
 
 ## Usage
 
