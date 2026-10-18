@@ -1,6 +1,6 @@
 //! Storage reads for the filtered replica. These are keys, declared indexes,
 //! startup pages and the authoritative log, never runtime whole-kind scans.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_schema::{Address, Timestamp};
 use flotilla_state_machines::{machines::message::*, EdgeEventOf, InputRead, Log, LogError, Resource, StoredState, Transport, Version};
@@ -48,7 +48,7 @@ pub struct MemoryInboxLog {
     pending: BTreeMap<(Address, u64), String>,
     events: BTreeMap<u64, MemoryEntry>,
     admissions: BTreeMap<u64, String>,
-    about: BTreeMap<(String, u64), u64>,
+    about: BTreeSet<(String, u64)>,
 }
 
 struct MemoryEntry {
@@ -119,8 +119,13 @@ impl InboxLog for MemoryInboxLog {
     }
     fn scan(&mut self, after: Option<i64>) -> Result<ScanPage, Error> {
         use std::ops::Bound::{Excluded, Unbounded};
-        let rows: Vec<_> = self.admissions.range((Excluded(after.unwrap_or(0) as u64), Unbounded)).take(33).collect();
-        let next = (rows.len() > 32).then(|| *rows[31].0 as i64);
+        let after = u64::try_from(after.unwrap_or(0)).map_err(|_| Error::Storage("negative memory scan cursor".into()))?;
+        let rows: Vec<_> = self.admissions.range((Excluded(after), Unbounded)).take(33).collect();
+        let next = if rows.len() > 32 {
+            Some(i64::try_from(*rows[31].0).map_err(|_| Error::Storage("memory scan sequence exceeds cursor range".into()))?)
+        } else {
+            None
+        };
         Ok(ScanPage { messages: rows.into_iter().take(32).map(|(_, name)| self.resources[name].clone()).collect(), next })
     }
     fn pending(&mut self, inbox: &Address, after: Option<&u64>) -> Result<(Vec<String>, Option<u64>), Error> {
@@ -146,23 +151,21 @@ impl InboxLog for MemoryInboxLog {
     fn changes_since(&mut self, after: Cursor) -> Result<ChangePage, Error> {
         use std::ops::Bound::{Excluded, Unbounded};
         let mut changes = Vec::new();
-        let mut bytes = 0;
+        let mut budget = crate::resident::WatchPageBudget::default();
         let mut through = after;
         for (_, entry) in self.events.range((Excluded(after.0), Unbounded)).take(16) {
-            let charge = crate::resident::change(&entry.inbox, &entry.change);
-            if !changes.is_empty() && bytes + charge > crate::resident::WATCH_PAGE_BYTES {
+            if !budget.admit(&entry.inbox, &entry.change) {
                 break;
             }
             changes.push((entry.inbox.clone(), entry.change.clone()));
             through = entry.change.cursor;
-            bytes += charge;
         }
         Ok(ChangePage { changes, through })
     }
     fn receipt(&mut self, inbox: &Address, message: &str, consumer: &Receiver, transport: Transport) -> Result<(), Error> {
         let version =
             self.append(inbox.clone(), message.into(), ChangeKind::Receipt { consumer: consumer.clone(), transport }, None, Vec::new());
-        self.about.insert((message.to_owned(), version.0), version.0);
+        self.about.insert((message.to_owned(), version.0));
         Ok(())
     }
     fn next_name(&mut self) -> Result<String, Error> {

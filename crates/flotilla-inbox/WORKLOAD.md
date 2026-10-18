@@ -127,7 +127,9 @@ source entries/s; this replaces the earlier resident-journal zero-read choice
 at the issue owner's explicit direction. Pages of at most 16 entries and a 16 KiB decoded-byte cap bound subscriber
 memory; sparse inboxes advance their source cursor past unrelated entries. This
 amortizes log calls for dense histories, while key/create-event attribution is
-still per relevant edge or receipt. Any future batched/shared-tail optimization must
+performed once per distinct message in a page (zero lookups when its create is
+already in that page); the decoded change buffer itself supplies this page-local
+cache, so there is no retained name-to-inbox map. Any future batched/shared-tail optimization must
 preserve log authority and a byte budget, not reinstate a second retained journal.
 The source log's explicit cursor gaps are the recovery backstop.
 
@@ -153,6 +155,20 @@ to isolate replica allocations (`resident_allocations`, separate process allocat
 - Enqueue 6,000: 3,661 ms; stream all 6,000 cold pending items: 2,218 ms.
 - Cold reads: 12,000 typed loads, 188 Pending pages, 6,000 receipt pages,
   **zero terminal loads, startup scans or resource-history pages**.
+
+A dense watch replay of one create/receipt/edge lifecycle, repeated 1,000 times
+(3,000 changes), took 295 ms with page-local attribution reuse and zero resource
+history reads. Disabling reuse took 625 ms and 2,000 resource-history reads
+(each also requires a resolve); the new read-count guard fails in that case.
+This is development-profile in-memory SQLite, a warm three-event source page,
+not a sparse/mixed-inbox or 500-subscriber benchmark. A page without a message's
+create still needs one resolve + create-history read per distinct message; the
+worst case remains 16 pairs per page. Fanout therefore remains an explicit
+performance expiry above, rather than a demonstrated 10k/s watch throughput.
+
+The allocation workload is the calibration check for the conservative charge
+heuristics, not a proof for every possible accepted value shape. Extend its
+body/address/reference/receiver coverage when those types change.
 
 These are diagnostic CPU/worker measurements, not fsync latency or a promise of
 10,000 durable writes/s. The root's disk write budget is a different constraint.

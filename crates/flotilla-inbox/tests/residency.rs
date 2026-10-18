@@ -330,3 +330,26 @@ async fn control_budget_refusal_preserves_existing_binding() {
         backend.pending(&inbox(), &consumer("a"), &Rules::default()).await.expect("pending").try_collect::<Vec<_>>().await.expect("stream");
     assert_eq!(pending.into_iter().map(|p| p.message).collect::<Vec<_>>(), vec![message]);
 }
+
+// Behaviour: watch attribution reuses a message's create within the same source page,
+// including its receipt and edge, without loading terminal rows or resource history.
+// One lifecycle suffices for this page-local routing seam; paging/oversize is covered above.
+#[tokio::test]
+async fn watch_attributes_dense_lifecycle_once_per_page() {
+    let (backend, mut log) = backend(database(), Arc::new(Evidence::default()), RESIDENT_BUDGET);
+    backend.bind(inbox(), consumer("a")).await.expect("bind");
+    let message = backend.enqueue(spec()).await.expect("enqueue");
+    backend.receive(&consumer("a"), &message, Transport::Turn).await.expect("receive");
+    backend.deliver(&message, Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("deliver");
+    log.reset_read_counts();
+    let started = std::time::Instant::now();
+    for _ in 0..1000 {
+        let page = log.changes_since(Cursor(0)).expect("page");
+        assert_eq!(page.changes.len(), 3);
+    }
+    let reads = log.read_counts();
+    eprintln!("dense watch: 1000 pages / 3000 changes in {:?}; {reads:?}", started.elapsed());
+    assert_eq!(reads.watch_pages, 1000);
+    assert_eq!(reads.resource_history_pages, 0);
+    assert_eq!(reads.terminal_loads, 0);
+}

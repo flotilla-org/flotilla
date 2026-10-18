@@ -1,5 +1,7 @@
 //! Conservative owned-byte accounting for the rebuildable replica. The backing
 //! store/log and caller-owned ports/evidence are not replica allocations.
+//! `tests/resident_allocations.rs` calibrates these heuristic charges against
+//! live Rust allocations; extend its shape coverage when accepted types change.
 use std::mem::size_of;
 
 use flotilla_schema::Address;
@@ -95,4 +97,23 @@ pub(crate) fn change(inbox: &Address, change: &crate::Change) -> usize {
         }
     }
     bytes
+}
+
+/// Shared decoded-page rule: a first oversized event makes progress alone.
+#[derive(Default)]
+pub(crate) struct WatchPageBudget {
+    bytes: usize,
+    entries: usize,
+}
+
+impl WatchPageBudget {
+    pub(crate) fn admit(&mut self, inbox: &Address, value: &crate::Change) -> bool {
+        let charge = change(inbox, value);
+        if self.entries > 0 && self.bytes.saturating_add(charge) > WATCH_PAGE_BYTES {
+            return false;
+        }
+        self.bytes = self.bytes.saturating_add(charge);
+        self.entries += 1;
+        true
+    }
 }

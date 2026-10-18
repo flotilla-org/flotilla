@@ -254,8 +254,8 @@ impl InboxLog for StoreLog {
         let events = read.changes_since(&self.home, after.0, 16).map_err(storage)?;
         self.reads.lock().expect("read counters").watch_pages += 1;
         let mut through = after;
-        let mut changes = Vec::new();
-        let mut bytes = 0;
+        let mut changes: Vec<(Address, Change)> = Vec::new();
+        let mut budget = crate::resident::WatchPageBudget::default();
         for entry in events {
             if entry.home_seq != through.0 + 1 {
                 return Err(Error::CursorExpired);
@@ -280,6 +280,8 @@ impl InboxLog for StoreLog {
             };
             let inbox = if entry.kind == Resource::<Message>::CODE && entry.cause == Cause::Create {
                 created_inbox(&entry)?
+            } else if let Some((inbox, _)) = changes.iter().find(|(_, prior)| prior.message == message) {
+                inbox.clone()
             } else {
                 let id = read.resolve(Resource::<Message>::CODE, &message, &self.home).map_err(storage)?.ok_or(Error::CursorExpired)?;
                 let create = read.changes(id, 0, 1).map_err(storage)?.into_iter().next().ok_or(Error::CursorExpired)?;
@@ -287,12 +289,10 @@ impl InboxLog for StoreLog {
                 created_inbox(&create)?
             };
             let change = Change { cursor: Cursor(entry.home_seq), message, kind };
-            let charge = crate::resident::change(&inbox, &change);
-            if !changes.is_empty() && bytes + charge > crate::resident::WATCH_PAGE_BYTES {
+            if !budget.admit(&inbox, &change) {
                 through = previous;
                 break;
             }
-            bytes += charge;
             changes.push((inbox, change));
         }
         if through == after && read.last_sequence(&self.home).map_err(storage)? > after.0 {
