@@ -117,6 +117,21 @@ The checks:
   ~75 GB / ~750 GB per day. Heartbeats are observations: latest value only, not durable
   history.
 
+## Proposed change-stream cost (#3463 schema checkpoint)
+
+Write-time scope tagging adds one persisted row per distinct event scope key, not per
+subscriber. Fan-out uses resident scope-key postings. Standing subscriptions scale with
+hosts × scope predicates plus clients, never with resources. Identity snapshots are global;
+body snapshots are filtered and must be paged. Keepalives and applied watermarks remain
+latest observations outside the durable log.
+
+The [schema workload note](docs/implementation-choices/change-stream.md) calculates the
+fan-out, subscription, joining-snapshot and tag-storage costs at the ceiling. Tag storage is
+an additional dominant operation: even one assumed 40-byte tag per durable event adds
+~1.43 GB over seven days at 59 writes/s/host, before index overhead. The existing disk budget
+already fails; this proposal does not claim to fix it. Measure relation fan-out and tag/index
+bytes with the ADR 0064 load plans (#3425) before claiming budget fit.
+
 ## Usage
 
 | Operation | Arrival | Rate | Work per operation | Latency | Staleness tolerated |

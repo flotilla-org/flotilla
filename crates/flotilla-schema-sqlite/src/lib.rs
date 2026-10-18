@@ -42,6 +42,9 @@ mod shared;
 mod sql;
 mod store;
 
+/// Schema-review proposal only; not installed or accessed by `Store`.
+pub mod stream_schema;
+
 pub use audit::audit_domains;
 pub use error::{Malformed, StoreError};
 pub use query::{Cursor, Page, MAX_PAGE};

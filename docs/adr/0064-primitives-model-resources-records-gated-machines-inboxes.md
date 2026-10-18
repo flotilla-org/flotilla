@@ -199,6 +199,16 @@ How Checkouts and lends behave:
 - **Subscriptions.** Every host holds the identity row (kind, name, home) of every live resource. Full rows travel by subscription to coarse scopes: a project, a time window, or "related to host H". The old per-kind rules become default subscriptions.
 - **Misses** are routed to the home or the archive. Gates make a home subscribe to any input they need, and never query remotely. Subscription maintenance must never dominate: subscriptions are tagged once at write time and fanned out by a bitmap lookup.
 
+**#3463 schema checkpoint (proposed, not yet implemented).** The
+[change-stream schema proposal](../implementation-choices/change-stream.md) records the
+stored relation provenance, current scope membership, write-time change tags, subscriptions,
+per-home applied-time watermark and resume floor. Its generated DDL is review-only and is
+not installed by the store. After owner schema approval, #3463 implements snapshot then tail,
+resume/resnapshot, identity distribution, local watermark inputs, keepalives, routed misses
+and the resource HTTP seam. Project/time-window scopes, non-peer consumers, archives beyond
+the history window and retiring old replication remain deferred. Message relation derivation
+belongs to #3317. The Quint specs remain unchanged.
+
 **Liveness.** Liveness is judged from the observer host's link. Observations are written only when they change. Heartbeat-only writes go away.
 
 **Views.**
