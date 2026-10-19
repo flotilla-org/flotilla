@@ -460,6 +460,9 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         Residency {
             budget_bytes: state.budget,
             accounted_bytes: state.resident_bytes + state.control_bytes,
+            value_bytes: state.resident_bytes,
+            control_bytes: state.control_bytes,
+            control_budget_bytes: state.budget.min(resident::CONTROL_BUDGET),
             open_messages: state.sizes.len(),
             pending_index_complete: true,
             pending_bytes: state.pending_bytes,

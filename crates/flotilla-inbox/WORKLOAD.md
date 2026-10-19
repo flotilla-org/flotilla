@@ -20,6 +20,9 @@ Total charged long-lived replica cap is **256 MiB**, not 128 MiB: complete
 Pending keys have their own 128 MiB alongside the 128 MiB value/control share.
 Control state reduces the value allowance; it does not force index eviction.
 Recovery refuses a source whose required keys/controls exceed these caps.
+Residency diagnostics expose value bytes, control bytes and their effective
+control cap alongside Pending usage/cap, so callers can diagnose capacity
+refusals without interpreting the combined value/control total.
 
 `Address` charge is `size_of(Address) + 4 * canonical_len + 2 * segment_slice_bytes`.
 The previous length multiplier 8 and fixed 128 B/segment are gone. Parsed String

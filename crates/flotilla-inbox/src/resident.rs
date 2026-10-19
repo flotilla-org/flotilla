@@ -13,15 +13,22 @@ use flotilla_state_machines::{
     Resource, Transport,
 };
 
-/// Default share of the root daemon's 1 GiB budget. Stored history is not resident.
+/// Independent budget for the complete resident Pending index (never value-evicted).
 pub const PENDING_BUDGET: usize = 128 * 1024 * 1024;
+/// Control-state ceiling within RESIDENT_BUDGET, not an additional allocation.
 pub const CONTROL_BUDGET: usize = 96 * 1024 * 1024;
+/// Shared budget for cached values and controls; total with Pending is 256 MiB.
 pub const RESIDENT_BUDGET: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Residency {
     pub budget_bytes: usize,
+    /// Values plus controls; Pending keys have their independent fields below.
     pub accounted_bytes: usize,
+    pub value_bytes: usize,
+    pub control_bytes: usize,
+    /// Effective control ceiling within budget_bytes (also honors a custom budget).
+    pub control_budget_bytes: usize,
     pub open_messages: usize,
     pub pending_index_complete: bool,
     pub pending_bytes: usize,
@@ -118,7 +125,7 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&std::collect
             DropReason::Withdrawn { by, authority } | DropReason::ConsumerUnreachable { by, authority } => {
                 bytes += heap_address(by) + heap_address(authority)
             }
-            _ => {}
+            DropReason::Undeliverable | DropReason::Expired => {}
         }
     }
     bytes += receipts.map_or(0, |rows| {
