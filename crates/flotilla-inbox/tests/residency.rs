@@ -549,6 +549,7 @@ async fn pending_spill_and_restart_use_declared_index() {
         assert!(stream.next().await.is_none());
         assert_eq!(source.read_counts().resource_loads, 1, "spill decodes only the one un-emitted candidate");
         assert!(source.read_counts().pending_pages > 0);
+        assert_eq!(source.read_counts().pending_key_pages, 0, "a read never recaches the spilled inbox");
         drop(stream);
         let other_inbox = address("project:test/role:small");
         backend.bind(other_inbox.clone(), consumer("a")).await.unwrap();

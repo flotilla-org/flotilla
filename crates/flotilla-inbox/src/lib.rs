@@ -575,8 +575,10 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
 
     fn evict_pending(state: &mut State<L>, inbox: &Address) {
         if let Some(rows) = state.inboxes.remove(inbox) {
-            state.pending_bytes -= resident::pending(inbox, "", true) - resident::pending(inbox, "", false)
+            let charge = resident::pending(inbox, "", true) - resident::pending(inbox, "", false)
                 + rows.values().map(|name| resident::pending(inbox, name, false)).sum::<usize>();
+            debug_assert!(state.pending_bytes >= charge, "Pending accounting includes the whole inbox and each remaining row");
+            state.pending_bytes -= charge;
         }
     }
 
@@ -627,6 +629,8 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         state.pending_bytes += charge;
     }
 
+    // Ok(Some(name)) leaves Home holding that candidate and its receipts until
+    // the caller trims. Never trim between returning its name and the last use.
     fn next_pending(state: &mut State<L>, inbox: &Address, query: &mut PendingRead) -> Result<Option<String>, Error> {
         use std::ops::Bound::{Excluded, Unbounded};
         if let Some(rows) = state.inboxes.get(inbox) {
