@@ -162,6 +162,36 @@ fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
             let names: Vec<_> = rows.iter().filter(|(_, row_home, _)| row_home == home).map(|(_, _, name)| name.clone()).collect();
             assert_eq!(names, (1..=12).map(|seq| format!("message-{seq}")).collect::<Vec<_>>());
         }
+        // The key-only lower-bound route returns the same home order without bodies,
+        // excluding tied admissions at other homes before applying each page limit.
+        for home in ["sender-a", "sender-b"] {
+            let query = MessageSpec::pending_by_inbox(&project("inbox"));
+            let mut after = 0;
+            let mut keys = Vec::new();
+            loop {
+                let page = read.integer_index_keys(&query, home, after, limit).expect("integer keys");
+                assert!(page.len() <= limit as usize);
+                if page.is_empty() {
+                    break;
+                }
+                after = page.last().unwrap().1;
+                for (id, seq) in page {
+                    let (identity, _) = read.identity(id).unwrap().unwrap();
+                    assert_eq!(identity.home, home);
+                    keys.push((seq, identity.name));
+                }
+            }
+            assert_eq!(keys, (1..=12).map(|seq| (seq, format!("message-{seq}"))).collect::<Vec<_>>());
+            assert!(read.integer_index_keys(&query, home, 12, 1).unwrap().is_empty());
+            assert!(read.integer_index_keys(&query, home, i64::MAX, 1).unwrap().is_empty());
+            assert_eq!(read.integer_index_keys(&query, home, i64::MIN, 1).unwrap()[0].1, 1);
+            assert!(matches!(
+                read.integer_index_keys(&EnsureSpec::by_inbox(&project("inbox")), home, 0, 1),
+                Err(StoreError::IntegerIndex { .. })
+            ));
+            assert!(read.integer_index_keys(&query, "missing", 0, limit).unwrap().is_empty());
+            assert!(matches!(read.integer_index_keys(&query, home, 0, 0), Err(StoreError::ZeroLimit)));
+        }
         snapshots.reverse();
     }
     assert!(assigned_ids[0].iter().all(|(identity, id)| assigned_ids[1][identity] != *id));

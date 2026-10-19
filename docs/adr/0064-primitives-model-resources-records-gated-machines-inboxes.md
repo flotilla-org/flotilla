@@ -90,6 +90,8 @@ How Checkouts and lends behave:
 - **A lend** lets another role, or a person, borrow a resource the owner holds: a Checkout, a process with an open port, or a jackstay stream. It is a relation asserted by the lender, with terms: who, mode (read-only or shared-write), and until a time or an event. The environment enforces the mode where it can. In a workflow with a co-placed coder and reviewer, their sharing of local files is a lend, not a shared placement owner.
 - **A lend gates release.** The lender's `release` is refused while an unexpired lend exists, unless the borrower has returned it or an authorised override records a reason. A lend until an event that never comes stays unexpired until it is returned or overridden. Return is the borrower's edge. Loss is `vanish`, with a message to the borrower.
 
+ADR 0064 records that a machine's log may stamp persistence-only metadata (such as Message's `admitted_seq`) inside the create transaction through `Log::create_resource`, that `Home::evict` drops rebuildable values without touching the log, and that observations are read through a borrowed consistent snapshot.
+
 ### Promises
 
 - **Promise kinds are declared, not built in.** The engine knows a Promise, its submissions and the `deliver` gate over them. Each kind is a declaration that says:
@@ -103,6 +105,8 @@ How Checkouts and lends behave:
   Either form may also require a human verdict.
 
 ### Roles, inboxes and delivery
+
+ADR 0064 §"Roles, inboxes and delivery" records that resident pending order is a budgeted cache over the store's `pending_by_inbox` index (which also serves restart), and that an unbound inbox's timeout clock starts when it gains its first open message and is released when it has none.
 
 - **Inboxes.** Each role instance owns an **Inbox** resource, homed with the role's owner: the convoy for convoy roles, and the project's declarations for standing roles. Messages queue there and outlive any fulfiller.
 - **Standing roles** are declared in the charter and own their inboxes, whether or not anything automatic fills them. An Ensure is optional, layered on a role: it keeps an agent bound. Retiring an Ensure leaves the role and its inbox in place. There is no separate person kind: a person's own inbox is a declared role with one holder.

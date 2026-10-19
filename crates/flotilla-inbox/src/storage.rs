@@ -23,19 +23,11 @@ pub trait WatchReader: Send {
     fn changes_since(&mut self, after: Cursor) -> Result<ChangePage, Error>;
 }
 
-pub struct PendingPage<C> {
-    pub messages: Vec<Resource<Message>>,
-    pub next: Option<C>,
-}
-
 pub trait InboxLog: Log<Message> + Send {
-    type PendingCursor: Send;
-    fn pending(
-        &mut self,
-        inbox: &Address,
-        after: Option<&Self::PendingCursor>,
-        limit: u32,
-    ) -> Result<PendingPage<Self::PendingCursor>, Error>;
+    /// Home-scoped keys in admission order, strictly above `after`; never decodes bodies.
+    fn pending_keys(&mut self, inbox: &Address, after: u64, limit: u32) -> Result<Vec<(u64, String)>, Error>;
+    /// The first Pending resource strictly above this admission bound, decoded once.
+    fn pending(&mut self, inbox: &Address, after: u64) -> Result<Option<Resource<Message>>, Error>;
     fn reader(&self) -> Box<dyn WatchReader>;
     fn exists(&mut self, name: &str) -> Result<bool, Error>;
     fn consumer_scope(&self) -> Option<ReceiptScope> {
@@ -185,18 +177,24 @@ impl Log<Message> for MemoryInboxLog {
     }
 }
 impl InboxLog for MemoryInboxLog {
-    type PendingCursor = u64;
-    fn pending(&mut self, inbox: &Address, after: Option<&u64>, limit: u32) -> Result<PendingPage<u64>, Error> {
+    fn pending_keys(&mut self, inbox: &Address, after: u64, limit: u32) -> Result<Vec<(u64, String)>, Error> {
         use std::ops::Bound::{Excluded, Included};
         let store = self.0.lock().expect("memory store");
-        let limit = limit.clamp(1, 32) as usize;
-        let rows: Vec<_> = store
+        Ok(store
             .pending
-            .range((Excluded((inbox.clone(), after.copied().unwrap_or(0))), Included((inbox.clone(), u64::MAX))))
-            .take(limit + 1)
-            .collect();
-        let next = (rows.len() > limit).then(|| rows[limit - 1].0 .1);
-        Ok(PendingPage { messages: rows.into_iter().take(limit).map(|(_, name)| store.resources[name].clone()).collect(), next })
+            .range((Excluded((inbox.clone(), after)), Included((inbox.clone(), u64::MAX))))
+            .take(limit.clamp(1, 32) as usize)
+            .map(|((_, seq), name)| (*seq, name.clone()))
+            .collect())
+    }
+    fn pending(&mut self, inbox: &Address, after: u64) -> Result<Option<Resource<Message>>, Error> {
+        use std::ops::Bound::{Excluded, Included};
+        let store = self.0.lock().expect("memory store");
+        Ok(store
+            .pending
+            .range((Excluded((inbox.clone(), after)), Included((inbox.clone(), u64::MAX))))
+            .next()
+            .map(|(_, name)| store.resources[name].clone()))
     }
     fn reader(&self) -> Box<dyn WatchReader> {
         Box::new(self.clone())

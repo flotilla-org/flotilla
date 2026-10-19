@@ -20,7 +20,7 @@ use flotilla_state_machines::{
 };
 
 use crate::{
-    storage::{ChangePage, PendingPage, ScanPage},
+    storage::{ChangePage, ScanPage},
     Change, ChangeKind, ConsumerLog, Cursor, Error, InboxLog, ReceiptScope,
 };
 
@@ -147,31 +147,26 @@ fn created_inbox(entry: &flotilla_schema::Event) -> Result<Address, Error> {
 }
 
 impl InboxLog for MessageLog {
-    type PendingCursor = flotilla_schema_sqlite::Cursor;
-    fn pending(
-        &mut self,
-        inbox: &Address,
-        after: Option<&Self::PendingCursor>,
-        limit: u32,
-    ) -> Result<PendingPage<Self::PendingCursor>, Error> {
+    fn pending_keys(&mut self, inbox: &Address, after: u64, limit: u32) -> Result<Vec<(u64, String)>, Error> {
         let mut store = self.store.lock().expect("store writer");
         let mut read = store.read().map_err(storage)?;
-        let mut cursor = after.cloned();
-        loop {
-            let page = read.page(&MessageSpec::pending_by_inbox(inbox), cursor.as_ref(), limit.clamp(1, 32)).map_err(storage)?;
-            let mut messages = Vec::new();
-            for id in page.ids {
-                if read.identity(id).map_err(storage)?.is_some_and(|(identity, _)| identity.home == self.home) {
-                    if let Some(loaded) = read.load::<Resource<Message>>(id).map_err(storage)? {
-                        messages.push(loaded.value);
-                    }
-                }
-            }
-            cursor = page.next;
-            if !messages.is_empty() || cursor.is_none() {
-                return Ok(PendingPage { messages, next: cursor });
-            }
-        }
+        let after = i64::try_from(after).map_err(storage)?;
+        let keys =
+            read.integer_index_keys(&MessageSpec::pending_by_inbox(inbox), &self.home, after, limit.clamp(1, 32)).map_err(storage)?;
+        keys.into_iter()
+            .map(|(id, seq)| {
+                let (identity, _) = read.identity(id).map_err(storage)?.ok_or_else(|| Error::Storage("Pending identity missing".into()))?;
+                Ok((u64::try_from(seq).map_err(storage)?, identity.name))
+            })
+            .collect()
+    }
+    fn pending(&mut self, inbox: &Address, after: u64) -> Result<Option<Resource<Message>>, Error> {
+        let mut store = self.store.lock().expect("store writer");
+        let mut read = store.read().map_err(storage)?;
+        let after = i64::try_from(after).map_err(storage)?;
+        let keys = read.integer_index_keys(&MessageSpec::pending_by_inbox(inbox), &self.home, after, 1).map_err(storage)?;
+        let Some((id, _)) = keys.first() else { return Ok(None) };
+        Ok(read.load::<Resource<Message>>(*id).map_err(storage)?.map(|loaded| loaded.value))
     }
     fn consumer_scope(&self) -> Option<ReceiptScope> {
         self.receipt_scope()

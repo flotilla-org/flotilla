@@ -18,7 +18,7 @@ mod resident;
 pub mod sqlite;
 mod storage;
 pub use resident::{Residency, RESIDENT_BUDGET};
-pub use storage::{ChangePage, InboxLog, MemoryInboxLog, PendingPage, ScanPage, WatchReader};
+pub use storage::{ChangePage, InboxLog, MemoryInboxLog, ScanPage, WatchReader};
 
 /// Opaque canonical address assigned by the backend; usable as a subject.
 pub type MessageId = String;
@@ -282,17 +282,9 @@ struct State<L: InboxLog> {
     observation_version: u64,
 }
 
-struct PendingRead<C> {
+#[derive(Default)]
+struct PendingRead {
     after: u64,
-    cursor: Option<C>,
-    rows: VecDeque<Resource<Message>>,
-    ended: bool,
-    store: bool,
-}
-impl<C> Default for PendingRead<C> {
-    fn default() -> Self {
-        Self { after: 0, cursor: None, rows: VecDeque::new(), ended: false, store: false }
-    }
 }
 
 /// Single home writer. The mutex covers the engine decision and its committed
@@ -595,18 +587,22 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             return Ok(());
         }
         let mut rows = BTreeMap::new();
-        let mut cursor = None;
+        let mut after = 0;
         loop {
-            let page = state.home.log_mut().pending(inbox, cursor.as_ref(), 32)?;
-            for resource in page.messages {
-                charge += resident::pending(inbox, resource.name(), false);
+            let keys = state.home.log_mut().pending_keys(inbox, after, 32)?;
+            if keys.is_empty() {
+                break;
+            }
+            let last_page = keys.len() < 32;
+            for (seq, name) in keys {
+                charge += resident::pending(inbox, &name, false);
                 if state.pending_bytes.saturating_add(charge) > state.pending_budget {
                     return Ok(());
                 }
-                rows.insert(resource.spec().admitted_seq, resource.name().to_owned());
+                after = seq;
+                rows.insert(seq, name);
             }
-            cursor = page.next;
-            if cursor.is_none() {
+            if last_page {
                 break;
             }
         }
@@ -631,47 +627,30 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         state.pending_bytes += charge;
     }
 
-    fn next_pending(state: &mut State<L>, inbox: &Address, query: &mut PendingRead<L::PendingCursor>) -> Result<Option<String>, Error> {
+    fn next_pending(state: &mut State<L>, inbox: &Address, query: &mut PendingRead) -> Result<Option<String>, Error> {
         use std::ops::Bound::{Excluded, Unbounded};
-        if !query.store {
-            if let Some(rows) = state.inboxes.get(inbox) {
-                let next = rows.range((Excluded(query.after), Unbounded)).next().map(|(seq, name)| (*seq, name.clone()));
-                let Some((seq, name)) = next else { return Ok(None) };
-                query.after = seq;
-                if !Self::load(state, &name)? {
-                    return Err(Error::Storage("cached Pending key missing from store".into()));
-                }
-                return Ok(Some(name));
+        if let Some(rows) = state.inboxes.get(inbox) {
+            let next = rows.range((Excluded(query.after), Unbounded)).next().map(|(seq, name)| (*seq, name.clone()));
+            let Some((seq, name)) = next else { return Ok(None) };
+            query.after = seq;
+            if !Self::load(state, &name)? {
+                return Err(Error::Storage("cached Pending key missing from store".into()));
             }
-            query.store = true;
+            return Ok(Some(name));
         }
-        loop {
-            while let Some(resource) = query.rows.pop_front() {
-                if resource.spec().admitted_seq <= query.after {
-                    continue;
-                }
-                Self::validate_admission(&resource)?;
-                query.after = resource.spec().admitted_seq;
-                let name = resource.name().to_owned();
-                if state.home.get(&name).is_none() {
-                    let receipts = state.home.log_mut().receipts(&name)?;
-                    if !receipts.is_empty() {
-                        state.receipts.insert(name.clone(), receipts);
-                    }
-                    state.home.restore(resource)?;
-                }
-                state.touched.insert(name.clone());
-                return Ok(Some(name));
+        let Some(resource) = state.home.log_mut().pending(inbox, query.after)? else { return Ok(None) };
+        Self::validate_admission(&resource)?;
+        query.after = resource.spec().admitted_seq;
+        let name = resource.name().to_owned();
+        if state.home.get(&name).is_none() {
+            let receipts = state.home.log_mut().receipts(&name)?;
+            if !receipts.is_empty() {
+                state.receipts.insert(name.clone(), receipts);
             }
-            if query.ended {
-                return Ok(None);
-            }
-            // One value per pull avoids retaining a page of bodies in every stream.
-            let page = state.home.log_mut().pending(inbox, query.cursor.as_ref(), 1)?;
-            query.ended = page.next.is_none();
-            query.cursor = page.next;
-            query.rows = page.messages.into();
+            state.home.restore(resource)?;
         }
+        state.touched.insert(name.clone());
+        Ok(Some(name))
     }
 
     fn binding_blocked(&self, state: &mut State<L>, inbox: &Address) -> Result<bool, Error> {

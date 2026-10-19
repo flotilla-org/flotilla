@@ -523,7 +523,7 @@ async fn watch_reads_do_not_take_inbox_writer_lock() {
 
 // Behaviour: a whole inbox spills when its complete order does not fit; cached
 // inboxes and spilled inboxes keep admission order, including mid-stream spill.
-// Restart rebuilds cache order through pending(), never from scan order, and a
+// Restart rebuilds cache order through key-only pending_keys(), never from scan order, and a
 // zero cache/value allowance never refuses admission or recovery. Both stores.
 #[tokio::test]
 async fn pending_spill_and_restart_use_declared_index() {
@@ -538,13 +538,16 @@ async fn pending_spill_and_restart_use_declared_index() {
         }
         assert_eq!(backend.residency_blocking().pending_messages, 2);
         let mut stream = backend.pending(&inbox(), &consumer("a"), &Rules::default()).await.unwrap();
-        let mut pulled = vec![stream.next().await.unwrap().unwrap().message];
+        let mut pulled = vec![stream.next().await.unwrap().unwrap().message, stream.next().await.unwrap().unwrap().message];
+        source.reset_read_counts();
         names.push(backend.enqueue(spec()).await.unwrap());
         assert_eq!(backend.residency_blocking().pending_messages, 0, "inbox spills as a whole");
-        while let Some(row) = stream.next().await {
-            pulled.push(row.unwrap().message);
+        for _ in pulled.len()..names.len() {
+            pulled.push(stream.next().await.unwrap().unwrap().message);
         }
         assert_eq!(pulled, names);
+        assert!(stream.next().await.is_none());
+        assert_eq!(source.read_counts().resource_loads, 1, "spill decodes only the one un-emitted candidate");
         assert!(source.read_counts().pending_pages > 0);
         drop(stream);
         let other_inbox = address("project:test/role:small");
@@ -561,11 +564,23 @@ async fn pending_spill_and_restart_use_declared_index() {
         drop(backend);
         source.reset_read_counts();
         let recovered = EngineInbox::open_with_budgets("test", source.clone(), evidence.clone(), Arc::new(Supervisors), 0, 900).unwrap();
-        assert!(source.read_counts().pending_pages > 0, "restart reads declared Pending index to rebuild cache");
+        assert!(source.read_counts().pending_key_pages > 0, "restart reads key-only declared index to rebuild cache");
+        assert_eq!(source.read_counts().scan_resource_loads, 4, "startup decodes each current body once");
+        assert_eq!(source.read_counts().resource_loads, 0, "rebuilding Pending order decodes no bodies");
+        assert_eq!(source.read_counts().pending_pages, 0);
         let actual = recovered.pending(&inbox(), &consumer("a"), &Rules::default()).await.unwrap().try_collect::<Vec<_>>().await.unwrap();
         // Recovery is Unbound; provide binding evidence through the regular API
         // on a backend with a normal control allowance below instead.
         assert!(actual.is_empty());
+        drop(recovered);
+        let recovered =
+            EngineInbox::open_with_budgets("test", source.clone(), evidence.clone(), Arc::new(Supervisors), 65536, 65536).unwrap();
+        assert_eq!(recovered.residency_blocking().pending_messages, 4, "all orders fit on restart");
+        recovered.bind(inbox(), consumer("a")).await.unwrap();
+        source.reset_read_counts();
+        let actual = recovered.pending(&inbox(), &consumer("a"), &Rules::default()).await.unwrap().try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(actual.into_iter().map(|p| p.message).collect::<Vec<_>>(), names, "cached restart preserves admission order");
+        assert_eq!(source.read_counts().pending_pages, 0, "cached restart serves order from memory");
         drop(recovered);
         let recovered = EngineInbox::open_with_budgets("test", source.clone(), evidence, Arc::new(Supervisors), 2048, 0).unwrap();
         recovered.bind(inbox(), consumer("a")).await.unwrap();

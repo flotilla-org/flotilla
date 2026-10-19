@@ -89,6 +89,8 @@ pub enum StoreError {
     ZeroLimit,
     #[error("kind code {kind} declares no index {index}")]
     UnknownIndex { kind: KindCode, index: String },
+    #[error("index {index} of {kind} does not have a single integer order column")]
+    IntegerIndex { kind: KindCode, index: String },
     /// A cursor from another query: a different kind, index or `eq` arguments.
     #[error("cursor does not belong to this query of index {index}")]
     CursorMismatch { index: String },

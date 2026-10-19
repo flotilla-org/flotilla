@@ -120,6 +120,37 @@ impl Ctx<'_> {
         Ok(Page { ids: rows.into_iter().map(|(id, _)| id).collect(), next })
     }
 
+    pub(crate) fn integer_index_keys<K>(
+        &mut self,
+        query: &IndexQuery<K>,
+        home: &str,
+        after: i64,
+        limit: u32,
+    ) -> Result<Vec<(ResourceId, i64)>, StoreError> {
+        let kind = query.kind();
+        let limit = page_limit(limit)?;
+        let eq = query.eq()?;
+        let index =
+            self.sql(kind)?.indexes.get(query.index()).ok_or_else(|| StoreError::UnknownIndex { kind, index: query.index().into() })?;
+        if index.integer_keys.is_none() {
+            return Err(StoreError::IntegerIndex { kind, index: query.index().into() });
+        }
+        let columns = index.eq_columns.clone();
+        let mut params = Vec::with_capacity(eq.len() + 3);
+        for (column, value) in columns.iter().zip(eq) {
+            let Some(param) = self.lookup(kind, column, value)? else { return Ok(Vec::new()) };
+            params.push(param);
+        }
+        let Some(home) = self.string_id(HOME_DOMAIN, home)? else { return Ok(Vec::new()) };
+        params.extend([SqlValue::Integer(after), SqlValue::Integer(home), SqlValue::Integer(limit)]);
+        let statement = self.sql(kind)?.indexes[query.index()].integer_keys.as_ref().expect("validated integer index");
+        Ok(self
+            .conn
+            .prepare_cached(statement)?
+            .query_map(params_from_iter(params), |row| Ok((ResourceId(row.get(0)?), row.get(1)?)))?
+            .collect::<Result<_, _>>()?)
+    }
+
     pub(crate) fn scan<K: Kind>(&mut self, home: &str, after: Option<ResourceId>, limit: u32) -> Result<Page<ResourceId>, StoreError> {
         let limit = page_limit(limit)?;
         self.sql(K::CODE)?;

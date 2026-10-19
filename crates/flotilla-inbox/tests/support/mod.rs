@@ -1,5 +1,5 @@
 //! Test-only logical storage-operation audit. No production allocation/counters.
-use flotilla_inbox::{sqlite::MessageLog, ChangePage, Cursor, Error, InboxLog, PendingPage, ReceiptScope, ScanPage, WatchReader};
+use flotilla_inbox::{sqlite::MessageLog, ChangePage, Cursor, Error, InboxLog, ReceiptScope, ScanPage, WatchReader};
 use flotilla_schema::{Address, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{machines::message::*, EdgeEventOf, InputRead, Log, LogError, Resource, StoredState, Transport, Version};
@@ -13,6 +13,8 @@ pub struct ReadCounts {
     pub terminal_loads: u64,
     pub scan_pages: u64,
     pub pending_pages: u64,
+    pub pending_key_pages: u64,
+    pub scan_resource_loads: u64,
     pub receipt_reads: u64,
     pub watch_pages: u64,
     pub exists: u64,
@@ -51,21 +53,18 @@ impl<L: InboxLog> Log<Message> for CountingLog<L> {
     }
 }
 impl<L: InboxLog> InboxLog for CountingLog<L> {
-    type PendingCursor = L::PendingCursor;
-    fn pending(
-        &mut self,
-        inbox: &Address,
-        after: Option<&Self::PendingCursor>,
-        limit: u32,
-    ) -> Result<PendingPage<Self::PendingCursor>, Error> {
-        let page = self.inner.pending(inbox, after, limit)?;
+    fn pending_keys(&mut self, inbox: &Address, after: u64, limit: u32) -> Result<Vec<(u64, String)>, Error> {
+        self.counts.lock().unwrap().pending_key_pages += 1;
+        self.inner.pending_keys(inbox, after, limit)
+    }
+    fn pending(&mut self, inbox: &Address, after: u64) -> Result<Option<Resource<Message>>, Error> {
+        let resource = self.inner.pending(inbox, after)?;
         let mut counts = self.counts.lock().unwrap();
         counts.pending_pages += 1;
-        counts.resource_loads += page.messages.len() as u64;
+        counts.resource_loads += u64::from(resource.is_some());
         counts.terminal_loads +=
-            page.messages.iter().filter(|r| matches!(r.state(), MessageState::Settled { .. } | MessageState::Dropped { .. })).count()
-                as u64;
-        Ok(page)
+            u64::from(resource.as_ref().is_some_and(|r| matches!(r.state(), MessageState::Settled { .. } | MessageState::Dropped { .. })));
+        Ok(resource)
     }
 
     fn reader(&self) -> Box<dyn WatchReader> {
@@ -92,7 +91,9 @@ impl<L: InboxLog> InboxLog for CountingLog<L> {
     }
     fn scan(&mut self, a: Option<i64>) -> Result<ScanPage, Error> {
         self.counts.lock().unwrap().scan_pages += 1;
-        self.inner.scan(a)
+        let page = self.inner.scan(a)?;
+        self.counts.lock().unwrap().scan_resource_loads += page.messages.len() as u64;
+        Ok(page)
     }
     fn receipts(&mut self, n: &str) -> Result<BTreeMap<Receiver, Transport>, Error> {
         self.counts.lock().unwrap().receipt_reads += 1;

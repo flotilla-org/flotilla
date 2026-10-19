@@ -16,20 +16,15 @@ semantics live in the [implementation record](../../docs/implementation-choices/
 | Inbox bindings/unbound clocks and consumer keys | Address + binding header + 128 B outer-map slack; nonempty consumer set adds 512 B node allowance + twice receiver charge; registered key adds receiver charge + 64 B | 96 MiB setup ceiling within shared 128 MiB; required live clocks retained, values evicted first |
 | Temporary touched/read sets | keys touched by the current operation; only declared evidence keys copied with versions | released after operation; source/port observations themselves are caller-owned |
 
-The normal dynamic allowance is **256 MiB**: Pending-order cache has 128 MiB
-alongside the 128 MiB value/control share. Control state reduces the value
-allowance. Pending cache pressure spills inboxes to the store; value pressure
-leaves bodies cold. Neither refuses admission or restart. Required live clocks
-are retained even if a custom value/control target is smaller than their charge;
-that target is soft for mandatory observations, and diagnostics expose the excess.
-Explicit binding/consumer setup retains its 96 MiB control ceiling. Historical-only
-unbound inboxes consume no controls. Diagnostics report value/control charges,
-effective setup ceiling and Pending cache usage/cap separately.
+The normal dynamic allowance is **256 MiB**: 128 MiB for Pending-order keys
+and 128 MiB shared by values and controls. The explicit control setup ceiling
+is 96 MiB within that share. Required live-control charges can exceed a smaller
+custom target. Historical-only unbound inboxes charge zero. Residency reports
+value/control charges, effective setup ceiling and Pending cache usage/cap.
 
 `Address` charge is `size_of(Address) + 4 * canonical_len + 2 * segment_slice_bytes`.
-The previous length multiplier 8 and fixed 128 B/segment are gone. Parsed String
-capacity matters: multiplier 2 undercounted the long-address calibration, so 4
-is retained. Segment slots allow Vec spare capacity. `receiver` includes its
+Parsed String
+capacity and segment Vec spare capacity are included in that charge. `receiver` includes its
 header, id/host capacity and node slack. Resource accounting lists every
 MessageSpec field explicitly. Fixed resource/map headers are counted once,
 with two BTree slots per live row for Home, LRU and size metadata; add three
@@ -62,8 +57,7 @@ asserting that accounting counters stay below a cap.
 | Unbound clock with outer map | 368 | 483 |
 | One-consumer binding with outer map | 1,005 | 1,309 |
 
-The one-element BTreeSet was measured, not treated as just a Receiver: omitting
-its node allowance undercounted (before including the node allowance).
+The one-consumer binding measurement includes the BTreeSet node allocation.
 These measurements calibrate the tested address/body/binding shapes; larger
 fanout, reference/request shapes and different address envelopes must continue
 to satisfy accounting. The formula includes their owned capacities explicitly.
@@ -105,25 +99,24 @@ This is an ownership model, not a measured whole-process RSS guarantee.
 |---|---|---|
 | enqueue | resident binding/clock and read set; transaction-assigned admission | source sequence for opaque name; one create transaction; no pre-read for admission |
 | reply/supersede/dead-letter existence | resident identity or source resolve | resolve only, never terminal body/history |
-| pending | complete cached inbox order, or declared `pending_by_inbox` fallback | cache: one keyed load per absent item; fallback: one indexed resource per pull, restored without a second load; indexed receipts for cold values |
+| pending | complete cached inbox order, or declared `pending_by_inbox` fallback | cache: one keyed load per absent item; fallback: one home-scoped indexed resource above the last admission per pull; indexed receipts for cold values |
 | receive/deliver/settle/drop | typed cached value and receipts/evidence | keyed `resolve` + `load`, receipt `about` if needed; no Settled/Dropped or source-history read for steady-state delivery |
 | bind | same Pending cache/fallback; inspect candidates until receipt hit | one value read + receipt query per absent candidate; linear backlog under writer, then receipt wait outside lock (#3491) |
 | unbind | resident binding | no store read |
 | explicit terminal get | key | resolve + typed load, then discard |
 | watch | separate source reader, authoritative `changes_since` | at most 16 entries/store page under existing byte cap; non-create attribution resolves original create, reused within page |
-| restart | home-scoped `Read::scan` for open values/clocks; declared Pending index for order | 32 resources/scan page plus Pending-index pages of 32; recover open receipts and repair reactions; stop caching a group when it cannot fit |
+| restart | home-scoped `Read::scan` for open values/clocks; declared Pending index for order | 32 resources/scan page plus key-only Pending-index pages of 32 (no second body decode); recover open receipts and repair reactions |
 
-Fallback index pages resolve resource identity before decoding a body, excluding
-foreign homes even when inbox addresses, names and admission numbers collide.
-The index cursor orders by immutable admitted_seq; its resource is returned once.
-A transition from cached order to fallback resumes after the last emitted admission.
+Key-only index reads project id and admitted_seq, with the home predicate applied
+before the limit. Fallback bodies decode once per returned candidate; already
+emitted admissions and foreign-home rows incur no body loads.
 
 ## Small read-count probes
 
 A 32 KiB value/control allowance, eight-entry source caches and distinct 2 KiB
 bodies retain four values at 32, 64 and 96 stored open messages. Value/control
 charge stays 27,643 B; Pending charges are 3,600 / 6,576 / 9,552 B. Live Rust
-bytes are 209,002 / 211,802 / 215,498. Pulling 96 messages makes 96 value loads,
+bytes are 210,633 / 213,433 / 217,129. Pulling 96 messages makes 96 value loads,
 96 receipt queries and no terminal loads, scans or watch reads.
 Cold bind over three messages makes three loads and three receipt queries.
 Restart over three terminal messages uses one scan page, no receipts and no

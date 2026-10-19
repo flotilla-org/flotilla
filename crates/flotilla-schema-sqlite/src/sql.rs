@@ -100,6 +100,8 @@ pub(crate) struct IndexSql {
     pub first: String,
     /// A later page: eq values, the cursor's order values and id, then the limit.
     pub after: String,
+    /// Home-scoped keys after an exclusive integer order bound; only single integer orders.
+    pub integer_keys: Option<String>,
 }
 
 /// Interned columns read back as their strings through `strings`' primary key.
@@ -188,6 +190,9 @@ impl KindSql {
         for index in self.indexes.values() {
             out.push((format!("index {} first", index.object), index.first.clone()));
             out.push((format!("index {} after", index.object), index.after.clone()));
+            if let Some(sql) = &index.integer_keys {
+                out.push((format!("index {} integer keys", index.object), sql.clone()));
+            }
         }
         out.push((format!("{root} scan"), self.scan.clone()));
         out
@@ -228,6 +233,25 @@ impl IndexSql {
                 .iter()
                 .map(|name| root.columns.iter().find(|column| &column.name == name).expect("validated eq column").clone())
                 .collect(),
+            integer_keys: if index.order.len() == 1
+                && root.columns.iter().any(|column| column.name == index.order[0] && column.ty == ColumnType::Integer)
+            {
+                let mut bounds = first.clone();
+                bounds.push(format!("{} > ?{next}", order[0]));
+                bounds.push(format!(
+                    "EXISTS (SELECT 1 FROM \"resource_identity\" AS ri WHERE ri.\"id\" = {table}.\"id\" AND ri.\"home\" = ?{})",
+                    next + 1
+                ));
+                Some(format!(
+                    "SELECT \"id\", {} FROM {table} INDEXED BY {} WHERE {} {}",
+                    order[0],
+                    quote_ident(&index.object_name()),
+                    bounds.join(" AND "),
+                    limit(next + 2)
+                ))
+            } else {
+                None
+            },
             object: index.object_name(),
             order: order.len(),
             first: format!("{select} {} {}", first.join(" AND "), limit(next)),

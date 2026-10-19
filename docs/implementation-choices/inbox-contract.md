@@ -1,9 +1,8 @@
 # Inbox bounded filtered replica
 
-Implements #3466 before the Message switch (#3317). The owner approved the
-stored admission column and Pending-only index, then approved the owned create
-hook, borrowed observation snapshot and Home eviction seams. The
-[component workload](../../crates/flotilla-inbox/WORKLOAD.md) owns the size
+The Message inbox uses store-independent admission order, a Pending-only index,
+an owned create hook, borrowed observation snapshots and rebuildable Home values.
+The [component workload](../../crates/flotilla-inbox/WORKLOAD.md) owns the size
 formula, measurements, ceiling arithmetic and access-cost numbers.
 
 ## Resident state and recovery
@@ -16,9 +15,10 @@ uses the declared pending_by_inbox index by admission; a returned resource is
 restored without another body load. Index identity metadata excludes other homes
 before decoding bodies. Value eviction does not affect the independent key cache.
 Cache pressure never refuses admission or recovery. Groups are cached whole,
-with no unbounded set of spilled inboxes; a spilled group stays store-backed until
-it empties or recovery considers it again. Mid-stream spill resumes after the
-last emitted admission number.
+without retaining a separate set of spilled inbox names. A nonempty inbox whose
+order has spilled continues reading the store until it empties; recovery may
+cache its order again if it fits. Mid-stream spill uses an exclusive admitted_seq
+lower bound, so previously emitted rows are never decoded again.
 
 Settled/Dropped values leave Home after the operation. An explicit terminal read
 is keyed; historical state is decoded from the source entry, never from today's
@@ -27,17 +27,18 @@ without loading those resources. Receipts use the master's declared about index.
 
 Restart streams the home-scoped scan for open values, live inbox counts/clocks,
 receipts and interrupted Undeliverable reactions. It rebuilds Pending order from
-the declared index, never from scan order. Only values and inbox-order groups
-that fit their cache allowances are retained. Bindings remain local observations.
+key-only reads of the declared index, never from scan order or a second body
+decode. The store applies the home filter before its page limit. Only values and
+inbox-order groups that fit their cache allowances are retained. Bindings remain local observations.
 An Unbound clock starts when an empty inbox gains its first open message, and
 recovery creates one only for inboxes with open messages. When the last open
 message settles or drops, an unbound inbox releases its clock; refilling starts
 a fresh period. Bound inbox behavior is unchanged. A missing required clock is
-a returned error rather than a panic. The Quint specs remain unchanged.
+a returned error rather than a panic.
 
 Values are evicted before required live controls. Admission and restart retain
 those controls even when a custom target is too small; setup of explicit bindings
-and consumer keys keeps its existing capacity check. A binding update beyond the
+and consumer keys has a capacity check. A binding update beyond the
 setup ceiling returns a Storage capacity error before mutating the binding; it
 does not silently degrade or discard a receiver. This unavoidable live-state
 floor is sized against live inbox cardinality, not terminal history. Actual oldest
@@ -46,21 +47,18 @@ Oversized values remain cold.
 
 ## Approved engine and storage seams
 
-Home still decides admission. Log::create_resource owns the admitted resource,
+Home decides admission. Log::create_resource owns the admitted resource,
 persists it, and returns exactly the committed resource to Home. Its default
-preserves the old create behavior for other machines. MessageLog specializes this
+delegates to Log::create for other machines. MessageLog specializes this
 hook: it assigns admitted_seq inside the same Store lock/write transaction as
 insert and commit. It changes only persistence metadata, not gate-read fields,
-identity, state or recorded inputs. There is no read-then-retry path, MessageSpec
-downcast, or extra static bound in the shared consumer StoreLog. The memory
-source assigns admission under its own authoritative storage lock.
+identity, state or recorded inputs. The memory source assigns admission under
+its own authoritative storage lock.
 
 Observations::with_snapshot borrows one consistent generation. The adapter
-uses Table::select to copy only the declared Message read set, including exact versions and
-absences; debug/test Source lookups assert membership. A missing snapshot is a
-returned error, not a poisoned writer. Engine tables and MemoryMessageWorld no
-longer implement whole-world Clone. Home::evict removes only reconstructible
-values, leaving their authoritative log intact.
+uses Table::select to copy only the declared Message read set, including exact
+versions and absences; debug/test Source lookups assert membership. A missing snapshot is a
+returned error. Home::evict removes only reconstructible values, leaving their authoritative log intact.
 
 ## Watches and cursor loss
 
@@ -68,18 +66,16 @@ Watches read the authoritative source through a separate reader handle. They do
 not acquire the inbox writer mutex or its worker admission lock. Readers await
 one shared handle before submitting blocking work; decoded source pages are not
 retained as a journal. Store serialization can still contend with commits, but a
-long engine decision does not prevent a source read. Source page limits apply;
-there is no second decoded-byte budget. Memory uses the equivalent authoritative
-read and stores no unused copies of accepted edges or admission input vectors.
+long engine decision does not prevent a source read. Source page limits bound
+reads. Memory uses the equivalent authoritative read.
 
-Lag and restart alone do not expire retained cursors. The current cursor-loss
+Lag and restart alone do not expire retained cursors. The cursor-loss
 policy is deliberately conservative: **any missing home sequence returns
 CursorExpired, including a sequence removed by a logged expunge**. Thus one
 resource's expunge expires older cursors at that home even when their subscribers
-watch unrelated inboxes. Logged expunge is not currently distinguished from
+watch unrelated inboxes. Logged expunge is not distinguished from
 unexplained loss. Resume after the gap can work; clients needing an older
-baseline must resynchronize. This issue adds no trimming, archive or expunge
-policy. The home-wide consequence is tested explicitly.
+baseline must resynchronize.
 
 ## Expiry
 
