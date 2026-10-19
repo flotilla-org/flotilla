@@ -2,7 +2,7 @@
 
 **Status:** Accepted (owner grill, 2026-10-08; map #2912, recorded by #2913)
 **Date:** 2026-10-08
-**Amended:** 2026-10-18, §3 for shared inboxes (ADR 0064, #3424 ruling 3).
+**Amended:** 2026-10-18, §3 for shared inboxes (ADR 0064, #3424 ruling 3); 2026-10-19, §4 for coexisting transports (#2951).
 **Amends:** ADR 0055 (delivery wording and "holder"), ADR 0028 (the delivery ladder), ADR 0010 (tool crew and the Crew definition), ADR 0054 ("role holders"), ADR 0031 (AttachableSet is retired, not split)
 **Relates to:** ADR 0047 (stored data stays decodable for one generation), ADR 0051 (presentation metadata and `pm connect`), #2872 (host loss and rehydration), #2894 (the held transport draft that prompted this)
 
@@ -99,15 +99,25 @@ An **AgentChannel** is an AgentSession's current binding to a **transport** at
 a concrete endpoint on the session's current Process. The transports named so
 far are `keystroke` (typing into the terminal through cleat),
 `codex-app-server` (JSON-RPC turns) and `claude-channels` (Claude Code's
-Channels). The AgentAdapter declares which transports a harness supports, by
-harness version; the AgentChannel records which one is bound.
+Channels). The harness connector declares which transports a harness
+supports, by operation and harness version; the AgentChannel records which
+are live for the session.
 
-Binding happens when a session is launched or revived. Any later fallback is
-an explicit re-bind with a recorded reason, never a silent fallthrough at
-send time. Docs and code say "AgentChannel" or "transport", never a bare
+A session may offer several transports at once, registered by the harness
+connector for each live session shape; a router chooses one per delivery by
+policy and configuration. A message is delivered by one transport, never two
+where that can be avoided, and at least one transport must deliver it; the
+receipt records which one did. Docs and code say "AgentChannel" or "transport", never a bare
 "channel", which collides with Claude Code's Channels feature.
 
-*Rationale:* #2894's per-send preference list made the transport a property of
+*Amendment (2026-10-19, #2951):* the original rule bound a session to one
+transport at launch or revival, with any later fallback an explicit re-bind.
+Real harnesses do not fit that: a Codex session can be reachable through its
+TUI and its app-server at once, and Claude crews keep a visible TUI while
+gaining a native route. What the rule protected is kept: no double delivery
+where avoidable, and a receipt that names the transport used.
+
+*Original rationale:* #2894's per-send preference list made the transport a property of
 each delivery attempt, so the same session could receive input through
 different paths with different guarantees and nobody could say which applied.
 One recorded binding per session makes the guarantee knowable before a send,

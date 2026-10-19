@@ -2,7 +2,7 @@
 
 **Status:** Accepted (owner grill, 2026-10-09; #2749)
 **Date:** 2026-10-09
-**Amended:** 2026-10-13 (homes for modules the target crates did not place; #3152)
+**Amended:** 2026-10-13 (homes for modules the target crates did not place; #3152); 2026-10-19 (harness connectors replace `flotilla-agent-channel`; #2951)
 **Amends:** the VCS operation boundary rule in CLAUDE.md (CLI is no longer the universal implementation); the #2222 ruling that command handlers live in `flotilla-commands`
 **Supersedes:** the two-layer providers/orchestration cut proposed on #2749
 **Relates to:** ADR 0047 (stored data stays decodable for one generation), ADR 0058 (environment providers), ADR 0059 (agent sessions, processes and channels), ADR 0029 (the leaf engine), #2747 (build graph check), #2948 (test support), #2953 (store query pushdown)
@@ -50,7 +50,7 @@ The owner's direction is to break flotilla into components so it isn't committed
   - `flotilla-discovery`: the generic detectors, plus assembly of the factory list, static for now and open to registration later (for example plugin factories: scripted, wasm, dylib).
 - **Charter:** `flotilla-charter` holds the project's declarations read through a `RevisionedTree` interface: a local directory, git at a ref, or a database later. VCS offers only a generic "read files under a path at a revision" operation. `CharterSnapshot` leaves the `Vcs` trait. Agent guidance (briefs and prose delivery) consumes the charter from the agent and role layer.
 - **Agents:**
-  - `flotilla-agent-channel` (#2951): sessions over transports (codex-app-server, Claude SDK, Claude channels, cleat keystrokes, ACP). It contains no resource types.
+  - `flotilla-agent-connector` (#2951) holds the traits a harness connector implements (session shapes and their launch, hook parsing, a state stream marked native or inferred, and the delivery transports offered per operation and harness version); it contains no resource types. Each harness has one connector crate implementing it, and connectors never depend on each other. The router that picks a transport per delivery replaces messaging's terminal-typed `MessageTransport` seam.
   - cleat owns terminal content and agent screen state (flotilla-org/cleat#326).
   - The TerminalSession resource and its reconciler remain orchestration.
 - **Messaging:** `flotilla-messaging` behind a trait. It is resource-backed by default; a broker may replace it for large installs.
@@ -78,7 +78,7 @@ VCS operations go through the `Vcs` trait. Each provider chooses a CLI implement
 2. **Extract the leaf crates:** paths and daemon-api (which frees the client), the testkits (#2948), then the store API, discovery API, provider runtime and type crates.
 3. **The store trait and backend crates**, together with #2953's pushdown.
 4. **The orchestration capability crates.** The aggregator and credentials move onto ports.
-5. **The terminal and agent-channel moves**, with cleat#326 and #2951.
+5. **The terminal and agent-connector moves**, with cleat#326 and #2951.
 6. **#2909**, CI by crate scope.
 
 Stored shapes are unaffected by moving code. Any crate move that changes a serialized type follows ADR 0047.
@@ -89,7 +89,7 @@ The step-4 survey found core and store code with no home in the target crates. O
 
 - **Change feed.** Domain code drifted into `flotilla-store` because the store is the only component that publishes domain changes. The change-feed interface (typed watches, indexed views and the controller runtime) is the seam domain crates depend on; persistence is one backend behind it. It stays in `flotilla-store`'s public API until the resident-state redesign lifts it into its own crate. `flotilla-store` holds only generic machinery: the store trait, queries, views and watches, the controller runtime, owner garbage collection and dynamic kinds. A build-graph rule refusing domain modules in it lands with the store-goes-domain-free stream of #3152; until then the rule is a review check.
 - **`flotilla-observation`** (new): the change-request, issue and forge observers and the observed-resource projection, turning provider facts into observed resources. It sits between the provider type crates, which stay storage-free, and the store. It owns the public `ChangeRequestQueryPort` and `IssueQueryPort`; core supplies their provider-resolution implementations. It is expected to become event-log driven. ADR 0060's observation entry lists `ConvoyBranchRefresh` among the observation results that capability crates share.
-- **`flotilla-messaging`**: delivery (with the `MessageTransport` seam that agent-channel transports implement), inbox, retention, conditions and role routing (including charter notifications), moved out of `flotilla-store`. Receiver resolution moves with messaging and reads resource kinds directly; there is no receiver-resolution port. The primitives-model mission #3108 will replace it with role bindings. `MessageQuery` stays a pure pushdown-query data type in the store interface; SQL translation and memory indexing belong to the respective backends (resolution #3297, extraction #3298).
+- **`flotilla-messaging`**: delivery (through the `MessageTransport` seam, which the agent-connector router replaces per #2951), inbox, retention, conditions and role routing (including charter notifications), moved out of `flotilla-store`. Receiver resolution moves with messaging and reads resource kinds directly; there is no receiver-resolution port. The primitives-model mission #3108 will replace it with role bindings. `MessageQuery` stays a pure pushdown-query data type in the store interface; SQL translation and memory indexing belong to the respective backends (resolution #3297, extraction #3298).
 - **Reconcilers live with the capability that owns their kind,** and `flotilla-controllers` retires. Each capability crate exports its reconcilers; the daemon registers them.
   - `flotilla-admission`: standing-convoy ensure and vessel placement.
   - `flotilla-crew`: the convoy phase and landing reconciler, vessel, terminal session, settlement-claim publishing.
