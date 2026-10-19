@@ -143,6 +143,7 @@ use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_discovery::discover_checkout_with_host_scoped;
 use flotilla_discovery::environment_manager::EnvironmentManager;
 use flotilla_discovery::environment_manager::ResolvedEnvironment;
+use flotilla_discovery::environments::{EnvironmentLifecycle, Environments};
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery::run_host_detectors;
 use flotilla_discovery::status::provider_names_from_registry;
@@ -867,7 +868,7 @@ impl InProcessDaemon {
             config: &self.config,
             active_commands: &self.active_commands,
             observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
-            environment_manager: Arc::clone(&self.environment_manager) as _,
+            environment_manager: Arc::clone(&self.environment_manager) as Arc<dyn EnvironmentLifecycle>,
             runner: &self.discovery.runner,
             env: &self.discovery.env,
             daemon_socket_path: &self.daemon_socket_path,
@@ -1271,7 +1272,7 @@ impl InProcessDaemon {
                 .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
                 .config(Arc::clone(&config))
                 .discovery(Arc::clone(&discovery))
-                .environment_manager(Arc::clone(&environment_manager) as _)
+                .environment_manager(Arc::clone(&environment_manager) as Arc<dyn Environments>)
                 .local_environment_id(local_environment_id.clone())
                 .provisioning_namespace(Arc::clone(&provisioning_namespace))
                 .repository_change_requests(Arc::clone(&repository_change_requests))
@@ -4854,7 +4855,7 @@ impl InProcessDaemon {
             daemon_socket_path,
 
             local_host: self.host_name.clone(),
-            environment_manager: Arc::clone(&self.environment_manager) as _,
+            environment_manager: Arc::clone(&self.environment_manager) as Arc<dyn EnvironmentLifecycle>,
             vcs_resolver: self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")?
                 as Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>,
         };
