@@ -49,6 +49,9 @@ asserting that accounting counters stay below a cap.
 | Cloned Address, length 23 | 168 | 292 |
 | Parsed Address, length 142 | 584 | 768 |
 | Cloned Address, length 142 | 406 | 768 |
+| Parsed / cloned Address, length 2,062 | 6,344 / 4,246 | 8,448 |
+| Parsed / cloned three-segment Address, length 790 | 1,992 / 1,726 | 3,424 |
+| Parsed / cloned artifact Address with escaped subject, length 1,101 | 2,366 / 2,360 | 4,732 |
 | Open resource, empty text, Home + LRU + metadata | 2,142 | 2,426 |
 | Same, distinct 2 KiB text | 6,238 | 6,524 |
 | Same, distinct 8 KiB text | 18,526 | 18,812 |

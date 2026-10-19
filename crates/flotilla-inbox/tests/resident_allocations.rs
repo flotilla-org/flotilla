@@ -117,7 +117,19 @@ fn calibrate() {
     use flotilla_state_machines::{machines::message::*, Resource, Version};
     use std::{collections::BTreeMap, hint::black_box, mem::size_of};
     const N: usize = 1000;
-    for text in ["project:test/role:inbox".to_owned(), format!("project:{}/role:{}", "p".repeat(64), "r".repeat(64))] {
+    let artifact = address("project:test/convoy:run/role:coder")
+        .artifact("explainer", &format!("project:{}/role:{}", "p".repeat(512), "r".repeat(512)))
+        .unwrap()
+        .to_string();
+    // Parsed and cloned cases span short/long values, extra hierarchy depth,
+    // artifact subjects and escaped delimiters in the canonical representation.
+    for text in [
+        "project:test/role:inbox".to_owned(),
+        format!("project:{}/role:{}", "p".repeat(64), "r".repeat(64)),
+        format!("project:{}/role:{}", "p".repeat(1024), "r".repeat(1024)),
+        format!("project:{}/convoy:{}/role:{}", "p".repeat(256), "c".repeat(256), "r".repeat(256)),
+        artifact,
+    ] {
         let template = address(&text);
         let base = LIVE.load(Ordering::SeqCst);
         let rows: Vec<_> = (0..N).map(|_| address(&text)).collect();

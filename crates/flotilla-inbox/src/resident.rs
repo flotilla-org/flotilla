@@ -2,9 +2,12 @@
 //! store/log and caller-owned ports/evidence are not replica allocations.
 //! `tests/resident_allocations.rs` calibrates these heuristic charges against
 //! live Rust allocations; extend its shape coverage when accepted types change.
-use std::mem::size_of;
+use std::{
+    collections::BTreeMap,
+    mem::{size_of, size_of_val},
+};
 
-use flotilla_schema::Address;
+use flotilla_schema::{Address, Timestamp};
 use flotilla_state_machines::{
     machines::{
         convoy::{ConvoyRequest, Promise, PromiseId, VesselClass},
@@ -19,6 +22,7 @@ pub const PENDING_BUDGET: usize = 128 * 1024 * 1024;
 pub const CONTROL_BUDGET: usize = 96 * 1024 * 1024;
 /// Shared budget for cached values and controls; total with Pending is 256 MiB.
 pub const RESIDENT_BUDGET: usize = 128 * 1024 * 1024;
+const _: () = assert!(CONTROL_BUDGET <= RESIDENT_BUDGET);
 
 #[derive(Clone, Debug)]
 pub struct Residency {
@@ -34,8 +38,8 @@ pub struct Residency {
     pub pending_bytes: usize,
     pub pending_budget_bytes: usize,
     pub pending_messages: usize,
-    pub oldest_state_since: Option<flotilla_schema::Timestamp>,
-    pub newest_state_since: Option<flotilla_schema::Timestamp>,
+    pub oldest_state_since: Option<Timestamp>,
+    pub newest_state_since: Option<Timestamp>,
 }
 
 pub(crate) fn address(value: &Address) -> usize {
@@ -44,7 +48,7 @@ pub(crate) fn address(value: &Address) -> usize {
     // plus parse-time String growth bounds decoded values/optional subject.
     // A factor of two failed calibration for a 142-byte parsed address; four
     // covers that capacity. Calibration measures freshly parsed and cloned shapes.
-    size_of::<Address>() + value.as_str().len() * 4 + std::mem::size_of_val(value.segments()) * 2
+    size_of::<Address>() + value.as_str().len() * 4 + size_of_val(value.segments()) * 2
 }
 
 pub(crate) fn receiver(value: &Receiver) -> usize {
@@ -67,7 +71,7 @@ pub(crate) fn binding(inbox: &Address, value: &InboxBinding) -> usize {
         }
 }
 
-pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&std::collections::BTreeMap<Receiver, Transport>>) -> usize {
+pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&BTreeMap<Receiver, Transport>>) -> usize {
     // Exhaustive destructuring makes every new spec field a compile error here.
     let MessageSpec {
         sender,
@@ -140,7 +144,5 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&std::collect
 }
 
 pub(crate) fn pending(inbox: &Address, name: &str, new_inbox: bool) -> usize {
-    name.len()
-        + 2 * size_of::<(u64, String)>()
-        + if new_inbox { 2 * (address(inbox) + size_of::<std::collections::BTreeMap<u64, String>>()) } else { 0 }
+    name.len() + 2 * size_of::<(u64, String)>() + if new_inbox { 2 * (address(inbox) + size_of::<BTreeMap<u64, String>>()) } else { 0 }
 }
