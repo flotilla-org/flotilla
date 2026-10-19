@@ -410,6 +410,23 @@ fleet-install <generation>
 fleet-install rollback
 ```
 
+Hosts that cannot reach the lab Forgejo, such as hosted boxes, are pushed to
+from a lab machine instead. Such hosts hold no package token:
+
+```sh
+scripts/fleet-push <generation> <ssh-host>...
+```
+
+`fleet-push` downloads the generation once and checks the archive's size and
+digest. It gates the generation with the feta canary once, then works through
+the hosts in order. For each host it copies the manifest, the host's archive,
+and this checkout's installer and validator over SSH, then runs
+`fleet-install --from <dir> --skip-canary <generation>` there. The first host
+that fails stops the push. `--from` verifies the pushed files exactly as it
+would verify downloaded ones, and accepts only a named generation. Read a
+pushed host's state over SSH, because `fleet-install status` needs Forgejo:
+`ls -l ~/.local/opt/flotilla-fleet/current`.
+
 On Linux, every install and rollback refreshes and enables the
 `~/.config/systemd/user/flotillad.service` user unit, enables lingering, and
 starts the selected generation. Restart the daemon through that canonical unit
