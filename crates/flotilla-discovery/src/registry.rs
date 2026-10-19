@@ -223,14 +223,15 @@ impl ProviderSet<dyn EnvironmentProvider> {
 
     /// Bridge unlabelled preceding-generation specs until #3108. An omitted
     /// instance resolves only when exactly one provider accepts the stored input.
-    /// Explicit instance identity remains authoritative; prepare validates inputs.
+    /// Explicit legacy bindings must also accept the stored input, because recovery
+    /// can call list/destroy without preparing an environment first.
     pub fn select_legacy_input(
         &self,
         kind: EnvironmentInput,
         instance: Option<&str>,
     ) -> Option<(&ProviderDescriptor, &Arc<dyn EnvironmentProvider>)> {
         if let Some(instance) = instance {
-            return self.get(instance);
+            return self.select(instance).filter(|(_, provider)| provider.legacy_input() == Some(kind));
         }
         let mut matches = self.iter().filter(|(_, provider)| provider.legacy_input() == Some(kind));
         let selected = matches.next()?;
@@ -397,6 +398,11 @@ mod environment_tests {
         assert_eq!(registry.environment_providers.select_legacy_input(EnvironmentInput::Docker, None).is_some(), count == 1);
         assert_eq!(registry.environment_providers.select("endpoint-0").is_some(), count > 0);
         assert!(registry.environment_providers.select("direct").is_some());
+        // A mislabelled legacy Docker record must not reach host adoption during
+        // recovery, which does not call prepare. Instance-only lookup stays open.
+        assert!(registry.environment_providers.select_legacy_input(EnvironmentInput::Docker, Some("direct")).is_none());
+        assert_eq!(registry.environment_providers.select_legacy_input(EnvironmentInput::Docker, Some("endpoint-0")).is_some(), count > 0);
+        assert!(registry.environment_providers.select_legacy_input(EnvironmentInput::HostDirect, Some("endpoint-0")).is_none());
         assert!(registry.environment_providers.select("absent").is_none());
         assert!(registry.environment_providers.select_legacy_input(EnvironmentInput::HostDirect, None).is_some());
     }

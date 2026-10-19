@@ -74,7 +74,12 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     use flotilla_environment::environment::{EnvironmentInput, ENVIRONMENT_PROVIDER_INSTANCE_LABEL};
     if environments.is_empty() {
         let mut observed = false;
-        for (_, provider) in state.local_registry.environment_providers.iter().filter(|(_, provider)| provider.capabilities().per_vessel) {
+        for (_, provider) in state
+            .local_registry
+            .environment_providers
+            .iter()
+            .filter(|(_, provider)| provider.legacy_input() == Some(flotilla_environment::environment::EnvironmentInput::Docker))
+        {
             provider.list().await?;
             observed = true;
         }

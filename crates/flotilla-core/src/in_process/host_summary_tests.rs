@@ -54,12 +54,7 @@ mod tests {
 
     #[async_trait]
     impl ProvisionedEnvironment for TestProvisionedEnvironment {
-        fn backing_id(&self) -> &str {
-            self.container_name().unwrap_or_else(|| self.id().as_str())
-        }
-        fn workspace_root(&self) -> &std::path::Path {
-            std::path::Path::new("/workspace")
-        }
+        flotilla_discovery_testkit::injected_environment_handle!();
 
         fn id(&self) -> &flotilla_protocol::EnvironmentId {
             &self.id

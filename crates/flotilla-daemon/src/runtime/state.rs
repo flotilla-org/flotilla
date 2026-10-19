@@ -304,7 +304,7 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                 .local_registry
                 .environment_providers
                 .iter()
-                .filter(|(_, provider)| provider.capabilities().per_vessel)
+                .filter(|(_, provider)| provider.legacy_input() == Some(flotilla_environment::environment::EnvironmentInput::Docker))
                 .collect::<Vec<_>>();
             if providers.is_empty() {
                 return Err("Docker environment provider absent for standing-convoy liveness check".into());
@@ -351,13 +351,16 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                 .environment_providers
                 .select_legacy_input(flotilla_environment::environment::EnvironmentInput::Docker, instance.map(String::as_str))
                 .ok_or_else(|| {
-                    let reason = if instance.is_some() {
-                        "instance absent or wrong kind"
-                    } else if self.local_registry.environment_providers.iter().any(|(_, provider)| provider.capabilities().per_vessel) {
-                        "ambiguous instances"
-                    } else {
-                        "absent"
-                    };
+                    let reason =
+                        if instance.is_some() {
+                            "instance absent or wrong kind"
+                        } else if self.local_registry.environment_providers.iter().any(|(_, provider)| {
+                            provider.legacy_input() == Some(flotilla_environment::environment::EnvironmentInput::Docker)
+                        }) {
+                            "ambiguous instances"
+                        } else {
+                            "absent"
+                        };
                     format!("Docker environment provider {reason} for Environment/{} (instance {instance:?})", environment.metadata.name)
                 })?;
             let handles = provider

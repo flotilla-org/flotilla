@@ -132,6 +132,7 @@ pub enum ObservationState {
     Unknown { reason: UnknownReason },
 }
 
+/// Runtime-only observation payload; not a wire or stored resource shape.
 /// Keep all existing Docker memory/exit evidence without changing stored facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderObservation {
@@ -176,6 +177,7 @@ pub struct EnvironmentDescriptor {
     pub provider_versions: std::collections::BTreeMap<String, String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Runtime-only stream event. Publication/serialization belongs to its consumer.
 pub struct EnvironmentObservation {
     pub descriptor: EnvironmentDescriptor,
     pub backing_id: Option<String>,

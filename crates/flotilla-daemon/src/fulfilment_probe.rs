@@ -325,6 +325,74 @@ mod tests {
         .await
     }
 
+    // A provider can lack detection while retaining its real host lifecycle.
+    // The wrapper withholds only that optional capability.
+    struct WithoutDetection(Arc<dyn EnvironmentProvider>);
+    #[async_trait::async_trait]
+    impl EnvironmentProvider for WithoutDetection {
+        fn kind(&self) -> flotilla_environment::environment::ProviderKind {
+            self.0.kind()
+        }
+        fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
+            let mut declaration = self.0.capabilities();
+            declaration.detection = false;
+            declaration
+        }
+        async fn prepare(
+            &self,
+            spec: &flotilla_resources::EnvironmentSpec,
+            opts: &flotilla_environment::environment::PrepareOpts,
+        ) -> Result<flotilla_environment::environment::PreparedEnvironment, String> {
+            self.0.prepare(spec, opts).await
+        }
+        async fn provision(
+            &self,
+            id: flotilla_protocol::EnvironmentId,
+            prepared: &flotilla_environment::environment::PreparedEnvironment,
+            opts: flotilla_environment::environment::ProvisionOpts,
+        ) -> Result<flotilla_environment::environment::EnvironmentHandle, String> {
+            self.0.provision(id, prepared, opts).await
+        }
+        async fn list(&self) -> Result<Vec<flotilla_environment::environment::EnvironmentHandle>, String> {
+            self.0.list().await
+        }
+        async fn destroy(&self, backing_id: &str) -> Result<(), String> {
+            self.0.destroy(backing_id).await
+        }
+    }
+
+    // ADR 0058: absent optional detection cannot attest tool/harness facts and
+    // must not turn a successful host observation into an operational failure.
+    #[tokio::test]
+    async fn absent_detection_leaves_fulfilment_facts_unknown() {
+        let scratch = Path::new("/tmp/flotilla-probe-test");
+        let runner =
+            Arc::new(DiscoveryMockRunner::builder().on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new())).build());
+        let provider = WithoutDetection(Arc::new(flotilla_environment::environment::host_direct::HostDirectEnvironmentProvider::new(
+            runner.clone(),
+            Default::default(),
+        )));
+        let mut spec = docker_kind();
+        spec.realisation = FulfilmentRealisation::HostDirect;
+        let mut models = ModelProbeState::default();
+        let facts = super::probe_kind(
+            &spec,
+            DetectionTarget { image: None, provider: &provider },
+            true,
+            runner.as_ref(),
+            &TestEnvVars::default(),
+            scratch,
+            &mut models,
+        )
+        .await
+        .expect("observation succeeds without detection");
+        assert!(facts.toolchains.is_empty());
+        assert!(facts.harnesses.is_empty());
+        assert!(facts.image_present.is_none());
+        assert!(facts.free_vessel_slots.is_none());
+        assert!(models.entries.is_empty());
+    }
+
     #[hegel::test]
     fn probed_codex_versions_cover_only_compatible_launches(tc: hegel::TestCase) {
         let minor = tc.draw(hegel::generators::integers::<u32>().min_value(150).max_value(170));

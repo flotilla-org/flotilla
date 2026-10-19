@@ -5133,22 +5133,7 @@ struct GatedStartupEnvironmentProvider {
 
 #[async_trait::async_trait]
 impl flotilla_environment::environment::EnvironmentProvider for GatedStartupEnvironmentProvider {
-    fn kind(&self) -> flotilla_environment::environment::ProviderKind {
-        flotilla_environment::environment::ProviderKind::new(flotilla_environment::environment::EnvironmentClass::Dummy, "injected")
-    }
-    fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
-        flotilla_environment::environment::ProviderCapabilities {
-            workspace_root: "/workspace".into(),
-            reference_root: Some("/ref/repo".into()),
-            receives_host_tools: true,
-            per_vessel: true,
-            ..Default::default()
-        }
-    }
-
-    fn legacy_input(&self) -> Option<flotilla_environment::environment::EnvironmentInput> {
-        Some(flotilla_environment::environment::EnvironmentInput::Docker)
-    }
+    flotilla_discovery_testkit::injected_environment_provider!();
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,

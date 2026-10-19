@@ -255,7 +255,7 @@ pub(super) async fn apply_agentless_ssh_observation(
     };
     let status = HostStatus {
         capabilities: BTreeMap::from([
-            ("environment_providers".to_string(), json!(profile.environment_providers)),
+            (flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.to_string(), json!(profile.environment_providers)),
             (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
             (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(held_credentials)),
             (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(credential_expiry)),

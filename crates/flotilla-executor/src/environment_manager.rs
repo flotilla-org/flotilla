@@ -21,8 +21,6 @@ use flotilla_discovery::FactoryRegistry;
 use flotilla_environment::environment::contained_daemon_socket_path;
 use flotilla_environment::environment::CreateOpts;
 use flotilla_environment::environment::EnvironmentHandle;
-#[cfg(test)]
-use flotilla_environment::environment::EnvironmentInput;
 use flotilla_environment::environment::EnvironmentTool;
 use flotilla_environment::environment::EnvironmentToolAsset;
 use flotilla_environment::environment::EnvironmentToolAssetAccess;
@@ -623,12 +621,7 @@ mod tests {
 
     #[async_trait]
     impl ProvisionedEnvironment for MockProvisionedEnvironment {
-        fn backing_id(&self) -> &str {
-            self.container_name().unwrap_or_else(|| self.id().as_str())
-        }
-        fn workspace_root(&self) -> &std::path::Path {
-            std::path::Path::new("/workspace")
-        }
+        flotilla_discovery_testkit::injected_environment_handle!();
 
         fn id(&self) -> &EnvironmentId {
             &self.id
@@ -673,22 +666,7 @@ mod tests {
 
     #[async_trait]
     impl EnvironmentProvider for MockEnvironmentProvider {
-        fn kind(&self) -> flotilla_environment::environment::ProviderKind {
-            flotilla_environment::environment::ProviderKind::new(flotilla_environment::environment::EnvironmentClass::Dummy, "injected")
-        }
-        fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
-            flotilla_environment::environment::ProviderCapabilities {
-                workspace_root: "/workspace".into(),
-                reference_root: Some("/ref/repo".into()),
-                receives_host_tools: true,
-                per_vessel: true,
-                ..Default::default()
-            }
-        }
-
-        fn legacy_input(&self) -> Option<EnvironmentInput> {
-            Some(EnvironmentInput::Docker)
-        }
+        flotilla_discovery_testkit::injected_environment_provider!();
         async fn prepare(&self, _spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {
             Ok(PreparedEnvironment::new(&Arc::new(()), ()))
         }

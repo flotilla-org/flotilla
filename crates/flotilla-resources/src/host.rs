@@ -25,6 +25,8 @@ define_resource!(
     event_history = EventHistory::LatestOnly
 );
 
+/// Kind-neutral provider instance advertisements in the existing capability map.
+pub const ENVIRONMENT_PROVIDERS_CAPABILITY: &str = "environment_providers";
 pub const AGENT_ADAPTERS_CAPABILITY: &str = "agent_adapters";
 pub const HELD_CREDENTIALS_CAPABILITY: &str = "held_credentials";
 pub const CREDENTIAL_EXPIRY_CAPABILITY: &str = "credential_expiry";

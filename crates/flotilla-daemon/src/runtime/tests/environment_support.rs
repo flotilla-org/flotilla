@@ -160,12 +160,7 @@ pub(super) struct TestInteriorEnvironment {
 
 #[async_trait]
 impl ProvisionedEnvironment for TestInteriorEnvironment {
-    fn backing_id(&self) -> &str {
-        self.container_name().unwrap_or_else(|| self.id().as_str())
-    }
-    fn workspace_root(&self) -> &std::path::Path {
-        std::path::Path::new("/workspace")
-    }
+    flotilla_discovery_testkit::injected_environment_handle!();
 
     fn id(&self) -> &EnvironmentId {
         &self.id
@@ -212,12 +207,7 @@ pub(super) struct TestUncertainEnvironment {
 
 #[async_trait]
 impl ProvisionedEnvironment for TestUncertainEnvironment {
-    fn backing_id(&self) -> &str {
-        self.container_name().unwrap_or_else(|| self.id().as_str())
-    }
-    fn workspace_root(&self) -> &std::path::Path {
-        std::path::Path::new("/workspace")
-    }
+    flotilla_discovery_testkit::injected_environment_handle!();
 
     fn id(&self) -> &EnvironmentId {
         &self.id
@@ -259,22 +249,7 @@ pub(super) struct TestInteriorEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for TestInteriorEnvironmentProvider {
-    fn kind(&self) -> flotilla_environment::environment::ProviderKind {
-        flotilla_environment::environment::ProviderKind::new(flotilla_environment::environment::EnvironmentClass::Dummy, "injected")
-    }
-    fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
-        flotilla_environment::environment::ProviderCapabilities {
-            workspace_root: "/workspace".into(),
-            reference_root: Some("/ref/repo".into()),
-            receives_host_tools: true,
-            per_vessel: true,
-            ..Default::default()
-        }
-    }
-
-    fn legacy_input(&self) -> Option<flotilla_environment::environment::EnvironmentInput> {
-        Some(flotilla_environment::environment::EnvironmentInput::Docker)
-    }
+    flotilla_discovery_testkit::injected_environment_provider!();
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
@@ -307,22 +282,7 @@ pub(super) struct AdoptionEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for AdoptionEnvironmentProvider {
-    fn kind(&self) -> flotilla_environment::environment::ProviderKind {
-        flotilla_environment::environment::ProviderKind::new(flotilla_environment::environment::EnvironmentClass::Dummy, "injected")
-    }
-    fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
-        flotilla_environment::environment::ProviderCapabilities {
-            workspace_root: "/workspace".into(),
-            reference_root: Some("/ref/repo".into()),
-            receives_host_tools: true,
-            per_vessel: true,
-            ..Default::default()
-        }
-    }
-
-    fn legacy_input(&self) -> Option<flotilla_environment::environment::EnvironmentInput> {
-        Some(flotilla_environment::environment::EnvironmentInput::Docker)
-    }
+    flotilla_discovery_testkit::injected_environment_provider!();
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
@@ -361,22 +321,7 @@ pub(super) struct CapturingFailingEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for CapturingFailingEnvironmentProvider {
-    fn kind(&self) -> flotilla_environment::environment::ProviderKind {
-        flotilla_environment::environment::ProviderKind::new(flotilla_environment::environment::EnvironmentClass::Dummy, "injected")
-    }
-    fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
-        flotilla_environment::environment::ProviderCapabilities {
-            workspace_root: "/workspace".into(),
-            reference_root: Some("/ref/repo".into()),
-            receives_host_tools: true,
-            per_vessel: true,
-            ..Default::default()
-        }
-    }
-
-    fn legacy_input(&self) -> Option<flotilla_environment::environment::EnvironmentInput> {
-        Some(flotilla_environment::environment::EnvironmentInput::Docker)
-    }
+    flotilla_discovery_testkit::injected_environment_provider!();
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
@@ -500,22 +445,7 @@ pub(super) struct ListingEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for ListingEnvironmentProvider {
-    fn kind(&self) -> flotilla_environment::environment::ProviderKind {
-        flotilla_environment::environment::ProviderKind::new(flotilla_environment::environment::EnvironmentClass::Dummy, "injected")
-    }
-    fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
-        flotilla_environment::environment::ProviderCapabilities {
-            workspace_root: "/workspace".into(),
-            reference_root: Some("/ref/repo".into()),
-            receives_host_tools: true,
-            per_vessel: true,
-            ..Default::default()
-        }
-    }
-
-    fn legacy_input(&self) -> Option<flotilla_environment::environment::EnvironmentInput> {
-        Some(flotilla_environment::environment::EnvironmentInput::Docker)
-    }
+    flotilla_discovery_testkit::injected_environment_provider!();
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
