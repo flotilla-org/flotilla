@@ -8,6 +8,10 @@ members:
   - alias: flotilla
     url: https://github.com/flotilla-org/flotilla
     roles: [code, ops, knowledge]
+  # Drydock, the environment substrate flotilla depends on (ADR 0070, #3503).
+  - alias: drydock
+    url: https://github.com/flotilla-org/drydock
+    roles: [code]
 skills:
   '*':
     - flotilla-org/flotilla@flotilla-commands
