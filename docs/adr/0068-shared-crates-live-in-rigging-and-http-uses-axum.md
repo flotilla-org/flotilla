@@ -1,6 +1,6 @@
 # 68. Shared crates live in rigging, and HTTP uses axum
 
-**Status:** Accepted (owner rulings, 2026-10-17)
+**Status:** Accepted (owner rulings, 2026-10-17; amended 2026-10-19, #3514)
 **Date:** 2026-10-17
 **Relates to:**
 - [ADR 0063](0063-cbor-is-the-stack-binary-format.md): CBOR is the stack's binary format, implemented by `flotilla-cbor`;
@@ -81,3 +81,45 @@ These do not change the decisions above, but each is checked before work that re
 - The CLAUDE.md crate table no longer lists `cleat` as a crate. cleat is a separate program.
 - The relay's hand-written routing (`route.rs`) becomes an axum router when the relay is next changed.
 - Sibling repos that want shared code take it from rigging, never from the flotilla repo.
+
+## Amendment (2026-10-19, the second wave; #3514)
+
+Drydock (ADR 0070) is the second project for most of flotilla's runtime plumbing. The owner ruled on #3514 that the shared pieces move to rigging before drydock writes its own copies.
+
+### Names
+
+- **New rigging crates use a `rigging-` prefix,** so a shared crate is never mistaken for a project's own.
+- `flotilla-cbor` becomes `rigging-cbor` when convenient. flotilla is its only consumer.
+
+### The crates
+
+One crate per concern, so each consumer takes only what it uses and crate boundaries enforce the dependency rules:
+
+| Crate | Contents | Ticket |
+|---|---|---|
+| `rigging-http-serve` | The serving crate from §4 | flotilla-org/rigging#3 |
+| `rigging-tls` | TLS provider choice and client building | flotilla-org/rigging#4 |
+| `rigging-process` | The command runner, environment variables, `run!`, bounded probes, binary and version detection | flotilla-org/rigging#4 |
+| `rigging-http-client` | The `HttpClient` trait and its reqwest implementation | flotilla-org/rigging#4 |
+| `rigging-replay-testkit` | Record and replay, masks, the mock runner and the HTTP stand-in (dev-only) | flotilla-org/rigging#4 |
+| `rigging-stream` | `RawStream` and `ByteStream` | flotilla-org/rigging#5 |
+| `rigging-ssh` | An `SshSession` port with an OpenSSH backend | flotilla-org/rigging#5 |
+
+The parts that belong to flotilla stay in flotilla, layered on these crates: the git config guard, the helper scripts and the GitHub replay channel.
+
+### Order
+
+1. **`rigging-http-serve`** is built in rigging#3, not by the #3248 crew. It blocks drydock's Rust host and #3248, which keeps flotillad's own side.
+2. **The runner, HTTP client, TLS and replay crates move together** (rigging#4), and flotilla switches in #3518. They are tightly linked: the replay harness hooks into both the runner and the HTTP client.
+3. **`rigging-stream` and `rigging-ssh` are seeded from drydock's transport crate** once drydock#12 lands, with its contract suite. Drydock and Tender then switch to them.
+
+### Siblings are design inputs, not migrations
+
+A rigging crate is designed against the siblings' existing implementations of the same thing, so they can adopt it later. The extraction does not change them. For the serving crate, those are porthole, wheelhouse, cleat and jackstay's peer-credential code.
+
+### SSH stays on OpenSSH
+
+- **OpenSSH is the default backend** behind the `SshSession` port. It keeps the operator's ssh_config (ProxyJump, agents, certificates) working, and its per-channel flow control means one slow stream never stalls the others.
+- **russh fails that test by design:** it grants the peer more data as soon as data arrives, then waits on a bounded queue, so one stalled reader blocks the session. The fix was proposed upstream and declined (russh#730).
+- **A library backend may come later,** for Windows or for pinned targets, once it passes the same contract suite.
+- **PTY attach stays native `ssh -tt`,** outside the port.
