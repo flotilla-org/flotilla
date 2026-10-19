@@ -14,3 +14,6 @@ pub mod regard_lifecycle;
 pub mod repository_addressing;
 pub mod repository_inspection;
 pub mod support;
+
+#[cfg(test)]
+mod test_support;

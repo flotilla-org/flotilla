@@ -254,7 +254,7 @@ pub async fn reconcile_now_waits_for_periodic_backing_inspection_and_keeps_one_g
     });
     backing.entered.notified().await;
     // Rebuilding runtime around this daemon must retain the in-flight guard.
-    daemon.install_convoy_ensure_reconciler(factory.create(backend.clone(), clock.clone())).await;
+    daemon.install_convoy_ensure_reconciler(factory.create(daemon.convoy_teardown(), backend.clone(), clock.clone())).await;
 
     let mut forced = Box::pin(daemon.reconcile_convoy_ensure_now("flotilla", "quartermaster", &RecordlessBacking));
     assert!(
@@ -331,10 +331,8 @@ pub async fn standing_backing_inspection_holds_empty_evidence_after_provisioning
         .await
         .expect("record post-provisioning failure");
 
-    let refusal = daemon
-        .verify_standing_convoy_resource_backing_dead(&convoy)
-        .await
-        .expect_err("missing backing evidence after provisioning must remain conservative");
+    let refusal =
+        daemon.verify_backing_dead(&convoy).await.expect_err("missing backing evidence after provisioning must remain conservative");
 
     assert_eq!(refusal, "no backing environment evidence is available");
 

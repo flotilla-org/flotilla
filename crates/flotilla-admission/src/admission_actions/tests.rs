@@ -1,93 +1,13 @@
 use super::super::convoy_admission::HandlerContractFixture;
 use super::*;
-use crate::convoy_admission::ConvoyStartTask;
-use crate::repository_inspection::{RepositoryInspection, RepositoryInspector};
-use async_trait::async_trait;
 use flotilla_daemon_api::action_events::ActionEvents;
 use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_protocol::{ConvoyStartIntent, NodeId};
 use flotilla_protocol_testkit::event_sink::RecordingEventSink;
-use flotilla_resources::RepositorySpec;
 use flotilla_resources::{Convoy, CrewSource, CrewSpec, VesselRequirement, WorkflowTemplateSpec};
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
-// Boundary stand-in: the asynchronous admission worker can be unavailable or
-// retain a queued task without running a process. Other integrations are unused.
-#[derive(Default)]
-struct Worker {
-    available: AtomicBool,
-    inspections: AtomicUsize,
-    tasks: std::sync::Mutex<Vec<ConvoyStartTask>>,
-}
-#[async_trait]
-impl crate::project_ops::ProjectOperations for Worker {
-    // Stand-in for Git inspection I/O; checkout persistence uses real stores.
-    async fn inspect_adopted_checkout(
-        &self,
-        path: &Path,
-        repository_url: Option<&str>,
-        git_ref: Option<&str>,
-    ) -> Result<RepositoryInspection, String> {
-        self.inspections.fetch_add(1, Ordering::SeqCst);
-        let url = repository_url.expect("explicit repository");
-        Ok(RepositoryInspection {
-            spec: RepositorySpec::remote(url)?,
-            checkout: crate::repository_inspection::LocalCheckoutInspection {
-                path: path.into(),
-                host_ref: "host".into(),
-                git_ref: git_ref.unwrap().into(),
-                is_main: false,
-            },
-            transport_url: Some(url.into()),
-            replaces_prior_repository: false,
-        })
-    }
-    async fn project_add(&self, _: &str, _: Option<&str>, _: Option<&str>, _: Option<&str>) -> Result<String, String> {
-        panic!("no project edits")
-    }
-    async fn project_refresh(&self, _: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
-        panic!("no project edits")
-    }
-    async fn project_register(&self, _: &str) -> Result<(String, usize), String> {
-        panic!("no project edits")
-    }
-    async fn image_check(
-        &self,
-        _: &flotilla_protocol::image_check::ImageCheckRequest,
-    ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String> {
-        panic!("no image checks")
-    }
-    async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
-        RepositorySpec::remote(remote)
-    }
-    async fn roll_convoy_ensure(&self, _: &str, _: &str) -> Result<String, String> {
-        panic!("no ensure roll")
-    }
-    fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool {
-        if !self.available.load(Ordering::SeqCst) {
-            return false;
-        }
-        self.tasks.lock().unwrap().push(task);
-        true
-    }
-
-    fn remember_bootstrap_checkout(&self, _inspection: &RepositoryInspection) -> Result<(), String> {
-        Err("unexpected remember_bootstrap_checkout".into())
-    }
-    async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
-        Err("unexpected repository_inspector".into())
-    }
-    async fn inspect_repository_path(&self, _path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
-        Err("unexpected inspect_repository_path".into())
-    }
-    async fn resolve_forge_identity_in(&self, _namespace: &str, _spec: RepositorySpec) -> Result<RepositorySpec, String> {
-        Err("unexpected resolve_forge_identity_in".into())
-    }
-    async fn reap_ensured_convoy(&self, _namespace: &str, _ensure_name: &str, _convoy_name: &str, _force: bool) -> Result<(), String> {
-        Err("unexpected reap_ensured_convoy".into())
-    }
-}
+use crate::test_support::TestProjectOperations as Worker;
 
 fn handlers<'a>(
     worker: &'a Worker,

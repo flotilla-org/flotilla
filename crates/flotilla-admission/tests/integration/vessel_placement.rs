@@ -218,14 +218,14 @@ async fn placement_status_churn_does_not_spin() {
     let convoy_reads = || backend.read_snapshot().calls("Convoy", ReadOperation::List);
     let projector = VesselPlacementProjector::new(backend.clone(), NAMESPACE, CanonicalHostId::resolved("local"));
     let task = tokio::spawn(async move { projector.run().await });
-    // Store transcoding uses spawn_blocking: a fixed number of runtime yields
-    // does not guarantee bootstrap completes when other scenarios run in parallel.
-    let bootstrap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while convoy_reads() < 4 {
-        assert!(!task.is_finished(), "projector exited before initial reconciliation");
-        assert!(std::time::Instant::now() < bootstrap_deadline, "initial reconciliation did not complete");
-        tokio::task::yield_now().await;
+    async fn wait_for_reads(backend: &ResourceBackend, expected: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backend.read_snapshot().calls("Convoy", ReadOperation::List) < expected {
+            assert!(std::time::Instant::now() < deadline, "expected {expected} Convoy reads");
+            tokio::task::yield_now().await;
+        }
     }
+    wait_for_reads(&backend, 4).await;
     assert_eq!(convoy_reads(), 4, "bootstrap and initial reconciliation");
     for update in 0..100 {
         convoy = convoys
@@ -245,9 +245,7 @@ async fn placement_status_churn_does_not_spin() {
         }
         tokio::time::advance(std::time::Duration::from_millis(30)).await;
     }
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_reads(&backend, 4).await;
     eprintln!("placement load: 100 replicated status updates: {} Convoy reads", convoy_reads());
     assert_eq!(convoy_reads(), 4, "status-only updates must not rescan placement");
     // Real placement changes still reconcile, with one scan for a queued burst.
@@ -283,14 +281,10 @@ async fn placement_status_churn_does_not_spin() {
         tokio::task::yield_now().await;
     }
     tokio::time::advance(std::time::Duration::from_millis(30)).await;
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_reads(&backend, 6).await;
     assert_eq!(convoy_reads(), 6, "placement burst should reconcile once");
     tokio::time::advance(std::time::Duration::from_secs(60)).await;
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_reads(&backend, 8).await;
     assert_eq!(convoy_reads(), 8, "bounded resync should repair drift even without watch changes");
     task.abort();
 }

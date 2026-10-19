@@ -11,6 +11,7 @@ use crate::convoy_admission::PreparedConvoyAdmission;
 use crate::convoy_ensure::ConvoyEnsureAdmission;
 use crate::convoy_ensure::ConvoyEnsureReconciler;
 use crate::convoy_ensure::StandingConvoyBackingInspector;
+use crate::ports::ConvoyTeardown;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use flotilla_charter::ops_entry::{
@@ -77,6 +78,7 @@ fn ensure_config_hash(spec: &ConvoyEnsureSpec) -> Result<String, String> {
 #[derive(bon::Builder)]
 pub struct EnsureReconciler {
     resource_backend: ResourceBackend,
+    teardown: Arc<dyn ConvoyTeardown>,
     clock: Arc<dyn Clock>,
     #[builder(skip)]
     ensure_admission_retries: Mutex<HashMap<(String, String), EnsureAdmissionRetry>>,
@@ -89,6 +91,7 @@ pub struct EnsureReconciler {
 impl EnsureReconciler {
     fn pass<'a>(&'a self, admission: &'a dyn ConvoyEnsureAdmission) -> EnsurePass<'a> {
         EnsurePass::builder()
+            .teardown(&self.teardown)
             .resource_backend(&self.resource_backend)
             .clock(&self.clock)
             .ensure_admission_retries(&self.ensure_admission_retries)
@@ -121,6 +124,7 @@ impl EnsureReconciler {
 }
 #[derive(bon::Builder)]
 struct EnsurePass<'a> {
+    teardown: &'a Arc<dyn ConvoyTeardown>,
     resource_backend: &'a ResourceBackend,
     clock: &'a Arc<dyn Clock>,
     ensure_admission_retries: &'a Mutex<HashMap<(String, String), EnsureAdmissionRetry>>,
@@ -425,7 +429,7 @@ impl EnsurePass<'_> {
             ),
             None => None,
         };
-        self.admission
+        self.teardown
             .abandon(
                 namespace,
                 &convoy.metadata.name,
@@ -1176,7 +1180,7 @@ impl EnsurePass<'_> {
         if convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(String::as_str) != Some(ensure_name) {
             return Err(format!("refusing to reap standing convoy: it is not owned by ConvoyEnsure/{ensure_name}"));
         }
-        self.admission.reap(namespace, convoy_name, force).await
+        self.teardown.reap(namespace, convoy_name, force).await
     }
 }
 async fn canonical_placement_host_ref(
@@ -1205,17 +1209,17 @@ mod tests {
 
     // Stands in for provider-backed admission and lifecycle operations. Resource
     // storage, status patches, the clock and the reconcile loop are real.
-    #[derive(bon::Builder)]
+    #[derive(bon::Builder, Clone)]
     struct Admission {
         backend: ResourceBackend,
         #[builder(skip)]
-        refused: AtomicBool,
+        refused: Arc<AtomicBool>,
         #[builder(skip)]
-        prepares: AtomicU32,
+        prepares: Arc<AtomicU32>,
         #[builder(skip)]
-        commits: AtomicU32,
+        commits: Arc<AtomicU32>,
         #[builder(skip)]
-        reaps: AtomicU32,
+        reaps: Arc<AtomicU32>,
     }
 
     #[async_trait]
@@ -1274,6 +1278,10 @@ mod tests {
                 .map_err(|e| e.to_string())?;
             Ok(name)
         }
+    }
+
+    #[async_trait]
+    impl ConvoyTeardown for Admission {
         async fn abandon(&self, _: &str, _: &str, _: &str, _: Option<&PrincipalRef>) -> Result<(), String> {
             unreachable!("not rolling in these contracts")
         }
@@ -1340,7 +1348,11 @@ mod tests {
             .await
             .expect("replicas");
         let clock = Arc::new(VirtualClock::new(Utc::now()));
-        let controller = EnsureReconciler::builder().resource_backend(backend.clone()).clock(clock).build();
+        let controller = EnsureReconciler::builder()
+            .teardown(Arc::new(Admission::builder().backend(backend.clone()).build()))
+            .resource_backend(backend.clone())
+            .clock(clock)
+            .build();
         let admission = Admission::builder().backend(backend.clone()).build();
         for scope in [EnsureConvoyScope::Local, EnsureConvoyScope::IncludingReplicas] {
             let (rows, reads) = measure_reads(controller.pass(&admission).active_ensured_convoys("test", "wanted", scope)).await;
@@ -1384,8 +1396,12 @@ mod tests {
             )
             .await
             .expect("fixture operation succeeds");
-        let controller = EnsureReconciler::builder().resource_backend(backend.clone()).clock(clock.clone()).build();
-        let admission = Admission::builder().backend(backend).build();
+        let admission = Admission::builder().backend(backend.clone()).build();
+        let controller = EnsureReconciler::builder()
+            .teardown(Arc::new(admission.clone()))
+            .resource_backend(backend.clone())
+            .clock(clock.clone())
+            .build();
         (controller, admission, clock)
     }
     async fn fail_current(admission: &Admission) {
@@ -1415,7 +1431,11 @@ mod tests {
         status.finished_at = Some(clock.now());
         convoys.update_status(name, &failed.metadata.resource_version, &status).await.expect("failure time");
         for _ in 0..3 {
-            let controller = EnsureReconciler::builder().resource_backend(admission.backend.clone()).clock(clock.clone()).build();
+            let controller = EnsureReconciler::builder()
+                .teardown(Arc::new(admission.clone()))
+                .resource_backend(admission.backend.clone())
+                .clock(clock.clone())
+                .build();
             let ensure = ensures.get("standing").await.expect("ensure");
             controller.pass(&admission).reconcile_driver_convoy_ensure("test", &ensure, &Backing::Dead, false).await.expect("backoff");
             assert_eq!(admission.commits.load(Ordering::SeqCst), 1);
@@ -1437,7 +1457,11 @@ mod tests {
         let (controller, admission, clock) = fixture().await;
         admission.refused.store(true, Ordering::SeqCst);
         assert!(controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.is_err());
-        let controller = EnsureReconciler::builder().resource_backend(admission.backend.clone()).clock(clock.clone()).build();
+        let controller = EnsureReconciler::builder()
+            .teardown(Arc::new(admission.clone()))
+            .resource_backend(admission.backend.clone())
+            .clock(clock.clone())
+            .build();
         clock.advance(ChronoDuration::seconds(29));
         assert!(controller
             .reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead)

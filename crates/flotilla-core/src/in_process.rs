@@ -790,12 +790,6 @@ impl ConvoyEnsureAdmission for InProcessDaemon {
     ) -> Result<String, String> {
         self.admission.admit_ensured_convoy(namespace, ensure, admission, annotations).await
     }
-    async fn abandon(&self, namespace: &str, name: &str, reason: &str, principal_ref: Option<&PrincipalRef>) -> Result<(), String> {
-        flotilla_admission::ports::ConvoyTeardown::abandon(self.crew_ops.as_ref(), namespace, name, reason, principal_ref).await
-    }
-    async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
-        flotilla_admission::ports::ConvoyTeardown::reap(self.crew_ops.as_ref(), namespace, name, force).await
-    }
 }
 
 /// Runtime-owned reconciliation entry points which need collaborators that do
@@ -817,7 +811,9 @@ pub trait WorkCredentialReconciler: Send + Sync {
 #[async_trait]
 impl StandingConvoyBackingInspector for InProcessDaemon {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
-        self.verify_standing_convoy_resource_backing_dead(convoy).await
+        flotilla_admission::convoy_ensure::ResourceStandingConvoyBackingInspector { resource_backend: self.resource_backend.clone() }
+            .verify_backing_dead(convoy)
+            .await
     }
 }
 
@@ -3257,6 +3253,11 @@ impl InProcessDaemon {
         self.admission.admit_convoy_start(namespace, intent, dispatching_principal_ref).await
     }
 
+    /// Teardown handle for composing the standing-convoy reconciler.
+    pub fn convoy_teardown(&self) -> Arc<dyn flotilla_admission::ports::ConvoyTeardown> {
+        self.crew_ops.clone()
+    }
+
     /// Install the controller before driving standing-convoy operations.
     /// Repeated runtime construction retains the transaction guard and retries.
     /// First install wins: subsequent reconcilers are dropped without replacing
@@ -3310,11 +3311,6 @@ impl InProcessDaemon {
         self.admission.prepare_ensured_convoy(self, namespace, ensure).await
     }
 
-    pub async fn verify_standing_convoy_resource_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
-        flotilla_admission::convoy_ensure::ResourceStandingConvoyBackingInspector { resource_backend: self.resource_backend.clone() }
-            .verify_backing_dead(convoy)
-            .await
-    }
     pub async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         self.crew_ops.reap(namespace, name, force).await
     }

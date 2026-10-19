@@ -89,7 +89,13 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    restarted.install_convoy_ensure_reconciler(factory.create(restarted.resource_backend(), restarted.clock_for_scenarios())).await;
+    restarted
+        .install_convoy_ensure_reconciler(factory.create(
+            restarted.convoy_teardown(),
+            restarted.resource_backend(),
+            restarted.clock_for_scenarios(),
+        ))
+        .await;
 
     let reconciler =
         flotilla_store::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
@@ -438,7 +444,14 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
     let mut ensure = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure");
     ensure.spec.placement_policy = Some("remote-policy".to_string());
     let absent = factory
-        .dependency_hash(daemon.as_ref(), daemon.resource_backend(), daemon.clock_for_scenarios(), "flotilla", &ensure)
+        .dependency_hash(
+            daemon.as_ref(),
+            daemon.convoy_teardown(),
+            daemon.resource_backend(),
+            daemon.clock_for_scenarios(),
+            "flotilla",
+            &ensure,
+        )
         .await
         .expect("absent fingerprint");
     let source = ResourceBackend::new(InMemoryBackend::default());
@@ -449,7 +462,14 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
         .await
         .expect("replicate policy");
     let present = factory
-        .dependency_hash(daemon.as_ref(), daemon.resource_backend(), daemon.clock_for_scenarios(), "flotilla", &ensure)
+        .dependency_hash(
+            daemon.as_ref(),
+            daemon.convoy_teardown(),
+            daemon.resource_backend(),
+            daemon.clock_for_scenarios(),
+            "flotilla",
+            &ensure,
+        )
         .await
         .expect("replica fingerprint");
     assert_ne!(absent, present, "arrival must invalidate an admission refusal");
@@ -466,7 +486,14 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
     assert_ne!(
         present,
         factory
-            .dependency_hash(daemon.as_ref(), daemon.resource_backend(), daemon.clock_for_scenarios(), "flotilla", &ensure)
+            .dependency_hash(
+                daemon.as_ref(),
+                daemon.convoy_teardown(),
+                daemon.resource_backend(),
+                daemon.clock_for_scenarios(),
+                "flotilla",
+                &ensure
+            )
             .await
             .expect("changed fingerprint")
     );
@@ -617,7 +644,9 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    daemon.install_convoy_ensure_reconciler(factory.create(daemon.resource_backend(), daemon.clock_for_scenarios())).await;
+    daemon
+        .install_convoy_ensure_reconciler(factory.create(daemon.convoy_teardown(), daemon.resource_backend(), daemon.clock_for_scenarios()))
+        .await;
     let driver_ref = daemon.canonical_local_host_id().expect("root B host identity").to_string();
     target
         .using::<ResourceHost>("flotilla")
@@ -892,11 +921,13 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    driver.install_convoy_ensure_reconciler(factory.create(driver.resource_backend(), driver.clock_for_scenarios())).await;
+    driver
+        .install_convoy_ensure_reconciler(factory.create(driver.convoy_teardown(), driver.resource_backend(), driver.clock_for_scenarios()))
+        .await;
     let ensure = home_backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("home ensure");
 
     factory
-        .start(driver.as_ref(), driver.resource_backend(), driver.clock_for_scenarios(), "flotilla", &ensure)
+        .start(driver.as_ref(), driver.convoy_teardown(), driver.resource_backend(), driver.clock_for_scenarios(), "flotilla", &ensure)
         .await
         .expect("driver admits replicated template");
 

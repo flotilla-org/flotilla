@@ -1676,7 +1676,7 @@ pub async fn snapshot_project_repositories_from_project(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
     use flotilla_resources::SystemClock;
     use flotilla_store_memory::InMemoryBackend;
@@ -1717,74 +1717,7 @@ mod tests {
         }
     }
 
-    struct FakeProjectOperations {
-        inspector: Arc<dyn RepositoryInspector>,
-        identity_resolutions: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl ProjectOperations for FakeProjectOperations {
-        fn remember_bootstrap_checkout(&self, _: &RepositoryInspection) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
-            Ok(Arc::clone(&self.inspector))
-        }
-
-        async fn inspect_repository_path(&self, _: &Path, _: Option<&str>) -> Result<RepositoryInspection, String> {
-            Err("unexpected direct repository inspection".into())
-        }
-
-        async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
-            RepositorySpec::remote(remote)
-        }
-
-        async fn resolve_forge_identity_in(&self, _namespace: &str, spec: RepositorySpec) -> Result<RepositorySpec, String> {
-            self.identity_resolutions.fetch_add(1, Ordering::SeqCst);
-            Ok(spec)
-        }
-
-        async fn reap_ensured_convoy(&self, _: &str, _: &str, _: &str, _: bool) -> Result<(), String> {
-            Err("unexpected convoy reap".into())
-        }
-
-        async fn inspect_adopted_checkout(
-            &self,
-            _path: &Path,
-            _repository_url: Option<&str>,
-            _git_ref: Option<&str>,
-        ) -> Result<RepositoryInspection, String> {
-            Err("unexpected inspect_adopted_checkout".into())
-        }
-        async fn project_add(
-            &self,
-            _target: &str,
-            _explicit_name: Option<&str>,
-            _explicit_display_name: Option<&str>,
-            _remote: Option<&str>,
-        ) -> Result<String, String> {
-            Err("unexpected project_add".into())
-        }
-        async fn project_refresh(&self, _name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
-            Err("unexpected project_refresh".into())
-        }
-        async fn image_check(
-            &self,
-            _request: &flotilla_protocol::image_check::ImageCheckRequest,
-        ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String> {
-            Err("unexpected image_check".into())
-        }
-        async fn project_register(&self, _target: &str) -> Result<(String, usize), String> {
-            Err("unexpected project_register".into())
-        }
-        async fn roll_convoy_ensure(&self, _namespace: &str, _name: &str) -> Result<String, String> {
-            Err("unexpected roll_convoy_ensure".into())
-        }
-        fn spawn_convoy_start(&self, _task: ConvoyStartTask) -> bool {
-            false
-        }
-    }
+    use crate::test_support::TestProjectOperations as FakeProjectOperations;
 
     // #2720: both store adapters feed the same operational materializer, without
     // checkout facts. A bad revision cannot replace its last-good workflow.
@@ -1821,7 +1754,7 @@ mod tests {
             };
             let runner: Arc<dyn flotilla_provider_runtime::CommandRunner> = Arc::new(ProcessCommandRunner);
             let inspector = Arc::new(CharterSourceInspector { runner, cache: cache.path().to_path_buf() });
-            let operations = FakeProjectOperations { inspector: inspector.clone(), identity_resolutions: AtomicUsize::new(0) };
+            let operations = FakeProjectOperations::with_inspector(inspector.clone());
             let backend = ResourceBackend::new(InMemoryBackend::default());
             let observed = ResourceBackend::new(InMemoryBackend::observed());
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -1950,7 +1883,7 @@ mod tests {
         let remote = "https://github.com/example/app";
         let repository_spec = RepositorySpec::remote(remote).expect("repository spec");
         let operations = FakeProjectOperations {
-            inspector: Arc::new(FakeRepositoryInspector {
+            inspector: Some(Arc::new(FakeRepositoryInspector {
                 inspection: ProjectDeclarationInspection {
                     repository: RepositoryInspection {
                         spec: repository_spec.clone(),
@@ -1966,8 +1899,8 @@ mod tests {
                     yaml: format!("name: app\nmembers:\n  - alias: app\n    url: {remote}\n    roles: [code]\n"),
                     commit: "abc123".into(),
                 },
-            }),
-            identity_resolutions: AtomicUsize::new(0),
+            })),
+            ..Default::default()
         };
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let observed = ResourceBackend::new(InMemoryBackend::observed());

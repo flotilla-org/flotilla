@@ -26,8 +26,8 @@ use super::support::{test_meta, BatchedObservationRunner};
 use crate::in_process::CrewCompletionRefusalCause;
 use crate::in_process::InProcessDaemon;
 
-use crate::testkits::cr_name;
 use crate::testkits::discovery::fake_discovery_with_runner;
+use flotilla_store_testkit::cr_name;
 
 // #2585: the real convoy resolver shares proven branch absence across callers
 // while preserving ordered repository selection and refreshing after five minutes.

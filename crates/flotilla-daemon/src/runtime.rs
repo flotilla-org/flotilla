@@ -392,7 +392,11 @@ impl DaemonRuntime {
         let mut controller_state = None;
         daemon
             .install_convoy_ensure_reconciler(Arc::new(
-                EnsureReconciler::builder().resource_backend(daemon.resource_backend()).clock(Arc::new(SystemClock)).build(),
+                EnsureReconciler::builder()
+                    .teardown(daemon.convoy_teardown())
+                    .resource_backend(daemon.resource_backend())
+                    .clock(Arc::new(SystemClock))
+                    .build(),
             ))
             .await;
         if options.start_controllers {

@@ -13,18 +13,25 @@ use flotilla_store::ResourceBackend;
 struct Controller;
 #[async_trait]
 impl EnsureScenarioController for Controller {
-    fn create(&self, backend: ResourceBackend, clock: Arc<dyn Clock>) -> Arc<dyn ConvoyEnsureReconciler> {
-        Arc::new(EnsureReconciler::builder().resource_backend(backend).clock(clock).build())
+    fn create(
+        &self,
+        teardown: Arc<dyn flotilla_admission::ports::ConvoyTeardown>,
+        backend: ResourceBackend,
+        clock: Arc<dyn Clock>,
+    ) -> Arc<dyn ConvoyEnsureReconciler> {
+        Arc::new(EnsureReconciler::builder().teardown(teardown).resource_backend(backend).clock(clock).build())
     }
     async fn dependency_hash(
         &self,
         admission: &dyn ConvoyEnsureAdmission,
+        teardown: Arc<dyn flotilla_admission::ports::ConvoyTeardown>,
         backend: ResourceBackend,
         clock: Arc<dyn Clock>,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
     ) -> Result<String, String> {
         EnsureReconciler::builder()
+            .teardown(teardown)
             .resource_backend(backend)
             .clock(clock)
             .build()
@@ -34,12 +41,19 @@ impl EnsureScenarioController for Controller {
     async fn start(
         &self,
         admission: &dyn ConvoyEnsureAdmission,
+        teardown: Arc<dyn flotilla_admission::ports::ConvoyTeardown>,
         backend: ResourceBackend,
         clock: Arc<dyn Clock>,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
     ) -> Result<String, String> {
-        EnsureReconciler::builder().resource_backend(backend).clock(clock).build().start_ensured_convoy(admission, namespace, ensure).await
+        EnsureReconciler::builder()
+            .teardown(teardown)
+            .resource_backend(backend)
+            .clock(clock)
+            .build()
+            .start_ensured_convoy(admission, namespace, ensure)
+            .await
     }
 }
 

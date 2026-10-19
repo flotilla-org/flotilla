@@ -89,10 +89,16 @@ pub use addressing::*;
 /// Injects the controller crate at the composition boundary without a production cycle.
 #[async_trait]
 pub trait EnsureScenarioController: Send + Sync {
-    fn create(&self, backend: ResourceBackend, clock: Arc<dyn Clock>) -> Arc<dyn ConvoyEnsureReconciler>;
+    fn create(
+        &self,
+        teardown: Arc<dyn flotilla_admission::ports::ConvoyTeardown>,
+        backend: ResourceBackend,
+        clock: Arc<dyn Clock>,
+    ) -> Arc<dyn ConvoyEnsureReconciler>;
     async fn dependency_hash(
         &self,
         admission: &dyn ConvoyEnsureAdmission,
+        teardown: Arc<dyn flotilla_admission::ports::ConvoyTeardown>,
         backend: ResourceBackend,
         clock: Arc<dyn Clock>,
         namespace: &str,
@@ -101,6 +107,7 @@ pub trait EnsureScenarioController: Send + Sync {
     async fn start(
         &self,
         admission: &dyn ConvoyEnsureAdmission,
+        teardown: Arc<dyn flotilla_admission::ports::ConvoyTeardown>,
         backend: ResourceBackend,
         clock: Arc<dyn Clock>,
         namespace: &str,
@@ -227,7 +234,9 @@ async fn standing_ensure_fixture_for(
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    daemon.install_convoy_ensure_reconciler(factory.create(daemon.resource_backend(), daemon.clock_for_scenarios())).await;
+    daemon
+        .install_convoy_ensure_reconciler(factory.create(daemon.convoy_teardown(), daemon.resource_backend(), daemon.clock_for_scenarios()))
+        .await;
     let repository_spec = RepositorySpec::remote("https://github.com/acme/standing").expect("repository spec");
     let repository_key = repository_spec.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository_spec).await.expect("repository");

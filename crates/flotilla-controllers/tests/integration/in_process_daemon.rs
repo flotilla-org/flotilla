@@ -7389,6 +7389,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     daemon
         .install_convoy_ensure_reconciler(Arc::new(
             EnsureReconciler::builder()
+                .teardown(daemon.convoy_teardown())
                 .resource_backend(daemon.resource_backend())
                 .clock(Arc::new(flotilla_resources::SystemClock))
                 .build(),

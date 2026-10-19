@@ -23,7 +23,6 @@ use flotilla_store::ResourceBackend;
 
 use super::support::{test_meta, ForgeAwareTestChangeRequestFactory};
 use crate::in_process::{CheckoutArchiveStatus, CheckoutIntegrationStatus, InProcessDaemon, IntegrationCondition};
-use crate::testkits::cr_name;
 use crate::testkits::discovery::{fake_discovery, fake_discovery_with_runner, FakeChangeRequest};
 use crate::testkits::replay::testing::MockRunner;
 use flotilla_admission::convoy_admission::{KindCandidate, PlacementResolution, PlacementTieBreak};
@@ -34,6 +33,7 @@ use flotilla_admission::repository_inspection::RepositoryInspector;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::ChangeRequest;
 use flotilla_provider_runtime::available_space::AvailableSpaceProbe;
+use flotilla_store_testkit::cr_name;
 
 #[tokio::test]
 async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credential() {

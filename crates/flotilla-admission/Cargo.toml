@@ -30,7 +30,6 @@ async-trait = { workspace = true }
 bon = { workspace = true }
 tracing = { workspace = true }
 serde_yml = { workspace = true }
-url = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { workspace = true, features = ["v4"] }
 sha2 = { workspace = true }
@@ -38,7 +37,6 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 flotilla-orchestration-testkit = { path = "../flotilla-orchestration-testkit" }
-flotilla-projections = { path = "../flotilla-projections" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 indexmap = { workspace = true }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
