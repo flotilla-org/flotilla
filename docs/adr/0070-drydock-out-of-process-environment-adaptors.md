@@ -1,12 +1,12 @@
 # 70. Drydock: out-of-process environment adaptors
 
-**Status:** Accepted, not yet implemented (owner rulings, 2026-10-19; #3503)
+**Status:** Accepted, not yet implemented (owner rulings, 2026-10-19; #3503, #3514)
 **Date:** 2026-10-19
 **Amends:** [ADR 0069](0069-an-agent-inside-every-vessel.md): one multiplexed pipe per vessel carries both agent links
 **Relates to:**
 - [ADR 0058](0058-environment-providers-own-lifecycle-and-runtime-capabilities.md): the kind-neutral provider seam (2026-10-18 section), which adaptors serve;
 - [ADR 0063](0063-cbor-is-the-stack-binary-format.md): CBOR, a later second presentation;
-- [ADR 0068](0068-shared-crates-live-in-rigging-and-http-uses-axum.md): axum, reqwest, rigging and Git `rev` pinning;
+- [ADR 0068](0068-shared-crates-live-in-rigging-and-http-uses-axum.md): axum, reqwest, rigging and Git `rev` pinning, and its 2026-10-19 second wave of shared crates;
 - the environment providers mission #3468, the credential proxy rulings #3262 and the Namespace provider #3489.
 
 ## Context
@@ -195,3 +195,40 @@ This replaces "The agent's configuration" under Bootstrap above.
 
 - An optional `POST /v1/providers/{provider}/{id}/exec` upgrades to a raw stream that runs one command through the provider's own exec, without the agent.
 - It is declared by `fallback_runner`, and used for bootstrap and diagnosis only.
+
+## Amendment (2026-10-19, provider order and shared code; #3514)
+
+The owner made these rulings on drydock#1, drydock#5 and drydock#8, and on the shared-code decision #3514.
+
+### Environments under their own collection
+
+This replaces the per-sandbox addresses in the API-review amendment above. The Claude review of drydock#7 found that `GET /v1/providers/{provider}/usage` could not be told apart from inspecting a sandbox whose `id` is `usage`. So environments get their own path segment:
+- `POST` and `GET /v1/providers/{provider}/environments` provision and list;
+- `GET` and `DELETE /v1/providers/{provider}/environments/{id}` inspect and destroy;
+- `/reach`, `/relay`, `/suspend`, `/resume` and `/exec` hang off `/v1/providers/{provider}/environments/{id}`;
+- `credential`, `prepare`, `usage` and `quota` stay at the provider level, where they can no longer collide with an `id`.
+
+There are no aliases, so each route has one spelling. The noun is `environments`, not `vessels`. In flotilla a Vessel runs inside an Environment, and the vessel agent keeps its name because it serves the vessel inside.
+
+**Secret-bearing wire fields use a redacting type** whose `Debug` output does not show the value: the credential value, the Dial token and the placeholder token.
+
+### A Rust host first, with Daytona
+
+- **The Rust language host is the reference host.** It serves the `/v1` API directly from the protocol crate's types, and the TypeScript and Python hosts are checked against it. Rust provider modules live in it. "A new cloud provider is a module in a language host" (Consequences) counts Rust as a language host.
+- **Providers with a plain HTTP API come first, in Rust, starting with Daytona** (drydock#9). Its OpenAPI document, digest-pinned snapshots, IPv4 CIDR allowlist and SSH gateway fit this contract closely. Supervision, the client and conformance are proven against the Rust host, so they do not wait for the TypeScript host. Runtime is the likely second Rust module.
+
+### Namespace through devboxes and the TypeScript SDK
+
+- **Namespace is driven through devboxes and `@namespacelabs/sdk`,** not through its public compute API. The TypeScript host exists for SDK-only providers like this one. A provider we want to drive over plain HTTP is a different provider.
+- **Namespace now belongs to the providers that convert images** (Bootstrap above). Prepare registers and optimises the image, with the vessel tools baked in. The agent runs as a devbox service that starts on boot. Suspend is devbox stop, which keeps the filesystem but not memory.
+
+### Shared code and the credential port
+
+- **Drydock takes shared code only from rigging,** never from flotilla. The command runner, HTTP client, TLS, the replay and stand-in harness, the byte-stream types, the serving crate and SSH handling move to rigging before drydock would write its own copies (ADR 0068, second wave).
+- **Drydock owns a `CredentialSource` port,** a callback from drydock to the environment it runs in. It resolves a credential reference to a secret, with an optional expiry, and reports changes so that Direct mode refreshes the host. The references are:
+  - `File { path, json_field? }`;
+  - `Env { name }`;
+  - `Embedder(String)`, which is opaque to drydock and resolved by whoever embeds it. flotilla resolves it over its credential store.
+
+  Drydock has built-in resolvers for `File` and `Env`. There is no command reference for now.
+- **Proxied mode needs flotillad's per-host proxy,** so it works only when drydock is embedded. If the proxy becomes a separate component, the reference type and its resolvers move to rigging, so the proxy and drydock agree on what a reference means.
