@@ -95,9 +95,9 @@ inside) inside the model.
 
 ### 4. AgentChannels connect a session to its transports
 
-An **AgentChannel** is an AgentSession's live connection to one **transport**
-at a concrete endpoint on the session's current Process; a session can have
-several at once. The transports named so
+An **AgentChannel** is one live way input reaches an AgentSession: a
+**transport** at a concrete endpoint on the session's current Process. A
+session can have several at once. The transports named so
 far are `keystroke` (typing into the terminal through cleat),
 `codex-app-server` (JSON-RPC turns) and `claude-channels` (Claude Code's
 Channels). The harness connector declares which transports a harness
