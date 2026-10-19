@@ -9,9 +9,35 @@ use flotilla_store::{DockerImageSourceStoreExt, ResolvedCascadeStoreExt, StoreQu
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
 
-use super::*;
+use super::{
+    api_version, apply_resource_status_patch, authoritative_placement_host, capped_github_app_permissions, check_placement_capacity,
+    ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot, home_copy_wins_by_name, host_generation, normalize_issue_source,
+    placement_actuator_host_ref, placement_host_not_ready_reason, placement_host_ref, placement_target_host, policy_targets_agentless_ssh,
+    prepared_snapshot_name, project_ops, required_agent_adapters, resolve_project_issue_sources, unready_placement_refusal,
+    validate_docker_placement_host, warn, AiUtility, AllocationDecision, Arc, AttachBinding, BTreeMap, BTreeSet, BoundChangeRequest,
+    BriefArtifactWriter, CanonicalHostId, CapabilityNeed, CapabilityTable, ChangeRequestKey, ChangeRequestQueryPort, ChangeRequestTracker,
+    ChronoDuration, Clock, CommandRunner, CommandValue, ConfigStore, ConvoyChangeRequest, ConvoyDispatchRegard, ConvoyEnsure, ConvoyIssue,
+    ConvoyNames, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource,
+    CrewSpec, DateTime, DiscoveryRuntime, EnvironmentId, EnvironmentManager, ExecutionEnvironmentPath, Forge, FulfilmentAllocation,
+    FulfilmentAllocationCandidate, FulfilmentGrant, FulfilmentKind, HashMap, HashSet, HostName, InputMeta, InputValue, IssueQueryPort,
+    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, Mutex, ObjectMeta, ObservationError, ObservedChangeRequestState, PathBuf,
+    PlacementDecision, PlacementPolicy, PlacementPolicySpec, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, Platform,
+    PrincipalRef, Project, ProjectSpec, ProviderChangeRequestObservationSource, ReadResourceObject, RegardLifecycle, Repository,
+    RepositoryKey, RepositoryTrust, ResourceBackend, ResourceChangeRequest, ResourceCheckout, ResourceConvoy, ResourceError, ResourceHost,
+    ResourceObject, ResourceProvenance, ResourceRef, Reverse, RoleHandoff, RwLock, Sha256, SupervisionTarget, SurfaceGestureOutcome,
+    TerminalCrewContext, Utc, VesselRequirement, ViewAddress, WorkflowTemplate, WorkflowTemplateSpec, BRIEF_ARTIFACTS_ANNOTATION,
+    ENSURED_FROM_ANNOTATION, GENERATION_LABEL, MATERIALIZED_PROJECT_ANNOTATION, PROJECT_LABEL, ROLE_LABEL,
+};
+#[cfg(test)]
+use super::{
+    async_trait, DaemonHostPath, HoldAct, InProcessDaemon, ProviderChangeRequestQueryPort, ProviderIssueQueryPort, RepositorySpec,
+    SystemClock,
+};
 use flotilla_agent::adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver};
+use flotilla_change_request::observation::ChangeRequestObservationSource;
 use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
+use flotilla_resources::Resource;
+use sha2::Digest;
 
 use flotilla_discovery::AiUtilityFactory;
 

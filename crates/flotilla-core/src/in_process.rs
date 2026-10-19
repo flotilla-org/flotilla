@@ -69,7 +69,6 @@ use convoy_admission::{project_not_ready_error, ConvoyAdmission, ConvoyStartTask
 use flotilla_resources::convoy_address::{convoy_ensure_name, RoleAddress};
 mod repository_discovery;
 use flotilla_change_request::observation::ChangeRequestKey;
-use flotilla_change_request::observation::ChangeRequestObservationSource;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_projections::ports::ResolvedAttach;
 #[cfg(test)]
@@ -115,7 +114,7 @@ use flotilla_store::{
 };
 use futures::{FutureExt, StreamExt};
 pub use image_check::{check_image, image_build_report, ImageCheckSources};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
