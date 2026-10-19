@@ -141,3 +141,7 @@ Rules:
   - Convoy: `CallerProcess.container` becomes per-listener identity (#3262);
   - FulfilmentKind: `PerVessel{class}`.
 - **Each PR that changes these shapes** names its out-of-repo authoring sources (ops and project-map manifests) and ships companion updates.
+
+### Out-of-process providers (2026-10-19, #3503)
+
+Providers may also run out of process, in a language host behind drydock's adaptor protocol ([ADR 0070](0070-drydock-out-of-process-environment-adaptors.md)). In flotilla they appear through one adaptor-client provider that implements this seam by calling a language host, and that is selected like any other configured instance. One conformance suite runs against in-process and out-of-process providers alike. The seam traits and the built-in providers move into drydock after the seam refactor (#3483) lands.

@@ -102,3 +102,9 @@ Later features are each filed when a consumer needs them:
 - The vessel tool set becomes a delivered artifact with its own build, and possibly static linking.
 - The hello and upgrade routes become the one cross-generation contract inside vessels.
 - Codex WebSockets through the TLS-intercepting proxy must be tested before Codex crews run with enforced egress.
+
+## Amendment (2026-10-19, #3503)
+
+[ADR 0070](0070-drydock-out-of-process-environment-adaptors.md) changes two things here:
+- **One pipe per vessel.** The host opens exactly one byte stream to the agent and multiplexes both links inside it. On Namespace that is one SSH forward carrying both links, not a forward in each direction. Every kind's transport now only has to produce that one stream: vsock, a socket, SSH, a dial URL, or a relay through a provider SDK.
+- **The agent becomes a drydock component.** It is likely to move to [flotilla-org/drydock](https://github.com/flotilla-org/drydock), with a generic bridge that in-vessel tools use to reach whatever controls the vessel. flotilla's CLI, hooks and MCP reaching flotillad become one use of that bridge.

@@ -1,0 +1,141 @@
+# 70. Drydock: out-of-process environment adaptors
+
+**Status:** Accepted, not yet implemented (owner rulings, 2026-10-19; #3503)
+**Date:** 2026-10-19
+**Amends:** [ADR 0069](0069-an-agent-inside-every-vessel.md): one multiplexed pipe per vessel carries both agent links
+**Relates to:**
+- [ADR 0058](0058-environment-providers-own-lifecycle-and-runtime-capabilities.md): the kind-neutral provider seam (2026-10-18 section), which adaptors serve;
+- [ADR 0063](0063-cbor-is-the-stack-binary-format.md): CBOR, a later second presentation;
+- [ADR 0068](0068-shared-crates-live-in-rigging-and-http-uses-axum.md): axum, reqwest, rigging and Git `rev` pinning;
+- the environment providers mission #3468, the credential proxy rulings #3262 and the Namespace provider #3489.
+
+## Context
+
+The environment seam (ADR 0058) has in-process Rust providers: Docker, and Firecracker next. Cloud sandbox providers are many, change often, and are usually easiest to drive from their own TypeScript or Python SDKs. A survey of 32 providers on 2026-10-19 found:
+- most of the shortlist publishes REST with OpenAPI, but Modal is SDK/gRPC-only and Namespace's devbox API is private;
+- Modal and E2B have no native SSH;
+- every provider has its own way to restrict network egress;
+- usage and spend APIs are weak almost everywhere.
+
+The map had left "a declared provider mechanism" as a later follow-on. This ADR replaces it with a protocol, and names the substrate it belongs to.
+
+## Decision
+
+### Drydock
+
+**Drydock is the substrate for just launching vessels.** It is a Rust layer, a crate plus an optional standalone daemon, that:
+- hosts out-of-process provider adaptors;
+- reaches the agent inside each vessel (ADR 0069);
+- carries the vessel's egress to the per-vessel listener.
+
+flotillad embeds it. A bare `drydock launch` uses the same pieces without a store.
+
+### Parties and state
+
+- **Adaptors are thin, stateless translators over vendor SDKs.** The provider's API, plus our environment ID written as a tag at creation, is the record of what exists. `list` reads the tags back, and the existing re-adoption rule applies.
+- **Drydock delegates; it does not reconcile.** It may cache provider status to stay inside rate limits, for example to keep `drydock list` fresh across many providers. Adaptors stay stateless and declare their provider's rate limits.
+- **Desired state and retries stay flotilla's,** including retrying on another provider. A standalone drydock may later keep its own log, by choice.
+
+### Language hosts and modules
+
+- **One language host per language** (TypeScript, Python, others later). Each carries that language's version of the seam interface and its own implementation of the HTTP layer.
+- **Each provider implementation is a module** exporting what its language's interface requires.
+- **Drydock decides the process layout** by sending a host a configuration document: which implementations and instances it loads. One process per language is the starting layout. Drydock can isolate a module, for example when two modules need incompatible versions of a shared library.
+- **Requests route by implementation and instance.**
+- **Hosts are managed by default:** drydock spawns and supervises them, each on a Unix socket in its runtime directory. An external host at a loopback TCP URL or socket path is an option; drydock connects to it but does not supervise it.
+- **The `hello` handshake** reports the protocol version, the host version, the loaded implementations, and each instance's capability declaration and readiness (ADR 0058). A version mismatch makes the instance not ready, with a reason.
+- **Host runtimes** (`node`, `uv`) are found by detectors. A missing runtime makes the instances it would serve report "missing tool".
+
+### Credentials
+
+Both modes are supported, chosen per instance:
+- **Direct:** the configuration names a credential reference. Drydock resolves it and sends the value over the socket, held in memory only, with a refresh route for rotation. This suits drydock and our own adaptors on our own infrastructure.
+- **Proxied:** the host holds a placeholder token, and the per-host proxy swaps it for the real one (#3262).
+
+The proxy matters most for code inside vessels that agents wrote.
+
+### Reach
+
+- **Drydock opens exactly one byte stream per vessel to the agent,** and multiplexes ADR 0069's two links inside it (HTTP/2 or yamux). The same multiplexing runs on every kind, including over vsock.
+- **Reach returns one of three recipes:**
+  - **SSH:** endpoint, user and host key. Drydock makes a keypair per vessel and passes the public key at provision, then forwards to the agent's guest socket.
+  - **Dial:** a TCP or WebSocket URL, plus a short-lived token that drydock presents.
+  - **Relay:** an HTTP upgrade on the language host, which bridges bytes through the vendor SDK, for example by running the agent's bridge under the SDK's exec.
+- **Relay carries a vessel's egress,** so its throughput is tested on a relay provider before relying on it.
+
+### Egress
+
+- **Provision takes an egress request:** deny-all plus a list of direct destinations (host:port or CIDR), such as a nearer proxy, a trusted forge or a mirror. The list is empty by default. `Open` is a placement opt-in.
+- **The adaptor maps the request to the provider's own rules** and reports what it achieved:
+  - `Enforced`: a rule outside the guest that root inside cannot undo;
+  - `Advisory`: no such rule, so only the in-guest redirect applies.
+
+  It refuses an entry the provider cannot express, with a reason, and never widens a request silently.
+- **The agent is the proxy for redirected traffic** (ADR 0069). The firewall only steers connections to it, and the agent's own process is exempt. The agent may give a trusted direct destination a real DNS answer that bypasses it, and keep fake addresses for names that must pass through it. That choice belongs to the network-posture work; this contract is the same either way.
+
+### Bootstrap
+
+- **Where the provider converts images** (E2B templates, Daytona and Freestyle snapshots, Vercel's registry mirror), prepare bakes the vessel tools into the provider's prepared form: the agent, cleat, and an init that starts the agent. The prepared form is keyed by the image digest and the tools digest.
+- **Where the provider runs the digest directly** (Namespace, Fly, Runtime), the adaptor uploads the tools through the provider's files API at provision and starts the agent through its exec API.
+- The adaptor declares which route it uses.
+- **The agent's configuration** (environment ID, expected features, guest socket path) is a small Frozen file delivered the same way. The agent waits for drydock to connect in.
+- **Running vessels upgrade by ADR 0069's push plus re-exec;** the adaptor is not involved.
+
+### Observe and metering
+
+flotilla's own metering is the primary usage source, and `observe` is what it counts.
+- **Each event carries** the backing ID, instance, environment ID, and a timestamp with its source: `provider` when the vendor reported it, `adaptor` when the adaptor first saw the change.
+- **Events report billing transitions:**
+  - created;
+  - running, with the size actually granted;
+  - stopped or paused;
+  - resumed;
+  - gone, with a cause.
+- **The stream resumes after a gap** from the last event seen. An adaptor that cannot replay sends a fresh snapshot from `list`, marked as one, so metering knows it has a gap.
+- **Optional `usage(instance, period)` and account `quota` routes** (credits remaining, concurrency in use) reconcile against our metering, declared in the capability data. A later source may scrape billing pages where no API exists.
+- The first slice records sandbox-hours by size. Pricing comes with cost-based placement.
+
+### Errors and retries
+
+- **Every call is idempotent by environment ID.** Provision for an existing environment ID returns the existing sandbox found by its tag, and destroying something already gone succeeds.
+- **Errors are typed, each with a reason:**
+  - `Refused`: the request cannot be met as asked;
+  - `Unavailable` and `RateLimited`: with `retry_after` when known;
+  - `QuotaExhausted`: feeds placement back pressure;
+  - `CredentialRejected`: the instance becomes not ready with "missing credential";
+  - `Internal`: an adaptor bug, carrying the provider's raw error text.
+- **Adaptors do not retry.** Modules turn off the SDK's internal retries where they can.
+
+### Encoding
+
+- **JSON over HTTP, described by an OpenAPI document.** The Rust types are the source of truth. The document is generated from them and checked in, with a test that fails on drift. Each language host generates its types from the document (`openapi-typescript`; a Pydantic generator).
+- **Event streams** are newline-delimited JSON over a long-lived response, resumed with `since`.
+- **Relay** is a raw HTTP upgrade.
+- **CBOR, under ADR 0063's profile,** may come later as a second presentation through content negotiation.
+
+### Where it lives
+
+- **[flotilla-org/drydock](https://github.com/flotilla-org/drydock)** is a separate project, public because flotilla depends on it. It holds:
+  - the protocol crate;
+  - the TypeScript and Python hosts;
+  - the provider modules, Namespace first;
+  - the conformance suite, a runnable checker for any language host or built-in provider.
+- **It follows ADR 0068:** axum and reqwest, rigging for shared crates, and no dependency on flotilla.
+- **flotilla pins drydock once by Git `rev`** in `[workspace.dependencies]`. `flotilla-environment` gains an adaptor-client provider that implements the seam traits by calling a language host. It is an ordinary configured provider instance.
+- **The seam traits and the built-in providers move into drydock after #3483 lands.** Until then the protocol mirrors the seam, and one conformance suite runs against built-ins and adaptors alike.
+- **The vessel agent likely becomes a drydock component,** with a generic bridge that in-vessel tools use to reach whatever controls the vessel. flotilla's CLI reaching flotillad is one use.
+
+### Conformance
+
+The suite tests behaviour, not declarations. Each provider is run against the same checks:
+- calls are idempotent;
+- loss causes are typed;
+- events resume after a gap;
+- an `Enforced` egress claim holds: as root in the guest, a listed destination is reachable directly, while an unlisted canary and a raw DNS lookup are blocked.
+
+## Consequences
+
+- A new cloud provider is a module in a language host, not a Rust crate in flotilla.
+- The Namespace provider (#3489) becomes the adaptor-client provider in flotilla plus a TypeScript module in drydock. A second adaptor (Modal or E2B) exercises Relay.
+- flotilla gains a Git dependency on a sibling project's public protocol crate.
+- Usage figures come mainly from our own metering, so lifecycle events must be complete and timestamped.
