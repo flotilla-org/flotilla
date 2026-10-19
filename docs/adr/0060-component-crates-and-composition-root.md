@@ -65,6 +65,8 @@ The owner's direction is to break flotilla into components so it isn't committed
 
 `EnvironmentManager` lives in `flotilla-discovery`. Capability crates read environments through discovery's `Environments` port; only the executor creates and destroys them, through `EnvironmentLifecycle`.
 
+`flotilla-crew` holds crew operations, crew actions and capability cards, the leaf engine as a module, the decision log, charter notifications, and the Vessel, TerminalSession and Convoy reconcilers. The Convoy reconciler is its own module and reaches crew operations through one named interface. `attach` stays in core. Crew does not depend on `flotilla-state-machines`.
+
 ### VCS operation boundary (amended)
 
 VCS operations go through the `Vcs` trait. Each provider chooses a CLI implementation through the environment runner, or a library implementation. The previous rule ("CLI via the runner is the universal implementation; a library backend must not replace it for remote or provisioned environments") no longer holds: an environment may run a minimal flotilla agent beside cleat, so library implementations can run in-environment. The Git boundary check continues to forbid invoking `git` outside the VCS implementation.
@@ -142,10 +144,6 @@ projector. The daemon registers both from `flotilla-admission`; the reverse
 `ConvoyEnsureReconciler` port and its core installation remain unchanged.
 `VesselPlacementProjector` is expected to move again under the Vessel machine
 (#3108).
-
-### Crew capability (#3523)
-
-`flotilla-crew` holds crew operations, crew actions and capability cards, the leaf engine as a module, the decision log, charter notifications, and the Vessel, TerminalSession and Convoy reconcilers. The Convoy reconciler is its own module and reaches crew operations through one named interface. `attach` stays in core. Crew does not depend on `flotilla-state-machines`.
 
 ## Consequences
 
