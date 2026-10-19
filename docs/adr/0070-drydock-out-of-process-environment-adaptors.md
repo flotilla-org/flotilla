@@ -139,3 +139,59 @@ The suite tests behaviour, not declarations. Each provider is run against the sa
 - The Namespace provider (#3489) becomes the adaptor-client provider in flotilla plus a TypeScript module in drydock. A second adaptor (Modal or E2B) exercises Relay.
 - flotilla gains a Git dependency on a sibling project's public protocol crate.
 - Usage figures come mainly from our own metering, so lifecycle events must be complete and timestamped.
+
+## Amendment (2026-10-19, API review; #3503)
+
+The owner went through a mockup of the HTTP API. Six changes follow from it.
+
+### Names
+
+- **A provider is a configured, named thing drydock launches vessels on.** It is usually named after the service (`namespace`, `modal`). It gets another name when there are two of one service (`namespace-work`), or when it isn't an account at all (`docker`, `firecracker`). This replaces "provider instance" here and in ADR 0058's 2026-10-18 section.
+- **A provider module** is the code for one service, loaded by a language host. One module can serve several providers. It replaces "implementation" in this ADR.
+- **The sandbox's own ID is just `id`,** the provider's opaque ID. It replaces "backing ID" on the wire.
+
+### Addresses
+
+- **Provision** is `POST /v1/providers/{provider}`. The body carries a `label`: flotilla's environment ID, which the module writes as a tag at the provider. The label is a client label, not the resource's identity. It does two jobs:
+  - a repeat `POST` with the same label returns the existing sandbox (200), so retries never create a second one;
+  - `list` returns each sandbox's label, so flotilla can match sandboxes back to its environments.
+- **Everything after provision uses the provider's `id`,** directly under the provider:
+  - `GET /v1/providers/{provider}` lists the provider's sandboxes;
+  - `GET` and `DELETE /v1/providers/{provider}/{id}` inspect and destroy one;
+  - `/reach`, `/relay`, `/suspend`, `/resume` and `/exec` act on one.
+- Destroy and inspect work for unlabelled sandboxes found by listing.
+
+### Events and prepare
+
+- **There is one event stream per language host,** covering every provider it serves. A noisy provider is isolated in its own host process.
+- **Prepare stays a separate call,** so flotilla can prepare ahead of admission and a slow image conversion never sits inside a provision timeout.
+- **Modules record the prepared form at the provider,** named or tagged by the image and tools digest pair. Prepare is look up or build, and drydock records nothing.
+
+### Authentication between drydock and a host
+
+- **Managed hosts** use a Unix socket with a peer-credential check.
+- **External hosts on loopback TCP** use a bearer token file (mode 0600), compared in constant time.
+- Drydock uses rigging's serving crate (ADR 0068). The TypeScript and Python hosts implement both checks, each with a conformance test.
+
+### A stream transport, not exactly one pipe
+
+This replaces "exactly one byte stream per vessel" under Reach above.
+- **Each vessel has one stream transport with two operations:** open a stream to the agent, and accept a stream from it.
+- **Each of ADR 0069's links is a long-lived HTTP/2 connection** over its own stream. Bulk traffic (cleat attach, port forwards) uses raw streams that open with a short header.
+- **Kinds with cheap two-way connections use them natively:** vsock, Docker's sockets, and SSH channels with local and remote forwards.
+- **Dial and Relay run yamux over their single stream.** yamux is also the fallback that works on every kind.
+- **Tender keeps reachability across the mesh** (identity, publications, grants) and splices in streams that drydock opens. It never learns about providers. The shared byte-stream and stream-opener types move to rigging when both projects need them.
+
+### The agent is told nothing per vessel at start
+
+This replaces "The agent's configuration" under Bootstrap above.
+- **There is no per-vessel configuration file.** A baked prepared form is shared by many vessels, so it could not hold one anyway.
+- **The agent starts with fixed flags:** a well-known guest socket, plus a vsock port where the kind has vsock.
+- **Each connection's first bytes say whether it carries yamux.**
+- **Drydock already knows which vessel it connected to.** After the hello it pushes the egress table, the CA and the features over the control API.
+- If identity inside the vessel is ever needed, for logging or tracing, the provider contract can require a well-known environment variable or file.
+
+### Fallback runner
+
+- An optional `POST /v1/providers/{provider}/{id}/exec` upgrades to a raw stream that runs one command through the provider's own exec, without the agent.
+- It is declared by `fallback_runner`, and used for bootstrap and diagnosis only.

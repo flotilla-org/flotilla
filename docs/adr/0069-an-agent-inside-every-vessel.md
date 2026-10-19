@@ -106,5 +106,6 @@ Later features are each filed when a consumer needs them:
 ## Amendment (2026-10-19, #3503)
 
 [ADR 0070](0070-drydock-out-of-process-environment-adaptors.md) changes two things here:
-- **One pipe per vessel.** The host opens exactly one byte stream to the agent and multiplexes both links inside it. On Namespace that is one SSH forward carrying both links, not a forward in each direction. Every kind's transport now only has to produce that one stream: vsock, a socket, SSH, a dial URL, or a relay through a provider SDK.
+- **One stream transport per vessel** (revised in ADR 0070's API-review amendment). The host opens streams to the agent and accepts streams from it. Kinds with cheap two-way connections use them natively (vsock, Docker's sockets, SSH channels with local and remote forwards). Dial and Relay run yamux over their single stream. Each link is a long-lived HTTP/2 connection over its own stream.
+- **The hello no longer carries the environment ID.** The host already knows which vessel it connected to. The hello carries the build fingerprint and supported features, and the host pushes the rest after connecting.
 - **The agent becomes a drydock component.** It is likely to move to [flotilla-org/drydock](https://github.com/flotilla-org/drydock), with a generic bridge that in-vessel tools use to reach whatever controls the vessel. flotilla's CLI, hooks and MCP reaching flotillad become one use of that bridge.
