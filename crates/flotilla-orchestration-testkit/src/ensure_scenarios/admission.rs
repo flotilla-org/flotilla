@@ -437,7 +437,10 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     let mut ensure = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure");
     ensure.spec.placement_policy = Some("remote-policy".to_string());
-    let absent = factory.dependency_hash(&daemon, "flotilla", &ensure).await.expect("absent fingerprint");
+    let absent = factory
+        .dependency_hash(daemon.as_ref(), daemon.resource_backend(), daemon.clock_for_scenarios(), "flotilla", &ensure)
+        .await
+        .expect("absent fingerprint");
     let source = ResourceBackend::new(InMemoryBackend::default());
     let mut policy = placement_policy(&source, "remote-policy", "other-host").await;
     let writer = backend.replica_writer::<PlacementPolicy>(NodeId::new("other-root"), "flotilla");
@@ -445,7 +448,10 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
         .replace(&source.using::<PlacementPolicy>("flotilla").list().await.expect("policies"), Utc::now())
         .await
         .expect("replicate policy");
-    let present = factory.dependency_hash(&daemon, "flotilla", &ensure).await.expect("replica fingerprint");
+    let present = factory
+        .dependency_hash(daemon.as_ref(), daemon.resource_backend(), daemon.clock_for_scenarios(), "flotilla", &ensure)
+        .await
+        .expect("replica fingerprint");
     assert_ne!(absent, present, "arrival must invalidate an admission refusal");
     policy.spec.priority = 42;
     source
@@ -457,7 +463,13 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
         .replace(&source.using::<PlacementPolicy>("flotilla").list().await.expect("updated policies"), Utc::now())
         .await
         .expect("replicate change");
-    assert_ne!(present, factory.dependency_hash(&daemon, "flotilla", &ensure).await.expect("changed fingerprint"));
+    assert_ne!(
+        present,
+        factory
+            .dependency_hash(daemon.as_ref(), daemon.resource_backend(), daemon.clock_for_scenarios(), "flotilla", &ensure)
+            .await
+            .expect("changed fingerprint")
+    );
 }
 
 pub async fn replicated_ensure_is_not_reconciled_away_from_its_project_home(factory: &dyn EnsureScenarioController) {
@@ -883,7 +895,10 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
     driver.install_convoy_ensure_reconciler(factory.create(driver.resource_backend(), driver.clock_for_scenarios())).await;
     let ensure = home_backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("home ensure");
 
-    factory.start(&driver, "flotilla", &ensure).await.expect("driver admits replicated template");
+    factory
+        .start(driver.as_ref(), driver.resource_backend(), driver.clock_for_scenarios(), "flotilla", &ensure)
+        .await
+        .expect("driver admits replicated template");
 
     let admitted = driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("driver convoys").items;
     assert_eq!(admitted.len(), 1);

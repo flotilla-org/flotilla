@@ -1,11 +1,10 @@
-//! The controller owns scenario registration; core supplies private daemon setup.
+//! Admission owns scenario registration; core supplies private daemon setup.
 
 use std::sync::Arc;
 
-use super::EnsureReconciler;
 use async_trait::async_trait;
-use flotilla_admission::convoy_ensure::ConvoyEnsureReconciler;
-use flotilla_core::in_process::InProcessDaemon;
+use flotilla_admission::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler};
+use flotilla_admission::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_orchestration_testkit as ensure_scenarios;
 use flotilla_orchestration_testkit::EnsureScenarioController;
 use flotilla_resources::{Clock, ConvoyEnsure, ResourceObject};
@@ -19,24 +18,28 @@ impl EnsureScenarioController for Controller {
     }
     async fn dependency_hash(
         &self,
-        daemon: &InProcessDaemon,
+        admission: &dyn ConvoyEnsureAdmission,
+        backend: ResourceBackend,
+        clock: Arc<dyn Clock>,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
     ) -> Result<String, String> {
         EnsureReconciler::builder()
-            .resource_backend(daemon.resource_backend())
-            .clock(daemon.clock_for_scenarios())
+            .resource_backend(backend)
+            .clock(clock)
             .build()
-            .ensure_admission_dependency_hash(daemon, namespace, ensure)
+            .ensure_admission_dependency_hash(admission, namespace, ensure)
             .await
     }
-    async fn start(&self, daemon: &InProcessDaemon, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String> {
-        EnsureReconciler::builder()
-            .resource_backend(daemon.resource_backend())
-            .clock(daemon.clock_for_scenarios())
-            .build()
-            .start_ensured_convoy(daemon, namespace, ensure)
-            .await
+    async fn start(
+        &self,
+        admission: &dyn ConvoyEnsureAdmission,
+        backend: ResourceBackend,
+        clock: Arc<dyn Clock>,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+    ) -> Result<String, String> {
+        EnsureReconciler::builder().resource_backend(backend).clock(clock).build().start_ensured_convoy(admission, namespace, ensure).await
     }
 }
 

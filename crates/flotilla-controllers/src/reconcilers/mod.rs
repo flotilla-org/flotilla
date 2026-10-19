@@ -1,12 +1,10 @@
 pub mod checkout;
 pub mod clone;
-pub mod convoy_ensure;
 pub mod environment;
 pub mod image_build;
 pub mod repository;
 pub mod terminal_session;
 pub mod vessel;
-pub mod vessel_placement;
 
 pub use checkout::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
@@ -21,7 +19,6 @@ pub use terminal_session::{
     TerminalRuntimeState, TerminalSessionReconciler,
 };
 pub use vessel::{checkout_path_component, VesselPrepared, VesselReconciler};
-pub use vessel_placement::{VesselPlacementProjector, VesselPlacementSync};
 
 #[cfg(test)]
 mod runtime_tests;

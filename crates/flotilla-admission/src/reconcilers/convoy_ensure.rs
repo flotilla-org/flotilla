@@ -7,12 +7,12 @@ use std::{
     sync::Arc,
 };
 
+use crate::convoy_admission::PreparedConvoyAdmission;
+use crate::convoy_ensure::ConvoyEnsureAdmission;
+use crate::convoy_ensure::ConvoyEnsureReconciler;
+use crate::convoy_ensure::StandingConvoyBackingInspector;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use flotilla_admission::convoy_admission::PreparedConvoyAdmission;
-use flotilla_admission::convoy_ensure::ConvoyEnsureAdmission;
-use flotilla_admission::convoy_ensure::ConvoyEnsureReconciler;
-use flotilla_admission::convoy_ensure::StandingConvoyBackingInspector;
 use flotilla_charter::ops_entry::{
     materialized_workflow_name, ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
     ENSURE_PROVENANCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
@@ -98,8 +98,8 @@ impl EnsureReconciler {
     }
 }
 impl EnsureReconciler {
-    #[cfg(test)]
-    pub(crate) async fn ensure_admission_dependency_hash(
+    #[doc(hidden)]
+    pub async fn ensure_admission_dependency_hash(
         &self,
         admission: &dyn ConvoyEnsureAdmission,
         namespace: &str,
@@ -107,8 +107,8 @@ impl EnsureReconciler {
     ) -> Result<String, String> {
         self.pass(admission).ensure_admission_dependency_hash(namespace, ensure).await
     }
-    #[cfg(test)]
-    pub(crate) async fn start_ensured_convoy(
+    #[doc(hidden)]
+    pub async fn start_ensured_convoy(
         &self,
         admission: &dyn ConvoyEnsureAdmission,
         namespace: &str,
@@ -1549,6 +1549,3 @@ mod tests {
         assert_eq!(admission.commits.load(Ordering::SeqCst), 1);
     }
 }
-
-#[cfg(test)]
-mod scenarios;

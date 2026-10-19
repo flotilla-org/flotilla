@@ -17,7 +17,6 @@ mod terminal_session_reconciler;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;
 mod vessel_finalization;
-mod vessel_placement;
 mod vessel_reconciler;
 
 // Reuse the lower crate's backend contracts and fixtures without reversing its build graph.

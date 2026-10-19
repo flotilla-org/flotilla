@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+futures = { workspace = true }
 flotilla-messaging = { path = "../flotilla-messaging" }
 flotilla-observation = { path = "../flotilla-observation" }
 flotilla-config = { path = "../flotilla-config" }
@@ -36,6 +37,7 @@ sha2 = { workspace = true }
 
 
 [dev-dependencies]
+flotilla-orchestration-testkit = { path = "../flotilla-orchestration-testkit" }
 flotilla-projections = { path = "../flotilla-projections" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 indexmap = { workspace = true }
