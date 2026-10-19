@@ -1,6 +1,6 @@
 # 68. Shared crates live in rigging, and HTTP uses axum
 
-**Status:** Accepted (owner rulings, 2026-10-17; amended 2026-10-19, #3514)
+**Status:** Accepted (owner rulings, 2026-10-17; amended 2026-10-19, #3514; consumer list withdrawn 2026-10-19)
 **Date:** 2026-10-17
 **Relates to:**
 - [ADR 0063](0063-cbor-is-the-stack-binary-format.md): CBOR is the stack's binary format, implemented by `flotilla-cbor`;
@@ -64,8 +64,8 @@ flotilla talks to cleat as a program, by command line and JSON today and by HTTP
 ### 6. Pinning
 
 - **Each consumer names rigging once,** in its workspace `Cargo.toml` `[workspace.dependencies]`, with a single `rev`. Its crates use `workspace = true`, so two crates in one project cannot pin different revisions.
-- **`consumers.toml` in rigging lists every consumer and the revision it pins.** It is updated in the same change that bumps a consumer.
-- **Bumps are automated after a trial** (flotilla-org/rigging#2). Renovate is tried first on one consumer (porthole, which also pins jackstay). If it does not bump a Git `rev` cleanly, a scheduled job in rigging reads `consumers.toml` and opens the bump PRs itself.
+- **Rigging keeps no list of consumers** (withdrawn 2026-10-19; see the last amendment). A consumer's pin lives only in its own repository.
+- **Bumps are automated after a trial** (flotilla-org/rigging#2). Renovate is tried first on one consumer (porthole, which also pins jackstay). If it does not bump a Git `rev` cleanly, each consumer runs its own scheduled bump job.
 
 ### Still to verify
 
@@ -123,3 +123,10 @@ A rigging crate is designed against the siblings' existing implementations of th
 - **russh fails that test by design:** it grants the peer more data as soon as data arrives, then waits on a bounded queue, so one stalled reader blocks the session. The fix was proposed upstream and declined (russh#730).
 - **A library backend may come later,** for Windows or for pinned targets, once it passes the same contract suite.
 - **PTY attach stays native `ssh -tt`,** outside the port.
+
+## Amendment (2026-10-19, no consumer list in rigging)
+
+The owner withdrew `consumers.toml`, rigging's list of consumers and the revision each pins, a day after it was added.
+- **A consumer's pin lives only in its own workspace `Cargo.toml` and `Cargo.lock`.** Dependencies point one way: consumers name rigging, and rigging names no consumer.
+- **A copy of the pin in rigging cannot stay in step.** It lives in another repository, so every bump needs a second change, and a squash merge leaves it naming a commit that no longer exists. Nothing read it.
+- **Bump automation lives in each consumer,** through Renovate or the consumer's own scheduled job. A list of projects, if one is ever wanted, belongs in a portfolio repository that nothing depends on, generated rather than kept by hand.

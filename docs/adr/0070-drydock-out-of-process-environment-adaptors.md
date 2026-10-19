@@ -234,3 +234,11 @@ There are no aliases, so each route has one spelling. The noun is `environments`
 
   Drydock has built-in resolvers for `File` and `Env`. There is no command reference for now.
 - **Proxied mode needs flotillad's per-host proxy,** so it works only when drydock is embedded. If the proxy becomes a separate component, the reference type and its resolvers move to rigging, so the proxy and drydock agree on what a reference means.
+
+## Amendment (2026-10-19, the host owns observation for polling providers; drydock#8)
+
+The owner ruled on drydock#8, from the design review of drydock#18. This refines "Parties and state" and "Observe and metering" above.
+- **A module declares how it observes:** it polls or it pushes. Daytona and Namespace poll. A provider with webhooks or an event stream pushes.
+- **For a polling module, the host runs the poller.** It lists at an interval within the provider's declared rate limits, keeps the last-seen state, diffs, and emits the billing-transition events with source `adaptor`. It uses the provider's own timestamps where `list` or `inspect` returns them. The module stays a stateless translator that implements `list` and `inspect`. A snapshot for a polling module is served from that last-seen state, so the host keeps one view of what exists.
+- **A push module publishes through the event sink.** The sink takes an optional typed timestamp, and the host stamps the event when the module gives none, so modules never format time.
+- **Provider-module methods take `&self`.** The host holds each provider as a shared reference and serialises nothing per provider. A module that keeps state, such as the in-memory reference module, holds its own lock, so a slow `prepare` never blocks other calls to the same provider.
