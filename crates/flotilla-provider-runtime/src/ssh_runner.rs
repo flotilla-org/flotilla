@@ -4,11 +4,12 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_protocol::arg::shell_quote;
 use uuid::Uuid;
 
 use crate::{
-    atomic_write_script, helper_exec_script, install_managed_helper_script, rename_command_timeout, ChannelLabel, CommandOutput,
-    CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
+    atomic_write_script, helper_exec_script, managed_helper_install_words, managed_helper_path, rename_command_timeout, ChannelLabel,
+    CommandOutput, CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
 const REMOTE_WRITABLE_BASE_SCRIPT: &str = "if [ -n \"${XDG_RUNTIME_DIR:-}\" ] \
@@ -55,28 +56,35 @@ impl SshCommandRunner {
         args
     }
 
-    fn ssh_shell_args<'a>(&'a self, script: &'a str) -> Vec<&'a str> {
-        let mut args = self.ssh_prefix_args();
-        args.push("sh");
-        args.push("-lc");
-        args.push(script);
+    /// `ssh` joins every argument after the destination with spaces, and the
+    /// remote login shell parses that string again. Send the remote command as
+    /// one argument whose words are quoted, so the remote shell recovers exactly
+    /// these words: a multi-line script stays one `sh -c` operand, and a script's
+    /// own positional arguments reach it.
+    fn ssh_remote_args(&self, words: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = self.ssh_prefix_args().into_iter().map(str::to_string).collect();
+        args.push(words.iter().map(|word| shell_quote(word)).collect::<Vec<_>>().join(" "));
         args
+    }
+
+    fn ssh_shell_args(&self, script: &str) -> Vec<String> {
+        self.ssh_remote_args(&["sh", "-lc", script])
     }
 
     fn remote_exec_script(&self, cmd: &str, args: &[&str], cwd: &Path) -> String {
         let mut parts = Vec::with_capacity(args.len() + 4);
-        parts.push(format!("cd {}", flotilla_protocol::arg::shell_quote(&cwd.to_string_lossy())));
+        parts.push(format!("cd {}", shell_quote(&cwd.to_string_lossy())));
         parts.push("&&".to_string());
         parts.push("exec".to_string());
-        parts.push(flotilla_protocol::arg::shell_quote(cmd));
-        parts.extend(args.iter().map(|arg| flotilla_protocol::arg::shell_quote(arg)));
+        parts.push(shell_quote(cmd));
+        parts.extend(args.iter().map(|arg| shell_quote(arg)));
         parts.join(" ")
     }
 
     async fn execute(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         let script = self.remote_exec_script(cmd, args, cwd);
         let ssh_args = self.ssh_shell_args(&script);
-        self.runner.run("ssh", &ssh_args, Path::new("/"), label).await
+        self.runner.run("ssh", &as_strs(&ssh_args), Path::new("/"), label).await
     }
 
     async fn writable_base(&self, purpose: &str) -> Result<PathBuf, String> {
@@ -90,6 +98,10 @@ impl SshCommandRunner {
         }
         Ok(PathBuf::from(base))
     }
+}
+
+fn as_strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
 }
 
 #[async_trait]
@@ -113,7 +125,7 @@ impl CommandRunner for SshCommandRunner {
         let script = self.remote_exec_script(cmd, args, cwd);
         let ssh_args = self.ssh_shell_args(&script);
         self.runner
-            .run_with_timeout("ssh", &ssh_args, Path::new("/"), label, timeout)
+            .run_with_timeout("ssh", &as_strs(&ssh_args), Path::new("/"), label, timeout)
             .await
             .map_err(|error| rename_command_timeout(error, "ssh", cmd, timeout))
     }
@@ -121,13 +133,13 @@ impl CommandRunner for SshCommandRunner {
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         let script = self.remote_exec_script(cmd, args, cwd);
         let ssh_args = self.ssh_shell_args(&script);
-        self.runner.run_output("ssh", &ssh_args, Path::new("/"), label).await
+        self.runner.run_output("ssh", &as_strs(&ssh_args), Path::new("/"), label).await
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         let script = self.remote_exec_script(cmd, args, cwd);
         let ssh_args = self.ssh_shell_args(&script);
-        self.runner.run_with_input("ssh", &ssh_args, Path::new("/"), label, input).await
+        self.runner.run_with_input("ssh", &as_strs(&ssh_args), Path::new("/"), label, input).await
     }
 
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
@@ -145,45 +157,38 @@ impl CommandRunner for SshCommandRunner {
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
         let temp_suffix = Uuid::new_v4().to_string();
         let path_str = path.to_string_lossy().into_owned();
-        let helper_path = install_managed_helper_script(
-            &*self.runner,
-            "ssh",
-            &self.ssh_prefix_args(),
-            "-lc",
-            FLOTILLA_HELPER_NAME,
-            FLOTILLA_HELPER_SCRIPT,
-        )
-        .await?;
+        let install_words = managed_helper_install_words("-lc", FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT);
+        let install_args = self.ssh_remote_args(&as_strs(&install_words));
+        let output = self.runner.run("ssh", &as_strs(&install_args), Path::new("/"), &ChannelLabel::Default).await?;
+        let helper_path = managed_helper_path(&output, FLOTILLA_HELPER_NAME)?;
         let helper_script = helper_exec_script(&helper_path, "ensure-file-if-absent", &[&path_str, content, &temp_suffix])?;
-        let mut owned_args: Vec<String> = self.ssh_prefix_args().into_iter().map(str::to_string).collect();
-        owned_args.extend(["sh".to_string(), "-lc".to_string(), helper_script]);
-        let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-        self.runner.run("ssh", &arg_refs, Path::new("/"), &ChannelLabel::Default).await
+        let ssh_args = self.ssh_shell_args(&helper_script);
+        self.runner.run("ssh", &as_strs(&ssh_args), Path::new("/"), &ChannelLabel::Default).await
     }
 
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
         let script = atomic_write_script(path, &Uuid::new_v4().to_string(), None)?;
         let ssh_args = self.ssh_shell_args(&script);
-        self.runner.run_with_input("ssh", &ssh_args, Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
+        self.runner.run_with_input("ssh", &as_strs(&ssh_args), Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
     }
 
     async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
         let script = atomic_write_script(path, &Uuid::new_v4().to_string(), Some(mode))?;
         let ssh_args = self.ssh_shell_args(&script);
-        self.runner.run_with_input("ssh", &ssh_args, Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
+        self.runner.run_with_input("ssh", &as_strs(&ssh_args), Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
     }
 
     async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
         let source = source.to_string_lossy();
         let script = self.remote_exec_script("cat", &[&source], Path::new("/"));
         let args = self.ssh_shell_args(&script);
-        self.runner.run_to_file("ssh", &args, Path::new("/"), destination).await
+        self.runner.run_to_file("ssh", &as_strs(&args), Path::new("/"), destination).await
     }
 
     async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
         let script = atomic_write_script(destination, &Uuid::new_v4().to_string(), None)?;
         let args = self.ssh_shell_args(&script);
-        self.runner.run_from_file("ssh", &args, Path::new("/"), source).await
+        self.runner.run_from_file("ssh", &as_strs(&args), Path::new("/"), source).await
     }
 }
 
@@ -351,9 +356,8 @@ mod tests {
         assert_eq!(args[1], "-o");
         assert_eq!(args[2], "BatchMode=yes");
         assert_eq!(args[3], "alice@feta.local");
-        assert_eq!(args[4], "sh");
-        assert_eq!(args[5], "-lc");
-        assert_eq!(args[6], "cd '/repo with space' && exec 'git' 'status' '--short'");
+        assert_eq!(args.len(), 5, "the remote command is one argument");
+        assert_eq!(args[4], r#"'sh' '-lc' 'cd '\''/repo with space'\'' && exec '\''git'\'' '\''status'\'' '\''--short'\'''"#);
     }
 
     #[tokio::test]
@@ -379,9 +383,8 @@ mod tests {
         assert_eq!(args[2], "BatchMode=yes");
         assert_eq!(&args[3..9], ["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/flotilla-ssh-%C", "-o", "ControlPersist=60"]);
         assert_eq!(args[9], "alice@feta.local");
-        assert_eq!(args[10], "sh");
-        assert_eq!(args[11], "-lc");
-        assert_eq!(args[12], "cd '/repo' && exec 'git' 'status'");
+        assert_eq!(args.len(), 11, "the remote command is one argument");
+        assert_eq!(args[10], r#"'sh' '-lc' 'cd '\''/repo'\'' && exec '\''git'\'' '\''status'\'''"#);
     }
 
     #[tokio::test]
@@ -397,9 +400,8 @@ mod tests {
         assert_eq!(args[1], "-o");
         assert_eq!(args[2], "BatchMode=yes");
         assert_eq!(args[3], "alice@feta.local");
-        assert_eq!(args[4], "sh");
-        assert_eq!(args[5], "-lc");
-        assert_eq!(args[6], "cd '/' && exec 'cleat' '--version'");
+        assert_eq!(args.len(), 5, "the remote command is one argument");
+        assert_eq!(args[4], r#"'sh' '-lc' 'cd '\''/'\'' && exec '\''cleat'\'' '\''--version'\'''"#);
     }
 
     #[tokio::test]
@@ -497,28 +499,132 @@ mod tests {
         assert_eq!(calls.len(), 2);
 
         let install_args = &calls[0].1;
-        assert_eq!(install_args[0], "-T");
-        assert_eq!(install_args[1], "-o");
-        assert_eq!(install_args[2], "BatchMode=yes");
-        assert_eq!(install_args[3], "alice@feta.local");
-        assert_eq!(install_args[4], "sh");
-        assert_eq!(install_args[5], "-lc");
-        assert!(install_args[6].contains("helpers/$helper_hash"));
-        assert_eq!(install_args[7], "flotilla-bootstrap-install-managed-script");
-        assert_eq!(install_args[8], "flotilla-helper");
-        assert!(!install_args[9].is_empty());
+        assert_eq!(&install_args[..4], ["-T", "-o", "BatchMode=yes", "alice@feta.local"]);
+        assert_eq!(install_args.len(), 5, "the installer is one remote command argument");
+        assert!(install_args[4].starts_with("'sh' '-lc' '"));
+        assert!(install_args[4].contains("helpers/$helper_hash"));
+        assert!(install_args[4].contains("'flotilla-bootstrap-install-managed-script' 'flotilla-helper' '"));
 
         let args = &calls[1].1;
-        assert_eq!(args[0], "-T");
-        assert_eq!(args[1], "-o");
-        assert_eq!(args[2], "BatchMode=yes");
-        assert_eq!(args[3], "alice@feta.local");
-        assert_eq!(args[4], "sh");
-        assert_eq!(args[5], "-lc");
-        assert!(args[6].contains("PATH='/remote/state/flotilla/helpers/helper-hash':\"$PATH\""));
-        assert!(args[6].contains("exec 'flotilla-helper' 'ensure-file-if-absent'"));
-        assert!(args[6].contains("'/etc/flotilla/config.toml'"));
-        assert!(args[6].contains("'key = true\n'"));
+        assert_eq!(&args[..4], ["-T", "-o", "BatchMode=yes", "alice@feta.local"]);
+        assert_eq!(args.len(), 5, "the helper call is one remote command argument");
+        assert!(args[4].starts_with("'sh' '-lc' '"));
+        assert!(args[4].contains("flotilla-helper"));
+        assert!(args[4].contains("ensure-file-if-absent"));
+        assert!(args[4].contains("/etc/flotilla/config.toml"));
+    }
+
+    /// Stands in for `ssh` and the remote sshd: everything after the
+    /// destination is joined with spaces and run with `sh -c`, which is what
+    /// sshd does with the command string. The "remote" home is a temporary
+    /// directory.
+    struct LoopbackSsh {
+        home: PathBuf,
+    }
+
+    impl LoopbackSsh {
+        fn remote_command(args: &[&str]) -> String {
+            // Skips the prefix SshCommandRunner emits: bare flags and `-o X`.
+            // A new flag that takes a separate value must be added here.
+            let mut index = 0;
+            while index < args.len() && args[index].starts_with('-') {
+                index += if args[index] == "-o" { 2 } else { 1 };
+            }
+            // Skip the destination; sshd receives the rest as one string.
+            args[index + 1..].join(" ")
+        }
+
+        async fn shell(&self, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
+            let command = Self::remote_command(args);
+            let home = self.home.to_string_lossy().into_owned();
+            let home_assignment = format!("HOME={home}");
+            let state_assignment = format!("XDG_STATE_HOME={home}/.local/state");
+            let env_args = ["-u", "XDG_RUNTIME_DIR", "-u", "FLOTILLA_ROOT", &home_assignment, &state_assignment, "sh", "-c", &command];
+            match input {
+                Some(input) => ProcessCommandRunner.run_with_input("env", &env_args, &self.home, &ChannelLabel::Default, input).await,
+                None => ProcessCommandRunner.run("env", &env_args, &self.home, &ChannelLabel::Default).await,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for LoopbackSsh {
+        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            assert_eq!(cmd, "ssh");
+            self.shell(args, None).await
+        }
+
+        async fn run_with_input(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            _cwd: &Path,
+            _label: &ChannelLabel,
+            input: &[u8],
+        ) -> Result<String, String> {
+            assert_eq!(cmd, "ssh");
+            self.shell(args, Some(input)).await
+        }
+
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            unimplemented!("loopback tests use run and run_with_input")
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            true
+        }
+    }
+
+    fn loopback_runner() -> (tempfile::TempDir, SshCommandRunner) {
+        let home = tempfile::tempdir().expect("remote home");
+        let runner = SshCommandRunner::new("alice@feta.local", false, std::sync::Arc::new(LoopbackSsh { home: home.path().to_path_buf() }));
+        (home, runner)
+    }
+
+    #[tokio::test]
+    async fn remote_commands_run_in_the_requested_directory() {
+        let (home, runner) = loopback_runner();
+        let work = home.path().join("repo with space");
+        std::fs::create_dir(&work).expect("remote work directory");
+
+        let pwd = runner.run("pwd", &[], &work, &ChannelLabel::Default).await.expect("remote pwd");
+
+        assert_eq!(Path::new(pwd.trim()).canonicalize().unwrap(), work.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn remote_arguments_survive_the_remote_shell() {
+        let (home, runner) = loopback_runner();
+        let awkward = ["two words", "it's", "$HOME", "`date`", "line\nbreak", "", "a;b"];
+        let mut args = vec!["%s|"];
+        args.extend(awkward);
+
+        let output = runner.run("printf", &args, home.path(), &ChannelLabel::Default).await.expect("remote printf");
+
+        assert_eq!(output, format!("{}|", awkward.join("|")));
+    }
+
+    #[tokio::test]
+    async fn ensure_file_installs_its_helper_through_the_remote_shell() {
+        let (home, runner) = loopback_runner();
+        let target = home.path().join(".local/state/flotilla/host-id");
+
+        let first = runner.ensure_file(&target, "first-id\n").await.expect("create remote file");
+        let second = runner.ensure_file(&target, "second-id\n").await.expect("keep existing remote file");
+
+        assert_eq!(first, "first-id\n");
+        assert_eq!(second, "first-id\n");
+        assert_eq!(std::fs::read_to_string(&target).expect("remote file"), "first-id\n");
+    }
+
+    #[tokio::test]
+    async fn write_file_lands_through_the_remote_shell() {
+        let (home, runner) = loopback_runner();
+        let target = home.path().join("briefs dir/coder.md");
+
+        runner.write_file(&target, "assignment\nwith 'quotes'\n").await.expect("remote write");
+
+        assert_eq!(std::fs::read_to_string(&target).expect("remote file"), "assignment\nwith 'quotes'\n");
     }
 
     #[tokio::test]
@@ -572,7 +678,7 @@ mod tests {
         let calls = inner.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "ssh");
-        assert!(calls[0].1.last().expect("read script").contains("'cat' '/work/body.bin'"));
+        assert!(calls[0].1.last().expect("read script").contains(r#"'\''cat'\'' '\''/work/body.bin'\''"#));
         assert_eq!(calls[1].0, "ssh");
         assert!(calls[1].1.last().expect("write script").contains("cat > \"$tmp\""));
     }

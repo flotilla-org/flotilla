@@ -3834,19 +3834,17 @@ mod tests {
         use flotilla_provider_runtime::ChannelLabel;
         use flotilla_provider_runtime::ProcessCommandRunner;
 
-        // Execute the remote shell locally, preserving the real SSH decorator
-        // and process runner. No live host or SSH credentials are required.
+        // Execute the remote command locally the way sshd does, preserving the
+        // real SSH decorator and process runner. The remote login shell takes
+        // its PATH from the loopback home's profile. No live host or SSH
+        // credentials are required.
         struct LoopbackSshRunner(PathBuf);
         #[async_trait]
         impl CommandRunner for LoopbackSshRunner {
             async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
                 assert_eq!(cmd, "ssh");
-                let script = format!(
-                    "PATH={}:\"$PATH\"; {}",
-                    flotilla_protocol::arg::shell_quote(self.0.to_str().expect("bin path")),
-                    args.last().expect("remote script")
-                );
-                ProcessCommandRunner.run("sh", &["-c", &script], cwd, label).await
+                let home = format!("HOME={}", self.0.display());
+                ProcessCommandRunner.run("env", &[&home, "sh", "-c", args.last().expect("remote command")], cwd, label).await
             }
             async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
                 Err("unused output seam".into())
@@ -3878,7 +3876,12 @@ mod tests {
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("executable shim");
             let past = (chrono::Utc::now() - chrono::Duration::days(20)).format("%Y%m%d%H%M.%S").to_string();
             assert!(std::process::Command::new("touch").args(["-t", &past]).arg(&old).status().expect("age archive").success());
-            let runner = SshCommandRunner::new("loopback", false, Arc::new(LoopbackSshRunner(bin.clone())));
+            std::fs::write(
+                dir.path().join(".profile"),
+                format!("PATH={}:\"$PATH\"\n", flotilla_protocol::arg::shell_quote(bin.to_str().expect("bin path"))),
+            )
+            .expect("loopback profile");
+            let runner = SshCommandRunner::new("loopback", false, Arc::new(LoopbackSshRunner(dir.path().to_path_buf())));
             assert!(prune_remote_checkout_archives(&runner, &root, 14, Duration::from_secs(1)).await.is_err());
             assert!(started.exists(), "the {blocked_command} command must actually have started before cancellation");
             tokio::time::sleep(Duration::from_millis(2200)).await;

@@ -96,9 +96,17 @@ pub async fn install_managed_helper_script(
     helper_name: &str,
     helper_content: &str,
 ) -> Result<String, String> {
-    let helper_hash = format!("{:x}", Sha256::digest(helper_content.as_bytes()));
     let mut owned_args: Vec<String> = command_prefix.iter().map(|arg| (*arg).to_string()).collect();
-    owned_args.extend([
+    owned_args.extend(managed_helper_install_words(shell_flag, helper_name, helper_content));
+    let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+    let output = runner.run(command, &arg_refs, Path::new("/"), &ChannelLabel::Default).await?;
+    managed_helper_path(&output, helper_name)
+}
+
+/// The `sh` invocation that installs a managed helper, as separate argv words.
+/// Runners whose transport re-parses a command line (SSH) quote these words.
+pub fn managed_helper_install_words(shell_flag: &str, helper_name: &str, helper_content: &str) -> Vec<String> {
+    vec![
         "sh".to_string(),
         shell_flag.to_string(),
         INSTALL_MANAGED_SCRIPT.to_string(),
@@ -106,12 +114,14 @@ pub async fn install_managed_helper_script(
         // placeholder for the one-time bootstrap script text above.
         INSTALL_MANAGED_SCRIPT_BOOTSTRAP_NAME.to_string(),
         helper_name.to_string(),
-        helper_hash,
+        format!("{:x}", Sha256::digest(helper_content.as_bytes())),
         helper_content.to_string(),
-    ]);
-    let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-    let helper_path = runner.run(command, &arg_refs, Path::new("/"), &ChannelLabel::Default).await?;
-    let helper_path = helper_path.trim();
+    ]
+}
+
+/// The installed helper path printed by the installer.
+pub fn managed_helper_path(output: &str, helper_name: &str) -> Result<String, String> {
+    let helper_path = output.trim();
     if helper_path.is_empty() {
         return Err(format!("managed helper installer returned empty path for {helper_name}"));
     }
