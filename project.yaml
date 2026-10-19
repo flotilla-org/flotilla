@@ -12,6 +12,10 @@ members:
   - alias: drydock
     url: https://github.com/flotilla-org/drydock
     roles: [code]
+  # Rigging, the shared leaf crates flotilla and drydock take from (ADR 0068, #3514).
+  - alias: rigging
+    url: https://github.com/flotilla-org/rigging
+    roles: [code]
 skills:
   '*':
     - flotilla-org/flotilla@flotilla-commands
