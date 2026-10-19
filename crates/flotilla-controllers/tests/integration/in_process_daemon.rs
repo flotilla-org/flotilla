@@ -121,6 +121,13 @@ use tokio::sync::Notify;
 struct ReceiverIntentPublisher {
     inbox: flotilla_messaging::MessageInbox,
 }
+
+/// The single remote command string `SshCommandRunner` hands to `ssh`: the
+/// remote shell re-parses it, so every word arrives quoted.
+fn ssh_remote_command(script: &str) -> String {
+    ["sh", "-lc", script].iter().map(|word| flotilla_protocol::arg::shell_quote(word)).collect::<Vec<_>>().join(" ")
+}
+
 #[async_trait]
 impl flotilla_core::leaf_engine::ResourceIntentPublisher for ReceiverIntentPublisher {
     async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String> {
@@ -5713,9 +5720,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'true'",
+                    ssh_remote_command("cd '/' && exec 'true'").as_str(),
                 ],
                 Ok(String::new()),
             )
@@ -5732,9 +5737,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'env'",
+                    ssh_remote_command("cd '/' && exec 'env'").as_str(),
                 ],
                 Ok("XDG_STATE_HOME=/var/state\nTERM=screen-256color\nCOLORTERM=truecolor\n".into()),
             )
@@ -5751,9 +5754,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'cat' '/var/state/flotilla/environment-id'",
+                    ssh_remote_command("cd '/' && exec 'cat' '/var/state/flotilla/environment-id'").as_str(),
                 ],
                 Ok("buildbox-env-id\n".into()),
             )
@@ -5770,9 +5771,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'cat' '/var/state/flotilla/host-id'",
+                    ssh_remote_command("cd '/' && exec 'cat' '/var/state/flotilla/host-id'").as_str(),
                 ],
                 Ok("buildbox-host-id\n".into()),
             )
@@ -5845,9 +5844,7 @@ display_name = "Build Box"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'true'",
+                    ssh_remote_command("cd '/' && exec 'true'").as_str(),
                 ],
                 Ok(String::new()),
             )
@@ -5864,9 +5861,7 @@ display_name = "Build Box"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'env'",
+                    ssh_remote_command("cd '/' && exec 'env'").as_str(),
                 ],
                 Ok("HOME=/home/build\n".into()),
             )
@@ -5883,9 +5878,7 @@ display_name = "Build Box"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'cat' '/home/build/.local/state/flotilla/environment-id'",
+                    ssh_remote_command("cd '/' && exec 'cat' '/home/build/.local/state/flotilla/environment-id'").as_str(),
                 ],
                 Ok("buildbox-visible-id\n".into()),
             )
@@ -5902,9 +5895,7 @@ display_name = "Build Box"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'cat' '/home/build/.local/state/flotilla/host-id'",
+                    ssh_remote_command("cd '/' && exec 'cat' '/home/build/.local/state/flotilla/host-id'").as_str(),
                 ],
                 Ok("buildbox-visible-host-id\n".into()),
             )
@@ -5973,9 +5964,7 @@ hostname = "brokenbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'true'",
+                    ssh_remote_command("cd '/' && exec 'true'").as_str(),
                 ],
                 Ok(String::new()),
             )
@@ -5992,9 +5981,7 @@ hostname = "brokenbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'probe-env' 'REMOTE_MARKER'",
+                    ssh_remote_command("cd '/' && exec 'probe-env' 'REMOTE_MARKER'").as_str(),
                 ],
                 Ok("buildbox".into()),
             )
@@ -6011,9 +5998,7 @@ hostname = "brokenbox.example"
                     "-o",
                     "ControlPersist=60",
                     "brokenbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'true'",
+                    ssh_remote_command("cd '/' && exec 'true'").as_str(),
                 ],
                 Err("ssh failed".into()),
             )
@@ -6068,9 +6053,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'true'",
+                    ssh_remote_command("cd '/' && exec 'true'").as_str(),
                 ],
                 Ok(String::new()),
             )
@@ -6129,9 +6112,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'true'",
+                    ssh_remote_command("cd '/' && exec 'true'").as_str(),
                 ],
                 Ok(String::new()),
             )
@@ -6148,9 +6129,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'env'",
+                    ssh_remote_command("cd '/' && exec 'env'").as_str(),
                 ],
                 Ok("TERM=xterm-256color\n".into()),
             )
@@ -6167,9 +6146,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    format!("cd '{}' && exec 'git' 'rev-parse' '--is-inside-work-tree'", repo.display()).as_str(),
+                    ssh_remote_command(&format!("cd '{}' && exec 'git' 'rev-parse' '--is-inside-work-tree'", repo.display())).as_str(),
                 ],
                 Err("fatal: not a git repository".into()),
             )
@@ -6186,9 +6163,8 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    format!("cd '{}' && exec 'git' 'rev-parse' '--abbrev-ref' '@{{upstream}}'", repo.display()).as_str(),
+                    ssh_remote_command(&format!("cd '{}' && exec 'git' 'rev-parse' '--abbrev-ref' '@{{upstream}}'", repo.display()))
+                        .as_str(),
                 ],
                 Err("fatal: not a git repository".into()),
             )
@@ -6205,9 +6181,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    format!("cd '{}' && exec 'git' 'remote'", repo.display()).as_str(),
+                    ssh_remote_command(&format!("cd '{}' && exec 'git' 'remote'", repo.display())).as_str(),
                 ],
                 Err("fatal: not a git repository".into()),
             )
@@ -6307,9 +6281,7 @@ hostname = "builddash.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'true'",
+                    ssh_remote_command("cd '/' && exec 'true'").as_str(),
                 ],
                 Ok(String::new()),
             )
@@ -6326,9 +6298,7 @@ hostname = "builddash.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'probe-env' 'REMOTE_MARKER'",
+                    ssh_remote_command("cd '/' && exec 'probe-env' 'REMOTE_MARKER'").as_str(),
                 ],
                 Ok("box".into()),
             )
@@ -6345,9 +6315,7 @@ hostname = "builddash.example"
                     "-o",
                     "ControlPersist=60",
                     "builddash.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'true'",
+                    ssh_remote_command("cd '/' && exec 'true'").as_str(),
                 ],
                 Ok(String::new()),
             )
@@ -6364,9 +6332,7 @@ hostname = "builddash.example"
                     "-o",
                     "ControlPersist=60",
                     "builddash.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'probe-env' 'REMOTE_MARKER'",
+                    ssh_remote_command("cd '/' && exec 'probe-env' 'REMOTE_MARKER'").as_str(),
                 ],
                 Ok("dash".into()),
             )
@@ -8600,9 +8566,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'true'",
+                    ssh_remote_command("cd '/' && exec 'true'").as_str(),
                 ],
                 Ok(String::new()),
             )
@@ -8619,9 +8583,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'env'",
+                    ssh_remote_command("cd '/' && exec 'env'").as_str(),
                 ],
                 Ok("TERM=xterm-256color\n".into()),
             )
@@ -8638,9 +8600,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    format!("cd '{}' && exec 'git' 'rev-parse' '--is-inside-work-tree'", repo.display()).as_str(),
+                    ssh_remote_command(&format!("cd '{}' && exec 'git' 'rev-parse' '--is-inside-work-tree'", repo.display())).as_str(),
                 ],
                 Ok("true\n".into()),
             )
@@ -8657,9 +8617,8 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    format!("cd '{}' && exec 'git' 'rev-parse' '--path-format=absolute' '--git-dir'", repo.display()).as_str(),
+                    ssh_remote_command(&format!("cd '{}' && exec 'git' 'rev-parse' '--path-format=absolute' '--git-dir'", repo.display()))
+                        .as_str(),
                 ],
                 Ok("/remote/repo/.git\n".into()),
             )
@@ -8676,9 +8635,11 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    format!("cd '{}' && exec 'git' 'rev-parse' '--path-format=absolute' '--git-common-dir'", repo.display()).as_str(),
+                    ssh_remote_command(&format!(
+                        "cd '{}' && exec 'git' 'rev-parse' '--path-format=absolute' '--git-common-dir'",
+                        repo.display()
+                    ))
+                    .as_str(),
                 ],
                 Ok("/remote/repo/.git\n".into()),
             )
@@ -8695,9 +8656,8 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    format!("cd '{}' && exec 'git' 'rev-parse' '--abbrev-ref' '@{{upstream}}'", repo.display()).as_str(),
+                    ssh_remote_command(&format!("cd '{}' && exec 'git' 'rev-parse' '--abbrev-ref' '@{{upstream}}'", repo.display()))
+                        .as_str(),
                 ],
                 Err("fatal: no upstream".into()),
             )
@@ -8714,9 +8674,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    format!("cd '{}' && exec 'git' 'remote'", repo.display()).as_str(),
+                    ssh_remote_command(&format!("cd '{}' && exec 'git' 'remote'", repo.display())).as_str(),
                 ],
                 Ok("origin\n".into()),
             )
@@ -8733,9 +8691,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    format!("cd '{}' && exec 'git' 'remote' 'get-url' 'origin'", repo.display()).as_str(),
+                    ssh_remote_command(&format!("cd '{}' && exec 'git' 'remote' 'get-url' 'origin'", repo.display())).as_str(),
                 ],
                 Ok("git@github.com:owner/remote-repo.git\n".into()),
             )
@@ -8792,9 +8748,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'true'",
+                    ssh_remote_command("cd '/' && exec 'true'").as_str(),
                 ],
                 Ok(String::new()),
             )
@@ -8811,9 +8765,7 @@ hostname = "buildbox.example"
                     "-o",
                     "ControlPersist=60",
                     "buildbox.example",
-                    "sh",
-                    "-lc",
-                    "cd '/' && exec 'probe-env' 'ENABLE_REMOTE_TERMINALS'",
+                    ssh_remote_command("cd '/' && exec 'probe-env' 'ENABLE_REMOTE_TERMINALS'").as_str(),
                 ],
                 Ok("1".into()),
             )
