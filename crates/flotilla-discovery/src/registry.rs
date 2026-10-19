@@ -247,7 +247,7 @@ impl ProviderSet<dyn EnvironmentProvider> {
             .iter()
             .map(|(instance, (_, provider))| flotilla_environment::environment::ProviderAdvertisement {
                 instance: instance.clone(),
-                kind: provider.kind(),
+                kind: Some(provider.kind()),
                 capabilities: provider.capabilities(),
             })
             .collect()
@@ -424,7 +424,7 @@ mod advertisement_tests {
         let advertisements = set.advertisements();
         assert_eq!(advertisements.iter().map(|entry| entry.instance.as_str()).collect::<Vec<_>>(), ["first", "second"]);
         for entry in advertisements {
-            assert_eq!(entry.kind.class, EnvironmentClass::Dummy);
+            assert_eq!(entry.kind.as_ref().unwrap().class, EnvironmentClass::Dummy);
             assert_eq!(entry.capabilities, provider.capabilities());
         }
     }

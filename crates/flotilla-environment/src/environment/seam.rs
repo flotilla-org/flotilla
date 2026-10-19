@@ -81,7 +81,7 @@ pub struct ProviderCapabilities {
 #[serde(default)]
 pub struct ProviderAdvertisement {
     pub instance: String,
-    pub kind: ProviderKind,
+    pub kind: Option<ProviderKind>,
     pub capabilities: ProviderCapabilities,
 }
 
@@ -98,7 +98,13 @@ pub enum GoneCause {
     LifetimeCapReached,
     EvictedByProvider,
     HostOutOfMemory,
-    VmmExited { code: i32 },
+    /// The environment exceeded its own memory allocation.
+    MemoryLimitReached,
+    /// The backing process ended. Docker reports signal exits as 128 + signal;
+    /// the runtime termination retains the signal separately for diagnostics.
+    BackingExited {
+        code: i32,
+    },
     GuestPoweredOff,
     MissingOnList,
     DestroyedByRequest,
@@ -142,11 +148,4 @@ pub trait EnvironmentDetection: Send + Sync {
         args: &[&str],
         scratch: &std::path::Path,
     ) -> Result<flotilla_provider_runtime::CommandOutput, String>;
-}
-
-impl Default for ProviderKind {
-    fn default() -> Self {
-        // Empty advertisement identity is descriptive only and selects no instance.
-        Self::new(EnvironmentClass::Dummy, "")
-    }
 }

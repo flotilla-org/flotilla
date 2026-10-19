@@ -570,9 +570,9 @@ fn classify_provider_state(status: &str, runtime: &flotilla_protocol::Environmen
             let cause = match runtime.termination.as_ref() {
                 Some(exit) => match exit.cause {
                     EnvironmentExitCause::HostOomd | EnvironmentExitCause::KernelOom => GoneCause::HostOutOfMemory,
-                    EnvironmentExitCause::CgroupOom => GoneCause::HostOutOfMemory,
+                    EnvironmentExitCause::CgroupOom => GoneCause::MemoryLimitReached,
                     EnvironmentExitCause::NormalStop => GoneCause::GuestPoweredOff,
-                    EnvironmentExitCause::Signal | EnvironmentExitCause::NonzeroExit => GoneCause::VmmExited { code: exit.exit_code },
+                    EnvironmentExitCause::Signal | EnvironmentExitCause::NonzeroExit => GoneCause::BackingExited { code: exit.exit_code },
                 },
                 None => {
                     return ObservationState::Unknown {
@@ -888,9 +888,10 @@ mod seam_tests {
     fn docker_observation_causes(tc: hegel::TestCase) {
         use hegel::generators as gs;
         let fixtures = [
-            (include_str!("fixtures/cgroup-oomkilled.json"), "", GoneCause::HostOutOfMemory),
+            (include_str!("fixtures/cgroup-oomkilled.json"), "", GoneCause::MemoryLimitReached),
             (include_str!("fixtures/oomd-exit137.json"), include_str!("fixtures/oomd-journal.txt"), GoneCause::HostOutOfMemory),
-            (include_str!("fixtures/nonzero-exit3.json"), "", GoneCause::VmmExited { code: 3 }),
+            (include_str!("fixtures/oomd-exit137.json"), "", GoneCause::BackingExited { code: 137 }),
+            (include_str!("fixtures/nonzero-exit3.json"), "", GoneCause::BackingExited { code: 3 }),
             (include_str!("fixtures/normal-stop.json"), "", GoneCause::GuestPoweredOff),
         ];
         let (raw, oomd, expected) = &fixtures[tc.draw(gs::integers::<usize>().min_value(0).max_value(fixtures.len() - 1))];

@@ -1518,11 +1518,21 @@ async fn recorded_container_deaths_are_classified_through_the_provider() {
         (include_str!("fixtures/normal-stop.json"), None, EnvironmentExitCause::NormalStop, 143, Some(15), false),
         (include_str!("fixtures/oomd-exit137.json"), None, EnvironmentExitCause::Signal, 137, Some(9), false),
     ];
-    for (inspect, oomd, cause, code, signal, oom_killed) in cases {
+    use super::{GoneCause, ObservationState};
+    let expected = [
+        GoneCause::MemoryLimitReached,
+        GoneCause::HostOutOfMemory,
+        GoneCause::BackingExited { code: 3 },
+        GoneCause::GuestPoweredOff,
+        GoneCause::BackingExited { code: 137 },
+    ];
+    for ((inspect, oomd, cause, code, signal, oom_killed), expected) in cases.into_iter().zip(expected) {
         let runner = Arc::new(InspectionRunner { inspect: inspect.into(), usage: None, oomd, calls: Mutex::new(Vec::new()) });
         let provider = DockerEnvironmentProvider::new(runner.clone());
         let handles = provider.list().await.expect("list");
-        let observation = handles[0].observe().await.runtime.expect("Docker observation");
+        let observed = handles[0].observe().await;
+        assert_eq!(observed.state, ObservationState::Gone { cause: expected });
+        let observation = observed.runtime.expect("Docker observation");
         let termination = observation.termination.expect("terminated");
         assert_eq!(
             (termination.cause, termination.exit_code, termination.signal, termination.oom_killed),

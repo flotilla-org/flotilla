@@ -165,7 +165,7 @@ async fn provider_instances_and_declarations() {
 #[tokio::test(start_paused = true)]
 async fn observation_recovers_after_provider_error() {
     let engine = Arc::new(DockerEngine::default());
-    let provider = Arc::new(docker::DockerEnvironmentProvider::new(engine.clone()));
+    let provider: Arc<dyn EnvironmentProvider> = Arc::new(docker::DockerEnvironmentProvider::new(engine.clone()));
     let spec = legacy_environment_spec(&EnvironmentSpec { image: ImageSource::Registry(DIGEST.into()), token_env_vars: vec![] }).unwrap();
     let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
     let id = EnvironmentId::new("env-1");
@@ -177,6 +177,11 @@ async fn observation_recovers_after_provider_error() {
     let recovered = handle.observe().await;
     assert_eq!(recovered.state, ObservationState::Running);
     assert_eq!(handle.local_image_id(), Some(DIGEST));
+    provider.destroy(handle.backing_id()).await.unwrap();
+    // Authoritative absence comes from inventory; an unavailable inspect alone
+    // cannot distinguish deletion from an API outage and remains Unknown.
+    assert!(provider.inspect(&id).await.unwrap().is_none());
+    assert!(matches!(handle.observe().await.state, ObservationState::Unknown { reason: UnknownReason::ProviderApiError { .. } }));
 }
 
 // Advertisements are additive data: missing fields decode to their declared
@@ -186,7 +191,7 @@ fn advertisement_fields_default_when_omitted(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let (provider, _) = providers().remove(tc.draw(gs::integers::<usize>().min_value(0).max_value(2)));
     let advertisement =
-        ProviderAdvertisement { instance: "configured".into(), kind: provider.kind(), capabilities: provider.capabilities() };
+        ProviderAdvertisement { instance: "configured".into(), kind: Some(provider.kind()), capabilities: provider.capabilities() };
     let mut value = serde_json::to_value(&advertisement).unwrap();
     let nested = tc.draw(gs::booleans());
     let object = if nested { value["capabilities"].as_object_mut().unwrap() } else { value.as_object_mut().unwrap() };
@@ -202,4 +207,28 @@ fn advertisement_fields_default_when_omitted(tc: hegel::TestCase) {
     } else {
         assert_eq!(decoded[omitted], default[omitted]);
     }
+}
+
+// Host/dummy destruction retires adoption without stopping the host. Retained
+// handles report requested destruction, and inventories no longer list them.
+#[tokio::test]
+async fn host_and_dummy_retirement_is_observable_and_excluded_from_inventory() {
+    for (provider, spec) in providers().into_iter().skip(1) {
+        let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
+        let id = EnvironmentId::new("env-0");
+        let handle = provider.provision(id.clone(), &prepared, Default::default()).await.unwrap();
+        handle.destroy().await.unwrap();
+        assert_eq!(handle.observe().await.state, ObservationState::Gone { cause: GoneCause::DestroyedByRequest });
+        assert!(provider.inspect(&id).await.unwrap().is_none());
+        assert!(provider.list().await.unwrap().is_empty());
+        assert!(provider.list_backings().await.unwrap().is_empty());
+    }
+}
+
+// Missing descriptive identity never impersonates a dummy provider. One example
+// exhausts this decoder default; omission of other fields is generated above.
+#[test]
+fn omitted_advertisement_kind_stays_absent() {
+    let decoded: ProviderAdvertisement = serde_json::from_str(r#"{"instance":"unadvertised"}"#).unwrap();
+    assert_eq!(decoded.kind, None);
 }

@@ -96,7 +96,7 @@ Rules:
 - **Providers report facts from their own authority:**
   - `Running`;
   - `Stopped{cause}`: SuspendedByRequest, PausedByProvider, GuestHalted;
-  - `Gone{cause}`: LifetimeCapReached, EvictedByProvider, HostOutOfMemory, VmmExited{code}, GuestPoweredOff, MissingOnList, DestroyedByRequest;
+  - ADR 0058's `Gone{cause}` list becomes LifetimeCapReached, EvictedByProvider, HostOutOfMemory, MemoryLimitReached, BackingExited{code}, GuestPoweredOff, MissingOnList, DestroyedByRequest; MemoryLimitReached means the environment exceeded its own memory allocation, distinct from the host running out, and BackingExited is the kind-neutral exit of the process holding the environment up.
   - `Unknown{reason}`: HostUnreachable, ProviderApiError, GuestUnresponsive.
 - **`observe` is a stream:** pushed where the kind allows, with polling as the provider's internal fallback.
 - **How observations map to Vessel state:**
