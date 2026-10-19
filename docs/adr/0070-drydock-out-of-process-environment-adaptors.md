@@ -152,6 +152,8 @@ The owner went through a mockup of the HTTP API. Six changes follow from it.
 
 ### Addresses
 
+The per-sandbox paths below are superseded by the next amendment, which moves them under `/v1/providers/{provider}/environments`. The label rules still hold.
+
 - **Provision** is `POST /v1/providers/{provider}`. The body carries a `label`: flotilla's environment ID, which the module writes as a tag at the provider. The label is a client label, not the resource's identity. It does two jobs:
   - a repeat `POST` with the same label returns the existing sandbox (200), so retries never create a second one;
   - `list` returns each sandbox's label, so flotilla can match sandboxes back to its environments.
@@ -210,7 +212,7 @@ This replaces the per-sandbox addresses in the API-review amendment above. The C
 
 There are no aliases, so each route has one spelling. The noun is `environments`, not `vessels`. In flotilla a Vessel runs inside an Environment, and the vessel agent keeps its name because it serves the vessel inside.
 
-**Secret-bearing wire fields use a redacting type** whose `Debug` output does not show the value: the credential value, the Dial token and the placeholder token.
+**Secret-bearing wire fields use a redacting type** whose value never appears in `Debug` or `Display` output, or in serde error messages: the credential value, the Dial token and the placeholder token.
 
 ### A Rust host first, with Daytona
 
