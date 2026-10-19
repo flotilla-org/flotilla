@@ -13,7 +13,7 @@ Flotilla is one member of a product family that communicates over HTTP-over-UDS
 **Message**:
 A durable communication addressed to a role and homed on its receiver. It names
 its sender, relationship, references and expectation. Its delivery receipt
-records what the receiving **AgentChannel** proves: `sent` (the transport
+records what the **Transport** that delivered it proves: `sent` (the transport
 accepted the input) or `received` (the harness echoed it back). Activity after
 delivery is a separate derived observation. Whether the input was acted on is
 judged only by the expectation: satisfaction means a reply or outcome has met
@@ -481,22 +481,23 @@ changes, a receipt does not.
 _Avoid_: Holder, assignment.
 
 **AgentChannel**:
-How input reaches an **AgentSession** now: its current binding to a
-**Transport** at a concrete endpoint on the session's current **Process**. It is
-bound when the session is launched or revived. A later fallback is an explicit
-re-bind with a recorded reason, never a fallthrough at send time. Message
-delivery receipts record what the bound AgentChannel proves (ADR 0059).
+One live way input reaches an **AgentSession**: a **Transport** at a concrete
+endpoint on the session's current **Process**. A session can have several at
+once, registered by its harness connector for each live session shape. A router
+picks one per delivery by policy and configuration: never two where that can be
+avoided, and at least one must deliver. The delivery receipt names the
+transport used and records what it proves (ADR 0059).
 _Avoid_: Channel (bare: it collides with Claude Code's Channels), holder
 transport, connection.
 
 **Transport**:
 A way of putting input into a harness: `keystroke` (typing into its terminal
 through cleat), `codex-app-server` (JSON-RPC turns) or `claude-channels`
-(Claude Code's Channels). The **AgentAdapter** declares which transports a
-harness supports, by harness version; an **AgentChannel** records which one a
-session uses (ADR 0059). Distinct from the **Federation** transport (ssh) and
-the daemon's framed socket sessions; say "agent transport" where context leaves
-it unclear.
+(Claude Code's Channels). The harness connector declares which transports a
+harness supports, by operation and harness version; a session's
+**AgentChannels** record which are live (ADR 0059). Distinct from the
+**Federation** transport (ssh) and the daemon's framed socket sessions; say
+"agent transport" where context leaves it unclear.
 _Avoid_: Channel (bare), delivery method, holder transport.
 
 **CloudAgent**:
@@ -1002,9 +1003,9 @@ _Avoid_: Checkpoint, sync.
 The degradation ladder ensure-flavored turn delivery walks to restore agent
 context (ADR 0028, amended by ADR 0059): revive the role's bound
 **AgentSession**, either already live or parked and resumed on a new process
-with a re-bound **AgentChannel**; otherwise start a new AgentSession for the
-role with a reconstructed **Brief**, the never-fails floor. Only the floor
-starts a new conversation. Every delivery records its rung; rung selection is
+with its **AgentChannels** re-registered; otherwise start a new AgentSession
+for the role with a reconstructed **Brief**, the never-fails floor. Only the
+floor starts a new conversation. Every delivery records its rung; rung selection is
 an experiment, not an edict.
 _Avoid_: Retry, failover.
 
