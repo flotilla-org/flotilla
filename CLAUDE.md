@@ -141,8 +141,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 |-------|------|
 | `flotilla-build-features` | No runtime interface; shared native dependency features and host proc-macro features for stable build/test reuse |
 | `flotilla-terminal` | Terminal pool traits, Cleat and passthrough adapters, factories and shared session scans |
-| `flotilla-discovery-api` | Environment facts, narrow provider config view, detector traits, shared generic probe detectors (environment variable, command version, binary path resolution, version parsing) and generic factory contracts |
-| `flotilla-provider-runtime` | Flotilla Git guard and helper scripts over Rigging process and HTTP interfaces; neutral observation errors |
+| `flotilla-discovery-api` | Environment facts, narrow provider config view, detector traits and factory contracts; wraps Rigging version/binary probes into Flotilla environment assertions |
+| `flotilla-provider-runtime` | Flotilla Git guard, scratch namespace, helper scripts, SSH runner and neutral observation errors; re-exports Rigging process, probe and HTTP interfaces |
 | `flotilla-forge-github` | GitHub client, invocation macros, rate-limit classification, polling, telemetry, host budget accounting and discovery-time repository resolution |
 | `flotilla-environment` | Environment and image capability traits, Docker and host-direct adapters, factories and transport hop resolution |
 | `flotilla-vcs` | Checkout-scoped VCS traits, Git strategies, factory and Git discovery probes |
@@ -191,7 +191,10 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-schema-sqlite` | Rusqlite runtime for derived kinds: shared tables (`strings`, `resource_identity`, `objects`, `home_sequence`, `log`), per-kind statements, interning, owner-checked writes (creation, spec edits, `apply_edge`, delete and expunge), the per-home event log with one lowering for local writes and `apply` of other homes' events, snapshot restore, reads of entries about a master, keyset-paged index queries and the startup scan |
 | `flotilla-replication` | Store-to-store replication over `dyn Store`: list/watch/resume, origin filtering, digest scheduling; host ports for stores, identity, health and peer sources |
 | `flotilla-review-bundle-object-store` | Object-store/S3 byte adapter for the review-bundle port |
-| `rigging-tls`, `rigging-process`, `rigging-http-client` | Shared TLS, process execution, probes and HTTP clients (pinned from Rigging) |
+| `rigging-tls` (external) | TLS provider selection and reqwest builders from the pinned Rigging revision |
+| `rigging-process` (external) | Command supervision, invocation macros, environment variables, filesystem/space probes, scan cache and binary/version detection |
+| `rigging-http-client` (external) | Injectable HTTP execution and the reqwest implementation |
+| `rigging-replay-testkit` (external, dev-only) | Replay sessions, recording, masks, mock runners and HTTP stand-ins |
 | `flotilla-replay-testkit` | GitHub replay channel over `rigging-replay-testkit` scheduling, masks and test helpers |
 | `flotilla-controllers` | Reconcilers for resource-driven control-plane behavior, including standing-convoy ensures, retries, attention and rolls |
 | `flotilla-commands` | Resource-oriented command preparation and execution |
