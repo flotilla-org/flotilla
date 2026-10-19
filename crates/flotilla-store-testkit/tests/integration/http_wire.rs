@@ -90,7 +90,7 @@ async fn list_decodes_collection_resource_version() {
     })
     .to_string();
     let (base_url, _request_rx) = spawn_one_shot_server(response("200 OK", &body)).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");
 
     let listed = resolver.list().await.expect("list should succeed");
@@ -127,7 +127,7 @@ async fn replica_point_get_requests_read_view_and_decodes_provenance() {
     })
     .to_string();
     let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", &body)).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
 
     let object = backend.including_replicas::<Convoy>("flotilla").get("alpha").await.expect("get replica read view");
 
@@ -170,7 +170,7 @@ async fn provenance_point_get_requests_only_one_name() {
     })
     .to_string();
     let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", &body)).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     let copies = backend.including_replicas::<Convoy>("flotilla").get_all("alpha").await.expect("read named provenances");
     assert_eq!(copies.items.len(), 1);
     assert!(matches!(copies.items[0].provenance, flotilla_resources::ResourceProvenance::Replica { .. }));
@@ -201,7 +201,7 @@ async fn update_status_uses_status_subresource_path_and_body() {
     })
     .to_string();
     let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", &body)).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");
 
     let updated = resolver.update_status("alpha", "7", &convoy_status(ConvoyPhase::Active)).await.expect("status update should succeed");
@@ -221,7 +221,7 @@ async fn watch_decodes_kubernetes_watch_events() {
         "{\"type\":\"DELETED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"8\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\n"
     );
     let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", body)).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");
 
     let mut watch = resolver.watch(WatchStart::FromVersion("6".to_string())).await.expect("watch should succeed");
@@ -261,7 +261,7 @@ async fn stale_watch_maps_http_gone_to_typed_expiry() {
     })
     .to_string();
     let (base_url, request_rx) = spawn_one_shot_server(response("410 Gone", &body)).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");
 
     let error = resolver.watch(WatchStart::FromVersion("6".to_string())).await.expect_err("stale watch should expire");
@@ -276,7 +276,7 @@ async fn stale_watch_maps_http_gone_to_typed_expiry() {
 async fn stale_watch_maps_http_gone_before_reading_a_truncated_body() {
     let response = "HTTP/1.1 410 Gone\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{";
     let (base_url, _request_rx) = spawn_one_shot_server(response.to_string()).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");
 
     let error = resolver.watch(WatchStart::FromVersion("6".to_string())).await.expect_err("stale watch should expire");
@@ -290,7 +290,7 @@ async fn watch_decodes_crlf_terminated_events() {
     let body =
         "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"7\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\r\n";
     let (base_url, _request_rx) = spawn_one_shot_server(response("200 OK", body)).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");
 
     let mut watch = resolver.watch(WatchStart::Now).await.expect("watch should succeed");
@@ -307,7 +307,7 @@ async fn watch_decodes_crlf_terminated_events() {
 async fn status_errors_map_to_resource_errors() {
     let body = serde_json::json!({ "message": "resource version conflict" }).to_string();
     let (base_url, _request_rx) = spawn_one_shot_server(response("409 Conflict", &body)).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");
 
     let err = resolver.update(&convoy_meta("alpha"), "7", &convoy_spec("review")).await.expect_err("update should conflict");
@@ -325,7 +325,7 @@ async fn status_errors_map_to_resource_errors() {
 async fn not_found_errors_preserve_requested_name() {
     let body = serde_json::json!({ "message": "convoys.flotilla.work \"alpha\" not found" }).to_string();
     let (base_url, _request_rx) = spawn_one_shot_server(response("404 Not Found", &body)).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");
 
     let err = resolver.get("alpha").await.expect_err("get should fail");
@@ -339,7 +339,7 @@ async fn not_found_errors_preserve_requested_name() {
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn server_disconnect_ends_watch_stream_cleanly() {
     let (base_url, _request_rx) = spawn_one_shot_server(response("200 OK", "")).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");
 
     let mut watch = resolver.watch(WatchStart::Now).await.expect("watch should succeed");
@@ -356,7 +356,7 @@ async fn filtered_list_encodes_exact_match_label_selector() {
     })
     .to_string();
     let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", &body)).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");
     let selector = BTreeMap::from([
         ("flotilla.work/convoy".to_string(), "convoy-a".to_string()),
@@ -382,7 +382,7 @@ async fn hyphenated_label_selectors_are_filtered_by_server() {
         for replicas in [false, true] {
             let body = serde_json::json!({"metadata": {"resourceVersion": "9"}, "items": []}).to_string();
             let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", &body)).await;
-            let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+            let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
             let resolver = backend.using::<Convoy>("flotilla");
             let selector = BTreeMap::from([(key.to_string(), "work".to_string())]);
             if replicas {
@@ -411,7 +411,7 @@ async fn hyphenated_label_selectors_are_filtered_by_server() {
 async fn current_position_reads_only_collection_metadata() {
     let body = r#"{"metadata":{"resourceVersion":"opaque-7","generation":"epoch-2"},"items":[{"spec":"invalid"}]}"#;
     let (url, request) = spawn_one_shot_server(response("200 OK", body)).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), url));
     let position = backend.using::<Convoy>("flotilla").current_position().await.expect("position");
     assert_eq!(position.resource_version, "opaque-7");
     assert_eq!(position.generation.as_deref(), Some("epoch-2"));
@@ -497,7 +497,7 @@ async fn message_admission_accepts_opaque_and_large_kubernetes_versions() {
             }
             requests
         });
-        let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), format!("http://{address}")));
+        let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), format!("http://{address}")));
         let admission = MessageInbox::new(backend, "flotilla")
             .accept(&InputMeta::builder().name("partial".into()).build(), &intent, chrono::Utc::now())
             .await
@@ -516,7 +516,7 @@ async fn message_queries_encode_filter_and_replica_visibility() {
     use flotilla_resources::Message;
     use flotilla_store::MessageQuery;
     let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", r#"{"metadata":{"resourceVersion":"0"},"items":[]}"#)).await;
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), base_url));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     assert!(backend
         .using::<Message>("flotilla")
         .query(&MessageQuery::Active { receiver: Some("project/role".into()) })

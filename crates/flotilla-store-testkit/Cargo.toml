@@ -41,7 +41,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 serde_yml = "0.0.12"
 flotilla-review-bundle-object-store = { path = "../flotilla-review-bundle-object-store" }
 object_store = { version = "0.12", features = ["aws"] }
-flotilla-tls = { path = "../flotilla-tls" }
+rigging-tls = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
 hegeltest = "=0.48.1"
 rstest.workspace = true

@@ -5,7 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
-flotilla-tls = { path = "../flotilla-tls" }
+rigging-tls = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 flotilla-protocol = { path = "../flotilla-protocol" }

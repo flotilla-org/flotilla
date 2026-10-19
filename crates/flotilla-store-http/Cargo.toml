@@ -7,13 +7,13 @@ license.workspace = true
 [features]
 # Keep helper features uniform across build/workspace/package commands on stable.
 default = []
-aws-lc-provider = ["flotilla-tls/aws-lc-provider"]
+aws-lc-provider = ["rigging-tls/aws-lc-provider"]
 skip-no-sandbox-tests = []
 
 [dependencies]
 flotilla-store = { path = "../flotilla-store" }
 flotilla-resources = { path = "../flotilla-resources" }
-flotilla-tls = { path = "../flotilla-tls" }
+rigging-tls = { workspace = true }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
 serde = { workspace = true, features = ["derive"] }

@@ -13,7 +13,7 @@ skip-no-sandbox-tests = []
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-paths = { path = "../flotilla-paths" }
-flotilla-tls = { path = "../flotilla-tls" }
+rigging-tls = { workspace = true }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

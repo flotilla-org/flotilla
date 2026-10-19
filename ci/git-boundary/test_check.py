@@ -14,6 +14,13 @@ from store_reads_tests import StoreReadTests  # noqa: E402,F401
 
 
 class GitBoundaryTests(unittest.TestCase):
+    # Moving invocation macros and the runner trait to Rigging must preserve both boundaries.
+    def test_rigging_invocations(self):
+        for macro in ["rigging_process::run", "flotilla_provider_runtime::run"]:
+            self.assertEqual(check.violations(f'fn a() {{ {macro}!(runner, "git", &[], cwd); }}', "src/a.rs"), [1])
+            self.assertEqual(check.violations(f'fn a() {{ {macro}!(runner, "docker", &[], cwd); }}', "src/a.rs"), [1])
+        self.assertEqual(check.runner_wrapper_violations('impl rigging_process::CommandRunner for Wrapper {}', "src/a.rs"), [1])
+
     # Literal Git calls are rejected across constructor aliases, method names,
     # whitespace, comments and literal forms; other command strings are allowed.
     def test_call_matrix(self):

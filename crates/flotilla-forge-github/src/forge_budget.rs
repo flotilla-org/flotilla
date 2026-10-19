@@ -166,6 +166,10 @@ pub struct BudgetedRunner {
 }
 #[async_trait]
 impl CommandRunner for BudgetedRunner {
+    fn scratch_namespace(&self) -> &str {
+        self.inner.scratch_namespace()
+    }
+
     async fn same_filesystem(&self, source: &Path, destination: &Path) -> Result<bool, String> {
         self.inner.same_filesystem(source, destination).await
     }
@@ -437,10 +441,32 @@ mod tests {
         fn methods(source: &str) -> std::collections::BTreeSet<&str> {
             source.split("fn ").skip(1).map(|method| method.split('(').next().unwrap().trim()).collect()
         }
-        let runtime = include_str!("../../flotilla-provider-runtime/src/lib.rs");
+        // Cargo owns the location of the pinned Git dependency; do not assume a checkout/cache layout.
+        let output = std::process::Command::new(env!("CARGO"))
+            .args(["metadata", "--locked", "--format-version", "1"])
+            .output()
+            .expect("locate the pinned Rigging source");
+        assert!(output.status.success(), "cargo metadata: {}", String::from_utf8_lossy(&output.stderr));
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).expect("Cargo metadata JSON");
+        let manifest = metadata["packages"]
+            .as_array()
+            .expect("packages")
+            .iter()
+            .find(|package| package["name"] == "rigging-process")
+            .expect("pinned rigging-process")["manifest_path"]
+            .as_str()
+            .expect("manifest path");
+        let runtime = std::fs::read_to_string(Path::new(manifest).parent().expect("crate directory").join("src/lib.rs"))
+            .expect("Rigging CommandRunner source");
         let runner = runtime.split("pub trait CommandRunner: Send + Sync {").nth(1).unwrap().split("\n}\n").next().unwrap();
         let budget = include_str!("forge_budget.rs");
-        let wrapper = budget.split("impl CommandRunner for BudgetedRunner {").nth(1).unwrap().split("#[cfg(test)]").next().unwrap();
+        let wrapper = budget
+            .split("impl CommandRunner for BudgetedRunner {")
+            .nth(1)
+            .expect("budget wrapper implementation")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production implementation");
         assert_eq!(methods(wrapper), methods(runner), "every CommandRunner method needs explicit forwarding");
     }
 }

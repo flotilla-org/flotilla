@@ -241,7 +241,7 @@ impl WheelhouseHttpSink {
     }
 
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        let builder = flotilla_tls::client_builder();
+        let builder = rigging_tls::client_builder();
         #[cfg(unix)]
         let builder = builder.unix_socket(path.into());
         #[cfg(windows)]

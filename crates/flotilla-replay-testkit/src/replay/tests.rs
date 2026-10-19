@@ -7,6 +7,7 @@ macro_rules! run {
     };
 }
 use super::*;
+use flotilla_provider_runtime::CommandOutput;
 
 #[test]
 fn masks_substitute_and_reverse() {
@@ -34,14 +35,14 @@ fn yaml_round_trip() {
                 exit_code: Some(0),
                 error: None,
             },
-            Interaction::GhApi {
+            Interaction::Extra(GithubChannel::GhApi {
                 label: None,
                 method: "GET".into(),
                 endpoint: "/repos/owner/repo/pulls".into(),
                 status: 200,
                 body: "[]".into(),
                 headers: HashMap::new(),
-            },
+            }),
         ],
     };
 
@@ -137,7 +138,7 @@ interactions:
     let api = ReplayGhApi::new(session.clone());
 
     let endpoint = "/repos/owner/repo/pulls?state=all&per_page=100";
-    let label = ChannelLabel::GhApi(endpoint.to_string());
+    let label = ChannelLabel::Extra("gh_api".into(), endpoint.to_string());
     let result = api.get(endpoint, Path::new("/repo"), &label).await;
     assert!(result.is_ok());
     assert!(result.unwrap().contains("Fix bug"));
@@ -162,7 +163,7 @@ interactions:
     let api = ReplayGhApi::new(session.clone());
 
     let endpoint = "/repos/owner/repo/pulls";
-    let label = ChannelLabel::GhApi(endpoint.to_string());
+    let label = ChannelLabel::Extra("gh_api".into(), endpoint.to_string());
     let result = api.get(endpoint, Path::new("/repo"), &label).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("404"));
@@ -188,7 +189,7 @@ interactions:
     let session = Session::replaying(&path, Masks::new());
     let api = ReplayGhApi::new(session.clone());
     let endpoint = "/repos/owner/repo/issues/42";
-    let label = ChannelLabel::GhApi(endpoint.to_string());
+    let label = ChannelLabel::Extra("gh_api".into(), endpoint.to_string());
 
     let error = api.get(endpoint, Path::new("/repo"), &label).await.expect_err("403 must fail");
 
@@ -218,7 +219,7 @@ interactions:
     let api = ReplayGhApi::new(session.clone());
 
     let endpoint = "/repos/owner/repo/issues?per_page=100";
-    let label = ChannelLabel::GhApi(endpoint.to_string());
+    let label = ChannelLabel::Extra("gh_api".into(), endpoint.to_string());
     let result = api.get_with_headers(endpoint, Path::new("/repo"), &label).await;
     assert!(result.is_ok());
     let resp = result.unwrap();
@@ -248,7 +249,7 @@ interactions:
     let api = ReplayGhApi::new(session.clone());
 
     let endpoint = "/repos/owner/repo/issues";
-    let label = ChannelLabel::GhApi(endpoint.to_string());
+    let label = ChannelLabel::Extra("gh_api".into(), endpoint.to_string());
     let result = api.get_with_headers(endpoint, Path::new("/repo"), &label).await;
     assert!(result.is_ok());
     let resp = result.unwrap();
@@ -318,7 +319,7 @@ interactions:
     let session = Session::replaying(&path, Masks::new());
     let client = ReplayHttpClient::new(session.clone());
 
-    let request = flotilla_tls::client()
+    let request = rigging_tls::client()
         .get("https://example.test/v1/sessions")
         .header("authorization", "Bearer token-1")
         .header("anthropic-version", "2023-06-01")
@@ -409,15 +410,15 @@ fn channel_label_from_interaction() {
     };
     assert_eq!(cmd_no_args.channel_label(), ChannelLabel::Command("git".into()));
 
-    let api = Interaction::GhApi {
+    let api = Interaction::Extra(GithubChannel::GhApi {
         label: None,
         method: "GET".into(),
         endpoint: "repos/owner/repo/pulls".into(),
         status: 200,
         body: "[]".into(),
         headers: HashMap::new(),
-    };
-    assert_eq!(api.channel_label(), ChannelLabel::GhApi("repos/owner/repo/pulls".into()));
+    });
+    assert_eq!(api.channel_label(), ChannelLabel::Extra("gh_api".into(), "repos/owner/repo/pulls".into()));
 
     let http = Interaction::Http {
         label: None,
@@ -452,73 +453,6 @@ fn task_id_overrides_label() {
 }
 
 #[test]
-fn load_rounds_flat_format() {
-    let yaml = r#"
-interactions:
-  - channel: command
-    cmd: git
-    args: ["status"]
-    cwd: "/repo"
-    stdout: "ok\n"
-    exit_code: 0
-  - channel: gh_api
-    method: GET
-    endpoint: "/repos/owner/repo/pulls"
-    status: 200
-    body: "[]"
-"#;
-    let rounds = load_rounds_from_str(yaml);
-    assert_eq!(rounds.len(), 1);
-    assert_eq!(rounds[0].queues.len(), 2);
-    assert!(rounds[0].queues.contains_key(&ChannelLabel::Command("git status".into())));
-    assert!(rounds[0].queues.contains_key(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into())));
-}
-
-#[test]
-fn load_rounds_multi_round_format() {
-    let yaml = r#"
-rounds:
-  - interactions:
-      - channel: command
-        cmd: git
-        args: ["status"]
-        cwd: "/repo"
-        stdout: "ok\n"
-        exit_code: 0
-  - interactions:
-      - channel: gh_api
-        method: GET
-        endpoint: "/repos/owner/repo/pulls"
-        status: 200
-        body: "[]"
-"#;
-    let rounds = load_rounds_from_str(yaml);
-    assert_eq!(rounds.len(), 2);
-    assert_eq!(rounds[0].queues.len(), 1);
-    assert!(rounds[0].queues.contains_key(&ChannelLabel::Command("git status".into())));
-    assert_eq!(rounds[1].queues.len(), 1);
-    assert!(rounds[1].queues.contains_key(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into())));
-}
-
-#[test]
-fn round_is_empty() {
-    let round = Round::from_interactions(vec![]);
-    assert!(round.is_empty());
-
-    let round = Round::from_interactions(vec![Interaction::Command {
-        label: None,
-        cmd: "git".into(),
-        args: vec![],
-        cwd: "/repo".into(),
-        stdout: None,
-        stderr: None,
-        exit_code: Some(0),
-        error: None,
-    }]);
-    assert!(!round.is_empty());
-}
-
-#[test]
 fn replayer_serves_by_channel_label() {
     let yaml = r#"
 interactions:
@@ -547,9 +481,9 @@ interactions:
     let replayer = Replayer::from_file(&path, Masks::new());
 
     // Can consume in any channel order within the same round
-    let api = replayer.next(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into()));
+    let api = replayer.next(&ChannelLabel::Extra("gh_api".into(), "/repos/owner/repo/pulls".into()));
     match api {
-        Interaction::GhApi { endpoint, .. } => {
+        Interaction::Extra(GithubChannel::GhApi { endpoint, .. }) => {
             assert_eq!(endpoint, "/repos/owner/repo/pulls");
         }
         _ => panic!("expected gh_api"),
@@ -602,7 +536,7 @@ rounds:
     let replayer = Replayer::from_file(&path, Masks::new());
 
     // Round 1 only has a command — requesting gh_api should panic
-    replayer.next(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into()));
+    replayer.next(&ChannelLabel::Extra("gh_api".into(), "/repos/owner/repo/pulls".into()));
 }
 
 #[test]
@@ -637,9 +571,9 @@ rounds:
     }
 
     // Round auto-advances — now we can get gh_api from round 2
-    let api = replayer.next(&ChannelLabel::GhApi("/repos/owner/repo/pulls".into()));
+    let api = replayer.next(&ChannelLabel::Extra("gh_api".into(), "/repos/owner/repo/pulls".into()));
     match api {
-        Interaction::GhApi { endpoint, .. } => {
+        Interaction::Extra(GithubChannel::GhApi { endpoint, .. }) => {
             assert_eq!(endpoint, "/repos/owner/repo/pulls");
         }
         _ => panic!("expected gh_api"),
@@ -689,14 +623,14 @@ fn recorder_saves_multi_round_with_barriers() {
         error: None,
     });
     recorder.barrier();
-    recorder.record(Interaction::GhApi {
+    recorder.record(Interaction::Extra(GithubChannel::GhApi {
         label: None,
         method: "GET".into(),
         endpoint: "/repos/owner/repo/pulls".into(),
         status: 200,
         body: "[]".into(),
         headers: HashMap::new(),
-    });
+    }));
     recorder.save();
 
     let content = std::fs::read_to_string(&path).expect("read fixture");
@@ -974,7 +908,9 @@ fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
             if let Err(ObservationError::RateLimited { budget, .. }) = &recorded {
                 // The neutral budget is consumed by the recorder's existing metadata schema.
                 let log: RoundLog = serde_yml::from_str(&std::fs::read_to_string(&path).expect("recording")).expect("log");
-                let Interaction::GhApi { headers, .. } = &log.rounds[0].interactions[0] else { panic!("gh recording") };
+                let Interaction::Extra(GithubChannel::GhApi { headers, .. }) = &log.rounds[0].interactions[0] else {
+                    panic!("gh recording")
+                };
                 assert_eq!(headers.get("observation-budget"), Some(budget));
             }
             let replay = Session::replaying(&path, Masks::new());
@@ -1085,7 +1021,9 @@ fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
             }
             detailed.finish();
             let log: RoundLog = serde_yml::from_str(&std::fs::read_to_string(&path).expect("recording")).expect("log");
-            let Interaction::GhApi { status: actual_status, body: actual_body, headers, .. } = &log.rounds[0].interactions[0] else {
+            let Interaction::Extra(GithubChannel::GhApi { status: actual_status, body: actual_body, headers, .. }) =
+                &log.rounds[0].interactions[0]
+            else {
                 panic!("REST recording")
             };
             assert_eq!(*actual_status, status);
@@ -1239,4 +1177,10 @@ async fn command_execution_error_survives_record_replay() {
     assert_eq!(actual, expected);
     assert_eq!(actual.as_deref(), Some("cannot execute in /private/runtime"));
     session.finish();
+}
+
+// Only the public recorded schema belongs to this consumer; scheduling lives in Rigging.
+#[derive(Deserialize)]
+struct RoundLog {
+    rounds: Vec<InteractionLog>,
 }

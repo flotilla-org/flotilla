@@ -5,18 +5,16 @@
 //! implementation keeps command arguments, path resolution, warnings and
 //! version parsing identical everywhere (#3049).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
-use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
-use tracing::warn;
 
 use crate::{EnvironmentAssertion, HostDetector};
 
 /// Extracts a version from a successful probe's standard output.
-pub type VersionParser = fn(&str) -> Option<String>;
+pub use rigging_process::discovery::{parse_first_dotted_version, VersionParser};
 
 /// Asserts an environment variable's value when the injected environment sets it.
 pub struct EnvVarDetector {
@@ -65,7 +63,7 @@ impl CommandDetector {
 #[async_trait]
 impl HostDetector for CommandDetector {
     async fn detect(&self, runner: &dyn CommandRunner, _env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
-        let Ok(output) = run!(runner, self.command, self.args, Path::new("/")) else {
+        let Ok(version) = rigging_process::discovery::command_version(runner, self.command, self.args, self.version_parser).await else {
             return Vec::new();
         };
         let path = match self.path_mode {
@@ -77,7 +75,7 @@ impl HostDetector for CommandDetector {
                 path
             }
         };
-        match (self.version_parser)(&output) {
+        match version {
             Some(version) => vec![EnvironmentAssertion::versioned_binary(self.command, path, version)],
             None => vec![EnvironmentAssertion::binary(self.command, path)],
         }
@@ -91,74 +89,7 @@ impl HostDetector for CommandDetector {
 /// the daemon host: the runner may be remote or provisioned, so the daemon's
 /// own `PATH` can name a different binary or none.
 pub async fn resolve_binary_path(runner: &dyn CommandRunner, command: &str) -> Option<PathBuf> {
-    // Resolve inside the runner's environment: provisioned and remote runners
-    // intentionally do not share the daemon process's PATH.
-    let output = match runner
-        .run(
-            "sh",
-            &["-c", "command -v \"$1\"", "flotilla-binary-discovery", command],
-            Path::new("/"),
-            &flotilla_provider_runtime::ChannelLabel::Default,
-        )
-        .await
-    {
-        Ok(output) => output,
-        Err(error) => {
-            warn!(binary = command, %error, "agent adapter binary path resolution failed after successful version probe");
-            return None;
-        }
-    };
-    let path = PathBuf::from(output.trim());
-    if path.is_absolute() {
-        Some(path)
-    } else {
-        warn!(binary = command, resolved_path = %path.display(), "agent adapter binary path resolution returned a relative path after successful version probe");
-        None
-    }
-}
-
-/// The first token of digits containing at least one dot, such as `2.43.0`.
-pub fn parse_first_dotted_version(output: &str) -> Option<String> {
-    let mut start = None;
-    let mut dot_count = 0;
-    let mut saw_digit = false;
-
-    for (idx, ch) in output.char_indices() {
-        let Some(begin) = start else {
-            if ch.is_ascii_digit() {
-                start = Some(idx);
-                saw_digit = true;
-            }
-            continue;
-        };
-
-        if ch.is_ascii_digit() {
-            saw_digit = true;
-            continue;
-        }
-
-        if ch == '.' {
-            dot_count += 1;
-            saw_digit = false;
-            continue;
-        }
-
-        if dot_count > 0 && saw_digit {
-            return Some(output[begin..idx].to_string());
-        }
-
-        start = if ch.is_ascii_digit() { Some(idx) } else { None };
-        dot_count = 0;
-        saw_digit = ch.is_ascii_digit();
-    }
-
-    if let Some(start) = start {
-        if dot_count > 0 && saw_digit {
-            return Some(output[start..].trim().to_string());
-        }
-    }
-
-    None
+    rigging_process::discovery::resolve_binary_path_with_marker(runner, command, "flotilla-binary-discovery").await
 }
 
 #[cfg(test)]

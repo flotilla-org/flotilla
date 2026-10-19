@@ -40,7 +40,7 @@ impl HttpFixture {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve fixture");
         });
-        Self { backend: ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), url)), task }
+        Self { backend: ResourceBackend::new(HttpBackend::new(rigging_tls::client(), url)), task }
     }
 }
 async fn request(
@@ -264,7 +264,7 @@ async fn read_operations_classify_selectors(#[case] adapter: &str) {
 async fn unsupported_defaults_are_neutral_and_http_refusals_are_unchanged() {
     let memory = ResourceBackend::new(InMemoryBackend::default());
     assert_eq!(memory.store().unsupported_operation("replicas"), ResourceError::invalid("this store does not support replicas"));
-    let http = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), "http://127.0.0.1:1"));
+    let http = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), "http://127.0.0.1:1"));
     assert!(matches!(http.store().list_replicas_raw(ResourceKind::of::<Convoy>(), "flotilla").await,
         Err(ResourceError::Invalid { message }) if message == "HTTP backends cannot hold replicas"));
     assert!(matches!(http.local_namespaces::<Convoy>().await,
@@ -812,7 +812,7 @@ async fn late_relay_watch_includes_retained_deletions(#[case] adapter: &str, #[v
 // Store::watch_replica_sources_raw to consume the remote resource API instead.
 #[tokio::test]
 async fn replica_source_registry_rejects_http_backed_stores_before_io() {
-    let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), "http://unused.invalid"));
+    let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), "http://unused.invalid"));
     let error = flotilla_store::watch_resource_kind_replica_sources(&backend, "flotilla", "convoys")
         .await
         .err()

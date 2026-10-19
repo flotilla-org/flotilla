@@ -10,7 +10,7 @@ flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-resources = { path = "../flotilla-resources" }
-flotilla-tls = { path = "../flotilla-tls" }
+rigging-tls = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde_json.workspace = true
 urlencoding.workspace = true

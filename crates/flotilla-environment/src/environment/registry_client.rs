@@ -45,7 +45,7 @@ impl RegistryClient {
         {
             return Err("registry requires an HTTP(S) origin without credentials or path".into());
         }
-        let http = flotilla_tls::client_builder()
+        let http = rigging_tls::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .build()

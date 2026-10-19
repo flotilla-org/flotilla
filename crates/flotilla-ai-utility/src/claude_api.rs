@@ -7,7 +7,7 @@ use tracing::info;
 use flotilla_provider_runtime::http_execute;
 use flotilla_provider_runtime::HttpClient;
 
-static REQUEST_FACTORY: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(flotilla_tls::client);
+static REQUEST_FACTORY: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(rigging_tls::client);
 
 const API_BASE: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
@@ -194,7 +194,7 @@ mod tests {
                 crate::ConvoyNames { name: "contract-convoy".into(), branch: "contract-branch".into() }
             );
             // Malformed JSON must receive a service refusal, not panic the handler.
-            let response = flotilla_tls::client()
+            let response = rigging_tls::client()
                 .post(server.url.join("/v1/messages").expect("stand-in URL"))
                 .header("x-api-key", "test-key")
                 .header("anthropic-version", "2023-06-01")

@@ -31,6 +31,15 @@ def graph(*packages):
 
 
 class BuildGraphContract(unittest.TestCase):
+    def test_external_rigging_testkit_remains_dev_only(self):
+        # ADR 0068: moving the replay crate outside the workspace must preserve the dev-only boundary.
+        for kind in ("normal", "build", "dev"):
+            metadata = graph(package("flotilla-provider-runtime", **{kind: ("rigging-replay-testkit",)}),
+                             package("rigging-replay-testkit"))
+            metadata["workspace_members"] = ["flotilla-provider-runtime"]
+            expected = [] if kind == "dev" else ["flotilla-provider-runtime: production dependency on testkit rigging-replay-testkit"]
+            self.assertEqual(violations(metadata), expected)
+
     def test_vessel_cli_excludes_dashboard_dependencies(self):
         # ADR 0069: finite generator covers every renderer entry point, even transitively.
         for dependency in ("flotilla-tui", "ratatui", "ratatui-core", "ratatui-widgets", "tui-input", "catppuccin", "crokey"):
@@ -299,9 +308,9 @@ class BuildGraphContract(unittest.TestCase):
                             package("adapter", normal=(target,)), package(target),
                         )), [f"flotilla-provider-runtime: must not depend on {target}, directly or transitively"])
         self.assertEqual(violations(graph(
-            package("flotilla-provider-runtime", normal=("flotilla-protocol", "flotilla-tls")),
+            package("flotilla-provider-runtime", normal=("flotilla-protocol", "rigging-tls")),
             package("flotilla-core", normal=("flotilla-provider-runtime",)),
-            package("flotilla-protocol"), package("flotilla-tls"),
+            package("flotilla-protocol"), package("rigging-tls"),
         )), [])
 
     def test_config_is_base_and_independent(self):

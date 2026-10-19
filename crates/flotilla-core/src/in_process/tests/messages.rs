@@ -26,7 +26,7 @@ async fn convoy_sender_lookup_diagnostics_preserve_fallbacks() {
         .await
         .expect("convoy");
     // Real HTTP collaborator with an invalid URL fails before any network request.
-    let invalid = ResourceBackend::new(flotilla_store_http::HttpBackend::new(flotilla_tls::client(), "://invalid"));
+    let invalid = ResourceBackend::new(flotilla_store_http::HttpBackend::new(rigging_tls::client(), "://invalid"));
     for (backend, name, expected, failure) in
         [(&memory, "supervisor", "governor", false), (&memory, "missing", "missing", true), (&invalid, "unavailable", "unavailable", true)]
     {

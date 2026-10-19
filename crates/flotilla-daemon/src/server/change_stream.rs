@@ -112,7 +112,7 @@ pub async fn read_record(
     if let Some(value) = local {
         return Ok(stream::ReadResult { value: Some(value), remote: false, age_micros: 0 });
     }
-    let client = flotilla_tls::client_builder()
+    let client = rigging_tls::client_builder()
         .unix_socket(socket)
         .connect_timeout(IO_DEADLINE)
         .timeout(IO_DEADLINE)
@@ -180,7 +180,7 @@ enum Baseline {
 
 async fn follow_connection(service: Arc<Service>, home: &str, socket: &std::path::Path, baseline: Baseline) -> Result<(), String> {
     let after = service.watermark(home).map_err(|e| e.to_string())?;
-    let client = flotilla_tls::client_builder()
+    let client = rigging_tls::client_builder()
         .unix_socket(socket)
         .connect_timeout(IO_DEADLINE)
         .read_timeout(IO_DEADLINE)

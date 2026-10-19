@@ -820,7 +820,7 @@ mod tests {
             io::{AsyncReadExt, AsyncWriteExt},
             net::UnixListener,
         };
-        flotilla_tls::install_default_provider();
+        rigging_tls::install_default_provider();
         for legacy in [false, true] {
             let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
             let record = backend
@@ -896,7 +896,7 @@ mod tests {
             io::{AsyncReadExt, AsyncWriteExt},
             net::UnixListener,
         };
-        flotilla_tls::install_default_provider();
+        rigging_tls::install_default_provider();
         for mode in 0..6 {
             let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
             let project = backend
@@ -1015,7 +1015,7 @@ mod tests {
 
     #[tokio::test]
     async fn validates_mixed_kinds_from_an_in_process_daemon() {
-        flotilla_tls::install_default_provider();
+        rigging_tls::install_default_provider();
         let root = std::env::temp_dir().join(format!("flotilla-live-validate-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("config")).expect("create daemon directory");
         std::fs::write(root.join("config/daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon identity");
@@ -1283,7 +1283,7 @@ mod tests {
 
     #[tokio::test]
     async fn candidate_checks_registered_ops_entries_and_fails_on_unknown_fields() {
-        flotilla_tls::install_default_provider();
+        rigging_tls::install_default_provider();
         use std::sync::Arc;
 
         use flotilla_core::repository_inspection::GitRepositoryInspector;
@@ -1620,7 +1620,7 @@ mod frozen_reference_regression {
     // The true resource HTTP boundary is injected; records use the real decoder.
     #[tokio::test]
     async fn candidate_refuses_schema_valid_unresolvable_governor_pin() {
-        flotilla_tls::install_default_provider();
+        rigging_tls::install_default_provider();
         let mut status = serde_json::to_value(ConvoyStatus::default()).expect("status");
         status["phase"] = serde_json::json!("Active");
         status["workflow_snapshot"] = serde_json::json!({"vessels":[{"name":"work","crew":[{
