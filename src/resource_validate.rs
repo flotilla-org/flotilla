@@ -16,7 +16,7 @@ use flotilla_core::repository_inspection::{
     inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector,
 };
 #[cfg(unix)]
-use flotilla_environment::environment::{command_provider, EnvironmentKind};
+use flotilla_environment::environment::{command_provider, EnvironmentInput};
 #[cfg(unix)]
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 #[cfg(unix)]
@@ -249,7 +249,7 @@ async fn validate_daemon_with_preview(
             }
         }
     }
-    let image_provider = command_provider(EnvironmentKind::Docker, Arc::new(ProcessCommandRunner));
+    let image_provider = command_provider(EnvironmentInput::Docker, Arc::new(ProcessCommandRunner));
     let mut frozen_report = frozen::check(
         &frozen_inventory,
         &retired,
