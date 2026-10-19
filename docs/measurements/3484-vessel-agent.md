@@ -7,8 +7,8 @@ guard. It has no store, reconciler or provider dependencies. Listeners, hello,
 readiness and supervision arrive in the next ADR 0069 slices.
 
 `flotilla-cli` owns the argument tree, command output, image-check client, PM
-connector and CLI terminal attachment. `flotilla-tui` reexports the previous CLI
-and connector paths for callers, and owns rendering and terminal restoration.
+connector and CLI terminal attachment. `flotilla-tui` owns rendering and terminal
+restoration; CLI and connector callers import `flotilla-cli` directly.
 The root package's default-on `tui` feature preserves `cargo run`, `flotilla`,
 and `flotilla view …` for operators.
 
@@ -18,7 +18,7 @@ and `flotilla view …` for operators.
 # Operator CLI with dashboard (existing release selection is unchanged).
 cargo build -p flotilla --bin flotilla --release --locked
 
-# Vessel CLI with the resident agent and no dashboard dependency.
+# No-dashboard root CLI variant (not the small vessel binary; not shipped).
 cargo build -p flotilla --bin flotilla --release --locked --no-default-features
 
 # Check the actual selected vessel graph, including transitive dependencies.
@@ -26,10 +26,24 @@ cargo tree -p flotilla --no-default-features --locked --edges normal,build
 python3 ci/build-graph/check.py
 ```
 
-The feature must be omitted when building the binary intended for vessel delivery.
+This no-dashboard binary is **not yet slim or shipped**. It still links the daemon,
+core, controllers, storage, replication and providers: the owner measured 348 of
+370 packages, 66.4 MB against 70.1 MB. The candidate build still installs the
+default-feature operator binary in vessels, so the post-roll Docker convoy check
+tests nothing new yet. The owner-directed separate small vessel binary and its
+candidate delivery follow in [#3509](https://github.com/flotilla-org/flotilla/issues/3509).
+
+The feature must be omitted when building the no-dashboard variant.
 This ticket does not switch the fleet candidate/release build. A no-TUI binary
 still supports CLI operations and `vessel-agent`; invoking its dashboard reports
 that an operator build with `tui` is needed.
+
+`flotilla attach` no longer resets the terminal or installs the dashboard panic
+and signal handlers. It runs as a foreground CLI, without initializing ratatui,
+mouse capture or dashboard raw mode, so there is no dashboard state to restore.
+Unix replaces the CLI with the attach command; Windows still scopes its native
+console input mode to the child lifetime and restores it on exit/error/unwind.
+Dashboard temporary attachment keeps its own restoration and handlers.
 
 ## Startup contract
 
@@ -56,13 +70,13 @@ use the same toolchain, lockfile dependency versions and build environment.
 
 | Tool/asset | Before (bytes) | Vessel build (bytes) |
 |---|---:|---:|
-| flotilla | 70,086,680 | 66,351,488 |
+| flotilla | 70,086,680 | 66,351,480 |
 | cleat | 6,651,264 | 6,651,264 |
 | libghostty-vt.so.0 | 12,597,640 | 12,597,640 |
 | xterm-ghostty | 3,884 | 3,884 |
-| Total | 89,339,468 | 85,604,276 |
+| Total | 89,339,468 | 85,604,268 |
 
-The CLI shrank by 3,735,192 bytes (5.3%); the complete tool set shrank by 4.2%.
+The CLI shrank by 3,735,200 bytes (5.3%); the complete tool set shrank by 4.2%.
 
 
 The frozen tool set also includes cleat's shared library and terminfo, so both

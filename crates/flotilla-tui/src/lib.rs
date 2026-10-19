@@ -4,7 +4,6 @@
 
 pub mod app;
 pub mod binding_table;
-pub use flotilla_cli::cli;
 pub mod convoy_model;
 pub mod event;
 pub mod event_log;
@@ -12,7 +11,6 @@ pub mod file_picker_model;
 pub mod interaction;
 pub mod keymap;
 pub mod palette;
-pub use flotilla_cli::pm_connect;
 pub mod pm_open;
 pub mod run;
 pub use flotilla_client as socket;

@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_cli::pm_connect::Connector;
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
@@ -26,7 +27,6 @@ use flotilla_resources::{
     ObservedChangeRequestState, Project, ProjectSpec, ResourceObject, WatchEvent, ENSURED_FROM_ANNOTATION,
 };
 use flotilla_store::ResourceBackend;
-use flotilla_tui::pm_connect::Connector;
 
 #[derive(Default)]
 struct Sink {

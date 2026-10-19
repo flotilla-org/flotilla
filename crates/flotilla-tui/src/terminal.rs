@@ -27,15 +27,6 @@ static ATTACH_PANIC_HOOK: Once = Once::new();
 #[cfg(unix)]
 static ATTACH_SIGNAL_HANDLER: Once = Once::new();
 
-/// Leave the dashboard before replacing it with an attach hop.
-pub fn exec_attach_plan(plan: &ResolvedAttachPlan) -> Result<std::convert::Infallible, String> {
-    install_panic_hook();
-    #[cfg(unix)]
-    install_sigterm_handler();
-    restore_terminal();
-    flotilla_cli::terminal::exec_attach_plan(plan)
-}
-
 /// Temporarily leave the TUI to inspect a terminal session, then restore it.
 ///
 /// This deliberately does not stamp Presentation Manager metadata: the pane

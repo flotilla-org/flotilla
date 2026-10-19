@@ -133,7 +133,8 @@ mod windows_console {
     }
 
     pub(super) fn enter() -> Result<Modes, String> {
-        // Capture the cooked console after leaving any TUI mouse/raw modes.
+        // The foreground CLI has not entered dashboard mouse/raw modes.
+        // Capture its console state before handing the terminal to the child.
         // SAFETY: standard handles are borrowed for the child lifetime; mode
         // pointers refer to live u32s. No handle is closed by this module.
         unsafe {

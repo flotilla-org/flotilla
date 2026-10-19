@@ -86,6 +86,9 @@ large_diff=$'+#[cfg(unix)]\n'$(printf '+line %s padding padding padding\n' $(seq
 check "early content hit in a large diff runs Windows" pull_request false "crates/flotilla-core/src/x.rs" \
   "$large_diff" "windows=true macos=false quint=false "
 
+check "agent process contract runs both platform jobs" pull_request false "tests/vessel_agent.rs" "" \
+  "windows=true macos=true quint=false "
+
 if ((failures > 0)); then
   echo "$failures platform-changes classification test(s) failed" >&2
   exit 1

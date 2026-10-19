@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
 use clap::{error::ErrorKind, CommandFactory, FromArgMatches};
-use flotilla_tui::cli::args::{Cli, SubCommand};
+use flotilla_cli::cli::args::{Cli, SubCommand};
 
 fn check_file(path: &Path) -> usize {
     let source = fs::read_to_string(path).expect("read stock skill reference");
