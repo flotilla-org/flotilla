@@ -34,6 +34,13 @@ CAPABILITY_FORBIDDEN = (
     "flotilla-core", "flotilla-daemon", "flotilla-controllers",
     "flotilla-credentials",
 )
+# #3524: discovery owns EnvironmentManager and the Environments and EnvironmentLifecycle
+# ports. Capability crates and hosts consume them; discovery never reaches back.
+DISCOVERY = "flotilla-discovery"
+DISCOVERY_FORBIDDEN = (
+    "flotilla-core", "flotilla-credentials", "flotilla-controllers", "flotilla-daemon",
+    "flotilla-store", "flotilla-observation", *sorted(CAPABILITY_CRATES),
+)
 # #3320: the storage derive stack, lowest first. Each may depend in production only on
 # flotilla-address (#3392 G1: references outside the store are addresses), flotilla-cbor,
 # the schema crates below it and the build-feature anchors.
@@ -104,11 +111,14 @@ def violations(metadata):
     errors = []
     if "flotilla-client" in packages and "flotilla-core" in packages and reaches("flotilla-client", "flotilla-core"):
         errors.append("flotilla-client: must not depend on flotilla-core, directly or transitively")
-    for component in ("flotilla-config", "flotilla-provider-runtime", "flotilla-discovery-api", "flotilla-vcs", "flotilla-environment", "flotilla-terminal", "flotilla-cloud-agent", "flotilla-ai-utility", "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-change-request", "flotilla-issue-tracker", "flotilla-agent", "flotilla-discovery", "flotilla-dummy-fleet", "flotilla-charter"):
+    for component in ("flotilla-config", "flotilla-provider-runtime", "flotilla-discovery-api", "flotilla-vcs", "flotilla-environment", "flotilla-terminal", "flotilla-cloud-agent", "flotilla-ai-utility", "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-change-request", "flotilla-issue-tracker", "flotilla-agent", "flotilla-dummy-fleet", "flotilla-charter"):
         for target in ("flotilla-core", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store", "flotilla-observation", *sorted(CAPABILITY_CRATES)):
             if component in packages and target in packages and reaches(component, target):
                 errors.append(f"{component}: must not depend on {target}, directly or transitively")
+    for target in DISCOVERY_FORBIDDEN:
+        if DISCOVERY in packages and target in packages and reaches(DISCOVERY, target):
+            errors.append(f"{DISCOVERY}: must not depend on {target}, directly or transitively")
     # #3480: forge-neutral contracts and forge-specific adapters have separate graphs.
     for component in ("flotilla-change-request", "flotilla-issue-tracker"):
         for target in ("flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-github-providers", "flotilla-forgejo-providers"):

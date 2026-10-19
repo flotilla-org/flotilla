@@ -20,7 +20,6 @@ use super::{
     checkout::{resolve_checkout_branch, CheckoutIntent, CheckoutResolutionScope, CheckoutService},
     ExecutorStepResolver, PlannerRefusal, RepoExecutionContext,
 };
-use crate::environment_manager::EnvironmentManager;
 use crate::provider_data::ProviderData;
 use crate::step::StepAction;
 use crate::step::StepExecutionContext;
@@ -31,6 +30,7 @@ use crate::testkits::discovery::test_vcs_resolver;
 use crate::testkits::discovery::DiscoveryMockRunner;
 use crate::testkits::discovery::TestEnvVars;
 use crate::testkits::replay::testing::MockRunner;
+use flotilla_discovery::environment_manager::EnvironmentManager;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_environment::environment::ProvisionedMount;
 use flotilla_environment::environment::{PrepareOpts, PreparedEnvironment, ProvisionOpts};

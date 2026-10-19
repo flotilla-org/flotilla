@@ -16,11 +16,11 @@ mod tests {
     }
 
     use crate::testkits::discovery::TestEnvVars as FixtureEnvVars;
+    use flotilla_discovery::environment_manager::EnvironmentManager;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_environment::environment::EnvironmentHandle;
     use flotilla_environment::environment::ProvisionedEnvironment;
-    use flotilla_executor::environment_manager::EnvironmentManager;
     use flotilla_protocol::{HostName, NodeId};
     use flotilla_provider_runtime::{CommandRunner, EnvVars};
 
@@ -118,7 +118,7 @@ mod tests {
             &NodeId::new("test-node"),
             &host_name,
             EnvironmentId::host(HostId::new("test-local-host-id")),
-            &super::super::projection_ports::ProjectionEnvironments(&manager),
+            &super::super::projection_ports::ProjectionEnvironmentSummaries(&manager),
             vec![],
             &env,
         )
@@ -156,7 +156,7 @@ mod tests {
             &NodeId::new("test-node"),
             &host_name,
             EnvironmentId::host(HostId::new("test-local-host-id")),
-            &super::super::projection_ports::ProjectionEnvironments(&manager),
+            &super::super::projection_ports::ProjectionEnvironmentSummaries(&manager),
             vec![],
             &env,
         )
@@ -214,7 +214,7 @@ mod tests {
             &NodeId::new("test-node"),
             &host_name,
             EnvironmentId::host(HostId::new("test-local-host-id")),
-            &super::super::projection_ports::ProjectionEnvironments(&manager),
+            &super::super::projection_ports::ProjectionEnvironmentSummaries(&manager),
             vec![],
             &env,
         )

@@ -5,7 +5,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from check import (CAPABILITY_CRATES, C_FREE_BASE, RESOURCE_EXEMPTIONS, SCHEMA_CRATES, STATE_MACHINES, c_free_violations,
+from check import (CAPABILITY_CRATES, C_FREE_BASE, DISCOVERY_FORBIDDEN, RESOURCE_EXEMPTIONS, SCHEMA_CRATES, STATE_MACHINES, c_free_violations,
                    vessel_graph_violations, feature_differences, is_testkit, layer, main, tree_features, violations)
 
 
@@ -584,6 +584,27 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-discovery-api", normal=("flotilla-provider-runtime",)), package("flotilla-provider-runtime"),
             package("flotilla-core", normal=("flotilla-discovery",) + type_crates),
             package("flotilla-discovery-testkit", normal=("flotilla-discovery",)),
+        )), [])
+
+    def test_discovery_cannot_reach_environment_consumers(self):
+        # #3524: EnvironmentManager and its ports live in discovery; the executor, admission,
+        # projections, core and daemon consume them. Explicit generator, independent of the policy set.
+        consumers = ("flotilla-executor", "flotilla-admission", "flotilla-projections", "flotilla-core", "flotilla-daemon")
+        self.assertTrue(set(consumers) - {"flotilla-core", "flotilla-daemon"} <= CAPABILITY_CRATES)
+        for target in (*consumers, *sorted(CAPABILITY_CRATES)):
+            self.assertIn(target, DISCOVERY_FORBIDDEN)
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertEqual(violations(graph(
+                            package("flotilla-discovery", **{kind: (middle,)}),
+                            package("adapter", normal=(target,)), package(target),
+                        )), [f"flotilla-discovery: must not depend on {target}, directly or transitively"])
+        # Discovery reads config and resources; consumers depend on discovery, never the reverse.
+        self.assertEqual(violations(graph(
+            package("flotilla-discovery", normal=("flotilla-config", "flotilla-resources", "flotilla-environment")),
+            package("flotilla-config", normal=("flotilla-resources",)), package("flotilla-resources"), package("flotilla-environment"),
+            *(package(name, normal=("flotilla-discovery",)) for name in consumers),
         )), [])
 
     def test_credentials_cannot_depend_on_core(self):

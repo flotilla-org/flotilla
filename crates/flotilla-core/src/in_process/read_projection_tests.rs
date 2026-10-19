@@ -1,4 +1,4 @@
-use flotilla_projections::ports::Environments;
+use flotilla_projections::ports::EnvironmentSummaries;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
@@ -52,7 +52,7 @@ mod tests {
     use crate::leaf_engine::LeafSubscriptionTable;
     use flotilla_change_request::observation::GhChangeRequestObservationSource;
     use flotilla_daemon_api::event_sink::EventSink;
-    use flotilla_executor::environment_manager::EnvironmentManager;
+    use flotilla_discovery::environment_manager::EnvironmentManager;
     use flotilla_observation::change_request_observer::ChangeRequestRefreshCadence;
     use flotilla_observation::change_request_observer::ChangeRequestRefresher;
     use flotilla_projections::aggregator_projection::AggregatorProjectionState;
@@ -253,7 +253,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Environments for ProjectionFixture {
+    impl EnvironmentSummaries for ProjectionFixture {
         fn local_inventory(&self) -> flotilla_protocol::ToolInventory {
             crate::convert::inventory_from_bag(&self.environments.local_environment_bag())
         }

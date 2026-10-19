@@ -1,5 +1,6 @@
-# ADR 0060: generic discovery runs and static factory-list assembly over the
-# provider type crates; no composition-root or store dependencies.
+# ADR 0060: generic discovery runs, static factory-list assembly over the
+# provider type crates and environment management; no composition-root,
+# capability or store dependencies.
 # See docs/adr/0060-component-crates-and-composition-root.md and ci/build-graph/check.py.
 [package]
 name = "flotilla-discovery"
@@ -14,12 +15,14 @@ flotilla-agent = { path = "../flotilla-agent" }
 flotilla-ai-utility = { path = "../flotilla-ai-utility" }
 flotilla-change-request = { path = "../flotilla-change-request" }
 flotilla-cloud-agent = { path = "../flotilla-cloud-agent" }
+flotilla-config = { path = "../flotilla-config" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-environment = { path = "../flotilla-environment" }
 flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-resources = { path = "../flotilla-resources" }
 flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 async-trait.workspace = true
@@ -33,8 +36,8 @@ tracing.workspace = true
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
-flotilla-resources = { path = "../flotilla-resources" }
 hegeltest = "=0.48.1"
+serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

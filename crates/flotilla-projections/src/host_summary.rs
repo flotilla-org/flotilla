@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use flotilla_protocol::{EnvironmentId, HostEnvironment, HostName, HostProviderStatus, HostSummary, NodeId, NodeInfo, SystemInfo};
 use sysinfo::System;
 
-use crate::ports::Environments;
+use crate::ports::EnvironmentSummaries;
 use flotilla_provider_runtime::EnvVars;
 
 /// Resident bytes of this daemon process, sampled for the host heartbeat.
@@ -23,7 +23,7 @@ pub async fn build_local_host_summary(
     node_id: &NodeId,
     host_name: &HostName,
     environment_id: EnvironmentId,
-    environment_manager: &dyn Environments,
+    environment_manager: &dyn EnvironmentSummaries,
     providers: Vec<HostProviderStatus>,
     env: &dyn EnvVars,
 ) -> HostSummary {

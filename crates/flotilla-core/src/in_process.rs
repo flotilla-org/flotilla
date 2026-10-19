@@ -141,14 +141,14 @@ use flotilla_daemon_api::daemon::{DaemonHandle, QuerySubscription};
 use flotilla_daemon_api::event_sink::BroadcastEventSink;
 use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_discovery::discover_checkout_with_host_scoped;
+use flotilla_discovery::environment_manager::EnvironmentManager;
+use flotilla_discovery::environment_manager::ResolvedEnvironment;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery::run_host_detectors;
 use flotilla_discovery::status::provider_names_from_registry;
 use flotilla_discovery::DiscoveryResult;
 use flotilla_discovery::DiscoveryRuntime;
 use flotilla_environment::environment::EnvironmentHandle;
-use flotilla_executor::environment_manager::EnvironmentManager;
-use flotilla_executor::environment_manager::ResolvedEnvironment;
 use flotilla_executor::executor;
 use flotilla_executor::executor::checkout::CheckoutResolutionScope;
 use flotilla_executor::step::RemoteStepBatchRequest;
@@ -867,7 +867,7 @@ impl InProcessDaemon {
             config: &self.config,
             active_commands: &self.active_commands,
             observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
-            environment_manager: &self.environment_manager,
+            environment_manager: Arc::clone(&self.environment_manager) as _,
             runner: &self.discovery.runner,
             env: &self.discovery.env,
             daemon_socket_path: &self.daemon_socket_path,
@@ -1142,7 +1142,7 @@ impl InProcessDaemon {
             &local_node_id,
             &host_name,
             EnvironmentId::host(environment_manager.local_host_id().clone()),
-            &projection_ports::ProjectionEnvironments(&environment_manager),
+            &projection_ports::ProjectionEnvironmentSummaries(&environment_manager),
             local_provider_statuses.clone(),
             &*discovery.env,
         )
@@ -1271,7 +1271,7 @@ impl InProcessDaemon {
                 .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
                 .config(Arc::clone(&config))
                 .discovery(Arc::clone(&discovery))
-                .environment_manager(Arc::new(AdmissionEnvironmentAdapter(Arc::clone(&environment_manager))))
+                .environment_manager(Arc::clone(&environment_manager) as _)
                 .local_environment_id(local_environment_id.clone())
                 .provisioning_namespace(Arc::clone(&provisioning_namespace))
                 .repository_change_requests(Arc::clone(&repository_change_requests))
@@ -1987,12 +1987,12 @@ impl InProcessDaemon {
 
     /// Direct SSH environments explicitly opted into host-direct placement.
     /// Their environment key is derived from the remote host's stable ID.
-    pub fn agentless_ssh_environments(&self) -> Vec<(EnvironmentId, flotilla_executor::environment_manager::DirectEnvironmentState)> {
+    pub fn agentless_ssh_environments(&self) -> Vec<(EnvironmentId, flotilla_discovery::environment_manager::DirectEnvironmentState)> {
         self.environment_manager
             .managed_environments()
             .into_iter()
             .filter_map(|(id, managed)| match managed {
-                flotilla_executor::environment_manager::ManagedEnvironmentKind::Direct(state)
+                flotilla_discovery::environment_manager::ManagedEnvironmentKind::Direct(state)
                     if state.host_id.as_ref().is_some_and(|host| id.as_str() == host_direct_environment_name(host.as_str())) =>
                 {
                     Some((id, state))
@@ -4749,7 +4749,7 @@ impl InProcessDaemon {
             &self.node_id,
             &self.host_name,
             EnvironmentId::host(self.environment_manager.local_host_id().clone()),
-            &projection_ports::ProjectionEnvironments(&self.environment_manager),
+            &projection_ports::ProjectionEnvironmentSummaries(&self.environment_manager),
             providers,
             &*self.discovery.env,
         )
@@ -4854,7 +4854,7 @@ impl InProcessDaemon {
             daemon_socket_path,
 
             local_host: self.host_name.clone(),
-            environment_manager: Arc::clone(&self.environment_manager),
+            environment_manager: Arc::clone(&self.environment_manager) as _,
             vcs_resolver: self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")?
                 as Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>,
         };
@@ -5653,21 +5653,6 @@ impl ProjectOperations for InProcessDaemon {
         } else {
             false
         }
-    }
-}
-struct AdmissionEnvironmentAdapter(Arc<EnvironmentManager>);
-impl flotilla_admission::ports::AdmissionEnvironments for AdmissionEnvironmentAdapter {
-    fn local_host_id(&self) -> &flotilla_protocol::qualified_path::HostId {
-        self.0.local_host_id()
-    }
-    fn environment_bag(&self, environment: &EnvironmentId) -> Option<EnvironmentBag> {
-        self.0.environment_bag(environment)
-    }
-    fn environment_runner(&self, environment: &EnvironmentId) -> Option<Arc<dyn CommandRunner>> {
-        self.0.environment_runner(environment)
-    }
-    fn host_id_for_environment(&self, environment: &EnvironmentId) -> Option<flotilla_protocol::qualified_path::HostId> {
-        self.0.host_id_for_environment(environment)
     }
 }
 #[async_trait]

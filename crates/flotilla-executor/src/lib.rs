@@ -2,7 +2,6 @@
 #![allow(clippy::double_must_use)]
 pub mod action_support;
 mod data;
-pub mod environment_manager;
 pub mod executor;
 pub mod executor_actions;
 mod provider_data;
