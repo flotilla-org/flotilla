@@ -67,6 +67,9 @@ impl MemoryStore {
 
 impl Log<Message> for MemoryStore {
     fn create(&mut self, _: &str, _: Timestamp, resource: &Resource<Message>, _: &[InputRead]) -> Result<Version, LogError> {
+        if self.resources.contains_key(resource.name()) {
+            return Err(LogError::new("Message identity already exists in the source"));
+        }
         if resource.spec().admitted_seq != self.sequence + 1 {
             return Err(LogError::new("Message admission must equal its create home sequence"));
         }
@@ -153,6 +156,9 @@ impl Log<Message> for MemoryInboxLog {
         spec.admitted_seq = store.sequence + 1;
         let resource = resource.with_spec(spec);
         let version = store.create(writer, at, &resource, reads)?;
+        // MemoryStore::create appends exactly one authoritative entry. Keep
+        // admission tied to that entry if its implementation changes.
+        debug_assert_eq!(version.0, resource.spec().admitted_seq);
         Ok(Resource::stored(resource.name(), resource.spec().clone(), resource.stored_state().clone(), version))
     }
     fn edge(

@@ -275,7 +275,7 @@ impl MessageLog {
 
 impl Log<Message> for MessageLog {
     fn create(&mut self, _: &str, _: Timestamp, _: &Resource<Message>, _: &[InputRead]) -> Result<Version, LogError> {
-        Err(LogError::new("Message creation requires the owned-resource create hook"))
+        Err(LogError::new("Message creation requires engine Home to call Log::create_resource"))
     }
 
     fn create_resource(

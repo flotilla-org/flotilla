@@ -72,3 +72,33 @@ fn stamp_does_not_change_gate_inputs(tc: TestCase) {
     };
     assert_eq!(run(stamped), run(0));
 }
+
+// Behaviour: eviction forgets a cache value, not its durable identity. Both
+// inbox logs reject re-creating that name, leave Home empty, and preserve the
+// original resource and sequence. This also exercises the new owned hook.
+#[test]
+fn evicted_names_remain_unique_in_the_source() {
+    fn check<L: flotilla_inbox::InboxLog>(log: L) {
+        let mut home = Home::<Message, L>::with_log("test", log).unwrap();
+        let world = MemoryMessageWorld::default();
+        let name = "project:inbox/role:duplicate";
+        home.create(name, spec(), &world, Timestamp(10)).unwrap();
+        let original = home.evict(name).unwrap();
+        let sequence = home.log_mut().sequence().unwrap();
+        let result = home.create(name, spec(), &world, Timestamp(11));
+        assert!(
+            matches!(result, Err(flotilla_state_machines::WriteError::Log(_))),
+            "source must reject duplicate after eviction: {result:?}"
+        );
+        assert!(home.get(name).is_none());
+        assert_eq!(home.log_mut().sequence().unwrap(), sequence);
+        let stored = home.log_mut().load(name).unwrap().unwrap();
+        assert_eq!(stored.spec(), original.spec());
+        assert_eq!(stored.version(), original.version());
+    }
+    check(flotilla_inbox::MemoryInboxLog::default());
+    let store = Arc::new(Mutex::new(
+        Store::open(Connection::open_in_memory().unwrap(), "test", flotilla_state_machines::kinds().unwrap()).unwrap(),
+    ));
+    check(MessageLog::new(store));
+}

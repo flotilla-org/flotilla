@@ -244,6 +244,9 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
 
     /// Removes only this home's read replica value. The log remains authoritative;
     /// a storage adapter may restore the value before the next keyed operation.
+    /// The resident duplicate check (`WriteError::Exists`) is no longer
+    /// authoritative for evicted names: the log must enforce source uniqueness
+    /// if a caller tries to create that name again.
     pub fn evict(&mut self, name: &str) -> Option<Resource<M>> {
         self.resources.remove(name)
     }
