@@ -152,12 +152,14 @@ The owner went through a mockup of the HTTP API. Six changes follow from it.
 
 ### Addresses
 
-- **Provision** is `PUT /v1/providers/{provider}/environments/{environment}`, idempotent by our environment ID.
+- **Provision** is `POST /v1/providers/{provider}`. The body carries a `label`: flotilla's environment ID, which the module writes as a tag at the provider. The label is a client label, not the resource's identity. It does two jobs:
+  - a repeat `POST` with the same label returns the existing sandbox (200), so retries never create a second one;
+  - `list` returns each sandbox's label, so flotilla can match sandboxes back to its environments.
 - **Everything after provision uses the provider's `id`,** directly under the provider:
   - `GET /v1/providers/{provider}` lists the provider's sandboxes;
   - `GET` and `DELETE /v1/providers/{provider}/{id}` inspect and destroy one;
   - `/reach`, `/relay`, `/suspend`, `/resume` and `/exec` act on one.
-- Destroy and inspect work for untagged sandboxes found by listing.
+- Destroy and inspect work for unlabelled sandboxes found by listing.
 
 ### Events and prepare
 
