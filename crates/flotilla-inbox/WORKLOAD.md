@@ -1,5 +1,7 @@
 # Workload model: inbox bounded replica
 
+> Owner review 2026-10-19: the current resident-index, clock and ceiling model is rejected. The existing numbers/choices below are historical implementation evidence pending the requested corrections; they are not an accepted sizing or switch-readiness claim.
+
 Inherits deployment tiers, messages, convoys, changes and budgets from the root
 [workload](../../WORKLOAD.md). The sizing case is one large daemon: 10,000
 running convoys, about 500,000 messages (50/convoy), 2 KB mean bodies, 500 view

@@ -313,3 +313,50 @@ impl InboxLog for StoreLog {
 }
 
 pub type SqliteInbox = crate::EngineInbox<StoreLog>;
+
+/// Proposed Message-only adapter for transaction-assigned admission metadata.
+/// Not yet wired into InboxLog: that switch and removal of StoreLog's temporary
+/// downcast/retry path await the owner's engine-hook ruling.
+#[derive(Clone)]
+pub struct MessageLog {
+    inner: StoreLog,
+}
+
+impl MessageLog {
+    pub fn new(store: Arc<Mutex<Store>>) -> Self {
+        Self { inner: StoreLog::new(store) }
+    }
+}
+
+impl Log<Message> for MessageLog {
+    fn create(&mut self, _: &str, _: Timestamp, _: &Resource<Message>, _: &[InputRead]) -> Result<Version, LogError> {
+        Err(LogError::new("Message creation requires the owned-resource create hook"))
+    }
+
+    fn create_resource(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        resource: Resource<Message>,
+        reads: &[InputRead],
+    ) -> Result<Resource<Message>, LogError> {
+        let origin = Origin::new(writer, at).with_payload(&reads.to_vec()).map_err(refused)?;
+        let mut store = self.inner.store.lock().expect("store writer");
+        let mut write = store.write().map_err(refused)?;
+        let mut spec = resource.spec().clone();
+        spec.admitted_seq = write.last_sequence(&self.inner.home).map_err(refused)? + 1;
+        let resource = resource.with_spec(spec);
+        let stamp = write.insert(resource.name(), &resource, &origin).map_err(refused)?;
+        write.commit().map_err(refused)?;
+        Ok(Resource::stored(resource.name(), resource.spec().clone(), resource.stored_state().clone(), Version(stamp.version)))
+    }
+
+    fn edge(
+        &mut self,
+        previous: &StoredState<Message>,
+        next: &Resource<Message>,
+        event: &EdgeEventOf<Message>,
+    ) -> Result<Version, LogError> {
+        <StoreLog as Log<Message>>::edge(&mut self.inner, previous, next, event)
+    }
+}

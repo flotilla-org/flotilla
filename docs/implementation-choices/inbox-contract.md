@@ -1,5 +1,7 @@
 # Inbox bounded filtered replica
 
+> Owner review 2026-10-19: the current resident-index, clock and ceiling model is rejected. The existing numbers/choices below are historical implementation evidence pending the requested corrections; they are not an accepted sizing or switch-readiness claim.
+
 The [component workload](../../crates/flotilla-inbox/WORKLOAD.md) contains the
 size formula, ceiling arithmetic, measurements and every query's default route.
 The public seam remains `InboxBackend`; its operations and streamed results are

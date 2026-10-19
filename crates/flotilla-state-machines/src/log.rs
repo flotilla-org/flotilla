@@ -34,6 +34,25 @@ pub trait Log<M: Machine> {
     /// own version is not yet set.
     fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<M>, reads: &[InputRead]) -> Result<Version, LogError>;
 
+    /// Proposed storage-assigned creation metadata seam. The log may assign
+    /// persistence metadata in its create transaction and returns the exact
+    /// committed resource. It must preserve the admitted identity/state and
+    /// admission inputs; a failure must not publish a resource to Home.
+    ///
+    /// The default preserves existing machines' immutable-spec create behavior.
+    /// A specialized adapter must not change fields read by admission or gates.
+    /// Owner ruling pending for the Message admission-sequence use of this hook.
+    fn create_resource(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        mut resource: Resource<M>,
+        reads: &[InputRead],
+    ) -> Result<Resource<M>, LogError> {
+        resource.version = self.create(writer, at, &resource, reads)?;
+        Ok(resource)
+    }
+
     /// Persists `event`, which moved `next` out of `previous`, and returns the
     /// write's version. `next` holds its next state at the version the write
     /// must find stored, so a log over the store applies the edge under that

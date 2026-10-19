@@ -273,9 +273,9 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
         if state.label() != self.definition.initial() {
             return Err(WriteError::Fault(Fault::Initial { state: state.label() }));
         }
-        let mut resource = Resource::stored(name.clone(), spec, State::new(state, now), Version(0));
+        let resource = Resource::stored(name.clone(), spec, State::new(state, now), Version(0));
         let reads = admission.into_reads();
-        resource.version = self.log.create(&self.writer, now, &resource, &reads).map_err(WriteError::Log)?;
+        let resource = self.log.create_resource(&self.writer, now, resource, &reads).map_err(WriteError::Log)?;
         Ok(Created { resource: self.resources.entry(name).or_insert(resource), reads })
     }
 
