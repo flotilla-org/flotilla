@@ -113,12 +113,10 @@ reverse reconciler port and install step remain in place until #3492.
 
 ADR 0060's admission entry records that the ensure reconciler tears down through admission's `ConvoyTeardown` port, which the composition root implements over crew operations.
 
-Core composes admission with three owned ports:
+Core composes admission with two owned ports and discovery's `Environments`:
 
 - `ConvoyTeardown` supplies `abandon` and `reap` over the crew service.
-- `AdmissionEnvironments` supplies the local host identity, environment bag,
-  runner and environment-to-host lookup. It is distinct from projections'
-  `Environments`; the live `EnvironmentManager` stays in core's composition.
+- Admission reads environments through discovery's `Environments` port (local host identity, environment bag, runner, provider registry and environment-to-host lookup), which `EnvironmentManager` implements in `flotilla-discovery`. Only the executor creates and destroys environments, through `EnvironmentLifecycle`.
 - `ProjectOperations` is the repository port: repository inspection, project
   integration, adopted-checkout inspection, image checks, convoy-start worker
   submission and namespace-explicit forge-identity resolution. It owns the
