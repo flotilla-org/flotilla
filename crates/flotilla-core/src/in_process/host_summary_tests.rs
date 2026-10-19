@@ -72,8 +72,13 @@ mod tests {
             vec![]
         }
 
-        async fn status(&self) -> Result<flotilla_protocol::EnvironmentStatus, String> {
-            Ok(self.status.clone())
+        async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+            use flotilla_environment::environment::{ObservationState, ProviderObservation, StoppedCause, UnknownReason};
+            ProviderObservation::new(match &self.status {
+                flotilla_protocol::EnvironmentStatus::Running => ObservationState::Running,
+                flotilla_protocol::EnvironmentStatus::Stopped => ObservationState::Stopped { cause: StoppedCause::GuestHalted },
+                status => ObservationState::Unknown { reason: UnknownReason::ProviderApiError { message: format!("{status:?}") } },
+            })
         }
 
         async fn env_vars(&self) -> Result<HashMap<String, String>, String> {

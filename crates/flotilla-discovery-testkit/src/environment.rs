@@ -35,11 +35,11 @@ macro_rules! injected_environment_provider {
 #[macro_export]
 macro_rules! injected_environment_handle {
     () => {
+        fn capabilities(&self) -> $crate::environment::ProviderCapabilities {
+            $crate::environment::injected_capabilities()
+        }
         fn backing_id(&self) -> &str {
             self.container_name().unwrap_or_else(|| self.id().as_str())
-        }
-        fn workspace_root(&self) -> &std::path::Path {
-            std::path::Path::new("/workspace")
         }
     };
 }

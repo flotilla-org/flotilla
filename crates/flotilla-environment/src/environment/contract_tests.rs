@@ -40,25 +40,27 @@ impl CommandRunner for DockerEngine {
                 let id = args.iter().find_map(|arg| arg.strip_prefix("FLOTILLA_ENVIRONMENT_ID=")).unwrap();
                 assert!(!inventory.contains_key(name), "duplicate backing creation");
                 inventory.insert(name.into(), id.into());
-                Ok("created".into())
+                Ok(immutable_id(id))
             }
             ["inspect", "--format", "{{.Image}}", name] => {
                 assert!(inventory.contains_key(*name));
                 Ok(DIGEST.into())
             }
             ["inspect", name] => {
-                let id = inventory.get(*name).ok_or("missing container")?;
+                let id =
+                    inventory.get(*name).or_else(|| inventory.values().find(|id| immutable_id(id) == *name)).ok_or("missing container")?;
                 let mut record: serde_json::Value = serde_json::from_str(include_str!("fixtures/normal-stop.json")).unwrap();
                 record[0]["Id"] = immutable_id(id).into();
                 record[0]["State"]["Status"] = "running".into();
                 Ok(record.to_string())
             }
-            ["ps", ..] if args.contains(&"--no-trunc") => {
-                Ok(inventory.values().map(|id| format!("{}\t{id}\n", immutable_id(id))).collect())
+            ["ps", ..] if args.last().unwrap().contains("{{.Image}}") => {
+                Ok(inventory.iter().map(|(name, id)| format!("{} {name}\t{id}\t{DIGEST}\t[]\n", immutable_id(id))).collect())
             }
-            ["ps", ..] => Ok(inventory.iter().map(|(name, id)| format!("{name}\t{id}\t{DIGEST}\t[]\n")).collect()),
+            ["ps", ..] => Ok(inventory.values().map(|id| format!("{}\t{id}\n", immutable_id(id))).collect()),
             ["rm", "-f", backing] => {
-                inventory.retain(|name, id| name != backing && immutable_id(id) != *backing);
+                assert!(backing.len() == 64 && backing.bytes().all(|byte| byte.is_ascii_hexdigit()), "rm must use immutable ID");
+                inventory.retain(|_, id| immutable_id(id) != *backing);
                 Ok(String::new())
             }
             _ => panic!("unexpected Docker invocation: {args:?}"),
@@ -105,20 +107,23 @@ fn provider_lifecycle_contract(tc: hegel::TestCase) {
     runtime.block_on(async {
         for (provider, spec) in providers() {
             let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
-            let mut live = BTreeMap::new();
+            let mut live: BTreeMap<String, EnvironmentHandle> = BTreeMap::new();
             for (index, destroy) in &operations {
                 let id = EnvironmentId::new(format!("env-{index}"));
                 if *destroy {
-                    if live.remove(id.as_str()).is_some() {
+                    if let Some(handle) = live.remove(id.as_str()) {
                         let backing =
                             provider.list_backings().await.unwrap().into_iter().find(|backing| backing.environment_id == id).unwrap();
-                        provider.destroy(&backing.backing_id).await.unwrap();
+                        if *index == 0 {
+                            handle.destroy().await.unwrap();
+                        } else {
+                            provider.destroy(&backing.backing_id).await.unwrap();
+                        }
                     }
                 } else if !live.contains_key(id.as_str()) {
                     let handle = provider.provision(id.clone(), &prepared, Default::default()).await.unwrap();
                     assert_eq!(handle.id(), &id);
-                    assert_eq!(handle.workspace_root(), provider.capabilities().workspace_root);
-                    assert_eq!(handle.fallback_runner().is_some(), provider.capabilities().fallback_runner);
+                    assert_eq!(handle.capabilities(), provider.capabilities());
                     assert_eq!(handle.observe().await.state, ObservationState::Running);
                     live.insert(id.to_string(), handle);
                 }
@@ -128,15 +133,13 @@ fn provider_lifecycle_contract(tc: hegel::TestCase) {
                     let id = EnvironmentId::new(format!("env-{index}"));
                     let expected = live.contains_key(id.as_str());
                     assert_eq!(provider.inspect(&id).await.unwrap().is_some(), expected);
-                    let mut stream = Arc::clone(&provider).observe("configured-instance".into(), id);
-                    let event = stream.recv().await.unwrap();
-                    assert_eq!(event.descriptor.instance, "configured-instance");
-                    assert_eq!(event.descriptor.kind, provider.kind());
-                    let state = event.observation.state;
-                    assert_eq!(
-                        state,
-                        if expected { ObservationState::Running } else { ObservationState::Gone { cause: GoneCause::MissingOnList } }
-                    );
+                    if let Some(handle) = provider.inspect(&id).await.unwrap() {
+                        assert_eq!(handle.observe().await.state, ObservationState::Running);
+                        let backing =
+                            provider.list_backings().await.unwrap().into_iter().find(|backing| backing.environment_id == id).unwrap();
+                        assert_eq!(handle.backing_id(), backing.backing_id);
+                        assert_eq!(live[id.as_str()].backing_id(), backing.backing_id);
+                    }
                 }
             }
         }
@@ -152,17 +155,13 @@ async fn provider_instances_and_declarations() {
         let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
         assert!(other.provision(EnvironmentId::new("wrong-owner"), &prepared, Default::default()).await.is_err());
         let declaration = provider.capabilities();
-        assert_eq!(declaration.suspend_resume, provider.suspend_resume().is_some());
-        assert_eq!(declaration.export, provider.storage_export().is_some());
-        assert_eq!(declaration.local_image_cache, provider.local_image_cache().is_some());
-        assert_eq!(declaration.detection, provider.detection().is_some());
         assert!(!declaration.workspace_root.as_os_str().is_empty());
     }
     assert_eq!(providers()[1].0.kind(), ProviderKind::new(EnvironmentClass::Dummy, "dummy"));
 }
 
-// A provider error means Unknown, never Gone. Polling recovers on the same
-// stream when the injected process boundary becomes available again.
+// A provider error means Unknown, never Gone. The same handle recovers
+// when the injected process boundary becomes available again.
 #[tokio::test(start_paused = true)]
 async fn observation_recovers_after_provider_error() {
     let engine = Arc::new(DockerEngine::default());
@@ -170,14 +169,37 @@ async fn observation_recovers_after_provider_error() {
     let spec = legacy_environment_spec(&EnvironmentSpec { image: ImageSource::Registry(DIGEST.into()), token_env_vars: vec![] }).unwrap();
     let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
     let id = EnvironmentId::new("env-1");
-    provider.provision(id.clone(), &prepared, Default::default()).await.unwrap();
+    let handle = provider.provision(id.clone(), &prepared, Default::default()).await.unwrap();
     engine.unavailable.store(true, Ordering::Release);
-    let mut observations = provider.observe("endpoint".into(), id);
-    let unknown = observations.recv().await.unwrap();
-    assert!(matches!(unknown.observation.state, ObservationState::Unknown { reason: UnknownReason::ProviderApiError { .. } }));
+    let unknown = handle.observe().await;
+    assert!(matches!(unknown.state, ObservationState::Unknown { reason: UnknownReason::ProviderApiError { .. } }));
     engine.unavailable.store(false, Ordering::Release);
-    let recovered = observations.recv().await.unwrap();
-    assert_eq!(recovered.observation.state, ObservationState::Running);
-    assert_eq!(recovered.descriptor.instance, "endpoint");
-    assert_eq!(recovered.descriptor.image_digest.as_deref(), Some(DIGEST));
+    let recovered = handle.observe().await;
+    assert_eq!(recovered.state, ObservationState::Running);
+    assert_eq!(handle.local_image_id(), Some(DIGEST));
+}
+
+// Advertisements are additive data: missing fields decode to their declared
+// defaults. Generate every top-level and nested capability field omission.
+#[hegel::test]
+fn advertisement_fields_default_when_omitted(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let (provider, _) = providers().remove(tc.draw(gs::integers::<usize>().min_value(0).max_value(2)));
+    let advertisement =
+        ProviderAdvertisement { instance: "configured".into(), kind: provider.kind(), capabilities: provider.capabilities() };
+    let mut value = serde_json::to_value(&advertisement).unwrap();
+    let nested = tc.draw(gs::booleans());
+    let object = if nested { value["capabilities"].as_object_mut().unwrap() } else { value.as_object_mut().unwrap() };
+    let keys: Vec<_> = object.keys().cloned().collect();
+    let omitted = &keys[tc.draw(gs::integers::<usize>().min_value(0).max_value(keys.len() - 1))];
+    object.remove(omitted);
+    let decoded: ProviderAdvertisement = serde_json::from_value(value).unwrap();
+    let decoded = serde_json::to_value(decoded).unwrap();
+    let default = serde_json::to_value(ProviderAdvertisement::default()).unwrap();
+    let default_caps = serde_json::to_value(ProviderCapabilities::default()).unwrap();
+    if nested {
+        assert_eq!(decoded["capabilities"][omitted], default_caps[omitted]);
+    } else {
+        assert_eq!(decoded[omitted], default[omitted]);
+    }
 }

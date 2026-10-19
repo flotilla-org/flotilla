@@ -289,7 +289,7 @@ impl EnvironmentManager {
         let mut environments = Vec::new();
         for (env_id, state) in self.managed_environments() {
             if let ManagedEnvironmentKind::Provisioned(state) = state {
-                let status = state.handle.status().await.unwrap_or_else(EnvironmentStatus::Failed);
+                let status = environment_display_status(state.handle.observe().await.state);
                 environments.push(EnvironmentInfo::Provisioned {
                     id: env_id,
                     display_name: state.display_name.clone(),
@@ -315,7 +315,7 @@ impl EnvironmentManager {
                     });
                 }
                 ManagedEnvironmentKind::Provisioned(state) => {
-                    let status = state.handle.status().await.unwrap_or_else(EnvironmentStatus::Failed);
+                    let status = environment_display_status(state.handle.observe().await.state);
                     environments.push(EnvironmentInfo::Provisioned {
                         id: env_id,
                         display_name: state.display_name.clone(),
@@ -519,7 +519,7 @@ impl EnvironmentManager {
         let bag = run_provisioned_host_detectors(&self.host_detectors, &*env_runner, &raw_env_vars).await;
 
         let config = ConfigStore::with_base(config_base.as_path().join(format!("env-discovery/{env_id}")));
-        let env_repo_root = ExecutionEnvironmentPath::new(handle.workspace_root());
+        let env_repo_root = ExecutionEnvironmentPath::new(handle.capabilities().workspace_root);
         // Environment lifetimes own host capabilities. Checkout VCS and forge
         // capabilities are discovered by their resource-scoped consumers.
         let mut factories = FactoryRegistry::default_all();
@@ -580,6 +580,19 @@ enum MountDomain {
     Environment,
 }
 
+// The legacy query surface has fewer states; operational consumers use observe.
+fn environment_display_status(state: flotilla_environment::environment::ObservationState) -> EnvironmentStatus {
+    use flotilla_environment::environment::ObservationState;
+    match state {
+        ObservationState::Running => EnvironmentStatus::Running,
+        ObservationState::Stopped { .. } | ObservationState::Gone { .. } => EnvironmentStatus::Stopped,
+        ObservationState::Unknown { reason: flotilla_environment::environment::UnknownReason::GuestUnresponsive } => {
+            EnvironmentStatus::Starting
+        }
+        ObservationState::Unknown { reason } => EnvironmentStatus::Failed(format!("{reason:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -635,8 +648,8 @@ mod tests {
             Some("mock-container")
         }
 
-        async fn status(&self) -> Result<EnvironmentStatus, String> {
-            Ok(EnvironmentStatus::Running)
+        async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+            flotilla_environment::environment::ProviderObservation::new(flotilla_environment::environment::ObservationState::Running)
         }
 
         async fn env_vars(&self) -> Result<HashMap<String, String>, String> {

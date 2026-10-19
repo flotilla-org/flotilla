@@ -115,7 +115,15 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
         let env_id = EnvironmentId::new(environment.metadata.name.clone());
         let container_id = environment.status.as_ref().and_then(|status| status.docker_container_id.clone());
         let handles = inventories.get_mut(&instance).expect("provider inventory loaded");
-        let handle = container_id.as_ref().and_then(|container_id| handles.remove(&(env_id.clone(), container_id.clone())));
+        // Preceding-generation records stored a Docker transport name. Accept
+        // that alias during adoption; new provisioning stores the opaque ID.
+        let handle = container_id.as_ref().and_then(|container_id| {
+            let key = handles
+                .keys()
+                .find(|key| key.0 == env_id && (key.1 == *container_id || handles[*key].container_name() == Some(container_id.as_str())))
+                .cloned()?;
+            handles.remove(&key)
+        });
         reconciliations.push((environment, env_id, container_id, handle));
     }
     let results = futures::future::join_all(reconciliations.into_iter().map(|(environment, env_id, container_id, handle)| {
@@ -174,19 +182,8 @@ pub(super) async fn reconcile_provisioned_environment(
         )
         .await;
     };
-    let status = handle.status().await;
-    let observation = match handle.runtime_observation().await {
-        Ok(observation) => observation,
-        Err(error)
-            if matches!(status, Ok(flotilla_protocol::EnvironmentStatus::Stopped | flotilla_protocol::EnvironmentStatus::Failed(_))) =>
-        {
-            // Richer evidence is best effort once liveness establishes death.
-            // Keep existing samples and mark backing lost rather than retry forever.
-            warn!(container = %container_id, %error, "terminal backing observation unavailable");
-            None
-        }
-        Err(error) => return Err(format!("Docker container {container_id} observation failed: {error}; will retry")),
-    };
+    let observed = handle.observe().await;
+    let observation = observed.runtime;
     if let Some(observation) = &observation {
         record_environment_observation(state, namespace, &env_id, observation).await?;
     }
@@ -200,23 +197,21 @@ pub(super) async fn reconcile_provisioned_environment(
         )
         .await;
     }
-    match status {
-        Ok(flotilla_protocol::EnvironmentStatus::Running) => {}
-        Ok(status @ (flotilla_protocol::EnvironmentStatus::Stopped | flotilla_protocol::EnvironmentStatus::Failed(_))) => {
+    match observed.state {
+        flotilla_environment::environment::ObservationState::Running => {}
+        observed_state @ (flotilla_environment::environment::ObservationState::Stopped { .. }
+        | flotilla_environment::environment::ObservationState::Gone { .. }) => {
             return mark_unavailable_environment(
                 state,
                 namespace,
                 &env_id,
                 BackingDisposition::Lost,
-                &format!("Docker container {container_id} is not running (status: {status:?})"),
+                &format!("Docker container {container_id} is not running (observation: {observed_state:?})"),
             )
             .await;
         }
-        Ok(status) => {
-            return Err(format!("Docker container {container_id} for environment {env_id} is not ready (status: {status:?}); will retry"))
-        }
-        Err(error) => {
-            return Err(format!("Docker container {container_id} liveness check failed for environment {env_id}: {error}; will retry"))
+        flotilla_environment::environment::ObservationState::Unknown { reason } => {
+            return Err(format!("Docker container {container_id} liveness check failed for environment {env_id}: {reason:?}; will retry"));
         }
     }
 

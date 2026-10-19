@@ -1576,7 +1576,7 @@ async fn checkout_service_validate_target_propagates_checkout_manager_error() {
 // Tests: Environment lifecycle actions
 // -----------------------------------------------------------------------
 
-use flotilla_protocol::{EnvironmentId, EnvironmentSpec, EnvironmentStatus, ImageId};
+use flotilla_protocol::{EnvironmentId, EnvironmentSpec, ImageId};
 
 use flotilla_environment::environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment};
 
@@ -1626,8 +1626,8 @@ impl ProvisionedEnvironment for MockProvisionedEnvironment {
     fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
         vec![]
     }
-    async fn status(&self) -> Result<EnvironmentStatus, String> {
-        Ok(EnvironmentStatus::Running)
+    async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+        flotilla_environment::environment::ProviderObservation::new(flotilla_environment::environment::ObservationState::Running)
     }
     async fn env_vars(&self) -> Result<std::collections::HashMap<String, String>, String> {
         let mut vars = std::collections::HashMap::new();

@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = provider.provision(env_id, &prepared, opts.into()).await?;
     let container = handle.container_name().unwrap_or("unknown");
     println!("Container: {container}");
-    println!("Status:    {:?}", handle.status().await?);
+    println!("Status:    {:?}", handle.observe().await.state);
 
     // Install git inside the container (debian:bookworm-slim doesn't have it)
     println!("\n--- Installing git in container ---");

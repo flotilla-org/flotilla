@@ -380,25 +380,23 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                 ));
             };
             let key = (EnvironmentId::new(environment.metadata.name.clone()), container_id.clone());
-            let Some(handle) = handles.get(&key) else {
+            // Old Docker status values were transport names, before opaque IDs.
+            let Some(handle) = handles.get(&key).or_else(|| {
+                handles.values().find(|handle| handle.id() == &key.0 && handle.container_name() == Some(container_id.as_str()))
+            }) else {
                 continue;
             };
-            match handle.status().await {
-                Ok(flotilla_protocol::EnvironmentStatus::Running) => {
+            match handle.observe().await.state {
+                flotilla_environment::environment::ObservationState::Running => {
                     return Err(format!("backing is live: Docker container {container_id} for Environment/{}", environment.metadata.name))
                 }
-                Ok(flotilla_protocol::EnvironmentStatus::Stopped | flotilla_protocol::EnvironmentStatus::Failed(_)) => {}
-                Ok(status) => {
+                flotilla_environment::environment::ObservationState::Stopped { .. }
+                | flotilla_environment::environment::ObservationState::Gone { .. } => {}
+                flotilla_environment::environment::ObservationState::Unknown { reason } => {
                     return Err(format!(
-                        "backing is not verified dead: Docker container {container_id} for Environment/{} is {status:?}",
+                        "backing is not verifiable: Docker container {container_id} for Environment/{}: {reason:?}",
                         environment.metadata.name
-                    ))
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "backing is not verifiable: Docker container {container_id} for Environment/{}: {error}",
-                        environment.metadata.name
-                    ))
+                    ));
                 }
             }
         }

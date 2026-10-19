@@ -248,7 +248,6 @@ impl ProviderSet<dyn EnvironmentProvider> {
             .map(|(instance, (_, provider))| flotilla_environment::environment::ProviderAdvertisement {
                 instance: instance.clone(),
                 kind: provider.kind(),
-                readiness: provider.readiness(),
                 capabilities: provider.capabilities(),
             })
             .collect()
@@ -411,7 +410,7 @@ mod environment_tests {
 #[cfg(test)]
 mod advertisement_tests {
     use super::*;
-    use flotilla_environment::environment::{dummy::DummyEnvironmentProvider, EnvironmentClass, ProviderReadiness};
+    use flotilla_environment::environment::{dummy::DummyEnvironmentProvider, EnvironmentClass};
 
     // Glue: advertisements copy each configured key, including aliases of the
     // same object, and retain the provider's independent class and declaration.
@@ -426,7 +425,6 @@ mod advertisement_tests {
         assert_eq!(advertisements.iter().map(|entry| entry.instance.as_str()).collect::<Vec<_>>(), ["first", "second"]);
         for entry in advertisements {
             assert_eq!(entry.kind.class, EnvironmentClass::Dummy);
-            assert_eq!(entry.readiness, ProviderReadiness::Ready);
             assert_eq!(entry.capabilities, provider.capabilities());
         }
     }

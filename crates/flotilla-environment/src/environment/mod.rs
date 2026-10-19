@@ -24,7 +24,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentStatus, ExecutionEnvironmentPath, ImageId};
+use flotilla_protocol::{DaemonHostPath, EnvironmentId, ExecutionEnvironmentPath, ImageId};
 use serde::{Deserialize, Serialize};
 
 use flotilla_provider_runtime::CommandRunner;
@@ -304,65 +304,12 @@ pub trait EnvironmentProvider: Send + Sync {
     /// Descriptive identity only; callers must use capability data for behaviour.
     fn kind(&self) -> ProviderKind;
     fn capabilities(&self) -> ProviderCapabilities;
-    fn versions(&self) -> std::collections::BTreeMap<String, String> {
-        Default::default()
-    }
-    /// A polling stream is the fallback for providers without pushed events.
-    /// Dropping the receiver cancels polling, including while a probe is pending.
-    fn observe(self: Arc<Self>, instance: String, id: EnvironmentId) -> tokio::sync::mpsc::Receiver<EnvironmentObservation>
-    where
-        Self: 'static,
-    {
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(async move {
-            loop {
-                let event = tokio::select! {
-                    () = sender.closed() => break,
-                    result = async {
-                        let (backing_id, image_digest, observation) = match self.inspect(&id).await {
-                            Ok(Some(handle)) => (
-                                Some(handle.backing_id().to_string()),
-                                handle.local_image_id().or_else(|| handle.registry_digest()).or_else(|| {
-                                    flotilla_resources::is_image_digest(handle.image().as_str()).then(|| handle.image().as_str())
-                                }).map(str::to_owned),
-                                handle.observe().await,
-                            ),
-                            Ok(None) => (None, None, ProviderObservation::new(ObservationState::Gone { cause: GoneCause::MissingOnList })),
-                            Err(message) => (None, None, ProviderObservation::new(ObservationState::Unknown { reason: UnknownReason::ProviderApiError { message } })),
-                        };
-                        EnvironmentObservation {
-                            descriptor: EnvironmentDescriptor { kind: self.kind(), instance: instance.clone(), image_digest, provider_versions: self.versions() },
-                            backing_id,
-                            observation,
-                        }
-                    } => result
-                };
-                if sender.send(event).await.is_err() {
-                    break;
-                }
-                tokio::select! {
-                    () = sender.closed() => break,
-                    () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
-                }
-            }
-        });
-        receiver
-    }
     /// Compatibility with unlabelled preceding-generation stored inputs only.
     /// New providers need no legacy input discriminator.
     fn legacy_input(&self) -> Option<EnvironmentInput> {
         None
     }
-    fn suspend_resume(&self) -> Option<&dyn SuspendResume> {
-        None
-    }
-    fn storage_export(&self) -> Option<&dyn StorageExport> {
-        None
-    }
-    /// Discovery may override this with evidence from its injected detector.
-    fn readiness(&self) -> ProviderReadiness {
-        ProviderReadiness::Ready
-    }
+
     /// Optional image capability owned by this exact provider instance.
     fn local_image_cache(&self) -> Option<&dyn LocalImageCache> {
         None
@@ -410,20 +357,8 @@ pub trait EnvironmentProvider: Send + Sync {
 pub trait ProvisionedEnvironment: Send + Sync {
     /// Opaque identity interpreted only by this provider, independent of transport.
     fn backing_id(&self) -> &str;
-    async fn observe(&self) -> ProviderObservation {
-        match self.status().await {
-            Ok(EnvironmentStatus::Running) => ProviderObservation::new(ObservationState::Running),
-            Ok(EnvironmentStatus::Stopped) => ProviderObservation::new(ObservationState::Stopped { cause: StoppedCause::GuestHalted }),
-            Ok(other) => ProviderObservation::new(ObservationState::Unknown {
-                reason: UnknownReason::ProviderApiError { message: format!("{other:?}") },
-            }),
-            Err(message) => ProviderObservation::new(ObservationState::Unknown { reason: UnknownReason::ProviderApiError { message } }),
-        }
-    }
-    fn fallback_runner(&self) -> Option<Arc<dyn CommandRunner>> {
-        Some(self.runner())
-    }
-    fn workspace_root(&self) -> &Path;
+    async fn observe(&self) -> ProviderObservation;
+    fn capabilities(&self) -> ProviderCapabilities;
     fn id(&self) -> &EnvironmentId;
     fn image(&self) -> &ImageId;
     /// Immutable content digest of the image actually backing this environment.
@@ -444,11 +379,7 @@ pub trait ProvisionedEnvironment: Send + Sync {
     fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
         Vec::new()
     }
-    async fn status(&self) -> Result<EnvironmentStatus, String>;
-    /// Provider observations are optional for non-Docker adapters.
-    async fn runtime_observation(&self) -> Result<Option<flotilla_protocol::EnvironmentRuntimeObservation>, String> {
-        Ok(None)
-    }
+
     /// The vessel's configured environment, used as the terminal baseline.
     /// This must not include the provisioning host's ambient environment.
     async fn env_vars(&self) -> Result<HashMap<String, String>, String>;

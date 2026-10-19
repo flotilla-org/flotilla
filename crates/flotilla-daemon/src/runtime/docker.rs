@@ -881,7 +881,7 @@ pub(super) async fn probe_provisioned_environment(
     let env_vars = handle.env_vars().await?;
     let discovery = state.daemon.discovery_runtime();
     let bag = run_provisioned_host_detectors(&discovery.host_detectors, &*handle.runner(), &env_vars).await;
-    let probe_root = ExecutionEnvironmentPath::new(handle.workspace_root());
+    let probe_root = ExecutionEnvironmentPath::new(handle.capabilities().workspace_root);
     let config = ConfigStore::with_base(state.config.base_path().as_path().join(format!("env-discovery/{env_id}")));
     let registry = discovery.factories.probe_all(&bag, &config, &probe_root, handle.runner()).await;
     Ok((bag, Arc::new(registry)))

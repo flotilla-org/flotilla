@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, EnvironmentStatus, HostName, ImageSource};
+use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, HostName, ImageSource};
 
 use super::{
     contained_daemon_socket_path, docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner, CreateOpts, EnvironmentProvider,
@@ -442,7 +442,7 @@ async fn create_removes_container_when_local_image_id_cannot_be_resolved() {
     assert!(error.contains("additionally failed to remove container flotilla-env-invalid-digest: docker rm failed"), "{error}");
     let calls = runner.calls();
     assert_eq!(calls[2].0, "docker");
-    assert_eq!(calls[2].1, ["rm", "-f", "flotilla-env-invalid-digest"]);
+    assert_eq!(calls[2].1, ["rm", "-f", "container-id-123"]);
 }
 
 // Docker crews retain pull and memory policies while sharing CPU without a quota.
@@ -1099,7 +1099,7 @@ async fn status_returns_running() {
     let runner = Arc::new(QueuedRunner::new([
         Ok("container-id".into()), // docker run
         Ok("sha256:test-image".into()),
-        Ok("running".into()), // docker inspect status
+        Ok(include_str!("fixtures/normal-stop.json").replace("exited", "running")), // full inspect
     ]));
     let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
@@ -1116,15 +1116,15 @@ async fn status_returns_running() {
 
     let id = EnvironmentId::new("test-env-status");
     let handle = provider.create(id, &image, opts).await.expect("create");
-    let status = handle.status().await.expect("status");
+    let status = handle.observe().await.state;
 
-    assert_eq!(status, EnvironmentStatus::Running);
+    assert_eq!(status, super::ObservationState::Running);
     let calls = runner.calls();
     // Third call should inspect container status after image digest resolution.
     let (cmd, args, _) = &calls[2];
     assert_eq!(cmd, "docker");
     assert_eq!(args[0], "inspect");
-    assert!(args.contains(&"--format".to_string()));
+    assert_eq!(args, &["inspect", "container-id"]);
 }
 
 // #2790: read the container configuration, without login-shell mutations or
@@ -1214,7 +1214,7 @@ async fn destroy_calls_docker_rm() {
 
     let id = EnvironmentId::new("test-env-destroy");
     let handle = provider.create(id, &image, opts).await.expect("create");
-    let container_name = format!("flotilla-env-{}", handle.id());
+    let backing_id = handle.backing_id().to_string();
     handle.destroy().await.expect("destroy");
 
     let calls = runner.calls();
@@ -1222,7 +1222,8 @@ async fn destroy_calls_docker_rm() {
     assert_eq!(cmd, "docker");
     assert_eq!(args[0], "rm");
     assert!(args.contains(&"-f".to_string()), "should pass -f flag");
-    assert!(args.contains(&container_name), "should pass container name");
+    assert_eq!(backing_id, "container-id");
+    assert!(args.contains(&backing_id), "destroy must use the immutable backing ID");
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,7 +1522,7 @@ async fn recorded_container_deaths_are_classified_through_the_provider() {
         let runner = Arc::new(InspectionRunner { inspect: inspect.into(), usage: None, oomd, calls: Mutex::new(Vec::new()) });
         let provider = DockerEnvironmentProvider::new(runner.clone());
         let handles = provider.list().await.expect("list");
-        let observation = handles[0].runtime_observation().await.expect("inspect").expect("Docker observation");
+        let observation = handles[0].observe().await.runtime.expect("Docker observation");
         let termination = observation.termination.expect("terminated");
         assert_eq!(
             (termination.cause, termination.exit_code, termination.signal, termination.oom_killed),
@@ -1569,7 +1570,7 @@ fn oomd_requires_a_matching_kill_record(tc: hegel::TestCase) {
             calls: Mutex::new(Vec::new()),
         }));
         let handles = provider.list().await.expect("list");
-        let termination = handles[0].runtime_observation().await.expect("inspect").expect("observation").termination.expect("termination");
+        let termination = handles[0].observe().await.runtime.expect("Docker observation").termination.expect("termination");
         assert_eq!(termination.cause, if choice == 3 { EnvironmentExitCause::HostOomd } else { EnvironmentExitCause::Signal });
     });
 }
@@ -1638,7 +1639,7 @@ fn running_memory_samples_do_not_invent_usage(tc: hegel::TestCase) {
             calls: Mutex::new(Vec::new()),
         }));
         let handles = provider.list().await.expect("list");
-        let observation = handles[0].runtime_observation().await.expect("inspect").expect("observation");
+        let observation = handles[0].observe().await.runtime.expect("Docker observation");
         assert_eq!(observation.memory_usage_bytes, expected);
         assert_eq!(observation.memory_observed_at.is_some(), expected.is_some());
         assert!(observation.termination.is_none());
@@ -1803,7 +1804,7 @@ async fn inspection_reports_weight_and_legacy_quotas() {
         let runner = Arc::new(InspectionRunner { inspect: inspect.to_string(), usage: None, oomd: None, calls: Mutex::new(Vec::new()) });
         let provider = DockerEnvironmentProvider::new(runner);
         let handles = provider.list().await.expect("list");
-        let observed = handles[0].runtime_observation().await.expect("inspect").expect("observation");
+        let observed = handles[0].observe().await.runtime.expect("Docker observation");
         let limits = observed.configured_limits.expect("inspected CPU settings");
         assert_eq!((limits.cpus, limits.cpu_shares), (cpus, shares));
     }

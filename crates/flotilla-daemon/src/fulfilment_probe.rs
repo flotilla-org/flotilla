@@ -330,14 +330,7 @@ mod tests {
     struct WithoutDetection(Arc<dyn EnvironmentProvider>);
     #[async_trait::async_trait]
     impl EnvironmentProvider for WithoutDetection {
-        fn kind(&self) -> flotilla_environment::environment::ProviderKind {
-            self.0.kind()
-        }
-        fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
-            let mut declaration = self.0.capabilities();
-            declaration.detection = false;
-            declaration
-        }
+        flotilla_discovery_testkit::injected_environment_provider!();
         async fn prepare(
             &self,
             spec: &flotilla_resources::EnvironmentSpec,

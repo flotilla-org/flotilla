@@ -197,7 +197,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use async_trait::async_trait;
-    use flotilla_protocol::{qualified_path::HostId, EnvironmentId, EnvironmentStatus, HostName, ImageId};
+    use flotilla_protocol::{qualified_path::HostId, EnvironmentId, HostName, ImageId};
     use flotilla_resources::{ConditionValue, InputMeta, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus};
     use flotilla_store::ResourceBackend;
 
@@ -234,8 +234,8 @@ mod tests {
         fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
             vec![]
         }
-        async fn status(&self) -> Result<EnvironmentStatus, String> {
-            Ok(EnvironmentStatus::Running)
+        async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+            flotilla_environment::environment::ProviderObservation::new(flotilla_environment::environment::ObservationState::Running)
         }
         async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
             Ok(HashMap::new())

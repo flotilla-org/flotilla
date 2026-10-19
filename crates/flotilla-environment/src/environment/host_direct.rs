@@ -8,7 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
+use flotilla_protocol::{EnvironmentId, ImageId};
 
 use super::{EnvironmentHandle, EnvironmentInput, EnvironmentProvider, PreparedEnvironment, ProvisionedEnvironment, ProvisionedMount};
 use crate::environment::{PrepareOpts, ProvisionOpts};
@@ -36,23 +36,7 @@ impl EnvironmentProvider for HostDirectEnvironmentProvider {
         super::ProviderKind::new(super::EnvironmentClass::HostDirect, "host-direct")
     }
     fn capabilities(&self) -> super::ProviderCapabilities {
-        super::ProviderCapabilities {
-            material_modes: vec![super::MaterialMode::Frozen, super::MaterialMode::Pushed, super::MaterialMode::Shared],
-            checkout_strategies: vec![
-                super::CheckoutStrategy::HostWorktree,
-                super::CheckoutStrategy::HostClone,
-                super::CheckoutStrategy::CloneInVessel,
-            ],
-            workspace_root: "/".into(),
-            fallback_runner: true,
-            local_image_cache: false,
-            image_builder: false,
-            detection: true,
-            receives_host_tools: false,
-            per_vessel: false,
-            egress_route: super::EgressRoute::Open,
-            ..Default::default()
-        }
+        Self::capability_declaration()
     }
 
     fn legacy_input(&self) -> Option<EnvironmentInput> {
@@ -128,13 +112,13 @@ struct HostHandle {
 
 #[async_trait]
 impl ProvisionedEnvironment for HostHandle {
+    fn capabilities(&self) -> super::ProviderCapabilities {
+        HostDirectEnvironmentProvider::capability_declaration()
+    }
     fn backing_id(&self) -> &str {
         &self.backing_id
     }
 
-    fn workspace_root(&self) -> &std::path::Path {
-        std::path::Path::new("/")
-    }
     fn id(&self) -> &EnvironmentId {
         &self.id
     }
@@ -154,9 +138,7 @@ impl ProvisionedEnvironment for HostHandle {
             super::ObservationState::Running
         })
     }
-    async fn status(&self) -> Result<EnvironmentStatus, String> {
-        Ok(if self.detached.load(Ordering::Acquire) { EnvironmentStatus::Stopped } else { EnvironmentStatus::Running })
-    }
+
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
         Ok(self.environment.clone())
     }
@@ -182,5 +164,24 @@ impl super::EnvironmentDetection for HostDirectEnvironmentProvider {
             return Err("host-direct detection does not accept an image".into());
         }
         self.runner.run_output(binary, args, scratch, &flotilla_provider_runtime::ChannelLabel::Default).await
+    }
+}
+
+impl HostDirectEnvironmentProvider {
+    fn capability_declaration() -> super::ProviderCapabilities {
+        super::ProviderCapabilities {
+            material_modes: vec![super::MaterialMode::Frozen, super::MaterialMode::Pushed, super::MaterialMode::Shared],
+            checkout_strategies: vec![
+                super::CheckoutStrategy::HostWorktree,
+                super::CheckoutStrategy::HostClone,
+                super::CheckoutStrategy::CloneInVessel,
+            ],
+            workspace_root: "/".into(),
+            fallback_runner: true,
+            receives_host_tools: false,
+            per_vessel: false,
+            egress_route: super::EgressRoute::Open,
+            ..Default::default()
+        }
     }
 }

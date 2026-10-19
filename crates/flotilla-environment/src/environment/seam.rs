@@ -62,6 +62,7 @@ pub enum EgressEnforcement {
 /// Data consumed without branching on a runtime name or class. Unsupported
 /// operations default closed. Optional operation traits remain instance-owned.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProviderCapabilities {
     pub material_modes: Vec<MaterialMode>,
     pub checkout_strategies: Vec<CheckoutStrategy>,
@@ -72,27 +73,15 @@ pub struct ProviderCapabilities {
     pub egress_route: EgressRoute,
     pub egress_enforcement: EgressEnforcement,
     pub fallback_runner: bool,
-    pub local_image_cache: bool,
-    pub image_builder: bool,
-    pub detection: bool,
     pub receives_host_tools: bool,
     pub per_vessel: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum ProviderReadiness {
-    Ready,
-    MissingTool { tool: String },
-    MissingCredential { credential: String },
-    Unknown { reason: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProviderAdvertisement {
     pub instance: String,
     pub kind: ProviderKind,
-    pub readiness: ProviderReadiness,
     pub capabilities: ProviderCapabilities,
 }
 
@@ -109,8 +98,6 @@ pub enum GoneCause {
     LifetimeCapReached,
     EvictedByProvider,
     HostOutOfMemory,
-    CgroupOutOfMemory,
-    BackingExited { code: i32 },
     VmmExited { code: i32 },
     GuestPoweredOff,
     MissingOnList,
@@ -145,17 +132,6 @@ impl ProviderObservation {
     }
 }
 
-/// Tokens are opaque and accepted only by the originating instance.
-#[async_trait]
-pub trait SuspendResume: Send + Sync {
-    async fn suspend(&self, backing_id: &str) -> Result<String, String>;
-    async fn resume(&self, token: &str) -> Result<(), String>;
-}
-#[async_trait]
-pub trait StorageExport: Send + Sync {
-    async fn export(&self, backing_id: &str) -> Result<String, String>;
-}
-
 /// Read-only tool detection, separate from required lifecycle operations.
 #[async_trait]
 pub trait EnvironmentDetection: Send + Sync {
@@ -168,18 +144,9 @@ pub trait EnvironmentDetection: Send + Sync {
     ) -> Result<flotilla_provider_runtime::CommandOutput, String>;
 }
 
-/// The stream binds observations to the configured instance and actual image.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnvironmentDescriptor {
-    pub kind: ProviderKind,
-    pub instance: String,
-    pub image_digest: Option<String>,
-    pub provider_versions: std::collections::BTreeMap<String, String>,
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Runtime-only stream event. Publication/serialization belongs to its consumer.
-pub struct EnvironmentObservation {
-    pub descriptor: EnvironmentDescriptor,
-    pub backing_id: Option<String>,
-    pub observation: ProviderObservation,
+impl Default for ProviderKind {
+    fn default() -> Self {
+        // Empty advertisement identity is descriptive only and selects no instance.
+        Self::new(EnvironmentClass::Dummy, "")
+    }
 }

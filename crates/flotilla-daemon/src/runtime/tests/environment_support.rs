@@ -182,8 +182,8 @@ impl ProvisionedEnvironment for TestInteriorEnvironment {
         Vec::new()
     }
 
-    async fn status(&self) -> Result<flotilla_protocol::EnvironmentStatus, String> {
-        Ok(flotilla_protocol::EnvironmentStatus::Running)
+    async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+        flotilla_environment::environment::ProviderObservation::new(flotilla_environment::environment::ObservationState::Running)
     }
 
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
@@ -226,8 +226,10 @@ impl ProvisionedEnvironment for TestUncertainEnvironment {
         Vec::new()
     }
 
-    async fn status(&self) -> Result<flotilla_protocol::EnvironmentStatus, String> {
-        Err(self.status_error.clone())
+    async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+        flotilla_environment::environment::ProviderObservation::new(flotilla_environment::environment::ObservationState::Unknown {
+            reason: flotilla_environment::environment::UnknownReason::ProviderApiError { message: self.status_error.clone() },
+        })
     }
 
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
