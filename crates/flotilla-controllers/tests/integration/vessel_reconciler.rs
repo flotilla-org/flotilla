@@ -13,8 +13,8 @@ use common::{
     labeled_meta, meta, vessel_meta, work_state, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
 };
 use flotilla_controllers::reconcilers::{vessel::WorktreeMetadataResolver, VesselReconciler};
-use flotilla_core::in_process::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
+use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, interactive_single_workflow_spec, Artifact, ArtifactSpec, BoundChangeRequest, Checkout,
     CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec,

@@ -2489,6 +2489,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "flotilla-agent",
  "flotilla-charter",
  "flotilla-config",
  "flotilla-core",
@@ -2549,6 +2550,7 @@ dependencies = [
  "flotilla-github-providers",
  "flotilla-issue-tracker",
  "flotilla-manifest",
+ "flotilla-observation",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
  "flotilla-provider-runtime",

@@ -1,6 +1,8 @@
 //! Crew outcomes, lifecycle teardown, and serialized crew message delivery.
 use flotilla_resources::{credential_refresh_alert_for_vessel, LANDING_EVIDENCE_TTL};
 
+use flotilla_agent::brief_artifact::BriefArtifactWriter;
+use flotilla_resources::convoy_address::convoy_address;
 use flotilla_resources::ResumeIntent;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -42,9 +44,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 use tracing::warn;
 
-use super::{
-    checkout_path, checkout_providers::CheckoutProviders, convoy_admission::convoy_address, BriefArtifactWriter, WorkCredentialReconciler,
-};
+use super::{checkout_path, checkout_providers::CheckoutProviders, WorkCredentialReconciler};
 use flotilla_agent::adapter::{CrewAssignment, CrewBriefTemplateResolver};
 
 use crate::{

@@ -1,5 +1,5 @@
 //! Synchronous command publication shared by capability handlers.
-use flotilla_daemon_api::event_sink::EventSink;
+use crate::event_sink::EventSink;
 use flotilla_protocol::{CommandValue, DaemonEvent, NodeId, RepoIdentity};
 use std::sync::Arc;
 

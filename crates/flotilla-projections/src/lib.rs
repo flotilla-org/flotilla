@@ -24,7 +24,6 @@ pub use aggregator::{AttachCapabilityResolver, ConvoyChangeRequestResolver};
 pub use issue_materializer::{IssueMaterializationResolver, IssuePollingHealth};
 pub mod aggregator_projection;
 pub mod awareness_projection;
-pub mod convoy_branch_refresh;
 pub mod dispatch_board;
 mod dispatch_ready;
 pub mod fleet;

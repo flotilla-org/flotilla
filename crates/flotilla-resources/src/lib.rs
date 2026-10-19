@@ -314,8 +314,12 @@ pub use leaf_diagnostics::*;
 mod read_evidence;
 pub use read_evidence::*;
 
-mod convoy_address;
-pub use convoy_address::*;
+pub mod convoy_address;
+pub use convoy_address::{convoy_disambiguation_address, parse_role_address, resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 
 mod host_projection;
 pub use host_projection::canonical_placement_host_ref_from_sources;
+
+pub const BRIEF_ARTIFACTS_ANNOTATION: &str = "flotilla.work/brief-artifacts";
+
+pub mod image_architecture;

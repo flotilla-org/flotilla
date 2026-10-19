@@ -1,6 +1,6 @@
 //! Repository capabilities are independent of observation roots and working copies.
 use super::*;
-use crate::in_process::convoy_admission::repository_provider_bag;
+use crate::in_process::repository_discovery::repository_provider_bag;
 use flotilla_discovery::registry::ProviderSet;
 use flotilla_discovery_api::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
 

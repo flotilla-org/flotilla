@@ -1,6 +1,6 @@
-use super::super::action_events::ActionEvents;
 use super::super::convoy_admission::HandlerContractFixture;
 use super::*;
+use flotilla_daemon_api::action_events::ActionEvents;
 use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_protocol::{ConvoyStartIntent, NodeId};
 use flotilla_protocol_testkit::event_sink::RecordingEventSink;

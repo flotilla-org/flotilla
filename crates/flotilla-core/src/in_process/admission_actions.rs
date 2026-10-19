@@ -30,7 +30,6 @@ use super::{
     placement_target_host, AdoptedCheckoutRequest,
 };
 use crate::in_process::convoy_admission::allocate_convoy_generation;
-use crate::in_process::convoy_admission::convoy_record_name;
 use crate::in_process::convoy_admission::normalize_convoy_start_intent;
 use crate::in_process::convoy_admission::resolve_and_validate_workflow_credentials;
 use crate::in_process::convoy_admission::validate_convoy_name;
@@ -41,6 +40,7 @@ use crate::in_process::convoy_admission::ConvoyStartTask;
 use crate::in_process::project_ops::is_declaration_backed_project;
 use crate::in_process::project_ops::validate_project_name;
 use crate::repository_inspection::RepositoryInspection;
+use flotilla_resources::convoy_address::convoy_record_name;
 
 /// Repository/project integration and worker submission supplied by the host.
 /// Admission state, placement and disk refusals remain owned by ConvoyAdmission;
@@ -78,12 +78,12 @@ pub(super) struct AdmissionActions<'a> {
     pub(super) observed_resource_backend: &'a ResourceBackend,
     pub(super) observed_checkout_reconciliation: &'a Arc<Mutex<()>>,
     pub(super) convoy_admission: &'a ConvoyAdmission,
-    pub(super) events: super::action_events::ActionEvents<'a>,
+    pub(super) events: flotilla_daemon_api::action_events::ActionEvents<'a>,
 }
 
 impl AdmissionActions<'_> {
     async fn provisioning_namespace(&self) -> String {
-        super::action_namespace::provisioning_namespace(self.namespace)
+        flotilla_daemon_api::action_namespace::provisioning_namespace(self.namespace)
     }
     pub(super) async fn execute_action_ensure_roll(&self, id: u64, command: &Command) -> Result<u64, String> {
         let CommandAction::ConvoyEnsureRoll { namespace, name } = &command.action else {

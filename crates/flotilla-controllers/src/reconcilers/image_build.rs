@@ -134,14 +134,15 @@ impl ImageBuildReconciler {
             Err(ResourceError::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error),
         };
-        if flotilla_core::image_build::host_architecture(&host).is_some_and(|actual| actual != architecture) {
+        if flotilla_resources::image_architecture::host_architecture(&host).is_some_and(|actual| actual != architecture) {
             return Ok(None);
         }
         Ok(match host.spec.image_build_capacity {
             None => Some(1),
             Some(ImageBuildCapacity::None) => None,
             Some(ImageBuildCapacity::Builder { architecture: builds, slots, .. }) => {
-                (flotilla_core::image_build::canonical_image_architecture(&builds) == architecture && slots > 0).then_some(slots)
+                (flotilla_resources::image_architecture::canonical_image_architecture(&builds) == architecture && slots > 0)
+                    .then_some(slots)
             }
         })
     }

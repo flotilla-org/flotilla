@@ -28,3 +28,5 @@ pub use store::{
 
 #[cfg(test)]
 mod testing;
+
+pub mod brief_artifact;

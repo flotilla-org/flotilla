@@ -6,8 +6,8 @@ use std::{
 };
 
 use flotilla_core::in_process::InProcessDaemon;
+use flotilla_daemon_api::action_support::empty_repo_identity;
 use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_executor::action_support::empty_repo_identity;
 use flotilla_protocol::{
     CallerCrew, CommandAction, CommandCaller, CrewCommandContext, DaemonEvent, EnvironmentId, Message, PrincipalRef, Request, Response,
     ResponseResult,

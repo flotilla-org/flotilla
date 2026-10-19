@@ -245,7 +245,7 @@ struct ConcurrentSessionCreation {
 }
 
 #[async_trait::async_trait]
-impl crate::in_process::BriefArtifactWriter for ConcurrentSessionCreation {
+impl flotilla_agent::brief_artifact::BriefArtifactWriter for ConcurrentSessionCreation {
     async fn put_brief(&self, _: &str, _: &str, _: &str, _: &str, _: &[u8], _: Option<&str>) -> Result<String, String> {
         self.sessions.create(&self.meta, &self.spec).await.map_err(|error| error.to_string())?;
         Ok("sha256:brief".to_string())

@@ -2,6 +2,7 @@
 //! ordered layer list and get-or-creates the one ImageBuild for that identity
 //! and the placement architecture. Executing builds belongs to the build
 //! service; this module never runs one.
+use flotilla_resources::image_architecture::{canonical_image_architecture, host_architecture};
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_resources::{
@@ -10,14 +11,6 @@ use flotilla_resources::{
     ResolvedImage, ResourceError, ResourceObject, ResourceProvenance, VesselRequirement, FLEET_DESIGNATION_NAME,
 };
 use flotilla_store::{ResourceBackend, StoreQuery};
-
-pub fn canonical_image_architecture(architecture: &str) -> &str {
-    match architecture {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => other,
-    }
-}
 
 /// Builds on hosts that predate `image_build_capacity` reserve this much.
 const DEFAULT_BUILD_RESERVATION: ImageBuildReservation = ImageBuildReservation { cpu: 1, disk_bytes: 1024 * 1024 * 1024 };
@@ -93,15 +86,6 @@ async fn hosts(backend: &ResourceBackend, namespace: &str) -> Result<Vec<Resourc
         }
     }
     Ok(resolved.into_values().map(|(_, host)| host).collect())
-}
-
-/// The canonical architecture a host reports, if observed.
-pub fn host_architecture(host: &ResourceObject<Host>) -> Option<String> {
-    host.status
-        .as_ref()
-        .and_then(|status| status.description.as_ref())
-        .and_then(|description| description.system.arch.as_deref())
-        .map(|arch| canonical_image_architecture(arch).to_string())
 }
 
 /// The ImageBuild name a composed identity uses on a placement: the

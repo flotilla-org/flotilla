@@ -3,25 +3,29 @@
 //! `InProcessDaemon` owns repos, runs refresh loops, executes commands,
 //! and broadcasts events — all within the same process.
 
+use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_observation::sources::{
     ChangeRequestQueryPort, IssueQueryPort, ProviderChangeRequestObservationSource, ProviderIssueObservationSource,
 };
 use flotilla_resources::address::{remote_change_request_subject, same_subject};
+use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
+use repository_discovery::discover_repository_change_request_with;
 #[cfg(test)]
 mod host_registry_tests;
 mod host_summary_tests;
 mod projection_ports;
+use flotilla_daemon_api::action_support::empty_repo_identity;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
-use flotilla_executor::action_support::{empty_repo_identity, fallback_repo_identity, AddRepoOutcome};
+use flotilla_executor::action_support::{fallback_repo_identity, AddRepoOutcome};
 use flotilla_resources::ResumeIntent;
 use flotilla_store::get_resource_kind;
 use flotilla_store::ResolvedCascadeStoreExt;
 use flotilla_store_memory::InMemoryBackend;
 
-use flotilla_executor::action_events;
-use flotilla_executor::action_namespace;
+use flotilla_daemon_api::action_events;
+use flotilla_daemon_api::action_namespace;
 mod admission_actions;
 #[path = "attach.rs"]
 mod attach;
@@ -46,10 +50,8 @@ mod repository_operations;
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fmt,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Weak,
@@ -62,11 +64,10 @@ use attach::AttachResolver;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 #[cfg(test)]
 use convoy_admission::PlacementResolution;
-use convoy_admission::{
-    convoy_address, convoy_ensure_name, discover_repository_change_request_with, project_not_ready_error, ConvoyAdmission, ConvoyStartTask,
-    StaticFulfilmentDecider,
-};
-pub use convoy_admission::{PreparedConvoyAdmission, RoleAddress};
+pub use convoy_admission::PreparedConvoyAdmission;
+use convoy_admission::{project_not_ready_error, ConvoyAdmission, ConvoyStartTask, StaticFulfilmentDecider};
+use flotilla_resources::convoy_address::{convoy_ensure_name, RoleAddress};
+mod repository_discovery;
 use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_change_request::observation::ChangeRequestObservationSource;
 use flotilla_change_request::ChangeRequestTracker;
@@ -260,7 +261,7 @@ impl IssueQueryPort for ProviderIssueQueryPort {
                         selected_source.scope
                     ))?
                 };
-                convoy_admission::repository_provider_bag(
+                repository_discovery::repository_provider_bag(
                     &self.backend,
                     &self.config,
                     &self.environment_manager,
@@ -276,7 +277,7 @@ impl IssueQueryPort for ProviderIssueQueryPort {
                 // credential selection as repository-backed bindings.
                 match RepositorySpec::remote(format!("{}/{}", selected_source.service.trim_end_matches('/'), selected_source.scope)) {
                     Ok(intent) => {
-                        convoy_admission::repository_provider_bag(
+                        repository_discovery::repository_provider_bag(
                             &self.backend,
                             &self.config,
                             &self.environment_manager,
@@ -850,7 +851,7 @@ pub async fn discover_repo_for_environment(
         environment_manager.environment_runner(environment_id).ok_or_else(|| format!("environment runner not found: {environment_id}"))?;
     if let Some(spec) = repository_spec {
         host_bag =
-            convoy_admission::repository_provider_bag(resource_backend, config, environment_manager, environment_id, namespace, spec)
+            repository_discovery::repository_provider_bag(resource_backend, config, environment_manager, environment_id, namespace, spec)
                 .await?;
     }
     let ee_path = ExecutionEnvironmentPath::new(repo_path);
@@ -1053,21 +1054,6 @@ pub const DEFAULT_PROVISIONING_NAMESPACE: &str = "flotilla";
 enum RepositoryRefreshFailurePolicy {
     BestEffort,
     Strict,
-}
-
-pub const BRIEF_ARTIFACTS_ANNOTATION: &str = "flotilla.work/brief-artifacts";
-
-#[async_trait]
-pub trait BriefArtifactWriter: Send + Sync {
-    async fn put_brief(
-        &self,
-        namespace: &str,
-        convoy: &str,
-        role: &str,
-        subject: &str,
-        content: &[u8],
-        charter_commit: Option<&str>,
-    ) -> Result<String, String>;
 }
 
 #[async_trait]
@@ -3179,7 +3165,7 @@ impl InProcessDaemon {
         repository_keys: &[RepositoryKey],
         branch: &str,
         binding: Option<&flotilla_resources::BoundChangeRequest>,
-    ) -> flotilla_projections::convoy_branch_refresh::ConvoyBranchRefresh {
+    ) -> flotilla_observation::convoy_branch_refresh::ConvoyBranchRefresh {
         self.convoy_admission.refresh_convoy_branch(repository_keys, branch, binding).await
     }
 
@@ -3188,7 +3174,7 @@ impl InProcessDaemon {
         namespace: &str,
         convoy_name: &str,
         branch: &str,
-        resolution: Option<&flotilla_projections::convoy_branch_refresh::ConvoyBranchRefresh>,
+        resolution: Option<&flotilla_observation::convoy_branch_refresh::ConvoyBranchRefresh>,
     ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = match convoys.get(convoy_name).await {

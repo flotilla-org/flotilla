@@ -10,10 +10,6 @@ pub fn fallback_repo_identity(path: &Path) -> flotilla_protocol::RepoIdentity {
     flotilla_protocol::RepoIdentity { authority: "local".into(), path: path.to_string_lossy().into_owned() }
 }
 
-pub fn empty_repo_identity() -> flotilla_protocol::RepoIdentity {
-    flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() }
-}
-
 #[derive(Debug)]
 pub struct AddRepoOutcome {
     pub tracked_path: PathBuf,

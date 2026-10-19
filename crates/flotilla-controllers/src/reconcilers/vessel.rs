@@ -13,9 +13,9 @@ use flotilla_agent::adapter::{
     append_convoy_work_context, build_convoy_crew_brief_with_options, required_agent_adapters, CrewAssignment, CrewBriefMember,
     CrewBriefTemplateResolver,
 };
-use flotilla_core::in_process::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, PlacementDecision};
+use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{
     address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
     repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,

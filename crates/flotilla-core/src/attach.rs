@@ -32,10 +32,11 @@ use flotilla_resources::{
 use flotilla_store::{ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
 
-use super::{convoy_address, discover_repo_for_environment, LiveConvoyRecord, RoleAddress};
+use super::{discover_repo_for_environment, LiveConvoyRecord};
 use flotilla_discovery::{registry::ProviderRegistry, DiscoveryRuntime};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_projections::aggregator_projection::AggregatorProjectionState;
+use flotilla_resources::convoy_address::{convoy_address, RoleAddress};
 use flotilla_terminal::TerminalSessionLiveness;
 
 type HostSnapshot = Result<Vec<ReadResourceObject<ResourceHost>>, String>;
