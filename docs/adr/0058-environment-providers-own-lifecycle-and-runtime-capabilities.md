@@ -38,3 +38,106 @@ an isolated empty configuration and never read ambient registry credentials.
 
 B2 changes no stored resource, manifest or config shapes. B1's N→N+1 availability
 and inventory readers remain unchanged. The runtime boundary checker is B3.
+
+## Kind-neutral provider seam (2026-10-18 amendment; #3281, #3473, #3474)
+
+Owner rulings from the environment providers mission (#3468), which adds a Firecracker microVM kind and a cloud sandbox kind (Namespace first) beside Docker. [ADR 0069](0069-an-agent-inside-every-vessel.md) records the in-vessel agent that this seam relies on.
+
+### Required core and optional capabilities
+
+- **Every provider implements a small required core:**
+  - prepare, provision, inspect and list;
+  - destroy by an opaque backing ID;
+  - observe;
+  - reach the in-vessel agent.
+- **Everything else is an optional capability,** a narrow trait behind an `Option` accessor.
+- **A plain capability declaration (data)** lets placement and admission decide without constructing a provider. It declares:
+  - material modes;
+  - checkout strategies;
+  - the workspace root;
+  - suspend/resume;
+  - export;
+  - egress;
+  - whether a fallback runner exists.
+- **The dummy load-test provider becomes its own kind,** instead of posing as Docker.
+
+### The agent handle
+
+- **The in-vessel agent is the runner on every kind.** Firecracker and Namespace use it from the start; Docker switches once it exists.
+- **Each handle offers:**
+  - an agent handle: runner, files, streams, flush, environment pushes and resume time;
+  - an optional fallback runner, the kind's native way in, used to bootstrap the agent and to diagnose a dead one: `docker exec`, or `nsc exec`/SSH. Firecracker has none; its serial log is the evidence, and recovery is a restart.
+
+### Material replaces bind mounts
+
+Material has three modes:
+- **Frozen:** copied at start.
+- **Pushed:** updated by the host through the agent, with write-then-rename.
+- **Shared:** one live folder both sides write. It is an optional capability, offered only by kinds that share folders (Docker).
+
+Rules:
+- Host-mounted checkouts and user-declared mounts require Shared.
+- The host reads vessel files back through the agent: agent logs and sessions, and Wheelhouse files.
+- Sockets are agent streams, not material.
+
+### Two-level kind
+
+- **A typed class** for each qualitatively distinct shape: HostDirect, Container, MicroVm, CloudSandbox and Dummy. It carries an open implementation name (docker, firecracker, namespace, later e2b and others).
+- **The class fixes:**
+  - the configuration and input shape (a MicroVm needs a kernel; a CloudSandbox an account, region and lifetime cap);
+  - display;
+  - placement grouping.
+- **Behaviour comes only from the capability declaration.** Nothing branches on class or implementation.
+- **Selection is by configured provider instance.** The backing ID is an opaque provider-chosen string.
+- **The runtime observation carries an environment descriptor:** class, implementation, instance, image digest and provider versions.
+
+### Observations, never judgements
+
+- **Providers report facts from their own authority:**
+  - `Running`;
+  - `Stopped{cause}`: SuspendedByRequest, PausedByProvider, GuestHalted;
+  - `Gone{cause}`: LifetimeCapReached, EvictedByProvider, HostOutOfMemory, VmmExited{code}, GuestPoweredOff, MissingOnList, DestroyedByRequest;
+  - `Unknown{reason}`: HostUnreachable, ProviderApiError, GuestUnresponsive.
+- **`observe` is a stream:** pushed where the kind allows, with polling as the provider's internal fallback.
+- **How observations map to Vessel state:**
+  - A `Gone` that flotilla didn't request is `lost`.
+  - A `Stopped` that flotilla didn't request goes to recovery first. Resume is tried where supported, and the vessel becomes `lost` only if resume fails or turns into `Gone`.
+  - `Unknown` never becomes `lost` on its own. It stays a "can't tell" whose reason has an owner (#3464).
+  - `failed` is only for the work itself, never for losing the environment.
+- **The agent heartbeat is advisory** (`Unknown{GuestUnresponsive}`).
+- **Re-adoption:** `list` returns every visible backing with the environment ID recorded at launch. The daemon adopts matches and quarantines unknowns, and never kills them outright.
+
+### Survivors
+
+- **Loss observations carry `survivors`:**
+  - the kind's persistent storage, which holds the agent home and checkout (a Firecracker data drive, a Docker volume or host folder, or cloud storage);
+  - a host-side checkpoint read back through the agent, used only where storage doesn't outlive the vessel;
+  - the pushed branch, as the floor.
+- **Survivors are kept until the convoy decides:** continue (#3108) or abandon.
+- **A recovery step** then extracts what matters, and the rest is expunged (#3081). Nothing is deleted on a timer, and host disk pressure is the visible signal. Abandon doesn't cascade.
+
+### Checkout, quiesce, hosts and egress
+
+- **Checkout strategy is kind-neutral:** HostWorktree, HostClone and CloneInVessel.
+  - The two host strategies require Shared, and placement refuses them elsewhere with a reason.
+  - CloneInVessel works everywhere, onto persistent storage.
+  - The reference repo is optional material.
+  - The provider declares its workspace root, so code stops assuming `/workspace` and `/ref/repo`.
+- **Flush is required on every handle.** Suspend/resume in place (an opaque token, valid only with the same provider) and storage export (a reference that can be copied across providers) are separate optional capabilities. Without export, the work moves by reading it back through the agent.
+- **Hosts advertise the provider instances they can run,** each with its kind, its readiness from `detect` (ready, missing tool, missing credential, unknown) and its capability declaration.
+  - Admission matches the policy against them, replacing the separate docker and Linux checks.
+  - For a cloud sandbox, the advertising host is the controlling host, which holds the credential.
+- **Providers declare egress** as a route (None, ExplicitProxy, TransparentProxy, Open) plus enforcement (Enforced, Advisory). A placement policy may require Enforced egress. ADR 0069 gives the route every kind uses.
+
+### Stored shape
+
+- **Docker's stored fields fold into the kind-neutral shape once,** when Environment moves to the generated tables (#3108), with the schema review.
+- **Until then, new kinds use additive fields only:** `spec.provider` (instance, two-level kind, class inputs), `status.backing_id`, and matching PlacementPolicy and FulfilmentKind variants. These are ADR 0047 defaults with no shim to remove.
+- **Target outline for the schema review:**
+  - Environment spec: provider instance, class plus implementation, per-class input records, a material child table, env and checkout strategy;
+  - Environment status: an opaque indexed backing ID, the descriptor, the observation and survivors;
+  - PlacementPolicy: an instance, or a class plus capabilities, the checkout strategy, the egress requirement, and a reserved ordered `preferences` list for later capacity and cost ranking;
+  - Host: advertised instances;
+  - Convoy: `CallerProcess.container` becomes per-listener identity (#3262);
+  - FulfilmentKind: `PerVessel{class}`.
+- **Each PR that changes these shapes** names its out-of-repo authoring sources (ops and project-map manifests) and ships companion updates.
