@@ -93,10 +93,11 @@ swap. Defining crew by what the session works for, rather than where its
 process runs, keeps central agent loops (reasoning outside the vessel, tools
 inside) inside the model.
 
-### 4. AgentChannel binds a session to a transport
+### 4. AgentChannels connect a session to its transports
 
-An **AgentChannel** is an AgentSession's current binding to a **transport** at
-a concrete endpoint on the session's current Process. The transports named so
+An **AgentChannel** is an AgentSession's live connection to one **transport**
+at a concrete endpoint on the session's current Process; a session can have
+several at once. The transports named so
 far are `keystroke` (typing into the terminal through cleat),
 `codex-app-server` (JSON-RPC turns) and `claude-channels` (Claude Code's
 Channels). The harness connector declares which transports a harness
@@ -107,8 +108,12 @@ A session may offer several transports at once, registered by the harness
 connector for each live session shape; a router chooses one per delivery by
 policy and configuration. A message is delivered by one transport, never two
 where that can be avoided, and at least one transport must deliver it; the
-receipt records which one did. Docs and code say "AgentChannel" or "transport", never a bare
-"channel", which collides with Claude Code's Channels feature.
+receipt records which one did. An unknown outcome (a timeout with no receipt)
+counts as possibly delivered: the router tries another transport only once the
+first is known not to have delivered, or when configuration accepts a repeat
+for that operation, and records each failover with its reason. Docs and code
+say "AgentChannel" or "transport", never a bare "channel", which collides with
+Claude Code's Channels feature.
 
 *Amendment (2026-10-19, #2951):* the original rule bound a session to one
 transport at launch or revival, with any later fallback an explicit re-bind.
@@ -117,16 +122,18 @@ TUI and its app-server at once, and Claude crews keep a visible TUI while
 gaining a native route. What the rule protected is kept: no double delivery
 where avoidable, and a receipt that names the transport used.
 
-*Original rationale:* #2894's per-send preference list made the transport a property of
-each delivery attempt, so the same session could receive input through
-different paths with different guarantees and nobody could say which applied.
+*Original rationale:* #2894's per-send preference list made the transport a
+property of each delivery attempt, so the same session could receive input
+through different paths with different guarantees and nobody could say which
+applied.
 One recorded binding per session makes the guarantee knowable before a send,
 keeps adapter capability (what is possible) separate from session state (what
 is in use), and fits adapter definitions as data (#2836).
 
-### 5. Delivery receipts say what the channel proves
+### 5. Delivery receipts say what the transport proves
 
-A Message delivery receipt records what the bound AgentChannel can prove:
+A Message delivery receipt records what the transport that delivered it can
+prove:
 
 - `sent`: the transport accepted the input;
 - `received`: the harness echoed the input back (for example a correlated user
@@ -197,7 +204,7 @@ recoverable situation look final and blocked `convoy resume`.
 
 A **Brief** belongs to starting a **new** conversation for a role: the first
 start, or the fresh-agent rung of the delivery ladder. Revival is ordinary:
-resume the same conversation, re-bind its AgentChannel, and deliver pending
+resume the same conversation, re-register its transports, and deliver pending
 Messages normally. Material changes while a session was parked (a charter
 revision, a ruling) arrive as ordinary superseding `system:` Messages, never as
 a forced re-brief.
@@ -214,7 +221,7 @@ session was parked need no second mechanism.
 | ADR 0055 (delivery) | Delivery means evidence that a resolved holder accepted the input; activity after submission counts | Receipts record `sent` or `received` as the AgentChannel proves; activity is a derived observation; acting on input is judged by the expectation |
 | ADR 0055 (addressing) | Holders are resolved at delivery | The role's current role binding names the AgentSession resolved at delivery; "holder" is retired |
 | ADR 0055 (interrupts) | Supervisor senders may request interrupts where supported | Parked until a producer exists (decision 6) |
-| ADR 0028 (delivery ladder) | Warm session → adapter resume from the session log → fresh agent with a reconstructed brief | Revive the bound AgentSession (live, or parked and resumed on a new process with a re-bound AgentChannel) → start a new AgentSession for the role with a brief. Only the floor starts a new conversation, so only the floor briefs |
+| ADR 0028 (delivery ladder) | Warm session → adapter resume from the session log → fresh agent with a reconstructed brief | Revive the bound AgentSession (live, or parked and resumed on a new process with its transports re-registered) → start a new AgentSession for the role with a brief. Only the floor starts a new conversation, so only the floor briefs |
 | ADR 0028 (park depth) | Park depth is a vessel spectrum: warm process → suspended vessel → no vessel | Unchanged for vessels; AgentSession has its own park depth (`live`, `parked`, `archived`) |
 | ADR 0010 (tool crew) | Crew members may be agents or tools (`ProcessSource`/`CrewSource::Tool`) | Tools are vessel-declared Processes; crew is agent sessions only |
 | ADR 0010 (Crew) | A crew is the processes aboard a vessel for a Leg | Crew is the AgentSessions working in or for a vessel |
