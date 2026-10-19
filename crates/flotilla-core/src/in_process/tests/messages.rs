@@ -9,74 +9,9 @@ use flotilla_resources::{Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, Conv
 use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
-use crate::in_process::crew_ops::{convoy_message_address, convoy_sender_address};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
-
-// #2597: failed reads retain the resource identity and emit scoped debug diagnostics;
-// successful reads never emit fallback diagnostics. Glue: exhaust the three read outcomes.
-#[tokio::test]
-async fn convoy_sender_lookup_diagnostics_preserve_fallbacks() {
-    use crate::testkits::replay::testing::capture_logs;
-    let memory = ResourceBackend::new(InMemoryBackend::default());
-    memory
-        .using::<ResourceConvoy>("attribution")
-        .create(&test_meta("supervisor"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).role("governor".to_string()).build())
-        .await
-        .expect("convoy");
-    // Real HTTP collaborator with an invalid URL fails before any network request.
-    let invalid = ResourceBackend::new(flotilla_store_http::HttpBackend::new(rigging_tls::client(), "://invalid"));
-    for (backend, name, expected, failure) in
-        [(&memory, "supervisor", "governor", false), (&memory, "missing", "missing", true), (&invalid, "unavailable", "unavailable", true)]
-    {
-        // Mirror the sender lookup's replica-inclusive read to check the exact backend error.
-        // Keep this read aligned if the attribution lookup path changes.
-        let read = backend.including_replicas::<ResourceConvoy>("attribution").get(name).await;
-        let (address, logs) = capture_logs(tracing::Level::DEBUG, convoy_sender_address(backend, "attribution", name)).await;
-        assert_eq!(address, expected);
-        if failure {
-            let error = read.expect_err("failed read").to_string();
-            assert!(logs.contains("DEBUG"), "{logs}");
-            assert!(logs.contains("namespace=attribution"), "{logs}");
-            assert!(logs.contains(&format!("convoy_ref={name}")), "{logs}");
-            assert!(logs.contains(&format!("error={error}")), "{logs}");
-            assert_eq!(logs.matches("convoy sender attribution lookup failed").count(), 1, "{logs}");
-        } else {
-            assert!(!logs.contains("convoy sender attribution lookup failed"), "{logs}");
-        }
-    }
-}
-
-// #2592: attribution uses role/project addresses, preserves legacy resource names,
-// and remains available when a supervisor convoy is absent from the replica view.
-// Formatting glue: these rows exhaust empty/nonempty role and absent/present project.
-#[tokio::test]
-async fn convoy_sender_addresses_preserve_legacy_and_missing_convoy_identity() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    for (name, role, project, expected) in [
-        ("legacy", "", None, "legacy"),
-        ("legacy-project", "", Some("project"), "legacy-project"),
-        ("named", "graphql-budget", None, "graphql-budget"),
-        ("named-project", "graphql-budget", Some("project"), "graphql-budget@project"),
-    ] {
-        let convoy = convoys
-            .create(
-                &test_meta(name),
-                &ConvoySpec::builder()
-                    .workflow_ref("workflow".to_string())
-                    .role(role.to_string())
-                    .maybe_project_ref(project.map(str::to_string))
-                    .build(),
-            )
-            .await
-            .expect("convoy");
-        assert_eq!(convoy_message_address(&convoy), expected);
-        assert_eq!(convoy_sender_address(&backend, "flotilla", name).await, expected);
-    }
-    assert_eq!(convoy_sender_address(&backend, "flotilla", "missing-governor").await, "missing-governor");
-}
 
 // #2767: address-taking commands share this resolver. Terminal history must
 // never displace a live governor; an exact record ID still addresses history.

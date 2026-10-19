@@ -12,7 +12,7 @@ use flotilla_resources::{
 use tokio::sync::{Mutex, RwLock};
 
 use super::fixture;
-use crate::in_process::CREDENTIAL_REFS_ANNOTATION;
+use flotilla_resources::CREDENTIAL_REFS_ANNOTATION;
 
 #[tokio::test]
 async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
@@ -96,14 +96,14 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
         .await
         .expect("broken session");
     sessions.update_status("000-malformed", &broken.metadata.resource_version, &status).await.expect("running broken session");
-    let first = crew.crew_capabilities_internal(&context).await.expect("first live card");
+    let first = crew.query_capabilities(&context).await.expect("first live card");
     assert!(first.contains("You can push `.github/workflows`"));
     let session = sessions.get("session").await.expect("session");
     crate::crew_capabilities::observe_card(&backend, "flotilla", &session, &first, &crew.capability_cards).await.expect("launch baseline");
     assert!(backend.using::<Message>("flotilla").list().await.expect("messages").items.is_empty());
     for (index, permissions) in [BTreeMap::from([("contents".into(), "read".into())]), BTreeMap::new()].into_iter().enumerate() {
         source.0.write().await[0].permissions = Some(permissions);
-        let card = crew.crew_capabilities_internal(&context).await.expect("refreshed card");
+        let card = crew.query_capabilities(&context).await.expect("refreshed card");
         assert!(!card.contains("You can push `.github/workflows`"));
         let session = sessions.get("session").await.expect("session");
         if index == 0 {
@@ -140,7 +140,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
         .expect("duplicate observation");
     }
     source.1.write().await.insert("pinned service".into(), "127.0.0.1:7423".into());
-    let card = crew.crew_capabilities_internal(&context).await.expect("endpoint change");
+    let card = crew.query_capabilities(&context).await.expect("endpoint change");
     assert!(card.contains("`127.0.0.1:7423` → pinned service"));
     crate::crew_capabilities::observe_card(
         &backend,
@@ -152,7 +152,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     .await
     .expect("environment notification");
     source.0.write().await.clear();
-    let card = crew.crew_capabilities_internal(&context).await.expect("revoked credential");
+    let card = crew.query_capabilities(&context).await.expect("revoked credential");
     assert!(!card.contains("Credential `github`"));
     crate::crew_capabilities::observe_card(
         &backend,

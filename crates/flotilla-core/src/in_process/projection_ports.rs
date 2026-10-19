@@ -18,7 +18,7 @@ use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{BoundChangeRequest, LeafFiringRecord, LeafSubscriptionRow, ResolvedIssueSourceBinding};
 
 use super::InProcessDaemon;
-use crate::leaf_engine::LeafSubscriptionTable;
+use flotilla_crew::leaf_engine::LeafSubscriptionTable;
 
 #[async_trait]
 impl ConvoyChangeRequestResolver for InProcessDaemon {
@@ -79,18 +79,21 @@ impl EnvironmentSummaries for ProjectionEnvironmentSummaries<'_> {
     }
 }
 
+/// Read projections' view of the crew service's shared leaf subscription table.
+pub(super) struct LeafSubscriptionDiagnostics(pub LeafSubscriptionTable);
+
 #[async_trait]
-impl LeafSubscriptionRead for LeafSubscriptionTable {
+impl LeafSubscriptionRead for LeafSubscriptionDiagnostics {
     fn change_request_stale_after(&self) -> Duration {
-        LeafSubscriptionTable::change_request_stale_after(self)
+        self.0.change_request_stale_after()
     }
 
     async fn change_request_observation_error(&self, subject: &ChangeRequestKey) -> Option<ObservationError> {
-        LeafSubscriptionTable::change_request_observation_error(self, subject).await
+        self.0.change_request_observation_error(subject).await
     }
 
     async fn diagnostics(&self) -> Vec<(LeafSubscriptionRow, Vec<LeafFiringRecord>)> {
-        LeafSubscriptionTable::diagnostics(self).await
+        self.0.diagnostics().await
     }
 }
 

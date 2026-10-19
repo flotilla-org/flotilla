@@ -1,5 +1,4 @@
-use crate::in_process::crew_ops::MessageAttribution;
-use flotilla_config::ConfigStore;
+use crate::crew_ops::MessageAttribution;
 use flotilla_resources::ResumeIntent;
 use flotilla_store_memory::InMemoryBackend;
 use std::sync::atomic::Ordering;
@@ -7,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_protocol::{HostName, ResourceRef};
+use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoyStatusPatch, CrewCompletionPending, CrewMessageSender, CrewWorkPhase, InputMeta,
     TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
@@ -15,8 +14,7 @@ use flotilla_resources::{
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
 
 use super::{fixture, StagingProbe};
-use crate::in_process::WorkCredentialReconciler;
-use crate::testkits::discovery::fake_discovery;
+use crate::ports::WorkCredentialReconciler;
 
 #[tokio::test]
 async fn turn_admission_returns_the_canonical_suppressed_message() {
@@ -334,50 +332,6 @@ async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() 
             assert!(backend.using::<Message>("flotilla").list().await.unwrap().items.is_empty());
         }
     }
-}
-
-#[tokio::test]
-async fn unknown_controller_sender_has_a_creatable_system_reply() {
-    use flotilla_resources::Message;
-
-    use crate::{in_process::InProcessDaemon, leaf_engine::CrewTurnIntent};
-
-    let (crew, backend, probe, config) = fixture(CrewWorkPhase::Done).await;
-    probe.fail.store(false, Ordering::SeqCst);
-    let request = CrewTurnIntent::builder()
-        .namespace("flotilla".into())
-        .convoy("crew".into())
-        .source("legacy".into())
-        .vessel("work".into())
-        .role("coder".into())
-        .brief("legacy controller turn".into())
-        .subject_revision("legacy-head".into())
-        .sender(flotilla_resources::legacy_message_sender(&CrewMessageSender::Unknown).0)
-        .build();
-    let admission = crew.deliver_turn(&request).await.expect("controller intent");
-    let original = backend.using::<Message>("flotilla").get(&admission.message.name).await.expect("receiver intent");
-    std::fs::write(config.path().join("daemon.toml"), "machine_id = \"legacy-message-reply-test\"\n").expect("reply daemon identity");
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(config.path())),
-        fake_discovery(false),
-        HostName::new("host"),
-        backend.clone(),
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
-    let reply = serde_json::json!({
-        "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"legacy-reply"},
-        "spec":{"sender":original.spec.receiver,"receiver":original.spec.sender,"relation":"peer",
-                "body":"acknowledged","in_reply_to":original.metadata.name}
-    });
-    assert_eq!(
-        daemon.message_creation_origin("flotilla", &reply).await.expect("correlated system reply has a home"),
-        Some(daemon.node_id().clone())
-    );
-    assert_eq!(original.spec.sender, "system:legacy");
-    daemon.apply_intent_document("flotilla", reply).await.expect("create correlated system reply");
-    assert!(backend.using::<Message>("flotilla").get("legacy-reply").await.is_ok());
 }
 
 // Failed durable admission must not reopen settled work. Exercise an external

@@ -163,7 +163,7 @@ pub trait TerminalRuntime: Send + Sync {
 
 pub struct TerminalSessionReconciler<R> {
     runtime: Arc<R>,
-    decisions: flotilla_core::decision_log::DecisionLog,
+    decisions: flotilla_crew::decision_log::DecisionLog,
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     environments: TypedResolver<Environment>,

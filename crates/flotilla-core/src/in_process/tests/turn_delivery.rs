@@ -22,7 +22,7 @@ async fn turn_delivery_accepts_intent_when_terminal_changes_during_staging() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     probe.invalidate_next.store(true, std::sync::atomic::Ordering::SeqCst);
-    let request = crate::leaf_engine::CrewTurnIntent::builder()
+    let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
         .convoy("resume-staging".to_string())
         .source("review".to_string())
@@ -67,7 +67,7 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
         )
         .await
         .expect("stopped session");
-    let request = crate::leaf_engine::CrewTurnIntent::builder()
+    let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
         .convoy("resume-staging".to_string())
         .source("review".to_string())
@@ -95,7 +95,7 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
 async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
-    let request = crate::leaf_engine::CrewTurnIntent::builder()
+    let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
         .convoy("resume-staging".to_string())
         .source("review".to_string())
@@ -243,7 +243,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             )
             .await
             .expect("session phase");
-        let request = crate::leaf_engine::CrewTurnIntent::builder()
+        let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
             .namespace("flotilla".to_string())
             .convoy("turn-credential-work".to_string())
             .source("conflicting".to_string())
@@ -369,4 +369,38 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         daemon.reconcile_crew_stalls_once("flotilla").await.expect("clear stall");
         assert!(convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.is_none());
     }
+}
+
+// A system reply to a legacy controller sender is correlated with its receiver
+// intent and has a creatable home on this daemon.
+#[tokio::test]
+async fn unknown_controller_sender_has_a_creatable_system_reply() {
+    use flotilla_resources::{CrewMessageSender, Message};
+
+    let (daemon, backend, probe) = resume_staging_fixture().await;
+    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+    let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
+        .namespace("flotilla".into())
+        .convoy("resume-staging".into())
+        .source("legacy".into())
+        .vessel("work".into())
+        .role("coder".into())
+        .brief("legacy controller turn".into())
+        .subject_revision("legacy-head".into())
+        .sender(flotilla_resources::legacy_message_sender(&CrewMessageSender::Unknown).0)
+        .build();
+    let admission = daemon.crew.deliver_turn(&request).await.expect("controller intent");
+    let original = backend.using::<Message>("flotilla").get(&admission.message.name).await.expect("receiver intent");
+    let reply = serde_json::json!({
+        "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"legacy-reply"},
+        "spec":{"sender":original.spec.receiver,"receiver":original.spec.sender,"relation":"peer",
+                "body":"acknowledged","in_reply_to":original.metadata.name}
+    });
+    assert_eq!(
+        daemon.message_creation_origin("flotilla", &reply).await.expect("correlated system reply has a home"),
+        Some(daemon.node_id().clone())
+    );
+    assert_eq!(original.spec.sender, "system:legacy");
+    daemon.apply_intent_document("flotilla", reply).await.expect("create correlated system reply");
+    assert!(backend.using::<Message>("flotilla").get("legacy-reply").await.is_ok());
 }

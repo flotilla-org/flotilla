@@ -178,7 +178,7 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     assert_eq!(stalled.source, flotilla_resources::StallEvidenceSource::Screen);
     let mut events = daemon.subscribe();
     let subscription = daemon
-        .crew_ops
+        .crew
         .subscribe_wait(
             uuid::Uuid::new_v4(),
             flotilla_protocol::WaitSubscriptionRequest {
@@ -299,8 +299,9 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if daemon
-                .crew_ops
-                .subscription_rows()
+                .crew
+                .subscription_diagnostics()
+                .rows()
                 .await
                 .iter()
                 .any(|row| matches!(&row.watcher, flotilla_resources::LeafWatcher::ReconcilerWake { convoy } if convoy == "landed-claim"))
@@ -713,9 +714,9 @@ async fn promise_retractions_and_named_completion_refusal() {
     for id in ["template", "dispatch", "own"] {
         assert!(error.contains(id), "{error}");
     }
-    daemon.crew_ops.promise(&context, CrewPromiseOperation::Retract { id: "own".into(), reason: "scope reduced".into() }).await.unwrap();
+    daemon.crew.promise(&context, CrewPromiseOperation::Retract { id: "own".into(), reason: "scope reduced".into() }).await.unwrap();
     for id in ["template", "dispatch"] {
-        daemon.crew_ops.promise(&context, CrewPromiseOperation::Retract { id: id.into(), reason: "not achievable".into() }).await.unwrap();
+        daemon.crew.promise(&context, CrewPromiseOperation::Retract { id: id.into(), reason: "not achievable".into() }).await.unwrap();
         let status = convoys.get("promise-crew").await.unwrap().status.unwrap();
         let promise = status.promises["work"]["coder"].iter().find(|p| p.id == id).unwrap();
         assert_eq!(promise.state, PromiseState::Open);

@@ -13,9 +13,9 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{test_meta, SessionStagingProbe};
-use crate::in_process::crew_ops::terminal_meta_with_vessel_credentials;
 use crate::in_process::{InProcessDaemon, TerminalSessionIdentity, CREDENTIAL_SCOPES_ANNOTATION};
 use crate::testkits::discovery::fake_discovery;
+use flotilla_crew::crew_ops::terminal_meta_with_vessel_credentials;
 
 #[tokio::test]
 async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_reviewer() {

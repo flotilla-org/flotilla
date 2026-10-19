@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_change_request::observation::ChangeRequestObservationSource;
 use flotilla_config::ConfigStore;
-use flotilla_protocol::qualified_path::HostId;
 use flotilla_protocol::{EnvironmentId, HostName};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
@@ -17,20 +16,18 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_testkit::ReadCountsBackendExt;
+use flotilla_vcs::vcs::{CheckoutVcsResolver, Vcs};
 use tokio::sync::RwLock;
 
-use crate::in_process::checkout_providers::CheckoutProviders;
-use crate::in_process::crew_ops::frame_crew_message;
-use crate::in_process::crew_ops::CrewService;
-use crate::in_process::ConvoyPhase;
-use crate::in_process::CrewMessageSender;
-use crate::in_process::WorkCredentialReconciler;
+use crate::crew_ops::frame_crew_message;
+use crate::crew_ops::CrewService;
 use crate::leaf_engine::LeafSubscriptionTable;
-use crate::testkits::discovery::fake_discovery;
-use flotilla_discovery::environment_manager::EnvironmentManager;
+use crate::ports::WorkCredentialReconciler;
 use flotilla_observation::change_request_observer::ChangeRequestRefreshCadence;
 use flotilla_observation::change_request_observer::ChangeRequestRefresher;
 use flotilla_protocol_testkit::event_sink::RecordingEventSink;
+use flotilla_resources::ConvoyPhase;
+use flotilla_resources::CrewMessageSender;
 
 // Stand-in for forge I/O; these crew scenarios never request forge observations.
 struct UnusedForge;
@@ -39,6 +36,16 @@ struct UnusedForge;
 impl ChangeRequestObservationSource for UnusedForge {
     async fn observe(&self, _: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
         panic!("crew delivery must not query the forge")
+    }
+}
+
+// These crew fixtures own no Checkouts, so no scenario resolves a checkout VCS.
+struct NoCheckoutVcs;
+
+#[async_trait]
+impl CheckoutVcsResolver for NoCheckoutVcs {
+    async fn vcs_for(&self, _: Option<&EnvironmentId>, path: &std::path::Path) -> Result<Arc<dyn Vcs>, String> {
+        Err(format!("crew fixture has no checkout VCS for {}", path.display()))
     }
 }
 
@@ -70,21 +77,8 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
     let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
     let config_dir = tempfile::tempdir().expect("config directory");
     let config = Arc::new(ConfigStore::with_base(config_dir.path()));
-    let discovery = Arc::new(fake_discovery(false));
     let environment = EnvironmentId::new("local");
-    let environment_manager = Arc::new(EnvironmentManager::new_local(&discovery, environment.clone(), HostId::new("host")).await);
     let namespace = Arc::new(std::sync::RwLock::new("flotilla".into()));
-    let providers = Arc::new(
-        CheckoutProviders::builder()
-            .resource_backend(backend.clone())
-            .observed_resource_backend(ResourceBackend::new(InMemoryBackend::default()))
-            .config(config.clone())
-            .discovery(discovery)
-            .environment_manager(environment_manager.clone())
-            .local_environment_id(environment.clone())
-            .provisioning_namespace(namespace.clone())
-            .build(),
-    );
     let refresher = ChangeRequestRefresher::new(
         "host".into(),
         backend.clone(),
@@ -105,7 +99,7 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
             .config(config)
             .host_name(HostName::new("host"))
             .brief_artifact_writer(Arc::new(RwLock::new(None)))
-            .checkout_providers(providers)
+            .checkout_vcs(Arc::new(NoCheckoutVcs))
             .local_environment_id(environment)
             .build(),
     );

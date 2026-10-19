@@ -21,15 +21,17 @@ use flotilla_resources::WorkPhase;
 use flotilla_store::apply_status_patch_checked as apply_resource_status_patch_checked;
 use flotilla_store::ResourceBackend;
 
-use super::{crew_ops, resolve_local_convoy_name};
-use crate::in_process::crew_ops::ConvoyResumeOutcome;
-use crate::in_process::crew_ops::CrewSupervisionRequest;
+use crate::crew_ops;
+use crate::crew_ops::resolve_local_convoy_name;
+use crate::crew_ops::ConvoyResumeOutcome;
+use crate::crew_ops::CrewSupervisionRequest;
+use flotilla_daemon_api::action_events::ActionEvents;
 
 /// Subject reference resolution requires host repository context. Lifecycle,
 /// routing, message admission and audit mutations use the shared CrewService
 /// directly rather than calling back through the composition root.
 #[async_trait]
-pub(super) trait CrewActionPort: Send + Sync {
+pub trait CrewActionPort: Send + Sync {
     async fn link_convoy_subject(
         &self,
         namespace: &str,
@@ -39,16 +41,16 @@ pub(super) trait CrewActionPort: Send + Sync {
     ) -> Result<(), String>;
 }
 
-pub(super) struct CrewActions<'a> {
-    pub(super) port: &'a dyn CrewActionPort,
-    pub(super) crew: &'a crew_ops::CrewService,
-    pub(super) resource_backend: &'a ResourceBackend,
-    pub(super) clock: &'a Arc<dyn Clock>,
-    pub(super) events: super::action_events::ActionEvents<'a>,
+pub struct CrewActions<'a> {
+    pub port: &'a dyn CrewActionPort,
+    pub crew: &'a crew_ops::CrewService,
+    pub resource_backend: &'a ResourceBackend,
+    pub clock: &'a Arc<dyn Clock>,
+    pub events: ActionEvents<'a>,
 }
 
 impl CrewActions<'_> {
-    pub(super) async fn execute_action_crew_promise(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_crew_promise(&self, id: u64, command: &Command) -> Result<u64, String> {
         let CommandAction::CrewPromise { context, operation } = &command.action else {
             return Err("wrong promise handler".into());
         };
@@ -61,7 +63,7 @@ impl CrewActions<'_> {
         Ok(id)
     }
 
-    pub(super) async fn execute_action_artifact_reserve_ledger_comment(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_artifact_reserve_ledger_comment(&self, id: u64, command: &Command) -> Result<u64, String> {
         let CommandAction::ArtifactReserveLedgerComment { namespace, name, address } = &command.action else {
             return Err("ledger reservation selected the wrong handler".into());
         };
@@ -74,7 +76,7 @@ impl CrewActions<'_> {
         Ok(id)
     }
 
-    pub(super) async fn execute_action_crew_handoff(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_crew_handoff(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::CrewHandoff { context, target, message, carries } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let result = match Box::pin(self.crew.handoff_with_carries(context, target, message, carries.clone())).await {
@@ -87,7 +89,7 @@ impl CrewActions<'_> {
         Err("CrewHandoff action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_convoy_resume(
+    pub async fn execute_action_convoy_resume(
         &self,
         id: u64,
         command: &Command,
@@ -139,7 +141,7 @@ impl CrewActions<'_> {
         Err("ConvoyResume action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_convoy_withdraw_pending_brief(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_convoy_withdraw_pending_brief(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ConvoyWithdrawPendingBrief { namespace, name } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let namespace = namespace.clone().unwrap_or(self.crew.provisioning_namespace().await);
@@ -156,7 +158,7 @@ impl CrewActions<'_> {
         Err("ConvoyWithdrawPendingBrief action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_crew_complete(
+    pub async fn execute_action_crew_complete(
         &self,
         id: u64,
         command: &Command,
@@ -197,7 +199,7 @@ impl CrewActions<'_> {
         Err("CrewComplete action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_crew_fail(&self, id: u64, command: &Command, caller: &Option<CommandCaller>) -> Result<u64, String> {
+    pub async fn execute_action_crew_fail(&self, id: u64, command: &Command, caller: &Option<CommandCaller>) -> Result<u64, String> {
         let caller = caller.clone();
         if let CommandAction::CrewFail { context, message, force } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
@@ -213,7 +215,7 @@ impl CrewActions<'_> {
         Err("CrewFail action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_crew_stall(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_crew_stall(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::CrewStall { context, reason, proposed_disposition, message } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let result = match self.crew.stall(context, *reason, *proposed_disposition, message.clone()).await {
@@ -226,7 +228,7 @@ impl CrewActions<'_> {
         Err("CrewStall action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_crew_supervise(
+    pub async fn execute_action_crew_supervise(
         &self,
         id: u64,
         command: &Command,
@@ -279,7 +281,7 @@ impl CrewActions<'_> {
         Err("CrewSupervise action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_convoy_link(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_convoy_link(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ConvoyLink { namespace, name, reference, relationship } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let namespace = match namespace {
@@ -296,7 +298,7 @@ impl CrewActions<'_> {
         Err("ConvoyLink action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_convoy_unlink(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_convoy_unlink(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ConvoyUnlink { namespace, name, reference } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let namespace = match namespace {
@@ -313,12 +315,7 @@ impl CrewActions<'_> {
         Err("ConvoyUnlink action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_convoy_delete(
-        &self,
-        id: u64,
-        command: &Command,
-        caller: &Option<CommandCaller>,
-    ) -> Result<u64, String> {
+    pub async fn execute_action_convoy_delete(&self, id: u64, command: &Command, caller: &Option<CommandCaller>) -> Result<u64, String> {
         let caller = caller.clone();
         if let CommandAction::ConvoyDelete { namespace, name, force } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
@@ -346,7 +343,7 @@ impl CrewActions<'_> {
         Err("ConvoyDelete action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_convoy_abandon(
+    pub async fn execute_action_convoy_abandon(
         &self,
         id: u64,
         command: &Command,
@@ -379,7 +376,7 @@ impl CrewActions<'_> {
         Err("ConvoyAbandon action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_convoy_work_force_complete(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_convoy_work_force_complete(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ConvoyWorkForceComplete { convoy, work, message } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let namespace = self.crew.provisioning_namespace().await;
@@ -420,7 +417,7 @@ impl CrewActions<'_> {
 }
 
 impl CrewActions<'_> {
-    pub(super) async fn execute_action_message_fail_batch(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_message_fail_batch(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::MessageFailBatch { namespace, name, reason } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
             let result = match self.crew.message_inbox(namespace).await.fail_batch(name, reason, self.clock.now()).await {

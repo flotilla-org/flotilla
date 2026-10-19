@@ -49,8 +49,8 @@ mod tests {
     use hegel::generators as gs;
 
     use super::*;
-    use crate::leaf_engine::LeafSubscriptionTable;
     use flotilla_change_request::observation::GhChangeRequestObservationSource;
+    use flotilla_crew::leaf_engine::LeafSubscriptionTable;
     use flotilla_daemon_api::event_sink::EventSink;
     use flotilla_discovery::environment_manager::EnvironmentManager;
     use flotilla_observation::change_request_observer::ChangeRequestRefreshCadence;
@@ -248,7 +248,7 @@ mod tests {
         host_name: HostName,
         node_id: NodeId,
         clock: Arc<dyn Clock>,
-        subscriptions: LeafSubscriptionTable,
+        subscriptions: super::super::projection_ports::LeafSubscriptionDiagnostics,
         fleet: FleetService,
     }
 
@@ -296,7 +296,11 @@ mod tests {
                 Arc::new(GhChangeRequestObservationSource::new(Arc::clone(&runner))),
                 ChangeRequestRefreshCadence::default(),
             );
-            let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::clone(&event_sink), refresher);
+            let subscriptions = super::super::projection_ports::LeafSubscriptionDiagnostics(LeafSubscriptionTable::new(
+                backend.clone(),
+                Arc::clone(&event_sink),
+                refresher,
+            ));
             let fleet = FleetService::new(AggregatorProjectionState::new(), host_name.clone(), None);
             Self { temp, backend, config, registry, environments, host_name, node_id, clock: Arc::new(SystemClock), subscriptions, fleet }
         }

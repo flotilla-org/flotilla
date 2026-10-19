@@ -7,7 +7,7 @@ use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewMessageSender, CrewWorkPhase, CrewWorkState, InputMeta, Selector,
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, Selector,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
     TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL,
     VESSEL_LABEL,
@@ -16,78 +16,8 @@ use flotilla_store::ResourceBackend;
 use futures::{FutureExt, StreamExt};
 
 use super::support::test_meta;
-use crate::in_process::crew_ops::queue_pending_crew_message;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
-
-#[tokio::test]
-async fn operator_brief_survives_a_racing_nudge_until_delivery() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder()
-                .name("racing-messages".into())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), "convoy".into()),
-                    (VESSEL_LABEL.into(), "work".into()),
-                    (ROLE_LABEL.into(), "coder".into()),
-                ]))
-                .build(),
-            &ResourceTerminalSessionSpec {
-                env_ref: "env".to_string(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("coding"),
-                    brief: flotilla_resources::TerminalBrief {
-                        path: "brief.md".to_string(),
-                        content: "Initial".to_string(),
-                        artifact_digest: None,
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".to_string(),
-                        convoy: "convoy".to_string(),
-                        vessel_ref: "work".to_string(),
-                    }),
-                    message: None,
-                },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("session");
-    backend
-        .using::<ResourceConvoy>("flotilla")
-        .create(&test_meta("convoy"), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-        .await
-        .expect("convoy context");
-    queue_pending_crew_message(&sessions, &session, CrewMessageSender::OperatorResume { principal: None }, "Continue the work")
-        .await
-        .expect("operator brief queued");
-    let queued = sessions.get("racing-messages").await.expect("queued operator brief");
-    queue_pending_crew_message(&sessions, &queued, CrewMessageSender::FlotillaNudge, "Please settle").await.expect("nudge queued");
-    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("records").items;
-    assert_eq!(records.len(), 2);
-    assert!(records.iter().any(|message| message.spec.sender == "principal:implicit" && message.spec.body.contains("Continue the work")));
-    assert!(records.iter().any(|message| message.spec.sender == "system:nudge"));
-
-    let concurrent = sessions
-        .create(&InputMeta::builder().name("concurrent-messages".into()).labels(session.metadata.labels.clone()).build(), &session.spec)
-        .await
-        .expect("concurrent session");
-    let (operator, nudge) = tokio::join!(
-        queue_pending_crew_message(&sessions, &concurrent, CrewMessageSender::OperatorResume { principal: None }, "New guidance"),
-        queue_pending_crew_message(&sessions, &concurrent, CrewMessageSender::FlotillaNudge, "Please settle"),
-    );
-    operator.expect("operator brief survives concurrent write");
-    nudge.expect("nudge does not erase concurrent brief");
-    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("concurrent records").items;
-    assert_eq!(records.len(), 4);
-    assert!(records.iter().any(|message| message.spec.body.contains("New guidance")));
-}
 
 // #2559: an idle reconciliation pass must neither write resources nor emit
 // events, because its runtime caller is triggered by those same watches.
@@ -339,7 +269,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         )
         .await
         .expect("running terminal");
-    let request = crate::leaf_engine::CrewTurnIntent::builder()
+    let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
         .convoy("governor-convoy".to_string())
         .source("supervision-stalled-crew".to_string())
@@ -354,7 +284,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
     // still runs through the real daemon's ordinary resource mutation handler.
     struct PlacementPublisher(Arc<InProcessDaemon>);
     #[async_trait]
-    impl crate::leaf_engine::ResourceIntentPublisher for PlacementPublisher {
+    impl flotilla_crew::leaf_engine::ResourceIntentPublisher for PlacementPublisher {
         async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String> {
             let admitted = self.0.apply_intent_document(namespace, document).await.map_err(|error| error.to_string())?;
             Ok(flotilla_protocol::ResourceRef::new(
@@ -365,7 +295,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
             ))
         }
     }
-    let publisher: Arc<dyn crate::leaf_engine::ResourceIntentPublisher> = Arc::new(PlacementPublisher(placement_daemon));
+    let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> = Arc::new(PlacementPublisher(placement_daemon));
     daemon.set_resource_intent_publisher(Arc::downgrade(&publisher));
     daemon.deliver_standing_turn(&request).await.expect("remote governor intent accepted");
     let messages = placement.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver messages").items;

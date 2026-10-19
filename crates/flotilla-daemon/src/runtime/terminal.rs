@@ -420,7 +420,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     store.record_capability_endpoints(&spec.env_ref, name, &credential_env).await;
                     let card = async {
                         let credentials = store.credentials(&spec.env_ref, &credential_refs).await?;
-                        flotilla_core::crew_capabilities::session_card(
+                        flotilla_crew::crew_capabilities::session_card(
                             &self.state.daemon.resource_backend(),
                             &context.namespace,
                             &context.convoy,

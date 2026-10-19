@@ -39,15 +39,13 @@ use flotilla_daemon_api::action_namespace;
 #[path = "attach.rs"]
 mod attach;
 mod checkout_providers;
-mod crew_actions;
 use flotilla_executor::executor_actions;
 use flotilla_projections::projections_actions;
 
 mod cleat_roll;
-mod crew_ops;
-pub(crate) use crew_ops::convoy_message_address;
-pub use crew_ops::{ConvoyResumeOutcome, CrewRoutingContext};
-use crew_ops::{CrewService, CrewTurnDeliveryActuator};
+use flotilla_crew::crew_actions;
+use flotilla_crew::crew_ops::{ConvoyResumeOutcome, CrewRoutingContext, CrewService, CrewTurnDeliveryActuator, MessageAttribution};
+use flotilla_crew::ports::WorkCredentialReconciler;
 
 mod image_check;
 use checkout_providers::{CheckoutProvider, CheckoutProviders};
@@ -88,8 +86,6 @@ use flotilla_protocol::{
     RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachPlan, ResourceRef, StatusResponse, StreamKey,
     SurfaceDeclaration, TopologyResponse, TopologyRoute, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
-#[cfg(test)]
-use flotilla_resources::CrewMessageSender;
 use flotilla_resources::{
     host_direct_environment_name, observed_change_request_subjects, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
@@ -97,13 +93,12 @@ use flotilla_resources::{
     CrewCompletionPending, Forge, ForgeKind, InputMeta, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope,
     LifecycleAuthority, ManifestRoot, ObservedChangeRequestState, PlacementPolicy, Project, Repository, RepositoryIdentity, RepositoryKey,
     RepositorySpec, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TurnDeliveryRung, WatchEvent, WatchStart,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, PROJECT_LABEL,
-    ROLE_LABEL,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{
-    CheckoutIntegrationStatus, ConditionValue, ConvoyPhase, CrewCompletionRefusalCause, IntegrationCondition, TerminalSessionIdentity,
-    Vessel, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
+    CheckoutIntegrationStatus, ConditionValue, CrewCompletionRefusalCause, IntegrationCondition, TerminalSessionIdentity,
+    CREDENTIAL_SCOPES_ANNOTATION,
 };
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::{
@@ -121,7 +116,6 @@ use crate::host_identity::resolve_local_node_id;
 use crate::host_identity::resolve_or_create_environment_id;
 use crate::host_identity::resolve_or_create_remote_environment_id;
 use crate::host_identity::resolve_or_create_remote_host_id;
-use crate::leaf_engine::LeafSubscriptionTable;
 use crate::model::repo_name;
 use crate::model::RepoModel;
 use crate::repo_state::RepoRootState;
@@ -137,6 +131,7 @@ use flotilla_admission::repository_inspection::RepositoryInspector;
 use flotilla_cloud_agent::RepoCriteria;
 use flotilla_config::ConfigStore;
 use flotilla_config::StaticEnvironmentConfig;
+use flotilla_crew::leaf_engine::LeafSubscriptionTable;
 use flotilla_daemon_api::daemon::{DaemonHandle, QuerySubscription};
 use flotilla_daemon_api::event_sink::BroadcastEventSink;
 use flotilla_daemon_api::event_sink::EventSink;
@@ -614,26 +609,6 @@ pub struct LiveConvoyRecord {
     pub owner_host: HostName,
 }
 
-async fn resolve_local_convoy_name(backend: &ResourceBackend, namespace: &str, address: &str) -> Result<String, String> {
-    let convoys = backend.clone().using::<ResourceConvoy>(namespace);
-    let candidates = convoys.list().await.map_err(|error| error.to_string())?.items;
-    let identities = candidates
-        .iter()
-        .map(|convoy| ConvoyAddressIdentity {
-            record_name: &convoy.metadata.name,
-            role: convoy.metadata.labels.get(ROLE_LABEL).map(String::as_str),
-            project: convoy.metadata.labels.get(PROJECT_LABEL).map(String::as_str),
-            terminal: convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()),
-        })
-        .collect::<Vec<_>>();
-    let selected = resolve_convoy_candidate_indices(&identities, address)?;
-    match selected.as_slice() {
-        [index] => Ok(candidates[*index].metadata.name.clone()),
-        [] => Err(format!("no convoy matches `{address}`")),
-        _ => Err(format!("convoy record `{address}` is present from multiple sources")),
-    }
-}
-
 fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<String> {
     let role = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
     let identity = convoy.spec.project_ref.as_ref().map_or_else(|| role.clone(), |project| format!("{role}@{project}"));
@@ -726,7 +701,8 @@ pub struct InProcessDaemon {
     self_weak: Weak<InProcessDaemon>,
     admission: ConvoyAdmission,
     convoy_ensure_reconciler: RwLock<Option<Arc<dyn ConvoyEnsureReconciler>>>,
-    crew_ops: Arc<CrewService>,
+    crew: Arc<CrewService>,
+    leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
     /// Unique identity for this daemon instance, generated at startup.
     /// Used in peer Hello handshake to detect remote daemon restarts.
@@ -799,15 +775,6 @@ impl ConvoyEnsureAdmission for InProcessDaemon {
 #[async_trait]
 pub trait OperatorReconciler: Send + Sync {
     async fn reconcile_now(&self, namespace: &str, kind: &str, name: &str) -> Result<String, String>;
-}
-
-#[async_trait]
-pub trait WorkCredentialReconciler: Send + Sync {
-    async fn reconcile(&self, namespace: &str, environment_ref: &str) -> Result<(), String>;
-
-    async fn ledger_delivery_environment(&self, _namespace: &str, _environment_ref: &str) -> Result<BTreeMap<String, String>, String> {
-        Err("credential delivery record is unavailable".to_string())
-    }
 }
 
 #[async_trait]
@@ -1196,7 +1163,7 @@ impl InProcessDaemon {
             LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher)
                 .with_clock(Arc::clone(&clock))
                 .with_message_inboxes(Arc::clone(&message_inboxes))
-                .with_charter_brief_renderer(Arc::new(crate::charter_notifications::LiveCharterBriefRenderer::new(
+                .with_charter_brief_renderer(Arc::new(flotilla_crew::charter_notifications::LiveCharterBriefRenderer::new(
                     resource_backend.clone(),
                     Arc::clone(&config),
                 )));
@@ -1222,7 +1189,7 @@ impl InProcessDaemon {
                 .provisioning_namespace(Arc::clone(&provisioning_namespace))
                 .build(),
         );
-        let crew_ops = Arc::new(
+        let crew = Arc::new(
             CrewService::builder()
                 .message_inboxes(Arc::clone(&message_inboxes))
                 .resource_backend(resource_backend.clone())
@@ -1232,7 +1199,7 @@ impl InProcessDaemon {
                 .config(Arc::clone(&config))
                 .host_name(host_name.clone())
                 .brief_artifact_writer(Arc::clone(&brief_artifact_writer))
-                .checkout_providers(Arc::clone(&checkout_providers))
+                .checkout_vcs(Arc::clone(&checkout_providers) as Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>)
                 .local_environment_id(local_environment_id.clone())
                 .build(),
         );
@@ -1288,7 +1255,8 @@ impl InProcessDaemon {
                 .build(),
             convoy_ensure_reconciler: RwLock::new(None),
 
-            crew_ops: Arc::clone(&crew_ops),
+            crew: Arc::clone(&crew),
+            leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics(leaf_subscriptions),
             brief_artifact_writer: Arc::clone(&brief_artifact_writer),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
@@ -1312,7 +1280,7 @@ impl InProcessDaemon {
             local_provider_statuses,
             local_placement_provider_statuses: RwLock::new(Vec::new()),
         });
-        crew_ops.set_turn_delivery_actuator(Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew_ops) })).await;
+        crew.set_turn_delivery_actuator(Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew) })).await;
 
         daemon.spawn_checkout_provider_retirement();
 
@@ -1489,11 +1457,11 @@ impl InProcessDaemon {
     }
 
     pub async fn set_work_credential_reconciler(&self, reconciler: Arc<dyn WorkCredentialReconciler>) {
-        self.crew_ops.set_work_credential_reconciler(reconciler).await;
+        self.crew.set_work_credential_reconciler(reconciler).await;
     }
 
     pub async fn ledger_delivery_environment(&self, namespace: &str, environment_ref: &str) -> Result<BTreeMap<String, String>, String> {
-        self.crew_ops.ledger_delivery_environment(namespace, environment_ref).await
+        self.crew.ledger_delivery_environment(namespace, environment_ref).await
     }
 
     async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
@@ -2115,23 +2083,23 @@ impl InProcessDaemon {
         connection_id: uuid::Uuid,
         request: flotilla_protocol::WaitSubscriptionRequest,
     ) -> Result<uuid::Uuid, String> {
-        self.crew_ops.subscribe_wait(connection_id, request).await
+        self.crew.subscribe_wait(connection_id, request).await
     }
 
     pub async fn unsubscribe_waits(&self, connection_id: uuid::Uuid) {
-        self.crew_ops.unsubscribe_waits(connection_id).await;
+        self.crew.unsubscribe_waits(connection_id).await;
     }
 
     pub fn reconciler_wake_watch(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = flotilla_resources::Convoy>> {
-        self.crew_ops.reconciler_wake_watch()
+        self.crew.reconciler_wake_watch()
     }
 
     pub fn change_request_stale_after(&self) -> Duration {
-        self.crew_ops.change_request_stale_after()
+        self.crew.change_request_stale_after()
     }
 
     pub async fn refresh_change_request_hint(&self, hint: &flotilla_address::Address) -> Result<(), String> {
-        self.crew_ops.refresh_change_request_hint(hint).await?;
+        self.crew.refresh_change_request_hint(hint).await?;
         let Some(hint_text) = flotilla_relay_protocol::hint_subject(hint).filter(|_| hint.kind() == flotilla_address::Kind::ChangeRequest)
         else {
             return Ok(());
@@ -2199,15 +2167,15 @@ impl InProcessDaemon {
     }
 
     pub async fn watch_change_request_convoy_demands(&self, namespace: &str) {
-        self.crew_ops.watch_change_request_convoy_demands(namespace).await;
+        self.crew.watch_change_request_convoy_demands(namespace).await;
     }
 
     pub async fn refresh_demanded_owned_change_requests(&self) -> Result<(), String> {
-        self.crew_ops.refresh_demanded_owned_change_requests().await
+        self.crew.refresh_demanded_owned_change_requests().await
     }
 
     pub fn set_change_request_relay_healthy(&self, healthy: bool) {
-        self.crew_ops.set_change_request_relay_healthy(healthy);
+        self.crew.set_change_request_relay_healthy(healthy);
     }
 
     pub fn connect_surface(&self, surface_id: uuid::Uuid, declaration: SurfaceDeclaration) {
@@ -3257,7 +3225,7 @@ impl InProcessDaemon {
 
     /// Teardown handle for composing the standing-convoy reconciler.
     pub fn convoy_teardown(&self) -> Arc<dyn flotilla_admission::ports::ConvoyTeardown> {
-        self.crew_ops.clone()
+        Arc::new(CrewTeardown(Arc::clone(&self.crew)))
     }
 
     /// Install the controller before driving standing-convoy operations.
@@ -3314,7 +3282,7 @@ impl InProcessDaemon {
     }
 
     pub async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
-        self.crew_ops.reap(namespace, name, force).await
+        self.crew.reap(namespace, name, force).await
     }
 
     pub fn admission_free_space_floor_bytes(&self) -> Result<u64, String> {
@@ -3968,7 +3936,7 @@ impl InProcessDaemon {
             host_name: &self.host_name,
             node_id: &self.node_id,
             clock: &self.clock,
-            leaf_subscriptions: self.crew_ops.subscription_diagnostics(),
+            leaf_subscriptions: &self.leaf_subscription_diagnostics,
             fleet: &self.fleet,
         }
     }
@@ -4275,7 +4243,7 @@ impl InProcessDaemon {
     }
 
     pub async fn resolve_crew_routing_context(&self, requested: &CrewCommandContext) -> Result<CrewRoutingContext, String> {
-        self.crew_ops.resolve_crew_routing_context(requested).await
+        self.crew.resolve_crew_routing_context(requested).await
     }
 
     pub async fn mark_crew_completion_pending(
@@ -4284,36 +4252,33 @@ impl InProcessDaemon {
         session_name: &str,
         pending: CrewCompletionPending,
     ) -> Result<(), String> {
-        self.crew_ops.mark_crew_completion_pending(namespace, session_name, pending).await
+        self.crew.mark_crew_completion_pending(namespace, session_name, pending).await
     }
 
     pub async fn clear_crew_completion_pending(&self, namespace: &str, session_name: &str) -> Result<(), String> {
-        self.crew_ops.clear_crew_completion_pending(namespace, session_name).await
+        self.crew.clear_crew_completion_pending(namespace, session_name).await
     }
 
     pub async fn pending_crew_completions(&self) -> Result<Vec<(String, CrewCompletionPending, CrewCommandContext)>, String> {
-        self.crew_ops.pending_crew_completions().await
+        self.crew.pending_crew_completions().await
     }
 
     pub async fn set_session_capability_source(&self, source: Arc<dyn flotilla_capability_contract::SessionCapabilitySource>) {
-        *self.crew_ops.capability_source.write().await = Some(source);
+        *self.crew.capability_source().write().await = Some(source);
     }
 
     pub async fn observe_launch_capability_card(&self, namespace: &str, name: &str, card: &str) -> Result<(), String> {
-        crate::crew_capabilities::observe_launch_card(&self.resource_backend, namespace, name, card, &self.crew_ops.capability_cards).await
+        flotilla_crew::crew_capabilities::observe_launch_card(&self.resource_backend, namespace, name, card, self.crew.capability_cards())
+            .await
     }
 
     pub async fn refresh_capability_cards(&self, namespace: &str) -> Result<(), String> {
-        let source = self.crew_ops.capability_source.read().await.clone().ok_or("session capability source unavailable")?;
-        crate::crew_capabilities::refresh_cards(&self.resource_backend, namespace, &*source, &self.crew_ops.capability_cards).await
-    }
-
-    pub async fn crew_capabilities_internal(&self, requested: &CrewCommandContext) -> Result<String, String> {
-        self.crew_ops.crew_capabilities_internal(requested).await
+        let source = self.crew.capability_source().read().await.clone().ok_or("session capability source unavailable")?;
+        flotilla_crew::crew_capabilities::refresh_cards(&self.resource_backend, namespace, &*source, self.crew.capability_cards()).await
     }
 
     pub async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {
-        self.crew_ops.crew_list_internal(requested).await
+        self.crew.crew_list_internal(requested).await
     }
 
     pub async fn crew_complete_internal(
@@ -4343,7 +4308,7 @@ impl InProcessDaemon {
         force: bool,
         principal: Option<PrincipalRef>,
     ) -> Result<flotilla_protocol::CommandValue, String> {
-        self.crew_ops.complete(requested, message, disposition, decision_ledger_ref, force, principal).await
+        self.crew.complete(requested, message, disposition, decision_ledger_ref, force, principal).await
     }
 
     pub async fn crew_fail_internal(
@@ -4353,7 +4318,7 @@ impl InProcessDaemon {
         force: bool,
         principal: Option<&PrincipalRef>,
     ) -> Result<(), String> {
-        self.crew_ops.fail(requested, message, force, principal).await
+        self.crew.fail(requested, message, force, principal).await
     }
 
     pub async fn crew_stall_internal(
@@ -4363,7 +4328,7 @@ impl InProcessDaemon {
         proposed_disposition: Option<flotilla_protocol::StallProposedDisposition>,
         message: String,
     ) -> Result<(), String> {
-        self.crew_ops.stall(requested, reason, proposed_disposition, message).await
+        self.crew.stall(requested, reason, proposed_disposition, message).await
     }
 
     async fn runner_for_resource_checkout(&self, _checkout: &ResourceObject<ResourceCheckout>) -> Result<Arc<dyn CommandRunner>, String> {
@@ -4371,7 +4336,7 @@ impl InProcessDaemon {
     }
 
     pub async fn verify_convoy_teardown_gate(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
-        self.crew_ops.teardown(namespace, name, force).await
+        self.crew.teardown(namespace, name, force).await
     }
 
     pub async fn verify_convoy_teardown_gate_for_checkouts(
@@ -4380,7 +4345,7 @@ impl InProcessDaemon {
         checkout_list: &[ResourceObject<ResourceCheckout>],
         force: bool,
     ) -> Result<(), String> {
-        self.crew_ops.verify_convoy_teardown_gate_for_checkouts(convoy, checkout_list, force).await
+        self.crew.verify_convoy_teardown_gate_for_checkouts(convoy, checkout_list, force).await
     }
 
     pub async fn abandon_convoy_internal(
@@ -4390,7 +4355,7 @@ impl InProcessDaemon {
         reason: &str,
         principal_ref: Option<&PrincipalRef>,
     ) -> Result<Vec<CheckoutArchiveOutcome>, String> {
-        self.crew_ops.abandon(namespace, name, reason, principal_ref).await
+        self.crew.abandon(namespace, name, reason, principal_ref).await
     }
 
     pub async fn abandon_convoy_internal_with_hook<F, Fut>(
@@ -4405,11 +4370,11 @@ impl InProcessDaemon {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        self.crew_ops.abandon_convoy_internal_with_hook(namespace, name, reason, principal_ref, before_update).await
+        self.crew.abandon_convoy_internal_with_hook(namespace, name, reason, principal_ref, before_update).await
     }
 
     pub async fn crew_handoff_internal(&self, requested: &CrewCommandContext, target: &str, message: &str) -> Result<(), String> {
-        self.crew_ops.handoff(requested, target, message).await
+        self.crew.handoff(requested, target, message).await
     }
 
     pub async fn convoy_resume_internal(
@@ -4422,43 +4387,43 @@ impl InProcessDaemon {
         intent: ResumeIntent,
     ) -> Result<ConvoyResumeOutcome, String> {
         if intent == ResumeIntent::Reminder {
-            return self.crew_ops.resume(namespace, name, prompt, requested_vessel, requested_role).await;
+            return self.crew.resume(namespace, name, prompt, requested_vessel, requested_role).await;
         }
-        self.crew_ops
+        self.crew
             .convoy_resume_with_sender_internal(
                 namespace,
                 name,
                 prompt,
                 (requested_vessel, requested_role),
-                crew_ops::MessageAttribution::operator(None),
+                MessageAttribution::operator(None),
                 intent,
             )
             .await
     }
 
     pub async fn convoy_withdraw_pending_brief_internal(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {
-        self.crew_ops.withdraw_pending_brief(namespace, name).await
+        self.crew.withdraw_pending_brief(namespace, name).await
     }
 
     pub async fn reconcile_crew_stalls_once(&self, namespace: &str) -> Result<(), String> {
-        self.crew_ops.reconcile_crew_stalls_once(namespace).await
+        self.crew.reconcile_crew_stalls_once(namespace).await
     }
 
-    pub fn set_resource_intent_publisher(&self, publisher: Weak<dyn crate::leaf_engine::ResourceIntentPublisher>) {
-        self.crew_ops.set_resource_intent_publisher(publisher);
+    pub fn set_resource_intent_publisher(&self, publisher: Weak<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher>) {
+        self.crew.set_resource_intent_publisher(publisher);
     }
 
-    pub async fn deliver_standing_turn(&self, request: &crate::leaf_engine::CrewTurnIntent) -> Result<TurnDeliveryRung, String> {
-        self.crew_ops.deliver_turn(request).await.map(|admission| admission.rung)
+    pub async fn deliver_standing_turn(&self, request: &flotilla_crew::leaf_engine::CrewTurnIntent) -> Result<TurnDeliveryRung, String> {
+        self.crew.deliver_turn(request).await.map(|admission| admission.rung)
     }
 
     /// Recover previous-generation queue intent at startup and periodic resync.
     pub async fn adopt_legacy_convoy_queues_once(&self, namespace: &str) -> Result<(), String> {
-        self.crew_ops.adopt_legacy_convoy_queues_once(namespace, None).await
+        self.crew.adopt_legacy_convoy_queues_once(namespace, None).await
     }
 
     pub async fn reconcile_pending_supervisor_turns_once(&self, namespace: &str) -> Result<(), String> {
-        self.crew_ops.reconcile_pending_supervisor_turns_once(namespace).await
+        self.crew.reconcile_pending_supervisor_turns_once(namespace).await
     }
 
     fn attach_resolver(&self) -> AttachResolver<'_> {
@@ -4864,7 +4829,7 @@ impl InProcessDaemon {
     }
 
     pub async fn message_inbox(&self, namespace: &str) -> flotilla_messaging::MessageInbox {
-        self.crew_ops.message_inbox(namespace).await
+        self.crew.message_inbox(namespace).await
     }
 
     /// Returns the canonical admitted record. Suppression before creation does
@@ -4973,7 +4938,7 @@ impl InProcessDaemon {
             events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
         };
         let crew = crew_actions::CrewActions {
-            crew: &self.crew_ops,
+            crew: &self.crew,
             port: self,
             resource_backend: &self.resource_backend,
             clock: &self.clock,
@@ -5388,21 +5353,21 @@ impl projections_actions::ProjectionsActionPort for InProcessDaemon {
     async fn image_build_report(&self, namespace: &str, name: &str) -> Result<flotilla_protocol::image_check::ImageBuildReport, String> {
         image_check::image_build_report(&self.resource_backend, namespace, name).await
     }
-    async fn crew_capabilities_internal(&self, context: &flotilla_protocol::CrewCommandContext) -> Result<String, String> {
-        self.crew_ops.crew_capabilities_internal(context).await
+    async fn crew_capability_card(&self, context: &flotilla_protocol::CrewCommandContext) -> Result<String, String> {
+        self.crew.query_capabilities(context).await
     }
     async fn message_contacts_internal(
         &self,
         context: &flotilla_protocol::CrewCommandContext,
     ) -> Result<(String, serde_json::Value), String> {
-        let book = self.crew_ops.message_contacts_internal(context).await?;
+        let book = self.crew.message_contacts_internal(context).await?;
         Ok((book.render(), serde_json::to_value(book).map_err(|error| error.to_string())?))
     }
     async fn crew_list_internal(
         &self,
         context: &flotilla_protocol::CrewCommandContext,
     ) -> Result<flotilla_protocol::CrewListResponse, String> {
-        self.crew_ops.crew_list_internal(context).await
+        self.crew.crew_list_internal(context).await
     }
 
     async fn provisioning_namespace(&self) -> String {
@@ -5656,13 +5621,16 @@ impl ProjectOperations for InProcessDaemon {
         }
     }
 }
+/// Admission's standing-convoy teardown, served by the crew service.
+struct CrewTeardown(Arc<CrewService>);
+
 #[async_trait]
-impl flotilla_admission::ports::ConvoyTeardown for CrewService {
+impl flotilla_admission::ports::ConvoyTeardown for CrewTeardown {
     async fn abandon(&self, namespace: &str, name: &str, reason: &str, principal: Option<&PrincipalRef>) -> Result<(), String> {
-        CrewService::abandon(self, namespace, name, reason, principal).await.map(|_| ())
+        self.0.abandon(namespace, name, reason, principal).await.map(|_| ())
     }
     async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
-        CrewService::reap(self, namespace, name, force).await
+        self.0.reap(namespace, name, force).await
     }
 }
 

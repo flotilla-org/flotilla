@@ -73,7 +73,7 @@ use flotilla_issue_tracker::IssueProvider;
 #[async_trait]
 pub trait ProjectionsActionPort: Send + Sync {
     async fn image_build_report(&self, namespace: &str, name: &str) -> Result<flotilla_protocol::image_check::ImageBuildReport, String>;
-    async fn crew_capabilities_internal(&self, context: &flotilla_protocol::CrewCommandContext) -> Result<String, String>;
+    async fn crew_capability_card(&self, context: &flotilla_protocol::CrewCommandContext) -> Result<String, String>;
     async fn message_contacts_internal(
         &self,
         context: &flotilla_protocol::CrewCommandContext,
@@ -259,7 +259,7 @@ impl ProjectionsActions<'_> {
                     Err(message) => Ok(CommandValue::Error { message }),
                 }
             }
-            CommandAction::QueryCrewCapabilities { context } => match self.port.crew_capabilities_internal(context).await {
+            CommandAction::QueryCrewCapabilities { context } => match self.port.crew_capability_card(context).await {
                 Ok(card) => Ok(CommandValue::CrewCapabilities { card }),
                 Err(message) => Ok(CommandValue::Error { message }),
             },

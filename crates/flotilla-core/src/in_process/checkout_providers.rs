@@ -243,6 +243,14 @@ impl CheckoutProviders {
     }
 }
 
+/// Crew resolves checkout VCS through the shared lookup state, defaulting to the local environment.
+#[async_trait::async_trait]
+impl flotilla_vcs::vcs::CheckoutVcsResolver for CheckoutProviders {
+    async fn vcs_for(&self, environment: Option<&EnvironmentId>, path: &Path) -> Result<Arc<dyn Vcs>, String> {
+        self.vcs_for_checkout(environment.unwrap_or(&self.local_environment_id), path).await
+    }
+}
+
 impl InProcessDaemon {
     pub(super) async fn checkout_provider(&self, env_id: &EnvironmentId, path: &Path) -> Result<Arc<CheckoutProvider>, String> {
         self.checkout_providers.checkout_provider(env_id, path).await

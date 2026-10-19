@@ -122,7 +122,7 @@ struct ReceiverIntentPublisher {
     inbox: flotilla_messaging::MessageInbox,
 }
 #[async_trait]
-impl flotilla_core::leaf_engine::ResourceIntentPublisher for ReceiverIntentPublisher {
+impl flotilla_crew::leaf_engine::ResourceIntentPublisher for ReceiverIntentPublisher {
     async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String> {
         if document["kind"] != "Message" || document["metadata"]["namespace"] != namespace {
             return Err("invalid receiver-home resource document".into());
@@ -8882,7 +8882,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> =
+    let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> =
         Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     let snapshot = WorkflowSnapshot {
@@ -9012,12 +9012,12 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     };
     struct FailedHandoffPublisher;
     #[async_trait::async_trait]
-    impl flotilla_core::leaf_engine::ResourceIntentPublisher for FailedHandoffPublisher {
+    impl flotilla_crew::leaf_engine::ResourceIntentPublisher for FailedHandoffPublisher {
         async fn publish(self: Arc<Self>, _: &str, _: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String> {
             Err("remote handoff publication unavailable".into())
         }
     }
-    let failed: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> = Arc::new(FailedHandoffPublisher);
+    let failed: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> = Arc::new(FailedHandoffPublisher);
     authority.set_resource_intent_publisher(Arc::downgrade(&failed));
     let before = convoys.get("handoff-convoy").await.expect("before failed handoff").status;
     let error = authority.crew_handoff_internal(&context, "reviewer", "Review this").await.expect_err("publication fails");
@@ -9081,7 +9081,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> =
+    let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> =
         Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
@@ -9156,7 +9156,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         .convoy_resume_internal("flotilla", "split-convoy", "Continue", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("resume remote crew session");
-    assert!(matches!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { .. }));
+    assert!(matches!(outcome, flotilla_crew::crew_ops::ConvoyResumeOutcome::Queued { .. }));
     let convoy = convoys.get("split-convoy").await.expect("convoy after resume");
     assert!(convoy.status.expect("convoy status").turn_deliveries.values().all(|delivery| delivery.pending_supervisor_turn.is_none()));
     assert!(authority.resource_backend().using::<TerminalSession>("flotilla").list().await.expect("local sessions").items.is_empty());
@@ -9224,7 +9224,7 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
         .convoy_resume_internal("flotilla", "busy-convoy", "Use the newer instruction", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("replace pending brief");
-    assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: Some("Check the edge case".to_string()) });
+    assert_eq!(outcome, flotilla_crew::crew_ops::ConvoyResumeOutcome::Queued { displaced: Some("Check the edge case".to_string()) });
     let convoy = convoys.get("busy-convoy").await.expect("read updated convoy");
     let status = convoy.status.unwrap();
     let reference = status.crew_work["work"]["coder"].pending_follow_up.as_ref().unwrap();
@@ -9427,12 +9427,12 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .convoy_resume_internal("flotilla", "idle-convoy", "Finish the current turn", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("queue brief while crew is working");
-    assert_eq!(queued, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: None });
+    assert_eq!(queued, flotilla_crew::crew_ops::ConvoyResumeOutcome::Queued { displaced: None });
     let unrelated = daemon
         .convoy_resume_internal("flotilla", "idle-convoy", "Start the review", Some("review"), Some("qa"), ResumeIntent::Reopen)
         .await
         .expect("resume unrelated crew");
-    assert_eq!(unrelated, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: None });
+    assert_eq!(unrelated, flotilla_crew::crew_ops::ConvoyResumeOutcome::Queued { displaced: None });
     let status = convoys.get("idle-convoy").await.unwrap().status.unwrap();
     let reference = status.crew_work["work"]["coder"].pending_follow_up.as_ref().unwrap();
     let first = backend.using::<flotilla_resources::Message>("flotilla").get(&reference.name).await.unwrap();

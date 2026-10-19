@@ -4,6 +4,7 @@ use flotilla_resources::{credential_refresh_alert_for_vessel, LANDING_EVIDENCE_T
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_resources::convoy_address::convoy_address;
 use flotilla_resources::ResumeIntent;
+use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity, PROJECT_LABEL};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -46,15 +47,41 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 use tracing::warn;
 
-use super::{checkout_providers::CheckoutProviders, WorkCredentialReconciler};
+use crate::ports::WorkCredentialReconciler;
 use flotilla_agent::adapter::{CrewAssignment, CrewBriefTemplateResolver};
+use flotilla_vcs::vcs::CheckoutVcsResolver;
 
-use crate::leaf_engine::{EscalationAdmission, LeafSubscriptionTable, TurnDeliveryActuator};
+use crate::crew_capabilities::{credential_references, session_card, CapabilityCardTracker};
+use crate::leaf_engine::{
+    crew_role_address, supervision_message_source, turn_message_producer_key, CrewTurnAdmission, CrewTurnIntent, EscalationAdmission,
+    LeafSubscriptionTable, ResourceIntentPublisher, TurnDeliveryActuator,
+};
 use flotilla_resources::crew_attention;
 
 use flotilla_resources::explain_unmet_expectation;
 
 use flotilla_config::ConfigStore;
+
+/// Resolves a convoy address to its local record name.
+pub async fn resolve_local_convoy_name(backend: &ResourceBackend, namespace: &str, address: &str) -> Result<String, String> {
+    let convoys = backend.clone().using::<ResourceConvoy>(namespace);
+    let candidates = convoys.list().await.map_err(|error| error.to_string())?.items;
+    let identities = candidates
+        .iter()
+        .map(|convoy| ConvoyAddressIdentity {
+            record_name: &convoy.metadata.name,
+            role: convoy.metadata.labels.get(ROLE_LABEL).map(String::as_str),
+            project: convoy.metadata.labels.get(PROJECT_LABEL).map(String::as_str),
+            terminal: convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()),
+        })
+        .collect::<Vec<_>>();
+    let selected = resolve_convoy_candidate_indices(&identities, address)?;
+    match selected.as_slice() {
+        [index] => Ok(candidates[*index].metadata.name.clone()),
+        [] => Err(format!("no convoy matches `{address}`")),
+        _ => Err(format!("convoy record `{address}` is present from multiple sources")),
+    }
+}
 
 /// An authorized supervision decision; escalation carries its admitted recipient.
 enum SupervisorRuling {
@@ -68,16 +95,16 @@ enum SupervisorRuling {
 /// Leaf subscriptions retain their injected EventSink and delivery actuator;
 /// the actuator points weakly to this module so subscriptions cannot keep it alive.
 #[derive(bon::Builder)]
-pub(super) struct CrewService {
+pub struct CrewService {
     resource_backend: ResourceBackend,
     #[builder(default)]
-    pub(super) capability_source: RwLock<Option<Arc<dyn flotilla_capability_contract::SessionCapabilitySource>>>,
+    capability_source: RwLock<Option<Arc<dyn flotilla_capability_contract::SessionCapabilitySource>>>,
     #[builder(default)]
-    pub(super) capability_cards: crate::crew_capabilities::CapabilityCardTracker,
+    capability_cards: CapabilityCardTracker,
     #[builder(default)]
     message_inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>,
     #[builder(default)]
-    resource_intent_publisher: std::sync::RwLock<Option<Weak<dyn crate::leaf_engine::ResourceIntentPublisher>>>,
+    resource_intent_publisher: std::sync::RwLock<Option<Weak<dyn ResourceIntentPublisher>>>,
     leaf_subscriptions: LeafSubscriptionTable,
     /// Serializes Message continuation intent with convoy workflow activation.
     #[builder(default)]
@@ -89,7 +116,7 @@ pub(super) struct CrewService {
     config: Arc<ConfigStore>,
     host_name: HostName,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
-    checkout_providers: Arc<CheckoutProviders>,
+    checkout_vcs: Arc<dyn CheckoutVcsResolver>,
     local_environment_id: EnvironmentId,
 }
 
@@ -104,28 +131,28 @@ struct ResolvedCrewContext {
 }
 
 #[derive(bon::Builder)]
-pub(super) struct CrewSupervisionRequest<'a> {
-    pub(super) namespace: &'a str,
-    pub(super) convoy_name: &'a str,
-    pub(super) vessel: &'a str,
-    pub(super) role: &'a str,
-    pub(super) operation: flotilla_protocol::CrewSupervisionAction,
-    pub(super) message: &'a str,
-    pub(super) actor_crew_id: Option<&'a str>,
-    pub(super) principal: Option<&'a PrincipalRef>,
+pub struct CrewSupervisionRequest<'a> {
+    pub namespace: &'a str,
+    pub convoy_name: &'a str,
+    pub vessel: &'a str,
+    pub role: &'a str,
+    pub operation: flotilla_protocol::CrewSupervisionAction,
+    pub message: &'a str,
+    pub actor_crew_id: Option<&'a str>,
+    pub principal: Option<&'a PrincipalRef>,
 }
 
-pub(super) struct CrewTurnDeliveryActuator {
-    pub(super) crew: Weak<CrewService>,
+pub struct CrewTurnDeliveryActuator {
+    pub crew: Weak<CrewService>,
 }
 
 #[async_trait]
-impl crate::leaf_engine::TurnDeliveryActuator for CrewTurnDeliveryActuator {
-    async fn deliver(&self, request: &crate::leaf_engine::CrewTurnIntent) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
+impl TurnDeliveryActuator for CrewTurnDeliveryActuator {
+    async fn deliver(&self, request: &CrewTurnIntent) -> Result<CrewTurnAdmission, String> {
         self.crew.upgrade().ok_or_else(|| "daemon stopped before turn delivery".to_string())?.deliver_turn(request).await
     }
 
-    async fn hold(&self, request: &crate::leaf_engine::CrewTurnIntent, act: &HoldAct, reason: &str) -> Result<(), String> {
+    async fn hold(&self, request: &CrewTurnIntent, act: &HoldAct, reason: &str) -> Result<(), String> {
         self.crew
             .upgrade()
             .ok_or_else(|| "daemon stopped before turn-delivery hold".to_string())?
@@ -273,7 +300,7 @@ fn crew_change_request_query(
 
 /// Legacy convoys may have no role; retain their resource identity instead of
 /// rendering an empty address or a bare project suffix.
-pub(crate) fn convoy_message_address(convoy: &ResourceObject<ResourceConvoy>) -> String {
+pub fn convoy_message_address(convoy: &ResourceObject<ResourceConvoy>) -> String {
     if convoy.spec.role.is_empty() {
         convoy.metadata.name.clone()
     } else {
@@ -283,7 +310,7 @@ pub(crate) fn convoy_message_address(convoy: &ResourceObject<ResourceConvoy>) ->
 
 // Legacy fixture seeding only; remove after the first fleet roll deploying #2710.
 #[cfg(test)]
-pub(super) async fn convoy_sender_address(backend: &ResourceBackend, namespace: &str, name: &str) -> String {
+pub(crate) async fn convoy_sender_address(backend: &ResourceBackend, namespace: &str, name: &str) -> String {
     backend
         .including_replicas::<ResourceConvoy>(namespace)
         .get(name)
@@ -343,7 +370,7 @@ fn crew_message_header(sender: &CrewMessageSender) -> String {
 
 // Legacy fixture seeding only; remove after the first fleet roll deploying #2710.
 #[cfg(test)]
-pub(super) fn frame_crew_message(sender: &CrewMessageSender, body: &str) -> String {
+pub(crate) fn frame_crew_message(sender: &CrewMessageSender, body: &str) -> String {
     format!("[{}]\n\n{body}", crew_message_header(sender))
 }
 
@@ -376,13 +403,13 @@ fn ensure_crew_work_is_defined(
     }
 }
 
-pub(super) struct MessageAttribution {
-    pub(super) sender: String,
-    pub(super) in_reply_to: Option<String>,
+pub struct MessageAttribution {
+    pub sender: String,
+    pub in_reply_to: Option<String>,
 }
 
 impl MessageAttribution {
-    pub(super) fn operator(principal: Option<&PrincipalRef>) -> Self {
+    pub fn operator(principal: Option<&PrincipalRef>) -> Self {
         Self {
             sender: format!("principal:{}", principal.map_or(PrincipalRef::IMPLICIT_NAME, |principal| principal.name.as_str())),
             in_reply_to: None,
@@ -405,7 +432,7 @@ fn crew_handoff_address_error(target: &str, vessel: &str) -> String {
     format!("no such crew target; handoff requires a different crew member (target `{target}`, vessel `{vessel}`)")
 }
 
-pub(super) fn terminal_meta_with_vessel_credentials(mut meta: InputMeta, requirement: &flotilla_resources::VesselRequirement) -> InputMeta {
+pub fn terminal_meta_with_vessel_credentials(mut meta: InputMeta, requirement: &flotilla_resources::VesselRequirement) -> InputMeta {
     if !requirement.credential_refs.is_empty() {
         meta.annotations.insert(
             CREDENTIAL_REFS_ANNOTATION.to_string(),
@@ -429,7 +456,7 @@ pub(super) fn terminal_meta_with_vessel_credentials(mut meta: InputMeta, require
 
 // Legacy fixture seeding only; remove after the first fleet roll deploying #2710.
 #[cfg(test)]
-pub(super) async fn queue_pending_crew_message(
+pub async fn queue_pending_crew_message(
     sessions: &flotilla_store::TypedResolver<ResourceTerminalSession>,
     existing: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
     sender: CrewMessageSender,
@@ -449,15 +476,25 @@ async fn queue_crew_message_object(
 }
 
 impl CrewService {
-    pub(super) fn set_resource_intent_publisher(&self, publisher: Weak<dyn crate::leaf_engine::ResourceIntentPublisher>) {
+    /// The session capability source the runtime installs after construction.
+    pub fn capability_source(&self) -> &RwLock<Option<Arc<dyn flotilla_capability_contract::SessionCapabilitySource>>> {
+        &self.capability_source
+    }
+
+    /// Per-session capability card observations.
+    pub fn capability_cards(&self) -> &CapabilityCardTracker {
+        &self.capability_cards
+    }
+
+    pub fn set_resource_intent_publisher(&self, publisher: Weak<dyn ResourceIntentPublisher>) {
         *self.resource_intent_publisher.write().expect("resource intent publisher lock") = Some(publisher);
     }
 
-    pub(super) fn message_observation_staleness(&self) -> (std::time::Duration, std::time::Duration) {
+    pub(crate) fn message_observation_staleness(&self) -> (std::time::Duration, std::time::Duration) {
         (self.leaf_subscriptions.change_request_stale_after(), self.leaf_subscriptions.issue_stale_after())
     }
 
-    pub(super) async fn subscribe_wait(
+    pub async fn subscribe_wait(
         &self,
         connection_id: uuid::Uuid,
         request: flotilla_protocol::WaitSubscriptionRequest,
@@ -465,61 +502,52 @@ impl CrewService {
         self.leaf_subscriptions.subscribe_wait(connection_id, request).await
     }
 
-    pub(super) async fn unsubscribe_waits(&self, connection_id: uuid::Uuid) {
+    pub async fn unsubscribe_waits(&self, connection_id: uuid::Uuid) {
         self.leaf_subscriptions.unsubscribe_connection(connection_id).await;
     }
 
-    pub(super) fn reconciler_wake_watch(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = ResourceConvoy>> {
+    pub fn reconciler_wake_watch(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = ResourceConvoy>> {
         self.leaf_subscriptions.reconciler_wake_watch()
     }
 
-    pub(super) fn change_request_stale_after(&self) -> Duration {
+    pub fn change_request_stale_after(&self) -> Duration {
         self.leaf_subscriptions.change_request_stale_after()
     }
 
-    pub(super) async fn watch_change_request_convoy_demands(&self, namespace: &str) {
+    pub async fn watch_change_request_convoy_demands(&self, namespace: &str) {
         self.leaf_subscriptions.watch_change_request_convoy_demands(namespace).await;
     }
 
-    pub(super) async fn refresh_change_request_hint(&self, hint: &flotilla_address::Address) -> Result<(), String> {
+    pub async fn refresh_change_request_hint(&self, hint: &flotilla_address::Address) -> Result<(), String> {
         self.leaf_subscriptions.refresh_change_request_hint(hint).await
     }
 
-    pub(super) async fn refresh_demanded_owned_change_requests(&self) -> Result<(), String> {
+    pub async fn refresh_demanded_owned_change_requests(&self) -> Result<(), String> {
         self.leaf_subscriptions.refresh_demanded_owned_change_requests().await
     }
 
-    pub(super) fn set_change_request_relay_healthy(&self, healthy: bool) {
+    pub fn set_change_request_relay_healthy(&self, healthy: bool) {
         self.leaf_subscriptions.set_change_request_relay_healthy(healthy);
     }
 
-    pub(super) async fn set_turn_delivery_actuator(&self, actuator: Arc<dyn TurnDeliveryActuator>) {
+    pub async fn set_turn_delivery_actuator(&self, actuator: Arc<dyn TurnDeliveryActuator>) {
         self.leaf_subscriptions.set_turn_delivery_actuator(actuator).await;
     }
 
-    pub(super) fn subscription_diagnostics(&self) -> &LeafSubscriptionTable {
+    pub fn subscription_diagnostics(&self) -> &LeafSubscriptionTable {
         &self.leaf_subscriptions
     }
 
-    #[cfg(test)]
-    pub(super) async fn subscription_rows(&self) -> Vec<flotilla_resources::LeafSubscriptionRow> {
-        self.leaf_subscriptions.rows().await
-    }
-
-    pub(super) async fn set_work_credential_reconciler(&self, reconciler: Arc<dyn WorkCredentialReconciler>) {
+    pub async fn set_work_credential_reconciler(&self, reconciler: Arc<dyn WorkCredentialReconciler>) {
         *self.work_credential_reconciler.write().await = Some(reconciler);
     }
 
-    pub(super) async fn ledger_delivery_environment(
-        &self,
-        namespace: &str,
-        environment_ref: &str,
-    ) -> Result<BTreeMap<String, String>, String> {
+    pub async fn ledger_delivery_environment(&self, namespace: &str, environment_ref: &str) -> Result<BTreeMap<String, String>, String> {
         let reconciler = self.work_credential_reconciler.read().await.clone().ok_or("credential controller is unavailable")?;
         reconciler.ledger_delivery_environment(namespace, environment_ref).await
     }
 
-    pub(super) async fn message_inbox(&self, namespace: &str) -> flotilla_messaging::MessageInbox {
+    pub async fn message_inbox(&self, namespace: &str) -> flotilla_messaging::MessageInbox {
         self.message_inboxes
             .lock()
             .await
@@ -533,16 +561,16 @@ impl CrewService {
             .clone()
     }
 
-    pub(super) async fn provisioning_namespace(&self) -> String {
+    pub async fn provisioning_namespace(&self) -> String {
         self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone()
     }
 
     async fn local_vcs_for_checkout(&self, path: &Path) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, String> {
-        self.checkout_providers.vcs_for_checkout(&self.local_environment_id, path).await
+        self.checkout_vcs.vcs_for(Some(&self.local_environment_id), path).await
     }
     /// Resolve enough local identity to route to the convoy authority without
     /// reading its authority-owned Convoy or Vessel.
-    pub(super) async fn resolve_crew_routing_context(&self, requested: &CrewCommandContext) -> Result<CrewRoutingContext, String> {
+    pub async fn resolve_crew_routing_context(&self, requested: &CrewCommandContext) -> Result<CrewRoutingContext, String> {
         let provisioning_namespace = self.provisioning_namespace().await;
         let namespace = requested.namespace.clone().unwrap_or_else(|| provisioning_namespace.clone());
         if namespace != provisioning_namespace {
@@ -679,7 +707,7 @@ impl CrewService {
         self.resolved_crew_context(namespace, convoy, vessel_ref, role, caller).await
     }
 
-    pub(super) async fn mark_crew_completion_pending(
+    pub async fn mark_crew_completion_pending(
         &self,
         namespace: &str,
         session_name: &str,
@@ -695,7 +723,7 @@ impl CrewService {
         .map_err(|error| error.to_string())
     }
 
-    pub(super) async fn clear_crew_completion_pending(&self, namespace: &str, session_name: &str) -> Result<(), String> {
+    pub async fn clear_crew_completion_pending(&self, namespace: &str, session_name: &str) -> Result<(), String> {
         apply_resource_status_patch(
             &self.resource_backend.clone().using::<ResourceTerminalSession>(namespace),
             session_name,
@@ -706,7 +734,7 @@ impl CrewService {
         .map_err(|error| error.to_string())
     }
 
-    pub(super) async fn pending_crew_completions(&self) -> Result<Vec<(String, CrewCompletionPending, CrewCommandContext)>, String> {
+    pub async fn pending_crew_completions(&self) -> Result<Vec<(String, CrewCompletionPending, CrewCommandContext)>, String> {
         let namespace = self.provisioning_namespace().await;
         let sessions = self
             .resource_backend
@@ -761,12 +789,12 @@ impl CrewService {
             .build())
     }
 
-    pub(super) async fn crew_capabilities_internal(&self, requested: &CrewCommandContext) -> Result<String, String> {
+    pub async fn query_capabilities(&self, requested: &CrewCommandContext) -> Result<String, String> {
         let context = self.resolve_crew_context(requested).await?;
         let session = context.caller_session.as_ref().ok_or("capabilities requires a live crew session")?;
         let source = self.capability_source.read().await.clone().ok_or("session capability source unavailable")?;
-        let credentials = source.credentials(&session.spec.env_ref, &crate::crew_capabilities::credential_references(session)?).await?;
-        crate::crew_capabilities::session_card(
+        let credentials = source.credentials(&session.spec.env_ref, &credential_references(session)?).await?;
+        session_card(
             &self.resource_backend,
             &context.namespace,
             &context.convoy,
@@ -777,10 +805,7 @@ impl CrewService {
         .await
     }
 
-    pub(super) async fn message_contacts_internal(
-        &self,
-        requested: &CrewCommandContext,
-    ) -> Result<flotilla_messaging::CrewAddressBook, String> {
+    pub async fn message_contacts_internal(&self, requested: &CrewCommandContext) -> Result<flotilla_messaging::CrewAddressBook, String> {
         let context = self.resolve_crew_context(requested).await?;
         let convoy = self
             .resource_backend
@@ -793,7 +818,7 @@ impl CrewService {
         flotilla_messaging::crew_address_book(&self.resource_backend, &context.namespace, &address).await.map_err(|error| error.to_string())
     }
 
-    pub(super) async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {
+    pub async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
         let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
@@ -946,7 +971,7 @@ impl CrewService {
             .build())
     }
 
-    pub(super) async fn promise(
+    pub async fn promise(
         &self,
         requested: &CrewCommandContext,
         operation: flotilla_protocol::commands::CrewPromiseOperation,
@@ -1080,7 +1105,7 @@ impl CrewService {
         Ok(())
     }
 
-    pub(super) async fn complete(
+    pub async fn complete(
         &self,
         requested: &CrewCommandContext,
         message: Option<String>,
@@ -1470,7 +1495,7 @@ impl CrewService {
         Ok(flotilla_protocol::CommandValue::Ok)
     }
 
-    pub(super) async fn fail(
+    pub async fn fail(
         &self,
         requested: &CrewCommandContext,
         message: String,
@@ -1486,7 +1511,7 @@ impl CrewService {
         .await
     }
 
-    pub(super) async fn stall(
+    pub async fn stall(
         &self,
         requested: &CrewCommandContext,
         reason: flotilla_protocol::StallReason,
@@ -1541,7 +1566,7 @@ impl CrewService {
         .map_err(|error| error.to_string())
     }
 
-    pub(super) async fn supervise(&self, request: CrewSupervisionRequest<'_>) -> Result<CommandValue, String> {
+    pub async fn supervise(&self, request: CrewSupervisionRequest<'_>) -> Result<CommandValue, String> {
         let CrewSupervisionRequest { namespace, convoy_name, vessel, role, operation: action, message, actor_crew_id, principal } = request;
         if message.trim().is_empty() {
             return Err("crew supervision requires a non-empty message".to_string());
@@ -1602,8 +1627,7 @@ impl CrewService {
                 reason: "stall is already at the operator rung".into(),
             });
         }
-        let receiver =
-            crate::leaf_engine::crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), convoy_name, vessel, role);
+        let receiver = crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), convoy_name, vessel, role);
         let sender = if actor_crew_id.is_some() {
             let supervisor = stalled.supervisor.as_ref().expect("checked supervisor above");
             let supervisor_convoy = self
@@ -1612,7 +1636,7 @@ impl CrewService {
                 .get(&supervisor.convoy)
                 .await
                 .map_err(|error| error.to_string())?;
-            crate::leaf_engine::crew_role_address(
+            crew_role_address(
                 supervisor_convoy.object.spec.project_ref.as_deref().unwrap_or(namespace),
                 &supervisor.convoy,
                 &supervisor.vessel,
@@ -1656,8 +1680,8 @@ impl CrewService {
                         flotilla_resources::message_record_name(
                             &sender,
                             &receiver,
-                            &crate::leaf_engine::turn_message_producer_key(
-                                &crate::leaf_engine::supervision_message_source(convoy_name, index),
+                            &turn_message_producer_key(
+                                &supervision_message_source(convoy_name, index),
                                 &stalled.began_at.timestamp_micros().to_string(),
                             ),
                         )
@@ -1749,7 +1773,7 @@ impl CrewService {
         Ok(CommandValue::Ok)
     }
 
-    pub(super) async fn teardown(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+    pub async fn teardown(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         if force {
             return Ok(());
         }
@@ -1808,7 +1832,7 @@ impl CrewService {
         Ok(())
     }
 
-    pub(super) async fn verify_convoy_teardown_gate_for_checkouts(
+    pub async fn verify_convoy_teardown_gate_for_checkouts(
         &self,
         convoy: &ResourceObject<ResourceConvoy>,
         checkout_list: &[ResourceObject<ResourceCheckout>],
@@ -1955,11 +1979,7 @@ impl CrewService {
         }
     }
 
-    pub(super) async fn archive_convoy_checkouts_best_effort(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Vec<CheckoutArchiveOutcome>, String> {
+    pub async fn archive_convoy_checkouts_best_effort(&self, namespace: &str, name: &str) -> Result<Vec<CheckoutArchiveOutcome>, String> {
         let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
         let checkout_list = checkouts
             .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
@@ -2025,7 +2045,7 @@ impl CrewService {
         Ok(outcomes)
     }
 
-    pub(super) async fn abandon(
+    pub async fn abandon(
         &self,
         namespace: &str,
         name: &str,
@@ -2035,7 +2055,7 @@ impl CrewService {
         self.abandon_convoy_internal_with_hook(namespace, name, reason, principal_ref, || async {}).await
     }
 
-    pub(super) async fn abandon_convoy_internal_with_hook<F, Fut>(
+    pub async fn abandon_convoy_internal_with_hook<F, Fut>(
         &self,
         namespace: &str,
         name: &str,
@@ -2104,7 +2124,7 @@ impl CrewService {
         .map_err(|error| error.to_string())
     }
 
-    pub(super) async fn record_lifecycle_mutation_best_effort(
+    pub(crate) async fn record_lifecycle_mutation_best_effort(
         &self,
         namespace: &str,
         name: &str,
@@ -2131,11 +2151,11 @@ impl CrewService {
         apply_resource_status_patch(&convoys, &context.convoy, &patch(&context)).await.map(|_| ()).map_err(|err| err.to_string())
     }
 
-    pub(super) async fn handoff(&self, requested: &CrewCommandContext, target: &str, message: &str) -> Result<(), String> {
+    pub async fn handoff(&self, requested: &CrewCommandContext, target: &str, message: &str) -> Result<(), String> {
         self.handoff_with_carries(requested, target, message, Vec::new()).await
     }
 
-    pub(super) async fn handoff_with_carries(
+    pub async fn handoff_with_carries(
         &self,
         requested: &CrewCommandContext,
         target: &str,
@@ -2196,7 +2216,7 @@ impl CrewService {
                 return Err(format!("crew target `{receiver}` failed provisioning and cannot be revived"));
             }
             self.deliver_turn(
-                &crate::leaf_engine::CrewTurnIntent::builder()
+                &CrewTurnIntent::builder()
                     .namespace(context.namespace.clone())
                     .convoy(context.convoy.clone())
                     .source("handoff".into())
@@ -2204,7 +2224,7 @@ impl CrewService {
                     .role((*target_role).into())
                     .brief(message.into())
                     .subject_revision(uuid::Uuid::new_v4().to_string())
-                    .sender(crate::leaf_engine::crew_role_address(project, &context.convoy, &context.vessel, &context.caller_role))
+                    .sender(crew_role_address(project, &context.convoy, &context.vessel, &context.caller_role))
                     .relation(flotilla_resources::MessageRelation::Peer)
                     .references(carries)
                     .build(),
@@ -2243,8 +2263,8 @@ impl CrewService {
         }
 
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
-        let sender = crate::leaf_engine::crew_role_address(project, &context.convoy, &context.vessel, &context.caller_role);
-        let receiver = crate::leaf_engine::crew_role_address(project, &context.convoy, &context.vessel, target);
+        let sender = crew_role_address(project, &context.convoy, &context.vessel, &context.caller_role);
+        let receiver = crew_role_address(project, &context.convoy, &context.vessel, target);
         let intent = flotilla_resources::MessageSpec::builder()
             .sender(sender.clone())
             .receiver(receiver.clone())
@@ -2479,7 +2499,7 @@ impl CrewService {
         Ok(())
     }
 
-    pub(super) async fn resume(
+    pub async fn resume(
         &self,
         namespace: &str,
         name: &str,
@@ -2498,7 +2518,7 @@ impl CrewService {
         .await
     }
 
-    pub(super) async fn convoy_resume_with_sender_internal(
+    pub async fn convoy_resume_with_sender_internal(
         &self,
         namespace: &str,
         name: &str,
@@ -2568,8 +2588,7 @@ impl CrewService {
         };
 
         if intent == ResumeIntent::Reminder && status.crew_claim_is_settled(&vessel, &role) {
-            let receiver =
-                crate::leaf_engine::crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), name, &vessel, &role);
+            let receiver = crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), name, &vessel, &role);
             let message_name = flotilla_resources::message_record_name(&receiver, &sender, &format!("resume:{}", uuid::Uuid::new_v4()));
             let intent = flotilla_resources::MessageSpec::builder()
                 .sender(sender)
@@ -2635,7 +2654,7 @@ impl CrewService {
         );
         if queue_until_boundary {
             let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
-            let receiver = crate::leaf_engine::crew_role_address(project, name, &vessel, &role);
+            let receiver = crew_role_address(project, name, &vessel, &role);
             let address = sender.clone();
             let relation = flotilla_resources::MessageRelation::Supervisor;
             let prior = self
@@ -2696,7 +2715,7 @@ impl CrewService {
         if session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed) {
             return Err(format!("crew member `{role}` on vessel `{vessel}` failed provisioning and cannot be resumed"));
         }
-        let receiver = crate::leaf_engine::crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), name, &vessel, &role);
+        let receiver = crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), name, &vessel, &role);
         let resume_intent = flotilla_resources::MessageSpec::builder()
             .sender(sender.clone())
             .receiver(receiver.clone())
@@ -2765,7 +2784,7 @@ impl CrewService {
         Ok(ConvoyResumeOutcome::Queued { displaced })
     }
 
-    pub(super) async fn withdraw_pending_brief(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {
+    pub async fn withdraw_pending_brief(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {
         let message_lock = self.convoy_message_lock(namespace, name).await;
         let _message_guard = message_lock.lock().await;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
@@ -2897,15 +2916,11 @@ impl CrewService {
         }
     }
 
-    pub(super) async fn reconcile_crew_stalls_once(&self, namespace: &str) -> Result<(), String> {
+    pub async fn reconcile_crew_stalls_once(&self, namespace: &str) -> Result<(), String> {
         self.leaf_subscriptions.reconcile_stalls_once(namespace).await
     }
 
-    async fn deliver_addressed_turn(
-        &self,
-        request: &crate::leaf_engine::CrewTurnIntent,
-        receiver: &str,
-    ) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
+    async fn deliver_addressed_turn(&self, request: &CrewTurnIntent, receiver: &str) -> Result<CrewTurnAdmission, String> {
         let intent = flotilla_resources::MessageSpec::builder()
             .sender(request.sender.clone())
             .receiver(receiver.to_string())
@@ -2919,11 +2934,11 @@ impl CrewService {
         let name = flotilla_resources::message_record_name(
             receiver,
             &request.sender,
-            &crate::leaf_engine::turn_message_producer_key(&request.source, &request.subject_revision),
+            &turn_message_producer_key(&request.source, &request.subject_revision),
         );
         match self.resource_backend.including_replicas::<flotilla_resources::Message>(&request.namespace).get(&name).await {
             Ok(existing) if existing.object.spec.same_intent(&intent) => {
-                return Ok(crate::leaf_engine::CrewTurnAdmission {
+                return Ok(CrewTurnAdmission {
                     new_turn: false,
                     rung: TurnDeliveryRung::WarmSession,
                     message: existing
@@ -2968,7 +2983,7 @@ impl CrewService {
             };
             (ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, object.metadata.name), !existing)
         };
-        Ok(crate::leaf_engine::CrewTurnAdmission { message, new_turn, rung: TurnDeliveryRung::WarmSession })
+        Ok(CrewTurnAdmission { message, new_turn, rung: TurnDeliveryRung::WarmSession })
     }
 
     async fn ensure_vessel_backing_available(&self, namespace: &str, convoy: &str, vessel: &str) -> Result<(), String> {
@@ -2984,10 +2999,7 @@ impl CrewService {
         }
     }
 
-    pub(super) async fn deliver_turn(
-        &self,
-        request: &crate::leaf_engine::CrewTurnIntent,
-    ) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
+    pub async fn deliver_turn(&self, request: &CrewTurnIntent) -> Result<CrewTurnAdmission, String> {
         use flotilla_resources::MessageSpec;
         let managed_request;
         let request = if let Some(receiver) = &request.receiver {
@@ -3025,7 +3037,7 @@ impl CrewService {
         }
         self.ensure_vessel_backing_available(&request.namespace, &request.convoy, &request.vessel).await?;
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&request.namespace);
-        let receiver = crate::leaf_engine::crew_role_address(project, &request.convoy, &request.vessel, &request.role);
+        let receiver = crew_role_address(project, &request.convoy, &request.vessel, &request.role);
         let context = flotilla_resources::MessageAddressContext {
             project: project.to_string(),
             convoy: request.convoy.clone(),
@@ -3045,7 +3057,7 @@ impl CrewService {
         let name = flotilla_resources::message_record_name(
             &receiver,
             &sender,
-            &crate::leaf_engine::turn_message_producer_key(&request.source, &request.subject_revision),
+            &turn_message_producer_key(&request.source, &request.subject_revision),
         );
         let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, &receiver)
             .await
@@ -3061,7 +3073,7 @@ impl CrewService {
         };
         match self.resource_backend.including_replicas::<flotilla_resources::Message>(&request.namespace).get(&name).await {
             Ok(existing) if existing.object.spec.same_intent(&intent) => {
-                return Ok(crate::leaf_engine::CrewTurnAdmission {
+                return Ok(CrewTurnAdmission {
                     new_turn: false,
                     rung,
                     message: existing
@@ -3091,7 +3103,7 @@ impl CrewService {
                 && flotilla_resources::message_supersedes(&intent, &record.object)
                 && flotilla_resources::message_expectation_open(&record.object)
         }) {
-            return Ok(crate::leaf_engine::CrewTurnAdmission {
+            return Ok(CrewTurnAdmission {
                 new_turn: false,
                 rung,
                 message: ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &existing.object.metadata.name),
@@ -3197,13 +3209,13 @@ impl CrewService {
         let message = publication?;
         let new_turn = message.name == name;
 
-        Ok(crate::leaf_engine::CrewTurnAdmission { new_turn, rung, message })
+        Ok(CrewTurnAdmission { new_turn, rung, message })
     }
 
     // Convoy queues remain decodable and adoptable for #2710's one-generation window.
     // Terminal receipt/launch-witness retirement and the pre-roll guard from #2878
     // remain intact. Remove this convoy-only adoption after the first #2710 roll.
-    pub(super) async fn adopt_legacy_convoy_queues_once(&self, namespace: &str, name: Option<&str>) -> Result<(), String> {
+    pub async fn adopt_legacy_convoy_queues_once(&self, namespace: &str, name: Option<&str>) -> Result<(), String> {
         // Previous-generation authority queues may arrive before a local
         // TerminalSession payload. Their receiver home adopts the same IDs.
         let candidates = self
@@ -3213,24 +3225,26 @@ impl CrewService {
             .map_err(|error| error.to_string())?
             .items;
         // Startup/reconciliation backfill needs all legacy convoy queues when no name is selected.
-        let addresses =
-            candidates
-                .iter()
-                .flat_map(|source| {
-                    source.object.status.iter().flat_map(|status| status.turn_deliveries.values()).flat_map(|delivery| {
-                        let convoy = &source.object;
-                        let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
-                        delivery
-                            .pending_supervisor_turn
-                            .as_ref()
-                            .map(|turn| crate::leaf_engine::crew_role_address(project, &convoy.metadata.name, &turn.vessel, &turn.role))
-                            .into_iter()
-                            .chain(delivery.pending_brief.as_ref().map(|brief| {
-                                crate::leaf_engine::crew_role_address(project, &convoy.metadata.name, &brief.vessel, &brief.role)
-                            }))
-                    })
+        let addresses = candidates
+            .iter()
+            .flat_map(|source| {
+                source.object.status.iter().flat_map(|status| status.turn_deliveries.values()).flat_map(|delivery| {
+                    let convoy = &source.object;
+                    let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+                    delivery
+                        .pending_supervisor_turn
+                        .as_ref()
+                        .map(|turn| crew_role_address(project, &convoy.metadata.name, &turn.vessel, &turn.role))
+                        .into_iter()
+                        .chain(
+                            delivery
+                                .pending_brief
+                                .as_ref()
+                                .map(|brief| crew_role_address(project, &convoy.metadata.name, &brief.vessel, &brief.role)),
+                        )
                 })
-                .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
         let receiver_snapshot =
             flotilla_messaging::MessageReceiverSnapshot::load_for_addresses(&self.resource_backend, namespace, &addresses)
                 .await
@@ -3250,7 +3264,7 @@ impl CrewService {
                 .collect::<Vec<_>>();
             turns.sort_by_key(|turn| turn.queued_order);
             for turn in turns {
-                let receiver = crate::leaf_engine::crew_role_address(project, &convoy.metadata.name, &turn.vessel, &turn.role);
+                let receiver = crew_role_address(project, &convoy.metadata.name, &turn.vessel, &turn.role);
                 let holder = receiver_snapshot.resolve(&receiver).map_err(|error| error.to_string())?;
                 if !holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Local)) {
                     continue;
@@ -3266,7 +3280,7 @@ impl CrewService {
                 .flat_map(|status| status.turn_deliveries.values())
                 .filter_map(|delivery| delivery.pending_brief.as_ref())
             {
-                let receiver = crate::leaf_engine::crew_role_address(project, &convoy.metadata.name, &brief.vessel, &brief.role);
+                let receiver = crew_role_address(project, &convoy.metadata.name, &brief.vessel, &brief.role);
                 let holder = receiver_snapshot.resolve(&receiver).map_err(|error| error.to_string())?;
                 if !holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Local)) {
                     continue;
@@ -3296,14 +3310,14 @@ impl CrewService {
             queues.sort_by_key(|(_, delivery)| delivery.pending_supervisor_turn.as_ref().map_or(u64::MAX, |turn| turn.queued_order));
             for (key, delivery) in queues {
                 if let Some(turn) = &delivery.pending_supervisor_turn {
-                    let receiver = crate::leaf_engine::crew_role_address(project, &convoy.metadata.name, &turn.vessel, &turn.role);
+                    let receiver = crew_role_address(project, &convoy.metadata.name, &turn.vessel, &turn.role);
                     let intent = flotilla_resources::legacy_message_spec(&receiver, &turn.message);
                     let name = flotilla_resources::message_record_name(&receiver, &intent.sender, &turn.message.id);
                     self.publish_message_intent(namespace, &name, &intent).await?;
                     replacements.push((key.clone(), name, turn.message.id.clone()));
                 }
                 if let Some(brief) = &delivery.pending_brief {
-                    let receiver = crate::leaf_engine::crew_role_address(project, &convoy.metadata.name, &brief.vessel, &brief.role);
+                    let receiver = crew_role_address(project, &convoy.metadata.name, &brief.vessel, &brief.role);
                     let (sender, relation) = flotilla_resources::legacy_message_sender(&brief.sender);
                     let name = flotilla_resources::message_record_name(&receiver, &sender, &format!("pending-brief:{}", brief.queued_at));
                     let intent = flotilla_resources::MessageSpec::builder()
@@ -3368,7 +3382,7 @@ impl CrewService {
     }
 
     /// Continue follow-ups only from receiver-owned Message evidence.
-    pub(super) async fn reconcile_pending_supervisor_turns_once(&self, namespace: &str) -> Result<(), String> {
+    pub async fn reconcile_pending_supervisor_turns_once(&self, namespace: &str) -> Result<(), String> {
         self.reconcile_pending_supervisor_turns_selected(namespace, None).await
     }
     async fn reconcile_pending_supervisor_turns_selected(&self, namespace: &str, name: Option<&str>) -> Result<(), String> {
@@ -3500,12 +3514,7 @@ impl CrewService {
         Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
     }
 
-    async fn execute_turn_delivery_hold(
-        &self,
-        request: &crate::leaf_engine::CrewTurnIntent,
-        act: &HoldAct,
-        reason: &str,
-    ) -> Result<(), String> {
+    async fn execute_turn_delivery_hold(&self, request: &CrewTurnIntent, act: &HoldAct, reason: &str) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace);
         let HoldAct::State = act; // Also covers previous-generation snapshots through the serde alias.
         let attention =
@@ -3593,7 +3602,7 @@ impl CrewService {
                             && crew.contains_key(role)
                             && !(**name == request.vessel && *role == request.role)
                     })
-                    .map(|(vessel, _)| crate::leaf_engine::crew_role_address(project, &request.convoy, vessel, role)),
+                    .map(|(vessel, _)| crew_role_address(project, &request.convoy, vessel, role)),
                 // The existing project receiver resolver selects the session for this symbolic role.
                 // Vessel/crew selection belongs to that resolver, not hold delivery.
                 flotilla_resources::SupervisionTarget::ProjectCrew { convoy_role, .. } => Some(format!("{project}/{convoy_role}")),
@@ -3680,7 +3689,7 @@ impl CrewService {
         }
     }
 
-    pub(super) async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+    pub async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         if force {
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
             for attempt in 0..3 {
