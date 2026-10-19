@@ -1,5 +1,5 @@
 //! Test-only logical storage-operation audit. No production allocation/counters.
-use flotilla_inbox::{sqlite::MessageLog, ChangePage, Cursor, Error, InboxLog, ReceiptScope, ScanPage, WatchReader};
+use flotilla_inbox::{sqlite::MessageLog, ChangePage, Cursor, Error, InboxLog, PendingPage, ReceiptScope, ScanPage, WatchReader};
 use flotilla_schema::{Address, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{machines::message::*, EdgeEventOf, InputRead, Log, LogError, Resource, StoredState, Transport, Version};
@@ -12,19 +12,25 @@ pub struct ReadCounts {
     pub resource_loads: u64,
     pub terminal_loads: u64,
     pub scan_pages: u64,
+    pub pending_pages: u64,
     pub receipt_reads: u64,
     pub watch_pages: u64,
     pub exists: u64,
 }
 #[derive(Clone)]
-pub struct CountingLog {
-    inner: MessageLog,
+pub struct CountingLog<L = MessageLog> {
+    inner: L,
     counts: Arc<Mutex<ReadCounts>>,
 }
 pub type CountedInbox = flotilla_inbox::EngineInbox<CountingLog>;
 impl CountingLog {
     pub fn new(store: Arc<Mutex<Store>>) -> Self {
-        Self { inner: MessageLog::new(store), counts: Default::default() }
+        Self::wrap(MessageLog::new(store))
+    }
+}
+impl<L> CountingLog<L> {
+    pub fn wrap(inner: L) -> Self {
+        Self { inner, counts: Default::default() }
     }
     pub fn read_counts(&self) -> ReadCounts {
         self.counts.lock().unwrap().clone()
@@ -33,7 +39,7 @@ impl CountingLog {
         *self.counts.lock().unwrap() = ReadCounts::default();
     }
 }
-impl Log<Message> for CountingLog {
+impl<L: InboxLog> Log<Message> for CountingLog<L> {
     fn create(&mut self, w: &str, t: Timestamp, r: &Resource<Message>, reads: &[InputRead]) -> Result<Version, LogError> {
         self.inner.create(w, t, r, reads)
     }
@@ -44,7 +50,24 @@ impl Log<Message> for CountingLog {
         self.inner.edge(p, n, e)
     }
 }
-impl InboxLog for CountingLog {
+impl<L: InboxLog> InboxLog for CountingLog<L> {
+    type PendingCursor = L::PendingCursor;
+    fn pending(
+        &mut self,
+        inbox: &Address,
+        after: Option<&Self::PendingCursor>,
+        limit: u32,
+    ) -> Result<PendingPage<Self::PendingCursor>, Error> {
+        let page = self.inner.pending(inbox, after, limit)?;
+        let mut counts = self.counts.lock().unwrap();
+        counts.pending_pages += 1;
+        counts.resource_loads += page.messages.len() as u64;
+        counts.terminal_loads +=
+            page.messages.iter().filter(|r| matches!(r.state(), MessageState::Settled { .. } | MessageState::Dropped { .. })).count()
+                as u64;
+        Ok(page)
+    }
+
     fn reader(&self) -> Box<dyn WatchReader> {
         Box::new(CountedReader { inner: self.inner.reader(), counts: self.counts.clone() })
     }
@@ -74,10 +97,6 @@ impl InboxLog for CountingLog {
     fn receipts(&mut self, n: &str) -> Result<BTreeMap<Receiver, Transport>, Error> {
         self.counts.lock().unwrap().receipt_reads += 1;
         self.inner.receipts(n)
-    }
-    fn changes_since(&mut self, a: Cursor) -> Result<ChangePage, Error> {
-        self.counts.lock().unwrap().watch_pages += 1;
-        InboxLog::changes_since(&mut self.inner, a)
     }
     fn receipt(&mut self, a: &Address, n: &str, r: &Receiver, t: Transport) -> Result<(), Error> {
         self.inner.receipt(a, n, r, t)

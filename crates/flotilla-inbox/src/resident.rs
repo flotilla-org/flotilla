@@ -16,11 +16,11 @@ use flotilla_state_machines::{
     Resource, Transport,
 };
 
-/// Independent budget for the complete resident Pending index (never value-evicted).
+/// Independent budget for cached complete inbox orders; overflow uses the store index.
 pub const PENDING_BUDGET: usize = 128 * 1024 * 1024;
-/// Control-state ceiling within RESIDENT_BUDGET, not an additional allocation.
+/// Explicit control setup ceiling within RESIDENT_BUDGET; required live clocks may exceed it.
 pub const CONTROL_BUDGET: usize = 96 * 1024 * 1024;
-/// Shared budget for cached values and controls; total with Pending is 256 MiB.
+/// Target for cached values and controls; normal total with Pending is 256 MiB.
 pub const RESIDENT_BUDGET: usize = 128 * 1024 * 1024;
 const _: () = assert!(CONTROL_BUDGET <= RESIDENT_BUDGET);
 
@@ -31,10 +31,9 @@ pub struct Residency {
     pub accounted_bytes: usize,
     pub value_bytes: usize,
     pub control_bytes: usize,
-    /// Effective control ceiling within budget_bytes (also honors a custom budget).
+    /// Effective setup ceiling; required live clocks may exceed it.
     pub control_budget_bytes: usize,
     pub open_messages: usize,
-    pub pending_index_complete: bool,
     pub pending_bytes: usize,
     pub pending_budget_bytes: usize,
     pub pending_messages: usize,
@@ -58,6 +57,7 @@ pub(crate) fn receiver(value: &Receiver) -> usize {
 pub(crate) fn binding(inbox: &Address, value: &InboxBinding) -> usize {
     address(inbox)
         + size_of::<InboxBinding>()
+        + 2 * size_of::<usize>()
         + 128
         + match value {
             InboxBinding::Unbound { .. } => 0,

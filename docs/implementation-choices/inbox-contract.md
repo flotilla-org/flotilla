@@ -8,33 +8,39 @@ formula, measurements, ceiling arithmetic and access-cost numbers.
 
 ## Resident state and recovery
 
-The adapter maintains a complete per-inbox Pending index, local inbox
-bindings/clocks, and a recency-evicted cache of typed open Message values and
-receipts. The Pending index has a separate budget: value eviction never drops
-its keys or changes query coverage. Pending walks that index in home admission
-order and loads each absent value once by resource key. There is no store-page
-candidate decode followed by a second load, nor a cross-home candidate query.
-The approved stored Pending index remains available to other store clients.
+The adapter maintains a budgeted cache of complete per-inbox Pending order,
+local inbox bindings/live clocks, and a recency-evicted cache of typed open
+Message values and receipts. Within budget, pending uses cached admission keys
+and loads an absent value once. If a complete inbox order cannot fit, that inbox
+uses the declared pending_by_inbox index by admission; a returned resource is
+restored without another body load. Index identity metadata excludes other homes
+before decoding bodies. Value eviction does not affect the independent key cache.
+Cache pressure never refuses admission or recovery. Groups are cached whole,
+with no unbounded set of spilled inboxes; a spilled group stays store-backed until
+it empties or recovery considers it again. Mid-stream spill resumes after the
+last emitted admission number.
 
 Settled/Dropped values leave Home after the operation. An explicit terminal read
 is keyed; historical state is decoded from the source entry, never from today's
 terminal body. Reply, supersession and dead-letter existence checks use resolve
 without loading those resources. Receipts use the master's declared about index.
 
-Restart streams the store's home-scoped scan, restores the Pending index and
-inbox clocks, recovers open receipts, and retains only values that fit. It also
-finishes interrupted Undeliverable reactions idempotently. Bindings are local
-observations, as in the reference backend: recovery initializes one Unbound clock
-per inbox at open. During a backend lifetime, the first successful enqueue starts
-that inbox's clock; subsequent messages and value eviction do not reset it.
-Unbinding the last consumer starts a new unbound period. The Quint specs and
-Message gate semantics are unchanged.
+Restart streams the home-scoped scan for open values, live inbox counts/clocks,
+receipts and interrupted Undeliverable reactions. It rebuilds Pending order from
+the declared index, never from scan order. Only values and inbox-order groups
+that fit their cache allowances are retained. Bindings remain local observations.
+An Unbound clock starts when an empty inbox gains its first open message, and
+recovery creates one only for inboxes with open messages. When the last open
+message settles or drops, an unbound inbox releases its clock; refilling starts
+a fresh period. Bound inbox behavior is unchanged. A missing required clock is
+a returned error rather than a panic. The Quint specs remain unchanged.
 
-Pending keys and irreducible controls are never silently evicted. Admission or
-setup refuses new state before mutation if their budgets cannot represent it;
-recovery refuses an over-budget rebuild. Values are evicted to respect the
-remaining cache share. The reported oldest/newest state times describe actual
-resident cover, not a configured time horizon. Oversized values remain cold.
+Values are evicted before required live controls. Admission and restart retain
+those controls even when a custom target is too small; setup of explicit bindings
+and consumer keys keeps its existing capacity check. This unavoidable live-state
+floor is sized against live inbox cardinality, not terminal history. Actual oldest
+and newest retained state times describe coverage; no retention horizon is fixed.
+Oversized values remain cold.
 
 ## Approved engine and storage seams
 
@@ -48,7 +54,7 @@ downcast, or extra static bound in the shared consumer StoreLog. The memory
 source assigns admission under its own authoritative storage lock.
 
 Observations::with_snapshot borrows one consistent generation. The adapter
-copies only the declared Message read set, including exact versions and
+uses Table::select to copy only the declared Message read set, including exact versions and
 absences; debug/test Source lookups assert membership. A missing snapshot is a
 returned error, not a poisoned writer. Engine tables and MemoryMessageWorld no
 longer implement whole-world Clone. Home::evict removes only reconstructible
@@ -73,22 +79,13 @@ unexplained loss. Resume after the gap can work; clients needing an older
 baseline must resynchronize. This issue adds no trimming, archive or expunge
 policy. The home-wide consequence is tested explicitly.
 
-## Acceptance and remaining expiry
+## Expiry
 
-InboxBackend operations and signatures, shared testkit-suite assertions and
-Quint specs are unchanged. Two backend-specific contract.rs assertions were
-changed for retained lag/restart cursors, and the large lag test is replaced by
-small lag and restart cases. Recovery/receipt, claim, race and generated
-conformance cases exercise both backends. Read auditing lives in test-side
-wrapper logs, not production StoreLog. Charge calibration uses a separate live
-Rust allocator target, including the full ceiling Pending index. Exhaustive
-MessageSpec destructuring makes a new field fail to compile in accounting.
-
-The previous full-resident workaround has expired and is removed: no copied
-watch journal, worker-permit pool or engine-table Clone. Revisit this shape when
-measured cold reads, reader fanout, startup or bind latency miss the deployment
-budget, when key/control cardinality or address shape exceeds the workload, or
-when the accounting calibration fails. Large-backlog cold-bind scheduling remains
-tracked in #3491; a new index would require another owner look-over. The memory
-backend's authoritative store is intentionally in-memory; its retained storage is
-separate from the filtered replica and is not the daemon's SQLite sizing model.
+Revisit this shape when cold reads, reader fanout, startup or bind latency miss
+the deployment budget, when live controls exceed the workload envelope, or when
+new address/body shapes fail allocation calibration. Cache exhaustion itself uses
+the declared fallback rather than requiring admission refusal. Large-backlog
+cold-bind scheduling remains #3491; a new index requires owner look-over.
+The memory backend's authoritative store remains in-memory and is separate from
+the filtered replica's sizing. Archive, expunge policy and disk-growth measurement
+remain separate work.

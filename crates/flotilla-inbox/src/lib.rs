@@ -18,7 +18,7 @@ mod resident;
 pub mod sqlite;
 mod storage;
 pub use resident::{Residency, RESIDENT_BUDGET};
-pub use storage::{ChangePage, InboxLog, MemoryInboxLog, ScanPage, WatchReader};
+pub use storage::{ChangePage, InboxLog, MemoryInboxLog, PendingPage, ScanPage, WatchReader};
 
 /// Opaque canonical address assigned by the backend; usable as a subject.
 pub type MessageId = String;
@@ -257,13 +257,20 @@ impl GateInputs {
     }
 }
 
+#[derive(Clone)]
+struct InboxState {
+    binding: InboxBinding,
+    open: usize,
+}
+
 struct State<L: InboxLog> {
     home: Home<Message, L>,
-    bindings: BTreeMap<Address, InboxBinding>,
+    bindings: BTreeMap<Address, InboxState>,
     receipts: BTreeMap<String, BTreeMap<Receiver, Transport>>,
     consumers: BTreeMap<Receiver, Box<dyn ConsumerPort>>,
     inboxes: BTreeMap<Address, BTreeMap<u64, String>>,
     pending_bytes: usize,
+    pending_budget: usize,
     sequence: u64,
     budget: usize,
     resident_bytes: usize,
@@ -275,9 +282,17 @@ struct State<L: InboxLog> {
     observation_version: u64,
 }
 
-#[derive(Default)]
-struct PendingRead {
+struct PendingRead<C> {
     after: u64,
+    cursor: Option<C>,
+    rows: VecDeque<Resource<Message>>,
+    ended: bool,
+    store: bool,
+}
+impl<C> Default for PendingRead<C> {
+    fn default() -> Self {
+        Self { after: 0, cursor: None, rows: VecDeque::new(), ended: false, store: false }
+    }
 }
 
 /// Single home writer. The mutex covers the engine decision and its committed
@@ -314,10 +329,22 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
 
     pub fn open_with_budget(
         writer: &str,
+        log: L,
+        observations: Arc<dyn Observations>,
+        supervision: Arc<dyn Supervision>,
+        budget: usize,
+    ) -> Result<Self, Error> {
+        Self::open_with_budgets(writer, log, observations, supervision, budget, resident::PENDING_BUDGET)
+    }
+
+    /// Separate value/control and Pending-order cache budgets; cache pressure never refuses admission.
+    pub fn open_with_budgets(
+        writer: &str,
         mut log: L,
         observations: Arc<dyn Observations>,
         supervision: Arc<dyn Supervision>,
         budget: usize,
+        pending_budget: usize,
     ) -> Result<Self, Error> {
         let reader = Arc::new(tokio::sync::Mutex::new(log.reader()));
         let sequence = log.sequence()?;
@@ -328,6 +355,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             consumers: BTreeMap::new(),
             inboxes: BTreeMap::new(),
             pending_bytes: 0,
+            pending_budget,
             sequence,
             budget,
             resident_bytes: 0,
@@ -355,15 +383,11 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
                 let name = resource.name().to_owned();
                 let recover_reaction = resource.state().drop_reason() == Some(&DropReason::Undeliverable);
                 let inbox = resource.spec().inbox.clone();
-                // Recovery restores the 3461 home-local clock: one per inbox,
-                // reset at backend open, not one per recovered message.
-                if !state.bindings.contains_key(&inbox) {
-                    Self::set_binding(&mut state, inbox.clone(), InboxBinding::Unbound { since: backend.observations.now() })?;
-                }
+                if resource.spec().admitted_seq > sequence {
+                    continue;
+                } // reactions created by this recovery were already counted
                 if matches!(resource.state(), MessageState::Pending | MessageState::Awaiting { .. }) {
-                    if *resource.state() == MessageState::Pending {
-                        Self::index_pending(&mut state, &inbox, resource.spec().admitted_seq, &name)?;
-                    }
+                    Self::open_inbox(&mut state, &inbox, backend.observations.now());
                     let receipts = state.home.log_mut().receipts(&name)?;
                     if !receipts.is_empty() {
                         state.receipts.insert(name.clone(), receipts);
@@ -386,6 +410,11 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             if after.is_none() {
                 break;
             }
+        }
+        // Pending order is rebuilt from its declared index, not scan order.
+        let inboxes: Vec<_> = state.bindings.keys().cloned().collect();
+        for inbox in inboxes {
+            Self::cache_pending(&mut state, &inbox)?;
         }
         drop(state);
         Ok(backend)
@@ -464,9 +493,8 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             control_bytes: state.control_bytes,
             control_budget_bytes: state.budget.min(resident::CONTROL_BUDGET),
             open_messages: state.sizes.len(),
-            pending_index_complete: true,
             pending_bytes: state.pending_bytes,
-            pending_budget_bytes: resident::PENDING_BUDGET,
+            pending_budget_bytes: state.pending_budget,
             pending_messages: state.inboxes.values().map(BTreeMap::len).sum(),
             oldest_state_since: state.home.resources().map(Resource::since).min(),
             newest_state_since: state.home.resources().map(Resource::since).max(),
@@ -530,50 +558,127 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
     }
 
     fn set_binding(state: &mut State<L>, inbox: Address, binding: InboxBinding) -> Result<(), Error> {
-        let previous = state.bindings.get(&inbox).map_or(0, |value| resident::binding(&inbox, value));
+        let previous = state.bindings.get(&inbox).map_or(0, |value| resident::binding(&inbox, &value.binding));
         let next = state.control_bytes - previous + resident::binding(&inbox, &binding);
         if next > state.budget.min(resident::CONTROL_BUDGET) {
             return Err(Error::Storage("resident budget exhausted by binding observations".into()));
         }
         state.control_bytes = next;
-        state.bindings.insert(inbox, binding);
+        let open = state.bindings.get(&inbox).map_or(0, |value| value.open);
+        state.bindings.insert(inbox, InboxState { binding, open });
         state.observation_version += 1;
         Ok(())
     }
 
-    fn index_pending(state: &mut State<L>, inbox: &Address, seq: u64, name: &str) -> Result<(), Error> {
-        if state.inboxes.get(inbox).is_some_and(|rows| rows.contains_key(&seq)) {
+    fn open_inbox(state: &mut State<L>, inbox: &Address, now: Timestamp) {
+        if let Some(value) = state.bindings.get_mut(inbox) {
+            value.open += 1;
+            return;
+        }
+        let binding = InboxBinding::Unbound { since: now };
+        state.control_bytes += resident::binding(inbox, &binding);
+        state.bindings.insert(inbox.clone(), InboxState { binding, open: 1 });
+        state.observation_version += 1;
+    }
+
+    fn evict_pending(state: &mut State<L>, inbox: &Address) {
+        if let Some(rows) = state.inboxes.remove(inbox) {
+            state.pending_bytes -= resident::pending(inbox, "", true) - resident::pending(inbox, "", false)
+                + rows.values().map(|name| resident::pending(inbox, name, false)).sum::<usize>();
+        }
+    }
+
+    fn cache_pending(state: &mut State<L>, inbox: &Address) -> Result<(), Error> {
+        Self::evict_pending(state, inbox);
+        let mut charge = resident::pending(inbox, "", true) - resident::pending(inbox, "", false);
+        if state.pending_bytes.saturating_add(charge) > state.pending_budget {
             return Ok(());
         }
-        let charge = resident::pending(inbox, name, !state.inboxes.contains_key(inbox));
-        if state.pending_bytes.saturating_add(charge) > resident::PENDING_BUDGET {
-            return Err(Error::Storage("resident Pending index budget exhausted".into()));
+        let mut rows = BTreeMap::new();
+        let mut cursor = None;
+        loop {
+            let page = state.home.log_mut().pending(inbox, cursor.as_ref(), 32)?;
+            for resource in page.messages {
+                charge += resident::pending(inbox, resource.name(), false);
+                if state.pending_bytes.saturating_add(charge) > state.pending_budget {
+                    return Ok(());
+                }
+                rows.insert(resource.spec().admitted_seq, resource.name().to_owned());
+            }
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
         }
         state.pending_bytes += charge;
-        state.inboxes.entry(inbox.clone()).or_default().insert(seq, name.to_owned());
+        state.inboxes.insert(inbox.clone(), rows);
         Ok(())
     }
 
-    fn next_pending(state: &mut State<L>, inbox: &Address, query: &mut PendingRead) -> Result<Option<String>, Error> {
-        use std::ops::Bound::{Excluded, Unbounded};
-        let next = state
-            .inboxes
-            .get(inbox)
-            .and_then(|names| names.range((Excluded(query.after), Unbounded)).next())
-            .map(|(seq, name)| (*seq, name.clone()));
-        let Some((seq, name)) = next else { return Ok(None) };
-        query.after = seq;
-        if !Self::load(state, &name)? {
-            return Err(Error::Storage("resident Pending key missing from store".into()));
+    fn index_pending(state: &mut State<L>, inbox: &Address, seq: u64, name: &str) {
+        let Some(rows) = state.inboxes.get_mut(inbox) else {
+            return;
+        };
+        if rows.contains_key(&seq) {
+            return;
         }
-        Ok(Some(name))
+        let charge = resident::pending(inbox, name, false);
+        if state.pending_bytes.saturating_add(charge) > state.pending_budget {
+            Self::evict_pending(state, inbox);
+            return;
+        }
+        rows.insert(seq, name.to_owned());
+        state.pending_bytes += charge;
+    }
+
+    fn next_pending(state: &mut State<L>, inbox: &Address, query: &mut PendingRead<L::PendingCursor>) -> Result<Option<String>, Error> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if !query.store {
+            if let Some(rows) = state.inboxes.get(inbox) {
+                let next = rows.range((Excluded(query.after), Unbounded)).next().map(|(seq, name)| (*seq, name.clone()));
+                let Some((seq, name)) = next else { return Ok(None) };
+                query.after = seq;
+                if !Self::load(state, &name)? {
+                    return Err(Error::Storage("cached Pending key missing from store".into()));
+                }
+                return Ok(Some(name));
+            }
+            query.store = true;
+        }
+        loop {
+            while let Some(resource) = query.rows.pop_front() {
+                if resource.spec().admitted_seq <= query.after {
+                    continue;
+                }
+                Self::validate_admission(&resource)?;
+                query.after = resource.spec().admitted_seq;
+                let name = resource.name().to_owned();
+                if state.home.get(&name).is_none() {
+                    let receipts = state.home.log_mut().receipts(&name)?;
+                    if !receipts.is_empty() {
+                        state.receipts.insert(name.clone(), receipts);
+                    }
+                    state.home.restore(resource)?;
+                }
+                state.touched.insert(name.clone());
+                return Ok(Some(name));
+            }
+            if query.ended {
+                return Ok(None);
+            }
+            // One value per pull avoids retaining a page of bodies in every stream.
+            let page = state.home.log_mut().pending(inbox, query.cursor.as_ref(), 1)?;
+            query.ended = page.next.is_none();
+            query.cursor = page.next;
+            query.rows = page.messages.into();
+        }
     }
 
     fn binding_blocked(&self, state: &mut State<L>, inbox: &Address) -> Result<bool, Error> {
         let mut query = PendingRead::default();
         while let Some(name) = Self::next_pending(state, inbox, &mut query)? {
             let blocked = state.home.get(&name).is_some_and(|resource| *resource.state() == MessageState::Pending)
-                && self.world(state, Some(&name)).run(self.observations.as_ref(), |world| {
+                && self.world(state, Some(&name))?.run(self.observations.as_ref(), |world| {
                     world.lookup(&Ref::<Receipts>::new(&name)).is_some_and(|(_, rows)| !rows.is_empty())
                 })?;
             Self::trim(state);
@@ -614,7 +719,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
     // resource/spec, admission references and the explicit Drop payload below.
     // Extend this set with any new gate read; GateWorld asserts membership in
     // debug/test builds, including reads whose observed value is absent.
-    fn world(&self, state: &State<L>, message: Option<&str>) -> GateInputs {
+    fn world(&self, state: &State<L>, message: Option<&str>) -> Result<GateInputs, Error> {
         let mut world = GateInputs { names: BTreeSet::new(), receipts: None, binding: None, sent: BTreeSet::new() };
         if let Some(name) = message {
             if let Some(resource) = state.home.get(name) {
@@ -627,13 +732,16 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
                 if let Some(condition) = &resource.spec().delivery_condition {
                     world.names.insert(condition.to_string());
                 }
-                let binding = state.bindings.get(inbox).cloned().expect("one clock per admitted inbox");
-                world.binding = Some((inbox.to_string(), Version(state.observation_version), binding));
+                if matches!(resource.state(), MessageState::Pending | MessageState::Awaiting { .. }) {
+                    let binding =
+                        state.bindings.get(inbox).ok_or_else(|| Error::Storage("open inbox has no binding clock".into()))?.binding.clone();
+                    world.binding = Some((inbox.to_string(), Version(state.observation_version), binding));
+                }
                 world.receipts =
                     state.receipts.get(name).map(|receipts| (name.to_owned(), Version(state.observation_version), receipts.clone()));
             }
         }
-        world
+        Ok(world)
     }
 
     fn publish(state: &mut State<L>) -> Result<(), Error> {
@@ -652,7 +760,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
     fn enqueue_named(&self, state: &mut State<L>, spec: MessageSpec, name: Option<String>) -> Result<String, Error> {
         let inbox = spec.inbox.clone();
         let now = self.observations.now();
-        let mut world = self.world(state, None);
+        let mut world = self.world(state, None)?;
         for reference in [&spec.in_reply_to, &spec.supersedes].into_iter().flatten() {
             world.names.insert(sent(reference).name().to_owned());
             if reference.home == state.home.writer()
@@ -665,25 +773,21 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             Some(name) => name,
             None => state.home.log_mut().next_name()?,
         };
-        let clock_charge =
-            if state.bindings.contains_key(&inbox) { 0 } else { resident::binding(&inbox, &InboxBinding::Unbound { since: now }) };
-        if state.control_bytes.saturating_add(clock_charge) > state.budget.min(resident::CONTROL_BUDGET) {
-            return Err(Error::Storage("resident inbox clock budget exhausted".into()));
-        }
-        if state.pending_bytes.saturating_add(resident::pending(&inbox, &name, !state.inboxes.contains_key(&inbox)))
-            > resident::PENDING_BUDGET
-        {
-            return Err(Error::Storage("resident Pending index budget exhausted".into()));
-        }
+        let empty = state.bindings.get(&inbox).is_none_or(|value| value.open == 0);
         world.run(self.observations.as_ref(), |world| state.home.create(&name, spec, world, now).map(|_| ()))??;
-        if !state.bindings.contains_key(&inbox) {
-            Self::set_binding(state, inbox.clone(), InboxBinding::Unbound { since: now })?;
+        Self::open_inbox(state, &inbox, now);
+        if empty && !state.inboxes.contains_key(&inbox) {
+            let charge = resident::pending(&inbox, "", true) - resident::pending(&inbox, "", false);
+            if state.pending_bytes.saturating_add(charge) <= state.pending_budget {
+                state.pending_bytes += charge;
+                state.inboxes.insert(inbox.clone(), BTreeMap::new());
+            }
         }
         state.touched.insert(name.clone());
         // Pending has no self edge: its version remains its admission sequence
         // until it leaves this index. Numeric keys preserve arrival order.
         let admitted = state.home.get(&name).expect("admitted message").spec().admitted_seq;
-        Self::index_pending(state, &inbox, admitted, &name)?;
+        Self::index_pending(state, &inbox, admitted, &name);
         Self::publish(state)?;
         Ok(name)
     }
@@ -723,8 +827,9 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
 
     fn apply_locked(&self, state: &mut State<L>, message: &str, edge: impl Into<MessageEdge>) -> Result<(), Error> {
         Self::load(state, message)?;
+        let was_open = state.home.get(message).is_some_and(|r| matches!(r.state(), MessageState::Pending | MessageState::Awaiting { .. }));
         let previous = state.home.get(message).map(|resource| resource.spec().admitted_seq);
-        let mut world = self.world(state, Some(message));
+        let mut world = self.world(state, Some(message))?;
         let edge = edge.into();
         if let MessageEdge::Drop(drop) = &edge {
             match &drop.reason {
@@ -746,9 +851,18 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
                 if let Some(name) = index.remove(&previous) {
                     state.pending_bytes -= resident::pending(&inbox, &name, false);
                 }
-                if index.is_empty() {
-                    state.pending_bytes -= resident::pending(&inbox, "", true) - resident::pending(&inbox, "", false);
-                    state.inboxes.remove(&inbox);
+            }
+        }
+        if was_open && matches!(next, MessageState::Settled { .. } | MessageState::Dropped { .. }) {
+            let observation = state.bindings.get_mut(&inbox).ok_or_else(|| Error::Storage("open inbox has no binding clock".into()))?;
+            observation.open -= 1;
+            if observation.open == 0 {
+                Self::evict_pending(state, &inbox);
+                if state.bindings.get(&inbox).is_some_and(|value| matches!(value.binding, InboxBinding::Unbound { .. })) {
+                    if let Some(value) = state.bindings.remove(&inbox) {
+                        state.control_bytes -= resident::binding(&inbox, &value.binding);
+                    }
+                    state.observation_version += 1;
                 }
             }
         }
@@ -797,8 +911,11 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
                     if backend.binding_blocked(state, &inbox)? {
                         return Ok(false);
                     }
-                    let mut binding =
-                        state.bindings.get(&inbox).cloned().unwrap_or(InboxBinding::Unbound { since: backend.observations.now() });
+                    let mut binding = state
+                        .bindings
+                        .get(&inbox)
+                        .map(|value| value.binding.clone())
+                        .unwrap_or(InboxBinding::Unbound { since: backend.observations.now() });
                     match &mut binding {
                         InboxBinding::Bound { consumers } => {
                             consumers.insert(consumer);
@@ -821,14 +938,20 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
         let inbox = inbox.clone();
         let consumer = consumer.clone();
         self.access(move |backend, state| {
-            if let Some(InboxBinding::Bound { mut consumers }) = state.bindings.get(&inbox).cloned() {
+            if let Some(InboxBinding::Bound { mut consumers }) = state.bindings.get(&inbox).map(|value| value.binding.clone()) {
                 consumers.remove(&consumer);
                 let binding = if consumers.is_empty() {
                     InboxBinding::Unbound { since: backend.observations.now() }
                 } else {
                     InboxBinding::Bound { consumers }
                 };
-                Self::set_binding(state, inbox, binding)?;
+                if matches!(binding, InboxBinding::Unbound { .. }) && state.bindings.get(&inbox).is_some_and(|value| value.open == 0) {
+                    if let Some(value) = state.bindings.remove(&inbox) {
+                        state.control_bytes -= resident::binding(&inbox, &value.binding);
+                    }
+                } else {
+                    Self::set_binding(state, inbox, binding)?;
+                }
             }
             Ok(())
         })
@@ -850,7 +973,7 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
                     .access(move |backend, state| {
                         while let Some(name) = Self::next_pending(state, &query_inbox, &mut query)? {
                             let resource = state.home.get(&name).expect("pending candidate");
-                            let allowed = backend.world(state, Some(&name)).run(backend.observations.as_ref(), |world| {
+                            let allowed = backend.world(state, Some(&name))?.run(backend.observations.as_ref(), |world| {
                                 resource.judge(world, backend.observations.now(), |h| pending_for(h, &query_consumer)).value
                             })?;
                             if allowed {
@@ -918,13 +1041,6 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
                 let cursor = after.unwrap_or(Cursor(latest));
                 if cursor.0 > latest {
                     return Err(Error::CursorAhead);
-                }
-                // Validate against retained source history, not a replica generation.
-                if let Err(error) = reader.changes_since(cursor) {
-                    if matches!(error, Error::CursorExpired) {
-                        tracing::warn!(cursor = cursor.0, "inbox source log cursor expired");
-                    }
-                    return Err(error);
                 }
                 Ok(cursor)
             })

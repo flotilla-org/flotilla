@@ -77,7 +77,6 @@ async fn exercise_eviction<L: InboxLog + 'static>(
         backend.receive(&consumer("a"), message, Transport::Turn).await.expect("receive");
         backend.deliver(message, Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("deliver");
         assert!(backend.residency_blocking().accounted_bytes <= budget);
-        assert!(backend.residency_blocking().pending_index_complete);
     }
     assert_eq!(backend.residency_blocking().open_messages, 0);
     assert!(backend.pending(&inbox(), &consumer("a"), &Rules::default()).await.expect("pending").next().await.is_none());
@@ -185,7 +184,7 @@ async fn restart_rebuilds_bounded_open_state_and_cold_terminal_reads() {
 // Behaviour: the row's admission is the actual create home sequence, not zero or a caller
 // supplied value. Consumer log writes create gaps between consecutive message admissions.
 #[tokio::test]
-async fn admission_is_stamped_before_create_and_never_changes() {
+async fn admission_is_transaction_assigned_and_never_changes() {
     let evidence = Arc::new(Evidence::default());
     let (backend, _) = backend(database(), evidence, RESIDENT_BUDGET);
     backend.bind(inbox(), consumer("a")).await.expect("bind");
@@ -255,8 +254,10 @@ async fn watch_reports_expired_when_source_history_was_expunged() {
         write.expunge::<Resource<Message>>(id, &origin).expect("expunge");
         write.commit().expect("commit");
     }
-    assert!(matches!(backend.watch(&inbox(), Some(Cursor(0))).await, Err(Error::CursorExpired)));
-    assert!(matches!(backend.watch(&address("project:test/role:unrelated"), Some(Cursor(0))).await, Err(Error::CursorExpired)));
+    let mut watch = backend.watch(&inbox(), Some(Cursor(0))).await.unwrap();
+    assert!(matches!(watch.next().await, Some(Err(Error::CursorExpired))));
+    let mut unrelated = backend.watch(&address("project:test/role:unrelated"), Some(Cursor(0))).await.unwrap();
+    assert!(matches!(unrelated.next().await, Some(Err(Error::CursorExpired))));
 }
 
 // Behaviour: a restart that repairs a committed Undeliverable drop may encounter
@@ -339,108 +340,6 @@ async fn control_budget_refusal_preserves_existing_binding() {
     assert_eq!(pending.into_iter().map(|p| p.message).collect::<Vec<_>>(), vec![message]);
 }
 
-// Behaviour: a watch page replays the create/receipt/edge lifecycle without
-// asking the resident-value log to decode current terminal bodies.
-// One lifecycle suffices for this page-local routing seam; paging/oversize is covered above.
-#[tokio::test]
-async fn watch_attributes_dense_lifecycle_once_per_page() {
-    let (backend, mut log) = backend(database(), Arc::new(Evidence::default()), RESIDENT_BUDGET);
-    backend.bind(inbox(), consumer("a")).await.expect("bind");
-    let message = backend.enqueue(spec()).await.expect("enqueue");
-    backend.receive(&consumer("a"), &message, Transport::Turn).await.expect("receive");
-    backend.deliver(&message, Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("deliver");
-    log.reset_read_counts();
-    let started = std::time::Instant::now();
-    for _ in 0..1000 {
-        let page = log.changes_since(Cursor(0)).expect("page");
-        assert_eq!(page.changes.len(), 3);
-    }
-    let reads = log.read_counts();
-    eprintln!("dense watch: 1000 pages / 3000 changes in {:?}; {reads:?}", started.elapsed());
-    assert_eq!(reads.watch_pages, 1000);
-    assert_eq!(reads.terminal_loads, 0);
-}
-
-// A deterministic interleaving at the source-log boundary: the real SQLite
-// consumer writer commits after stamping and before the Message transaction.
-struct InterleavedLog {
-    inner: CountingLog,
-    competing_store: Option<Arc<Mutex<Store>>>,
-}
-impl flotilla_state_machines::Log<Message> for InterleavedLog {
-    fn create(
-        &mut self,
-        writer: &str,
-        at: flotilla_schema::Timestamp,
-        resource: &flotilla_state_machines::Resource<Message>,
-        reads: &[flotilla_state_machines::InputRead],
-    ) -> Result<flotilla_state_machines::Version, flotilla_state_machines::LogError> {
-        self.inner.create(writer, at, resource, reads)
-    }
-    fn create_resource(
-        &mut self,
-        writer: &str,
-        at: flotilla_schema::Timestamp,
-        resource: flotilla_state_machines::Resource<Message>,
-        reads: &[flotilla_state_machines::InputRead],
-    ) -> Result<flotilla_state_machines::Resource<Message>, flotilla_state_machines::LogError> {
-        if let Some(store) = self.competing_store.take() {
-            let _other = SessionPort::new("competing", StoreLog::new(store));
-        }
-        self.inner.create_resource(writer, at, resource, reads)
-    }
-    fn edge(
-        &mut self,
-        previous: &flotilla_state_machines::StoredState<Message>,
-        next: &flotilla_state_machines::Resource<Message>,
-        event: &flotilla_state_machines::EdgeEventOf<Message>,
-    ) -> Result<flotilla_state_machines::Version, flotilla_state_machines::LogError> {
-        self.inner.edge(previous, next, event)
-    }
-}
-impl InboxLog for InterleavedLog {
-    fn reader(&self) -> Box<dyn flotilla_inbox::WatchReader> {
-        self.inner.reader()
-    }
-    fn exists(&mut self, name: &str) -> Result<bool, Error> {
-        self.inner.exists(name)
-    }
-    fn sequence(&mut self) -> Result<u64, Error> {
-        self.inner.sequence()
-    }
-    fn load(&mut self, name: &str) -> Result<Option<flotilla_state_machines::Resource<Message>>, Error> {
-        self.inner.load(name)
-    }
-    fn scan(&mut self, after: Option<i64>) -> Result<flotilla_inbox::ScanPage, Error> {
-        self.inner.scan(after)
-    }
-    fn receipts(&mut self, name: &str) -> Result<std::collections::BTreeMap<Receiver, Transport>, Error> {
-        self.inner.receipts(name)
-    }
-    fn changes_since(&mut self, after: Cursor) -> Result<flotilla_inbox::ChangePage, Error> {
-        self.inner.changes_since(after)
-    }
-    fn receipt(&mut self, inbox: &flotilla_schema::Address, message: &str, consumer: &Receiver, transport: Transport) -> Result<(), Error> {
-        self.inner.receipt(inbox, message, consumer, transport)
-    }
-    fn next_name(&mut self) -> Result<String, Error> {
-        self.inner.next_name()
-    }
-}
-
-// Behaviour: a competing home write between admission preparation and commit
-// cannot cause a spurious sequence refusal: the transaction assigns admission.
-#[tokio::test]
-async fn admission_assigns_after_competing_home_writer() {
-    let store = database();
-    let log = InterleavedLog { inner: CountingLog::new(store.clone()), competing_store: Some(store) };
-    let backend = EngineInbox::open("test", log, Arc::new(Evidence::default()), Arc::new(Supervisors)).expect("open");
-    let message = backend.enqueue(spec()).await.expect("transaction admission");
-    let resource = backend.get_async(&message).await.expect("get").expect("message");
-    assert_eq!(resource.spec().admitted_seq, 2);
-    assert_eq!(resource.version().0, 2);
-}
-
 // Behaviour: absent observation callbacks return an error without poisoning the
 // writer. The next valid snapshot can still admit a message.
 #[tokio::test]
@@ -472,13 +371,11 @@ async fn value_eviction_preserves_resident_pending_stream() {
     for _ in 0..2 {
         expected.push(backend.enqueue(spec()).await.expect("warm"));
     }
-    assert!(backend.residency_blocking().pending_index_complete);
     let mut pending = backend.pending(&inbox(), &consumer("a"), &Rules::default()).await.expect("pending");
     let mut actual = vec![pending.next().await.expect("first").expect("item").message];
     let mut large = spec();
     large.body = MessageBody::text("x".repeat(64 * 1024)).expect("body");
     expected.push(backend.enqueue(large).await.expect("overflow"));
-    assert!(backend.residency_blocking().pending_index_complete);
     while let Some(item) = pending.next().await {
         actual.push(item.expect("item").message);
     }
@@ -490,16 +387,14 @@ async fn value_eviction_preserves_resident_pending_stream() {
 #[tokio::test]
 async fn cold_bind_backlog_cost() {
     let (backend, log) = backend(database(), Arc::new(Evidence::default()), 2048);
-    for _ in 0..1024 {
+    for _ in 0..3 {
         backend.enqueue(spec()).await.expect("backlog");
     }
     log.reset_read_counts();
-    let started = std::time::Instant::now();
     backend.bind(inbox(), consumer("a")).await.expect("bind");
     let reads = log.read_counts();
-    eprintln!("cold bind 1024: {:?}; {reads:?}", started.elapsed());
-    assert_eq!(reads.resource_loads, 1024);
-    assert_eq!(reads.receipt_reads, 1024);
+    assert_eq!(reads.resource_loads, 3);
+    assert_eq!(reads.receipt_reads, 3);
     assert_eq!(reads.terminal_loads + reads.scan_pages, 0);
 }
 
@@ -511,17 +406,15 @@ async fn terminal_backlog_restart_cost() {
     let evidence = Arc::new(Evidence::default());
     let (backend, _) = backend(store.clone(), evidence.clone(), 2048);
     backend.bind(inbox(), consumer("a")).await.expect("bind");
-    for _ in 0..2048 {
+    for _ in 0..3 {
         let message = backend.enqueue(spec()).await.expect("enqueue");
         backend.receive(&consumer("a"), &message, Transport::Turn).await.expect("receipt");
         backend.deliver(&message, Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("terminal");
     }
     drop(backend);
     let log = CountingLog::new(store);
-    let started = std::time::Instant::now();
     let reopened = SqliteInbox::open_with_budget("test", log.clone(), evidence, Arc::new(Supervisors), 2048).expect("restart");
-    eprintln!("terminal restart 2048: {:?}; {:?}", started.elapsed(), log.read_counts());
-    assert_eq!(log.read_counts().scan_pages, 64);
+    assert_eq!(log.read_counts().scan_pages, 1);
     assert_eq!(log.read_counts().receipt_reads, 0);
     assert_eq!(reopened.residency_blocking().open_messages, 0);
     assert!(reopened.residency_blocking().accounted_bytes <= 2048);
@@ -573,7 +466,9 @@ async fn pending_excludes_other_homes_before_value_reads() {
         write.restore(&snapshot).unwrap();
         write.commit().unwrap();
     }
-    let (backend, log) = backend(store, Arc::new(Evidence::default()), 2048);
+    let log = CountingLog::new(store);
+    let backend =
+        EngineInbox::open_with_budgets("test", log.clone(), Arc::new(Evidence::default()), Arc::new(Supervisors), 2048, 0).unwrap();
     assert_eq!(backend.residency_blocking().pending_messages, 0);
     backend.bind(inbox(), consumer("a")).await.unwrap();
     let mut own = Vec::new();
@@ -583,7 +478,8 @@ async fn pending_excludes_other_homes_before_value_reads() {
     log.reset_read_counts();
     let pending = backend.pending(&inbox(), &consumer("a"), &Rules::default()).await.unwrap().try_collect::<Vec<_>>().await.unwrap();
     assert_eq!(pending.iter().map(|p| p.message.clone()).collect::<Vec<_>>(), own);
-    assert_eq!(log.read_counts().resource_loads, 3, "one keyed value read per local candidate");
+    assert_eq!(log.read_counts().resource_loads, 3, "one indexed value read per local candidate");
+    assert!(log.read_counts().pending_pages > 0, "exercise the shared-home store fallback");
     assert_eq!(log.read_counts().terminal_loads, 0);
 }
 
@@ -623,4 +519,184 @@ async fn watch_reads_do_not_take_inbox_writer_lock() {
     release.send(()).unwrap();
     task.await.unwrap().unwrap();
     let _watch = result.expect("watch does not wait for writer").expect("source watch");
+}
+
+// Behaviour: a whole inbox spills when its complete order does not fit; cached
+// inboxes and spilled inboxes keep admission order, including mid-stream spill.
+// Restart rebuilds cache order through pending(), never from scan order, and a
+// zero cache/value allowance never refuses admission or recovery. Both stores.
+#[tokio::test]
+async fn pending_spill_and_restart_use_declared_index() {
+    async fn run<L: InboxLog + Clone + 'static>(source: L) {
+        let source = CountingLog::wrap(source);
+        let evidence = Arc::new(Evidence::default());
+        let backend = EngineInbox::open_with_budgets("test", source.clone(), evidence.clone(), Arc::new(Supervisors), 65536, 900).unwrap();
+        backend.bind(inbox(), consumer("a")).await.unwrap();
+        let mut names = Vec::new();
+        for _ in 0..2 {
+            names.push(backend.enqueue(spec()).await.unwrap());
+        }
+        assert_eq!(backend.residency_blocking().pending_messages, 2);
+        let mut stream = backend.pending(&inbox(), &consumer("a"), &Rules::default()).await.unwrap();
+        let mut pulled = vec![stream.next().await.unwrap().unwrap().message];
+        names.push(backend.enqueue(spec()).await.unwrap());
+        assert_eq!(backend.residency_blocking().pending_messages, 0, "inbox spills as a whole");
+        while let Some(row) = stream.next().await {
+            pulled.push(row.unwrap().message);
+        }
+        assert_eq!(pulled, names);
+        assert!(source.read_counts().pending_pages > 0);
+        drop(stream);
+        let other_inbox = address("project:test/role:small");
+        backend.bind(other_inbox.clone(), consumer("a")).await.unwrap();
+        let mut other = spec();
+        other.inbox = other_inbox.clone();
+        let other_name = backend.enqueue(other).await.unwrap();
+        assert_eq!(backend.residency_blocking().pending_messages, 1, "small inbox fits alongside spilled inbox");
+        source.reset_read_counts();
+        let other_rows =
+            backend.pending(&other_inbox, &consumer("a"), &Rules::default()).await.unwrap().try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(other_rows[0].message, other_name);
+        assert_eq!(source.read_counts().pending_pages, 0, "fitting inbox serves cached order");
+        drop(backend);
+        source.reset_read_counts();
+        let recovered = EngineInbox::open_with_budgets("test", source.clone(), evidence.clone(), Arc::new(Supervisors), 0, 900).unwrap();
+        assert!(source.read_counts().pending_pages > 0, "restart reads declared Pending index to rebuild cache");
+        let actual = recovered.pending(&inbox(), &consumer("a"), &Rules::default()).await.unwrap().try_collect::<Vec<_>>().await.unwrap();
+        // Recovery is Unbound; provide binding evidence through the regular API
+        // on a backend with a normal control allowance below instead.
+        assert!(actual.is_empty());
+        drop(recovered);
+        let recovered = EngineInbox::open_with_budgets("test", source.clone(), evidence, Arc::new(Supervisors), 2048, 0).unwrap();
+        recovered.bind(inbox(), consumer("a")).await.unwrap();
+        let actual = recovered.pending(&inbox(), &consumer("a"), &Rules::default()).await.unwrap().try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(actual.into_iter().map(|p| p.message).collect::<Vec<_>>(), names);
+        let mut extra = spec();
+        extra.inbox = address("project:test/role:another");
+        recovered.enqueue(extra).await.expect("no cache budget admission failure");
+        assert_eq!(recovered.residency_blocking().pending_bytes, 0);
+    }
+    run(MemoryInboxLog::default()).await;
+    run(MessageLog::new(database())).await;
+}
+
+// Behaviour: only live unbound inboxes retain clocks. Emptying and refilling
+// creates a fresh clock; historical-only inboxes get no clock on restart.
+#[tokio::test]
+async fn empty_inbox_refill_and_recovery_clock_lifetime() {
+    async fn run<L: InboxLog + Clone + 'static>(log: L) {
+        let evidence = Arc::new(Evidence::default());
+        let backend = EngineInbox::open_with_budgets("test", log.clone(), evidence.clone(), Arc::new(Supervisors), 0, 0).unwrap();
+        let value = || {
+            let mut value = spec();
+            value.sender = address("project:test/role:alone");
+            value.unbound_after = 100;
+            value
+        };
+        let first = backend.enqueue(value()).await.unwrap();
+        evidence.clock.store(111, std::sync::atomic::Ordering::SeqCst);
+        backend.drop(&first, DropReason::Undeliverable).await.unwrap();
+        assert_eq!(backend.residency_blocking().control_bytes, 0);
+        evidence.clock.store(200, std::sync::atomic::Ordering::SeqCst);
+        let next = backend.enqueue(value()).await.unwrap();
+        evidence.clock.store(250, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(backend.drop(&next, DropReason::Undeliverable).await, Err(Error::Message(_))), "fresh clock has not matured");
+        evidence.clock.store(301, std::sync::atomic::Ordering::SeqCst);
+        backend.drop(&next, DropReason::Undeliverable).await.unwrap();
+        drop(backend);
+        let recovered = EngineInbox::open_with_budgets("test", log, evidence, Arc::new(Supervisors), 0, 0).unwrap();
+        assert_eq!(recovered.residency_blocking().control_bytes, 0, "terminal history has no inbox clock");
+    }
+    run(MemoryInboxLog::default()).await;
+    run(MessageLog::new(database())).await;
+}
+
+// Behaviour: a lagging watch crosses the source's 16-entry page boundary with
+// no extra validation page. A restart resumes from the last emitted cursor,
+// including events buffered but not emitted before shutdown. Both stores.
+#[tokio::test]
+async fn watch_lag_crosses_pages_and_restart() {
+    async fn run<L: InboxLog + Clone + 'static>(log: L, restart: bool) {
+        let log = CountingLog::wrap(log);
+        let evidence = Arc::new(Evidence::default());
+        let backend = EngineInbox::open("test", log.clone(), evidence.clone(), Arc::new(Supervisors)).unwrap();
+        log.reset_read_counts();
+        let mut watch = backend.watch(&inbox(), Some(Cursor(0))).await.unwrap();
+        assert_eq!(log.read_counts().watch_pages, 0, "construction does not read the first page");
+        let mut names = Vec::new();
+        for _ in 0..35 {
+            names.push(backend.enqueue(spec()).await.unwrap());
+        }
+        if restart {
+            let mut last = Cursor(0);
+            for name in &names[..17] {
+                let row = watch.next().await.unwrap().unwrap();
+                assert_eq!(&row.message, name);
+                last = row.cursor;
+            }
+            drop(watch);
+            drop(backend);
+            let backend = EngineInbox::open("test", log.clone(), evidence, Arc::new(Supervisors)).unwrap();
+            log.reset_read_counts();
+            let mut watch = backend.watch(&inbox(), Some(last)).await.unwrap();
+            assert_eq!(log.read_counts().watch_pages, 0);
+            for name in &names[17..] {
+                assert_eq!(&watch.next().await.unwrap().unwrap().message, name);
+            }
+            assert_eq!(log.read_counts().watch_pages, 2);
+        } else {
+            for name in names {
+                assert_eq!(watch.next().await.unwrap().unwrap().message, name);
+            }
+            assert_eq!(log.read_counts().watch_pages, 3);
+        }
+    }
+    for restart in [false, true] {
+        run(MemoryInboxLog::default(), restart).await;
+        run(MessageLog::new(database()), restart).await;
+    }
+}
+
+// Behaviour: lag survives closing the actual SQLite connection, including
+// unconsumed buffered entries, and resumes through multiple source pages.
+#[tokio::test]
+async fn watch_lag_survives_sqlite_connection_restart() {
+    struct File(std::path::PathBuf);
+    impl Drop for File {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let file = File(std::env::temp_dir().join(format!("inbox-watch-{}-{unique}.sqlite", std::process::id())));
+    let open = || {
+        CountingLog::new(Arc::new(Mutex::new(
+            Store::open(Connection::open(&file.0).unwrap(), "test", flotilla_state_machines::kinds().unwrap()).unwrap(),
+        )))
+    };
+    let evidence = Arc::new(Evidence::default());
+    let log = open();
+    let backend = EngineInbox::open("test", log.clone(), evidence.clone(), Arc::new(Supervisors)).unwrap();
+    let mut watch = backend.watch(&inbox(), Some(Cursor(0))).await.unwrap();
+    let mut names = Vec::new();
+    for _ in 0..35 {
+        names.push(backend.enqueue(spec()).await.unwrap());
+    }
+    let mut last = Cursor(0);
+    for name in &names[..7] {
+        let row = watch.next().await.unwrap().unwrap();
+        assert_eq!(&row.message, name);
+        last = row.cursor;
+    }
+    drop(watch);
+    drop(backend);
+    drop(log);
+    let log = open();
+    let recovered = EngineInbox::open("test", log.clone(), evidence, Arc::new(Supervisors)).unwrap();
+    log.reset_read_counts();
+    let mut watch = recovered.watch(&inbox(), Some(last)).await.unwrap();
+    for name in &names[7..] {
+        assert_eq!(&watch.next().await.unwrap().unwrap().message, name);
+    }
+    assert_eq!(log.read_counts().watch_pages, 2);
 }

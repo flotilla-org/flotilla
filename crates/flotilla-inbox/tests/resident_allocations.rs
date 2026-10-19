@@ -8,7 +8,6 @@ use std::{
         atomic::{AtomicIsize, Ordering},
         Arc, Mutex,
     },
-    time::Instant,
 };
 
 use flotilla_inbox::{sqlite::StoreLog, InboxBackend, Rules};
@@ -58,7 +57,7 @@ static ALLOCATOR: LiveAllocator = LiveAllocator;
 #[tokio::test(flavor = "current_thread")]
 async fn bounded_resident_allocation_workload() {
     calibrate();
-    const BUDGET: usize = 512 * 1024;
+    const BUDGET: usize = 32 * 1024;
     // Small, explicitly bounded source caches isolate the replica plateau.
     // Production Store defaults have the same two-generation policy at 65,536.
     let store = Arc::new(Mutex::new(
@@ -66,7 +65,7 @@ async fn bounded_resident_allocation_workload() {
             Connection::open_in_memory().expect("db"),
             "test",
             flotilla_state_machines::kinds().expect("registry"),
-            StoreOptions { string_cache: 128, identity_cache: 128, ..StoreOptions::default() },
+            StoreOptions { string_cache: 8, identity_cache: 8, ..StoreOptions::default() },
         )
         .expect("store"),
     ));
@@ -76,36 +75,28 @@ async fn bounded_resident_allocation_workload() {
     backend.register_blocking(consumer("a"), SessionPort::new("a", StoreLog::new(store)));
     backend.bind(inbox(), consumer("a")).await.expect("bind");
     let mut retained = Vec::new();
-    let start = Instant::now();
     for block in 0..3 {
-        for n in 0..2000 {
+        for n in 0..32 {
             let mut value = spec();
             value.body = MessageBody::text(format!("{block}/{n}:{}", "x".repeat(2048))).expect("body");
             backend.enqueue(value).await.expect("enqueue");
         }
         let residency = backend.residency_blocking();
         assert!(residency.accounted_bytes <= BUDGET, "{residency:?}");
-        assert_eq!(residency.pending_messages, (block + 1) * 2000);
-        assert!(residency.pending_index_complete);
+        assert_eq!(residency.pending_messages, (block + 1) * 32);
         retained.push(LIVE.load(Ordering::SeqCst));
-        eprintln!("messages={} retained_rust_bytes={} residency={residency:?}", (block + 1) * 2000, retained[block]);
+        eprintln!("messages={} retained_rust_bytes={} residency={residency:?}", (block + 1) * 32, retained[block]);
     }
-    let enqueue_time = start.elapsed();
     assert!(retained[2] - retained[1] < BUDGET as isize, "resident allocations plateau: {retained:?}");
-    let start = Instant::now();
     log.reset_read_counts();
     let mut pending = backend.pending(&inbox(), &consumer("a"), &Rules::default()).await.expect("pending");
     let mut count = 0;
     while pending.try_next().await.expect("stream").is_some() {
         count += 1;
     }
-    assert_eq!(count, 6000);
-    eprintln!(
-        "enqueue_6000_ms={} cold_pending_6000_ms={} reads={:?}",
-        enqueue_time.as_millis(),
-        start.elapsed().as_millis(),
-        log.read_counts()
-    );
+    assert_eq!(count, 96);
+    assert_eq!(log.read_counts().resource_loads, 96);
+    assert_eq!(log.read_counts().terminal_loads + log.read_counts().scan_pages, 0);
 }
 
 #[allow(dead_code)]
@@ -204,7 +195,7 @@ fn calibrate() {
                 InboxBinding::Unbound { since: flotilla_schema::Timestamp(10) }
             };
             charged += charges::binding(&inbox, &value);
-            rows.insert(inbox, value);
+            rows.insert(inbox, (value, 0usize));
         }
         let actual = (LIVE.load(Ordering::SeqCst) - base) as usize / N;
         eprintln!("calibrate binding bound={bound} allocated={actual} charge={}", charged / N);

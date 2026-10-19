@@ -23,7 +23,19 @@ pub trait WatchReader: Send {
     fn changes_since(&mut self, after: Cursor) -> Result<ChangePage, Error>;
 }
 
+pub struct PendingPage<C> {
+    pub messages: Vec<Resource<Message>>,
+    pub next: Option<C>,
+}
+
 pub trait InboxLog: Log<Message> + Send {
+    type PendingCursor: Send;
+    fn pending(
+        &mut self,
+        inbox: &Address,
+        after: Option<&Self::PendingCursor>,
+        limit: u32,
+    ) -> Result<PendingPage<Self::PendingCursor>, Error>;
     fn reader(&self) -> Box<dyn WatchReader>;
     fn exists(&mut self, name: &str) -> Result<bool, Error>;
     fn consumer_scope(&self) -> Option<ReceiptScope> {
@@ -33,7 +45,6 @@ pub trait InboxLog: Log<Message> + Send {
     fn load(&mut self, name: &str) -> Result<Option<Resource<Message>>, Error>;
     fn scan(&mut self, after: Option<i64>) -> Result<ScanPage, Error>;
     fn receipts(&mut self, name: &str) -> Result<BTreeMap<Receiver, Transport>, Error>;
-    fn changes_since(&mut self, after: Cursor) -> Result<ChangePage, Error>;
     /// Memory consumer logs have independent sequences; persist their observed
     /// Receive in this inbox's authoritative log before notifying watchers.
     fn receipt(&mut self, inbox: &Address, message: &str, consumer: &Receiver, transport: Transport) -> Result<(), Error>;
@@ -48,6 +59,7 @@ struct MemoryStore {
     resources: BTreeMap<String, Resource<Message>>,
     events: BTreeMap<u64, MemoryEntry>,
     admissions: BTreeMap<u64, String>,
+    pending: BTreeMap<(Address, u64), String>,
     about: BTreeSet<(String, u64)>,
 }
 
@@ -75,6 +87,7 @@ impl Log<Message> for MemoryStore {
         }
         let version = self.append(resource.spec().inbox.clone(), resource.name().into(), ChangeKind::Message(MessageState::Pending));
         self.admissions.insert(resource.spec().admitted_seq, resource.name().into());
+        self.pending.insert((resource.spec().inbox.clone(), resource.spec().admitted_seq), resource.name().into());
         self.resources.insert(
             resource.name().into(),
             Resource::stored(resource.name(), resource.spec().clone(), resource.stored_state().clone(), version),
@@ -82,6 +95,7 @@ impl Log<Message> for MemoryStore {
         Ok(version)
     }
     fn edge(&mut self, _: &StoredState<Message>, next: &Resource<Message>, _: &EdgeEventOf<Message>) -> Result<Version, LogError> {
+        self.pending.remove(&(next.spec().inbox.clone(), next.spec().admitted_seq));
         let version = self.append(next.spec().inbox.clone(), next.name().into(), ChangeKind::Message(next.state().clone()));
         self.resources.insert(next.name().into(), Resource::stored(next.name(), next.spec().clone(), next.stored_state().clone(), version));
         Ok(version)
@@ -141,8 +155,8 @@ impl MemoryStore {
 #[derive(Clone, Default)]
 pub struct MemoryInboxLog(std::sync::Arc<std::sync::Mutex<MemoryStore>>);
 impl Log<Message> for MemoryInboxLog {
-    fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<Message>, reads: &[InputRead]) -> Result<Version, LogError> {
-        self.0.lock().expect("memory store").create(writer, at, resource, reads)
+    fn create(&mut self, _: &str, _: Timestamp, _: &Resource<Message>, _: &[InputRead]) -> Result<Version, LogError> {
+        Err(LogError::new("Message creation requires engine Home to call Log::create_resource"))
     }
     fn create_resource(
         &mut self,
@@ -171,6 +185,19 @@ impl Log<Message> for MemoryInboxLog {
     }
 }
 impl InboxLog for MemoryInboxLog {
+    type PendingCursor = u64;
+    fn pending(&mut self, inbox: &Address, after: Option<&u64>, limit: u32) -> Result<PendingPage<u64>, Error> {
+        use std::ops::Bound::{Excluded, Included};
+        let store = self.0.lock().expect("memory store");
+        let limit = limit.clamp(1, 32) as usize;
+        let rows: Vec<_> = store
+            .pending
+            .range((Excluded((inbox.clone(), after.copied().unwrap_or(0))), Included((inbox.clone(), u64::MAX))))
+            .take(limit + 1)
+            .collect();
+        let next = (rows.len() > limit).then(|| rows[limit - 1].0 .1);
+        Ok(PendingPage { messages: rows.into_iter().take(limit).map(|(_, name)| store.resources[name].clone()).collect(), next })
+    }
     fn reader(&self) -> Box<dyn WatchReader> {
         Box::new(self.clone())
     }
@@ -189,9 +216,6 @@ impl InboxLog for MemoryInboxLog {
     fn receipts(&mut self, name: &str) -> Result<BTreeMap<Receiver, Transport>, Error> {
         self.0.lock().expect("memory store").receipts(name)
     }
-    fn changes_since(&mut self, after: Cursor) -> Result<ChangePage, Error> {
-        self.0.lock().expect("memory store").changes_since(after)
-    }
     fn receipt(&mut self, inbox: &Address, message: &str, consumer: &Receiver, transport: Transport) -> Result<(), Error> {
         self.0.lock().expect("memory store").receipt(inbox, message, consumer, transport)
     }
@@ -204,6 +228,6 @@ impl WatchReader for MemoryInboxLog {
         InboxLog::sequence(self)
     }
     fn changes_since(&mut self, after: Cursor) -> Result<ChangePage, Error> {
-        InboxLog::changes_since(self, after)
+        self.0.lock().expect("memory store").changes_since(after)
     }
 }

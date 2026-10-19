@@ -102,3 +102,27 @@ fn evicted_names_remain_unique_in_the_source() {
     ));
     check(MessageLog::new(store));
 }
+
+// Behaviour: only the owned transaction hook may persist a Message; neither
+// source accepts a caller-stamped resource through the generic create path.
+#[test]
+fn both_logs_refuse_direct_caller_stamped_create() {
+    fn check<L: flotilla_inbox::InboxLog>(mut log: L) {
+        let mut value = spec();
+        value.admitted_seq = 123;
+        let resource = Resource::<Message>::stored(
+            "caller-stamped",
+            value,
+            flotilla_schema::State::new(flotilla_state_machines::machines::message::MessageState::Pending, Timestamp(10)),
+            flotilla_state_machines::Version(123),
+        );
+        assert!(flotilla_state_machines::Log::create(&mut log, "test", Timestamp(10), &resource, &[]).is_err());
+        assert_eq!(log.sequence().unwrap(), 0);
+        assert!(log.load("caller-stamped").unwrap().is_none());
+    }
+    check(flotilla_inbox::MemoryInboxLog::default());
+    let store = Arc::new(Mutex::new(
+        Store::open(Connection::open_in_memory().unwrap(), "test", flotilla_state_machines::kinds().unwrap()).unwrap(),
+    ));
+    check(MessageLog::new(store));
+}

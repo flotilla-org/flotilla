@@ -14,13 +14,13 @@ use flotilla_state_machines::{
     machines::{
         agent_session::AgentSession,
         consumer::{Consumer, Receiver},
-        message::{Message, MessageState},
+        message::{Message, MessageSpec, MessageState},
     },
     EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, Version,
 };
 
 use crate::{
-    storage::{ChangePage, ScanPage},
+    storage::{ChangePage, PendingPage, ScanPage},
     Change, ChangeKind, ConsumerLog, Cursor, Error, InboxLog, ReceiptScope,
 };
 
@@ -147,6 +147,32 @@ fn created_inbox(entry: &flotilla_schema::Event) -> Result<Address, Error> {
 }
 
 impl InboxLog for MessageLog {
+    type PendingCursor = flotilla_schema_sqlite::Cursor;
+    fn pending(
+        &mut self,
+        inbox: &Address,
+        after: Option<&Self::PendingCursor>,
+        limit: u32,
+    ) -> Result<PendingPage<Self::PendingCursor>, Error> {
+        let mut store = self.store.lock().expect("store writer");
+        let mut read = store.read().map_err(storage)?;
+        let mut cursor = after.cloned();
+        loop {
+            let page = read.page(&MessageSpec::pending_by_inbox(inbox), cursor.as_ref(), limit.clamp(1, 32)).map_err(storage)?;
+            let mut messages = Vec::new();
+            for id in page.ids {
+                if read.identity(id).map_err(storage)?.is_some_and(|identity| identity.home == self.home) {
+                    if let Some(loaded) = read.load::<Resource<Message>>(id).map_err(storage)? {
+                        messages.push(loaded.value);
+                    }
+                }
+            }
+            cursor = page.next;
+            if !messages.is_empty() || cursor.is_none() {
+                return Ok(PendingPage { messages, next: cursor });
+            }
+        }
+    }
     fn consumer_scope(&self) -> Option<ReceiptScope> {
         self.receipt_scope()
     }
@@ -200,50 +226,6 @@ impl InboxLog for MessageLog {
             }
         }
         Ok(receipts)
-    }
-    fn changes_since(&mut self, after: Cursor) -> Result<ChangePage, Error> {
-        let mut store = self.store.lock().expect("store writer");
-        let mut read = store.read().map_err(storage)?;
-        let events = read.changes_since(&self.home, after.0, 16).map_err(storage)?;
-        let mut through = after;
-        let mut changes: Vec<(Address, Change)> = Vec::new();
-        for entry in events {
-            if entry.home_seq != through.0 + 1 {
-                return Err(Error::CursorExpired);
-            }
-            through = Cursor(entry.home_seq);
-            let (message, kind) = if entry.kind == Resource::<Message>::CODE {
-                let state = match entry.cause {
-                    Cause::Create => MessageState::Pending,
-                    Cause::Edge { .. } => changed_state(&entry)?,
-                    _ => continue,
-                };
-                (entry.name.clone(), ChangeKind::Message(state))
-            } else {
-                let Some(master) = &entry.about else { continue };
-                if master.kind != Resource::<Message>::CODE || master.home != self.home {
-                    continue;
-                }
-                let Some(decode) = self.decoders.get(&entry.kind) else { continue };
-                let Some((consumer, transport)) = decode(&entry)? else { continue };
-                (master.name.clone(), ChangeKind::Receipt { consumer, transport })
-            };
-            let inbox = if entry.kind == Resource::<Message>::CODE && entry.cause == Cause::Create {
-                created_inbox(&entry)?
-            } else if let Some((inbox, _)) = changes.iter().find(|(_, prior)| prior.message == message) {
-                inbox.clone()
-            } else {
-                let id = read.resolve(Resource::<Message>::CODE, &message, &self.home).map_err(storage)?.ok_or(Error::CursorExpired)?;
-                let create = read.changes(id, 0, 1).map_err(storage)?.into_iter().next().ok_or(Error::CursorExpired)?;
-                created_inbox(&create)?
-            };
-            let change = Change { cursor: Cursor(entry.home_seq), message, kind };
-            changes.push((inbox, change));
-        }
-        if through == after && read.last_sequence(&self.home).map_err(storage)? > after.0 {
-            return Err(Error::CursorExpired);
-        }
-        Ok(ChangePage { changes, through })
     }
     fn receipt(&mut self, _: &Address, _: &str, _: &Receiver, _: flotilla_state_machines::Transport) -> Result<(), Error> {
         Ok(())
@@ -311,6 +293,47 @@ impl crate::WatchReader for MessageLog {
         InboxLog::sequence(self)
     }
     fn changes_since(&mut self, after: Cursor) -> Result<ChangePage, Error> {
-        InboxLog::changes_since(self, after)
+        let mut store = self.store.lock().expect("store writer");
+        let mut read = store.read().map_err(storage)?;
+        let events = read.changes_since(&self.home, after.0, 16).map_err(storage)?;
+        let mut through = after;
+        let mut changes: Vec<(Address, Change)> = Vec::new();
+        for entry in events {
+            if entry.home_seq != through.0 + 1 {
+                return Err(Error::CursorExpired);
+            }
+            through = Cursor(entry.home_seq);
+            let (message, kind) = if entry.kind == Resource::<Message>::CODE {
+                let state = match entry.cause {
+                    Cause::Create => MessageState::Pending,
+                    Cause::Edge { .. } => changed_state(&entry)?,
+                    _ => continue,
+                };
+                (entry.name.clone(), ChangeKind::Message(state))
+            } else {
+                let Some(master) = &entry.about else { continue };
+                if master.kind != Resource::<Message>::CODE || master.home != self.home {
+                    continue;
+                }
+                let Some(decode) = self.decoders.get(&entry.kind) else { continue };
+                let Some((consumer, transport)) = decode(&entry)? else { continue };
+                (master.name.clone(), ChangeKind::Receipt { consumer, transport })
+            };
+            let inbox = if entry.kind == Resource::<Message>::CODE && entry.cause == Cause::Create {
+                created_inbox(&entry)?
+            } else if let Some((inbox, _)) = changes.iter().find(|(_, prior)| prior.message == message) {
+                inbox.clone()
+            } else {
+                let id = read.resolve(Resource::<Message>::CODE, &message, &self.home).map_err(storage)?.ok_or(Error::CursorExpired)?;
+                let create = read.changes(id, 0, 1).map_err(storage)?.into_iter().next().ok_or(Error::CursorExpired)?;
+                created_inbox(&create)?
+            };
+            let change = Change { cursor: Cursor(entry.home_seq), message, kind };
+            changes.push((inbox, change));
+        }
+        if through == after && read.last_sequence(&self.home).map_err(storage)? > after.0 {
+            return Err(Error::CursorExpired);
+        }
+        Ok(ChangePage { changes, through })
     }
 }

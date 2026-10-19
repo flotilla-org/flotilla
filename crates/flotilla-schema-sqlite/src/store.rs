@@ -275,6 +275,11 @@ impl Read<'_> {
         self.ctx().load(id)
     }
 
+    /// Reads natural identity metadata by primary key without decoding its resource body.
+    pub fn identity(&mut self, id: ResourceId) -> Result<Option<Identity>, StoreError> {
+        self.ctx().identity_of(id)
+    }
+
     pub fn load_snapshot(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
         self.ctx().snapshot(id)
     }
