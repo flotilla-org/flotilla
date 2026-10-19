@@ -37,7 +37,9 @@ a returned error rather than a panic. The Quint specs remain unchanged.
 
 Values are evicted before required live controls. Admission and restart retain
 those controls even when a custom target is too small; setup of explicit bindings
-and consumer keys keeps its existing capacity check. This unavoidable live-state
+and consumer keys keeps its existing capacity check. A binding update beyond the
+setup ceiling returns a Storage capacity error before mutating the binding; it
+does not silently degrade or discard a receiver. This unavoidable live-state
 floor is sized against live inbox cardinality, not terminal history. Actual oldest
 and newest retained state times describe coverage; no retention horizon is fixed.
 Oversized values remain cold.

@@ -786,7 +786,8 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         state.touched.insert(name.clone());
         // Pending has no self edge: its version remains its admission sequence
         // until it leaves this index. Numeric keys preserve arrival order.
-        let admitted = state.home.get(&name).expect("admitted message").spec().admitted_seq;
+        let admitted =
+            state.home.get(&name).ok_or_else(|| Error::Storage("committed admission missing from Home".into()))?.spec().admitted_seq;
         Self::index_pending(state, &inbox, admitted, &name);
         Self::publish(state)?;
         Ok(name)
