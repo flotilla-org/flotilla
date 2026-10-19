@@ -161,7 +161,7 @@ impl InboxLog for MessageLog {
             let page = read.page(&MessageSpec::pending_by_inbox(inbox), cursor.as_ref(), limit.clamp(1, 32)).map_err(storage)?;
             let mut messages = Vec::new();
             for id in page.ids {
-                if read.identity(id).map_err(storage)?.is_some_and(|identity| identity.home == self.home) {
+                if read.identity(id).map_err(storage)?.is_some_and(|(identity, _)| identity.home == self.home) {
                     if let Some(loaded) = read.load::<Resource<Message>>(id).map_err(storage)? {
                         messages.push(loaded.value);
                     }
