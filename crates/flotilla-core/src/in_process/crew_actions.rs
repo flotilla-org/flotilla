@@ -21,9 +21,11 @@ use flotilla_resources::WorkPhase;
 use flotilla_store::apply_status_patch_checked as apply_resource_status_patch_checked;
 use flotilla_store::ResourceBackend;
 
-use super::{crew_ops, resolve_local_convoy_name};
+use crate::in_process::crew_ops;
 use crate::in_process::crew_ops::ConvoyResumeOutcome;
 use crate::in_process::crew_ops::CrewSupervisionRequest;
+use crate::in_process::resolve_local_convoy_name;
+use flotilla_daemon_api::action_events::ActionEvents;
 
 /// Subject reference resolution requires host repository context. Lifecycle,
 /// routing, message admission and audit mutations use the shared CrewService
@@ -44,7 +46,7 @@ pub(super) struct CrewActions<'a> {
     pub(super) crew: &'a crew_ops::CrewService,
     pub(super) resource_backend: &'a ResourceBackend,
     pub(super) clock: &'a Arc<dyn Clock>,
-    pub(super) events: super::action_events::ActionEvents<'a>,
+    pub(super) events: ActionEvents<'a>,
 }
 
 impl CrewActions<'_> {
