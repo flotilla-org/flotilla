@@ -2,7 +2,7 @@ use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 
 use chrono::Utc;
-use flotilla_controllers::reconcilers::VesselPlacementProjector;
+use flotilla_admission::reconcilers::vessel_placement::VesselPlacementProjector;
 use flotilla_protocol::{CanonicalHostId, NodeId, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     Convoy, ConvoySpec, ConvoyStatus, InputMeta, ResourceError, Vessel, VesselSpec, ACTUATOR_HOST_REF_ANNOTATION,
@@ -196,40 +196,15 @@ async fn owning_daemon_projects_a_vessel_placed_on_its_agentless_ssh_host() {
 }
 
 // #2775: replicated status churn must not cause repeated no-op placement scans.
-// Observe the existing sync event with a task-local subscriber; no global tracing state.
+// Each Convoy list reads the local and replica stores. Bootstrap plus the first
+// scan costs four reads; each later scan adds two.
 #[tokio::test(start_paused = true)]
 async fn placement_status_churn_does_not_spin() {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
+    use flotilla_store_testkit::{ReadCountsBackendExt, ReadOperation};
 
-    use tracing::instrument::WithSubscriber;
-    use tracing_subscriber::{layer::SubscriberExt, Layer};
-
-    struct SyncCounter(Arc<AtomicUsize>);
-    impl<S: tracing::Subscriber> Layer<S> for SyncCounter {
-        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-            struct SyncCompleted(bool);
-            impl tracing::field::Visit for SyncCompleted {
-                fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-                    if field.name() == "placement_sync_completed" {
-                        self.0 = value;
-                    }
-                }
-
-                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
-            }
-            let mut message = SyncCompleted(false);
-            event.record(&mut message);
-            if message.0 {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-    }
     let origin = NodeId::new("admitting");
     let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(origin.clone());
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("actuator"));
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("actuator")).with_read_counts();
     let convoys = source.using::<Convoy>(NAMESPACE);
     let mut convoy = convoys
         .create(
@@ -240,14 +215,18 @@ async fn placement_status_churn_does_not_spin() {
         .expect("placement scenario operation");
     let writer = backend.replica_writer::<Convoy>(origin, NAMESPACE);
     writer.replace(&convoys.list().await.expect("placement scenario operation"), Utc::now()).await.expect("placement scenario operation");
-    let scans = Arc::new(AtomicUsize::new(0));
-    let subscriber = tracing_subscriber::registry().with(SyncCounter(scans.clone()));
-    let projector = VesselPlacementProjector::new(backend, NAMESPACE, CanonicalHostId::resolved("local"));
-    let task = tokio::spawn(async move { projector.run().await }.with_subscriber(subscriber));
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
+    let convoy_reads = || backend.read_snapshot().calls("Convoy", ReadOperation::List);
+    let projector = VesselPlacementProjector::new(backend.clone(), NAMESPACE, CanonicalHostId::resolved("local"));
+    let task = tokio::spawn(async move { projector.run().await });
+    async fn wait_for_reads(backend: &ResourceBackend, expected: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backend.read_snapshot().calls("Convoy", ReadOperation::List) < expected {
+            assert!(std::time::Instant::now() < deadline, "expected {expected} Convoy reads");
+            tokio::task::yield_now().await;
+        }
     }
-    assert_eq!(scans.load(Ordering::SeqCst), 1, "initial reconciliation");
+    wait_for_reads(&backend, 4).await;
+    assert_eq!(convoy_reads(), 4, "bootstrap and initial reconciliation");
     for update in 0..100 {
         convoy = convoys
             .update_status(
@@ -266,11 +245,9 @@ async fn placement_status_churn_does_not_spin() {
         }
         tokio::time::advance(std::time::Duration::from_millis(30)).await;
     }
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
-    eprintln!("placement load: 100 replicated status updates: {} scans", scans.load(Ordering::SeqCst));
-    assert_eq!(scans.load(Ordering::SeqCst), 1, "status-only updates must not rescan placement");
+    wait_for_reads(&backend, 4).await;
+    eprintln!("placement load: 100 replicated status updates: {} Convoy reads", convoy_reads());
+    assert_eq!(convoy_reads(), 4, "status-only updates must not rescan placement");
     // Real placement changes still reconcile, with one scan for a queued burst.
     for update in 0..100 {
         convoy = convoys
@@ -304,14 +281,10 @@ async fn placement_status_churn_does_not_spin() {
         tokio::task::yield_now().await;
     }
     tokio::time::advance(std::time::Duration::from_millis(30)).await;
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(scans.load(Ordering::SeqCst), 2, "placement burst should reconcile once");
+    wait_for_reads(&backend, 6).await;
+    assert_eq!(convoy_reads(), 6, "placement burst should reconcile once");
     tokio::time::advance(std::time::Duration::from_secs(60)).await;
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(scans.load(Ordering::SeqCst), 3, "bounded resync should repair drift even without watch changes");
+    wait_for_reads(&backend, 8).await;
+    assert_eq!(convoy_reads(), 8, "bounded resync should repair drift even without watch changes");
     task.abort();
 }

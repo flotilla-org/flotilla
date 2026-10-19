@@ -9,6 +9,7 @@ pub mod placement_policy;
 pub mod ports;
 pub mod project_image_layers;
 pub mod project_ops;
+pub mod reconcilers;
 pub mod regard_lifecycle;
 pub mod repository_addressing;
 pub mod repository_inspection;

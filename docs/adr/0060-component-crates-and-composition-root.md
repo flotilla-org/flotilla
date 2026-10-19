@@ -133,6 +133,12 @@ their owners directly. The build-graph guard registers admission as a capability
 and refuses other capabilities, composition, provider reachbacks and the
 state-machine engine. These moves change no resource schema or wire shape.
 
+Admission also owns the standing-convoy ensure reconciler and vessel-placement
+projector. The daemon registers both from `flotilla-admission`; the reverse
+`ConvoyEnsureReconciler` port and its core installation remain unchanged.
+`VesselPlacementProjector` is expected to move again under the Vessel machine
+(#3108).
+
 ## Consequences
 
 - Adding a provider touches one crate. Swapping a store backend, persistence posture or message transport is a composition change.

@@ -1,7 +1,7 @@
 //! Standing-convoy behavior scenarios driven by an injected controller.
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_admission::convoy_ensure::{ConvoyEnsureReconciler, StandingConvoyBackingInspector};
+use flotilla_admission::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler, StandingConvoyBackingInspector};
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{CommandAction, HostName, NodeId};
@@ -97,11 +97,22 @@ pub trait EnsureScenarioController: Send + Sync {
     ) -> Arc<dyn ConvoyEnsureReconciler>;
     async fn dependency_hash(
         &self,
-        daemon: &InProcessDaemon,
+        admission: &dyn ConvoyEnsureAdmission,
+        teardown: Arc<dyn flotilla_admission::ports::ConvoyTeardown>,
+        backend: ResourceBackend,
+        clock: Arc<dyn Clock>,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
     ) -> Result<String, String>;
-    async fn start(&self, daemon: &InProcessDaemon, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String>;
+    async fn start(
+        &self,
+        admission: &dyn ConvoyEnsureAdmission,
+        teardown: Arc<dyn flotilla_admission::ports::ConvoyTeardown>,
+        backend: ResourceBackend,
+        clock: Arc<dyn Clock>,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+    ) -> Result<String, String>;
 }
 
 async fn assert_independent_placement_snapshots(factory: &dyn EnsureScenarioController, replica_before_admission: bool) {

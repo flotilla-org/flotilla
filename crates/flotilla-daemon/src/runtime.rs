@@ -20,10 +20,11 @@ use std::{
 pub(crate) use terminal::{DELIVERY_CONFIRMATION_POLL, DELIVERY_CONFIRMATION_STABLE_FOR};
 
 use chrono::Utc;
+use flotilla_admission::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_config::ConfigStore;
 use flotilla_controllers::reconcilers::{
-    convoy_ensure::EnsureReconciler, CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver,
-    RepositoryReconciler, TerminalSessionReconciler, VesselReconciler,
+    CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver, RepositoryReconciler,
+    TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
