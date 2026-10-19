@@ -52,7 +52,7 @@ pub enum GithubChannel {
 impl rigging_replay_testkit::ExtraChannel for GithubChannel {
     fn channel_label(&self) -> ChannelLabel {
         let Self::GhApi { label, endpoint, .. } = self;
-        ChannelLabel::Extra("gh_api".into(), label.clone().unwrap_or_else(|| endpoint.clone()))
+        flotilla_provider_runtime::gh_api_label(label.clone().unwrap_or_else(|| endpoint.clone()))
     }
     fn transform(&self, map: &dyn Fn(&str) -> String) -> Self {
         let Self::GhApi { label, method, endpoint, status, body, headers } = self;
@@ -268,7 +268,7 @@ impl GhApi for RecordingGhApi {
     async fn get(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<String, String> {
         let result = self.inner.get(endpoint, repo_root, label).await;
 
-        let request = ChannelRequest::Extra { namespace: "gh_api", key: endpoint };
+        let request = ChannelRequest::Extra { namespace: flotilla_provider_runtime::GH_API_REPLAY_NAMESPACE, key: endpoint };
         let default = DefaultLabeler.label_for(&request);
         let explicit = explicit_label(label, &default);
 
@@ -302,7 +302,7 @@ impl GhApi for RecordingGhApi {
     async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, String> {
         let result = self.inner.get_with_headers(endpoint, repo_root, label).await;
 
-        let request = ChannelRequest::Extra { namespace: "gh_api", key: endpoint };
+        let request = ChannelRequest::Extra { namespace: flotilla_provider_runtime::GH_API_REPLAY_NAMESPACE, key: endpoint };
         let default = DefaultLabeler.label_for(&request);
         let explicit = explicit_label(label, &default);
 
@@ -354,7 +354,8 @@ impl GhApi for RecordingGhApi {
 
     async fn get_classified_response(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, GhApiFailure> {
         let result = self.inner.get_classified_response(endpoint, repo_root, label).await;
-        let default = DefaultLabeler.label_for(&ChannelRequest::Extra { namespace: "gh_api", key: endpoint });
+        let default = DefaultLabeler
+            .label_for(&ChannelRequest::Extra { namespace: flotilla_provider_runtime::GH_API_REPLAY_NAMESPACE, key: endpoint });
         let mut headers = HashMap::new();
         let (status, body) = match &result {
             Ok(response) => {

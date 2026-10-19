@@ -138,7 +138,7 @@ interactions:
     let api = ReplayGhApi::new(session.clone());
 
     let endpoint = "/repos/owner/repo/pulls?state=all&per_page=100";
-    let label = ChannelLabel::Extra("gh_api".into(), endpoint.to_string());
+    let label = flotilla_provider_runtime::gh_api_label(endpoint.to_string());
     let result = api.get(endpoint, Path::new("/repo"), &label).await;
     assert!(result.is_ok());
     assert!(result.unwrap().contains("Fix bug"));
@@ -163,7 +163,7 @@ interactions:
     let api = ReplayGhApi::new(session.clone());
 
     let endpoint = "/repos/owner/repo/pulls";
-    let label = ChannelLabel::Extra("gh_api".into(), endpoint.to_string());
+    let label = flotilla_provider_runtime::gh_api_label(endpoint.to_string());
     let result = api.get(endpoint, Path::new("/repo"), &label).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("404"));
@@ -189,7 +189,7 @@ interactions:
     let session = Session::replaying(&path, Masks::new());
     let api = ReplayGhApi::new(session.clone());
     let endpoint = "/repos/owner/repo/issues/42";
-    let label = ChannelLabel::Extra("gh_api".into(), endpoint.to_string());
+    let label = flotilla_provider_runtime::gh_api_label(endpoint.to_string());
 
     let error = api.get(endpoint, Path::new("/repo"), &label).await.expect_err("403 must fail");
 
@@ -219,7 +219,7 @@ interactions:
     let api = ReplayGhApi::new(session.clone());
 
     let endpoint = "/repos/owner/repo/issues?per_page=100";
-    let label = ChannelLabel::Extra("gh_api".into(), endpoint.to_string());
+    let label = flotilla_provider_runtime::gh_api_label(endpoint.to_string());
     let result = api.get_with_headers(endpoint, Path::new("/repo"), &label).await;
     assert!(result.is_ok());
     let resp = result.unwrap();
@@ -249,7 +249,7 @@ interactions:
     let api = ReplayGhApi::new(session.clone());
 
     let endpoint = "/repos/owner/repo/issues";
-    let label = ChannelLabel::Extra("gh_api".into(), endpoint.to_string());
+    let label = flotilla_provider_runtime::gh_api_label(endpoint.to_string());
     let result = api.get_with_headers(endpoint, Path::new("/repo"), &label).await;
     assert!(result.is_ok());
     let resp = result.unwrap();
@@ -418,7 +418,7 @@ fn channel_label_from_interaction() {
         body: "[]".into(),
         headers: HashMap::new(),
     });
-    assert_eq!(api.channel_label(), ChannelLabel::Extra("gh_api".into(), "repos/owner/repo/pulls".into()));
+    assert_eq!(api.channel_label(), flotilla_provider_runtime::gh_api_label("repos/owner/repo/pulls".into()));
 
     let http = Interaction::Http {
         label: None,
@@ -481,7 +481,7 @@ interactions:
     let replayer = Replayer::from_file(&path, Masks::new());
 
     // Can consume in any channel order within the same round
-    let api = replayer.next(&ChannelLabel::Extra("gh_api".into(), "/repos/owner/repo/pulls".into()));
+    let api = replayer.next(&flotilla_provider_runtime::gh_api_label("/repos/owner/repo/pulls".into()));
     match api {
         Interaction::Extra(GithubChannel::GhApi { endpoint, .. }) => {
             assert_eq!(endpoint, "/repos/owner/repo/pulls");
@@ -536,7 +536,7 @@ rounds:
     let replayer = Replayer::from_file(&path, Masks::new());
 
     // Round 1 only has a command — requesting gh_api should panic
-    replayer.next(&ChannelLabel::Extra("gh_api".into(), "/repos/owner/repo/pulls".into()));
+    replayer.next(&flotilla_provider_runtime::gh_api_label("/repos/owner/repo/pulls".into()));
 }
 
 #[test]
@@ -571,7 +571,7 @@ rounds:
     }
 
     // Round auto-advances — now we can get gh_api from round 2
-    let api = replayer.next(&ChannelLabel::Extra("gh_api".into(), "/repos/owner/repo/pulls".into()));
+    let api = replayer.next(&flotilla_provider_runtime::gh_api_label("/repos/owner/repo/pulls".into()));
     match api {
         Interaction::Extra(GithubChannel::GhApi { endpoint, .. }) => {
             assert_eq!(endpoint, "/repos/owner/repo/pulls");

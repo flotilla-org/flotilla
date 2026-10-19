@@ -458,7 +458,13 @@ mod tests {
             .expect("manifest path");
         let runtime = std::fs::read_to_string(Path::new(manifest).parent().expect("crate directory").join("src/lib.rs"))
             .expect("Rigging CommandRunner source");
-        let runner = runtime.split("pub trait CommandRunner: Send + Sync {").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let runner = runtime
+            .split("pub trait CommandRunner: Send + Sync {")
+            .nth(1)
+            .expect("Rigging bump may have changed CommandRunner's declaration; update the completeness-test parser")
+            .split("\n}\n")
+            .next()
+            .expect("CommandRunner trait body");
         let budget = include_str!("forge_budget.rs");
         let wrapper = budget
             .split("impl CommandRunner for BudgetedRunner {")

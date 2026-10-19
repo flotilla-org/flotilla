@@ -77,7 +77,7 @@ Core and daemon unit tests compile shared adapter sources only under `cfg(test)`
 integration tests import the testkit crates directly. Native libraries share `flotilla-build-features`' feature-only dependency
 selections on stable Cargo; `ci/build-graph/check.py` checks build and test selections separately for every workspace package,
 rejects production testkit dependencies and production `test-util`, and runs in workspace CI. Keep its anchors aligned when
-adding dependencies. Optional TLS providers and sandbox skips remain opt-in. The Relay Workers WebAssembly target does not
+adding dependencies. The build-graph check resolves the full Cargo graph to enforce the boundary on external Rigging crates; its first run may fetch the pinned Git sources. Optional TLS providers and sandbox skips remain opt-in. The Relay Workers WebAssembly target does not
 depend on the native feature selections.
 Workspace tests require Python 3.9+ and Cargo on PATH (`python` on Windows, `python3` elsewhere) for this guard.
 

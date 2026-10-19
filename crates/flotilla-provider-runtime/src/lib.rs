@@ -23,19 +23,32 @@ impl rigging_process::CommandGuard for GitConfigGuard {
         git_config_guard::guard_host_git_config_async(cmd, args, cwd).await
     }
 }
+/// Guarded Rigging runner. The same-named value below preserves existing unit-struct-style call sites.
+/// Callers can migrate to explicit `ProcessCommandRunner::new(GitConfigGuard)` construction;
+/// retain the value shim until those call sites have migrated.
 pub type ProcessCommandRunner = rigging_process::ProcessRunner<GitConfigGuard>;
+/// Compatibility value for callers that previously constructed the unit struct as `ProcessCommandRunner`.
 #[allow(non_upper_case_globals)]
 pub const ProcessCommandRunner: ProcessCommandRunner = rigging_process::ProcessRunner::new(GitConfigGuard);
-pub fn gh_api_channel_label(_method: &'static str, endpoint: &str) -> ChannelLabel {
-    gh_api_channel_label_with::<REPLAY_LABELS_ENABLED, _>(_method, endpoint, &DefaultLabeler)
+/// Consumer-owned replay namespace; GitHub fixtures have always used endpoint-only keys.
+pub const GH_API_REPLAY_NAMESPACE: &str = "gh_api";
+
+/// Construct a GitHub replay label, including explicit task labels.
+pub fn gh_api_label(endpoint: String) -> ChannelLabel {
+    ChannelLabel::Extra(GH_API_REPLAY_NAMESPACE.into(), endpoint)
+}
+
+pub fn gh_api_channel_label(method: &'static str, endpoint: &str) -> ChannelLabel {
+    gh_api_channel_label_with::<REPLAY_LABELS_ENABLED, _>(method, endpoint, &DefaultLabeler)
 }
 pub fn gh_api_channel_label_with<const ENABLED: bool, L: ChannelLabeler + ?Sized>(
+    // Retained for invocation compatibility; historical GitHub labels intentionally ignore the method.
     _method: &'static str,
     endpoint: &str,
     labeler: &L,
 ) -> ChannelLabel {
     if ENABLED {
-        labeler.label_for(&ChannelRequest::Extra { namespace: "gh_api", key: endpoint })
+        labeler.label_for(&ChannelRequest::Extra { namespace: GH_API_REPLAY_NAMESPACE, key: endpoint })
     } else {
         default_channel_label()
     }
@@ -110,4 +123,19 @@ pub use rigging_process::run_output;
 #[cfg(test)]
 mod test_support {
     pub use rigging_replay_testkit::testing::TimeoutOnlyRunner;
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    // Glue: GitHub fixtures require the historical namespace and endpoint-only key, independent of HTTP method.
+    #[test]
+    fn github_labels_preserve_fixture_channel_identity() {
+        let expected = ChannelLabel::Extra("gh_api".into(), "repos/team/repo/pulls".into());
+        assert_eq!(gh_api_label("repos/team/repo/pulls".into()), expected);
+        for method in ["GET", "POST"] {
+            assert_eq!(gh_api_channel_label(method, "repos/team/repo/pulls"), expected);
+        }
+    }
 }

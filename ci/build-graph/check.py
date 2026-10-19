@@ -80,10 +80,16 @@ def is_testkit(name):
     return name.endswith("-testkit") or name == "flotilla-test-support"
 
 
+def rigging_source(package):
+    # Cargo Git source IDs include the pinned query and resolved commit. Match the repository, not crate names.
+    source = (package.get("source") or "").partition("?")[0].partition("#")[0].removesuffix(".git")
+    return source == "git+https://github.com/flotilla-org/rigging"
+
+
 def violations(metadata):
     packages = {package["name"]: package for package in metadata["packages"]}
     members = set(metadata["workspace_members"])
-    packages = {name: package for name, package in packages.items() if package["id"] in members or name.startswith("rigging-")}
+    packages = {name: package for name, package in packages.items() if package["id"] in members or rigging_source(package)}
     production = {
         name: {dependency["name"] for dependency in package["dependencies"]
                if dependency["kind"] in (None, "build") and dependency["name"] in packages}
