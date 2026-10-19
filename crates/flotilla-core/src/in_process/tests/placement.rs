@@ -24,7 +24,8 @@ use super::support::{
 use crate::in_process::{placement_actuator_host_ref, placement_target_host, ConditionValue, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_admission::convoy_admission::{
-    default_convoy_placement_policy, resolve_workflow_credentials, validate_workflow_agent_adapters, validate_workflow_credentials,
+    default_convoy_placement_policy, placement_agent_adapters, resolve_workflow_credentials, validate_workflow_agent_adapters,
+    validate_workflow_credentials,
 };
 
 #[tokio::test]
@@ -296,7 +297,7 @@ async fn placement_target_host_rejects_ambiguous_display_name() {
 }
 
 #[tokio::test]
-async fn agentless_ssh_host_is_selected_for_trusted_work_and_routes_to_its_owner() {
+async fn agentless_ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
@@ -342,49 +343,29 @@ async fn agentless_ssh_host_is_selected_for_trusted_work_and_routes_to_its_owner
                 .build()])
             .build()])
         .build();
-    let accepted = default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted, None).await.expect("placement scoring");
-    assert_eq!(accepted.selected.expect("SSH host selected").metadata.name, policy.metadata.name);
+    let unpinned = default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted, None).await.expect("placement scoring");
+    assert!(unpinned.selected.is_none(), "an unpinned convoy must not land on an agentless SSH host");
+    assert_eq!(unpinned.refused_candidates.len(), 1);
+    assert_eq!(unpinned.refused_candidates[0].policy_name, policy.metadata.name);
+    assert_eq!(unpinned.refused_candidates[0].reason, "agentless SSH host takes only convoys that pin its placement");
+    validate_workflow_agent_adapters(&backend, "flotilla", &trusted, Some(&policy), false)
+        .await
+        .expect("pinned trusted work is admissible");
     let target = placement_target_host(&backend, "flotilla", &policy).await.expect("target host");
     assert_eq!(placement_actuator_host_ref(&backend, "flotilla", &target).await.expect("owner").as_str(), "owner-host");
 
-    backend
-        .using::<PlacementPolicy>("flotilla")
-        .create(
-            &test_meta("docker-ssh-host"),
-            &PlacementPolicySpec::builder()
-                .pool("cleat".to_string())
-                .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
-                    legacy_image_baseline_ref: None,
-                    memory_policy: Default::default(),
-                    host_ref: "ssh-host".to_string(),
-                    image: Some("crew:latest".into()),
-                    pull_policy: Default::default(),
-                    agent_adapters: BTreeSet::from(["codex".to_string()]),
-                    default_cwd: None,
-                    env: BTreeMap::new(),
-                    checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
-                })
-                .build(),
-        )
-        .await
-        .expect("synthetic Docker policy for SSH host");
-
     let agent_workflow = flotilla_resources::single_agent_workflow_spec();
-    let refused = default_convoy_placement_policy(&backend, "flotilla", None, &[], &agent_workflow, None)
+    let refused = validate_workflow_agent_adapters(&backend, "flotilla", &agent_workflow, Some(&policy), false)
         .await
         .expect_err("agentless SSH host cannot run a local agent adapter");
     assert!(refused.contains("agent adapter `codex`"), "{refused}");
-
-    backend.using::<PlacementPolicy>("flotilla").delete("docker-ssh-host").await.expect("remove synthetic Docker policy");
 
     let observed = hosts.get("ssh-host").await.expect("SSH Host");
     let mut unreachable = observed.status.expect("observed SSH status");
     unreachable.ready = false;
     hosts.update_status("ssh-host", &observed.metadata.resource_version, &unreachable).await.expect("failed SSH probe");
-    let unavailable =
-        default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted, None).await.expect("score unreachable host");
-    assert!(unavailable.selected.is_none());
-    assert!(unavailable.refused_candidates.iter().any(|candidate| candidate.reason.contains("not ready")));
+    let unavailable = placement_agent_adapters(&backend, "flotilla", &policy, false).await.expect_err("unreachable host is not ready");
+    assert!(unavailable.contains("not ready"), "{unavailable}");
 }
 
 #[tokio::test]

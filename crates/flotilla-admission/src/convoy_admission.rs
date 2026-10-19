@@ -2589,6 +2589,10 @@ impl AdmissionReadContext<'_> {
             if let Some(canonical_kind_host) = &canonical_kind_host {
                 kind.spec.host_ref = canonical_kind_host.to_string();
             }
+            if host.is_some_and(is_agentless_ssh_host) && pin != Some(kind.metadata.name.as_str()) {
+                rejected.push(refusal(AGENTLESS_SSH_PIN_ONLY.to_string()));
+                continue;
+            }
             let facts = host.and_then(|host| host.status.as_ref()).and_then(|status| status.fulfilment_facts.get(&kind.metadata.name));
             // A kind that omits its image realises each vessel's composed
             // image: resolution provides every image need or refuses, naming it.
@@ -4070,6 +4074,15 @@ pub async fn default_convoy_placement_policy(
     decide_default_placement(backend, namespace, project_ref, repositories, workflow, local_host_ref, PlacementPurpose::Admission).await
 }
 
+/// Agentless SSH hosts run crews in an account the owning daemon does not
+/// control, so they take only convoys that name their placement deliberately.
+/// Capacity-aware selection may relax this once hosts advertise their limits.
+const AGENTLESS_SSH_PIN_ONLY: &str = "agentless SSH host takes only convoys that pin its placement";
+
+fn is_agentless_ssh_host(host: &ResourceObject<ResourceHost>) -> bool {
+    matches!(host.spec.connection, flotilla_resources::HostConnection::AgentlessSsh { .. })
+}
+
 async fn decide_default_placement(
     backend: &ResourceBackend,
     namespace: &str,
@@ -4098,17 +4111,12 @@ async fn decide_default_placement(
     let mut refused_candidates = Vec::new();
     for policy in policies {
         let mut candidate_workflow = workflow.clone();
-        let agentless_ssh = policy_targets_agentless_ssh(backend, namespace, &policy).await;
-        let agentless_unready = if purpose == PlacementPurpose::Admission && agentless_ssh {
-            placement_agent_adapters(backend, namespace, &policy, false).await.err()
-        } else {
-            None
-        };
-        let refusal = if purpose == PlacementPurpose::Routing {
+        // Only unpinned convoys reach default placement.
+        let refusal = if policy_targets_agentless_ssh(backend, namespace, &policy).await {
+            Some(AGENTLESS_SSH_PIN_ONLY.to_string())
+        } else if purpose == PlacementPurpose::Routing {
             None
         } else if let Err(reason) = validate_docker_placement_host(backend, namespace, &policy).await {
-            Some(reason)
-        } else if let Some(reason) = agentless_unready {
             Some(reason)
         } else if let Err(reason) = validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy), false).await {
             Some(reason)
