@@ -18,6 +18,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_admission::convoy_ensure::StandingConvoyBackingInspector;
 use flotilla_agent::adapter::AgentAdapterRegistry;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_config::ConfigStore;
@@ -28,7 +29,6 @@ use flotilla_controllers::reconcilers::{
     TerminalDeliveryReadiness, TerminalLiveness, TerminalRuntime, TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_core::in_process::StandingConvoyBackingInspector;
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE;
 use flotilla_credentials::crew_git_identity_environment;
 use flotilla_credentials::AgentMaterialRegistry;

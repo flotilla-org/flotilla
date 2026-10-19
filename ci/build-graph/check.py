@@ -29,7 +29,7 @@ REPLICATION_FORBIDDEN = (
 )
 # ADR 0060 step 4: capabilities read resources through the store and receive
 # higher orchestration through ports. Register each new capability here.
-CAPABILITY_CRATES = frozenset({"flotilla-executor", "flotilla-projections"})
+CAPABILITY_CRATES = frozenset({"flotilla-executor", "flotilla-projections", "flotilla-admission"})
 CAPABILITY_FORBIDDEN = (
     "flotilla-core", "flotilla-daemon", "flotilla-controllers",
     "flotilla-credentials",
@@ -122,6 +122,8 @@ def violations(metadata):
         for target in (*CAPABILITY_FORBIDDEN, *sorted(CAPABILITY_CRATES - {capability})):
             if target in packages and reaches(capability, target):
                 errors.append(f"{capability}: must not depend on {target}, directly or transitively")
+    if "flotilla-admission" in packages and STATE_MACHINES in packages and reaches("flotilla-admission", STATE_MACHINES):
+        errors.append("flotilla-admission: must not depend on flotilla-state-machines, directly or transitively")
     # Observation is shared below capabilities and uses forge-neutral traits only.
     for target in (*CAPABILITY_FORBIDDEN, "flotilla-projections", "flotilla-messaging", *sorted(CAPABILITY_CRATES),
                    "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-github-providers", "flotilla-forgejo-providers",

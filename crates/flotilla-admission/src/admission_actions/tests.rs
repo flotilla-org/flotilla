@@ -5,68 +5,9 @@ use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_protocol::{ConvoyStartIntent, NodeId};
 use flotilla_protocol_testkit::event_sink::RecordingEventSink;
 use flotilla_resources::{Convoy, CrewSource, CrewSpec, VesselRequirement, WorkflowTemplateSpec};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
-// Boundary stand-in: the asynchronous admission worker can be unavailable or
-// retain a queued task without running a process. Other integrations are unused.
-#[derive(Default)]
-struct Worker {
-    available: AtomicBool,
-    inspections: AtomicUsize,
-    tasks: std::sync::Mutex<Vec<ConvoyStartTask>>,
-}
-#[async_trait]
-impl AdmissionActionPort for Worker {
-    // Stand-in for Git inspection I/O; checkout persistence uses real stores.
-    async fn inspect_adopted_checkout(
-        &self,
-        path: &Path,
-        repository_url: Option<&str>,
-        git_ref: Option<&str>,
-    ) -> Result<RepositoryInspection, String> {
-        self.inspections.fetch_add(1, Ordering::SeqCst);
-        let url = repository_url.expect("explicit repository");
-        Ok(RepositoryInspection {
-            spec: RepositorySpec::remote(url)?,
-            checkout: crate::repository_inspection::LocalCheckoutInspection {
-                path: path.into(),
-                host_ref: "host".into(),
-                git_ref: git_ref.unwrap().into(),
-                is_main: false,
-            },
-            transport_url: Some(url.into()),
-            replaces_prior_repository: false,
-        })
-    }
-    async fn project_add(&self, _: &str, _: Option<&str>, _: Option<&str>, _: Option<&str>) -> Result<String, String> {
-        panic!("no project edits")
-    }
-    async fn project_refresh(&self, _: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
-        panic!("no project edits")
-    }
-    async fn project_register(&self, _: &str) -> Result<(String, usize), String> {
-        panic!("no project edits")
-    }
-    async fn image_check(
-        &self,
-        _: &flotilla_protocol::image_check::ImageCheckRequest,
-    ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String> {
-        panic!("no image checks")
-    }
-    async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
-        RepositorySpec::remote(remote)
-    }
-    async fn roll_convoy_ensure(&self, _: &str, _: &str) -> Result<String, String> {
-        panic!("no ensure roll")
-    }
-    fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool {
-        if !self.available.load(Ordering::SeqCst) {
-            return false;
-        }
-        self.tasks.lock().unwrap().push(task);
-        true
-    }
-}
+use crate::test_support::TestProjectOperations as Worker;
 
 fn handlers<'a>(
     worker: &'a Worker,
@@ -79,7 +20,7 @@ fn handlers<'a>(
 ) -> AdmissionActions<'a> {
     AdmissionActions {
         port: worker,
-        convoy_admission: owner,
+        admission: owner,
         resource_backend: backend,
         observed_resource_backend: observed,
         observed_checkout_reconciliation: reconciliation,

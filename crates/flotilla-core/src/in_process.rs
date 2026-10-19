@@ -3,13 +3,23 @@
 //! `InProcessDaemon` owns repos, runs refresh loops, executes commands,
 //! and broadcasts events — all within the same process.
 
+use flotilla_admission::admission_actions::AdmissionActions;
+use flotilla_admission::project_ops::{ProjectOperations, ProjectService, RepositoryIndex};
+use flotilla_admission::repository_inspection::inspect_project_ops_entries as inspect_operational_entries;
+use flotilla_admission::support::{
+    authoritative_placement_host, canonical_placement_host_ref, checkout_path, ensure_repository_and_default_project_workflow,
+    placement_actuator_host_ref, placement_target_host, unready_placement_refusal,
+};
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_observation::sources::{
     ChangeRequestQueryPort, IssueQueryPort, ProviderChangeRequestObservationSource, ProviderIssueObservationSource,
 };
+#[cfg(test)]
+use flotilla_protocol::PlacementDecision;
 use flotilla_resources::address::{remote_change_request_subject, same_subject};
-use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
+#[cfg(test)]
+use flotilla_resources::{CapabilityNeed, ProjectSpec, Resource};
 use repository_discovery::discover_repository_change_request_with;
 #[cfg(test)]
 mod host_registry_tests;
@@ -26,7 +36,6 @@ use flotilla_store_memory::InMemoryBackend;
 
 use flotilla_daemon_api::action_events;
 use flotilla_daemon_api::action_namespace;
-mod admission_actions;
 #[path = "attach.rs"]
 mod attach;
 mod checkout_providers;
@@ -40,15 +49,11 @@ pub(crate) use crew_ops::convoy_message_address;
 pub use crew_ops::{ConvoyResumeOutcome, CrewRoutingContext};
 use crew_ops::{CrewService, CrewTurnDeliveryActuator};
 
-#[path = "in_process/convoy_admission.rs"]
-pub mod convoy_admission;
 mod image_check;
-mod project_image_layers;
-mod project_ops;
 use checkout_providers::{CheckoutProvider, CheckoutProviders};
+use flotilla_admission::project_image_layers;
 mod repository_operations;
 use std::{
-    cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
@@ -61,15 +66,13 @@ use std::{
 
 use async_trait::async_trait;
 use attach::AttachResolver;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, Utc};
 #[cfg(test)]
-use convoy_admission::PlacementResolution;
-pub use convoy_admission::PreparedConvoyAdmission;
-use convoy_admission::{project_not_ready_error, ConvoyAdmission, ConvoyStartTask, StaticFulfilmentDecider};
-use flotilla_resources::convoy_address::{convoy_ensure_name, RoleAddress};
+use flotilla_admission::convoy_admission::PlacementResolution;
+use flotilla_admission::convoy_admission::PreparedConvoyAdmission;
+use flotilla_admission::convoy_admission::{ConvoyAdmission, ConvoyStartTask, StaticFulfilmentDecider};
+use flotilla_resources::convoy_address::RoleAddress;
 mod repository_discovery;
-use flotilla_change_request::observation::ChangeRequestKey;
-use flotilla_change_request::observation::ChangeRequestObservationSource;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_projections::ports::ResolvedAttach;
 #[cfg(test)]
@@ -79,35 +82,28 @@ use flotilla_protocol::{
     qualified_path::QualifiedPath,
     result_set::{ConvoyChangeRequest, Rows},
     AttachBinding, CanonicalHostId, CheckoutArchiveOutcome, CliListKind, CliListResponse, CliListRow, Command, CommandAction, CommandValue,
-    ConvoyDispatchRegard, ConvoyExplanation, CrewCommandContext, CrewListResponse, DaemonEvent, DispatchQueueResponse, EnvironmentId,
-    FleetHealthResponse, FleetListResponse, FulfilmentAllocation, FulfilmentAllocationCandidate, FulfilmentListResponse, HostListResponse,
-    HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState,
-    PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListResponse, ProviderData,
-    ProviderInfo, QueryCursor, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachPlan, ResourceRef, StatusResponse,
-    StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY,
-    TERMINAL_POOL_PROVIDER_CATEGORY,
+    ConvoyExplanation, CrewCommandContext, CrewListResponse, DaemonEvent, DispatchQueueResponse, EnvironmentId, FleetHealthResponse,
+    FleetListResponse, FulfilmentListResponse, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse,
+    HostSummary, NodeId, NodeInfo, PeerConnectionState, PrincipalRef, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor,
+    RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachPlan, ResourceRef, StatusResponse, StreamKey,
+    SurfaceDeclaration, TopologyResponse, TopologyRoute, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 #[cfg(test)]
 use flotilla_resources::CrewMessageSender;
 use flotilla_resources::{
-    api_version, capped_github_app_permissions, host_direct_environment_name, normalize_issue_source, observed_change_request_subjects,
-    AllocationDecision, BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
-    Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch,
-    CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionPending, CrewSource, CrewSpec,
-    Environment as ResourceEnvironment, EnvironmentPhase, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, Host as ResourceHost,
-    HostStatus as ResourceHostStatus, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
-    LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectMeta, ObservedChangeRequestState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec,
-    ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceError,
-    ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget, SystemClock, TerminalCrewContext, TurnDeliveryRung,
-    VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    host_direct_environment_name, observed_change_request_subjects, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec,
+    CrewCompletionPending, Forge, ForgeKind, InputMeta, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope,
+    LifecycleAuthority, ManifestRoot, ObservedChangeRequestState, PlacementPolicy, Project, Repository, RepositoryIdentity, RepositoryKey,
+    RepositorySpec, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TurnDeliveryRung, WatchEvent, WatchStart,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, PROJECT_LABEL,
+    ROLE_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{
-    CheckoutIntegrationStatus, ConditionValue, ConvoyPhase, CrewCompletionRefusalCause, HoldAct, IntegrationCondition,
-    TerminalSessionIdentity, Vessel, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
+    CheckoutIntegrationStatus, ConditionValue, ConvoyPhase, CrewCompletionRefusalCause, IntegrationCondition, TerminalSessionIdentity,
+    Vessel, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
 };
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::{
@@ -115,16 +111,13 @@ use flotilla_store::{
 };
 use futures::{FutureExt, StreamExt};
 pub use image_check::{check_image, image_build_report, ImageCheckSources};
-use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::checkout_integration::checkout_path_from_status_and_spec;
 use crate::checkout_integration::convoy_change_request_id_for_checkout;
 use crate::checkout_integration::inspect_checkout_integration;
 use crate::checkout_integration::inspect_convoy_checkout_integration;
-pub use crate::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler, StandingConvoyBackingInspector};
 use crate::host_identity::resolve_local_environment_state_dir;
 use crate::host_identity::resolve_local_host_id;
 use crate::host_identity::resolve_local_node_id;
@@ -134,23 +127,16 @@ use crate::host_identity::resolve_or_create_remote_host_id;
 use crate::leaf_engine::LeafSubscriptionTable;
 use crate::model::repo_name;
 use crate::model::RepoModel;
-use crate::regard_lifecycle::RegardLifecycle;
-use crate::regard_lifecycle::SurfaceGestureOutcome;
-use crate::regard_lifecycle::DEFAULT_REGARD_DECAY_SECONDS;
-use crate::regard_lifecycle::DEFAULT_REGARD_REFRESH_SECONDS;
 use crate::repo_state::RepoRootState;
 use crate::repo_state::RepoState;
 use crate::repository_inspection::GitRepositoryInspector;
-use crate::repository_inspection::RepositoryContinuity;
-use crate::repository_inspection::RepositoryInspection;
-use crate::repository_inspection::RepositoryInspector;
-use flotilla_agent::adapter::required_agent_adapters;
-use flotilla_agent::adapter::CapabilityTable;
-use flotilla_ai_utility::AiUtility;
-use flotilla_ai_utility::ConvoyNames;
-use flotilla_charter::ops_entry::ENSURED_FROM_ANNOTATION;
-use flotilla_charter::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
-use flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION;
+use flotilla_admission::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler, StandingConvoyBackingInspector};
+use flotilla_admission::regard_lifecycle::RegardLifecycle;
+use flotilla_admission::regard_lifecycle::DEFAULT_REGARD_DECAY_SECONDS;
+use flotilla_admission::regard_lifecycle::DEFAULT_REGARD_REFRESH_SECONDS;
+use flotilla_admission::repository_inspection::RepositoryContinuity;
+use flotilla_admission::repository_inspection::RepositoryInspection;
+use flotilla_admission::repository_inspection::RepositoryInspector;
 use flotilla_cloud_agent::RepoCriteria;
 use flotilla_config::ConfigStore;
 use flotilla_config::StaticEnvironmentConfig;
@@ -183,8 +169,6 @@ use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
-use flotilla_provider_runtime::ObservationError;
-use flotilla_resources::canonical_placement_host_ref_from_sources;
 
 struct ProviderChangeRequestQueryPort {
     resource_backend: ResourceBackend,
@@ -514,273 +498,6 @@ async fn register_static_ssh_direct_environments(
     }
 }
 
-fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTemplateSpec, String> {
-    let spec: WorkflowTemplateSpec = serde_yml::from_str(yaml).map_err(|err| format!("invalid workflow template YAML: {err}"))?;
-    flotilla_resources::validate(&spec).map_err(|errors| {
-        let joined = errors.iter().map(|e| format!("{e}")).collect::<Vec<_>>().join("; ");
-        format!("workflow template validation failed: {joined}")
-    })?;
-    Ok(spec)
-}
-
-fn parse_project_yaml(yaml: &str) -> Result<ProjectSpec, String> {
-    serde_yml::from_str(yaml).map_err(|err| format!("invalid project YAML: {err}"))
-}
-
-fn adopted_checkout_name(convoy_name: &str) -> String {
-    format!("adopted-checkout-{convoy_name}")
-}
-
-#[derive(bon::Builder)]
-struct AdoptedCheckoutRequest<'a> {
-    namespace: &'a str,
-    convoy_name: &'a str,
-    checkout_path: &'a Path,
-    repository_spec: &'a RepositorySpec,
-    repository_url: &'a str,
-    git_ref: &'a str,
-    host_ref: &'a str,
-}
-
-async fn create_adopted_checkout_resource(
-    durable_backend: &ResourceBackend,
-    observed_backend: &ResourceBackend,
-    request: AdoptedCheckoutRequest<'_>,
-) -> Result<(String, String, String), String> {
-    let AdoptedCheckoutRequest { namespace, convoy_name, checkout_path, repository_spec, repository_url, git_ref, host_ref } = request;
-    let path = flotilla_provider_runtime::probe::canonicalize(checkout_path).await?;
-    let path_str = path.to_string_lossy().to_string();
-    let checkout_ref = adopted_checkout_name(convoy_name);
-    let repository_key = repository_spec.key();
-    flotilla_store::ensure_repository(&durable_backend.clone().using::<Repository>(namespace), &repository_key, repository_spec)
-        .await
-        .map_err(|error| error.to_string())?;
-    let meta = InputMeta::builder()
-        .name(checkout_ref.clone())
-        .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
-        .build()
-        .with_lifecycle_authority(LifecycleAuthority::Adopted);
-    let spec = ResourceCheckoutSpec::Observed(
-        ResourceObservedCheckoutSpec::builder()
-            .r#ref(git_ref.to_string())
-            .path(path_str.clone())
-            .repo_ref(repository_key)
-            .host_ref(host_ref.to_string())
-            .is_main(matches!(git_ref, "main" | "master" | "trunk"))
-            .build(),
-    );
-    let status = ResourceCheckoutStatus::builder().phase(ResourceCheckoutPhase::Ready).path(path_str).build();
-
-    let durable = persist_adopted_checkout(durable_backend, namespace, &checkout_ref, &meta, &spec, &status).await?;
-    match flotilla_observation::observed_resources::project_adopted_checkout(observed_backend, namespace, &durable).await {
-        Ok(()) => {}
-        Err(ResourceError::Invalid { message }) => return Err(message),
-        Err(error) => {
-            warn!(checkout = %checkout_ref, %error, "adopted checkout committed durably but observed publication failed; reconciliation will retry");
-        }
-    }
-
-    Ok((checkout_ref, repository_url.to_string(), git_ref.to_string()))
-}
-
-async fn persist_adopted_checkout(
-    backend: &ResourceBackend,
-    namespace: &str,
-    checkout_ref: &str,
-    meta: &InputMeta,
-    spec: &ResourceCheckoutSpec,
-    status: &ResourceCheckoutStatus,
-) -> Result<ResourceObject<ResourceCheckout>, String> {
-    let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
-    let checkout = match checkouts.create(meta, spec).await {
-        Ok(checkout) => checkout,
-        Err(ResourceError::Conflict { .. }) => {
-            let existing = checkouts.get(checkout_ref).await.map_err(|err| err.to_string())?;
-            if existing.metadata.lifecycle_authority().map_err(|err| err.to_string())? != Some(LifecycleAuthority::Adopted) {
-                return Err(format!("checkout {checkout_ref} already exists but is not adopted"));
-            }
-            if &existing.spec != spec {
-                return Err(format!("checkout {checkout_ref} already exists with different adopted checkout details"));
-            }
-            existing
-        }
-        Err(err) => return Err(err.to_string()),
-    };
-    if checkout.status.is_some() {
-        Ok(checkout)
-    } else {
-        checkouts.update_status(checkout_ref, &checkout.metadata.resource_version, status).await.map_err(|err| err.to_string())
-    }
-}
-
-fn home_copy_wins_by_name<T: Resource>(sources: impl IntoIterator<Item = ReadResourceObject<T>>) -> Vec<ResourceObject<T>> {
-    let mut resolved = BTreeMap::<String, ReadResourceObject<T>>::new();
-    for source in sources {
-        let name = source.object.metadata.name.clone();
-        match resolved.entry(name) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(source);
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry)
-                if matches!(source.provenance, ResourceProvenance::Local)
-                    && matches!(entry.get().provenance, ResourceProvenance::Replica { .. }) =>
-            {
-                entry.insert(source);
-            }
-            std::collections::btree_map::Entry::Occupied(_) => {}
-        }
-    }
-    resolved.into_values().map(|source| source.object).collect()
-}
-
-fn placement_host_ref(policy: &ResourceObject<PlacementPolicy>) -> Option<&str> {
-    policy
-        .spec
-        .host_direct
-        .as_ref()
-        .map(|spec| spec.host_ref.as_str())
-        .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|spec| spec.host_ref.as_str()))
-}
-
-async fn placement_target_host(
-    backend: &ResourceBackend,
-    namespace: &str,
-    policy: &ResourceObject<PlacementPolicy>,
-) -> Result<PlacementTargetHost, String> {
-    let host_ref = placement_host_ref(policy).ok_or_else(|| format!("placement `{}` has no target host", policy.metadata.name))?;
-    canonical_placement_host_ref(backend, namespace, host_ref)
-        .await
-        .and_then(|target| target.ok_or_else(|| format!("references unknown host `{host_ref}`")))
-        .map_err(|error| format!("placement `{}` {error}", policy.metadata.name))
-}
-
-async fn canonical_placement_host_ref(
-    backend: &ResourceBackend,
-    namespace: &str,
-    host_ref: &str,
-) -> Result<Option<PlacementTargetHost>, String> {
-    let hosts = backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
-    canonical_placement_host_ref_from_sources(&hosts.items, host_ref)
-}
-
-async fn authoritative_placement_host(
-    backend: &ResourceBackend,
-    namespace: &str,
-    target_host: &PlacementTargetHost,
-    placement_name: &str,
-) -> Result<ResourceObject<ResourceHost>, String> {
-    backend
-        .including_replicas::<ResourceHost>(namespace)
-        .get(target_host.reference.as_str())
-        .await
-        .map(|source| source.object)
-        .map_err(|error| format!("placement `{placement_name}` target host is not ready: {error}"))
-}
-
-fn host_generation(status: Option<&ResourceHostStatus>) -> &str {
-    status.and_then(|status| status.daemon_generation.as_deref()).unwrap_or("unknown")
-}
-
-fn placement_host_not_ready_reason(placement_name: &str, host_label: &str, generation: &str, status: &ResourceHostStatus) -> String {
-    let mut failing_conditions = status
-        .conditions
-        .iter()
-        .filter(|condition| condition.blocks_readiness())
-        .map(|condition| format!("{}: {}", condition.reason, condition.message))
-        .collect::<Vec<_>>();
-    failing_conditions.sort();
-    let detail = if failing_conditions.is_empty() { String::new() } else { format!(": {}", failing_conditions.join("; ")) };
-    format!("placement `{placement_name}` host `{host_label}` generation `{generation}` is not ready{detail}")
-}
-
-fn unready_placement_refusal(
-    placement_name: &str,
-    host_label: &str,
-    status: Option<&ResourceHostStatus>,
-    now: DateTime<Utc>,
-) -> Option<String> {
-    let Some(status) = status else {
-        return Some(format!("placement `{placement_name}` host `{host_label}` is not ready: status is unavailable"));
-    };
-    if status.sleeping_until.is_some_and(|until| until > now) {
-        return None;
-    }
-    let mut observed = status.clone();
-    observed.apply_heartbeat_readiness(now);
-    if observed.ready {
-        return None;
-    }
-    let mut reason = placement_host_not_ready_reason(placement_name, host_label, host_generation(Some(status)), &observed);
-    if !observed.readiness_blocked() && !status.heartbeat_is_fresh(now) {
-        match observed.heartbeat_at {
-            None => reason.push_str(": heartbeat is unavailable"),
-            Some(_) => reason.push_str(": heartbeat is stale"),
-        }
-    }
-    Some(reason)
-}
-
-fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Option<(u64, Option<u64>)>) -> Result<(), String> {
-    let Some((floor_bytes, free_bytes)) = capacity else {
-        return Err(format!("placement refused on host `{}`: admission free-space floor is unavailable", target_host.display_name));
-    };
-    if floor_bytes == 0 {
-        return Ok(());
-    }
-    let free_bytes =
-        free_bytes.ok_or_else(|| format!("placement refused on host `{}`: free space is unavailable", target_host.display_name))?;
-    crate::admission::check_measured_free_space(&target_host.display_name, free_bytes, floor_bytes)
-}
-
-async fn policy_targets_agentless_ssh(backend: &ResourceBackend, namespace: &str, policy: &ResourceObject<PlacementPolicy>) -> bool {
-    let Ok(target) = placement_target_host(backend, namespace, policy).await else {
-        return false;
-    };
-    authoritative_placement_host(backend, namespace, &target, &policy.metadata.name)
-        .await
-        .ok()
-        .is_some_and(|host| matches!(host.spec.connection, flotilla_resources::HostConnection::AgentlessSsh { .. }))
-}
-
-async fn validate_docker_placement_host(
-    backend: &ResourceBackend,
-    namespace: &str,
-    policy: &ResourceObject<PlacementPolicy>,
-) -> Result<(), String> {
-    if policy.spec.docker_per_vessel.is_none() {
-        return Ok(());
-    }
-    let target = placement_target_host(backend, namespace, policy).await?;
-    let host = authoritative_placement_host(backend, namespace, &target, &policy.metadata.name).await?;
-    let capabilities = host.status.as_ref().map(|status| &status.capabilities);
-    if capabilities.and_then(|capabilities| capabilities.get("docker")) != Some(&serde_json::Value::Bool(true)) {
-        return Err(format!(
-            "placement `{}` host `{}` is missing docker capability required for Docker vessels",
-            policy.metadata.name, target.display_name
-        ));
-    }
-    if capabilities.and_then(|capabilities| capabilities.get("os")).and_then(serde_json::Value::as_str) != Some(Platform::Linux.as_str()) {
-        return Err(format!(
-            "placement `{}` host `{}` is missing Linux host capability required for daemon-adjacent injection",
-            policy.metadata.name, target.display_name
-        ));
-    }
-    Ok(())
-}
-
-async fn placement_actuator_host_ref(
-    backend: &ResourceBackend,
-    namespace: &str,
-    target: &PlacementTargetHost,
-) -> Result<CanonicalHostId, String> {
-    let host = authoritative_placement_host(backend, namespace, target, "actuator routing").await?;
-    match host.spec.connection {
-        flotilla_resources::HostConnection::AgentlessSsh { owning_daemon, .. } => Ok(CanonicalHostId::resolved(owning_daemon)),
-        flotilla_resources::HostConnection::Daemon => Ok(target.reference.clone()),
-    }
-}
-
-/// Resolve one remote independently; callers choose which remote's forge to carry.
 async fn forge_for_remote(
     resource_backend: &ResourceBackend,
     namespace: &str,
@@ -937,10 +654,6 @@ fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<Strin
     }
 }
 
-fn checkout_path(checkout: &ResourceObject<ResourceCheckout>) -> Option<&str> {
-    checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExistingConvoyTarget {
     pub home: HostName,
@@ -1009,7 +722,7 @@ pub struct InProcessDaemon {
     /// Running commands, keyed by command ID, for cancellation.
     active_commands: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     self_weak: Weak<InProcessDaemon>,
-    convoy_admission: ConvoyAdmission,
+    admission: ConvoyAdmission,
     convoy_ensure_reconciler: RwLock<Option<Arc<dyn ConvoyEnsureReconciler>>>,
     crew_ops: Arc<CrewService>,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
@@ -1075,13 +788,7 @@ impl ConvoyEnsureAdmission for InProcessDaemon {
         admission: PreparedConvoyAdmission,
         annotations: BTreeMap<String, String>,
     ) -> Result<String, String> {
-        self.convoy_admission.admit_ensured_convoy(namespace, ensure, admission, annotations).await
-    }
-    async fn abandon(&self, namespace: &str, name: &str, reason: &str, principal_ref: Option<&PrincipalRef>) -> Result<(), String> {
-        self.abandon_convoy_internal(namespace, name, reason, principal_ref).await.map(|_| ())
-    }
-    async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
-        self.reap_convoy_internal(namespace, name, force).await
+        self.admission.admit_ensured_convoy(namespace, ensure, admission, annotations).await
     }
 }
 
@@ -1104,7 +811,9 @@ pub trait WorkCredentialReconciler: Send + Sync {
 #[async_trait]
 impl StandingConvoyBackingInspector for InProcessDaemon {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
-        self.verify_standing_convoy_resource_backing_dead(convoy).await
+        flotilla_admission::convoy_ensure::ResourceStandingConvoyBackingInspector { resource_backend: self.resource_backend.clone() }
+            .verify_backing_dead(convoy)
+            .await
     }
 }
 
@@ -1555,13 +1264,13 @@ impl InProcessDaemon {
             repository_providers: Mutex::new(HashMap::new()),
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
-            convoy_admission: ConvoyAdmission::builder()
+            admission: ConvoyAdmission::builder()
                 .backend(resource_backend.clone())
                 .observed_backend(observed_resource_backend.clone())
                 .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
                 .config(Arc::clone(&config))
                 .discovery(Arc::clone(&discovery))
-                .environment_manager(Arc::clone(&environment_manager))
+                .environment_manager(Arc::new(AdmissionEnvironmentAdapter(Arc::clone(&environment_manager))))
                 .local_environment_id(local_environment_id.clone())
                 .provisioning_namespace(Arc::clone(&provisioning_namespace))
                 .repository_change_requests(Arc::clone(&repository_change_requests))
@@ -1619,7 +1328,7 @@ impl InProcessDaemon {
                     }
                 };
                 let live = listed.items.iter().map(|repository| repository.metadata.name.as_str()).collect::<HashSet<_>>();
-                daemon.convoy_admission.repository_change_requests.write().await.retain(|key, _| live.contains(key.to_string().as_str()));
+                daemon.admission.repository_change_requests().write().await.retain(|key, _| live.contains(key.to_string().as_str()));
                 daemon
                     .repository_providers
                     .lock()
@@ -1659,7 +1368,7 @@ impl InProcessDaemon {
                         None => break,
                     };
                     let Some(daemon) = weak.upgrade() else { return };
-                    daemon.convoy_admission.repository_change_requests.write().await.retain(|key, _| key.to_string() != name);
+                    daemon.admission.repository_change_requests().write().await.retain(|key, _| key.to_string() != name);
                     daemon
                         .repository_providers
                         .lock()
@@ -1750,7 +1459,7 @@ impl InProcessDaemon {
     /// Use `path` as the canonical capacity source for both local and
     /// federated convoy admission.
     pub fn set_admission_free_space_path(&self, path: PathBuf) {
-        self.convoy_admission.set_free_space_path(path);
+        self.admission.set_free_space_path(path);
     }
 
     pub async fn set_brief_artifact_writer(&self, writer: Arc<dyn BriefArtifactWriter>) {
@@ -1758,7 +1467,7 @@ impl InProcessDaemon {
     }
 
     pub async fn admission_free_space_bytes(&self) -> Result<Option<u64>, String> {
-        self.convoy_admission.free_space_bytes().await
+        self.admission.free_space_bytes().await
     }
 
     pub fn local_environment_id(&self) -> &EnvironmentId {
@@ -1874,7 +1583,7 @@ impl InProcessDaemon {
     async fn observed_repository_key_for_path(&self, path: &Path) -> Result<Option<RepositoryKey>, String> {
         let path = canonical_or_original(path);
         let namespace = self.provisioning_namespace().await;
-        let checkouts = crate::repository_addressing::local_checkouts(
+        let checkouts = flotilla_admission::repository_addressing::local_checkouts(
             &self.resource_backend,
             &self.observed_resource_backend,
             &namespace,
@@ -2184,7 +1893,7 @@ impl InProcessDaemon {
                 let host_ref = self.local_host_id().ok_or_else(|| "local Host identity is unavailable".to_string())?.to_string();
                 return Ok(RepositoryInspection {
                     spec,
-                    checkout: crate::repository_inspection::LocalCheckoutInspection {
+                    checkout: flotilla_admission::repository_inspection::LocalCheckoutInspection {
                         path,
                         host_ref,
                         git_ref: git_ref.to_string(),
@@ -2788,7 +2497,7 @@ impl InProcessDaemon {
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<Option<flotilla_protocol::qualified_path::HostId>, String> {
-        self.convoy_admission.start_placement_host(namespace, intent).await
+        self.admission.start_placement_host(namespace, intent).await
     }
 
     pub async fn resolve_existing_convoy_target(
@@ -2936,7 +2645,7 @@ impl InProcessDaemon {
         &self,
         selector: &flotilla_protocol::RepoSelector,
     ) -> Result<Option<RepositoryKey>, String> {
-        crate::repository_addressing::resolve_repository(
+        flotilla_admission::repository_addressing::resolve_repository(
             &self.resource_backend,
             &self.observed_resource_backend,
             &self.provisioning_namespace().await,
@@ -2977,7 +2686,7 @@ impl InProcessDaemon {
         scope: &CheckoutResolutionScope,
     ) -> Result<(PathBuf, String), String> {
         let namespace = self.provisioning_namespace().await;
-        let checkouts = crate::repository_addressing::local_checkouts(
+        let checkouts = flotilla_admission::repository_addressing::local_checkouts(
             &self.resource_backend,
             &self.observed_resource_backend,
             &namespace,
@@ -3076,7 +2785,7 @@ impl InProcessDaemon {
             false
         };
         let (candidates, failures) =
-            self.convoy_admission.repository_change_request_candidates(std::slice::from_ref(checkout.spec.repo_ref())).await;
+            self.admission.repository_change_request_candidates(std::slice::from_ref(checkout.spec.repo_ref())).await;
         if let Some(error) = failures.into_iter().next() {
             return Err(error);
         }
@@ -3166,7 +2875,7 @@ impl InProcessDaemon {
         branch: &str,
         binding: Option<&flotilla_resources::BoundChangeRequest>,
     ) -> flotilla_observation::convoy_branch_refresh::ConvoyBranchRefresh {
-        self.convoy_admission.refresh_convoy_branch(repository_keys, branch, binding).await
+        self.admission.refresh_convoy_branch(repository_keys, branch, binding).await
     }
 
     pub async fn discover_convoy_branch_subjects_with_resolution(
@@ -3384,7 +3093,7 @@ impl InProcessDaemon {
         branch: &str,
         change_request_id: Option<&str>,
     ) -> Result<Option<ConvoyChangeRequest>, String> {
-        self.convoy_admission.resolve_convoy_change_request(repository_keys, branch, change_request_id).await
+        self.admission.resolve_convoy_change_request(repository_keys, branch, change_request_id).await
     }
 
     /// Add a virtual repo (no local filesystem path) for a remote-only repo.
@@ -3489,106 +3198,6 @@ impl InProcessDaemon {
 
 /// Non-trait methods that are called directly on the concrete `InProcessDaemon`
 /// type by the daemon server peer-overlay code and by the `execute()` implementation.
-fn repository_matches_target(repository: &ResourceObject<Repository>, target: &str) -> bool {
-    repository.metadata.name == target || repository.spec.matches_catalog_target(target)
-}
-
-async fn ensure_default_workflows(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
-    let templates = backend.clone().using::<WorkflowTemplate>(namespace);
-    for (name, spec) in [
-        ("single-agent", flotilla_resources::single_agent_workflow_spec()),
-        ("single-agent-shepherd", flotilla_resources::single_agent_shepherd_workflow_spec()),
-        ("implement-review", flotilla_resources::implement_review_workflow_spec()),
-    ] {
-        let meta = InputMeta::builder().name(name.to_string()).build();
-        match templates.create(&meta, &spec).await {
-            Ok(_) | Err(ResourceError::Conflict { .. }) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Ok(())
-}
-
-fn prepared_snapshot_name(kind: &str, spec: &serde_json::Value) -> Result<String, String> {
-    let suffix = flotilla_resources::content_hash(spec).map_err(|error| error.to_string())?;
-    Ok(format!("{kind}-snapshot-{suffix}"))
-}
-
-async fn ensure_prepared_workflow_snapshot(
-    backend: &ResourceBackend,
-    namespace: &str,
-    name: &str,
-    spec: &WorkflowTemplateSpec,
-) -> Result<(), String> {
-    let templates = backend.definitions::<WorkflowTemplate>(namespace);
-    match templates.get(name).await {
-        Ok(existing) if existing.spec == *spec => Ok(()),
-        Ok(_) => Err(format!("prepared workflow snapshot {name} already exists with different contents")),
-        Err(ResourceError::NotFound { .. }) => templates
-            .apply(
-                &InputMeta::builder()
-                    .name(name.to_string())
-                    .labels(BTreeMap::from([(
-                        flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(),
-                        flotilla_resources::WORKFLOW_SNAPSHOT_KIND.to_string(),
-                    )]))
-                    .build(),
-                spec,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-async fn ensure_prepared_placement_snapshot(
-    backend: &ResourceBackend,
-    namespace: &str,
-    name: &str,
-    spec: &PlacementPolicySpec,
-) -> Result<(), String> {
-    let policies = backend.including_replicas::<PlacementPolicy>(namespace);
-    match policies.get(name).await {
-        Ok(existing) if existing.object.spec == *spec => Ok(()),
-        Ok(_) => Err(format!("prepared placement snapshot {name} already exists with different contents")),
-        Err(ResourceError::NotFound { .. }) => backend
-            .clone()
-            .using::<PlacementPolicy>(namespace)
-            .create(
-                &InputMeta::builder()
-                    .name(name.to_string())
-                    .labels(BTreeMap::from([(
-                        flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(),
-                        flotilla_resources::PLACEMENT_SNAPSHOT_KIND.to_string(),
-                    )]))
-                    .build(),
-                spec,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-async fn ensure_repository_and_default_project_workflow(
-    backend: &ResourceBackend,
-    namespace: &str,
-    repository_key: &RepositoryKey,
-    repository_spec: &RepositorySpec,
-) -> Result<(), String> {
-    flotilla_store::ensure_repository(&backend.clone().using::<Repository>(namespace), repository_key, repository_spec)
-        .await
-        .map_err(|error| error.to_string())?;
-    ensure_default_workflows(backend, namespace).await?;
-    flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), namespace)
-        .collect(None)
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
 fn repository_identity_display(spec: &RepositorySpec) -> String {
     match spec.identity() {
         flotilla_resources::RepositoryIdentity::Forge { forge_ref, owner, repo_name } => format!("{forge_ref}/{owner}/{repo_name}"),
@@ -3597,7 +3206,10 @@ fn repository_identity_display(spec: &RepositorySpec) -> String {
     }
 }
 
-fn local_repository_matches_checkout(spec: &RepositorySpec, checkout: &crate::repository_inspection::LocalCheckoutInspection) -> bool {
+fn local_repository_matches_checkout(
+    spec: &RepositorySpec,
+    checkout: &flotilla_admission::repository_inspection::LocalCheckoutInspection,
+) -> bool {
     match spec.identity() {
         flotilla_resources::RepositoryIdentity::Local { host_ref, git_common_dir } => {
             host_ref == &checkout.host_ref && Path::new(git_common_dir).parent() == Some(checkout.path.as_path())
@@ -3608,7 +3220,7 @@ fn local_repository_matches_checkout(spec: &RepositorySpec, checkout: &crate::re
 
 impl InProcessDaemon {
     #[cfg(test)]
-    async fn resolve_convoy_admission_workflow(
+    async fn resolve_workflow(
         &self,
         namespace: &str,
         project_ref: &str,
@@ -3616,7 +3228,7 @@ impl InProcessDaemon {
         repositories: &[ConvoyRepositorySpec],
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<(String, WorkflowTemplateSpec), String> {
-        self.convoy_admission.resolve_convoy_admission_workflow(namespace, project_ref, project, repositories, intent).await
+        self.admission.resolve_workflow(namespace, project_ref, project, repositories, intent).await
     }
 
     #[cfg(test)]
@@ -3629,17 +3241,7 @@ impl InProcessDaemon {
         needs: &BTreeSet<CapabilityNeed>,
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<(PlacementResolution, Vec<String>), String> {
-        self.convoy_admission.resolve_capability_placement(namespace, project_ref, repositories, workflow, needs, intent).await
-    }
-
-    async fn prepare_convoy_admission_with_preferences(
-        &self,
-        namespace: &str,
-        intent: &flotilla_protocol::ConvoyStartIntent,
-        dispatching_principal_ref: &PrincipalRef,
-        repositories: Option<&[RepositoryKey]>,
-    ) -> Result<PreparedConvoyAdmission, String> {
-        self.convoy_admission.prepare_convoy_admission_with_preferences(namespace, intent, dispatching_principal_ref, repositories).await
+        self.admission.resolve_capability_placement(namespace, project_ref, repositories, workflow, needs, intent).await
     }
 
     async fn admit_convoy_start(
@@ -3648,7 +3250,12 @@ impl InProcessDaemon {
         intent: &flotilla_protocol::ConvoyStartIntent,
         dispatching_principal_ref: &PrincipalRef,
     ) -> Result<(String, String, Option<flotilla_protocol::ConvoyNaming>), String> {
-        self.convoy_admission.admit_convoy_start(namespace, intent, dispatching_principal_ref).await
+        self.admission.admit_convoy_start(namespace, intent, dispatching_principal_ref).await
+    }
+
+    /// Teardown handle for composing the standing-convoy reconciler.
+    pub fn convoy_teardown(&self) -> Arc<dyn flotilla_admission::ports::ConvoyTeardown> {
+        self.crew_ops.clone()
     }
 
     /// Install the controller before driving standing-convoy operations.
@@ -3701,108 +3308,24 @@ impl InProcessDaemon {
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
     ) -> Result<(ResourceObject<ConvoyEnsure>, PreparedConvoyAdmission), String> {
-        let repositories = self.resource_backend.clone().including_replicas::<Repository>(namespace);
-        for key in &ensure.spec.repositories {
-            match repositories.get(&key.to_string()).await {
-                Ok(repository) => {
-                    self.resolve_forge_identity_in(namespace, repository.object.spec)
-                        .await
-                        .map_err(|error| format!("repository {key}: {error}"))?;
-                }
-                Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        // The forge sweep may rewrite both Project membership and this ensure.
-        let ensure = match self.resource_backend.clone().including_replicas::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await {
-            Ok(updated) => updated.object,
-            Err(ResourceError::NotFound { .. }) => ensure.clone(),
-            Err(error) => return Err(error.to_string()),
-        };
-        let intent = flotilla_protocol::ConvoyStartIntent::builder()
-            .namespace(namespace.to_string())
-            .project_ref(ensure.spec.project_ref.clone())
-            .name(ensure.spec.role.clone())
-            .branch(ensure.spec.role.clone())
-            .standing_role(ensure.spec.role.clone())
-            .maybe_workflow_ref((!ensure.spec.workflow_ref.is_empty()).then(|| ensure.spec.workflow_ref.clone()))
-            .maybe_placement_policy(ensure.spec.placement_policy.clone())
-            .maybe_escalation_reason(ensure.spec.escalation_reason.clone())
-            .agent_overrides(ensure.spec.agent_overrides.clone())
-            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-            .build();
-        let admission = self
-            .prepare_convoy_admission_with_preferences(
-                namespace,
-                &intent,
-                &PrincipalRef::implicit_for_namespace(namespace),
-                Some(&ensure.spec.repositories),
-            )
-            .await?;
-        self.check_local_free_space_floor().await?;
-        self.convoy_admission.check_prepared_placement_floors(namespace, &admission).await?;
-        if admission.workflow.exit.is_some() {
-            return Err(format!(
-                "workflow template {} declares an exit table; standing convoys require no exit declaration",
-                ensure.spec.workflow_ref
-            ));
-        }
-        if !ensure.metadata.annotations.contains_key(SOURCE_COMMIT_ANNOTATION) {
-            return Err("materialized ensure has no source commit provenance".into());
-        }
-        Ok((ensure, admission))
+        self.admission.prepare_ensured_convoy(self, namespace, ensure).await
     }
 
-    pub async fn verify_standing_convoy_resource_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
-        let environments = self
-            .resource_backend
-            .using::<ResourceEnvironment>(&convoy.metadata.namespace)
-            .list()
-            .await
-            .map_err(|error| format!("could not inspect backing environments: {error}"))?
-            .items
-            .into_iter()
-            .filter(|environment| environment.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.metadata.name))
-            .collect::<Vec<_>>();
-        if environments.is_empty() {
-            if convoy.status.as_ref().and_then(|status| status.provisioning) == Some(ConvoyProvisioningState::NotStarted) {
-                return Ok(());
-            }
-            return Err("no backing environment evidence is available".to_string());
-        }
-        let not_dead = environments
-            .iter()
-            .filter(|environment| environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Failed))
-            .map(|environment| {
-                let phase = environment.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending);
-                format!("Environment/{} is {phase:?}", environment.metadata.name)
-            })
-            .collect::<Vec<_>>();
-        if not_dead.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("backing is not verified dead: {}", not_dead.join(", ")))
-        }
-    }
     pub async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         self.crew_ops.reap(namespace, name, force).await
     }
 
-    async fn check_local_free_space_floor(&self) -> Result<(), String> {
-        self.convoy_admission.check_local_free_space_floor().await
-    }
-
     pub fn admission_free_space_floor_bytes(&self) -> Result<u64, String> {
-        self.convoy_admission.admission_free_space_floor_bytes()
+        self.admission.admission_free_space_floor_bytes()
     }
 
     #[cfg(test)]
     async fn check_remote_placement_free_space_floor(&self, namespace: &str, placement: Option<&PlacementDecision>) -> Result<(), String> {
-        self.convoy_admission.check_remote_placement_free_space_floor(namespace, placement).await
+        self.admission.check_remote_placement_free_space_floor(namespace, placement).await
     }
 
     async fn emit_attach_regard(&self, binding: &AttachBinding, surface_id: uuid::Uuid) -> Result<(), String> {
-        self.convoy_admission.emit_attach_regard(binding, surface_id).await
+        self.admission.emit_attach_regard(binding, surface_id).await
     }
 
     async fn run_convoy_start(
@@ -3846,7 +3369,7 @@ impl InProcessDaemon {
                 flotilla_protocol::CommandValue::Error { message: "convoy start worker panicked".to_string() }
             }
         };
-        self.convoy_admission.clear_pending(&key).await;
+        self.admission.clear_pending(&key).await;
         self.finish_context_free_command(command_id, empty_repo_identity(), result);
     }
 
@@ -3895,14 +3418,14 @@ impl InProcessDaemon {
         }
     }
 
-    fn project_service(&self) -> project_ops::ProjectService<'_> {
-        project_ops::ProjectService {
+    fn project_service(&self) -> ProjectService<'_> {
+        ProjectService {
             image_layer_refresh: Arc::clone(&self.image_layer_refresh),
             resource_backend: &self.resource_backend,
             observed_resource_backend: &self.observed_resource_backend,
             clock: &self.clock,
             namespace: &self.provisioning_namespace,
-            repository_index: project_ops::RepositoryIndex {
+            repository_index: RepositoryIndex {
                 backend: &self.resource_backend,
                 observed: &self.observed_resource_backend,
                 namespace: &self.provisioning_namespace,
@@ -3932,7 +3455,7 @@ impl InProcessDaemon {
             warn!(%error, "project image layer reconciliation failed");
         }
         // Cache retention is housekeeping and never fails the sweep.
-        match project_ops::ProjectOperations::repository_inspector(self).await {
+        match ProjectOperations::repository_inspector(self).await {
             Ok(inspector) => {
                 if let Err(error) = inspector.retire_unused_charter_caches().await {
                     warn!(%error, "charter cache retention failed");
@@ -3959,7 +3482,7 @@ impl InProcessDaemon {
 
     async fn reconcile_tracked_repository(
         &self,
-        inspection: &crate::repository_inspection::RepositoryInspection,
+        inspection: &flotilla_admission::repository_inspection::RepositoryInspection,
     ) -> Result<Option<RepositoryIdentityChange>, String> {
         let previous = self.observed_repository_key_for_path(&inspection.checkout.path).await?;
         self.reconcile_inspected_repository(inspection, previous.as_ref()).await
@@ -4035,7 +3558,7 @@ impl InProcessDaemon {
             .map_err(|error| error.to_string())?;
         }
 
-        let other_tracked_keys = crate::repository_addressing::local_checkouts(
+        let other_tracked_keys = flotilla_admission::repository_addressing::local_checkouts(
             &self.resource_backend,
             &self.observed_resource_backend,
             &namespace,
@@ -4115,7 +3638,7 @@ impl InProcessDaemon {
         namespace: &str,
         repository_key: &RepositoryKey,
         repository_spec: &RepositorySpec,
-        checkout: crate::repository_inspection::LocalCheckoutInspection,
+        checkout: flotilla_admission::repository_inspection::LocalCheckoutInspection,
     ) -> Result<(), String> {
         self.project_service().reconcile_project_checkouts(namespace, repository_key, repository_spec, checkout).await
     }
@@ -4562,7 +4085,7 @@ impl InProcessDaemon {
     pub async fn project_operational_entry_inventory(
         &self,
         namespace: &str,
-    ) -> Result<crate::repository_inspection::OperationalEntryInventory, String> {
+    ) -> Result<flotilla_admission::repository_inspection::OperationalEntryInventory, String> {
         let projects = self.resource_backend.definitions::<Project>(namespace).list().await.map_err(|error| error.to_string())?;
         if !projects.iter().any(|project| {
             project.spec.repositories.iter().any(|member| member.roles.contains(&flotilla_resources::ProjectRepositoryRole::Ops))
@@ -4570,7 +4093,7 @@ impl InProcessDaemon {
             return Ok(Default::default());
         }
         let mut paths = BTreeMap::<RepositoryKey, Vec<PathBuf>>::new();
-        for checkout in crate::repository_addressing::local_checkouts(
+        for checkout in flotilla_admission::repository_addressing::local_checkouts(
             &self.resource_backend,
             &self.observed_resource_backend,
             namespace,
@@ -4584,7 +4107,7 @@ impl InProcessDaemon {
             }
         }
         let inspector = self.repository_inspector().await?;
-        crate::repository_inspection::inspect_project_ops_entries(&projects, &paths, &*inspector).await
+        inspect_operational_entries(&projects, &paths, &*inspector).await
     }
 
     pub async fn list_projects_internal(&self) -> Result<ProjectListResponse, String> {
@@ -5438,13 +4961,13 @@ impl InProcessDaemon {
             };
         }
 
-        let admission = admission_actions::AdmissionActions {
+        let admission = AdmissionActions {
             namespace: &self.provisioning_namespace,
             port: self,
             resource_backend: &self.resource_backend,
             observed_resource_backend: &self.observed_resource_backend,
             observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
-            convoy_admission: &self.convoy_admission,
+            admission: &self.admission,
             events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
         };
         let crew = crew_actions::CrewActions {
@@ -5625,7 +5148,7 @@ impl InProcessDaemon {
         namespace: &str,
         name: &str,
     ) -> Result<BTreeMap<String, flotilla_protocol::DispatchScore>, String> {
-        use crate::dispatch_missions::{issue_from_convoy, MissionBoard, MissionOccupancy};
+        use flotilla_admission::dispatch_missions::{issue_from_convoy, MissionBoard, MissionOccupancy};
         let convoy = self
             .resource_backend
             .query_declared::<ResourceConvoy>(namespace, &flotilla_store::StoreQuery::names([name.to_string()], true))
@@ -5652,7 +5175,10 @@ impl InProcessDaemon {
         let board = MissionBoard::new(&snapshots.iter().map(|(_, board)| board.as_ref().clone()).collect::<Vec<_>>())?;
         let convoys = self
             .resource_backend
-            .query_declared::<ResourceConvoy>(namespace, &crate::dispatch_missions::live_project_convoys_query([project_name.clone()]))
+            .query_declared::<ResourceConvoy>(
+                namespace,
+                &flotilla_projections::dispatch_board::live_project_convoys_query([project_name.clone()]),
+            )
             .await
             .map_err(|e| e.to_string())?;
         let occupancy = MissionOccupancy::collect(&board, policy, convoys.items.iter().map(|source| &source.object))?;
@@ -5824,7 +5350,7 @@ impl InProcessDaemon {
         spec: &ConvoySpec,
         workflow: &WorkflowTemplateSpec,
     ) -> Result<bool, String> {
-        self.convoy_admission.write_admission_briefs(namespace, name, spec, workflow).await
+        self.admission.write_admission_briefs(namespace, name, spec, workflow).await
     }
 }
 
@@ -5841,57 +5367,6 @@ impl InProcessDaemon {
     }
 }
 mod forge_demands;
-
-#[async_trait]
-impl admission_actions::AdmissionActionPort for InProcessDaemon {
-    async fn inspect_adopted_checkout(
-        &self,
-        path: &Path,
-        repository_url: Option<&str>,
-        git_ref: Option<&str>,
-    ) -> Result<RepositoryInspection, String> {
-        InProcessDaemon::inspect_adopted_checkout(self, path, repository_url, git_ref).await
-    }
-    async fn project_add(
-        &self,
-        target: &str,
-        explicit_name: Option<&str>,
-        explicit_display_name: Option<&str>,
-        remote: Option<&str>,
-    ) -> Result<String, String> {
-        InProcessDaemon::project_add(self, target, explicit_name, explicit_display_name, remote).await
-    }
-    async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
-        InProcessDaemon::project_refresh(self, name).await
-    }
-    async fn image_check(
-        &self,
-        request: &flotilla_protocol::image_check::ImageCheckRequest,
-    ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String> {
-        let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
-        let host = self.environment_manager.local_host_id().as_str().to_string();
-        image_check::check_image(&self.resource_backend, &namespace, &host, self, request).await
-    }
-    async fn project_register(&self, target: &str) -> Result<(String, usize), String> {
-        InProcessDaemon::project_register(self, target).await
-    }
-    async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
-        InProcessDaemon::resolve_repository_remote(self, remote).await
-    }
-    async fn roll_convoy_ensure(&self, namespace: &str, name: &str) -> Result<String, String> {
-        InProcessDaemon::roll_convoy_ensure(self, namespace, name).await
-    }
-    fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool {
-        if let Some(daemon) = self.self_weak.upgrade() {
-            tokio::spawn(async move {
-                daemon.supervise_convoy_start(task).await;
-            });
-            true
-        } else {
-            false
-        }
-    }
-}
 
 #[async_trait]
 impl crew_actions::CrewActionPort for InProcessDaemon {
@@ -6091,7 +5566,7 @@ impl image_check::ImageCheckSources for InProcessDaemon {
         &self,
         source: &flotilla_resources::CharterSource,
     ) -> Result<Option<flotilla_charter::charter_store::LayerDirectorySnapshot>, String> {
-        project_ops::ProjectOperations::repository_inspector(self).await?.image_layer_snapshot(source).await
+        ProjectOperations::repository_inspector(self).await?.image_layer_snapshot(source).await
     }
 
     async fn default_harness_adapters(
@@ -6100,6 +5575,109 @@ impl image_check::ImageCheckSources for InProcessDaemon {
         project_ref: &str,
         project: &flotilla_resources::ProjectSpec,
     ) -> Result<std::collections::BTreeSet<String>, String> {
-        self.convoy_admission.default_workflow_harness_adapters(namespace, project_ref, project).await
+        self.admission.default_workflow_harness_adapters(namespace, project_ref, project).await
     }
 }
+
+#[async_trait]
+impl ProjectOperations for InProcessDaemon {
+    fn remember_bootstrap_checkout(&self, inspection: &RepositoryInspection) -> Result<(), String> {
+        use flotilla_paths::path_context::ExecutionEnvironmentPath;
+        let path = ExecutionEnvironmentPath::new(&inspection.checkout.path);
+        self.config.add_observation_root(&path)?;
+        self.config.set_checkout_config(&path, inspection.spec.vcs().clone());
+        Ok(())
+    }
+
+    async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
+        InProcessDaemon::repository_inspector(self).await
+    }
+
+    async fn inspect_repository_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        InProcessDaemon::inspect_repository_path(self, path, remote).await
+    }
+
+    async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
+        InProcessDaemon::resolve_repository_remote(self, remote).await
+    }
+
+    async fn resolve_forge_identity_in(&self, namespace: &str, spec: RepositorySpec) -> Result<RepositorySpec, String> {
+        InProcessDaemon::resolve_forge_identity_in(self, namespace, spec).await
+    }
+
+    async fn reap_ensured_convoy(&self, namespace: &str, ensure_name: &str, convoy_name: &str, force: bool) -> Result<(), String> {
+        InProcessDaemon::reap_ensured_convoy(self, namespace, ensure_name, convoy_name, force).await
+    }
+
+    async fn inspect_adopted_checkout(
+        &self,
+        path: &Path,
+        repository_url: Option<&str>,
+        git_ref: Option<&str>,
+    ) -> Result<RepositoryInspection, String> {
+        InProcessDaemon::inspect_adopted_checkout(self, path, repository_url, git_ref).await
+    }
+    async fn project_add(
+        &self,
+        target: &str,
+        explicit_name: Option<&str>,
+        explicit_display_name: Option<&str>,
+        remote: Option<&str>,
+    ) -> Result<String, String> {
+        InProcessDaemon::project_add(self, target, explicit_name, explicit_display_name, remote).await
+    }
+    async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
+        InProcessDaemon::project_refresh(self, name).await
+    }
+    async fn image_check(
+        &self,
+        request: &flotilla_protocol::image_check::ImageCheckRequest,
+    ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String> {
+        let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
+        let host = self.environment_manager.local_host_id().as_str().to_string();
+        image_check::check_image(&self.resource_backend, &namespace, &host, self, request).await
+    }
+    async fn project_register(&self, target: &str) -> Result<(String, usize), String> {
+        InProcessDaemon::project_register(self, target).await
+    }
+    async fn roll_convoy_ensure(&self, namespace: &str, name: &str) -> Result<String, String> {
+        InProcessDaemon::roll_convoy_ensure(self, namespace, name).await
+    }
+    fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool {
+        if let Some(daemon) = self.self_weak.upgrade() {
+            tokio::spawn(async move {
+                daemon.supervise_convoy_start(task).await;
+            });
+            true
+        } else {
+            false
+        }
+    }
+}
+struct AdmissionEnvironmentAdapter(Arc<EnvironmentManager>);
+impl flotilla_admission::ports::AdmissionEnvironments for AdmissionEnvironmentAdapter {
+    fn local_host_id(&self) -> &flotilla_protocol::qualified_path::HostId {
+        self.0.local_host_id()
+    }
+    fn environment_bag(&self, environment: &EnvironmentId) -> Option<EnvironmentBag> {
+        self.0.environment_bag(environment)
+    }
+    fn environment_runner(&self, environment: &EnvironmentId) -> Option<Arc<dyn CommandRunner>> {
+        self.0.environment_runner(environment)
+    }
+    fn host_id_for_environment(&self, environment: &EnvironmentId) -> Option<flotilla_protocol::qualified_path::HostId> {
+        self.0.host_id_for_environment(environment)
+    }
+}
+#[async_trait]
+impl flotilla_admission::ports::ConvoyTeardown for CrewService {
+    async fn abandon(&self, namespace: &str, name: &str, reason: &str, principal: Option<&PrincipalRef>) -> Result<(), String> {
+        CrewService::abandon(self, namespace, name, reason, principal).await.map(|_| ())
+    }
+    async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+        CrewService::reap(self, namespace, name, force).await
+    }
+}
+
+#[cfg(test)]
+mod admission_composition_tests;

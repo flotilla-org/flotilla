@@ -1,3 +1,4 @@
+use flotilla_admission::support::placement_host_ref;
 use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -20,11 +21,11 @@ use super::support::{
     create_host_direct_placement, create_identity_convoy, create_running_session, create_test_environment, placement_policy, test_meta,
     trusted_codex_workflow,
 };
-use crate::in_process::convoy_admission::{
+use crate::in_process::{placement_actuator_host_ref, placement_target_host, ConditionValue, InProcessDaemon};
+use crate::testkits::discovery::fake_discovery;
+use flotilla_admission::convoy_admission::{
     default_convoy_placement_policy, resolve_workflow_credentials, validate_workflow_agent_adapters, validate_workflow_credentials,
 };
-use crate::in_process::{placement_actuator_host_ref, placement_host_ref, placement_target_host, ConditionValue, InProcessDaemon};
-use crate::testkits::discovery::fake_discovery;
 
 #[tokio::test]
 async fn default_remote_placement_resolves_replicated_credentials_before_admission() {
@@ -150,7 +151,7 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
 
     let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("andamento".to_string()).build();
     let (_, mut resolved_workflow) = daemon
-        .resolve_convoy_admission_workflow(
+        .resolve_workflow(
             "flotilla",
             "andamento",
             &backend.definitions::<Project>("flotilla").get("andamento").await.expect("project").spec,

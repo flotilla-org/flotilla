@@ -352,8 +352,8 @@ fn concurrent_demand_executes_one_build_per_identity(tc: hegel::TestCase) {
         // Each admission plans at placement and creates at its commit; a
         // concurrent creator's copy is reused.
         let names = futures::future::join_all((0..admissions).map(|_| async {
-            let planned = flotilla_core::image_build::plan_image_build(&backend, NS, &resolved, HOST).await?;
-            flotilla_core::image_build::create_planned_builds(&backend, NS, std::slice::from_ref(&planned)).await?;
+            let planned = flotilla_admission::image_build::plan_image_build(&backend, NS, &resolved, HOST).await?;
+            flotilla_admission::image_build::create_planned_builds(&backend, NS, std::slice::from_ref(&planned)).await?;
             Ok::<_, String>(planned.name)
         }))
         .await;

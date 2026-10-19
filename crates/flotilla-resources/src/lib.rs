@@ -325,3 +325,7 @@ pub use host_projection::canonical_placement_host_ref_from_sources;
 pub const BRIEF_ARTIFACTS_ANNOTATION: &str = "flotilla.work/brief-artifacts";
 
 pub mod image_architecture;
+
+pub mod convoy_accounting;
+
+pub mod checkout_path;

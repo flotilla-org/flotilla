@@ -1,5 +1,7 @@
 //! Project registration, refresh, and operational entry materialization.
 
+use crate::convoy_admission::{project_not_ready_error, ConvoyStartTask};
+use flotilla_resources::convoy_address::convoy_ensure_name;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -31,12 +33,10 @@ use flotilla_resources::{
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, ensure_repository, EventRecorder, ResourceBackend};
 use tracing::{debug, warn};
 
-use super::{
-    convoy_ensure_name, ensure_repository_and_default_project_workflow, project_not_ready_error, repository_matches_target, InProcessDaemon,
-};
 use crate::repository_inspection::{
     LocalCheckoutInspection, OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector,
 };
+use crate::support::{ensure_repository_and_default_project_workflow, repository_matches_target};
 
 /// A refresh refusal preserves file identity independently of its display text.
 struct OperationalEntryRefusal {
@@ -50,7 +50,7 @@ impl std::fmt::Display for OperationalEntryRefusal {
     }
 }
 
-pub(super) fn validate_project_name(name: &str) -> Result<(), String> {
+pub fn validate_project_name(name: &str) -> Result<(), String> {
     let normalized = normalize_project_name(name)?;
     if normalized != name {
         return Err(format!("project name `{name}` is invalid; use `{normalized}`"));
@@ -138,7 +138,7 @@ async fn reconcile_whole_repository_project_definition(
     Ok(reconciled)
 }
 
-pub(super) fn is_declaration_backed_project(project: &ResourceObject<Project>) -> bool {
+pub fn is_declaration_backed_project(project: &ResourceObject<Project>) -> bool {
     project.metadata.annotations.contains_key(BOOTSTRAP_REPOSITORY_ANNOTATION)
 }
 
@@ -168,11 +168,11 @@ fn project_target_syntax(target: &str) -> ProjectTargetSyntax {
 }
 
 /// Local execution paths come from Checkout facts, joined by Repository key.
-pub(super) struct RepositoryIndex<'a> {
-    pub(super) backend: &'a ResourceBackend,
-    pub(super) observed: &'a ResourceBackend,
-    pub(super) namespace: &'a std::sync::RwLock<String>,
-    pub(super) host: &'a str,
+pub struct RepositoryIndex<'a> {
+    pub backend: &'a ResourceBackend,
+    pub observed: &'a ResourceBackend,
+    pub namespace: &'a std::sync::RwLock<String>,
+    pub host: &'a str,
 }
 
 enum CheckoutSelection {
@@ -197,7 +197,11 @@ impl RepositoryIndex<'_> {
         match candidates.as_slice() {
             [checkout] => Ok(CheckoutSelection::Selected(
                 LocalCheckoutInspection::builder()
-                    .path(super::checkout_path(checkout).map(PathBuf::from).ok_or_else(|| format!("repository {key} has no local path"))?)
+                    .path(
+                        crate::support::checkout_path(checkout)
+                            .map(PathBuf::from)
+                            .ok_or_else(|| format!("repository {key} has no local path"))?,
+                    )
                     .host_ref(self.host.to_string())
                     .git_ref(checkout.spec.branch().to_string())
                     .is_main(matches!(&checkout.spec, flotilla_resources::CheckoutSpec::Observed(spec) if spec.is_main))
@@ -213,61 +217,52 @@ impl RepositoryIndex<'_> {
             .await?
             .into_iter()
             .filter(|checkout| checkout.spec.repo_ref() == key)
-            .filter_map(|checkout| super::checkout_path(&checkout).map(PathBuf::from))
+            .filter_map(|checkout| crate::support::checkout_path(&checkout).map(PathBuf::from))
             .collect())
     }
 }
 
-/// Repository inspection and convoy teardown operations owned by their existing subsystems.
+/// Host repository/project integration, inspection, image checks and worker submission.
 #[async_trait]
-pub(super) trait ProjectOperations: Send + Sync {
+pub trait ProjectOperations: Send + Sync {
     fn remember_bootstrap_checkout(&self, inspection: &RepositoryInspection) -> Result<(), String>;
     async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String>;
     async fn inspect_repository_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String>;
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String>;
-    async fn resolve_forge_identity(&self, spec: RepositorySpec) -> Result<RepositorySpec, String>;
+    async fn resolve_forge_identity_in(&self, namespace: &str, spec: RepositorySpec) -> Result<RepositorySpec, String>;
     async fn reap_ensured_convoy(&self, namespace: &str, ensure_name: &str, convoy_name: &str, force: bool) -> Result<(), String>;
+
+    async fn inspect_adopted_checkout(
+        &self,
+        path: &Path,
+        repository_url: Option<&str>,
+        git_ref: Option<&str>,
+    ) -> Result<RepositoryInspection, String>;
+    async fn project_add(
+        &self,
+        target: &str,
+        explicit_name: Option<&str>,
+        explicit_display_name: Option<&str>,
+        remote: Option<&str>,
+    ) -> Result<String, String>;
+    async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String>;
+    async fn image_check(
+        &self,
+        request: &flotilla_protocol::image_check::ImageCheckRequest,
+    ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String>;
+    async fn project_register(&self, target: &str) -> Result<(String, usize), String>;
+    async fn roll_convoy_ensure(&self, namespace: &str, name: &str) -> Result<String, String>;
+    fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool;
 }
 
-#[async_trait]
-impl ProjectOperations for InProcessDaemon {
-    fn remember_bootstrap_checkout(&self, inspection: &RepositoryInspection) -> Result<(), String> {
-        use flotilla_paths::path_context::ExecutionEnvironmentPath;
-        let path = ExecutionEnvironmentPath::new(&inspection.checkout.path);
-        self.config.add_observation_root(&path)?;
-        self.config.set_checkout_config(&path, inspection.spec.vcs().clone());
-        Ok(())
-    }
-
-    async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
-        InProcessDaemon::repository_inspector(self).await
-    }
-
-    async fn inspect_repository_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
-        InProcessDaemon::inspect_repository_path(self, path, remote).await
-    }
-
-    async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
-        InProcessDaemon::resolve_repository_remote(self, remote).await
-    }
-
-    async fn resolve_forge_identity(&self, spec: RepositorySpec) -> Result<RepositorySpec, String> {
-        InProcessDaemon::resolve_forge_identity(self, spec).await
-    }
-
-    async fn reap_ensured_convoy(&self, namespace: &str, ensure_name: &str, convoy_name: &str, force: bool) -> Result<(), String> {
-        InProcessDaemon::reap_ensured_convoy(self, namespace, ensure_name, convoy_name, force).await
-    }
-}
-
-pub(super) struct ProjectService<'a> {
-    pub(super) image_layer_refresh: Arc<tokio::sync::Mutex<super::project_image_layers::LayerRefreshState>>,
-    pub(super) resource_backend: &'a ResourceBackend,
-    pub(super) observed_resource_backend: &'a ResourceBackend,
-    pub(super) clock: &'a Arc<dyn Clock>,
-    pub(super) namespace: &'a std::sync::RwLock<String>,
-    pub(super) repository_index: RepositoryIndex<'a>,
-    pub(super) operations: &'a dyn ProjectOperations,
+pub struct ProjectService<'a> {
+    pub image_layer_refresh: Arc<tokio::sync::Mutex<crate::project_image_layers::LayerRefreshState>>,
+    pub resource_backend: &'a ResourceBackend,
+    pub observed_resource_backend: &'a ResourceBackend,
+    pub clock: &'a Arc<dyn Clock>,
+    pub namespace: &'a std::sync::RwLock<String>,
+    pub repository_index: RepositoryIndex<'a>,
+    pub operations: &'a dyn ProjectOperations,
 }
 
 impl ProjectService<'_> {
@@ -275,7 +270,7 @@ impl ProjectService<'_> {
         self.namespace.read().expect("provisioning namespace lock poisoned").clone()
     }
 
-    pub(super) async fn snapshot_project_repositories(
+    pub async fn snapshot_project_repositories(
         &self,
         namespace: &str,
         project_ref: &str,
@@ -284,7 +279,7 @@ impl ProjectService<'_> {
         snapshot_project_repositories_with_backend(self.resource_backend, namespace, project_ref, selected).await
     }
 
-    pub(super) async fn project_register(&self, target: &str) -> Result<(String, usize), String> {
+    pub async fn project_register(&self, target: &str) -> Result<(String, usize), String> {
         let namespace = self.provisioning_namespace();
         let path = if Path::new(target).exists() {
             PathBuf::from(target)
@@ -343,7 +338,7 @@ impl ProjectService<'_> {
         Ok((name, project.spec.repositories.len()))
     }
 
-    pub(super) async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
+    pub async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
         validate_project_name(name)?;
         let namespace = self.provisioning_namespace();
         let project =
@@ -395,14 +390,14 @@ impl ProjectService<'_> {
         Ok((members, !changes.is_empty(), changes, operational_entries))
     }
 
-    pub(super) async fn materialize_project_declaration(
+    pub async fn materialize_project_declaration(
         &self,
         declaration: ProjectDeclaration,
         mut inspection: ProjectDeclarationInspection,
     ) -> Result<(Vec<String>, Vec<String>), String> {
         validate_project_name(&declaration.name)?;
-        inspection.repository.spec = self.operations.resolve_forge_identity(inspection.repository.spec).await?;
         let namespace = self.provisioning_namespace();
+        inspection.repository.spec = self.operations.resolve_forge_identity_in(&namespace, inspection.repository.spec).await?;
         let authoring_lock = flotilla_charter::charter_store::authoring_lock(&namespace);
         let authoring_guard = authoring_lock.lock().await;
         let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
@@ -549,7 +544,7 @@ impl ProjectService<'_> {
         Ok((changes, operational_entries))
     }
 
-    pub(super) async fn record_project_operational_refusal(&self, namespace: &str, project_name: &str, error: &str) {
+    pub async fn record_project_operational_refusal(&self, namespace: &str, project_name: &str, error: &str) {
         let Ok(project) = self.resource_backend.definitions::<Project>(namespace).get(project_name).await else {
             return;
         };
@@ -562,7 +557,7 @@ impl ProjectService<'_> {
         }
     }
 
-    pub(super) async fn reconcile_bound_charters(&self) -> Result<(), String> {
+    pub async fn reconcile_bound_charters(&self) -> Result<(), String> {
         let namespace = self.provisioning_namespace();
         let projects = self
             .resource_backend
@@ -1319,7 +1314,7 @@ impl ProjectService<'_> {
         Ok(())
     }
 
-    pub(super) async fn project_add(
+    pub async fn project_add(
         &self,
         target: &str,
         explicit_name: Option<&str>,
@@ -1436,7 +1431,7 @@ impl ProjectService<'_> {
         Ok(project_name)
     }
 
-    pub(super) async fn reconcile_project_checkouts(
+    pub async fn reconcile_project_checkouts(
         &self,
         namespace: &str,
         repository_key: &RepositoryKey,
@@ -1517,7 +1512,7 @@ fn repository_catalog_query(target: &str) -> flotilla_store::StoreQuery {
     }
 }
 
-pub(super) async fn repository_transport_url_with_backend(
+pub async fn repository_transport_url_with_backend(
     backend: &ResourceBackend,
     namespace: &str,
     repository: &RepositorySpec,
@@ -1536,7 +1531,7 @@ pub(super) async fn repository_transport_url_with_backend(
     }
 }
 
-pub(super) async fn snapshot_project_repositories_with_backend(
+pub async fn snapshot_project_repositories_with_backend(
     backend: &ResourceBackend,
     namespace: &str,
     project_ref: &str,
@@ -1552,7 +1547,7 @@ pub(super) async fn snapshot_project_repositories_with_backend(
     snapshot_project_repositories_from_project(backend, namespace, &project, selected).await
 }
 
-pub(super) async fn snapshot_project_repositories_from_project(
+pub async fn snapshot_project_repositories_from_project(
     backend: &ResourceBackend,
     namespace: &str,
     project: &ResourceObject<Project>,
@@ -1681,7 +1676,7 @@ pub(super) async fn snapshot_project_repositories_from_project(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
     use flotilla_resources::SystemClock;
     use flotilla_store_memory::InMemoryBackend;
@@ -1689,6 +1684,24 @@ mod tests {
     use super::*;
     use flotilla_charter::ops_entry::OperationalEntryFile;
 
+    // The inspector boundary supplies real charter snapshots without the core Git adapter.
+    struct CharterSourceInspector {
+        runner: Arc<dyn flotilla_provider_runtime::CommandRunner>,
+        cache: PathBuf,
+    }
+    #[async_trait]
+    impl RepositoryInspector for CharterSourceInspector {
+        async fn inspect_path(&self, _: &Path, _: Option<&str>) -> Result<RepositoryInspection, String> {
+            Err("unexpected checkout inspection".into())
+        }
+        async fn charter_snapshot(
+            &self,
+            source: &flotilla_resources::CharterSource,
+        ) -> Result<flotilla_charter::charter_store::CharterSnapshot, String> {
+            let vcs = flotilla_vcs::vcs::FlotillaVcs::object_cache(self.runner.clone());
+            flotilla_charter::charter_store::read_charter_source(source, &self.cache, Some(&vcs)).await
+        }
+    }
     struct FakeRepositoryInspector {
         inspection: ProjectDeclarationInspection,
     }
@@ -1704,38 +1717,7 @@ mod tests {
         }
     }
 
-    struct FakeProjectOperations {
-        inspector: Arc<dyn RepositoryInspector>,
-        identity_resolutions: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl ProjectOperations for FakeProjectOperations {
-        fn remember_bootstrap_checkout(&self, _: &RepositoryInspection) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
-            Ok(Arc::clone(&self.inspector))
-        }
-
-        async fn inspect_repository_path(&self, _: &Path, _: Option<&str>) -> Result<RepositoryInspection, String> {
-            Err("unexpected direct repository inspection".into())
-        }
-
-        async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
-            RepositorySpec::remote(remote)
-        }
-
-        async fn resolve_forge_identity(&self, spec: RepositorySpec) -> Result<RepositorySpec, String> {
-            self.identity_resolutions.fetch_add(1, Ordering::SeqCst);
-            Ok(spec)
-        }
-
-        async fn reap_ensured_convoy(&self, _: &str, _: &str, _: &str, _: bool) -> Result<(), String> {
-            Err("unexpected convoy reap".into())
-        }
-    }
+    use crate::test_support::TestProjectOperations as FakeProjectOperations;
 
     // #2720: both store adapters feed the same operational materializer, without
     // checkout facts. A bad revision cannot replace its last-good workflow.
@@ -1743,8 +1725,6 @@ mod tests {
     async fn bound_ops_sources_apply_without_checkouts_and_preserve_last_good() {
         use flotilla_resources::{CharterSource, CharterStoreBinding, ManifestRoot};
 
-        use crate::repository_inspection::GitRepositoryInspector;
-        use crate::testkits::discovery::test_vcs_resolver;
         use flotilla_provider_runtime::ProcessCommandRunner;
         for local in [false, true] {
             let source_dir = tempfile::tempdir().expect("source");
@@ -1773,11 +1753,8 @@ mod tests {
                 }
             };
             let runner: Arc<dyn flotilla_provider_runtime::CommandRunner> = Arc::new(ProcessCommandRunner);
-            let inspector = Arc::new(
-                GitRepositoryInspector::new(runner.clone(), test_vcs_resolver(runner), "local-host")
-                    .with_charter_cache(cache.path().to_path_buf()),
-            );
-            let operations = FakeProjectOperations { inspector: inspector.clone(), identity_resolutions: AtomicUsize::new(0) };
+            let inspector = Arc::new(CharterSourceInspector { runner, cache: cache.path().to_path_buf() });
+            let operations = FakeProjectOperations::with_inspector(inspector.clone());
             let backend = ResourceBackend::new(InMemoryBackend::default());
             let observed = ResourceBackend::new(InMemoryBackend::observed());
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -1906,7 +1883,7 @@ mod tests {
         let remote = "https://github.com/example/app";
         let repository_spec = RepositorySpec::remote(remote).expect("repository spec");
         let operations = FakeProjectOperations {
-            inspector: Arc::new(FakeRepositoryInspector {
+            inspector: Some(Arc::new(FakeRepositoryInspector {
                 inspection: ProjectDeclarationInspection {
                     repository: RepositoryInspection {
                         spec: repository_spec.clone(),
@@ -1922,8 +1899,8 @@ mod tests {
                     yaml: format!("name: app\nmembers:\n  - alias: app\n    url: {remote}\n    roles: [code]\n"),
                     commit: "abc123".into(),
                 },
-            }),
-            identity_resolutions: AtomicUsize::new(0),
+            })),
+            ..Default::default()
         };
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let observed = ResourceBackend::new(InMemoryBackend::observed());

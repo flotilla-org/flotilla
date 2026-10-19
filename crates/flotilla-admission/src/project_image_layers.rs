@@ -22,7 +22,7 @@ use super::project_ops::{repository_transport_url_with_backend, ProjectService};
 
 /// Where one project's layer directory lives, as seen from this host.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum LayerHome {
+pub enum LayerHome {
     /// Read the directory here.
     Source(CharterSource),
     /// Nothing can be read yet (no default branch); leave the layer as it is.
@@ -32,7 +32,7 @@ pub(super) enum LayerHome {
 /// The project's primary (first code) repository's layer directory, at
 /// `branch` or else the repository's default branch. `None`: the project has
 /// no code repository.
-pub(super) async fn primary_layer_home(
+pub async fn primary_layer_home(
     backend: &ResourceBackend,
     namespace: &str,
     project: &ProjectSpec,
@@ -85,7 +85,7 @@ fn bounded_layer_diagnosis(message: String) -> String {
 
 /// Host-local retry state; successful reads and source changes reset refusal backoff.
 #[derive(Default)]
-pub(super) struct LayerRefreshState {
+pub struct LayerRefreshState {
     refusals: BTreeMap<(String, String), LayerRefusal>,
 }
 
@@ -98,7 +98,7 @@ struct LayerRefusal {
 }
 
 impl LayerRefreshState {
-    pub(super) fn conditions(&self) -> Vec<HostCondition> {
+    pub fn conditions(&self) -> Vec<HostCondition> {
         self.refusals
             .iter()
             .map(|((namespace, project), refusal)| {
@@ -141,7 +141,7 @@ impl LayerRefreshState {
 impl ProjectService<'_> {
     /// Sync every project's layer directory this host is responsible for.
     /// Each project's failure is reported and leaves its previous layer.
-    pub(super) async fn reconcile_project_image_layers(&self) -> Result<(), String> {
+    pub async fn reconcile_project_image_layers(&self) -> Result<(), String> {
         let namespace = self.namespace.read().expect("provisioning namespace lock poisoned").clone();
         let local = self
             .resource_backend
@@ -258,6 +258,7 @@ impl ProjectService<'_> {
 
 #[cfg(test)]
 mod tests {
+
     use std::{
         path::Path,
         sync::{Arc, Mutex},
@@ -273,7 +274,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        in_process::project_ops::{ProjectOperations, RepositoryIndex},
+        project_ops::RepositoryIndex,
         repository_inspection::{RepositoryInspection, RepositoryInspector},
     };
 
@@ -301,29 +302,7 @@ mod tests {
         }
     }
 
-    struct Operations(Arc<LayerSource>);
-
-    #[async_trait]
-    impl ProjectOperations for Operations {
-        fn remember_bootstrap_checkout(&self, _: &RepositoryInspection) -> Result<(), String> {
-            Ok(())
-        }
-        async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
-            Ok(Arc::clone(&self.0) as Arc<dyn RepositoryInspector>)
-        }
-        async fn inspect_repository_path(&self, _: &Path, _: Option<&str>) -> Result<RepositoryInspection, String> {
-            Err("unexpected inspection".into())
-        }
-        async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
-            RepositorySpec::remote(remote)
-        }
-        async fn resolve_forge_identity(&self, spec: RepositorySpec) -> Result<RepositorySpec, String> {
-            Ok(spec)
-        }
-        async fn reap_ensured_convoy(&self, _: &str, _: &str, _: &str, _: bool) -> Result<(), String> {
-            Err("unexpected reap".into())
-        }
-    }
+    use crate::test_support::TestProjectOperations as Operations;
 
     fn layer_files(version: &str) -> BTreeMap<String, Vec<u8>> {
         BTreeMap::from([
@@ -378,7 +357,7 @@ mod tests {
         let observed = ResourceBackend::new(InMemoryBackend::observed());
         seed(&backend, None).await;
         let source = Arc::new(LayerSource::default());
-        let operations = Operations(source.clone());
+        let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
         let service = service(&backend, &observed, &clock, &namespace, &operations);
@@ -437,7 +416,7 @@ mod tests {
             seed(&backend, None).await;
             let source = Arc::new(LayerSource::default());
             *source.error.lock().unwrap() = Some("old /cache/shallow.lock refusal".into());
-            let operations = Operations(source.clone());
+            let operations = Operations::with_inspector(source.clone());
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let namespace = std::sync::RwLock::new("flotilla".to_string());
             let service = service(&backend, &observed, &clock, &namespace, &operations);
@@ -536,7 +515,7 @@ mod tests {
         seed(&backend, None).await;
         let source = Arc::new(LayerSource::default());
         *source.files.lock().expect("files") = Some(layer_files("1.0.0"));
-        let operations = Operations(Arc::clone(&source));
+        let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
         let service = ProjectService {
@@ -620,7 +599,7 @@ mod tests {
         seed(&backend, Some(CharterPointer::Inline { documents: Vec::new(), files: BTreeMap::new() })).await;
         let source = Arc::new(LayerSource::default());
         *source.files.lock().expect("files") = Some(layer_files("1.0.0"));
-        let operations = Operations(Arc::clone(&source));
+        let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
         let service = service(&backend, &observed, &clock, &namespace, &operations);

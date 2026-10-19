@@ -2,10 +2,13 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use flotilla_protocol::{CanonicalHostId, PrincipalRef};
-use flotilla_resources::{Convoy as ResourceConvoy, ConvoyEnsure, ReadResourceObject, ResourceObject};
+use flotilla_protocol::CanonicalHostId;
+use flotilla_resources::{
+    Convoy as ResourceConvoy, ConvoyEnsure, ConvoyProvisioningState, Environment as ResourceEnvironment, EnvironmentPhase,
+    ReadResourceObject, ResourceObject, CONVOY_LABEL,
+};
 
-use crate::in_process::PreparedConvoyAdmission;
+use crate::convoy_admission::PreparedConvoyAdmission;
 
 /// Controller entry points injected by the runtime; core only delegates.
 #[async_trait]
@@ -58,8 +61,6 @@ pub trait ConvoyEnsureAdmission: Send + Sync {
         admission: PreparedConvoyAdmission,
         annotations: BTreeMap<String, String>,
     ) -> Result<String, String>;
-    async fn abandon(&self, namespace: &str, name: &str, reason: &str, principal_ref: Option<&PrincipalRef>) -> Result<(), String>;
-    async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String>;
 }
 
 /// Verifies the provider backing of a terminal standing convoy before the
@@ -69,4 +70,43 @@ pub trait ConvoyEnsureAdmission: Send + Sync {
 #[async_trait]
 pub trait StandingConvoyBackingInspector: Send + Sync {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String>;
+}
+
+/// Default fail-closed inspection of a standing convoy's backing Environment records.
+pub struct ResourceStandingConvoyBackingInspector {
+    pub resource_backend: flotilla_store::ResourceBackend,
+}
+#[async_trait]
+impl StandingConvoyBackingInspector for ResourceStandingConvoyBackingInspector {
+    async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
+        let environments = self
+            .resource_backend
+            .using::<ResourceEnvironment>(&convoy.metadata.namespace)
+            .list()
+            .await
+            .map_err(|error| format!("could not inspect backing environments: {error}"))?
+            .items
+            .into_iter()
+            .filter(|environment| environment.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.metadata.name))
+            .collect::<Vec<_>>();
+        if environments.is_empty() {
+            if convoy.status.as_ref().and_then(|status| status.provisioning) == Some(ConvoyProvisioningState::NotStarted) {
+                return Ok(());
+            }
+            return Err("no backing environment evidence is available".to_string());
+        }
+        let not_dead = environments
+            .iter()
+            .filter(|environment| environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Failed))
+            .map(|environment| {
+                let phase = environment.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending);
+                format!("Environment/{} is {phase:?}", environment.metadata.name)
+            })
+            .collect::<Vec<_>>();
+        if not_dead.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("backing is not verified dead: {}", not_dead.join(", ")))
+        }
+    }
 }

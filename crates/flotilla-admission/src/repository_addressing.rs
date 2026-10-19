@@ -11,7 +11,7 @@ use flotilla_store::ResourceBackend;
 
 use flotilla_paths::path_context::canonical_or_original;
 
-pub(crate) async fn resolve_repository(
+pub async fn resolve_repository(
     backend: &ResourceBackend,
     observed: &ResourceBackend,
     namespace: &str,
@@ -109,7 +109,7 @@ pub(crate) async fn resolve_repository(
 }
 
 /// Ready checkout facts on the local host, with durable-over-observed precedence.
-pub(crate) async fn local_checkouts(
+pub async fn local_checkouts(
     backend: &ResourceBackend,
     observed: &ResourceBackend,
     namespace: &str,

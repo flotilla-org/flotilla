@@ -4,11 +4,11 @@ use flotilla_provider_runtime::available_space::AvailableSpaceProbe;
 
 const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
-pub(crate) fn free_space_floor_bytes(floor_gib: u64) -> Result<u64, String> {
+pub fn free_space_floor_bytes(floor_gib: u64) -> Result<u64, String> {
     floor_gib.checked_mul(BYTES_PER_GIB).ok_or_else(|| format!("free-space floor is too large: {floor_gib} GiB"))
 }
 
-pub(crate) fn check_free_space_floor(probe: &dyn AvailableSpaceProbe, host: &str, path: &Path, floor_gib: u64) -> Result<(), String> {
+pub fn check_free_space_floor(probe: &dyn AvailableSpaceProbe, host: &str, path: &Path, floor_gib: u64) -> Result<(), String> {
     if floor_gib == 0 {
         return Ok(());
     }
@@ -21,7 +21,7 @@ pub(crate) fn check_free_space_floor(probe: &dyn AvailableSpaceProbe, host: &str
     check_measured_free_space(host, free_bytes, floor_bytes)
 }
 
-pub(crate) fn check_measured_free_space(host: &str, free_bytes: u64, floor_bytes: u64) -> Result<(), String> {
+pub fn check_measured_free_space(host: &str, free_bytes: u64, floor_bytes: u64) -> Result<(), String> {
     if free_bytes >= floor_bytes {
         return Ok(());
     }

@@ -521,7 +521,11 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
     )
     .await;
     restarted_daemon
-        .install_convoy_ensure_reconciler(factory.create(restarted_daemon.resource_backend(), restarted_daemon.clock_for_scenarios()))
+        .install_convoy_ensure_reconciler(factory.create(
+            restarted_daemon.convoy_teardown(),
+            restarted_daemon.resource_backend(),
+            restarted_daemon.clock_for_scenarios(),
+        ))
         .await;
     assert!(restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("retry not due").is_empty());
     clock.set(retry_at);

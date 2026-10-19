@@ -29,10 +29,8 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use super::{
-    convoy_admission::installation_image_defaults,
-    project_image_layers::{primary_layer_home, LayerHome},
-};
+use super::project_image_layers::{primary_layer_home, LayerHome};
+use flotilla_admission::convoy_admission::installation_image_defaults;
 
 /// What a check reads beyond the store: the layer directory at a ref, and
 /// the harness adapters a project's default workflow uses.
@@ -184,16 +182,22 @@ pub async fn check_image(
         })
         .collect();
 
-    let planned =
-        crate::image_build::plan_image_build_for(backend, namespace, &resolved, placement_host, request.architecture.as_deref()).await?;
-    let created = crate::image_build::create_planned_builds(backend, namespace, std::slice::from_ref(&planned)).await?;
+    let planned = flotilla_admission::image_build::plan_image_build_for(
+        backend,
+        namespace,
+        &resolved,
+        placement_host,
+        request.architecture.as_deref(),
+    )
+    .await?;
+    let created = flotilla_admission::image_build::create_planned_builds(backend, namespace, std::slice::from_ref(&planned)).await?;
     report.reused = created.is_empty();
     report.build = Some(image_build_report(backend, namespace, &planned.name).await?);
     Ok(report)
 }
 
 /// The replica-inclusive catalogue admission reads
-/// ([`crate::image_build::declared_image_layers`]), with the project's
+/// ([`flotilla_admission::image_build::declared_image_layers`]), with the project's
 /// primary-repository layer replaced by the one at the checked ref (`None`:
 /// the ref has no project layer). Also returns a charter-authored project
 /// layer for this project, if any.
@@ -205,7 +209,7 @@ async fn catalogue_with_branch_layer(
 ) -> Result<(ImageCatalogue, Option<String>), String> {
     let mut charter_layer = None;
     let mut specs = Vec::new();
-    for layer in crate::image_build::declared_image_layers(backend, namespace).await? {
+    for layer in flotilla_admission::image_build::declared_image_layers(backend, namespace).await? {
         if let Some(spec) = layer.spec.current() {
             if spec.source == ImageLayerSource::Project && spec.project.as_deref() == Some(project) {
                 if layer.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(PROJECT_IMAGE_MANAGER) {

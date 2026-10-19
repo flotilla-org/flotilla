@@ -5,10 +5,11 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use flotilla_core::{
-    dispatch_missions::{MissionBoard, MissionBoardIndex, MissionOccupancy, MissionSourceSnapshot},
-    in_process::InProcessDaemon,
-};
+use flotilla_admission::dispatch_missions::MissionBoard;
+use flotilla_admission::dispatch_missions::MissionBoardIndex;
+use flotilla_admission::dispatch_missions::MissionOccupancy;
+use flotilla_admission::dispatch_missions::MissionSourceSnapshot;
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::{
     issue_query::{IssueQuery, READY_ISSUE_LABEL},
     DispatchIssueFacts, Issue, IssueRef, IssueState,
@@ -730,7 +731,6 @@ mod tests {
     use flotilla_store_testkit::VirtualClock;
 
     use super::*;
-    use flotilla_core::dispatch_missions::active_crew_count;
 
     const NAMESPACE: &str = "flotilla";
 
@@ -1118,39 +1118,6 @@ mod tests {
 
     fn policy(stale_after_seconds: u64) -> DispatchPolicy {
         DispatchPolicy::builder().stale_after_seconds(stale_after_seconds).build()
-    }
-
-    // #2783 admission inputs count unsettled roles, not completed obligations.
-    // Exhaustive finite enum mapping: every phase, unknown publication, terminal
-    // convoy, and mixed roles. No process boundary or random interleaving exists.
-    #[test]
-    fn settled_roles_release_share_before_the_convoy_lands() {
-        use flotilla_resources::{ConvoyStatus, CrewWorkPhase, CrewWorkState};
-        assert_eq!(active_crew_count(None), 1);
-        assert_eq!(active_crew_count(Some(&ConvoyStatus::default())), 1);
-        for (phase, unsettled) in [
-            (CrewWorkPhase::Pending, true),
-            (CrewWorkPhase::Working, true),
-            (CrewWorkPhase::Interrupted, true),
-            (CrewWorkPhase::Stalled, true),
-            (CrewWorkPhase::Done, false),
-            (CrewWorkPhase::HandedBack, false),
-            (CrewWorkPhase::Failed, false),
-        ] {
-            let mut status = ConvoyStatus::default();
-            status.crew_work.insert(
-                "work".into(),
-                BTreeMap::from([
-                    ("coder".into(), CrewWorkState::builder().phase(phase).build()),
-                    ("reviewer".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
-                ]),
-            );
-            assert_eq!(active_crew_count(Some(&status)), 1 + usize::from(unsettled));
-            status.crew_work.get_mut("work").expect("work").remove("reviewer");
-            assert_eq!(active_crew_count(Some(&status)), usize::from(unsettled));
-            status.phase = ConvoyPhase::Landed;
-            assert_eq!(active_crew_count(Some(&status)), 0);
-        }
     }
 
     // #2783: a mission score survives real in-memory status writes; changing

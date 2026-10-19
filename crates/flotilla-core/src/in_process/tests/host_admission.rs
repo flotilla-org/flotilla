@@ -16,9 +16,9 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{create_identity_convoy, placement_policy, test_meta};
-use crate::in_process::convoy_admission::allocate_convoy_generation;
 use crate::in_process::{placement_target_host, resolve_local_convoy_name, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
+use flotilla_admission::convoy_admission::allocate_convoy_generation;
 
 #[test]
 fn convoy_role_addresses_reject_malformed_values() {

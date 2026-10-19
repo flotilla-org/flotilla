@@ -2,7 +2,7 @@ use flotilla_store_memory::InMemoryBackend;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use flotilla_core::regard_lifecycle::{Clock, RegardLifecycle, SurfaceGestureOutcome};
+use flotilla_admission::regard_lifecycle::{Clock, RegardLifecycle, SurfaceGestureOutcome};
 use flotilla_protocol::{PrincipalRef, ResourceRef, SurfaceCharacter, SurfaceDeclaration};
 use flotilla_resources::{InputMeta, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatusPatch};
 use flotilla_store::{apply_status_patch, ResourceBackend};

@@ -14,9 +14,9 @@ use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 
 use super::support::test_meta;
-use crate::in_process::convoy_admission::RepositoryChangeRequestProvider;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_admission::convoy_admission::RepositoryChangeRequestProvider;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RestAdmissionReply {
@@ -160,7 +160,7 @@ pub(super) async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lo
         let repository = RepositorySpec::remote(format!("https://github.com/{scope}")).expect("repository");
         let key = repository.key();
         backend.using::<Repository>("flotilla").create(&test_meta(&key.to_string()), &repository).await.expect("repository");
-        daemon.convoy_admission.repository_change_requests.write().await.insert(
+        daemon.admission.repository_change_requests().write().await.insert(
             key.clone(),
             RepositoryChangeRequestProvider {
                 service_url: repository.forge().expect("forge").service_url.clone(),

@@ -1,5 +1,6 @@
 //! Slow tracker observations outlive interactive requests. One refresh per source
 //! serves all Projects, retaining the last successful snapshot during outages.
+use flotilla_resources::convoy_accounting::active_crew_count;
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -127,30 +128,6 @@ pub fn live_project_convoys_query(projects: impl IntoIterator<Item = String>) ->
         field_values: BTreeMap::from([("spec.project_ref".into(), projects.into_iter().collect())]),
         ..flotilla_store::live_convoys_query()
     }
-}
-
-/// Settled roles release share before landing; unpublished crew state counts one.
-pub fn active_crew_count(status: Option<&flotilla_resources::ConvoyStatus>) -> usize {
-    if status.is_some_and(|status| status.phase.is_terminal()) {
-        return 0;
-    }
-    let Some(status) = status.filter(|status| status.crew_work.values().any(|crew| !crew.is_empty())) else {
-        return 1;
-    };
-    status
-        .crew_work
-        .values()
-        .flat_map(|crew| crew.values())
-        .filter(|state| {
-            matches!(
-                state.phase,
-                flotilla_resources::CrewWorkPhase::Pending
-                    | flotilla_resources::CrewWorkPhase::Working
-                    | flotilla_resources::CrewWorkPhase::Interrupted
-                    | flotilla_resources::CrewWorkPhase::Stalled
-            )
-        })
-        .count()
 }
 
 pub struct DispatchBoard<'a> {
@@ -582,5 +559,56 @@ pub mod tests {
         assert_eq!(cache.entries.lock().await.len(), 1);
         cache.retain_sources(&BTreeSet::from([source.clone()])).await;
         assert_eq!(cache.read(&source, || async { panic!("retained source") }).await.expect("retained").issues, snapshot.issues);
+    }
+}
+
+#[cfg(test)]
+mod query_contract {
+    use crate::dispatch_board::live_project_convoys_query;
+    // WORKLOAD.md: retained history must not multiply decoded live-accounting
+    // objects. Compare zero history to 1,000 terminal records using the real
+    // indexed store; unrelated projects and missing-status convoys are included.
+    #[tokio::test]
+    async fn live_inventory_reads_are_flat_with_terminal_history() {
+        use flotilla_resources::{Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta};
+        use flotilla_store::ResourceBackend;
+        use flotilla_store_memory::InMemoryBackend;
+        use flotilla_store_testkit::{assert_flat_reads, measure_reads, ReadCountsBackendExt};
+        assert_flat_reads([0, 1000], |history| async move {
+            let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+            let convoys = backend.using::<Convoy>("ns");
+            for index in 0..history + 3 {
+                let record = convoys
+                    .create(
+                        &InputMeta::builder().name(format!("c-{index}")).build(),
+                        &ConvoySpec::builder()
+                            .workflow_ref("workflow".into())
+                            .project_ref(if index == history + 2 { "other" } else { "p" }.into())
+                            .build(),
+                    )
+                    .await
+                    .expect("convoy");
+                if index < history {
+                    convoys
+                        .update_status(
+                            &record.metadata.name,
+                            &record.metadata.resource_version,
+                            &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
+                        )
+                        .await
+                        .expect("terminal history");
+                }
+            }
+            let (rows, reads) = measure_reads(backend.query_declared::<Convoy>("ns", &live_project_convoys_query(["p".into()]))).await;
+            assert_eq!(rows.expect("live query").items.len(), 2);
+            assert!(backend
+                .query_declared::<Convoy>("ns", &live_project_convoys_query([]))
+                .await
+                .expect("empty projects")
+                .items
+                .is_empty());
+            reads.of(&backend)
+        })
+        .await;
     }
 }

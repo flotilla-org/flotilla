@@ -12,9 +12,9 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
-use crate::in_process::convoy_admission::RepositoryChangeRequestProvider;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::{fake_discovery, FakeChangeRequest, FakeVcsFactory, FakeVcsState};
+use flotilla_admission::convoy_admission::RepositoryChangeRequestProvider;
 
 #[tokio::test]
 async fn checkout_vcs_discovery_is_cached_per_checkout() {
@@ -93,7 +93,7 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
     daemon.set_provisioning_namespace("flotilla".to_string()).await;
     let provider: Arc<dyn ChangeRequestTracker> = Arc::new(FakeChangeRequest::new());
     for repository in [&first, &second] {
-        daemon.convoy_admission.repository_change_requests.write().await.insert(
+        daemon.admission.repository_change_requests().write().await.insert(
             repository.key(),
             RepositoryChangeRequestProvider {
                 service_url: "https://github.com".to_string(),
@@ -105,7 +105,7 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
     repositories.delete(&first.key().to_string()).await.expect("delete first repository");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if !daemon.convoy_admission.repository_change_requests.read().await.contains_key(&first.key()) {
+            if !daemon.admission.repository_change_requests().read().await.contains_key(&first.key()) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -113,14 +113,11 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
     })
     .await
     .expect("repository watch should evict provider");
-    assert!(
-        daemon.convoy_admission.repository_change_requests.read().await.contains_key(&second.key()),
-        "live repository keeps its provider"
-    );
+    assert!(daemon.admission.repository_change_requests().read().await.contains_key(&second.key()), "live repository keeps its provider");
 
     let third = RepositorySpec::remote("https://github.com/example/third").expect("third repository");
     repositories.create(&test_meta(&third.key().to_string()), &third).await.expect("create third repository");
-    daemon.convoy_admission.repository_change_requests.write().await.insert(
+    daemon.admission.repository_change_requests().write().await.insert(
         third.key(),
         RepositoryChangeRequestProvider { service_url: "https://github.com".to_string(), repository: third.key().to_string(), provider },
     );
@@ -133,7 +130,7 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
     daemon.set_provisioning_namespace("alternate".to_string()).await;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if !daemon.convoy_admission.repository_change_requests.read().await.contains_key(&third.key()) {
+            if !daemon.admission.repository_change_requests().read().await.contains_key(&third.key()) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -141,8 +138,5 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
     })
     .await
     .expect("restarted watch should reconcile cached providers from the new list");
-    assert!(
-        daemon.convoy_admission.repository_change_requests.read().await.contains_key(&second.key()),
-        "relist retains the live provider"
-    );
+    assert!(daemon.admission.repository_change_requests().read().await.contains_key(&second.key()), "relist retains the live provider");
 }
