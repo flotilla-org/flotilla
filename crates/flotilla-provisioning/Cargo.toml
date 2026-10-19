@@ -40,7 +40,6 @@ serde = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 flotilla-core = { path = "../flotilla-core" }
 hegeltest = "=0.48.1"
-flotilla-resources = { path = "../flotilla-resources" }
 tempfile = { workspace = true }
 
 [lints]

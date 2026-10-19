@@ -32,7 +32,6 @@ sha2 = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-flotilla-provisioning = { path = "../flotilla-provisioning" }
 flotilla-ai-utility = { path = "../flotilla-ai-utility" }
 flotilla-change-request = { path = "../flotilla-change-request" }
 flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
@@ -44,6 +43,7 @@ flotilla-build-features-logging = { path = "../flotilla-build-features-logging" 
 flotilla-discovery = { path = "../flotilla-discovery" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
+flotilla-provisioning = { path = "../flotilla-provisioning" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-orchestration-testkit = { path = "../flotilla-orchestration-testkit" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }

@@ -10,7 +10,6 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-tls/aws-lc-provide
 skip-no-sandbox-tests = ["flotilla-executor/skip-no-sandbox-tests", "flotilla-core/skip-no-sandbox-tests", "flotilla-store/skip-no-sandbox-tests", "flotilla-store-testkit/skip-no-sandbox-tests", "flotilla-credentials/skip-no-sandbox-tests", "flotilla-projections/skip-no-sandbox-tests"]
 
 [dependencies]
-flotilla-provisioning = { path = "../flotilla-provisioning" }
 flotilla-admission = { path = "../flotilla-admission" }
 flotilla-observation = { path = "../flotilla-observation" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
@@ -29,6 +28,7 @@ flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 # daemon.toml [dummy_fleet]; it is not test-support machinery.
 flotilla-dummy-fleet = { path = "../flotilla-dummy-fleet" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-provisioning = { path = "../flotilla-provisioning" }
 flotilla-review-bundle-object-store = { path = "../flotilla-review-bundle-object-store" }
 flotilla-store-http = { path = "../flotilla-store-http" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
