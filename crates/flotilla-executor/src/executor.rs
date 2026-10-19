@@ -19,8 +19,6 @@ use self::{
     session_actions::ReadOnlySessionActionService,
 };
 use crate::data;
-use crate::environment_manager::CreateProvisionedEnvironmentRequest;
-use crate::environment_manager::EnvironmentManager;
 use crate::provider_data::ProviderData;
 use crate::step::Step;
 use crate::step::StepAction;
@@ -28,6 +26,8 @@ use crate::step::StepExecutionContext;
 use crate::step::StepOutcome;
 use crate::step::StepPlan;
 use crate::step::StepResolver;
+use flotilla_discovery::environments::CreateProvisionedEnvironmentRequest;
+use flotilla_discovery::environments::EnvironmentLifecycle;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_environment::environment::legacy_environment_spec;
 use flotilla_issue_tracker::forge_issue_source;
@@ -430,7 +430,7 @@ pub struct ExecutorStepResolver {
     pub config_base: DaemonHostPath,
     pub daemon_socket_path: Option<DaemonHostPath>,
     pub local_host: HostName,
-    pub environment_manager: Arc<EnvironmentManager>,
+    pub environment_manager: Arc<dyn EnvironmentLifecycle>,
     pub vcs_resolver: Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>,
 }
 

@@ -7,10 +7,10 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_change_request::observation::ChangeRequestKey;
-use flotilla_executor::environment_manager::EnvironmentManager;
+use flotilla_discovery::environment_manager::EnvironmentManager;
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_projections::{
-    ports::Environments, read_projections::LeafSubscriptionRead, AttachCapabilityResolver, ConvoyChangeRequestResolver,
+    ports::EnvironmentSummaries, read_projections::LeafSubscriptionRead, AttachCapabilityResolver, ConvoyChangeRequestResolver,
     IssueMaterializationResolver,
 };
 use flotilla_protocol::{EnvironmentInfo, HostName, IssueSource, NodeId, QueryScope, RepositoryKey, ToolInventory};
@@ -64,10 +64,10 @@ impl IssueMaterializationResolver for InProcessDaemon {
     }
 }
 
-pub(super) struct ProjectionEnvironments<'a>(pub &'a EnvironmentManager);
+pub(super) struct ProjectionEnvironmentSummaries<'a>(pub &'a EnvironmentManager);
 
 #[async_trait]
-impl Environments for ProjectionEnvironments<'_> {
+impl EnvironmentSummaries for ProjectionEnvironmentSummaries<'_> {
     fn local_inventory(&self) -> ToolInventory {
         crate::convert::inventory_from_bag(&self.0.local_environment_bag())
     }
@@ -95,15 +95,15 @@ impl LeafSubscriptionRead for LeafSubscriptionTable {
 }
 
 #[async_trait]
-impl Environments for InProcessDaemon {
+impl EnvironmentSummaries for InProcessDaemon {
     fn local_inventory(&self) -> ToolInventory {
-        ProjectionEnvironments(&self.environment_manager).local_inventory()
+        ProjectionEnvironmentSummaries(&self.environment_manager).local_inventory()
     }
     async fn host_summary_environments(&self) -> Vec<EnvironmentInfo> {
-        ProjectionEnvironments(&self.environment_manager).host_summary_environments().await
+        ProjectionEnvironmentSummaries(&self.environment_manager).host_summary_environments().await
     }
     async fn visible_environments(&self) -> Vec<EnvironmentInfo> {
-        ProjectionEnvironments(&self.environment_manager).visible_environments().await
+        ProjectionEnvironmentSummaries(&self.environment_manager).visible_environments().await
     }
 }
 

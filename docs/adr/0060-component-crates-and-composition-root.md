@@ -63,6 +63,8 @@ The owner's direction is to break flotilla into components so it isn't committed
   - `flotilla-tui`, and `flotilla-commands` (parsing only; it may become modular; moving off clap is allowed).
   - `flotilla-manifest` remains the presentation manifest wire layer.
 
+`EnvironmentManager` lives in `flotilla-discovery`. Capability crates read environments through discovery's `Environments` port; only the executor creates and destroys them, through `EnvironmentLifecycle`.
+
 ### VCS operation boundary (amended)
 
 VCS operations go through the `Vcs` trait. Each provider chooses a CLI implementation through the environment runner, or a library implementation. The previous rule ("CLI via the runner is the universal implementation; a library backend must not replace it for remote or provisioned environments") no longer holds: an environment may run a minimal flotilla agent beside cleat, so library implementations can run in-environment. The Git boundary check continues to forbid invoking `git` outside the VCS implementation.

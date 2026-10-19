@@ -156,9 +156,9 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-agent` | Agent harness adapters and registry, crew brief rendering, hook parsing and installation, agent state store, process-exit receipts |
 | `flotilla-dummy-fleet` | Load-testing dummies installed behind `daemon.toml` `[dummy_fleet]`: scripted crews in an in-process terminal pool and agent adapter, a dummy VCS, a dummy forge's change-request tracker, and the workflow/policy catalog (#3206); the dummy environment provider lives in `flotilla-environment` |
 | `flotilla-fake-forge` | Rehearsal-only fake Forgejo service (#3374): one shared in-memory forge behind the strict Forgejo API the providers use, an HTTPS admin API for scenario drivers, seed generation and the in-process `HttpClient` the provider contract tests run against |
-| `flotilla-discovery` | Static factory-list assembly, default detector lists, detector runs, provider discovery, host-scoped provider cache, `ProviderRegistry` and provider status |
+| `flotilla-discovery` | Static factory-list assembly, default detector lists, detector runs, provider discovery, host-scoped provider cache, `ProviderRegistry`, provider status, and environment management (`EnvironmentManager` behind the `Environments` and `EnvironmentLifecycle` ports) |
 | `flotilla-charter` | Charter inputs read through a `RevisionedTree` (Git via `Vcs`, or a local directory): `project.yaml` declarations, operational entries and their provenance annotations, charter locks and source status |
-| `flotilla-executor` | Provider-backed command handlers, step plans and resolution, remote step batches, environment management and host orchestration ports |
+| `flotilla-executor` | Provider-backed command handlers, step plans and resolution, remote step batches and host orchestration ports |
 | `flotilla-observation` | Provider-neutral change-request, issue and forge observation, demand servicing and observed-resource projection |
 | `flotilla-provisioning` | Environment, ImageBuild, Checkout, Clone and Repository reconcilers; orphaned-environment and image-inventory loops |
 | `flotilla-admission` | Convoy admission, standing-convoy reconciliation, vessel placement projection, placement planning, project operations and composed-image planning; host orchestration through owned ports |
@@ -226,6 +226,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-core/src/convert.rs` | Core-to-protocol type conversion |
 | `crates/flotilla-discovery/src/lib.rs` | `DiscoveryRuntime`, detector runs, checkout and host-scoped provider discovery |
 | `crates/flotilla-discovery/src/registry.rs` | `ProviderRegistry`, typed provider sets and `command_provider_registry` |
+| `crates/flotilla-discovery/src/environment_manager.rs`, `crates/flotilla-discovery/src/environments.rs` | `EnvironmentManager` and the `Environments` and `EnvironmentLifecycle` ports |
 | `crates/flotilla-discovery/src/factories.rs`, `crates/flotilla-discovery/src/detectors/` | Default factory and detector lists |
 | `crates/flotilla-config/src/lib.rs` | Persistence to `~/.config/flotilla/` |
 | `crates/flotilla-core/src/template.rs` | `.flotilla/workspace.yaml` pane templates |

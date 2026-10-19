@@ -18,7 +18,7 @@ use flotilla_change_request::observation::{ChangeRequestKey, ChangeRequestObserv
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_charter::ops_entry::{ENSURED_FROM_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION};
 use flotilla_config::ConfigStore;
-use flotilla_discovery::{AiUtilityFactory, DiscoveryRuntime};
+use flotilla_discovery::{environments::Environments, AiUtilityFactory, DiscoveryRuntime};
 use flotilla_discovery_api::{provider_config::ProviderConfigView, EnvironmentBag};
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_observation::sources::{ChangeRequestQueryPort, IssueQueryPort, ProviderChangeRequestObservationSource};
@@ -123,7 +123,7 @@ pub struct ConvoyAdmission {
     observed_checkout_reconciliation: Arc<Mutex<()>>,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
-    environment_manager: Arc<dyn crate::ports::AdmissionEnvironments>,
+    environment_manager: Arc<dyn Environments>,
     local_environment_id: EnvironmentId,
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
     repository_change_requests: Arc<RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>>,
@@ -157,7 +157,7 @@ struct AdmissionReadContext<'a> {
 struct AdmissionRuntime<'a> {
     config: &'a ConfigStore,
     discovery: &'a DiscoveryRuntime,
-    environment_manager: &'a dyn crate::ports::AdmissionEnvironments,
+    environment_manager: &'a dyn Environments,
     local_environment_id: &'a EnvironmentId,
     local_host: Option<CanonicalHostId>,
     namespace: String,
@@ -5026,7 +5026,7 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let discovery = Arc::new(fake_discovery(false));
     let local_environment_id = EnvironmentId::new("local");
-    let environment_manager: Arc<dyn crate::ports::AdmissionEnvironments> = Arc::new(FixtureEnvironment {
+    let environment_manager: Arc<dyn Environments> = Arc::new(FixtureEnvironment {
         host: flotilla_protocol::qualified_path::HostId::new("host"),
         runner: discovery.runner.clone(),
         bag: flotilla_discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await,
@@ -6299,7 +6299,7 @@ struct FixtureEnvironment {
     bag: EnvironmentBag,
 }
 #[cfg(test)]
-impl crate::ports::AdmissionEnvironments for FixtureEnvironment {
+impl Environments for FixtureEnvironment {
     fn local_host_id(&self) -> &flotilla_protocol::qualified_path::HostId {
         &self.host
     }
@@ -6308,6 +6308,9 @@ impl crate::ports::AdmissionEnvironments for FixtureEnvironment {
     }
     fn environment_runner(&self, _: &EnvironmentId) -> Option<Arc<dyn CommandRunner>> {
         Some(self.runner.clone())
+    }
+    fn environment_registry(&self, _: &EnvironmentId) -> Option<Arc<flotilla_discovery::registry::ProviderRegistry>> {
+        None
     }
     fn host_id_for_environment(&self, _: &EnvironmentId) -> Option<flotilla_protocol::qualified_path::HostId> {
         Some(self.host.clone())

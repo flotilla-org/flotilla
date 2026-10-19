@@ -27,7 +27,7 @@ use crate::in_process::CrewMessageSender;
 use crate::in_process::WorkCredentialReconciler;
 use crate::leaf_engine::LeafSubscriptionTable;
 use crate::testkits::discovery::fake_discovery;
-use flotilla_executor::environment_manager::EnvironmentManager;
+use flotilla_discovery::environment_manager::EnvironmentManager;
 use flotilla_observation::change_request_observer::ChangeRequestRefreshCadence;
 use flotilla_observation::change_request_observer::ChangeRequestRefresher;
 use flotilla_protocol_testkit::event_sink::RecordingEventSink;

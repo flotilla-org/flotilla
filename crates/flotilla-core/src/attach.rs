@@ -1,6 +1,6 @@
 //! Attach target indexing, role resolution, and plan construction.
 
-use flotilla_executor::environment_manager::{EnvironmentManager, ManagedEnvironmentKind};
+use flotilla_discovery::environment_manager::{EnvironmentManager, ManagedEnvironmentKind};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::Path,

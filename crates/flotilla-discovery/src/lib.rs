@@ -5,10 +5,13 @@
 //! `EnvironmentAssertion` values collected into an `EnvironmentBag`. Factories
 //! from each provider type crate consume the bag to construct typed provider
 //! instances, assembled here into a [`registry::ProviderRegistry`].
+//! [`environment_manager::EnvironmentManager`] keeps the per-environment
+//! runners, bags and registries behind the [`environments`] ports.
 //!
 //! ADR 0060 (`docs/adr/0060-component-crates-and-composition-root.md`): this
-//! component depends only on the discovery API, provider runtime and provider
-//! type crates; never on core, storage or composition roots. The build-graph
+//! component depends only on base crates, the discovery API, provider runtime
+//! and provider type crates; never on core, storage, capability crates or
+//! composition roots. The build-graph
 //! gate enforces the upward-dependency prohibition.
 
 use flotilla_agent::adapter::{AgentAdapterFactory, AgentAdapterRegistry};
@@ -22,6 +25,8 @@ use futures::StreamExt;
 
 use flotilla_environment::environment::EnvironmentProvider;
 pub mod detectors;
+pub mod environment_manager;
+pub mod environments;
 pub mod factories;
 pub mod registry;
 

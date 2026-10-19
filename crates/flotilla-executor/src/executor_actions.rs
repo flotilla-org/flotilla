@@ -42,10 +42,10 @@ use tokio_util::sync::CancellationToken;
 use crate::action_support::{
     fallback_repo_identity, repository_event_identity, request_manifest_resolution, retry_resource_apply, AddRepoOutcome,
 };
-use crate::environment_manager::EnvironmentManager;
 use crate::executor;
 use crate::step::run_step_plan_with_remote_executor;
 use crate::step::RemoteStepExecutor;
+use flotilla_discovery::environments::EnvironmentLifecycle;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
@@ -90,7 +90,7 @@ pub struct ExecutorActions<'a> {
     pub config: &'a Arc<ConfigStore>,
     pub active_commands: &'a Arc<Mutex<HashMap<u64, CancellationToken>>>,
     pub observed_checkout_reconciliation: &'a Arc<Mutex<()>>,
-    pub environment_manager: &'a Arc<EnvironmentManager>,
+    pub environment_manager: Arc<dyn EnvironmentLifecycle>,
     pub runner: &'a Arc<dyn CommandRunner>,
     pub env: &'a Arc<dyn EnvVars>,
     pub daemon_socket_path: &'a RwLock<Option<PathBuf>>,
@@ -447,7 +447,7 @@ impl ExecutorActions<'_> {
         let local_host = self.host_name.clone();
         let local_node_id = self.events.node_id.clone();
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
-        let environment_manager = Arc::clone(self.environment_manager);
+        let environment_manager = Arc::clone(&self.environment_manager);
         let vcs_resolver = self.port.vcs_resolver()?;
         tokio::spawn(async move {
             let resolver_registry = Arc::clone(&registry);

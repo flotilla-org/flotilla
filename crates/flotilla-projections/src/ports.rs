@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use flotilla_protocol::{EnvironmentInfo, ToolInventory};
 #[async_trait]
-pub trait Environments: Send + Sync {
+pub trait EnvironmentSummaries: Send + Sync {
     fn local_inventory(&self) -> ToolInventory;
     async fn host_summary_environments(&self) -> Vec<EnvironmentInfo>;
     async fn visible_environments(&self) -> Vec<EnvironmentInfo>;

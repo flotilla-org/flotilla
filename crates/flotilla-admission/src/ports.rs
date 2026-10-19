@@ -1,17 +1,7 @@
 //! Host orchestration collaborators required by admission.
+//! Environment facts arrive through discovery's `Environments` port.
 use async_trait::async_trait;
-use flotilla_discovery_api::EnvironmentBag;
-use flotilla_protocol::{qualified_path::HostId, EnvironmentId, PrincipalRef};
-use flotilla_provider_runtime::CommandRunner;
-use std::sync::Arc;
-
-/// Read-only host identity, environment facts and command runners used by admission.
-pub trait AdmissionEnvironments: Send + Sync {
-    fn local_host_id(&self) -> &HostId;
-    fn environment_bag(&self, environment: &EnvironmentId) -> Option<EnvironmentBag>;
-    fn environment_runner(&self, environment: &EnvironmentId) -> Option<Arc<dyn CommandRunner>>;
-    fn host_id_for_environment(&self, environment: &EnvironmentId) -> Option<HostId>;
-}
+use flotilla_protocol::PrincipalRef;
 
 #[async_trait]
 /// Crew-service teardown required by standing-convoy admission.

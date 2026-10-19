@@ -13,7 +13,7 @@ use crate::cleat_roll;
 use crate::cleat_roll::CleatEnvironment;
 use crate::cleat_roll::CleatTarget;
 use crate::cleat_roll::RollReport;
-use flotilla_executor::environment_manager::ManagedEnvironmentKind;
+use flotilla_discovery::environment_manager::ManagedEnvironmentKind;
 use flotilla_provider_runtime::ChannelLabel;
 
 #[derive(Default)]

@@ -1,6 +1,6 @@
 //! Read-side query projections over resource state and explicit runtime inputs.
 
-use crate::ports::Environments;
+use crate::ports::EnvironmentSummaries;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
@@ -99,7 +99,7 @@ pub struct ReadProjections<'a> {
     pub message_receivers: &'a dyn MessageReceiverLoader,
     pub config: &'a ConfigStore,
     pub host_registry: &'a crate::host_registry::HostRegistry,
-    pub environment_manager: &'a dyn Environments,
+    pub environment_manager: &'a dyn EnvironmentSummaries,
     pub host_name: &'a HostName,
     pub node_id: &'a NodeId,
     pub clock: &'a Arc<dyn Clock>,
