@@ -9,12 +9,11 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use color_eyre::{eyre::eyre, Result};
 #[cfg(unix)]
-use flotilla_admission::repository_inspection::inspect_project_ops_entries;
-use flotilla_admission::repository_inspection::OperationalEntryInventory;
-use flotilla_admission::repository_inspection::RepositoryInspector;
+use flotilla_admission::repository_inspection::{inspect_project_ops_entries, OperationalEntryInventory, RepositoryInspector};
 #[cfg(unix)]
 use flotilla_charter::ops_entry::{parse_operational_entry, OperationalEntryFile};
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
+#[cfg(unix)]
 use flotilla_core::repository_inspection::GitRepositoryInspector;
 #[cfg(unix)]
 use flotilla_environment::environment::{command_provider, EnvironmentKind};
