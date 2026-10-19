@@ -41,13 +41,13 @@ use super::stalls::*;
 use super::subscriptions::*;
 use super::wake::*;
 use super::*;
-use crate::testkits::replay::test_runner;
-use crate::testkits::replay::Masks;
-use crate::testkits::replay::Session;
 use flotilla_observation::change_request_observer::ChangeRequestRefresher;
 use flotilla_observation::issue_observer::IssueRefreshCadence;
 use flotilla_observation::issue_observer::IssueRefresher;
 use flotilla_protocol_testkit::event_sink::broadcast_test_sink;
+use flotilla_replay_testkit::test_runner;
+use flotilla_replay_testkit::Masks;
+use flotilla_replay_testkit::Session;
 use flotilla_store_testkit::cr_name;
 
 #[derive(Clone)]

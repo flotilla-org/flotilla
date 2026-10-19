@@ -12,11 +12,11 @@ use chrono::Utc;
 use flotilla_capability_contract::CredentialCapability;
 use flotilla_capability_contract::SessionCapabilitySource;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_core::in_process::WorkCredentialReconciler;
 use flotilla_credentials::{
     codex_central_auth_path, compose_agent_environment, AgentMaterialRegistry, CodexCentralRefresher, CredentialRefreshError,
     CredentialStore, GithubAppScope,
 };
+use flotilla_crew::ports::WorkCredentialReconciler;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::Resource;

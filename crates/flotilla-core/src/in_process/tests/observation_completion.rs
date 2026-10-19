@@ -346,12 +346,15 @@ async fn mixed_observation_completion_refuses_and_recovers() {
 
 async fn completion_claim_observation_case(rate_limited: bool, missing_artifact: bool, mixed: bool) {
     #[derive(Default)]
-    struct DeliveredTurns(std::sync::Mutex<Vec<crate::leaf_engine::CrewTurnIntent>>);
+    struct DeliveredTurns(std::sync::Mutex<Vec<flotilla_crew::leaf_engine::CrewTurnIntent>>);
     #[async_trait]
-    impl crate::leaf_engine::TurnDeliveryActuator for DeliveredTurns {
-        async fn deliver(&self, request: &crate::leaf_engine::CrewTurnIntent) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
+    impl flotilla_crew::leaf_engine::TurnDeliveryActuator for DeliveredTurns {
+        async fn deliver(
+            &self,
+            request: &flotilla_crew::leaf_engine::CrewTurnIntent,
+        ) -> Result<flotilla_crew::leaf_engine::CrewTurnAdmission, String> {
             self.0.lock().expect("turns").push(request.clone());
-            Ok(crate::leaf_engine::CrewTurnAdmission {
+            Ok(flotilla_crew::leaf_engine::CrewTurnAdmission {
                 new_turn: true,
                 rung: flotilla_resources::TurnDeliveryRung::WarmSession,
                 message: flotilla_protocol::ResourceRef::new(
@@ -363,7 +366,12 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
             })
         }
 
-        async fn hold(&self, _: &crate::leaf_engine::CrewTurnIntent, _: &flotilla_resources::HoldAct, _: &str) -> Result<(), String> {
+        async fn hold(
+            &self,
+            _: &flotilla_crew::leaf_engine::CrewTurnIntent,
+            _: &flotilla_resources::HoldAct,
+            _: &str,
+        ) -> Result<(), String> {
             Ok(())
         }
     }
@@ -396,7 +404,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
         .expect("gh discovery");
     let turns = Arc::new(DeliveredTurns::default());
-    daemon.crew_ops.set_turn_delivery_actuator(turns.clone()).await;
+    daemon.crew.set_turn_delivery_actuator(turns.clone()).await;
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
     let repository_key = repository.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository).await.expect("repository");
@@ -626,7 +634,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
             )
             .expect("key");
             assert!(
-                daemon.crew_ops.subscription_diagnostics().change_request_observation_error(&subject).await.is_none(),
+                daemon.crew.subscription_diagnostics().change_request_observation_error(&subject).await.is_none(),
                 "recovery clears subject errors"
             );
         }

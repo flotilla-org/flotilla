@@ -325,6 +325,33 @@ class BuildGraphContract(unittest.TestCase):
                             violations(graph(package(provider, **{kind: (middle,)}),
                                              package("adapter", normal=("flotilla-provisioning",)), package("flotilla-provisioning"))))
 
+    def test_crew_refuses_capabilities_and_core(self):
+        # Explicit finite generator: crew refuses every other capability,
+        # composition and engine target through direct/transitive normal/build edges.
+        self.assertIn("flotilla-crew", CAPABILITY_CRATES)
+        self.assertEqual(violations(graph(
+            package("flotilla-core", normal=("flotilla-crew",)),
+            package("flotilla-crew", normal=("flotilla-store", "flotilla-observation", "flotilla-messaging", "flotilla-vcs")),
+            package("flotilla-store"), package("flotilla-observation"), package("flotilla-messaging"), package("flotilla-vcs"),
+        )), [])
+        targets = {"flotilla-core", "flotilla-daemon", "flotilla-controllers", "flotilla-credentials", STATE_MACHINES}
+        targets.update(CAPABILITY_CRATES - {"flotilla-crew"})
+        for target in sorted(targets):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertIn(f"flotilla-crew: must not depend on {target}, directly or transitively",
+                            violations(graph(package("flotilla-crew", **{kind: (middle,)}),
+                                             package("adapter", normal=(target,)), package(target))))
+        # Lower providers cannot turn the capability into their dependency.
+        for provider in ("flotilla-discovery", "flotilla-agent", "flotilla-vcs", "flotilla-messaging", "flotilla-observation"):
+            for kind in ("normal", "build"):
+                for middle in ("flotilla-crew", "adapter"):
+                    with self.subTest(provider=provider, kind=kind, middle=middle):
+                        self.assertIn(f"{provider}: must not depend on flotilla-crew, directly or transitively",
+                            violations(graph(package(provider, **{kind: (middle,)}),
+                                             package("adapter", normal=("flotilla-crew",)), package("flotilla-crew"))))
+
     def test_components_refuse_capability_reachbacks(self):
         # A lower component cannot gain an upward dependency on the executor.
         self.assertIn(

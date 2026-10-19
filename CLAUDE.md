@@ -162,7 +162,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-observation` | Provider-neutral change-request, issue and forge observation, demand servicing and observed-resource projection |
 | `flotilla-provisioning` | Environment, ImageBuild, Checkout, Clone and Repository reconcilers; orphaned-environment and image-inventory loops |
 | `flotilla-admission` | Convoy admission, standing-convoy reconciliation, vessel placement projection, placement planning, project operations and composed-image planning; host orchestration through owned ports |
-| `flotilla-core` | Refresh and `InProcessDaemon` composition root; implements admission and observation ports |
+| `flotilla-crew` | Crew operations and actions, capability cards, the leaf engine, the decision log and charter notifications; host collaborators through owned ports |
+| `flotilla-core` | Refresh and `InProcessDaemon` composition root; implements admission, crew and observation ports |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
 | `flotilla-config` | Host-local config files (`config.toml`, `daemon.toml`, `hosts.toml`, observation roots, open views), provider preference values, default checkout path and bounded log files |
@@ -213,6 +214,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-admission/src/convoy_ensure.rs` | Narrow admission and controller ports for standing convoys |
 | `crates/flotilla-admission/src/convoy_admission.rs` | Transaction-owning convoy admission primitive |
 | `crates/flotilla-admission/src/reconcilers/convoy_ensure.rs` | Standing-convoy reconciliation, retry state and the complete ensure transaction guard |
+| `crates/flotilla-crew/src/crew_ops.rs` | `CrewService`: crew outcomes, lifecycle teardown and serialized crew message delivery |
+| `crates/flotilla-crew/src/leaf_engine.rs` | Leaf subscriptions, wait wakes, turn delivery, stalls and supervision |
 | `crates/flotilla-executor/src/executor.rs` | Executes provider-backed command steps and returns `CommandValue` |
 | `crates/flotilla-executor/src/executor/` | Executor submodules: checkout, session actions and tests |
 | `crates/flotilla-core/src/model.rs` | `RepoModel` and provider label/name helpers |

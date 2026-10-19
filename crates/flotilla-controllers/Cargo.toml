@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 flotilla-admission = { path = "../flotilla-admission" }
+flotilla-crew = { path = "../flotilla-crew" }
 flotilla-messaging = { path = "../flotilla-messaging" }
 flotilla-config = { path = "../flotilla-config" }
 flotilla-environment = { path = "../flotilla-environment" }

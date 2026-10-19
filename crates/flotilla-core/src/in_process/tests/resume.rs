@@ -14,9 +14,9 @@ use flotilla_resources::{
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
 
 use super::support::{resume_staging_fixture, resume_staging_fixture_with_backend, test_meta};
-use crate::in_process::crew_ops::{ConvoyResumeOutcome, CrewSupervisionRequest};
 use crate::in_process::{input_meta_from_resource, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
+use flotilla_crew::crew_ops::{ConvoyResumeOutcome, CrewSupervisionRequest};
 
 // Working crews already own staged credentials. Operator input is admitted as
 // durable intent; ordinary attention changes cannot fabricate its delivery receipt.
@@ -101,13 +101,16 @@ async fn resume_retries_a_racing_session_write_after_staging() {
 async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     #[derive(Default)]
     struct AcceptSupervision {
-        requests: std::sync::Mutex<Vec<crate::leaf_engine::CrewTurnIntent>>,
+        requests: std::sync::Mutex<Vec<flotilla_crew::leaf_engine::CrewTurnIntent>>,
     }
     #[async_trait]
-    impl crate::leaf_engine::TurnDeliveryActuator for AcceptSupervision {
-        async fn deliver(&self, request: &crate::leaf_engine::CrewTurnIntent) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
+    impl flotilla_crew::leaf_engine::TurnDeliveryActuator for AcceptSupervision {
+        async fn deliver(
+            &self,
+            request: &flotilla_crew::leaf_engine::CrewTurnIntent,
+        ) -> Result<flotilla_crew::leaf_engine::CrewTurnAdmission, String> {
             self.requests.lock().expect("supervision requests").push(request.clone());
-            Ok(crate::leaf_engine::CrewTurnAdmission {
+            Ok(flotilla_crew::leaf_engine::CrewTurnAdmission {
                 new_turn: true,
                 rung: flotilla_resources::TurnDeliveryRung::WarmSession,
                 message: flotilla_protocol::ResourceRef::new(
@@ -120,7 +123,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         }
         async fn hold(
             &self,
-            _request: &crate::leaf_engine::CrewTurnIntent,
+            _request: &flotilla_crew::leaf_engine::CrewTurnIntent,
             _act: &flotilla_resources::HoldAct,
             _reason: &str,
         ) -> Result<(), String> {
@@ -136,7 +139,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     .await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let supervision = Arc::new(AcceptSupervision::default());
-    daemon.crew_ops.set_turn_delivery_actuator(supervision.clone()).await;
+    daemon.crew.set_turn_delivery_actuator(supervision.clone()).await;
     backend
         .clone()
         .using::<flotilla_resources::Project>("flotilla")
@@ -288,7 +291,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     }
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if daemon.crew_ops.subscription_rows().await.iter().any(|row| {
+            if daemon.crew.subscription_diagnostics().rows().await.iter().any(|row| {
                 matches!(&row.maker,
                 flotilla_resources::LeafMaker::Supervisor { convoy, role, .. } if convoy == "governor" && role == "governor")
             }) {
@@ -319,12 +322,12 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     )
     .await;
     daemon.set_work_credential_reconciler(probe.clone()).await;
-    daemon.crew_ops.set_turn_delivery_actuator(supervision.clone()).await;
+    daemon.crew.set_turn_delivery_actuator(supervision.clone()).await;
     let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
     task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if daemon.crew_ops.subscription_rows().await.iter().any(|row| {
+            if daemon.crew.subscription_diagnostics().rows().await.iter().any(|row| {
                 matches!(&row.maker, flotilla_resources::LeafMaker::Supervisor { convoy, role, .. }
                     if convoy == "governor" && role == "governor")
             }) {
@@ -336,7 +339,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     .await
     .expect("supervisor row restored after restart");
     daemon
-        .crew_ops
+        .crew
         .supervise(
             CrewSupervisionRequest::builder()
                 .namespace("flotilla")

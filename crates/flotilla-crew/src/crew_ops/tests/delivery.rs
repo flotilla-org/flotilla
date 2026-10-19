@@ -1,11 +1,11 @@
-use crate::in_process::crew_ops::MessageAttribution;
+use crate::crew_ops::MessageAttribution;
 use flotilla_resources::ResumeIntent;
 use std::sync::atomic::Ordering;
 
 use flotilla_resources::{Convoy as ResourceConvoy, CrewWorkPhase, TerminalSession as ResourceTerminalSession, TerminalSessionSource};
 
 use super::fixture;
-use crate::in_process::crew_ops::ConvoyResumeOutcome;
+use crate::crew_ops::ConvoyResumeOutcome;
 
 #[tokio::test]
 async fn resume_restores_work_until_credentials_are_staged() {

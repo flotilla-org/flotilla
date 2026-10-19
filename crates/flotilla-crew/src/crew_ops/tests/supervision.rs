@@ -16,8 +16,9 @@ use flotilla_store::{apply_status_patch as apply_resource_status_patch, Resource
 use tokio::sync::RwLock;
 
 use super::fixture;
-use crate::in_process::crew_ops::{CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator, ResolvedCrewContext};
-use crate::in_process::{Vessel, WorkCredentialReconciler};
+use crate::crew_ops::{queue_pending_crew_message, CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator, ResolvedCrewContext};
+use crate::ports::WorkCredentialReconciler;
+use flotilla_resources::{CrewMessageSender, Selector, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, Vessel};
 
 #[hegel::test]
 fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
@@ -641,7 +642,7 @@ async fn lost_vessel_resume_explains_rehydration() {
         .config(crew.config.clone())
         .host_name(crew.host_name.clone())
         .brief_artifact_writer(crew.brief_artifact_writer.clone())
-        .checkout_providers(crew.checkout_providers.clone())
+        .checkout_vcs(crew.checkout_vcs.clone())
         .local_environment_id(crew.local_environment_id.clone())
         .build();
     drop(crew);
@@ -1221,4 +1222,73 @@ async fn terminal_legacy_brief_is_ignored() {
     crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("reconcile");
     assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items.is_empty());
     assert_eq!(convoys.get("crew").await.expect("terminal").status, Some(status));
+}
+
+#[tokio::test]
+async fn operator_brief_survives_a_racing_nudge_until_delivery() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let session = sessions
+        .create(
+            &InputMeta::builder()
+                .name("racing-messages".into())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.into(), "convoy".into()),
+                    (VESSEL_LABEL.into(), "work".into()),
+                    (ROLE_LABEL.into(), "coder".into()),
+                ]))
+                .build(),
+            &ResourceTerminalSessionSpec {
+                env_ref: "env".to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: "brief.md".to_string(),
+                        content: "Initial".to_string(),
+                        artifact_digest: None,
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "convoy".to_string(),
+                        vessel_ref: "work".to_string(),
+                    }),
+                    message: None,
+                },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("session");
+    backend
+        .using::<ResourceConvoy>("flotilla")
+        .create(&InputMeta::builder().name("convoy".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+        .await
+        .expect("convoy context");
+    queue_pending_crew_message(&sessions, &session, CrewMessageSender::OperatorResume { principal: None }, "Continue the work")
+        .await
+        .expect("operator brief queued");
+    let queued = sessions.get("racing-messages").await.expect("queued operator brief");
+    queue_pending_crew_message(&sessions, &queued, CrewMessageSender::FlotillaNudge, "Please settle").await.expect("nudge queued");
+    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("records").items;
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().any(|message| message.spec.sender == "principal:implicit" && message.spec.body.contains("Continue the work")));
+    assert!(records.iter().any(|message| message.spec.sender == "system:nudge"));
+
+    let concurrent = sessions
+        .create(&InputMeta::builder().name("concurrent-messages".into()).labels(session.metadata.labels.clone()).build(), &session.spec)
+        .await
+        .expect("concurrent session");
+    let (operator, nudge) = tokio::join!(
+        queue_pending_crew_message(&sessions, &concurrent, CrewMessageSender::OperatorResume { principal: None }, "New guidance"),
+        queue_pending_crew_message(&sessions, &concurrent, CrewMessageSender::FlotillaNudge, "Please settle"),
+    );
+    operator.expect("operator brief survives concurrent write");
+    nudge.expect("nudge does not erase concurrent brief");
+    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("concurrent records").items;
+    assert_eq!(records.len(), 4);
+    assert!(records.iter().any(|message| message.spec.body.contains("New guidance")));
 }

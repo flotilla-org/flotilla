@@ -1,0 +1,64 @@
+[package]
+name = "flotilla-crew"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-address = { path = "../flotilla-address" }
+flotilla-agent = { path = "../flotilla-agent" }
+flotilla-capability-contract = { path = "../flotilla-capability-contract" }
+flotilla-change-request = { path = "../flotilla-change-request" }
+flotilla-config = { path = "../flotilla-config" }
+flotilla-daemon-api = { path = "../flotilla-daemon-api" }
+flotilla-messaging = { path = "../flotilla-messaging" }
+flotilla-observation = { path = "../flotilla-observation" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-store = { path = "../flotilla-store" }
+flotilla-vcs = { path = "../flotilla-vcs" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+uuid = { workspace = true, features = ["v4"] }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+flotilla-forge-github = { path = "../flotilla-forge-github" }
+flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
+flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
+flotilla-store-http = { path = "../flotilla-store-http" }
+flotilla-store-memory = { path = "../flotilla-store-memory" }
+flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
+flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+rigging-tls = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+hegeltest = { workspace = true }
+indexmap = { workspace = true }
+tempfile = { workspace = true }
+insta = "1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+
+[lints]
+workspace = true
+
+# Keep native feature selection aligned with flotilla-admission.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-signing = { path = "../flotilla-build-features-signing" }
+flotilla-build-features-sqlite = { path = "../flotilla-build-features-sqlite" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

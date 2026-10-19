@@ -13,13 +13,13 @@ use flotilla_store::ResourceBackend;
 
 use flotilla_config::ConfigStore;
 
-pub(crate) struct LiveCharterBriefRenderer {
+pub struct LiveCharterBriefRenderer {
     backend: ResourceBackend,
     config: Arc<ConfigStore>,
 }
 
 impl LiveCharterBriefRenderer {
-    pub(crate) fn new(backend: ResourceBackend, config: Arc<ConfigStore>) -> Self {
+    pub fn new(backend: ResourceBackend, config: Arc<ConfigStore>) -> Self {
         Self { backend, config }
     }
 }

@@ -205,7 +205,7 @@ impl std::ops::Deref for RemoteCommandRouter {
 }
 
 #[async_trait]
-impl flotilla_core::leaf_engine::ResourceIntentPublisher for RemoteCommandRouterInner {
+impl flotilla_crew::leaf_engine::ResourceIntentPublisher for RemoteCommandRouterInner {
     async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String> {
         let router = RemoteCommandRouter { inner: self };
         let command = Command::builder().action(CommandAction::ResourceApply { namespace: namespace.to_string(), document }).build();
@@ -273,7 +273,7 @@ impl RemoteCommandRouter {
             retrying_crew_completions: Arc::new(StdMutex::new(HashMap::new())),
             blob_store: Arc::new(OnceLock::new()),
         });
-        let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> = inner.clone();
+        let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> = inner.clone();
         inner.daemon.set_resource_intent_publisher(Arc::downgrade(&publisher));
         Self { inner }
     }

@@ -11,6 +11,7 @@ skip-no-sandbox-tests = ["flotilla-executor/skip-no-sandbox-tests", "flotilla-st
 
 [dependencies]
 flotilla-admission = { path = "../flotilla-admission" }
+flotilla-crew = { path = "../flotilla-crew" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-messaging = { path = "../flotilla-messaging" }

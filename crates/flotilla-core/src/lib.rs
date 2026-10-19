@@ -2,16 +2,12 @@
 // Remove when async_trait or Clippy stops producing this warning.
 #![allow(clippy::double_must_use)]
 
-mod charter_notifications;
 pub mod cleat_roll;
 pub mod command_target;
 pub mod convert;
-pub mod crew_capabilities;
-pub mod decision_log;
 pub mod demand_lifecycle;
 pub mod host_identity;
 pub mod in_process;
-pub mod leaf_engine;
 pub mod model;
 pub(crate) mod repo_state;
 pub mod repository_inspection;

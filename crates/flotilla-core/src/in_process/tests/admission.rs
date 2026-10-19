@@ -459,7 +459,7 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
             .expect("checkout status");
     }
 
-    let outcomes = daemon.crew_ops.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.expect("best-effort archive");
+    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.expect("best-effort archive");
 
     assert_eq!(
         outcomes.iter().map(|outcome| (outcome.checkout.as_str(), outcome.status)).collect::<Vec<_>>(),

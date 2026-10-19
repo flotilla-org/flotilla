@@ -1,5 +1,5 @@
 use super::*;
-use crate::in_process::crew_actions::{CrewActionPort, CrewActions};
+use crate::crew_actions::{CrewActionPort, CrewActions};
 use flotilla_daemon_api::action_events::ActionEvents;
 use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_protocol::{Command, CommandAction, CommandCaller, CommandValue, CrewCommandContext, DaemonEvent, NodeId, PrincipalRef};

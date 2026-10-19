@@ -13,7 +13,7 @@ use flotilla_admission::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_config::ConfigStore;
 use flotilla_core::command_target::TargetHost;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_core::in_process::WorkCredentialReconciler;
+use flotilla_crew::ports::WorkCredentialReconciler;
 use flotilla_daemon::blob_store::TieredBlobStore;
 use flotilla_daemon::runtime::DaemonRuntime;
 use flotilla_daemon::runtime::RuntimeOptions;
