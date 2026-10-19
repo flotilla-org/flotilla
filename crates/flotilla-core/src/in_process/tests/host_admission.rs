@@ -550,4 +550,17 @@ async fn capability_admission_places_on_agentless_ssh_hosts_only_when_pinned() {
         .await
         .expect("a pinned convoy is admitted");
     assert_eq!(placement.selected.expect("pinned placement").metadata.name, "host-direct-ssh-host");
+
+    let refused = daemon
+        .resolve_capability_placement(
+            "flotilla",
+            "project",
+            &[],
+            &flotilla_resources::single_agent_workflow_spec(),
+            &BTreeSet::new(),
+            &pinned,
+        )
+        .await
+        .expect_err("pinning does not let an agentless SSH host run an agent it lacks");
+    assert!(refused.contains("agent adapter `codex`"), "{refused}");
 }

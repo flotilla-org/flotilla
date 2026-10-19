@@ -61,8 +61,9 @@ use crate::project_ops;
 use crate::regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome};
 use crate::support::{
     authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot,
-    home_copy_wins_by_name, host_generation, placement_actuator_host_ref, placement_host_not_ready_reason, placement_host_ref,
-    placement_target_host, policy_targets_agentless_ssh, prepared_snapshot_name, unready_placement_refusal, validate_docker_placement_host,
+    home_copy_wins_by_name, host_generation, is_agentless_ssh_host, placement_actuator_host_ref, placement_host_not_ready_reason,
+    placement_host_ref, placement_target_host, policy_targets_agentless_ssh, prepared_snapshot_name, unready_placement_refusal,
+    validate_docker_placement_host, AGENTLESS_SSH_PIN_ONLY,
 };
 
 /// Routing uses replicated observations as hints; only admission may refuse on
@@ -4072,15 +4073,6 @@ pub async fn default_convoy_placement_policy(
     local_host_ref: Option<&CanonicalHostId>,
 ) -> Result<PlacementResolution, String> {
     decide_default_placement(backend, namespace, project_ref, repositories, workflow, local_host_ref, PlacementPurpose::Admission).await
-}
-
-/// Agentless SSH hosts run crews in an account the owning daemon does not
-/// control, so they take only convoys that name their placement deliberately.
-/// Capacity-aware selection may relax this once hosts advertise their limits.
-const AGENTLESS_SSH_PIN_ONLY: &str = "agentless SSH host takes only convoys that pin its placement";
-
-fn is_agentless_ssh_host(host: &ResourceObject<ResourceHost>) -> bool {
-    matches!(host.spec.connection, flotilla_resources::HostConnection::AgentlessSsh { .. })
 }
 
 async fn decide_default_placement(
