@@ -24,7 +24,10 @@ use flotilla_provider_runtime::DefaultLabeler;
 use flotilla_provider_runtime::ObservationError;
 
 #[allow(unused_imports)]
-pub use rigging_replay_testkit::{is_live, replay_mode, test_http_client, Masks, ReplayMode};
+pub use rigging_replay_testkit::{is_live, replay_mode, test_http_client};
+pub use rigging_replay_testkit::{Masks, ReplayMode};
+// These aliases expose Rigging's public replay extension API: consumer-owned
+// channels need next/record across the crate boundary. This crate remains dev-only.
 pub type Session = rigging_replay_testkit::Session<GithubChannel>;
 pub type Interaction = rigging_replay_testkit::Interaction<GithubChannel>;
 pub type InteractionLog = rigging_replay_testkit::InteractionLog<GithubChannel>;

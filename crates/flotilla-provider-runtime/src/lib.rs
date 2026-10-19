@@ -139,3 +139,20 @@ mod channel_tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod guarded_process_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Credentials require secret publication at 0600. This single call-through
+    // exercises the actual Rigging implementation with Flotilla's guard injected.
+    #[tokio::test]
+    async fn guarded_runner_publishes_secret_with_requested_permissions() {
+        let directory = tempfile::tempdir().expect("secret directory");
+        let path = directory.path().join("credential");
+        ProcessCommandRunner.write_file_with_mode(&path, "secret", 0o600).await.expect("publish secret");
+        assert_eq!(std::fs::read_to_string(&path).expect("secret contents"), "secret");
+        assert_eq!(std::fs::metadata(&path).expect("secret metadata").permissions().mode() & 0o777, 0o600);
+    }
+}
