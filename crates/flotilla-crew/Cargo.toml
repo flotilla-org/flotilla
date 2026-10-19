@@ -34,7 +34,6 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
-rstest = { workspace = true }
 flotilla-forge-github = { path = "../flotilla-forge-github" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
 flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
@@ -45,6 +44,7 @@ flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 rigging-tls = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 hegeltest = { workspace = true }
+rstest = { workspace = true }
 indexmap = { workspace = true }
 tempfile = { workspace = true }
 insta = "1"
