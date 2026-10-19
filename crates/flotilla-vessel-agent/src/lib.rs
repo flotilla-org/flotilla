@@ -2,7 +2,7 @@
 //!
 //! The agent deliberately has no store, reconciliation or provider dependencies.
 
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, future::Future, path::PathBuf};
 
 /// Identity and parent link injected by the environment provider.
 #[derive(Debug, PartialEq, Eq)]
@@ -46,24 +46,32 @@ pub async fn run() -> Result<(), String> {
         .with_ansi(false)
         .try_init()
         .map_err(|error| format!("initialize vessel-agent logging: {error}"))?;
+    let shutdown = shutdown_signal()?;
     tracing::info!(environment_id = %config.environment_id, daemon_socket = %config.daemon_socket.display(), "vessel agent started (skeleton; no listeners)");
-    shutdown_signal().await?;
+    shutdown.await?;
     tracing::info!("vessel agent stopped");
     Ok(())
 }
 
-async fn shutdown_signal() -> Result<(), String> {
+fn shutdown_signal() -> Result<impl Future<Output = Result<(), String>>, String> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
+        // Install both handlers before logging startup: a supervisor may signal
+        // immediately. Installation failure must fail startup rather than leave
+        // an apparently healthy resident that cannot honor shutdown.
         let mut terminate = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result.map_err(|error| error.to_string()),
-            _ = terminate.recv() => Ok(()),
-        }
+        let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => Ok(()),
+                _ = terminate.recv() => Ok(()),
+            }
+        })
     }
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await.map_err(|error| error.to_string())
+    // A Ctrl-C handler installation failure propagates as a process failure.
+    Ok(async { tokio::signal::ctrl_c().await.map_err(|error| error.to_string()) })
 }
 
 #[cfg(test)]

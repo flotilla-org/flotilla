@@ -56,13 +56,13 @@ use the same toolchain, lockfile dependency versions and build environment.
 
 | Tool/asset | Before (bytes) | Vessel build (bytes) |
 |---|---:|---:|
-| flotilla | 70,086,680 | 66,346,432 |
+| flotilla | 70,086,680 | 66,351,488 |
 | cleat | 6,651,264 | 6,651,264 |
 | libghostty-vt.so.0 | 12,597,640 | 12,597,640 |
 | xterm-ghostty | 3,884 | 3,884 |
-| Total | 89,339,468 | 85,599,220 |
+| Total | 89,339,468 | 85,604,276 |
 
-The CLI shrank by 3,740,248 bytes (5.3%); the complete tool set shrank by 4.2%.
+The CLI shrank by 3,735,192 bytes (5.3%); the complete tool set shrank by 4.2%.
 
 
 The frozen tool set also includes cleat's shared library and terminfo, so both
@@ -85,3 +85,4 @@ A complete static tool set was **not demonstrated** in this environment:
 This is an environment-limited probe, not evidence that musl is incompatible with
 the source. A successful static build needs a writable musl-capable toolchain and
 a static cleat/ghostty selection. Release builds remain unchanged as requested.
+The complete static-tool-set validation is tracked in [#3500](https://github.com/flotilla-org/flotilla/issues/3500).
