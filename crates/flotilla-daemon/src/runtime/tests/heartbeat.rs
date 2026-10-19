@@ -478,7 +478,7 @@ impl CommandRunner for UnselectedProbeRunner {
 // and two matching instances, present/absent prior facts and pool availability.
 #[hegel::test]
 fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
-    use flotilla_environment::environment::{command_provider, EnvironmentKind};
+    use flotilla_environment::environment::{command_provider, EnvironmentInput};
     let docker = tc.draw(hegel::generators::booleans());
     let ambiguous = tc.draw(hegel::generators::booleans());
     let prior = tc.draw(hegel::generators::booleans());
@@ -503,7 +503,7 @@ fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
             .expect("kind");
         let runner = Arc::new(UnselectedProbeRunner);
         let mut providers = ProviderRegistry::new();
-        let provider_kind = if docker { EnvironmentKind::Docker } else { EnvironmentKind::HostDirect };
+        let provider_kind = if docker { EnvironmentInput::Docker } else { EnvironmentInput::HostDirect };
         if ambiguous {
             for instance in ["cache-a", "cache-b"] {
                 providers.environment_providers.insert(

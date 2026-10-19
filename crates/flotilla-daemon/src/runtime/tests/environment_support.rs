@@ -160,6 +160,8 @@ pub(super) struct TestInteriorEnvironment {
 
 #[async_trait]
 impl ProvisionedEnvironment for TestInteriorEnvironment {
+    flotilla_discovery_testkit::injected_environment_handle!();
+
     fn id(&self) -> &EnvironmentId {
         &self.id
     }
@@ -180,8 +182,8 @@ impl ProvisionedEnvironment for TestInteriorEnvironment {
         Vec::new()
     }
 
-    async fn status(&self) -> Result<flotilla_protocol::EnvironmentStatus, String> {
-        Ok(flotilla_protocol::EnvironmentStatus::Running)
+    async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+        flotilla_environment::environment::ProviderObservation::new(flotilla_environment::environment::ObservationState::Running)
     }
 
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
@@ -205,6 +207,8 @@ pub(super) struct TestUncertainEnvironment {
 
 #[async_trait]
 impl ProvisionedEnvironment for TestUncertainEnvironment {
+    flotilla_discovery_testkit::injected_environment_handle!();
+
     fn id(&self) -> &EnvironmentId {
         &self.id
     }
@@ -222,8 +226,10 @@ impl ProvisionedEnvironment for TestUncertainEnvironment {
         Vec::new()
     }
 
-    async fn status(&self) -> Result<flotilla_protocol::EnvironmentStatus, String> {
-        Err(self.status_error.clone())
+    async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+        flotilla_environment::environment::ProviderObservation::new(flotilla_environment::environment::ObservationState::Unknown {
+            reason: flotilla_environment::environment::UnknownReason::ProviderApiError { message: self.status_error.clone() },
+        })
     }
 
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
@@ -245,9 +251,7 @@ pub(super) struct TestInteriorEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for TestInteriorEnvironmentProvider {
-    fn kind(&self) -> flotilla_environment::environment::EnvironmentKind {
-        flotilla_environment::environment::EnvironmentKind::Docker
-    }
+    flotilla_discovery_testkit::injected_environment_provider!();
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
@@ -280,9 +284,7 @@ pub(super) struct AdoptionEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for AdoptionEnvironmentProvider {
-    fn kind(&self) -> flotilla_environment::environment::EnvironmentKind {
-        flotilla_environment::environment::EnvironmentKind::Docker
-    }
+    flotilla_discovery_testkit::injected_environment_provider!();
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
@@ -321,9 +323,7 @@ pub(super) struct CapturingFailingEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for CapturingFailingEnvironmentProvider {
-    fn kind(&self) -> flotilla_environment::environment::EnvironmentKind {
-        flotilla_environment::environment::EnvironmentKind::Docker
-    }
+    flotilla_discovery_testkit::injected_environment_provider!();
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
@@ -447,9 +447,7 @@ pub(super) struct ListingEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for ListingEnvironmentProvider {
-    fn kind(&self) -> flotilla_environment::environment::EnvironmentKind {
-        flotilla_environment::environment::EnvironmentKind::Docker
-    }
+    flotilla_discovery_testkit::injected_environment_provider!();
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,

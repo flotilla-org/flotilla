@@ -17,9 +17,7 @@ struct FakeEnvironmentProvider;
 
 #[async_trait]
 impl EnvironmentProvider for FakeEnvironmentProvider {
-    fn kind(&self) -> flotilla_environment::environment::EnvironmentKind {
-        flotilla_environment::environment::EnvironmentKind::Docker
-    }
+    flotilla_discovery_testkit::injected_environment_provider!();
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,

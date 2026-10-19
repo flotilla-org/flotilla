@@ -1042,7 +1042,7 @@ mod tests {
                 calls: std::sync::Mutex::new(0),
             });
             let provider = flotilla_environment::environment::command_provider(
-                flotilla_environment::environment::EnvironmentKind::Docker,
+                flotilla_environment::environment::EnvironmentInput::Docker,
                 runner.clone(),
             );
             let probes = CandidateProbes { options: &options, inventory: &inventory, runner: runner.as_ref(), provider: provider.as_ref() };
@@ -1068,8 +1068,10 @@ mod tests {
             local: Some(local),
             calls: std::sync::Mutex::new(0),
         });
-        let provider =
-            flotilla_environment::environment::command_provider(flotilla_environment::environment::EnvironmentKind::Docker, runner.clone());
+        let provider = flotilla_environment::environment::command_provider(
+            flotilla_environment::environment::EnvironmentInput::Docker,
+            runner.clone(),
+        );
         let options = ProbeOptions::default();
         let probes = CandidateProbes { options: &options, inventory: &[], runner: runner.as_ref(), provider: provider.as_ref() };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
@@ -1103,8 +1105,10 @@ mod tests {
             local: None,
             calls: std::sync::Mutex::new(0),
         });
-        let provider =
-            flotilla_environment::environment::command_provider(flotilla_environment::environment::EnvironmentKind::Docker, runner.clone());
+        let provider = flotilla_environment::environment::command_provider(
+            flotilla_environment::environment::EnvironmentInput::Docker,
+            runner.clone(),
+        );
         let probes = CandidateProbes { options: &options, inventory: &inventory, runner: runner.as_ref(), provider: provider.as_ref() };
         assert!(probes.image(&digest).await.is_err(), "retired availability is not evidence");
         assert_eq!(*runner.calls.lock().expect("calls"), 0);

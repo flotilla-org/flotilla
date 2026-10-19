@@ -20,9 +20,9 @@ impl CommandRunner for MemoryIncidentRunner {
             "docker" if args.first() == Some(&"ps") => Ok("container\tenv-memory-incident\timage\t[]".into()),
             "docker" if args == ["inspect", "container"] && self.inspect_error => Err("inspect unavailable".into()),
             "docker" if args == ["inspect", "container"] => {
-                Ok(include_str!("../../../../flotilla-environment/src/environment/fixtures/oomd-exit137.json").into())
+                Ok(include_str!("../../../../flotilla-environment/src/environment/fixtures/oomd-exit137.json")
+                    .replace("exited", self.status))
             }
-            "docker" if args.starts_with(&["inspect", "--format", "{{.State.Status}}"]) => Ok(self.status.into()),
             "journalctl" if args.contains(&"--unit=systemd-oomd") => {
                 Ok(include_str!("../../../../flotilla-environment/src/environment/fixtures/oomd-journal.txt").into())
             }
@@ -263,10 +263,10 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     assert!(checkouts.get("recoverable-work").await.is_ok(), "failure must retain work");
 }
 
-// Terminal liveness must still mark backing lost when richer inspection is unavailable;
-// running backing remains Ready for retry. The runner is the subprocess boundary.
+// A failed observation has no separate liveness authority: Unknown preserves
+// the ready backing for retry, regardless of the engine's inaccessible state.
 #[tokio::test]
-async fn observation_error_preserves_terminal_liveness_and_retries_running_backing() {
+async fn observation_error_preserves_backing_and_retries() {
     for terminal in [true, false] {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
@@ -298,14 +298,8 @@ async fn observation_error_preserves_terminal_liveness_and_retries_running_backi
             .expect("environment")
             .status
             .expect("status");
-        if terminal {
-            result.expect("terminal backing is lost even without inspect");
-            assert_eq!(status.phase, EnvironmentPhase::Lost);
-            assert!(status.message.expect("message").contains("Stopped"));
-        } else {
-            assert!(result.expect_err("running inspection failure retries").contains("will retry"));
-            assert_eq!(status.phase, EnvironmentPhase::Ready);
-        }
+        assert!(result.expect_err("unknown inspection failure retries").contains("will retry"));
+        assert_eq!(status.phase, EnvironmentPhase::Ready);
         assert!(status.runtime_observation.is_none(), "unavailable evidence stays unknown");
     }
 }

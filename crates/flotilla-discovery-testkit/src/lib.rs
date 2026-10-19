@@ -4,6 +4,8 @@
 //! responses keyed by `(cmd, args)` and tracks which `cwd` paths and
 //! `exists` calls were made.
 
+pub mod environment;
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},

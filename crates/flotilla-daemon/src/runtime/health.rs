@@ -783,6 +783,7 @@ pub(super) fn host_capabilities(
     credential_expiry: &BTreeMap<String, CredentialExpiry>,
 ) -> BTreeMap<String, serde_json::Value> {
     BTreeMap::from([
+        (flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.to_string(), json!(profile.environment_providers)),
         (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
         (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(held_credentials)),
         (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(credential_expiry)),

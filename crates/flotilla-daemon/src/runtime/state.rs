@@ -300,11 +300,14 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
             if home != Some(&local_host_id) || !self.local_backing_observed.load(Ordering::Acquire) {
                 return Err("no backing environment evidence is available".to_string());
             }
+            // Unlike the general provisioning profile's per_vessel capability
+            // test, this recovery path reads legacy Docker status. Retire its
+            // input filter with the legacy-input bridge at the table move (#3108).
             let providers = self
                 .local_registry
                 .environment_providers
                 .iter()
-                .filter(|(_, provider)| provider.kind() == flotilla_environment::environment::EnvironmentKind::Docker)
+                .filter(|(_, provider)| provider.legacy_input() == Some(flotilla_environment::environment::EnvironmentInput::Docker))
                 .collect::<Vec<_>>();
             if providers.is_empty() {
                 return Err("Docker environment provider absent for standing-convoy liveness check".into());
@@ -349,20 +352,18 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
             let (_, provider) = self
                 .local_registry
                 .environment_providers
-                .select(flotilla_environment::environment::EnvironmentKind::Docker, instance.map(String::as_str))
+                .select_legacy_input(flotilla_environment::environment::EnvironmentInput::Docker, instance.map(String::as_str))
                 .ok_or_else(|| {
-                    let reason = if instance.is_some() {
-                        "instance absent or wrong kind"
-                    } else if self
-                        .local_registry
-                        .environment_providers
-                        .iter()
-                        .any(|(_, provider)| provider.kind() == flotilla_environment::environment::EnvironmentKind::Docker)
-                    {
-                        "ambiguous instances"
-                    } else {
-                        "absent"
-                    };
+                    let reason =
+                        if instance.is_some() {
+                            "instance absent or wrong kind"
+                        } else if self.local_registry.environment_providers.iter().any(|(_, provider)| {
+                            provider.legacy_input() == Some(flotilla_environment::environment::EnvironmentInput::Docker)
+                        }) {
+                            "ambiguous instances"
+                        } else {
+                            "absent"
+                        };
                     format!("Docker environment provider {reason} for Environment/{} (instance {instance:?})", environment.metadata.name)
                 })?;
             let handles = provider
@@ -370,7 +371,7 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                 .await
                 .map_err(|error| format!("Docker backing liveness check failed: {error}"))?
                 .into_iter()
-                .filter_map(|handle| Some(((handle.id().clone(), handle.container_name()?.to_string()), handle)))
+                .map(|handle| ((handle.id().clone(), handle.backing_id().to_string()), handle))
                 .collect::<HashMap<_, _>>();
             let Some(container_id) = environment.status.as_ref().and_then(|status| status.docker_container_id.as_ref()) else {
                 return Err(format!(
@@ -379,25 +380,23 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                 ));
             };
             let key = (EnvironmentId::new(environment.metadata.name.clone()), container_id.clone());
-            let Some(handle) = handles.get(&key) else {
+            // Old Docker status values were transport names, before opaque IDs.
+            let Some(handle) = handles.get(&key).or_else(|| {
+                handles.values().find(|handle| handle.id() == &key.0 && handle.container_name() == Some(container_id.as_str()))
+            }) else {
                 continue;
             };
-            match handle.status().await {
-                Ok(flotilla_protocol::EnvironmentStatus::Running) => {
+            match handle.observe().await.state {
+                flotilla_environment::environment::ObservationState::Running => {
                     return Err(format!("backing is live: Docker container {container_id} for Environment/{}", environment.metadata.name))
                 }
-                Ok(flotilla_protocol::EnvironmentStatus::Stopped | flotilla_protocol::EnvironmentStatus::Failed(_)) => {}
-                Ok(status) => {
+                flotilla_environment::environment::ObservationState::Stopped { .. }
+                | flotilla_environment::environment::ObservationState::Gone { .. } => {}
+                flotilla_environment::environment::ObservationState::Unknown { reason } => {
                     return Err(format!(
-                        "backing is not verified dead: Docker container {container_id} for Environment/{} is {status:?}",
+                        "backing is not verifiable: Docker container {container_id} for Environment/{}: {reason:?}",
                         environment.metadata.name
-                    ))
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "backing is not verifiable: Docker container {container_id} for Environment/{}: {error}",
-                        environment.metadata.name
-                    ))
+                    ));
                 }
             }
         }

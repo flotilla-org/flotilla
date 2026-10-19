@@ -1,6 +1,6 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -21,7 +21,6 @@ use flotilla_discovery::FactoryRegistry;
 use flotilla_environment::environment::contained_daemon_socket_path;
 use flotilla_environment::environment::CreateOpts;
 use flotilla_environment::environment::EnvironmentHandle;
-use flotilla_environment::environment::EnvironmentKind;
 use flotilla_environment::environment::EnvironmentTool;
 use flotilla_environment::environment::EnvironmentToolAsset;
 use flotilla_environment::environment::EnvironmentToolAssetAccess;
@@ -290,7 +289,7 @@ impl EnvironmentManager {
         let mut environments = Vec::new();
         for (env_id, state) in self.managed_environments() {
             if let ManagedEnvironmentKind::Provisioned(state) = state {
-                let status = state.handle.status().await.unwrap_or_else(EnvironmentStatus::Failed);
+                let status = environment_display_status(state.handle.observe().await.state);
                 environments.push(EnvironmentInfo::Provisioned {
                     id: env_id,
                     display_name: state.display_name.clone(),
@@ -316,7 +315,7 @@ impl EnvironmentManager {
                     });
                 }
                 ManagedEnvironmentKind::Provisioned(state) => {
-                    let status = state.handle.status().await.unwrap_or_else(EnvironmentStatus::Failed);
+                    let status = environment_display_status(state.handle.observe().await.state);
                     environments.push(EnvironmentInfo::Provisioned {
                         id: env_id,
                         display_name: state.display_name.clone(),
@@ -341,14 +340,14 @@ impl EnvironmentManager {
             daemon_socket_path,
             reference_repo,
         } = request;
-        let (_, env_provider) = registry
-            .environment_providers
-            .select(EnvironmentKind::Docker, Some(provider))
-            .ok_or_else(|| format!("environment provider not available: {provider}"))?;
+        let (_, env_provider) =
+            registry.environment_providers.select(provider).ok_or_else(|| format!("environment provider not available: {provider}"))?;
 
+        let capabilities = env_provider.capabilities();
         let provisioned_mounts = reference_repo
             .as_ref()
-            .map(|repo| vec![ProvisionedMount::new(repo.as_path().to_path_buf(), PathBuf::from("/ref/repo"), ProvisionedMountMode::Ro)])
+            .zip(capabilities.reference_root.as_ref())
+            .map(|(repo, root)| vec![ProvisionedMount::new(repo.as_path().to_path_buf(), root.clone(), ProvisionedMountMode::Ro)])
             .unwrap_or_default();
         let environment_socket_path = contained_daemon_socket_path(daemon_socket_path.as_path());
         let opts = CreateOpts {
@@ -520,7 +519,7 @@ impl EnvironmentManager {
         let bag = run_provisioned_host_detectors(&self.host_detectors, &*env_runner, &raw_env_vars).await;
 
         let config = ConfigStore::with_base(config_base.as_path().join(format!("env-discovery/{env_id}")));
-        let env_repo_root = ExecutionEnvironmentPath::new("/workspace");
+        let env_repo_root = ExecutionEnvironmentPath::new(handle.capabilities().workspace_root);
         // Environment lifetimes own host capabilities. Checkout VCS and forge
         // capabilities are discovered by their resource-scoped consumers.
         let mut factories = FactoryRegistry::default_all();
@@ -581,6 +580,19 @@ enum MountDomain {
     Environment,
 }
 
+// The legacy query surface has fewer states; operational consumers use observe.
+fn environment_display_status(state: flotilla_environment::environment::ObservationState) -> EnvironmentStatus {
+    use flotilla_environment::environment::ObservationState;
+    match state {
+        ObservationState::Running => EnvironmentStatus::Running,
+        ObservationState::Stopped { .. } | ObservationState::Gone { .. } => EnvironmentStatus::Stopped,
+        ObservationState::Unknown { reason: flotilla_environment::environment::UnknownReason::GuestUnresponsive } => {
+            EnvironmentStatus::Starting
+        }
+        ObservationState::Unknown { reason } => EnvironmentStatus::Failed(format!("{reason:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -622,6 +634,8 @@ mod tests {
 
     #[async_trait]
     impl ProvisionedEnvironment for MockProvisionedEnvironment {
+        flotilla_discovery_testkit::injected_environment_handle!();
+
         fn id(&self) -> &EnvironmentId {
             &self.id
         }
@@ -634,8 +648,8 @@ mod tests {
             Some("mock-container")
         }
 
-        async fn status(&self) -> Result<EnvironmentStatus, String> {
-            Ok(EnvironmentStatus::Running)
+        async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+            flotilla_environment::environment::ProviderObservation::new(flotilla_environment::environment::ObservationState::Running)
         }
 
         async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
@@ -665,9 +679,7 @@ mod tests {
 
     #[async_trait]
     impl EnvironmentProvider for MockEnvironmentProvider {
-        fn kind(&self) -> EnvironmentKind {
-            EnvironmentKind::Docker
-        }
+        flotilla_discovery_testkit::injected_environment_provider!();
         async fn prepare(&self, _spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {
             Ok(PreparedEnvironment::new(&Arc::new(()), ()))
         }

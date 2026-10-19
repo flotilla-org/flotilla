@@ -1,3 +1,5 @@
+mod seam;
+pub use seam::*;
 pub mod docker;
 pub mod docker_image;
 pub mod dummy;
@@ -11,6 +13,8 @@ pub use image::{ImageBuildService, LocalImageCache, OwnedBuilderSettings};
 pub use registry_auth::RegistryAuth;
 
 #[cfg(test)]
+mod contract_tests;
+#[cfg(test)]
 mod tests;
 
 use std::{
@@ -20,7 +24,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentStatus, ExecutionEnvironmentPath, ImageId};
+use flotilla_protocol::{DaemonHostPath, EnvironmentId, ExecutionEnvironmentPath, ImageId};
 use serde::{Deserialize, Serialize};
 
 use flotilla_provider_runtime::CommandRunner;
@@ -252,17 +256,19 @@ pub type EnvironmentHandle = Arc<dyn ProvisionedEnvironment>;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EnvironmentBacking {
     pub environment_id: EnvironmentId,
-    pub container_id: String,
+    pub backing_id: String,
 }
 
-/// One kind of environment supported by a provider instance.
+/// Transitional discriminator for the unchanged stored EnvironmentSpec inputs.
+/// This is not the provider's runtime kind: dummy accepts the legacy image input
+/// too. Retire this bridge when Environment moves to generated tables (#3108).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnvironmentKind {
+pub enum EnvironmentInput {
     HostDirect,
     Docker,
 }
 
-impl EnvironmentKind {
+impl EnvironmentInput {
     pub fn of(spec: &flotilla_resources::EnvironmentSpec) -> Result<Self, String> {
         match (spec.host_direct.is_some(), spec.docker.is_some()) {
             (true, false) => Ok(Self::HostDirect),
@@ -295,7 +301,15 @@ impl PreparedEnvironment {
 /// Makes an environment spec real, without exposing runtime-specific inputs.
 #[async_trait]
 pub trait EnvironmentProvider: Send + Sync {
-    fn kind(&self) -> EnvironmentKind;
+    /// Descriptive identity only; callers must use capability data for behaviour.
+    fn kind(&self) -> ProviderKind;
+    fn capabilities(&self) -> ProviderCapabilities;
+    /// Compatibility with unlabelled preceding-generation stored inputs only.
+    /// New providers need no legacy input discriminator.
+    fn legacy_input(&self) -> Option<EnvironmentInput> {
+        None
+    }
+
     /// Optional image capability owned by this exact provider instance.
     fn local_image_cache(&self) -> Option<&dyn LocalImageCache> {
         None
@@ -305,23 +319,15 @@ pub trait EnvironmentProvider: Send + Sync {
     /// cleat pool. Per-vessel (Docker-kind) environments do unless their
     /// instance brings its own crew runtime; host adoption never does.
     fn receives_host_tools(&self) -> bool {
-        self.kind() == EnvironmentKind::Docker
+        self.capabilities().receives_host_tools
     }
     /// Optional owned build service using the same endpoint as this
     /// instance's local cache, bound to the host's owned builder settings.
     fn image_build_service(&self, _builder: OwnedBuilderSettings) -> Option<Arc<dyn ImageBuildService>> {
         None
     }
-    /// Read-only detection before provisioning. Image-backed providers run in
-    /// an ephemeral environment without pulling or changing the local cache.
-    async fn detect(
-        &self,
-        _image: Option<&str>,
-        _binary: &str,
-        _args: &[&str],
-        _scratch: &Path,
-    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
-        Err("environment provider does not support detection".into())
+    fn detection(&self) -> Option<&dyn EnvironmentDetection> {
+        None
     }
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String>;
     async fn provision(&self, id: EnvironmentId, prepared: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String>;
@@ -334,8 +340,8 @@ pub trait EnvironmentProvider: Send + Sync {
             .await?
             .into_iter()
             .map(|handle| {
-                let container_id = handle.container_name().ok_or("environment backing has no container identity")?.to_string();
-                Ok(EnvironmentBacking { environment_id: handle.id().clone(), container_id })
+                let backing_id = handle.backing_id().to_string();
+                Ok(EnvironmentBacking { environment_id: handle.id().clone(), backing_id })
             })
             .collect()
     }
@@ -343,12 +349,16 @@ pub trait EnvironmentProvider: Send + Sync {
     ///
     /// Teardown must not depend on parsing mutable actuated-object metadata:
     /// that metadata can outlive the daemon version which wrote it.
-    async fn destroy(&self, container_id: &str) -> Result<(), String>;
+    async fn destroy(&self, backing_id: &str) -> Result<(), String>;
 }
 
 /// A handle to a single provisioned sandbox environment instance.
 #[async_trait]
 pub trait ProvisionedEnvironment: Send + Sync {
+    /// Opaque identity interpreted only by this provider, independent of transport.
+    fn backing_id(&self) -> &str;
+    async fn observe(&self) -> ProviderObservation;
+    fn capabilities(&self) -> ProviderCapabilities;
     fn id(&self) -> &EnvironmentId;
     fn image(&self) -> &ImageId;
     /// Immutable content digest of the image actually backing this environment.
@@ -363,13 +373,13 @@ pub trait ProvisionedEnvironment: Send + Sync {
 
     /// Provider-specific transport identifier (e.g. Docker container name).
     /// Used by hop chain to construct exec/enter commands.
-    fn container_name(&self) -> Option<&str>;
-    fn provisioned_mounts(&self) -> Vec<ProvisionedMount>;
-    async fn status(&self) -> Result<EnvironmentStatus, String>;
-    /// Provider observations are optional for non-Docker adapters.
-    async fn runtime_observation(&self) -> Result<Option<flotilla_protocol::EnvironmentRuntimeObservation>, String> {
-        Ok(None)
+    fn container_name(&self) -> Option<&str> {
+        None
     }
+    fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
+        Vec::new()
+    }
+
     /// The vessel's configured environment, used as the terminal baseline.
     /// This must not include the provisioning host's ambient environment.
     async fn env_vars(&self) -> Result<HashMap<String, String>, String>;
@@ -414,9 +424,9 @@ mod image_build_tests;
 
 /// Compose the built-in provider for a known command endpoint. Callers with a
 /// discovered registry must select its existing instance instead.
-pub fn command_provider(kind: EnvironmentKind, runner: Arc<dyn CommandRunner>) -> Arc<dyn EnvironmentProvider> {
+pub fn command_provider(kind: EnvironmentInput, runner: Arc<dyn CommandRunner>) -> Arc<dyn EnvironmentProvider> {
     match kind {
-        EnvironmentKind::Docker => Arc::new(docker::DockerEnvironmentProvider::new(runner)),
-        EnvironmentKind::HostDirect => Arc::new(host_direct::HostDirectEnvironmentProvider::new(runner, HashMap::new())),
+        EnvironmentInput::Docker => Arc::new(docker::DockerEnvironmentProvider::new(runner)),
+        EnvironmentInput::HostDirect => Arc::new(host_direct::HostDirectEnvironmentProvider::new(runner, HashMap::new())),
     }
 }

@@ -50,7 +50,6 @@ use flotilla_protocol::ConvoyStartIntent;
 use flotilla_protocol::CrewCommandContext;
 use flotilla_protocol::DaemonEvent;
 use flotilla_protocol::EnvironmentId;
-use flotilla_protocol::EnvironmentStatus;
 use flotilla_protocol::HostName;
 use flotilla_protocol::ImageId;
 use flotilla_protocol::Issue;
@@ -2624,6 +2623,8 @@ struct ArtifactContractEnvironment {
 
 #[async_trait]
 impl ProvisionedEnvironment for ArtifactContractEnvironment {
+    flotilla_discovery_testkit::injected_environment_handle!();
+
     fn id(&self) -> &EnvironmentId {
         &self.id
     }
@@ -2636,8 +2637,8 @@ impl ProvisionedEnvironment for ArtifactContractEnvironment {
     fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
         vec![]
     }
-    async fn status(&self) -> Result<EnvironmentStatus, String> {
-        Ok(EnvironmentStatus::Running)
+    async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+        flotilla_environment::environment::ProviderObservation::new(flotilla_environment::environment::ObservationState::Running)
     }
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
         Ok(HashMap::new())

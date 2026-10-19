@@ -1,13 +1,16 @@
 //! Host adoption is an environment lifecycle, with no backing to create or kill.
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
+use flotilla_protocol::{EnvironmentId, ImageId};
 
-use super::{EnvironmentHandle, EnvironmentKind, EnvironmentProvider, PreparedEnvironment, ProvisionedEnvironment, ProvisionedMount};
+use super::{EnvironmentHandle, EnvironmentInput, EnvironmentProvider, PreparedEnvironment, ProvisionedEnvironment, ProvisionedMount};
 use crate::environment::{PrepareOpts, ProvisionOpts};
 use flotilla_provider_runtime::CommandRunner;
 
@@ -18,7 +21,7 @@ pub struct HostDirectEnvironmentProvider {
     runner: Arc<dyn CommandRunner>,
     environment: HashMap<String, String>,
     owner: Arc<()>,
-    handles: Mutex<HashMap<EnvironmentId, EnvironmentHandle>>,
+    handles: Mutex<HashMap<EnvironmentId, Arc<HostHandle>>>,
 }
 
 impl HostDirectEnvironmentProvider {
@@ -29,25 +32,23 @@ impl HostDirectEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for HostDirectEnvironmentProvider {
-    fn kind(&self) -> EnvironmentKind {
-        EnvironmentKind::HostDirect
+    fn kind(&self) -> super::ProviderKind {
+        super::ProviderKind::new(super::EnvironmentClass::HostDirect, "host-direct")
+    }
+    fn capabilities(&self) -> super::ProviderCapabilities {
+        Self::capability_declaration()
     }
 
-    async fn detect(
-        &self,
-        image: Option<&str>,
-        binary: &str,
-        args: &[&str],
-        scratch: &std::path::Path,
-    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
-        if image.is_some() {
-            return Err("host-direct detection does not accept an image".into());
-        }
-        self.runner.run_output(binary, args, scratch, &flotilla_provider_runtime::ChannelLabel::Default).await
+    fn legacy_input(&self) -> Option<EnvironmentInput> {
+        Some(EnvironmentInput::HostDirect)
+    }
+
+    fn detection(&self) -> Option<&dyn super::EnvironmentDetection> {
+        Some(self)
     }
 
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {
-        if EnvironmentKind::of(spec)? != self.kind() {
+        if Some(EnvironmentInput::of(spec)?) != self.legacy_input() {
             return Err("host-direct provider requires a host-direct spec".into());
         }
         Ok(PreparedEnvironment::new(&self.owner, ()))
@@ -64,31 +65,45 @@ impl EnvironmentProvider for HostDirectEnvironmentProvider {
             return Err("host-direct adoption cannot install tokens, mounts, tools, or resource limits".into());
         }
         let mut handles = self.handles.lock().expect("host adoption lock");
+        handles.retain(|_, handle| !handle.detached.load(Ordering::Acquire));
         Ok(Arc::clone(handles.entry(id.clone()).or_insert_with(|| {
             Arc::new(HostHandle {
+                backing_id: id.canonical_string(),
+                detached: AtomicBool::new(false),
                 id,
                 runner: Arc::clone(&self.runner),
                 environment: self.environment.clone(),
                 image: ImageId::new(HOST_DIRECT_IMAGE_SENTINEL),
             })
-        })))
+        })) as EnvironmentHandle)
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
-        Ok(self.handles.lock().expect("host adoption lock").values().cloned().collect())
-    }
-
-    async fn list_backings(&self) -> Result<Vec<super::EnvironmentBacking>, String> {
-        Ok(Vec::new())
+        Ok(self
+            .handles
+            .lock()
+            .expect("host adoption lock")
+            .values()
+            .filter(|handle| !handle.detached.load(Ordering::Acquire))
+            .map(|handle| Arc::clone(handle) as EnvironmentHandle)
+            .collect())
     }
 
     async fn destroy(&self, identity: &str) -> Result<(), String> {
-        self.handles.lock().expect("host adoption lock").retain(|id, _| id.as_str() != identity);
+        self.handles.lock().expect("host adoption lock").retain(|id, handle| {
+            let matches = handle.backing_id == identity || id.as_str() == identity;
+            if matches {
+                handle.detached.store(true, Ordering::Release);
+            }
+            !matches
+        });
         Ok(())
     }
 }
 
 struct HostHandle {
+    backing_id: String,
+    detached: AtomicBool,
     id: EnvironmentId,
     runner: Arc<dyn CommandRunner>,
     environment: HashMap<String, String>,
@@ -97,6 +112,13 @@ struct HostHandle {
 
 #[async_trait]
 impl ProvisionedEnvironment for HostHandle {
+    fn capabilities(&self) -> super::ProviderCapabilities {
+        HostDirectEnvironmentProvider::capability_declaration()
+    }
+    fn backing_id(&self) -> &str {
+        &self.backing_id
+    }
+
     fn id(&self) -> &EnvironmentId {
         &self.id
     }
@@ -109,9 +131,14 @@ impl ProvisionedEnvironment for HostHandle {
     fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
         Vec::new()
     }
-    async fn status(&self) -> Result<EnvironmentStatus, String> {
-        Ok(EnvironmentStatus::Running)
+    async fn observe(&self) -> super::ProviderObservation {
+        super::ProviderObservation::new(if self.detached.load(Ordering::Acquire) {
+            super::ObservationState::Gone { cause: super::GoneCause::DestroyedByRequest }
+        } else {
+            super::ObservationState::Running
+        })
     }
+
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
         Ok(self.environment.clone())
     }
@@ -119,6 +146,42 @@ impl ProvisionedEnvironment for HostHandle {
         Arc::clone(&self.runner)
     }
     async fn destroy(&self) -> Result<(), String> {
+        self.detached.store(true, Ordering::Release);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl super::EnvironmentDetection for HostDirectEnvironmentProvider {
+    async fn detect(
+        &self,
+        image: Option<&str>,
+        binary: &str,
+        args: &[&str],
+        scratch: &std::path::Path,
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+        if image.is_some() {
+            return Err("host-direct detection does not accept an image".into());
+        }
+        self.runner.run_output(binary, args, scratch, &flotilla_provider_runtime::ChannelLabel::Default).await
+    }
+}
+
+impl HostDirectEnvironmentProvider {
+    fn capability_declaration() -> super::ProviderCapabilities {
+        super::ProviderCapabilities {
+            material_modes: vec![super::MaterialMode::Frozen, super::MaterialMode::Pushed, super::MaterialMode::Shared],
+            checkout_strategies: vec![
+                super::CheckoutStrategy::HostWorktree,
+                super::CheckoutStrategy::HostClone,
+                super::CheckoutStrategy::CloneInVessel,
+            ],
+            workspace_root: "/".into(),
+            fallback_runner: true,
+            receives_host_tools: false,
+            per_vessel: false,
+            egress_route: super::EgressRoute::Open,
+            ..Default::default()
+        }
     }
 }

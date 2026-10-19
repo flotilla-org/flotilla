@@ -33,7 +33,7 @@ use crate::testkits::discovery::TestEnvVars;
 use crate::testkits::replay::testing::MockRunner;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_environment::environment::ProvisionedMount;
-use flotilla_environment::environment::{EnvironmentKind, PrepareOpts, PreparedEnvironment, ProvisionOpts};
+use flotilla_environment::environment::{PrepareOpts, PreparedEnvironment, ProvisionOpts};
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_protocol::{ChangeRequest, Checkout, CloudAgentSession, Issue};
 use flotilla_protocol_testkit::event_sink::RecordingEventSink;
@@ -1576,7 +1576,7 @@ async fn checkout_service_validate_target_propagates_checkout_manager_error() {
 // Tests: Environment lifecycle actions
 // -----------------------------------------------------------------------
 
-use flotilla_protocol::{EnvironmentId, EnvironmentSpec, EnvironmentStatus, ImageId};
+use flotilla_protocol::{EnvironmentId, EnvironmentSpec, ImageId};
 
 use flotilla_environment::environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment};
 
@@ -1587,9 +1587,7 @@ struct MockEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for MockEnvironmentProvider {
-    fn kind(&self) -> EnvironmentKind {
-        EnvironmentKind::Docker
-    }
+    flotilla_discovery_testkit::injected_environment_provider!();
     async fn prepare(&self, _spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {
         Ok(PreparedEnvironment::new(&Arc::new(()), ()))
     }
@@ -1614,6 +1612,8 @@ struct MockProvisionedEnvironment {
 
 #[async_trait]
 impl ProvisionedEnvironment for MockProvisionedEnvironment {
+    flotilla_discovery_testkit::injected_environment_handle!();
+
     fn id(&self) -> &EnvironmentId {
         &self.id
     }
@@ -1626,8 +1626,8 @@ impl ProvisionedEnvironment for MockProvisionedEnvironment {
     fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
         vec![]
     }
-    async fn status(&self) -> Result<EnvironmentStatus, String> {
-        Ok(EnvironmentStatus::Running)
+    async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+        flotilla_environment::environment::ProviderObservation::new(flotilla_environment::environment::ObservationState::Running)
     }
     async fn env_vars(&self) -> Result<std::collections::HashMap<String, String>, String> {
         let mut vars = std::collections::HashMap::new();

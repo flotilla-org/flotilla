@@ -18,7 +18,7 @@ use flotilla_discovery::FactoryRegistry;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_environment::environment::CreateOpts;
-use flotilla_environment::environment::EnvironmentKind;
+use flotilla_environment::environment::EnvironmentInput;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, ImageSource};
 use flotilla_provider_runtime::ChannelLabel;
@@ -44,8 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host_registry = factory_registry.probe_all(&host_bag, &config, &ExecutionEnvironmentPath::new(&repo_path), runner.clone()).await;
     let host_vcs = host_registry.vcs.preferred().ok_or("no VCS provider discovered for reference repo")?;
 
-    let (_, provider) =
-        host_registry.environment_providers.select(EnvironmentKind::Docker, None).ok_or("Docker provider unavailable or ambiguous")?;
+    let (_, provider) = host_registry
+        .environment_providers
+        .select_legacy_input(EnvironmentInput::Docker, None)
+        .ok_or("Docker provider unavailable or ambiguous")?;
     let image = std::env::args().nth(3).ok_or("provide a pinned registry image as the third argument")?;
 
     // 1. Resolve the reference repo (.git common dir)
@@ -81,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = provider.provision(env_id, &prepared, opts.into()).await?;
     let container = handle.container_name().unwrap_or("unknown");
     println!("Container: {container}");
-    println!("Status:    {:?}", handle.status().await?);
+    println!("Status:    {:?}", handle.observe().await.state);
 
     // Install git inside the container (debian:bookworm-slim doesn't have it)
     println!("\n--- Installing git in container ---");

@@ -3,7 +3,7 @@ use flotilla_ai_utility::AiUtility;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_cloud_agent::CloudAgentService;
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
-use flotilla_environment::environment::{EnvironmentKind, EnvironmentProvider};
+use flotilla_environment::environment::{EnvironmentInput, EnvironmentProvider};
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_terminal::TerminalPool;
 use flotilla_vcs::vcs::Vcs;
@@ -216,14 +216,24 @@ impl ProviderRegistry {
 }
 
 impl ProviderSet<dyn EnvironmentProvider> {
-    /// Resolve a kind and optional exact instance. An omitted instance is valid
-    /// only when exactly one provider supports the kind; priority never picks a
-    /// different runtime endpoint accidentally.
-    pub fn select(&self, kind: EnvironmentKind, instance: Option<&str>) -> Option<(&ProviderDescriptor, &Arc<dyn EnvironmentProvider>)> {
+    /// Resolve the configured instance without interpreting class or implementation.
+    pub fn select(&self, instance: &str) -> Option<(&ProviderDescriptor, &Arc<dyn EnvironmentProvider>)> {
+        self.get(instance)
+    }
+
+    /// Bridge unlabelled preceding-generation specs until #3108. An omitted
+    /// instance resolves only when exactly one provider accepts the stored input.
+    /// Explicit legacy bindings must also accept the stored input, because recovery
+    /// can call list/destroy without preparing an environment first.
+    pub fn select_legacy_input(
+        &self,
+        kind: EnvironmentInput,
+        instance: Option<&str>,
+    ) -> Option<(&ProviderDescriptor, &Arc<dyn EnvironmentProvider>)> {
         if let Some(instance) = instance {
-            return self.get(instance).filter(|(_, provider)| provider.kind() == kind);
+            return self.select(instance).filter(|(_, provider)| provider.legacy_input() == Some(kind));
         }
-        let mut matches = self.iter().filter(|(_, provider)| provider.kind() == kind);
+        let mut matches = self.iter().filter(|(_, provider)| provider.legacy_input() == Some(kind));
         let selected = matches.next()?;
         if matches.next().is_some() {
             return None;
@@ -231,8 +241,20 @@ impl ProviderSet<dyn EnvironmentProvider> {
         Some(selected)
     }
 
-    pub fn for_kind(&self, kind: EnvironmentKind) -> Option<(&ProviderDescriptor, &Arc<dyn EnvironmentProvider>)> {
-        self.select(kind, None)
+    /// Host records carry this data in their existing capabilities map.
+    pub fn advertisements(&self) -> Vec<flotilla_environment::environment::ProviderAdvertisement> {
+        self.inner
+            .iter()
+            .map(|(instance, (_, provider))| flotilla_environment::environment::ProviderAdvertisement {
+                instance: instance.clone(),
+                kind: Some(provider.kind()),
+                capabilities: provider.capabilities(),
+            })
+            .collect()
+    }
+
+    pub fn for_legacy_input(&self, kind: EnvironmentInput) -> Option<(&ProviderDescriptor, &Arc<dyn EnvironmentProvider>)> {
+        self.select_legacy_input(kind, None)
     }
 }
 
@@ -326,12 +348,12 @@ mod tests {
 
 /// Compose detection-only endpoint providers with their canonical instance
 /// descriptors. This is for callers without a discovered provider registry.
-pub fn command_provider_registry(kinds: &[EnvironmentKind], runner: Arc<dyn CommandRunner>) -> ProviderRegistry {
+pub fn command_provider_registry(kinds: &[EnvironmentInput], runner: Arc<dyn CommandRunner>) -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
     for &kind in kinds {
         let name = match kind {
-            EnvironmentKind::Docker => "docker",
-            EnvironmentKind::HostDirect => "host-direct",
+            EnvironmentInput::Docker => "docker",
+            EnvironmentInput::HostDirect => "host-direct",
         };
         registry.environment_providers.insert(
             name,
@@ -345,7 +367,7 @@ pub fn command_provider_registry(kinds: &[EnvironmentKind], runner: Arc<dyn Comm
 #[cfg(test)]
 mod environment_tests {
     use std::sync::Arc;
-    // Explicit instance selection never crosses kinds. Generate zero through three
+    // Explicit selection uses the instance independently of legacy input grouping. Generate zero through three
     // same-kind instances, including ambiguity, exact hits and an absent identity.
     #[hegel::test]
     fn provider_selection_is_kind_and_instance_scoped(tc: hegel::TestCase) {
@@ -353,7 +375,7 @@ mod environment_tests {
         use flotilla_discovery_api::ProviderCategory;
         use flotilla_discovery_api::ProviderDescriptor;
         use flotilla_environment::environment::{
-            docker::DockerEnvironmentProvider, host_direct::HostDirectEnvironmentProvider, EnvironmentKind,
+            docker::DockerEnvironmentProvider, host_direct::HostDirectEnvironmentProvider, EnvironmentInput,
         };
         use hegel::generators as gs;
         let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
@@ -372,10 +394,38 @@ mod environment_tests {
                 Arc::new(DockerEnvironmentProvider::new(runner.clone())),
             );
         }
-        assert_eq!(registry.environment_providers.select(EnvironmentKind::Docker, None).is_some(), count == 1);
-        assert_eq!(registry.environment_providers.select(EnvironmentKind::Docker, Some("endpoint-0")).is_some(), count > 0);
-        assert!(registry.environment_providers.select(EnvironmentKind::Docker, Some("direct")).is_none());
-        assert!(registry.environment_providers.select(EnvironmentKind::HostDirect, Some("absent")).is_none());
-        assert!(registry.environment_providers.select(EnvironmentKind::HostDirect, None).is_some());
+        assert_eq!(registry.environment_providers.select_legacy_input(EnvironmentInput::Docker, None).is_some(), count == 1);
+        assert_eq!(registry.environment_providers.select("endpoint-0").is_some(), count > 0);
+        assert!(registry.environment_providers.select("direct").is_some());
+        // A mislabelled legacy Docker record must not reach host adoption during
+        // recovery, which does not call prepare. Instance-only lookup stays open.
+        assert!(registry.environment_providers.select_legacy_input(EnvironmentInput::Docker, Some("direct")).is_none());
+        assert_eq!(registry.environment_providers.select_legacy_input(EnvironmentInput::Docker, Some("endpoint-0")).is_some(), count > 0);
+        assert!(registry.environment_providers.select_legacy_input(EnvironmentInput::HostDirect, Some("endpoint-0")).is_none());
+        assert!(registry.environment_providers.select("absent").is_none());
+        assert!(registry.environment_providers.select_legacy_input(EnvironmentInput::HostDirect, None).is_some());
+    }
+}
+
+#[cfg(test)]
+mod advertisement_tests {
+    use super::*;
+    use flotilla_environment::environment::{dummy::DummyEnvironmentProvider, EnvironmentClass};
+
+    // Glue: advertisements copy each configured key, including aliases of the
+    // same object, and retain the provider's independent class and declaration.
+    #[test]
+    fn advertisements_preserve_configured_instance_aliases() {
+        let provider: Arc<dyn EnvironmentProvider> = Arc::new(DummyEnvironmentProvider::new(Default::default()));
+        let mut set = ProviderSet::<dyn EnvironmentProvider>::new();
+        for instance in ["first", "second"] {
+            set.insert(instance, ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "dummy"), provider.clone());
+        }
+        let advertisements = set.advertisements();
+        assert_eq!(advertisements.iter().map(|entry| entry.instance.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+        for entry in advertisements {
+            assert_eq!(entry.kind.as_ref().unwrap().class, EnvironmentClass::Dummy);
+            assert_eq!(entry.capabilities, provider.capabilities());
+        }
     }
 }

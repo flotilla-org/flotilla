@@ -1,6 +1,6 @@
 //! Dummy environments for load testing (#3206).
 //!
-//! A Docker-kind provider instance that realises per-vessel environments
+//! A dummy-class provider instance that realises per-vessel environments
 //! without containers. Provisioning waits a configured delay, fails at a
 //! configured rate (drawn deterministically from the seed and environment ID),
 //! and otherwise returns a handle whose command runner is an in-memory world:
@@ -24,12 +24,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
+use flotilla_protocol::{EnvironmentId, ImageId};
 use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 use flotilla_resources::PlacedImageIdentity;
 
 use super::{
-    EnvironmentHandle, EnvironmentKind, EnvironmentProvider, LocalImageCache, PrepareOpts, PreparedEnvironment, ProvisionOpts,
+    EnvironmentHandle, EnvironmentInput, EnvironmentProvider, LocalImageCache, PrepareOpts, PreparedEnvironment, ProvisionOpts,
     ProvisionedEnvironment, ProvisionedMount, RegistryAuth,
 };
 
@@ -97,25 +97,27 @@ fn dummy_image_id(image: &str) -> String {
 
 #[async_trait]
 impl EnvironmentProvider for DummyEnvironmentProvider {
-    fn kind(&self) -> EnvironmentKind {
-        EnvironmentKind::Docker
+    fn kind(&self) -> super::ProviderKind {
+        super::ProviderKind::new(super::EnvironmentClass::Dummy, "dummy")
+    }
+    fn capabilities(&self) -> super::ProviderCapabilities {
+        Self::capability_declaration()
+    }
+
+    fn legacy_input(&self) -> Option<EnvironmentInput> {
+        Some(EnvironmentInput::Docker)
     }
 
     fn local_image_cache(&self) -> Option<&dyn LocalImageCache> {
         Some(self)
     }
 
-    /// Dummy crews run in the dummy terminal pool, not under delivered cleat.
-    fn receives_host_tools(&self) -> bool {
-        false
-    }
-
-    async fn detect(&self, _image: Option<&str>, binary: &str, _args: &[&str], _scratch: &Path) -> Result<CommandOutput, String> {
-        Ok(absent(binary))
+    fn detection(&self) -> Option<&dyn super::EnvironmentDetection> {
+        Some(self)
     }
 
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {
-        let docker = spec.docker.as_ref().filter(|_| spec.host_direct.is_none()).ok_or("dummy provider requires a Docker-kind spec")?;
+        let docker = spec.docker.as_ref().filter(|_| spec.host_direct.is_none()).ok_or("dummy provider requires legacy image inputs")?;
         Ok(PreparedEnvironment::new(&self.owner, docker.image.clone()))
     }
 
@@ -219,6 +221,13 @@ struct DummyEnvironment {
 
 #[async_trait]
 impl ProvisionedEnvironment for DummyEnvironment {
+    fn capabilities(&self) -> super::ProviderCapabilities {
+        DummyEnvironmentProvider::capability_declaration()
+    }
+    fn backing_id(&self) -> &str {
+        &self.container_name
+    }
+
     fn id(&self) -> &EnvironmentId {
         &self.id
     }
@@ -234,9 +243,14 @@ impl ProvisionedEnvironment for DummyEnvironment {
     fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
         self.mounts.clone()
     }
-    async fn status(&self) -> Result<EnvironmentStatus, String> {
-        Ok(if self.destroyed.load(Ordering::Acquire) { EnvironmentStatus::Stopped } else { EnvironmentStatus::Running })
+    async fn observe(&self) -> super::ProviderObservation {
+        super::ProviderObservation::new(if self.destroyed.load(Ordering::Acquire) {
+            super::ObservationState::Gone { cause: super::GoneCause::DestroyedByRequest }
+        } else {
+            super::ObservationState::Running
+        })
     }
+
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
         Ok(self.environment.clone())
     }
@@ -435,6 +449,33 @@ impl CommandRunner for DummyCommandRunner {
     }
 }
 
+#[async_trait]
+impl super::EnvironmentDetection for DummyEnvironmentProvider {
+    async fn detect(&self, _image: Option<&str>, binary: &str, _args: &[&str], _scratch: &Path) -> Result<CommandOutput, String> {
+        Ok(absent(binary))
+    }
+}
+
+impl DummyEnvironmentProvider {
+    fn capability_declaration() -> super::ProviderCapabilities {
+        super::ProviderCapabilities {
+            material_modes: vec![super::MaterialMode::Frozen, super::MaterialMode::Pushed, super::MaterialMode::Shared],
+            checkout_strategies: vec![
+                super::CheckoutStrategy::HostWorktree,
+                super::CheckoutStrategy::HostClone,
+                super::CheckoutStrategy::CloneInVessel,
+            ],
+            workspace_root: "/workspace".into(),
+            reference_root: Some("/ref/repo".into()),
+            fallback_runner: true,
+            receives_host_tools: false,
+            per_vessel: true,
+            egress_route: super::EgressRoute::Open,
+            ..Default::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use flotilla_resources::{DockerEnvironmentSpec, EnvironmentSpec};
@@ -480,7 +521,7 @@ mod tests {
         let one = provision(&provider, "one").await.expect("one");
         provision(&provider, "two").await.expect("two");
         one.destroy().await.expect("destroy active handle");
-        assert_eq!(one.status().await.expect("status"), EnvironmentStatus::Stopped);
+        assert_eq!(one.observe().await.state, super::super::ObservationState::Gone { cause: super::super::GoneCause::DestroyedByRequest });
         provider.destroy("flotilla-dummy-one").await.expect("destroy one");
         provider.destroy("one").await.expect("idempotent destroy");
         assert_eq!(*removed.lock().expect("removed"), vec!["one"]);
@@ -504,7 +545,7 @@ mod tests {
         let environment = handle.env_vars().await.expect("environment");
         assert_eq!(environment.get(DUMMY_FLEET_ENV).map(String::as_str), Some("1"));
         assert_eq!(environment.get("CREW").map(String::as_str), Some("coder"));
-        assert_eq!(handle.status().await, Ok(EnvironmentStatus::Running));
+        assert_eq!(handle.observe().await.state, super::super::ObservationState::Running);
         assert!(!provider.receives_host_tools(), "dummy crews need no delivered cleat or CLI");
         assert!(handle.local_image_id().is_some());
         // Provisioning the same identity again returns the realised handle.
