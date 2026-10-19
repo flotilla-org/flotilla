@@ -1,6 +1,4 @@
 //! Convoy admission, placement planning, and project operations.
-// async_trait-generated futures trigger this Clippy 1.99 lint, as in core.
-#![allow(clippy::double_must_use)]
 pub mod admission;
 pub mod admission_actions;
 pub mod convoy_admission;
