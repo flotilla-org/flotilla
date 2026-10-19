@@ -4,6 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_protocol::arg::shell_quote;
 use uuid::Uuid;
 
 use crate::{
@@ -62,7 +63,7 @@ impl SshCommandRunner {
     /// own positional arguments reach it.
     fn ssh_remote_args(&self, words: &[&str]) -> Vec<String> {
         let mut args: Vec<String> = self.ssh_prefix_args().into_iter().map(str::to_string).collect();
-        args.push(words.iter().map(|word| flotilla_protocol::arg::shell_quote(word)).collect::<Vec<_>>().join(" "));
+        args.push(words.iter().map(|word| shell_quote(word)).collect::<Vec<_>>().join(" "));
         args
     }
 
@@ -72,11 +73,11 @@ impl SshCommandRunner {
 
     fn remote_exec_script(&self, cmd: &str, args: &[&str], cwd: &Path) -> String {
         let mut parts = Vec::with_capacity(args.len() + 4);
-        parts.push(format!("cd {}", flotilla_protocol::arg::shell_quote(&cwd.to_string_lossy())));
+        parts.push(format!("cd {}", shell_quote(&cwd.to_string_lossy())));
         parts.push("&&".to_string());
         parts.push("exec".to_string());
-        parts.push(flotilla_protocol::arg::shell_quote(cmd));
-        parts.extend(args.iter().map(|arg| flotilla_protocol::arg::shell_quote(arg)));
+        parts.push(shell_quote(cmd));
+        parts.extend(args.iter().map(|arg| shell_quote(arg)));
         parts.join(" ")
     }
 
@@ -523,6 +524,8 @@ mod tests {
 
     impl LoopbackSsh {
         fn remote_command(args: &[&str]) -> String {
+            // Skips the prefix SshCommandRunner emits: bare flags and `-o X`.
+            // A new flag that takes a separate value must be added here.
             let mut index = 0;
             while index < args.len() && args[index].starts_with('-') {
                 index += if args[index] == "-o" { 2 } else { 1 };
