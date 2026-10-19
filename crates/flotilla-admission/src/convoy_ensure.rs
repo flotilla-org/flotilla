@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use flotilla_protocol::{CanonicalHostId, PrincipalRef};
+use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoyEnsure, ConvoyProvisioningState, Environment as ResourceEnvironment, EnvironmentPhase,
     ReadResourceObject, ResourceObject, CONVOY_LABEL,
@@ -61,8 +61,6 @@ pub trait ConvoyEnsureAdmission: Send + Sync {
         admission: PreparedConvoyAdmission,
         annotations: BTreeMap<String, String>,
     ) -> Result<String, String>;
-    async fn abandon(&self, namespace: &str, name: &str, reason: &str, principal_ref: Option<&PrincipalRef>) -> Result<(), String>;
-    async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String>;
 }
 
 /// Verifies the provider backing of a terminal standing convoy before the

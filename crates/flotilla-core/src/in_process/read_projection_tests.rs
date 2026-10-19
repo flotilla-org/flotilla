@@ -50,13 +50,13 @@ mod tests {
 
     use super::*;
     use crate::leaf_engine::LeafSubscriptionTable;
-    use crate::testkits::cr_name;
     use flotilla_change_request::observation::GhChangeRequestObservationSource;
     use flotilla_daemon_api::event_sink::EventSink;
     use flotilla_executor::environment_manager::EnvironmentManager;
     use flotilla_observation::change_request_observer::ChangeRequestRefreshCadence;
     use flotilla_observation::change_request_observer::ChangeRequestRefresher;
     use flotilla_projections::aggregator_projection::AggregatorProjectionState;
+    use flotilla_store_testkit::cr_name;
 
     use flotilla_protocol_testkit::event_sink::RecordingEventSink;
 

@@ -258,7 +258,7 @@ impl ProjectService<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::convoy_admission::ConvoyStartTask;
+
     use std::{
         path::Path,
         sync::{Arc, Mutex},
@@ -274,7 +274,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        project_ops::{ProjectOperations, RepositoryIndex},
+        project_ops::RepositoryIndex,
         repository_inspection::{RepositoryInspection, RepositoryInspector},
     };
 
@@ -302,65 +302,7 @@ mod tests {
         }
     }
 
-    struct Operations(Arc<LayerSource>);
-
-    #[async_trait]
-    impl ProjectOperations for Operations {
-        fn remember_bootstrap_checkout(&self, _: &RepositoryInspection) -> Result<(), String> {
-            Ok(())
-        }
-        async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
-            Ok(Arc::clone(&self.0) as Arc<dyn RepositoryInspector>)
-        }
-        async fn inspect_repository_path(&self, _: &Path, _: Option<&str>) -> Result<RepositoryInspection, String> {
-            Err("unexpected inspection".into())
-        }
-        async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
-            RepositorySpec::remote(remote)
-        }
-        async fn resolve_forge_identity_in(&self, _namespace: &str, spec: RepositorySpec) -> Result<RepositorySpec, String> {
-            Ok(spec)
-        }
-        async fn reap_ensured_convoy(&self, _: &str, _: &str, _: &str, _: bool) -> Result<(), String> {
-            Err("unexpected reap".into())
-        }
-
-        async fn inspect_adopted_checkout(
-            &self,
-            _path: &Path,
-            _repository_url: Option<&str>,
-            _git_ref: Option<&str>,
-        ) -> Result<RepositoryInspection, String> {
-            Err("unexpected inspect_adopted_checkout".into())
-        }
-        async fn project_add(
-            &self,
-            _target: &str,
-            _explicit_name: Option<&str>,
-            _explicit_display_name: Option<&str>,
-            _remote: Option<&str>,
-        ) -> Result<String, String> {
-            Err("unexpected project_add".into())
-        }
-        async fn project_refresh(&self, _name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
-            Err("unexpected project_refresh".into())
-        }
-        async fn image_check(
-            &self,
-            _request: &flotilla_protocol::image_check::ImageCheckRequest,
-        ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String> {
-            Err("unexpected image_check".into())
-        }
-        async fn project_register(&self, _target: &str) -> Result<(String, usize), String> {
-            Err("unexpected project_register".into())
-        }
-        async fn roll_convoy_ensure(&self, _namespace: &str, _name: &str) -> Result<String, String> {
-            Err("unexpected roll_convoy_ensure".into())
-        }
-        fn spawn_convoy_start(&self, _task: ConvoyStartTask) -> bool {
-            false
-        }
-    }
+    use crate::test_support::TestProjectOperations as Operations;
 
     fn layer_files(version: &str) -> BTreeMap<String, Vec<u8>> {
         BTreeMap::from([
@@ -415,7 +357,7 @@ mod tests {
         let observed = ResourceBackend::new(InMemoryBackend::observed());
         seed(&backend, None).await;
         let source = Arc::new(LayerSource::default());
-        let operations = Operations(source.clone());
+        let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
         let service = service(&backend, &observed, &clock, &namespace, &operations);
@@ -474,7 +416,7 @@ mod tests {
             seed(&backend, None).await;
             let source = Arc::new(LayerSource::default());
             *source.error.lock().unwrap() = Some("old /cache/shallow.lock refusal".into());
-            let operations = Operations(source.clone());
+            let operations = Operations::with_inspector(source.clone());
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let namespace = std::sync::RwLock::new("flotilla".to_string());
             let service = service(&backend, &observed, &clock, &namespace, &operations);
@@ -573,7 +515,7 @@ mod tests {
         seed(&backend, None).await;
         let source = Arc::new(LayerSource::default());
         *source.files.lock().expect("files") = Some(layer_files("1.0.0"));
-        let operations = Operations(Arc::clone(&source));
+        let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
         let service = ProjectService {
@@ -657,7 +599,7 @@ mod tests {
         seed(&backend, Some(CharterPointer::Inline { documents: Vec::new(), files: BTreeMap::new() })).await;
         let source = Arc::new(LayerSource::default());
         *source.files.lock().expect("files") = Some(layer_files("1.0.0"));
-        let operations = Operations(Arc::clone(&source));
+        let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
         let service = service(&backend, &observed, &clock, &namespace, &operations);

@@ -285,7 +285,11 @@ async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Op
     .await;
     daemon
         .install_convoy_ensure_reconciler(Arc::new(
-            EnsureReconciler::builder().resource_backend(daemon.resource_backend()).clock(Arc::new(SystemClock)).build(),
+            EnsureReconciler::builder()
+                .teardown(daemon.convoy_teardown())
+                .resource_backend(daemon.resource_backend())
+                .clock(Arc::new(SystemClock))
+                .build(),
         ))
         .await;
     daemon

@@ -1,148 +1,68 @@
 //! Convoy admission state and transaction boundary.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(test)]
 use async_trait::async_trait;
-use chrono::DateTime;
-use chrono::Duration as ChronoDuration;
-use chrono::Utc;
-use flotilla_agent::adapter::required_agent_adapters;
-use flotilla_agent::adapter::CapabilityTable;
-use flotilla_agent::adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use flotilla_agent::adapter::{
+    minimum_harness_version, required_agent_adapters, CapabilityTable, CrewAssignment, CrewBriefTemplateResolver,
+};
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
-use flotilla_ai_utility::AiUtility;
-use flotilla_ai_utility::ConvoyNames;
+use flotilla_ai_utility::{AiUtility, ConvoyNames};
 use flotilla_change_request::branch_lookup_observer::BranchLookupObserver;
-use flotilla_change_request::observation::ChangeRequestKey;
-use flotilla_change_request::observation::ChangeRequestObservationSource;
+use flotilla_change_request::observation::{ChangeRequestKey, ChangeRequestObservationSource};
 use flotilla_change_request::ChangeRequestTracker;
-use flotilla_charter::ops_entry::ENSURED_FROM_ANNOTATION;
-use flotilla_charter::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
-use flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION;
+use flotilla_charter::ops_entry::{ENSURED_FROM_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION};
 use flotilla_config::ConfigStore;
-use flotilla_discovery::AiUtilityFactory;
-use flotilla_discovery::DiscoveryRuntime;
+use flotilla_discovery::{AiUtilityFactory, DiscoveryRuntime};
 use flotilla_discovery_api::{provider_config::ProviderConfigView, EnvironmentBag};
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
-use flotilla_observation::sources::ChangeRequestQueryPort;
-use flotilla_observation::sources::IssueQueryPort;
-use flotilla_observation::sources::ProviderChangeRequestObservationSource;
+use flotilla_observation::sources::{ChangeRequestQueryPort, IssueQueryPort, ProviderChangeRequestObservationSource};
 #[cfg(test)]
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::result_set::ConvoyChangeRequest;
-use flotilla_protocol::AttachBinding;
-use flotilla_protocol::CanonicalHostId;
-use flotilla_protocol::CommandValue;
-use flotilla_protocol::ConvoyDispatchRegard;
-use flotilla_protocol::ConvoyNaming;
-use flotilla_protocol::EnvironmentId;
-use flotilla_protocol::FulfilmentAllocation;
-use flotilla_protocol::FulfilmentAllocationCandidate;
-use flotilla_protocol::HostName;
-use flotilla_protocol::PlacementDecision;
-use flotilla_protocol::PlacementRefusal;
-use flotilla_protocol::PlacementTargetHost;
-use flotilla_protocol::PlacementViableCandidate;
-use flotilla_protocol::PrincipalRef;
-use flotilla_protocol::ResourceRef;
-use flotilla_protocol::ViewAddress;
-use flotilla_provider_runtime::CommandRunner;
-use flotilla_provider_runtime::ObservationError;
+use flotilla_protocol::{
+    AttachBinding, CanonicalHostId, CommandValue, ConvoyDispatchRegard, ConvoyNaming, EnvironmentId, FulfilmentAllocation,
+    FulfilmentAllocationCandidate, HostName, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate,
+    PrincipalRef, ResourceRef, ViewAddress,
+};
+use flotilla_provider_runtime::{CommandRunner, ObservationError};
 use flotilla_resources::address::{record_name, remote_change_request_address};
-use flotilla_resources::api_version;
-use flotilla_resources::capped_github_app_permissions;
 use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
-use flotilla_resources::normalize_issue_source;
-use flotilla_resources::AllocationDecision;
-use flotilla_resources::BoundChangeRequest;
-use flotilla_resources::CapabilityNeed;
-use flotilla_resources::ChangeRequest as ResourceChangeRequest;
-use flotilla_resources::Checkout as ResourceCheckout;
-use flotilla_resources::Clock;
-use flotilla_resources::Convoy as ResourceConvoy;
-use flotilla_resources::ConvoyEnsure;
-use flotilla_resources::ConvoyIssue;
-use flotilla_resources::ConvoyRepositorySpec;
-use flotilla_resources::ConvoySpec;
-use flotilla_resources::ConvoyStatusPatch;
-use flotilla_resources::CredentialConsumer;
-use flotilla_resources::CredentialGrant;
-use flotilla_resources::CredentialSpec;
-use flotilla_resources::CrewSource;
-use flotilla_resources::CrewSpec;
-use flotilla_resources::Forge;
-use flotilla_resources::FulfilmentGrant;
-use flotilla_resources::FulfilmentKind;
-use flotilla_resources::Host as ResourceHost;
-use flotilla_resources::InputMeta;
-use flotilla_resources::InputValue;
-use flotilla_resources::IssueSnapshot;
-use flotilla_resources::IssueSourceResolution;
-use flotilla_resources::IssueSourceUnavailable;
-use flotilla_resources::ObjectMeta;
-use flotilla_resources::ObservedChangeRequestState;
-use flotilla_resources::PlacementPolicy;
-use flotilla_resources::PlacementPolicySpec;
-use flotilla_resources::Platform;
-use flotilla_resources::Project;
-use flotilla_resources::ProjectSpec;
-use flotilla_resources::ReadResourceObject;
-use flotilla_resources::Repository;
-use flotilla_resources::RepositoryKey;
-use flotilla_resources::RepositoryTrust;
-use flotilla_resources::Resource;
-use flotilla_resources::ResourceError;
-use flotilla_resources::ResourceObject;
-use flotilla_resources::ResourceProvenance;
-use flotilla_resources::RoleHandoff;
-use flotilla_resources::SupervisionTarget;
-use flotilla_resources::TerminalCrewContext;
-use flotilla_resources::VesselRequirement;
-use flotilla_resources::WorkflowTemplate;
-use flotilla_resources::WorkflowTemplateSpec;
-use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
-use flotilla_resources::GENERATION_LABEL;
-use flotilla_resources::PROJECT_LABEL;
-use flotilla_resources::ROLE_LABEL;
+use flotilla_resources::{
+    api_version, capped_github_app_permissions, normalize_issue_source, AllocationDecision, BoundChangeRequest, CapabilityNeed,
+    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, Clock, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource, CrewSpec, Forge,
+    FulfilmentGrant, FulfilmentKind, Host as ResourceHost, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec,
+    ReadResourceObject, Repository, RepositoryKey, RepositoryTrust, Resource, ResourceError, ResourceObject, ResourceProvenance,
+    RoleHandoff, SupervisionTarget, TerminalCrewContext, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    BRIEF_ARTIFACTS_ANNOTATION, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+};
 #[cfg(test)]
 use flotilla_resources::{HoldAct, RepositorySpec, SystemClock};
-use flotilla_store::apply_status_patch as apply_resource_status_patch;
-use flotilla_store::resolve_project_issue_sources;
-use flotilla_store::ResourceBackend;
-use flotilla_store::{DockerImageSourceStoreExt, ResolvedCascadeStoreExt, StoreQuery};
+use flotilla_store::{
+    apply_status_patch as apply_resource_status_patch, resolve_project_issue_sources, DockerImageSourceStoreExt, ResolvedCascadeStoreExt,
+    ResourceBackend, StoreQuery,
+};
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
-use sha2::Digest;
-use sha2::Sha256;
-use tokio::sync::Mutex;
-use tokio::sync::RwLock;
+use sha2::{Digest, Sha256};
+use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
 use crate::project_ops;
-use crate::regard_lifecycle::RegardLifecycle;
-use crate::regard_lifecycle::SurfaceGestureOutcome;
-use crate::support::authoritative_placement_host;
-use crate::support::check_placement_capacity;
-use crate::support::ensure_prepared_placement_snapshot;
-use crate::support::ensure_prepared_workflow_snapshot;
-use crate::support::home_copy_wins_by_name;
-use crate::support::host_generation;
-use crate::support::placement_actuator_host_ref;
-use crate::support::placement_host_not_ready_reason;
-use crate::support::placement_host_ref;
-use crate::support::placement_target_host;
-use crate::support::policy_targets_agentless_ssh;
-use crate::support::prepared_snapshot_name;
-use crate::support::unready_placement_refusal;
-use crate::support::validate_docker_placement_host;
+use crate::regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome};
+use crate::support::{
+    authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot,
+    home_copy_wins_by_name, host_generation, placement_actuator_host_ref, placement_host_not_ready_reason, placement_host_ref,
+    placement_target_host, policy_targets_agentless_ssh, prepared_snapshot_name, unready_placement_refusal, validate_docker_placement_host,
+};
 
 /// Routing uses replicated observations as hints; only admission may refuse on
 /// destination-owned facts, credentials, or the installed skill catalog.
@@ -762,7 +682,6 @@ impl ConvoyAdmission {
         .await
     }
 
-    #[doc(hidden)]
     async fn decide_capability_placement(
         &self,
         context: &PlacementContext<'_>,
@@ -5274,8 +5193,8 @@ mod tests {
         FulfilmentCostClass, FulfilmentKindSpec, FulfilmentRealisation, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
     };
 
-    use super::cr_name;
     use super::*;
+    use flotilla_store_testkit::cr_name;
 
     use flotilla_discovery_testkit::FakeChangeRequest;
     use flotilla_protocol::ChangeRequest;
@@ -6411,12 +6330,4 @@ impl IssueQueryPort for FixtureQueries {
     ) -> Result<Arc<dyn flotilla_issue_tracker::IssueProvider>, String> {
         Ok(Arc::new(flotilla_discovery_testkit::FakeIssueProvider::default()))
     }
-}
-
-#[cfg(test)]
-fn cr_name(service: &str, scope: &str, number: u64) -> String {
-    flotilla_resources::address::record_name(
-        &flotilla_resources::address::stored_change_request_address(service, scope, number, &[]).expect("change request address"),
-    )
-    .expect("record name")
 }

@@ -86,7 +86,7 @@ Stored shapes are unaffected by moving code. Any crate move that changes a seria
 The step-4 survey found core and store code with no home in the target crates. Owner rulings:
 
 - **Change feed.** Domain code drifted into `flotilla-store` because the store is the only component that publishes domain changes. The change-feed interface (typed watches, indexed views and the controller runtime) is the seam domain crates depend on; persistence is one backend behind it. It stays in `flotilla-store`'s public API until the resident-state redesign lifts it into its own crate. `flotilla-store` holds only generic machinery: the store trait, queries, views and watches, the controller runtime, owner garbage collection and dynamic kinds. A build-graph rule refusing domain modules in it lands with the store-goes-domain-free stream of #3152; until then the rule is a review check.
-- **`flotilla-observation`** (new): the change-request, issue and forge observers and the observed-resource projection, turning provider facts into observed resources. It sits between the provider type crates, which stay storage-free, and the store. It owns the public `ChangeRequestQueryPort` and `IssueQueryPort`; core supplies their provider-resolution implementations. It is expected to become event-log driven.
+- **`flotilla-observation`** (new): the change-request, issue and forge observers and the observed-resource projection, turning provider facts into observed resources. It sits between the provider type crates, which stay storage-free, and the store. It owns the public `ChangeRequestQueryPort` and `IssueQueryPort`; core supplies their provider-resolution implementations. It is expected to become event-log driven. ADR 0060's observation entry lists `ConvoyBranchRefresh` among the observation results that capability crates share.
 - **`flotilla-messaging`**: delivery (with the `MessageTransport` seam that agent-channel transports implement), inbox, retention, conditions and role routing (including charter notifications), moved out of `flotilla-store`. Receiver resolution moves with messaging and reads resource kinds directly; there is no receiver-resolution port. The primitives-model mission #3108 will replace it with role bindings. `MessageQuery` stays a pure pushdown-query data type in the store interface; SQL translation and memory indexing belong to the respective backends (resolution #3297, extraction #3298).
 - **Reconcilers live with the capability that owns their kind,** and `flotilla-controllers` retires. Each capability crate exports its reconcilers; the daemon registers them.
   - `flotilla-admission`: standing-convoy ensure and vessel placement.
@@ -107,6 +107,8 @@ registration/refresh and project image layers. Standing-convoy admission ports
 and the default fail-closed backing inspector live with this capability; the
 reverse reconciler port and install step remain in place until #3492.
 
+ADR 0060's admission entry records that the ensure reconciler tears down through admission's `ConvoyTeardown` port, which the composition root implements over crew operations.
+
 Core composes admission with three owned ports:
 
 - `ConvoyTeardown` supplies `abandon` and `reap` over the crew service.
@@ -126,8 +128,7 @@ are accessed through admission's public accessor, not its state field.
 
 Shared naming, architecture aliases, checkout path selection, crew accounting
 and the brief-artifact marker live in resources. `BriefArtifactWriter` lives in
-agent, command-event helpers in daemon-api, and the change-request observation
-result `ConvoyBranchRefresh` in observation. Consumers import these APIs from
+agent and command-event helpers in daemon-api. Consumers import these APIs from
 their owners directly. The build-graph guard registers admission as a capability
 and refuses other capabilities, composition, provider reachbacks and the
 state-machine engine. These moves change no resource schema or wire shape.

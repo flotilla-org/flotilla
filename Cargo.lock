@@ -1151,7 +1151,6 @@ dependencies = [
  "flotilla-messaging",
  "flotilla-observation",
  "flotilla-paths",
- "flotilla-projections",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
  "flotilla-provider-runtime",
@@ -1170,7 +1169,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "url",
  "uuid",
 ]
 

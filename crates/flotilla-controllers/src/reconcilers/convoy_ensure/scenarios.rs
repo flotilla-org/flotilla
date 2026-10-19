@@ -14,8 +14,13 @@ use flotilla_store::ResourceBackend;
 struct Controller;
 #[async_trait]
 impl EnsureScenarioController for Controller {
-    fn create(&self, backend: ResourceBackend, clock: Arc<dyn Clock>) -> Arc<dyn ConvoyEnsureReconciler> {
-        Arc::new(EnsureReconciler::builder().resource_backend(backend).clock(clock).build())
+    fn create(
+        &self,
+        teardown: Arc<dyn flotilla_admission::ports::ConvoyTeardown>,
+        backend: ResourceBackend,
+        clock: Arc<dyn Clock>,
+    ) -> Arc<dyn ConvoyEnsureReconciler> {
+        Arc::new(EnsureReconciler::builder().teardown(teardown).resource_backend(backend).clock(clock).build())
     }
     async fn dependency_hash(
         &self,
@@ -24,6 +29,7 @@ impl EnsureScenarioController for Controller {
         ensure: &ResourceObject<ConvoyEnsure>,
     ) -> Result<String, String> {
         EnsureReconciler::builder()
+            .teardown(daemon.convoy_teardown())
             .resource_backend(daemon.resource_backend())
             .clock(daemon.clock_for_scenarios())
             .build()
@@ -32,6 +38,7 @@ impl EnsureScenarioController for Controller {
     }
     async fn start(&self, daemon: &InProcessDaemon, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String> {
         EnsureReconciler::builder()
+            .teardown(daemon.convoy_teardown())
             .resource_backend(daemon.resource_backend())
             .clock(daemon.clock_for_scenarios())
             .build()
