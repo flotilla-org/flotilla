@@ -1,68 +1,89 @@
-# Inbox reference implementations
+# Inbox bounded filtered replica
 
-The [component workload](../../crates/flotilla-inbox/WORKLOAD.md) records the
-operations, inherited scales, arithmetic, bounds and expiry of the reference
-implementations from #3316.
+The Message inbox uses store-independent admission order, a Pending-only index,
+an owned create hook, borrowed observation snapshots and rebuildable Home values.
+The [component workload](../../crates/flotilla-inbox/WORKLOAD.md) owns the size
+formula, measurements, ceiling arithmetic and access-cost numbers.
 
-The open seam is InboxBackend: foreign backends implement its operations
-without inheriting the engine, SQLite or the reference implementations' indexes.
-For the two local implementations, one Home decides Message edges and its Log
-persists them. The SQLite StoreLog promotes the schema integration test's
-insert/apply-edge transaction boundary; no table or stored kind changes.
+## Resident state and recovery
 
-A per-inbox BTree index ordered by admission sequence serves pending reads. A globally bounded journal serves
-watch deltas. A separate channel per subscriber would multiply backlog by the
-root ceiling of 500 clients; scanning history per cursor would make successive
-pulls quadratic. The journal's indexed ranges and shared payloads avoid both.
-At 10,000 changes/s its 65,536-entry default bridges about 6.5 seconds. A slow
-reader gets CursorExpired rather than silently missing changes. After expiry,
-establish a live watch (no cursor), then read the pending baseline and continue
-that watch. Both result streams materialize one item per pull.
+The adapter maintains a budgeted cache of complete per-inbox Pending order,
+local inbox bindings/live clocks, and a recency-evicted cache of typed open
+Message values and receipts. Within budget, pending uses cached admission keys
+and loads an absent value once. If a complete inbox order cannot fit, that inbox
+uses the declared pending_by_inbox index by admission; a returned resource is
+restored without another body load. Index identity metadata excludes other homes
+before decoding bodies. Value eviction does not affect the independent key cache.
+Cache pressure never refuses admission or recovery. Groups are cached whole,
+without retaining a separate set of spilled inbox names. A nonempty inbox whose
+order has spilled continues reading the store until it empties; recovery may
+cache its order again if it fits. Mid-stream spill uses an exclusive admitted_seq
+lower bound, so previously emitted rows are never decoded again.
 
-A single writer lock spans each engine decision and its persistence. Tokio
-blocking workers own that work, behind 64 permits, so SQLite does not block an
-async executor thread and the blocking pool's submission queue stays bounded.
-The 64 permits accommodate the root's roughly 59 budgeted durable writes/s with
-about one second of admission backlog; callers beyond that wait asynchronously.
-Notifications are registered before looking for a change. A bind that finds an
-observed receipt waits outside the writer and retries after delivery.
+Settled/Dropped values leave Home after the operation. An explicit terminal read
+is keyed; historical state is decoded from the source entry, never from today's
+terminal body. Reply, supersession and dead-letter existence checks use resolve
+without loading those resources. Receipts use the master's declared about index.
 
-Binding sets and gate evidence are home-local observations. Receipt ports must
-commit Receive on the named consumer's resource before reporting success. Mode
-rules are ordered, use conjunctive optional selectors, and default to Turn.
-Dead letters have deterministic identities derived from their source message,
-so recovery can finish a reaction interrupted after the source drop. An explicit reaction-provenance set, rebuilt from dropped sources on recovery,
-forces Notify for those dead letters; an ordinary system message still
-uses the caller's rules. The supervision port supplies the declared system role,
-leaving real system-sender mapping to #3317.
+Restart streams the home-scoped scan for open values, live inbox counts/clocks,
+receipts and interrupted Undeliverable reactions. It rebuilds Pending order from
+key-only reads of the declared index, never from scan order or a second body
+decode. The store applies the home filter before its page limit. Only values and
+inbox-order groups that fit their cache allowances are retained. Bindings remain local observations.
+An Unbound clock starts when an empty inbox gains its first open message, and
+recovery creates one only for inboxes with open messages. When the last open
+message settles or drops, an unbound inbox releases its clock; refilling starts
+a fresh period. Bound inbox behavior is unchanged. A missing required clock is
+a returned error rather than a panic.
 
-The no-production-caller assumption is enforced in ci/build-graph/check.py.
-Home's full resident resources and history are a deliberately smaller reference
-query model: at the inherited ceiling they exceed the daemon budget. This
-choice expires before the #3317 production switch. The open trait, streamed
-results, and explicit expired-cursor outcome allow compact open-state views,
-indexed cold reads and archival without a public contract migration. The
-contract and its conformance suite remain the acceptance boundary for that work.
+Values are evicted before required live controls. Admission and restart retain
+those controls even when a custom target is too small; setup of explicit bindings
+and consumer keys has a capacity check. A binding update beyond the
+setup ceiling returns a Storage capacity error before mutating the binding; it
+does not silently degrade or discard a receiver. This unavoidable live-state
+floor is sized against live inbox cardinality, not terminal history. Actual oldest
+and newest retained state times describe coverage; no retention horizon is fixed.
+Oversized values remain cold.
 
-SQLite consumer ports identify their shared Store/home scope. A port on another
-store is rejected before Receive rather than allowing its event to reuse the
-inbox's unchanged cursor. Publication also enforces strictly increasing cursors.
-Repeated Drop keeps the machine's Ended refusal, even when it repairs a pending
-reaction: it never records a second Message edge. Construction uses fallible open;
-synchronous register_blocking/get_blocking are setup/diagnostic only, with async worker
-variants available for runtime callers. Poisoning the writer requires reopening.
+## Approved engine and storage seams
 
-Quint parsing, graph traversal, trace/step/stream types, small helpers and the
-Message mapping/race replay live once in dev-only flotilla-quint-testkit. The
-engine's other scenario replays stay in its integration test. Shared race replay
-probes expiry against evidence written by the deadline, including rows not yet
-applied at the home, through both real adapters. Full-graph conformance remains
-with the engine; backends replay only message_race. Both run from
-specs/primitives/check.sh in the existing Quint job.
+Home decides admission. Log::create_resource owns the admitted resource,
+persists it, and returns exactly the committed resource to Home. Its default
+delegates to Log::create for other machines. MessageLog specializes this
+hook: it assigns admitted_seq inside the same Store lock/write transaction as
+insert and commit. It changes only persistence metadata, not gate-read fields,
+identity, state or recorded inputs. The memory source assigns admission under
+its own authoritative storage lock.
 
-SQLite recovery loads current Message state and consumer receipts, then starts
-an empty watch journal. Every pre-restart cursor expires, including the last
-committed cursor. A fresh live tail precedes reading a pending baseline;
-post-restart cursors resume normally. No historical store replay is needed.
-The resident query model, watch journal and worker permits are replaced by
-#3466 before production use.
+Observations::with_snapshot borrows one consistent generation. The adapter
+uses Table::select to copy only the declared Message read set, including exact
+versions and absences; debug/test Source lookups assert membership. A missing snapshot is a
+returned error. Home::evict removes only reconstructible values, leaving their authoritative log intact.
+
+## Watches and cursor loss
+
+Watches read the authoritative source through a separate reader handle. They do
+not acquire the inbox writer mutex or its worker admission lock. Readers await
+one shared handle before submitting blocking work; decoded source pages are not
+retained as a journal. Store serialization can still contend with commits, but a
+long engine decision does not prevent a source read. Source page limits bound
+reads. Memory uses the equivalent authoritative read.
+
+Lag and restart alone do not expire retained cursors. The cursor-loss
+policy is deliberately conservative: **any missing home sequence returns
+CursorExpired, including a sequence removed by a logged expunge**. Thus one
+resource's expunge expires older cursors at that home even when their subscribers
+watch unrelated inboxes. Logged expunge is not distinguished from
+unexplained loss. Resume after the gap can work; clients needing an older
+baseline must resynchronize.
+
+## Expiry
+
+Revisit this shape when cold reads, reader fanout, startup or bind latency miss
+the deployment budget, when live controls exceed the workload envelope, or when
+new address/body shapes fail allocation calibration. Cache exhaustion itself uses
+the declared fallback rather than requiring admission refusal. Large-backlog
+cold-bind scheduling remains #3491; a new index requires owner look-over.
+The memory backend's authoritative store remains in-memory and is separate from
+the filtered replica's sizing. Archive, expunge policy and disk-growth measurement
+remain separate work.

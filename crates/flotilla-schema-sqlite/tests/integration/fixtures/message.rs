@@ -100,6 +100,7 @@ pub fn spec(tc: &TestCase, pick: Pick) -> MessageSpec {
     MessageSpec {
         sender: address(tc),
         inbox: address(tc),
+        admitted_seq: tc.draw(gs::integers::<u64>().max_value(i64::MAX as u64)),
         relation: code_enum(tc, pick, &[Relation::Supervisor, Relation::Peer, Relation::Dependency, Relation::Dependee, Relation::System]),
         body: body(tc, pick),
         references: references(tc, pick),

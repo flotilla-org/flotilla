@@ -11,10 +11,11 @@ use flotilla_state_machines::machines::{
     message::{MessageSpec, MessageState},
 };
 use hegel::{generators as gs, TestCase};
+use rusqlite::Connection;
 
 use crate::fixtures::{
-    convoy, ensure, message, origin, store, terminal, terminal::TerminalRequest, AgentSession, Convoy, Ensure, Fixture, Message, Pick,
-    Referral, Resource, TerminalSession, Vessel, LOCAL,
+    convoy, ensure, message, origin, registry, store, terminal, terminal::TerminalRequest, AgentSession, Convoy, Ensure, Fixture, Message,
+    Pick, Referral, Resource, TerminalSession, Vessel, LOCAL,
 };
 
 /// Every id of `query`, page by page with `limit`. Each page holds at most `limit` ids, a page
@@ -77,6 +78,7 @@ fn drawn_spec(tc: &TestCase, message: Resource<Message>) -> Resource<Message> {
     let spec = MessageSpec {
         inbox: project(&tc.draw(gs::sampled_from(vec!["i0".to_owned(), "i1".to_owned()]))),
         deadline: tc.draw(gs::booleans()).then(|| small_time(tc)),
+        admitted_seq: tc.draw(gs::integers::<u64>().max_value(110)),
         ..message::spec(tc, Pick::Draw)
     };
     message.with_spec(spec)
@@ -91,14 +93,108 @@ fn check_messages(tc: &TestCase, store: &mut Store, model: &BTreeMap<ResourceId,
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(4));
     for inbox in ["i0", "i1"] {
         let inbox = project(inbox);
-        let want = expected(model, |m| open(m) && m.spec().inbox == inbox, |_| ());
-        assert_eq!(collect(store, &MessageSpec::open_by_inbox(&inbox), limit), want, "open_by_inbox {inbox}");
+        let want = expected(model, |m| *m.state() == MessageState::Pending && m.spec().inbox == inbox, |m| m.spec().admitted_seq);
+        assert_eq!(collect(store, &MessageSpec::pending_by_inbox(&inbox), limit), want, "pending_by_inbox {inbox}");
     }
     let want = expected(model, |m| open(m) && m.spec().deadline.is_some(), |m| m.spec().deadline.map(Timestamp::micros));
     assert_eq!(collect(store, &MessageSpec::deadline(), limit), want, "deadline");
     let all: Vec<ResourceId> = model.keys().copied().collect();
     assert_eq!(scan_all::<Resource<Message>>(store, LOCAL, limit), all, "scan");
     assert_eq!(scan_all::<Resource<Message>>(store, "elsewhere", limit), Vec::<ResourceId>::new());
+}
+
+// Behaviour: Pending order is the numeric, home-assigned admission
+// sequence carried by the row, even when replicas assign different local ids and other homes
+// share the inbox. Paging must preserve each home's order across 9/10 and 99/100 local ids.
+#[hegel::test(test_cases = 12)]
+fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
+    // Generate page boundaries and a rotation of snapshot arrival order. Both replicas always
+    // cross a decimal id boundary, and the sources always cross the 9/10 admission boundary.
+    let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(5));
+    let rotation = tc.draw(gs::integers::<usize>().max_value(23));
+    let mut snapshots = Vec::new();
+    for home in ["sender-a", "sender-b"] {
+        let mut source = Store::open(Connection::open_in_memory().expect("db"), home, registry()).expect("source");
+        let mut write = source.write().expect("write");
+        for admitted_seq in 1..=12 {
+            let value = message::sample().with_spec(MessageSpec { admitted_seq, ..message::sample_spec() });
+            let stamp = write.insert(&format!("message-{admitted_seq}"), &value, &origin()).expect("insert");
+            // Each fixture insert consumes one home sequence; this checks the
+            // source allocation assumption before testing replication/order.
+            assert_eq!(stamp.version, admitted_seq, "fixture uses the create's home sequence");
+            snapshots.push(write.load_snapshot(stamp.id).expect("snapshot").expect("present"));
+        }
+        write.commit().expect("commit");
+    }
+    snapshots.rotate_left(rotation);
+
+    let mut assigned_ids = Vec::new();
+    for padding in [0, 90] {
+        let mut replica = store();
+        // These unrelated local rows change surrogate ids, never the replicated order column.
+        insert_messages(&mut replica, padding, |_| message::sample_in(project("unrelated")));
+        let mut write = replica.write().expect("write");
+        let mut identities = BTreeMap::new();
+        for snapshot in &snapshots {
+            let stamp = write.restore(snapshot).expect("restore");
+            identities.insert((snapshot.home.clone(), snapshot.name.clone()), stamp.id);
+        }
+        write.commit().expect("commit");
+        let boundary = if padding == 0 { 10 } else { 100 };
+        assert!(identities.values().any(|id| id.0 == boundary - 1));
+        assert!(identities.values().any(|id| id.0 == boundary));
+        assigned_ids.push(identities);
+
+        let ids = collect(&mut replica, &MessageSpec::pending_by_inbox(&project("inbox")), limit);
+        let mut read = replica.read().expect("read");
+        let rows: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let snapshot = read.load_snapshot(*id).expect("snapshot").expect("present");
+                let value = snapshot.decode::<Resource<Message>>().expect("decode");
+                assert_eq!(value.spec().admitted_seq, snapshot.version, "replication preserved admission");
+                (value.spec().admitted_seq, snapshot.home, snapshot.name)
+            })
+            .collect();
+        let want_sequences: Vec<u64> = (1..=12).flat_map(|seq| [seq, seq]).collect();
+        assert_eq!(rows.iter().map(|(seq, _, _)| *seq).collect::<Vec<_>>(), want_sequences);
+        for home in ["sender-a", "sender-b"] {
+            let names: Vec<_> = rows.iter().filter(|(_, row_home, _)| row_home == home).map(|(_, _, name)| name.clone()).collect();
+            assert_eq!(names, (1..=12).map(|seq| format!("message-{seq}")).collect::<Vec<_>>());
+        }
+        // The key-only lower-bound route returns the same home order without bodies,
+        // excluding tied admissions at other homes before applying each page limit.
+        for home in ["sender-a", "sender-b"] {
+            let query = MessageSpec::pending_by_inbox(&project("inbox"));
+            let mut after = 0;
+            let mut keys = Vec::new();
+            loop {
+                let page = read.integer_index_keys(&query, home, after, limit).expect("integer keys");
+                assert!(page.len() <= limit as usize);
+                if page.is_empty() {
+                    break;
+                }
+                after = page.last().unwrap().1;
+                for (id, seq) in page {
+                    let (identity, _) = read.identity(id).unwrap().unwrap();
+                    assert_eq!(identity.home, home);
+                    keys.push((seq, identity.name));
+                }
+            }
+            assert_eq!(keys, (1..=12).map(|seq| (seq, format!("message-{seq}"))).collect::<Vec<_>>());
+            assert!(read.integer_index_keys(&query, home, 12, 1).unwrap().is_empty());
+            assert!(read.integer_index_keys(&query, home, i64::MAX, 1).unwrap().is_empty());
+            assert_eq!(read.integer_index_keys(&query, home, i64::MIN, 1).unwrap()[0].1, 1);
+            assert!(matches!(
+                read.integer_index_keys(&EnsureSpec::by_inbox(&project("inbox")), home, 0, 1),
+                Err(StoreError::IntegerIndex { .. })
+            ));
+            assert!(read.integer_index_keys(&query, "missing", 0, limit).unwrap().is_empty());
+            assert!(matches!(read.integer_index_keys(&query, home, 0, 0), Err(StoreError::ZeroLimit)));
+        }
+        snapshots.reverse();
+    }
+    assert!(assigned_ids[0].iter().all(|(identity, id)| assigned_ids[1][identity] != *id));
 }
 
 // Behaviour (DESIGN queries, #3320): after any sequence of inserts, spec edits, edges and deletes, paging a
@@ -282,7 +378,7 @@ fn unknown_arguments_give_an_empty_page_and_create_nothing() {
     let mut store = store();
     insert_messages(&mut store, 2, |_| message::sample());
     let mut read = store.read().expect("read");
-    let page = read.page(&MessageSpec::open_by_inbox(&project("never")), None, 10).expect("page");
+    let page = read.page(&MessageSpec::pending_by_inbox(&project("never")), None, 10).expect("page");
     assert_eq!(page, Page { ids: vec![], next: None });
     let page = read.page(&Referral::by_session(&Ref::new("never", LOCAL)), None, 10).expect("page");
     assert!(page.ids.is_empty());
@@ -312,10 +408,10 @@ fn cursors_are_bound_to_their_query() {
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
-    let inbox = MessageSpec::open_by_inbox(&project("inbox"));
+    let inbox = MessageSpec::pending_by_inbox(&project("inbox"));
     let cursor = read.page(&inbox, None, 1).expect("page").next.expect("more follow");
     assert_eq!(read.page(&inbox, Some(&cursor), 5).expect("continue").ids.len(), 2);
-    let other_inbox = MessageSpec::open_by_inbox(&project("other"));
+    let other_inbox = MessageSpec::pending_by_inbox(&project("other"));
     assert!(matches!(read.page(&other_inbox, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
     let deadline = MessageSpec::deadline();
     assert!(matches!(read.page(&deadline, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
@@ -330,7 +426,7 @@ fn limits_are_required_and_capped() {
     let mut store = store();
     insert_messages(&mut store, MAX_PAGE as usize + 1, |_| message::sample());
     let mut read = store.read().expect("read");
-    let inbox = MessageSpec::open_by_inbox(&project("inbox"));
+    let inbox = MessageSpec::pending_by_inbox(&project("inbox"));
     assert!(matches!(read.page(&inbox, None, 0), Err(StoreError::ZeroLimit)));
     assert!(matches!(read.scan::<Resource<Message>>(LOCAL, None, 0), Err(StoreError::ZeroLimit)));
     let page = read.page(&inbox, None, u32::MAX).expect("page");

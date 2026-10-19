@@ -242,6 +242,15 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
         self.resources.get(name)
     }
 
+    /// Removes only this home's read replica value. The log remains authoritative;
+    /// a storage adapter may restore the value before the next keyed operation.
+    /// The resident duplicate check (`WriteError::Exists`) is no longer
+    /// authoritative for evicted names: the log must enforce source uniqueness
+    /// if a caller tries to create that name again.
+    pub fn evict(&mut self, name: &str) -> Option<Resource<M>> {
+        self.resources.remove(name)
+    }
+
     pub fn resources(&self) -> impl Iterator<Item = &Resource<M>> {
         self.resources.values()
     }
@@ -267,9 +276,9 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
         if state.label() != self.definition.initial() {
             return Err(WriteError::Fault(Fault::Initial { state: state.label() }));
         }
-        let mut resource = Resource::stored(name.clone(), spec, State::new(state, now), Version(0));
+        let resource = Resource::stored(name.clone(), spec, State::new(state, now), Version(0));
         let reads = admission.into_reads();
-        resource.version = self.log.create(&self.writer, now, &resource, &reads).map_err(WriteError::Log)?;
+        let resource = self.log.create_resource(&self.writer, now, resource, &reads).map_err(WriteError::Log)?;
         Ok(Created { resource: self.resources.entry(name).or_insert(resource), reads })
     }
 

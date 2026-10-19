@@ -321,6 +321,21 @@ impl Read<'_> {
         self.ctx().page(query, after, limit)
     }
 
+    /// Key-only read of a declared single-integer-order index, restricted to one home.
+    /// Returns ids and their order values strictly greater than `after`, without decoding bodies.
+    /// The bound is an order value, not a store-local cursor. Rows tied at the bound are excluded;
+    /// callers paginating by this value must have a unique order within their home.
+    /// The ordinary positive/capped listing limit applies.
+    pub fn integer_index_keys<K>(
+        &mut self,
+        query: &IndexQuery<K>,
+        home: &str,
+        after: i64,
+        limit: u32,
+    ) -> Result<Vec<(ResourceId, i64)>, StoreError> {
+        self.ctx().integer_index_keys(query, home, after, limit)
+    }
+
     /// The startup scan: up to `limit` resources of kind `K` homed at `home` with ids above `after`,
     /// in id order, through `resource_identity_by_home`. The one sanctioned pass over a whole kind;
     /// everything else reads by key or declared index.

@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use flotilla_inbox::{
-    sqlite::{SqliteInbox, StoreLog},
+    sqlite::{MessageLog, SqliteInbox, StoreLog},
     EngineInbox, MemoryInbox, MemoryInboxLog,
 };
 use flotilla_inbox_testkit::{consumer, Evidence, Factory, Harness, SessionPort, Supervisors};
@@ -46,7 +46,8 @@ impl Factory for Sqlite {
                 .expect("store"),
         ));
         let evidence = Arc::new(Evidence::default());
-        let backend = EngineInbox::open("test", StoreLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
+        let backend =
+            EngineInbox::open("test", MessageLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
         for name in ["a", "b"] {
             backend.register_blocking(consumer(name), SessionPort::new(name, StoreLog::new(store.clone())));
         }
@@ -64,10 +65,10 @@ async fn sqlite_contract() {
 }
 
 // Behaviour: SQLite recovery reads the actual Receive entries about a message;
-// a receipt remains deliverable after reopening, old cursors expire, and a
-// fresh live tail observes only post-restart changes.
+// a receipt remains deliverable after reopening, old cursors resume from the
+// durable log, and a fresh live tail observes only post-restart changes.
 #[tokio::test]
-async fn sqlite_recovers_receipts_and_expires_old_cursors() {
+async fn sqlite_recovers_receipts_and_resumes_log_cursors() {
     use flotilla_inbox::{Cursor, InboxBackend};
     use flotilla_inbox_testkit::{inbox, spec};
     use flotilla_state_machines::{machines::message::Deliver, Transport};
@@ -77,7 +78,7 @@ async fn sqlite_recovers_receipts_and_expires_old_cursors() {
             .expect("store"),
     ));
     let evidence = Arc::new(Evidence::default());
-    let backend = SqliteInbox::open("test", StoreLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
+    let backend = SqliteInbox::open("test", MessageLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
     backend.register_blocking(consumer("a"), SessionPort::new("a", StoreLog::new(store.clone())));
     backend.bind(inbox(), consumer("a")).await.expect("bind");
     let message = backend.enqueue(spec()).await.expect("enqueue");
@@ -85,11 +86,17 @@ async fn sqlite_recovers_receipts_and_expires_old_cursors() {
     let created = watch.next().await.expect("create").expect("event");
     backend.receive(&consumer("a"), &message, Transport::Turn).await.expect("receive");
     let receipt = watch.next().await.expect("receipt").expect("event");
+    let mut lagged = Vec::new();
+    for _ in 0..3 {
+        lagged.push(backend.enqueue(spec()).await.expect("lagged create"));
+    }
     drop(watch);
     drop(backend);
-    let backend = SqliteInbox::open("test", StoreLog::new(store), evidence, Arc::new(Supervisors)).expect("recover");
-    for cursor in [created.cursor, receipt.cursor] {
-        assert!(matches!(backend.watch(&inbox(), Some(cursor)).await, Err(flotilla_inbox::Error::CursorExpired)));
+    let backend = SqliteInbox::open("test", MessageLog::new(store), evidence, Arc::new(Supervisors)).expect("recover");
+    let mut replay = backend.watch(&inbox(), Some(created.cursor)).await.expect("durable cursor survives restart");
+    assert_eq!(replay.next().await.expect("receipt").expect("event"), receipt);
+    for message in lagged {
+        assert_eq!(replay.next().await.expect("lagged create").expect("event").message, message);
     }
     let mut live = backend.watch(&inbox(), None).await.expect("fresh live tail");
     backend.deliver(&message, Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("recovered receipt");
@@ -150,21 +157,21 @@ fn rule_selectors_and_precedence(tc: hegel::TestCase) {
     assert_eq!(Rules(vec![fallback, rule]).choose(&spec()), Transport::Mute);
 }
 
-// Behaviour: a lagging watcher gets an explicit terminal cursor-expired error,
-// and can establish a fresh live tail before obtaining a pending baseline.
+// Behaviour: a lagging reader resumes from authoritative memory history; a fresh live tail starts at the current log.
 #[tokio::test]
-async fn watch_expiry_and_live_restart() {
-    use flotilla_inbox::{Cursor, Error, InboxBackend, WATCH_HISTORY};
+async fn log_watch_survives_lag() {
+    use flotilla_inbox::{Cursor, Error, InboxBackend};
     use flotilla_inbox_testkit::{inbox, spec};
     use futures::StreamExt;
     let harness = Memory.create();
     let mut lagging = harness.backend.watch(&inbox(), Some(Cursor(0))).await.expect("watch");
-    for _ in 0..=WATCH_HISTORY {
+    let first = harness.backend.enqueue(spec()).await.expect("first");
+    for _ in 0..8 {
         harness.backend.enqueue(spec()).await.expect("enqueue");
     }
-    assert!(matches!(lagging.next().await, Some(Err(Error::CursorExpired))));
-    assert!(lagging.next().await.is_none(), "expired stream terminates");
-    assert!(matches!(harness.backend.watch(&inbox(), Some(Cursor(0))).await, Err(Error::CursorExpired)));
+    assert_eq!(lagging.next().await.expect("retained event").expect("change").message, first);
+    let mut replay = harness.backend.watch(&inbox(), Some(Cursor(0))).await.expect("old cursor retained");
+    assert_eq!(replay.next().await.expect("first").expect("change").message, first);
     let mut live = harness.backend.watch(&inbox(), None).await.expect("fresh live tail");
     let next = harness.backend.enqueue(spec()).await.expect("new message");
     assert_eq!(live.next().await.expect("new event").expect("change").message, next);
@@ -185,8 +192,8 @@ async fn sqlite_rejects_consumer_in_another_store() {
     };
     let local = make_store();
     let foreign = make_store();
-    let backend =
-        SqliteInbox::open("test", StoreLog::new(local.clone()), Arc::new(Evidence::default()), Arc::new(Supervisors)).expect("open inbox");
+    let backend = SqliteInbox::open("test", MessageLog::new(local.clone()), Arc::new(Evidence::default()), Arc::new(Supervisors))
+        .expect("open inbox");
     backend.register_blocking(consumer("a"), SessionPort::new("a", StoreLog::new(foreign.clone())));
     let message = backend.enqueue(spec()).await.expect("enqueue");
     let before = foreign.lock().expect("store").read().expect("read").last_sequence("test").expect("sequence");
