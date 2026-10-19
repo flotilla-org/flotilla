@@ -18,23 +18,6 @@ use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::{fake_discovery, fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders};
 use flotilla_daemon_api::daemon::DaemonHandle;
 
-// UTC-to-monotonic conversion must preserve a future header deadline and keep
-// expired/zero deadlines from causing a burst of concurrent cache misses.
-#[tokio::test(start_paused = true)]
-async fn observation_cache_deadline_crosses_both_clocks() {
-    let wall = chrono::DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z").expect("fixed UTC timestamp").with_timezone(&chrono::Utc);
-    let retry = wall + chrono::Duration::seconds(60);
-    let expires = tokio::time::Instant::now() + super::observation_cache_delay(Some(retry), wall);
-    tokio::time::advance(std::time::Duration::from_secs(59)).await;
-    assert!(tokio::time::Instant::now() < expires);
-    assert_eq!(super::observation_cache_delay(Some(retry), wall + chrono::Duration::seconds(59)), std::time::Duration::from_secs(1));
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    assert_eq!(tokio::time::Instant::now(), expires);
-    for now in [retry, retry + chrono::Duration::seconds(1)] {
-        assert_eq!(super::observation_cache_delay(Some(retry), now), std::time::Duration::from_secs(9));
-    }
-}
-
 // #1496 operator follow-up: host provider observations and CLI summaries are
 // independent of tracked roots; the published status remains the query authority.
 #[hegel::test]

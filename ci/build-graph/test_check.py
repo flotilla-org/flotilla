@@ -121,6 +121,21 @@ class BuildGraphContract(unittest.TestCase):
                             violations(graph(package("flotilla-messaging", **{kind: (middle,)}),
                                              package("adapter", normal=(target,)), package(target))))
 
+    def test_observation_refuses_upper_layers(self):
+        self.assertNotIn("flotilla-observation", CAPABILITY_CRATES)
+        # Finite generator covers every forbidden layer, direct/transitive and normal/build edges.
+        for target in ("flotilla-core", "flotilla-daemon", "flotilla-controllers",
+                       "flotilla-projections", "flotilla-credentials", "flotilla-messaging",
+                       "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-github-providers", "flotilla-forgejo-providers",
+                       "flotilla-discovery", "flotilla-environment", "flotilla-vcs", "flotilla-terminal", "flotilla-agent",
+                       "flotilla-ai-utility", "flotilla-cloud-agent", "flotilla-dummy-fleet", "flotilla-fake-forge", *CAPABILITY_CRATES):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertIn(f"flotilla-observation: must not depend on {target}, directly or transitively",
+                            violations(graph(package("flotilla-observation", **{kind: (middle,)}),
+                                             package("adapter", normal=(target,)), package(target))))
+
     def test_schema_crates_are_a_self_contained_stack(self):
         # #3320: derive and schema are C-free base crates; sqlite is native. Each may use
         # flotilla-cbor, the schema crates below it and the build-feature anchors.
@@ -472,7 +487,7 @@ class BuildGraphContract(unittest.TestCase):
     def test_forge_providers_cannot_reach_orchestration(self):
         # #3480: forge providers stay below capabilities and composition.
         for component in ("flotilla-github-providers", "flotilla-forgejo-providers"):
-            for target in ("flotilla-executor", "flotilla-projections", "flotilla-core", "flotilla-daemon", "flotilla-messaging"):
+            for target in ("flotilla-executor", "flotilla-projections", "flotilla-core", "flotilla-daemon", "flotilla-messaging", "flotilla-observation"):
                 self.assert_boundary(component, target)
 
     def assert_boundary(self, component, target):

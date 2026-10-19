@@ -1106,7 +1106,7 @@ async fn lost_crew_session_stalls_with_dead_evidence_but_stale_busy_screen_does_
         backend.clone(),
         "test-host".into(),
         Arc::new(UnavailableChangeRequests),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let wake = ReconcilerWake::new(LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher));
     create_convoy(
@@ -1205,7 +1205,7 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
         backend.clone(),
         "test-host".to_string(),
         Arc::new(UnavailableChangeRequests),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let wake = ReconcilerWake::new(LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher));
     create_convoy(&backend, "delivery", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
@@ -1351,7 +1351,7 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
         backend.clone(),
         "authority".into(),
         Arc::new(LimitedSource(error)),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let subject = ChangeRequestKey::new(
         "flotilla",

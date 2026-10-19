@@ -1492,7 +1492,7 @@ impl ProjectService<'_> {
                 );
             }
         }
-        crate::observed_resources::reconcile_checkouts(
+        flotilla_observation::observed_resources::reconcile_checkouts(
             self.observed_resource_backend,
             namespace,
             repository_key,

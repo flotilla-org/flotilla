@@ -13,6 +13,7 @@ skip-no-sandbox-tests = ["flotilla-executor/skip-no-sandbox-tests", "flotilla-st
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-messaging = { path = "../flotilla-messaging" }
+flotilla-observation = { path = "../flotilla-observation" }
 flotilla-projections = { path = "../flotilla-projections" }
 flotilla-executor = { path = "../flotilla-executor" }
 flotilla-capability-contract = { path = "../flotilla-capability-contract" }

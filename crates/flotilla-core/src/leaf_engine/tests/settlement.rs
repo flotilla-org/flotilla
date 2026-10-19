@@ -6,7 +6,7 @@ async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
     let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
-    let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
+    let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
         state: Duration::from_secs(3600),
         checks_pending: Duration::from_millis(20),
         freshness_demanded: Duration::from_millis(20),
@@ -158,7 +158,7 @@ fn generated_active_checks_settlement_deduplicates_heads(tc: hegel::TestCase) {
 async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
-    let cadence = crate::change_request_observer::ChangeRequestRefreshCadence::default();
+    let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default();
     let refresher = ChangeRequestRefresher::new(
         "fleet".to_string(),
         backend.clone(),
@@ -228,7 +228,7 @@ async fn change_request_bound_after_claims_instantiates_and_settles() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
     let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
-    let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
+    let cadence = flotilla_observation::change_request_observer::ChangeRequestRefreshCadence {
         state: Duration::from_millis(20),
         checks_pending: Duration::from_millis(20),
         freshness_demanded: Duration::from_millis(20),

@@ -19,7 +19,7 @@ A system for improving multi-agent developer workflows. Consists of a daemon mes
 
 ### Plane-A freeze (transition in progress)
 
-Flotilla is consolidating its provider integrations and k8s-isomorphic control plane around resources. Provider refreshes still gather adapter data, while discovered checkout facts are projected into a second, ephemeral `ResourceBackend` by `crates/flotilla-core/src/observed_resources.rs`. The Aggregator combines observed and durable resources into query result sets for the TUI. See `docs/roadmap.md`, `CONTEXT.md`, and the ADRs in `docs/adr/`; the umbrella is flotilla-org/flotilla#604.
+Flotilla is consolidating its provider integrations and k8s-isomorphic control plane around resources. Provider refreshes still gather adapter data, while discovered checkout facts are projected into a second, ephemeral `ResourceBackend` by `crates/flotilla-observation/src/observed_resources.rs`. The Aggregator combines observed and durable resources into query result sets for the TUI. See `docs/roadmap.md`, `CONTEXT.md`, and the ADRs in `docs/adr/`; the umbrella is flotilla-org/flotilla#604.
 
 **The remaining Plane-A peer layer is bugfix-only.** Do not add net-new features to the peer-merge subsystem (`crates/flotilla-daemon/src/peer/`); it is slated for deletion as multi-host behavior finishes moving to resource-store federation. Bugfixes and tests are fine. New multi-host capability belongs in resource replication and the eventual Tender. If a change feels like it grows peer-merge, stop and check the roadmap.
 
@@ -121,6 +121,8 @@ See [ADR 0058](docs/adr/0058-environment-providers-own-lifecycle-and-runtime-cap
 for provider selection, preparation ownership, host adoption and image capability boundaries.
 
 
+`flotilla-observation` is a shared layer below the capability crates. It turns provider facts into observed resources through forge-neutral query ports; core supplies provider discovery and keeps the observed-checkout reconciliation lock.
+
 Provider observations and control-plane resources meet at the Aggregator:
 
 ```
@@ -157,7 +159,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-discovery` | Static factory-list assembly, default detector lists, detector runs, provider discovery, host-scoped provider cache, `ProviderRegistry` and provider status |
 | `flotilla-charter` | Charter inputs read through a `RevisionedTree` (Git via `Vcs`, or a local directory): `project.yaml` declarations, operational entries and their provenance annotations, charter locks and source status |
 | `flotilla-executor` | Provider-backed command handlers, step plans and resolution, remote step batches, environment management and host orchestration ports |
-| `flotilla-core` | Refresh, observed-resource projection, convoy admission and controller ports, `InProcessDaemon` composition root |
+| `flotilla-observation` | Provider-neutral change-request, issue and forge observation, demand servicing and observed-resource projection |
+| `flotilla-core` | Refresh, convoy admission and controller ports, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
 | `flotilla-config` | Host-local config files (`config.toml`, `daemon.toml`, `hosts.toml`, observation roots, open views), provider preference values, default checkout path and bounded log files |
@@ -206,7 +209,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-executor/src/executor/` | Executor submodules: checkout, session actions and tests |
 | `crates/flotilla-core/src/model.rs` | `RepoModel` and provider label/name helpers |
 | `crates/flotilla-executor/src/data.rs` | Checkout status inspection |
-| `crates/flotilla-core/src/observed_resources.rs` | Projects discovered and adopted Checkouts into the ephemeral observed-resource store |
+| `crates/flotilla-observation/src/observed_resources.rs` | Projects discovered and adopted Checkouts into the ephemeral observed-resource store |
 | `crates/flotilla-executor/src/step.rs` | Step planning and execution system |
 | `crates/flotilla-agent/src/adapter.rs` | Agent harness adapters, `AgentAdapterRegistry`, capability table and crew brief rendering |
 | `crates/flotilla-agent/src/hooks.rs`, `crates/flotilla-agent/src/store.rs` | Agent hook handling and state management |

@@ -97,7 +97,7 @@ def violations(metadata):
         errors.append("flotilla-client: must not depend on flotilla-core, directly or transitively")
     for component in ("flotilla-config", "flotilla-provider-runtime", "flotilla-discovery-api", "flotilla-vcs", "flotilla-environment", "flotilla-terminal", "flotilla-cloud-agent", "flotilla-ai-utility", "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-change-request", "flotilla-issue-tracker", "flotilla-agent", "flotilla-discovery", "flotilla-dummy-fleet", "flotilla-charter"):
         for target in ("flotilla-core", "flotilla-credentials",
-                       "flotilla-controllers", "flotilla-daemon", "flotilla-store", *sorted(CAPABILITY_CRATES)):
+                       "flotilla-controllers", "flotilla-daemon", "flotilla-store", "flotilla-observation", *sorted(CAPABILITY_CRATES)):
             if component in packages and target in packages and reaches(component, target):
                 errors.append(f"{component}: must not depend on {target}, directly or transitively")
     # #3480: forge-neutral contracts and forge-specific adapters have separate graphs.
@@ -106,13 +106,20 @@ def violations(metadata):
             if component in packages and target in packages and reaches(component, target):
                 errors.append(f"{component}: must not depend on {target}, directly or transitively")
     for component in ("flotilla-github-providers", "flotilla-forgejo-providers"):
-        for target in sorted(CAPABILITY_CRATES | {"flotilla-core", "flotilla-daemon", "flotilla-projections", "flotilla-messaging"}):
+        for target in sorted(CAPABILITY_CRATES | {"flotilla-core", "flotilla-daemon", "flotilla-projections", "flotilla-messaging", "flotilla-observation"}):
             if component in packages and target in packages and reaches(component, target):
                 errors.append(f"{component}: must not depend on {target}, directly or transitively")
     for capability in sorted(CAPABILITY_CRATES & packages.keys()):
         for target in (*CAPABILITY_FORBIDDEN, *sorted(CAPABILITY_CRATES - {capability})):
             if target in packages and reaches(capability, target):
                 errors.append(f"{capability}: must not depend on {target}, directly or transitively")
+    # Observation is shared below capabilities and uses forge-neutral traits only.
+    for target in (*CAPABILITY_FORBIDDEN, "flotilla-projections", "flotilla-messaging", *sorted(CAPABILITY_CRATES),
+                   "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-github-providers", "flotilla-forgejo-providers",
+                   "flotilla-discovery", "flotilla-environment", "flotilla-vcs", "flotilla-terminal", "flotilla-agent",
+                   "flotilla-ai-utility", "flotilla-cloud-agent", "flotilla-dummy-fleet", "flotilla-fake-forge"):
+        if "flotilla-observation" in packages and target in packages and reaches("flotilla-observation", target):
+            errors.append(f"flotilla-observation: must not depend on {target}, directly or transitively")
     # Messaging remains below crew capabilities; receiver resolution reads resources.
     for target in (*CAPABILITY_FORBIDDEN, "flotilla-projections", *sorted(CAPABILITY_CRATES)):
         if "flotilla-messaging" in packages and target in packages and reaches("flotilla-messaging", target):

@@ -15,9 +15,9 @@ use flotilla_store::ResourceBackend;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::{test_meta, SuspendedBoardProvider};
-use crate::forge_observation::OWNER_LOCAL_INCREMENTAL_READ_ERROR;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::{fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders};
+use flotilla_observation::forge_observation::OWNER_LOCAL_INCREMENTAL_READ_ERROR;
 use flotilla_protocol::ChangeRequest;
 
 // #2868: three daemons sharing a Project poll its source once per pass.
@@ -133,7 +133,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     let refreshers = daemons
         .iter()
         .map(|daemon| {
-            crate::change_request_observer::ChangeRequestRefresher::new(
+            flotilla_observation::change_request_observer::ChangeRequestRefresher::new(
                 "topology".into(),
                 daemon.resource_backend(),
                 daemon.resource_backend().local_root().unwrap().to_string(),
@@ -163,7 +163,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     // positive unready evidence. Ready replicas must not steal its source.
     for daemon in &daemons {
         assert_eq!(
-            crate::forge_observation::source_owner(&daemon.resource_backend(), "flotilla", &source).await.unwrap(),
+            flotilla_observation::forge_observation::source_owner(&daemon.resource_backend(), "flotilla", &source).await.unwrap(),
             Some(daemons[0].resource_backend().local_root().unwrap())
         );
     }
@@ -195,7 +195,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
 
     for daemon in &daemons {
         assert_eq!(
-            crate::forge_observation::source_owner(&daemon.resource_backend(), "flotilla", &source).await.unwrap(),
+            flotilla_observation::forge_observation::source_owner(&daemon.resource_backend(), "flotilla", &source).await.unwrap(),
             Some(daemons[0].resource_backend().local_root().unwrap()),
             "Project sources: {:?}; Hosts: {:?}",
             daemon.resource_backend().including_replicas::<Project>("flotilla").list_replica_sources().await.unwrap(),
@@ -267,7 +267,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     let expected = daemons[1..].iter().map(|daemon| daemon.resource_backend().local_root().unwrap()).min().unwrap();
     for daemon in &daemons {
         assert_eq!(
-            crate::forge_observation::source_owner(&daemon.resource_backend(), "flotilla", &source).await.unwrap(),
+            flotilla_observation::forge_observation::source_owner(&daemon.resource_backend(), "flotilla", &source).await.unwrap(),
             Some(expected.clone())
         );
     }
@@ -340,7 +340,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     replicate::<ResourceHost>(&daemons).await;
     for daemon in &daemons {
         assert_eq!(
-            crate::forge_observation::source_owner(&daemon.resource_backend(), "flotilla", &source).await.unwrap(),
+            flotilla_observation::forge_observation::source_owner(&daemon.resource_backend(), "flotilla", &source).await.unwrap(),
             Some(daemons[0].resource_backend().local_root().unwrap())
         );
         let reads = daemon.resource_backend().using::<ForgeRead>("flotilla");

@@ -25,7 +25,7 @@ use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, Re
 use super::support::{test_meta, BatchedObservationRunner};
 use crate::in_process::CrewCompletionRefusalCause;
 use crate::in_process::InProcessDaemon;
-use crate::in_process::{forge_service_matches, repository_observes_subject};
+
 use crate::testkits::cr_name;
 use crate::testkits::discovery::fake_discovery_with_runner;
 
@@ -746,35 +746,6 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         "a persisted turn episode prevents duplicate Active conflict delivery after restart"
     );
     restarted.abort();
-}
-
-#[test]
-fn observation_service_matching_preserves_http_and_authority_port() {
-    assert!(forge_service_matches("http://forgejo.local:3000", "forgejo.local:3000"));
-    assert!(forge_service_matches("https://github.com/", "github.com"));
-    assert!(!forge_service_matches("http://forgejo.local:3000", "forgejo.local:3001"));
-}
-
-// A Forge-identity repository's subjects carry its forge_ref, a DNS label that
-// can never equal the web authority (#3206 found these were never observed).
-#[test]
-fn forge_identity_subjects_resolve_their_repository() {
-    let forge = flotilla_resources::ForgeSpec {
-        forge_id: "lab".into(),
-        kind: flotilla_resources::ForgeKind::Forgejo,
-        hosts: ["forgejo.lab.example".to_string()].into(),
-        https_url: "https://forgejo.lab.example".into(),
-        git_ssh_host: "forgejo.lab.example".into(),
-    };
-    let spec =
-        RepositorySpec::remote("https://forgejo.lab.example/team/app.git").and_then(|spec| spec.on_forge(&forge)).expect("forge spec");
-    assert!(repository_observes_subject(&spec, "lab", "team/app"));
-    assert!(repository_observes_subject(&spec, "forgejo.lab.example", "team/app"), "web authority still matches");
-    assert!(!repository_observes_subject(&spec, "lab", "team/other"));
-    assert!(!repository_observes_subject(&spec, "elsewhere", "team/app"));
-    let remote = RepositorySpec::remote("https://github.com/team/app.git").expect("remote spec");
-    assert!(repository_observes_subject(&remote, "github.com", "team/app"));
-    assert!(!repository_observes_subject(&remote, "lab", "team/app"));
 }
 
 use crate::testkits::in_process_ext::InProcessDiscoveryExt;

@@ -531,7 +531,7 @@ async fn issue_turn_delivery_fires_once_for_changed_issue() {
         backend.clone(),
         "authority".into(),
         Arc::new(UnavailableChangeRequests),
-        crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
     let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher);
     let actuator = Arc::new(RecordingTurnDelivery::default());

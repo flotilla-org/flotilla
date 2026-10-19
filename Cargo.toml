@@ -38,6 +38,7 @@ members = [
     "crates/flotilla-load-driver",
     "crates/flotilla-issue-tracker",
     "crates/flotilla-manifest",
+    "crates/flotilla-observation",
     "crates/flotilla-orchestration-testkit",
     "crates/flotilla-paths",
     "crates/flotilla-provider-runtime",
@@ -78,6 +79,7 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yml = "0.0.12"
 tokio-util = "0.7"
 hegeltest = "=0.48.1"
@@ -149,7 +151,7 @@ reqwest = { workspace = true, features = ["json"] }
 toml_edit = "0.22"
 libc = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 flotilla-daemon = { path = "crates/flotilla-daemon" }

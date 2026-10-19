@@ -1462,7 +1462,12 @@ impl ConvoyAdmission {
                     let _reconciliation = self.observed_checkout_reconciliation.lock().await;
                     let cleanup = async {
                         self.backend.clone().using::<ResourceCheckout>(namespace).delete(&checkout_ref).await?;
-                        crate::observed_resources::delete_stale_adopted_checkouts(&self.backend, &self.observed_backend, namespace).await
+                        flotilla_observation::observed_resources::delete_stale_adopted_checkouts(
+                            &self.backend,
+                            &self.observed_backend,
+                            namespace,
+                        )
+                        .await
                     }
                     .await;
                     if let Err(error) = cleanup {
@@ -3983,9 +3988,9 @@ pub(super) async fn discover_repository_change_request_with(
     for factory in &discovery.factories.change_requests {
         match factory.probe(&bag, config, &probe_root, Arc::clone(&discovery.runner)).await {
             Ok(provider) => {
-                return Ok(Arc::new(crate::forge_observation::ObservedChangeRequestTracker {
+                return Ok(Arc::new(flotilla_observation::forge_observation::ObservedChangeRequestTracker {
                     inner: provider,
-                    reads: crate::forge_observation::ForgeReads::new(resource_backend.clone(), namespace.into()),
+                    reads: flotilla_observation::forge_observation::ForgeReads::new(resource_backend.clone(), namespace.into()),
                     source: flotilla_protocol::IssueSource { service: identity.service_url.clone(), scope: identity.repository.clone() },
                 }))
             }
@@ -5138,7 +5143,7 @@ pub(super) async fn handler_contract_fixture() -> HandlerContractFixture {
         local_environment_id: local_environment_id.clone(),
     });
     let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(ProviderIssueQueryPort {
-        forge_reads: crate::forge_observation::ForgeReads::new(resource_backend.clone(), "flotilla".into()),
+        forge_reads: flotilla_observation::forge_observation::ForgeReads::new(resource_backend.clone(), "flotilla".into()),
         host_providers: Mutex::new(HashMap::new()),
         backend: resource_backend.clone(),
         config: config.clone(),
