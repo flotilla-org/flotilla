@@ -205,6 +205,13 @@ impl<K: Kind> Table<K> {
         self.clock
     }
 
+    /// Writes `value` as read at `version` from its own source, as a routed
+    /// or replicated read records the version it saw.
+    pub fn put_at(&mut self, reference: &Ref<K>, value: K::Value, version: Version) {
+        self.clock = self.clock.max(version);
+        self.rows.insert(reference.name.clone(), (version, value));
+    }
+
     pub fn remove(&mut self, reference: &Ref<K>) -> Option<K::Value> {
         self.rows.remove(&reference.name).map(|(_, value)| value)
     }

@@ -87,6 +87,10 @@ forge:github/repo:flotilla-org%2Fflotilla/issue:7           an issue
 forge:github/repo:flotilla-org%2Fflotilla/commit:<sha>      a commit (the full 40-character SHA)
 ```
 
+`message` is a kind that sits under an inbox address: `<inbox address>/message:<id>`. A message sent with a de-duplication key takes the digest of its inbox, sender and key as its id, so a repeated key names the same message; an imported message keeps its earlier record name.
+
+Fleet-wide roles are roles of the fleet's designated project (`FleetDesignation`): `project:<designated project>/role:<name>`. There is no root `role:` segment. Changing the designation changes these addresses.
+
 - **A reference is an address plus a revision.** This replaces `MessageReference` and its two spellings of a CR.
 - **A condition (Leaf)** is an address, a field path, an operator and a literal. Field-path segments and literals use JSON string quoting when they contain anything other than a bare word. The printer always produces the canonical form, so print-then-parse returns exactly what went in.
 - **Templates** (`$cr .checks == passing`) use the same field-path and literal rules.

@@ -67,7 +67,7 @@ pub fn expectation(tc: &TestCase, pick: Pick) -> Expectation {
     match pick.digit(tc, 3, 1) {
         0 => Expectation::Nothing,
         1 => Expectation::Reply,
-        _ => Expectation::Outcome { condition: address(tc) },
+        _ => Expectation::Outcome { condition: super::condition(tc) },
     }
 }
 
@@ -109,7 +109,7 @@ pub fn spec(tc: &TestCase, pick: Pick) -> MessageSpec {
         expectation: expectation(tc, pick),
         deadline: pick.some(tc, 8).then(|| timestamp(tc)),
         unbound_after: tc.draw(gs::integers::<i64>()),
-        delivery_condition: pick.some(tc, 12).then(|| address(tc)),
+        delivery_condition: pick.some(tc, 12).then(|| super::condition(tc)),
     }
 }
 
@@ -159,7 +159,7 @@ pub fn candidates(tc: &TestCase, message: &Resource<Message>) -> Vec<Candidate<M
     candidates.push((Settle { by: Settlement::Answered }.into(), boxed(world), now));
     if let Expectation::Outcome { condition } = &spec.expectation {
         let mut world = MemoryMessageWorld::default();
-        world.condition.put(&Ref::new(condition.as_str()), true);
+        world.condition.put(&Ref::new(condition.to_string()), true);
         candidates.push((Settle { by: Settlement::OutcomeObserved }.into(), boxed(world), now));
     }
 

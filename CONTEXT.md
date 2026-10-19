@@ -57,7 +57,8 @@ segments over a closed kind enum, project, convoy and role to start, shown as
 `project:flotilla/convoy:stack-3152/role:coder`. There is no vessel segment, so
 replacing a vessel never changes an address, and new kinds never change
 existing addresses. Every role is declared with a one-line purpose; a Message
-to an undeclared role is refused at send time with the reason. A person's own
+to an undeclared role is refused at send time with the reason. A role is a
+declared destination that can be bound to any handler. A person's own
 inbox is a declared role, replacing `principal:<name>`. Role names may be
 dynamic, such as `coder-pr45`, with the role type as an attribute of the
 **Inbox**. A Message's sender is a declared role too: a person sends as their

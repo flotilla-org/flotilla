@@ -551,4 +551,16 @@ mod shape {
         assert!(demo.is_under(&demo));
         assert!(!demo.is_under(&role));
     }
+
+    #[test]
+    fn a_message_sits_under_its_inbox_role() {
+        let inbox = Address::project("fleet").and_then(|p| p.child(Kind::Role, "turn-rules")).expect("role");
+        let message = Address::message(&inbox, "message-0a1b").expect("message");
+        assert_eq!(message.as_str(), "project:fleet/role:turn-rules/message:message-0a1b");
+        assert_eq!(message.parent(), Some(inbox.clone()));
+        assert_eq!(message.as_str().parse::<Address>().expect("parses"), message);
+        assert!(Address::message(&Address::project("fleet").expect("project"), "x").is_err());
+        assert!("message:x".parse::<Address>().is_err());
+        assert!(message.child(Kind::Message, "y").is_err());
+    }
 }

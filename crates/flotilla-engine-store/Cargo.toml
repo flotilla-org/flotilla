@@ -1,0 +1,28 @@
+[package]
+name = "flotilla-engine-store"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "The ADR 0064 engine's storage port: Log and ReceiptLog over flotilla-schema-sqlite, one transaction per write"
+
+[dependencies]
+flotilla-schema = { path = "../flotilla-schema" }
+flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-state-machines = { path = "../flotilla-state-machines" }
+
+[dev-dependencies]
+rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
+
+[lints]
+workspace = true
+
+# Keep native library features stable across build and test commands: the
+# anchors of flotilla-schema-sqlite, which this crate wraps.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-sqlite = { path = "../flotilla-build-features-sqlite" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

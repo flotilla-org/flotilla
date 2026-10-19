@@ -7,6 +7,7 @@ mod environments;
 mod health;
 mod message;
 mod ports;
+mod primitives;
 mod seed;
 mod state;
 mod tasks;
@@ -146,6 +147,11 @@ impl DaemonRuntime {
         phase("set_provisioning_namespace", daemon.set_provisioning_namespace(options.namespace.clone())).await;
         let aggregator_projection_state = phase("aggregator_projection_state", daemon.aggregator_projection_state()).await;
         let daemon_config = config.load_daemon_config()?;
+        // ADR 0064 switch-over (#3317): `[primitives]` moves Message onto the
+        // engine and its store; refused without `[dummy_fleet]`. Absent, nothing changes.
+        if daemon_config.primitives()?.is_some() {
+            phase("open_message_primitives", open_message_primitives(&daemon, &config)).await?;
+        }
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
         let forge_default_branches = crate::dummy_fleet::dummy_forge_default_branches(daemon_config.dummy_fleet.as_ref());
@@ -596,25 +602,37 @@ impl StartupRestoration {
             },
         )));
         let audit_daemon = Arc::clone(daemon);
-        controller_tasks.push(AbortOnDropHandle::new(spawn_periodic_task(
-            Duration::from_secs(60 * 60),
-            PeriodicTaskStart::Immediate,
-            move || {
-                let daemon = Arc::clone(&audit_daemon);
-                async move {
-                    match daemon.resource_backend().local_namespaces::<flotilla_resources::Message>().await {
-                        Ok(namespaces) => {
-                            for namespace in namespaces {
-                                if let Err(error) = daemon.message_inbox(&namespace).await.compact_audit(Utc::now()).await {
-                                    warn!(%error, %namespace, "Message audit retention sweep failed");
+        // The old store's audit sweep compacts old Messages; on the engine path there are none.
+        if daemon.message_primitives().is_none() {
+            controller_tasks.push(AbortOnDropHandle::new(spawn_periodic_task(
+                Duration::from_secs(60 * 60),
+                PeriodicTaskStart::Immediate,
+                move || {
+                    let daemon = Arc::clone(&audit_daemon);
+                    async move {
+                        match daemon.resource_backend().local_namespaces::<flotilla_resources::Message>().await {
+                            Ok(namespaces) => {
+                                for namespace in namespaces {
+                                    if let Err(error) = daemon.message_inbox(&namespace).await.compact_audit(Utc::now()).await {
+                                        warn!(%error, %namespace, "Message audit retention sweep failed");
+                                    }
                                 }
                             }
+                            Err(error) => warn!(%error, "Message retention namespace inventory failed"),
                         }
-                        Err(error) => warn!(%error, "Message retention namespace inventory failed"),
                     }
+                },
+            )));
+        }
+        if let (Some(primitives), Some(state)) = (daemon.message_primitives(), self.state.as_ref()) {
+            let delivery = self::primitives::MessageDelivery::new(Arc::clone(state), primitives, options.namespace.clone());
+            let interval = options.controller_resync_interval.min(Duration::from_secs(1));
+            controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
+                if let Err(error) = delivery.run(interval).await {
+                    warn!(%error, "engine message delivery stopped");
                 }
-            },
-        )));
+            })));
+        }
         controller_tasks.push(AbortOnDropHandle::new(spawn_dispatch_reconciler_task(
             Arc::clone(daemon),
             options.namespace.clone(),
@@ -834,30 +852,6 @@ fn spawn_controller_loops(
                 )
             }
         }),
-        {
-            let state = Arc::clone(&state);
-            let health = runtime_health.clone();
-            spawn_resource_controller::<flotilla_resources::Message, _, _>(
-                backend.clone(),
-                namespace_string.clone(),
-                supervision.clone(),
-                runtime_health.clone(),
-                move |_backend, namespace| {
-                    let controller = MessageController { state: Arc::clone(&state), namespace };
-                    let heartbeat = Arc::new(AtomicU64::new(0));
-                    let health = health.clone();
-                    let metrics = state.controller_metrics.for_kind("Message");
-                    async move {
-                        let watchdog =
-                            spawn_controller_loop_watchdog("Message", Arc::clone(&heartbeat), controller_resync_interval, health.clone());
-                        let result = controller.run(controller_resync_interval, heartbeat, metrics).await;
-                        watchdog.abort();
-                        health.clear_controller_loop_stall("Message");
-                        result
-                    }
-                },
-            )
-        },
         controller!(TerminalSession, {
             let state = Arc::clone(&state);
             move |backend: ResourceBackend, namespace_string: String| {
@@ -997,7 +991,58 @@ fn spawn_controller_loops(
             .await;
         }));
     }
+    // The old Message controller runs only while Message is in the old store
+    // (#3317); behind `[primitives]` the engine path's delivery adapter takes over.
+    if state.daemon.message_primitives().is_none() {
+        controllers.push({
+            let state = Arc::clone(&state);
+            let health = runtime_health.clone();
+            spawn_resource_controller::<flotilla_resources::Message, _, _>(
+                backend.clone(),
+                namespace_string.clone(),
+                supervision.clone(),
+                runtime_health.clone(),
+                move |_backend, namespace| {
+                    let controller = MessageController { state: Arc::clone(&state), namespace };
+                    let heartbeat = Arc::new(AtomicU64::new(0));
+                    let health = health.clone();
+                    let metrics = state.controller_metrics.for_kind("Message");
+                    async move {
+                        let watchdog =
+                            spawn_controller_loop_watchdog("Message", Arc::clone(&heartbeat), controller_resync_interval, health.clone());
+                        let result = controller.run(controller_resync_interval, heartbeat, metrics).await;
+                        watchdog.abort();
+                        health.clear_controller_loop_stall("Message");
+                        result
+                    }
+                },
+            )
+        });
+    }
     controllers
+}
+
+/// Opens the engine path behind `[primitives]` (#3317): the decided store
+/// with Message and AgentSession, homed at this daemon's node id, and the
+/// Message path over it. Installed before peer tasks start, so every peer's
+/// log is followed from the first connection.
+async fn open_message_primitives(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Result<(), String> {
+    let path = config.state_dir().as_path().join("decided.sqlite");
+    let home = daemon.node_id().as_str().to_owned();
+    let registry = flotilla_engine_store::registry().map_err(|error| format!("decided store registry: {error:?}"))?;
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(&path, &home, registry)
+            .map_err(|error| format!("open decided store {}: {error}", path.display()))?,
+    );
+    daemon.install_decided_store(Arc::clone(&service))?;
+    let primitives = tokio::task::spawn_blocking({
+        let backend = daemon.resource_backend();
+        let clock = daemon.clock_for_scenarios();
+        move || flotilla_core::primitives::MessagePrimitives::open(&home, service, backend, clock)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    daemon.install_message_primitives(Arc::new(primitives))
 }
 
 /// Daemon-owned image build state: the owned builder's Buildx state, build

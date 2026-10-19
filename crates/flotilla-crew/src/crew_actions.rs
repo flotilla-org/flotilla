@@ -420,6 +420,13 @@ impl CrewActions<'_> {
     pub async fn execute_action_message_fail_batch(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::MessageFailBatch { namespace, name, reason } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
+            if self.crew.message_primitives().is_some() {
+                // The engine path submits no batches; a message it cannot deliver drops as undeliverable.
+                let result =
+                    CommandValue::Error { message: format!("Message `{name}` is on the engine path, which holds no submission batches") };
+                self.events.finish(id, empty_identity, result);
+                return Ok(id);
+            }
             let result = match self.crew.message_inbox(namespace).await.fail_batch(name, reason, self.clock.now()).await {
                 Ok(()) => CommandValue::Ok,
                 Err(error) => CommandValue::Error { message: error.to_string() },

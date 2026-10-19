@@ -262,7 +262,13 @@ impl ReconcilerWake {
         let checkouts = &checkouts_list.items;
         let vessels_list = views.vessels.shared_list().await.map_err(|error| error.to_string())?;
         let vessels = &vessels_list.items;
-        let messages_list = views.messages.shared_list().await.map_err(|error| error.to_string())?;
+        let primitives = self.subscriptions.message_primitives();
+        let messages_list = match &primitives {
+            Some(primitives) => std::sync::Arc::new(flotilla_resources::ReadResourceList {
+                items: primitives.views(namespace).await.map_err(|error| error.to_string())?,
+            }),
+            None => views.messages.shared_list().await.map_err(|error| error.to_string())?,
+        };
         let messages = &messages_list.items;
         // Routing helpers retain their public Store-based interface, but all
         // their reads come from the same request snapshot of the watched kinds.
@@ -287,8 +293,13 @@ impl ReconcilerWake {
         )
         .await
         .map_err(|error| error.to_string())?;
+        let engine_notices = primitives.map(|primitives| primitives.charter_notices(namespace));
+        let notices: &dyn flotilla_messaging::CharterNotices = match &engine_notices {
+            Some(notices) => notices.as_ref(),
+            None => &inbox,
+        };
         flotilla_messaging::reconcile_charter_notifications_with_receivers(
-            &inbox,
+            notices,
             self.subscriptions.inner.charter_brief_renderer.as_ref(),
             now,
             &read_backend,

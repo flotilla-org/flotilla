@@ -19,6 +19,8 @@ pub enum Kind {
     Role,
     /// An artifact slot under its producing role; always followed by `of:`.
     Artifact,
+    /// A message, under the inbox (role) that receives it.
+    Message,
     /// A forge, named by its `forge_id`.
     Forge,
     /// A repository on a forge: one value holding `owner/repo`.
@@ -40,12 +42,13 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 14] = [
+    pub const ALL: [Kind; 15] = [
         Kind::Project,
         Kind::Convoy,
         Kind::Vessel,
         Kind::Role,
         Kind::Artifact,
+        Kind::Message,
         Kind::Forge,
         Kind::Repo,
         Kind::ChangeRequest,
@@ -65,6 +68,7 @@ impl Kind {
             Kind::Vessel => "vessel",
             Kind::Role => "role",
             Kind::Artifact => "artifact",
+            Kind::Message => "message",
             Kind::Forge => "forge",
             Kind::Repo => "repo",
             Kind::ChangeRequest => "cr",
@@ -88,6 +92,8 @@ impl Kind {
             Kind::Vessel => parent == Some(Kind::Convoy),
             Kind::Role => matches!(parent, Some(Kind::Project | Kind::Convoy)),
             Kind::Artifact => parent == Some(Kind::Role),
+            // A message sits under its inbox, which is always a role.
+            Kind::Message => parent == Some(Kind::Role),
             Kind::Repo => parent == Some(Kind::Forge),
             Kind::ChangeRequest | Kind::Issue | Kind::Comment | Kind::Commit | Kind::Ref => parent == Some(Kind::Repo),
             Kind::Account => parent == Some(Kind::Usage),

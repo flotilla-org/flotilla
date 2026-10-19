@@ -210,7 +210,7 @@ pub(crate) fn watermark(marks: &Watermarks, home: &str) -> Watermark {
 /// Listener-independent store service. The daemon's HTTP adapter supplies the transport and
 /// injected home time. All production writes, gates and followers share this same store.
 pub struct Service {
-    store: Mutex<Store>,
+    store: std::sync::Arc<Mutex<Store>>,
     source: Source,
     watermarks: Watermarks,
 }
@@ -219,10 +219,23 @@ impl Service {
     pub fn watermark(&self, home: &str) -> Result<Watermark, StoreError> {
         Ok(watermark(&self.watermarks, home))
     }
+    /// This home and every home whose stream this store has applied, sorted.
+    pub fn homes(&self) -> Vec<String> {
+        let mut homes: Vec<String> = self.watermarks.read().unwrap_or_else(std::sync::PoisonError::into_inner).keys().cloned().collect();
+        homes.push(self.source.home.clone());
+        homes.sort();
+        homes.dedup();
+        homes
+    }
     /// Only synchronous local work belongs here; never wait on a network inside this closure.
     pub fn with_store<T>(&self, op: impl FnOnce(&mut Store) -> Result<T, StoreError>) -> Result<T, StoreError> {
         let mut store = self.store.lock().map_err(|_| StoreError::Stream("store lock poisoned".into()))?;
         op(&mut store)
+    }
+    /// The store's shared handle, for engine logs that write through the same
+    /// connection and lock as the service's followers (#3317).
+    pub fn store(&self) -> std::sync::Arc<Mutex<Store>> {
+        std::sync::Arc::clone(&self.store)
     }
     pub fn open(path: &std::path::Path, home: &str, kinds: flotilla_schema::KindRegistry) -> Result<Self, StoreError> {
         let conn = rusqlite::Connection::open(path)?;
@@ -230,7 +243,7 @@ impl Service {
         let source = Source { path: path.to_owned(), home: home.to_owned(), kinds: kinds.clone() };
         let store = Store::open(conn, home, kinds)?;
         let watermarks = store.watermarks();
-        Ok(Self { store: Mutex::new(store), source, watermarks })
+        Ok(Self { store: std::sync::Arc::new(Mutex::new(store)), source, watermarks })
     }
     pub fn serve(&self, after: Option<u64>, now: Timestamp, sink: impl FnMut(&[u8]) -> Result<(), StoreError>) -> Result<u64, StoreError> {
         // Wait for any writer currently holding the mutex before taking the read snapshot;

@@ -13,7 +13,9 @@ impl MessageInbox {
         Ok(self.condition_value(condition, now).await? == ThreeValue::True)
     }
 
-    async fn condition_value(&self, condition: &Leaf, now: DateTime<Utc>) -> Result<ThreeValue, ResourceError> {
+    /// A condition's current value over this namespace's records, as the
+    /// old-store reads the engine path's condition observations come from.
+    pub async fn condition_value(&self, condition: &Leaf, now: DateTime<Utc>) -> Result<ThreeValue, ResourceError> {
         let evaluate = |subject: Option<&dyn LeafSubject>| {
             evaluate_leaf(condition, subject, None).map(|evaluation| evaluation.result).map_err(ResourceError::invalid)
         };

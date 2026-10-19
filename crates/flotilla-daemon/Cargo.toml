@@ -14,6 +14,9 @@ flotilla-admission = { path = "../flotilla-admission" }
 flotilla-crew = { path = "../flotilla-crew" }
 flotilla-observation = { path = "../flotilla-observation" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-inbox = { path = "../flotilla-inbox" }
+flotilla-state-machines = { path = "../flotilla-state-machines" }
 flotilla-schema = { path = "../flotilla-schema" }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-messaging = { path = "../flotilla-messaging" }

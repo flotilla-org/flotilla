@@ -7,12 +7,14 @@ license.workspace = true
 [dependencies]
 bon = { workspace = true }
 tracing = { workspace = true }
+flotilla-address = { path = "../flotilla-address" }
 flotilla-schema = { path = "../flotilla-schema" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-engine-store = { path = "../flotilla-engine-store" }
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
 
 [dev-dependencies]

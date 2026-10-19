@@ -110,7 +110,7 @@ class BuildGraphContract(unittest.TestCase):
 
     def test_no_production_crate_depends_on_state_machines(self):
         # Rule 2 makes "no runtime use yet" mechanical; a named allowlist relaxes it.
-        for dependent in ("flotilla-core", "flotilla-daemon", "flotilla-store", "flotilla"):
+        for dependent in ("flotilla-store", "flotilla-messaging", "flotilla-controllers", "flotilla"):
             for kind in ("normal", "build"):
                 with self.subTest(dependent=dependent, kind=kind):
                     self.assertEqual(violations(graph(
@@ -132,9 +132,30 @@ class BuildGraphContract(unittest.TestCase):
         )), [])
         for kind in ("normal", "build"):
             self.assertEqual(violations(graph(
-                package("flotilla-daemon", **{kind: ("flotilla-inbox",)}),
+                package("flotilla-controllers", **{kind: ("flotilla-inbox",)}),
                 package("flotilla-inbox"),
-            )), ["flotilla-daemon: production dependency on flotilla-inbox before the Message switch"])
+            )), ["flotilla-controllers: production dependency on flotilla-inbox outside the Message switch's composition"])
+
+    def test_the_message_switch_composes_the_engine_inbox(self):
+        # #3317: the composition root and daemon compose the engine inbox and
+        # state machines behind `[primitives]`; crates above reach it only
+        # through them, and old admission still never reaches the engine.
+        self.assertEqual(violations(graph(
+            package("flotilla", normal=("flotilla-daemon",)),
+            package("flotilla-daemon", normal=("flotilla-core", "flotilla-inbox", STATE_MACHINES)),
+            package("flotilla-core", normal=("flotilla-inbox", "flotilla-engine-store", STATE_MACHINES)),
+            package("flotilla-engine-store", normal=(STATE_MACHINES,)),
+            package("flotilla-inbox", normal=(STATE_MACHINES,)),
+            package(STATE_MACHINES),
+        )), [])
+        self.assertEqual(violations(graph(
+            package("flotilla-admission", normal=("flotilla-messaging",)),
+            package("flotilla-messaging", normal=(STATE_MACHINES,)),
+            package(STATE_MACHINES),
+        )), [
+            "flotilla-admission: must not depend on flotilla-state-machines, directly or transitively",
+            f"flotilla-messaging: production dependency on {STATE_MACHINES} before the composition-root switch",
+        ])
 
     def test_messaging_reads_store_in_c_free_base(self):
         # Messaging is below capabilities, with resource-only receiver resolution.

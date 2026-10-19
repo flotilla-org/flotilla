@@ -19,6 +19,10 @@ use futures::{StreamExt, TryStreamExt};
 pub fn address(value: &str) -> Address {
     value.parse().expect("test address")
 }
+/// A condition, by its canonical text (ADR 0066 §4).
+pub fn condition(value: &str) -> flotilla_address::Condition {
+    value.parse().expect("test condition")
+}
 pub fn inbox() -> Address {
     address("project:test/role:inbox")
 }
@@ -258,13 +262,13 @@ pub async fn receipt_and_condition_gates<F: Factory>(factory: &F) {
     evidence.clock.store(20, Ordering::SeqCst);
     refused(backend.drop(&message, DropReason::Undeliverable).await, MessageRefusal::ReceiptConfirmed);
     let mut envelope = spec();
-    envelope.delivery_condition = Some(address("project:test/role:condition"));
+    envelope.delivery_condition = Some(condition("project:test/role:condition .phase == Wanted"));
     let message = backend.enqueue(envelope).await.expect("condition message");
     let reason = DropReason::Withdrawn { by: spec().sender, authority: address("project:test/role:authority") };
     refused(backend.drop(&message, reason.clone()).await, MessageRefusal::Unauthorised);
-    evidence.world.lock().expect("world").condition.put(&Ref::new("project:test/role:condition"), true);
+    evidence.world.lock().expect("world").condition.put(&Ref::new("project:test/role:condition .phase == Wanted"), true);
     refused(backend.drop(&message, reason.clone()).await, MessageRefusal::Unauthorised);
-    evidence.world.lock().expect("world").condition.put(&Ref::new("project:test/role:condition"), false);
+    evidence.world.lock().expect("world").condition.put(&Ref::new("project:test/role:condition .phase == Wanted"), false);
     backend.drop(&message, reason).await.expect("observed failed condition");
     let Harness { backend, evidence } = factory.create();
     backend.bind(inbox(), a).await.expect("bound");
@@ -303,11 +307,11 @@ pub async fn admission<F: Factory>(factory: &F) {
 pub async fn outcome<F: Factory>(factory: &F) {
     let Harness { backend, evidence } = factory.create();
     let mut envelope = spec();
-    envelope.expectation = Expectation::Outcome { condition: address("project:test/role:outcome") };
+    envelope.expectation = Expectation::Outcome { condition: condition("project:test/role:outcome .phase == Done") };
     let message = backend.enqueue(envelope).await.expect("enqueue");
     refused(backend.settle(&message, Settle { by: Settlement::OutcomeObserved }).await, MessageRefusal::MissingEvidence);
     refused(backend.settle(&message, Settle { by: Settlement::Answered }).await, MessageRefusal::WrongState);
-    evidence.world.lock().expect("world").condition.put(&Ref::new("project:test/role:outcome"), true);
+    evidence.world.lock().expect("world").condition.put(&Ref::new("project:test/role:outcome .phase == Done"), true);
     backend.settle(&message, Settle { by: Settlement::OutcomeObserved }).await.expect("outcome from Pending");
 }
 

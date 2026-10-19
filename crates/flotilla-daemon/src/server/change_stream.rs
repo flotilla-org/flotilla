@@ -146,6 +146,31 @@ pub async fn read_record(
     }
 }
 
+/// The routed read for an engine replica's misses (#3317): each connected
+/// home's record socket, read in turn until one holds the record.
+pub(super) struct DecidedHomeReads {
+    pub(super) service: Arc<Service>,
+    pub(super) peers: Arc<std::sync::Mutex<std::collections::BTreeMap<String, PathBuf>>>,
+    pub(super) clock: Arc<dyn flotilla_resources::Clock>,
+}
+
+#[async_trait::async_trait]
+impl flotilla_core::primitives::ports::HomeReads for DecidedHomeReads {
+    async fn find(&self, kind: KindCode, name: &str) -> Result<Option<stream::ReadResult>, String> {
+        let peers = self.peers.lock().expect("decided peers").clone();
+        for (home, socket) in peers {
+            let identity = flotilla_schema::Identity { kind, name: name.to_owned(), home };
+            let clock = Arc::clone(&self.clock);
+            match read_record(Arc::clone(&self.service), identity, &socket, move || Timestamp::from_datetime(&clock.now())).await {
+                Ok(read) if read.value.is_some() => return Ok(Some(read)),
+                Ok(_) => {}
+                Err(error) => tracing::debug!(%error, "home read failed; trying the next home"),
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// Every direct home is followed over the existing forwarded resource socket. Dropping the
 /// returned task cancels this generation; failures retry from the last committed prefix.
 pub(super) fn follow(service: Arc<Service>, home: String, socket: PathBuf) -> tokio::task::JoinHandle<()> {

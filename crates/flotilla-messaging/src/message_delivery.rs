@@ -928,7 +928,9 @@ fn header_value(value: &str) -> String {
         .collect()
 }
 
-fn frame_message(spec: &MessageSpec) -> String {
+/// One Message as its turn text: a header naming sender, relation, subject
+/// and expectation, then the body. Both delivery paths frame turns this way.
+pub fn frame_message(spec: &MessageSpec) -> String {
     let relation = match spec.relation {
         MessageRelation::Supervisor => "supervisor",
         MessageRelation::Peer => "peer",

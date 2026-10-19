@@ -703,6 +703,11 @@ pub struct InProcessDaemon {
     convoy_ensure_reconciler: RwLock<Option<Arc<dyn ConvoyEnsureReconciler>>>,
     crew: Arc<CrewService>,
     leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics,
+    /// The `[primitives]` Message path, installed once at composition.
+    message_path: crate::primitives::MessagePath,
+    /// The same path, as crew code reaches it: through its EngineMessages port.
+    crew_message_path: flotilla_crew::ports::MessagePath,
+    message_receivers: projection_ports::MessageReceivers,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
     /// Unique identity for this daemon instance, generated at startup.
     /// Used in peer Hello handshake to detect remote daemon restarts.
@@ -1159,10 +1164,13 @@ impl InProcessDaemon {
             tracing::warn!(%error, "garbage collect orphaned issue observations at startup failed");
         }
         let message_inboxes = Arc::new(Mutex::new(HashMap::new()));
+        let message_path = crate::primitives::MessagePath::default();
+        let crew_message_path = flotilla_crew::ports::MessagePath::default();
         let leaf_subscriptions =
             LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher)
                 .with_clock(Arc::clone(&clock))
                 .with_message_inboxes(Arc::clone(&message_inboxes))
+                .with_message_path(Arc::clone(&crew_message_path))
                 .with_charter_brief_renderer(Arc::new(flotilla_crew::charter_notifications::LiveCharterBriefRenderer::new(
                     resource_backend.clone(),
                     Arc::clone(&config),
@@ -1192,6 +1200,10 @@ impl InProcessDaemon {
         let crew = Arc::new(
             CrewService::builder()
                 .message_inboxes(Arc::clone(&message_inboxes))
+                .message_path(Arc::clone(&crew_message_path))
+                .capability_cards(flotilla_crew::crew_capabilities::CapabilityCardTracker::with_message_path(Arc::clone(
+                    &crew_message_path,
+                )))
                 .resource_backend(resource_backend.clone())
                 .leaf_subscriptions(leaf_subscriptions.clone())
                 .clock(Arc::clone(&clock))
@@ -1257,6 +1269,9 @@ impl InProcessDaemon {
 
             crew: Arc::clone(&crew),
             leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics(leaf_subscriptions),
+            message_receivers: projection_ports::MessageReceivers(Arc::clone(&message_path)),
+            message_path,
+            crew_message_path,
             brief_artifact_writer: Arc::clone(&brief_artifact_writer),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
@@ -2058,6 +2073,19 @@ impl InProcessDaemon {
         }
         *slot = Some(service);
         Ok(())
+    }
+
+    /// Installs the `[primitives]` Message path during composition (#3317),
+    /// after its decided store. Absent, every Message stays in the old store.
+    pub fn install_message_primitives(&self, primitives: Arc<crate::primitives::MessagePrimitives>) -> Result<(), String> {
+        self.message_path.set(Arc::clone(&primitives)).map_err(|_| "the Message path is already installed".to_owned())?;
+        let engine: Arc<dyn flotilla_crew::ports::EngineMessages> = primitives;
+        self.crew_message_path.set(engine).map_err(|_| "the crew's Message path is already installed".to_owned())
+    }
+
+    /// The `[primitives]` Message path, when the switch is on.
+    pub fn message_primitives(&self) -> Option<Arc<crate::primitives::MessagePrimitives>> {
+        self.message_path.get().cloned()
     }
 
     /// Present only after the first kind migration installs its registered store.
@@ -3928,7 +3956,7 @@ impl InProcessDaemon {
 
     fn read_projections(&self) -> read_projections::ReadProjections<'_> {
         read_projections::ReadProjections {
-            message_receivers: &projection_ports::MessageReceivers,
+            message_receivers: &self.message_receivers,
             backend: &self.resource_backend,
             config: &self.config,
             host_registry: &self.host_registry,
@@ -4413,6 +4441,17 @@ impl InProcessDaemon {
         self.crew.set_resource_intent_publisher(publisher);
     }
 
+    /// Sends a Message intent as producers do: deduplicated by its name and
+    /// handed to the receiver's home through the receiver-home router.
+    pub async fn publish_message(
+        &self,
+        namespace: &str,
+        name: &str,
+        intent: &flotilla_resources::MessageSpec,
+    ) -> Result<ResourceRef, String> {
+        self.crew.publish_message_intent(namespace, name, intent).await
+    }
+
     pub async fn deliver_standing_turn(&self, request: &flotilla_crew::leaf_engine::CrewTurnIntent) -> Result<TurnDeliveryRung, String> {
         self.crew.deliver_turn(request).await.map(|admission| admission.rung)
     }
@@ -4543,6 +4582,53 @@ impl InProcessDaemon {
         Ok(object.value.pointer("/metadata/annotations/flotilla.work~1origin-root").and_then(serde_json::Value::as_str).map(NodeId::new))
     }
 
+    /// A reply to a fleet role is routed by its subject (#3317): the reply to
+    /// turn-rules about convoy X goes to the turn-rules handler at X's home.
+    /// Its subject is the convoy it references, else the convoy whose crew
+    /// the original was sent to; with neither, the original's home.
+    async fn fleet_role_reply_origin(
+        &self,
+        primitives: &crate::primitives::MessagePrimitives,
+        namespace: &str,
+        reply: &flotilla_resources::MessageSpec,
+        original_id: &str,
+    ) -> Result<NodeId, String> {
+        // The original was sent to the replying role: its inbox names it at its home on a replica miss.
+        let roles = primitives.roles(namespace).await?;
+        let records = primitives.records(namespace).await.map_err(|error| error.to_string())?;
+        let conversion = crate::primitives::convert::Conversion { roles: &roles, forges: &records.forges, records: &*records };
+        let original = primitives
+            .read_view(namespace, original_id, conversion.inbox(&reply.sender).ok())
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("replied-to message `{original_id}` is neither in this home's replica nor at a reachable home"))?;
+        if original.object.spec.sender != reply.receiver {
+            return Err("reply system receiver does not match the original sender".into());
+        }
+        let referenced = reply.references.iter().chain(original.object.spec.references.iter()).find_map(|reference| match reference {
+            flotilla_resources::MessageReference::ControlRecord { resource, .. } if resource.kind == "Convoy" => {
+                Some(resource.name.clone())
+            }
+            _ => None,
+        });
+        let convoy = referenced.or_else(|| match original.object.spec.receiver.split('/').collect::<Vec<_>>().as_slice() {
+            [_, convoy, _, _] => Some((*convoy).to_owned()),
+            _ => None,
+        });
+        if let Some(convoy) = convoy {
+            if let Ok(convoy) = self.resource_backend.including_replicas::<ResourceConvoy>(namespace).get(&convoy).await {
+                return Ok(match convoy.provenance {
+                    ResourceProvenance::Local => self.node_id.clone(),
+                    ResourceProvenance::Replica { origin_root, .. } => origin_root,
+                });
+            }
+        }
+        Ok(match original.provenance {
+            ResourceProvenance::Local => self.node_id.clone(),
+            ResourceProvenance::Replica { origin_root, .. } => origin_root,
+        })
+    }
+
     async fn message_creation_origin(&self, namespace: &str, document: &serde_json::Value) -> Result<Option<NodeId>, String> {
         let namespace = document.pointer("/metadata/namespace").and_then(serde_json::Value::as_str).unwrap_or(namespace);
         let spec = flotilla_resources::qualify_message_spec(
@@ -4552,6 +4638,9 @@ impl InProcessDaemon {
         let receiver = spec.receiver.as_str();
         if receiver.starts_with("system:") {
             let original_id = spec.in_reply_to.as_deref().ok_or("a system receiver requires a correlated reply")?;
+            if let Some(primitives) = self.message_primitives() {
+                return self.fleet_role_reply_origin(&primitives, namespace, &spec, original_id).await.map(Some);
+            }
             let original = self
                 .resource_backend
                 .including_replicas::<flotilla_resources::Message>(namespace)
@@ -4852,6 +4941,22 @@ impl InProcessDaemon {
         let spec: MessageSpec = serde_json::from_value(document.get("spec").cloned().unwrap_or_default())
             .map_err(|error| ResourceError::decode(format!("message spec: {error}")))?;
         let spec = flotilla_resources::qualify_message_spec(spec)?;
+        if let Some(primitives) = self.message_primitives() {
+            let object = primitives.admit(namespace, &meta.name, &spec).await?;
+            return Ok(flotilla_store::DynamicResourceObject {
+                kind: "Message".into(),
+                plural: "messages".into(),
+                namespace: namespace.to_owned(),
+                value: serde_json::to_value(serde_json::json!({
+                    "apiVersion": "flotilla.work/v1",
+                    "kind": "Message",
+                    "metadata": object.metadata,
+                    "spec": object.spec,
+                    "status": object.status,
+                }))
+                .map_err(|error| ResourceError::decode(error.to_string()))?,
+            });
+        }
         let admission = self.message_inbox(namespace).await.accept(&meta, &spec, self.clock.now()).await?;
         let record = match admission {
             MessageAdmission::Accepted(record) => record,

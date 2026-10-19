@@ -50,8 +50,22 @@ pub fn record_name(address: &Address) -> Option<String> {
             Some(format!("usage-{}", &digest[..54]))
         }
         Kind::Project | Kind::Convoy => Some(address.name().to_string()),
-        Kind::Vessel | Kind::Role | Kind::Forge | Kind::Repo | Kind::Comment | Kind::Commit | Kind::Ref | Kind::Usage => None,
+        Kind::Vessel | Kind::Role | Kind::Message | Kind::Forge | Kind::Repo | Kind::Comment | Kind::Commit | Kind::Ref | Kind::Usage => {
+            None
+        }
     }
+}
+
+/// A message's record name from its receiver, sender and producer key: the
+/// id a keyed send takes (ADR 0066 §4), so a repeated key names the same
+/// message. Old Message records carry this name with their own receiver text.
+pub fn message_record_name(receiver: &str, sender: &str, producer_key: &str) -> String {
+    let mut hash = Sha256::new();
+    for component in [receiver, sender, producer_key] {
+        hash.update((component.len() as u64).to_be_bytes());
+        hash.update(component.as_bytes());
+    }
+    format!("message-{:x}", hash.finalize())
 }
 
 fn forge_record_name(prefix: &str, address: &Address) -> String {

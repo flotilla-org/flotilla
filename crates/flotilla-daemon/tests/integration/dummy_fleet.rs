@@ -45,11 +45,21 @@ impl DummyDaemon {
     }
 
     async fn start_with_resync(agent: &str, environment: &str, resync: Duration) -> Self {
+        Self::start_switched(agent, environment, resync, false).await
+    }
+
+    /// A daemon with `[primitives]` on: Message runs on the engine (#3317).
+    async fn start_on_primitives(agent: &str, environment: &str) -> Self {
+        Self::start_switched(agent, environment, Duration::from_millis(200), true).await
+    }
+
+    async fn start_switched(agent: &str, environment: &str, resync: Duration, primitives: bool) -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_dir = dir.path().join("config");
         std::fs::create_dir_all(&config_dir).expect("config dir");
+        let switch = if primitives { "[primitives]\n" } else { "" };
         let daemon_toml = format!(
-            "machine_id = \"dummy-load\"\n\n[dummy_fleet]\n[dummy_fleet.agent]\nlong_runner_turns = {LONG_RUNNER_TURNS}\n{agent}\n[dummy_fleet.environment]\n{environment}"
+            "machine_id = \"dummy-load\"\n\n{switch}[dummy_fleet]\n[dummy_fleet.agent]\nlong_runner_turns = {LONG_RUNNER_TURNS}\n{agent}\n[dummy_fleet.environment]\n{environment}"
         );
         std::fs::write(config_dir.join("daemon.toml"), daemon_toml).expect("daemon.toml");
         let config = Arc::new(ConfigStore::with_base(config_dir));
@@ -85,6 +95,31 @@ impl DummyDaemon {
 
     async fn seed(&self) {
         let backend = self.backend();
+        if self.daemon.message_primitives().is_some() {
+            // The fleet roles live under the designated project; tests keep `project:fleet`.
+            backend
+                .clone()
+                .using::<flotilla_resources::Project>(NAMESPACE)
+                .create(
+                    &InputMeta::builder().name("fleet".to_string()).build(),
+                    &flotilla_resources::ProjectSpec::builder()
+                        .display_name("Fleet".to_string())
+                        .default_workflow_ref(CrewMix::Coder.workflow_name().to_string())
+                        .repositories(Vec::new())
+                        .build(),
+                )
+                .await
+                .expect("fleet project");
+            backend
+                .clone()
+                .definitions::<flotilla_resources::FleetDesignation>(NAMESPACE)
+                .create(
+                    &InputMeta::builder().name(flotilla_resources::FLEET_DESIGNATION_NAME.to_string()).build(),
+                    &flotilla_resources::FleetDesignationSpec { project: "fleet".into(), image_cache: None },
+                )
+                .await
+                .expect("fleet designation");
+        }
         let host = backend.clone().using::<Host>(NAMESPACE).list().await.expect("hosts").items.into_iter().next().expect("local host");
         let forge = catalog::forge(&self.fleet.config().forge_service_url);
         backend
@@ -399,4 +434,71 @@ async fn a_coder_lands_at_the_production_resync_interval() {
     fleet.dispatch("production-resync", CrewMix::Coder).await;
     fleet.wait_for_phase("production-resync", ConvoyPhase::Landed).await;
     assert_eq!(fleet.fleet.snapshot().command_errors, 0, "{:?}", fleet.fleet.command_error_samples());
+}
+
+// Behaviour (#3317): with `[primitives]` on, crew turns run end to end on the
+// engine path: every review request and answer is an engine Message, typed by
+// the delivery adapter, with its receipt on the session's AgentSession, and
+// the old store holds no Message at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_the_engine_a_reviewed_coder_lands_after_its_reviewer_answers() {
+    let fleet = DummyDaemon::start_on_primitives(SCENARIO_AGENT, "").await;
+    let snapshot = fleet.deliver("engine-reviewed", CrewMix::CoderReviewer).await;
+    assert_eq!(snapshot.crews_completed, 2, "{snapshot:?}");
+    assert_eq!(snapshot.turns_received, 2, "the review request and its answer are delivered turns: {snapshot:?}");
+    fleet.assert_on_the_engine().await;
+}
+
+// Behaviour (#3317): a long runner's turns all travel the engine path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_the_engine_a_long_runner_exchanges_its_turns_before_landing() {
+    let fleet = DummyDaemon::start_on_primitives(SCENARIO_AGENT, "").await;
+    let snapshot = fleet.deliver("engine-long-runner", CrewMix::LongRunner).await;
+    assert_eq!(snapshot.crews_completed, 2, "{snapshot:?}");
+    assert_eq!(snapshot.turns_received, u64::from(2 * LONG_RUNNER_TURNS), "every task and reply is a delivered turn: {snapshot:?}");
+    fleet.assert_on_the_engine().await;
+}
+
+impl DummyDaemon {
+    /// Every Message is on the engine, delivered with a receipt on a real
+    /// AgentSession; the old store holds none.
+    async fn assert_on_the_engine(&self) {
+        use flotilla_state_machines::machines::message::MessageState;
+        let old = self.backend().using::<flotilla_resources::Message>(NAMESPACE).list().await.expect("old messages");
+        assert!(old.items.is_empty(), "the old store holds Messages: {:?}", old.items);
+        let primitives = self.daemon.message_primitives().expect("engine path");
+        let messages = primitives.messages().expect("engine messages");
+        assert!(!messages.is_empty(), "the turns were engine Messages");
+        let delivered: Vec<_> = messages.iter().filter_map(|(_, message)| message.state().receiver().cloned()).collect();
+        assert!(!delivered.is_empty(), "turns were delivered: {messages:?}");
+        for receiver in &delivered {
+            let session = primitives.sessions().get(&receiver.id).expect("each receiver is an AgentSession record");
+            assert_eq!(receiver.host, primitives.home());
+            let _ = session;
+        }
+        for (_, message) in &messages {
+            assert!(!matches!(message.state(), MessageState::Dropped { .. }), "no turn was dropped: {message:?}");
+            assert_eq!(message.name().parse::<flotilla_address::Address>().map(|a| a.kind()), Ok(flotilla_address::Kind::Message));
+        }
+        eprintln!(
+            "ENGINE senders: {:?}",
+            messages
+                .iter()
+                .map(|(_, m)| (m.spec().sender.to_string(), m.spec().inbox.to_string(), format!("{:?}", m.state())))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+// Behaviour (#3317): an operator sends as `principal:<name>`, which has no
+// declared role until the principals model (#3457); on the engine path the
+// ruling is refused with that reason, never sent as a guessed role.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_the_engine_an_operator_ruling_is_refused_until_principals() {
+    let fleet = DummyDaemon::start_on_primitives(&format!("{SCENARIO_AGENT}stall_rate = 1.0\n"), "").await;
+    fleet.dispatch("engine-stalled", CrewMix::Coder).await;
+    fleet.wait_for("engine-stalled", "stall accounting", |_| fleet.fleet.snapshot().crews_stalled > 0).await;
+    let convoy = fleet.wait_for_stall("engine-stalled").await;
+    let resumed = fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Resume)).await;
+    assert!(matches!(&resumed, CommandValue::Error { message } if message.contains("#3457")), "{resumed:?}");
 }

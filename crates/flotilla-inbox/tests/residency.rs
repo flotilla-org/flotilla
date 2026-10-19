@@ -269,9 +269,13 @@ fn paged_restart_finishes_interrupted_dead_letter_once() {
     let mut home = Home::<Message, MessageLog>::with_log("test", MessageLog::new(store.clone())).expect("home");
     let mut world = MemoryMessageWorld::default();
     world.binding.put(&Ref::new(inbox().to_string()), InboxBinding::Unbound { since: flotilla_schema::Timestamp(0) });
+    let mut first = String::new();
     for n in 0..40 {
         let value = spec();
-        let name = format!("project:inbox/role:message-{n}");
+        let name = flotilla_inbox::keyed_name(&inbox(), &value.sender, &n.to_string()).expect("message address");
+        if n == 0 {
+            first = name.clone();
+        }
         home.create(&name, value, &world, flotilla_schema::Timestamp(0)).expect("create");
         if n == 0 {
             home.apply(&name, DropMessage { reason: DropReason::Undeliverable }, &world, flotilla_schema::Timestamp(1))
@@ -283,7 +287,10 @@ fn paged_restart_finishes_interrupted_dead_letter_once() {
         let reopened = SqliteInbox::open("test", CountingLog::new(store.clone()), Arc::new(Evidence::default()), Arc::new(Supervisors))
             .expect("restart repairs reaction");
         assert!(matches!(
-            reopened.get_blocking("project:inbox/role:dead-letter-message-0").expect("one dead letter").state(),
+            reopened
+                .get_blocking(&flotilla_inbox::dead_letter_name(&address("project:test/role:supervisor"), &first).expect("dead letter"))
+                .expect("one dead letter")
+                .state(),
             MessageState::Pending
         ));
         assert_eq!(reopened.residency_blocking().open_messages, 40);
@@ -445,8 +452,8 @@ async fn pending_excludes_other_homes_before_value_reads() {
     let mut donor = Store::open(Connection::open_in_memory().unwrap(), "other", flotilla_state_machines::kinds().unwrap()).unwrap();
     let mut snapshots = Vec::new();
     for n in 0..40 {
-        let name = format!("project:inbox/role:message-{}", n + 1);
         let mut value = spec();
+        let name = flotilla_inbox::keyed_name(&inbox(), &value.sender, &n.to_string()).expect("message address");
         value.admitted_seq = n + 1;
         let resource = Resource::<Message>::stored(
             &name,
@@ -530,7 +537,7 @@ async fn pending_spill_and_restart_use_declared_index() {
     async fn run<L: InboxLog + Clone + 'static>(source: L) {
         let source = CountingLog::wrap(source);
         let evidence = Arc::new(Evidence::default());
-        let backend = EngineInbox::open_with_budgets("test", source.clone(), evidence.clone(), Arc::new(Supervisors), 65536, 900).unwrap();
+        let backend = EngineInbox::open_with_budgets("test", source.clone(), evidence.clone(), Arc::new(Supervisors), 65536, 1100).unwrap(); // two message addresses fit, a third spills
         backend.bind(inbox(), consumer("a")).await.unwrap();
         let mut names = Vec::new();
         for _ in 0..2 {
@@ -564,7 +571,7 @@ async fn pending_spill_and_restart_use_declared_index() {
         assert_eq!(source.read_counts().pending_pages, 0, "fitting inbox serves cached order");
         drop(backend);
         source.reset_read_counts();
-        let recovered = EngineInbox::open_with_budgets("test", source.clone(), evidence.clone(), Arc::new(Supervisors), 0, 900).unwrap();
+        let recovered = EngineInbox::open_with_budgets("test", source.clone(), evidence.clone(), Arc::new(Supervisors), 0, 1100).unwrap();
         assert!(source.read_counts().pending_key_pages > 0, "restart reads key-only declared index to rebuild cache");
         assert_eq!(source.read_counts().scan_resource_loads, 4, "startup decodes each current body once");
         assert_eq!(source.read_counts().resource_loads, 0, "rebuilding Pending order decodes no bodies");

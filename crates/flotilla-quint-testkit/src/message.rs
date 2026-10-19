@@ -1,7 +1,10 @@
 //! One Message envelope, evidence and value mapping for every replay subject.
 use crate::{
     itf::{boolean, int, list, number, payload, tag, variant},
-    replay::{at_address, constant, id_of, moment, slot_at, Stream, Trace, DELIVERY, INBOX, NEWER, OUTCOME, OWNER, TURN_RULES, UNIT},
+    replay::{
+        at_address, condition, constant, id_of, moment, slot_at, Stream, Trace, DELIVERY, DELIVERY_CONDITION, INBOX, NEWER,
+        OUTCOME_CONDITION, OWNER, TURN_RULES, UNIT,
+    },
 };
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
@@ -155,12 +158,12 @@ pub fn spec_from_envelope(envelope: &Value) -> MessageSpec {
         expectation: match tag(&envelope["expectation"]) {
             "Nothing" => Expectation::Nothing,
             "Reply" => Expectation::Reply,
-            "Outcome" => Expectation::Outcome { condition: at_address(OUTCOME) },
+            "Outcome" => Expectation::Outcome { condition: condition(OUTCOME_CONDITION) },
             other => panic!("expectation {other}"),
         },
         deadline: boolean(&envelope["hasDeadline"]).then(|| moment(number(&envelope["deadline"]))),
         unbound_after: UNIT,
-        delivery_condition: boolean(&envelope["hasCondition"]).then(|| at_address(DELIVERY)),
+        delivery_condition: boolean(&envelope["hasCondition"]).then(|| condition(DELIVERY_CONDITION)),
         ..message_spec()
     }
 }
@@ -178,14 +181,14 @@ pub fn observed_world(
     if stream.any("reply") {
         world.reply.put(&Ref::new(name), ());
     }
-    world.condition.put(&Ref::new(OUTCOME), stream.any("outcome"));
+    world.condition.put(&Ref::new(OUTCOME_CONDITION), stream.any("outcome"));
     if stream.any("failure") {
         world.delivery_failure.put(&Ref::new(name), ());
     }
     world.applied_through.put(&Ref::new(INBOX), moment(stream.watermark()));
     world.binding.put(&Ref::new(INBOX), binding);
     if let Some(holds) = delivery_condition {
-        world.condition.put(&Ref::new(DELIVERY), holds);
+        world.condition.put(&Ref::new(DELIVERY_CONDITION), holds);
     }
     world.authority.put(&Ref::new(OWNER), authorised);
     if authorised {

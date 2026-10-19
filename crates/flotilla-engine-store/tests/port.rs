@@ -1,0 +1,123 @@
+//! The storage port (#3317): the engine's Log over one Store, and receipts
+//! served from `Read::about`.
+
+use std::sync::{Arc, Mutex};
+
+use flotilla_engine_store::{registry, MessageLog, StoreLog};
+use flotilla_schema::{Address, Kind, Timestamp};
+use flotilla_schema_sqlite::Store;
+use flotilla_state_machines::{
+    machines::{
+        agent_session::{AgentSession, MemoryAgentSessionWorld, Receive},
+        consumer::{ConsumerKind, Receiver},
+        message::{
+            Deliver, DropMessage, DropReason, Expectation, InboxBinding, MemoryMessageWorld, Message, MessageBody, MessageSpec,
+            MessageState, Receipts, Relation, Settle, Settlement,
+        },
+    },
+    Home, Ref, Resource, Source, Transport,
+};
+use rusqlite::Connection;
+
+const HOME: &str = "alpha";
+
+fn store() -> Arc<Mutex<Store>> {
+    Arc::new(Mutex::new(Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry().expect("registry")).expect("store")))
+}
+
+fn inbox() -> Address {
+    "project:fleet/convoy:demo/role:coder".parse().expect("inbox")
+}
+
+fn spec(expectation: Expectation) -> MessageSpec {
+    MessageSpec {
+        expectation,
+        unbound_after: 10,
+        ..MessageSpec::new(
+            "project:fleet/role:turn-rules".parse().expect("sender"),
+            inbox(),
+            Relation::System,
+            MessageBody::text("take a turn").expect("small body"),
+        )
+    }
+}
+
+fn name(id: &str) -> String {
+    Address::message(&inbox(), id).expect("message address").as_str().to_owned()
+}
+
+fn session() -> Receiver {
+    Receiver { kind: ConsumerKind::AgentSession, id: "terminal-demo-coder".into(), host: HOME.into() }
+}
+
+fn last_sequence(store: &Arc<Mutex<Store>>) -> u64 {
+    store.lock().expect("store").read().expect("read").last_sequence(HOME).expect("sequence")
+}
+
+fn stored(store: &Arc<Mutex<Store>>, name: &str) -> Resource<Message> {
+    let mut store = store.lock().expect("store");
+    let mut read = store.read().expect("read");
+    let id = read.resolve(Resource::<Message>::CODE, name, HOME).expect("resolve").expect("stored");
+    read.load::<Resource<Message>>(id).expect("load").expect("body").value
+}
+
+// Behaviour: create, Deliver, Settle and Drop each commit one write whose
+// version is the home's sequence; admission is the create's sequence; the
+// stored resource reloads equal to the engine's. Deliver's gate reads the
+// receipt a real AgentSession's Receive wrote, through Read::about.
+#[test]
+fn port_round_trips_every_message_edge_at_the_home_sequence() {
+    let store = store();
+    let log = MessageLog::new(store.clone());
+    let mut messages = Home::<Message, MessageLog>::with_log(HOME, log.clone()).expect("message home");
+    let mut sessions = Home::<AgentSession, StoreLog>::with_log(HOME, log.consumers()).expect("session home");
+    let mut world = MemoryMessageWorld::default();
+    world.binding.put(&Ref::new(inbox().as_str()), InboxBinding::Bound { consumers: [session()].into() });
+
+    let (answered, dropped) = (name("answered"), name("dropped"));
+    for (message, expectation) in [(&answered, Expectation::Reply), (&dropped, Expectation::Nothing)] {
+        messages.create(message, spec(expectation), &world, Timestamp(1)).expect("create");
+        let resource = messages.get(message).expect("created");
+        assert_eq!(resource.version().0, last_sequence(&store), "create version is the home sequence");
+        assert_eq!(resource.spec().admitted_seq, resource.version().0, "admission is the create's sequence");
+        assert_eq!(&stored(&store, message), resource);
+    }
+
+    sessions.create(&session().id, (), &MemoryAgentSessionWorld::default(), Timestamp(2)).expect("session");
+    sessions
+        .apply(
+            &session().id,
+            Receive { message: answered.clone(), transport: Transport::Turn },
+            &MemoryAgentSessionWorld::default(),
+            Timestamp(3),
+        )
+        .expect("receive");
+    let receipts = {
+        let mut locked = store.lock().expect("store");
+        let mut read = locked.read().expect("read");
+        log.receipt_log(&mut read, [answered.as_str(), dropped.as_str()]).expect("receipts from about")
+    };
+    assert_eq!(
+        receipts.lookup(&Ref::<Receipts>::new(answered.as_str())).map(|(_, rows)| rows.clone()),
+        Some([(session(), Transport::Turn)].into())
+    );
+    assert!(receipts.lookup(&Ref::<Receipts>::new(dropped.as_str())).is_none(), "no receipt about the other message");
+    world.receipts = Default::default();
+    world.receipts.put(&Ref::new(answered.as_str()), receipts.lookup(&Ref::new(answered.as_str())).expect("receipt").1.clone());
+
+    messages.apply(&answered, Deliver { receiver: session(), transport: Transport::Turn }, &world, Timestamp(4)).expect("deliver");
+    assert_eq!(messages.get(&answered).expect("message").version().0, last_sequence(&store));
+    assert_eq!(*messages.get(&answered).expect("message").state(), MessageState::Awaiting { receiver: session() });
+
+    world.reply.put(&Ref::new(answered.as_str()), ());
+    messages.apply(&answered, Settle { by: Settlement::Answered }, &world, Timestamp(5)).expect("settle");
+    assert_eq!(messages.get(&answered).expect("message").version().0, last_sequence(&store));
+    assert_eq!(&stored(&store, &answered), messages.get(&answered).expect("message"));
+
+    world.binding.put(&Ref::new(inbox().as_str()), InboxBinding::Unbound { since: Timestamp(0) });
+    messages.apply(&dropped, DropMessage { reason: DropReason::Undeliverable }, &world, Timestamp(50)).expect("drop");
+    let resource = messages.get(&dropped).expect("message");
+    assert_eq!(resource.version().0, last_sequence(&store));
+    assert!(matches!(resource.state(), MessageState::Dropped { reason: DropReason::Undeliverable, .. }));
+    assert_eq!(&stored(&store, &dropped), resource);
+}

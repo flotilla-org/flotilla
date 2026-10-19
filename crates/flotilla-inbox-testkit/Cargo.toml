@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
 serde_json = { workspace = true }
+flotilla-address = { path = "../flotilla-address" }
 flotilla-schema = { path = "../flotilla-schema" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 async-trait = { workspace = true }

@@ -103,7 +103,7 @@ fn resources_survive_the_codec() {
         expectation: Expectation::Reply,
         deadline: Some(Timestamp(9)),
         unbound_after: 3,
-        delivery_condition: Some(Address::project("still-wanted").expect("condition")),
+        delivery_condition: Some("project:still-wanted .phase == Wanted".parse().expect("condition")),
         ..MessageSpec::new(
             Address::project("sender").expect("sender"),
             Address::project("i").expect("inbox"),

@@ -40,7 +40,9 @@ pub trait InboxLog: Log<Message> + Send {
     /// Memory consumer logs have independent sequences; persist their observed
     /// Receive in this inbox's authoritative log before notifying watchers.
     fn receipt(&mut self, inbox: &Address, message: &str, consumer: &Receiver, transport: Transport) -> Result<(), Error>;
-    fn next_name(&mut self) -> Result<String, Error>;
+    /// The next unkeyed message's address under `inbox` (ADR 0066 §4): a
+    /// digest of its sender, this home and the admission sequence it takes.
+    fn next_name(&mut self, inbox: &Address, sender: &Address) -> Result<String, Error>;
 }
 
 /// The memory backend's authoritative store. Its durable-in-memory rows and log
@@ -137,8 +139,8 @@ impl MemoryStore {
         self.about.insert((message.to_owned(), version.0));
         Ok(())
     }
-    fn next_name(&mut self) -> Result<String, Error> {
-        Ok(format!("project:inbox/role:message-{}", self.sequence + 1))
+    fn next_name(&mut self, inbox: &Address, sender: &Address) -> Result<String, Error> {
+        crate::unkeyed_name(inbox, sender, "memory", self.sequence + 1)
     }
 }
 
@@ -217,8 +219,8 @@ impl InboxLog for MemoryInboxLog {
     fn receipt(&mut self, inbox: &Address, message: &str, consumer: &Receiver, transport: Transport) -> Result<(), Error> {
         self.0.lock().expect("memory store").receipt(inbox, message, consumer, transport)
     }
-    fn next_name(&mut self) -> Result<String, Error> {
-        self.0.lock().expect("memory store").next_name()
+    fn next_name(&mut self, inbox: &Address, sender: &Address) -> Result<String, Error> {
+        self.0.lock().expect("memory store").next_name(inbox, sender)
     }
 }
 impl WatchReader for MemoryInboxLog {

@@ -151,6 +151,10 @@ pub trait ConsumerPort: Send {
 #[async_trait]
 pub trait InboxBackend: Send + Sync {
     async fn enqueue(&self, spec: MessageSpec) -> Result<MessageId, Error>;
+    /// Enqueue as `<inbox>/message:<id>`, where `id` is a producer's
+    /// deterministic digest (see [`keyed_name`]): a repeated id returns the
+    /// existing message and admits nothing.
+    async fn enqueue_as(&self, spec: MessageSpec, id: &str) -> Result<MessageId, Error>;
     /// Wait for the already-observed receipts' deliver before adding a binding.
     async fn bind(&self, inbox: Address, consumer: Receiver) -> Result<(), Error>;
     async fn unbind(&self, inbox: &Address, consumer: &Receiver) -> Result<(), Error>;
@@ -167,7 +171,44 @@ pub trait InboxBackend: Send + Sync {
     async fn watch(&self, inbox: &Address, after: Option<Cursor>) -> Result<Watch, Error>;
 }
 
-const DEAD_LETTER_PREFIX: &str = "project:inbox/role:dead-letter-";
+/// A dead letter's id prefix; its id is a digest of the dropped message, so a
+/// retried reaction names the same dead letter.
+const DEAD_LETTER_PREFIX: &str = "dead-letter-";
+
+/// A keyed send's address (ADR 0066 §4): the digest of its inbox, sender and
+/// key, so a repeated key names the same message.
+pub fn keyed_name(inbox: &Address, sender: &Address, key: &str) -> Result<MessageId, Error> {
+    message_address(inbox, &keyed_id(inbox, sender, key))
+}
+
+/// The id [`keyed_name`] gives under the inbox.
+pub fn keyed_id(inbox: &Address, sender: &Address, key: &str) -> String {
+    flotilla_address::message_record_name(inbox.as_str(), sender.as_str(), key)
+}
+
+/// An unkeyed send's address: the digest of its sender, its home and the
+/// admission sequence it takes. The home names where it is stored, never a
+/// part of the address anyone reads.
+pub fn unkeyed_name(inbox: &Address, sender: &Address, home: &str, admission: u64) -> Result<MessageId, Error> {
+    keyed_name(inbox, sender, &format!("admission\0{home}\0{admission}"))
+}
+
+/// A message's address under its inbox.
+pub fn message_address(inbox: &Address, id: &str) -> Result<MessageId, Error> {
+    Address::message(inbox, id).map(|address| address.as_str().to_owned()).map_err(|error| Error::Storage(error.to_string()))
+}
+
+/// The dead letter a supervisor's inbox receives for `message`.
+pub fn dead_letter_name(supervisor: &Address, message: &str) -> Result<MessageId, Error> {
+    let digest = flotilla_address::message_record_name(message, "", "dead-letter");
+    message_address(supervisor, &format!("{DEAD_LETTER_PREFIX}{}", &digest["message-".len()..]))
+}
+
+fn is_dead_letter(message: &str) -> bool {
+    message
+        .parse::<Address>()
+        .is_ok_and(|address| address.kind() == flotilla_address::Kind::Message && address.name().starts_with(DEAD_LETTER_PREFIX))
+}
 
 struct GateWorld {
     names: BTreeSet<String>,
@@ -754,7 +795,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         }
         let name = match name {
             Some(name) => name,
-            None => state.home.log_mut().next_name()?,
+            None => state.home.log_mut().next_name(&spec.inbox, &spec.sender)?,
         };
         let empty = state.bindings.get(&inbox).is_none_or(|value| value.open == 0);
         world.run(self.observations.as_ref(), |world| state.home.create(&name, spec, world, now).map(|_| ()))??;
@@ -854,13 +895,14 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         Ok(())
     }
     fn dead_letter(&self, state: &mut State<L>, message: &str) -> Result<(), Error> {
-        let name = format!("{DEAD_LETTER_PREFIX}{}", message.rsplit(':').next().expect("message address"));
-        if state.home.get(&name).is_some() || state.home.log_mut().exists(&name)? {
-            return Ok(());
-        }
         let resource = state.home.get(message).expect("dropped");
         let sender = &resource.spec().sender;
         if let Some(supervisor) = self.supervision.supervisor(sender).filter(|supervisor| supervisor != sender) {
+            let name = dead_letter_name(&supervisor, message)?;
+            if state.home.get(&name).is_some() || state.home.log_mut().exists(&name)? {
+                return Ok(());
+            }
+            let resource = state.home.get(message).expect("dropped");
             let mut spec = MessageSpec::new(
                 self.supervision.system_sender(),
                 supervisor,
@@ -882,6 +924,16 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
 impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
     async fn enqueue(&self, spec: MessageSpec) -> Result<String, Error> {
         self.access(move |backend, state| backend.enqueue_locked(state, spec)).await
+    }
+    async fn enqueue_as(&self, spec: MessageSpec, id: &str) -> Result<String, Error> {
+        let name = message_address(&spec.inbox, id)?;
+        self.access(move |backend, state| {
+            if state.home.get(&name).is_some() || state.home.log_mut().exists(&name)? {
+                return Ok(name);
+            }
+            backend.enqueue_named(state, spec, Some(name))
+        })
+        .await
     }
     async fn bind(&self, inbox: Address, consumer: Receiver) -> Result<(), Error> {
         loop {
@@ -961,11 +1013,7 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
                                 resource.judge(world, backend.observations.now(), |h| pending_for(h, &query_consumer)).value
                             })?;
                             if allowed {
-                                let mode = if name.starts_with(DEAD_LETTER_PREFIX) {
-                                    Transport::Notify
-                                } else {
-                                    query_rules.choose(resource.spec())
-                                };
+                                let mode = if is_dead_letter(&name) { Transport::Notify } else { query_rules.choose(resource.spec()) };
                                 let pending = Pending { message: name.clone(), spec: resource.spec().clone(), mode };
                                 if mode != Transport::Turn {
                                     backend.receive_locked(state, &query_consumer, &name, mode)?;

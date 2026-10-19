@@ -101,6 +101,8 @@ struct LeafSubscriptionTableInner {
     backend: ResourceBackend,
     watch_views: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<wake::LeafViews>>>>,
     message_inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>,
+    /// The `[primitives]` Message path; empty while the switch is off.
+    message_path: crate::ports::MessagePath,
     charter_brief_renderer: Arc<dyn flotilla_messaging::CharterBriefRenderer>,
     event_sink: Arc<dyn EventSink>,
     rows: Mutex<HashMap<uuid::Uuid, LeafSubscriptionRow>>,
@@ -142,6 +144,15 @@ impl LeafSubscriptionTable {
     pub fn with_charter_brief_renderer(mut self, renderer: Arc<dyn flotilla_messaging::CharterBriefRenderer>) -> Self {
         Arc::get_mut(&mut self.inner).expect("configure rendering before sharing subscriptions").charter_brief_renderer = renderer;
         self
+    }
+
+    pub fn with_message_path(mut self, path: crate::ports::MessagePath) -> Self {
+        Arc::get_mut(&mut self.inner).expect("configure the message path before sharing subscriptions").message_path = path;
+        self
+    }
+
+    pub(crate) fn message_primitives(&self) -> Option<Arc<dyn crate::ports::EngineMessages>> {
+        self.inner.message_path.get().cloned()
     }
 
     pub fn with_message_inboxes(mut self, inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>) -> Self {
@@ -187,6 +198,7 @@ impl LeafSubscriptionTable {
                 backend,
                 watch_views: Default::default(),
                 message_inboxes: Default::default(),
+                message_path: Default::default(),
                 charter_brief_renderer: Arc::new(flotilla_messaging::CharterProseRenderer),
                 event_sink,
                 rows: Mutex::new(HashMap::new()),

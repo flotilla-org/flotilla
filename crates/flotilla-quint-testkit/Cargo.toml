@@ -6,6 +6,7 @@ license.workspace = true
 description = "Dev-only shared Quint ITF, graph conformance and scenario replay machinery"
 
 [dependencies]
+flotilla-address = { path = "../flotilla-address" }
 flotilla-schema = { path = "../flotilla-schema" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 serde_json = { workspace = true }

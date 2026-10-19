@@ -4551,6 +4551,7 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
 mod change_request_observation;
 mod forge_reads;
 mod image_layers;
+mod message_homes;
 
 // Project roles retain a home before admission or launch. The ordinary router
 // must create their intent there and admit a reply addressed to a system sender.

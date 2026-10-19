@@ -69,7 +69,7 @@ pub enum Expectation {
     #[store(code = "re")]
     Reply,
     #[store(code = "ou")]
-    Outcome { condition: Address },
+    Outcome { condition: flotilla_address::Condition },
 }
 
 /// How the sender stands to the consumer: delivery filters and the turn's
@@ -174,7 +174,7 @@ pub struct MessageSpec {
     /// A condition that must still hold when the message is delivered; once
     /// it is observed not to hold, the turn-rules role withdraws the message
     /// (#3424 ruling 9).
-    pub delivery_condition: Option<Address>,
+    pub delivery_condition: Option<flotilla_address::Condition>,
 }
 
 impl MessageSpec {
@@ -338,6 +338,7 @@ type DecodeReceipt = fn(&Event) -> Result<Option<(String, Transport)>, EventErro
 /// message's version is the number of receipts about it: entries are only
 /// appended while the message is live, so a later read never sees fewer. A
 /// message with no receipts reads as absent.
+#[derive(Clone)]
 pub struct ReceiptLog {
     consumers: BTreeMap<KindCode, (ConsumerKind, DecodeReceipt)>,
     messages: BTreeMap<String, (Version, BTreeMap<Receiver, Transport>)>,
@@ -727,8 +728,8 @@ fn gate_settle(h: &mut Handle<'_, Message>, settle: &Settle) -> Result<(), Messa
     }
 }
 
-fn outcome_observed(h: &mut Handle<'_, Message>, condition: &Address) -> bool {
-    h.read(&Ref::<Condition>::new(condition.as_str())).copied().unwrap_or(false)
+fn outcome_observed(h: &mut Handle<'_, Message>, condition: &flotilla_address::Condition) -> bool {
+    h.read(&Ref::<Condition>::new(condition.to_string())).copied().unwrap_or(false)
 }
 
 fn authorised(h: &mut Handle<'_, Message>, authority: &Address) -> Result<(), MessageRefusal> {
@@ -762,7 +763,7 @@ fn gate_drop(h: &mut Handle<'_, Message>, drop: &DropMessage) -> Result<(), Mess
 // is observed not to hold. Unobserved is not failed.
 fn condition_lapsed(h: &mut Handle<'_, Message>) -> bool {
     let Some(condition) = h.spec().delivery_condition.as_ref() else { return false };
-    h.read(&Ref::<Condition>::new(condition.as_str())) == Some(&false)
+    h.read(&Ref::<Condition>::new(condition.to_string())) == Some(&false)
 }
 
 // Spec `bound`: at least one consumer bound to the inbox, or a receiver.
