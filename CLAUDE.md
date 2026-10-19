@@ -166,7 +166,9 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-config` | Host-local config files (`config.toml`, `daemon.toml`, `hosts.toml`, observation roots, open views), provider preference values, default checkout path and bounded log files |
 | `flotilla-daemon-api` | `DaemonHandle` and event publication interfaces, query subscription token, build identity and lifecycle lock file |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
-| `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
+| `flotilla-cli` | Shared CLI parsing/output, image-check client, PM connector and foreground terminal attachment; no dashboard renderer |
+| `flotilla-vessel-agent` | Narrow resident vessel startup, environment configuration, logging and shutdown; no store, reconcilers or providers |
+| `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap and event loop; selected by the root default-on `tui` feature |
 | `flotilla-daemon` | Runtime supervision, socket server, replication composition and routed transport, peer networking, multi-host command routing |
 | `flotilla-address` | ADR 0066 addresses: typed `kind:value` segments, canonical encoding, forge-kind normalisation, lenient input through a Forge lookup, `record_name`, references and the condition/template grammar; no flotilla dependencies |
 | `flotilla-cbor` | The ADR 0063 CBOR profile over `cbor2`: deterministic writers, safe readers, limits, framing and the conformance corpus; no flotilla dependencies; moving to the shared [rigging](https://github.com/flotilla-org/rigging) repo, where sibling projects take it from (ADR 0068) |

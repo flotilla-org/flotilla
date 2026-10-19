@@ -1,4 +1,5 @@
 //! Capture diagnostics in a separate executable to isolate tracing callsites.
+use flotilla_cli::pm_connect::ConnectorState;
 use flotilla_manifest::recipe::FlotillaRecipes;
 use flotilla_protocol::{
     result_set::{ConvoySubjectRow, ResultSet, Rows},
@@ -8,7 +9,6 @@ use flotilla_protocol::{
 use flotilla_resources::{Forge, ForgeKind, ForgeSpec, InputMeta};
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_tui::pm_connect::ConnectorState;
 use tracing::instrument::WithSubscriber;
 
 // #2512: each connector warns on first uncovered services and recurrence,

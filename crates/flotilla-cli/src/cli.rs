@@ -1877,4 +1877,6 @@ async fn run_query_command(daemon: &dyn DaemonHandle, command: Command, format: 
 }
 
 #[cfg(test)]
+mod test_daemon;
+#[cfg(test)]
 mod tests;

@@ -3,7 +3,7 @@ use std::time::Duration;
 use color_eyre::Result;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 
-use flotilla_tui::cli::args::{Cli, CliPaths};
+use flotilla_cli::cli::args::{Cli, CliPaths};
 
 use super::daemon::{connect_cli_socket, connect_daemon, host_daemon_socket_required, reset_sigpipe};
 use super::targets::resolve_optional_host_node;
@@ -11,13 +11,13 @@ use super::targets::resolve_optional_host_node;
 pub(crate) async fn run_status(cli: &Cli, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     let endpoint = cli.daemon_endpoint().map_err(|e| color_eyre::eyre::eyre!(e))?;
-    flotilla_tui::cli::run_status(&endpoint, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+    flotilla_cli::cli::run_status(&endpoint, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
 pub(crate) async fn run_watch(cli: &Cli, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     let endpoint = cli.daemon_endpoint().map_err(|e| color_eyre::eyre::eyre!(e))?;
-    flotilla_tui::cli::run_watch(&endpoint, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+    flotilla_cli::cli::run_watch(&endpoint, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
 pub(crate) async fn run_wait(
@@ -73,13 +73,13 @@ pub(crate) async fn run_topology_command(cli: &Cli, format: OutputFormat, dot: b
     reset_sigpipe();
     let format = topology_output_format(format, dot).map_err(|e| color_eyre::eyre::eyre!(e))?;
     let daemon = connect_daemon(cli).await?;
-    flotilla_tui::cli::run_topology(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+    flotilla_cli::cli::run_topology(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
-fn topology_output_format(format: OutputFormat, dot: bool) -> Result<flotilla_tui::cli::TopologyOutputFormat, String> {
+fn topology_output_format(format: OutputFormat, dot: bool) -> Result<flotilla_cli::cli::TopologyOutputFormat, String> {
     match (format, dot) {
         (OutputFormat::Json, true) => Err("--dot cannot be used with --json".to_string()),
-        (_, true) => Ok(flotilla_tui::cli::TopologyOutputFormat::Dot),
+        (_, true) => Ok(flotilla_cli::cli::TopologyOutputFormat::Dot),
         (format, false) => Ok(format.into()),
     }
 }
@@ -128,7 +128,7 @@ pub(crate) async fn run_logs(
 mod tests {
     use super::*;
     use clap::Parser;
-    use flotilla_tui::cli::args::{SubCommand, TopologyArgs};
+    use flotilla_cli::cli::args::{SubCommand, TopologyArgs};
     #[test]
     fn cli_rejects_topology_dot_with_json() {
         assert!(Cli::try_parse_from(["flotilla", "topology", "--dot", "--json"]).is_err());

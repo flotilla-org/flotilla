@@ -4,7 +4,7 @@ use color_eyre::Result;
 use flotilla_agent as agents;
 use flotilla_protocol::{AgentHookEvent, AttachableId};
 
-use flotilla_tui::cli::args::{Cli, CompletionShell, HooksSubCommand};
+use flotilla_cli::cli::args::{Cli, CompletionShell, HooksSubCommand};
 
 pub(crate) async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argument_payload: Option<&str>) -> Result<()> {
     use std::io::Read;
@@ -59,7 +59,7 @@ pub(crate) async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argumen
 
 /// One-shot client: connect to daemon, send an AgentHook request, read one response, exit.
 async fn send_hook_event(socket_path: &std::path::Path, event: AgentHookEvent) -> Result<()> {
-    let daemon = flotilla_tui::socket::SocketDaemon::connect(socket_path)
+    let daemon = flotilla_client::SocketDaemon::connect(socket_path)
         .await
         .map_err(|error| color_eyre::eyre::eyre!("failed to connect to daemon at {}: {error}", socket_path.display()))?;
     daemon.send_agent_hook(event).await.map_err(|error| color_eyre::eyre::eyre!("daemon error: {error}"))

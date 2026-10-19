@@ -4,7 +4,7 @@ use color_eyre::Result;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 
-use flotilla_tui::cli::args::{Cli, CliPaths, PmSubCommand};
+use flotilla_cli::cli::args::{Cli, CliPaths, PmSubCommand};
 
 use super::daemon::{connect_cli_socket, host_daemon_socket_required};
 use super::resource::run_control_command;
@@ -13,7 +13,7 @@ pub(crate) async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<(
     match command {
         PmSubCommand::Connect { zellij_bin, plugin_url, wheelhouse_socket, flotilla_bin } => {
             let flotilla_bin = resolve_pm_flotilla_bin(flotilla_bin, std::env::current_exe)?;
-            let options = flotilla_tui::pm_connect::PmConnectOptions::builder()
+            let options = flotilla_cli::pm_connect::PmConnectOptions::builder()
                 .maybe_zellij_bin(zellij_bin)
                 .maybe_plugin_url(plugin_url)
                 .maybe_wheelhouse_socket(wheelhouse_socket)
@@ -21,7 +21,7 @@ pub(crate) async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<(
                 .build();
             let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
             let remote = cli.remote_daemon().map_err(|error| color_eyre::eyre::eyre!(error))?;
-            flotilla_tui::pm_connect::run(
+            flotilla_cli::pm_connect::run(
                 remote,
                 &socket_path,
                 &config_dir,

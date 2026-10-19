@@ -1063,6 +1063,7 @@ dependencies = [
  "color-eyre",
  "flotilla-agent",
  "flotilla-charter",
+ "flotilla-cli",
  "flotilla-client",
  "flotilla-commands",
  "flotilla-config",
@@ -1084,6 +1085,7 @@ dependencies = [
  "flotilla-tls",
  "flotilla-tui",
  "flotilla-vcs",
+ "flotilla-vessel-agent",
  "hegeltest",
  "libc",
  "ratatui",
@@ -1481,6 +1483,56 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "flotilla-cli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bon",
+ "chrono",
+ "clap",
+ "color-eyre",
+ "comfy-table",
+ "crossterm",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-http",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-signing",
+ "flotilla-build-features-time",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-charter",
+ "flotilla-client",
+ "flotilla-commands",
+ "flotilla-config",
+ "flotilla-core",
+ "flotilla-daemon",
+ "flotilla-daemon-api",
+ "flotilla-discovery-testkit",
+ "flotilla-manifest",
+ "flotilla-paths",
+ "flotilla-protocol",
+ "flotilla-resources",
+ "flotilla-store",
+ "flotilla-store-memory",
+ "futures",
+ "humantime",
+ "insta",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3137,6 +3189,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-charter",
+ "flotilla-cli",
  "flotilla-client",
  "flotilla-commands",
  "flotilla-config",
@@ -3198,6 +3251,19 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "flotilla-vessel-agent"
+version = "0.1.0"
+dependencies = [
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-tracing",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

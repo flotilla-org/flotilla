@@ -678,7 +678,7 @@ async fn completion_wait_case(cancel: bool) {
 
     use flotilla_protocol::{Command, CommandAction, CrewCommandContext};
 
-    use crate::app::test_support::StubDaemon;
+    use super::test_daemon::StubDaemon;
     let (tx, _) = tokio::sync::broadcast::channel(8);
     let calls = Arc::new(Mutex::new(Vec::new()));
     let daemon = StubDaemon::builder().tx(tx.clone()).execute_calls(calls.clone()).build();

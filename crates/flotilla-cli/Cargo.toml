@@ -1,0 +1,70 @@
+[package]
+name = "flotilla-cli"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-config = { path = "../flotilla-config" }
+flotilla-paths = { path = "../flotilla-paths" }
+flotilla-daemon-api = { path = "../flotilla-daemon-api" }
+humantime = "2"
+bon = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+flotilla-client = { path = "../flotilla-client" }
+flotilla-commands = { path = "../flotilla-commands" }
+flotilla-manifest = { path = "../flotilla-manifest" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+color-eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+futures = "0.3"
+comfy-table = "7.2.2"
+# Match the native graph selection for comfy-table's terminal support.
+crossterm = "0.29"
+clap = { version = "4", features = ["derive"] }
+uuid = { workspace = true, features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+flotilla-store-memory = { path = "../flotilla-store-memory" }
+flotilla-store = { path = "../flotilla-store" }
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { version = "0.3.22", features = ["json"] }
+async-trait = { workspace = true }
+flotilla-core = { path = "../flotilla-core" }
+flotilla-charter = { path = "../flotilla-charter" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+insta = "1"
+tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+flotilla-daemon = { path = "../flotilla-daemon" }
+
+[lints]
+workspace = true
+
+# Keep native library features stable across build and test commands.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-signing = { path = "../flotilla-build-features-signing" }
+flotilla-build-features-time = { path = "../flotilla-build-features-time" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

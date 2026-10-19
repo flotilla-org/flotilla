@@ -14,6 +14,8 @@ members = [
     "crates/flotilla-forgejo-providers",
     "crates/flotilla-charter",
     "crates/flotilla-client",
+    "crates/flotilla-cli",
+    "crates/flotilla-vessel-agent",
     "crates/flotilla-ai-utility",
     "crates/flotilla-cloud-agent",
     "crates/flotilla-commands",
@@ -114,7 +116,8 @@ edition = "2021"
 license.workspace = true
 
 [features]
-default = []
+default = ["tui"]
+tui = ["dep:flotilla-tui", "dep:ratatui"]
 aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-provider"]
 
 # New external crates also belong in clippy.toml's absolute-paths-allowed-crates.
@@ -137,8 +140,10 @@ flotilla-core = { path = "crates/flotilla-core" }
 flotilla-manifest = { path = "crates/flotilla-manifest" }
 flotilla-protocol = { path = "crates/flotilla-protocol" }
 flotilla-resources = { path = "crates/flotilla-resources" }
-flotilla-tui = { path = "crates/flotilla-tui" }
-ratatui = "0.30"
+flotilla-tui = { path = "crates/flotilla-tui", optional = true }
+flotilla-cli = { path = "crates/flotilla-cli" }
+flotilla-vessel-agent = { path = "crates/flotilla-vessel-agent" }
+ratatui = { version = "0.30", optional = true }
 tokio = { workspace = true }
 color-eyre = { workspace = true }
 clap = { version = "4", features = ["derive"] }
@@ -168,6 +173,7 @@ tempfile = { workspace = true }
 [[example]]
 name = "glyph_showcase"
 test = false
+required-features = ["tui"]
 
 [workspace.lints.clippy]
 absolute_paths = "warn"
