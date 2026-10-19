@@ -13,6 +13,9 @@ pub(super) struct DeliveryProbePool {
     pub(super) retries: AtomicUsize,
     pub(super) screens: Vec<String>,
     pub(super) submission_error: bool,
+    pub(super) controller_refusals: AtomicUsize,
+    pub(super) submission_attempts: AtomicUsize,
+    pub(super) submission_attempted: tokio::sync::Notify,
 }
 
 impl DeliveryProbePool {
@@ -26,6 +29,9 @@ impl DeliveryProbePool {
             retries: AtomicUsize::new(0),
             screens: Vec::new(),
             submission_error: false,
+            controller_refusals: AtomicUsize::new(0),
+            submission_attempts: AtomicUsize::new(0),
+            submission_attempted: tokio::sync::Notify::new(),
         }
     }
 }
@@ -86,6 +92,17 @@ impl TerminalPool for DeliveryProbePool {
         } else {
             Ok(())
         }
+    }
+
+    // Process boundary fake: the daemon guard refuses before any PTY bytes.
+    async fn guarded_deliver(&self, session: &str, text: &str) -> Result<flotilla_terminal::TerminalSubmission, String> {
+        self.submission_attempts.fetch_add(1, Ordering::SeqCst);
+        self.submission_attempted.notify_one();
+        if self.controller_refusals.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
+            return Ok(flotilla_terminal::TerminalSubmission::Refused("controller input is not idle".into()));
+        }
+        self.deliver(session, text).await?;
+        Ok(flotilla_terminal::TerminalSubmission::Submitted)
     }
 
     async fn retry_delivery(&self, _session_name: &str, _text: &str) -> Result<(), String> {
@@ -161,7 +178,7 @@ pub(super) async fn refresh_message_test_attention(runtime: &TerminalControllerR
     .expect("terminal controller attention projection");
 }
 
-pub(super) async fn run_message_batch_pool_case(operator_closes: bool) {
+pub(super) async fn run_message_batch_pool_case(operator_closes: bool, refusals: usize) {
     use flotilla_discovery_testkit::fake_discovery;
     use flotilla_resources::{Message, MessageExpectation, MessagePhase, MessageRelation, MessageSpec, ROLE_LABEL, VESSEL_LABEL};
 
@@ -174,6 +191,7 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool) {
     let backend = daemon.resource_backend();
     let mut probe = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
     probe.submission_error = true;
+    probe.controller_refusals.store(refusals, Ordering::SeqCst);
     probe.screens = vec!["› Ask Codex to do anything".into(); 1000];
     probe.screens.push("new tool output\n• Working (1s • esc to interrupt)\n› Ask Codex to do anything".into());
     let pool = Arc::new(probe);
@@ -309,8 +327,23 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool) {
     );
     assert_eq!(backend.using::<Message>(NAMESPACE).list().await.expect("cross-host Message fixture operation succeeds").items.len(), 3);
     inbox.reconcile_delivery(&runtime, now).await.expect("cross-host Message fixture operation succeeds");
+    tokio::task::yield_now().await;
+    for attempt in 1..=refusals {
+        tokio::time::timeout(Duration::from_secs(2), pool.submission_attempted.notified()).await.expect("guard retry reached PTY boundary");
+        assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), attempt);
+        assert!(pool.inputs.lock().expect("input log").is_empty(), "a refusal leaves the FIFO batch queued and unsent");
+        assert!(
+            !runtime.state.terminal_deliveries.lock().expect("delivery reservation").is_empty(),
+            "the batch keeps its de-duplication reservation"
+        );
+        inbox.reconcile_delivery(&runtime, now).await.expect("pending batch reconciliation");
+        assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), attempt, "reconciliation must not start another submission");
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+    }
     tokio::time::sleep(Duration::from_secs(6)).await;
     inbox.reconcile_delivery(&runtime, now + chrono::Duration::seconds(1)).await.expect("cross-host Message fixture operation succeeds");
+    assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), refusals + 1);
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
     assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
     {

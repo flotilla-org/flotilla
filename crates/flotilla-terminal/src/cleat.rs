@@ -12,16 +12,13 @@ use serde::Deserialize;
 
 use super::{
     environment::ControlledTerminalEnvironment, ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness,
-    TerminalSessionTag, TerminalSize,
+    TerminalSessionTag, TerminalSize, TerminalSubmission,
 };
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 
-const BRACKETED_PASTE_START: &str = "\x1b[200~";
-const BRACKETED_PASTE_END: &str = "\x1b[201~";
-const DELIVERY_ENTER_DELAY: Duration = Duration::from_millis(100);
 const ENDPOINT_CACHE_TTL: Duration = Duration::from_secs(1);
 const RECORDING_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const RECORDING_PRUNE_SCRIPT: &str = r#"[ -d "$1/$2/sessions" ] || exit 0
@@ -75,6 +72,7 @@ enum ScreenActivityWire {
 pub struct CleatTerminalPool {
     runner: Arc<dyn CommandRunner>,
     binary: String,
+    controller_idle: Duration,
     environment: ControlledTerminalEnvironment,
     /// Whether this cleat accepts `launch --env-clear` (cleat#318).
     launch_capability: tokio::sync::OnceCell<bool>,
@@ -94,12 +92,19 @@ impl CleatTerminalPool {
         Self {
             runner: environment.runner(runner),
             binary: binary.into(),
+            controller_idle: Duration::from_secs(1),
             environment,
             launch_capability: tokio::sync::OnceCell::new(),
             attach_capability: tokio::sync::OnceCell::new(),
             endpoint_cache: tokio::sync::Mutex::new(None),
             last_recording_prune: tokio::sync::Mutex::new(Instant::now()),
         }
+    }
+
+    /// Default matches cleat's existing one-second screen quiet period.
+    pub fn with_controller_idle(mut self, window: Duration) -> Self {
+        self.controller_idle = window;
+        self
     }
 
     async fn dead_recording_daemons(runner: &dyn CommandRunner, binary: &str) -> Result<Vec<DaemonInfo>, String> {
@@ -389,11 +394,31 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
-        let paste = format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}");
-        run!(self.runner, &self.binary, &["send", session_name, &paste, "--no-enter"], Path::new("/"))?;
-        tokio::time::sleep(DELIVERY_ENTER_DELAY).await;
-        run!(self.runner, &self.binary, &["send-keys", session_name, "Enter"], Path::new("/"))?;
-        Ok(())
+        match self.guarded_deliver(session_name, text).await? {
+            TerminalSubmission::Submitted => Ok(()),
+            TerminalSubmission::Refused(reason) => Err(reason),
+        }
+    }
+
+    async fn guarded_deliver(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
+        let idle = format!("{}ms", self.controller_idle.as_millis());
+        // Cleat owns paste encoding and Enter in the same daemon transaction.
+        let result = run!(self.runner, &self.binary, &["send", session_name, text, "--submit", "--controller-idle", &idle], Path::new("/"));
+        match result {
+            Ok(_) => Ok(TerminalSubmission::Submitted),
+            // Exact daemon refusal reasons only: other errors may follow a write.
+            Err(reason)
+                if matches!(
+                    reason.trim(),
+                    "controller input is not idle"
+                        | "controller input has not yet produced a verifiable PTY echo"
+                        | "controller input output fence is still settling"
+                ) =>
+            {
+                Ok(TerminalSubmission::Refused(reason))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
@@ -746,29 +771,45 @@ mod tests {
         assert_eq!(calls[0].1, vec!["kill", "my-session"]);
     }
 
+    // Glue: each single-line, multiline and empty message is one atomic cleat call;
+    // cleat, rather than flotilla, owns bracketed-paste encoding and Enter.
     #[tokio::test(start_paused = true)]
-    async fn delivery_writes_bracketed_paste_then_enter_for_single_and_multiline_messages() {
-        let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new()), Ok(String::new()), Ok(String::new())]));
-        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
-
-        let single_started = tokio::time::Instant::now();
-        pool.deliver("reviewer-session", "Please review commit abc123").await.expect("deliver single-line message");
-        assert_eq!(single_started.elapsed(), DELIVERY_ENTER_DELAY);
-        let multiline_started = tokio::time::Instant::now();
-        pool.deliver("reviewer-session", "handoff from coder@work\n\nPlease review commit abc123")
-            .await
-            .expect("deliver multiline message");
-        assert_eq!(multiline_started.elapsed(), DELIVERY_ENTER_DELAY);
-
+    async fn delivery_uses_one_atomic_guarded_call_per_message() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new()), Ok(String::new())]));
+        let pool = test_pool(runner.clone(), "cleat").with_controller_idle(Duration::from_millis(1750));
+        for text in ["Please review commit abc123", "handoff from coder@work\n\nPlease review", ""] {
+            let started = tokio::time::Instant::now();
+            pool.deliver("reviewer-session", text).await.expect("submit");
+            assert_eq!(started.elapsed(), Duration::ZERO);
+        }
         let calls = logical_calls(&runner);
-        assert_eq!(calls[0].0, "cleat");
-        assert_eq!(calls[0].1, vec!["send", "reviewer-session", "\x1b[200~Please review commit abc123\x1b[201~", "--no-enter"]);
-        assert_eq!(calls[1].1, vec!["send-keys", "reviewer-session", "Enter"]);
-        assert_eq!(
-            calls[2].1,
-            vec!["send", "reviewer-session", "\x1b[200~handoff from coder@work\n\nPlease review commit abc123\x1b[201~", "--no-enter"]
-        );
-        assert_eq!(calls[3].1, vec!["send-keys", "reviewer-session", "Enter"]);
+        assert_eq!(calls.len(), 3);
+        for (call, text) in calls.iter().zip(["Please review commit abc123", "handoff from coder@work\n\nPlease review", ""]) {
+            assert_eq!(call.0, "cleat");
+            assert_eq!(call.1, vec!["send", "reviewer-session", text, "--submit", "--controller-idle", "1750ms"]);
+        }
+    }
+
+    // Only explicit pre-write controller refusals establish a safe retry;
+    // transport errors and unrecognized failures remain ambiguous.
+    #[tokio::test]
+    async fn guarded_delivery_distinguishes_refusal_from_ambiguous_failure() {
+        for reason in [
+            "controller input is not idle",
+            "controller input has not yet produced a verifiable PTY echo",
+            "controller input output fence is still settling",
+            "connection lost",
+            "write failed: controller input is not idle",
+        ] {
+            let runner = Arc::new(MockRunner::new(vec![Err(format!("{reason}\n"))]));
+            let result = test_pool(runner.clone(), "cleat").guarded_deliver("agent", "turn").await;
+            if reason.starts_with("controller input") {
+                assert_eq!(result, Ok(TerminalSubmission::Refused(format!("{reason}\n"))));
+            } else {
+                assert_eq!(result, Err(format!("{reason}\n")));
+            }
+            assert_eq!(logical_calls(&runner).len(), 1);
+        }
     }
 
     // ── attach_args tests ──────────────────────────────────────────
@@ -937,15 +978,15 @@ mod tests {
 
     #[tokio::test]
     async fn retry_delivery_clears_a_stuck_composer_before_resubmitting() {
-        let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new()), Ok(String::new())]));
+        let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new())]));
         let pool = test_pool(runner.clone(), "cleat");
 
         pool.retry_delivery("reviewer-session", "Please review commit abc123").await.expect("retry delivery");
 
         let calls = logical_calls(&runner);
         assert_eq!(calls[0].1, vec!["send-keys", "reviewer-session", "C-c"]);
-        assert_eq!(calls[1].1, vec!["send", "reviewer-session", "\x1b[200~Please review commit abc123\x1b[201~", "--no-enter"]);
-        assert_eq!(calls[2].1, vec!["send-keys", "reviewer-session", "Enter"]);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].1, vec!["send", "reviewer-session", "Please review commit abc123", "--submit", "--controller-idle", "1000ms"]);
     }
 }
 

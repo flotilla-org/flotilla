@@ -64,6 +64,8 @@ pub struct ClaudeAiUtilityConfig {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TerminalPoolConfig {
+    /// Cleat's atomic submission guard window; defaults to the existing 1s quiet period.
+    pub controller_idle_ms: Option<u64>,
     #[serde(flatten)]
     pub preference: ProviderPreference,
 }

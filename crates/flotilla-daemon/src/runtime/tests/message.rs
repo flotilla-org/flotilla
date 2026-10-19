@@ -1049,14 +1049,17 @@ async fn terminal_delivery_lookup_deduplicates_same_message_and_replaces_a_diffe
     assert_eq!(completed.task.await.expect("delivery task").expect("delivery result"), TerminalDeliveryOutcome::Confirmed);
 }
 
-// Three receiver-homed intents reach the real adapter/pool boundary as one
-// ordered frame. An ambiguous write keeps observations fresh, resolves on
-// later Working evidence, and releases its slot without typing again.
-#[tokio::test(start_paused = true)]
-async fn message_batch_uses_one_pool_input_and_releases_a_late_receipt() {
-    for operator_closes in [false, true] {
-        run_message_batch_pool_case(operator_closes).await;
-    }
+// Three receiver-homed intents remain queued through controller refusals, then
+// reach the real adapter/pool boundary once, in FIFO order. An ambiguous write
+// resolves on later Working evidence (or operator closure) without duplication.
+#[hegel::test]
+fn message_batch_uses_one_pool_input_and_releases_a_late_receipt(tc: hegel::TestCase) {
+    // Generate repeated controller-input interleavings, including a single
+    // refusal and five refusals, and both receipt/closure settlement paths.
+    let refusals = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(5));
+    let operator_closes = tc.draw(hegel::generators::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused scenario runtime");
+    runtime.block_on(run_message_batch_pool_case(operator_closes, refusals));
 }
 
 // Legacy queue work cannot drain or replace a Message batch's task,

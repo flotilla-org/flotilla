@@ -29,13 +29,15 @@ impl Factory for CleatTerminalPoolFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &dyn ProviderConfigView,
+        config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if let Some(binary) = env.find_binary("cleat") {
+            let config = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
+            let window = std::time::Duration::from_millis(config.terminal_pool.controller_idle_ms.unwrap_or(1000));
             // Cleat's VT engine chooses the child's terminal identity at launch.
-            Ok(Arc::new(CleatTerminalPool::new(runner, binary.as_path().display().to_string(), env)))
+            Ok(Arc::new(CleatTerminalPool::new(runner, binary.as_path().display().to_string(), env).with_controller_idle(window)))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("cleat".into())])
         }
@@ -99,6 +101,24 @@ mod tests {
             let env = calls[2].1.windows(2).filter(|args| args[0] == "--env").map(|args| args[1].as_str()).collect::<Vec<_>>();
             assert_eq!(env, vec!["HOME=/execution/home", "PATH=/execution/bin:/usr/bin:/bin"]);
         }
+    }
+
+    // Glue: discovery forwards the configured atomic guard window to cleat.
+    #[tokio::test]
+    async fn session_factory_configures_controller_idle_window() {
+        use flotilla_replay_testkit::testing::MockRunner;
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("cleat", "/tools/cleat"));
+        let mut config = ConfigStore::with_base("/config");
+        config.1.terminal_pool.controller_idle_ms = Some(2500);
+        let runner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
+        let pool = CleatTerminalPoolFactory
+            .probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner.clone())
+            .await
+            .expect("configured cleat pool");
+        pool.deliver("agent", "turn").await.expect("atomic turn submission");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(&calls[0].1[calls[0].1.len() - 2..], &["--controller-idle", "2500ms"]);
     }
 
     #[tokio::test]
