@@ -6,14 +6,14 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-serde_json.workspace = true
 flotilla-config = { path = "../flotilla-config" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde_json.workspace = true
 async-trait.workspace = true
 bon.workspace = true
 tracing.workspace = true

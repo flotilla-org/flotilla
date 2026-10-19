@@ -1,5 +1,4 @@
 //! Project registration, refresh, and operational entry materialization.
-use flotilla_resources::checkout_path::checkout_path;
 
 use crate::convoy_admission::{project_not_ready_error, ConvoyStartTask};
 use flotilla_resources::convoy_address::convoy_ensure_name;
@@ -25,6 +24,7 @@ use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     PrincipalRef, ProviderData, ResourceRef,
 };
+use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::{
     normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyRepositorySpec,
     DeclarationRefusedCondition, Demand, DemandKind, DemandSpec, Forge, InputMeta, ObjectEvent, Project, ProjectRepositoryRole,

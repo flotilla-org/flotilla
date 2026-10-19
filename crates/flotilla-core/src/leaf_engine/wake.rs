@@ -1,4 +1,3 @@
-use flotilla_resources::checkout_integration::remote_ref_for_branch;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     future::Future,
@@ -10,6 +9,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
+use flotilla_resources::checkout_integration::remote_ref_for_branch;
 use flotilla_resources::{
     actor_obligation,
     address::{leaf_address, leaf_for, record_name, subject_address},

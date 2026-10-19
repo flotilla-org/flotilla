@@ -3,6 +3,8 @@ use crate::{Checkout, CheckoutIntegrationStatus, Convoy, ResourceObject, CHANGE_
 use std::collections::BTreeSet;
 
 /// Evidence detail used when the checkout cannot establish its convoy association.
+/// VCS inspection produces this detail and resource helpers consume it; both
+/// crates must agree on this value to recognize incomplete association evidence.
 pub const CONVOY_ASSOCIATION_UNAVAILABLE: &str = "no change request exists for the checkout ref, but convoy association was not available";
 
 /// Whether landing evidence is incomplete because convoy association was unavailable.
@@ -82,6 +84,16 @@ mod tests {
     use super::*;
     use crate::{CheckoutSpec, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ObservedCheckoutSpec};
     use chrono::Utc;
+    fn lab_forge() -> crate::ForgeSpec {
+        crate::ForgeSpec::builder()
+            .forge_id("lab".into())
+            .kind(crate::ForgeKind::Forgejo)
+            .hosts(std::collections::BTreeSet::from(["forge.example".into()]))
+            .https_url("https://forge.example/team".into())
+            .git_ssh_host("forge.example".into())
+            .build()
+    }
+
     fn resource<T: crate::Resource>(name: &str, spec: T::Spec) -> ResourceObject<T> {
         ResourceObject {
             metadata: crate::ObjectMeta {
@@ -110,13 +122,7 @@ mod tests {
             workspace_slug: "project-map".into(),
             subpaths: Vec::new(),
         }];
-        let forge = crate::ForgeSpec::builder()
-            .forge_id("lab".into())
-            .kind(crate::ForgeKind::Forgejo)
-            .hosts(std::collections::BTreeSet::from(["forge.example".into()]))
-            .https_url("https://forge.example/team".into())
-            .git_ssh_host("forge.example".into())
-            .build();
+        let forge = lab_forge();
         let subjects = change_request_subjects_from_claim(
             "Published from another branch: [PR](https://forge.example/team/robert/project-map/pulls/12).",
             &repositories,
@@ -125,17 +131,8 @@ mod tests {
         assert_eq!(subjects.len(), 1);
         assert_eq!(subjects[0].source, flotilla_protocol::IssueSource { service: "lab".into(), scope: "robert/project-map".into() });
         assert_eq!(subjects[0].id, "12");
-        let subjects = change_request_subjects_from_claim(
-            "https://forge.example/team/other/repository/pulls/13",
-            &repositories,
-            &[crate::ForgeSpec::builder()
-                .forge_id("lab".into())
-                .kind(crate::ForgeKind::Forgejo)
-                .hosts(std::collections::BTreeSet::from(["forge.example".into()]))
-                .https_url("https://forge.example/team".into())
-                .git_ssh_host("forge.example".into())
-                .build()],
-        );
+        let subjects =
+            change_request_subjects_from_claim("https://forge.example/team/other/repository/pulls/13", &repositories, &[lab_forge()]);
         assert!(subjects.is_empty(), "a claim cannot produce a PR in an unadmitted repository");
     }
 
@@ -173,13 +170,7 @@ mod tests {
                 is_main: false,
             }),
         );
-        let forge = crate::ForgeSpec::builder()
-            .forge_id("lab".into())
-            .kind(crate::ForgeKind::Forgejo)
-            .hosts(std::collections::BTreeSet::from(["forge.example".into()]))
-            .https_url("https://forge.example/team".into())
-            .git_ssh_host("forge.example".into())
-            .build();
+        let forge = lab_forge();
         assert_eq!(convoy_change_request_id_for_checkout(&convoy, &checkout, &[forge]), Some("12".into()));
         assert_eq!(convoy_change_request_id_for_checkout(&convoy, &checkout, &[]), None);
     }

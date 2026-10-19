@@ -1,6 +1,4 @@
 //! Crew outcomes, lifecycle teardown, and serialized crew message delivery.
-use flotilla_resources::checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id_for_checkout};
-use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::{credential_refresh_alert_for_vessel, LANDING_EVIDENCE_TTL};
 
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
@@ -21,6 +19,8 @@ use flotilla_protocol::{
     CheckoutArchiveOutcome, CheckoutArchiveStatus, CommandValue, CrewCommandContext, CrewListMember, CrewListResponse, CrewProject,
     CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
 };
+use flotilla_resources::checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id_for_checkout};
+use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::{
     address::{
         artifact_slot_record_name, leaf_address, leaf_record_name, record_name, remote_change_request_address, repository_address,

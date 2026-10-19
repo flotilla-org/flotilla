@@ -1,5 +1,4 @@
 //! Convoy admission state and transaction boundary.
-use flotilla_resources::checkout_path::checkout_path;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -34,6 +33,7 @@ use flotilla_protocol::{
 };
 use flotilla_provider_runtime::{CommandRunner, ObservationError};
 use flotilla_resources::address::{record_name, remote_change_request_address};
+use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
 use flotilla_resources::{
     api_version, capped_github_app_permissions, normalize_issue_source, AllocationDecision, BoundChangeRequest, CapabilityNeed,

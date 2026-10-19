@@ -1,6 +1,5 @@
 //! Observed Checkout lifetimes own discovered VCS capabilities. Active commands
 //! retain leases; presentation rows retain descriptors, never provider instances.
-use flotilla_resources::checkout_path::checkout_path;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -13,6 +12,7 @@ use chrono::{DateTime, Utc};
 use flotilla_config::ConfigStore;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_protocol::EnvironmentId;
+use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Repository, RepositoryKey, ResourceError,
     ResourceObject, WatchEvent, WatchStart,
