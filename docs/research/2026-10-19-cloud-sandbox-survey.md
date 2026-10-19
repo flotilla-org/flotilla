@@ -48,6 +48,13 @@ Monthly cost for one 4 vCPU / 8 GB sandbox, run for 160 h (steady) and for 200 h
 
 - **Usage APIs are weak across the field.** Only Runtime, Superserve, Morph, Koyeb and Railway expose usage, credit and quota well. Cost-based admission needs our own metering from create and stop events. The working assumption is our own accounting first, reconciled against provider usage APIs where they exist and against scraped billing pages where they don't.
 - **Many providers are SDK-only** (Python or TypeScript, no documented REST or gRPC API). A TypeScript connector would cover them (#3494). Because the in-vessel agent is the runner (#3281), such a connector only needs control-plane operations: lifecycle, image preparation, network policy, volumes, loss causes, and usage or quota.
+- **Private registry access varies more than the wire protocol does.** No hosted provider reaches a registry off the internet unless its puller runs in our network. A few providers take short-lived credentials with each create:
+  - Namespace (Basic, OIDC, ECR and GAR federation);
+  - exe.dev;
+  - Tensorlake;
+  - Beam.
+
+  Most others store a static secret or cloud key. Some take only public images (Sailboxes, Superserve, Docker) or only their own registry (Vercel). The fit is ADR 0058's `CredentialStore` minting scoped pull tokens for one internet-reachable registry, while each provider's adapter picks the route there: direct pull, copy into the provider's registry, or template build.
 - **gVisor has no working nftables.** Where a provider defaults to gVisor (Modal, GKE's managed Agent Sandbox), vessels need its VM runtime.
 
 ## Docker Cloud Sandboxes, probed 2026-10-19
