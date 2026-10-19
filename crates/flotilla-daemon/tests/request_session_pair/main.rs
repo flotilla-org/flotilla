@@ -13,6 +13,7 @@ use flotilla_admission::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_config::ConfigStore;
 use flotilla_core::command_target::TargetHost;
 use flotilla_core::in_process::InProcessDaemon;
+use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::ports::WorkCredentialReconciler;
 use flotilla_daemon::blob_store::TieredBlobStore;
 use flotilla_daemon::runtime::DaemonRuntime;
@@ -80,9 +81,7 @@ use flotilla_resources::{
     WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL,
     HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{
-    controller::ControllerLoop, list_resource_kind, ConvoyReconciler, OwnerGarbageCollector, ResourceBackend, REGISTERED_RESOURCE_KINDS,
-};
+use flotilla_store::{controller::ControllerLoop, list_resource_kind, OwnerGarbageCollector, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use hegel::generators as gs;
 
 struct TeardownCheckoutRuntime;

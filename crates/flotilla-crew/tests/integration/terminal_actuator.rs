@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use flotilla_crew::reconcilers::terminal_session::TerminalActuator;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_resources::TerminalSessionSpec;
 use flotilla_terminal::{TerminalEnvVars, TerminalPool, TerminalSession as PoolSession};
-use std::sync::Arc;
 
 #[derive(Default)]
 struct FakeTerminalPool;
@@ -41,7 +43,7 @@ impl TerminalPool for FakeTerminalPool {
 
 #[tokio::test]
 async fn terminal_actuator_uses_literal_command_and_cwd() {
-    let actuator = flotilla_controllers::actuators::TerminalActuator::new(Arc::new(FakeTerminalPool));
+    let actuator = TerminalActuator::new(Arc::new(FakeTerminalPool));
     let spec = TerminalSessionSpec {
         env_ref: "env-a".to_string(),
         role: "coder".to_string(),

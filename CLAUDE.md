@@ -81,7 +81,7 @@ adding dependencies. The build-graph check resolves the full Cargo graph to enfo
 depend on the native feature selections.
 Workspace tests require Python 3.9+ and Cargo on PATH (`python` on Windows, `python3` elsewhere) for this guard.
 
-`flotilla-store-testkit` and `flotilla-controllers` collect their integration tests in `tests/integration/main.rs`.
+`flotilla-store-testkit`, `flotilla-crew` and `flotilla-controllers` collect their integration tests in `tests/integration/main.rs`.
 The store-testkit `watch_allocations` and `decode_cost` targets and the daemon `daemon_allocations` target stay separate because they install process-wide counting allocators.
 `flotilla-daemon` uses that target for general integration tests and `tests/request_session_pair/main.rs` for routing scenarios.
 Run `cargo test -p <package> --locked --test integration` for the integration target, and
@@ -162,7 +162,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-observation` | Provider-neutral change-request, issue and forge observation, demand servicing and observed-resource projection |
 | `flotilla-provisioning` | Environment, ImageBuild, Checkout, Clone and Repository reconcilers; orphaned-environment and image-inventory loops |
 | `flotilla-admission` | Convoy admission, standing-convoy reconciliation, vessel placement projection, placement planning, project operations and composed-image planning; host orchestration through owned ports |
-| `flotilla-crew` | Crew operations and actions, capability cards, the leaf engine, the decision log and charter notifications; host collaborators through owned ports |
+| `flotilla-crew` | Crew operations and actions, capability cards, the leaf engine, the decision log, charter notifications, review bundles, and the Vessel, TerminalSession and Convoy reconcilers; host collaborators through owned ports |
 | `flotilla-core` | Refresh and `InProcessDaemon` composition root; implements admission, crew and observation ports |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
@@ -198,7 +198,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `rigging-http-client` (external) | Injectable HTTP execution and the reqwest implementation |
 | `rigging-replay-testkit` (external, dev-only) | Replay sessions, recording, masks, mock runners and HTTP stand-ins |
 | `flotilla-replay-testkit` | GitHub replay channel over `rigging-replay-testkit` scheduling, masks and test helpers |
-| `flotilla-controllers` | Reconcilers for resource-driven control-plane behavior, including standing-convoy ensures, retries, attention and rolls |
+| `flotilla-controllers` | Cross-capability reconciler tests and the `provisioned_mount` helper, pending retirement |
 | `flotilla-commands` | Resource-oriented command preparation and execution |
 | `flotilla-transport` | Framed message sessions over Unix sockets or in-memory channels for daemon client and peer connections |
 | `tender` | Publication, discovery, pinned-exposure, and raw-stream contracts with an in-memory adapter and shared behavior tests |
@@ -216,6 +216,9 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-admission/src/reconcilers/convoy_ensure.rs` | Standing-convoy reconciliation, retry state and the complete ensure transaction guard |
 | `crates/flotilla-crew/src/crew_ops.rs` | `CrewService`: crew outcomes, lifecycle teardown and serialized crew message delivery |
 | `crates/flotilla-crew/src/leaf_engine.rs` | Leaf subscriptions, wait wakes, turn delivery, stalls and supervision |
+| `crates/flotilla-crew/src/convoy.rs` | Convoy phase and landing reconciler; reaches crew operations only through `ConvoyTeardownRuntime` |
+| `crates/flotilla-crew/src/reconcilers/vessel.rs` | Vessel reconciler and its `WorktreeMetadataResolver` port |
+| `crates/flotilla-crew/src/reconcilers/terminal_session.rs` | TerminalSession reconciler, its `TerminalRuntime` port and the tool-session `TerminalActuator` |
 | `crates/flotilla-executor/src/executor.rs` | Executes provider-backed command steps and returns `CommandValue` |
 | `crates/flotilla-executor/src/executor/` | Executor submodules: checkout, session actions and tests |
 | `crates/flotilla-core/src/model.rs` | `RepoModel` and provider label/name helpers |

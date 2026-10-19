@@ -1,7 +1,7 @@
 use std::{fs, path::Path, process::Command};
 
+use flotilla_crew::review_bundle::validate_settlement_claim;
 use flotilla_resources::{FindingResolution, SettlementClaimEvidence, REVIEW_BUNDLE_INDEX_FILE};
-use flotilla_store::validate_settlement_claim;
 
 fn run(command: &mut Command) -> String {
     let output = command.output().expect("run command");

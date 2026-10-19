@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license.workspace = true
 [dependencies]
-flotilla-store = { path = "../flotilla-store" }
+flotilla-crew = { path = "../flotilla-crew" }
 flotilla-resources = { path = "../flotilla-resources" }
 async-trait.workspace = true
 object_store = { version = "0.12", features = ["aws"] }
@@ -17,4 +17,6 @@ flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
 flotilla-build-features-types = { path = "../flotilla-build-features-types" }
 
 [dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

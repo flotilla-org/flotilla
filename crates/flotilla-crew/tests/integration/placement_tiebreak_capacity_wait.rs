@@ -2,12 +2,13 @@ use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 
 use chrono::Utc;
+use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_protocol::{CanonicalHostId, FulfilmentAllocation, FulfilmentAllocationCandidate, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     Convoy, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, FulfilmentFacts, Host, HostSpec, HostStatus, InputMeta, StallCause, StatusPatch,
     WorkflowTemplate,
 };
-use flotilla_store::{controller::Reconciler, ConvoyReconciler, ResourceBackend};
+use flotilla_store::{controller::Reconciler, ResourceBackend};
 
 #[tokio::test]
 async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resumes_when_capacity_returns() {

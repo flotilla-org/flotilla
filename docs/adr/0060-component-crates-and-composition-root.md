@@ -143,6 +143,10 @@ projector. The daemon registers both from `flotilla-admission`; the reverse
 `VesselPlacementProjector` is expected to move again under the Vessel machine
 (#3108).
 
+### Crew capability (#3523)
+
+`flotilla-crew` holds crew operations, crew actions and capability cards, the leaf engine as a module, the decision log, charter notifications, and the Vessel, TerminalSession and Convoy reconcilers. The Convoy reconciler is its own module and reaches crew operations through one named interface. `attach` stays in core. Crew does not depend on `flotilla-state-machines`.
+
 ## Consequences
 
 - Adding a provider touches one crate. Swapping a store backend, persistence posture or message transport is a composition change.

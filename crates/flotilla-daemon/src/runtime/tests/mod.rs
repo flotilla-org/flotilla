@@ -22,10 +22,6 @@ use flotilla_admission::convoy_ensure::StandingConvoyBackingInspector;
 use flotilla_agent::adapter::AgentAdapterRegistry;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_config::ConfigStore;
-use flotilla_controllers::reconcilers::{
-    TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalRuntime,
-    TerminalSessionReconciler, VesselReconciler,
-};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE;
 use flotilla_credentials::crew_git_identity_environment;
@@ -35,6 +31,12 @@ use flotilla_credentials::CredentialStore;
 use flotilla_credentials::CONTAINER_CODEX_HOME;
 use flotilla_credentials::FLOTILLA_SKILLS_DIR_ENV;
 use flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY;
+use flotilla_crew::convoy::ConvoyReconciler;
+use flotilla_crew::reconcilers::terminal_session::{
+    TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalRuntime,
+    TerminalSessionReconciler,
+};
+use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery_testkit::fake_discovery_with_provider_set;
@@ -93,8 +95,7 @@ use flotilla_resources::{
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
-    delete_resource_kind, home_bound_authorship_collisions, watch_resource_kind, watch_resource_kind_including_replicas, ConvoyReconciler,
-    ResourceBackend,
+    delete_resource_kind, home_bound_authorship_collisions, watch_resource_kind, watch_resource_kind_including_replicas, ResourceBackend,
 };
 use flotilla_terminal::{
     ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession as ProviderTerminalSession, TerminalSessionLiveness, TerminalSessionTag,

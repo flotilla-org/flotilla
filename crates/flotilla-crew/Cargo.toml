@@ -11,12 +11,15 @@ flotilla-capability-contract = { path = "../flotilla-capability-contract" }
 flotilla-change-request = { path = "../flotilla-change-request" }
 flotilla-config = { path = "../flotilla-config" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
+flotilla-environment = { path = "../flotilla-environment" }
 flotilla-messaging = { path = "../flotilla-messaging" }
 flotilla-observation = { path = "../flotilla-observation" }
+flotilla-paths = { path = "../flotilla-paths" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-store = { path = "../flotilla-store" }
+flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -30,6 +33,8 @@ uuid = { workspace = true, features = ["v4"] }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+flotilla-discovery-api = { path = "../flotilla-discovery-api" }
+rstest = { workspace = true }
 flotilla-forge-github = { path = "../flotilla-forge-github" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
 flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }

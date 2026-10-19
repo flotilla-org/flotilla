@@ -13,7 +13,8 @@ use common::{
     controller_meta, create_convoy_with_single_task, create_host_direct_policy, create_ready_clone, create_ready_host_direct_environment,
     create_workspace, ControllerLoopHarness,
 };
-use flotilla_controllers::reconcilers::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler};
+use flotilla_crew::reconcilers::terminal_session::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
+use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_provisioning::reconcilers::{
     checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler,

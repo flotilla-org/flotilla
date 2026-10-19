@@ -13,11 +13,11 @@ use flotilla_agent::adapter::AgentAdapter;
 use flotilla_agent::adapter::AgentLaunchRequest;
 use flotilla_agent::adapter::CapabilityTable;
 use flotilla_capability_contract::SessionCapabilitySource;
-use flotilla_controllers::reconcilers::{
+use flotilla_credentials::crew_git_identity_environment;
+use flotilla_crew::reconcilers::terminal_session::{
     TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime,
     TerminalRuntimeState,
 };
-use flotilla_credentials::crew_git_identity_environment;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId, TerminalStatus};

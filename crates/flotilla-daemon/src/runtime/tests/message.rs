@@ -1,5 +1,5 @@
 use super::*;
-use flotilla_controllers::reconcilers::TerminalObservation;
+use flotilla_crew::reconcilers::terminal_session::TerminalObservation;
 use flotilla_resources::TerminalOccupancy;
 
 #[tokio::test]
@@ -795,7 +795,7 @@ async fn held_pool_delivery_scenario(mode: &str) {
         runtime.deliver_message("agent", &spec, "wake", TerminalDeliveryReadiness::Startup).await.expect("ambiguous result"),
         TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)
     );
-    let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryUnconfirmed {
+    let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryUnconfirmed {
         message_id: "held-turn".into(),
         message: "accepted but reply lost".into(),
     };
@@ -907,7 +907,7 @@ async fn held_pool_delivery_scenario(mode: &str) {
                     legacy.spec = spec.clone();
                     let outcome = reconciler.reconcile(
                         &legacy,
-                        &flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                        &flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
                             attention: None,
                             occupancy: TerminalOccupancy::Vacant,
                             output_digest: None,
@@ -932,7 +932,7 @@ async fn held_pool_delivery_scenario(mode: &str) {
         reconciler
             .reconcile(
                 &legacy_receiver,
-                &flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                &flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
                     attention: None,
                     occupancy: TerminalOccupancy::Vacant,
                     output_digest: None,

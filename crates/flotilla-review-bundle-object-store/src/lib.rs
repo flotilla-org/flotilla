@@ -1,5 +1,5 @@
+use flotilla_crew::review_bundle::{ReviewBundleObjects, ReviewBundleStore, ReviewBundleStoreError};
 use flotilla_resources::*;
-use flotilla_store::{ReviewBundleObjects, ReviewBundleStore, ReviewBundleStoreError};
 use object_store::{path::Path, ObjectStore, PutPayload};
 use std::sync::Arc;
 

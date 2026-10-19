@@ -6,17 +6,13 @@ license.workspace = true
 
 [dependencies]
 flotilla-admission = { path = "../flotilla-admission" }
-flotilla-crew = { path = "../flotilla-crew" }
-flotilla-messaging = { path = "../flotilla-messaging" }
 flotilla-config = { path = "../flotilla-config" }
 flotilla-environment = { path = "../flotilla-environment" }
 flotilla-vcs = { path = "../flotilla-vcs" }
-flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
-flotilla-agent = { path = "../flotilla-agent" }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-charter = { path = "../flotilla-charter" }
 flotilla-manifest = { path = "../flotilla-manifest" }
@@ -29,10 +25,12 @@ tracing = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 dirs = "6"
 futures = "0.3"
-sha2 = { workspace = true }
-serde_json = { workspace = true }
 
 [dev-dependencies]
+flotilla-crew = { path = "../flotilla-crew" }
+flotilla-messaging = { path = "../flotilla-messaging" }
+flotilla-terminal = { path = "../flotilla-terminal" }
+serde_json = { workspace = true }
 flotilla-ai-utility = { path = "../flotilla-ai-utility" }
 flotilla-change-request = { path = "../flotilla-change-request" }
 flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }

@@ -12,7 +12,9 @@ use common::{
     create_ready_clone, create_ready_docker_environment, create_ready_host_direct_environment, create_stopped_terminal, create_workspace,
     labeled_meta, meta, vessel_meta, work_state, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
 };
-use flotilla_controllers::reconcilers::{vessel::WorktreeMetadataResolver, VesselReconciler};
+use flotilla_crew::convoy::ConvoyReconciler;
+use flotilla_crew::reconcilers::vessel::VesselReconciler;
+use flotilla_crew::reconcilers::vessel::WorktreeMetadataResolver;
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{
@@ -29,7 +31,7 @@ use flotilla_resources::{
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
-    ensure_repository, patch_resource_annotation, ConvoyReconciler, ResourceBackend,
+    ensure_repository, patch_resource_annotation, ResourceBackend,
 };
 use flotilla_vcs::vcs::WorktreeMetadata;
 use rstest::rstest;
