@@ -22,9 +22,11 @@ pub(crate) use terminal::{DELIVERY_CONFIRMATION_POLL, DELIVERY_CONFIRMATION_STAB
 use chrono::Utc;
 use flotilla_admission::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_config::ConfigStore;
-use flotilla_controllers::reconcilers::{TerminalSessionReconciler, VesselReconciler};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
+use flotilla_crew::convoy::ConvoyReconciler;
+use flotilla_crew::reconcilers::terminal_session::TerminalSessionReconciler;
+use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
@@ -36,7 +38,7 @@ use flotilla_resources::{
     host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, Environment, Forge, Host, ManifestRoot, Repository, Resource,
     ResourceError, SystemClock, TerminalSession, Vessel, WorkflowTemplate,
 };
-use flotilla_store::{controller::ControllerLoop, ConvoyReconciler, ResourceBackend};
+use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};

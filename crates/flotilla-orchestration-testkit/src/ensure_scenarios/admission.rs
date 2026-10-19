@@ -98,7 +98,7 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
         .await;
 
     let reconciler =
-        flotilla_store::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
+        flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
     let convoy = convoys.get(&convoy_name).await.expect("governor after reboot");
     let outcome = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("reboot observations"), clock.now());
     assert!(matches!(outcome.patch, Some(flotilla_resources::ConvoyStatusPatch::WorkProvisioningRetry { .. })));

@@ -5,14 +5,15 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_controllers::reconcilers::VesselReconciler;
+use flotilla_crew::convoy::ConvoyReconciler;
+use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_resources::{
     Convoy, ConvoyPhase, ConvoyTeardownRuntime, Host, ResourceError, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel,
     VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
-    ConvoyReconciler, ResourceBackend,
+    ResourceBackend,
 };
 use futures::StreamExt;
 use tempfile::tempdir;

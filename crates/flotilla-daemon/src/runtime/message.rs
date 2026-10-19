@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_controllers::reconcilers::{TerminalDeliveryFailure, TerminalDeliveryOutcome};
+use flotilla_crew::reconcilers::terminal_session::{TerminalDeliveryFailure, TerminalDeliveryOutcome};
 use flotilla_resources::{Resource, ResourceError, ResourceObject, TerminalAttentionSource, TerminalAttentionState, TerminalSession};
 use flotilla_store::ResourceBackend;
 use futures::StreamExt;

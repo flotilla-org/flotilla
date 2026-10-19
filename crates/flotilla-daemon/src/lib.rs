@@ -39,6 +39,6 @@ mod testkits;
 pub fn review_bundle_store(
     config: &flotilla_resources::ReviewBundleStoreConfig,
     credential: &flotilla_resources::ReviewBundleWriteCredential,
-) -> Result<flotilla_store::ReviewBundleStore, flotilla_store::ReviewBundleStoreError> {
+) -> Result<flotilla_crew::review_bundle::ReviewBundleStore, flotilla_crew::review_bundle::ReviewBundleStoreError> {
     flotilla_review_bundle_object_store::connect_review_bundle(config, credential)
 }

@@ -5,6 +5,7 @@ use std::{
 };
 use std::{collections::HashMap, sync::Arc};
 
+use crate::convoy::ConvoyReconciler;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_change_request::observation;
@@ -29,8 +30,8 @@ use flotilla_resources::{
     CrewWorkState, ExitDeclaration, InputMeta, IntegrationCondition, LifecycleAuthority, ObservedCheckoutSpec, PlacementStatus,
     RepositoryKey, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
 };
+use flotilla_store::controller::ControllerLoop;
 use flotilla_store::ResourceBackend;
-use flotilla_store::{controller::ControllerLoop, ConvoyReconciler};
 use flotilla_store_memory::InMemoryBackend;
 use futures::StreamExt;
 use tokio::sync::broadcast;

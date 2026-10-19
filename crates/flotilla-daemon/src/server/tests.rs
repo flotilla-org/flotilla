@@ -15,6 +15,7 @@ use std::{
 use flotilla_agent::AgentEntry;
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
+use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_api::provider_config;
 use flotilla_discovery_testkit::fake_discovery;
@@ -39,7 +40,7 @@ use flotilla_resources::{
     TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart,
     WorkflowTemplate,
 };
-use flotilla_store::{controller::ControllerLoop, list_resource_kind, ConvoyReconciler, ResourceBackend};
+use flotilla_store::{controller::ControllerLoop, list_resource_kind, ResourceBackend};
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use tokio::{
@@ -2260,8 +2261,8 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     let vessel_task = tokio::spawn(
         ControllerLoop {
             primary: placed.using::<Vessel>("flotilla"),
-            secondaries: flotilla_controllers::reconcilers::VesselReconciler::secondary_watches(),
-            reconciler: flotilla_controllers::reconcilers::VesselReconciler::new(placed.clone(), "flotilla"),
+            secondaries: flotilla_crew::reconcilers::vessel::VesselReconciler::secondary_watches(),
+            reconciler: flotilla_crew::reconcilers::vessel::VesselReconciler::new(placed.clone(), "flotilla"),
             resync_interval: Duration::from_millis(20),
             backend: placed.clone(),
         }
@@ -2271,7 +2272,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
         ControllerLoop {
             primary: placed.using::<TerminalSession>("flotilla"),
             secondaries: Vec::new(),
-            reconciler: flotilla_controllers::reconcilers::TerminalSessionReconciler::new(
+            reconciler: flotilla_crew::reconcilers::terminal_session::TerminalSessionReconciler::new(
                 Arc::new(RunningTerminalRuntime),
                 placed.clone(),
                 "flotilla",
@@ -2541,14 +2542,14 @@ async fn dispatch_execute_requires_a_route_for_unready_or_statusless_placement()
 struct RunningTerminalRuntime;
 
 #[async_trait::async_trait]
-impl flotilla_controllers::reconcilers::TerminalRuntime for RunningTerminalRuntime {
+impl flotilla_crew::reconcilers::terminal_session::TerminalRuntime for RunningTerminalRuntime {
     async fn ensure_session(
         &self,
         name: &str,
         _spec: &flotilla_resources::TerminalSessionSpec,
         _tags: &[flotilla_resources::TerminalSessionTag],
-    ) -> Result<flotilla_controllers::reconcilers::TerminalRuntimeState, String> {
-        Ok(flotilla_controllers::reconcilers::TerminalRuntimeState::builder()
+    ) -> Result<flotilla_crew::reconcilers::terminal_session::TerminalRuntimeState, String> {
+        Ok(flotilla_crew::reconcilers::terminal_session::TerminalRuntimeState::builder()
             .session_id(format!("session-{name}"))
             .pid(42)
             .started_at(chrono::Utc::now())

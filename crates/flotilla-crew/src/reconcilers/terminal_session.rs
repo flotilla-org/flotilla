@@ -1,4 +1,6 @@
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_resources::Actuation;
+use flotilla_terminal::TerminalPool;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -8,10 +10,10 @@ use flotilla_resources::{
     api_version, Convoy, ConvoyPhase, CrewMessageDelivery, Demand, DemandAddressee, DemandKind, DemandSpec, Environment, EnvironmentPhase,
     InputMeta, LifecycleAuthority, OwnerReference, Resource, ResourceError, ResourceObject, ResourceProvenance, TerminalAttention,
     TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionStatusPatch, TerminalSessionTag, Vessel, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
-    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG,
-    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON,
-    TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
+    TerminalSessionSpec, TerminalSessionStatusPatch, TerminalSessionTag, Vessel, ACTUATOR_HOST_REF_ANNOTATION,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
+    TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
@@ -163,7 +165,7 @@ pub trait TerminalRuntime: Send + Sync {
 
 pub struct TerminalSessionReconciler<R> {
     runtime: Arc<R>,
-    decisions: flotilla_crew::decision_log::DecisionLog,
+    decisions: crate::decision_log::DecisionLog,
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     environments: TypedResolver<Environment>,
@@ -1091,4 +1093,23 @@ fn terminal_demand_actuation(session: &ResourceObject<TerminalSession>, name: St
 
 fn attention_demand_name(session: &ResourceObject<TerminalSession>) -> String {
     format!("terminal-attention-{}", session.metadata.name)
+}
+
+/// Starts tool sessions in a terminal pool; agent sessions need an adapter-aware runtime.
+pub struct TerminalActuator {
+    pool: Arc<dyn TerminalPool>,
+}
+
+impl TerminalActuator {
+    pub fn new(pool: Arc<dyn TerminalPool>) -> Self {
+        Self { pool }
+    }
+
+    pub async fn ensure_session(&self, name: &str, spec: &TerminalSessionSpec, env_vars: &[(String, String)]) -> Result<(), String> {
+        let env_vars = env_vars.to_vec();
+        let TerminalSessionSource::Tool { command } = &spec.source else {
+            return Err("agent sessions require an AgentAdapter-aware runtime".to_string());
+        };
+        self.pool.ensure_session(name, command, &ExecutionEnvironmentPath::new(spec.cwd.clone()), &env_vars, &[]).await
+    }
 }

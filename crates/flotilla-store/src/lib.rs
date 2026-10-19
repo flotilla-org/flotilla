@@ -42,8 +42,6 @@ pub use registry::*;
 pub mod replica;
 mod repository;
 pub use repository::*;
-mod review_bundle;
-pub use review_bundle::*;
 mod role_cascade;
 pub use role_cascade::*;
 mod status_patch;

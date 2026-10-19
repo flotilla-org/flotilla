@@ -8,6 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_provisioning::reconcilers::{
     checkout::{CheckoutPrepared, CheckoutReconciler},
     CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
@@ -45,7 +46,6 @@ use flotilla_resources::ResourceObject;
 use flotilla_resources::WorkPhase;
 use flotilla_resources::CONVOY_LABEL;
 use flotilla_store::controller::Reconciler;
-use flotilla_store::ConvoyReconciler;
 use flotilla_store_testkit::assert_actuation_drop_recovery;
 use flotilla_store_testkit::assert_bounded_convergence;
 use flotilla_store_testkit::assert_degradation_not_wedging;

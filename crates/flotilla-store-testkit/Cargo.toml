@@ -39,8 +39,6 @@ tracing.workspace = true
 rusqlite = { version = "0.37", features = ["bundled", "functions"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 serde_yml = "0.0.12"
-flotilla-review-bundle-object-store = { path = "../flotilla-review-bundle-object-store" }
-object_store = { version = "0.12", features = ["aws"] }
 rigging-tls = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
 hegeltest = "=0.48.1"

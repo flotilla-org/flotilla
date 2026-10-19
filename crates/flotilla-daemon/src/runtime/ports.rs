@@ -8,9 +8,9 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_controllers::reconcilers::vessel::WorktreeMetadataResolver;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::OperatorReconciler;
+use flotilla_crew::reconcilers::vessel::WorktreeMetadataResolver;
 use flotilla_protocol::RepoSelector;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;

@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 flotilla-admission = { path = "../flotilla-admission" }
+flotilla-crew = { path = "../flotilla-crew" }
 flotilla-agent = { path = "../flotilla-agent" }
 flotilla-config = { path = "../flotilla-config" }
 flotilla-store-memory = { path = "../flotilla-store-memory" }

@@ -3,9 +3,10 @@ use flotilla_store_http::ensure_namespace;
 use flotilla_store_http::HttpBackend;
 use std::{env, path::PathBuf, time::Duration};
 
-use flotilla_controllers::reconcilers::VesselReconciler;
+use flotilla_crew::convoy::ConvoyReconciler;
+use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_resources::{Checkout, Convoy, Vessel, WorkflowTemplate};
-use flotilla_store::{controller::ControllerLoop, ConvoyReconciler, ResourceBackend};
+use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tracing::info;
 
 fn kubeconfig_path() -> PathBuf {

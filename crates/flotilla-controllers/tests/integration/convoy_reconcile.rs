@@ -11,8 +11,6 @@ use common::{
     task_provisioning_convoy_spec, timestamp, tool_only_workflow_template_object, valid_convoy_spec, valid_workflow_template_object,
     workflow_template_meta,
 };
-use flotilla_controllers::reconcilers::VesselReconciler;
-use flotilla_provisioning::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler};
 use flotilla_resources::{
     controller_patches, evaluate_crew_completion, evaluate_landing_settlement, external_patches, implement_review_workflow_spec,
     interactive_single_workflow_spec, reconcile, Actuation, BoundChangeRequest, ChangeRequest, ChangeRequestMergeability,
@@ -27,9 +25,12 @@ use flotilla_resources::{
 };
 use flotilla_store::{
     controller::{ReconcileOutcome as ControllerReconcileOutcome, Reconciler},
-    ConvoyReconciler, ResourceBackend,
+    ResourceBackend,
 };
 
+use flotilla_crew::convoy::ConvoyReconciler;
+use flotilla_crew::reconcilers::vessel::VesselReconciler;
+use flotilla_provisioning::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler};
 use flotilla_store_testkit::fixtures as common;
 
 use crate::common::cr_name;

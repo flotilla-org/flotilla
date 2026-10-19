@@ -1,7 +1,6 @@
 // Keep integration coverage in one executable to avoid linking the crate graph per module.
 // Tests share a process: isolate state and keep process-wide mutations in separate targets.
 mod controller_loop;
-mod convoy_in_memory;
 mod convoy_status_patch;
 mod crew_image_baseline;
 mod decode_once;
@@ -19,7 +18,6 @@ mod lifecycle_hygiene;
 mod lifecycle_status_patch;
 mod manifest_root;
 mod owner_gc;
-mod placement_tiebreak_capacity_wait;
 mod platform_vocabulary;
 mod prepared_snapshot_gc;
 mod principal_attention_status_patch;
@@ -28,8 +26,6 @@ mod provisioning_resources_in_memory;
 mod provisioning_status_patch;
 mod repository_in_memory;
 mod resource_projection;
-mod review_bundle;
-mod review_bundle_aggregator;
 mod sqlite;
 mod status_patch;
 mod stored_corpus;
