@@ -495,9 +495,9 @@ A way of putting input into a harness: `keystroke` (typing into its terminal
 through cleat), `codex-app-server` (JSON-RPC turns) or `claude-channels`
 (Claude Code's Channels). The harness connector declares which transports a
 harness supports, by operation and harness version; a session's
-**AgentChannels** record which are live (ADR 0059). Distinct from the **Federation** transport (ssh) and
-the daemon's framed socket sessions; say "agent transport" where context leaves
-it unclear.
+**AgentChannels** record which are live (ADR 0059). Distinct from the
+**Federation** transport (ssh) and the daemon's framed socket sessions; say
+"agent transport" where context leaves it unclear.
 _Avoid_: Channel (bare), delivery method, holder transport.
 
 **CloudAgent**:
@@ -1003,9 +1003,9 @@ _Avoid_: Checkpoint, sync.
 The degradation ladder ensure-flavored turn delivery walks to restore agent
 context (ADR 0028, amended by ADR 0059): revive the role's bound
 **AgentSession**, either already live or parked and resumed on a new process
-with its **AgentChannels** re-registered; otherwise start a new AgentSession for the
-role with a reconstructed **Brief**, the never-fails floor. Only the floor
-starts a new conversation. Every delivery records its rung; rung selection is
+with its **AgentChannels** re-registered; otherwise start a new AgentSession
+for the role with a reconstructed **Brief**, the never-fails floor. Only the
+floor starts a new conversation. Every delivery records its rung; rung selection is
 an experiment, not an edict.
 _Avoid_: Retry, failover.
 
