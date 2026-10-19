@@ -1,7 +1,7 @@
+use flotilla_resources::convoy_address::convoy_record_name;
 use flotilla_resources::parse_role_address;
 use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -16,7 +16,7 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{create_identity_convoy, placement_policy, test_meta};
-use crate::in_process::convoy_admission::{allocate_convoy_generation, convoy_record_name, RoleAddress};
+use crate::in_process::convoy_admission::allocate_convoy_generation;
 use crate::in_process::{placement_target_host, resolve_local_convoy_name, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 
@@ -29,17 +29,6 @@ fn convoy_role_addresses_reject_malformed_values() {
         assert_eq!(parse_role_address(value), Err(format!("invalid convoy address `{value}`: expected role@project")));
     }
     assert_eq!(parse_role_address(""), Err("convoy role cannot be empty".to_string()));
-}
-
-#[test]
-fn qualified_role_address_is_a_typed_project_role_pair() {
-    assert_eq!(
-        RoleAddress::from_str("governor@andamento"),
-        Ok(RoleAddress { project: "andamento".to_string(), role: "governor".to_string() })
-    );
-    for value in ["governor", "@andamento", "governor@", "governor@andamento@extra"] {
-        assert!(RoleAddress::from_str(value).is_err(), "{value} must not produce a qualified address");
-    }
 }
 
 #[tokio::test]

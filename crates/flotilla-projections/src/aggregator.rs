@@ -1,6 +1,7 @@
 //! Resource-store Aggregator maintaining named-query result sets.
 
 use flotilla_daemon_api::event_sink::EventSink;
+use flotilla_observation::convoy_branch_refresh::ConvoyBranchRefresh;
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
 use std::{
@@ -10,7 +11,6 @@ use std::{
 
 use crate::{
     aggregator_projection::AggregatorProjectionState,
-    convoy_branch_refresh::ConvoyBranchRefresh,
     salience::{AttentionFact, DemandFact, RegardFact, SalienceFacts},
     terminal_health,
 };

@@ -286,7 +286,7 @@ mod tests {
         let mut event = DaemonEvent::CommandFinished {
             command_id: 1,
             node_id: flotilla_protocol::NodeId::new("host"),
-            repo_identity: flotilla_executor::action_support::empty_repo_identity(),
+            repo_identity: flotilla_daemon_api::action_support::empty_repo_identity(),
             repo: None,
             result: flotilla_protocol::CommandValue::CrewStalls(Box::new(flotilla_protocol::CrewStallsResponse {
                 rows,

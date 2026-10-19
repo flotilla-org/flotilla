@@ -2,6 +2,7 @@
 //!
 //! Handlers use the capability-owned port below; the composition root supplies
 //! orchestration collaborators and shares their existing state.
+use flotilla_daemon_api::action_support::empty_repo_identity;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -39,8 +40,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::action_support::{
-    empty_repo_identity, fallback_repo_identity, repository_event_identity, request_manifest_resolution, retry_resource_apply,
-    AddRepoOutcome,
+    fallback_repo_identity, repository_event_identity, request_manifest_resolution, retry_resource_apply, AddRepoOutcome,
 };
 use crate::environment_manager::EnvironmentManager;
 use crate::executor;
@@ -95,12 +95,12 @@ pub struct ExecutorActions<'a> {
     pub env: &'a Arc<dyn EnvVars>,
     pub daemon_socket_path: &'a RwLock<Option<PathBuf>>,
     pub host_name: &'a HostName,
-    pub events: crate::action_events::ActionEvents<'a>,
+    pub events: flotilla_daemon_api::action_events::ActionEvents<'a>,
 }
 
 impl ExecutorActions<'_> {
     async fn provisioning_namespace(&self) -> String {
-        crate::action_namespace::provisioning_namespace(self.namespace)
+        flotilla_daemon_api::action_namespace::provisioning_namespace(self.namespace)
     }
     pub async fn execute_action_resource_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceApply { namespace, document } = &command.action {

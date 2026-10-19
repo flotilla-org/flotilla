@@ -3,16 +3,15 @@
 use flotilla_change_request::branch_lookup_observer::BranchLookupObserver;
 use flotilla_discovery_api::{provider_config::ProviderConfigView, EnvironmentBag};
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
-use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
 use flotilla_protocol::ConvoyNaming;
 use flotilla_resources::address::{record_name, remote_change_request_address};
 use flotilla_store::{DockerImageSourceStoreExt, ResolvedCascadeStoreExt, StoreQuery};
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_vcs::providers::detection::remote_assertion;
 
 use super::*;
 use flotilla_agent::adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver};
+use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
 
 use flotilla_discovery::AiUtilityFactory;
 
@@ -347,7 +346,7 @@ impl ConvoyAdmission {
         repository_keys: &[RepositoryKey],
         branch: &str,
         binding: Option<&flotilla_resources::BoundChangeRequest>,
-    ) -> flotilla_projections::convoy_branch_refresh::ConvoyBranchRefresh {
+    ) -> flotilla_observation::convoy_branch_refresh::ConvoyBranchRefresh {
         let namespace = self.provisioning_namespace().await;
         let mut keys = repository_keys.to_vec();
         if let Some(binding) = binding {
@@ -356,7 +355,7 @@ impl ConvoyAdmission {
         let reads = match self.change_request_read_inventory(&namespace, &keys, binding.map_or("", |binding| binding.id.as_str())).await {
             Ok(reads) => reads,
             Err(error) => {
-                return flotilla_projections::convoy_branch_refresh::ConvoyBranchRefresh {
+                return flotilla_observation::convoy_branch_refresh::ConvoyBranchRefresh {
                     primary: Err(error.clone()),
                     repositories: repository_keys.iter().cloned().map(|key| (key, Err(error.clone()))).collect(),
                 }
@@ -416,7 +415,7 @@ impl ConvoyAdmission {
             let error = failures.iter().find(|error| matches!(error, ObservationError::RateLimited { .. })).or_else(|| failures.first());
             error.map_or(Ok(None), |error| Err(error.to_string()))
         };
-        flotilla_projections::convoy_branch_refresh::ConvoyBranchRefresh { primary, repositories: results }
+        flotilla_observation::convoy_branch_refresh::ConvoyBranchRefresh { primary, repositories: results }
     }
 
     #[cfg(test)]
@@ -3645,47 +3644,6 @@ pub(super) async fn allocation_credential_grants(
         .collect()
 }
 
-pub(super) fn convoy_record_name() -> String {
-    format!("convoy-{}", uuid::Uuid::new_v4().simple())
-}
-
-pub(super) fn convoy_ensure_name(project: &str, role: &str) -> String {
-    let digest = Sha256::digest(format!("{project}\0{role}").as_bytes());
-    format!("ensure-{digest:x}")
-}
-
-pub(super) fn convoy_address(role: &str, project: Option<&str>) -> String {
-    project.map_or_else(|| role.to_string(), |project| format!("{role}@{project}"))
-}
-
-/// The stable human-facing address of a convoy role, independent of any one
-/// generation's resource record name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RoleAddress {
-    pub project: String,
-    pub role: String,
-}
-
-impl FromStr for RoleAddress {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let Some((role, project)) = value.split_once('@') else {
-            return Err(format!("invalid role address `{value}`: expected role@project"));
-        };
-        if role.is_empty() || project.is_empty() || project.contains('@') {
-            return Err(format!("invalid role address `{value}`: expected role@project"));
-        }
-        Ok(Self { project: project.to_string(), role: role.to_string() })
-    }
-}
-
-impl fmt::Display for RoleAddress {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}@{}", self.role, self.project)
-    }
-}
-
 fn brief_convoy_query(
     project: &str,
     name: &str,
@@ -3970,111 +3928,6 @@ pub(super) struct RepositoryChangeRequestProvider {
     pub(super) service_url: String,
     pub(super) repository: String,
     pub(super) provider: Arc<dyn ChangeRequestTracker>,
-}
-
-pub(super) async fn discover_repository_change_request_with(
-    resource_backend: &ResourceBackend,
-    config: &ConfigStore,
-    discovery: &DiscoveryRuntime,
-    environment_manager: &EnvironmentManager,
-    local_environment_id: &EnvironmentId,
-    namespace: &str,
-    repository: &RepositorySpec,
-) -> Result<Arc<dyn ChangeRequestTracker>, String> {
-    let identity = repository.forge().ok_or("no forge identity")?;
-    let bag = repository_provider_bag(resource_backend, config, environment_manager, local_environment_id, namespace, repository).await?;
-    let probe_root = ExecutionEnvironmentPath::new(config.base_path().as_ref());
-    let mut unmet = Vec::new();
-    for factory in &discovery.factories.change_requests {
-        match factory.probe(&bag, config, &probe_root, Arc::clone(&discovery.runner)).await {
-            Ok(provider) => {
-                return Ok(Arc::new(flotilla_observation::forge_observation::ObservedChangeRequestTracker {
-                    inner: provider,
-                    reads: flotilla_observation::forge_observation::ForgeReads::new(resource_backend.clone(), namespace.into()),
-                    source: flotilla_protocol::IssueSource { service: identity.service_url.clone(), scope: identity.repository.clone() },
-                }))
-            }
-            Err(requirements) => unmet.extend(requirements.into_iter().map(|requirement| format!("{requirement:?}"))),
-        }
-    }
-    Err(format!("change request provider unavailable for {} ({})", identity.service_url, unmet.join(", ")))
-}
-
-pub(super) async fn repository_provider_bag(
-    resource_backend: &ResourceBackend,
-    config: &ConfigStore,
-    environment_manager: &EnvironmentManager,
-    local_environment_id: &EnvironmentId,
-    namespace: &str,
-    repository: &RepositorySpec,
-) -> Result<EnvironmentBag, String> {
-    let host_bag = environment_manager.environment_bag(local_environment_id).ok_or("local discovery environment unavailable")?;
-    // Host capabilities cannot contribute an ambient checkout's forge target.
-    let host_bag = host_bag
-        .assertions()
-        .iter()
-        .filter(|assertion| {
-            !matches!(
-                assertion,
-                EnvironmentAssertion::AuthFileExists { provider, .. } if provider == FORGEJO_AUTH_PROVIDER
-            ) && !matches!(
-                assertion,
-                EnvironmentAssertion::RemoteHost { .. }
-                    | EnvironmentAssertion::OriginForge { .. }
-                    | EnvironmentAssertion::ForgeOverride { .. }
-                    | EnvironmentAssertion::VcsCheckoutDetected { .. }
-            )
-        })
-        .fold(EnvironmentBag::new(), |bag, assertion| bag.with(assertion.clone()));
-    let Some(identity) = repository.forge() else {
-        return Ok(host_bag);
-    };
-    let remote = format!("{}/{}", identity.service_url.trim_end_matches('/'), identity.repository);
-    let forge = match repository.identity() {
-        RepositoryIdentity::Forge { forge_ref, .. } => Some(
-            resource_backend
-                .including_replicas::<Forge>(namespace)
-                .get(forge_ref)
-                .await
-                .map_err(|error| format!("Forge {forge_ref}: {error}"))?
-                .object
-                .spec,
-        ),
-        _ => forge_for_remote(resource_backend, namespace, &remote).await?,
-    };
-    let remote_assertion = remote_assertion(&remote, "origin").ok_or_else(|| format!("invalid repository remote {remote}"))?;
-    let mut bag = host_bag.with(remote_assertion);
-    if let Some(forge) = &forge {
-        bag = bag.with(EnvironmentAssertion::origin_forge(forge.clone()));
-    }
-    // Resolve execution independently of the logical Forge, including builtin GitHub.
-    let daemon = config.load_daemon_config()?;
-    if let Some(binding) = daemon.forge_overrides.get(identity.service_url.trim_end_matches('/')) {
-        binding.validate()?;
-        return Ok(bag.with(EnvironmentAssertion::ForgeOverride { binding: binding.clone() }));
-    }
-    if let Some(forge) = &forge {
-        if forge.kind == ForgeKind::Forgejo {
-            // Read current intent on each request: provider leases compare the
-            // resolved bag so a changed identity cannot reuse a stale credential.
-            if let Some(name) = daemon.credentials.forgejo.get(&forge.forge_id) {
-                let credential = resource_backend
-                    .definitions::<CredentialSpec>(namespace)
-                    .get(name)
-                    .await
-                    .map_err(|error| format!("daemon Forgejo credential {name}: {error}"))?;
-                match (&credential.spec.consumer, &credential.spec.source) {
-                    (CredentialConsumer::Forgejo { forge_ref, .. }, CredentialSource::File { path }) if forge_ref == &forge.forge_id => {
-                        bag = bag.with(EnvironmentAssertion::auth_file(FORGEJO_AUTH_PROVIDER, path));
-                    }
-                    _ => {
-                        return Err(format!("daemon Forgejo credential {name} must use a file source and target Forge {}", forge.forge_id))
-                    }
-                }
-            }
-        }
-    }
-    Ok(bag)
 }
 
 #[derive(Debug)]
@@ -5065,7 +4918,7 @@ async fn image_placement_cost(
         held.is_some_and(|held| held.contains(image) || image.rsplit_once('@').is_some_and(|(_, digest)| held.contains(digest)))
     };
     if let Some(identities) = composed {
-        let architecture = host.and_then(crate::image_build::host_architecture);
+        let architecture = host.and_then(flotilla_resources::image_architecture::host_architecture);
         let image_cache = crate::image_build::fleet_image_cache(backend, namespace).await?;
         let mut cost = ImageAcquisitionCost::Held;
         for identity in identities {

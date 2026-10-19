@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use flotilla_core::in_process::BriefArtifactWriter;
+use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_protocol::CallerCrew;
 use flotilla_resources::{
     address::artifact_slot_record_name, Artifact, ArtifactSpec, Convoy, InputMeta, OwnerReference, Resource, ResourceError, ResourceObject,

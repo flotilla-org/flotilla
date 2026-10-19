@@ -10,6 +10,7 @@ aws-lc-provider = ["flotilla-tls/aws-lc-provider"]
 skip-no-sandbox-tests = ["flotilla-store/skip-no-sandbox-tests"]
 
 [dependencies]
+flotilla-observation = { path = "../flotilla-observation" }
 flotilla-change-request = { path = "../flotilla-change-request" }
 sysinfo = "0.38.4"
 flotilla-config = { path = "../flotilla-config" }

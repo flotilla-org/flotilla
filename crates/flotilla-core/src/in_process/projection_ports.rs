@@ -1,3 +1,4 @@
+use flotilla_observation::convoy_branch_refresh::ConvoyBranchRefresh;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -9,8 +10,8 @@ use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_executor::environment_manager::EnvironmentManager;
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_projections::{
-    convoy_branch_refresh::ConvoyBranchRefresh, ports::Environments, read_projections::LeafSubscriptionRead, AttachCapabilityResolver,
-    ConvoyChangeRequestResolver, IssueMaterializationResolver,
+    ports::Environments, read_projections::LeafSubscriptionRead, AttachCapabilityResolver, ConvoyChangeRequestResolver,
+    IssueMaterializationResolver,
 };
 use flotilla_protocol::{EnvironmentInfo, HostName, IssueSource, NodeId, QueryScope, RepositoryKey, ToolInventory};
 use flotilla_provider_runtime::ObservationError;

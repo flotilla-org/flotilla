@@ -10,3 +10,7 @@ pub const DAEMON_LIFECYCLE_LOCK_FILE: &str = "flotillad-lifecycle.lock";
 pub const DAEMON_INSTALL_MARKER_FILE: &str = "install-in-progress";
 
 pub mod event_sink;
+
+pub mod action_events;
+pub mod action_namespace;
+pub mod action_support;

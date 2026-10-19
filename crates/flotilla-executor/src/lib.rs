@@ -1,7 +1,5 @@
 //! Provider-backed command execution composed through host-owned ports.
 #![allow(clippy::double_must_use)]
-pub mod action_events;
-pub mod action_namespace;
 pub mod action_support;
 mod data;
 pub mod environment_manager;

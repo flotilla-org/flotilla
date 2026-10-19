@@ -656,7 +656,7 @@ async fn rehearsal_binding_preserves_copied_forge_data() {
             Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
-        let bag = super::super::convoy_admission::repository_provider_bag(
+        let bag = super::super::repository_discovery::repository_provider_bag(
             &backend,
             &config,
             &daemon.environment_manager,
