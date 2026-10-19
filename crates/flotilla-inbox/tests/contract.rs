@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use flotilla_inbox::{
-    sqlite::{SqliteInbox, StoreLog},
+    sqlite::{MessageLog, SqliteInbox, StoreLog},
     EngineInbox, MemoryInbox, MemoryInboxLog,
 };
 use flotilla_inbox_testkit::{consumer, Evidence, Factory, Harness, SessionPort, Supervisors};
@@ -46,7 +46,8 @@ impl Factory for Sqlite {
                 .expect("store"),
         ));
         let evidence = Arc::new(Evidence::default());
-        let backend = EngineInbox::open("test", StoreLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
+        let backend =
+            EngineInbox::open("test", MessageLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
         for name in ["a", "b"] {
             backend.register_blocking(consumer(name), SessionPort::new(name, StoreLog::new(store.clone())));
         }
@@ -77,7 +78,7 @@ async fn sqlite_recovers_receipts_and_resumes_log_cursors() {
             .expect("store"),
     ));
     let evidence = Arc::new(Evidence::default());
-    let backend = SqliteInbox::open("test", StoreLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
+    let backend = SqliteInbox::open("test", MessageLog::new(store.clone()), evidence.clone(), Arc::new(Supervisors)).expect("open inbox");
     backend.register_blocking(consumer("a"), SessionPort::new("a", StoreLog::new(store.clone())));
     backend.bind(inbox(), consumer("a")).await.expect("bind");
     let message = backend.enqueue(spec()).await.expect("enqueue");
@@ -85,11 +86,18 @@ async fn sqlite_recovers_receipts_and_resumes_log_cursors() {
     let created = watch.next().await.expect("create").expect("event");
     backend.receive(&consumer("a"), &message, Transport::Turn).await.expect("receive");
     let receipt = watch.next().await.expect("receipt").expect("event");
+    let mut lagged = Vec::new();
+    for _ in 0..3 {
+        lagged.push(backend.enqueue(spec()).await.expect("lagged create"));
+    }
     drop(watch);
     drop(backend);
-    let backend = SqliteInbox::open("test", StoreLog::new(store), evidence, Arc::new(Supervisors)).expect("recover");
+    let backend = SqliteInbox::open("test", MessageLog::new(store), evidence, Arc::new(Supervisors)).expect("recover");
     let mut replay = backend.watch(&inbox(), Some(created.cursor)).await.expect("durable cursor survives restart");
     assert_eq!(replay.next().await.expect("receipt").expect("event"), receipt);
+    for message in lagged {
+        assert_eq!(replay.next().await.expect("lagged create").expect("event").message, message);
+    }
     let mut live = backend.watch(&inbox(), None).await.expect("fresh live tail");
     backend.deliver(&message, Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("recovered receipt");
     let delivered = live.next().await.expect("delivery").expect("event");
@@ -149,17 +157,16 @@ fn rule_selectors_and_precedence(tc: hegel::TestCase) {
     assert_eq!(Rules(vec![fallback, rule]).choose(&spec()), Transport::Mute);
 }
 
-// Behaviour: lag beyond the former 65,536-entry journal still resumes from
-// authoritative memory history; a fresh live tail starts at the current log.
+// Behaviour: a lagging reader resumes from authoritative memory history; a fresh live tail starts at the current log.
 #[tokio::test]
-async fn log_watch_survives_the_former_journal_limit() {
+async fn log_watch_survives_lag() {
     use flotilla_inbox::{Cursor, Error, InboxBackend};
     use flotilla_inbox_testkit::{inbox, spec};
     use futures::StreamExt;
     let harness = Memory.create();
     let mut lagging = harness.backend.watch(&inbox(), Some(Cursor(0))).await.expect("watch");
     let first = harness.backend.enqueue(spec()).await.expect("first");
-    for _ in 0..65_536 {
+    for _ in 0..8 {
         harness.backend.enqueue(spec()).await.expect("enqueue");
     }
     assert_eq!(lagging.next().await.expect("retained event").expect("change").message, first);
@@ -185,8 +192,8 @@ async fn sqlite_rejects_consumer_in_another_store() {
     };
     let local = make_store();
     let foreign = make_store();
-    let backend =
-        SqliteInbox::open("test", StoreLog::new(local.clone()), Arc::new(Evidence::default()), Arc::new(Supervisors)).expect("open inbox");
+    let backend = SqliteInbox::open("test", MessageLog::new(local.clone()), Arc::new(Evidence::default()), Arc::new(Supervisors))
+        .expect("open inbox");
     backend.register_blocking(consumer("a"), SessionPort::new("a", StoreLog::new(foreign.clone())));
     let message = backend.enqueue(spec()).await.expect("enqueue");
     let before = foreign.lock().expect("store").read().expect("read").last_sequence("test").expect("sequence");

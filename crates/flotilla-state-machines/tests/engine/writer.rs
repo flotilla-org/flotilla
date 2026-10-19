@@ -441,6 +441,7 @@ fn eviction_preserves_the_log_and_restore_version() {
     let count = home.log().history("l", Version(0), usize::MAX).len();
     let resource = home.evict("l").expect("evicted value");
     assert!(home.get("l").is_none());
+    assert!(matches!(home.apply("l", note(), &Table::new(), at(1)), Err(WriteError::Unknown(name)) if name == "l"));
     assert_eq!(home.log().history("l", Version(0), usize::MAX).len(), count);
     home.restore(resource).expect("restore");
     assert_eq!(home.get("l").expect("restored").version(), version);

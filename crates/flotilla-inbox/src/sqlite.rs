@@ -14,7 +14,7 @@ use flotilla_state_machines::{
     machines::{
         agent_session::AgentSession,
         consumer::{Consumer, Receiver},
-        message::{Message, MessageSpec, MessageState},
+        message::{Message, MessageState},
     },
     EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, Version,
 };
@@ -24,16 +24,12 @@ use crate::{
     Change, ChangeKind, ConsumerLog, Cursor, Error, InboxLog, ReceiptScope,
 };
 
-/// Inbox-local SQLite adapter for Message and its consumer machines. The
-/// generic Log implementation shares consumer persistence, while its Message
-/// admission check remains scoped here rather than changing the engine/schema
-/// contracts for every machine.
+/// Shared SQLite persistence for consumer machines. Message admission uses MessageLog.
 #[derive(Clone)]
 pub struct StoreLog {
     store: Arc<Mutex<Store>>,
     home: String,
     decoders: BTreeMap<flotilla_schema::KindCode, ReceiptDecoder>,
-    reads: Arc<Mutex<ReadCounts>>,
 }
 
 fn refused(error: impl std::error::Error + Send + Sync + 'static) -> LogError {
@@ -43,14 +39,7 @@ fn refused(error: impl std::error::Error + Send + Sync + 'static) -> LogError {
 impl StoreLog {
     pub fn new(store: Arc<Mutex<Store>>) -> Self {
         let home = store.lock().expect("store writer").home().to_owned();
-        Self { store, home, decoders: BTreeMap::new(), reads: Arc::new(Mutex::new(ReadCounts::default())) }.consumer::<AgentSession>()
-    }
-
-    pub fn read_counts(&self) -> ReadCounts {
-        self.reads.lock().expect("read counters").clone()
-    }
-    pub fn reset_read_counts(&self) {
-        *self.reads.lock().expect("read counters") = ReadCounts::default();
+        Self { store, home, decoders: BTreeMap::new() }.consumer::<AgentSession>()
     }
 
     /// Register every consumer kind whose Receive edges this inbox can observe.
@@ -81,7 +70,7 @@ fn storage(error: impl std::fmt::Display) -> Error {
 impl<M> Log<M> for StoreLog
 where
     M: Machine,
-    M::Spec: KindSpec<State = M::State> + 'static,
+    M::Spec: KindSpec<State = M::State>,
     M::State: StateData + Labelled<Label = Label<M>>,
     EdgePayload<M::Edge>: Cbor,
 {
@@ -89,11 +78,6 @@ where
         let origin = Origin::new(writer, at).with_payload(&reads.to_vec()).map_err(refused)?;
         let mut store = self.store.lock().expect("store writer");
         let mut write = store.write().map_err(refused)?;
-        if let Some(spec) = (resource.spec() as &dyn std::any::Any).downcast_ref::<MessageSpec>() {
-            if spec.admitted_seq == 0 || spec.admitted_seq != write.last_sequence(&self.home).map_err(refused)? + 1 {
-                return Err(LogError::new("Message admission must equal its create home sequence"));
-            }
-        }
         let stamp = write.insert(resource.name(), resource, &origin).map_err(refused)?;
         write.commit().map_err(refused)?;
         Ok(Version(stamp.version))
@@ -117,19 +101,6 @@ impl ConsumerLog for StoreLog {
     }
 }
 
-/// Logical read counts, shared by clones of this log. They distinguish explicit
-/// history/watch queries from delivery's open-state reads.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReadCounts {
-    pub resource_loads: u64,
-    pub terminal_loads: u64,
-    pub scan_pages: u64,
-    pub pending_pages: u64,
-    pub about_pages: u64,
-    pub resource_history_pages: u64,
-    pub watch_pages: u64,
-}
-
 // Codec only: this declares no stored kind or additional persistent table.
 #[derive(flotilla_schema::Stored)]
 struct LoggedState {
@@ -147,11 +118,13 @@ fn changed_state(entry: &flotilla_schema::Event) -> Result<MessageState, Error> 
             _ => None,
         })
         .ok_or_else(|| Error::Storage("Message edge lacks its state effect".into()))?;
-    let mut layout = Layout::root("LoggedState", Resource::<Message>::CODE);
-    LoggedState::layout_row(&mut layout);
-    let columns = &layout.finish().tables[0].columns;
-    let row =
-        Row { key: Vec::new(), values: columns.iter().map(|column| values.get(&column.name).cloned().unwrap_or(Value::Null)).collect() };
+    static COLUMNS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let columns = COLUMNS.get_or_init(|| {
+        let mut layout = Layout::root("LoggedState", Resource::<Message>::CODE);
+        LoggedState::layout_row(&mut layout);
+        layout.finish().tables.remove(0).columns.into_iter().map(|column| column.name).collect()
+    });
+    let row = Row { key: Vec::new(), values: columns.iter().map(|column| values.get(column).cloned().unwrap_or(Value::Null)).collect() };
     Ok(Decoder::decode::<LoggedState>(Rows { tables: vec![vec![row]], objects: BTreeMap::new() }).map_err(storage)?.state.value)
 }
 
@@ -173,10 +146,17 @@ fn created_inbox(entry: &flotilla_schema::Event) -> Result<Address, Error> {
         .map_err(storage)
 }
 
-impl InboxLog for StoreLog {
-    type PendingCursor = flotilla_schema_sqlite::Cursor;
+impl InboxLog for MessageLog {
     fn consumer_scope(&self) -> Option<ReceiptScope> {
         self.receipt_scope()
+    }
+    fn reader(&self) -> Box<dyn crate::WatchReader> {
+        Box::new(self.clone())
+    }
+    fn exists(&mut self, name: &str) -> Result<bool, Error> {
+        let mut store = self.store.lock().expect("store writer");
+        let mut read = store.read().map_err(storage)?;
+        Ok(read.resolve(Resource::<Message>::CODE, name, &self.home).map_err(storage)?.is_some())
     }
     fn sequence(&mut self) -> Result<u64, Error> {
         self.store.lock().expect("store writer").read().map_err(storage)?.last_sequence(&self.home).map_err(storage)
@@ -186,18 +166,12 @@ impl InboxLog for StoreLog {
         let mut read = store.read().map_err(storage)?;
         let Some(id) = read.resolve(Resource::<Message>::CODE, name, &self.home).map_err(storage)? else { return Ok(None) };
         let loaded = read.load::<Resource<Message>>(id).map_err(storage)?;
-        let mut counts = self.reads.lock().expect("read counters");
-        counts.resource_loads += 1;
-        if loaded.as_ref().is_some_and(|r| matches!(r.value.state(), MessageState::Settled { .. } | MessageState::Dropped { .. })) {
-            counts.terminal_loads += 1;
-        }
         Ok(loaded.map(|r| r.value))
     }
     fn scan(&mut self, after: Option<i64>) -> Result<ScanPage, Error> {
         let mut store = self.store.lock().expect("store writer");
         let mut read = store.read().map_err(storage)?;
         let page = read.scan::<Resource<Message>>(&self.home, after.map(flotilla_schema_sqlite::ResourceId), 32).map_err(storage)?;
-        self.reads.lock().expect("read counters").scan_pages += 1;
         let mut messages = Vec::new();
         for id in page.ids {
             if let Some(loaded) = read.load::<Resource<Message>>(id).map_err(storage)? {
@@ -205,30 +179,6 @@ impl InboxLog for StoreLog {
             }
         }
         Ok(ScanPage { messages, next: page.next.map(|id| id.0) })
-    }
-    fn pending(
-        &mut self,
-        inbox: &Address,
-        after: Option<&Self::PendingCursor>,
-    ) -> Result<(Vec<String>, Option<Self::PendingCursor>), Error> {
-        let mut store = self.store.lock().expect("store writer");
-        let mut read = store.read().map_err(storage)?;
-        let page = read.page(&MessageSpec::pending_by_inbox(inbox), after, 32).map_err(storage)?;
-        self.reads.lock().expect("read counters").pending_pages += 1;
-        let mut names = Vec::new();
-        for id in page.ids {
-            if let Some(loaded) = read.load::<Resource<Message>>(id).map_err(storage)? {
-                let mut counts = self.reads.lock().expect("read counters");
-                counts.resource_loads += 1;
-                if matches!(loaded.value.state(), MessageState::Settled { .. } | MessageState::Dropped { .. }) {
-                    counts.terminal_loads += 1;
-                }
-                if loaded.home == self.home {
-                    names.push(loaded.name);
-                }
-            }
-        }
-        Ok((names, page.next))
     }
     fn receipts(&mut self, name: &str) -> Result<BTreeMap<Receiver, flotilla_state_machines::Transport>, Error> {
         let mut store = self.store.lock().expect("store writer");
@@ -238,7 +188,6 @@ impl InboxLog for StoreLog {
         let mut after = None;
         loop {
             let page = read.about(id, after.as_ref(), 32).map_err(storage)?;
-            self.reads.lock().expect("read counters").about_pages += 1;
             for entry in page.events {
                 let Some(decode) = self.decoders.get(&entry.kind) else { continue };
                 if let Some((consumer, transport)) = decode(&entry)? {
@@ -256,15 +205,12 @@ impl InboxLog for StoreLog {
         let mut store = self.store.lock().expect("store writer");
         let mut read = store.read().map_err(storage)?;
         let events = read.changes_since(&self.home, after.0, 16).map_err(storage)?;
-        self.reads.lock().expect("read counters").watch_pages += 1;
         let mut through = after;
         let mut changes: Vec<(Address, Change)> = Vec::new();
-        let mut budget = crate::resident::WatchPageBudget::default();
         for entry in events {
             if entry.home_seq != through.0 + 1 {
                 return Err(Error::CursorExpired);
             }
-            let previous = through;
             through = Cursor(entry.home_seq);
             let (message, kind) = if entry.kind == Resource::<Message>::CODE {
                 let state = match entry.cause {
@@ -289,14 +235,9 @@ impl InboxLog for StoreLog {
             } else {
                 let id = read.resolve(Resource::<Message>::CODE, &message, &self.home).map_err(storage)?.ok_or(Error::CursorExpired)?;
                 let create = read.changes(id, 0, 1).map_err(storage)?.into_iter().next().ok_or(Error::CursorExpired)?;
-                self.reads.lock().expect("read counters").resource_history_pages += 1;
                 created_inbox(&create)?
             };
             let change = Change { cursor: Cursor(entry.home_seq), message, kind };
-            if !budget.admit(&inbox, &change) {
-                through = previous;
-                break;
-            }
             changes.push((inbox, change));
         }
         if through == after && read.last_sequence(&self.home).map_err(storage)? > after.0 {
@@ -312,16 +253,20 @@ impl InboxLog for StoreLog {
     }
 }
 
-pub type SqliteInbox = crate::EngineInbox<StoreLog>;
+pub type SqliteInbox = crate::EngineInbox<MessageLog>;
 
-/// Proposed Message-only adapter for transaction-assigned admission metadata.
-/// Not yet wired into InboxLog: that switch and removal of StoreLog's temporary
-/// downcast/retry path await the owner's engine-hook ruling.
+/// Message-only adapter: admission metadata is assigned in its create transaction.
 #[derive(Clone)]
 pub struct MessageLog {
     inner: StoreLog,
 }
 
+impl std::ops::Deref for MessageLog {
+    type Target = StoreLog;
+    fn deref(&self) -> &StoreLog {
+        &self.inner
+    }
+}
 impl MessageLog {
     pub fn new(store: Arc<Mutex<Store>>) -> Self {
         Self { inner: StoreLog::new(store) }
@@ -358,5 +303,14 @@ impl Log<Message> for MessageLog {
         event: &EdgeEventOf<Message>,
     ) -> Result<Version, LogError> {
         <StoreLog as Log<Message>>::edge(&mut self.inner, previous, next, event)
+    }
+}
+
+impl crate::WatchReader for MessageLog {
+    fn sequence(&mut self) -> Result<u64, Error> {
+        InboxLog::sequence(self)
+    }
+    fn changes_since(&mut self, after: Cursor) -> Result<ChangePage, Error> {
+        InboxLog::changes_since(self, after)
     }
 }

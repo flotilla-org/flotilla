@@ -139,10 +139,6 @@ pub fn sent(message: &MessageRef) -> Ref<Sent> {
 /// messages by deadline (the expiry sweep's read), and by the message each
 /// replies to or supersedes, which also keeps an expunge's foreign-key checks
 /// off a table scan.
-///
-/// When adding or changing spec fields, update the replica charge model in
-/// `flotilla-inbox/src/resident.rs::resource` and its allocator calibration
-/// workload; new fields do not necessarily make that accounting fail to compile.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(
     kind = "Message",
@@ -158,10 +154,10 @@ pub struct MessageSpec {
     /// fleet roles too (#3424 ruling 6).
     pub sender: Address,
     pub inbox: Address,
-    /// Immutable admission order assigned by the home writer before the create
-    /// write, and preserved by replication. Never a store-local resource id.
-    /// Zero is the unassigned constructor value; the inbox writer stamps this
-    /// before create and its log refuses a zero or mismatched sequence.
+    /// Immutable admission order assigned by the home writer inside the create
+    /// transaction, and preserved by replication. Never a store-local resource id.
+    /// Zero is the unassigned constructor value; the Message log assigns this
+    /// atomically with the create write.
     pub admitted_seq: u64,
     pub relation: Relation,
     #[store(frozen)]

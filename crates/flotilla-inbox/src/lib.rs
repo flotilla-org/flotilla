@@ -18,7 +18,7 @@ mod resident;
 pub mod sqlite;
 mod storage;
 pub use resident::{Residency, RESIDENT_BUDGET};
-pub use storage::{ChangePage, InboxLog, MemoryInboxLog, ScanPage};
+pub use storage::{ChangePage, InboxLog, MemoryInboxLog, ScanPage, WatchReader};
 
 /// Opaque canonical address assigned by the backend; usable as a subject.
 pub type MessageId = String;
@@ -263,9 +263,8 @@ struct State<L: InboxLog> {
     receipts: BTreeMap<String, BTreeMap<Receiver, Transport>>,
     consumers: BTreeMap<Receiver, Box<dyn ConsumerPort>>,
     inboxes: BTreeMap<Address, BTreeMap<u64, String>>,
-    pending_complete: bool,
+    pending_bytes: usize,
     sequence: u64,
-    opened_at: Timestamp,
     budget: usize,
     resident_bytes: usize,
     control_bytes: usize,
@@ -276,17 +275,9 @@ struct State<L: InboxLog> {
     observation_version: u64,
 }
 
-struct PendingRead<C> {
+#[derive(Default)]
+struct PendingRead {
     after: u64,
-    cursor: Option<C>,
-    names: VecDeque<String>,
-    ended: bool,
-    store: bool,
-}
-impl<C> Default for PendingRead<C> {
-    fn default() -> Self {
-        Self { after: 0, cursor: None, names: VecDeque::new(), ended: false, store: false }
-    }
 }
 
 /// Single home writer. The mutex covers the engine decision and its committed
@@ -294,6 +285,7 @@ impl<C> Default for PendingRead<C> {
 /// [Workload and choices](../../../docs/implementation-choices/inbox-contract.md) describe the bounds and expiry.
 pub struct EngineInbox<L: InboxLog> {
     state: Arc<Mutex<State<L>>>,
+    reader: Arc<tokio::sync::Mutex<Box<dyn WatchReader>>>,
     changed: Arc<Notify>,
     worker: Arc<tokio::sync::Mutex<()>>,
     observations: Arc<dyn Observations>,
@@ -306,6 +298,7 @@ impl<L: InboxLog> Clone for EngineInbox<L> {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
+            reader: self.reader.clone(),
             changed: self.changed.clone(),
             worker: self.worker.clone(),
             observations: self.observations.clone(),
@@ -326,6 +319,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         supervision: Arc<dyn Supervision>,
         budget: usize,
     ) -> Result<Self, Error> {
+        let reader = Arc::new(tokio::sync::Mutex::new(log.reader()));
         let sequence = log.sequence()?;
         let state = State {
             home: Home::with_log(writer, log).expect("Message declaration validates"),
@@ -333,9 +327,8 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             receipts: BTreeMap::new(),
             consumers: BTreeMap::new(),
             inboxes: BTreeMap::new(),
-            pending_complete: true,
+            pending_bytes: 0,
             sequence,
-            opened_at: observations.now(),
             budget,
             resident_bytes: 0,
             control_bytes: 0,
@@ -347,6 +340,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         };
         let backend = Self {
             state: Arc::new(Mutex::new(state)),
+            reader,
             changed: Arc::new(Notify::new()),
             worker: Arc::new(tokio::sync::Mutex::new(())),
             observations,
@@ -360,9 +354,15 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
                 Self::validate_admission(&resource)?;
                 let name = resource.name().to_owned();
                 let recover_reaction = resource.state().drop_reason() == Some(&DropReason::Undeliverable);
+                let inbox = resource.spec().inbox.clone();
+                // Recovery restores the 3461 home-local clock: one per inbox,
+                // reset at backend open, not one per recovered message.
+                if !state.bindings.contains_key(&inbox) {
+                    Self::set_binding(&mut state, inbox.clone(), InboxBinding::Unbound { since: backend.observations.now() })?;
+                }
                 if matches!(resource.state(), MessageState::Pending | MessageState::Awaiting { .. }) {
-                    if state.pending_complete && *resource.state() == MessageState::Pending {
-                        state.inboxes.entry(resource.spec().inbox.clone()).or_default().insert(resource.spec().admitted_seq, name.clone());
+                    if *resource.state() == MessageState::Pending {
+                        Self::index_pending(&mut state, &inbox, resource.spec().admitted_seq, &name)?;
                     }
                     let receipts = state.home.log_mut().receipts(&name)?;
                     if !receipts.is_empty() {
@@ -452,10 +452,6 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         while state.resident_bytes.saturating_add(state.control_bytes) > state.budget {
             let Some((_, name)) = state.lru.first_key_value().map(|(tick, name)| (*tick, name.clone())) else { break };
             Self::forget(state, &name);
-            // Once coverage is incomplete, queries route to the store's declared
-            // Pending index. Never return a partial resident result as complete.
-            state.pending_complete = false;
-            state.inboxes.clear();
         }
     }
 
@@ -465,10 +461,23 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             budget_bytes: state.budget,
             accounted_bytes: state.resident_bytes + state.control_bytes,
             open_messages: state.sizes.len(),
-            pending_index_complete: state.pending_complete,
+            pending_index_complete: true,
+            pending_bytes: state.pending_bytes,
+            pending_budget_bytes: resident::PENDING_BUDGET,
+            pending_messages: state.inboxes.values().map(BTreeMap::len).sum(),
             oldest_state_since: state.home.resources().map(Resource::since).min(),
             newest_state_since: state.home.resources().map(Resource::since).max(),
         }
+    }
+
+    async fn read_log<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut dyn WatchReader) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
+        // Serialize this source handle before submitting blocking work. Waiting
+        // watchers occupy futures, never blocked pool threads or the writer.
+        let mut reader = self.reader.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || operation(reader.as_mut())).await.map_err(|error| Error::Storage(error.to_string()))?
     }
 
     async fn access<T: Send + 'static>(
@@ -509,7 +518,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
 
     fn register(state: &mut State<L>, consumer: Receiver, port: Box<dyn ConsumerPort>) -> Result<(), Error> {
         let extra = if state.consumers.contains_key(&consumer) { 0 } else { resident::receiver(&consumer) + 64 };
-        if state.control_bytes.saturating_add(extra) > state.budget {
+        if state.control_bytes.saturating_add(extra) > state.budget.min(resident::CONTROL_BUDGET) {
             return Err(Error::Storage("resident budget exhausted by consumer keys".into()));
         }
         state.control_bytes += extra;
@@ -520,7 +529,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
     fn set_binding(state: &mut State<L>, inbox: Address, binding: InboxBinding) -> Result<(), Error> {
         let previous = state.bindings.get(&inbox).map_or(0, |value| resident::binding(&inbox, value));
         let next = state.control_bytes - previous + resident::binding(&inbox, &binding);
-        if next > state.budget {
+        if next > state.budget.min(resident::CONTROL_BUDGET) {
             return Err(Error::Storage("resident budget exhausted by binding observations".into()));
         }
         state.control_bytes = next;
@@ -529,42 +538,32 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         Ok(())
     }
 
-    fn next_pending(state: &mut State<L>, inbox: &Address, query: &mut PendingRead<L::PendingCursor>) -> Result<Option<String>, Error> {
+    fn index_pending(state: &mut State<L>, inbox: &Address, seq: u64, name: &str) -> Result<(), Error> {
+        if state.inboxes.get(inbox).is_some_and(|rows| rows.contains_key(&seq)) {
+            return Ok(());
+        }
+        let charge = resident::pending(inbox, name, !state.inboxes.contains_key(inbox));
+        if state.pending_bytes.saturating_add(charge) > resident::PENDING_BUDGET {
+            return Err(Error::Storage("resident Pending index budget exhausted".into()));
+        }
+        state.pending_bytes += charge;
+        state.inboxes.entry(inbox.clone()).or_default().insert(seq, name.to_owned());
+        Ok(())
+    }
+
+    fn next_pending(state: &mut State<L>, inbox: &Address, query: &mut PendingRead) -> Result<Option<String>, Error> {
         use std::ops::Bound::{Excluded, Unbounded};
-        if state.pending_complete && !query.store {
-            let next = state
-                .inboxes
-                .get(inbox)
-                .and_then(|names| names.range((Excluded(query.after), Unbounded)).next())
-                .map(|(seq, name)| (*seq, name.clone()));
-            return Ok(next.map(|(seq, name)| {
-                query.after = seq;
-                state.touched.insert(name.clone());
-                name
-            }));
+        let next = state
+            .inboxes
+            .get(inbox)
+            .and_then(|names| names.range((Excluded(query.after), Unbounded)).next())
+            .map(|(seq, name)| (*seq, name.clone()));
+        let Some((seq, name)) = next else { return Ok(None) };
+        query.after = seq;
+        if !Self::load(state, &name)? {
+            return Err(Error::Storage("resident Pending key missing from store".into()));
         }
-        query.store = true;
-        loop {
-            while let Some(name) = query.names.pop_front() {
-                if !Self::load(state, &name)? {
-                    continue;
-                }
-                let resource = state.home.get(&name).expect("loaded pending candidate");
-                let admitted = resource.spec().admitted_seq;
-                if admitted > query.after {
-                    query.after = admitted;
-                    return Ok(Some(name));
-                }
-                Self::trim(state);
-            }
-            if query.ended {
-                return Ok(None);
-            }
-            let (names, cursor) = state.home.log_mut().pending(inbox, query.cursor.as_ref())?;
-            query.names = names.into();
-            query.ended = cursor.is_none();
-            query.cursor = cursor;
-        }
+        Ok(Some(name))
     }
 
     fn binding_blocked(&self, state: &mut State<L>, inbox: &Address) -> Result<bool, Error> {
@@ -625,8 +624,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
                 if let Some(condition) = &resource.spec().delivery_condition {
                     world.names.insert(condition.to_string());
                 }
-                let binding =
-                    state.bindings.get(inbox).cloned().unwrap_or(InboxBinding::Unbound { since: state.opened_at.max(resource.since()) });
+                let binding = state.bindings.get(inbox).cloned().expect("one clock per admitted inbox");
                 world.binding = Some((inbox.to_string(), Version(state.observation_version), binding));
                 world.receipts =
                     state.receipts.get(name).map(|receipts| (name.to_owned(), Version(state.observation_version), receipts.clone()));
@@ -648,14 +646,14 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         self.enqueue_named(state, spec, None)
     }
 
-    fn enqueue_named(&self, state: &mut State<L>, mut spec: MessageSpec, name: Option<String>) -> Result<String, Error> {
+    fn enqueue_named(&self, state: &mut State<L>, spec: MessageSpec, name: Option<String>) -> Result<String, Error> {
         let inbox = spec.inbox.clone();
         let now = self.observations.now();
         let mut world = self.world(state, None);
         for reference in [&spec.in_reply_to, &spec.supersedes].into_iter().flatten() {
             world.names.insert(sent(reference).name().to_owned());
             if reference.home == state.home.writer()
-                && (state.home.get(&reference.name).is_some() || state.home.log_mut().load(&reference.name)?.is_some())
+                && (state.home.get(&reference.name).is_some() || state.home.log_mut().exists(&reference.name)?)
             {
                 world.sent.insert(sent(reference).name().to_owned());
             }
@@ -664,27 +662,25 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             Some(name) => name,
             None => state.home.log_mut().next_name()?,
         };
-        // Other users of the same Store/home may commit between sequence() and
-        // create(). A refused create leaves Home unchanged; retry once with a
-        // fresh sequence when the source advanced, preserving the same name.
-        world.run(self.observations.as_ref(), |world| {
-            for attempt in 0..2 {
-                spec.admitted_seq = state.home.log_mut().sequence()? + 1;
-                match state.home.create(&name, spec.clone(), world, now).map(|_| ()) {
-                    Ok(()) => return Ok(()),
-                    Err(WriteError::Log(_)) if attempt == 0 && state.home.log_mut().sequence()? >= spec.admitted_seq => continue,
-                    Err(error) => return Err(Error::Message(error)),
-                }
-            }
-            unreachable!("bounded admission attempts return on last iteration")
-        })??;
+        let clock_charge =
+            if state.bindings.contains_key(&inbox) { 0 } else { resident::binding(&inbox, &InboxBinding::Unbound { since: now }) };
+        if state.control_bytes.saturating_add(clock_charge) > state.budget.min(resident::CONTROL_BUDGET) {
+            return Err(Error::Storage("resident inbox clock budget exhausted".into()));
+        }
+        if state.pending_bytes.saturating_add(resident::pending(&inbox, &name, !state.inboxes.contains_key(&inbox)))
+            > resident::PENDING_BUDGET
+        {
+            return Err(Error::Storage("resident Pending index budget exhausted".into()));
+        }
+        world.run(self.observations.as_ref(), |world| state.home.create(&name, spec, world, now).map(|_| ()))??;
+        if !state.bindings.contains_key(&inbox) {
+            Self::set_binding(state, inbox.clone(), InboxBinding::Unbound { since: now })?;
+        }
         state.touched.insert(name.clone());
         // Pending has no self edge: its version remains its admission sequence
         // until it leaves this index. Numeric keys preserve arrival order.
         let admitted = state.home.get(&name).expect("admitted message").spec().admitted_seq;
-        if state.pending_complete {
-            state.inboxes.entry(inbox).or_default().insert(admitted, name.clone());
-        }
+        Self::index_pending(state, &inbox, admitted, &name)?;
         Self::publish(state)?;
         Ok(name)
     }
@@ -744,8 +740,11 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         let next = resource.state().clone();
         if next != MessageState::Pending {
             if let (Some(index), Some(previous)) = (state.inboxes.get_mut(&inbox), previous) {
-                index.remove(&previous);
+                if let Some(name) = index.remove(&previous) {
+                    state.pending_bytes -= resident::pending(&inbox, &name, false);
+                }
                 if index.is_empty() {
+                    state.pending_bytes -= resident::pending(&inbox, "", true) - resident::pending(&inbox, "", false);
                     state.inboxes.remove(&inbox);
                 }
             }
@@ -755,7 +754,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
     }
     fn dead_letter(&self, state: &mut State<L>, message: &str) -> Result<(), Error> {
         let name = format!("{DEAD_LETTER_PREFIX}{}", message.rsplit(':').next().expect("message address"));
-        if state.home.get(&name).is_some() || state.home.log_mut().load(&name)?.is_some() {
+        if state.home.get(&name).is_some() || state.home.log_mut().exists(&name)? {
             return Ok(());
         }
         let resource = state.home.get(message).expect("dropped");
@@ -911,14 +910,14 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
     }
     async fn watch(&self, inbox: &Address, after: Option<Cursor>) -> Result<Watch, Error> {
         let after = self
-            .access(move |_, state| {
-                let latest = state.home.log_mut().sequence()?;
+            .read_log(move |reader| {
+                let latest = reader.sequence()?;
                 let cursor = after.unwrap_or(Cursor(latest));
                 if cursor.0 > latest {
                     return Err(Error::CursorAhead);
                 }
                 // Validate against retained source history, not a replica generation.
-                if let Err(error) = state.home.log_mut().changes_since(cursor) {
+                if let Err(error) = reader.changes_since(cursor) {
                     if matches!(error, Error::CursorExpired) {
                         tracing::warn!(cursor = cursor.0, "inbox source log cursor expired");
                     }
@@ -942,7 +941,7 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
                     let notified = backend.changed.notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
-                    let page = backend.access(move |_, state| state.home.log_mut().changes_since(cursor)).await;
+                    let page = backend.read_log(move |reader| reader.changes_since(cursor)).await;
                     match page {
                         Ok(page) => {
                             let advanced = page.through > cursor;

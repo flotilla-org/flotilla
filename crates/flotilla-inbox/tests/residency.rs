@@ -1,7 +1,9 @@
+mod support;
 use std::sync::{Arc, Mutex};
+use support::{CountedInbox as SqliteInbox, CountingLog};
 
 use flotilla_inbox::{
-    sqlite::{SqliteInbox, StoreLog},
+    sqlite::{MessageLog, StoreLog},
     Cursor, EngineInbox, Error, InboxBackend, InboxLog, MemoryInbox, MemoryInboxLog, Rules, RESIDENT_BUDGET,
 };
 use flotilla_inbox_testkit::{address, consumer, inbox, spec, Evidence, SessionPort, Supervisors};
@@ -20,8 +22,8 @@ fn database() -> Arc<Mutex<Store>> {
     ))
 }
 
-fn backend(store: Arc<Mutex<Store>>, evidence: Arc<Evidence>, budget: usize) -> (SqliteInbox, StoreLog) {
-    let log = StoreLog::new(store.clone());
+fn backend(store: Arc<Mutex<Store>>, evidence: Arc<Evidence>, budget: usize) -> (SqliteInbox, CountingLog) {
+    let log = CountingLog::new(store.clone());
     let backend = SqliteInbox::open_with_budget("test", log.clone(), evidence, Arc::new(Supervisors), budget).expect("open");
     backend.register_blocking(consumer("a"), SessionPort::new("a", StoreLog::new(store)));
     (backend, log)
@@ -75,6 +77,7 @@ async fn exercise_eviction<L: InboxLog + 'static>(
         backend.receive(&consumer("a"), message, Transport::Turn).await.expect("receive");
         backend.deliver(message, Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("deliver");
         assert!(backend.residency_blocking().accounted_bytes <= budget);
+        assert!(backend.residency_blocking().pending_index_complete);
     }
     assert_eq!(backend.residency_blocking().open_messages, 0);
     assert!(backend.pending(&inbox(), &consumer("a"), &Rules::default()).await.expect("pending").next().await.is_none());
@@ -89,8 +92,12 @@ async fn delivery_reads_no_terminal_history() {
         let (backend, log) = backend(database(), evidence.clone(), budget);
         backend.bind(inbox(), consumer("a")).await.expect("bind");
         evidence.world.lock().expect("world").authority.put(&Ref::new(address("project:test/role:owner").to_string()), true);
+        let mut parent = String::new();
         for n in 0..96 {
             let message = backend.enqueue(spec()).await.expect("history message");
+            if n == 0 {
+                parent = message.clone();
+            }
             if n % 2 == 0 {
                 backend.receive(&consumer("a"), &message, Transport::Turn).await.expect("receive");
                 backend.deliver(&message, Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("settled");
@@ -107,7 +114,9 @@ async fn delivery_reads_no_terminal_history() {
         assert_eq!(backend.residency_blocking().open_messages, 0);
         log.reset_read_counts();
         for _ in 0..24 {
-            let message = backend.enqueue(spec()).await.expect("enqueue");
+            let mut reply = spec();
+            reply.in_reply_to = Some(MessageRef::new(parent.clone(), "test"));
+            let message = backend.enqueue(reply).await.expect("reply to settled parent");
             let pending = backend
                 .pending(&inbox(), &consumer("a"), &Rules::default())
                 .await
@@ -122,15 +131,15 @@ async fn delivery_reads_no_terminal_history() {
         }
         let reads = log.read_counts();
         assert_eq!(reads.terminal_loads, 0, "{reads:?}");
-        assert_eq!(reads.resource_history_pages, 0, "{reads:?}");
         assert_eq!(reads.scan_pages, 0, "{reads:?}");
         assert_eq!(reads.watch_pages, 0, "{reads:?}");
         if budget == RESIDENT_BUDGET {
             assert_eq!(reads.resource_loads, 0, "warm delivery reads no stored resources");
-            assert_eq!(reads.about_pages, 0, "warm delivery reads no receipt history");
+            assert_eq!(reads.receipt_reads, 0, "warm delivery reads no receipt history");
         } else {
-            assert!(reads.pending_pages > 0 && reads.about_pages > 0, "exercise the cold route");
+            assert!(reads.resource_loads > 0, "cold values are read by key");
         }
+        assert_eq!(reads.exists, 24, "reply admission resolves its settled parent without decoding it");
     }
 }
 
@@ -150,7 +159,7 @@ async fn restart_rebuilds_bounded_open_state_and_cold_terminal_reads() {
     first.deliver(&messages[0], Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("deliver");
     first.receive(&consumer("a"), &messages[1], Transport::Turn).await.expect("receipt survives restart");
     drop(first);
-    let log = StoreLog::new(store.clone());
+    let log = CountingLog::new(store.clone());
     let reopened = SqliteInbox::open_with_budget("test", log.clone(), evidence, Arc::new(Supervisors), 2048).expect("restart");
     assert!(log.read_counts().scan_pages >= 3);
     assert!(reopened.residency_blocking().accounted_bytes <= 2048);
@@ -227,8 +236,8 @@ async fn watch_replays_historical_states_after_eviction() {
     );
 }
 
-// Behaviour: only a real gap in the authoritative log expires a cursor. The
-// backend itself never trims history; this exercises the store's existing expunge.
+// Behaviour: expunging any resource at the home creates a sequence gap;
+// older cursors expire even for unrelated inboxes. No backend trimming occurs.
 #[tokio::test]
 async fn watch_reports_expired_when_source_history_was_expunged() {
     use flotilla_schema::{Kind, Origin, Timestamp};
@@ -247,21 +256,20 @@ async fn watch_reports_expired_when_source_history_was_expunged() {
         write.commit().expect("commit");
     }
     assert!(matches!(backend.watch(&inbox(), Some(Cursor(0))).await, Err(Error::CursorExpired)));
+    assert!(matches!(backend.watch(&address("project:test/role:unrelated"), Some(Cursor(0))).await, Err(Error::CursorExpired)));
 }
 
 // Behaviour: a restart that repairs a committed Undeliverable drop may encounter
 // its new dead letter in a later scan page; restore must not duplicate admission.
 #[test]
 fn paged_restart_finishes_interrupted_dead_letter_once() {
-    use flotilla_inbox::InboxLog;
     use flotilla_state_machines::Home;
     let store = database();
-    let mut home = Home::<Message, StoreLog>::with_log("test", StoreLog::new(store.clone())).expect("home");
+    let mut home = Home::<Message, MessageLog>::with_log("test", MessageLog::new(store.clone())).expect("home");
     let mut world = MemoryMessageWorld::default();
     world.binding.put(&Ref::new(inbox().to_string()), InboxBinding::Unbound { since: flotilla_schema::Timestamp(0) });
     for n in 0..40 {
-        let mut value = spec();
-        value.admitted_seq = home.log_mut().sequence().expect("sequence") + 1;
+        let value = spec();
         let name = format!("project:inbox/role:message-{n}");
         home.create(&name, value, &world, flotilla_schema::Timestamp(0)).expect("create");
         if n == 0 {
@@ -271,7 +279,7 @@ fn paged_restart_finishes_interrupted_dead_letter_once() {
     }
     drop(home);
     for _ in 0..2 {
-        let reopened = SqliteInbox::open("test", StoreLog::new(store.clone()), Arc::new(Evidence::default()), Arc::new(Supervisors))
+        let reopened = SqliteInbox::open("test", CountingLog::new(store.clone()), Arc::new(Evidence::default()), Arc::new(Supervisors))
             .expect("restart repairs reaction");
         assert!(matches!(
             reopened.get_blocking("project:inbox/role:dead-letter-message-0").expect("one dead letter").state(),
@@ -281,10 +289,10 @@ fn paged_restart_finishes_interrupted_dead_letter_once() {
     }
 }
 
-// Behaviour: byte-bounded watch batches make progress for a first oversized
-// change and never skip its cursor or the following smaller changes.
+// Behaviour: store-paged watches preserve a large change and all its
+// followers without a second decoded-page budget or cursor skipping.
 #[tokio::test]
-async fn watch_pages_preserve_oversized_changes_and_followers() {
+async fn watch_pages_preserve_large_changes_and_followers() {
     let evidence = Arc::new(Evidence::default());
     let authority = address(&format!("project:test/role:{}", "a".repeat(4096)));
     evidence.world.lock().expect("world").authority.put(&Ref::new(authority.to_string()), true);
@@ -331,8 +339,8 @@ async fn control_budget_refusal_preserves_existing_binding() {
     assert_eq!(pending.into_iter().map(|p| p.message).collect::<Vec<_>>(), vec![message]);
 }
 
-// Behaviour: watch attribution reuses a message's create within the same source page,
-// including its receipt and edge, without loading terminal rows or resource history.
+// Behaviour: a watch page replays the create/receipt/edge lifecycle without
+// asking the resident-value log to decode current terminal bodies.
 // One lifecycle suffices for this page-local routing seam; paging/oversize is covered above.
 #[tokio::test]
 async fn watch_attributes_dense_lifecycle_once_per_page() {
@@ -350,14 +358,13 @@ async fn watch_attributes_dense_lifecycle_once_per_page() {
     let reads = log.read_counts();
     eprintln!("dense watch: 1000 pages / 3000 changes in {:?}; {reads:?}", started.elapsed());
     assert_eq!(reads.watch_pages, 1000);
-    assert_eq!(reads.resource_history_pages, 0);
     assert_eq!(reads.terminal_loads, 0);
 }
 
 // A deterministic interleaving at the source-log boundary: the real SQLite
 // consumer writer commits after stamping and before the Message transaction.
 struct InterleavedLog {
-    inner: StoreLog,
+    inner: CountingLog,
     competing_store: Option<Arc<Mutex<Store>>>,
 }
 impl flotilla_state_machines::Log<Message> for InterleavedLog {
@@ -368,10 +375,19 @@ impl flotilla_state_machines::Log<Message> for InterleavedLog {
         resource: &flotilla_state_machines::Resource<Message>,
         reads: &[flotilla_state_machines::InputRead],
     ) -> Result<flotilla_state_machines::Version, flotilla_state_machines::LogError> {
+        self.inner.create(writer, at, resource, reads)
+    }
+    fn create_resource(
+        &mut self,
+        writer: &str,
+        at: flotilla_schema::Timestamp,
+        resource: flotilla_state_machines::Resource<Message>,
+        reads: &[flotilla_state_machines::InputRead],
+    ) -> Result<flotilla_state_machines::Resource<Message>, flotilla_state_machines::LogError> {
         if let Some(store) = self.competing_store.take() {
             let _other = SessionPort::new("competing", StoreLog::new(store));
         }
-        self.inner.create(writer, at, resource, reads)
+        self.inner.create_resource(writer, at, resource, reads)
     }
     fn edge(
         &mut self,
@@ -383,7 +399,12 @@ impl flotilla_state_machines::Log<Message> for InterleavedLog {
     }
 }
 impl InboxLog for InterleavedLog {
-    type PendingCursor = <StoreLog as InboxLog>::PendingCursor;
+    fn reader(&self) -> Box<dyn flotilla_inbox::WatchReader> {
+        self.inner.reader()
+    }
+    fn exists(&mut self, name: &str) -> Result<bool, Error> {
+        self.inner.exists(name)
+    }
     fn sequence(&mut self) -> Result<u64, Error> {
         self.inner.sequence()
     }
@@ -392,13 +413,6 @@ impl InboxLog for InterleavedLog {
     }
     fn scan(&mut self, after: Option<i64>) -> Result<flotilla_inbox::ScanPage, Error> {
         self.inner.scan(after)
-    }
-    fn pending(
-        &mut self,
-        inbox: &flotilla_schema::Address,
-        after: Option<&Self::PendingCursor>,
-    ) -> Result<(Vec<String>, Option<Self::PendingCursor>), Error> {
-        self.inner.pending(inbox, after)
     }
     fn receipts(&mut self, name: &str) -> Result<std::collections::BTreeMap<Receiver, Transport>, Error> {
         self.inner.receipts(name)
@@ -415,13 +429,13 @@ impl InboxLog for InterleavedLog {
 }
 
 // Behaviour: a competing home write between admission preparation and commit
-// causes a bounded retry, never a mismatched stored admission or duplicate Message.
+// cannot cause a spurious sequence refusal: the transaction assigns admission.
 #[tokio::test]
-async fn admission_retries_competing_home_writer() {
+async fn admission_assigns_after_competing_home_writer() {
     let store = database();
-    let log = InterleavedLog { inner: StoreLog::new(store.clone()), competing_store: Some(store) };
+    let log = InterleavedLog { inner: CountingLog::new(store.clone()), competing_store: Some(store) };
     let backend = EngineInbox::open("test", log, Arc::new(Evidence::default()), Arc::new(Supervisors)).expect("open");
-    let message = backend.enqueue(spec()).await.expect("retry admission");
+    let message = backend.enqueue(spec()).await.expect("transaction admission");
     let resource = backend.get_async(&message).await.expect("get").expect("message");
     assert_eq!(resource.spec().admitted_seq, 2);
     assert_eq!(resource.version().0, 2);
@@ -448,10 +462,10 @@ async fn missing_snapshot_is_recoverable() {
     backend.enqueue(spec()).await.expect("writer is not poisoned");
 }
 
-// Behaviour: switching to cold coverage mid-stream preserves the admission
-// boundary, including a concurrent later enqueue, without skips or duplicates.
+// Behaviour: value eviction during a Pending stream leaves the complete
+// resident index intact, including a later enqueue, without skips or duplicates.
 #[tokio::test]
-async fn pending_handoff_preserves_admission_boundary() {
+async fn value_eviction_preserves_resident_pending_stream() {
     let (backend, _) = backend(database(), Arc::new(Evidence::default()), 32 * 1024);
     backend.bind(inbox(), consumer("a")).await.expect("bind");
     let mut expected = Vec::new();
@@ -464,7 +478,7 @@ async fn pending_handoff_preserves_admission_boundary() {
     let mut large = spec();
     large.body = MessageBody::text("x".repeat(64 * 1024)).expect("body");
     expected.push(backend.enqueue(large).await.expect("overflow"));
-    assert!(!backend.residency_blocking().pending_index_complete);
+    assert!(backend.residency_blocking().pending_index_complete);
     while let Some(item) = pending.next().await {
         actual.push(item.expect("item").message);
     }
@@ -484,10 +498,9 @@ async fn cold_bind_backlog_cost() {
     backend.bind(inbox(), consumer("a")).await.expect("bind");
     let reads = log.read_counts();
     eprintln!("cold bind 1024: {:?}; {reads:?}", started.elapsed());
-    assert_eq!(reads.resource_loads, 2048);
-    assert_eq!(reads.pending_pages, 32);
-    assert_eq!(reads.about_pages, 1024);
-    assert_eq!(reads.terminal_loads + reads.resource_history_pages + reads.scan_pages, 0);
+    assert_eq!(reads.resource_loads, 1024);
+    assert_eq!(reads.receipt_reads, 1024);
+    assert_eq!(reads.terminal_loads + reads.scan_pages, 0);
 }
 
 // Behaviour: restart scans terminal history in bounded pages but retains none
@@ -504,12 +517,110 @@ async fn terminal_backlog_restart_cost() {
         backend.deliver(&message, Deliver { receiver: consumer("a"), transport: Transport::Turn }).await.expect("terminal");
     }
     drop(backend);
-    let log = StoreLog::new(store);
+    let log = CountingLog::new(store);
     let started = std::time::Instant::now();
     let reopened = SqliteInbox::open_with_budget("test", log.clone(), evidence, Arc::new(Supervisors), 2048).expect("restart");
     eprintln!("terminal restart 2048: {:?}; {:?}", started.elapsed(), log.read_counts());
     assert_eq!(log.read_counts().scan_pages, 64);
-    assert_eq!(log.read_counts().about_pages, 0);
+    assert_eq!(log.read_counts().receipt_reads, 0);
     assert_eq!(reopened.residency_blocking().open_messages, 0);
-    assert_eq!(reopened.residency_blocking().accounted_bytes, 0);
+    assert!(reopened.residency_blocking().accounted_bytes <= 2048);
+}
+
+// Behaviour: the first enqueue starts one clock shared by later messages in
+// that inbox, even when all message values are evicted between admissions.
+#[tokio::test]
+async fn unbound_clock_belongs_to_inbox_not_message() {
+    let evidence = Arc::new(Evidence::default());
+    let (backend, _) = backend(database(), evidence.clone(), 2048);
+    let mut first = spec();
+    first.unbound_after = 100;
+    backend.enqueue(first).await.expect("first at 10");
+    evidence.clock.store(50, std::sync::atomic::Ordering::SeqCst);
+    let mut later = spec();
+    later.unbound_after = 100;
+    let later = backend.enqueue(later).await.expect("later at 50");
+    evidence.clock.store(111, std::sync::atomic::Ordering::SeqCst);
+    backend.drop(&later, DropReason::Undeliverable).await.expect("inbox unbound since 10");
+}
+
+// Behaviour: sharing an inbox address across homes never adds another home's
+// Pending rows to this inbox's index or decodes their bodies during a pull.
+#[tokio::test]
+async fn pending_excludes_other_homes_before_value_reads() {
+    use flotilla_state_machines::Resource;
+    let mut donor = Store::open(Connection::open_in_memory().unwrap(), "other", flotilla_state_machines::kinds().unwrap()).unwrap();
+    let mut snapshots = Vec::new();
+    for n in 0..40 {
+        let name = format!("project:inbox/role:message-{}", n + 1);
+        let mut value = spec();
+        value.admitted_seq = n + 1;
+        let resource = Resource::<Message>::stored(
+            &name,
+            value,
+            flotilla_schema::State::new(MessageState::Pending, flotilla_schema::Timestamp(10)),
+            flotilla_state_machines::Version(0),
+        );
+        let mut write = donor.write().unwrap();
+        let stamp = write.insert(&name, &resource, &flotilla_schema::Origin::new("other", flotilla_schema::Timestamp(10))).unwrap();
+        write.commit().unwrap();
+        snapshots.push(donor.read().unwrap().load_snapshot(stamp.id).unwrap().unwrap());
+    }
+    let store = database();
+    for snapshot in snapshots {
+        let mut locked = store.lock().unwrap();
+        let mut write = locked.write().unwrap();
+        write.restore(&snapshot).unwrap();
+        write.commit().unwrap();
+    }
+    let (backend, log) = backend(store, Arc::new(Evidence::default()), 2048);
+    assert_eq!(backend.residency_blocking().pending_messages, 0);
+    backend.bind(inbox(), consumer("a")).await.unwrap();
+    let mut own = Vec::new();
+    for _ in 0..3 {
+        own.push(backend.enqueue(spec()).await.unwrap());
+    }
+    log.reset_read_counts();
+    let pending = backend.pending(&inbox(), &consumer("a"), &Rules::default()).await.unwrap().try_collect::<Vec<_>>().await.unwrap();
+    assert_eq!(pending.iter().map(|p| p.message.clone()).collect::<Vec<_>>(), own);
+    assert_eq!(log.read_counts().resource_loads, 3, "one keyed value read per local candidate");
+    assert_eq!(log.read_counts().terminal_loads, 0);
+}
+
+// Behaviour: a source watch may read while a gate holds the inbox writer lock.
+// A blocked observation callback is a deterministic simulation of a long decision.
+#[tokio::test]
+async fn watch_reads_do_not_take_inbox_writer_lock() {
+    struct Paused {
+        ready: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl flotilla_inbox::Observations for Paused {
+        fn now(&self) -> flotilla_schema::Timestamp {
+            flotilla_schema::Timestamp(10)
+        }
+        fn with_snapshot(&self, read: &mut dyn FnMut(&MemoryMessageWorld)) {
+            if let Some(ready) = self.ready.lock().unwrap().take() {
+                ready.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+            read(&MemoryMessageWorld::default());
+        }
+    }
+    let (ready_tx, ready) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let backend = flotilla_inbox::sqlite::SqliteInbox::open(
+        "test",
+        MessageLog::new(database()),
+        Arc::new(Paused { ready: Mutex::new(Some(ready_tx)), release: Mutex::new(release_rx) }),
+        Arc::new(Supervisors),
+    )
+    .unwrap();
+    let writer = backend.clone();
+    let task = tokio::spawn(async move { writer.enqueue(spec()).await });
+    ready.await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), backend.watch(&inbox(), None)).await;
+    release.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _watch = result.expect("watch does not wait for writer").expect("source watch");
 }

@@ -5,9 +5,17 @@
 use std::mem::size_of;
 
 use flotilla_schema::Address;
-use flotilla_state_machines::{machines::message::*, Resource, Transport};
+use flotilla_state_machines::{
+    machines::{
+        convoy::{ConvoyRequest, Promise, PromiseId, VesselClass},
+        message::*,
+    },
+    Resource, Transport,
+};
 
 /// Default share of the root daemon's 1 GiB budget. Stored history is not resident.
+pub const PENDING_BUDGET: usize = 128 * 1024 * 1024;
+pub const CONTROL_BUDGET: usize = 96 * 1024 * 1024;
 pub const RESIDENT_BUDGET: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -16,14 +24,20 @@ pub struct Residency {
     pub accounted_bytes: usize,
     pub open_messages: usize,
     pub pending_index_complete: bool,
+    pub pending_bytes: usize,
+    pub pending_budget_bytes: usize,
+    pub pending_messages: usize,
     pub oldest_state_since: Option<flotilla_schema::Timestamp>,
     pub newest_state_since: Option<flotilla_schema::Timestamp>,
 }
 
 pub(crate) fn address(value: &Address) -> usize {
-    // Address owns canonical text, decoded segment strings and a segment Vec.
-    // Charge slack and an optional artifact subject from the canonical length.
-    size_of::<Address>() + value.as_str().len() * 8 + value.segments().len() * 128
+    // Address clones allocate canonical text, segment Vec and decoded strings.
+    // Two segment slots per live segment cover Vec growth; canonical length
+    // plus parse-time String growth bounds decoded values/optional subject.
+    // A factor of two failed calibration for a 142-byte parsed address; four
+    // covers that capacity. Calibration measures freshly parsed and cloned shapes.
+    size_of::<Address>() + value.as_str().len() * 4 + std::mem::size_of_val(value.segments()) * 2
 }
 
 pub(crate) fn receiver(value: &Receiver) -> usize {
@@ -36,84 +50,90 @@ pub(crate) fn binding(inbox: &Address, value: &InboxBinding) -> usize {
         + 128
         + match value {
             InboxBinding::Unbound { .. } => 0,
-            InboxBinding::Bound { consumers } => consumers.iter().map(receiver).sum(),
+            InboxBinding::Bound { consumers } => {
+                if consumers.is_empty() {
+                    0
+                } else {
+                    512 + consumers.iter().map(receiver).sum::<usize>() * 2
+                }
+            }
         }
 }
 
 pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&std::collections::BTreeMap<Receiver, Transport>>) -> usize {
-    let spec = value.spec();
-    // Keys in Home, LRU, size metadata and the optional pending index, plus
-    // BTree node slack. Counting shared frozen allocations per handle is conservative.
-    let mut bytes = size_of::<Resource<Message>>() + 1024 + value.name().len() * 8;
-    bytes += address(&spec.sender) + address(&spec.inbox) * 2;
-    bytes += spec.body.bytes().len()
-        + match spec.body.value() {
+    // Exhaustive destructuring makes every new spec field a compile error here.
+    let MessageSpec {
+        sender,
+        inbox,
+        admitted_seq: _,
+        relation: _,
+        body,
+        references,
+        in_reply_to,
+        supersedes,
+        expectation,
+        deadline: _,
+        unbound_after: _,
+        delivery_condition,
+    } = value.spec();
+    let heap_address = |value: &Address| address(value) - size_of::<Address>();
+    // Home's resource map, accounting map and LRU map: two slots per live row
+    // bound BTree node slack. Headers inside Resource are counted only once.
+    let mut bytes = 2 * (size_of::<(String, Resource<Message>)>() + size_of::<(String, (usize, u64))>() + size_of::<(u64, String)>())
+        + value.name().len() * 3;
+    bytes += heap_address(sender) + heap_address(inbox);
+    bytes += body.bytes().len()
+        + 32
+        + size_of::<MessageBody>()
+        + match body.value() {
             MessageBody::Text(text) => text.capacity(),
             MessageBody::Request(RequestBody::Convoy(request)) => {
-                address(&request.project)
-                    + request.quota.len() * 128
-                    + request.promises.values().map(|p| 128 + p.kind.capacity() + address(&p.target)).sum::<usize>()
+                let ConvoyRequest { project, promises, quota, priority: _ } = request;
+                let nodes = |len: usize, slot: usize| if len == 0 { 0 } else { len.saturating_mul(2).max(11) * slot + (len / 5 + 1) * 96 };
+                heap_address(project)
+                    + nodes(quota.len(), size_of::<(VesselClass, u32)>())
+                    + nodes(promises.len(), size_of::<(PromiseId, Promise)>())
+                    + promises.values().map(|p| p.kind.capacity() + heap_address(&p.target)).sum::<usize>()
             }
         };
-    bytes += spec.references.capacity() * size_of::<MessageReference>();
-    for reference in &spec.references {
-        bytes += address(&reference.address) + reference.revision.capacity();
+    bytes += references.capacity() * size_of::<MessageReference>();
+    for reference in references {
+        bytes += heap_address(&reference.address) + reference.revision.capacity();
     }
-    for reference in [&spec.in_reply_to, &spec.supersedes].into_iter().flatten() {
+    for reference in [in_reply_to, supersedes].into_iter().flatten() {
         bytes += reference.name.capacity() + reference.home.capacity();
     }
-    if let Expectation::Outcome { condition } = &spec.expectation {
-        bytes += address(condition);
+    if let Expectation::Outcome { condition } = expectation {
+        bytes += heap_address(condition);
     }
-    if let Some(condition) = &spec.delivery_condition {
-        bytes += address(condition);
+    if let Some(condition) = delivery_condition {
+        bytes += heap_address(condition);
     }
     if let Some(receiver) = value.state().receiver() {
-        bytes += self::receiver(receiver);
+        bytes += receiver.id.capacity() + receiver.host.capacity();
     }
-    bytes += receipts.map_or(0, |rows| 128 + rows.keys().map(self::receiver).sum::<usize>());
+    if let Some(reason) = value.state().drop_reason() {
+        match reason {
+            DropReason::Superseded { by } => bytes += heap_address(by),
+            DropReason::Withdrawn { by, authority } | DropReason::ConsumerUnreachable { by, authority } => {
+                bytes += heap_address(by) + heap_address(authority)
+            }
+            _ => {}
+        }
+    }
+    bytes += receipts.map_or(0, |rows| {
+        let nodes = if rows.is_empty() {
+            0
+        } else {
+            rows.len().saturating_mul(2).max(11) * size_of::<(Receiver, Transport)>() + (rows.len() / 5 + 1) * 96
+        };
+        128 + value.name().len() + nodes + rows.keys().map(|receiver| receiver.id.capacity() + receiver.host.capacity()).sum::<usize>()
+    });
     bytes
 }
 
-pub(crate) const WATCH_PAGE_BYTES: usize = 16 * 1024;
-
-pub(crate) fn change(inbox: &Address, change: &crate::Change) -> usize {
-    let mut bytes = address(inbox) + size_of::<crate::Change>() + change.message.capacity() + 128;
-    match &change.kind {
-        crate::ChangeKind::Receipt { consumer, .. } => bytes += receiver(consumer),
-        crate::ChangeKind::Message(state) => {
-            if let Some(value) = state.receiver() {
-                bytes += receiver(value);
-            }
-            if let Some(reason) = state.drop_reason() {
-                match reason {
-                    DropReason::Superseded { by } => bytes += address(by),
-                    DropReason::Withdrawn { by, authority } | DropReason::ConsumerUnreachable { by, authority } => {
-                        bytes += address(by) + address(authority)
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    bytes
-}
-
-/// Shared decoded-page rule: a first oversized event makes progress alone.
-#[derive(Default)]
-pub(crate) struct WatchPageBudget {
-    bytes: usize,
-    entries: usize,
-}
-
-impl WatchPageBudget {
-    pub(crate) fn admit(&mut self, inbox: &Address, value: &crate::Change) -> bool {
-        let charge = change(inbox, value);
-        if self.entries > 0 && self.bytes.saturating_add(charge) > WATCH_PAGE_BYTES {
-            return false;
-        }
-        self.bytes = self.bytes.saturating_add(charge);
-        self.entries += 1;
-        true
-    }
+pub(crate) fn pending(inbox: &Address, name: &str, new_inbox: bool) -> usize {
+    name.len()
+        + 2 * size_of::<(u64, String)>()
+        + if new_inbox { 2 * (address(inbox) + size_of::<std::collections::BTreeMap<u64, String>>()) } else { 0 }
 }
