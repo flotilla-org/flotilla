@@ -252,6 +252,15 @@ pub fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Opt
     crate::admission::check_measured_free_space(&target_host.display_name, free_bytes, floor_bytes)
 }
 
+/// Agentless SSH hosts run crews in an account the owning daemon does not
+/// control, so they take only convoys that name their placement deliberately.
+/// Capacity-aware selection may relax this once hosts advertise their limits.
+pub const AGENTLESS_SSH_PIN_ONLY: &str = "agentless SSH host takes only convoys that pin its placement";
+
+pub fn is_agentless_ssh_host(host: &ResourceObject<ResourceHost>) -> bool {
+    matches!(host.spec.connection, flotilla_resources::HostConnection::AgentlessSsh { .. })
+}
+
 pub async fn policy_targets_agentless_ssh(backend: &ResourceBackend, namespace: &str, policy: &ResourceObject<PlacementPolicy>) -> bool {
     let Ok(target) = placement_target_host(backend, namespace, policy).await else {
         return false;
@@ -259,7 +268,7 @@ pub async fn policy_targets_agentless_ssh(backend: &ResourceBackend, namespace: 
     authoritative_placement_host(backend, namespace, &target, &policy.metadata.name)
         .await
         .ok()
-        .is_some_and(|host| matches!(host.spec.connection, flotilla_resources::HostConnection::AgentlessSsh { .. }))
+        .is_some_and(|host| is_agentless_ssh_host(&host))
 }
 
 pub async fn validate_docker_placement_host(

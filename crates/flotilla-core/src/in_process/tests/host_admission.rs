@@ -469,3 +469,98 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
         .await
         .expect("healthy authoritative local capacity should admit self-targeted placement");
 }
+
+#[tokio::test]
+async fn capability_admission_places_on_agentless_ssh_hosts_only_when_pinned() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"agentless-owner\"\n").expect("daemon config");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("udder"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts
+        .create(
+            &test_meta("ssh-host"),
+            &HostSpec {
+                display_name: "beaufort".into(),
+                connection: flotilla_resources::HostConnection::AgentlessSsh {
+                    owning_daemon: "agentless-owner".into(),
+                    destination: "crew@beaufort.example".into(),
+                },
+                ..HostSpec::default()
+            },
+        )
+        .await
+        .expect("SSH host");
+    hosts
+        .update_status(
+            "ssh-host",
+            &host.metadata.resource_version,
+            &HostStatus {
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                fulfilment_facts: BTreeMap::from([(
+                    "host-direct-ssh-host".into(),
+                    FulfilmentFacts { observed_at: Utc::now(), ..Default::default() },
+                )]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("SSH host facts");
+    placement_policy(&backend, "host-direct-ssh-host", "ssh-host").await;
+    backend
+        .clone()
+        .using::<FulfilmentKind>("flotilla")
+        .create(
+            &test_meta("host-direct-ssh-host"),
+            &FulfilmentKindSpec::builder()
+                .host_ref("ssh-host".to_string())
+                .pool("cleat".to_string())
+                .realisation(FulfilmentRealisation::HostDirect)
+                .build(),
+        )
+        .await
+        .expect("SSH host kind");
+    let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
+    let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
+    let pinned = flotilla_protocol::ConvoyStartIntent::builder()
+        .project_ref("project".to_string())
+        .placement_policy("host-direct-ssh-host".to_string())
+        .build();
+
+    let refused = match daemon.resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &unpinned).await {
+        Ok((placement, _)) => {
+            assert!(placement.selected.is_none(), "an unpinned convoy must not land on an agentless SSH host");
+            placement.refused_candidates.into_iter().map(|candidate| candidate.reason).collect::<Vec<_>>().join("\n")
+        }
+        Err(error) => error,
+    };
+    assert!(refused.contains("agentless SSH host takes only convoys that pin its placement"), "{refused}");
+
+    let (placement, _) = daemon
+        .resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &pinned)
+        .await
+        .expect("a pinned convoy is admitted");
+    assert_eq!(placement.selected.expect("pinned placement").metadata.name, "host-direct-ssh-host");
+
+    let refused = daemon
+        .resolve_capability_placement(
+            "flotilla",
+            "project",
+            &[],
+            &flotilla_resources::single_agent_workflow_spec(),
+            &BTreeSet::new(),
+            &pinned,
+        )
+        .await
+        .expect_err("pinning does not let an agentless SSH host run an agent it lacks");
+    assert!(refused.contains("agent adapter `codex`"), "{refused}");
+}

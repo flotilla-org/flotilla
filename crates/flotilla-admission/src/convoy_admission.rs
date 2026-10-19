@@ -61,8 +61,9 @@ use crate::project_ops;
 use crate::regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome};
 use crate::support::{
     authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot,
-    home_copy_wins_by_name, host_generation, placement_actuator_host_ref, placement_host_not_ready_reason, placement_host_ref,
-    placement_target_host, policy_targets_agentless_ssh, prepared_snapshot_name, unready_placement_refusal, validate_docker_placement_host,
+    home_copy_wins_by_name, host_generation, is_agentless_ssh_host, placement_actuator_host_ref, placement_host_not_ready_reason,
+    placement_host_ref, placement_target_host, policy_targets_agentless_ssh, prepared_snapshot_name, unready_placement_refusal,
+    validate_docker_placement_host, AGENTLESS_SSH_PIN_ONLY,
 };
 
 /// Routing uses replicated observations as hints; only admission may refuse on
@@ -2589,6 +2590,10 @@ impl AdmissionReadContext<'_> {
             if let Some(canonical_kind_host) = &canonical_kind_host {
                 kind.spec.host_ref = canonical_kind_host.to_string();
             }
+            if host.is_some_and(is_agentless_ssh_host) && pin != Some(kind.metadata.name.as_str()) {
+                rejected.push(refusal(AGENTLESS_SSH_PIN_ONLY.to_string()));
+                continue;
+            }
             let facts = host.and_then(|host| host.status.as_ref()).and_then(|status| status.fulfilment_facts.get(&kind.metadata.name));
             // A kind that omits its image realises each vessel's composed
             // image: resolution provides every image need or refuses, naming it.
@@ -4098,17 +4103,12 @@ async fn decide_default_placement(
     let mut refused_candidates = Vec::new();
     for policy in policies {
         let mut candidate_workflow = workflow.clone();
-        let agentless_ssh = policy_targets_agentless_ssh(backend, namespace, &policy).await;
-        let agentless_unready = if purpose == PlacementPurpose::Admission && agentless_ssh {
-            placement_agent_adapters(backend, namespace, &policy, false).await.err()
-        } else {
-            None
-        };
-        let refusal = if purpose == PlacementPurpose::Routing {
+        // Only unpinned convoys reach default placement.
+        let refusal = if policy_targets_agentless_ssh(backend, namespace, &policy).await {
+            Some(AGENTLESS_SSH_PIN_ONLY.to_string())
+        } else if purpose == PlacementPurpose::Routing {
             None
         } else if let Err(reason) = validate_docker_placement_host(backend, namespace, &policy).await {
-            Some(reason)
-        } else if let Some(reason) = agentless_unready {
             Some(reason)
         } else if let Err(reason) = validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy), false).await {
             Some(reason)
