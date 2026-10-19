@@ -72,6 +72,9 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
         }
     }
     use flotilla_environment::environment::{EnvironmentInput, ENVIRONMENT_PROVIDER_INSTANCE_LABEL};
+    // This adoption path still consumes stored Docker status. Its input filter
+    // must stay narrower than the profile's per_vessel capability test. Retire
+    // the legacy-input bridge and these recovery filters together at #3108.
     if environments.is_empty() {
         let mut observed = false;
         for (_, provider) in state

@@ -328,10 +328,12 @@ pub(super) fn build_local_profile(
 
     let host_direct_pool = local_registry.terminal_pools.preferred_name().unwrap_or("passthrough").to_string();
     let docker_pool = "cleat".to_string();
-    // Per-vessel placement needs a Docker-kind instance whose environments can
-    // host crews: one receiving the host's cleat, or one bringing its own crew
-    // runtime. A host with only the dummy instance therefore offers per-vessel
-    // placement without a cleat pool; its crews run in the dummy pool.
+    // General provisioning availability follows per_vessel capability data:
+    // dummy brings its own crew runtime, while other instances need host cleat.
+    // This retains the historical docker_available admission fact until admission
+    // moves. Stored-Docker recovery in environments.rs/state.rs is deliberately
+    // narrower because it reads docker_container_id. Remove that legacy-input
+    // bridge and its recovery filters together at the generated-table move (#3108).
     let docker_available = local_registry.environment_providers.iter().any(|(_, provider)| {
         provider.capabilities().per_vessel && (!provider.receives_host_tools() || local_registry.terminal_pools.contains_key(&docker_pool))
     });

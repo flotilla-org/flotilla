@@ -300,6 +300,9 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
             if home != Some(&local_host_id) || !self.local_backing_observed.load(Ordering::Acquire) {
                 return Err("no backing environment evidence is available".to_string());
             }
+            // Unlike the general provisioning profile's per_vessel capability
+            // test, this recovery path reads legacy Docker status. Retire its
+            // input filter with the legacy-input bridge at the table move (#3108).
             let providers = self
                 .local_registry
                 .environment_providers
