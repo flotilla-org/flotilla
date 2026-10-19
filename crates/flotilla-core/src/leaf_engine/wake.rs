@@ -9,6 +9,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
+use flotilla_resources::checkout_integration::remote_ref_for_branch;
 use flotilla_resources::{
     actor_obligation,
     address::{leaf_address, leaf_for, record_name, subject_address},
@@ -652,7 +653,7 @@ impl ReconcilerWake {
                                     CheckoutSpec::FreshClone(spec) => &spec.r#ref,
                                     CheckoutSpec::Observed(spec) => &spec.r#ref,
                                 };
-                                crate::checkout_integration::remote_ref_for_branch(branch) == *reference
+                                remote_ref_for_branch(branch) == *reference
                             })
                             .map(|checkout| LeafMaker::Observed {
                                 refresher: "checkout_integration".into(),

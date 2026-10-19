@@ -3,7 +3,6 @@
 #![allow(clippy::double_must_use)]
 
 mod charter_notifications;
-pub mod checkout_integration;
 pub mod cleat_roll;
 pub mod command_target;
 pub mod convert;

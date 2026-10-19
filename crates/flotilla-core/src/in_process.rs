@@ -7,7 +7,7 @@ use flotilla_admission::admission_actions::AdmissionActions;
 use flotilla_admission::project_ops::{ProjectOperations, ProjectService, RepositoryIndex};
 use flotilla_admission::repository_inspection::inspect_project_ops_entries as inspect_operational_entries;
 use flotilla_admission::support::{
-    authoritative_placement_host, canonical_placement_host_ref, checkout_path, ensure_repository_and_default_project_workflow,
+    authoritative_placement_host, canonical_placement_host_ref, ensure_repository_and_default_project_workflow,
     placement_actuator_host_ref, placement_target_host, unready_placement_refusal,
 };
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
@@ -115,9 +115,6 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::checkout_integration::convoy_change_request_id_for_checkout;
-use crate::checkout_integration::inspect_checkout_integration;
-use crate::checkout_integration::inspect_convoy_checkout_integration;
 use crate::host_identity::resolve_local_environment_state_dir;
 use crate::host_identity::resolve_local_host_id;
 use crate::host_identity::resolve_local_node_id;
@@ -169,6 +166,10 @@ use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
+use flotilla_resources::checkout_integration::convoy_change_request_id_for_checkout;
+use flotilla_resources::checkout_path::checkout_path;
+use flotilla_vcs::checkout_integration::inspect_checkout_integration;
+use flotilla_vcs::checkout_integration::inspect_convoy_checkout_integration;
 
 struct ProviderChangeRequestQueryPort {
     resource_backend: ResourceBackend,

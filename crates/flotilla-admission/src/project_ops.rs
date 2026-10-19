@@ -24,6 +24,7 @@ use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     PrincipalRef, ProviderData, ResourceRef,
 };
+use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::{
     normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyRepositorySpec,
     DeclarationRefusedCondition, Demand, DemandKind, DemandSpec, Forge, InputMeta, ObjectEvent, Project, ProjectRepositoryRole,
@@ -197,11 +198,7 @@ impl RepositoryIndex<'_> {
         match candidates.as_slice() {
             [checkout] => Ok(CheckoutSelection::Selected(
                 LocalCheckoutInspection::builder()
-                    .path(
-                        crate::support::checkout_path(checkout)
-                            .map(PathBuf::from)
-                            .ok_or_else(|| format!("repository {key} has no local path"))?,
-                    )
+                    .path(checkout_path(checkout).map(PathBuf::from).ok_or_else(|| format!("repository {key} has no local path"))?)
                     .host_ref(self.host.to_string())
                     .git_ref(checkout.spec.branch().to_string())
                     .is_main(matches!(&checkout.spec, flotilla_resources::CheckoutSpec::Observed(spec) if spec.is_main))
@@ -217,7 +214,7 @@ impl RepositoryIndex<'_> {
             .await?
             .into_iter()
             .filter(|checkout| checkout.spec.repo_ref() == key)
-            .filter_map(|checkout| crate::support::checkout_path(&checkout).map(PathBuf::from))
+            .filter_map(|checkout| checkout_path(&checkout).map(PathBuf::from))
             .collect())
     }
 }

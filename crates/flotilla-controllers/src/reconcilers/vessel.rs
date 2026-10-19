@@ -1,3 +1,4 @@
+use flotilla_resources::checkout_path::checkout_path_component;
 use flotilla_resources::Actuation;
 use flotilla_store::DockerImageSourceStoreExt;
 use std::{
@@ -1704,21 +1705,6 @@ fn checkout_placement_scope(convoy: &ResourceObject<Convoy>, host_ref: Option<&s
     }
     let digest = format!("{:x}", hash.finalize());
     Some(digest[..12].to_string())
-}
-
-/// The filesystem component used for both branch refs and convoy names.
-/// Provisioning and cleanup must share this normalization rule.
-pub fn checkout_path_component(branch: &str) -> String {
-    let normalized = branch
-        .chars()
-        .map(|character| if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') { character } else { '-' })
-        .collect::<String>();
-    let normalized = normalized.trim_matches(['-', '.']).to_string();
-    if normalized.is_empty() {
-        "work".to_string()
-    } else {
-        normalized
-    }
 }
 
 fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &str, branch_slug: &str) -> String {

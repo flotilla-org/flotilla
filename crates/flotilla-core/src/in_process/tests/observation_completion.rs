@@ -1,3 +1,4 @@
+use flotilla_resources::checkout_integration::change_request_subjects_from_claim;
 use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -570,7 +571,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         )
     };
     if mixed {
-        let subjects = crate::checkout_integration::change_request_subjects_from_claim(
+        let subjects = change_request_subjects_from_claim(
             "https://github.com/flotilla-org/flotilla/pull/2201",
             &convoys.get("refused-claim").await.expect("convoy").spec.repositories,
             &[],

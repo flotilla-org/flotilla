@@ -33,6 +33,7 @@ use flotilla_protocol::{
 };
 use flotilla_provider_runtime::{CommandRunner, ObservationError};
 use flotilla_resources::address::{record_name, remote_change_request_address};
+use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
 use flotilla_resources::{
     api_version, capped_github_app_permissions, normalize_issue_source, AllocationDecision, BoundChangeRequest, CapabilityNeed,
@@ -1137,7 +1138,7 @@ impl ConvoyAdmission {
                 let mut source_roots = local_checkouts
                     .iter()
                     .filter(|checkout| checkout.spec.repo_ref() == repository_ref)
-                    .filter_map(|checkout| crate::support::checkout_path(checkout).map(PathBuf::from))
+                    .filter_map(|checkout| checkout_path(checkout).map(PathBuf::from))
                     .collect::<Vec<_>>();
                 source_roots.sort();
                 roots.extend(source_roots);
