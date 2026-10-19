@@ -13,7 +13,7 @@ RUN_METHODS = {"run", "run_output", "run_with_input"}
 RUN_MACROS = {"run", "run_output"}
 VCS = "crates/flotilla-core/src/"
 RUNTIME_BINARIES = {"docker", "podman", "buildah", "skopeo", "ctr"}
-RUNTIME_NAMES = RUNTIME_BINARIES | {"containerd", "host-direct", "host_direct"}
+RUNTIME_NAMES = RUNTIME_BINARIES | {"containerd", "host-direct", "host_direct", "dummy"}
 RUNTIME_METHODS = RUN_METHODS | {"run_with_timeout", "run_to_file", "run_from_file", "spawn_long_lived", "exists"}
 # Discovery's version probe is an implementation operation too. No directory
 # exemption: adding a new adapter requires an explicit boundary decision.
@@ -26,7 +26,7 @@ RUNTIME_IMPLEMENTATIONS = {
 CONCRETE_RUNTIME_TYPES = {
     "DockerEnvironmentProvider", "DockerEnvironmentProviderInner",
     "DockerProvisionedEnvironment", "DockerEnvironmentRunner",
-    "HostDirectEnvironmentProvider", "OwnedBuildKitService",
+    "HostDirectEnvironmentProvider", "DummyEnvironmentProvider", "OwnedBuildKitService",
 }
 COMPOSITION_ROOT = "crates/flotilla-daemon/src/runtime.rs"
 
@@ -167,7 +167,7 @@ def runtime_lookup(node):
         for identifier in receiver.find_all(kind="field_identifier")
     )
     if method not in {"prefer_by_implementation", "prefer_by_backend"} and not (
-        method in {"get", "contains_key", "select"} and provider_set
+        method in {"get", "contains_key", "select", "select_legacy_input"} and provider_set
     ):
         return False
     # Borrowed literals and select(kind, Some("docker")) are still literal
@@ -179,6 +179,36 @@ def runtime_lookup(node):
     )
 
 
+def provider_kind_value(node):
+    return any(
+        call.field("function").kind() == "field_expression"
+        and call.field("function").field("field").text() == "kind"
+        and call.field("function").field("value").text() in {"provider", "env_provider"}
+        for call in node.find_all(kind="call_expression")
+    )
+
+
+def provider_kind_branch(node):
+    # Inspect decision inputs and arm patterns, not constructors in arm bodies.
+    # Legacy EnvironmentInput remains a distinct stored-input compatibility seam.
+    if node.kind() == "binary_expression":
+        inputs = [node]
+    elif node.kind() == "match_expression":
+        inputs = [node.field("value")]
+        inputs.extend(arm.field("pattern") for arm in node.field("body").children()
+                      if arm.kind() == "match_arm")
+    elif node.kind() == "if_expression":
+        inputs = [node.field("condition")]
+    else:
+        return False
+    return any(
+        provider_kind_value(value) or any(
+            re.search(r"(?:^|::)EnvironmentClass::", item.text())
+            for item in [value] + value.find_all(kind="scoped_identifier")
+        ) for value in inputs if value is not None
+    )
+
+
 def runtime_violation(node, path):
     if path not in RUNTIME_IMPLEMENTATIONS and raw_command(node, RUNTIME_BINARIES, RUNTIME_METHODS):
         return True
@@ -187,7 +217,7 @@ def runtime_violation(node, path):
     if not providers and path != COMPOSITION_ROOT and node.kind() in {"identifier", "type_identifier"}:
         if node.text().removeprefix("r#") in CONCRETE_RUNTIME_TYPES:
             return True
-    return runtime_lookup(node)
+    return runtime_lookup(node) or provider_kind_branch(node)
 
 
 def test_modules(source, path, production=False):

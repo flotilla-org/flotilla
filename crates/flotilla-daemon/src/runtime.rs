@@ -403,11 +403,11 @@ impl DaemonRuntime {
             // cache inventory for placement cost.
             let image_build_service = local_registry
                 .environment_providers
-                .for_kind(flotilla_environment::environment::EnvironmentKind::Docker)
+                .for_legacy_input(flotilla_environment::environment::EnvironmentInput::Docker)
                 .and_then(|(_, provider)| provider.image_build_service(owned_builder_settings(config.state_dir().as_path())));
             let image_inventory = match local_registry
                 .environment_providers
-                .for_kind(flotilla_environment::environment::EnvironmentKind::Docker)
+                .for_legacy_input(flotilla_environment::environment::EnvironmentInput::Docker)
                 .filter(|(_, provider)| provider.local_image_cache().is_some())
             {
                 Some((_, provider)) => Some(Arc::new(
@@ -510,7 +510,7 @@ impl StartupRestoration {
         let credential_store = &self.credential_store;
         let options = &self.options;
         if let Some((_, provider)) =
-            local_registry.environment_providers.for_kind(flotilla_environment::environment::EnvironmentKind::Docker)
+            local_registry.environment_providers.for_legacy_input(flotilla_environment::environment::EnvironmentInput::Docker)
         {
             let live =
                 phase("list_environments_for_credential_sweep", daemon.resource_backend().using::<Environment>(&options.namespace).list())

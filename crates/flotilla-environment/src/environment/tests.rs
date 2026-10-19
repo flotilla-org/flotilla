@@ -256,7 +256,7 @@ impl CommandRunner for QueuedRunner {
 // preparation either validates the selected kind or refuses before execution.
 #[hegel::test]
 fn environment_specs_select_exactly_one_kind(tc: hegel::TestCase) {
-    use super::EnvironmentKind;
+    use super::EnvironmentInput;
     use hegel::generators as gs;
     let host = tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) == 1;
     let docker = tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) == 1;
@@ -266,7 +266,7 @@ fn environment_specs_select_exactly_one_kind(tc: hegel::TestCase) {
     }
     spec.host_direct =
         host.then(|| flotilla_resources::HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/".into() });
-    assert_eq!(EnvironmentKind::of(&spec).is_ok(), host != docker);
+    assert_eq!(EnvironmentInput::of(&spec).is_ok(), host != docker);
 }
 
 fn pinned_spec() -> flotilla_resources::EnvironmentSpec {
@@ -1653,7 +1653,7 @@ async fn list_backings_uses_immutable_identity_without_mount_metadata() {
     let runner = Arc::new(RecordingRunner::new_ok(&format!("{id}\tenv-orphan\n")));
     let provider = DockerEnvironmentProvider::new(runner.clone());
     let backings = provider.list_backings().await.expect("list backing identities");
-    assert_eq!(backings, vec![super::EnvironmentBacking { environment_id: EnvironmentId::new("env-orphan"), container_id: id }]);
+    assert_eq!(backings, vec![super::EnvironmentBacking { environment_id: EnvironmentId::new("env-orphan"), backing_id: id }]);
     assert_eq!(
         runner.calls(),
         vec![(

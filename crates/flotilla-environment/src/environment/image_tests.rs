@@ -267,13 +267,23 @@ fn detection_contract(tc: hegel::TestCase) {
     };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let output = provider.detect(docker.then_some("crew:test"), "tool", &args, Path::new("/scratch/probe")).await.expect("detect");
+        let output = provider
+            .detection()
+            .expect("detection capability")
+            .detect(docker.then_some("crew:test"), "tool", &args, Path::new("/scratch/probe"))
+            .await
+            .expect("detect");
         assert_eq!(output.success(), success);
         assert_eq!(output.stdout, "tool 1.0");
         assert_eq!(output.stderr, "diagnostic");
         assert_eq!(*runner.calls.lock().expect("calls"), 1);
         let invalid_image = if docker { None } else { Some("crew:test") };
-        assert!(provider.detect(invalid_image, "tool", &args, Path::new("/scratch/probe")).await.is_err());
+        assert!(provider
+            .detection()
+            .expect("detection capability")
+            .detect(invalid_image, "tool", &args, Path::new("/scratch/probe"))
+            .await
+            .is_err());
         assert_eq!(*runner.calls.lock().expect("calls"), 1);
     });
 }

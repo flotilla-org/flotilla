@@ -29,7 +29,7 @@ use crate::step::StepOutcome;
 use crate::step::StepPlan;
 use crate::step::StepResolver;
 use flotilla_discovery::registry::ProviderRegistry;
-use flotilla_environment::environment::{legacy_environment_spec, EnvironmentKind};
+use flotilla_environment::environment::legacy_environment_spec;
 use flotilla_issue_tracker::forge_issue_source;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -608,7 +608,7 @@ impl StepResolver for ExecutorStepResolver {
                 let (_, env_provider) = self
                     .registry
                     .environment_providers
-                    .select(EnvironmentKind::Docker, Some(&provider))
+                    .select(&provider)
                     .ok_or_else(|| format!("environment provider not available: {provider}"))?;
                 let resource_spec = legacy_environment_spec(spec)?;
                 // TODO(#2862 Part B): mint an operation-scoped RegistryAuth here;

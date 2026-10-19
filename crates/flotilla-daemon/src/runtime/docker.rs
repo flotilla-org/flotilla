@@ -71,7 +71,7 @@ impl DockerControllerRuntime {
     pub(super) async fn provider_for_environment(
         &self,
         name: &str,
-        kind: flotilla_environment::environment::EnvironmentKind,
+        kind: flotilla_environment::environment::EnvironmentInput,
     ) -> Result<Arc<dyn flotilla_environment::environment::EnvironmentProvider>, String> {
         use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
         let environment = match self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(name).await {
@@ -98,7 +98,7 @@ impl DockerControllerRuntime {
         };
         registry
             .environment_providers
-            .select(kind, instance.as_deref())
+            .select_legacy_input(kind, instance.as_deref())
             .map(|(_, provider)| Arc::clone(provider))
             .ok_or_else(|| format!("environment provider unavailable or ambiguous for {name} (instance {instance:?}, kind {kind:?})"))
     }
@@ -163,7 +163,7 @@ impl DockerControllerRuntime {
         spec: &flotilla_resources::DockerEnvironmentSpec,
     ) -> Result<DockerProvisioning, String> {
         let legacy_baseline = self.legacy_baseline_for_environment(name).await?;
-        let provider = self.provider_for_environment(name, flotilla_environment::environment::EnvironmentKind::Docker).await?;
+        let provider = self.provider_for_environment(name, flotilla_environment::environment::EnvironmentInput::Docker).await?;
         let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };
         let mut tools = if provider.receives_host_tools() {
             self.state.environment_tools.prepare(DOCKER_PROVIDER_KIND, name, &context).await?
@@ -399,7 +399,7 @@ impl DockerControllerRuntime {
             }
         };
 
-        let container_id = handle.container_name().map(ToString::to_string).unwrap_or_else(|| format!("flotilla-env-{}", env_id));
+        let container_id = handle.backing_id().to_string();
         let delivered_credential_environment = if let Some(store) = &self.state.credential_store {
             match store
                 .prepare_scoped_with_permissions(name, &credential_refs, &credential_scopes, &credential_permissions, handle.runner())
@@ -648,9 +648,9 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         spec: &EnvironmentSpec,
     ) -> Result<flotilla_controllers::reconcilers::environment::EnvironmentProvisioning, String> {
         use flotilla_controllers::reconcilers::environment::EnvironmentProvisioning;
-        use flotilla_environment::environment::EnvironmentKind;
-        let kind = EnvironmentKind::of(spec)?;
-        if kind == EnvironmentKind::Docker {
+        use flotilla_environment::environment::EnvironmentInput;
+        let kind = EnvironmentInput::of(spec)?;
+        if kind == EnvironmentInput::Docker {
             return self.provision(name, spec.docker.as_ref().expect("kind checked")).await.map(EnvironmentProvisioning::Docker);
         }
         let provider = self.provider_for_environment(name, kind).await?;
@@ -675,7 +675,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             Some(active) => active.handle.destroy().await?,
             None => {
                 let provider =
-                    self.provider_for_environment(environment_ref, flotilla_environment::environment::EnvironmentKind::Docker).await?;
+                    self.provider_for_environment(environment_ref, flotilla_environment::environment::EnvironmentInput::Docker).await?;
                 provider.destroy(container_id).await?;
             }
         }
@@ -688,12 +688,12 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn destroy_unrecorded(&self, environment_ref: &str) -> Result<(), String> {
-        let provider = self.provider_for_environment(environment_ref, flotilla_environment::environment::EnvironmentKind::Docker).await?;
+        let provider = self.provider_for_environment(environment_ref, flotilla_environment::environment::EnvironmentInput::Docker).await?;
         // The record may predate status persistence, or the daemon may have
         // restarted after Docker creation. Mutable mount labels are irrelevant.
         for backing in provider.list_backings().await? {
             if backing.environment_id.as_str() == environment_ref {
-                self.destroy(environment_ref, &backing.container_id).await?;
+                self.destroy(environment_ref, &backing.backing_id).await?;
             }
         }
         self.cleanup(environment_ref).await
@@ -706,7 +706,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let resource = self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(environment_ref).await;
         match resource {
             Ok(environment) if environment.spec.host_direct.is_some() => {
-                self.provider_for_environment(environment_ref, flotilla_environment::environment::EnvironmentKind::HostDirect)
+                self.provider_for_environment(environment_ref, flotilla_environment::environment::EnvironmentInput::HostDirect)
                     .await?
                     .destroy(environment_ref)
                     .await?;
@@ -881,7 +881,7 @@ pub(super) async fn probe_provisioned_environment(
     let env_vars = handle.env_vars().await?;
     let discovery = state.daemon.discovery_runtime();
     let bag = run_provisioned_host_detectors(&discovery.host_detectors, &*handle.runner(), &env_vars).await;
-    let probe_root = ExecutionEnvironmentPath::new("/workspace");
+    let probe_root = ExecutionEnvironmentPath::new(handle.workspace_root());
     let config = ConfigStore::with_base(state.config.base_path().as_path().join(format!("env-discovery/{env_id}")));
     let registry = discovery.factories.probe_all(&bag, &config, &probe_root, handle.runner()).await;
     Ok((bag, Arc::new(registry)))

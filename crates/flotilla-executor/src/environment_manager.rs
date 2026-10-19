@@ -1,6 +1,6 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -21,7 +21,8 @@ use flotilla_discovery::FactoryRegistry;
 use flotilla_environment::environment::contained_daemon_socket_path;
 use flotilla_environment::environment::CreateOpts;
 use flotilla_environment::environment::EnvironmentHandle;
-use flotilla_environment::environment::EnvironmentKind;
+#[cfg(test)]
+use flotilla_environment::environment::EnvironmentInput;
 use flotilla_environment::environment::EnvironmentTool;
 use flotilla_environment::environment::EnvironmentToolAsset;
 use flotilla_environment::environment::EnvironmentToolAssetAccess;
@@ -341,14 +342,14 @@ impl EnvironmentManager {
             daemon_socket_path,
             reference_repo,
         } = request;
-        let (_, env_provider) = registry
-            .environment_providers
-            .select(EnvironmentKind::Docker, Some(provider))
-            .ok_or_else(|| format!("environment provider not available: {provider}"))?;
+        let (_, env_provider) =
+            registry.environment_providers.select(provider).ok_or_else(|| format!("environment provider not available: {provider}"))?;
 
+        let capabilities = env_provider.capabilities();
         let provisioned_mounts = reference_repo
             .as_ref()
-            .map(|repo| vec![ProvisionedMount::new(repo.as_path().to_path_buf(), PathBuf::from("/ref/repo"), ProvisionedMountMode::Ro)])
+            .zip(capabilities.reference_root.as_ref())
+            .map(|(repo, root)| vec![ProvisionedMount::new(repo.as_path().to_path_buf(), root.clone(), ProvisionedMountMode::Ro)])
             .unwrap_or_default();
         let environment_socket_path = contained_daemon_socket_path(daemon_socket_path.as_path());
         let opts = CreateOpts {
@@ -520,7 +521,7 @@ impl EnvironmentManager {
         let bag = run_provisioned_host_detectors(&self.host_detectors, &*env_runner, &raw_env_vars).await;
 
         let config = ConfigStore::with_base(config_base.as_path().join(format!("env-discovery/{env_id}")));
-        let env_repo_root = ExecutionEnvironmentPath::new("/workspace");
+        let env_repo_root = ExecutionEnvironmentPath::new(handle.workspace_root());
         // Environment lifetimes own host capabilities. Checkout VCS and forge
         // capabilities are discovered by their resource-scoped consumers.
         let mut factories = FactoryRegistry::default_all();
@@ -622,6 +623,13 @@ mod tests {
 
     #[async_trait]
     impl ProvisionedEnvironment for MockProvisionedEnvironment {
+        fn backing_id(&self) -> &str {
+            self.container_name().unwrap_or_else(|| self.id().as_str())
+        }
+        fn workspace_root(&self) -> &std::path::Path {
+            std::path::Path::new("/workspace")
+        }
+
         fn id(&self) -> &EnvironmentId {
             &self.id
         }
@@ -665,8 +673,21 @@ mod tests {
 
     #[async_trait]
     impl EnvironmentProvider for MockEnvironmentProvider {
-        fn kind(&self) -> EnvironmentKind {
-            EnvironmentKind::Docker
+        fn kind(&self) -> flotilla_environment::environment::ProviderKind {
+            flotilla_environment::environment::ProviderKind::new(flotilla_environment::environment::EnvironmentClass::Dummy, "injected")
+        }
+        fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
+            flotilla_environment::environment::ProviderCapabilities {
+                workspace_root: "/workspace".into(),
+                reference_root: Some("/ref/repo".into()),
+                receives_host_tools: true,
+                per_vessel: true,
+                ..Default::default()
+            }
+        }
+
+        fn legacy_input(&self) -> Option<EnvironmentInput> {
+            Some(EnvironmentInput::Docker)
         }
         async fn prepare(&self, _spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {
             Ok(PreparedEnvironment::new(&Arc::new(()), ()))

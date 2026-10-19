@@ -141,6 +141,7 @@ pub(super) async fn create_credential_test_session(backend: &ResourceBackend, na
 
 pub(super) fn manual_profile(host_id: &str, docker_available: bool) -> LocalProvisioningProfile {
     LocalProvisioningProfile {
+        environment_providers: Vec::new(),
         host_id: host_id.to_string(),
         display_name: "kiwi".to_string(),
         repo_default_dir: "/Users/tester/dev/flotilla-repos".to_string(),
@@ -341,8 +342,8 @@ use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 // Real built-in detection providers over an injected subprocess stand-in.
 pub(super) fn detection_registry(runner: Arc<dyn CommandRunner>) -> Arc<ProviderRegistry> {
     use flotilla_discovery::registry::command_provider_registry;
-    use flotilla_environment::environment::EnvironmentKind;
-    Arc::new(command_provider_registry(&[EnvironmentKind::Docker, EnvironmentKind::HostDirect], runner))
+    use flotilla_environment::environment::EnvironmentInput;
+    Arc::new(command_provider_registry(&[EnvironmentInput::Docker, EnvironmentInput::HostDirect], runner))
 }
 
 /// The record name the observer writes for a stored `(service, scope, number)`

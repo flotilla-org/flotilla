@@ -71,12 +71,10 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
             environments.push(environment);
         }
     }
-    use flotilla_environment::environment::{EnvironmentKind, ENVIRONMENT_PROVIDER_INSTANCE_LABEL};
+    use flotilla_environment::environment::{EnvironmentInput, ENVIRONMENT_PROVIDER_INSTANCE_LABEL};
     if environments.is_empty() {
         let mut observed = false;
-        for (_, provider) in
-            state.local_registry.environment_providers.iter().filter(|(_, provider)| provider.kind() == EnvironmentKind::Docker)
-        {
+        for (_, provider) in state.local_registry.environment_providers.iter().filter(|(_, provider)| provider.capabilities().per_vessel) {
             provider.list().await?;
             observed = true;
         }
@@ -93,15 +91,15 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
             let (_, provider) = state
                 .local_registry
                 .environment_providers
-                .select(EnvironmentKind::Docker, instance.as_deref())
+                .select_legacy_input(EnvironmentInput::Docker, instance.as_deref())
                 .ok_or("environment provider unavailable or ambiguous during adoption")?;
             let handles = provider
                 .list()
                 .await?
                 .into_iter()
-                .filter_map(|handle| {
-                    let container = handle.container_name()?.to_string();
-                    Some(((handle.id().clone(), container), handle))
+                .map(|handle| {
+                    let backing = handle.backing_id().to_string();
+                    ((handle.id().clone(), backing), handle)
                 })
                 .collect::<HashMap<_, _>>();
             inventories.insert(instance.clone(), handles);

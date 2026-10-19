@@ -63,6 +63,30 @@ fn host_user() -> String {
 
 #[async_trait]
 impl EnvironmentProvider for DockerEnvironmentProvider {
+    fn kind(&self) -> super::ProviderKind {
+        super::ProviderKind::new(super::EnvironmentClass::Container, "docker")
+    }
+    fn capabilities(&self) -> super::ProviderCapabilities {
+        super::ProviderCapabilities {
+            material_modes: vec![super::MaterialMode::Frozen, super::MaterialMode::Pushed, super::MaterialMode::Shared],
+            checkout_strategies: vec![
+                super::CheckoutStrategy::HostWorktree,
+                super::CheckoutStrategy::HostClone,
+                super::CheckoutStrategy::CloneInVessel,
+            ],
+            workspace_root: "/workspace".into(),
+            reference_root: Some("/ref/repo".into()),
+            fallback_runner: true,
+            local_image_cache: true,
+            image_builder: true,
+            detection: true,
+            receives_host_tools: true,
+            per_vessel: true,
+            egress_route: super::EgressRoute::Open,
+            ..Default::default()
+        }
+    }
+
     fn image_build_service(&self, builder: super::OwnedBuilderSettings) -> Option<Arc<dyn super::ImageBuildService>> {
         Some(Arc::new(super::docker_image::OwnedBuildKitService::new(self.inner.runner.clone(), builder)))
     }
@@ -70,25 +94,16 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         Some(self)
     }
 
-    fn kind(&self) -> super::EnvironmentKind {
-        super::EnvironmentKind::Docker
+    fn legacy_input(&self) -> Option<super::EnvironmentInput> {
+        Some(super::EnvironmentInput::Docker)
     }
 
-    async fn detect(
-        &self,
-        image: Option<&str>,
-        binary: &str,
-        args: &[&str],
-        scratch: &Path,
-    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
-        let image = image.ok_or("detection requires an image reference")?;
-        let mut command = vec!["run", "--rm", "--pull=never", "--workdir", "/probe", "--tmpfs", "/probe", image, binary];
-        command.extend_from_slice(args);
-        self.inner.runner.run_output("docker", &command, scratch, &ChannelLabel::Default).await
+    fn detection(&self) -> Option<&dyn super::EnvironmentDetection> {
+        Some(self)
     }
 
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, opts: &PrepareOpts) -> Result<super::PreparedEnvironment, String> {
-        if super::EnvironmentKind::of(spec)? != self.kind() {
+        if Some(super::EnvironmentInput::of(spec)?) != self.legacy_input() {
             return Err("Docker provider requires a Docker environment spec".into());
         }
         let spec = spec.docker.as_ref().expect("kind checked");
@@ -240,7 +255,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
                 {
                     return Err("Docker backing identity is invalid".to_string());
                 }
-                Ok(EnvironmentBacking { environment_id: EnvironmentId::new(environment_id), container_id: container_id.into() })
+                Ok(EnvironmentBacking { environment_id: EnvironmentId::new(environment_id), backing_id: container_id.into() })
             })
             .collect()
     }
@@ -432,6 +447,13 @@ pub struct DockerProvisionedEnvironment {
 
 #[async_trait]
 impl ProvisionedEnvironment for DockerProvisionedEnvironment {
+    fn backing_id(&self) -> &str {
+        self.container_name().unwrap_or_else(|| self.id().as_str())
+    }
+    fn workspace_root(&self) -> &std::path::Path {
+        std::path::Path::new("/workspace")
+    }
+
     fn id(&self) -> &EnvironmentId {
         &self.id
     }
@@ -458,6 +480,15 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
 
     async fn status(&self) -> Result<EnvironmentStatus, String> {
         self.inner.status(&self.container_name).await
+    }
+
+    async fn observe(&self) -> super::ProviderObservation {
+        match provider_observation(self.inner.runner.as_ref(), &self.container_name).await {
+            Ok(observation) => observation,
+            Err(message) => super::ProviderObservation::new(super::ObservationState::Unknown {
+                reason: super::UnknownReason::ProviderApiError { message },
+            }),
+        }
     }
 
     async fn runtime_observation(&self) -> Result<Option<flotilla_protocol::EnvironmentRuntimeObservation>, String> {
@@ -521,6 +552,10 @@ struct DockerHostConfig {
 
 /// Full inspect is necessary: the OOM flag alone misses userspace oomd kills.
 async fn observation(runner: &dyn CommandRunner, container: &str) -> Result<flotilla_protocol::EnvironmentRuntimeObservation, String> {
+    Ok(provider_observation(runner, container).await?.runtime.expect("Docker observation carries runtime facts"))
+}
+
+async fn provider_observation(runner: &dyn CommandRunner, container: &str) -> Result<super::ProviderObservation, String> {
     let raw = runner.run("docker", &["inspect", container], Path::new("/"), &ChannelLabel::Default).await?;
     let inspect = parse_inspection(&raw)?;
     let mut oomd = String::new();
@@ -557,7 +592,34 @@ async fn observation(runner: &dyn CommandRunner, container: &str) -> Result<flot
             }
         }
     }
-    Ok(observation)
+    let state = classify_provider_state(&inspect.state.status, &observation);
+    Ok(super::ProviderObservation { state, runtime: Some(observation) })
+}
+
+fn classify_provider_state(status: &str, runtime: &flotilla_protocol::EnvironmentRuntimeObservation) -> super::ObservationState {
+    use super::{GoneCause, ObservationState, StoppedCause, UnknownReason};
+    use flotilla_protocol::EnvironmentExitCause;
+    match status {
+        "running" => ObservationState::Running,
+        "paused" => ObservationState::Stopped { cause: StoppedCause::PausedByProvider },
+        "exited" | "dead" => {
+            let cause = match runtime.termination.as_ref() {
+                Some(exit) => match exit.cause {
+                    EnvironmentExitCause::HostOomd | EnvironmentExitCause::KernelOom => GoneCause::HostOutOfMemory,
+                    EnvironmentExitCause::CgroupOom => GoneCause::CgroupOutOfMemory,
+                    EnvironmentExitCause::NormalStop => GoneCause::GuestPoweredOff,
+                    EnvironmentExitCause::Signal | EnvironmentExitCause::NonzeroExit => GoneCause::BackingExited { code: exit.exit_code },
+                },
+                None => {
+                    return ObservationState::Unknown {
+                        reason: UnknownReason::ProviderApiError { message: "exit status without termination evidence".into() },
+                    }
+                }
+            };
+            ObservationState::Gone { cause }
+        }
+        other => ObservationState::Unknown { reason: UnknownReason::ProviderApiError { message: format!("Docker status {other}") } },
+    }
 }
 
 fn parse_inspection(raw: &str) -> Result<DockerInspection, String> {
@@ -811,5 +873,53 @@ impl DockerEnvironmentProvider {
         };
 
         Ok(self.inner.provisioned_environment(id, image.clone(), Some(local_image_id), container_name, provisioned_mounts))
+    }
+}
+
+#[async_trait]
+impl super::EnvironmentDetection for DockerEnvironmentProvider {
+    async fn detect(
+        &self,
+        image: Option<&str>,
+        binary: &str,
+        args: &[&str],
+        scratch: &Path,
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+        let image = image.ok_or("detection requires an image reference")?;
+        let mut command = vec!["run", "--rm", "--pull=never", "--workdir", "/probe", "--tmpfs", "/probe", image, binary];
+        command.extend_from_slice(args);
+        self.inner.runner.run_output("docker", &command, scratch, &ChannelLabel::Default).await
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::*;
+    use crate::environment::{GoneCause, ObservationState, StoppedCause, UnknownReason};
+
+    // ADR 0058: observations are facts, with Docker's existing OOM and exit
+    // evidence preserved. The generator spans every captured exit cause and
+    // running, paused, terminal, transient and unrecognised runtime statuses.
+    #[hegel::test]
+    fn docker_observation_causes(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let fixtures = [
+            (include_str!("fixtures/cgroup-oomkilled.json"), "", GoneCause::CgroupOutOfMemory),
+            (include_str!("fixtures/oomd-exit137.json"), include_str!("fixtures/oomd-journal.txt"), GoneCause::HostOutOfMemory),
+            (include_str!("fixtures/nonzero-exit3.json"), "", GoneCause::BackingExited { code: 3 }),
+            (include_str!("fixtures/normal-stop.json"), "", GoneCause::GuestPoweredOff),
+        ];
+        let (raw, oomd, expected) = &fixtures[tc.draw(gs::integers::<usize>().min_value(0).max_value(fixtures.len() - 1))];
+        let inspect = parse_inspection(raw).unwrap();
+        let facts = classify_inspection(&inspect, oomd, "");
+        let statuses = ["running", "paused", "exited", "dead", "created", "restarting", "removing", "unexpected"];
+        let status = statuses[tc.draw(gs::integers::<usize>().min_value(0).max_value(statuses.len() - 1))];
+        let actual = classify_provider_state(status, &facts);
+        match status {
+            "running" => assert_eq!(actual, ObservationState::Running),
+            "paused" => assert_eq!(actual, ObservationState::Stopped { cause: StoppedCause::PausedByProvider }),
+            "exited" | "dead" => assert_eq!(actual, ObservationState::Gone { cause: expected.clone() }),
+            _ => assert!(matches!(actual, ObservationState::Unknown { reason: UnknownReason::ProviderApiError { .. } })),
+        }
     }
 }

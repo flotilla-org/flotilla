@@ -112,7 +112,7 @@ impl EnvironmentOrphanSweep {
             // A replacement gets its own grace. Never use an old cleanup retry
             // to destroy a new container or remove its environment-scoped files.
             if latest.contains(environment)
-                || backings.iter().any(|other| other.environment_id == backing.environment_id && other.container_id != backing.container_id)
+                || backings.iter().any(|other| other.environment_id == backing.environment_id && other.backing_id != backing.backing_id)
             {
                 self.pending_cleanup.remove(&backing);
                 self.absent_since.remove(&backing);
@@ -120,7 +120,7 @@ impl EnvironmentOrphanSweep {
             }
             retried.insert(backing.clone());
             let result = if backings.contains(&backing) {
-                runtime.destroy(environment, &backing.container_id).await
+                runtime.destroy(environment, &backing.backing_id).await
             } else {
                 runtime.cleanup(environment).await
             };
@@ -128,7 +128,7 @@ impl EnvironmentOrphanSweep {
                 Ok(()) => {
                     self.pending_cleanup.remove(&backing);
                     self.absent_since.remove(&backing);
-                    tracing::info!(%environment, container = %backing.container_id, "finished orphan environment teardown");
+                    tracing::info!(%environment, container = %backing.backing_id, "finished orphan environment teardown");
                 }
                 Err(error) => errors.push(format!("orphan {environment} cleanup: {error}")),
             }
@@ -155,16 +155,16 @@ impl EnvironmentOrphanSweep {
                 self.absent_since.remove(&backing);
                 continue;
             }
-            tracing::warn!(%environment, container = %backing.container_id, grace_seconds = ORPHAN_GRACE.as_secs(),
+            tracing::warn!(%environment, container = %backing.backing_id, grace_seconds = ORPHAN_GRACE.as_secs(),
                 "reclaiming orphan environment backing");
             self.pending_cleanup.insert(backing.clone());
-            if let Err(error) = runtime.destroy(environment, &backing.container_id).await {
+            if let Err(error) = runtime.destroy(environment, &backing.backing_id).await {
                 errors.push(format!("orphan {environment} teardown: {error}"));
                 continue;
             }
             self.pending_cleanup.remove(&backing);
             self.absent_since.remove(&backing);
-            tracing::info!(%environment, container = %backing.container_id, "reclaimed orphan environment backing and local state");
+            tracing::info!(%environment, container = %backing.backing_id, "reclaimed orphan environment backing and local state");
         }
         if errors.is_empty() {
             Ok(())
@@ -199,8 +199,21 @@ mod tests {
     }
     #[async_trait]
     impl EnvironmentProvider for DockerBoundary {
-        fn kind(&self) -> flotilla_environment::environment::EnvironmentKind {
-            flotilla_environment::environment::EnvironmentKind::Docker
+        fn kind(&self) -> flotilla_environment::environment::ProviderKind {
+            flotilla_environment::environment::ProviderKind::new(flotilla_environment::environment::EnvironmentClass::Dummy, "injected")
+        }
+        fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
+            flotilla_environment::environment::ProviderCapabilities {
+                workspace_root: "/workspace".into(),
+                reference_root: Some("/ref/repo".into()),
+                receives_host_tools: true,
+                per_vessel: true,
+                ..Default::default()
+            }
+        }
+
+        fn legacy_input(&self) -> Option<flotilla_environment::environment::EnvironmentInput> {
+            Some(flotilla_environment::environment::EnvironmentInput::Docker)
         }
         async fn prepare(
             &self,
@@ -246,7 +259,7 @@ mod tests {
         }
         async fn destroy(&self, environment: &str, id: &str) -> Result<(), String> {
             self.destroyed.lock().expect("destroyed").push(id.to_string());
-            self.backings.lock().expect("backings").retain(|backing| backing.container_id != id);
+            self.backings.lock().expect("backings").retain(|backing| backing.backing_id != id);
             self.cleanup(environment).await
         }
         async fn cleanup(&self, environment: &str) -> Result<(), String> {
@@ -258,7 +271,7 @@ mod tests {
         }
     }
     fn backing(id: &str) -> EnvironmentBacking {
-        EnvironmentBacking { environment_id: EnvironmentId::new("env"), container_id: id.into() }
+        EnvironmentBacking { environment_id: EnvironmentId::new("env"), backing_id: id.into() }
     }
     async fn create_environment(backend: &ResourceBackend) {
         backend

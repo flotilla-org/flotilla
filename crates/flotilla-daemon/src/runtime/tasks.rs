@@ -20,7 +20,7 @@ use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 
 use flotilla_credentials::CredentialStore;
 use flotilla_discovery::registry::{command_provider_registry, ProviderRegistry};
-use flotilla_environment::environment::EnvironmentKind;
+use flotilla_environment::environment::EnvironmentInput;
 use flotilla_protocol::{CanonicalHostId, NodeId};
 use flotilla_resources::{
     Checkout, Clone, Convoy, ForgeRead, ForgeReadHeartbeat, FulfilmentFacts, Host, HostStatusPatch, ReadWatchEvent, Resource,
@@ -376,7 +376,7 @@ pub(super) fn spawn_local_fulfilment_probe_task(
 pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, namespace: String, ssh: AgentlessSshProfile) -> JoinHandle<()> {
     // Compose the remote detection endpoint once, then retain that exact
     // provider instance across observation passes.
-    let providers = Arc::new(command_provider_registry(&[EnvironmentKind::HostDirect], Arc::clone(&ssh.runner)));
+    let providers = Arc::new(command_provider_registry(&[EnvironmentInput::HostDirect], Arc::clone(&ssh.runner)));
     spawn_periodic_task(FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
@@ -741,7 +741,7 @@ pub(super) fn spawn_environment_orphan_sweep_task(state: Arc<ControllerRuntimeSt
         let state = Arc::clone(&state);
         let sweep = Arc::clone(&sweep);
         async move {
-            let Some((_, provider)) = state.local_registry.environment_providers.for_kind(EnvironmentKind::Docker) else {
+            let Some((_, provider)) = state.local_registry.environment_providers.for_legacy_input(EnvironmentInput::Docker) else {
                 return;
             };
             let runtime = DockerControllerRuntime { state: Arc::clone(&state) };

@@ -304,7 +304,7 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                 .local_registry
                 .environment_providers
                 .iter()
-                .filter(|(_, provider)| provider.kind() == flotilla_environment::environment::EnvironmentKind::Docker)
+                .filter(|(_, provider)| provider.capabilities().per_vessel)
                 .collect::<Vec<_>>();
             if providers.is_empty() {
                 return Err("Docker environment provider absent for standing-convoy liveness check".into());
@@ -349,16 +349,11 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
             let (_, provider) = self
                 .local_registry
                 .environment_providers
-                .select(flotilla_environment::environment::EnvironmentKind::Docker, instance.map(String::as_str))
+                .select_legacy_input(flotilla_environment::environment::EnvironmentInput::Docker, instance.map(String::as_str))
                 .ok_or_else(|| {
                     let reason = if instance.is_some() {
                         "instance absent or wrong kind"
-                    } else if self
-                        .local_registry
-                        .environment_providers
-                        .iter()
-                        .any(|(_, provider)| provider.kind() == flotilla_environment::environment::EnvironmentKind::Docker)
-                    {
+                    } else if self.local_registry.environment_providers.iter().any(|(_, provider)| provider.capabilities().per_vessel) {
                         "ambiguous instances"
                     } else {
                         "absent"
@@ -370,7 +365,7 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                 .await
                 .map_err(|error| format!("Docker backing liveness check failed: {error}"))?
                 .into_iter()
-                .filter_map(|handle| Some(((handle.id().clone(), handle.container_name()?.to_string()), handle)))
+                .map(|handle| ((handle.id().clone(), handle.backing_id().to_string()), handle))
                 .collect::<HashMap<_, _>>();
             let Some(container_id) = environment.status.as_ref().and_then(|status| status.docker_container_id.as_ref()) else {
                 return Err(format!(

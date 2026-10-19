@@ -14,7 +14,7 @@ use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::CredentialStore;
 use flotilla_discovery::registry::ProviderRegistry;
-use flotilla_environment::environment::EnvironmentKind;
+use flotilla_environment::environment::EnvironmentInput;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::EnvironmentId;
@@ -41,6 +41,7 @@ use super::tasks::FULFILMENT_CHANGE_CHECK_INTERVAL;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LocalProvisioningProfile {
+    pub(super) environment_providers: Vec<flotilla_environment::environment::ProviderAdvertisement>,
     pub(super) host_id: String,
     pub(super) display_name: String,
     pub(super) repo_default_dir: String,
@@ -103,6 +104,7 @@ pub(super) async fn discover_agentless_ssh_profile(
         .to_string();
     let available_pools = registry.terminal_pools.iter().map(|(description, _)| description.implementation.clone()).collect();
     let provisioning = LocalProvisioningProfile {
+        environment_providers: registry.environment_providers.advertisements(),
         host_id,
         display_name: direct.display_name.unwrap_or_else(|| environment_id.to_string()),
         repo_default_dir: format!("{home}/{DEFAULT_REPO_DIR_SUFFIX}"),
@@ -253,6 +255,7 @@ pub(super) async fn apply_agentless_ssh_observation(
     };
     let status = HostStatus {
         capabilities: BTreeMap::from([
+            ("environment_providers".to_string(), json!(profile.environment_providers)),
             (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
             (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(held_credentials)),
             (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(credential_expiry)),
@@ -330,12 +333,12 @@ pub(super) fn build_local_profile(
     // runtime. A host with only the dummy instance therefore offers per-vessel
     // placement without a cleat pool; its crews run in the dummy pool.
     let docker_available = local_registry.environment_providers.iter().any(|(_, provider)| {
-        provider.kind() == EnvironmentKind::Docker
-            && (!provider.receives_host_tools() || local_registry.terminal_pools.contains_key(&docker_pool))
+        provider.capabilities().per_vessel && (!provider.receives_host_tools() || local_registry.terminal_pools.contains_key(&docker_pool))
     });
     let available_agent_adapters = local_registry.agent_adapters.ids().map(ToString::to_string).collect();
 
     Ok(LocalProvisioningProfile {
+        environment_providers: local_registry.environment_providers.advertisements(),
         host_id,
         display_name: daemon.host_name().to_string(),
         repo_default_dir,
@@ -410,10 +413,10 @@ pub(super) async fn observe_fulfilment_facts(
             FulfilmentRealisation::HostDirect => None,
         };
         let provider_kind = match kind.spec.realisation {
-            FulfilmentRealisation::HostDirect => EnvironmentKind::HostDirect,
-            FulfilmentRealisation::DockerPerVessel { .. } => EnvironmentKind::Docker,
+            FulfilmentRealisation::HostDirect => EnvironmentInput::HostDirect,
+            FulfilmentRealisation::DockerPerVessel { .. } => EnvironmentInput::Docker,
         };
-        let Some((_, provider)) = probe.providers.environment_providers.for_kind(provider_kind) else {
+        let Some((_, provider)) = probe.providers.environment_providers.for_legacy_input(provider_kind) else {
             debug!(kind = %kind.metadata.name, ?provider_kind, "cannot observe fulfilment facts without an unambiguous environment provider");
             // Absence or ambiguity cannot attest a runtime endpoint. Replace
             // stale affirmative evidence with a fresh unknown observation.

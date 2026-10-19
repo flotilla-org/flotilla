@@ -42,9 +42,17 @@ async fn run_in_realisation(
     args: &[&str],
     scratch: &Path,
 ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
-    tokio::time::timeout(Duration::from_secs(15), target.provider.detect(target.image, binary, args, scratch))
-        .await
-        .map_err(|_| format!("timed out probing {binary}"))?
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        target.provider.detection().ok_or("environment provider has no tool detection capability")?.detect(
+            target.image,
+            binary,
+            args,
+            scratch,
+        ),
+    )
+    .await
+    .map_err(|_| format!("timed out probing {binary}"))?
 }
 
 fn hash_field(hash: &mut Sha256, name: &str, value: &str) {
@@ -299,10 +307,10 @@ mod tests {
         scratch: &Path,
         model_probes: &mut ModelProbeState,
     ) -> Result<FulfilmentFacts, String> {
-        use flotilla_environment::environment::{command_provider, EnvironmentKind};
+        use flotilla_environment::environment::{command_provider, EnvironmentInput};
         let kind = match spec.realisation {
-            FulfilmentRealisation::HostDirect => EnvironmentKind::HostDirect,
-            FulfilmentRealisation::DockerPerVessel { .. } => EnvironmentKind::Docker,
+            FulfilmentRealisation::HostDirect => EnvironmentInput::HostDirect,
+            FulfilmentRealisation::DockerPerVessel { .. } => EnvironmentInput::Docker,
         };
         let provider = command_provider(kind, runner.clone());
         super::probe_kind(

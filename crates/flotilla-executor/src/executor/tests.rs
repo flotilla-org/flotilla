@@ -33,7 +33,7 @@ use crate::testkits::discovery::TestEnvVars;
 use crate::testkits::replay::testing::MockRunner;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_environment::environment::ProvisionedMount;
-use flotilla_environment::environment::{EnvironmentKind, PrepareOpts, PreparedEnvironment, ProvisionOpts};
+use flotilla_environment::environment::{EnvironmentInput, PrepareOpts, PreparedEnvironment, ProvisionOpts};
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_protocol::{ChangeRequest, Checkout, CloudAgentSession, Issue};
 use flotilla_protocol_testkit::event_sink::RecordingEventSink;
@@ -1587,8 +1587,21 @@ struct MockEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for MockEnvironmentProvider {
-    fn kind(&self) -> EnvironmentKind {
-        EnvironmentKind::Docker
+    fn kind(&self) -> flotilla_environment::environment::ProviderKind {
+        flotilla_environment::environment::ProviderKind::new(flotilla_environment::environment::EnvironmentClass::Dummy, "injected")
+    }
+    fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
+        flotilla_environment::environment::ProviderCapabilities {
+            workspace_root: "/workspace".into(),
+            reference_root: Some("/ref/repo".into()),
+            receives_host_tools: true,
+            per_vessel: true,
+            ..Default::default()
+        }
+    }
+
+    fn legacy_input(&self) -> Option<EnvironmentInput> {
+        Some(EnvironmentInput::Docker)
     }
     async fn prepare(&self, _spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {
         Ok(PreparedEnvironment::new(&Arc::new(()), ()))
@@ -1614,6 +1627,13 @@ struct MockProvisionedEnvironment {
 
 #[async_trait]
 impl ProvisionedEnvironment for MockProvisionedEnvironment {
+    fn backing_id(&self) -> &str {
+        self.container_name().unwrap_or_else(|| self.id().as_str())
+    }
+    fn workspace_root(&self) -> &std::path::Path {
+        std::path::Path::new("/workspace")
+    }
+
     fn id(&self) -> &EnvironmentId {
         &self.id
     }

@@ -211,6 +211,28 @@ class RuntimeBoundaryTests(unittest.TestCase):
                 self.assertEqual(check.violations(source, check.VCS + 'providers/environment/new.rs'), [1])
         self.assertEqual(check.violations('fn f(x: DockerEnvironmentSpec, y: EnvironmentKind) {}', 'src/a.rs'), [])
 
+    # ADR 0058: descriptive classes never choose provider operations. The new
+    # runtime module layout remains covered, including the dummy adapter.
+    def test_kind_neutral_provider_boundary(self):
+        for source in [
+            'fn f() { if provider.kind() == expected { run(); } }',
+            'fn f() { match class { EnvironmentClass::Container => run(), _ => () } }',
+            'fn f() { if class == EnvironmentClass::Dummy { run(); } }',
+            'fn f() { match provider.kind().implementation.as_str() { \"docker\" => run(), _ => () } }',
+            'fn f() { if let EnvironmentClass::Dummy = class { run(); } }',
+            'fn f() { registry.environment_providers.select("dummy"); }',
+            'fn f() { registry.environment_providers.select_legacy_input(input, Some("docker")); }',
+            'use adapters::DummyEnvironmentProvider;',
+        ]:
+            self.assertEqual(check.violations(source, 'crates/flotilla-daemon/src/runtime/environments.rs'), [1])
+        for source in [
+            'fn f() { provider.capabilities().per_vessel; }',
+            'fn f() { registry.environment_providers.select(instance); }',
+            'fn f() { ProviderKind::new(EnvironmentClass::Dummy, "dummy"); }',
+            'fn f() { match status { true => ProviderKind::new(EnvironmentClass::Dummy, "dummy"), false => other } }',
+        ]:
+            self.assertEqual(check.violations(source, 'src/a.rs'), [])
+
     # Selection by kind or configured instance is legal. Hardcoded runtime names
     # in environment registry lookups and implementation preferences are refused.
     def test_literal_runtime_lookup(self):
