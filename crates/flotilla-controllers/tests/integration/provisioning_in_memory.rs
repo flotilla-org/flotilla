@@ -13,12 +13,12 @@ use common::{
     controller_meta, create_convoy_with_single_task, create_host_direct_policy, create_ready_clone, create_ready_host_direct_environment,
     create_workspace, ControllerLoopHarness,
 };
-use flotilla_controllers::reconcilers::{
-    checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler,
-    CloneRuntime, DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, PreparedCheckout, TerminalRuntime,
-    TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
-};
+use flotilla_controllers::reconcilers::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler};
 use flotilla_protocol::ConfiguredResourceLimits;
+use flotilla_provisioning::reconcilers::{
+    checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler,
+    CloneRuntime, DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, PreparedCheckout,
+};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone,
     ClonePhase, CloneSpec, CloneStatus, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,

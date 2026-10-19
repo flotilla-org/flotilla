@@ -1,48 +1,8 @@
+use async_trait::async_trait;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_resources::TerminalSessionSpec;
 use flotilla_terminal::{TerminalEnvVars, TerminalPool, TerminalSession as PoolSession};
 use std::sync::Arc;
-
-use async_trait::async_trait;
-use flotilla_environment::environment::{
-    EnvironmentProvider, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
-};
-use flotilla_paths::path_context::DaemonHostPath;
-use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_protocol::EnvironmentId;
-use flotilla_resources::{
-    DockerEnvironmentSpec, DockerImagePullPolicy, EnvironmentMount, EnvironmentMountMode, FreshCloneCheckoutSpec, TerminalSessionSpec,
-};
-
-#[derive(Default)]
-struct FakeEnvironmentProvider;
-
-#[async_trait]
-impl EnvironmentProvider for FakeEnvironmentProvider {
-    flotilla_discovery_testkit::injected_environment_provider!();
-    async fn prepare(
-        &self,
-        _spec: &flotilla_resources::EnvironmentSpec,
-        _opts: &flotilla_environment::environment::PrepareOpts,
-    ) -> Result<flotilla_environment::environment::PreparedEnvironment, String> {
-        Ok(flotilla_environment::environment::PreparedEnvironment::new(&Arc::new(()), ()))
-    }
-
-    async fn provision(
-        &self,
-        _id: EnvironmentId,
-        _image: &flotilla_environment::environment::PreparedEnvironment,
-        _opts: flotilla_environment::environment::ProvisionOpts,
-    ) -> Result<Arc<dyn ProvisionedEnvironment>, String> {
-        unimplemented!("test double")
-    }
-
-    async fn list(&self) -> Result<Vec<Arc<dyn ProvisionedEnvironment>>, String> {
-        Ok(vec![])
-    }
-
-    async fn destroy(&self, _container_id: &str) -> Result<(), String> {
-        Err("unused in test".to_string())
-    }
-}
 
 #[derive(Default)]
 struct FakeTerminalPool;
@@ -80,42 +40,6 @@ impl TerminalPool for FakeTerminalPool {
 }
 
 #[tokio::test]
-async fn environment_actuator_translates_mounts_into_provider_create_opts() {
-    let actuator = flotilla_controllers::actuators::DockerEnvironmentActuator::new(
-        Arc::new(FakeEnvironmentProvider),
-        std::path::PathBuf::from("/repo"),
-        DaemonHostPath::new("/tmp/flotilla.sock"),
-        vec![("GITHUB_TOKEN".to_string(), "secret".to_string())],
-    );
-    let spec = DockerEnvironmentSpec {
-        image_build_ref: None,
-        memory_policy: flotilla_resources::EnvironmentMemoryPolicy {
-            host_memory_percent: 30,
-            expected_concurrent_crews: 3,
-            swap_bytes: 1_073_741_824,
-        },
-        host_ref: "01HXYZ".to_string(),
-        image: "ghcr.io/flotilla/dev:latest".to_string(),
-        declared_agent_adapters: Default::default(),
-        required_agent_adapters: Default::default(),
-        pull_policy: DockerImagePullPolicy::Never,
-        mounts: vec![EnvironmentMount {
-            source_path: "/Users/alice/dev/flotilla".to_string(),
-            target_path: "/workspace".to_string(),
-            mode: EnvironmentMountMode::Rw,
-        }],
-        env: Default::default(),
-    };
-
-    let opts = actuator.build_create_opts(&spec);
-
-    assert_eq!(opts.provisioned_mounts, vec![ProvisionedMount::new("/Users/alice/dev/flotilla", "/workspace", ProvisionedMountMode::Rw)]);
-    assert_eq!(opts.image_pull_policy, ImagePullPolicy::Never);
-    assert_eq!(opts.memory_policy, spec.memory_policy);
-    assert_eq!(opts.tokens, vec![("GITHUB_TOKEN".to_string(), "secret".to_string())]);
-}
-
-#[tokio::test]
 async fn terminal_actuator_uses_literal_command_and_cwd() {
     let actuator = flotilla_controllers::actuators::TerminalActuator::new(Arc::new(FakeTerminalPool));
     let spec = TerminalSessionSpec {
@@ -128,24 +52,4 @@ async fn terminal_actuator_uses_literal_command_and_cwd() {
     };
 
     actuator.ensure_session("term-a", &spec, &[]).await.expect("ensure should succeed");
-}
-
-#[tokio::test]
-async fn checkout_actuator_exposes_fresh_clone_transport_url() {
-    // Transport identity is the real repository URL for both container-fresh
-    // and host-local sources; a managed source ref must not become a transport.
-    let mut spec = FreshCloneCheckoutSpec {
-        source_clone_ref: None,
-        repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
-        env_ref: "env-a".to_string(),
-        r#ref: "main".to_string(),
-        base_ref: None,
-        target_path: "/workspace".to_string(),
-        url: "git@github.com:flotilla-org/flotilla.git".to_string(),
-    };
-    for source in [None, Some("managed-clone".to_string())] {
-        spec.source_clone_ref = source;
-        let command = flotilla_controllers::actuators::fresh_clone_transport_url(&spec);
-        assert_eq!(command, "git@github.com:flotilla-org/flotilla.git");
-    }
 }

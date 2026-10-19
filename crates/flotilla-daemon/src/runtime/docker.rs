@@ -8,7 +8,6 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_config::ConfigStore;
-use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning};
 use flotilla_credentials::{compose_agent_environment, AgentMaterialRegistry, CredentialStore};
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery::run_provisioned_host_detectors;
@@ -21,6 +20,7 @@ use flotilla_environment::environment::{contained_daemon_socket_path, DAEMON_SOC
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provisioning::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning};
 use flotilla_resources::{
     Environment, EnvironmentSpec, PlacementPolicy, Resource, ResourceError, Vessel, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ENV,
@@ -646,9 +646,9 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         &self,
         name: &str,
         spec: &EnvironmentSpec,
-    ) -> Result<flotilla_controllers::reconcilers::environment::EnvironmentProvisioning, String> {
-        use flotilla_controllers::reconcilers::environment::EnvironmentProvisioning;
+    ) -> Result<flotilla_provisioning::reconcilers::environment::EnvironmentProvisioning, String> {
         use flotilla_environment::environment::EnvironmentInput;
+        use flotilla_provisioning::reconcilers::environment::EnvironmentProvisioning;
         let kind = EnvironmentInput::of(spec)?;
         if kind == EnvironmentInput::Docker {
             return self.provision(name, spec.docker.as_ref().expect("kind checked")).await.map(EnvironmentProvisioning::Docker);

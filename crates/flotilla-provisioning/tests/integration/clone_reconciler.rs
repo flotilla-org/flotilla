@@ -5,7 +5,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use common::meta;
-use flotilla_controllers::reconcilers::{CloneReconciler, CloneRuntime};
+use flotilla_provisioning::reconcilers::{CloneReconciler, CloneRuntime};
 use flotilla_resources::{clone_key, CloneSpec, Repository, RepositorySpec};
 use flotilla_store::{controller::Reconciler, ResourceBackend};
 

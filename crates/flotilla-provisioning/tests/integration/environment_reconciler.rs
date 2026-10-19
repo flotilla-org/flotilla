@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler};
+use flotilla_provisioning::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler};
 use flotilla_resources::{
     DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, Host,
     HostDirectEnvironmentSpec, HostSpec, InputMeta, ResourceError, StatusPatch,

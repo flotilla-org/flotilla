@@ -160,6 +160,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-charter` | Charter inputs read through a `RevisionedTree` (Git via `Vcs`, or a local directory): `project.yaml` declarations, operational entries and their provenance annotations, charter locks and source status |
 | `flotilla-executor` | Provider-backed command handlers, step plans and resolution, remote step batches, environment management and host orchestration ports |
 | `flotilla-observation` | Provider-neutral change-request, issue and forge observation, demand servicing and observed-resource projection |
+| `flotilla-provisioning` | Environment, ImageBuild, Checkout, Clone and Repository reconcilers; orphaned-environment and image-inventory loops |
 | `flotilla-admission` | Convoy admission, standing-convoy reconciliation, vessel placement projection, placement planning, project operations and composed-image planning; host orchestration through owned ports |
 | `flotilla-core` | Refresh and `InProcessDaemon` composition root; implements admission and observation ports |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
@@ -291,6 +292,8 @@ Use the checkout-scoped `flotilla_vcs::vcs::Vcs` trait for Git and other VCS ope
 Do not invoke `git` directly through `CommandRunner` methods or `run!`, or through `std::process::Command::new("git")`, outside the VCS implementation. The ast-grep Git boundary check runs in the format job on every PR. Build scripts and build tooling are exempt because they run before a `CommandRunner` exists; tests may use Git to construct fixtures.
 
 ### Environment runtime boundary
+
+The environment reconciler and its unchanged `DockerEnvironmentRuntime` port live in `flotilla-provisioning`.
 
 Use `EnvironmentProvider`, its instance-owned `LocalImageCache`, and its `ImageBuildService` capability for environment and image operations. Pre-provisioning tool detection uses `EnvironmentProvider::detect`; read-only image-reference validation uses the owning cache's `inspect_reference` and `registry_available` methods. These observations never pull images or admit mutable tags for provisioning. Select providers by `EnvironmentKind` or a configured instance name, never by a literal runtime name. Direct OCI distribution reads use `RegistryClient`. Candidate validation's read-only registry fallback stays behind the provider cache and uses the host tool's configured credentials. Resource specifications and runtime-neutral traits remain usable by consumers.
 

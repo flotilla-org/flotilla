@@ -29,7 +29,7 @@ REPLICATION_FORBIDDEN = (
 )
 # ADR 0060 step 4: capabilities read resources through the store and receive
 # higher orchestration through ports. Register each new capability here.
-CAPABILITY_CRATES = frozenset({"flotilla-executor", "flotilla-projections", "flotilla-admission"})
+CAPABILITY_CRATES = frozenset({"flotilla-executor", "flotilla-projections", "flotilla-admission", "flotilla-provisioning"})
 CAPABILITY_FORBIDDEN = (
     "flotilla-core", "flotilla-daemon", "flotilla-controllers",
     "flotilla-credentials",

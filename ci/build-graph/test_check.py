@@ -278,6 +278,33 @@ class BuildGraphContract(unittest.TestCase):
                             violations(graph(package(provider, **{kind: (middle,)}),
                                              package("adapter", normal=("flotilla-admission",)), package("flotilla-admission"))))
 
+    def test_provisioning_refuses_capabilities_and_core(self):
+        # Explicit finite generator: provisioning refuses every other capability,
+        # composition target through direct/transitive normal/build edges.
+        self.assertIn("flotilla-provisioning", CAPABILITY_CRATES)
+        self.assertEqual(violations(graph(
+            package("flotilla-core", normal=("flotilla-provisioning",)),
+            package("flotilla-provisioning", normal=("flotilla-store", "flotilla-observation", "flotilla-discovery")),
+            package("flotilla-store"), package("flotilla-observation"), package("flotilla-discovery"),
+        )), [])
+        targets = {"flotilla-core", "flotilla-daemon", "flotilla-controllers", "flotilla-credentials"}
+        targets.update(CAPABILITY_CRATES - {"flotilla-provisioning"})
+        for target in sorted(targets):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertIn(f"flotilla-provisioning: must not depend on {target}, directly or transitively",
+                            violations(graph(package("flotilla-provisioning", **{kind: (middle,)}),
+                                             package("adapter", normal=(target,)), package(target))))
+        # Lower providers cannot turn the capability into their dependency.
+        for provider in ("flotilla-discovery", "flotilla-agent", "flotilla-vcs", "flotilla-github-providers", "flotilla-forgejo-providers"):
+            for kind in ("normal", "build"):
+                for middle in ("flotilla-provisioning", "adapter"):
+                    with self.subTest(provider=provider, kind=kind, middle=middle):
+                        self.assertIn(f"{provider}: must not depend on flotilla-provisioning, directly or transitively",
+                            violations(graph(package(provider, **{kind: (middle,)}),
+                                             package("adapter", normal=("flotilla-provisioning",)), package("flotilla-provisioning"))))
+
     def test_components_refuse_capability_reachbacks(self):
         # A lower component cannot gain an upward dependency on the executor.
         self.assertIn(

@@ -14,9 +14,9 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_admission::reconcilers::vessel_placement::VesselPlacementProjector;
-use flotilla_controllers::reconcilers::checkout::runtime::sweep_host_empty_convoy_directories;
 use flotilla_core::{demand_lifecycle::DemandLifecycle, in_process::InProcessDaemon};
 use flotilla_projections::aggregator_projection::AggregatorProjectionState;
+use flotilla_provisioning::reconcilers::checkout::runtime::sweep_host_empty_convoy_directories;
 
 use flotilla_credentials::CredentialStore;
 use flotilla_discovery::registry::{command_provider_registry, ProviderRegistry};
@@ -730,7 +730,7 @@ pub(super) fn spawn_provisioned_environment_reconciliation_task(
 }
 
 pub(super) fn spawn_environment_orphan_sweep_task(state: Arc<ControllerRuntimeState>) -> JoinHandle<()> {
-    use crate::environment_orphans::{EnvironmentOrphanSweep, ORPHAN_SWEEP_INTERVAL};
+    use flotilla_provisioning::environment_orphans::{EnvironmentOrphanSweep, ORPHAN_SWEEP_INTERVAL};
 
     // Called only after StartupRestoration has completed. A retry of restoration
     // creates a new sweep, so neither startup nor daemon restarts inherit grace.

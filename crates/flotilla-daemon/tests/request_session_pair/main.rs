@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_admission::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_config::ConfigStore;
-use flotilla_controllers::reconcilers::{CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout};
 use flotilla_core::command_target::TargetHost;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::WorkCredentialReconciler;
@@ -67,6 +66,7 @@ use flotilla_protocol_testkit::TestIssue;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_provisioning::reconcilers::{CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout};
 use flotilla_resources::{
     api_version, Artifact, ArtifactSubjectBinding, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy,
     ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector,

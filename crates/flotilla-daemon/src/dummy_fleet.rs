@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use flotilla_config::{dummy_fleet::DummyFleetConfig, DaemonConfig};
-use flotilla_controllers::reconcilers::ForgeDefaultBranchResolver;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery::DiscoveryRuntime;
 use flotilla_dummy_fleet::{CrewCommandPort, DaemonCommandPort, DummyFleet};
 use flotilla_protocol::{commands::CommandValue, query::CrewCommandContext, CommandAction};
+use flotilla_provisioning::reconcilers::ForgeDefaultBranchResolver;
 use flotilla_resources::{Convoy, TerminalAttentionState, Vessel};
 use flotilla_store::ResourceBackend;
 use tracing::warn;
