@@ -98,6 +98,8 @@ The step-4 survey found core and store code with no home in the target crates. O
 - **`flotilla-capability-contract`** (new, #3200): the session capability contract (`CredentialCapability`, `SessionCapabilitySource`, `endpoint_for_env`, `credential_card`). It depends on no flotilla crate, so `flotilla-credentials` implements the source and `flotilla-core` and the daemon consume it without a cycle. Card observation and rendering stay in core until the crew stream.
 - **Host identity** (HostId and NodeId resolution) lives in `flotilla-daemon`: the composition root resolves it once at startup and injects it.
 
+`flotilla-provisioning` holds the Environment, ImageBuild, Checkout, Clone and Repository reconcilers, with the orphaned-environment and image-inventory loops. It realises environments, images and checkouts on hosts and is distinct from the executor.
+
 ### Admission capability (#3299)
 
 `flotilla-admission` owns the admission transaction, admission command handlers,

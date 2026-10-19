@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common::meta;
-use flotilla_controllers::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
+use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::{
     Checkout, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, CloneStatus, Environment, EnvironmentSpec, ForgeIdentity,
     FreshCloneCheckoutSpec, HostDirectEnvironmentSpec, LifecycleAuthority, ObservedCheckoutSpec, Repository, RepositoryCheckoutKind,

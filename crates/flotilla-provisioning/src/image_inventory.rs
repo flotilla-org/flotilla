@@ -12,12 +12,12 @@ use flotilla_store::ResourceBackend;
 
 /// The local image cache's held image IDs.
 #[async_trait]
-pub(crate) trait ImageInventoryIo: Send + Sync {
+pub trait ImageInventoryIo: Send + Sync {
     async fn inventory(&self) -> Result<BTreeSet<String>, String>;
 }
 
 #[derive(bon::Builder)]
-pub(crate) struct ImageInventoryPublisher<I> {
+pub struct ImageInventoryPublisher<I> {
     pub io: Arc<I>,
     pub backend: ResourceBackend,
     pub namespace: String,
@@ -57,7 +57,7 @@ fn decode_inventory(value: Option<&serde_json::Value>, host: &str) -> LocalImage
 
 /// Registration is authoritative for cache identities. Run even on hosts with
 /// no image provider, where no distributor exists to refresh old observations.
-pub(crate) async fn prune_unregistered_caches(
+pub async fn prune_unregistered_caches(
     backend: &ResourceBackend,
     namespace: &str,
     host: &str,
@@ -78,18 +78,6 @@ pub(crate) async fn prune_unregistered_caches(
         }
     }
     Ok(())
-}
-
-#[derive(bon::Builder)]
-pub(crate) struct ProviderImageIo {
-    pub provider: Arc<dyn flotilla_environment::environment::EnvironmentProvider>,
-}
-
-#[async_trait]
-impl ImageInventoryIo for ProviderImageIo {
-    async fn inventory(&self) -> Result<BTreeSet<String>, String> {
-        self.provider.local_image_cache().ok_or("provider has no local image cache")?.inventory().await
-    }
 }
 
 #[cfg(test)]

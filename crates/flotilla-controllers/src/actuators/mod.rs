@@ -1,70 +1,9 @@
-use flotilla_terminal::TerminalPool;
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
-use flotilla_environment::environment::{
-    contained_daemon_socket_path, CreateOpts, EnvironmentProvider, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess,
-    EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode, CONTAINED_DAEMON_REQUIRED_ENV,
-};
-use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_environment::environment::{ProvisionedMount, ProvisionedMountMode};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_resources::{
-    DockerEnvironmentSpec, EnvironmentMount, EnvironmentMountMode, FreshCloneCheckoutSpec, TerminalSessionSource, TerminalSessionSpec,
-};
-
-pub struct DockerEnvironmentActuator {
-    daemon_socket_path: DaemonHostPath,
-    tokens: Vec<(String, String)>,
-}
-
-impl DockerEnvironmentActuator {
-    pub fn new(
-        _provider: Arc<dyn EnvironmentProvider>,
-        _repo_root: PathBuf,
-        daemon_socket_path: DaemonHostPath,
-        tokens: Vec<(String, String)>,
-    ) -> Self {
-        Self { daemon_socket_path, tokens }
-    }
-
-    pub fn build_create_opts(&self, spec: &DockerEnvironmentSpec) -> CreateOpts {
-        let environment_socket_path = contained_daemon_socket_path(self.daemon_socket_path.as_path());
-        CreateOpts {
-            tokens: self.tokens.clone(),
-            working_directory: None,
-            image_pull_policy: spec.pull_policy.into(),
-            prepared_auth: None,
-            provisioned_mounts: spec.mounts.iter().map(provisioned_mount).collect(),
-            tools: vec![EnvironmentTool::new("flotilla-daemon-access", "/usr/local/bin/flotilla")
-                .with_asset(EnvironmentToolAsset::new(
-                    self.daemon_socket_path.as_path().to_path_buf(),
-                    environment_socket_path.clone(),
-                    EnvironmentToolAssetKind::UnixSocket,
-                    EnvironmentToolAssetAccess::SharedWritable,
-                    "the daemon socket",
-                ))
-                .with_environment(EnvironmentVariableUpdate::set(
-                    "FLOTILLA_DAEMON_SOCKET",
-                    environment_socket_path.to_string_lossy(),
-                    "the daemon socket",
-                ))
-                .with_environment(EnvironmentVariableUpdate::set(
-                    CONTAINED_DAEMON_REQUIRED_ENV,
-                    "1",
-                    "the contained host-daemon requirement",
-                ))],
-            cpu_limit: None,
-            memory_policy: spec.memory_policy.clone(),
-        }
-    }
-}
-
-pub fn provisioned_mount(mount: &EnvironmentMount) -> ProvisionedMount {
-    let mode = match mount.mode {
-        EnvironmentMountMode::Ro => ProvisionedMountMode::Ro,
-        EnvironmentMountMode::Rw => ProvisionedMountMode::Rw,
-    };
-    ProvisionedMount::new(&mount.source_path, &mount.target_path, mode)
-}
+use flotilla_resources::{EnvironmentMount, EnvironmentMountMode, TerminalSessionSource, TerminalSessionSpec};
+use flotilla_terminal::TerminalPool;
 
 pub struct TerminalActuator {
     pool: Arc<dyn TerminalPool>,
@@ -84,6 +23,10 @@ impl TerminalActuator {
     }
 }
 
-pub fn fresh_clone_transport_url(spec: &FreshCloneCheckoutSpec) -> &str {
-    &spec.url
+pub fn provisioned_mount(mount: &EnvironmentMount) -> ProvisionedMount {
+    let mode = match mount.mode {
+        EnvironmentMountMode::Ro => ProvisionedMountMode::Ro,
+        EnvironmentMountMode::Rw => ProvisionedMountMode::Rw,
+    };
+    ProvisionedMount::new(&mount.source_path, &mount.target_path, mode)
 }

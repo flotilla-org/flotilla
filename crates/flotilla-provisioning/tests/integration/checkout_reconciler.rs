@@ -12,10 +12,10 @@ use std::{
 
 use async_trait::async_trait;
 use common::{create_ready_checkout, create_ready_clone, meta};
-use flotilla_controllers::reconcilers::{
+use flotilla_protocol::NodeId;
+use flotilla_provisioning::reconcilers::{
     checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
-use flotilla_protocol::NodeId;
 use flotilla_resources::repo_key;
 use flotilla_resources::Actuation;
 use flotilla_resources::Checkout;

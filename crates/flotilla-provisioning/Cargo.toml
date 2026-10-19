@@ -1,0 +1,59 @@
+[package]
+name = "flotilla-provisioning"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-config = { path = "../flotilla-config" }
+flotilla-environment = { path = "../flotilla-environment" }
+flotilla-vcs = { path = "../flotilla-vcs" }
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-store = { path = "../flotilla-store" }
+flotilla-paths = { path = "../flotilla-paths" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+tracing = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+rusqlite = { version = "0.37", features = ["bundled"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+rstest = { workspace = true }
+reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
+flotilla-admission = { path = "../flotilla-admission" }
+flotilla-charter = { path = "../flotilla-charter" }
+flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
+
+flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
+flotilla-store-memory = { path = "../flotilla-store-memory" }
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+tokio = { workspace = true, features = ["test-util"] }
+serde = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+flotilla-core = { path = "../flotilla-core" }
+hegeltest = "=0.48.1"
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
+
+# Keep native library features stable across build and test commands.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-signing = { path = "../flotilla-build-features-signing" }
+flotilla-build-features-sqlite = { path = "../flotilla-build-features-sqlite" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

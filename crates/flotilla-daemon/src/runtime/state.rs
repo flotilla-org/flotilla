@@ -15,14 +15,14 @@ use flotilla_admission::convoy_ensure::StandingConvoyBackingInspector;
 use flotilla_agent::process::ExitReceiptObserver;
 use flotilla_config::ConfigStore;
 use flotilla_config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY;
-use flotilla_controllers::reconcilers::clone::runtime::CloneFlights;
-use flotilla_controllers::reconcilers::{CheckoutRemoval, ForgeDefaultBranchResolver};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provisioning::reconcilers::clone::runtime::CloneFlights;
+use flotilla_provisioning::reconcilers::{CheckoutRemoval, ForgeDefaultBranchResolver};
 use flotilla_resources::{Convoy, ConvoyProvisioningState, Environment, Host, HostSpec, ResourceError, ResourceObject};
 use flotilla_store::load_metrics::ControllerMetricsRegistry;
 use tokio::sync::{Mutex, Semaphore};
@@ -54,7 +54,7 @@ pub(super) struct ControllerRuntimeState {
     pub(super) credential_store: Option<Arc<CredentialStore>>,
     pub(super) agent_material: Option<Arc<AgentMaterialRegistry>>,
     pub(super) blob_store: Option<Arc<TieredBlobStore>>,
-    pub(super) image_inventory: Option<Arc<crate::image_inventory::ImageInventoryPublisher<crate::image_inventory::ProviderImageIo>>>,
+    pub(super) image_inventory: Option<Arc<flotilla_provisioning::image_inventory::ImageInventoryPublisher<super::ports::ProviderImageIo>>>,
     /// This host's ADR 0062 image build service, when it can build images.
     pub(super) image_build_service: Option<Arc<dyn flotilla_environment::environment::ImageBuildService>>,
     pub(super) provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
@@ -222,7 +222,7 @@ impl ControllerRuntimeState {
 
     pub(super) fn with_image_inventory(
         mut self,
-        publisher: Option<Arc<crate::image_inventory::ImageInventoryPublisher<crate::image_inventory::ProviderImageIo>>>,
+        publisher: Option<Arc<flotilla_provisioning::image_inventory::ImageInventoryPublisher<super::ports::ProviderImageIo>>>,
     ) -> Self {
         self.image_inventory = publisher;
         self

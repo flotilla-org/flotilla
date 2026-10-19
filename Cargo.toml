@@ -7,6 +7,7 @@ members = [
     "crates/flotilla-admission",
     "crates/flotilla-agent",
     "crates/flotilla-projections",
+    "crates/flotilla-provisioning",
     "crates/flotilla-build-features",
     "crates/flotilla-capability-contract",
     "crates/flotilla-cbor",

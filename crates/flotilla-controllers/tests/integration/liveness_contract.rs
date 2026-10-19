@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use flotilla_controllers::reconcilers::{
+use flotilla_provisioning::reconcilers::{
     checkout::{CheckoutPrepared, CheckoutReconciler},
     CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };

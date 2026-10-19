@@ -1,24 +1,24 @@
 //! Core controller ports and environment-routing Clone/Checkout adapters.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::{Arc, Mutex as StdMutex},
 };
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_controllers::reconcilers::checkout::runtime::{removal_source_path, CheckoutControllerRuntime};
-use flotilla_controllers::reconcilers::clone::runtime::CloneControllerRuntime;
-use flotilla_controllers::reconcilers::{
-    vessel::WorktreeMetadataResolver, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneRuntime, ForgeDefaultBranchResolver,
-    PreparedCheckout,
-};
+use flotilla_controllers::reconcilers::vessel::WorktreeMetadataResolver;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::OperatorReconciler;
 use flotilla_protocol::RepoSelector;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_provisioning::reconcilers::checkout::runtime::{removal_source_path, CheckoutControllerRuntime};
+use flotilla_provisioning::reconcilers::clone::runtime::CloneControllerRuntime;
+use flotilla_provisioning::reconcilers::{
+    CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneRuntime, ForgeDefaultBranchResolver, PreparedCheckout,
+};
 use flotilla_resources::checkout_path::checkout_path_from_status_and_spec;
 use flotilla_resources::{
     ChangeRequest, Checkout, CheckoutIntegrationStatus, CheckoutSpec, Clone, ClonePhase, Convoy, ConvoyTeardownRuntime, Demand, DemandKind,
@@ -545,5 +545,17 @@ mod chained_default_branch_tests {
         assert_eq!(resolve(vec![Ok(None), Err("first"), Err("second")]).await, Err("first".into()));
         assert_eq!(resolve(vec![Ok(None), Ok(None)]).await, Ok(None));
         assert_eq!(resolve(Vec::new()).await, Ok(None));
+    }
+}
+
+#[derive(bon::Builder)]
+pub(super) struct ProviderImageIo {
+    pub provider: Arc<dyn flotilla_environment::environment::EnvironmentProvider>,
+}
+
+#[async_trait]
+impl flotilla_provisioning::image_inventory::ImageInventoryIo for ProviderImageIo {
+    async fn inventory(&self) -> Result<BTreeSet<String>, String> {
+        self.provider.local_image_cache().ok_or("provider has no local image cache")?.inventory().await
     }
 }

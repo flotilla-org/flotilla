@@ -22,15 +22,15 @@ pub(crate) use terminal::{DELIVERY_CONFIRMATION_POLL, DELIVERY_CONFIRMATION_STAB
 use chrono::Utc;
 use flotilla_admission::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_config::ConfigStore;
-use flotilla_controllers::reconcilers::{
-    CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver, RepositoryReconciler,
-    TerminalSessionReconciler, VesselReconciler,
-};
+use flotilla_controllers::reconcilers::{TerminalSessionReconciler, VesselReconciler};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
+use flotilla_provisioning::reconcilers::{
+    CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver, RepositoryReconciler,
+};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
     host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, Environment, Forge, Host, ManifestRoot, Repository, Resource,
@@ -233,7 +233,7 @@ impl DaemonRuntime {
             .filter(|(_, provider)| provider.local_image_cache().is_some())
             .filter_map(|(_, provider)| local_registry.environment_providers.instance_name(provider).map(String::from))
             .collect::<BTreeSet<_>>();
-        crate::image_inventory::prune_unregistered_caches(
+        flotilla_provisioning::image_inventory::prune_unregistered_caches(
             &daemon.resource_backend(),
             &options.namespace,
             &profile.host_id,
@@ -416,8 +416,8 @@ impl DaemonRuntime {
                 .filter(|(_, provider)| provider.local_image_cache().is_some())
             {
                 Some((_, provider)) => Some(Arc::new(
-                    crate::image_inventory::ImageInventoryPublisher::builder()
-                        .io(Arc::new(crate::image_inventory::ProviderImageIo::builder().provider(Arc::clone(provider)).build()))
+                    flotilla_provisioning::image_inventory::ImageInventoryPublisher::builder()
+                        .io(Arc::new(ports::ProviderImageIo::builder().provider(Arc::clone(provider)).build()))
                         .backend(daemon.resource_backend())
                         .namespace(options.namespace.clone())
                         .host(profile.host_id.clone())
@@ -939,7 +939,7 @@ fn spawn_controller_loops(
             Some(blobs) => blobs,
             None => Arc::new(crate::blob_store::LocalBlobStore::new(state.config.state_dir().as_path())),
         };
-        let materials: Arc<dyn flotilla_controllers::reconcilers::ImageBuildMaterials> =
+        let materials: Arc<dyn flotilla_provisioning::reconcilers::ImageBuildMaterials> =
             Arc::new(crate::image_build::DaemonImageBuildMaterials {
                 credentials,
                 blobs,
@@ -955,7 +955,7 @@ fn spawn_controller_loops(
             move |backend: ResourceBackend, namespace_string: String| {
                 (
                     vec![],
-                    flotilla_controllers::reconcilers::ImageBuildReconciler::new(
+                    flotilla_provisioning::reconcilers::ImageBuildReconciler::new(
                         service.clone(),
                         Arc::clone(&materials),
                         &backend,

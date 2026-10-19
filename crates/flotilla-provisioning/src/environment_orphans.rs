@@ -11,13 +11,14 @@ use std::{
     time::Duration,
 };
 
-use flotilla_controllers::reconcilers::DockerEnvironmentRuntime;
 use flotilla_environment::environment::{EnvironmentBacking, EnvironmentProvider};
 use flotilla_resources::{Environment, Resource};
 use flotilla_store::ResourceBackend;
 use tokio::time::Instant;
 
-pub(crate) const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+use crate::reconcilers::DockerEnvironmentRuntime;
+
+pub const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const ORPHAN_GRACE: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -28,7 +29,7 @@ pub(crate) enum StoreReadiness {
 }
 
 #[derive(Default)]
-pub(crate) struct EnvironmentOrphanSweep {
+pub struct EnvironmentOrphanSweep {
     readiness: StoreReadiness,
     absent_since: BTreeMap<EnvironmentBacking, Instant>,
     pending_cleanup: BTreeSet<EnvironmentBacking>,
@@ -58,11 +59,11 @@ async fn protected_environments(backend: &ResourceBackend) -> Result<BTreeSet<St
 }
 
 impl EnvironmentOrphanSweep {
-    pub(crate) fn mark_ready(&mut self) {
+    pub fn mark_ready(&mut self) {
         self.readiness = StoreReadiness::Ready;
     }
 
-    pub(crate) async fn sweep(
+    pub async fn sweep(
         &mut self,
         backend: &ResourceBackend,
         provider: &dyn EnvironmentProvider,
@@ -239,7 +240,7 @@ mod tests {
             &self,
             _: &str,
             _: &flotilla_resources::DockerEnvironmentSpec,
-        ) -> Result<flotilla_controllers::reconcilers::DockerProvisioning, String> {
+        ) -> Result<crate::reconcilers::DockerProvisioning, String> {
             unreachable!()
         }
         async fn destroy(&self, environment: &str, id: &str) -> Result<(), String> {

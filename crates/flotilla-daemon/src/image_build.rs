@@ -14,10 +14,10 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_controllers::reconcilers::ImageBuildMaterials;
 use flotilla_credentials::{BuildSecretError, CredentialStore};
 use flotilla_environment::environment::{image::SecretFile, RegistryAuth};
 use flotilla_protocol::NodeId;
+use flotilla_provisioning::reconcilers::ImageBuildMaterials;
 use flotilla_resources::{
     Artifact, ArtifactSpec, FleetDesignation, HostImageAction, ImageBuildFailure, ImageBuildFailureClass, InputMeta, ResourceError,
     FLEET_DESIGNATION_NAME,

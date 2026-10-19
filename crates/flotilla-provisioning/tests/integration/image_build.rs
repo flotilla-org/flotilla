@@ -13,16 +13,16 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_controllers::reconcilers::{
-    image_build::{attribute_recipe_failure, image_build_retry_backoff, registry_build_cache},
-    DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ImageBuildMaterials, ImageBuildReconciler,
-};
 use flotilla_environment::environment::{
     image::{BuiltImage, FailedImageBuild, ImageBuildRequest, ImageDeliveryTarget, SecretFile},
     registry_auth::{RegistryAuthMaterial, RegistryConfig},
     ImageBuildService, RegistryAuth,
 };
 use flotilla_protocol::{EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo};
+use flotilla_provisioning::reconcilers::{
+    image_build::{attribute_recipe_failure, image_build_retry_backoff, registry_build_cache},
+    DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ImageBuildMaterials, ImageBuildReconciler,
+};
 use flotilla_resources::{
     image_identity, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentSpec, FleetDesignation,
     FleetDesignationSpec, Host, HostImageAction, HostSpec, HostStatus, ImageBuild, ImageBuildCapacity, ImageBuildFailure,

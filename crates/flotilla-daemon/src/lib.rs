@@ -9,7 +9,6 @@ mod charter_delegation;
 pub mod cli;
 mod dispatch_reconciler;
 pub mod dummy_fleet;
-mod environment_orphans;
 mod environment_tools;
 mod event_relay;
 mod fulfilment_probe;
@@ -26,8 +25,6 @@ mod stdlib_image_layers;
 pub mod supervisor;
 
 pub(crate) const DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH: &str = "run/socket-path";
-
-mod image_inventory;
 
 pub use flotilla_credentials::validate_frozen_vessel_skills;
 
