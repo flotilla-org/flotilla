@@ -7,7 +7,7 @@ use flotilla_config::ConfigStore;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 
-use flotilla_tui::cli::args::{ArtifactSubCommand, Cli, CliPaths, ResourceSubCommand, ResourceWatchArgs};
+use flotilla_cli::cli::args::{ArtifactSubCommand, Cli, CliPaths, ResourceSubCommand, ResourceWatchArgs};
 
 use super::attach::{run_attach_plan, stamp_pane_identity};
 use super::daemon::{connect_cli_socket, connect_daemon, host_daemon_socket_required, reset_sigpipe};
@@ -122,7 +122,7 @@ pub(crate) async fn run_control_command(cli: &Cli, mut command: Command, format:
     if let Err(message) = resolve_command_repositories(&*daemon, &mut command).await {
         exit_command_error(message, format);
     }
-    let result = match flotilla_tui::cli::run_command(&*daemon, command, format).await {
+    let result = match flotilla_cli::cli::run_command(&*daemon, command, format).await {
         Ok(result) => result,
         Err(message) => exit_command_error(message, format),
     };
@@ -604,7 +604,7 @@ pub(crate) async fn dispatch(resolved: flotilla_commands::Resolved, cli: &Cli, f
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotilla_tui::cli::args::SubCommand;
+    use flotilla_cli::cli::args::SubCommand;
 
     use clap::Parser;
     #[cfg(unix)]

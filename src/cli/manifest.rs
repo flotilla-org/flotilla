@@ -3,7 +3,7 @@ use std::sync::Arc;
 use color_eyre::Result;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 
-use flotilla_tui::cli::args::{Cli, EnsureSubCommand, ManifestSubCommand, ResourceManifestResolutionArgs};
+use flotilla_cli::cli::args::{Cli, EnsureSubCommand, ManifestSubCommand, ResourceManifestResolutionArgs};
 
 use super::daemon::{cli_surface_from, connect_daemon, reset_sigpipe};
 use super::resource::run_control_command;
@@ -151,7 +151,7 @@ pub(crate) async fn run_ensure_command(cli: &Cli, command: EnsureSubCommand, for
     let total = names.len();
     let mut errors = Vec::new();
     for name in names {
-        let result = flotilla_tui::cli::run_command(
+        let result = flotilla_cli::cli::run_command(
             &*daemon,
             Command {
                 node_id: node_id.clone(),

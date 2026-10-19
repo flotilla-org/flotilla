@@ -28,8 +28,8 @@ check "plain core change runs neither" pull_request false "crates/flotilla-core/
 check "client change runs Windows" pull_request false "crates/flotilla-client/src/lib.rs" "" "windows=true macos=false quint=false "
 check "CLI definition change runs Windows" pull_request false "crates/flotilla-commands/src/commands/convoy.rs" "" "windows=true macos=false quint=false "
 # Connector viewer-locality changes must run the Windows-client tests.
-check "connector locality runs Windows" pull_request false "crates/flotilla-tui/src/pm_connect.rs" "" "windows=true macos=false quint=false "
-check "connector tests run Windows" pull_request false "crates/flotilla-tui/src/pm_connect/tests.rs" "" "windows=true macos=false quint=false "
+check "connector locality runs Windows" pull_request false "crates/flotilla-cli/src/pm_connect.rs" "" "windows=true macos=false quint=false "
+check "connector tests run Windows" pull_request false "crates/flotilla-cli/src/pm_connect/tests.rs" "" "windows=true macos=false quint=false "
 check "transport change runs both" merge_group false "crates/flotilla-transport/src/message.rs" "" "windows=true macos=true quint=false "
 check "caller change runs macOS" pull_request false "crates/flotilla-daemon/src/server/caller.rs" "" "windows=false macos=true quint=false "
 # The compiler pin and its assertion are shared platform-job inputs.

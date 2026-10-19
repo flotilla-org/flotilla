@@ -5,22 +5,31 @@ use std::{
 };
 
 use color_eyre::Result;
+use flotilla_client::{DaemonEndpoint, SshEndpoint};
+#[cfg(feature = "tui")]
 use flotilla_config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
+#[cfg(feature = "tui")]
 use flotilla_paths::path_context::DaemonHostPath;
+#[cfg(feature = "tui")]
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_protocol::{commands::CommandValue, Command, CommandAction, ProjectListResponse, RepoIdentity, RepoInfo, ViewAddress};
+use flotilla_protocol::ViewAddress;
+#[cfg(feature = "tui")]
+use flotilla_protocol::{commands::CommandValue, Command, CommandAction};
+#[cfg(any(feature = "tui", test))]
+use flotilla_protocol::{ProjectListResponse, RepoIdentity, RepoInfo};
+#[cfg(feature = "tui")]
 use flotilla_provider_runtime::ProcessCommandRunner;
-use flotilla_tui::{
-    app, event_log,
-    socket::{DaemonEndpoint, SshEndpoint},
-    theme,
-};
+#[cfg(feature = "tui")]
+use flotilla_tui::{app, event_log, theme};
+#[cfg(feature = "tui")]
 use flotilla_vcs::providers::git::GitVcs;
+#[cfg(feature = "tui")]
 use flotilla_vcs::providers::VcsInspection;
+#[cfg(feature = "tui")]
 use tracing::info;
 
-use flotilla_tui::cli::args::{Cli, CliPaths, DevModeSubCommand};
+use flotilla_cli::cli::args::{Cli, CliPaths, DevModeSubCommand};
 
 pub(super) fn host_daemon_socket_required(contained_marker: Option<&std::ffi::OsStr>) -> bool {
     contained_marker.is_some()
@@ -32,11 +41,11 @@ pub(super) async fn connect_cli_socket(
     config_dir: &Path,
     state_dir: &Path,
     require_host_daemon: bool,
-) -> Result<Arc<flotilla_tui::socket::SocketDaemon>, String> {
+) -> Result<Arc<flotilla_client::SocketDaemon>, String> {
     let surface =
         cli_surface_from(std::env::var("FLOTILLA_CREW_ROLE").ok().as_deref(), std::env::var("FLOTILLA_NAMESPACE").ok().as_deref());
     let endpoint = remote.cloned().map(DaemonEndpoint::Ssh).unwrap_or_else(|| DaemonEndpoint::Local(socket_path.to_path_buf()));
-    flotilla_tui::socket::connect_endpoint_or_spawn_with_surface(&endpoint, config_dir, state_dir, require_host_daemon, surface).await
+    flotilla_client::connect_endpoint_or_spawn_with_surface(&endpoint, config_dir, state_dir, require_host_daemon, surface).await
 }
 
 pub(super) fn cli_surface_from(crew_role: Option<&str>, namespace: Option<&str>) -> flotilla_protocol::SurfaceDeclaration {
@@ -48,6 +57,7 @@ pub(super) fn cli_surface_from(crew_role: Option<&str>, namespace: Option<&str>)
     flotilla_protocol::SurfaceDeclaration { principal_ref, character: flotilla_protocol::SurfaceCharacter::Focal }
 }
 
+#[cfg(any(feature = "tui", test))]
 fn select_startup_repo_roots(cli_roots: &[PathBuf], cwd_repo_root: Option<PathBuf>) -> Vec<PathBuf> {
     if cli_roots.is_empty() {
         cwd_repo_root.into_iter().collect()
@@ -63,6 +73,7 @@ fn select_startup_repo_roots(cli_roots: &[PathBuf], cwd_repo_root: Option<PathBu
     }
 }
 
+#[cfg(feature = "tui")]
 async fn startup_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
     let cwd_repo_root = if cli_roots.is_empty() {
         let cwd = std::env::current_dir().ok().map(ExecutionEnvironmentPath::new);
@@ -77,6 +88,7 @@ async fn startup_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
     select_startup_repo_roots(cli_roots, cwd_repo_root)
 }
 
+#[cfg(any(feature = "tui", test))]
 fn default_project_landing(
     repos: &[RepoInfo],
     startup_repo_roots: &[PathBuf],
@@ -101,6 +113,7 @@ fn default_project_landing(
 
 /// Run the TUI. With `scoped_view`, run in scoped mode: exactly that View,
 /// no tab shell, no open-view persistence.
+#[cfg(feature = "tui")]
 pub(crate) async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) -> Result<()> {
     let paths = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
     let resolved_state_dir = DaemonHostPath::new(paths.state_dir);
@@ -142,7 +155,7 @@ pub(crate) async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::Vie
     flotilla_tui::terminal::install_sigterm_handler();
     let daemon = match daemon_task.await {
         Ok(Ok(daemon)) => {
-            std::env::remove_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV);
+            std::env::remove_var(flotilla_client::reconnect::REEXEC_BUILD_ENV);
             info!(elapsed = ?startup.elapsed(), "daemon ready");
             daemon
         }
@@ -202,12 +215,12 @@ pub(crate) async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::Vie
         }
 
         terminal = ratatui::init();
-        let connected = match flotilla_tui::socket::reconnect::connect_with_retry(
+        let connected = match flotilla_client::reconnect::connect_with_retry(
             || connect_cli_socket(remote.as_ref(), &socket_path, &resolved_config_dir, resolved_state_dir.as_path(), require_host_daemon),
             |notice| {
                 let (attempt, detail) = match notice {
-                    flotilla_tui::socket::reconnect::ReconnectNotice::Attempt { attempt } => (attempt, None),
-                    flotilla_tui::socket::reconnect::ReconnectNotice::Retry { attempt, error, delay } => {
+                    flotilla_client::reconnect::ReconnectNotice::Attempt { attempt } => (attempt, None),
+                    flotilla_client::reconnect::ReconnectNotice::Retry { attempt, error, delay } => {
                         (attempt, Some(format!("{error} — retrying in {:.1}s", delay.as_secs_f64())))
                     }
                 };
@@ -233,8 +246,10 @@ pub(crate) async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::Vie
     }
 }
 
+#[cfg(feature = "tui")]
 const TUI_HANDOFF_ENV: &str = "FLOTILLA_TUI_HANDOFF";
 
+#[cfg(feature = "tui")]
 fn persist_tui_handoff(app: &app::App, state_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
     let path = state_dir.join(format!("tui-handoff-{}-{}.json", std::process::id(), uuid::Uuid::new_v4()));
@@ -243,6 +258,7 @@ fn persist_tui_handoff(app: &app::App, state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "tui")]
 fn restore_tui_handoff(app: &mut app::App) {
     let Some(path) = std::env::var_os(TUI_HANDOFF_ENV).map(PathBuf::from) else { return };
     std::env::remove_var(TUI_HANDOFF_ENV);
@@ -265,7 +281,7 @@ pub(crate) async fn run_daemon_bridge(cli: &Cli) -> Result<()> {
     cli.require_local_daemon("daemon-bridge")?;
     #[cfg(unix)]
     {
-        flotilla_tui::socket::bridge::bridge_stdio(&cli.socket_path()).await.map_err(|error| color_eyre::eyre::eyre!(error))
+        flotilla_client::bridge::bridge_stdio(&cli.socket_path()).await.map_err(|error| color_eyre::eyre::eyre!(error))
     }
     #[cfg(not(unix))]
     {
@@ -299,10 +315,10 @@ pub(crate) async fn run_daemon_stop(cli: &Cli) -> Result<()> {
     cli.require_local_daemon("daemon stop")?;
     let socket_path = cli.socket_path();
     let paths = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
-    let outcome = flotilla_tui::socket::shutdown_existing_or_absent(&socket_path, &paths.state_dir)
+    let outcome = flotilla_client::shutdown_existing_or_absent(&socket_path, &paths.state_dir)
         .await
         .map_err(|error| color_eyre::eyre::eyre!("could not stop daemon at {}: {error}", socket_path.display()))?;
-    if outcome == flotilla_tui::socket::ShutdownOutcome::NotRunning {
+    if outcome == flotilla_client::ShutdownOutcome::NotRunning {
         println!("Daemon is not running.");
         return Ok(());
     }
@@ -330,8 +346,7 @@ pub(crate) async fn run_daemon_dev_mode(cli: &Cli, command: DevModeSubCommand) -
             // resurrect the fleet daemon while we finish unloading the job.
             set_fleet_daemon_enabled(false)?;
             let socket_path = cli.socket_path();
-            let shutdown_error =
-                if socket_path.exists() { flotilla_tui::socket::shutdown_existing(&socket_path).await.err() } else { None };
+            let shutdown_error = if socket_path.exists() { flotilla_client::shutdown_existing(&socket_path).await.err() } else { None };
             stop_fleet_daemon_service()?;
             if socket_path.exists() {
                 wait_for_socket_removal(&socket_path).await?;
@@ -354,18 +369,18 @@ pub(crate) async fn run_daemon_dev_mode(cli: &Cli, command: DevModeSubCommand) -
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(unused_variables))]
 fn set_fleet_daemon_enabled(enabled: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
-    return flotilla_tui::socket::launchd::set_agent_enabled(enabled).map_err(|error| color_eyre::eyre::eyre!(error));
+    return flotilla_client::launchd::set_agent_enabled(enabled).map_err(|error| color_eyre::eyre::eyre!(error));
     #[cfg(target_os = "linux")]
-    return flotilla_tui::socket::systemd::set_unit_enabled(enabled).map_err(|error| color_eyre::eyre::eyre!(error));
+    return flotilla_client::systemd::set_unit_enabled(enabled).map_err(|error| color_eyre::eyre::eyre!(error));
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     Err(color_eyre::eyre::eyre!("daemon dev mode is only available on macOS and Linux fleet hosts"))
 }
 
 fn stop_fleet_daemon_service() -> Result<()> {
     #[cfg(target_os = "macos")]
-    return flotilla_tui::socket::launchd::bootout_agent().map_err(|error| color_eyre::eyre::eyre!(error));
+    return flotilla_client::launchd::bootout_agent().map_err(|error| color_eyre::eyre::eyre!(error));
     #[cfg(target_os = "linux")]
-    return flotilla_tui::socket::systemd::stop_unit().map_err(|error| color_eyre::eyre::eyre!(error));
+    return flotilla_client::systemd::stop_unit().map_err(|error| color_eyre::eyre::eyre!(error));
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     Err(color_eyre::eyre::eyre!("daemon dev mode is only available on macOS and Linux fleet hosts"))
 }
@@ -373,11 +388,11 @@ fn stop_fleet_daemon_service() -> Result<()> {
 fn start_fleet_daemon_service() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        flotilla_tui::socket::launchd::bootstrap_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
-        flotilla_tui::socket::launchd::kickstart_agent().map_err(|error| color_eyre::eyre::eyre!(error))
+        flotilla_client::launchd::bootstrap_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
+        flotilla_client::launchd::kickstart_agent().map_err(|error| color_eyre::eyre::eyre!(error))
     }
     #[cfg(target_os = "linux")]
-    return flotilla_tui::socket::systemd::start_unit().map_err(|error| color_eyre::eyre::eyre!(error));
+    return flotilla_client::systemd::start_unit().map_err(|error| color_eyre::eyre::eyre!(error));
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     Err(color_eyre::eyre::eyre!("daemon dev mode is only available on macOS and Linux fleet hosts"))
 }
@@ -429,6 +444,11 @@ pub(super) async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
     .await
     .map_err(|e| color_eyre::eyre::eyre!(e))?;
     Ok(daemon as Arc<dyn DaemonHandle>)
+}
+
+#[cfg(not(feature = "tui"))]
+pub(crate) async fn run_tui(_cli: Cli, _scoped_view: Option<ViewAddress>) -> Result<()> {
+    Err(color_eyre::eyre::eyre!("this binary was built without the TUI; use an operator build with the tui feature"))
 }
 
 #[cfg(test)]
@@ -530,7 +550,9 @@ mod tests {
     fn fresh_unadopted_cwd_lands_on_the_global_convoy_view() {
         let landing = default_project_landing(&[], &[PathBuf::from("/unadopted")], &ProjectListResponse { projects: vec![] });
         assert_eq!(landing, None);
+        #[cfg(feature = "tui")]
         let views = flotilla_tui::app::open_views::OpenViews::seed_with_landing(landing);
+        #[cfg(feature = "tui")]
         assert_eq!(views.active_address(), Some(&ViewAddress::Convoys { namespace: "flotilla".into(), scope: None }));
     }
 

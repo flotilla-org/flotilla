@@ -8,7 +8,7 @@ use color_eyre::Result;
 use flotilla_client::endpoint::{remote_daemon_from, DaemonEndpoint, SshEndpoint};
 use flotilla_paths::path_policy::{daemon_socket_path, PathPolicy};
 
-/// Flotilla: TUI dashboard for managing development workspaces
+/// Flotilla: development workspaces, fleet operations and vessel tools
 #[derive(Parser)]
 #[command(name = "flotilla", version)]
 pub struct Cli {
@@ -63,6 +63,11 @@ pub struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand)]
 pub enum SubCommand {
+    /// Run the resident vessel agent (skeleton; no listeners yet).
+    ///
+    /// Requires FLOTILLA_ENVIRONMENT_ID and an absolute FLOTILLA_DAEMON_SOCKET.
+    /// Logs to stderr; RUST_LOG controls filtering (default: info).
+    VesselAgent,
     /// Run the daemon server
     Daemon(DaemonArgs),
     /// Open the TUI scoped to one View (e.g. `flotilla view convoys/flotilla`).
@@ -908,6 +913,17 @@ pub fn attach_mode(watch: bool, strict: bool, take: bool) -> flotilla_protocol::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Glue: the ADR 0069 entry point must parse and render help before reading config.
+    #[test]
+    fn vessel_agent_parses_and_explains_its_environment() {
+        assert!(matches!(Cli::try_parse_from(["flotilla", "vessel-agent"]).expect("agent command").command, Some(SubCommand::VesselAgent)));
+        let help = Cli::try_parse_from(["flotilla", "vessel-agent", "--help"]).err().expect("help exit");
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let text = help.to_string();
+        assert!(text.contains("FLOTILLA_ENVIRONMENT_ID"));
+        assert!(text.contains("FLOTILLA_DAEMON_SOCKET"));
+    }
     use clap::{CommandFactory, Parser};
 
     use std::path::{Path, PathBuf};

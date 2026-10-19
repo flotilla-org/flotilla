@@ -55,6 +55,15 @@ C_BUILD_PACKAGES = frozenset({
 })
 
 
+# ADR 0069: the vessel CLI must not select dashboard/renderer packages.
+VESSEL_UI_PACKAGES = frozenset({"flotilla-tui", "ratatui", "ratatui-core", "ratatui-widgets", "tui-input", "catppuccin", "crokey"})
+
+
+def vessel_graph_violations(tree):
+    names = {package.split()[0] for package in tree}
+    return [f"vessel CLI: must not depend on {name}" for name in sorted(names & VESSEL_UI_PACKAGES)]
+
+
 def c_free_violations(name, tree):
     if name not in C_FREE_BASE:
         return []
@@ -141,6 +150,12 @@ def violations(metadata):
                 reached.add(node)
                 pending.extend(production[node])
         return reached - {start}
+
+    # The resident agent owns startup and transports, never host orchestration.
+    if "flotilla-vessel-agent" in packages:
+        for target in sorted(reached_from("flotilla-vessel-agent")):
+            if not target.startswith("flotilla-build-features"):
+                errors.append(f"flotilla-vessel-agent: must not depend on {target}; the agent has no host runtime dependencies")
 
     # The schema crates stay a self-contained stack: anything they reach, directly or through an
     # allowed crate, must itself be allowed. Upward schema edges are refused the same way.
@@ -231,6 +246,8 @@ def main(arguments=()):
     metadata = json.loads(cargo("metadata", "--no-deps", "--locked", "--format-version", "1"))
     errors = violations(metadata)
     tree_arguments = ("tree", "--locked", "--prefix", "none", "--format", "{p}|{f}")
+    vessel = tree_features(cargo(*tree_arguments, "-p", "flotilla", "--no-default-features", "--edges", "normal,build", *target_arguments))
+    errors.extend(vessel_graph_violations(vessel))
     members = [package for package in metadata["packages"] if package["id"] in metadata["workspace_members"]]
     # Resolver 2 unifies dependency features within a command. Compare to
     # the union of consumers in the same layer, not the unrelated native stack.
@@ -262,7 +279,7 @@ def main(arguments=()):
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print(f"Workspace build graph ({options.target or 'host'}): C-free Windows base; production excludes testkits and test-util; layer-local build/test features reusable")
+    print(f"Workspace build graph ({options.target or 'host'}): C-free Windows base; production excludes testkits and test-util; layer-local build/test features reusable; vessel CLI excludes TUI")
     return 0
 
 

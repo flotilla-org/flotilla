@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from check import (CAPABILITY_CRATES, C_FREE_BASE, RESOURCE_EXEMPTIONS, SCHEMA_CRATES, STATE_MACHINES, c_free_violations,
-                   feature_differences, is_testkit, layer, main, tree_features, violations)
+                   vessel_graph_violations, feature_differences, is_testkit, layer, main, tree_features, violations)
 
 
 # Explicit finite generator: the eight names are fixed by the amended contract,
@@ -31,6 +31,23 @@ def graph(*packages):
 
 
 class BuildGraphContract(unittest.TestCase):
+    def test_vessel_cli_excludes_dashboard_dependencies(self):
+        # ADR 0069: finite generator covers every renderer entry point, even transitively.
+        for dependency in ("flotilla-tui", "ratatui", "ratatui-core", "ratatui-widgets", "tui-input", "catppuccin", "crokey"):
+            with self.subTest(dependency=dependency):
+                self.assertEqual(vessel_graph_violations({f"{dependency} v1.0": set()}),
+                                 [f"vessel CLI: must not depend on {dependency}"])
+        self.assertEqual(vessel_graph_violations({"flotilla-cli v0.1": set(), "flotilla-vessel-agent v0.1": set()}), [])
+
+    def test_vessel_agent_excludes_host_runtime_transitively(self):
+        # ADR 0069: allow narrow runtime crates, refuse every kind of workspace dependency.
+        for dependency in ("flotilla-store", "flotilla-controllers", "flotilla-core", "flotilla-vcs", "flotilla-tui"):
+            with self.subTest(dependency=dependency):
+                errors = violations(graph(package("flotilla-vessel-agent", normal=("indirect",)),
+                                          package("indirect", normal=(dependency,)), package(dependency)))
+                self.assertIn(f"flotilla-vessel-agent: must not depend on {dependency}; the agent has no host runtime dependencies", errors)
+        self.assertEqual(violations(graph(package("flotilla-vessel-agent"))), [])
+
     def test_state_machines_are_c_free_and_self_contained(self):
         # ADR 0064 / #3319: the engine is base-tier and may be a dev-dependency of anything.
         self.assertEqual(STATE_MACHINES, "flotilla-state-machines")

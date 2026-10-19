@@ -5,7 +5,7 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{commands::CommandValue, Command, CommandAction, EnvironmentId, HostName, RepoSelector};
 use tracing::info;
 
-use flotilla_tui::cli::args::Cli;
+use flotilla_cli::cli::args::Cli;
 
 use super::daemon::connect_daemon;
 
@@ -265,7 +265,7 @@ pub(super) fn inject_repo_context(cmd: &mut Command, cli: &Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotilla_tui::cli::args::{DomainCommand, SubCommand};
+    use flotilla_cli::cli::args::{DomainCommand, SubCommand};
 
     use clap::Parser;
     use flotilla_protocol::{

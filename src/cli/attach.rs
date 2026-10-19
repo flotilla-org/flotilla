@@ -1,10 +1,10 @@
-use flotilla_tui::terminal::client_attach_plan;
+use flotilla_cli::terminal::client_attach_plan;
 
 use color_eyre::Result;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction, RepoSelector};
 
-use flotilla_tui::cli::args::Cli;
+use flotilla_cli::cli::args::Cli;
 
 use super::daemon::{connect_daemon, reset_sigpipe};
 use super::targets::{resolve_cli_repository, resolve_optional_cwd_repository, resolve_repo_from_env};
@@ -111,5 +111,5 @@ pub(super) async fn stamp_pane_identity(reference: &str, binding: Option<&flotil
 }
 
 pub(super) fn run_attach_plan(plan: &flotilla_protocol::ResolvedAttachPlan) -> Result<()> {
-    flotilla_tui::terminal::exec_attach_plan(plan).map(|never| match never {}).map_err(color_eyre::eyre::Report::msg)
+    flotilla_cli::terminal::exec_attach_plan(plan).map(|never| match never {}).map_err(color_eyre::eyre::Report::msg)
 }

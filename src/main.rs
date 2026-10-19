@@ -1,16 +1,16 @@
 use std::sync::OnceLock;
 
 use color_eyre::Result;
+use flotilla_cli::cli::args::{
+    attach_mode, AttachArgs, Cli, CompleteArgs, CompletionsArgs, DaemonArgs, DaemonSubCommand, DomainCommand, EventsArgs, FleetSubCommand,
+    HookArgs, LogsArgs, LsArgs, ResourceListArgs, ResourceSubCommand, SubCommand, TopologyArgs, ViewArgs, WaitArgs,
+};
 use flotilla_client::{
     build_id,
     reconnect::{should_reexec_for_incompatible_daemon, REEXEC_BUILD_ENV},
 };
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 use flotilla_provider_runtime::ProcessCommandRunner;
-use flotilla_tui::cli::args::{
-    attach_mode, AttachArgs, Cli, CompleteArgs, CompletionsArgs, DaemonArgs, DaemonSubCommand, DomainCommand, EventsArgs, FleetSubCommand,
-    HookArgs, LogsArgs, LsArgs, ResourceListArgs, ResourceSubCommand, SubCommand, TopologyArgs, ViewArgs, WaitArgs,
-};
 
 mod cli;
 mod fleet_prune;
@@ -63,6 +63,7 @@ fn main() -> Result<()> {
 
 async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat) -> Result<()> {
     match command {
+        Some(SubCommand::VesselAgent) => flotilla_vessel_agent::run().await.map_err(color_eyre::eyre::Report::msg),
         Some(SubCommand::View(ViewArgs { address })) => {
             // Parse before touching the terminal so a bad address in a
             // recipe fails loudly at the shell (ADR 0013).
