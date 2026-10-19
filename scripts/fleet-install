@@ -49,6 +49,8 @@ DARWIN_RECOVERY_GENERATION=""
 CONFIRMATION_PID=""
 CONFIRMATION_LOG=""
 CONFIRMATION_DONE=""
+# Set by --from: a pushed package directory replaces the Forgejo package store.
+SOURCE_DIR=""
 readonly GENERATION_INCOMPLETE_EXIT=20
 
 die() {
@@ -209,17 +211,40 @@ latest_generation() {
   die "Forgejo has no completed $PLATFORM flotilla-fleet generations"
 }
 
+# Copies one file of a generation from the pushed package directory, laid out
+# like the package store (<dir>/<generation>/<file>). A missing manifest means
+# the generation is incomplete, as a 404 does for the store.
+copy_pushed_file() {
+  local generation="$1"
+  local file="$2"
+  local destination="$3"
+  [[ "$file" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid package file name: $file"
+  local source="$SOURCE_DIR/$generation/$file"
+  if [[ "$file" == generation.json && ! -e "$source" && ! -L "$source" ]]; then
+    return "$GENERATION_INCOMPLETE_EXIT"
+  fi
+  [[ -f "$source" && ! -L "$source" ]] || die "pushed package file is missing or not a regular file: $source"
+  cp -- "$source" "$destination"
+}
+
 fetch_generation_manifest() {
   local generation="$1"
   local destination="$2"
   require_generation "$generation"
   local result
-  download_generation_manifest \
-    "$FLEET_PACKAGE_URL/$FLEET_OWNER/generic/$FLEET_PACKAGE/$generation/generation.json" "$destination" \
-    || {
+  if [[ -n "$SOURCE_DIR" ]]; then
+    copy_pushed_file "$generation" generation.json "$destination" || {
       result=$?
       return "$result"
     }
+  else
+    download_generation_manifest \
+      "$FLEET_PACKAGE_URL/$FLEET_OWNER/generic/$FLEET_PACKAGE/$generation/generation.json" "$destination" \
+      || {
+        result=$?
+        return "$result"
+      }
+  fi
   python3 "$GENERATION_VALIDATOR" generation "$destination" "$generation" "$PLATFORM" --installable
 }
 
@@ -956,7 +981,11 @@ install_generation() {
   artifact="$(platform_value "$outer" artifact)"
   expected="$(platform_value "$outer" sha256)"
   expected_size="$(platform_value "$outer" size_bytes)"
-  download "$FLEET_PACKAGE_URL/$FLEET_OWNER/generic/$FLEET_PACKAGE/$generation/$artifact" "$archive"
+  if [[ -n "$SOURCE_DIR" ]]; then
+    copy_pushed_file "$generation" "$artifact" "$archive"
+  else
+    download "$FLEET_PACKAGE_URL/$FLEET_OWNER/generic/$FLEET_PACKAGE/$generation/$artifact" "$archive"
+  fi
   actual="$(sha256_file "$archive")"
   actual_size="$(file_size "$archive")"
   [[ "$actual_size" == "$expected_size" ]] \
@@ -1043,20 +1072,32 @@ host_preflight() {
 }
 
 usage() {
-  echo 'usage: fleet-install [--min-free-bytes N] [--max-wait-seconds N] [--skip-canary] <latest|generation> | --canary <generation> | status | rollback | --prune-dry-run | --prune' >&2
+  echo 'usage: fleet-install [--min-free-bytes N] [--max-wait-seconds N] [--from DIR] [--skip-canary] <latest|generation> | --canary <generation> | status | rollback | --prune-dry-run | --prune' >&2
   echo 'defaults: --min-free-bytes 5368709120 (5 GiB); --max-wait-seconds 600; ordinary confirmation 90 seconds' >&2
+  echo '--from DIR installs a named generation from a pushed package directory (DIR/<generation>/generation.json and archive) instead of Forgejo; no package token is read' >&2
   exit 2
 }
 
 main() {
-  while [[ "${1:-}" == --min-free-bytes || "${1:-}" == --max-wait-seconds ]]; do
+  while [[ "${1:-}" == --min-free-bytes || "${1:-}" == --max-wait-seconds || "${1:-}" == --from ]]; do
     [[ $# -ge 2 ]] || usage
     case "$1" in
       --min-free-bytes) MIN_FREE_BYTES="$2" ;;
       --max-wait-seconds) MAX_WAIT_SECONDS="$2" ;;
+      --from) SOURCE_DIR="$2" ;;
     esac
     shift 2
   done
+  if [[ -n "$SOURCE_DIR" ]]; then
+    [[ -d "$SOURCE_DIR" && ! -L "$SOURCE_DIR" ]] || die "pushed package directory is missing or not a directory: $SOURCE_DIR"
+    # Only a named generation can come from a pushed directory: there is no
+    # package listing to select `latest` from, and the other commands never fetch.
+    local operand="${*: -1}"
+    case "$operand" in
+      ''|latest|status|rollback|--prune|--prune-dry-run|-h|--help|__*) die "--from installs a named generation only" ;;
+    esac
+    [[ "${1:-}" != --canary ]] || die '--from cannot stage a canary; gate the generation before pushing it'
+  fi
   [[ "$MIN_FREE_BYTES" =~ ^[0-9]{1,15}$ ]] || die 'minimum free bytes must be a non-negative integer (at most 15 digits)'
   [[ "$MAX_WAIT_SECONDS" =~ ^[0-9]{1,8}$ ]] || die 'maximum wait seconds must be a non-negative integer (at most 8 digits)'
   [[ "$CONFIRM_TIMEOUT_SECONDS" =~ ^[0-9]{1,8}$ ]] || die 'confirmation timeout must be a non-negative integer (at most 8 digits)'
@@ -1075,6 +1116,21 @@ main() {
     CANARY_ONLY=1
     PLATFORM="$(host_platform)"
     install_generation "$2"
+    return
+  fi
+  if [[ "${1:-}" == __gate ]]; then
+    # fleet-push gates a generation once, from the lab, before pushing it to
+    # hosts that cannot reach feta; those hosts then install with --skip-canary.
+    [[ $# -eq 2 ]] || usage
+    require_generation "$2"
+    require_generation_validator
+    PLATFORM="$(host_platform)"
+    if [[ "$(hostname -s)" == feta ]]; then
+      CANARY_ONLY=1
+      install_generation "$2"
+    else
+      run_generation_canary "$2"
+    fi
     return
   fi
   if [[ "${1:-}" == __validate_fixture ]]; then

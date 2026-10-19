@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# fleet-push: install a fleet generation on hosts that cannot reach the lab Forgejo.
+#
+#   fleet-push [--skip-canary] <generation> <ssh-host>...
+#
+# Run from a lab machine with a package-read token. It downloads the generation
+# once, verifies it, gates it with the feta canary (unless --skip-canary), then
+# for each host in turn copies the manifest and that host's archive into
+# ~/.local/opt/flotilla-fleet/incoming/<generation>/ and runs this checkout's
+# fleet-install with --from there. The pushed hosts never hold a package token.
+# Hosts are updated one at a time; the first failure stops the push.
+set -euo pipefail
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly INSTALLER="$SCRIPT_DIR/fleet-install"
+readonly VALIDATOR="${FLEET_GENERATION_VALIDATOR:-$SCRIPT_DIR/../ci/fleet-candidates/generation_validation.py}"
+readonly OWNER="${FLEET_INSTALL_OWNER:-lab}"
+readonly PACKAGE="${FLEET_INSTALL_PACKAGE:-flotilla-fleet}"
+readonly PACKAGE_URL="${FLEET_INSTALL_PACKAGE_URL:-https://forgejo.lab.flotilla.work/api/packages}"
+readonly TOKEN_FILE="${FLEET_INSTALL_TOKEN_FILE:-$HOME/.config/flotilla/fleet-reader-token}"
+readonly SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15)
+# Remote paths are relative to the remote home.
+readonly REMOTE_INCOMING=".local/opt/flotilla-fleet/incoming"
+
+die() {
+  printf 'fleet-push: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  echo 'usage: fleet-push [--skip-canary] <generation> <ssh-host>...' >&2
+  exit 2
+}
+
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fleet-push.XXXXXX")"
+trap 'rm -rf -- "$WORK_DIR"' EXIT
+
+skip_canary=0
+if [[ "${1:-}" == --skip-canary ]]; then
+  skip_canary=1
+  shift
+fi
+[[ $# -ge 2 ]] || usage
+generation="$1"
+shift
+[[ "$generation" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || die "invalid generation id: $generation"
+[[ -f "$VALIDATOR" ]] || die "generation validator is missing: $VALIDATOR"
+[[ -f "$TOKEN_FILE" && ! -L "$TOKEN_FILE" ]] || die "package token is missing: $TOKEN_FILE"
+
+auth_header="$WORK_DIR/authorization.header"
+(umask 077 && printf 'Authorization: token %s\n' "$(<"$TOKEN_FILE")" >"$auth_header")
+
+fetch() {
+  # Never forward the package credential through an HTTP redirect.
+  curl --fail --silent --show-error --header "@$auth_header" --output "$2" \
+    "$PACKAGE_URL/$OWNER/generic/$PACKAGE/$generation/$1"
+}
+
+remote_platform() {
+  local uname
+  uname="$("${SSH[@]}" "$1" 'uname -sm')" || die "cannot reach $1"
+  case "$uname" in
+    'Linux x86_64') printf 'linux-x86_64-gnu2.36\n' ;;
+    'Darwin arm64') printf 'darwin-aarch64\n' ;;
+    *) die "$1 has an unsupported platform: $uname" ;;
+  esac
+}
+
+# Resolve every host's platform before downloading anything.
+declare -a hosts=("$@") platforms=()
+for host in "${hosts[@]}"; do
+  platforms+=("$(remote_platform "$host")")
+done
+
+staged="$WORK_DIR/$generation"
+mkdir -p "$staged"
+fetch generation.json "$staged/generation.json" || die "could not download the manifest for $generation"
+
+declare -A artifact_for=()
+for platform in $(printf '%s\n' "${platforms[@]}" | sort -u); do
+  python3 "$VALIDATOR" generation "$staged/generation.json" "$generation" "$platform" --installable \
+    || die "generation $generation is not installable on $platform"
+  artifact="$(python3 "$VALIDATOR" platform-value -- "$staged/generation.json" "$platform" artifact)"
+  [[ "$artifact" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid artifact name for $platform: $artifact"
+  fetch "$artifact" "$staged/$artifact" || die "could not download $artifact"
+  [[ "$(python3 "$VALIDATOR" size -- "$staged/$artifact")" == \
+     "$(python3 "$VALIDATOR" platform-value -- "$staged/generation.json" "$platform" size_bytes)" ]] \
+    || die "size mismatch for $artifact"
+  [[ "$(python3 "$VALIDATOR" sha256 -- "$staged/$artifact")" == \
+     "$(python3 "$VALIDATOR" platform-value -- "$staged/generation.json" "$platform" sha256)" ]] \
+    || die "digest mismatch for $artifact"
+  artifact_for[$platform]="$artifact"
+done
+
+if ((skip_canary)); then
+  printf 'fleet-push: WARNING canary explicitly skipped for %s\n' "$generation" >&2
+else
+  FLEET_GENERATION_VALIDATOR="$VALIDATOR" bash "$INSTALLER" __gate "$generation" \
+    || die "canary failed for $generation; nothing was pushed"
+fi
+
+# The installer and validator travel with each push, so a host whose installed
+# fleet-install predates --from can still take this generation.
+cp "$INSTALLER" "$WORK_DIR/install.sh"
+cp "$VALIDATOR" "$WORK_DIR/generation_validation.py"
+
+for index in "${!hosts[@]}"; do
+  host="${hosts[$index]}"
+  artifact="${artifact_for[${platforms[$index]}]}"
+  printf 'fleet-push: %s <- %s (%s)\n' "$host" "$generation" "$artifact"
+  "${SSH[@]}" "$host" "mkdir -p $REMOTE_INCOMING/$generation" || die "cannot prepare $host"
+  tar -C "$WORK_DIR" -cf - "$generation/generation.json" "$generation/$artifact" install.sh generation_validation.py |
+    "${SSH[@]}" -T "$host" "set -eu
+      staging=\$(mktemp -d /tmp/fleet-push.XXXXXX)
+      trap 'rm -rf -- \"\$staging\"; rm -rf -- \"\$HOME/$REMOTE_INCOMING/$generation\"' EXIT
+      tar -xf - -C \"\$staging\"
+      mv \"\$staging/$generation/generation.json\" \"\$staging/$generation/$artifact\" \"\$HOME/$REMOTE_INCOMING/$generation/\"
+      bash \"\$staging/install.sh\" --from \"\$HOME/$REMOTE_INCOMING\" --skip-canary $generation" \
+    || die "install failed on $host; later hosts were not touched"
+done
+printf 'fleet-push: %s installed on %s\n' "$generation" "${hosts[*]}"

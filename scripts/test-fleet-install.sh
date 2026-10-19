@@ -1025,6 +1025,128 @@ grep -Fq -- '--keep-others 0' "$prune_log" || fail 'prune lost retention argumen
 grep -Fq -- '--keep-others 9 --dry-run' "$prune_log" || fail 'dry-run lost arguments'
 grep -Fq '/current/bin/flotilla|' "$prune_log" || fail 'prune did not use active binary'
 
+# --from installs a named generation from a pushed package directory laid out
+# like the store. It reads no package token and never calls curl.
+pushed_home="$test_root/pushed-home"
+pushed_bin="$test_root/pushed-bin"
+mkdir -p "$pushed_home/.config" "$pushed_bin"
+cat >"$pushed_bin/curl" <<SH
+#!/usr/bin/env bash
+printf 'curl %s\n' "\$*" >>"$test_root/pushed-curl.log"
+exit 7
+SH
+chmod 0755 "$pushed_bin/curl"
+run_pushed_installer() {
+  HOME="$pushed_home" XDG_CONFIG_HOME="$pushed_home/.config" \
+    PATH="$pushed_home/.local/bin:$pushed_bin:$fake_bin:$PATH" SHELL="$fake_bin/zsh" \
+    LOGIN_SHELL_PATH="$pushed_home/.local/bin:$fake_bin:/usr/bin:/bin" \
+    SYSTEMCTL_LOG="$test_root/pushed-systemctl.log" LOGINCTL_LOG="$test_root/pushed-loginctl.log" \
+    FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
+    FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
+    FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=30 \
+    "$installer" "$@"
+}
+for operand in latest status rollback --prune; do
+  if run_pushed_installer --from "$fixture_root" "$operand" >"$test_root/pushed-refused.out" 2>&1; then
+    fail "--from accepted $operand"
+  fi
+  grep -Fq -- '--from installs a named generation only' "$test_root/pushed-refused.out" \
+    || fail "--from refusal of $operand was unclear"
+done
+if run_pushed_installer --from "$test_root/no-such-dir" "$generation_one" >"$test_root/pushed-missing-dir.out" 2>&1; then
+  fail '--from accepted a missing directory'
+fi
+grep -Fq 'pushed package directory is missing' "$test_root/pushed-missing-dir.out" || fail 'missing --from directory was unclear'
+if run_pushed_installer --from "$fixture_root" "$generation_incomplete" >"$test_root/pushed-incomplete.out" 2>&1; then
+  fail '--from installed a generation without a pushed manifest'
+fi
+grep -Fq "generation $generation_incomplete is not complete" "$test_root/pushed-incomplete.out" \
+  || fail '--from did not treat a missing manifest as incomplete'
+run_pushed_installer --from "$fixture_root" "$generation_one" >"$test_root/pushed-install.out"
+test "$(link_generation "$pushed_home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
+  || fail '--from did not select the pushed generation'
+test ! -e "$pushed_home/.config/flotilla/fleet-reader-token" || fail '--from test home unexpectedly had a token'
+test ! -e "$test_root/pushed-curl.log" || fail '--from called curl'
+# A pushed archive must match the manifest, exactly as a downloaded one.
+pushed_corrupt="$test_root/pushed-corrupt"
+mkdir -p "$pushed_corrupt"
+cp -R "$fixture_root/$generation_two" "$pushed_corrupt/"
+for archive in "$pushed_corrupt/$generation_two"/*.tar.gz; do printf 'tampered' >>"$archive"; done
+if run_pushed_installer --from "$pushed_corrupt" "$generation_two" >"$test_root/pushed-corrupt.out" 2>&1; then
+  fail '--from installed a tampered archive'
+fi
+grep -Eq "archive (size|digest) mismatch for $generation_two" "$test_root/pushed-corrupt.out" \
+  || fail '--from did not verify the pushed archive'
+test "$(link_generation "$pushed_home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
+  || fail 'a tampered pushed archive switched current'
+
+# fleet-push downloads once with the lab token, then installs each host over
+# ssh with --from. The ssh double runs the remote command in a per-host home.
+push_bin="$test_root/push-bin"
+push_hosts="$test_root/push-hosts"
+mkdir -p "$push_bin" "$push_hosts/box-a/.config" "$push_hosts/box-b/.config"
+cat >"$push_bin/curl" <<SH
+#!/usr/bin/env bash
+output='' url='' header=''
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --output) output="\$2"; shift 2 ;;
+    --header) header="\$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="\$1"; shift ;;
+  esac
+done
+grep -Fqx 'Authorization: token test-token' "\${header#@}" || exit 22
+printf '%s\n' "\$url" >>"$test_root/push-curl.log"
+source="$fixture_root/\${url#https://test.invalid/api/packages/lab/generic/flotilla-fleet/}"
+[[ -f "\$source" ]] || exit 22
+cp "\$source" "\$output"
+SH
+cat >"$push_bin/ssh" <<SH
+#!/usr/bin/env bash
+while [[ "\$1" == -* ]]; do [[ "\$1" == -o ]] && shift; shift; done
+host="\$1"
+shift
+printf '%s\n' "\$host" >>"$test_root/push-ssh.log"
+[[ "\$host" != feta ]] || exit "\${PUSH_FETA_EXIT:-0}"
+[[ "\$*" != 'uname -sm' ]] || { echo 'Linux x86_64'; exit; }
+home="$push_hosts/\$host"
+cd "\$home"
+HOME="\$home" XDG_CONFIG_HOME="\$home/.config" \
+  PATH="\$home/.local/bin:$pushed_bin:$fake_bin:\$PATH" SHELL="$fake_bin/zsh" \
+  LOGIN_SHELL_PATH="\$home/.local/bin:$fake_bin:/usr/bin:/bin" \
+  SYSTEMCTL_LOG="$test_root/push-systemctl.log" LOGINCTL_LOG="$test_root/push-loginctl.log" \
+  FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
+  FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
+  FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=30 \
+  bash -c "\$*"
+SH
+chmod 0755 "$push_bin/curl" "$push_bin/ssh"
+run_push() {
+  HOME="$test_root/home" PATH="$push_bin:$PATH" \
+    FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages "$repo_root/scripts/fleet-push" "$@"
+}
+if PUSH_FETA_EXIT=1 FLEET_INSTALL_SKIP_CANARY=0 run_push "$generation_one" box-a >"$test_root/push-gate.out" 2>&1; then
+  fail 'fleet-push pushed after a failed canary'
+fi
+grep -Fq 'nothing was pushed' "$test_root/push-gate.out" || fail 'fleet-push canary refusal was unclear'
+grep -Fqx feta "$test_root/push-ssh.log" || fail 'fleet-push did not gate on feta'
+test ! -e "$push_hosts/box-a/.local" || fail 'fleet-push touched a host after a failed canary'
+: >"$test_root/push-curl.log"
+run_push --skip-canary "$generation_one" box-a box-b >"$test_root/push.out" 2>&1 \
+  || { cat "$test_root/push.out" >&2; fail 'fleet-push failed'; }
+for host in box-a box-b; do
+  test "$(link_generation "$push_hosts/$host/.local/opt/flotilla-fleet/current")" = "$generation_one" \
+    || fail "fleet-push did not install on $host"
+  test ! -e "$push_hosts/$host/.config/flotilla/fleet-reader-token" || fail "fleet-push left a token on $host"
+  test -z "$(ls -A "$push_hosts/$host/.local/opt/flotilla-fleet/incoming")" \
+    || fail "fleet-push left pushed packages on $host"
+done
+test "$(grep -c 'generation.json$' "$test_root/push-curl.log")" -eq 1 \
+  || fail 'fleet-push should download the manifest once per push'
+test "$(grep -c '\.tar\.gz$' "$test_root/push-curl.log")" -eq 1 \
+  || fail 'fleet-push downloaded the archive more than once for one platform'
+
 # The module unit tests cover Darwin copy policy through its public function.
 "$repo_root/scripts/test-fleet-canary.sh"
 "$repo_root/scripts/test-fleet-validation-retry.sh"
