@@ -22,7 +22,7 @@ use super::project_ops::{repository_transport_url_with_backend, ProjectService};
 
 /// Where one project's layer directory lives, as seen from this host.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum LayerHome {
+pub enum LayerHome {
     /// Read the directory here.
     Source(CharterSource),
     /// Nothing can be read yet (no default branch); leave the layer as it is.
@@ -32,7 +32,7 @@ pub(super) enum LayerHome {
 /// The project's primary (first code) repository's layer directory, at
 /// `branch` or else the repository's default branch. `None`: the project has
 /// no code repository.
-pub(super) async fn primary_layer_home(
+pub async fn primary_layer_home(
     backend: &ResourceBackend,
     namespace: &str,
     project: &ProjectSpec,
@@ -85,7 +85,7 @@ fn bounded_layer_diagnosis(message: String) -> String {
 
 /// Host-local retry state; successful reads and source changes reset refusal backoff.
 #[derive(Default)]
-pub(super) struct LayerRefreshState {
+pub struct LayerRefreshState {
     refusals: BTreeMap<(String, String), LayerRefusal>,
 }
 
@@ -98,7 +98,7 @@ struct LayerRefusal {
 }
 
 impl LayerRefreshState {
-    pub(super) fn conditions(&self) -> Vec<HostCondition> {
+    pub fn conditions(&self) -> Vec<HostCondition> {
         self.refusals
             .iter()
             .map(|((namespace, project), refusal)| {
@@ -141,7 +141,7 @@ impl LayerRefreshState {
 impl ProjectService<'_> {
     /// Sync every project's layer directory this host is responsible for.
     /// Each project's failure is reported and leaves its previous layer.
-    pub(super) async fn reconcile_project_image_layers(&self) -> Result<(), String> {
+    pub async fn reconcile_project_image_layers(&self) -> Result<(), String> {
         let namespace = self.namespace.read().expect("provisioning namespace lock poisoned").clone();
         let local = self
             .resource_backend
@@ -258,6 +258,7 @@ impl ProjectService<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::convoy_admission::ConvoyStartTask;
     use std::{
         path::Path,
         sync::{Arc, Mutex},
@@ -273,7 +274,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        in_process::project_ops::{ProjectOperations, RepositoryIndex},
+        project_ops::{ProjectOperations, RepositoryIndex},
         repository_inspection::{RepositoryInspection, RepositoryInspector},
     };
 
@@ -317,11 +318,47 @@ mod tests {
         async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
             RepositorySpec::remote(remote)
         }
-        async fn resolve_forge_identity(&self, spec: RepositorySpec) -> Result<RepositorySpec, String> {
+        async fn resolve_forge_identity_in(&self, _namespace: &str, spec: RepositorySpec) -> Result<RepositorySpec, String> {
             Ok(spec)
         }
         async fn reap_ensured_convoy(&self, _: &str, _: &str, _: &str, _: bool) -> Result<(), String> {
             Err("unexpected reap".into())
+        }
+
+        async fn inspect_adopted_checkout(
+            &self,
+            _path: &Path,
+            _repository_url: Option<&str>,
+            _git_ref: Option<&str>,
+        ) -> Result<RepositoryInspection, String> {
+            Err("unexpected inspect_adopted_checkout".into())
+        }
+        async fn project_add(
+            &self,
+            _target: &str,
+            _explicit_name: Option<&str>,
+            _explicit_display_name: Option<&str>,
+            _remote: Option<&str>,
+        ) -> Result<String, String> {
+            Err("unexpected project_add".into())
+        }
+        async fn project_refresh(&self, _name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
+            Err("unexpected project_refresh".into())
+        }
+        async fn image_check(
+            &self,
+            _request: &flotilla_protocol::image_check::ImageCheckRequest,
+        ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String> {
+            Err("unexpected image_check".into())
+        }
+        async fn project_register(&self, _target: &str) -> Result<(String, usize), String> {
+            Err("unexpected project_register".into())
+        }
+        async fn roll_convoy_ensure(&self, _namespace: &str, _name: &str) -> Result<String, String> {
+            Err("unexpected roll_convoy_ensure".into())
+        }
+        fn spawn_convoy_start(&self, _task: ConvoyStartTask) -> bool {
+            false
         }
     }
 

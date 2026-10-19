@@ -1,10 +1,15 @@
 use super::super::convoy_admission::HandlerContractFixture;
 use super::*;
+use crate::convoy_admission::ConvoyStartTask;
+use crate::repository_inspection::{RepositoryInspection, RepositoryInspector};
+use async_trait::async_trait;
 use flotilla_daemon_api::action_events::ActionEvents;
 use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_protocol::{ConvoyStartIntent, NodeId};
 use flotilla_protocol_testkit::event_sink::RecordingEventSink;
+use flotilla_resources::RepositorySpec;
 use flotilla_resources::{Convoy, CrewSource, CrewSpec, VesselRequirement, WorkflowTemplateSpec};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // Boundary stand-in: the asynchronous admission worker can be unavailable or
@@ -16,7 +21,7 @@ struct Worker {
     tasks: std::sync::Mutex<Vec<ConvoyStartTask>>,
 }
 #[async_trait]
-impl AdmissionActionPort for Worker {
+impl crate::project_ops::ProjectOperations for Worker {
     // Stand-in for Git inspection I/O; checkout persistence uses real stores.
     async fn inspect_adopted_checkout(
         &self,
@@ -66,6 +71,22 @@ impl AdmissionActionPort for Worker {
         self.tasks.lock().unwrap().push(task);
         true
     }
+
+    fn remember_bootstrap_checkout(&self, _inspection: &RepositoryInspection) -> Result<(), String> {
+        Err("unexpected remember_bootstrap_checkout".into())
+    }
+    async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
+        Err("unexpected repository_inspector".into())
+    }
+    async fn inspect_repository_path(&self, _path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        Err("unexpected inspect_repository_path".into())
+    }
+    async fn resolve_forge_identity_in(&self, _namespace: &str, _spec: RepositorySpec) -> Result<RepositorySpec, String> {
+        Err("unexpected resolve_forge_identity_in".into())
+    }
+    async fn reap_ensured_convoy(&self, _namespace: &str, _ensure_name: &str, _convoy_name: &str, _force: bool) -> Result<(), String> {
+        Err("unexpected reap_ensured_convoy".into())
+    }
 }
 
 fn handlers<'a>(
@@ -79,7 +100,7 @@ fn handlers<'a>(
 ) -> AdmissionActions<'a> {
     AdmissionActions {
         port: worker,
-        convoy_admission: owner,
+        admission: owner,
         resource_backend: backend,
         observed_resource_backend: observed,
         observed_checkout_reconciliation: reconciliation,

@@ -2,11 +2,10 @@
 //!
 //! Handlers use the capability-owned port below; the composition root supplies
 //! orchestration collaborators and shares their existing state.
+use flotilla_daemon_api::action_support::empty_repo_identity;
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use flotilla_protocol::Command;
 use flotilla_protocol::CommandAction;
 use flotilla_protocol::CommandValue;
@@ -18,74 +17,44 @@ use flotilla_resources::ConvoyRepositorySpec;
 use flotilla_resources::InputMeta;
 use flotilla_resources::Project;
 use flotilla_resources::Repository;
-use flotilla_resources::RepositorySpec;
 use flotilla_resources::ResourceError;
 use flotilla_resources::WorkflowTemplate;
 use flotilla_resources::WriterIdentity;
 use flotilla_store::ResourceBackend;
 use tokio::sync::Mutex;
 
-use super::{
-    create_adopted_checkout_resource, empty_repo_identity, parse_and_validate_workflow_template_yaml, parse_project_yaml,
-    placement_target_host, AdoptedCheckoutRequest,
+use crate::convoy_admission::allocate_convoy_generation;
+use crate::convoy_admission::normalize_convoy_start_intent;
+use crate::convoy_admission::resolve_and_validate_workflow_credentials;
+use crate::convoy_admission::validate_convoy_name;
+use crate::convoy_admission::ConvoyAdmission;
+use crate::convoy_admission::ConvoyCreateAdmission;
+use crate::convoy_admission::ConvoyStartKey;
+use crate::convoy_admission::ConvoyStartTask;
+use crate::project_ops::is_declaration_backed_project;
+use crate::project_ops::validate_project_name;
+use crate::support::{
+    create_adopted_checkout_resource, parse_and_validate_workflow_template_yaml, parse_project_yaml, placement_target_host,
+    AdoptedCheckoutRequest,
 };
-use crate::in_process::convoy_admission::allocate_convoy_generation;
-use crate::in_process::convoy_admission::normalize_convoy_start_intent;
-use crate::in_process::convoy_admission::resolve_and_validate_workflow_credentials;
-use crate::in_process::convoy_admission::validate_convoy_name;
-use crate::in_process::convoy_admission::ConvoyAdmission;
-use crate::in_process::convoy_admission::ConvoyCreateAdmission;
-use crate::in_process::convoy_admission::ConvoyStartKey;
-use crate::in_process::convoy_admission::ConvoyStartTask;
-use crate::in_process::project_ops::is_declaration_backed_project;
-use crate::in_process::project_ops::validate_project_name;
-use crate::repository_inspection::RepositoryInspection;
 use flotilla_resources::convoy_address::convoy_record_name;
 
-/// Repository/project integration and worker submission supplied by the host.
-/// Admission state, placement and disk refusals remain owned by ConvoyAdmission;
-/// handlers borrow that owner directly, including its complete transaction guard.
-#[async_trait]
-pub(super) trait AdmissionActionPort: Send + Sync {
-    async fn inspect_adopted_checkout(
-        &self,
-        path: &Path,
-        repository_url: Option<&str>,
-        git_ref: Option<&str>,
-    ) -> Result<RepositoryInspection, String>;
-    async fn project_add(
-        &self,
-        target: &str,
-        explicit_name: Option<&str>,
-        explicit_display_name: Option<&str>,
-        remote: Option<&str>,
-    ) -> Result<String, String>;
-    async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String>;
-    async fn image_check(
-        &self,
-        request: &flotilla_protocol::image_check::ImageCheckRequest,
-    ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String>;
-    async fn project_register(&self, target: &str) -> Result<(String, usize), String>;
-    async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String>;
-    async fn roll_convoy_ensure(&self, namespace: &str, name: &str) -> Result<String, String>;
-    fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool;
-}
-
-pub(super) struct AdmissionActions<'a> {
-    pub(super) port: &'a dyn AdmissionActionPort,
-    pub(super) namespace: &'a std::sync::RwLock<String>,
-    pub(super) resource_backend: &'a ResourceBackend,
-    pub(super) observed_resource_backend: &'a ResourceBackend,
-    pub(super) observed_checkout_reconciliation: &'a Arc<Mutex<()>>,
-    pub(super) convoy_admission: &'a ConvoyAdmission,
-    pub(super) events: flotilla_daemon_api::action_events::ActionEvents<'a>,
+/// Command handlers borrowing admission state and the host repository port.
+pub struct AdmissionActions<'a> {
+    pub port: &'a dyn crate::project_ops::ProjectOperations,
+    pub namespace: &'a std::sync::RwLock<String>,
+    pub resource_backend: &'a ResourceBackend,
+    pub observed_resource_backend: &'a ResourceBackend,
+    pub observed_checkout_reconciliation: &'a Arc<Mutex<()>>,
+    pub admission: &'a ConvoyAdmission,
+    pub events: flotilla_daemon_api::action_events::ActionEvents<'a>,
 }
 
 impl AdmissionActions<'_> {
     async fn provisioning_namespace(&self) -> String {
         flotilla_daemon_api::action_namespace::provisioning_namespace(self.namespace)
     }
-    pub(super) async fn execute_action_ensure_roll(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_ensure_roll(&self, id: u64, command: &Command) -> Result<u64, String> {
         let CommandAction::ConvoyEnsureRoll { namespace, name } = &command.action else {
             return Err("ensure roll selected the wrong handler".into());
         };
@@ -98,7 +67,7 @@ impl AdmissionActions<'_> {
         Ok(id)
     }
 
-    pub(super) async fn execute_action_convoy_start(
+    pub async fn execute_action_convoy_start(
         &self,
         id: u64,
         command: &Command,
@@ -119,7 +88,7 @@ impl AdmissionActions<'_> {
             let dispatching_principal_ref =
                 dispatching_principal_ref.clone().unwrap_or_else(|| PrincipalRef::implicit_for_namespace(&acting_namespace));
             let key = ConvoyStartKey::new(namespace, &intent);
-            if !self.convoy_admission.mark_pending(key.clone()).await {
+            if !self.admission.mark_pending(key.clone()).await {
                 self.events.finish(
                     id,
                     empty_identity,
@@ -134,7 +103,7 @@ impl AdmissionActions<'_> {
                 .dispatching_principal_ref(dispatching_principal_ref)
                 .build();
             if !self.port.spawn_convoy_start(task) {
-                self.convoy_admission.clear_pending(&key).await;
+                self.admission.clear_pending(&key).await;
                 self.events.finish(id, empty_identity, CommandValue::Error { message: "convoy start worker is unavailable".to_string() });
             }
             return Ok(id);
@@ -142,7 +111,7 @@ impl AdmissionActions<'_> {
         Err("ConvoyStart action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_convoy_create(
+    pub async fn execute_action_convoy_create(
         &self,
         id: u64,
         command: &Command,
@@ -176,14 +145,14 @@ impl AdmissionActions<'_> {
                 self.events.finish(id, empty_identity, result);
                 return Ok(id);
             }
-            if let Err(message) = self.convoy_admission.check_local_free_space_floor().await {
+            if let Err(message) = self.admission.check_local_free_space_floor().await {
                 let result = CommandValue::Error { message };
                 self.events.finish(id, empty_identity, result);
                 return Ok(id);
             }
             // Use the admission transaction before checking identity or writing
             // adopted checkout resources. A duplicate must have no side effects.
-            let admission_guard = self.convoy_admission.lock().await;
+            let admission_guard = self.admission.lock().await;
             if let Err(message) = allocate_convoy_generation(self.resource_backend, &namespace, project_identity, &role).await {
                 let result = CommandValue::Error { message };
                 self.events.finish(id, empty_identity, result);
@@ -329,7 +298,7 @@ impl AdmissionActions<'_> {
                 adopted_checkout_refs.insert(repo_ref, checkout_ref);
             }
             let mut placement = match self
-                .convoy_admission
+                .admission
                 .resolve_convoy_placement(
                     &namespace,
                     project_ref.as_deref(),
@@ -377,14 +346,12 @@ impl AdmissionActions<'_> {
                 },
                 None => None,
             };
-            if let Err(message) =
-                self.convoy_admission.check_remote_placement_free_space_floor(&namespace, placement_decision.as_ref()).await
-            {
+            if let Err(message) = self.admission.check_remote_placement_free_space_floor(&namespace, placement_decision.as_ref()).await {
                 self.events.finish(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);
             }
             let (vessel_placements, image_builds) = match self
-                .convoy_admission
+                .admission
                 .join_convoy_placement_builds(
                     &namespace,
                     project_ref.as_deref(),
@@ -401,7 +368,7 @@ impl AdmissionActions<'_> {
                 }
             };
             let result = self
-                .convoy_admission
+                .admission
                 .admit_created_convoy(
                     ConvoyCreateAdmission::builder()
                         .namespace(&namespace)
@@ -430,7 +397,7 @@ impl AdmissionActions<'_> {
         Err("ConvoyCreate action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_workflow_template_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_workflow_template_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::WorkflowTemplateApply { name, spec_yaml } = &command.action {
             let empty_identity = empty_repo_identity();
             self.events.sink.emit(DaemonEvent::CommandStarted {
@@ -463,7 +430,7 @@ impl AdmissionActions<'_> {
         Err("WorkflowTemplateApply action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_project_add(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_project_add(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ProjectAdd { target, name, display_name, remote } = &command.action {
             let empty_identity = empty_repo_identity();
             self.events.sink.emit(DaemonEvent::CommandStarted {
@@ -483,7 +450,7 @@ impl AdmissionActions<'_> {
         Err("ProjectAdd action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_project_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_project_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ProjectApply { name, spec_yaml } = &command.action {
             let empty_identity = empty_repo_identity();
             self.events.sink.emit(DaemonEvent::CommandStarted {
@@ -537,7 +504,7 @@ impl AdmissionActions<'_> {
         Err("ProjectApply action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_project_register(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_project_register(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ProjectRegister { target } = &command.action {
             let empty_identity = empty_repo_identity();
             self.events.sink.emit(DaemonEvent::CommandStarted {
@@ -557,7 +524,7 @@ impl AdmissionActions<'_> {
         Err("ProjectRegister action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_project_refresh(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_project_refresh(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ProjectRefresh { name } = &command.action {
             let empty_identity = empty_repo_identity();
             self.events.sink.emit(DaemonEvent::CommandStarted {
@@ -579,7 +546,7 @@ impl AdmissionActions<'_> {
         Err("ProjectRefresh action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_image_check(&self, id: u64, command: &Command) -> Result<u64, String> {
+    pub async fn execute_action_image_check(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ImageCheck { request } = &command.action {
             let empty_identity = empty_repo_identity();
             self.events.sink.emit(DaemonEvent::CommandStarted {

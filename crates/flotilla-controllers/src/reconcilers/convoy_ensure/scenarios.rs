@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::EnsureReconciler;
 use async_trait::async_trait;
-use flotilla_core::convoy_ensure::ConvoyEnsureReconciler;
+use flotilla_admission::convoy_ensure::ConvoyEnsureReconciler;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_orchestration_testkit as ensure_scenarios;
 use flotilla_orchestration_testkit::EnsureScenarioController;

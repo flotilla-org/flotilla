@@ -5,7 +5,9 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_core::{in_process::InProcessDaemon, placement_policy::reconcile_registered_policy};
+use flotilla_core::in_process::InProcessDaemon;
+
+use flotilla_admission::placement_policy::reconcile_registered_policy;
 use flotilla_resources::{
     canonical_host_id, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, FulfilmentKind, FulfilmentKindSpec, Host, HostDirectEnvironmentSpec,

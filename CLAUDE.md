@@ -160,7 +160,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-charter` | Charter inputs read through a `RevisionedTree` (Git via `Vcs`, or a local directory): `project.yaml` declarations, operational entries and their provenance annotations, charter locks and source status |
 | `flotilla-executor` | Provider-backed command handlers, step plans and resolution, remote step batches, environment management and host orchestration ports |
 | `flotilla-observation` | Provider-neutral change-request, issue and forge observation, demand servicing and observed-resource projection |
-| `flotilla-core` | Refresh, convoy admission and controller ports, `InProcessDaemon` composition root |
+| `flotilla-admission` | Convoy admission, standing-convoy admission ports, placement planning, project operations and composed-image planning; host orchestration through owned ports |
+| `flotilla-core` | Refresh and `InProcessDaemon` composition root; implements admission and observation ports |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
 | `flotilla-config` | Host-local config files (`config.toml`, `daemon.toml`, `hosts.toml`, observation roots, open views), provider preference values, default checkout path and bounded log files |
@@ -202,8 +203,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `src/main.rs` | Entry point, CLI dispatch |
 | `crates/flotilla-daemon-api/src/daemon.rs` | `DaemonHandle` trait |
 | `crates/flotilla-core/src/in_process.rs` | `InProcessDaemon` composition root and narrow controller ports |
-| `crates/flotilla-core/src/convoy_ensure.rs` | Narrow admission and controller ports for standing convoys |
-| `crates/flotilla-core/src/in_process/convoy_admission.rs` | Transaction-owning convoy admission primitive |
+| `crates/flotilla-admission/src/convoy_ensure.rs` | Narrow admission and controller ports for standing convoys |
+| `crates/flotilla-admission/src/convoy_admission.rs` | Transaction-owning convoy admission primitive |
 | `crates/flotilla-controllers/src/reconcilers/convoy_ensure.rs` | Standing-convoy reconciliation, retry state and the complete ensure transaction guard |
 | `crates/flotilla-executor/src/executor.rs` | Executes provider-backed command steps and returns `CommandValue` |
 | `crates/flotilla-executor/src/executor/` | Executor submodules: checkout, session actions and tests |

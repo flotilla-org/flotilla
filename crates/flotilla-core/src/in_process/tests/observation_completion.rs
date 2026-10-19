@@ -79,7 +79,7 @@ async fn rest_admission_lookup_selection_matrix() {
                     .await
                     .map(|found| found.map(|found| found.repository_key)),
                 RestAdmissionLookup::Id => {
-                    fixture.daemon.convoy_admission.resolve_convoy_change_request_admission(&fixture.keys, "7").await.map(|found| {
+                    fixture.daemon.admission.resolve_convoy_change_request_admission(&fixture.keys, "7").await.map(|found| {
                         assert_eq!(found.branch, "feature/wanted");
                         assert_eq!(found.base_ref, "main");
                         Some(found.binding.repository_ref)

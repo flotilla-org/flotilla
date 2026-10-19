@@ -15,6 +15,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_admission::repository_inspection::LocalCheckoutInspection;
+use flotilla_admission::repository_inspection::RepositoryContinuity;
+use flotilla_admission::repository_inspection::RepositoryInspection;
+use flotilla_admission::repository_inspection::RepositoryInspector;
 use flotilla_ai_utility::AiUtility;
 use flotilla_ai_utility::ConvoyNames;
 use flotilla_change_request::ChangeRequestTracker;
@@ -24,10 +28,6 @@ use flotilla_config::ConfigStore;
 use flotilla_controllers::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::model::RepoModel;
-use flotilla_core::repository_inspection::LocalCheckoutInspection;
-use flotilla_core::repository_inspection::RepositoryContinuity;
-use flotilla_core::repository_inspection::RepositoryInspection;
-use flotilla_core::repository_inspection::RepositoryInspector;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery::DiscoveryRuntime;
 use flotilla_discovery_api::provider_config;

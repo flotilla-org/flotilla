@@ -1,6 +1,7 @@
 //! Standing-convoy behavior scenarios driven by an injected controller.
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_admission::convoy_ensure::{ConvoyEnsureReconciler, StandingConvoyBackingInspector};
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{CommandAction, HostName, NodeId};
@@ -532,4 +533,4 @@ use flotilla_resources::{CheckoutStatus as ResourceCheckoutStatus, ConvoySpec, F
 use flotilla_store::apply_status_patch as apply_resource_status_patch;
 use sha2::{Digest, Sha256};
 
-use flotilla_core::in_process::convoy_admission::allocate_convoy_generation;
+use flotilla_admission::convoy_admission::allocate_convoy_generation;

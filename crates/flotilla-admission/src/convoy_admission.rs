@@ -1,50 +1,153 @@
 //! Convoy admission state and transaction boundary.
 
+use std::cmp::Reverse;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+#[cfg(test)]
+use async_trait::async_trait;
+use chrono::DateTime;
+use chrono::Duration as ChronoDuration;
+use chrono::Utc;
+use flotilla_agent::adapter::required_agent_adapters;
+use flotilla_agent::adapter::CapabilityTable;
+use flotilla_agent::adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver};
+use flotilla_agent::brief_artifact::BriefArtifactWriter;
+use flotilla_ai_utility::AiUtility;
+use flotilla_ai_utility::ConvoyNames;
 use flotilla_change_request::branch_lookup_observer::BranchLookupObserver;
+use flotilla_change_request::observation::ChangeRequestKey;
+use flotilla_change_request::observation::ChangeRequestObservationSource;
+use flotilla_change_request::ChangeRequestTracker;
+use flotilla_charter::ops_entry::ENSURED_FROM_ANNOTATION;
+use flotilla_charter::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
+use flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION;
+use flotilla_config::ConfigStore;
+use flotilla_discovery::AiUtilityFactory;
+use flotilla_discovery::DiscoveryRuntime;
 use flotilla_discovery_api::{provider_config::ProviderConfigView, EnvironmentBag};
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
+use flotilla_observation::sources::ChangeRequestQueryPort;
+use flotilla_observation::sources::IssueQueryPort;
+use flotilla_observation::sources::ProviderChangeRequestObservationSource;
+#[cfg(test)]
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_protocol::result_set::ConvoyChangeRequest;
+use flotilla_protocol::AttachBinding;
+use flotilla_protocol::CanonicalHostId;
+use flotilla_protocol::CommandValue;
+use flotilla_protocol::ConvoyDispatchRegard;
 use flotilla_protocol::ConvoyNaming;
+use flotilla_protocol::EnvironmentId;
+use flotilla_protocol::FulfilmentAllocation;
+use flotilla_protocol::FulfilmentAllocationCandidate;
+use flotilla_protocol::HostName;
+use flotilla_protocol::PlacementDecision;
+use flotilla_protocol::PlacementRefusal;
+use flotilla_protocol::PlacementTargetHost;
+use flotilla_protocol::PlacementViableCandidate;
+use flotilla_protocol::PrincipalRef;
+use flotilla_protocol::ResourceRef;
+use flotilla_protocol::ViewAddress;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::address::{record_name, remote_change_request_address};
+use flotilla_resources::api_version;
+use flotilla_resources::capped_github_app_permissions;
+use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
+use flotilla_resources::normalize_issue_source;
+use flotilla_resources::AllocationDecision;
+use flotilla_resources::BoundChangeRequest;
+use flotilla_resources::CapabilityNeed;
+use flotilla_resources::ChangeRequest as ResourceChangeRequest;
+use flotilla_resources::Checkout as ResourceCheckout;
+use flotilla_resources::Clock;
+use flotilla_resources::Convoy as ResourceConvoy;
+use flotilla_resources::ConvoyEnsure;
+use flotilla_resources::ConvoyIssue;
+use flotilla_resources::ConvoyRepositorySpec;
+use flotilla_resources::ConvoySpec;
+use flotilla_resources::ConvoyStatusPatch;
+use flotilla_resources::CredentialConsumer;
+use flotilla_resources::CredentialGrant;
+use flotilla_resources::CredentialSpec;
+use flotilla_resources::CrewSource;
+use flotilla_resources::CrewSpec;
+use flotilla_resources::Forge;
+use flotilla_resources::FulfilmentGrant;
+use flotilla_resources::FulfilmentKind;
+use flotilla_resources::Host as ResourceHost;
+use flotilla_resources::InputMeta;
+use flotilla_resources::InputValue;
+use flotilla_resources::IssueSnapshot;
+use flotilla_resources::IssueSourceResolution;
+use flotilla_resources::IssueSourceUnavailable;
+use flotilla_resources::ObjectMeta;
+use flotilla_resources::ObservedChangeRequestState;
+use flotilla_resources::PlacementPolicy;
+use flotilla_resources::PlacementPolicySpec;
+use flotilla_resources::Platform;
+use flotilla_resources::Project;
+use flotilla_resources::ProjectSpec;
+use flotilla_resources::ReadResourceObject;
+use flotilla_resources::Repository;
+use flotilla_resources::RepositoryKey;
+use flotilla_resources::RepositoryTrust;
+use flotilla_resources::Resource;
+use flotilla_resources::ResourceError;
+use flotilla_resources::ResourceObject;
+use flotilla_resources::ResourceProvenance;
+use flotilla_resources::RoleHandoff;
+use flotilla_resources::SupervisionTarget;
+use flotilla_resources::TerminalCrewContext;
+use flotilla_resources::VesselRequirement;
+use flotilla_resources::WorkflowTemplate;
+use flotilla_resources::WorkflowTemplateSpec;
+use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
+use flotilla_resources::GENERATION_LABEL;
+use flotilla_resources::PROJECT_LABEL;
+use flotilla_resources::ROLE_LABEL;
+#[cfg(test)]
+use flotilla_resources::{HoldAct, RepositorySpec, SystemClock};
+use flotilla_store::apply_status_patch as apply_resource_status_patch;
+use flotilla_store::resolve_project_issue_sources;
+use flotilla_store::ResourceBackend;
 use flotilla_store::{DockerImageSourceStoreExt, ResolvedCascadeStoreExt, StoreQuery};
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
-
-use super::{
-    api_version, apply_resource_status_patch, authoritative_placement_host, capped_github_app_permissions, check_placement_capacity,
-    ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot, home_copy_wins_by_name, host_generation, normalize_issue_source,
-    placement_actuator_host_ref, placement_host_not_ready_reason, placement_host_ref, placement_target_host, policy_targets_agentless_ssh,
-    prepared_snapshot_name, project_ops, required_agent_adapters, resolve_project_issue_sources, unready_placement_refusal,
-    validate_docker_placement_host, warn, AiUtility, AllocationDecision, Arc, AttachBinding, BTreeMap, BTreeSet, BoundChangeRequest,
-    BriefArtifactWriter, CanonicalHostId, CapabilityNeed, CapabilityTable, ChangeRequestKey, ChangeRequestQueryPort, ChangeRequestTracker,
-    ChronoDuration, Clock, CommandRunner, CommandValue, ConfigStore, ConvoyChangeRequest, ConvoyDispatchRegard, ConvoyEnsure, ConvoyIssue,
-    ConvoyNames, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource,
-    CrewSpec, DateTime, DiscoveryRuntime, EnvironmentId, EnvironmentManager, ExecutionEnvironmentPath, Forge, FulfilmentAllocation,
-    FulfilmentAllocationCandidate, FulfilmentGrant, FulfilmentKind, HashMap, HashSet, HostName, InputMeta, InputValue, IssueQueryPort,
-    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, Mutex, ObjectMeta, ObservationError, ObservedChangeRequestState, PathBuf,
-    PlacementDecision, PlacementPolicy, PlacementPolicySpec, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, Platform,
-    PrincipalRef, Project, ProjectSpec, ProviderChangeRequestObservationSource, ReadResourceObject, RegardLifecycle, Repository,
-    RepositoryKey, RepositoryTrust, ResourceBackend, ResourceChangeRequest, ResourceCheckout, ResourceConvoy, ResourceError, ResourceHost,
-    ResourceObject, ResourceProvenance, ResourceRef, Reverse, RoleHandoff, RwLock, Sha256, SupervisionTarget, SurfaceGestureOutcome,
-    TerminalCrewContext, Utc, VesselRequirement, ViewAddress, WorkflowTemplate, WorkflowTemplateSpec, BRIEF_ARTIFACTS_ANNOTATION,
-    ENSURED_FROM_ANNOTATION, GENERATION_LABEL, MATERIALIZED_PROJECT_ANNOTATION, PROJECT_LABEL, ROLE_LABEL,
-};
-#[cfg(test)]
-use super::{
-    async_trait, DaemonHostPath, HoldAct, InProcessDaemon, ProviderChangeRequestQueryPort, ProviderIssueQueryPort, RepositorySpec,
-    SystemClock,
-};
-use flotilla_agent::adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver};
-use flotilla_change_request::observation::ChangeRequestObservationSource;
-use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
-use flotilla_resources::Resource;
 use sha2::Digest;
+use sha2::Sha256;
+use tokio::sync::Mutex;
+use tokio::sync::RwLock;
+use tracing::warn;
 
-use flotilla_discovery::AiUtilityFactory;
+use crate::project_ops;
+use crate::regard_lifecycle::RegardLifecycle;
+use crate::regard_lifecycle::SurfaceGestureOutcome;
+use crate::support::authoritative_placement_host;
+use crate::support::check_placement_capacity;
+use crate::support::ensure_prepared_placement_snapshot;
+use crate::support::ensure_prepared_workflow_snapshot;
+use crate::support::home_copy_wins_by_name;
+use crate::support::host_generation;
+use crate::support::placement_actuator_host_ref;
+use crate::support::placement_host_not_ready_reason;
+use crate::support::placement_host_ref;
+use crate::support::placement_target_host;
+use crate::support::policy_targets_agentless_ssh;
+use crate::support::prepared_snapshot_name;
+use crate::support::unready_placement_refusal;
+use crate::support::validate_docker_placement_host;
 
 /// Routing uses replicated observations as hints; only admission may refuse on
 /// destination-owned facts, credentials, or the installed skill catalog.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum PlacementPurpose {
+pub enum PlacementPurpose {
     Routing,
     Admission,
 }
@@ -69,7 +172,7 @@ struct PolicyPlacementContext<'a> {
 }
 
 #[derive(bon::Builder)]
-pub(super) struct ConvoyCreateAdmission<'a> {
+pub struct ConvoyCreateAdmission<'a> {
     namespace: &'a str,
     name: &'a str,
     role: &'a str,
@@ -93,16 +196,16 @@ pub(super) struct ConvoyCreateAdmission<'a> {
 }
 
 #[derive(bon::Builder)]
-pub(super) struct ConvoyAdmission {
+pub struct ConvoyAdmission {
     backend: ResourceBackend,
     observed_backend: ResourceBackend,
     observed_checkout_reconciliation: Arc<Mutex<()>>,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
-    environment_manager: Arc<EnvironmentManager>,
+    environment_manager: Arc<dyn crate::ports::AdmissionEnvironments>,
     local_environment_id: EnvironmentId,
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
-    pub(super) repository_change_requests: Arc<RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>>,
+    repository_change_requests: Arc<RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>>,
     change_request_port: Arc<dyn ChangeRequestQueryPort>,
     #[builder(default)]
     branch_lookup_observer: BranchLookupObserver,
@@ -133,7 +236,7 @@ struct AdmissionReadContext<'a> {
 struct AdmissionRuntime<'a> {
     config: &'a ConfigStore,
     discovery: &'a DiscoveryRuntime,
-    environment_manager: &'a EnvironmentManager,
+    environment_manager: &'a dyn crate::ports::AdmissionEnvironments,
     local_environment_id: &'a EnvironmentId,
     local_host: Option<CanonicalHostId>,
     namespace: String,
@@ -166,13 +269,17 @@ impl AdmissionLookupFailure {
 }
 
 impl ConvoyAdmission {
+    pub fn repository_change_requests(&self) -> &Arc<RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>> {
+        &self.repository_change_requests
+    }
+
     fn reads(&self, backend: ResourceBackend) -> AdmissionReadContext<'_> {
         AdmissionReadContext {
             backend,
             runtime: AdmissionRuntime {
                 config: &self.config,
                 discovery: &self.discovery,
-                environment_manager: &self.environment_manager,
+                environment_manager: self.environment_manager.as_ref(),
                 local_environment_id: &self.local_environment_id,
                 local_host: self.canonical_local_host_id(),
                 namespace: self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone(),
@@ -186,11 +293,11 @@ impl ConvoyAdmission {
         }
     }
 
-    pub(super) fn set_free_space_path(&self, path: PathBuf) {
+    pub fn set_free_space_path(&self, path: PathBuf) {
         *self.admission_free_space_path.write().expect("admission free-space path lock poisoned") = path;
     }
 
-    pub(super) async fn free_space_bytes(&self) -> Result<Option<u64>, String> {
+    pub async fn free_space_bytes(&self) -> Result<Option<u64>, String> {
         let path = self.admission_free_space_path.read().expect("admission free-space path lock poisoned").clone();
         let probe = Arc::clone(&self.discovery.available_space_probe);
         flotilla_provider_runtime::probe::blocking("available disk space", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
@@ -209,15 +316,15 @@ impl ConvoyAdmission {
             .map(|host_id| CanonicalHostId::resolved(host_id.as_str()))
     }
 
-    pub(super) async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.guard.lock().await
     }
 
-    pub(super) async fn mark_pending(&self, key: ConvoyStartKey) -> bool {
+    pub async fn mark_pending(&self, key: ConvoyStartKey) -> bool {
         self.pending_starts.lock().await.insert(key)
     }
 
-    pub(super) async fn clear_pending(&self, key: &ConvoyStartKey) {
+    pub async fn clear_pending(&self, key: &ConvoyStartKey) {
         self.pending_starts.lock().await.remove(key);
     }
 }
@@ -225,8 +332,8 @@ impl ConvoyAdmission {
 impl ConvoyAdmission {
     /// Resolve explicit continuation with fresh forge facts. Absence is allowed
     /// for branch-only work; terminal requests are never silently adopted.
-    #[cfg(test)]
-    pub(super) async fn resolve_continuation(
+    #[doc(hidden)]
+    pub async fn resolve_continuation(
         &self,
         repositories: &[ConvoyRepositorySpec],
         continuation: &flotilla_protocol::ConvoyContinuation,
@@ -257,8 +364,8 @@ impl ConvoyAdmission {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(super) async fn resolve_convoy_change_request_admission(
+    #[doc(hidden)]
+    pub async fn resolve_convoy_change_request_admission(
         &self,
         repository_keys: &[RepositoryKey],
         requested_id: &str,
@@ -266,7 +373,7 @@ impl ConvoyAdmission {
         self.reads(self.backend.clone()).resolve_convoy_change_request_admission(repository_keys, requested_id).await
     }
 
-    pub(super) async fn repository_change_request_candidates(
+    pub async fn repository_change_request_candidates(
         &self,
         repository_keys: &[RepositoryKey],
     ) -> (Vec<(RepositoryKey, String, Arc<dyn ChangeRequestTracker>)>, Vec<String>) {
@@ -286,7 +393,7 @@ impl ConvoyAdmission {
         self.reads(ResourceBackend::new(snapshot)).repository_change_request_candidates(repository_keys).await
     }
 
-    pub(super) async fn resolve_convoy_change_request(
+    pub async fn resolve_convoy_change_request(
         &self,
         repository_keys: &[RepositoryKey],
         branch: &str,
@@ -367,7 +474,7 @@ impl ConvoyAdmission {
         failures.into_iter().next().map_or(Ok(None), |error| Err(error.to_string()))
     }
 
-    pub(super) async fn refresh_convoy_branch(
+    pub async fn refresh_convoy_branch(
         &self,
         repository_keys: &[RepositoryKey],
         branch: &str,
@@ -444,8 +551,8 @@ impl ConvoyAdmission {
         flotilla_observation::convoy_branch_refresh::ConvoyBranchRefresh { primary, repositories: results }
     }
 
-    #[cfg(test)]
-    pub(super) async fn resolve_observed_convoy_change_request(
+    #[doc(hidden)]
+    pub async fn resolve_observed_convoy_change_request(
         &self,
         repository_keys: &[RepositoryKey],
         change_request_id: Option<&str>,
@@ -560,7 +667,7 @@ impl ConvoyAdmission {
         }
     }
 
-    pub(super) async fn start_placement_host(
+    pub async fn start_placement_host(
         &self,
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
@@ -579,7 +686,7 @@ impl ConvoyAdmission {
         reads.start_placement_host(&namespace, &intent).await
     }
 
-    pub(super) async fn prepare_convoy_admission(
+    pub async fn prepare_convoy_admission(
         &self,
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
@@ -591,7 +698,7 @@ impl ConvoyAdmission {
     /// The harness adapters the project's default workflow's agent roles
     /// resolve to, through the same cascade and workflow lookup admission
     /// uses (`flotilla image check` without `--agent`).
-    pub(super) async fn default_workflow_harness_adapters(
+    pub async fn default_workflow_harness_adapters(
         &self,
         namespace: &str,
         project_ref: &str,
@@ -613,8 +720,8 @@ impl ConvoyAdmission {
         .map_err(|error| format!("workflow `{workflow_ref}`: {error}"))
     }
 
-    #[cfg(test)]
-    pub(super) async fn resolve_convoy_admission_workflow(
+    #[doc(hidden)]
+    pub async fn resolve_workflow(
         &self,
         namespace: &str,
         project_ref: &str,
@@ -622,11 +729,11 @@ impl ConvoyAdmission {
         repositories: &[ConvoyRepositorySpec],
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<(String, WorkflowTemplateSpec), String> {
-        self.reads(self.backend.clone()).resolve_convoy_admission_workflow(namespace, project_ref, project, repositories, intent).await
+        self.reads(self.backend.clone()).resolve_workflow(namespace, project_ref, project, repositories, intent).await
     }
 
-    #[cfg(test)]
-    pub(super) async fn compose_convoy_needs(
+    #[doc(hidden)]
+    pub async fn compose_convoy_needs(
         &self,
         namespace: &str,
         project: &ProjectSpec,
@@ -637,8 +744,8 @@ impl ConvoyAdmission {
         self.reads(self.backend.clone()).compose_convoy_needs(namespace, project, issues, intent, workflow).await
     }
 
-    #[cfg(test)]
-    pub(super) async fn resolve_capability_placement(
+    #[doc(hidden)]
+    pub async fn resolve_capability_placement(
         &self,
         namespace: &str,
         project_ref: &str,
@@ -655,7 +762,7 @@ impl ConvoyAdmission {
         .await
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     async fn decide_capability_placement(
         &self,
         context: &PlacementContext<'_>,
@@ -665,7 +772,7 @@ impl ConvoyAdmission {
         self.reads(self.backend.clone()).decide_capability_placement(context, workflow, needs).await
     }
 
-    pub(super) async fn prepare_convoy_admission_with_preferences(
+    pub async fn prepare_convoy_admission_with_preferences(
         &self,
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
@@ -676,7 +783,7 @@ impl ConvoyAdmission {
         reads.prepare_convoy_admission_with_preferences(namespace, intent, dispatching_principal_ref, repositories).await
     }
 
-    pub(super) async fn admit_convoy_start(
+    pub async fn admit_convoy_start(
         &self,
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
@@ -718,7 +825,7 @@ impl ConvoyAdmission {
         Ok((admission.name, address, admission.naming))
     }
 
-    pub(super) async fn check_local_free_space_floor(&self) -> Result<(), String> {
+    pub async fn check_local_free_space_floor(&self) -> Result<(), String> {
         let config = Arc::clone(&self.config);
         let available_space_probe = Arc::clone(&self.discovery.available_space_probe);
         let admission_free_space_path = self.admission_free_space_path.read().expect("admission free-space path lock poisoned").clone();
@@ -736,12 +843,12 @@ impl ConvoyAdmission {
         .map_err(|error| format!("free-space check failed on host `{}`: {error}", self.host_name))
     }
 
-    pub(super) fn admission_free_space_floor_bytes(&self) -> Result<u64, String> {
+    pub fn admission_free_space_floor_bytes(&self) -> Result<u64, String> {
         let floor_gib = self.config.load_daemon_config()?.admission.free_space_floor_gib;
         crate::admission::free_space_floor_bytes(floor_gib)
     }
 
-    pub(super) async fn check_remote_placement_free_space_floor(
+    pub async fn check_remote_placement_free_space_floor(
         &self,
         namespace: &str,
         placement: Option<&PlacementDecision>,
@@ -749,7 +856,7 @@ impl ConvoyAdmission {
         self.reads(self.backend.clone()).check_remote_placement_free_space_floor(namespace, placement).await
     }
 
-    pub(super) async fn check_prepared_placement_floors(&self, namespace: &str, admission: &PreparedConvoyAdmission) -> Result<(), String> {
+    pub async fn check_prepared_placement_floors(&self, namespace: &str, admission: &PreparedConvoyAdmission) -> Result<(), String> {
         let reads = self.reads(admission.evidence.clone());
         if admission.vessel_placements.is_empty() {
             reads.check_remote_placement_free_space_floor(namespace, admission.placement_decision.as_ref()).await?;
@@ -1010,7 +1117,7 @@ impl ConvoyAdmission {
         Ok((snapshot.finish(), observed_snapshot.finish()))
     }
 
-    pub(super) async fn write_admission_briefs(
+    pub async fn write_admission_briefs(
         &self,
         namespace: &str,
         name: &str,
@@ -1111,7 +1218,7 @@ impl ConvoyAdmission {
                 let mut source_roots = local_checkouts
                     .iter()
                     .filter(|checkout| checkout.spec.repo_ref() == repository_ref)
-                    .filter_map(|checkout| super::checkout_path(checkout).map(PathBuf::from))
+                    .filter_map(|checkout| crate::support::checkout_path(checkout).map(PathBuf::from))
                     .collect::<Vec<_>>();
                 source_roots.sort();
                 roots.extend(source_roots);
@@ -1207,7 +1314,7 @@ impl ConvoyAdmission {
         Ok(true)
     }
 
-    pub(super) async fn prepare_vessel_placement_annotations(
+    pub async fn prepare_vessel_placement_annotations(
         &self,
         namespace: &str,
         placements: &BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
@@ -1228,7 +1335,7 @@ impl ConvoyAdmission {
         )]))
     }
 
-    pub(super) async fn create_convoy_with_annotations(
+    pub async fn create_convoy_with_annotations(
         &self,
         namespace: &str,
         name: &str,
@@ -1263,17 +1370,12 @@ impl ConvoyAdmission {
         Ok(())
     }
 
-    pub(super) async fn emit_implicit_convoy_regard(
-        &self,
-        namespace: &str,
-        name: &str,
-        principal_ref: &PrincipalRef,
-    ) -> Result<(), String> {
+    pub async fn emit_implicit_convoy_regard(&self, namespace: &str, name: &str, principal_ref: &PrincipalRef) -> Result<(), String> {
         let target = ResourceRef::new(api_version(ResourceConvoy::API_PATHS), ResourceConvoy::API_PATHS.kind, namespace, name);
         self.regard_lifecycle.emit_implicit(principal_ref, &target, "convoy-dispatch").await
     }
 
-    pub(super) async fn emit_attach_regard(&self, binding: &AttachBinding, surface_id: uuid::Uuid) -> Result<(), String> {
+    pub async fn emit_attach_regard(&self, binding: &AttachBinding, surface_id: uuid::Uuid) -> Result<(), String> {
         let target = binding.resource_ref().ok_or_else(|| "resolved attach target has no resource identity".to_string())?;
         match self.regard_lifecycle.emit_expressed_for_surface(surface_id, &target).await? {
             SurfaceGestureOutcome::Handled => Ok(()),
@@ -1286,7 +1388,7 @@ impl ConvoyAdmission {
     /// Freeze each vessel's composed image for a ConvoyCreate placement. The
     /// returned per-vessel pins are non-empty only when vessels resolve to
     /// different images.
-    pub(super) async fn join_convoy_placement_builds(
+    pub async fn join_convoy_placement_builds(
         &self,
         namespace: &str,
         project_ref: Option<&str>,
@@ -1299,7 +1401,7 @@ impl ConvoyAdmission {
         Ok((apply_vessel_images(placement, images, decision)?, builds))
     }
 
-    pub(super) async fn resolve_convoy_placement(
+    pub async fn resolve_convoy_placement(
         &self,
         namespace: &str,
         project_ref: Option<&str>,
@@ -1332,7 +1434,7 @@ impl ConvoyAdmission {
 }
 
 impl ConvoyAdmission {
-    pub(super) async fn admit_ensured_convoy(
+    pub async fn admit_ensured_convoy(
         &self,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
@@ -1426,7 +1528,7 @@ impl ConvoyAdmission {
 impl ConvoyAdmission {
     /// The caller holds this guard from the identity check through any adopted
     /// checkout writes, and transfers it here through the final Convoy commit.
-    pub(super) async fn admit_created_convoy(
+    pub async fn admit_created_convoy(
         &self,
         request: ConvoyCreateAdmission<'_>,
         _admission_guard: tokio::sync::MutexGuard<'_, ()>,
@@ -1620,7 +1722,7 @@ async fn resolve_vessel_images(
 
 /// Installation image defaults outside a resolved workflow cascade: the
 /// project's cascade when it is declared, else the fleet-root CrewDefaults.
-pub(super) async fn installation_image_defaults(
+pub async fn installation_image_defaults(
     backend: &ResourceBackend,
     namespace: &str,
     project_ref: Option<&str>,
@@ -2255,7 +2357,7 @@ impl AdmissionReadContext<'_> {
         })
     }
 
-    async fn resolve_convoy_admission_workflow(
+    async fn resolve_workflow(
         &self,
         namespace: &str,
         project_ref: &str,
@@ -3148,7 +3250,7 @@ impl AdmissionReadContext<'_> {
             }
         }
         let (workflow_ref, mut workflow) =
-            self.resolve_convoy_admission_workflow(namespace, project_ref, &project.spec, &repositories_snapshot, intent).await?;
+            self.resolve_workflow(namespace, project_ref, &project.spec, &repositories_snapshot, intent).await?;
         let exclusions = intent
             .promise_exclusions
             .iter()
@@ -3296,42 +3398,42 @@ impl AdmissionReadContext<'_> {
 }
 
 #[derive(bon::Builder)]
-pub(super) struct ConvoyStartTask {
-    pub(super) command_id: u64,
-    pub(super) intent: flotilla_protocol::ConvoyStartIntent,
-    pub(super) key: ConvoyStartKey,
-    pub(super) dispatching_principal_ref: PrincipalRef,
+pub struct ConvoyStartTask {
+    pub command_id: u64,
+    pub intent: flotilla_protocol::ConvoyStartIntent,
+    pub key: ConvoyStartKey,
+    pub dispatching_principal_ref: PrincipalRef,
 }
 
 #[derive(bon::Builder)]
 pub struct PreparedConvoyAdmission {
-    pub(super) naming: Option<ConvoyNaming>,
+    pub naming: Option<ConvoyNaming>,
     // Reuse the exact host/policy evidence of this request through final capacity
     // validation; it is neither stored nor reused by another request.
     evidence: ResourceBackend,
 
-    pub(super) name: String,
-    pub(super) spec: ConvoySpec,
-    pub(super) workflow: WorkflowTemplateSpec,
-    pub(super) placement_policy: Option<PlacementPolicySpec>,
-    pub(super) placement_decision: Option<PlacementDecision>,
+    pub name: String,
+    pub spec: ConvoySpec,
+    pub workflow: WorkflowTemplateSpec,
+    pub placement_policy: Option<PlacementPolicySpec>,
+    pub placement_decision: Option<PlacementDecision>,
     #[builder(default)]
-    pub(super) vessel_placements: BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
+    pub vessel_placements: BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
     /// Builds for the composed images, created with the convoy.
     #[builder(default)]
-    pub(super) image_builds: Vec<crate::image_build::PlannedImageBuild>,
+    pub image_builds: Vec<crate::image_build::PlannedImageBuild>,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct AllocationRole {
-    pub(super) crew: CrewSpec,
-    pub(super) hint: String,
-    pub(super) repository_refs: Option<Vec<RepositoryKey>>,
-    pub(super) depends_on: Vec<String>,
-    pub(super) credential_signature: String,
+pub struct AllocationRole {
+    pub crew: CrewSpec,
+    pub hint: String,
+    pub repository_refs: Option<Vec<RepositoryKey>>,
+    pub depends_on: Vec<String>,
+    pub credential_signature: String,
     /// The authored leg's needs (ADR 0062); roles only share a vessel with
     /// roles from legs with equal needs.
-    pub(super) leg_needs: BTreeSet<CapabilityNeed>,
+    pub leg_needs: BTreeSet<CapabilityNeed>,
 }
 
 fn refresh_allocation_role_crews(workflow: &WorkflowTemplateSpec, roles: &mut [AllocationRole]) -> Result<(), String> {
@@ -3344,7 +3446,7 @@ fn refresh_allocation_role_crews(workflow: &WorkflowTemplateSpec, roles: &mut [A
     Ok(())
 }
 
-pub(super) fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, project: &ProjectSpec) -> Result<Vec<AllocationRole>, String> {
+pub fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, project: &ProjectSpec) -> Result<Vec<AllocationRole>, String> {
     let mut roles = Vec::new();
     if !workflow.roles.is_empty() {
         let mut declared = BTreeSet::new();
@@ -3433,7 +3535,7 @@ pub(super) fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, proje
     Ok(roles)
 }
 
-pub(super) fn allocate_roles(workflow: &mut WorkflowTemplateSpec, roles: &[AllocationRole]) -> Result<(), String> {
+pub fn allocate_roles(workflow: &mut WorkflowTemplateSpec, roles: &[AllocationRole]) -> Result<(), String> {
     let mut groups: Vec<Vec<&AllocationRole>> = Vec::new();
     for role in roles {
         let group = groups.iter_mut().find(|group| {
@@ -3579,7 +3681,7 @@ pub(super) fn allocate_roles(workflow: &mut WorkflowTemplateSpec, roles: &[Alloc
     Ok(())
 }
 
-pub(super) fn refresh_crossed_handoffs(workflow: &mut WorkflowTemplateSpec) {
+pub fn refresh_crossed_handoffs(workflow: &mut WorkflowTemplateSpec) {
     let mut crossed = BTreeMap::<String, BTreeSet<String>>::new();
     for vessel in &workflow.vessels {
         for dependency in &vessel.depends_on {
@@ -3602,7 +3704,7 @@ pub(super) fn refresh_crossed_handoffs(workflow: &mut WorkflowTemplateSpec) {
     }
 }
 
-pub(super) async fn allocation_credential_grants(
+pub async fn allocation_credential_grants(
     backend: &ResourceBackend,
     namespace: &str,
     project_ref: &str,
@@ -3877,14 +3979,14 @@ enum BriefReadSource<'a> {
 }
 
 struct ConvoySnapshotBundle<'a> {
-    pub(super) spec: &'a ConvoySpec,
-    pub(super) workflow: &'a WorkflowTemplateSpec,
-    pub(super) placement: Option<&'a PlacementPolicySpec>,
-    pub(super) placement_decision: Option<PlacementDecision>,
-    pub(super) vessel_placements: Option<&'a BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>>,
+    pub spec: &'a ConvoySpec,
+    pub workflow: &'a WorkflowTemplateSpec,
+    pub placement: Option<&'a PlacementPolicySpec>,
+    pub placement_decision: Option<PlacementDecision>,
+    pub vessel_placements: Option<&'a BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>>,
     /// Composed images' builds, created only with the convoy (refusals before
     /// this point never leave builds behind).
-    pub(super) image_builds: &'a [crate::image_build::PlannedImageBuild],
+    pub image_builds: &'a [crate::image_build::PlannedImageBuild],
     evidence: BriefEvidence<'a>,
 }
 
@@ -3892,14 +3994,14 @@ struct ConvoySnapshotBundle<'a> {
 /// recently observed snapshot. Keep this deliberately fixed until an
 /// operational need establishes that it should be configurable.
 const ISSUE_SNAPSHOT_FRESHNESS: ChronoDuration = ChronoDuration::minutes(5);
-pub(super) fn issue_snapshot_is_fresh(issue: &flotilla_protocol::Issue) -> bool {
+pub fn issue_snapshot_is_fresh(issue: &flotilla_protocol::Issue) -> bool {
     let Some(observed_at) = issue.observed_at else { return false };
     let age = Utc::now().signed_duration_since(observed_at);
     (ChronoDuration::zero()..=ISSUE_SNAPSHOT_FRESHNESS).contains(&age)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct ConvoyStartKey {
+pub struct ConvoyStartKey {
     namespace: String,
     project_ref: String,
     subject: ConvoyStartSubject,
@@ -3921,7 +4023,7 @@ enum ConvoyStartSubject {
 }
 
 impl ConvoyStartKey {
-    pub(super) fn new(namespace: String, intent: &flotilla_protocol::ConvoyStartIntent) -> Self {
+    pub fn new(namespace: String, intent: &flotilla_protocol::ConvoyStartIntent) -> Self {
         let subject = if let Some(continuation) = &intent.continuation {
             ConvoyStartSubject::Continuation(continuation.clone())
         } else if let Some(change_request) = &intent.change_request {
@@ -3944,46 +4046,46 @@ impl ConvoyStartKey {
     }
 }
 
-pub(super) struct ResolvedConvoyChangeRequestAdmission {
-    pub(super) binding: BoundChangeRequest,
-    pub(super) branch: String,
-    pub(super) base_ref: String,
+pub struct ResolvedConvoyChangeRequestAdmission {
+    pub binding: BoundChangeRequest,
+    pub branch: String,
+    pub base_ref: String,
 }
 
-pub(super) struct RepositoryChangeRequestProvider {
-    pub(super) service_url: String,
-    pub(super) repository: String,
-    pub(super) provider: Arc<dyn ChangeRequestTracker>,
+pub struct RepositoryChangeRequestProvider {
+    pub service_url: String,
+    pub repository: String,
+    pub provider: Arc<dyn ChangeRequestTracker>,
 }
 
 #[derive(Debug)]
-pub(super) struct PlacementResolution {
-    pub(super) selected: Option<ResourceObject<PlacementPolicy>>,
-    pub(super) refused_candidates: Vec<PlacementRefusal>,
-    pub(super) viable_not_selected: Vec<PlacementViableCandidate>,
-    pub(super) allocation: Option<FulfilmentAllocation>,
+pub struct PlacementResolution {
+    pub selected: Option<ResourceObject<PlacementPolicy>>,
+    pub refused_candidates: Vec<PlacementRefusal>,
+    pub viable_not_selected: Vec<PlacementViableCandidate>,
+    pub allocation: Option<FulfilmentAllocation>,
 }
 
-pub(super) struct KindCandidate {
-    pub(super) kind: ResourceObject<FulfilmentKind>,
-    pub(super) placement: PlacementResolution,
-    pub(super) free_slots: Option<u32>,
-    pub(super) host_ready: bool,
-    pub(super) sleeping_until: Option<DateTime<Utc>>,
-    pub(super) image_cost: flotilla_resources::ImageAcquisitionCost,
+pub struct KindCandidate {
+    pub kind: ResourceObject<FulfilmentKind>,
+    pub placement: PlacementResolution,
+    pub free_slots: Option<u32>,
+    pub host_ready: bool,
+    pub sleeping_until: Option<DateTime<Utc>>,
+    pub image_cost: flotilla_resources::ImageAcquisitionCost,
 }
 
-pub(super) trait PlacementCandidateOrder: Send + Sync {
+pub trait PlacementCandidateOrder: Send + Sync {
     fn compare(&self, left: &KindCandidate, right: &KindCandidate) -> std::cmp::Ordering;
     fn reserved(&self, candidate: &KindCandidate) -> bool;
     fn available(&self, candidate: &KindCandidate) -> bool;
 }
 
-pub(super) trait FulfilmentDecider: Send + Sync {
+pub trait FulfilmentDecider: Send + Sync {
     fn for_admission<'a>(&'a self, needs: &'a BTreeSet<CapabilityNeed>, now: DateTime<Utc>) -> Box<dyn PlacementCandidateOrder + 'a>;
 }
 
-pub(super) struct StaticFulfilmentDecider;
+pub struct StaticFulfilmentDecider;
 
 impl FulfilmentDecider for StaticFulfilmentDecider {
     fn for_admission<'a>(&'a self, needs: &'a BTreeSet<CapabilityNeed>, now: DateTime<Utc>) -> Box<dyn PlacementCandidateOrder + 'a> {
@@ -3991,13 +4093,13 @@ impl FulfilmentDecider for StaticFulfilmentDecider {
     }
 }
 
-pub(super) struct PlacementTieBreak<'a> {
-    pub(super) needs: &'a BTreeSet<CapabilityNeed>,
-    pub(super) now: DateTime<Utc>,
+pub struct PlacementTieBreak<'a> {
+    pub needs: &'a BTreeSet<CapabilityNeed>,
+    pub now: DateTime<Utc>,
 }
 
 impl PlacementTieBreak<'_> {
-    pub(super) fn reserved(&self, candidate: &KindCandidate) -> bool {
+    pub fn reserved(&self, candidate: &KindCandidate) -> bool {
         candidate.kind.spec.grants.iter().any(|grant| {
             let Some(platform) = grant.0.strip_prefix("platform:") else { return false };
             platform.parse::<Platform>().is_ok_and(Platform::is_reserved)
@@ -4036,8 +4138,8 @@ impl PlacementCandidateOrder for PlacementTieBreak<'_> {
     }
 }
 
-#[cfg(test)]
-pub(super) async fn default_convoy_placement_policy(
+#[doc(hidden)]
+pub async fn default_convoy_placement_policy(
     backend: &ResourceBackend,
     namespace: &str,
     project_ref: Option<&str>,
@@ -4192,7 +4294,7 @@ fn placement_ordering_reason(
     format!("fallback ordering preferred policy `{}` by name", selected.metadata.name)
 }
 
-pub(super) fn required_admission_value<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
+pub fn required_admission_value<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
     let value = value.trim();
     if value.is_empty() {
         Err(format!("{field} cannot be empty"))
@@ -4201,7 +4303,7 @@ pub(super) fn required_admission_value<'a>(value: &'a str, field: &str) -> Resul
     }
 }
 
-pub(super) fn resolve_project_ref(default_namespace: &str, value: &str) -> Result<(String, String), String> {
+pub fn resolve_project_ref(default_namespace: &str, value: &str) -> Result<(String, String), String> {
     let value = required_admission_value(value, "project")?;
     let address_value = value.strip_prefix(flotilla_protocol::view_address::SCHEME_PREFIX).unwrap_or(value);
     let has_scheme = address_value != value;
@@ -4219,7 +4321,7 @@ pub(super) fn resolve_project_ref(default_namespace: &str, value: &str) -> Resul
     }
 }
 
-pub(super) fn normalize_convoy_start_intent(
+pub fn normalize_convoy_start_intent(
     default_namespace: &str,
     intent: &flotilla_protocol::ConvoyStartIntent,
 ) -> Result<(String, flotilla_protocol::ConvoyStartIntent), String> {
@@ -4230,7 +4332,7 @@ pub(super) fn normalize_convoy_start_intent(
     Ok((namespace, intent))
 }
 
-pub(super) fn project_not_ready_error(namespace: &str, project_ref: &str, error: ResourceError) -> String {
+pub fn project_not_ready_error(namespace: &str, project_ref: &str, error: ResourceError) -> String {
     match error {
         ResourceError::NotFound { name } => {
             format!("project {namespace}/{project_ref} is not ready: resource not found: {name} (tried {namespace}/{project_ref})")
@@ -4239,7 +4341,7 @@ pub(super) fn project_not_ready_error(namespace: &str, project_ref: &str, error:
     }
 }
 
-pub(super) fn workflow_has_in_crew_review(workflow: &WorkflowTemplateSpec) -> bool {
+pub fn workflow_has_in_crew_review(workflow: &WorkflowTemplateSpec) -> bool {
     workflow.vessels.iter().any(|vessel| {
         let agent_count = vessel.crew.iter().filter(|crew| matches!(crew.source, CrewSource::Agent { .. })).count();
         agent_count > 1
@@ -4252,7 +4354,7 @@ pub(super) fn workflow_has_in_crew_review(workflow: &WorkflowTemplateSpec) -> bo
     })
 }
 
-pub(super) async fn validate_fork_workflow_admission(
+pub async fn validate_fork_workflow_admission(
     backend: &ResourceBackend,
     namespace: &str,
     repositories: &[ConvoyRepositorySpec],
@@ -4273,7 +4375,7 @@ pub(super) async fn validate_fork_workflow_admission(
     Ok(())
 }
 
-pub(super) async fn validate_workflow_agent_adapters(
+pub async fn validate_workflow_agent_adapters(
     backend: &ResourceBackend,
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
@@ -4339,7 +4441,7 @@ fn credential_grant_query(project: Option<&str>, roles: BTreeSet<String>) -> Sto
     }
 }
 
-pub(super) async fn resolve_workflow_credentials(
+pub async fn resolve_workflow_credentials(
     backend: &ResourceBackend,
     namespace: &str,
     project_ref: Option<&str>,
@@ -4505,7 +4607,7 @@ pub(super) async fn resolve_workflow_credentials(
     Ok(())
 }
 
-pub(super) async fn resolve_and_validate_workflow_credentials(
+pub async fn resolve_and_validate_workflow_credentials(
     backend: &ResourceBackend,
     namespace: &str,
     project_ref: Option<&str>,
@@ -4517,7 +4619,7 @@ pub(super) async fn resolve_and_validate_workflow_credentials(
     validate_workflow_credentials(backend, namespace, workflow, placement).await
 }
 
-pub(super) async fn resolve_and_validate_workflow_credentials_for_capability_admission(
+pub async fn resolve_and_validate_workflow_credentials_for_capability_admission(
     backend: &ResourceBackend,
     namespace: &str,
     project_ref: Option<&str>,
@@ -4530,7 +4632,7 @@ pub(super) async fn resolve_and_validate_workflow_credentials_for_capability_adm
         .await
 }
 
-pub(super) async fn validate_workflow_credentials(
+pub async fn validate_workflow_credentials(
     backend: &ResourceBackend,
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
@@ -4539,7 +4641,7 @@ pub(super) async fn validate_workflow_credentials(
     validate_workflow_credentials_with_capabilities(backend, namespace, workflow, placement, &CapabilityTable::seeded()).await
 }
 
-pub(super) async fn validate_workflow_credentials_with_capabilities(
+pub async fn validate_workflow_credentials_with_capabilities(
     backend: &ResourceBackend,
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
@@ -4549,7 +4651,7 @@ pub(super) async fn validate_workflow_credentials_with_capabilities(
     validate_workflow_credentials_with_capabilities_for_admission(backend, namespace, workflow, placement, capabilities, false).await
 }
 
-pub(super) async fn validate_workflow_credentials_with_capabilities_for_admission(
+pub async fn validate_workflow_credentials_with_capabilities_for_admission(
     backend: &ResourceBackend,
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
@@ -4692,7 +4794,7 @@ pub(super) async fn validate_workflow_credentials_with_capabilities_for_admissio
 /// being the entry name under the Host `credential_expiry` capability.
 /// The seeded adapters currently pair ambient Claude scope with a delivery
 /// slot, so this is forward-provisioned for an ambient-only adapter.
-pub(super) fn ambient_credential_dependent_vessels<'workflow>(
+pub fn ambient_credential_dependent_vessels<'workflow>(
     capabilities: &CapabilityTable,
     specs: &BTreeMap<String, CredentialConsumer>,
     workflow: &'workflow WorkflowTemplateSpec,
@@ -4730,14 +4832,11 @@ pub(super) fn ambient_credential_dependent_vessels<'workflow>(
 /// adapter ids and model names land in fields the launch layer treats as
 /// resolver-trusted (`Arg`'s safety invariant). Constrain them to the token
 /// charset real harness and model names use before they enter the snapshot.
-pub(super) fn valid_agent_override_token(token: &str) -> bool {
+pub fn valid_agent_override_token(token: &str) -> bool {
     !token.is_empty() && token.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
 }
 
-pub(super) fn apply_agent_overrides(
-    workflow: &mut WorkflowTemplateSpec,
-    overrides: &[flotilla_protocol::AgentOverride],
-) -> Result<(), String> {
+pub fn apply_agent_overrides(workflow: &mut WorkflowTemplateSpec, overrides: &[flotilla_protocol::AgentOverride]) -> Result<(), String> {
     let mut seen = HashSet::new();
     for choice in overrides {
         if !seen.insert(choice.capability.as_str()) {
@@ -4787,11 +4886,11 @@ pub(super) fn apply_agent_overrides(
     Ok(())
 }
 
-pub(super) fn required_workflow_agent_adapters(workflow: &WorkflowTemplateSpec) -> Result<BTreeSet<String>, String> {
+pub fn required_workflow_agent_adapters(workflow: &WorkflowTemplateSpec) -> Result<BTreeSet<String>, String> {
     required_agent_adapters(workflow.vessels.iter().flat_map(|vessel| &vessel.crew))
 }
 
-pub(super) async fn placement_agent_adapters(
+pub async fn placement_agent_adapters(
     backend: &ResourceBackend,
     namespace: &str,
     placement: &ResourceObject<PlacementPolicy>,
@@ -4832,7 +4931,7 @@ pub(super) async fn placement_agent_adapters(
     }
 }
 
-pub(super) fn convoy_fallback_slug(title: &str, id: &str) -> String {
+pub fn convoy_fallback_slug(title: &str, id: &str) -> String {
     let slug = format!("{title}-{id}")
         .chars()
         .fold((String::new(), false), |(mut output, pending_separator), character| {
@@ -4859,7 +4958,7 @@ pub(super) fn convoy_fallback_slug(title: &str, id: &str) -> String {
     format!("{base}-{suffix}")
 }
 
-pub(super) fn convoy_issues_fallback_slug(issues: &[ConvoyIssue], project_display_name: &str, project_ref: &str) -> String {
+pub fn convoy_issues_fallback_slug(issues: &[ConvoyIssue], project_display_name: &str, project_ref: &str) -> String {
     match issues {
         [] => convoy_fallback_slug(project_display_name, project_ref),
         [issue] => convoy_fallback_slug(&issue.snapshot.title, &issue.reference.id),
@@ -4870,11 +4969,11 @@ pub(super) fn convoy_issues_fallback_slug(issues: &[ConvoyIssue], project_displa
     }
 }
 
-pub(super) fn convoy_issue_name_context(issue: &ConvoyIssue) -> String {
+pub fn convoy_issue_name_context(issue: &ConvoyIssue) -> String {
     format!("Issue {}: {}\n{}", issue.reference.id, issue.snapshot.title, issue.snapshot.body.as_deref().unwrap_or_default())
 }
 
-pub(super) fn validate_convoy_name(name: &str) -> Result<(), String> {
+pub fn validate_convoy_name(name: &str) -> Result<(), String> {
     if name.len() > 63
         || !name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         || !name.bytes().next().is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
@@ -4885,7 +4984,7 @@ pub(super) fn validate_convoy_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn validate_convoy_branch(branch: &str) -> Result<(), String> {
+pub fn validate_convoy_branch(branch: &str) -> Result<(), String> {
     let invalid_character =
         branch.bytes().any(|byte| byte <= b' ' || byte == 0x7f || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\'));
     let invalid_component =
@@ -4905,7 +5004,7 @@ pub(super) fn validate_convoy_branch(branch: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn parse_ad_hoc_capability_need(value: &str) -> Result<CapabilityNeed, String> {
+pub fn parse_ad_hoc_capability_need(value: &str) -> Result<CapabilityNeed, String> {
     let need = value.parse::<CapabilityNeed>()?;
     if matches!(&need, CapabilityNeed::Platform(platform) if platform == Platform::MATRIX_PLACEHOLDER) {
         return Err("platform:$matrix is only valid on workflow roles or Project role needs".to_string());
@@ -4999,38 +5098,24 @@ fn require_open_continuation(status: &flotilla_protocol::ChangeRequestStatus, id
 }
 
 #[cfg(test)]
-pub(super) async fn handler_contract_fixture() -> HandlerContractFixture {
-    use crate::testkits::discovery::fake_discovery;
+pub async fn handler_contract_fixture() -> HandlerContractFixture {
+    use flotilla_discovery_testkit::fake_discovery;
 
     // Discovery stands in for host/subprocess I/O; orchestration and stores are real.
     let temp = tempfile::tempdir().expect("config");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let discovery = Arc::new(fake_discovery(false));
     let local_environment_id = EnvironmentId::new("local");
-    let environment_manager = Arc::new(
-        EnvironmentManager::new_local(&discovery, local_environment_id.clone(), flotilla_protocol::qualified_path::HostId::new("host"))
-            .await,
-    );
+    let environment_manager: Arc<dyn crate::ports::AdmissionEnvironments> = Arc::new(FixtureEnvironment {
+        host: flotilla_protocol::qualified_path::HostId::new("host"),
+        runner: discovery.runner.clone(),
+        bag: flotilla_discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await,
+    });
     let resource_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let observed_resource_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let provisioning_namespace = Arc::new(std::sync::RwLock::new("flotilla".into()));
-    let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(ProviderChangeRequestQueryPort {
-        resource_backend: resource_backend.clone(),
-        config: config.clone(),
-        discovery: discovery.clone(),
-        environment_manager: environment_manager.clone(),
-        local_environment_id: local_environment_id.clone(),
-    });
-    let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(ProviderIssueQueryPort {
-        forge_reads: flotilla_observation::forge_observation::ForgeReads::new(resource_backend.clone(), "flotilla".into()),
-        host_providers: Mutex::new(HashMap::new()),
-        backend: resource_backend.clone(),
-        config: config.clone(),
-        discovery: discovery.clone(),
-        environment_manager: environment_manager.clone(),
-        local_environment_id: local_environment_id.clone(),
-        provisioning_namespace: provisioning_namespace.clone(),
-    });
+    let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(FixtureQueries);
+    let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(FixtureQueries);
     let observation_source = Arc::new(ProviderChangeRequestObservationSource::new(resource_backend.clone(), query_port.clone()));
     let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
     let repository_change_requests = Arc::new(RwLock::new(HashMap::new()));
@@ -5070,13 +5155,13 @@ pub(super) async fn handler_contract_fixture() -> HandlerContractFixture {
 }
 
 #[cfg(test)]
-pub(super) struct HandlerContractFixture {
-    pub(super) owner: ConvoyAdmission,
-    pub(super) backend: ResourceBackend,
-    pub(super) observed: ResourceBackend,
-    pub(super) reconciliation: Arc<Mutex<()>>,
-    pub(super) namespace: Arc<std::sync::RwLock<String>>,
-    pub(super) temp: tempfile::TempDir,
+pub struct HandlerContractFixture {
+    pub owner: ConvoyAdmission,
+    pub backend: ResourceBackend,
+    pub observed: ResourceBackend,
+    pub reconciliation: Arc<Mutex<()>>,
+    pub namespace: Arc<std::sync::RwLock<String>>,
+    pub temp: tempfile::TempDir,
 }
 
 struct ProbedNamingUtility {
@@ -5189,10 +5274,10 @@ mod tests {
         FulfilmentCostClass, FulfilmentKindSpec, FulfilmentRealisation, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
     };
 
+    use super::cr_name;
     use super::*;
-    use crate::testkits::cr_name;
-    use crate::testkits::discovery::fake_discovery;
-    use crate::testkits::discovery::FakeChangeRequest;
+
+    use flotilla_discovery_testkit::FakeChangeRequest;
     use flotilla_protocol::ChangeRequest;
 
     // Artifact storage is the process boundary; read inventories and rendering
@@ -5567,46 +5652,6 @@ mod tests {
         assert_eq!(outcomes[0], outcomes[1]);
     }
 
-    // #2701: Projects with either retired builtin reference admit using the
-    // current rules even when the stale builtin still exists, or has been deleted.
-    #[tokio::test]
-    async fn retired_project_workflow_admits_current_turn_rules() {
-        let temp = tempfile::tempdir().expect("config");
-        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"retired-workflow-test\"\n").expect("machine identity");
-        let daemon = InProcessDaemon::new(
-            Vec::new(),
-            Arc::new(ConfigStore::with_base(temp.path())),
-            fake_discovery(false),
-            HostName::local(),
-            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-        )
-        .await;
-        let templates = daemon.resource_backend().definitions::<WorkflowTemplate>("flotilla");
-        let current = flotilla_resources::single_agent_workflow_spec();
-        templates.create(&InputMeta::builder().name("single-agent".into()).build(), &current).await.expect("current workflow");
-        for retired in ["single-agent-contained", "single-agent-trusted"] {
-            let mut stale = current.clone();
-            stale.turn_delivery.shift_remove("checks-settled");
-            templates.create(&InputMeta::builder().name(retired.into()).build(), &stale).await.expect("stale workflow");
-            let project = ProjectSpec::builder().display_name("Flotilla".into()).default_workflow_ref(retired.into()).build();
-            let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("flotilla".into()).build();
-            for deleted in [false, true] {
-                if deleted {
-                    templates.delete(retired).await.expect("retire stored builtin");
-                }
-                let (name, frozen) = daemon
-                    .convoy_admission
-                    .resolve_convoy_admission_workflow("flotilla", "flotilla", &project, &[], &intent)
-                    .await
-                    .expect("admit retired Project reference");
-                flotilla_resources::validate(&frozen).expect("admitted workflow must remain valid after resolution");
-                assert_eq!(name, "single-agent");
-                assert!(frozen.turn_delivery.contains_key("checks-settled"));
-                assert!(frozen.turn_delivery.contains_key("merged-unclaimed"));
-            }
-        }
-    }
-
     #[test]
     fn role_refresh_preserves_composed_needs_and_refuses_missing_crew() {
         // Behaviour: routing and admission must allocate the composed crew needs;
@@ -5627,174 +5672,6 @@ mod tests {
         );
         roles.clear();
         refresh_allocation_role_crews(&workflow, &mut roles).expect("empty workflow has no roles to refresh");
-    }
-
-    #[tokio::test]
-    async fn admission_freezes_role_selections_and_refuses_missing_imports() {
-        // Intended: admission resolves declarations once into the workflow that
-        // will be persisted. Later defaults cannot alter that admitted snapshot.
-        use flotilla_resources::{CrewDefaults, CrewDefaultsSpec, Selector, SkillCatalogEntry};
-
-        use crate::testkits::discovery::TestEnvVars;
-        let temp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"admission-skills-test\"\n").expect("config");
-        let catalog = ["research", "testing", "implement", "wayfinder", "review"]
-            .into_iter()
-            .map(|name| SkillCatalogEntry {
-                source: "source".into(),
-                repository: "owner/repo".into(),
-                revision: "1".repeat(40),
-                name: name.into(),
-                path: format!("skills/{name}"),
-            })
-            .collect::<Vec<_>>();
-        std::fs::write(temp.path().join(".flotilla-skill-catalog.json"), serde_json::to_string(&catalog).expect("catalog"))
-            .expect("catalog file");
-        std::fs::write(temp.path().join(".flotilla-sources.json"), serde_json::json!({"schema_version":5,"sources":[{"name":"source", "repository":"https://github.com/owner/repo.git", "revision":"1".repeat(40)}]}).to_string()).expect("source manifest");
-        let mut discovery = fake_discovery(false);
-        discovery.env = Arc::new(TestEnvVars::new([("FLOTILLA_SKILLS_DIR", temp.path().display().to_string())]));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let daemon = InProcessDaemon::new_with_resource_backend(
-            Vec::new(),
-            Arc::new(ConfigStore::with_base(temp.path())),
-            discovery,
-            HostName::new("test-host"),
-            backend.clone(),
-            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-        )
-        .await;
-        let defaults = CrewDefaultsSpec {
-            project_ref: None,
-            default_workflow_ref: None,
-            roles: BTreeMap::new(),
-            skills: BTreeMap::from([
-                ("*".into(), vec!["research".into()]),
-                ("coder".into(), vec!["testing".into(), "implement".into()]),
-                ("governor".into(), vec!["wayfinder".into()]),
-            ]),
-            image: None,
-        };
-        let meta = InputMeta::builder().name("fleet".to_string()).build();
-        backend.definitions::<CrewDefaults>("flotilla").apply(&meta, &defaults).await.expect("defaults");
-        let crew = |role: &str| {
-            CrewSpec::builder()
-                .role(role.into())
-                .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
-                .build()
-        };
-        let template = WorkflowTemplateSpec::builder()
-            .vessels(vec![VesselRequirement::builder().name("work".into()).crew(vec![crew("coder"), crew("governor")]).build()])
-            .build();
-        backend
-            .definitions::<WorkflowTemplate>("flotilla")
-            .apply(&InputMeta::builder().name("work".into()).build(), &template)
-            .await
-            .expect("template");
-        let project = ProjectSpec::builder()
-            .display_name("Example".into())
-            .default_workflow_ref("work".into())
-            .skills(BTreeMap::from([("coder".into(), vec!["-testing".into()])]))
-            .build();
-        let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("example".into()).skills(vec!["review".into()]).build();
-        let (_, frozen) = daemon
-            .convoy_admission
-            .resolve_convoy_admission_workflow("flotilla", "example", &project, &[], &intent)
-            .await
-            .expect("admission");
-        assert_eq!(
-            frozen.vessels[0].crew[0].skills.selected.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
-            ["implement", "research", "review"]
-        );
-        assert_eq!(
-            frozen.vessels[0].crew[1].skills.selected.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
-            ["research", "review", "wayfinder"]
-        );
-        backend.definitions::<CrewDefaults>("flotilla").apply(&meta, &CrewDefaultsSpec::default()).await.expect("change defaults");
-        assert_eq!(frozen.vessels[0].crew[0].skills.selected.len(), 3);
-        let mut invalid = intent;
-        invalid.skills = vec!["missing".into()];
-        let error = daemon
-            .convoy_admission
-            .resolve_convoy_admission_workflow("flotilla", "example", &project, &[], &invalid)
-            .await
-            .expect_err("missing import refuses admission");
-        assert!(error.contains("missing") && error.contains("dispatch") && error.contains("owner/repo"), "{error}");
-    }
-
-    // #2719: real admission applies fleet/parent/project defaults before
-    // convoy selectors and dispatch; explain provenance names the winner.
-    #[tokio::test]
-    async fn admission_cascade_precedence_and_dispatch_are_frozen() {
-        use flotilla_resources::{FleetDesignation, FleetDesignationSpec, RoleDefinition};
-        let temp = tempfile::tempdir().expect("config");
-        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"cascade-test\"\n").expect("machine identity");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let daemon = InProcessDaemon::new_with_resource_backend(
-            Vec::new(),
-            Arc::new(ConfigStore::with_base(temp.path())),
-            fake_discovery(false),
-            HostName::new("cascade"),
-            backend.clone(),
-            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-        )
-        .await;
-        let projects = backend.definitions::<Project>("flotilla");
-        let shape = |model: &str| {
-            BTreeMap::from([(
-                "coder".into(),
-                RoleDefinition { agent: Some("claude-code".into()), model: Some(model.into()), ..Default::default() },
-            )])
-        };
-        let fleet = ProjectSpec::builder()
-            .display_name("Fleet".into())
-            .default_workflow_ref("shared-work".into())
-            .role_definitions(shape("fleet"))
-            .build();
-        projects.apply(&InputMeta::builder().name("fleet".into()).build(), &fleet).await.expect("fleet");
-        backend
-            .definitions::<FleetDesignation>("flotilla")
-            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "fleet".into(), image_cache: None })
-            .await
-            .expect("designation");
-        let templates = backend.definitions::<WorkflowTemplate>("flotilla");
-        let mut template = flotilla_resources::single_agent_workflow_spec();
-        let meta = InputMeta::builder()
-            .name("fleet--shared-work".into())
-            .annotations(BTreeMap::from([(MATERIALIZED_PROJECT_ANNOTATION.into(), "fleet".into())]))
-            .build();
-        templates.apply(&meta, &template).await.expect("inherited workflow");
-        for position in 0..5 {
-            let parent = ProjectSpec::builder()
-                .display_name("Parent".into())
-                .role_definitions(if position >= 1 { shape("parent") } else { BTreeMap::new() })
-                .build();
-            projects.apply(&InputMeta::builder().name("parent".into()).build(), &parent).await.expect("parent");
-            let child = ProjectSpec::builder()
-                .display_name("Child".into())
-                .parent("parent".into())
-                .role_definitions(if position >= 2 { shape("project") } else { BTreeMap::new() })
-                .build();
-            projects.apply(&InputMeta::builder().name("child".into()).build(), &child).await.expect("child");
-            if let CrewSource::Agent { selector, .. } = &mut template.vessels[0].crew[0].source {
-                selector.model = (position >= 3).then(|| "convoy".into());
-            }
-            templates.apply(&meta, &template).await.expect("convoy layer");
-            let intent = flotilla_protocol::ConvoyStartIntent::builder()
-                .project_ref("child".into())
-                .agent_overrides(if position == 4 { vec!["code=codex:dispatch".parse().expect("override")] } else { Vec::new() })
-                .build();
-            let (_, frozen) = daemon
-                .convoy_admission
-                .resolve_convoy_admission_workflow("flotilla", "child", &child, &[], &intent)
-                .await
-                .expect("admission");
-            let expected = ["fleet", "parent", "project", "convoy", "dispatch"][position];
-            let layer = ["project:fleet", "project:parent", "project:child", "convoy:workflow", "dispatch"][position];
-            let CrewSource::Agent { selector, .. } = &frozen.vessels[0].crew[0].source else { panic!("agent") };
-            assert_eq!(selector.model.as_deref(), Some(expected));
-            assert_eq!(frozen.cascade.as_ref().expect("provenance").settings["roles.coder.model"].layer, layer);
-            assert_eq!(selector.adapter.as_deref(), Some(if position == 4 { "codex" } else { "claude-code" }));
-        }
     }
 
     struct FakeQueryPort {
@@ -5850,151 +5727,6 @@ mod tests {
         let status = source.observe(&subject).await.expect("observed change request");
         assert_eq!(status.state.value, Some(ObservedChangeRequestState::Open));
         assert_eq!(port.discoveries.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn need_composition_unites_project_role_and_dispatch_needs() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"admission-needs-test\"\n").expect("daemon config");
-        let daemon = InProcessDaemon::new_with_resource_backend(
-            Vec::new(),
-            Arc::new(ConfigStore::with_base(temp.path())),
-            fake_discovery(false),
-            HostName::new("test-host"),
-            ResourceBackend::new(InMemoryBackend::default()),
-            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-        )
-        .await;
-        let mut project = ProjectSpec::builder().display_name("Example".to_string()).default_workflow_ref("work".to_string()).build();
-        project.role_needs.insert("coder".to_string(), BTreeSet::from([CapabilityNeed::Platform("linux".to_string())]));
-        let mut workflow = WorkflowTemplateSpec::builder()
-            .vessels(vec![VesselRequirement::builder()
-                .name("work".to_string())
-                .crew(vec![CrewSpec::builder().role("coder".to_string()).source(CrewSource::Tool { command: "true".to_string() }).build()])
-                .build()])
-            .build();
-        let mut intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("example".to_string()).build();
-        intent.needs.push("gui_session".to_string());
-
-        let needs =
-            daemon.convoy_admission.compose_convoy_needs("flotilla", &project, &[], &intent, &mut workflow).await.expect("composed needs");
-        assert_eq!(needs, BTreeSet::from([CapabilityNeed::Platform("linux".to_string()), CapabilityNeed::GuiSession]));
-        assert_eq!(workflow.vessels[0].crew[0].needs, needs);
-    }
-    #[tokio::test]
-    async fn codex_adapter_floor_is_composed_without_a_model() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"codex-floor-test\"\n").expect("daemon config");
-        let daemon = InProcessDaemon::new_with_resource_backend(
-            Vec::new(),
-            Arc::new(ConfigStore::with_base(temp.path())),
-            fake_discovery(false),
-            HostName::new("test-host"),
-            ResourceBackend::new(InMemoryBackend::default()),
-            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-        )
-        .await;
-        let project = ProjectSpec::builder().display_name("Example".into()).default_workflow_ref("work".into()).build();
-        let mut workflow = WorkflowTemplateSpec::builder()
-            .vessels(vec![VesselRequirement::builder()
-                .name("work".into())
-                .crew(vec![CrewSpec::builder()
-                    .role("coder".into())
-                    .source(CrewSource::Agent {
-                        selector: flotilla_resources::Selector::for_capability("code"),
-                        prompt: None,
-                        brief_template: None,
-                    })
-                    .build()])
-                .build()])
-            .build();
-        let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("example".into()).build();
-        let needs = daemon.convoy_admission.compose_convoy_needs("flotilla", &project, &[], &intent, &mut workflow).await.expect("needs");
-        assert!(needs.contains(&CapabilityNeed::Harness { adapter: "codex".into(), minimum_version: "0.160.0".into() }));
-    }
-
-    /// Compose the needs of a one-crew workflow whose selector names `claude-code`
-    /// and `opus`, on hosts that each observe the given `(version, opus usable)`.
-    async fn compose_claude_opus_needs(observations: &[(&str, bool)]) -> Result<BTreeSet<CapabilityNeed>, String> {
-        let temp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"model-floor-test\"\n").expect("daemon config");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let daemon = InProcessDaemon::new_with_resource_backend(
-            Vec::new(),
-            Arc::new(ConfigStore::with_base(temp.path())),
-            fake_discovery(false),
-            HostName::new("test-host"),
-            backend.clone(),
-            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-        )
-        .await;
-        let hosts = backend.using::<ResourceHost>("flotilla");
-        for (index, (version, usable)) in observations.iter().enumerate() {
-            let name = format!("host-{index}");
-            let host =
-                hosts.create(&InputMeta::builder().name(name.clone()).build(), &flotilla_resources::HostSpec::default()).await.unwrap();
-            let harness = flotilla_resources::HarnessFacts {
-                version: version.to_string(),
-                models: BTreeMap::from([(
-                    "opus".to_string(),
-                    flotilla_resources::ModelFact { usable: *usable, source: flotilla_resources::ModelFactSource::Probe },
-                )]),
-            };
-            let facts = flotilla_resources::FulfilmentFacts {
-                harnesses: BTreeMap::from([("claude-code".to_string(), harness)]),
-                observed_at: Utc::now(),
-                ..Default::default()
-            };
-            let status =
-                flotilla_resources::HostStatus { fulfilment_facts: BTreeMap::from([("kind".to_string(), facts)]), ..Default::default() };
-            hosts.update_status(&name, &host.metadata.resource_version, &status).await.unwrap();
-        }
-        let project = ProjectSpec::builder().display_name("Example".into()).default_workflow_ref("work".into()).build();
-        let mut workflow = WorkflowTemplateSpec::builder()
-            .vessels(vec![VesselRequirement::builder()
-                .name("work".into())
-                .crew(vec![CrewSpec::builder()
-                    .role("coder".into())
-                    .source(CrewSource::Agent {
-                        selector: flotilla_resources::Selector {
-                            capability: "code".into(),
-                            adapter: Some("claude-code".into()),
-                            model: Some("opus".into()),
-                        },
-                        prompt: None,
-                        brief_template: None,
-                    })
-                    .build()])
-                .build()])
-            .build();
-        let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("example".into()).build();
-        daemon.convoy_admission.compose_convoy_needs("flotilla", &project, &[], &intent, &mut workflow).await
-    }
-
-    // #3202: a newer harness observed with the model usable is evidence, not a
-    // floor; a pinned image layer older than every host install must still admit.
-    #[tokio::test]
-    async fn observed_newer_harness_with_usable_model_adds_no_version_floor() {
-        let needs = compose_claude_opus_needs(&[("2.1.295", true), ("2.1.301", true)]).await.expect("admitted");
-        let observed = ["2.1.295", "2.1.301"];
-        assert!(
-            !needs.iter().any(|need| matches!(
-                need,
-                CapabilityNeed::Harness { adapter, minimum_version } if adapter == "claude-code" && observed.contains(&minimum_version.as_str())
-            )),
-            "observed versions leaked into needs: {needs:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn model_rejected_on_every_observed_harness_still_refuses() {
-        let error = compose_claude_opus_needs(&[("2.1.295", false), ("2.1.301", false)]).await.expect_err("refused");
-        assert_eq!(error, "no observed claude-code harness accepts model opus");
-    }
-
-    #[tokio::test]
-    async fn model_usable_on_one_observed_harness_is_not_rejected_everywhere() {
-        compose_claude_opus_needs(&[("2.1.295", true), ("2.1.301", false)]).await.expect("admitted");
     }
 
     // #2972: frozen provider-instance labels must not borrow legacy host-only
@@ -6351,10 +6083,10 @@ mod tests {
 #[cfg(test)]
 mod naming_tests {
     use super::*;
-    use crate::testkits::replay::testing::capture_logs;
     use flotilla_ai_utility::factories::claude::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory};
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_provider_runtime::{ChannelLabel, CommandOutput};
+    use flotilla_replay_testkit::testing::capture_logs;
     use flotilla_resources::StatusPatch;
 
     // Double at the Claude subprocess boundary; all probes and parsing are real.
@@ -6577,4 +6309,114 @@ mod naming_tests {
         assert_eq!(source, Some(ConvoyNaming::AiUtility { utility: "Claude CLI".to_string() }));
         assert_eq!(naming(environment, response, true).await.1, Some(ConvoyNaming::Explicit));
     }
+}
+
+impl ConvoyAdmission {
+    pub async fn prepare_ensured_convoy(
+        &self,
+        repository_port: &dyn crate::project_ops::ProjectOperations,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+    ) -> Result<(ResourceObject<ConvoyEnsure>, PreparedConvoyAdmission), String> {
+        let repositories = self.backend.clone().including_replicas::<Repository>(namespace);
+        for key in &ensure.spec.repositories {
+            match repositories.get(&key.to_string()).await {
+                Ok(repository) => {
+                    repository_port
+                        .resolve_forge_identity_in(namespace, repository.object.spec)
+                        .await
+                        .map_err(|error| format!("repository {key}: {error}"))?;
+                }
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        // The forge sweep may rewrite both Project membership and this ensure.
+        let ensure = match self.backend.clone().including_replicas::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await {
+            Ok(updated) => updated.object,
+            Err(ResourceError::NotFound { .. }) => ensure.clone(),
+            Err(error) => return Err(error.to_string()),
+        };
+        let intent = flotilla_protocol::ConvoyStartIntent::builder()
+            .namespace(namespace.to_string())
+            .project_ref(ensure.spec.project_ref.clone())
+            .name(ensure.spec.role.clone())
+            .branch(ensure.spec.role.clone())
+            .standing_role(ensure.spec.role.clone())
+            .maybe_workflow_ref((!ensure.spec.workflow_ref.is_empty()).then(|| ensure.spec.workflow_ref.clone()))
+            .maybe_placement_policy(ensure.spec.placement_policy.clone())
+            .maybe_escalation_reason(ensure.spec.escalation_reason.clone())
+            .agent_overrides(ensure.spec.agent_overrides.clone())
+            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+            .build();
+        let admission = self
+            .prepare_convoy_admission_with_preferences(
+                namespace,
+                &intent,
+                &PrincipalRef::implicit_for_namespace(namespace),
+                Some(&ensure.spec.repositories),
+            )
+            .await?;
+        self.check_local_free_space_floor().await?;
+        self.check_prepared_placement_floors(namespace, &admission).await?;
+        if admission.workflow.exit.is_some() {
+            return Err(format!(
+                "workflow template {} declares an exit table; standing convoys require no exit declaration",
+                ensure.spec.workflow_ref
+            ));
+        }
+        if !ensure.metadata.annotations.contains_key(SOURCE_COMMIT_ANNOTATION) {
+            return Err("materialized ensure has no source commit provenance".into());
+        }
+        Ok((ensure, admission))
+    }
+}
+
+#[cfg(test)]
+struct FixtureEnvironment {
+    host: flotilla_protocol::qualified_path::HostId,
+    runner: Arc<dyn CommandRunner>,
+    bag: EnvironmentBag,
+}
+#[cfg(test)]
+impl crate::ports::AdmissionEnvironments for FixtureEnvironment {
+    fn local_host_id(&self) -> &flotilla_protocol::qualified_path::HostId {
+        &self.host
+    }
+    fn environment_bag(&self, _: &EnvironmentId) -> Option<EnvironmentBag> {
+        Some(self.bag.clone())
+    }
+    fn environment_runner(&self, _: &EnvironmentId) -> Option<Arc<dyn CommandRunner>> {
+        Some(self.runner.clone())
+    }
+    fn host_id_for_environment(&self, _: &EnvironmentId) -> Option<flotilla_protocol::qualified_path::HostId> {
+        Some(self.host.clone())
+    }
+}
+#[cfg(test)]
+struct FixtureQueries;
+#[cfg(test)]
+#[async_trait]
+impl ChangeRequestQueryPort for FixtureQueries {
+    async fn discover_repository_change_request(&self, _: &str, _: &RepositorySpec) -> Result<Arc<dyn ChangeRequestTracker>, String> {
+        Ok(Arc::new(flotilla_discovery_testkit::FakeChangeRequest::default()))
+    }
+}
+#[cfg(test)]
+#[async_trait]
+impl IssueQueryPort for FixtureQueries {
+    async fn provider_for_source(
+        &self,
+        _: &flotilla_protocol::IssueSource,
+    ) -> Result<Arc<dyn flotilla_issue_tracker::IssueProvider>, String> {
+        Ok(Arc::new(flotilla_discovery_testkit::FakeIssueProvider::default()))
+    }
+}
+
+#[cfg(test)]
+fn cr_name(service: &str, scope: &str, number: u64) -> String {
+    flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address(service, scope, number, &[]).expect("change request address"),
+    )
+    .expect("record name")
 }

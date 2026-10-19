@@ -98,6 +98,40 @@ The step-4 survey found core and store code with no home in the target crates. O
 - **`flotilla-capability-contract`** (new, #3200): the session capability contract (`CredentialCapability`, `SessionCapabilitySource`, `endpoint_for_env`, `credential_card`). It depends on no flotilla crate, so `flotilla-credentials` implements the source and `flotilla-core` and the daemon consume it without a cycle. Card observation and rendering stay in core until the crew stream.
 - **Host identity** (HostId and NodeId resolution) lives in `flotilla-daemon`: the composition root resolves it once at startup and injects it.
 
+### Admission capability (#3299)
+
+`flotilla-admission` owns the admission transaction, admission command handlers,
+free-space floors, placement policy, mission normalization and accounting,
+repository addressing, regard lifecycle, composed-image planning, project
+registration/refresh and project image layers. Standing-convoy admission ports
+and the default fail-closed backing inspector live with this capability; the
+reverse reconciler port and install step remain in place until #3492.
+
+Core composes admission with three owned ports:
+
+- `ConvoyTeardown` supplies `abandon` and `reap` over the crew service.
+- `AdmissionEnvironments` supplies the local host identity, environment bag,
+  runner and environment-to-host lookup. It is distinct from projections'
+  `Environments`; the live `EnvironmentManager` stays in core's composition.
+- `ProjectOperations` is the repository port: repository inspection, project
+  integration, adopted-checkout inspection, image checks, convoy-start worker
+  submission and namespace-explicit forge-identity resolution. It owns the
+  `RepositoryInspector` interface and inspection values; core retains the
+  `GitRepositoryInspector` implementation.
+
+Admission reads observations and discovery directly. Core retains observation
+query-port implementations, forge-identity sweep composition, image-check
+execution and the attach-waiting convoy-start worker. Repository tracker leases
+are accessed through admission's public accessor, not its state field.
+
+Shared naming, architecture aliases, checkout path selection, crew accounting
+and the brief-artifact marker live in resources. `BriefArtifactWriter` lives in
+agent, command-event helpers in daemon-api, and the change-request observation
+result `ConvoyBranchRefresh` in observation. Consumers import these APIs from
+their owners directly. The build-graph guard registers admission as a capability
+and refuses other capabilities, composition, provider reachbacks and the
+state-machine engine. These moves change no resource schema or wire shape.
+
 ## Consequences
 
 - Adding a provider touches one crate. Swapping a store backend, persistence posture or message transport is a composition change.

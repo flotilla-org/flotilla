@@ -14,11 +14,11 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{create_docker_placement, create_host_direct_placement, set_host_credential_expiry, test_meta};
-use crate::in_process::convoy_admission::{
-    resolve_workflow_credentials, validate_workflow_credentials, validate_workflow_credentials_with_capabilities,
-};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_admission::convoy_admission::{
+    resolve_workflow_credentials, validate_workflow_credentials, validate_workflow_credentials_with_capabilities,
+};
 use flotilla_agent::adapter::{AgentRequirement, CapabilityTable};
 
 #[tokio::test]
@@ -50,7 +50,7 @@ async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selectio
 
         for policy in [Some("docker-kiwi"), None] {
             let error = daemon
-                .convoy_admission
+                .admission
                 .resolve_convoy_placement("flotilla", None, &[], &workflow, policy, false)
                 .await
                 .expect_err("ineligible host must refuse admission");

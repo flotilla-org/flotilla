@@ -50,7 +50,7 @@ impl InProcessDaemon {
     }
 
     pub(super) async fn local_checkout_for_repository(&self, key: &RepositoryKey) -> Result<Option<PathBuf>, String> {
-        let checkouts = crate::repository_addressing::local_checkouts(
+        let checkouts = flotilla_admission::repository_addressing::local_checkouts(
             &self.resource_backend,
             &self.observed_resource_backend,
             &self.provisioning_namespace().await,

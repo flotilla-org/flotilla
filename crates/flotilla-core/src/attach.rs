@@ -157,7 +157,7 @@ impl<'a> AttachResolver<'a> {
             return Ok(None);
         };
         let namespace = self.provisioning_namespace().await;
-        let repository_key = crate::repository_addressing::resolve_repository(
+        let repository_key = flotilla_admission::repository_addressing::resolve_repository(
             self.resource_backend,
             self.observed_resource_backend,
             &namespace,

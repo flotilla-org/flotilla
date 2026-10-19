@@ -1054,13 +1054,14 @@ struct ConflictCheckoutInspector {
 }
 
 #[async_trait::async_trait]
-impl flotilla_core::repository_inspection::RepositoryInspector for ConflictCheckoutInspector {
+impl flotilla_admission::repository_inspection::RepositoryInspector for ConflictCheckoutInspector {
     async fn inspect_path(
         &self,
         path: &std::path::Path,
         _remote: Option<&str>,
-    ) -> Result<flotilla_core::repository_inspection::RepositoryInspection, String> {
-        use flotilla_core::repository_inspection::{LocalCheckoutInspection, RepositoryInspection};
+    ) -> Result<flotilla_admission::repository_inspection::RepositoryInspection, String> {
+        use flotilla_admission::repository_inspection::LocalCheckoutInspection;
+        use flotilla_admission::repository_inspection::RepositoryInspection;
         self.backend
             .using::<Convoy>("flotilla")
             .create(

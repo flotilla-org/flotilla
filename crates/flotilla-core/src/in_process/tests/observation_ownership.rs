@@ -383,7 +383,7 @@ async fn continuation_resolves_branch_without_pr_and_refuses_terminal_pr() {
     };
     let (key, branch, request) = fixture
         .daemon
-        .convoy_admission
+        .admission
         .resolve_continuation(std::slice::from_ref(&repository), &ConvoyContinuation::Branch("wip".into()))
         .await
         .expect("WIP continuation");
@@ -405,12 +405,12 @@ async fn continuation_resolves_branch_without_pr_and_refuses_terminal_pr() {
                 },
             )])
             .await;
-        fixture.daemon.convoy_admission.repository_change_requests.write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
+        fixture.daemon.admission.repository_change_requests().write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
             provider;
         for input in [ConvoyContinuation::Branch("wip".into()), ConvoyContinuation::ChangeRequest("7".into())] {
             let error = fixture
                 .daemon
-                .convoy_admission
+                .admission
                 .resolve_continuation(std::slice::from_ref(&repository), &input)
                 .await
                 .err()

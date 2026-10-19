@@ -1,0 +1,67 @@
+[package]
+name = "flotilla-admission"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-messaging = { path = "../flotilla-messaging" }
+flotilla-observation = { path = "../flotilla-observation" }
+flotilla-config = { path = "../flotilla-config" }
+flotilla-environment = { path = "../flotilla-environment" }
+flotilla-ai-utility = { path = "../flotilla-ai-utility" }
+flotilla-change-request = { path = "../flotilla-change-request" }
+flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
+flotilla-charter = { path = "../flotilla-charter" }
+flotilla-agent = { path = "../flotilla-agent" }
+flotilla-discovery = { path = "../flotilla-discovery" }
+flotilla-discovery-api = { path = "../flotilla-discovery-api" }
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-store = { path = "../flotilla-store" }
+flotilla-paths = { path = "../flotilla-paths" }
+flotilla-daemon-api = { path = "../flotilla-daemon-api" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+tracing = { workspace = true }
+serde_yml = { workspace = true }
+url = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+uuid = { workspace = true, features = ["v4"] }
+sha2 = { workspace = true }
+
+
+[dev-dependencies]
+flotilla-projections = { path = "../flotilla-projections" }
+flotilla-vcs = { path = "../flotilla-vcs" }
+indexmap = { workspace = true }
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
+flotilla-store-memory = { path = "../flotilla-store-memory" }
+flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
+tempfile = { workspace = true }
+hegeltest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+
+[lints]
+workspace = true
+
+# Keep native feature selection aligned with flotilla-projections.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-signing = { path = "../flotilla-build-features-signing" }
+flotilla-build-features-sqlite = { path = "../flotilla-build-features-sqlite" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

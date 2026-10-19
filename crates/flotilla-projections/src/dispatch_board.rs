@@ -1,5 +1,6 @@
 //! Slow tracker observations outlive interactive requests. One refresh per source
 //! serves all Projects, retaining the last successful snapshot during outages.
+use flotilla_resources::convoy_accounting::active_crew_count;
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -127,30 +128,6 @@ pub fn live_project_convoys_query(projects: impl IntoIterator<Item = String>) ->
         field_values: BTreeMap::from([("spec.project_ref".into(), projects.into_iter().collect())]),
         ..flotilla_store::live_convoys_query()
     }
-}
-
-/// Settled roles release share before landing; unpublished crew state counts one.
-pub fn active_crew_count(status: Option<&flotilla_resources::ConvoyStatus>) -> usize {
-    if status.is_some_and(|status| status.phase.is_terminal()) {
-        return 0;
-    }
-    let Some(status) = status.filter(|status| status.crew_work.values().any(|crew| !crew.is_empty())) else {
-        return 1;
-    };
-    status
-        .crew_work
-        .values()
-        .flat_map(|crew| crew.values())
-        .filter(|state| {
-            matches!(
-                state.phase,
-                flotilla_resources::CrewWorkPhase::Pending
-                    | flotilla_resources::CrewWorkPhase::Working
-                    | flotilla_resources::CrewWorkPhase::Interrupted
-                    | flotilla_resources::CrewWorkPhase::Stalled
-            )
-        })
-        .count()
 }
 
 pub struct DispatchBoard<'a> {

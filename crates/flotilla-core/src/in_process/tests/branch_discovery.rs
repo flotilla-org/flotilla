@@ -37,7 +37,7 @@ async fn branch_discovery_ignores_preexisting_terminal_request() {
                 },
             )])
             .await;
-        fixture.daemon.convoy_admission.repository_change_requests.write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
+        fixture.daemon.admission.repository_change_requests().write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
             provider;
         let convoys = fixture.daemon.resource_backend().using::<ResourceConvoy>("flotilla");
         convoys
@@ -109,8 +109,7 @@ async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
             ),
         ])
         .await;
-    fixture.daemon.convoy_admission.repository_change_requests.write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
-        provider;
+    fixture.daemon.admission.repository_change_requests().write().await.get_mut(&fixture.keys[0]).expect("provider").provider = provider;
     let backend = fixture.daemon.resource_backend();
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     convoys
@@ -237,7 +236,7 @@ async fn checkout_creation_does_not_reuse_cached_branch_absence() {
         reads: flotilla_observation::forge_observation::ForgeReads::new(fixture.daemon.resource_backend(), "flotilla".into()),
         source: flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "team/repo0".into() },
     });
-    fixture.daemon.convoy_admission.repository_change_requests.write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
+    fixture.daemon.admission.repository_change_requests().write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
         observed.clone();
     assert!(fixture
         .daemon

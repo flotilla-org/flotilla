@@ -8,7 +8,7 @@ use std::{
 use flotilla_protocol::{DispatchBoardRepository, DispatchScore, Issue, IssueRef, MissionAttributes, MissionFields};
 use flotilla_resources::DispatchPolicy;
 
-pub use flotilla_projections::dispatch_board::{active_crew_count, live_project_convoys_query};
+use flotilla_resources::convoy_accounting::active_crew_count;
 
 /// Shared live-crew accounting for ready scores and convoy explanations.
 #[derive(Default)]
@@ -514,53 +514,6 @@ mod tests {
             .build()
     }
 
-    // WORKLOAD.md: retained history must not multiply decoded live-accounting
-    // objects. Compare zero history to 1,000 terminal records using the real
-    // indexed store; unrelated projects and missing-status convoys are included.
-    #[tokio::test]
-    async fn live_inventory_reads_are_flat_with_terminal_history() {
-        use flotilla_resources::{Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta};
-        use flotilla_store::ResourceBackend;
-        use flotilla_store_memory::InMemoryBackend;
-        use flotilla_store_testkit::{assert_flat_reads, measure_reads, ReadCountsBackendExt};
-        assert_flat_reads([0, 1000], |history| async move {
-            let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
-            let convoys = backend.using::<Convoy>("ns");
-            for index in 0..history + 3 {
-                let record = convoys
-                    .create(
-                        &InputMeta::builder().name(format!("c-{index}")).build(),
-                        &ConvoySpec::builder()
-                            .workflow_ref("workflow".into())
-                            .project_ref(if index == history + 2 { "other" } else { "p" }.into())
-                            .build(),
-                    )
-                    .await
-                    .expect("convoy");
-                if index < history {
-                    convoys
-                        .update_status(
-                            &record.metadata.name,
-                            &record.metadata.resource_version,
-                            &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
-                        )
-                        .await
-                        .expect("terminal history");
-                }
-            }
-            let (rows, reads) = measure_reads(backend.query_declared::<Convoy>("ns", &live_project_convoys_query(["p".into()]))).await;
-            assert_eq!(rows.expect("live query").items.len(), 2);
-            assert!(backend
-                .query_declared::<Convoy>("ns", &live_project_convoys_query([]))
-                .await
-                .expect("empty projects")
-                .items
-                .is_empty());
-            reads.of(&backend)
-        })
-        .await;
-    }
-
     // A convoy with two live roles serves both tier competitions with two crews,
     // while its Project has two crews total. Duplicate tickets in a tier add none.
     #[tokio::test]
@@ -1023,5 +976,56 @@ mod tests {
         )
         .is_ok());
         assert!(parse_mission_fields(&[serde_json::json!({"issue_field_name":"Weight","value":"high"})]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod query_contract {
+    use flotilla_projections::dispatch_board::live_project_convoys_query;
+    // WORKLOAD.md: retained history must not multiply decoded live-accounting
+    // objects. Compare zero history to 1,000 terminal records using the real
+    // indexed store; unrelated projects and missing-status convoys are included.
+    #[tokio::test]
+    async fn live_inventory_reads_are_flat_with_terminal_history() {
+        use flotilla_resources::{Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta};
+        use flotilla_store::ResourceBackend;
+        use flotilla_store_memory::InMemoryBackend;
+        use flotilla_store_testkit::{assert_flat_reads, measure_reads, ReadCountsBackendExt};
+        assert_flat_reads([0, 1000], |history| async move {
+            let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+            let convoys = backend.using::<Convoy>("ns");
+            for index in 0..history + 3 {
+                let record = convoys
+                    .create(
+                        &InputMeta::builder().name(format!("c-{index}")).build(),
+                        &ConvoySpec::builder()
+                            .workflow_ref("workflow".into())
+                            .project_ref(if index == history + 2 { "other" } else { "p" }.into())
+                            .build(),
+                    )
+                    .await
+                    .expect("convoy");
+                if index < history {
+                    convoys
+                        .update_status(
+                            &record.metadata.name,
+                            &record.metadata.resource_version,
+                            &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
+                        )
+                        .await
+                        .expect("terminal history");
+                }
+            }
+            let (rows, reads) = measure_reads(backend.query_declared::<Convoy>("ns", &live_project_convoys_query(["p".into()]))).await;
+            assert_eq!(rows.expect("live query").items.len(), 2);
+            assert!(backend
+                .query_declared::<Convoy>("ns", &live_project_convoys_query([]))
+                .await
+                .expect("empty projects")
+                .items
+                .is_empty());
+            reads.of(&backend)
+        })
+        .await;
     }
 }

@@ -9,11 +9,12 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_admission::repository_inspection::RepositoryInspector;
 use flotilla_charter::charter_store::{LayerDirectorySnapshot, PROJECT_IMAGE_LAYER_PATH, PROJECT_IMAGE_MANAGER};
-use flotilla_core::{
-    in_process::{check_image, image_build_report, ImageCheckSources},
-    repository_inspection::{GitRepositoryInspector, RepositoryInspector},
-};
+use flotilla_core::in_process::check_image;
+use flotilla_core::in_process::image_build_report;
+use flotilla_core::in_process::ImageCheckSources;
+use flotilla_core::repository_inspection::GitRepositoryInspector;
 use flotilla_discovery_testkit::test_vcs_resolver;
 use flotilla_protocol::image_check::{ImageBuildReportPhase, ImageCheckAgentSource, ImageCheckReport, ImageCheckRequest, ImageProbeReport};
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner, ProcessCommandRunner};
@@ -167,7 +168,7 @@ async fn a_branch_layer_change_builds_a_new_identity() {
 
     let main = check(&backend, &branches, &request("main")).await;
     let admitted = resolve_image(
-        &flotilla_core::image_build::read_image_catalogue(&backend, NS).await.expect("catalogue"),
+        &flotilla_admission::image_build::read_image_catalogue(&backend, NS).await.expect("catalogue"),
         &ImageRequest::builder()
             .project(PROJECT.into())
             .selection(ImageSelection { base: None, layers: vec!["rust".into()] })

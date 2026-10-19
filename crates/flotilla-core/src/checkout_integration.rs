@@ -9,7 +9,7 @@ use std::{
 use chrono::Utc;
 use flotilla_resources::{
     ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus,
-    CheckoutSpec, CheckoutStatus, ConditionValue, Convoy, CrewWorkPhase, IntegrationCondition, LandedEvidence, ObservedChangeRequestState,
+    CheckoutSpec, ConditionValue, Convoy, CrewWorkPhase, IntegrationCondition, LandedEvidence, ObservedChangeRequestState,
     RemoteRefObservation, ResourceObject, CHANGE_REQUEST_ID_LABEL,
 };
 
@@ -62,13 +62,6 @@ fn checkout_base_ref_from_spec(spec: &CheckoutSpec) -> Option<&str> {
         CheckoutSpec::Observed(spec) if spec.is_main => Some(&spec.r#ref),
         CheckoutSpec::Observed(_) => None,
     }
-}
-
-pub fn checkout_path_from_status_and_spec<'a>(status: Option<&'a CheckoutStatus>, spec: &'a CheckoutSpec) -> Option<&'a str> {
-    status.as_ref().and_then(|status| status.path.as_deref()).or_else(|| spec.target_path()).or(match spec {
-        CheckoutSpec::Observed(spec) => Some(spec.path.as_str()),
-        _ => None,
-    })
 }
 
 /// Resolve the change request associated with one of a convoy's checkouts.

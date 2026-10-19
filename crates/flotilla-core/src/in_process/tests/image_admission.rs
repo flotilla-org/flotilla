@@ -18,9 +18,9 @@ use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 
 use super::support::{create_docker_placement, test_meta};
-use crate::in_process::convoy_admission::PlacementResolution;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_admission::convoy_admission::PlacementResolution;
 
 const NS: &str = "flotilla";
 
@@ -144,11 +144,8 @@ async fn admit(
     let policy = fixture.backend.using::<PlacementPolicy>(NS).get("crew-policy").await.expect("policy");
     let mut placement =
         PlacementResolution { selected: Some(policy), refused_candidates: Vec::new(), viable_not_selected: Vec::new(), allocation: None };
-    let (pins, builds) = fixture
-        .daemon
-        .convoy_admission
-        .join_convoy_placement_builds(NS, Some("flotilla"), workflow, &mut placement, Some(&decision()))
-        .await?;
+    let (pins, builds) =
+        fixture.daemon.admission.join_convoy_placement_builds(NS, Some("flotilla"), workflow, &mut placement, Some(&decision())).await?;
     assert!(fixture
         .backend
         .using::<ImageBuild>(NS)
@@ -159,7 +156,7 @@ async fn admit(
         .iter()
         .all(|build| builds.iter().all(|planned| planned.create.is_none() || planned.name != build.metadata.name)));
     // Admission commits its planned builds with the convoy.
-    crate::image_build::create_planned_builds(&fixture.backend, NS, &builds).await?;
+    flotilla_admission::image_build::create_planned_builds(&fixture.backend, NS, &builds).await?;
     let image = placement.selected.expect("selected").spec.docker_per_vessel.expect("docker").image;
     Ok((image, pins.into_iter().map(|(vessel, (spec, _))| (vessel, spec.docker_per_vessel.expect("docker").image)).collect()))
 }

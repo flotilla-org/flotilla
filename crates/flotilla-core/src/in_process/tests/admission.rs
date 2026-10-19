@@ -1,3 +1,4 @@
+use flotilla_admission::support::{ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot, prepared_snapshot_name};
 use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -21,15 +22,15 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{test_meta, ForgeAwareTestChangeRequestFactory};
-use crate::in_process::convoy_admission::{KindCandidate, PlacementResolution, PlacementTieBreak};
-use crate::in_process::{
-    ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot, prepared_snapshot_name, CheckoutArchiveStatus,
-    CheckoutIntegrationStatus, InProcessDaemon, IntegrationCondition,
-};
-use crate::repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
+use crate::in_process::{CheckoutArchiveStatus, CheckoutIntegrationStatus, InProcessDaemon, IntegrationCondition};
 use crate::testkits::cr_name;
 use crate::testkits::discovery::{fake_discovery, fake_discovery_with_runner, FakeChangeRequest};
 use crate::testkits::replay::testing::MockRunner;
+use flotilla_admission::convoy_admission::{KindCandidate, PlacementResolution, PlacementTieBreak};
+use flotilla_admission::repository_inspection::LocalCheckoutInspection;
+use flotilla_admission::repository_inspection::RepositoryContinuity;
+use flotilla_admission::repository_inspection::RepositoryInspection;
+use flotilla_admission::repository_inspection::RepositoryInspector;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::ChangeRequest;
 use flotilla_provider_runtime::available_space::AvailableSpaceProbe;
