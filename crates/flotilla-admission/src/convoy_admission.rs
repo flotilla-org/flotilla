@@ -1,4 +1,5 @@
 //! Convoy admission state and transaction boundary.
+use flotilla_resources::checkout_path::checkout_path;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1137,7 +1138,7 @@ impl ConvoyAdmission {
                 let mut source_roots = local_checkouts
                     .iter()
                     .filter(|checkout| checkout.spec.repo_ref() == repository_ref)
-                    .filter_map(|checkout| crate::support::checkout_path(checkout).map(PathBuf::from))
+                    .filter_map(|checkout| checkout_path(checkout).map(PathBuf::from))
                     .collect::<Vec<_>>();
                 source_roots.sort();
                 roots.extend(source_roots);

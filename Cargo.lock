@@ -3309,6 +3309,7 @@ dependencies = [
  "flotilla-resources",
  "futures",
  "minijinja",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",

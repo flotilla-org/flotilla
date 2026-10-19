@@ -3,17 +3,17 @@
 use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use flotilla_core::checkout_integration::convoy_change_request_id_for_checkout;
-use flotilla_core::checkout_integration::inspect_checkout_integration;
-use flotilla_core::checkout_integration::inspect_convoy_checkout_integration;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_resources::checkout_path::checkout_path_from_status_and_spec;
+use flotilla_resources::checkout_integration::convoy_change_request_id_for_checkout;
+use flotilla_resources::checkout_path::{checkout_path_component, checkout_path_from_status_and_spec};
 use flotilla_resources::{
     canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Convoy, Environment, ForgeSpec,
     ResourceObject,
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
+use flotilla_vcs::checkout_integration::inspect_checkout_integration;
+use flotilla_vcs::checkout_integration::inspect_convoy_checkout_integration;
 use flotilla_vcs::vcs as core_vcs;
 use flotilla_vcs::vcs::CheckoutRegistration;
 use flotilla_vcs::vcs::Vcs;
@@ -21,7 +21,6 @@ use tracing::{debug, warn};
 
 use crate::reconcilers::{
     checkout::managed_checkout_reason,
-    checkout_path_component,
     clone::runtime::{clone_staging_path, controller_vcs, remove_checkout_path},
     BranchPreservationReason, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };

@@ -1,3 +1,4 @@
+use flotilla_resources::checkout_integration::remote_ref_for_branch;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     future::Future,
@@ -652,7 +653,7 @@ impl ReconcilerWake {
                                     CheckoutSpec::FreshClone(spec) => &spec.r#ref,
                                     CheckoutSpec::Observed(spec) => &spec.r#ref,
                                 };
-                                crate::checkout_integration::remote_ref_for_branch(branch) == *reference
+                                remote_ref_for_branch(branch) == *reference
                             })
                             .map(|checkout| LeafMaker::Observed {
                                 refresher: "checkout_integration".into(),

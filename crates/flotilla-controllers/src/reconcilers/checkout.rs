@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY;
-use flotilla_core::checkout_integration::{checkout_observation_lacks_convoy_association, convoy_change_request_id_for_checkout};
+use flotilla_resources::checkout_integration::{checkout_observation_lacks_convoy_association, convoy_change_request_id_for_checkout};
 use flotilla_resources::{
     convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
     CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, Forge, IntegrationCondition,

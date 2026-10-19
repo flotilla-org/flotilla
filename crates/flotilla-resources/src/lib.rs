@@ -329,4 +329,5 @@ pub mod image_architecture;
 
 pub mod convoy_accounting;
 
+pub mod checkout_integration;
 pub mod checkout_path;

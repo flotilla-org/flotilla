@@ -1,4 +1,5 @@
 //! Checkout-scoped VCS services, Git implementations and discovery probes.
+pub mod checkout_integration;
 pub mod factory;
 pub mod providers;
 pub mod vcs;

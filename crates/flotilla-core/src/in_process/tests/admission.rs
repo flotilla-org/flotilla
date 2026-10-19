@@ -1,4 +1,5 @@
 use flotilla_admission::support::{ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot, prepared_snapshot_name};
+use flotilla_resources::checkout_integration::change_request_subjects_from_claim;
 use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -171,7 +172,7 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         .iter()
         .all(|entry| entry.relationship == flotilla_protocol::Relationship::Produces));
 
-    let claim = crate::checkout_integration::change_request_subjects_from_claim(
+    let claim = change_request_subjects_from_claim(
         "https://forgejo.lab.flotilla.work/robert/ghostty-ops/pulls/18",
         &convoy.spec.repositories,
         &[forge],

@@ -400,7 +400,3 @@ pub async fn ensure_repository_and_default_project_workflow(
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
-
-pub fn checkout_path(checkout: &ResourceObject<ResourceCheckout>) -> Option<&str> {
-    flotilla_resources::checkout_path::checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
-}
