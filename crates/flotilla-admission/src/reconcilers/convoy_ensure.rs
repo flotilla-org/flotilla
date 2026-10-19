@@ -98,6 +98,7 @@ impl EnsureReconciler {
     }
 }
 impl EnsureReconciler {
+    // Test entry point for the integration controller used by orchestration-testkit.
     #[doc(hidden)]
     pub async fn ensure_admission_dependency_hash(
         &self,
@@ -107,6 +108,7 @@ impl EnsureReconciler {
     ) -> Result<String, String> {
         self.pass(admission).ensure_admission_dependency_hash(namespace, ensure).await
     }
+    // Test entry point for the integration controller used by orchestration-testkit.
     #[doc(hidden)]
     pub async fn start_ensured_convoy(
         &self,
