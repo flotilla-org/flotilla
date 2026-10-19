@@ -85,7 +85,7 @@ pub fn from_kubeconfig(path: impl AsRef<Path>) -> Result<HttpBackend, ResourceEr
         .find(|user| user.name == context.context.user)
         .ok_or_else(|| ResourceError::invalid(format!("user '{}' not found", context.context.user)))?;
 
-    let mut builder = flotilla_tls::client_builder().tls_backend_rustls();
+    let mut builder = rigging_tls::client_builder().tls_backend_rustls();
     if let Some(ca_bytes) =
         read_pem_bytes(path, cluster.cluster.certificate_authority.as_deref(), cluster.cluster.certificate_authority_data.as_deref())?
     {

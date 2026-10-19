@@ -1298,7 +1298,7 @@ mod tests {
     // without a server or a live request. Cleanup errors must not retire monitoring.
     #[tokio::test]
     async fn failed_collection_keeps_retained_monitoring() {
-        let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), "invalid://resource-store"));
+        let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), "invalid://resource-store"));
         let refresher = ChangeRequestRefresher::new(
             "kiwi".into(),
             backend,

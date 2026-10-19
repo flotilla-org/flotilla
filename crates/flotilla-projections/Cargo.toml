@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-aws-lc-provider = ["flotilla-tls/aws-lc-provider"]
+aws-lc-provider = ["rigging-tls/aws-lc-provider"]
 skip-no-sandbox-tests = ["flotilla-store/skip-no-sandbox-tests"]
 
 [dependencies]
@@ -19,7 +19,7 @@ serde = { workspace = true }
 flotilla-forge-github = { path = "../flotilla-forge-github" }
 flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
-flotilla-tls = { path = "../flotilla-tls" }
+rigging-tls = { workspace = true }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 flotilla-charter = { path = "../flotilla-charter" }

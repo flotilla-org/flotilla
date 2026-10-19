@@ -21,8 +21,11 @@ impl Invocation {
 async fn exported_macros_preserve_default_and_explicit_channel_labels() {
     let invocation = Invocation;
     let cwd = Path::new("/");
-    assert_eq!(gh_api_get!(invocation, "repos/o/r", cwd), ChannelLabel::GhApi("repos/o/r".into()));
-    assert_eq!(gh_api_get_with_headers!(invocation, "repos/o/r", cwd), ChannelLabel::GhApi("repos/o/r".into()));
-    assert_eq!(gh_api_get!(invocation, "repos/o/r", cwd, TaskId("task")), ChannelLabel::GhApi("task".into()));
-    assert_eq!(gh_api_get_with_headers!(invocation, "repos/o/r", cwd, TaskId("task")), ChannelLabel::GhApi("task".into()));
+    assert_eq!(gh_api_get!(invocation, "repos/o/r", cwd), flotilla_provider_runtime::gh_api_label("repos/o/r".into()));
+    assert_eq!(gh_api_get_with_headers!(invocation, "repos/o/r", cwd), flotilla_provider_runtime::gh_api_label("repos/o/r".into()));
+    assert_eq!(gh_api_get!(invocation, "repos/o/r", cwd, TaskId("task")), flotilla_provider_runtime::gh_api_label("task".into()));
+    assert_eq!(
+        gh_api_get_with_headers!(invocation, "repos/o/r", cwd, TaskId("task")),
+        flotilla_provider_runtime::gh_api_label("task".into())
+    );
 }

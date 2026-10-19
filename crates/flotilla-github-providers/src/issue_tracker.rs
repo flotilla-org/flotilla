@@ -553,11 +553,11 @@ impl flotilla_issue_tracker::IssueProvider for GitHubIssueProvider {
     }
 
     async fn mission_fields(&self, reference: &IssueRef) -> Result<flotilla_protocol::MissionFields, String> {
-        use flotilla_provider_runtime::ChannelLabel;
+        use flotilla_provider_runtime::gh_api_label;
         let mut values = Vec::new();
         for page in 1.. {
             let endpoint = format!("repos/{}/issues/{}/issue-field-values?per_page=100&page={page}", reference.source.scope, reference.id);
-            let response = self.api.get_classified_response(&endpoint, &self.host_root, &ChannelLabel::GhApi(endpoint.clone())).await;
+            let response = self.api.get_classified_response(&endpoint, &self.host_root, &gh_api_label(endpoint.clone())).await;
             let response = match response {
                 Ok(response) => response,
                 // GitHub documents unsupported/not present fields as 404/410. Authentication,

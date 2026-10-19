@@ -5,9 +5,11 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+rigging-process = { workspace = true }
+rigging-http-client = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 flotilla-protocol = { path = "../flotilla-protocol" }
-flotilla-tls = { path = "../flotilla-tls" }
+rigging-tls = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
@@ -24,6 +26,8 @@ libc = { workspace = true }
 sysinfo = "0.38.4"
 
 [dev-dependencies]
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+rigging-replay-testkit = { workspace = true }
 hegeltest = "=0.48.1"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

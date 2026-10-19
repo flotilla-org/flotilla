@@ -27,7 +27,7 @@ tokio-util = { workspace = true, features = ["rt"] }
 [dev-dependencies]
 flotilla-store-http = { path = "../flotilla-store-http" }
 flotilla-manifest = { path = "../flotilla-manifest" }
-flotilla-tls = { path = "../flotilla-tls" }
+rigging-tls = { workspace = true }
 flotilla-forgejo-providers = { path = "../flotilla-forgejo-providers" }
 flotilla-forge-forgejo = { path = "../flotilla-forge-forgejo" }
 flotilla-fake-forge = { path = "../flotilla-fake-forge" }

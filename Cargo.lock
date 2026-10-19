@@ -1083,7 +1083,6 @@ dependencies = [
  "flotilla-store",
  "flotilla-store-memory",
  "flotilla-test-support",
- "flotilla-tls",
  "flotilla-tui",
  "flotilla-vcs",
  "flotilla-vessel-agent",
@@ -1091,6 +1090,7 @@ dependencies = [
  "libc",
  "ratatui",
  "reqwest 0.13.2",
+ "rigging-tls",
  "serde",
  "serde_json",
  "serde_yml",
@@ -1230,9 +1230,9 @@ dependencies = [
  "flotilla-paths",
  "flotilla-provider-runtime",
  "flotilla-replay-testkit",
- "flotilla-tls",
  "http",
  "reqwest 0.13.2",
+ "rigging-tls",
  "serde",
  "serde_json",
  "tokio",
@@ -1642,9 +1642,9 @@ dependencies = [
  "flotilla-protocol",
  "flotilla-provider-runtime",
  "flotilla-replay-testkit",
- "flotilla-tls",
  "http",
  "reqwest 0.13.2",
+ "rigging-tls",
  "serde",
  "serde_json",
  "tempfile",
@@ -1822,7 +1822,6 @@ dependencies = [
  "flotilla-store-sqlite",
  "flotilla-store-testkit",
  "flotilla-terminal",
- "flotilla-tls",
  "flotilla-vcs",
  "futures",
  "hegeltest",
@@ -1833,6 +1832,8 @@ dependencies = [
  "minijinja",
  "rand_core 0.6.4",
  "reqwest 0.13.2",
+ "rigging-replay-testkit",
+ "rigging-tls",
  "serde",
  "serde_json",
  "serde_yml",
@@ -1882,13 +1883,13 @@ dependencies = [
  "flotilla-store",
  "flotilla-store-memory",
  "flotilla-store-testkit",
- "flotilla-tls",
  "flotilla-vcs",
  "futures",
  "hegeltest",
  "http",
  "jsonwebtoken",
  "reqwest 0.13.2",
+ "rigging-tls",
  "serde",
  "serde_json",
  "tempfile",
@@ -1975,7 +1976,6 @@ dependencies = [
  "flotilla-store-testkit",
  "flotilla-terminal",
  "flotilla-test-support",
- "flotilla-tls",
  "flotilla-transport",
  "flotilla-vcs",
  "futures",
@@ -1984,6 +1984,8 @@ dependencies = [
  "http",
  "libc",
  "reqwest 0.13.2",
+ "rigging-replay-testkit",
+ "rigging-tls",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2092,6 +2094,7 @@ dependencies = [
  "flotilla-provider-runtime",
  "flotilla-replay-testkit",
  "flotilla-resources",
+ "rigging-process",
  "tempfile",
  "tokio",
  "tracing",
@@ -2179,10 +2182,10 @@ dependencies = [
  "flotilla-replay-testkit",
  "flotilla-resources",
  "flotilla-terminal",
- "flotilla-tls",
  "hegeltest",
  "libc",
  "reqwest 0.13.2",
+ "rigging-tls",
  "serde",
  "serde_json",
  "sha2",
@@ -2296,8 +2299,8 @@ dependencies = [
  "flotilla-paths",
  "flotilla-provider-runtime",
  "flotilla-resources",
- "flotilla-tls",
  "reqwest 0.13.2",
+ "rigging-tls",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2506,9 +2509,9 @@ dependencies = [
  "flotilla-store",
  "flotilla-store-memory",
  "flotilla-test-support",
- "flotilla-tls",
  "hegeltest",
  "reqwest 0.13.2",
+ "rigging-tls",
  "serde",
  "serde_json",
  "tempfile",
@@ -2581,11 +2584,11 @@ dependencies = [
  "flotilla-store-http",
  "flotilla-store-memory",
  "flotilla-store-testkit",
- "flotilla-tls",
  "futures",
  "hegeltest",
  "http",
  "reqwest 0.13.2",
+ "rigging-tls",
  "serde",
  "serde_json",
  "sha2",
@@ -2672,9 +2675,9 @@ dependencies = [
  "flotilla-store-memory",
  "flotilla-store-sqlite",
  "flotilla-store-testkit",
- "flotilla-tls",
  "futures",
  "hegeltest",
+ "rigging-tls",
  "serde",
  "serde_json",
  "sysinfo",
@@ -2733,15 +2736,19 @@ dependencies = [
  "flotilla-build-features-async",
  "flotilla-build-features-base",
  "flotilla-build-features-http",
+ "flotilla-build-features-logging",
  "flotilla-build-features-os",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-protocol",
- "flotilla-tls",
  "hegeltest",
  "http",
  "libc",
  "reqwest 0.13.2",
+ "rigging-http-client",
+ "rigging-process",
+ "rigging-replay-testkit",
+ "rigging-tls",
  "sha2",
  "sysinfo",
  "tempfile",
@@ -2811,12 +2818,13 @@ dependencies = [
  "flotilla-forge-github",
  "flotilla-paths",
  "flotilla-provider-runtime",
- "flotilla-tls",
  "flotilla-vcs",
  "hegeltest",
  "http",
  "libc",
  "reqwest 0.13.2",
+ "rigging-replay-testkit",
+ "rigging-tls",
  "serde",
  "serde_yml",
  "tempfile",
@@ -3024,11 +3032,11 @@ dependencies = [
  "flotilla-resources",
  "flotilla-store",
  "flotilla-store-testkit",
- "flotilla-tls",
  "futures",
  "hegeltest",
  "indexmap",
  "reqwest 0.13.2",
+ "rigging-tls",
  "rstest",
  "rustls",
  "serde",
@@ -3139,11 +3147,11 @@ dependencies = [
  "flotilla-store-http",
  "flotilla-store-memory",
  "flotilla-store-sqlite",
- "flotilla-tls",
  "futures",
  "hegeltest",
  "object_store",
  "reqwest 0.13.2",
+ "rigging-tls",
  "rstest",
  "rusqlite",
  "serde",
@@ -3191,23 +3199,6 @@ dependencies = [
  "flotilla-build-features-async",
  "flotilla-build-features-os",
  "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "flotilla-tls"
-version = "0.1.0"
-dependencies = [
- "flotilla-build-features",
- "flotilla-build-features-async",
- "flotilla-build-features-base",
- "flotilla-build-features-http",
- "flotilla-build-features-logging",
- "flotilla-build-features-os",
- "flotilla-build-features-tracing",
- "flotilla-build-features-types",
- "reqwest 0.13.2",
- "rustls",
  "tokio",
 ]
 
@@ -5241,6 +5232,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-http-client"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=bf71f7d840b14e50dd12e7bfc58e2654f51692c2#bf71f7d840b14e50dd12e7bfc58e2654f51692c2"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "reqwest 0.13.2",
+ "rigging-process",
+ "rigging-tls",
+ "tokio",
+]
+
+[[package]]
+name = "rigging-process"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=bf71f7d840b14e50dd12e7bfc58e2654f51692c2#bf71f7d840b14e50dd12e7bfc58e2654f51692c2"
+dependencies = [
+ "async-trait",
+ "libc",
+ "sysinfo",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rigging-replay-testkit"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=bf71f7d840b14e50dd12e7bfc58e2654f51692c2#bf71f7d840b14e50dd12e7bfc58e2654f51692c2"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "http",
+ "reqwest 0.13.2",
+ "rigging-http-client",
+ "rigging-process",
+ "rigging-tls",
+ "serde",
+ "serde_norway",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "rigging-tls"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=bf71f7d840b14e50dd12e7bfc58e2654f51692c2#bf71f7d840b14e50dd12e7bfc58e2654f51692c2"
+dependencies = [
+ "reqwest 0.13.2",
+ "rustls",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5559,6 +5607,19 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_norway"
+version = "0.9.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e408f29489b5fd500fab51ff1484fc859bb655f32c671f307dcd733b72e8168c"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml-norway",
 ]
 
 [[package]]
@@ -6534,6 +6595,12 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unsafe-libyaml-norway"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b39abd59bf32521c7f2301b52d05a6a2c975b6003521cbd0c6dc1582f0a22104"
 
 [[package]]
 name = "untrusted"

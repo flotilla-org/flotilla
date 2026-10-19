@@ -302,7 +302,7 @@ async fn http_watch_view_contract() {
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let reader = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), url));
+    let reader = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), url));
     contract(reader, writer).await;
     server.abort();
 }

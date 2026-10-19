@@ -66,7 +66,6 @@ members = [
     "crates/flotilla-store-sqlite",
     "crates/flotilla-store-http",
     "crates/flotilla-review-bundle-object-store",
-    "crates/flotilla-tls",
     "crates/flotilla-store-testkit",
     "crates/flotilla-test-support",
     "crates/flotilla-transport",
@@ -82,6 +81,10 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
+rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "bf71f7d840b14e50dd12e7bfc58e2654f51692c2" }
+rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "bf71f7d840b14e50dd12e7bfc58e2654f51692c2" }
+rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "bf71f7d840b14e50dd12e7bfc58e2654f51692c2" }
+rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "bf71f7d840b14e50dd12e7bfc58e2654f51692c2" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yml = "0.0.12"
 tokio-util = "0.7"
@@ -131,7 +134,7 @@ flotilla-vcs = { path = "crates/flotilla-vcs" }
 flotilla-charter = { path = "crates/flotilla-charter" }
 flotilla-provider-runtime = { path = "crates/flotilla-provider-runtime" }
 flotilla-store-memory = { path = "crates/flotilla-store-memory" }
-flotilla-tls = { path = "crates/flotilla-tls" }
+rigging-tls = { workspace = true }
 flotilla-store = { path = "crates/flotilla-store" }
 flotilla-paths = { path = "crates/flotilla-paths" }
 flotilla-daemon-api = { path = "crates/flotilla-daemon-api" }

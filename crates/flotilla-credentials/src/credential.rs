@@ -185,7 +185,7 @@ impl GithubAppTokenMinter for RealGithubAppTokenMinter {
     async fn resolve_installation(&self, request: &GithubAppInstallationRequest) -> Result<u64, String> {
         let jwt = self.jwt(&request.app_id_path, &request.private_key_path).await?;
         let url = format!("https://api.github.com/repos/{}/installation", request.repository);
-        let http_request = flotilla_tls::client()
+        let http_request = rigging_tls::client()
             .get(&url)
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
@@ -217,7 +217,7 @@ impl GithubAppTokenMinter for RealGithubAppTokenMinter {
     async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
         let jwt = self.jwt(&request.app_id_path, &request.private_key_path).await.map_err(GithubAppMintError::Other)?;
         let url = format!("https://api.github.com/app/installations/{}/access_tokens", request.installation_id);
-        let http_request = flotilla_tls::client()
+        let http_request = rigging_tls::client()
             .post(&url)
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
@@ -3480,6 +3480,11 @@ mod tests {
 
     #[async_trait]
     impl CommandRunner for RecordingRunner {
+        // This double represents the guarded Flotilla host runner, including its directory namespace.
+        fn scratch_namespace(&self) -> &str {
+            "flotilla"
+        }
+
         async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
             self.calls.lock().expect("calls lock").push((cmd.to_string(), args.iter().map(|arg| (*arg).to_string()).collect(), Vec::new()));
             if cmd == "sh" && args.contains(&"command -v gh") {
@@ -3493,7 +3498,7 @@ mod tests {
 
         async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
             let stdout = self.run(cmd, args, cwd, label).await?;
-            let success = if cmd == "sh" && args.contains(&"flotilla-xdg-runtime-dir") {
+            let success = if cmd == "sh" && args.contains(&"rigging-xdg-runtime-dir") {
                 self.runtime_dir_checks.lock().expect("runtime dir checks lock").pop_front().unwrap_or(true)
             } else {
                 true

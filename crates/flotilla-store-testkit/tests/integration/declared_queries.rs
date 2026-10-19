@@ -811,7 +811,7 @@ async fn shared_query_contract() {
     let addr = listener.local_addr().unwrap();
     let app = Router::new().route("/apis/flotilla.work/v1/namespaces/{namespace}/{kind}", get(endpoint)).with_state(server.clone());
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let http = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), format!("http://{addr}")));
+    let http = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), format!("http://{addr}")));
     contract(&http, &server).await;
     task.abort();
 }
