@@ -9,6 +9,7 @@ description = "Backend-free gated state machines (ADR 0064): declarations, store
 # flotilla-schema may reach, and no production crate depends on it until the
 # composition-root switch.
 [dependencies]
+flotilla-address = { path = "../flotilla-address" }
 flotilla-schema = { path = "../flotilla-schema" }
 serde = { workspace = true }
 strum = { workspace = true }

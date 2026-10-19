@@ -60,6 +60,7 @@ members = [
     "crates/flotilla-schema-sqlite",
     "crates/flotilla-messaging",
     "crates/flotilla-inbox",
+    "crates/flotilla-engine-store",
     "crates/flotilla-inbox-testkit",
     "crates/flotilla-quint-testkit",
     "crates/flotilla-state-machines",

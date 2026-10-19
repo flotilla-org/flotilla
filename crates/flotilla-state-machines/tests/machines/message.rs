@@ -34,13 +34,13 @@ fn inbox() -> Address {
     INBOX.parse().expect("canonical inbox")
 }
 
-fn condition() -> Address {
-    a("build-green")
+fn condition() -> flotilla_address::Condition {
+    "project:build-green .phase == Passing".parse().expect("condition")
 }
 
 /// The world's key for [`condition`]: its canonical text.
 fn condition_ref() -> Ref<Condition> {
-    Ref::new(condition().as_str())
+    Ref::new(condition().to_string())
 }
 
 fn spec(expectation: Expectation, deadline: Option<i64>) -> MessageSpec {
@@ -480,22 +480,22 @@ fn a_second_subject_reads_as_no_subject() {
 // and a message without one is withdrawn only by authority.
 #[test]
 fn a_lapsed_delivery_condition_withdraws_the_message() {
-    let wanted = a("still-wanted");
-    let turn_rules = DropReason::Withdrawn { by: a("turn-rules"), authority: wanted.clone() };
+    let wanted: flotilla_address::Condition = "project:still-wanted .phase == Wanted".parse().expect("condition");
+    let turn_rules = DropReason::Withdrawn { by: a("turn-rules"), authority: wanted.address.clone() };
     let mut without = home(spec(Expectation::Reply, None));
     let mut world = MemoryMessageWorld::default();
-    world.condition.put(&Ref::new(wanted.as_str()), false);
+    world.condition.put(&Ref::new(wanted.to_string()), false);
     assert_eq!(without.apply("m", drop(turn_rules.clone()), &world, t(1)).err(), refused(MessageRefusal::Unauthorised));
 
     let mut home = home(MessageSpec { delivery_condition: Some(wanted.clone()), ..spec(Expectation::Reply, None) });
     let mut world = MemoryMessageWorld::default();
     assert_eq!(home.apply("m", drop(turn_rules.clone()), &world, t(1)).err(), refused(MessageRefusal::Unauthorised), "unobserved");
-    world.condition.put(&Ref::new(wanted.as_str()), true);
+    world.condition.put(&Ref::new(wanted.to_string()), true);
     assert_eq!(home.apply("m", drop(turn_rules.clone()), &world, t(1)).err(), refused(MessageRefusal::Unauthorised), "still holds");
-    world.condition.put(&Ref::new(wanted.as_str()), false);
+    world.condition.put(&Ref::new(wanted.to_string()), false);
     let event = home.apply("m", drop(turn_rules.clone()), &world, t(2)).expect("withdrawn");
     let reads: Vec<_> = event.payload.reads.iter().map(|read| (read.kind.as_ref(), read.name.as_str())).collect();
-    assert!(reads.contains(&(<Condition as Kind>::NAME, wanted.as_str())), "{reads:?}");
+    assert!(reads.contains(&(<Condition as Kind>::NAME, wanted.to_string().as_str())), "{reads:?}");
     assert_eq!(*state(&home), MessageState::Dropped { reason: turn_rules, receiver: None, watermark: None });
 }
 

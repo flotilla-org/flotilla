@@ -611,12 +611,25 @@ impl PeerRuntime {
             );
 
             let mut decided_followers: HashMap<NodeId, (u64, tokio_util::task::AbortOnDropHandle<()>)> = HashMap::new();
+            // The engine path's replica misses read at the home that holds the record.
+            let decided_peers = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+            if let (Some(primitives), Ok(service)) = (outbound_daemon.message_primitives(), outbound_daemon.decided_store()) {
+                let reads = super::change_stream::DecidedHomeReads {
+                    service,
+                    peers: Arc::clone(&decided_peers),
+                    clock: outbound_daemon.clock_for_scenarios(),
+                };
+                if let Err(error) = primitives.install_home_reads(Arc::new(reads)) {
+                    debug!(%error, "engine home reads already installed");
+                }
+            }
             while let Some(event) = peer_connected_rx.recv().await {
                 match event {
                     PeerConnectionEvent::Connected(notice) => {
                         debug!(peer = %notice.peer, generation = notice.generation, "starting peer resource replication");
                         if decided_followers.get(&notice.peer).is_none_or(|(generation, _)| *generation < notice.generation) {
                             if let (Ok(service), Some(socket)) = (outbound_daemon.decided_store(), notice.resource_socket_path.clone()) {
+                                decided_peers.lock().expect("decided peers").insert(notice.peer.as_str().to_owned(), socket.clone());
                                 let task = super::change_stream::follow(service, notice.peer.as_str().to_owned(), socket);
                                 decided_followers
                                     .insert(notice.peer.clone(), (notice.generation, tokio_util::task::AbortOnDropHandle::new(task)));
@@ -628,6 +641,7 @@ impl PeerRuntime {
                     PeerConnectionEvent::Disconnected { peer, generation } => {
                         if decided_followers.get(&peer).is_some_and(|(current, _)| *current == generation) {
                             decided_followers.remove(&peer);
+                            decided_peers.lock().expect("decided peers").remove(peer.as_str());
                         }
                         peer_replicators.peer_disconnected(&peer, generation);
                     }

@@ -108,6 +108,10 @@ ADR 0064 records that a machine's log may stamp persistence-only metadata (such 
 
 ADR 0064 §"Roles, inboxes and delivery" records that resident pending order is a budgeted cache over the store's `pending_by_inbox` index (which also serves restart), and that an unbound inbox's timeout clock starts when it gains its first open message and is released when it has none.
 
+ADR 0064 §"Roles, inboxes and delivery" records the five code-declared fleet roles as overridable defaults, each with an inbox and bindable to any handler, and the minimal AgentSession as the receipt holder.
+
+ADR 0064 §"Roles, inboxes and delivery" records that addresses never carry a host (ADR 0066), that a role's handler is a binding and routing rule (rebinding touches no stored message), that replies to a role are routed by subject, and that `enqueue` is the one place a message's home is worked out.
+
 - **Inboxes.** Each role instance owns an **Inbox** resource, homed with the role's owner: the convoy for convoy roles, and the project's declarations for standing roles. Messages queue there and outlive any fulfiller.
 - **Standing roles** are declared in the charter and own their inboxes, whether or not anything automatic fills them. An Ensure is optional, layered on a role: it keeps an agent bound. Retiring an Ensure leaves the role and its inbox in place. There is no separate person kind: a person's own inbox is a declared role with one holder.
 - **Addresses** are typed lists of segments over a closed kind enum: project, convoy and role to start. They are stored typed and shown as `project:flotilla/role:gui-approver` and `project:flotilla/convoy:stack-3152/role:coder`. There are two shapes to start, project/role and project/convoy/role, with no vessel segment. New kinds extend the enum without changing existing addresses.
@@ -258,6 +262,10 @@ The following stay:
 - plural names and kubectl-style verbs.
 
 ### Switch-over
+
+ADR 0064 §"Switch-over" records the `[primitives]` switch and its dummy-fleet guard, the phase-to-state import table with named refusals, and old-store reads behind named ports during the transition.
+
+ADR 0064 §"Switch-over" records that Message moves over only after the change stream (#3463), so cross-host reads come from local replicas and misses are marked remote.
 
 There is no double-write path and no long-lived branch.
 1. **Build alongside.** The new code is built on main in new crates, behind one switch in the composition root.

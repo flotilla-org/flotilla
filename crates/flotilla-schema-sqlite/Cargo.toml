@@ -13,6 +13,7 @@ rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
 thiserror = "2"
 
 [dev-dependencies]
+flotilla-address = { path = "../flotilla-address" }
 tempfile = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # The engine's machine declarations are the integration tests' stored kinds (#3319); dev-only.

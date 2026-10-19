@@ -397,15 +397,53 @@ pub async fn reconcile_charter_notifications_with_view(
 }
 
 /// Reuse shared receiver evidence already frozen by the leaf engine.
+/// Where charter notifications are admitted (#3317): the old store's inbox,
+/// or the engine's behind the `[primitives]` switch. One pass at a time;
+/// admission and predecessor selection hold [`CharterNotices::admission`].
+#[async_trait::async_trait]
+pub trait CharterNotices: Send + Sync {
+    fn namespace(&self) -> &str;
+    fn pass(&self) -> std::sync::Arc<tokio::sync::Mutex<()>>;
+    fn admission(&self) -> std::sync::Arc<tokio::sync::Mutex<()>>;
+    /// Whether `name` exists, repairing one stored without admission.
+    async fn existing(&self, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError>;
+    /// The open Messages to `receiver`.
+    async fn open_to(&self, receiver: &str) -> Result<Vec<ResourceObject<Message>>, ResourceError>;
+    async fn admit(&self, name: &str, spec: &crate::MessageSpec, now: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError>;
+}
+
+#[async_trait::async_trait]
+impl CharterNotices for crate::MessageInbox {
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
+    fn pass(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        std::sync::Arc::clone(&self.charter_notifications)
+    }
+    fn admission(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        std::sync::Arc::clone(&self.admission)
+    }
+    async fn existing(&self, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError> {
+        repair_existing_charter_notification(self, name, now).await
+    }
+    async fn open_to(&self, receiver: &str) -> Result<Vec<ResourceObject<Message>>, ResourceError> {
+        self.messages.query(&crate::MessageQuery::Active { receiver: Some(receiver.to_owned()) }).await
+    }
+    async fn admit(&self, name: &str, spec: &crate::MessageSpec, now: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {
+        self.accept_locked(&crate::InputMeta::builder().name(name.to_owned()).build(), spec, now).await.map(|_| ())
+    }
+}
+
 pub async fn reconcile_charter_notifications_with_receivers(
-    inbox: &crate::MessageInbox,
+    inbox: &dyn CharterNotices,
     renderer: &dyn CharterBriefRenderer,
     now: chrono::DateTime<chrono::Utc>,
     backend: &ResourceBackend,
     receivers: &MessageReceiverSnapshot,
     projects: &crate::ReadResourceList<Project>,
 ) -> Result<(), ResourceError> {
-    let _charter_pass = inbox.charter_notifications.lock().await;
+    let pass = inbox.pass();
+    let _charter_pass = pass.lock().await;
     reconcile_charter_notifications_from_receivers(
         inbox,
         renderer,
@@ -418,16 +456,16 @@ pub async fn reconcile_charter_notifications_with_receivers(
 }
 
 async fn reconcile_charter_notifications_from_receivers(
-    inbox: &crate::MessageInbox,
+    inbox: &dyn CharterNotices,
     renderer: &dyn CharterBriefRenderer,
     now: chrono::DateTime<chrono::Utc>,
     backend: &ResourceBackend,
     receivers: &MessageReceiverSnapshot,
     projects: Vec<&ResourceObject<Project>>,
 ) -> Result<(), ResourceError> {
-    use crate::{InputMeta, MessageExpectation, MessageReference, MessageRelation, MessageSpec, ResourceProvenance, TerminalSessionSource};
+    use crate::{MessageExpectation, MessageReference, MessageRelation, MessageSpec, ResourceProvenance, TerminalSessionSource};
     use sha2::{Digest, Sha256};
-    let namespace = inbox.namespace.as_str();
+    let namespace = inbox.namespace();
     let convoys = receivers.convoys();
     let mut cascades = BTreeMap::new();
     for holder in receivers.terminals() {
@@ -473,8 +511,9 @@ async fn reconcile_charter_notifications_from_receivers(
         }
         let name = format!("charter-{:x}", Sha256::digest(format!("{receiver}\0{revision}").as_bytes()));
         {
-            let _admission = inbox.admission.lock().await;
-            if repair_existing_charter_notification(inbox, &name, now).await? {
+            let admission = inbox.admission();
+            let _admission = admission.lock().await;
+            if inbox.existing(&name, now).await? {
                 continue;
             }
         }
@@ -501,11 +540,12 @@ async fn reconcile_charter_notifications_from_receivers(
             .await?;
         // Only admission and predecessor selection serialize. Rendering and
         // snapshot reads never block ordinary inbox producers.
-        let _admission = inbox.admission.lock().await;
-        if repair_existing_charter_notification(inbox, &name, now).await? {
+        let admission = inbox.admission();
+        let _admission = admission.lock().await;
+        if inbox.existing(&name, now).await? {
             continue;
         }
-        let predecessor = inbox.messages.query(&crate::MessageQuery::Active { receiver: Some(receiver.clone()) }).await?
+        let predecessor = inbox.open_to(&receiver).await?
             .into_iter().filter(|message| message.spec.sender == FLEET_STORE_SENDER && message.spec.subject.as_ref().is_some_and(|subject| {
                 matches!(subject, MessageReference::ControlRecord { resource, .. } if resource.kind == "Project" && resource.namespace == namespace && resource.name == project_name)
             })).max_by(|a, b| (a.metadata.creation_timestamp, &a.metadata.name).cmp(&(b.metadata.creation_timestamp, &b.metadata.name))).map(|message| message.metadata.name);
@@ -519,7 +559,7 @@ async fn reconcile_charter_notifications_from_receivers(
             .expectation(MessageExpectation::None)
             .maybe_supersedes(predecessor)
             .build();
-        inbox.accept_locked(&InputMeta::builder().name(name).build(), &spec, now).await?;
+        inbox.admit(&name, &spec, now).await?;
     }
     Ok(())
 }

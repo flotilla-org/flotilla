@@ -30,8 +30,12 @@ pub(super) async fn crew_message_views(
     namespace: &str,
 ) -> Result<Vec<flotilla_protocol::query::CrewMessageView>, String> {
     let receivers = flotilla_messaging::MessageReceiverSnapshot::load(backend, namespace).await.map_err(|error| error.to_string())?;
-    message_views(backend, namespace, &super::projection_ports::MessageReceiverEvidence(receivers), None, &BTreeSet::new()).await
+    message_views(backend, namespace, &super::projection_ports::MessageReceiverEvidence(receivers, None), None, &BTreeSet::new()).await
 }
+
+/// Receiver evidence with the switch off: Messages are read from the old store.
+static OLD_STORE_RECEIVERS: std::sync::LazyLock<super::projection_ports::MessageReceivers> =
+    std::sync::LazyLock::new(|| super::projection_ports::MessageReceivers(Default::default()));
 
 #[cfg(test)]
 mod tests {
@@ -307,7 +311,7 @@ mod tests {
 
         fn projections(&self) -> ReadProjections<'_> {
             ReadProjections {
-                message_receivers: &super::super::projection_ports::MessageReceivers,
+                message_receivers: &*OLD_STORE_RECEIVERS,
                 backend: &self.backend,
                 config: &self.config,
                 host_registry: &self.registry,

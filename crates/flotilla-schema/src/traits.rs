@@ -311,6 +311,20 @@ scalar!(Address, ColumnType::Interned(crate::ADDRESS_DOMAIN), |this| Ok(Value::S
     other => Err(DecodeError::unexpected("interned address", &other)),
 });
 
+// A condition (ADR 0066 §4): an address, a field path, an operator and a literal, stored as its
+// canonical print in the address domain, as condition addresses always were. Equality is id
+// equality; decoding refuses text that is not canonical.
+scalar!(flotilla_address::Condition, ColumnType::Interned(crate::ADDRESS_DOMAIN), |this| Ok(Value::Str(this.to_string())), |value| {
+    match value {
+        Value::Str(text) => text.parse::<flotilla_address::Condition>().map_err(|error| DecodeError::Address {
+            column: String::new(),
+            text,
+            reason: error.to_string(),
+        }),
+        other => Err(DecodeError::unexpected("interned condition", &other)),
+    }
+});
+
 // An untyped reference to a stored record of any kind in the new store. A reference to something
 // outside it, such as an authority or an observed condition, is an `Address`.
 scalar!(Identity, ColumnType::Ref, |this| Ok(Value::Ref(this.clone())), |value| match value {

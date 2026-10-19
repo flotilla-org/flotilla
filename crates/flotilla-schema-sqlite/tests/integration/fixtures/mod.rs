@@ -270,6 +270,12 @@ pub fn address(tc: &TestCase) -> Address {
     text.parse().expect("canonical fixture address")
 }
 
+/// A condition about one of [`address`]'s addresses.
+pub fn condition(tc: &TestCase) -> flotilla_address::Condition {
+    let literal = tc.draw(gs::sampled_from(vec!["Done", "passing", "\"two words\""]));
+    format!("{} .phase == {literal}", address(tc)).parse().expect("canonical fixture condition")
+}
+
 /// Map keys and set values from a small alphabet, so they collide and dedupe.
 pub fn key(tc: &TestCase) -> String {
     tc.draw(gs::text().alphabet("ab").max_size(2))

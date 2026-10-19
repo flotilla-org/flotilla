@@ -318,6 +318,26 @@ pub struct DaemonConfig {
     /// Opt-in dummy providers for load testing (#3206); absent in real fleets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dummy_fleet: Option<dummy_fleet::DummyFleetConfig>,
+    /// ADR 0064 primitives behind the composition-root switch (#3317): its
+    /// presence moves Message onto the engine and the new store. Refused
+    /// without `[dummy_fleet]` until the cut-over checklist is done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primitives: Option<PrimitivesConfig>,
+}
+
+/// The `[primitives]` section. It moves only Message for now, so it has no keys.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrimitivesConfig {}
+
+impl DaemonConfig {
+    /// The `[primitives]` switch, refused unless the dummy fleet runs too.
+    pub fn primitives(&self) -> Result<Option<&PrimitivesConfig>, String> {
+        match (&self.primitives, &self.dummy_fleet) {
+            (Some(_), None) => Err("[primitives] needs [dummy_fleet] until the ADR 0064 cut-over checklist is done (#3317)".into()),
+            (primitives, _) => Ok(primitives.as_ref()),
+        }
+    }
 }
 
 pub const DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(2).expect("default removal limit is positive");
@@ -340,6 +360,7 @@ impl Default for DaemonConfig {
             checkout_archive_retention_days: default_checkout_archive_retention_days(),
             checkout_removal_concurrency: default_checkout_removal_concurrency(),
             dummy_fleet: None,
+            primitives: None,
         }
     }
 }

@@ -77,6 +77,11 @@ pub trait MessageReceiverRead: Send + Sync {
     fn terminals(&self) -> &[ReadResourceObject<ResourceTerminalSession>];
     fn may_address_convoy(&self, address: &str, project: &str, convoy: &str) -> bool;
     fn resolve(&self, address: &str) -> Result<Option<ReadResourceObject<ResourceTerminalSession>>, String>;
+    /// The Messages in the old shape when they live on the engine (#3317):
+    /// the local replica's, every home's. None reads the old store.
+    fn messages(&self) -> Option<&[ReadResourceObject<flotilla_resources::Message>]> {
+        None
+    }
 }
 
 /// Resolve receiver evidence through the messaging resolver at the composition boundary.
@@ -2098,19 +2103,34 @@ pub async fn message_views(
             ]
         })
         .unwrap_or_default();
-    let mut records = backend
-        .query_declared::<flotilla_resources::Message>(
-            namespace,
-            &StoreQuery {
-                message: Some(flotilla_store::MessageQuery::active()),
-                any_of: (!any_of.is_empty()).then_some(any_of),
-                include_replicas: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?
-        .items;
+    let mut records = match receivers.messages() {
+        Some(messages) => messages
+            .iter()
+            .filter(|record| record.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+            .filter(|record| {
+                convoy.is_none_or(|convoy| {
+                    let prefix = format!("{}/{}/", convoy.spec.project_ref.as_deref().unwrap_or(namespace), convoy.metadata.name);
+                    record.object.spec.receiver.starts_with(&prefix) || aliases.contains(&record.object.spec.receiver)
+                })
+            })
+            .cloned()
+            .collect(),
+        None => {
+            backend
+                .query_declared::<flotilla_resources::Message>(
+                    namespace,
+                    &StoreQuery {
+                        message: Some(flotilla_store::MessageQuery::active()),
+                        any_of: (!any_of.is_empty()).then_some(any_of),
+                        include_replicas: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+        }
+    };
     if let Some(convoy) = convoy {
         records.retain(|record| {
             receivers.may_address_convoy(

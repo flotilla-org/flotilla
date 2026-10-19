@@ -43,7 +43,7 @@ pub use encoding::{decode_canonical, encode};
 pub use forge::{BuiltinForges, Forge, ForgeKind, ForgeLookup, GITHUB_FORGE_ID, GITHUB_HOSTS};
 pub use kind::Kind;
 pub use lenient::resolve;
-pub use record::record_name;
+pub use record::{message_record_name, record_name};
 pub use reference::{Reference, Revision};
 
 /// Why text did not parse or a value was refused.

@@ -12,7 +12,7 @@ pub const TURN_RULES: &str = "project:fleet/role:turn-rules";
 pub const UNIT: i64 = 600_000_000;
 /// The inbox every replayed message and Ensure names, as the world keys it:
 /// a canonical inbox address.
-pub const INBOX: &str = "project:inbox";
+pub const INBOX: &str = "project:replay/role:inbox";
 /// The authorised party, the superseding message and the outcome condition, as
 /// the world keys them: each address's canonical text.
 pub const OWNER: &str = "project:owner";
@@ -28,6 +28,13 @@ pub fn id_of(name: &str) -> i64 {
 }
 
 /// A canonical address; the world is keyed by its text.
+/// The delivery condition the replay's envelopes carry: about [`DELIVERY`].
+pub const DELIVERY_CONDITION: &str = "project:still-wanted .phase == Wanted";
+/// The outcome condition an Outcome expectation waits on: about [`OUTCOME`].
+pub const OUTCOME_CONDITION: &str = "project:outcome .phase == Done";
+pub fn condition(text: &str) -> flotilla_address::Condition {
+    text.parse().unwrap_or_else(|error| panic!("{text} as a condition: {error}"))
+}
 pub fn at_address(text: &str) -> Address {
     text.parse().unwrap_or_else(|error| panic!("{text} as an address: {error}"))
 }

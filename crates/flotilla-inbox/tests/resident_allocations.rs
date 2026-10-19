@@ -146,7 +146,7 @@ fn calibrate() {
         let mut charged = 0;
         let mut receipts = BTreeMap::new();
         for n in 0..N {
-            let name = format!("project:inbox/role:message-{n}");
+            let name = format!("project:test/role:inbox/message:message-{n:064x}");
             let mut value = spec();
             value.body = if body_len == usize::MAX {
                 use flotilla_state_machines::machines::convoy::*;
@@ -209,7 +209,7 @@ fn calibrate() {
     let mut charged = 0usize;
     for n in 0..500_000 {
         let inbox = address(&format!("project:test/role:inbox-{}", n % 46_000));
-        let name = format!("project:inbox/role:message-{n:064}");
+        let name = format!("project:test/role:inbox/message:message-{n:064x}");
         charged += charges::pending(&inbox, &name, !pending.contains_key(&inbox));
         pending.entry(inbox).or_default().insert(n as u64 + 1, name);
     }

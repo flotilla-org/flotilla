@@ -82,6 +82,11 @@ impl Address {
         Self::root(Kind::Usage, &normalise_usage(provider))?.child(Kind::Account, &normalise_usage(account))
     }
 
+    /// A message under its inbox: `<inbox>/message:<id>`.
+    pub fn message(inbox: &Address, id: &str) -> Result<Self, Error> {
+        inbox.child(Kind::Message, id)
+    }
+
     /// A one-segment address of a root kind.
     pub fn root(kind: Kind, value: &str) -> Result<Self, Error> {
         Self::empty().child(kind, value)

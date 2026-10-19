@@ -110,7 +110,9 @@ impl EnvironmentSummaries for InProcessDaemon {
     }
 }
 
-pub(super) struct MessageReceivers;
+/// Receiver evidence, and the Messages on the engine path when the
+/// `[primitives]` switch is on.
+pub(super) struct MessageReceivers(pub(super) crate::primitives::MessagePath);
 #[async_trait]
 impl flotilla_projections::read_projections::MessageReceiverLoader for MessageReceivers {
     async fn load(
@@ -120,14 +122,22 @@ impl flotilla_projections::read_projections::MessageReceiverLoader for MessageRe
         convoys: Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>,
         terminals: Vec<flotilla_resources::ReadResourceObject<flotilla_resources::TerminalSession>>,
     ) -> Result<Box<dyn flotilla_projections::read_projections::MessageReceiverRead>, String> {
+        let messages = match self.0.get() {
+            Some(primitives) => Some(primitives.views(namespace).await.map_err(|e| e.to_string())?),
+            None => None,
+        };
         Ok(Box::new(MessageReceiverEvidence(
             flotilla_messaging::MessageReceiverSnapshot::load_from_observations(backend, namespace, convoys, terminals)
                 .await
                 .map_err(|e| e.to_string())?,
+            messages,
         )))
     }
 }
-pub(super) struct MessageReceiverEvidence(pub flotilla_messaging::MessageReceiverSnapshot);
+pub(super) struct MessageReceiverEvidence(
+    pub flotilla_messaging::MessageReceiverSnapshot,
+    pub Option<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>>,
+);
 impl flotilla_projections::read_projections::MessageReceiverRead for MessageReceiverEvidence {
     fn terminals(&self) -> &[flotilla_resources::ReadResourceObject<flotilla_resources::TerminalSession>] {
         self.0.terminals()
@@ -140,5 +150,8 @@ impl flotilla_projections::read_projections::MessageReceiverRead for MessageRece
         address: &str,
     ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::TerminalSession>>, String> {
         self.0.resolve(address).map_err(|e| e.to_string())
+    }
+    fn messages(&self) -> Option<&[flotilla_resources::ReadResourceObject<flotilla_resources::Message>]> {
+        self.1.as_deref()
     }
 }

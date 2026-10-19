@@ -72,8 +72,8 @@ use crate::{
 
 const NAME: &str = "m";
 const INBOX: &str = "project:p/role:r";
-const CONDITION: &str = "project:condition";
-const DELIVERY: &str = "project:still-wanted";
+const CONDITION: &str = "project:condition .phase == Done";
+const DELIVERY: &str = "project:still-wanted .phase == Wanted";
 const NEWER: &str = "project:newer";
 const SENDER: &str = "project:sender";
 const SUPERVISOR: &str = "project:supervisor";
@@ -94,7 +94,7 @@ fn spec_of(envelope: &Value) -> MessageSpec {
     let expectation = match tag(&envelope["expectation"]) {
         "Nothing" => Expectation::Nothing,
         "Reply" => Expectation::Reply,
-        "Outcome" => Expectation::Outcome { condition: at(CONDITION) },
+        "Outcome" => Expectation::Outcome { condition: CONDITION.parse().expect("condition") },
         other => panic!("expectation {other}"),
     };
     MessageSpec {
@@ -102,7 +102,7 @@ fn spec_of(envelope: &Value) -> MessageSpec {
         expectation,
         deadline: boolean(&envelope["hasDeadline"]).then(|| tick(number(&envelope["deadline"]))),
         unbound_after: UNIT,
-        delivery_condition: boolean(&envelope["hasCondition"]).then(|| at(DELIVERY)),
+        delivery_condition: boolean(&envelope["hasCondition"]).then(|| DELIVERY.parse().expect("condition")),
         ..MessageSpec::new(at(SENDER), at(INBOX), Relation::Peer, MessageBody::text("turn").expect("small body"))
     }
 }
@@ -158,7 +158,7 @@ fn drop_reason_of(spec: &MessageSpec, o: &Value) -> DropReason {
 /// Who withdraws: the turn-rules role, naming the delivery condition, when the
 /// envelope has one; the sender otherwise.
 fn withdrawal_authority(spec: &MessageSpec) -> Address {
-    spec.delivery_condition.clone().unwrap_or_else(|| at(SENDER))
+    spec.delivery_condition.as_ref().map_or_else(|| at(SENDER), |condition| condition.address.clone())
 }
 
 /// The drop's world: only the evidence its reason's rule reads.

@@ -7,4 +7,5 @@ pub mod crew_capabilities;
 pub mod crew_ops;
 pub mod decision_log;
 pub mod leaf_engine;
+mod message_port;
 pub mod ports;

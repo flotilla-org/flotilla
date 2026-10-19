@@ -52,7 +52,13 @@ SCHEMA_ALLOWED = ("flotilla-address", "flotilla-cbor")
 # that adds the composition-root switch names its dependents here.
 STATE_MACHINES = "flotilla-state-machines"
 STATE_MACHINES_ALLOWED = ("flotilla-schema", "flotilla-schema-derive", *SCHEMA_ALLOWED)
-STATE_MACHINE_DEPENDENTS = frozenset({"flotilla-inbox", "flotilla-inbox-testkit", "flotilla-quint-testkit"})
+STATE_MACHINE_DEPENDENTS = frozenset({
+    "flotilla-engine-store", "flotilla-inbox", "flotilla-inbox-testkit", "flotilla-quint-testkit",
+    # #3317: the composition root and its Message path, behind `[primitives]`.
+    "flotilla-core", "flotilla-daemon",
+})
+# #3317: the Message switch composes the engine inbox; only these use it directly.
+INBOX_DEPENDENTS = frozenset({"flotilla-core", "flotilla-daemon"})
 # Known C packages and compiler drivers catch new anchors that reach them.
 # This is a metadata deny list, not build-script analysis: crates invoking a
 # compiler without these drivers need an explicit entry when introduced.
@@ -195,12 +201,12 @@ def violations(metadata):
         for name in sorted(packages):
             if name != STATE_MACHINES and STATE_MACHINES in production[name] and name not in STATE_MACHINE_DEPENDENTS:
                 errors.append(f"{name}: production dependency on {STATE_MACHINES} before the composition-root switch")
-    # #3316: the contract backend is an engine dependent, isolated from live
-    # delivery until #3317. Testkits are dev-only callers of this boundary.
+    # #3316/#3317: the contract backend is composed only behind the Message
+    # switch, by the composition crates. Testkits are dev-only callers.
     if "flotilla-inbox" in packages:
         for name in sorted(packages):
-            if name != "flotilla-inbox" and not is_testkit(name) and reaches(name, "flotilla-inbox"):
-                errors.append(f"{name}: production dependency on flotilla-inbox before the Message switch")
+            if name not in INBOX_DEPENDENTS and not is_testkit(name) and "flotilla-inbox" in production[name]:
+                errors.append(f"{name}: production dependency on flotilla-inbox outside the Message switch's composition")
     for name, package in sorted(packages.items()):
         # A dev-only testkit may depend on the library it tests, closing a
         # Cargo dev cycle without introducing an upward production edge.

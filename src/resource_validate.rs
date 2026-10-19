@@ -1,6 +1,8 @@
 #[cfg(unix)]
 pub(crate) mod frozen;
 #[cfg(unix)]
+mod message_import;
+#[cfg(unix)]
 mod retirement;
 
 use std::path::{Path, PathBuf};
@@ -126,6 +128,7 @@ async fn validate_daemon_with_preview(
     let mut retirement_inventory_failed = false;
     let has_templates = collections.iter().any(|(store, kind, _)| store == base && kind == "workflowtemplates");
     let mut charter_namespaces = std::collections::BTreeSet::new();
+    let mut message_documents = BTreeMap::<String, message_import::Documents>::new();
     for (store_base, kind, namespaces) in collections {
         let replication = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == kind).map(|entry| entry.replication_class);
         let query = if replication.is_some_and(|class| class != ReplicationClass::None) { "?replicaSources=true" } else { "" };
@@ -181,6 +184,9 @@ async fn validate_daemon_with_preview(
                     eprintln!("{label}/{name}: {error}");
                     failed = true;
                 }
+                if store_base == base && message_import::KINDS.contains(&kind.as_str()) {
+                    message_documents.entry(namespace.clone()).or_default().0.entry(kind.clone()).or_default().push(item.clone());
+                }
             }
             let frozen_collection = store_base == base
                 && matches!(
@@ -228,6 +234,10 @@ async fn validate_daemon_with_preview(
                 }
             }
         }
+    }
+    // #3317: rehearse the Message import before every roll; it reports and never fails the roll.
+    for (namespace, documents) in &message_documents {
+        message_import::print(namespace, &documents.rehearse(namespace));
     }
     if !retirement_inventory_failed {
         match retirement::preview(&retirement_templates, &retirement_projects, &retirement_designations) {

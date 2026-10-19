@@ -13,6 +13,11 @@ skip-no-sandbox-tests = ["flotilla-executor/skip-no-sandbox-tests", "flotilla-st
 flotilla-admission = { path = "../flotilla-admission" }
 flotilla-crew = { path = "../flotilla-crew" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-schema = { path = "../flotilla-schema" }
+flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-inbox = { path = "../flotilla-inbox" }
+rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
+flotilla-state-machines = { path = "../flotilla-state-machines" }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-messaging = { path = "../flotilla-messaging" }
 flotilla-observation = { path = "../flotilla-observation" }

@@ -1800,12 +1800,14 @@ dependencies = [
  "flotilla-discovery",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
+ "flotilla-engine-store",
  "flotilla-environment",
  "flotilla-executor",
  "flotilla-forge-forgejo",
  "flotilla-forge-github",
  "flotilla-forgejo-providers",
  "flotilla-github-providers",
+ "flotilla-inbox",
  "flotilla-issue-tracker",
  "flotilla-manifest",
  "flotilla-messaging",
@@ -1818,7 +1820,9 @@ dependencies = [
  "flotilla-relay-protocol",
  "flotilla-replay-testkit",
  "flotilla-resources",
+ "flotilla-schema",
  "flotilla-schema-sqlite",
+ "flotilla-state-machines",
  "flotilla-store",
  "flotilla-store-http",
  "flotilla-store-memory",
@@ -1837,6 +1841,7 @@ dependencies = [
  "reqwest 0.13.2",
  "rigging-replay-testkit",
  "rigging-tls",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yml",
@@ -2008,8 +2013,10 @@ dependencies = [
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-dummy-fleet",
+ "flotilla-engine-store",
  "flotilla-environment",
  "flotilla-executor",
+ "flotilla-inbox",
  "flotilla-issue-tracker",
  "flotilla-load-driver",
  "flotilla-messaging",
@@ -2028,6 +2035,7 @@ dependencies = [
  "flotilla-review-bundle-object-store",
  "flotilla-schema",
  "flotilla-schema-sqlite",
+ "flotilla-state-machines",
  "flotilla-store",
  "flotilla-store-http",
  "flotilla-store-memory",
@@ -2218,6 +2226,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "flotilla-engine-store"
+version = "0.1.0"
+dependencies = [
+ "flotilla-build-features",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-os",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-schema",
+ "flotilla-schema-sqlite",
+ "flotilla-state-machines",
+ "rusqlite",
 ]
 
 [[package]]
@@ -2477,7 +2502,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bon",
+ "flotilla-address",
  "flotilla-build-features-async",
+ "flotilla-engine-store",
  "flotilla-inbox-testkit",
  "flotilla-schema",
  "flotilla-schema-sqlite",
@@ -2494,6 +2521,7 @@ name = "flotilla-inbox-testkit"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "flotilla-address",
  "flotilla-build-features-async",
  "flotilla-inbox",
  "flotilla-quint-testkit",
@@ -2870,6 +2898,7 @@ dependencies = [
 name = "flotilla-quint-testkit"
 version = "0.1.0"
 dependencies = [
+ "flotilla-address",
  "flotilla-schema",
  "flotilla-state-machines",
  "serde_json",
@@ -3049,6 +3078,7 @@ name = "flotilla-schema-sqlite"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flotilla-address",
  "flotilla-build-features",
  "flotilla-build-features-base",
  "flotilla-build-features-hmac",
@@ -3070,6 +3100,7 @@ dependencies = [
 name = "flotilla-state-machines"
 version = "0.1.0"
 dependencies = [
+ "flotilla-address",
  "flotilla-quint-testkit",
  "flotilla-schema",
  "hegeltest",

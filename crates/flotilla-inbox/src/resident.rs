@@ -114,11 +114,14 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&BTreeMap<Rec
     for reference in [in_reply_to, supersedes].into_iter().flatten() {
         bytes += reference.name.capacity() + reference.home.capacity();
     }
+    // A condition is its address plus its path, operator and literal text.
+    let heap_condition =
+        |value: &flotilla_address::Condition| heap_address(&value.address) + value.path.to_string().len() + value.literal.capacity();
     if let Expectation::Outcome { condition } = expectation {
-        bytes += heap_address(condition);
+        bytes += heap_condition(condition);
     }
     if let Some(condition) = delivery_condition {
-        bytes += heap_address(condition);
+        bytes += heap_condition(condition);
     }
     if let Some(receiver) = value.state().receiver() {
         bytes += receiver.id.capacity() + receiver.host.capacity();

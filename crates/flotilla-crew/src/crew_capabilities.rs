@@ -235,12 +235,22 @@ pub fn card_delta(previous: &str, current: &str) -> String {
 
 /// Ephemeral baselines preserve stored resource shapes. Pending snapshots survive
 /// annotation CAS retries; delivery evidence advances the agent's delta baseline.
+/// The Message path it publishes through is the `[primitives]` switch's when on.
 #[derive(Default)]
-pub struct CapabilityCardTracker(Mutex<BTreeMap<(String, String), SessionCardObservation>>);
+pub struct CapabilityCardTracker(Mutex<BTreeMap<(String, String), SessionCardObservation>>, crate::ports::MessagePath);
 
 type SessionCardObservation = Arc<Mutex<CardObservation>>;
 
 impl CapabilityCardTracker {
+    /// A tracker publishing through `path` (the composition root's slot).
+    pub fn with_message_path(path: crate::ports::MessagePath) -> Self {
+        Self(Mutex::default(), path)
+    }
+
+    fn primitives(&self) -> Option<Arc<dyn crate::ports::EngineMessages>> {
+        self.1.get().cloned()
+    }
+
     async fn observation(&self, namespace: &str, session: &str) -> SessionCardObservation {
         // The map lock protects lookup/pruning only. Backend I/O holds a session's
         // observation lock, so unrelated launches and refreshes proceed independently.
@@ -294,7 +304,7 @@ pub async fn observe_card(
     let mut retired = Vec::new();
     let pending = observation.pending.clone();
     for (revision, (name, snapshot)) in &pending {
-        let message = match backend.clone().using::<Message>(namespace).get(name).await {
+        let message = match message_by_name(backend, namespace, name, tracker).await {
             Ok(message) => message,
             Err(ResourceError::NotFound { .. }) => {
                 // An audit record can be reaped before the next capability change.
@@ -327,7 +337,7 @@ pub async fn observe_card(
     let mut meta = InputMeta::from(&session.metadata);
     let observed_digest = if previous.is_some() {
         let body = observation.delivered.as_ref().map(|baseline| card_delta(baseline, card)).unwrap_or_else(|| card.to_string());
-        let (name, digest) = publish_card_revision(backend, namespace, session, revision, card, &body).await?;
+        let (name, digest) = publish_card_revision(backend, namespace, session, revision, card, &body, tracker).await?;
         if digest == card_digest(card) {
             observation.pending.insert(revision, (name.clone(), card.to_string()));
         }
@@ -355,7 +365,17 @@ async fn recover_published_revision(
     namespace: &str,
     name: &str,
     requested: &MessageSpec,
+    tracker: &CapabilityCardTracker,
 ) -> Result<Option<ResourceObject<Message>>, String> {
+    if tracker.primitives().is_some() {
+        // An engine message's name is its producer key's digest: the same
+        // revision of the same session's card.
+        return match message_by_name(backend, namespace, name, tracker).await {
+            Ok(existing) => Ok(Some(existing)),
+            Err(ResourceError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        };
+    }
     let messages = backend.clone().using::<Message>(namespace);
     match messages.get(name).await {
         Ok(existing) => {
@@ -378,6 +398,7 @@ async fn publish_card_revision(
     revision: u64,
     card: &str,
     body: &str,
+    tracker: &CapabilityCardTracker,
 ) -> Result<(String, String), String> {
     let TerminalSessionSource::Agent { context, .. } = &session.spec.source else {
         return Err("capability Messages require an agent session".into());
@@ -398,7 +419,7 @@ async fn publish_card_revision(
         revision: format!("capabilities@{revision}"),
     };
     let supersedes = match session.metadata.annotations.get(MESSAGE_ANNOTATION) {
-        Some(name) => match backend.clone().using::<Message>(namespace).get(name).await {
+        Some(name) => match message_by_name(backend, namespace, name, tracker).await {
             Ok(_) => Some(name.clone()),
             Err(ResourceError::NotFound { .. }) => None, // Reaped audit data cannot be a predecessor.
             Err(error) => return Err(error.to_string()),
@@ -414,7 +435,7 @@ async fn publish_card_revision(
         .subject(subject)
         .maybe_supersedes(supersedes)
         .build();
-    let recovered = recover_published_revision(backend, namespace, &name, &requested).await?;
+    let recovered = recover_published_revision(backend, namespace, &name, &requested, tracker).await?;
     let digest = recovered
         .as_ref()
         .and_then(|message| message.metadata.annotations.get(DIGEST_ANNOTATION))
@@ -422,6 +443,11 @@ async fn publish_card_revision(
         // Previous-generation Messages without this annotation always contain full cards.
         .unwrap_or_else(|| recovered.as_ref().map(|message| card_digest(&message.spec.body)).unwrap_or_else(|| card_digest(card)));
     let spec = recovered.map(|message| message.spec).unwrap_or(requested);
+    if let Some(primitives) = tracker.primitives() {
+        // The engine keeps no annotations: a revision's card is the one it was published with.
+        primitives.admit(namespace, &name, &spec).await.map_err(|error| error.to_string())?;
+        return Ok((name, digest));
+    }
     MessageInbox::new(backend.clone(), namespace)
         .accept(
             &InputMeta::builder().name(name.clone()).annotations(BTreeMap::from([(DIGEST_ANNOTATION.into(), digest.clone())])).build(),
@@ -431,6 +457,19 @@ async fn publish_card_revision(
         .await
         .map_err(|error| error.to_string())?;
     Ok((name, digest))
+}
+
+/// A capability Message by name, through the switch's Message path when on.
+async fn message_by_name(
+    backend: &ResourceBackend,
+    namespace: &str,
+    name: &str,
+    tracker: &CapabilityCardTracker,
+) -> Result<ResourceObject<Message>, ResourceError> {
+    match tracker.primitives() {
+        Some(primitives) => primitives.view(namespace, name).await?.map(|view| view.object).ok_or_else(|| ResourceError::not_found(name)),
+        None => backend.clone().using::<Message>(namespace).get(name).await,
+    }
 }
 
 /// Advisory launch persistence: callers can warn and still launch with the card.

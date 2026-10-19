@@ -714,3 +714,16 @@ async fn config_loaders_share_read_parse_warning_and_cache_policy() {
         }
     }
 }
+
+// Behaviour (#3317): `[primitives]` is off by default, is refused without
+// `[dummy_fleet]`, and takes no keys while it moves only Message.
+#[test]
+fn primitives_switch_defaults_off_and_requires_the_dummy_fleet() {
+    let off: DaemonConfig = toml::from_str("").unwrap();
+    assert_eq!(off.primitives(), Ok(None));
+    let alone: DaemonConfig = toml::from_str("[primitives]\n").unwrap();
+    assert!(alone.primitives().expect_err("refused without the dummy fleet").contains("[dummy_fleet]"));
+    let on: DaemonConfig = toml::from_str("[primitives]\n[dummy_fleet]\n").unwrap();
+    assert_eq!(on.primitives(), Ok(Some(&PrimitivesConfig::default())));
+    assert!(toml::from_str::<DaemonConfig>("[primitives]\nconvoy = true\n").is_err(), "only Message moves for now");
+}

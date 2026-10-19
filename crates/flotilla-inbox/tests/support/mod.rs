@@ -102,8 +102,8 @@ impl<L: InboxLog> InboxLog for CountingLog<L> {
     fn receipt(&mut self, a: &Address, n: &str, r: &Receiver, t: Transport) -> Result<(), Error> {
         self.inner.receipt(a, n, r, t)
     }
-    fn next_name(&mut self) -> Result<String, Error> {
-        self.inner.next_name()
+    fn next_name(&mut self, inbox: &flotilla_schema::Address, sender: &flotilla_schema::Address) -> Result<String, Error> {
+        self.inner.next_name(inbox, sender)
     }
 }
 struct CountedReader {

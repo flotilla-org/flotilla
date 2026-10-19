@@ -212,3 +212,29 @@ async fn sqlite_rejects_consumer_in_another_store() {
     let receipt = watch.next().await.expect("receipt").expect("change");
     assert!(receipt.cursor > created.cursor, "a receipt never overwrites its creation event");
 }
+
+// Behaviour (ADR 0066 §4): a message's identity is `<inbox>/message:<id>`; a
+// keyed send's id is the digest of inbox, sender and key, so a repeated key
+// returns the existing message and admits nothing, on both stores.
+#[tokio::test]
+async fn keyed_sends_name_one_message_under_their_inbox() {
+    use flotilla_inbox::InboxBackend;
+    use flotilla_inbox_testkit::{inbox, spec};
+    async fn run<F: Factory>(factory: &F) {
+        let Harness { backend, .. } = factory.create();
+        let first = backend.enqueue_as(spec(), &flotilla_inbox::keyed_id(&inbox(), &spec().sender, "hold")).await.expect("keyed");
+        let parsed: flotilla_schema::Address = first.parse().expect("message address");
+        assert_eq!(parsed.kind(), flotilla_address::Kind::Message);
+        assert_eq!(parsed.parent(), Some(inbox()));
+        assert_eq!(first, flotilla_inbox::keyed_name(&inbox(), &spec().sender, "hold").expect("name"));
+        let version = factory.inspect(&backend, &first).version();
+        assert_eq!(backend.enqueue_as(spec(), &flotilla_inbox::keyed_id(&inbox(), &spec().sender, "hold")).await.expect("repeat"), first);
+        assert_eq!(factory.inspect(&backend, &first).version(), version, "a repeated key writes nothing");
+        let other = backend.enqueue_as(spec(), &flotilla_inbox::keyed_id(&inbox(), &spec().sender, "other")).await.expect("other key");
+        let unkeyed = backend.enqueue(spec()).await.expect("unkeyed");
+        assert!(first != other && other != unkeyed);
+        assert_eq!(unkeyed.parse::<flotilla_schema::Address>().expect("address").parent(), Some(inbox()));
+    }
+    run(&Memory).await;
+    run(&Sqlite).await;
+}

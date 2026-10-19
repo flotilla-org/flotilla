@@ -96,13 +96,16 @@ enum SupervisorRuling {
 /// the actuator points weakly to this module so subscriptions cannot keep it alive.
 #[derive(bon::Builder)]
 pub struct CrewService {
-    resource_backend: ResourceBackend,
+    pub(crate) resource_backend: ResourceBackend,
     #[builder(default)]
     capability_source: RwLock<Option<Arc<dyn flotilla_capability_contract::SessionCapabilitySource>>>,
     #[builder(default)]
     capability_cards: CapabilityCardTracker,
     #[builder(default)]
     message_inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>,
+    /// The `[primitives]` switch's Message path; empty while it is off.
+    #[builder(default)]
+    pub(crate) message_path: crate::ports::MessagePath,
     #[builder(default)]
     resource_intent_publisher: std::sync::RwLock<Option<Weak<dyn ResourceIntentPublisher>>>,
     leaf_subscriptions: LeafSubscriptionTable,
@@ -111,7 +114,7 @@ pub struct CrewService {
     convoy_message_locks: Mutex<HashMap<ConvoyMessageKey, WeakConvoyMessageLock>>,
     #[builder(default)]
     work_credential_reconciler: RwLock<Option<Arc<dyn WorkCredentialReconciler>>>,
-    clock: Arc<dyn Clock>,
+    pub(super) clock: Arc<dyn Clock>,
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
     config: Arc<ConfigStore>,
     host_name: HostName,
@@ -1423,9 +1426,7 @@ impl CrewService {
             .and_then(|state| state.pending_follow_up.as_ref())
         {
             let follow_up = self
-                .resource_backend
-                .including_replicas::<flotilla_resources::Message>(namespace)
-                .get(&reference.name)
+                .message_record(namespace, &reference.name)
                 .await
                 .map_err(|error| format!("follow-up Message awaits replication: {error}"))?;
             if follow_up.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal()) {
@@ -1648,18 +1649,9 @@ impl CrewService {
         let in_reply_to = if let Some(reference) = &stalled.supervision_message {
             Some(reference.name.clone())
         } else {
-            self.resource_backend
-                .using::<flotilla_resources::Message>(namespace)
-                .query_declared(
-                    &StoreQuery {
-                        message: Some(flotilla_store::MessageQuery::Active { receiver: Some(sender.clone()) }),
-                        ..Default::default()
-                    }
-                    .with_replicas(),
-                )
+            self.active_message_records(namespace, Some(&sender))
                 .await
                 .map_err(|error| error.to_string())?
-                .items
                 .into_iter()
                 .filter(|record| {
                     record.object.spec.receiver == sender
@@ -2658,8 +2650,7 @@ impl CrewService {
             let address = sender.clone();
             let relation = flotilla_resources::MessageRelation::Supervisor;
             let prior = self
-                .resource_backend
-                .query_messages(namespace, &flotilla_store::MessageQuery::Active { receiver: Some(receiver.clone()) })
+                .open_messages_to(namespace, &receiver)
                 .await
                 .map_err(|error| error.to_string())?
                 .into_iter()
@@ -2700,9 +2691,7 @@ impl CrewService {
 
         let pending_ref = status.crew_work.get(&vessel).and_then(|crew| crew.get(&role)).and_then(|state| state.pending_follow_up.as_ref());
         let pending_message = if let Some(reference) = pending_ref {
-            self.resource_backend
-                .including_replicas::<flotilla_resources::Message>(namespace)
-                .get(&reference.name)
+            self.message_record(namespace, &reference.name)
                 .await
                 .map_err(|error| format!("follow-up Message awaits replication: {error}"))?
                 .object
@@ -2796,17 +2785,9 @@ impl CrewService {
         let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
         let prefix = format!("{project}/{name}/");
         let mut messages = self
-            .resource_backend
-            .using::<flotilla_resources::Message>(namespace)
-            .query_declared(&StoreQuery {
-                message: Some(flotilla_store::MessageQuery::active()),
-                field_prefixes: BTreeMap::from([("spec.receiver".into(), prefix.clone())]),
-                include_replicas: true,
-                ..Default::default()
-            })
+            .active_message_records_under(namespace, &prefix)
             .await
             .map_err(|error| error.to_string())?
-            .items
             .into_iter()
             .filter(|message| {
                 message.object.spec.receiver.starts_with(&prefix)
@@ -2829,7 +2810,9 @@ impl CrewService {
             let mut next = message.object.status.clone().unwrap_or_default();
             flotilla_resources::StatusPatch::apply(&patch, &mut next);
             let replacement = serde_json::to_value(next).expect("message status");
-            let result = if matches!(message.provenance, ResourceProvenance::Local) {
+            let result = if let Some(primitives) = self.message_primitives() {
+                primitives.withdraw(namespace, &message.object.metadata.name, name).await
+            } else if matches!(message.provenance, ResourceProvenance::Local) {
                 flotilla_store::patch_resource_status_if_version(
                     &self.resource_backend,
                     namespace,
@@ -2875,9 +2858,7 @@ impl CrewService {
                         // must not delay clearing its workflow continuation.
                         true
                     } else {
-                        self.resource_backend
-                            .including_replicas::<flotilla_resources::Message>(namespace)
-                            .get(&reference.name)
+                        self.message_record(namespace, &reference.name)
                             .await
                             .map_err(|error| {
                                 format!("follow-up Message awaits replication during withdrawal: {error}; last queued brief: {withdrawn:?}")
@@ -2936,8 +2917,8 @@ impl CrewService {
             &request.sender,
             &turn_message_producer_key(&request.source, &request.subject_revision),
         );
-        match self.resource_backend.including_replicas::<flotilla_resources::Message>(&request.namespace).get(&name).await {
-            Ok(existing) if existing.object.spec.same_intent(&intent) => {
+        match self.message_record(&request.namespace, &name).await {
+            Ok(existing) if self.same_message_intent(&existing.object.spec, &intent) => {
                 return Ok(CrewTurnAdmission {
                     new_turn: false,
                     rung: TurnDeliveryRung::WarmSession,
@@ -2965,16 +2946,12 @@ impl CrewService {
             if holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
                 return Err("receiver-home resource mutation router unavailable".into());
             }
-            let inbox = self
-                .message_inboxes
-                .lock()
-                .await
-                .entry(request.namespace.clone())
-                .or_insert_with(|| flotilla_messaging::MessageInbox::new(self.resource_backend.clone(), &request.namespace))
-                .clone();
-            let existing = self.resource_backend.using::<flotilla_resources::Message>(&request.namespace).get(&name).await.is_ok();
-            let admission = inbox
-                .accept(&InputMeta::builder().name(name).build(), &intent, self.clock.now())
+            let existing = match self.message_primitives() {
+                Some(_) => self.message_record(&request.namespace, &name).await.is_ok(),
+                None => self.resource_backend.using::<flotilla_resources::Message>(&request.namespace).get(&name).await.is_ok(),
+            };
+            let admission = self
+                .admit_message(&request.namespace, &InputMeta::builder().name(name).build(), &intent)
                 .await
                 .map_err(|error| error.to_string())?;
             let object = match admission {
@@ -3071,8 +3048,8 @@ impl CrewService {
         } else {
             TurnDeliveryRung::FreshAgent
         };
-        match self.resource_backend.including_replicas::<flotilla_resources::Message>(&request.namespace).get(&name).await {
-            Ok(existing) if existing.object.spec.same_intent(&intent) => {
+        match self.message_record(&request.namespace, &name).await {
+            Ok(existing) if self.same_message_intent(&existing.object.spec, &intent) => {
                 return Ok(CrewTurnAdmission {
                     new_turn: false,
                     rung,
@@ -3088,17 +3065,8 @@ impl CrewService {
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
-        let records = self
-            .resource_backend
-            .using::<flotilla_resources::Message>(&request.namespace)
-            .query_declared(&StoreQuery {
-                message: Some(flotilla_store::MessageQuery::Active { receiver: Some(intent.receiver.clone()) }),
-                include_replicas: true,
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        if let Some(existing) = records.items.iter().find(|record| {
+        let records = self.active_message_records(&request.namespace, Some(&intent.receiver)).await.map_err(|error| error.to_string())?;
+        if let Some(existing) = records.iter().find(|record| {
             intent.supersedes.is_none()
                 && flotilla_resources::message_supersedes(&intent, &record.object)
                 && flotilla_resources::message_expectation_open(&record.object)
@@ -3164,20 +3132,8 @@ impl CrewService {
                 {
                     return Err("receiver-home resource mutation router unavailable".into());
                 }
-                let inbox = self
-                    .message_inboxes
-                    .lock()
-                    .await
-                    .entry(request.namespace.clone())
-                    .or_insert_with(|| {
-                        flotilla_messaging::MessageInbox::new(self.resource_backend.clone(), &request.namespace).with_observation_staleness(
-                            self.leaf_subscriptions.change_request_stale_after(),
-                            self.leaf_subscriptions.issue_stale_after(),
-                        )
-                    })
-                    .clone();
-                let admission = inbox
-                    .accept(&InputMeta::builder().name(name.clone()).build(), &intent, self.clock.now())
+                let admission = self
+                    .admit_message(&request.namespace, &InputMeta::builder().name(name.clone()).build(), &intent)
                     .await
                     .map_err(|error| error.to_string())?;
                 let record = match admission {
@@ -3403,19 +3359,8 @@ impl CrewService {
         }
         let mut messages = BTreeMap::new();
         for (message_namespace, names) in references {
-            let records = self
-                .resource_backend
-                .query_declared::<flotilla_resources::Message>(
-                    &message_namespace,
-                    &StoreQuery {
-                        field_values: BTreeMap::from([("metadata.name".into(), names)]),
-                        include_replicas: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            for source in records.items {
+            let records = self.named_message_records(&message_namespace, &names).await.map_err(|error| error.to_string())?;
+            for source in records {
                 messages.entry((message_namespace.clone(), source.object.metadata.name.clone())).or_insert(source.object);
             }
         }
@@ -3472,14 +3417,14 @@ impl CrewService {
         Ok(())
     }
 
-    async fn publish_message_intent(
+    pub async fn publish_message_intent(
         &self,
         namespace: &str,
         name: &str,
         intent: &flotilla_resources::MessageSpec,
     ) -> Result<ResourceRef, String> {
-        match self.resource_backend.including_replicas::<flotilla_resources::Message>(namespace).get(name).await {
-            Ok(existing) if existing.object.spec.same_intent(intent) => {
+        match self.message_record(namespace, name).await {
+            Ok(existing) if self.same_message_intent(&existing.object.spec, intent) => {
                 return Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, &existing.object.metadata.name))
             }
             Ok(_) => return Err("message producer ID already names different intent".into()),
@@ -3496,15 +3441,8 @@ impl CrewService {
         if holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
             return Err("receiver-home resource mutation router unavailable".into());
         }
-        let inbox = self
-            .message_inboxes
-            .lock()
-            .await
-            .entry(namespace.into())
-            .or_insert_with(|| flotilla_messaging::MessageInbox::new(self.resource_backend.clone(), namespace))
-            .clone();
-        let admission = inbox
-            .accept(&InputMeta::builder().name(name.into()).build(), intent, self.clock.now())
+        let admission = self
+            .admit_message(namespace, &InputMeta::builder().name(name.into()).build(), intent)
             .await
             .map_err(|error| error.to_string())?;
         let record = match admission {
@@ -3625,7 +3563,7 @@ impl CrewService {
                 attention.raised_at.timestamp_micros()
             ),
         );
-        match self.resource_backend.including_replicas::<flotilla_resources::Message>(&request.namespace).get(&name).await {
+        match self.message_record(&request.namespace, &name).await {
             Ok(_) => return Ok(()),
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
