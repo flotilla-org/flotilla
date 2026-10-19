@@ -670,3 +670,13 @@ controller_idle_ms = 1000
 The default is 1000 ms, matching the existing screen quiet period. A controller
 input refusal keeps the turn queued for retry. Screen classification still
 decides readiness; a composer-empty guard will follow when cleat supports it.
+
+A zero window disables only the elapsed quiet-time requirement; cleat's
+controller-output fence still applies. An unreadable config prevents constructing
+the pool rather than silently shortening a configured guard to the default.
+This requires the fleet-pinned cleat with `--submit` and `--controller-idle`;
+unsupported flags remain visible transport errors, with no unguarded fallback.
+
+Legacy explicit composer-clearing retries send C-c before submission. If the
+following guarded send refuses, that legacy operation is held as ambiguous
+because the clear has already written input; it is not automatically repeated.

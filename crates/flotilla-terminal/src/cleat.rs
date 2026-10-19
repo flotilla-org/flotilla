@@ -403,21 +403,29 @@ impl TerminalPool for CleatTerminalPool {
     async fn guarded_deliver(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
         let idle = format!("{}ms", self.controller_idle.as_millis());
         // Cleat owns paste encoding and Enter in the same daemon transaction.
-        let result = run!(self.runner, &self.binary, &["send", session_name, text, "--submit", "--controller-idle", &idle], Path::new("/"));
-        match result {
-            Ok(_) => Ok(TerminalSubmission::Submitted),
-            // Exact daemon refusal reasons only: other errors may follow a write.
+        // End option parsing before either positional argument: raw crew text
+        // can itself be an option spelling such as --help or a Markdown bullet.
+        let args = ["send", "--submit", "--controller-idle", &idle, "--", session_name, text];
+        let label = flotilla_provider_runtime::command_channel_label(&self.binary, &args);
+        // Inspect the raw process result. Runner/spawn errors must never be
+        // mistaken for a daemon's explicit pre-write rejection, even if their
+        // context happens to contain one of the refusal strings.
+        let output = self.runner.run_output(&self.binary, &args, Path::new("/"), &label).await?;
+        if output.success() {
+            return Ok(TerminalSubmission::Submitted);
+        }
+        let reason = output.stderr;
+        if output.exit_code == Some(1)
+            && matches!(
+                reason.trim(),
+                "controller input is not idle"
+                    | "controller input has not yet produced a verifiable PTY echo"
+                    | "controller input output fence is still settling"
+            )
+        {
+            Ok(TerminalSubmission::Refused(reason))
+        } else {
             Err(reason)
-                if matches!(
-                    reason.trim(),
-                    "controller input is not idle"
-                        | "controller input has not yet produced a verifiable PTY echo"
-                        | "controller input output fence is still settling"
-                ) =>
-            {
-                Ok(TerminalSubmission::Refused(reason))
-            }
-            Err(error) => Err(error),
         }
     }
 
@@ -771,22 +779,23 @@ mod tests {
         assert_eq!(calls[0].1, vec!["kill", "my-session"]);
     }
 
-    // Glue: each single-line, multiline and empty message is one atomic cleat call;
-    // cleat, rather than flotilla, owns bracketed-paste encoding and Enter.
+    // Glue: raw text, including leading CLI option spellings, is always a
+    // positional payload in one atomic call; cleat owns paste encoding and Enter.
     #[tokio::test(start_paused = true)]
     async fn delivery_uses_one_atomic_guarded_call_per_message() {
-        let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new()), Ok(String::new())]));
+        let texts = ["Please review commit abc123", "handoff from coder@work\n\nPlease review", "", "--help", "- bullet", "--foo"];
+        let runner = Arc::new(MockRunner::new(texts.iter().map(|_| Ok(String::new())).collect()));
         let pool = test_pool(runner.clone(), "cleat").with_controller_idle(Duration::from_millis(1750));
-        for text in ["Please review commit abc123", "handoff from coder@work\n\nPlease review", ""] {
+        for text in texts {
             let started = tokio::time::Instant::now();
             pool.deliver("reviewer-session", text).await.expect("submit");
             assert_eq!(started.elapsed(), Duration::ZERO);
         }
         let calls = logical_calls(&runner);
-        assert_eq!(calls.len(), 3);
-        for (call, text) in calls.iter().zip(["Please review commit abc123", "handoff from coder@work\n\nPlease review", ""]) {
+        assert_eq!(calls.len(), texts.len());
+        for (call, text) in calls.iter().zip(texts) {
             assert_eq!(call.0, "cleat");
-            assert_eq!(call.1, vec!["send", "reviewer-session", text, "--submit", "--controller-idle", "1750ms"]);
+            assert_eq!(call.1, vec!["send", "--submit", "--controller-idle", "1750ms", "--", "reviewer-session", text]);
         }
     }
 
@@ -794,21 +803,35 @@ mod tests {
     // transport errors and unrecognized failures remain ambiguous.
     #[tokio::test]
     async fn guarded_delivery_distinguishes_refusal_from_ambiguous_failure() {
-        for reason in [
-            "controller input is not idle",
-            "controller input has not yet produced a verifiable PTY echo",
-            "controller input output fence is still settling",
-            "connection lost",
-            "write failed: controller input is not idle",
+        for (reason, refused) in [
+            ("controller input is not idle", true),
+            ("controller input has not yet produced a verifiable PTY echo", true),
+            ("controller input output fence is still settling", true),
+            ("connection lost", false),
+            ("write failed: controller input is not idle", false),
         ] {
             let runner = Arc::new(MockRunner::new(vec![Err(format!("{reason}\n"))]));
             let result = test_pool(runner.clone(), "cleat").guarded_deliver("agent", "turn").await;
-            if reason.starts_with("controller input") {
+            if refused {
                 assert_eq!(result, Ok(TerminalSubmission::Refused(format!("{reason}\n"))));
             } else {
                 assert_eq!(result, Err(format!("{reason}\n")));
             }
             assert_eq!(logical_calls(&runner).len(), 1);
+        }
+    }
+
+    // A runner failure or unrelated process exit never proves a safe refusal,
+    // even if its diagnostic happens to equal a known controller reason.
+    #[tokio::test]
+    async fn guarded_delivery_requires_a_daemon_process_refusal() {
+        use flotilla_provider_runtime::CommandOutput;
+        for response in [
+            Err("controller input is not idle".to_string()),
+            Ok(CommandOutput { stdout: String::new(), stderr: "controller input is not idle".into(), exit_code: Some(2) }),
+        ] {
+            let runner = Arc::new(MockRunner::with_outputs(vec![response]));
+            assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn").await, Err("controller input is not idle".into()));
         }
     }
 
@@ -986,7 +1009,10 @@ mod tests {
         let calls = logical_calls(&runner);
         assert_eq!(calls[0].1, vec!["send-keys", "reviewer-session", "C-c"]);
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1].1, vec!["send", "reviewer-session", "Please review commit abc123", "--submit", "--controller-idle", "1000ms"]);
+        assert_eq!(
+            calls[1].1,
+            vec!["send", "--submit", "--controller-idle", "1000ms", "--", "reviewer-session", "Please review commit abc123"]
+        );
     }
 }
 

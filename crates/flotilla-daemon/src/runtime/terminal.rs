@@ -193,13 +193,20 @@ pub(super) async fn deliver_and_confirm(
     // PTY input sent during agent startup can be consumed before the TUI has
     // enabled its composer input modes. A newly launched agent reports active,
     // so wait for its first idle observation before sending delivery bytes.
+    let deadline =
+        tokio::time::Instant::now() + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
     loop {
-        match wait_for_delivery_ready(pool, adapter, session_id, readiness).await {
-            Ok(true) => {}
+        match tokio::time::timeout_at(deadline, wait_for_delivery_ready(pool, adapter, session_id, readiness)).await {
+            Ok(Ok(true)) => {}
+            Err(_) => return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)),
             result => {
                 warn!(%session_id, ?result, "agent session readiness failed before any message input was sent");
                 return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
             }
+        }
+        // timeout_at can poll an immediately-ready observation at the deadline.
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
         }
         let outcome = submit_and_confirm(pool, adapter, session_id, message, clear_before_delivery).await?;
         if outcome != TerminalDeliveryOutcome::Pending {

@@ -118,7 +118,7 @@ mod tests {
         pool.deliver("agent", "turn").await.expect("atomic turn submission");
         let calls = runner.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(&calls[0].1[calls[0].1.len() - 2..], &["--controller-idle", "2500ms"]);
+        assert!(calls[0].1.windows(2).any(|args| args == ["--controller-idle", "2500ms"]));
     }
 
     #[tokio::test]

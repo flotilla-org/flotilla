@@ -183,6 +183,9 @@ pub trait TerminalPool: Send + Sync {
 
     /// Retry a delivery whose text is still present in a TUI composer. Pools
     /// with keyboard-level control should clear that text before resubmitting.
+    /// This legacy API reports failures after clearing as transport errors,
+    /// including a refused submission. Callers must hold those outcomes rather
+    /// than assume the preceding clear can safely be repeated.
     async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
         self.deliver(session_name, text).await
     }
