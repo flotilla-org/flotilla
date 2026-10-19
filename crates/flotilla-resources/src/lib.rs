@@ -315,11 +315,13 @@ mod read_evidence;
 pub use read_evidence::*;
 
 pub mod convoy_address;
+// Preserve existing root query APIs; admission naming is imported directly from the module.
 pub use convoy_address::{convoy_disambiguation_address, parse_role_address, resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 
 mod host_projection;
 pub use host_projection::canonical_placement_host_ref_from_sources;
 
+/// Marks a convoy whose admission briefs were persisted as artifacts.
 pub const BRIEF_ARTIFACTS_ANNOTATION: &str = "flotilla.work/brief-artifacts";
 
 pub mod image_architecture;

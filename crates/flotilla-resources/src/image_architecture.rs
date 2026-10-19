@@ -1,5 +1,7 @@
 //! Canonical architecture names used by image admission and builds.
 use crate::{Host, ResourceObject};
+
+/// Normalize host architecture aliases to the names used in image manifests.
 pub fn canonical_image_architecture(architecture: &str) -> &str {
     match architecture {
         "x86_64" => "amd64",

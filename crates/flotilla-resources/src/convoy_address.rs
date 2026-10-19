@@ -1,4 +1,7 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt, str::FromStr};
+
+use sha2::{Digest, Sha256};
+
 pub fn convoy_disambiguation_address(role: &str, project: Option<&str>) -> String {
     format!("{role}@{}", project.unwrap_or_default())
 }
@@ -63,8 +66,6 @@ pub fn resolve_convoy_candidate_indices(identities: &[ConvoyAddressIdentity<'_>]
     ))
 }
 
-use sha2::{Digest, Sha256};
-use std::{fmt, str::FromStr};
 pub fn convoy_record_name() -> String {
     format!("convoy-{}", uuid::Uuid::new_v4().simple())
 }
