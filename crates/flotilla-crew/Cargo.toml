@@ -25,7 +25,7 @@ async-trait = { workspace = true }
 bon = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 sha2 = { workspace = true }
 
