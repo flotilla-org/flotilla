@@ -98,7 +98,10 @@ provider_requirements:
 ```
 
 Use `instance: <configured-name>` to pin a specific instance instead of a class,
-or combine both as constraints. All requirements must hold. Host checkout
+or combine both as constraints. A metadata instance label can also complete an
+otherwise empty requirements record. All requirements must hold. Class and
+execution input shape must agree: host adoption uses HostDirect, and a
+per-vessel strategy cannot select HostDirect. Host checkout
 strategies additionally require Shared material; explicitly requesting another
 strategy cannot remove that requirement. `egress_enforcement: enforced` requires
 an enforcing provider; `advisory` or an omitted requirement accepts either.

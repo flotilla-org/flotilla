@@ -13,14 +13,14 @@ pub fn match_provider<'a>(
     advertisements: &'a [ProviderAdvertisement],
 ) -> Result<&'a ProviderAdvertisement, String> {
     let mut requirements = spec.provider_requirements.clone().unwrap_or_default();
-    if spec.provider_requirements.is_some() && requirements.instance.is_none() && requirements.class.is_none() {
-        return Err(format!("{host}: provider requirements need an instance or class"));
-    }
     if let Some(label) = labelled_instance {
         if requirements.instance.as_deref().is_some_and(|instance| instance != label) {
             return Err(format!("{host}: provider instance disagrees with policy label `{label}`"));
         }
         requirements.instance = Some(label.into());
+    }
+    if spec.provider_requirements.is_some() && requirements.instance.is_none() && requirements.class.is_none() {
+        return Err(format!("{host}: provider requirements need an instance or class"));
     }
     let checkout = match (&spec.host_direct, &spec.docker_per_vessel) {
         (Some(_), None) => {
@@ -41,6 +41,13 @@ pub fn match_provider<'a>(
         }
         _ => return Err(format!("{host}: placement must define exactly one execution strategy")),
     };
+    // Class fixes input shape (ADR 0058); capabilities still determine behavior.
+    // The legacy per-vessel input carrier also serves Dummy and future kinds.
+    let incompatible_class = |class| (class == EnvironmentClass::HostDirect) != spec.host_direct.is_some();
+    let strategy = if spec.host_direct.is_some() { "host-direct" } else { "per-vessel" };
+    if let Some(class) = requirements.class.filter(|class| incompatible_class(*class)) {
+        return Err(format!("{host}: provider class {class:?} is incompatible with {strategy} execution strategy"));
+    }
     let identity_matches = advertisements
         .iter()
         .filter(|provider| {
@@ -51,8 +58,9 @@ pub fn match_provider<'a>(
     if identity_matches.is_empty() {
         return Err(format!("{host}: no advertised provider matches instance {:?} class {:?}", requirements.instance, requirements.class));
     }
-    // Duplicate configured identities are malformed, even if only one duplicate
-    // currently happens to meet the constraints.
+    // For every identity selected above, count duplicates across the whole
+    // slice, including entries excluded by the class filter. Unrelated names
+    // do not affect this policy's selection.
     for provider in &identity_matches {
         if advertisements.iter().filter(|other| other.instance == provider.instance).count() != 1 {
             return Err(format!("{host}: ambiguous provider instance `{}` advertised more than once", provider.instance));
@@ -61,7 +69,11 @@ pub fn match_provider<'a>(
     let mut matching = Vec::new();
     let mut reasons = Vec::new();
     for provider in identity_matches {
-        match missing_requirement(provider, &requirements, checkout) {
+        let missing = match provider.kind.as_ref().map(|kind| kind.class).filter(|class| incompatible_class(*class)) {
+            Some(class) => Some(format!("class {class:?} is incompatible with {strategy} execution strategy")),
+            None => missing_requirement(provider, &requirements, checkout),
+        };
+        match missing {
             None => matching.push(provider),
             Some(reason) => reasons.push(format!("{host}: {} {reason}", provider.instance)),
         }
@@ -81,6 +93,8 @@ fn missing_requirement(
     requirements: &ProviderRequirements,
     checkout: Option<CheckoutStrategy>,
 ) -> Option<String> {
+    // When several defects coexist, report the actionable readiness failure
+    // first. Both unknown readiness and incomplete identity still fail closed.
     match &provider.readiness {
         ProviderReadiness::Ready => {}
         ProviderReadiness::MissingTool { reason } => return Some(format!("missing tool: {reason}")),
@@ -126,6 +140,13 @@ mod tests {
                 "checkout": { "fresh_clone_in_container": { "clone_path": "/workspace" } } }
         }))
         .unwrap();
+        if class == EnvironmentClass::HostDirect {
+            spec.docker_per_vessel = None;
+            spec.host_direct = Some(flotilla_resources::HostDirectPlacementPolicySpec {
+                host_ref: "feta".into(),
+                checkout: flotilla_resources::HostDirectPlacementPolicyCheckout::Worktree,
+            });
+        }
         spec.provider_requirements = Some(ProviderRequirements { class: Some(class), ..Default::default() });
         spec
     }
@@ -289,6 +310,57 @@ mod tests {
         spec.provider_requirements = Some(ProviderRequirements::default());
         assert!(match_provider("feta", &spec, None, &[entry]).unwrap_err().contains("instance or class"));
     }
+    // A configured identity label can complete an otherwise empty selector;
+    // combining a label and class is conjunctive, including every provider class.
+    #[hegel::test]
+    fn labelled_instance_combines_with_class_requirements(tc: hegel::TestCase) {
+        let classes = [
+            EnvironmentClass::HostDirect,
+            EnvironmentClass::Container,
+            EnvironmentClass::MicroVm,
+            EnvironmentClass::CloudSandbox,
+            EnvironmentClass::Dummy,
+        ];
+        let class = classes[tc.draw(gs::integers::<usize>().min_value(0).max_value(4))];
+        let with_class = tc.draw(gs::booleans());
+        let mut spec = policy(class);
+        if !with_class {
+            spec.provider_requirements = Some(ProviderRequirements::default());
+        }
+        let entry = provider(class);
+        let selected = match_provider("feta", &spec, Some("sandbox"), std::slice::from_ref(&entry)).unwrap();
+        assert_eq!(selected.instance, "sandbox");
+        assert!(match_provider("feta", &spec, Some("absent"), &[entry]).is_err());
+    }
+
+    // Input shapes distinguish host adoption from per-vessel provisioning.
+    // Capability matching cannot make a mismatched input shape meaningful.
+    #[hegel::test]
+    fn class_and_execution_strategy_disagreement_is_explicit(tc: hegel::TestCase) {
+        let direct_strategy = tc.draw(gs::booleans());
+        let mut spec = policy(if direct_strategy { EnvironmentClass::HostDirect } else { EnvironmentClass::Container });
+        let wrong_class = if direct_strategy { EnvironmentClass::Container } else { EnvironmentClass::HostDirect };
+        spec.provider_requirements.as_mut().unwrap().class = Some(wrong_class);
+        let error = match_provider("feta", &spec, None, &[provider(wrong_class)]).unwrap_err();
+        assert!(error.contains("incompatible with"), "{error}");
+        assert!(error.contains("feta"), "{error}");
+        // The same mismatch is refused when class comes only from the named instance.
+        spec.provider_requirements = Some(ProviderRequirements { instance: Some("sandbox".into()), ..Default::default() });
+        assert!(match_provider("feta", &spec, None, &[provider(wrong_class)]).is_err());
+    }
+
+    // Duplicate names count over the entire advertisement slice, even when
+    // one duplicate has a different class and fails the policy's class filter.
+    #[hegel::test]
+    fn duplicate_identity_across_classes_is_refused(tc: hegel::TestCase) {
+        let mut providers = vec![provider(EnvironmentClass::Container), provider(EnvironmentClass::CloudSandbox)];
+        if tc.draw(gs::booleans()) {
+            providers.reverse();
+        }
+        let error = match_provider("feta", &policy(EnvironmentClass::Container), None, &providers).unwrap_err();
+        assert!(error.contains("ambiguous provider instance `sandbox` advertised more than once"));
+    }
+
     // Repeated Host observations must control the next admission, including
     // malformed/old data. Two independently resolved vessels freeze distinct
     // identities; a selected instance is never borrowed from another vessel.
