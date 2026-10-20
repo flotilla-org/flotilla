@@ -71,3 +71,15 @@ ordered-query/notification port before this becomes a bulk export surface.
 Batch sizing currently measures JSON bytes for both carriers to keep consistent
 boundaries; CBOR then encodes that batch independently. This bounded extra encoding
 cost is accepted for this operational tier.
+
+Primitive table reads hold the engine store mutex while SQLite reads and decodes
+rows, on a blocking worker. Non-log watches poll the home-wide sequence as described
+above. Log watches return `unsupported_watch`; incremental log watching is deferred.
+
+A `{kind}.log` row request returns only a bounded initial snapshot in ascending
+sequence order. The SQL query applies `LIMIT` before materializing rows (the requested
+limit plus one sentinel, capped at 10,001). The response marks truncation as partial,
+without offering a continuation cursor. Cursor, offset, alternate sort and count
+requests return `unsupported_log_paging`; full keyset paging is deferred. This bounds
+returned history rows while the mutex is held; it does not promise index-bounded
+query execution for arbitrary filters.

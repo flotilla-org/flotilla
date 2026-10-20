@@ -1,5 +1,5 @@
 //! Derived kinds use their existing descriptor and the SQLite table-read port.
-use super::table_api::{encode, error, Format, Query};
+use super::table_api::{bad, encode, error, Format, Query};
 use axum::{
     body::Body,
     http::{header, StatusCode},
@@ -92,7 +92,7 @@ fn read_sync(service: &Service, name: &str, table: &Table, query: &Query) -> Res
             if query.filter.selects_none() {
                 filters.push(TableFilter::None);
             }
-            let result = store.table_read(&home, name, &filters)?;
+            let result = store.table_read(&home, name, &filters, query.limit + 1)?;
             let columns: BTreeMap<_, _> =
                 result.descriptor.key.iter().chain(&result.descriptor.columns).map(|column| (column.name.as_str(), &column.ty)).collect();
             let rows = result
@@ -166,7 +166,7 @@ fn page(name: &str, mut schema: Value, query: &Query, sequence: u64, mut rows: V
     let more = rows.len() > query.limit;
     let partial = more || query.offset > 0 || query.cursor.is_some();
     rows.truncate(query.limit);
-    let cursor = if more { rows.last().map(|row| query.cursor(name, row)).transpose()? } else { None };
+    let cursor = if more && !name.ends_with(".log") { rows.last().map(|row| query.cursor(name, row)).transpose()? } else { None };
     messages.extend(super::table_api::batches(rows.iter().map(|row| query.project(row)).collect(), sequence, partial, cursor)?);
     messages.push(Message::Synced { sequence });
     Ok(messages)
@@ -230,11 +230,14 @@ pub(super) async fn respond(name: &str, rows: bool, params: &[(String, String)],
             flotilla_schema::ColumnDef::new("resource.name", ColumnType::Text, false),
         ]
     };
+    for key in &mut keys {
+        key.add_role("key");
+    }
     keys.extend(table.key);
     table.key = keys;
-    for column in table.key.iter().chain(&table.columns) {
+    for column in table.key.iter_mut().chain(&mut table.columns) {
         let scalar = !matches!(column.ty, ColumnType::Frozen | ColumnType::Cbor | ColumnType::Blob);
-        let props = table.properties.entry(column.name.clone()).or_default();
+        let props = &mut column.properties;
         props.insert("sortable".into(), json!(scalar));
         props.insert("whereOperators".into(), json!(if scalar { vec!["=="] } else { vec![] }));
     }
@@ -245,6 +248,19 @@ pub(super) async fn respond(name: &str, rows: bool, params: &[(String, String)],
         Ok(query) => query,
         Err(err) => return err.into_response(),
     };
+    if name.ends_with(".log") {
+        if query.watch {
+            return bad("unsupported_watch", "log watches require an incremental log port").into_response();
+        }
+        if query.cursor.is_some()
+            || query.offset != 0
+            || query.count.is_some()
+            || query.sort != vec![("home".into(), false), ("sequence".into(), false)]
+        {
+            return bad("unsupported_log_paging", "log reads support only a bounded initial snapshot in sequence order, without counts")
+                .into_response();
+        }
+    }
     let (sequence, _, rows) = match read(&service, name, &table, &query).await {
         Ok(rows) => rows,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "table_source", err),

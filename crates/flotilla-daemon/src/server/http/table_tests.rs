@@ -215,6 +215,15 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
             write.commit()
         })
         .unwrap();
+    service
+        .with_store(|store| {
+            let bounded = store.table_read("home", "table_sample.log", &[], 1)?;
+            assert_eq!(bounded.rows.len(), 1, "SQL must apply the log limit before materializing rows");
+            assert!(store.table_read("home", "table_sample.log", &[], 0).is_err());
+            assert!(store.table_read("home", "table_sample.log", &[], 10_002).is_err());
+            Ok(())
+        })
+        .unwrap();
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let router = HttpRouter::builder()
         .backend(backend)
@@ -229,9 +238,25 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
     for cbor in [false, true] {
         let child = messages(&router, "/tables/table_sample_tags/rows", cbor).await;
         assert!(child.iter().any(|message| matches!(message,Message::Rows{rows,..} if rows.len()==2&&rows[0]["value"]=="tag")));
-        let log = messages(&router, "/tables/table_sample.log/rows?count=exact", cbor).await;
-        assert!(log.iter().any(|message| matches!(message, Message::Count { count: 2, .. })));
+        let log = messages(&router, "/tables/table_sample.log/rows?limit=1", cbor).await;
+        assert!(log.iter().any(|message| matches!(message, Message::Rows { rows, partial: true, cursor: None, .. } if rows.len() == 1)));
         assert!(log.iter().any(|message| matches!(message,Message::Rows{rows,..} if rows[0]["cause"]=="create")));
+    }
+    for cbor in [false, true] {
+        for (path, code) in [
+            ("/tables/table_sample/rows?where=.metadata.labels.group%20%3D%3D%20match", "unsupported_filter"),
+            ("/tables/table_sample_tags/rows?where=.metadata.labels.group%20%3D%3D%20match", "unsupported_filter"),
+            ("/tables/table_sample.log/rows?watch", "unsupported_watch"),
+            ("/tables/table_sample.log/rows?count=exact", "unsupported_log_paging"),
+            ("/tables/table_sample.log/rows?cursor=anything", "unsupported_log_paging"),
+            ("/tables/table_sample.log/rows?offset=1", "unsupported_log_paging"),
+            ("/tables/table_sample.log/rows?sort=-sequence", "unsupported_log_paging"),
+        ] {
+            let response = call(&router, path, cbor).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+            assert_eq!(body["code"], code, "{path}");
+        }
     }
     let empty =
         messages(&router, "/tables/table_sample/rows?where=.text%20%3D%3D%20match&where=.text%20%3D%3D%20other&count=exact", false).await;

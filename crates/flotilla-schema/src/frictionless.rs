@@ -1,45 +1,7 @@
 //! ADR 0067's native-value Frictionless profile, rendered from the shared descriptor.
-use crate::{ColumnDef, ColumnType, Table, TableRole};
+use crate::{ColumnType, Layout, Table};
 use serde_json::{json, Value};
 
-/// A descriptor builder for tables whose source is not a derived stored kind.
-pub struct TableBuilder(Table);
-impl TableBuilder {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(Table {
-            name: name.into(),
-            role: TableRole::Root,
-            parent: None,
-            field: String::new(),
-            key: vec![],
-            own_key: 0,
-            columns: vec![],
-            guards: vec![],
-            enums: vec![],
-            generated: vec![],
-            fields: vec![],
-            field_aliases: vec![],
-            aliases: vec![],
-            properties: Default::default(),
-        })
-    }
-    pub fn column(mut self, name: &str, ty: ColumnType, nullable: bool) -> Self {
-        self.0.columns.push(ColumnDef::new(name, ty, nullable));
-        self
-    }
-    pub fn key(mut self, name: &str, ty: ColumnType) -> Self {
-        self.0.key.push(ColumnDef::new(name, ty, false));
-        self.0.own_key += 1;
-        self
-    }
-    pub fn property(mut self, field: &str, name: &str, value: Value) -> Self {
-        self.0.properties.entry(field.into()).or_default().insert(name.into(), value);
-        self
-    }
-    pub fn build(self) -> Table {
-        self.0
-    }
-}
 impl Table {
     /// Frictionless Table Schema v2 without text parsing conventions. Native values cross
     /// the wire; interned text and references never expose backend-local identifiers.
@@ -75,17 +37,6 @@ impl Table {
                 if let Some(reference) = &column.reference {
                     field["reference"] = json!({"resource": reference});
                 }
-                if self.key.iter().any(|key| key.name == column.name) {
-                    let roles = field.as_object_mut().expect("field object").entry("roles").or_insert_with(|| json!([]));
-                    if let Some(roles) = roles.as_array_mut() {
-                        if !roles.iter().any(|role| role == "key") {
-                            roles.push(json!("key"));
-                        }
-                    }
-                }
-                if let Some(properties) = self.properties.get(&column.name) {
-                    field.as_object_mut().expect("field object").extend(properties.clone());
-                }
                 field
             })
             .collect();
@@ -112,20 +63,26 @@ impl crate::TableSet {
     }
     /// The kind's projection of the per-home event log; its key stays natural and portable.
     pub fn log_projection(&self) -> Table {
-        TableBuilder::new(format!("{}.log", self.tables[0].name))
-            .key("home", ColumnType::Text)
-            .key("sequence", ColumnType::Integer)
-            .column("name", ColumnType::Text, true)
-            .column("cause", ColumnType::Text, false)
-            .column("edge", ColumnType::Text, true)
-            .column("from", ColumnType::Text, true)
-            .column("to", ColumnType::Text, true)
-            .column("at", ColumnType::Timestamp, false)
-            .property("sequence", "roles", json!(["sequence"]))
-            .property("at", "roles", json!(["time"]))
-            .property("from", "roles", json!(["transition_from"]))
-            .property("to", "roles", json!(["transition_to"]))
-            .build()
+        let mut layout = Layout::description(&format!("{}.log", self.tables[0].name));
+        layout.key(|layout| {
+            layout.column("home", ColumnType::Text, true);
+            layout.column("sequence", ColumnType::Integer, true);
+            layout.role("sequence");
+        });
+        for (name, ty, required, role) in [
+            ("name", ColumnType::Text, false, None),
+            ("cause", ColumnType::Text, true, None),
+            ("edge", ColumnType::Text, false, None),
+            ("from", ColumnType::Text, false, Some("transition-from")),
+            ("to", ColumnType::Text, false, Some("transition-to")),
+            ("at", ColumnType::Timestamp, true, Some("time")),
+        ] {
+            layout.column(name, ty, required);
+            if let Some(role) = role {
+                layout.role(role);
+            }
+        }
+        layout.finish().tables.remove(0)
     }
 }
 
@@ -134,7 +91,9 @@ mod tests {
     use super::*;
     #[test]
     fn rendering_preserves_enriched_column_metadata() {
-        let mut table = TableBuilder::new("sample").key("state", ColumnType::Code(vec!["r".into()])).build();
+        let mut layout = Layout::description("sample");
+        layout.key(|layout| layout.column("state", ColumnType::Code(vec!["r".into()]), true));
+        let mut table = layout.finish().tables.remove(0);
         table.key[0].categories.push(("r".into(), "Running".into()));
         table.key[0].reference = Some("Agent".into());
         table.key[0].add_role("sequence");
@@ -143,7 +102,7 @@ mod tests {
         let field = &schema["fields"][0];
         assert_eq!(field["categories"], json!([{"value":"r", "label":"Running"}]));
         assert_eq!(field["reference"]["resource"], "Agent");
-        assert_eq!(field["roles"], json!(["sequence", "key"]));
+        assert_eq!(field["roles"], json!(["key", "sequence"]));
         assert_eq!(field["title"], "State");
     }
     // ADR 0067: field types come from the descriptor, independent of source. Generate
@@ -167,12 +126,12 @@ mod tests {
         let index = tc.draw(gs::integers::<usize>().min_value(0).max_value(cases.len() - 1));
         let nullable = tc.draw(gs::booleans());
         let (ty, expected) = &cases[index];
-        let table = TableBuilder::new("sample")
-            .key("name", ColumnType::Text)
-            .column("value", ty.clone(), nullable)
-            .property("value", "unit", json!("By"))
-            .property("value", "title", json!("Size"))
-            .build();
+        let mut layout = Layout::description("sample");
+        layout.key(|layout| layout.column("name", ColumnType::Text, true));
+        layout.column("value", ty.clone(), !nullable);
+        layout.property("unit", json!("By"));
+        layout.property("title", json!("Size"));
+        let table = layout.finish().tables.remove(0);
         let schema = table.frictionless();
         assert_eq!(schema["primaryKey"], json!(["name"]));
         assert_eq!(schema["fields"][1]["type"], *expected);

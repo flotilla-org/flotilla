@@ -133,9 +133,15 @@ struct Runtime {
 impl Store {
     /// Read one described table with predicates applied in SQLite. Natural identities
     /// replace owner ids; interned strings and object bytes are resolved in the query.
-    pub fn table_read(&self, home: &str, name: &str, filters: &[crate::TableFilter]) -> Result<crate::TableRead, StoreError> {
+    pub fn table_read(
+        &self,
+        home: &str,
+        name: &str,
+        filters: &[crate::TableFilter],
+        log_limit: usize,
+    ) -> Result<crate::TableRead, StoreError> {
         if name.ends_with(".log") {
-            crate::table_read::read_log(&self.conn, &self.runtime.kinds, home, name, filters)
+            crate::table_read::read_log(&self.conn, &self.runtime.kinds, home, name, filters, log_limit)
         } else {
             crate::table_read::read(&self.conn, &self.runtime.kinds, home, name, filters)
         }

@@ -11,7 +11,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use flotilla_address::{Operator, Template};
 use flotilla_protocol::table::{Message, Row};
 use flotilla_resources::WatchStart;
-use flotilla_schema::{ColumnType, Table, TableBuilder};
+use flotilla_schema::{ColumnType, Layout, Table};
 use flotilla_store::{query_resource_kind, watch_resource_kind_from, ResourceBackend, StoreQuery, REGISTERED_RESOURCE_KINDS};
 use futures::{stream::BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -132,38 +132,44 @@ fn descriptor(kind: &str) -> Table {
         }
     });
     let label_values = json!({"type":"string","whereOperators":["=="],"sortable":false});
-    let mut builder = TableBuilder::new(kind)
-        .key(KEY, ColumnType::Text)
-        .column("metadata.namespace", ColumnType::Text, false)
-        .column("metadata.resourceVersion", ColumnType::Text, false)
-        .column("metadata.creationTimestamp", ColumnType::Timestamp, false)
-        .column("metadata.deletionTimestamp", ColumnType::Timestamp, true)
-        .column("metadata.labels", ColumnType::Cbor, false)
-        .column("metadata.annotations", ColumnType::Cbor, false)
-        .column("status.phase", ColumnType::Text, true)
-        .column("status.conditions", ColumnType::Cbor, true)
-        .column("spec", ColumnType::Cbor, false)
-        .column("status", ColumnType::Cbor, true)
-        .property("metadata.labels", "additionalProperties", label_values)
-        .property("status.phase", "roles", json!(["state"]))
-        .property("status.conditions", "type", json!("array"))
-        .property("status.conditions", "items", condition_items);
+    let mut layout = Layout::description(kind);
+    layout.key(|layout| layout.column(KEY, ColumnType::Text, true));
+    for (name, ty, required) in [
+        ("metadata.namespace", ColumnType::Text, true),
+        ("metadata.resourceVersion", ColumnType::Text, true),
+        ("metadata.creationTimestamp", ColumnType::Timestamp, true),
+        ("metadata.deletionTimestamp", ColumnType::Timestamp, false),
+        ("metadata.labels", ColumnType::Cbor, true),
+        ("metadata.annotations", ColumnType::Cbor, true),
+        ("status.phase", ColumnType::Text, false),
+        ("status.conditions", ColumnType::Cbor, false),
+        ("spec", ColumnType::Cbor, true),
+        ("status", ColumnType::Cbor, false),
+    ] {
+        layout.column(name, ty, required);
+        match name {
+            "metadata.labels" => layout.property("additionalProperties", label_values.clone()),
+            "status.phase" => layout.role("state"),
+            "status.conditions" => {
+                layout.property("type", json!("array"));
+                layout.property("items", condition_items.clone());
+            }
+            _ => (),
+        }
+    }
+    let mut table = layout.finish().tables.remove(0);
     let declared = flotilla_store::declared_resource_kinds().into_iter().find(|entry| entry.paths.plural == kind);
     for field in
         [KEY, "metadata.namespace", "metadata.resourceVersion", "metadata.creationTimestamp", "metadata.deletionTimestamp", "status.phase"]
     {
         let operators: Vec<&str> = if declared.is_some_and(|entry| entry.queryable_fields.contains(&field)) { vec!["=="] } else { vec![] };
-        builder = builder.property(field, "sortable", json!(field != "metadata.resourceVersion")).property(
-            field,
-            "whereOperators",
-            json!(operators),
-        );
+        let column = table.key.iter_mut().chain(&mut table.columns).find(|column| column.name == field).expect("declared column");
+        column.properties.insert("sortable".into(), json!(field != "metadata.resourceVersion"));
+        column.properties.insert("whereOperators".into(), json!(operators));
     }
-    let mut table = builder.build();
-    for column in table.key.iter().chain(&table.columns) {
-        let props = table.properties.entry(column.name.clone()).or_default();
-        props.entry("sortable").or_insert(json!(false));
-        props.entry("whereOperators").or_insert(json!([]));
+    for column in table.key.iter_mut().chain(&mut table.columns) {
+        column.properties.entry("sortable".into()).or_insert(json!(false));
+        column.properties.entry("whereOperators".into()).or_insert(json!([]));
     }
     for (field, title) in [
         (KEY, "Name"),
@@ -175,7 +181,14 @@ fn descriptor(kind: &str) -> Table {
         ("spec", "Spec"),
         ("status", "Status"),
     ] {
-        table.properties.entry(field.into()).or_default().insert("title".into(), json!(title));
+        table
+            .key
+            .iter_mut()
+            .chain(&mut table.columns)
+            .find(|column| column.name == field)
+            .expect("declared column")
+            .properties
+            .insert("title".into(), json!(title));
     }
     table
 }
@@ -213,6 +226,9 @@ impl Query {
             let path = clause.path.segments().join(".");
             let label = clause.path.segments().strip_prefix(&["metadata".into(), "labels".into()]);
             let label = label.filter(|parts| parts.len() == 1).map(|parts| parts[0].clone());
+            if label.is_some() && !fields.contains("metadata.labels") {
+                return Err(bad("unsupported_filter", "table does not declare metadata.labels"));
+            }
             if !fields.contains(path.as_str()) && label.is_none() {
                 return Err(bad("unknown_column", &path));
             }
@@ -238,7 +254,13 @@ impl Query {
                 }
                 filter.labels.insert(label, clause.literal);
             } else {
-                let operators = table.properties.get(&path).and_then(|props| props.get("whereOperators")).and_then(Value::as_array);
+                let operators = table
+                    .key
+                    .iter()
+                    .chain(&table.columns)
+                    .find(|column| column.name == path)
+                    .and_then(|column| column.properties.get("whereOperators"))
+                    .and_then(Value::as_array);
                 if !operators.is_some_and(|ops| ops.contains(&json!("=="))) {
                     return Err(bad("unsupported_filter", &path));
                 }
@@ -255,7 +277,15 @@ impl Query {
             if !fields.contains(field) {
                 return Err(bad("unknown_column", field));
             }
-            if !table.properties.get(field).and_then(|props| props.get("sortable")).and_then(Value::as_bool).unwrap_or(false) {
+            if !table
+                .key
+                .iter()
+                .chain(&table.columns)
+                .find(|column| column.name == field)
+                .and_then(|column| column.properties.get("sortable"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 return Err(bad("unsupported_sort", field));
             }
             if sort.iter().any(|(name, _)| name == field) {
@@ -317,8 +347,18 @@ impl Query {
         self.sort.iter().map(|(name, _)| row.get(name).cloned().unwrap_or(Value::Null)).collect()
     }
     pub(super) fn compare(&self, a: &[Value], b: &[Value]) -> Ordering {
-        for ((a, b), (_, descending)) in a.iter().zip(b).zip(&self.sort) {
-            let order = compare(a, b);
+        for (((a, b), (_, descending)), (ty, _)) in a.iter().zip(b).zip(&self.sort).zip(&self.sort_types) {
+            let order = if *ty == ColumnType::Timestamp {
+                match (
+                    a.as_str().and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok()),
+                    b.as_str().and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok()),
+                ) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    _ => compare(a, b),
+                }
+            } else {
+                compare(a, b)
+            };
             let order = if *descending { order.reverse() } else { order };
             if order != Ordering::Equal {
                 return order;
@@ -729,6 +769,28 @@ pub(super) fn test_ordering() {
 #[cfg(test)]
 mod properties {
     use super::*;
+    #[test]
+    fn timestamp_keysets_compare_instants_across_precision_and_offsets() {
+        let table = descriptor("convoys");
+        for descending in [false, true] {
+            let field = if descending { "-metadata.deletionTimestamp" } else { "metadata.deletionTimestamp" };
+            let query = Query::parse(&[("sort".into(), field.into())], &table).unwrap();
+            let whole = vec![json!("2026-10-20T00:00:05Z"), json!("a")];
+            let fraction = vec![json!("2026-10-20T00:00:05.123Z"), json!("a")];
+            let equivalent = vec![json!("2026-10-20T01:00:05.000+01:00"), json!("a")];
+            let null = vec![Value::Null, json!("a")];
+            let before = if descending { Ordering::Greater } else { Ordering::Less };
+            assert_eq!(query.compare(&whole, &fraction), before);
+            assert_eq!(query.compare(&whole, &equivalent), Ordering::Equal);
+            assert_eq!(query.compare(&null, &whole), before);
+            let row = Row::from([("metadata.name".into(), json!("a")), ("metadata.deletionTimestamp".into(), whole[0].clone())]);
+            let cursor = query.cursor("convoys", &row).unwrap();
+            let continued = Query::parse(&[("sort".into(), field.into()), ("cursor".into(), cursor)], &table).unwrap();
+            let boundary = continued.after("convoys").unwrap().unwrap();
+            assert_eq!(continued.compare(&fraction, &boundary), before.reverse());
+        }
+    }
+
     // Backend failures are server errors, and malformed snapshots are refused rather
     // than panicking in either snapshot or live-stream decoding (review findings 2–3).
     #[test]

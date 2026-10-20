@@ -108,4 +108,3 @@ pub use value::{Hash, Identity, KindCode, Row, Rows, Value};
 pub use view::{column_count, enum_columns, render_table_view, render_view, state_data, WIDE};
 
 mod frictionless;
-pub use frictionless::TableBuilder;

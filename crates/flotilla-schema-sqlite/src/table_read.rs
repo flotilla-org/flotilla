@@ -35,6 +35,9 @@ pub(crate) fn read(
     let source = set.tables.iter().find(|table| table.name == name).expect("table found");
     let mut table = source.clone();
     let mut key = vec![ColumnDef::new("resource.home", ColumnType::Text, false), ColumnDef::new("resource.name", ColumnType::Text, false)];
+    for column in &mut key {
+        column.add_role("key");
+    }
     key.extend(table.key.clone());
     table.key = key;
     table.own_key += 2;
@@ -149,7 +152,11 @@ pub(crate) fn read_log(
     home: &str,
     name: &str,
     filters: &[TableFilter],
+    limit: usize,
 ) -> Result<TableRead, StoreError> {
+    if !(1..=10_001).contains(&limit) {
+        return Err(StoreError::Stream("log read requires a bounded limit".into()));
+    }
     let root = name.strip_suffix(".log").ok_or_else(|| StoreError::Stream("unknown log table".into()))?;
     let set = kinds.iter().find(|set| set.tables[0].name == root).ok_or_else(|| StoreError::Stream("unknown log kind".into()))?;
     let descriptor = set.log_projection();
@@ -180,7 +187,11 @@ pub(crate) fn read_log(
         |row| row.get(0),
     )?;
     let rows = {
-        let sql = format!("SELECT home,home_seq,name,cause,edge,\"from\",\"to\",at FROM log_view WHERE {}", clauses.join(" AND "));
+        let sql = format!(
+            "SELECT home,home_seq,name,cause,edge,\"from\",\"to\",at FROM log_view WHERE {} ORDER BY home_seq LIMIT ?",
+            clauses.join(" AND ")
+        );
+        values.push(SqlValue::Integer(limit as i64));
         let mut statement = tx.prepare(&sql)?;
         let mapped = statement.query_map(params_from_iter(values), |row| {
             descriptor
