@@ -3653,7 +3653,15 @@ async fn placement_host_convoy_start_enforces_capacity_before_persistence() {
 
 #[tokio::test]
 async fn remote_docker_admission_fails_closed_without_target_capacity() {
-    remote_docker_admission_refusal_scenario(None).await;
+    remote_docker_admission_refusal_scenario(None, false).await;
+}
+
+// Behaviour (#3578): an admitter below its own floor still judges work placed
+// on a remote host by that host's evidence, through both start and create
+// without an adopted checkout. Its own floor must not preempt the refusal.
+#[tokio::test]
+async fn full_admitter_judges_remote_placement_by_target_evidence() {
+    remote_docker_admission_refusal_scenario(None, true).await;
 }
 
 // Admission refuses provider deficiencies at the target host through both
@@ -3667,11 +3675,11 @@ fn remote_provider_refusals_fail_closed(tc: hegel::TestCase) {
         .start_paused(true)
         .build()
         .unwrap()
-        .block_on(remote_docker_admission_refusal_scenario(Some(case)));
+        .block_on(remote_docker_admission_refusal_scenario(Some(case), false));
 }
 
-async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>) {
-    let daemon = empty_daemon_named_with_floor("leader", Some(0)).await;
+async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, admitter_full: bool) {
+    let daemon = empty_daemon_named_with_floor("leader", Some(if admitter_full { 1_000_000 } else { 0 })).await;
     let namespace = "flotilla";
     seed_trusted_remote_convoy_project(&daemon, namespace).await;
 
