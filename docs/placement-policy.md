@@ -110,7 +110,8 @@ does not rank providers. Admission freezes the selected instance separately for
 each vessel, and provisioning uses that identity.
 
 Without this optional field, existing policies derive class and checkout from
-their execution inputs. The existing provider-instance metadata label remains
+their execution inputs. An unpinned per-vessel policy defaults to Container;
+MicroVm, CloudSandbox and Dummy require an explicit class or instance. The existing provider-instance metadata label remains
 accepted. A conflicting field and label refuses admission. Readiness is observed
 on the advertising host; for cloud providers that host controls the sandbox and
 must have its credential. Readiness is re-probed periodically; stale local samples

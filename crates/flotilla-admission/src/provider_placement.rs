@@ -48,8 +48,9 @@ pub fn match_provider<'a>(
     let host_adoption_classes = [EnvironmentClass::HostDirect];
     let incompatible_class = |class| host_adoption_classes.contains(&class) != spec.host_direct.is_some();
     let strategy = if spec.host_direct.is_some() { "host-direct" } else { "per-vessel" };
+    let shape_hint = "use host_direct for host adoption or docker_per_vessel for per-vessel provisioning";
     if let Some(class) = requirements.class.filter(|class| incompatible_class(*class)) {
-        return Err(format!("{host}: provider class {class:?} is incompatible with {strategy} execution strategy"));
+        return Err(format!("{host}: provider class {class:?} is incompatible with {strategy} execution strategy; {shape_hint}"));
     }
     let identity_matches = advertisements
         .iter()
@@ -73,7 +74,7 @@ pub fn match_provider<'a>(
     let mut reasons = Vec::new();
     for provider in identity_matches {
         let missing = match provider.kind.as_ref().map(|kind| kind.class).filter(|class| incompatible_class(*class)) {
-            Some(class) => Some(format!("class {class:?} is incompatible with {strategy} execution strategy")),
+            Some(class) => Some(format!("class {class:?} is incompatible with {strategy} execution strategy; {shape_hint}")),
             None => missing_requirement(provider, &requirements, checkout),
         };
         match missing {
