@@ -2876,7 +2876,11 @@ impl AgentTransport for NamedTransport {
         self.submissions.lock().expect("submissions").push(delivery.text.clone());
         self.outcome.clone()
     }
-    async fn poll(&self, _: &Delivery) -> TransportOutcome {
+    async fn poll(&self, delivery: &Delivery) -> TransportOutcome {
+        // Per the contract, a submission this transport never took is unconfirmed.
+        if !self.submissions.lock().expect("submissions").contains(&delivery.text) {
+            return TransportOutcome::Unconfirmed { reason: "no record of this submission".into() };
+        }
         self.outcome.clone()
     }
 }
@@ -2983,4 +2987,52 @@ async fn failed_over_pending_batch_records_and_polls_the_transport_used() {
     inbox.reconcile_delivery(&router, at(21)).await.expect("poll");
     assert_eq!(first.submissions.lock().expect("submissions").len(), 1);
     assert_eq!(keystroke.submissions.lock().expect("submissions").len(), 1, "polling never resubmits");
+}
+
+// Stands in for a transport whose submission hangs past the call bound.
+struct HangingSubmitTransport {
+    submissions: std::sync::Mutex<Vec<String>>,
+}
+#[async_trait::async_trait]
+impl AgentTransport for HangingSubmitTransport {
+    fn id(&self) -> TransportId {
+        KEYSTROKE.into()
+    }
+    async fn observe(&self, _: &DeliveryTarget, _: Option<&SubmissionRef>) -> Result<TransportObservation, String> {
+        Ok(TransportObservation { ready: true, ..Default::default() })
+    }
+    async fn submit(&self, delivery: &Delivery) -> TransportOutcome {
+        self.submissions.lock().expect("submissions").push(delivery.text.clone());
+        std::future::pending().await
+    }
+    async fn poll(&self, _: &Delivery) -> TransportOutcome {
+        TransportOutcome::Pending
+    }
+}
+
+// Behaviour: when the router fails over and the next transport's submission
+// outlives the call bound, the batch counts as possibly delivered. It stays
+// recorded against the planned transport, is held rather than retried, and
+// is never resubmitted through either transport, even past the hold bound.
+#[tokio::test(start_paused = true)]
+async fn submit_timeout_after_failover_holds_without_resubmission() {
+    let (backend, inbox) = delivery_inbox().await;
+    let first = named("codex-app-server", TransportOutcome::NotSubmitted { reason: "app-server not live".into() });
+    let hanging = Arc::new(HangingSubmitTransport { submissions: Default::default() });
+    let router = TransportRouter::new()
+        .with_connector("codex", Arc::new(PreferNamed(first.id)))
+        .with_transport(hanging.clone())
+        .with_transport(first.clone());
+    inbox.reconcile_delivery(&router, at(20)).await.expect("submit");
+    let status = backend.using::<Message>("flotilla").get("message-0").await.expect("message").status.expect("status");
+    assert_eq!(status.submission.expect("held submission").transport.as_deref(), Some("codex-app-server"));
+    assert!(status.resolved_receiver.is_none());
+    for second in [21, 400] {
+        inbox.reconcile_delivery(&router, at(second)).await.expect("held pass");
+    }
+    assert_eq!(first.submissions.lock().expect("submissions").len(), 1);
+    assert_eq!(hanging.submissions.lock().expect("submissions").len(), 1, "never resubmitted");
+    for message in backend.using::<Message>("flotilla").list().await.expect("messages").items {
+        assert!(!message.status.expect("status").phase.has_delivery_evidence());
+    }
 }

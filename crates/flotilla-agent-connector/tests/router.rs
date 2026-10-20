@@ -176,7 +176,13 @@ fn router_delivers_through_one_transport(tc: hegel::TestCase) {
                 assert!(matches!(routed.outcome, TransportOutcome::NotSubmitted { .. }));
             }
             Some(last) => {
-                assert_eq!(routed.transport, Some(name(*last)), "the router names the transport whose outcome it returns");
+                // Exhausted after an accepted repeat: the last transport that may have delivered.
+                let used = if stops(last) {
+                    *last
+                } else {
+                    *tried.iter().rev().find(|index| matches!(outcomes[**index], TransportOutcome::Unconfirmed { .. })).unwrap_or(last)
+                };
+                assert_eq!(routed.transport, Some(name(used)), "the router names the transport whose outcome it returns");
                 assert_eq!(routed.failovers.len(), tried.len() - 1);
                 if stops(last) {
                     assert_eq!(routed.outcome, outcomes[*last]);
@@ -281,10 +287,12 @@ fn unknown_harness_uses_keystroke_and_recorded_transport_answers() {
         let mut delivery = delivery("session", "one");
         delivery.target.harness = None;
         assert_eq!(router.candidates(Operation::NewTurn, &delivery.target), [TransportId::new(KEYSTROKE)]);
-        let observed = router.observe(Operation::NewTurn, &delivery.target, None).await.expect("observe");
+        let (used, observed) = router.observe(Operation::NewTurn, &delivery.target, None).await.expect("observe");
+        assert_eq!(used, TransportId::new(KEYSTROKE));
         assert_eq!(observed.evidence.as_deref(), Some(KEYSTROKE));
         delivery.submission.transport = Some("other".into());
-        let observed = router.observe(Operation::NewTurn, &delivery.target, Some(&delivery.submission)).await.expect("observe");
+        let (used, observed) = router.observe(Operation::NewTurn, &delivery.target, Some(&delivery.submission)).await.expect("observe");
+        assert_eq!(used, TransportId::new("other"));
         assert_eq!(observed.evidence.as_deref(), Some("other"));
         assert_eq!(router.poll(&delivery).await, TransportOutcome::Accepted { evidence: "polled other".into() });
         delivery.submission.transport = Some("gone".into());
@@ -320,7 +328,8 @@ fn unconfirmed_fails_over_only_when_configuration_accepts_a_repeat() {
         let order: Vec<_> = calls.lock().expect("calls").iter().map(|call| call.0.to_string()).collect();
         if accept_repeat {
             assert_eq!(order, ["a", "b"]);
-            assert_eq!(routed.transport, Some("b".into()));
+            assert_eq!(routed.transport, Some("a".into()), "polls follow the transport that may have delivered");
+            assert_eq!(routed.failovers, [flotilla_agent_connector::Failover { transport: "b".into(), reason: "not live".into() }]);
             assert!(matches!(routed.outcome, TransportOutcome::Unconfirmed { .. }), "a repeat may have delivered");
         } else {
             assert_eq!(order, ["a"]);

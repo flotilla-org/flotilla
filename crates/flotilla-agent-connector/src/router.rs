@@ -63,9 +63,15 @@ pub struct TransportRouter {
     fallback: Arc<dyn RouteDeclarations>,
     config: RouterConfig,
     /// Transports a session's running build refused, by session id. A new
-    /// session id (a relaunch, possibly a new build) starts clean.
+    /// session id (a relaunch, possibly a new build) starts clean. Bounded by
+    /// [`UNSUPPORTED_MEMORY`]: forgetting costs at most one more refused
+    /// attempt per session, which writes nothing.
     unsupported: Mutex<BTreeSet<(String, TransportId)>>,
 }
+
+/// How many refused `(session, transport)` pairs the router remembers before
+/// starting over, so churning session ids cannot grow it without bound.
+const UNSUPPORTED_MEMORY: usize = 4096;
 
 impl Default for TransportRouter {
     fn default() -> Self {
@@ -149,18 +155,19 @@ impl TransportRouter {
     }
 
     /// Observes through the transport a recorded submission used, or the
-    /// first eligible transport for a new one.
+    /// first eligible transport for a new one, and names the transport it
+    /// asked so a new submission can record the same one as planned.
     pub async fn observe(
         &self,
         operation: Operation,
         target: &DeliveryTarget,
         submission: Option<&SubmissionRef>,
-    ) -> Result<TransportObservation, String> {
+    ) -> Result<(TransportId, TransportObservation), String> {
         let transport = match submission.and_then(|submission| submission.transport.as_ref()) {
             Some(recorded) => self.transport(recorded).ok_or_else(|| format!("transport {recorded} is not registered on this host"))?,
             None => self.primary(operation, target).ok_or_else(|| format!("no transport offers {operation} for this session"))?,
         };
-        transport.observe(target, submission).await
+        Ok((transport.id(), transport.observe(target, submission).await?))
     }
 
     /// Submits through one transport. It moves to the next eligible transport
@@ -170,46 +177,47 @@ impl TransportRouter {
     pub async fn submit(&self, delivery: &Delivery) -> Routed {
         let accept_repeat = self.config.operations.get(&delivery.operation).is_some_and(|policy| policy.accept_repeat);
         let mut failovers: Vec<Failover> = Vec::new();
-        let mut possibly_delivered = false;
+        // The last transport that may have delivered after an accepted repeat.
+        let mut possibly_delivered: Option<TransportId> = None;
         for id in self.candidates(delivery.operation, &delivery.target) {
             let Some(transport) = self.transport(&id) else { continue };
             let mut attempt = delivery.clone();
             attempt.submission.transport = Some(id.clone());
             let reason = match transport.submit(&attempt).await {
                 TransportOutcome::Unsupported { reason } => {
-                    self.unsupported
-                        .lock()
-                        .expect("unsupported transports lock poisoned")
-                        .insert((delivery.submission.session.clone(), id.clone()));
+                    let mut refused = self.unsupported.lock().expect("unsupported transports lock poisoned");
+                    if refused.len() >= UNSUPPORTED_MEMORY {
+                        refused.clear();
+                    }
+                    refused.insert((delivery.submission.session.clone(), id.clone()));
                     reason
                 }
                 TransportOutcome::NotSubmitted { reason } => reason,
                 TransportOutcome::Unconfirmed { reason } if accept_repeat => {
-                    possibly_delivered = true;
+                    possibly_delivered = Some(id.clone());
                     reason
                 }
                 outcome => return Routed { transport: Some(id), outcome, failovers },
             };
             failovers.push(Failover { transport: id, reason });
         }
-        // Exhausted: the last attempt's transport stands as the one used.
-        let Some(last) = failovers.pop() else {
-            let reason = format!("no transport offers {} for this session", delivery.operation);
-            return Routed { transport: None, outcome: TransportOutcome::NotSubmitted { reason }, failovers };
+        let reason = match failovers.as_slice() {
+            [] => {
+                let reason = format!("no transport offers {} for this session", delivery.operation);
+                return Routed { transport: None, outcome: TransportOutcome::NotSubmitted { reason }, failovers };
+            }
+            [only] => only.reason.clone(),
+            all => all.iter().map(|failover| format!("{}: {}", failover.transport, failover.reason)).collect::<Vec<_>>().join("; "),
         };
-        let reason = if failovers.is_empty() {
-            last.reason.clone()
-        } else {
-            failovers
-                .iter()
-                .chain([&last])
-                .map(|failover| format!("{}: {}", failover.transport, failover.reason))
-                .collect::<Vec<_>>()
-                .join("; ")
+        // Exhausted. After an accepted repeat, the last transport that may have
+        // delivered stands as the one used, so polls look for its acceptance;
+        // otherwise nothing was submitted and the last attempt stands.
+        let (used, outcome) = match possibly_delivered {
+            Some(used) => (used, TransportOutcome::Unconfirmed { reason }),
+            None => (failovers.last().expect("failovers is non-empty").transport.clone(), TransportOutcome::NotSubmitted { reason }),
         };
-        // After an accepted repeat some transport may have delivered.
-        let outcome = if possibly_delivered { TransportOutcome::Unconfirmed { reason } } else { TransportOutcome::NotSubmitted { reason } };
-        Routed { transport: Some(last.transport), outcome, failovers }
+        failovers.retain(|failover| failover.transport != used);
+        Routed { transport: Some(used), outcome, failovers }
     }
 
     /// Polls the transport the submission went through; never resubmits.

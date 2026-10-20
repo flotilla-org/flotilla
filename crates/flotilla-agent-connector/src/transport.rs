@@ -89,6 +89,8 @@ pub trait AgentTransport: Send + Sync {
     fn id(&self) -> TransportId;
     async fn observe(&self, target: &DeliveryTarget, submission: Option<&SubmissionRef>) -> Result<TransportObservation, String>;
     async fn submit(&self, delivery: &Delivery) -> TransportOutcome;
+    /// A transport asked about a submission it holds no record of answers
+    /// `Unconfirmed`, never `NotSubmitted`: another transport may have taken it.
     async fn poll(&self, delivery: &Delivery) -> TransportOutcome;
     /// Forget exactly this delivery's bookkeeping after durable receipt.
     /// This must not send input.

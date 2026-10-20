@@ -45,6 +45,8 @@ pub fn delivery_target(holder: &ResourceObject<TerminalSession>) -> DeliveryTarg
         holder: holder.metadata.name.clone(),
         session: status.and_then(|status| status.session_id.clone()),
         crew_id: crew.map(|crew| crew.id.clone()),
+        // The running harness version and live shapes are not recorded yet
+        // (#3568): every offered shape stays eligible at any version.
         harness: crew.map(|crew| HarnessRef::new(crew.adapter.clone(), None)),
         live_shapes: None,
     }
@@ -460,7 +462,7 @@ impl MessageInbox {
         }
         let target = delivery_target(holder);
         let existing_ref = existing.as_ref().map(submission_ref);
-        let observation =
+        let (planned, observation) =
             match tokio::time::timeout(TRANSPORT_CALL_BOUND, router.observe(MESSAGE_OPERATION, &target, existing_ref.as_ref()))
                 .await
                 .unwrap_or_else(|_| Err("transport observation timed out".into()))
@@ -620,8 +622,9 @@ impl MessageInbox {
             .started_at(now)
             .members(pending.iter().map(|message| message.metadata.name.clone()).collect())
             .maybe_output_digest(observation.output_digest)
-            // Recorded with the intent, so recovery polls the transport the router plans to use.
-            .maybe_transport(router.candidates(MESSAGE_OPERATION, &target).into_iter().next().map(|transport| transport.0))
+            // Recorded with the intent: the transport that just observed readiness
+            // is the one the router tries first, so recovery polls it.
+            .transport(planned.0)
             .build();
         let admission = self.admission.lock().await;
         // The observation was outside admission. A successor or an operator
@@ -650,6 +653,11 @@ impl MessageInbox {
         let mut submission = submission;
         let routed = tokio::time::timeout(TRANSPORT_CALL_BOUND, router.submit(&delivery(holder, pending, submission.clone())))
             .await
+            // A timeout cannot say which transport was in flight. Any earlier
+            // failover moved past a transport that definitely did not deliver, so
+            // the planned transport stays recorded: recovery observes and polls it
+            // without resubmitting, and holds the batch for an operator past the
+            // hold bound if a later transport took it.
             .unwrap_or_else(|_| Routed {
                 transport: submission.transport.clone().map(TransportId::new),
                 outcome: TransportOutcome::Unconfirmed { reason: "transport submission timed out; input may have been accepted".into() },
