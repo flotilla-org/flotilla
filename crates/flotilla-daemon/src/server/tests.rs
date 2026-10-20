@@ -1337,7 +1337,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                     workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                         cascade: None,
                         vessels: workflow.vessels,
-                        exit: None,
+                        exit: workflow.exit,
                         turn_delivery: Default::default(),
                         stall_nudges: Default::default(),
                         supervision: None,
