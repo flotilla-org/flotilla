@@ -85,7 +85,7 @@ impl ControllerRuntimeState {
             Err(ResourceError::NotFound { .. }) if host_ref == self.local_host_ref => HostSpec::default(),
             Err(error) => return Err(format!("read build fulfilment setting for host {host_ref}: {error}")),
         };
-        let cores = if let Some(profile) = self.agentless_ssh.values().find(|profile| profile.provisioning.host_id == host_ref) {
+        let cores = if let Some(profile) = self.agentless_ssh_for_host(host_ref) {
             profile
                 .runner
                 .run("getconf", &["_NPROCESSORS_ONLN"], Path::new("/"), &ChannelLabel::Default)
@@ -204,6 +204,12 @@ impl ControllerRuntimeState {
     pub(super) fn with_namespace(mut self, namespace: String) -> Self {
         self.namespace = namespace;
         self
+    }
+
+    /// Profiles are keyed by their environment ID; this finds one by the Host
+    /// it drives.
+    pub(super) fn agentless_ssh_for_host(&self, host_ref: &str) -> Option<&AgentlessSshProfile> {
+        self.agentless_ssh.values().find(|profile| profile.provisioning.host_id == host_ref)
     }
 
     pub(super) fn agentless_host_refs(&self) -> Vec<CanonicalHostId> {
