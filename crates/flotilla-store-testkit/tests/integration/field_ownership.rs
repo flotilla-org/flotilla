@@ -47,6 +47,7 @@ fn placement_policy_declares_every_spec_leaf_and_no_status_fields() {
         vec![
             ("spec.pool", WriterRole::ReconcileLoop),
             ("spec.priority", WriterRole::Operator),
+            ("spec.provider_requirements", WriterRole::Operator),
             ("spec.host_direct", WriterRole::ReconcileLoop),
             ("spec.docker_per_vessel", WriterRole::ReconcileLoop),
             ("spec.docker_per_vessel.host_ref", WriterRole::ReconcileLoop),
