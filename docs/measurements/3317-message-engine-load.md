@@ -19,6 +19,9 @@ on feta. The raw reports are on `b5` under `~/flotilla/state/load/f1e6db00-*`.
 - **There is no Message controller row switch on.** The engine delivery pass replaces that controller; it has no
   controller metrics.
 - **Database size** is `resources.sqlite` only.
+- **The engine reader costs a little.** It calls `Service::serve` four times a second, and each call briefly takes the
+  writer mutex and opens a fresh SQLite reader. Switch off, the Message watch is an in-process subscription. This cost
+  is small next to the differences below.
 
 ## d1-n100
 
@@ -62,7 +65,7 @@ so it does not compare the switch: the box, not Message, is the limit.
 |---|---:|---:|
 | Ramp | 1,000 open only at the 900 s limit | 1,000 open only at the 900 s limit |
 | Delivered in window | 66 (0.22/s) | 30 (0.10/s) |
-| Delivered in total / abandoned at the deadline | 214 / 90 | 196 / 590 |
+| Delivered / abandoned / unfinished at drain end | 214 / 90 / 868 | 196 / 590 / 378 |
 | Delivered by 1,090 s into the run | 155 | 155 |
 | Admission p50 | 151 s | 143 s |
 | Turn delivery p50 / p90 | 2.2 / 168 s (n=112) | 3.3 / 143 s (n=142) |
@@ -73,11 +76,14 @@ so it does not compare the switch: the box, not Message, is the limit.
   the window sit in the same places in both runs (about 300 `Pending`, about 225 `Active · coder Pending`).
 - **The delivery series match through the window**: at 2-minute marks, 5, 8, 11, 22, 39, 76 delivered switch off and
   5, 8, 10, 20, 38, 72 switch on.
-  The runs diverge only in the drain, where more switch-on convoys reached their 1,800 s deadline before landing. That
-  difference sits in the slowest tail of a saturated run, and one run per state does not separate it from noise.
+- **The runs differ in the drain, and switch on drains further.** Both runs schedule the same convoys and the same
+  1,800 s deadlines. At the end of the drain, switch on had 196 delivered, 590 abandoned and 378 unfinished; switch off
+  had 214 delivered, 90 abandoned and 868 unfinished. The extra unfinished convoys switch off are most likely deadline
+  abandons that its saturated Convoy queue (319 s wait) had not processed when the drain ended. One run per state does not show
+  whether that gap is stable.
 - **Memory is about 250 MiB (14%) higher** switch on.
-- The correctness errors of both runs are the leftovers of deadline abandonment (vessels and checkouts not yet cleaned
-  up when the drain ended), from the saturated Convoy and Vessel queues.
+- The correctness errors of both runs are unfinished convoys and the leftovers of deadline abandonment (vessels and
+  checkouts not yet cleaned up when the drain ended), from the saturated Convoy and Vessel queues.
 
 A comparison at 1,000 open needs a larger box, such as feta (32 threads), where #3206 reached 1,000 open in 170 s.
 
@@ -97,7 +103,12 @@ timeline does not yet show when they arise. The code paths are:
 - **`session dead or absent`**: the leaf engine's stall judgement (`crates/flotilla-crew/src/leaf_engine/stalls.rs`) finds
   a crew session with no attention that is not `Running`, past the debounce. The escalation then appends `cannot find
   governor` (`leaf_engine/supervision.rs`), because dummy convoys carry no `project_ref`. The one switch-on case,
-  `load-277`, was a coder-reviewer convoy last seen `Active · coder Working, reviewer Done` before teardown.
+  `load-277`, was a coder-reviewer convoy last seen `Active · coder Working, reviewer Done`. Both of its sessions were
+  terminated by convoy teardown at landing.
+
+  A likely window, not confirmed: the judgement keeps holding a `Landing` convoy (`holding` covers `Active | Landing`).
+  It skips an actor row only when the row's own leaf is a `Done` crew phase, or once a Convoy controller row exists.
+  So a row judged between teardown terminating a session and the convoy landing can see an absent session.
 - **`idle`**: the same judgement finds hook attention `Idle` past the idle grace with no pending message and no reply
   awaited.
 
