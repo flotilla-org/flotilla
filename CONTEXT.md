@@ -258,13 +258,34 @@ ordered globally across the fleet.
 **Capacity Budget**:
 The capacity admission grants a **Convoy**. The **WorkflowTemplate** proposes
 it, and admission may grant less. Within it the convoy asks placement for
-vessels directly, and the host that owns the capacity decides. Going beyond it
-is a new request to admission. A subagent inside a vessel uses none (ADR 0064).
+vessels directly, and each **Capacity Pool**'s authoritative daemon decides.
+Going beyond it is a new request to admission. A subagent inside a vessel uses
+none (ADR 0064).
 _Avoid_: quota, allocation (the ledger's word).
 
 **Placement Queue**:
-A host's resource users awaiting reservations, inheriting the priority of their
-waiting convoy or highest-priority consumer.
+A **Capacity Pool**'s resource users awaiting **Vessel Leases**, inheriting the
+priority of their waiting convoy or highest-priority consumer.
+
+**Capacity Pool**:
+What a placement ledger is keyed by: a host's compute and disk, or a provider
+account's quota. Each has one authoritative daemon, which grants leases from it.
+A vessel may draw on several; its environment's capability declaration names
+them. A pool is separate from the controller that happens to use it.
+_Avoid_: host (when meaning capacity), reservation ledger.
+
+**Vessel Lease**:
+Capacity a **Capacity Pool** holds for one vessel, from placement until the
+vessel is Gone. Admission grants a **Capacity Budget**; only leases hold
+capacity.
+_Avoid_: reservation.
+
+**Provider Address**:
+The qualified address an **Environment** stores for its provider: a place
+(`host:` or `account:`) plus the provider instance, for example
+`host:b1/provider:host-direct`. It is copied from the vessel's lease; the
+controlling daemon is resolved from the place's record, never stored (ADR 0058,
+environment providers, 2026-10-20).
 
 **WorkflowTemplate**:
 The **Definition** resource declaring a workflow: its roles (each a
