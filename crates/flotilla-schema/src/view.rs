@@ -57,6 +57,23 @@ pub fn state_data(set: &TableSet, position: usize) -> Vec<(&str, Vec<&str>, Vec<
         .collect()
 }
 
+/// Markdown for a non-stored table, without inventing a stored kind or backend columns.
+pub fn render_table_view(table: &Table) -> String {
+    let mut out = format!("## {}\n\n| Field | Type | Required |\n|---|---|---|\n", table.name);
+    let schema = table.frictionless();
+    for field in schema["fields"].as_array().expect("descriptor fields") {
+        writeln!(
+            out,
+            "| `{}` | {} | {} |",
+            field["name"].as_str().unwrap_or_default(),
+            field["type"].as_str().unwrap_or_default(),
+            field["constraints"]["required"]
+        )
+        .expect("write string");
+    }
+    out
+}
+
 /// The view of `sets` as Markdown: a summary table of every table, then the wide tables, then the
 /// label-plus-data states (when any).
 pub fn render_view<'a>(sets: impl IntoIterator<Item = &'a TableSet>) -> String {

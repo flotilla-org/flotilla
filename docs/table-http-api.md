@@ -35,7 +35,8 @@ keeps the body open for `upsert`, `delete`, `progress`, and count changes.
   appear in cursors or row keys.
 - `offset=N` jumps to a position and returns a normal continuation cursor.
 - `sort=-status.phase,metadata.name` requests descending phase, then ascending
-  name. The primary key is appended to make the order total. Null sorts first
+  name. Resource versions remain opaque strings and cannot be sorted.
+  The primary key is appended to make the order total. Null sorts first
   ascending and last descending; strings compare by Unicode code point.
 - `columns=spec,status` projects columns. Primary key columns always return;
   the description contains exactly the returned columns.
@@ -54,3 +55,19 @@ including `sortable` and `whereOperators` field properties. `format=markdown`
 (or `Accept: text/markdown`) renders the schema through `render_view`.
 For a derived kind with a machine, `format=mermaid` renders the declared machine;
 `format=observed` renders counts from its log, optionally restricted with `name`.
+
+A watch follows the **whole filtered table** after its initial page. `limit`,
+`cursor`, and `offset` bound the initial snapshot page; later upserts and deletes
+may name rows outside that page. A position-aware live window is a view
+subscription (ADR 0067 decision 15), which is outside this HTTP table carrier.
+
+This first resource tier is intended for operational inventories that fit in the
+daemon's memory. Filtering is pushed down, but sorting and paging materialize the
+whole matching set. The page limit bounds response rows, not query work. Each
+resource watch reconciles O(n) matching rows per consumed event. Primitive watches
+check the home-wide sequence every 250 ms, so another kind's write can trigger a
+read; SQLite work runs on blocking workers. Large inventories need a backend
+ordered-query/notification port before this becomes a bulk export surface.
+Batch sizing currently measures JSON bytes for both carriers to keep consistent
+boundaries; CBOR then encodes that batch independently. This bounded extra encoding
+cost is accepted for this operational tier.

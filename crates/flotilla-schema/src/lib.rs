@@ -105,7 +105,7 @@ pub use state::{RowEdit, State};
 pub use time::Timestamp;
 pub use traits::{CodeEnum, Column, Columns, Element, Flat, Intern, KeyColumn, Kind, KindSpec, StateData, SUPPORTED_ATTRIBUTES};
 pub use value::{Hash, Identity, KindCode, Row, Rows, Value};
-pub use view::{column_count, enum_columns, render_view, state_data, WIDE};
+pub use view::{column_count, enum_columns, render_table_view, render_view, state_data, WIDE};
 
 mod frictionless;
 pub use frictionless::TableBuilder;

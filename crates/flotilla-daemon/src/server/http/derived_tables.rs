@@ -1,5 +1,5 @@
 //! Derived kinds use their existing descriptor and the SQLite table-read port.
-use super::table_api::{bad, encode, error, Query};
+use super::table_api::{encode, error, Format, Query};
 use axum::{
     body::Body,
     http::{header, StatusCode},
@@ -21,11 +21,47 @@ use std::{
     time::Duration,
 };
 
+pub(super) async fn blocking<T: Send + 'static>(
+    service: &Arc<Service>,
+    op: impl FnOnce(&mut flotilla_schema_sqlite::Store) -> Result<T, flotilla_schema_sqlite::StoreError> + Send + 'static,
+) -> Result<T, String> {
+    let service = Arc::clone(service);
+    tokio::task::spawn_blocking(move || service.with_store(op)).await.map_err(|error| error.to_string())?.map_err(|error| error.to_string())
+}
+
+pub(super) async fn list(service: &Arc<Service>) -> Result<Vec<Value>, String> {
+    blocking(service, |store| {
+        Ok(store
+            .kinds()
+            .iter()
+            .map(|set| {
+                let names: Vec<_> =
+                    set.tables.iter().map(|table| table.name.clone()).chain(std::iter::once(set.log_table().name)).collect();
+                json!({"kind":set.kind,"root":set.tables[0].name,"tables":names})
+            })
+            .collect())
+    })
+    .await
+}
+
+fn home(namespace: &str, local: &str) -> String {
+    if namespace == "default" {
+        local.into()
+    } else {
+        namespace.into()
+    }
+}
+
+async fn read(service: &Arc<Service>, name: &str, table: &Table, query: &Query) -> Result<(u64, Table, Vec<Row>), String> {
+    let (service, name, table, query) = (Arc::clone(service), name.to_owned(), table.clone(), query.clone());
+    tokio::task::spawn_blocking(move || read_sync(&service, &name, &table, &query)).await.map_err(|error| error.to_string())?
+}
+
 type Rows = BTreeMap<Vec<u8>, (Vec<Value>, Row)>;
-fn read(service: &Service, name: &str, table: &Table, query: &Query) -> Result<(u64, Table, Vec<Row>), String> {
+fn read_sync(service: &Service, name: &str, table: &Table, query: &Query) -> Result<(u64, Table, Vec<Row>), String> {
     service
         .with_store(|store| {
-            let home = if query.namespace == "default" { store.home().to_owned() } else { query.namespace.clone() };
+            let home = home(&query.namespace, store.home());
             // Validate and coerce literals using the same descriptor that is served.
             let mut filters = vec![];
             for (field, literal) in &query.filter.fields {
@@ -51,11 +87,10 @@ fn read(service: &Service, name: &str, table: &Table, query: &Query) -> Result<(
                     }),
                     _ => Cell::Text(literal.clone()),
                 };
-                filters.push(TableFilter { field: field.clone(), operator: "==".into(), value });
+                filters.push(TableFilter::Compare { field: field.clone(), operator: "==".into(), value });
             }
-            if query.filter.field_values.values().any(Vec::is_empty) {
-                filters.push(TableFilter { field: query.keys[0].clone(), operator: "==".into(), value: Cell::Text(String::new()) });
-                filters.push(TableFilter { field: query.keys[0].clone(), operator: "!=".into(), value: Cell::Text(String::new()) });
+            if query.filter.selects_none() {
+                filters.push(TableFilter::None);
             }
             let result = store.table_read(&home, name, &filters)?;
             let columns: BTreeMap<_, _> =
@@ -138,12 +173,19 @@ fn page(name: &str, mut schema: Value, query: &Query, sequence: u64, mut rows: V
 }
 
 pub(super) async fn respond(name: &str, rows: bool, params: &[(String, String)], accept: &str, service: Arc<Service>) -> Response {
-    let info = service.with_store(|store| {
-        Ok(store.kinds().iter().find(|set| set.tables.iter().any(|table| table.name == name) || set.log_table().name == name).cloned())
-    });
+    let table_name = name.to_owned();
+    let info = blocking(&service, move |store| {
+        Ok(store
+            .kinds()
+            .iter()
+            .find(|set| set.tables.iter().any(|table| table.name == table_name) || set.log_table().name == table_name)
+            .cloned())
+    })
+    .await;
     let mut set = match info {
         Ok(Some(set)) => set,
-        _ => return error(StatusCode::NOT_FOUND, "not_found", "unknown table"),
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "unknown table"),
+        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "table_source", err),
     };
     let log = set.log_table();
     set.tables.push(log);
@@ -152,16 +194,18 @@ pub(super) async fn respond(name: &str, rows: bool, params: &[(String, String)],
         Ok(format) => format,
         Err(error) => return error.into_response(),
     };
-    if !rows && (format == "mermaid" || format == "observed") {
+    if !rows && (format == Format::Mermaid || format == Format::Observed) {
         let declared = match set.kind.as_str() {
             "Message" => Some(MessageMachine::definition().mermaid(Diagram::Full)),
             "AgentSession" => Some(AgentSession::definition().mermaid(Diagram::Full)),
             _ => None,
         };
         let Some(mut diagram) = declared else { return error(StatusCode::NOT_FOUND, "no_machine", "kind has no declared machine") };
-        if format == "observed" {
+        if format == Format::Observed {
+            let (kind, namespace, record) =
+                (set.code.to_string(), get("namespace").unwrap_or("default").to_owned(), get("name").map(str::to_owned));
             let edges =
-                service.with_store(|store| store.observed_edges(set.code.as_str(), get("namespace").unwrap_or(store.home()), get("name")));
+                blocking(&service, move |store| store.observed_edges(&kind, &home(&namespace, store.home()), record.as_deref())).await;
             match edges {
                 Ok(edges) => {
                     diagram = "stateDiagram-v2\n".into();
@@ -169,12 +213,12 @@ pub(super) async fn respond(name: &str, rows: bool, params: &[(String, String)],
                         diagram.push_str(&format!("  {from} --> {to}: {count}\n"));
                     }
                 }
-                Err(err) => return bad("table_source", err).into_response(),
+                Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "table_source", err),
             }
         }
         return ([(header::CONTENT_TYPE, "text/vnd.mermaid; charset=utf-8")], diagram).into_response();
     }
-    if !rows && (format == "markdown") {
+    if !rows && (format == Format::Markdown) {
         return ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], flotilla_schema::render_view([&set])).into_response();
     }
     let mut table = set.tables.iter().find(|table| table.name == name).expect("described table").clone();
@@ -201,19 +245,19 @@ pub(super) async fn respond(name: &str, rows: bool, params: &[(String, String)],
         Ok(query) => query,
         Err(err) => return err.into_response(),
     };
-    let (sequence, _, rows) = match read(&service, name, &table, &query) {
+    let (sequence, _, rows) = match read(&service, name, &table, &query).await {
         Ok(rows) => rows,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "table_source", err),
     };
     let current = match indexed(&rows, &query.keys) {
         Ok(rows) => rows,
-        Err(err) => return bad("table_source", err).into_response(),
+        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "table_source", err),
     };
     let messages = match page(name, set.frictionless(&table), &query, sequence, rows) {
         Ok(messages) => messages,
-        Err(err) => return bad("table_source", err).into_response(),
+        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "table_source", err),
     };
-    let cbor = format == "cbor";
+    let cbor = format == Format::Cbor;
     let name = name.to_owned();
     let live = futures::stream::unfold(
         (current, sequence, VecDeque::new(), service, query, table, name, tokio::time::Instant::now()),
@@ -226,10 +270,12 @@ pub(super) async fn respond(name: &str, rows: bool, params: &[(String, String)],
                     return Some((Ok(message), (current, sequence, pending, service, query, table, name, heartbeat)));
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                let latest = service.with_store(|store| {
-                    let home = if query.namespace == "default" { store.home().to_owned() } else { query.namespace.clone() };
+                let namespace = query.namespace.clone();
+                let latest = blocking(&service, move |store| {
+                    let home = home(&namespace, store.home());
                     store.read()?.last_sequence(&home)
-                });
+                })
+                .await;
                 match latest {
                     Ok(latest) if latest == sequence => {
                         if heartbeat.elapsed() >= Duration::from_secs(15) {
@@ -238,10 +284,10 @@ pub(super) async fn respond(name: &str, rows: bool, params: &[(String, String)],
                         }
                         continue;
                     }
-                    Err(err) => return Some((Err(err.to_string()), (current, sequence, pending, service, query, table, name, heartbeat))),
+                    Err(err) => return Some((Err(err), (current, sequence, pending, service, query, table, name, heartbeat))),
                     _ => {}
                 }
-                let (next_sequence, _, rows) = match read(&service, &name, &table, &query) {
+                let (next_sequence, _, rows) = match read(&service, &name, &table, &query).await {
                     Ok(rows) => rows,
                     Err(err) => return Some((Err(err), (current, sequence, pending, service, query, table, name, heartbeat))),
                 };

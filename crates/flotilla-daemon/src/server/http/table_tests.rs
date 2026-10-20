@@ -118,6 +118,8 @@ async fn table_carriers_share_paging_filter_count_and_resync_contract() {
         assert!(next.iter().any(|message| matches!(message,Message::Rows{rows,cursor:None,..} if rows[0]["metadata.name"]=="a")));
         let reset = messages(&router, &format!("{path}&cursor=broken"), cbor).await;
         assert!(matches!(reset[0], Message::Resync { .. }));
+        let contradiction = messages(&router, &format!("{path}&where=.metadata.labels.group%20%3D%3D%20no"), cbor).await;
+        assert!(contradiction.iter().any(|message| matches!(message, Message::Count { count: 0, .. })));
         let offset = messages(&router, "/tables/convoys/rows?namespace=test&offset=2&count=estimate", cbor).await;
         assert!(offset.iter().any(|message| matches!(message,Message::Rows{rows,partial:true,..} if rows[0]["metadata.name"]=="z")));
         let empty = messages(&router, "/tables/convoys/rows?namespace=empty", cbor).await;
@@ -231,6 +233,9 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
         assert!(log.iter().any(|message| matches!(message, Message::Count { count: 2, .. })));
         assert!(log.iter().any(|message| matches!(message,Message::Rows{rows,..} if rows[0]["cause"]=="create")));
     }
+    let empty =
+        messages(&router, "/tables/table_sample/rows?where=.text%20%3D%3D%20match&where=.text%20%3D%3D%20other&count=exact", false).await;
+    assert!(empty.iter().any(|message| matches!(message, Message::Count { count: 0, .. })));
     let markdown = call(&router, "/tables/table_sample?format=markdown", false).await;
     assert_eq!(markdown.status(), StatusCode::OK);
     assert!(String::from_utf8(to_bytes(markdown.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap().contains("table_sample"));
@@ -268,7 +273,7 @@ async fn primitive_diagrams_describe_declared_and_observed_transitions() {
         .build()
         .into_router();
     for format in ["mermaid", "observed"] {
-        let response = call(&router, &format!("/tables/agent_session?format={format}&name=session"), false).await;
+        let response = call(&router, &format!("/tables/agent_session?format={format}&name=session&namespace=default"), false).await;
         assert_eq!(response.status(), StatusCode::OK);
         let text = String::from_utf8(to_bytes(response.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
         assert!(text.contains("Live --> Ended"), "{text}");
@@ -325,6 +330,10 @@ async fn table_request_errors_and_content_negotiation_are_explicit() {
         let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap();
         assert_eq!(body["code"], code);
     }
+    let response = call(&router, "/tables/convoys?format=markdown", false).await;
+    let markdown = String::from_utf8(to_bytes(response.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+    assert!(markdown.contains("`metadata.name`"));
+    assert!(!markdown.contains("`id`"));
     let mut request = Request::builder()
         .uri("/tables/convoys/rows")
         .header("accept", "application/cbor-seq;q=0, application/x-ndjson;q=0.5")
@@ -371,5 +380,59 @@ async fn table_watch_interleaving_preserves_filter_membership() {
         assert!(matches!(decode(&event, cbor)[0], Message::Count { count: 0, .. }));
         let event = stream.next().await.unwrap().unwrap();
         assert!(matches!(decode(&event, cbor)[0], Message::Progress { .. }));
+    }
+}
+
+// Resource versions stay opaque strings: numeric-looking tokens must not advertise
+// lexicographic sorting as though it were version ordering (review finding 1).
+#[tokio::test]
+async fn resource_version_sort_is_explicitly_unsupported() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    for number in 0..12 {
+        seed(&backend, &format!("row-{number}"), "yes").await;
+    }
+    let router = router(backend);
+    let response = call(&router, "/tables/convoys/rows?namespace=test&sort=metadata.resourceVersion", false).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["code"], "unsupported_sort");
+    let response = call(&router, "/tables/convoys", false).await;
+    let schema: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(
+        schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == "metadata.resourceVersion").unwrap()["sortable"],
+        false
+    );
+}
+
+// Paging bounds only the initial page. A table watch follows the entire filtered set;
+// positioned windows belong to ADR 0067 view subscriptions (review finding 5).
+#[tokio::test]
+async fn table_watch_tracks_rows_outside_its_initial_page() {
+    for cbor in [false, true] {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        seed(&backend, "a", "yes").await;
+        seed(&backend, "z", "yes").await;
+        let router = router(backend.clone());
+        let response = call(&router, "/tables/convoys/rows?namespace=test&limit=1&watch", cbor).await;
+        let mut stream = response.into_body().into_data_stream();
+        stream.next().await.unwrap().unwrap();
+        let page = stream.next().await.unwrap().unwrap();
+        assert!(matches!(&decode(&page,cbor)[0],Message::Rows{rows,partial:true,..}if rows.len()==1&&rows[0]["metadata.name"]=="a"));
+        stream.next().await.unwrap().unwrap();
+        let current = backend.using::<Convoy>("test").get("z").await.unwrap();
+        backend
+            .using::<Convoy>("test")
+            .update(
+                &InputMeta::builder()
+                    .name("z".into())
+                    .labels(std::collections::BTreeMap::from([("group".into(), "changed".into())]))
+                    .build(),
+                &current.metadata.resource_version,
+                &current.spec,
+            )
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await.unwrap().unwrap().unwrap();
+        assert!(matches!(&decode(&event,cbor)[0],Message::Upsert{row,..}if row["metadata.name"]=="z"));
     }
 }

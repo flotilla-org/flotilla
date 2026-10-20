@@ -1,5 +1,6 @@
 //! The resource-backed generic tier of ADR 0067. Filtering always uses the store's
-//! declared query port; sorting, projection and portable paging are carrier concerns.
+//! declared query port. This first adapter sorts and pages matching snapshots in memory;
+//! a page limit bounds response rows rather than backend query work.
 use axum::{
     body::Body,
     http::{header, StatusCode},
@@ -46,20 +47,29 @@ const LIMIT: usize = 200;
 const MAX_LIMIT: usize = 10_000;
 const KEY: &str = "metadata.name";
 
-pub(super) fn negotiate(format: Option<&str>, accept: &str, rows: bool) -> Result<&'static str, Failure> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Format {
+    Json,
+    Cbor,
+    Markdown,
+    Mermaid,
+    Observed,
+}
+
+pub(super) fn negotiate(format: Option<&str>, accept: &str, rows: bool) -> Result<Format, Failure> {
     let allowed = |format: &str| match (format, rows) {
-        ("json" | "jsonl", _) => Some("json"),
-        ("cbor", true) => Some("cbor"),
-        ("markdown", false) => Some("markdown"),
-        ("mermaid", false) => Some("mermaid"),
-        ("observed", false) => Some("observed"),
+        ("json" | "jsonl", _) => Some(Format::Json),
+        ("cbor", true) => Some(Format::Cbor),
+        ("markdown", false) => Some(Format::Markdown),
+        ("mermaid", false) => Some(Format::Mermaid),
+        ("observed", false) => Some(Format::Observed),
         _ => None,
     };
     if let Some(format) = format {
         return allowed(format).ok_or_else(|| Failure::new(StatusCode::NOT_ACCEPTABLE, "unsupported_format", format));
     }
     if accept.trim().is_empty() {
-        return Ok("json");
+        return Ok(Format::Json);
     }
     let mut choices = vec![];
     for (index, item) in accept.split(',').enumerate() {
@@ -70,11 +80,11 @@ pub(super) fn negotiate(format: Option<&str>, accept: &str, rows: bool) -> Resul
             continue;
         }
         let format = match media {
-            "*/*" | "application/*" | "application/json" => Some("json"),
-            "application/x-ndjson" | "application/jsonl" if rows => Some("json"),
-            "application/cbor-seq" if rows => Some("cbor"),
-            "text/markdown" if !rows => Some("markdown"),
-            "text/vnd.mermaid" if !rows => Some("mermaid"),
+            "*/*" | "application/*" | "application/json" => Some(Format::Json),
+            "application/x-ndjson" | "application/jsonl" if rows => Some(Format::Json),
+            "application/cbor-seq" if rows => Some(Format::Cbor),
+            "text/markdown" if !rows => Some(Format::Markdown),
+            "text/vnd.mermaid" if !rows => Some(Format::Mermaid),
             _ => None,
         };
         if let Some(format) = format {
@@ -88,28 +98,42 @@ pub(super) fn negotiate(format: Option<&str>, accept: &str, rows: bool) -> Resul
 pub(super) fn error(status: StatusCode, code: &str, message: impl ToString) -> Response {
     (status, Json(json!({"code":code,"message":message.to_string()}))).into_response()
 }
+
 #[derive(Debug)]
 pub(super) struct Failure {
     status: StatusCode,
     code: String,
     message: String,
 }
+
 impl Failure {
     fn new(status: StatusCode, code: &str, message: impl ToString) -> Self {
         Self { status, code: code.into(), message: message.to_string() }
     }
 }
+
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
         error(self.status, &self.code, self.message)
     }
 }
+
 pub(super) fn bad(code: &str, message: impl ToString) -> Failure {
     Failure::new(StatusCode::BAD_REQUEST, code, message)
 }
 
 fn descriptor(kind: &str) -> Table {
-    let mut builder = TableBuilder::new(kind).key(KEY, ColumnType::Text)
+    let condition_items = json!({
+        "type":"object",
+        "properties":{
+            "type":{"type":"string"},"status":{"type":"string"},
+            "reason":{"type":"string"},"message":{"type":"string"},
+            "lastTransitionTime":{"type":"string","format":"date-time"}
+        }
+    });
+    let label_values = json!({"type":"string","whereOperators":["=="],"sortable":false});
+    let mut builder = TableBuilder::new(kind)
+        .key(KEY, ColumnType::Text)
         .column("metadata.namespace", ColumnType::Text, false)
         .column("metadata.resourceVersion", ColumnType::Text, false)
         .column("metadata.creationTimestamp", ColumnType::Timestamp, false)
@@ -118,17 +142,22 @@ fn descriptor(kind: &str) -> Table {
         .column("metadata.annotations", ColumnType::Cbor, false)
         .column("status.phase", ColumnType::Text, true)
         .column("status.conditions", ColumnType::Cbor, true)
-        .column("spec", ColumnType::Cbor, false).column("status", ColumnType::Cbor, true)
-        .property("metadata.labels","additionalProperties",json!({"type":"string","whereOperators":["=="],"sortable":false}))
-        .property("status.phase","roles",json!(["state"]))
+        .column("spec", ColumnType::Cbor, false)
+        .column("status", ColumnType::Cbor, true)
+        .property("metadata.labels", "additionalProperties", label_values)
+        .property("status.phase", "roles", json!(["state"]))
         .property("status.conditions", "type", json!("array"))
-        .property("status.conditions", "items", json!({"type":"object","properties":{"type":{"type":"string"},"status":{"type":"string"},"reason":{"type":"string"},"message":{"type":"string"},"lastTransitionTime":{"type":"string","format":"date-time"}}}));
+        .property("status.conditions", "items", condition_items);
     let declared = flotilla_store::declared_resource_kinds().into_iter().find(|entry| entry.paths.plural == kind);
     for field in
         [KEY, "metadata.namespace", "metadata.resourceVersion", "metadata.creationTimestamp", "metadata.deletionTimestamp", "status.phase"]
     {
         let operators: Vec<&str> = if declared.is_some_and(|entry| entry.queryable_fields.contains(&field)) { vec!["=="] } else { vec![] };
-        builder = builder.property(field, "sortable", json!(true)).property(field, "whereOperators", json!(operators));
+        builder = builder.property(field, "sortable", json!(field != "metadata.resourceVersion")).property(
+            field,
+            "whereOperators",
+            json!(operators),
+        );
     }
     let mut table = builder.build();
     for column in table.key.iter().chain(&table.columns) {
@@ -205,7 +234,7 @@ impl Query {
             }
             if let Some(label) = label {
                 if filter.labels.get(&label).is_some_and(|value| value != &clause.literal) {
-                    filter.field_values.insert(KEY.into(), vec![]);
+                    filter = StoreQuery::none();
                 }
                 filter.labels.insert(label, clause.literal);
             } else {
@@ -214,7 +243,7 @@ impl Query {
                     return Err(bad("unsupported_filter", &path));
                 }
                 if filter.fields.get(&path).is_some_and(|value| value != &clause.literal) {
-                    filter.field_values.insert(KEY.into(), vec![]);
+                    filter = StoreQuery::none();
                 }
                 filter.fields.insert(path, clause.literal);
             }
@@ -394,7 +423,10 @@ pub(super) async fn respond(
         let mut kinds: Vec<Value> =
             REGISTERED_RESOURCE_KINDS.iter().map(|kind| json!({"kind":kind.kind,"root":kind.plural,"tables":[kind.plural]})).collect();
         if let Some(service) = &decided {
-            if let Ok(derived) = service.with_store(|store| Ok(store.kinds().iter().map(|set| json!({"kind":set.kind,"root":set.tables[0].name,"tables":set.tables.iter().map(|table| table.name.clone()).chain(std::iter::once(set.log_table().name)).collect::<Vec<_>>()})).collect::<Vec<_>>())) { kinds.extend(derived); }
+            match super::derived_tables::list(service).await {
+                Ok(derived) => kinds.extend(derived),
+                Err(error) => return error_response(&error).into_response(),
+            }
         }
         return Json(json!({"kinds":kinds})).into_response();
     }
@@ -415,16 +447,10 @@ pub(super) async fn respond(
         Err(error) => return error.into_response(),
     };
     if !rows {
-        if format == "markdown" {
-            let mut layout = flotilla_schema::Layout::root(kind.kind, flotilla_schema::KindCode::new("tb"));
-            for column in table.key.iter().chain(&table.columns) {
-                layout.column(&column.name, column.ty.clone(), column.nullable);
-            }
-            let mut set = layout.finish();
-            set.tables[0] = table;
-            return ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], flotilla_schema::render_view([&set])).into_response();
+        if format == Format::Markdown {
+            return ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], flotilla_schema::render_table_view(&table)).into_response();
         }
-        if format == "mermaid" || format == "observed" {
+        if format == Format::Mermaid || format == Format::Observed {
             return error(StatusCode::NOT_FOUND, "no_machine", "resource kind has no declared machine");
         }
         return Json(table.frictionless()).into_response();
@@ -433,7 +459,7 @@ pub(super) async fn respond(
         Ok(query) => query,
         Err(response) => return response.into_response(),
     };
-    let cbor = format == "cbor";
+    let cbor = format == Format::Cbor;
 
     let messages = match snapshot(&backend, kind.plural, &table, &query).await {
         Ok(messages) => messages,
@@ -451,10 +477,30 @@ pub(super) async fn respond(
         .into_response()
 }
 
+fn resource_rows(document: &Value, table: &Table) -> Result<Vec<Row>, String> {
+    document["items"]
+        .as_array()
+        .ok_or("missing resource items")?
+        .iter()
+        .map(|value| {
+            value.pointer("/metadata/name").and_then(Value::as_str).ok_or("missing resource name")?;
+            Ok(row(value, table))
+        })
+        .collect()
+}
+
+fn source_failure(error: flotilla_resources::ResourceError) -> Failure {
+    use flotilla_resources::ResourceError;
+    match error {
+        ResourceError::Invalid { .. } => bad("unsupported_filter", error),
+        ResourceError::Unauthorized { .. } => Failure::new(StatusCode::FORBIDDEN, "unauthorized", error),
+        _ => error_response(&error.to_string()),
+    }
+}
+
 type Snapshot = (Vec<Message>, WatchStart, BTreeMap<String, Row>);
 async fn snapshot(backend: &ResourceBackend, kind: &str, table: &Table, query: &Query) -> Result<Snapshot, Failure> {
-    let document =
-        query_resource_kind(backend, &query.namespace, kind, &query.filter).await.map_err(|error| bad("unsupported_filter", error))?;
+    let document = query_resource_kind(backend, &query.namespace, kind, &query.filter).await.map_err(source_failure)?;
     let sequence = snapshot_sequence(&document).map_err(|error| error_response(&error))?;
     let generation = document.pointer("/metadata/generation").and_then(Value::as_str).map(str::to_owned);
     let start = generation.clone().map_or_else(
@@ -475,13 +521,8 @@ async fn snapshot(backend: &ResourceBackend, kind: &str, table: &Table, query: &
         }
     };
     messages.push(Message::Table { table: kind.into(), schema, incarnation: generation.unwrap_or_else(|| "durable".into()), sequence });
-    let mut rows: Vec<_> = document["items"]
-        .as_array()
-        .ok_or_else(|| error_response("missing resource items"))?
-        .iter()
-        .map(|value| row(value, table))
-        .collect();
-    let matched = rows.iter().map(|row| (row[KEY].as_str().expect("resource name").to_owned(), row.clone())).collect();
+    let mut rows = resource_rows(&document, table).map_err(|error| error_response(&error))?;
+    let matched = rows.iter().map(|row| (row[KEY].as_str().unwrap_or_default().to_owned(), row.clone())).collect();
     let count = rows.len() as u64;
     rows.sort_by(|a, b| query.compare(&query.values(a), &query.values(b)));
     if let Some(after) = after {
@@ -514,6 +555,30 @@ fn watch(
     start: WatchStart,
     matched: BTreeMap<String, Row>,
 ) -> impl futures::Stream<Item = Result<Message, String>> + Send {
+    let source_backend = backend.clone();
+    let namespace = query.namespace.clone();
+    let source_kind = kind.clone();
+    let opener: Opener = Box::new(move |start| {
+        let backend = source_backend.clone();
+        let namespace = namespace.clone();
+        let kind = source_kind.clone();
+        Box::pin(async move { watch_resource_kind_from(&backend, &namespace, &kind, start).await })
+    });
+    watch_with(backend, kind, table, query, start, matched, opener)
+}
+
+type WatchReply = Result<flotilla_store::DynamicResourceWatch, flotilla_resources::ResourceError>;
+type Opener = Box<dyn FnMut(WatchStart) -> futures::future::BoxFuture<'static, WatchReply> + Send>;
+
+fn watch_with(
+    backend: ResourceBackend,
+    kind: String,
+    table: Table,
+    query: Query,
+    start: WatchStart,
+    matched: BTreeMap<String, Row>,
+    opener: Opener,
+) -> impl futures::Stream<Item = Result<Message, String>> + Send {
     struct State {
         backend: ResourceBackend,
         kind: String,
@@ -525,6 +590,8 @@ fn watch(
         pending: std::collections::VecDeque<Message>,
         sequence: u64,
         recovering: bool,
+        consecutive_errors: u8,
+        opener: Opener,
     }
     let sequence = match &start {
         WatchStart::FromVersion(version) | WatchStart::FromVersionInGeneration { resource_version: version, .. } => {
@@ -533,14 +600,27 @@ fn watch(
         WatchStart::Now => 0,
     };
     futures::stream::unfold(
-        State { backend, kind, table, query, start, matched, stream: None, pending: Default::default(), sequence, recovering: false },
+        State {
+            backend,
+            kind,
+            table,
+            query,
+            start,
+            matched,
+            stream: None,
+            pending: Default::default(),
+            sequence,
+            recovering: false,
+            consecutive_errors: 0,
+            opener,
+        },
         |mut state| async move {
             loop {
                 if let Some(message) = state.pending.pop_front() {
                     return Some((Ok(message), state));
                 }
                 if state.stream.is_none() {
-                    match watch_resource_kind_from(&state.backend, &state.query.namespace, &state.kind, state.start.clone()).await {
+                    match (state.opener)(state.start.clone()).await {
                         Ok(watch) => {
                             state.stream = Some(watch.stream);
                             state.recovering = false;
@@ -574,9 +654,17 @@ fn watch(
                     _ = tokio::time::sleep(Duration::from_secs(15)) => return Some((Ok(Message::Progress {sequence:state.sequence}),state)),
                 };
                 let value = match event {
-                    Some(Ok(event)) => event,
+                    Some(Ok(event)) => {
+                        state.consecutive_errors = 0;
+                        event
+                    }
                     None => return Some((Err("table watch ended".into()), state)),
-                    Some(Err(_)) => {
+                    Some(Err(error)) => {
+                        state.consecutive_errors += 1;
+                        if state.consecutive_errors >= 3 {
+                            return Some((Err(format!("table watch repeatedly failed: {error}")), state));
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         state.stream = None;
                         continue;
                     }
@@ -598,15 +686,12 @@ fn watch(
                     Ok(sequence) => sequence,
                     Err(error) => return Some((Err(error), state)),
                 };
-                let current: BTreeMap<String, Row> = document["items"]
-                    .as_array()
-                    .expect("resource items")
-                    .iter()
-                    .map(|value| {
-                        let row = row(value, &state.table);
-                        (row[KEY].as_str().expect("resource name").into(), row)
-                    })
-                    .collect();
+                let rows = match resource_rows(&document, &state.table) {
+                    Ok(rows) => rows,
+                    Err(error) => return Some((Err(error), state)),
+                };
+                let current: BTreeMap<String, Row> =
+                    rows.into_iter().map(|row| (row[KEY].as_str().unwrap_or_default().to_owned(), row)).collect();
                 for (name, row) in &current {
                     if state.matched.get(name) != Some(row) {
                         state.pending.push_back(Message::Upsert {
@@ -644,6 +729,58 @@ pub(super) fn test_ordering() {
 #[cfg(test)]
 mod properties {
     use super::*;
+    // Backend failures are server errors, and malformed snapshots are refused rather
+    // than panicking in either snapshot or live-stream decoding (review findings 2–3).
+    #[test]
+    fn source_failures_and_malformed_documents_are_errors() {
+        assert_eq!(source_failure(flotilla_resources::ResourceError::other("disk unavailable")).status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(source_failure(flotilla_resources::ResourceError::invalid("unsupported predicate")).status, StatusCode::BAD_REQUEST);
+        for document in [json!({}), json!({"items":null}), json!({"items":[{}]}), json!({"items":[{"metadata":{"name":3}}]})] {
+            assert!(resource_rows(&document, &descriptor("convoys")).is_err());
+        }
+    }
+
+    // The watch opener stands in for the store subscription boundary. Even if every
+    // open succeeds and its stream immediately fails, retries are delayed and bounded.
+    #[tokio::test(start_paused = true)]
+    async fn immediately_failing_reopened_watches_stop_after_three_attempts() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            Arc,
+        };
+        let opens = Arc::new(AtomicUsize::new(0));
+        let observed = opens.clone();
+        let opener: Opener = Box::new(move |_| {
+            observed.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async {
+                Ok(flotilla_store::DynamicResourceWatch::builder()
+                    .kind("Convoy".into())
+                    .plural("convoys".into())
+                    .namespace("test".into())
+                    .resource_version("0".into())
+                    .initial(vec![])
+                    .stream(futures::stream::once(async { Err(flotilla_resources::ResourceError::other("broken watch")) }).boxed())
+                    .build())
+            })
+        });
+        let table = descriptor("convoys");
+        let query = Query::parse(&[], &table).unwrap();
+        let stream = watch_with(
+            ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+            "convoys".into(),
+            table,
+            query,
+            WatchStart::FromVersion("0".into()),
+            BTreeMap::new(),
+            opener,
+        );
+        futures::pin_mut!(stream);
+        let started = tokio::time::Instant::now();
+        assert!(tokio::time::timeout(Duration::from_secs(1), stream.next()).await.expect("bounded retries").unwrap().is_err());
+        assert_eq!(opens.load(AtomicOrdering::SeqCst), 3);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+    }
+
     // ADR 0067 keysets use every sort value and the primary key, independent of
     // projection. Generate ties, nulls, both directions, and all cursor boundaries.
     #[hegel::test]
