@@ -66,6 +66,7 @@ impl PeerConnection {
                 session_id: self.daemon.session_id(),
                 connection_role: None,
                 surface: None,
+                crew_claims: Default::default(),
             })
             .await
             .is_err()

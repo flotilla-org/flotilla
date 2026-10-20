@@ -24,6 +24,7 @@ async fn hello_result(
                 session_id: uuid::Uuid::nil(),
                 connection_role: Some(ConnectionRole::Client),
                 surface: None,
+                crew_claims: Default::default(),
             })
             .await
             .expect("write daemon hello");

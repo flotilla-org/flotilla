@@ -1460,6 +1460,89 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
     ));
 }
 
+/// A live session whose crew's daemon reach the test controls (#3618).
+struct ReachRuntime(Mutex<Option<String>>);
+
+#[async_trait]
+impl TerminalRuntime for ReachRuntime {
+    async fn ensure_session(
+        &self,
+        _name: &str,
+        _spec: &TerminalSessionSpec,
+        _tags: &[flotilla_terminal::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
+        panic!("running sessions should be observed, not ensured")
+    }
+
+    async fn session_is_running(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn daemon_reach(&self, _spec: &TerminalSessionSpec) -> Result<Option<String>, String> {
+        Ok(self.0.lock().expect("reach").clone())
+    }
+}
+
+// #3618: while an agentless host's forward is down the running session records
+// why its crew cannot reach the daemon, without leaving Running; recovery clears it.
+#[tokio::test]
+async fn unreachable_daemon_is_recorded_on_a_running_session_and_cleared() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    create_ready_environment(&backend, "env-a").await;
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "implement", "https://github.com/flotilla-org/flotilla", "main").await;
+    let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
+    let created = sessions
+        .create(
+            &meta("term-a"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "shell".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "bash".into() },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("session");
+    let mut status = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
+        session_id: "cleat-session".into(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "bash".into(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
+    let mut session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
+    let runtime = Arc::new(ReachRuntime(Mutex::new(Some("daemon forward down: ssh forward exited".into()))));
+    let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend, "flotilla");
+
+    for expected in [Some("daemon forward down: ssh forward exited"), None] {
+        *runtime.0.lock().expect("reach") = expected.map(str::to_string);
+        let deps = reconciler.prepare(&session).await.expect("observe session");
+        let outcome = reconciler.reconcile(&session, &deps, Utc::now());
+        let patch = outcome.patch.expect("reach change is recorded");
+        assert!(matches!(&patch, TerminalSessionStatusPatch::ObserveDaemonReach { unreachable } if unreachable.as_deref() == expected));
+        let status = session.status.as_mut().expect("status");
+        patch.apply(status);
+        assert_eq!(status.phase, TerminalSessionPhase::Running);
+        assert_eq!(status.daemon_unreachable.as_deref(), expected);
+        // An unchanged observation writes nothing further.
+        let deps = reconciler.prepare(&session).await.expect("observe again");
+        assert!(!matches!(
+            reconciler.reconcile(&session, &deps, Utc::now()).patch,
+            Some(TerminalSessionStatusPatch::ObserveDaemonReach { .. })
+        ));
+    }
+}
+
 struct MissingTerminalRuntime;
 
 #[tokio::test]

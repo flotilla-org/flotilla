@@ -33,6 +33,7 @@ use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, T
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use super::agentless_reach::{apply_reach_environment, ReachTarget};
 use super::credentials::{agent_material_environment, RuntimeSessionCapabilities};
 use super::state::ControllerRuntimeState;
 use crate::blob_store::BlobDigest;
@@ -533,6 +534,19 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 (flotilla_agent::process::monitored_command(&plan.command, &crew.id), env, Some(crew))
             }
         };
+        // #3618: an agentless host's crews reach the daemon through the forwarded
+        // environment socket, with the controller generation's CLI on PATH.
+        if let Some(profile) = self.state.agentless_ssh.get(&spec.env_ref) {
+            match &self.state.agentless_reach {
+                Some(reach) => {
+                    let paths = reach.prepare_session(&ReachTarget::from(profile)).await?;
+                    apply_reach_environment(&mut env, &spec.env_ref, &paths, profile.env_bag.find_env_var("PATH"));
+                }
+                None => {
+                    warn!(environment = %spec.env_ref, "agentless session launched without a daemon socket server; crew hooks cannot reach the daemon")
+                }
+            }
+        }
         // Crews rebuild one checkout across edits, rebases and review fixes. Set this explicitly: Cargo turns
         // incremental compilation off by default when `CI` is set, and harness shells may set it.
         env.push(("CARGO_INCREMENTAL".to_string(), "1".to_string()));
@@ -634,6 +648,16 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn remove_exit_receipt(&self, spec: &TerminalSessionSpec, launch_id: &str) -> Result<(), String> {
         let runner = self.runner_for_env(&spec.env_ref)?;
         flotilla_agent::process::remove_exit_receipt(&*runner, Path::new(&spec.cwd), launch_id).await
+    }
+
+    async fn daemon_reach(&self, spec: &TerminalSessionSpec) -> Result<Option<String>, String> {
+        let (Some(profile), Some(reach)) = (self.state.agentless_ssh.get(&spec.env_ref), &self.state.agentless_reach) else {
+            return Ok(None);
+        };
+        // Also restarts the forward for sessions that outlived a controller restart.
+        let health = reach.ensure_forward(&ReachTarget::from(profile)).await?;
+        let reason = health.borrow().unreachable_reason();
+        Ok(reason)
     }
 
     async fn observe_attention(&self, session_id: &str, spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {

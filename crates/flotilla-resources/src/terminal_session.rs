@@ -368,6 +368,12 @@ pub struct TerminalSessionStatus {
     /// according to its error policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded: Option<TerminalSessionDegradedCondition>,
+    /// Why this session's crew cannot currently reach its controlling daemon,
+    /// observed by the actuator (an agentless host's forward is down, #3618).
+    /// The session itself keeps running. Remove the decoder default one fleet
+    /// roll after this field lands (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_unreachable: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -545,6 +551,9 @@ pub enum TerminalSessionStatusPatch {
     ObserveCleatEndpoint {
         endpoint: Option<flotilla_protocol::result_set::CleatEndpoint>,
     },
+    ObserveDaemonReach {
+        unreachable: Option<String>,
+    },
     MarkRunning {
         configured_limits: Option<ConfiguredResourceLimits>,
         session_id: String,
@@ -626,6 +635,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
             }
             Self::ClearRetiredLaunches => status.retired_launches.clear(),
             Self::ObserveCleatEndpoint { endpoint } => status.cleat_endpoint = endpoint.clone(),
+            Self::ObserveDaemonReach { unreachable } => status.daemon_unreachable = unreachable.clone(),
             Self::MarkRunning { configured_limits, session_id, pid, started_at, crew, launch_command, delivered_message_id } => {
                 status.configured_limits = configured_limits.clone();
                 status.phase = TerminalSessionPhase::Running;

@@ -1,5 +1,6 @@
 //! Daemon composition, startup restoration, and resource-controller wiring.
 
+pub(crate) mod agentless_reach;
 mod credentials;
 mod discovery;
 mod docker;
@@ -254,6 +255,16 @@ impl DaemonRuntime {
             &registered_image_caches,
         )
         .await?;
+        // #3618: agentless crews reach the daemon through forwarded environment sockets.
+        let agentless_reach = match (&options.environment_sockets, daemon.local_command_runner()) {
+            (Some(sockets), Some(local)) => Some(Arc::new(agentless_reach::AgentlessReach::new(
+                local,
+                sockets.clone(),
+                agentless_reach::CliSource::for_controller(),
+                agentless_reach::ForwardTiming::default(),
+            ))),
+            _ => None,
+        };
         let mut registered_ssh_profiles = Vec::new();
         for ssh in ssh_profiles {
             if let Err(error) = phase(
@@ -267,7 +278,7 @@ impl DaemonRuntime {
             }
             if let Err(error) = phase(
                 "apply_agentless_ssh_observation",
-                apply_agentless_ssh_observation(&daemon, &options.namespace, &ssh, Some(&credential_store)),
+                apply_agentless_ssh_observation(&daemon, &options.namespace, &ssh, Some(&credential_store), agentless_reach.as_deref()),
             )
             .await
             {
@@ -348,13 +359,18 @@ impl DaemonRuntime {
             let namespace = options.namespace.clone();
             let ssh = ssh.clone();
             let credential_store = Arc::clone(&credential_store);
+            let agentless_reach = agentless_reach.clone();
             tasks.push(spawn_periodic_task(options.heartbeat_interval, PeriodicTaskStart::AfterInterval, move || {
                 let daemon = Arc::clone(&daemon);
                 let namespace = namespace.clone();
                 let ssh = ssh.clone();
                 let credential_store = Arc::clone(&credential_store);
+                let agentless_reach = agentless_reach.clone();
                 async move {
-                    if let Err(error) = apply_agentless_ssh_observation(&daemon, &namespace, &ssh, Some(&credential_store)).await {
+                    if let Err(error) =
+                        apply_agentless_ssh_observation(&daemon, &namespace, &ssh, Some(&credential_store), agentless_reach.as_deref())
+                            .await
+                    {
                         warn!(host = %ssh.provisioning.host_id, %error, "failed to publish SSH host observation");
                     }
                 }
@@ -459,6 +475,7 @@ impl DaemonRuntime {
                     profile.host_direct_environment_name(),
                 )
                 .with_environment_sockets(options.environment_sockets.clone())
+                .with_agentless_reach(agentless_reach.clone())
                 .with_hook_endpoint(options.hook_endpoint.clone())
                 .with_checkout_removal_concurrency(daemon_config.checkout_removal_concurrency)
                 .with_namespace(options.namespace.clone())

@@ -117,6 +117,7 @@ define_patch_kinds! {
     TerminalClearRetiredLaunches => NONE,
     TerminalMarkRunning => DUPLICATE,
     TerminalObserveCleatEndpoint => NONE,
+    TerminalObserveDaemonReach => NONE,
     TerminalMarkMessageDelivered => NONE,
     TerminalMarkDeliveryExpired => NONE,
     TerminalMarkDeliveryUnconfirmed => NONE,
@@ -205,6 +206,7 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
         TerminalSessionStatusPatch::ClearRetiredLaunches => PatchKind::TerminalClearRetiredLaunches,
         TerminalSessionStatusPatch::MarkRunning { .. } => PatchKind::TerminalMarkRunning,
         TerminalSessionStatusPatch::ObserveCleatEndpoint { .. } => PatchKind::TerminalObserveCleatEndpoint,
+        TerminalSessionStatusPatch::ObserveDaemonReach { .. } => PatchKind::TerminalObserveDaemonReach,
         TerminalSessionStatusPatch::MarkMessageDelivered { .. } => PatchKind::TerminalMarkMessageDelivered,
         TerminalSessionStatusPatch::MarkDeliveryExpired => PatchKind::TerminalMarkDeliveryExpired,
         TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { .. } => PatchKind::TerminalMarkDeliveryUnconfirmed,
@@ -738,6 +740,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     occupancy: Default::default(),
                     completion_pending: None,
                     degraded: None,
+                    daemon_unreachable: None,
                 };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
                 let patch = TerminalSessionStatusPatch::MarkRunning {

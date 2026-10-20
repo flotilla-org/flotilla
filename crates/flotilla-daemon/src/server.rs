@@ -379,56 +379,63 @@ impl DaemonServer {
         let shutdown = self.shutdown_rx.clone();
         let http_router = self.http_router.clone();
         let directory = flotilla_protocol::DaemonHostPath::new(self.socket_path.with_extension("env"));
-        environment_sockets::EnvironmentSocketService::new(self.environment_sockets.clone(), directory, move |listener, environment| {
-            let daemon = daemon.clone();
-            let router = router.clone();
-            let http_router = http_router.clone();
-            let client_count = client_count.clone();
-            let client_notify = client_notify.clone();
-            let mut shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                let mut connections = JoinSet::new();
-                loop {
-                    tokio::select! {
-                        result = listener.accept() => match result {
-                            Ok((stream, _)) => {
-                                let peer = caller::socket_peer_credential(&stream);
-                                let daemon = daemon.clone();
-                                let router = router.clone();
-                                let environment = environment.clone();
-                                let shutdown = shutdown.clone();
-                                let http_router = http_router.clone();
-                                client_count.fetch_add(1, Ordering::SeqCst);
-                                client_notify.notify_one();
-                                let lease = EnvironmentClientLease { count: client_count.clone(), notify: client_notify.clone() };
-                                connections.spawn(async move {
-                                    let _lease = lease;
-                                    let mut stream = stream;
-                                    let Some(first_byte) = read_preface(&mut stream).await else { return };
-                                    if http::is_http_preface(first_byte) {
-                                        // The socket binds the caller to its environment, as the framed protocol does.
-                                        let bound = environment.clone();
-                                        let caller = move |peer| http::CallerAuth::Environment { environment: bound, peer: Some(peer) };
-                                        let serving = http::serve_sniffed(stream, first_byte, http_router, caller, shutdown_signal(shutdown.clone()));
-                                        serve_until_drained(serving, shutdown, "environment socket").await;
-                                        return;
-                                    }
-                                    let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
-                                        Ok(claims) => Some(claims),
-                                        Err(error) => { warn!(%error, "environment peer evidence unavailable"); return; }
-                                    };
-                                    let session = unix_message_session_with_prefix(stream, vec![first_byte]);
-                                    environment_connection::serve(session, daemon, router, environment, claims, shutdown).await;
-                                });
-                            }
-                            Err(error) => { warn!(%error, "environment socket accept failed"); return; }
-                        },
-                        _ = shutdown.changed() => return,
-                        _ = connections.join_next(), if !connections.is_empty() => {},
+        environment_sockets::EnvironmentSocketService::new(
+            self.environment_sockets.clone(),
+            directory,
+            move |listener, environment, reach| {
+                let daemon = daemon.clone();
+                let router = router.clone();
+                let http_router = http_router.clone();
+                let client_count = client_count.clone();
+                let client_notify = client_notify.clone();
+                let mut shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let mut connections = JoinSet::new();
+                    loop {
+                        tokio::select! {
+                            result = listener.accept() => match result {
+                                Ok((stream, _)) => {
+                                    let peer = caller::reach_evidence(reach, caller::socket_peer_credential(&stream));
+                                    let daemon = daemon.clone();
+                                    let router = router.clone();
+                                    let environment = environment.clone();
+                                    let shutdown = shutdown.clone();
+                                    let http_router = http_router.clone();
+                                    client_count.fetch_add(1, Ordering::SeqCst);
+                                    client_notify.notify_one();
+                                    let lease = EnvironmentClientLease { count: client_count.clone(), notify: client_notify.clone() };
+                                    connections.spawn(async move {
+                                        let _lease = lease;
+                                        let mut stream = stream;
+                                        let Some(first_byte) = read_preface(&mut stream).await else { return };
+                                        if http::is_http_preface(first_byte) {
+                                            // The socket binds the caller to its environment, as the framed protocol does.
+                                            let bound = environment.clone();
+                                            let caller = move |kernel_peer| http::CallerAuth::Environment {
+                                                environment: bound,
+                                                peer: caller::reach_evidence(reach, Some(kernel_peer)),
+                                            };
+                                            let serving = http::serve_sniffed(stream, first_byte, http_router, caller, shutdown_signal(shutdown.clone()));
+                                            serve_until_drained(serving, shutdown, "environment socket").await;
+                                            return;
+                                        }
+                                        let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
+                                            Ok(claims) => Some(claims),
+                                            Err(error) => { warn!(%error, "environment peer evidence unavailable"); return; }
+                                        };
+                                        let session = unix_message_session_with_prefix(stream, vec![first_byte]);
+                                        environment_connection::serve(session, daemon, router, environment, claims, shutdown).await;
+                                    });
+                                }
+                                Err(error) => { warn!(%error, "environment socket accept failed"); return; }
+                            },
+                            _ = shutdown.changed() => return,
+                            _ = connections.join_next(), if !connections.is_empty() => {},
+                        }
                     }
-                }
-            })
-        })
+                })
+            },
+        )
     }
 
     pub fn install_blob_store(&self, store: Arc<crate::blob_store::TieredBlobStore>) -> Result<(), String> {
@@ -1063,7 +1070,9 @@ async fn handle_client_session_with_identity(
     };
 
     match first_msg {
-        Message::Hello { protocol_version, node_id, display_name, session_id, connection_role, surface } => {
+        // The main socket derives identity from kernel peer evidence; in-band
+        // claims are honoured only by environment sockets.
+        Message::Hello { protocol_version, node_id, display_name, session_id, connection_role, surface, crew_claims: _ } => {
             if environment_context.is_some() {
                 warn!("peer/client hello on per-environment socket is unsupported");
                 return;
@@ -1117,6 +1126,7 @@ async fn handle_client_session_with_identity(
                         session_id: daemon.session_id(),
                         connection_role: Some(ConnectionRole::Client),
                         surface: None,
+                        crew_claims: Default::default(),
                     })
                     .await
                     .is_err()

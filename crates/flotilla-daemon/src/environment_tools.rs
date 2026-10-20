@@ -462,7 +462,7 @@ fn resolve_cleat_binary(path: &Path) -> Result<DaemonHostPath, String> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn adjacent_flotilla_binary(daemon_binary: &Path) -> Result<DaemonHostPath, String> {
+pub(crate) fn adjacent_flotilla_binary(daemon_binary: &Path) -> Result<DaemonHostPath, String> {
     let parent = daemon_binary.parent().ok_or_else(|| format!("daemon binary has no parent directory: {}", daemon_binary.display()))?;
     let flotilla_binary = parent.join("flotilla");
     if !flotilla_binary.is_file() {

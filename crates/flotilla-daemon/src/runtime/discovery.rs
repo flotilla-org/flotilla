@@ -34,6 +34,7 @@ use tracing::{debug, warn};
 
 use crate::fulfilment_probe::{probe_kind, DetectionTarget};
 
+use super::agentless_reach::{AgentlessReach, HostPlatform};
 use super::seed::{
     empty_meta, ensure_default_policies, ensure_host_direct_environment_exists, kind_belongs_to_host, migrate_live_placement_policies,
 };
@@ -185,6 +186,7 @@ pub(super) async fn apply_agentless_ssh_observation(
     namespace: &str,
     ssh: &AgentlessSshProfile,
     credential_store: Option<&CredentialStore>,
+    reach: Option<&AgentlessReach>,
 ) -> Result<(), String> {
     let profile = &ssh.provisioning;
     let hosts = daemon.resource_backend().using::<Host>(namespace);
@@ -243,6 +245,12 @@ pub(super) async fn apply_agentless_ssh_observation(
         let platform = agentless_platform(ssh.runner.as_ref()).await;
         migrate_live_placement_policies(&daemon.resource_backend(), namespace, &profile.host_id, &platform).await?;
     }
+    let mut ready = ready;
+    if let (true, Some(reach)) = (probe_succeeded, reach) {
+        let (reach_conditions, cli_available) = agentless_reach_conditions(reach, ssh).await;
+        ready &= cli_available;
+        conditions.extend(reach_conditions);
+    }
     let fulfilment_facts = if probe_succeeded {
         let observed = ssh.fulfilment_facts.read().await.clone();
         if observed.is_empty() {
@@ -292,6 +300,44 @@ pub(super) async fn apply_agentless_ssh_observation(
     };
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// #3618: a host whose platform has no CLI in the controller's generation is
+/// refused at placement, since its crews could neither hook nor settle. A down
+/// forward is diagnostic only: running crews keep working and it is re-dialled.
+pub(super) async fn agentless_reach_conditions(reach: &AgentlessReach, ssh: &AgentlessSshProfile) -> (Vec<HostCondition>, bool) {
+    let mut conditions = Vec::new();
+    let cli = match HostPlatform::probe(ssh.runner.as_ref()).await {
+        Ok(platform) => reach.cli().for_platform(&platform).map(|_| ()).map_err(|error| ("NoPlatformBuild", error)),
+        Err(error) => Err(("PlatformUnknown", error)),
+    };
+    let cli_available = cli.is_ok();
+    if let Err((reason, message)) = cli {
+        conditions.push(
+            HostCondition::builder()
+                .condition_type("Tooling/FlotillaCli")
+                .value(ConditionValue::False)
+                .reason(reason)
+                .message(message)
+                .observed_at(Utc::now())
+                .blocks_forge_observation(false)
+                .build(),
+        );
+    }
+    if let Some(reason) = reach.health(&ssh.environment_id).await.and_then(|health| health.unreachable_reason()) {
+        conditions.push(
+            HostCondition::builder()
+                .condition_type("Transport/DaemonForward")
+                .value(ConditionValue::False)
+                .reason("ForwardDown")
+                .message(reason)
+                .observed_at(Utc::now())
+                .blocks_readiness(false)
+                .blocks_forge_observation(false)
+                .build(),
+        );
+    }
+    (conditions, cli_available)
 }
 
 impl LocalProvisioningProfile {

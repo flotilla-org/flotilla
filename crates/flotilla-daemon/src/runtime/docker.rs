@@ -700,6 +700,10 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn cleanup(&self, environment_ref: &str) -> Result<(), String> {
+        // An agentless host's forward goes with its Environment (#3618).
+        if let Some(reach) = &self.state.agentless_reach {
+            reach.retire(&EnvironmentId::new(environment_ref)).await?;
+        }
         if let Some(sockets) = &self.state.environment_sockets {
             sockets.remove(&EnvironmentId::new(environment_ref)).await?;
         }

@@ -732,6 +732,7 @@ fn current_client_hello() -> Message {
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
+        crew_claims: Default::default(),
     }
 }
 
@@ -3875,6 +3876,7 @@ async fn handle_client_forwards_peer_link_state_and_registers_peer() {
         session_id: uuid::Uuid::nil(),
         connection_role: None,
         surface: None,
+        crew_claims: Default::default(),
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -3944,6 +3946,7 @@ async fn silent_peer_session_is_reaped_at_idle_deadline() {
         session_id: uuid::Uuid::nil(),
         connection_role: None,
         surface: None,
+        crew_claims: Default::default(),
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write peer hello");
     assert!(matches!(
@@ -4417,6 +4420,7 @@ async fn assert_client_hello_rejected(protocol_version: u32, display_name: Strin
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
+        crew_claims: Default::default(),
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -4459,6 +4463,7 @@ async fn wire_generation_mismatched_client_can_request_shutdown() {
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
+        crew_claims: Default::default(),
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write client hello");
     let hello = reader.next_line().await.expect("read hello").expect("hello payload");
@@ -4491,6 +4496,7 @@ async fn wire_generation_mismatched_client_cannot_request_rich_rpc() {
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
+        crew_claims: Default::default(),
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write client hello");
     let _hello = reader.next_line().await.expect("read hello").expect("hello payload");
@@ -4981,6 +4987,7 @@ async fn handle_client_relays_outbound_peer_messages() {
         session_id: uuid::Uuid::nil(),
         connection_role: None,
         surface: None,
+        crew_claims: Default::default(),
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
     let _ = reader.next_line().await.expect("read hello").expect("line");
@@ -5100,6 +5107,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
             session_id: uuid::Uuid::nil(),
             connection_role: None,
             surface: None,
+            crew_claims: Default::default(),
         };
         flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -5725,15 +5733,32 @@ async fn failed_connection_tasks_are_reaped() {
 
 pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     let (_tmp, daemon) = empty_daemon().await;
+    place_crew(&daemon, environment, PlacedCrew { convoy: "own", vessel: "placed-vessel", session: "placed-session", crew: "placed-crew" })
+        .await;
+    (_tmp, daemon)
+}
+
+/// One active single-agent convoy whose coder session is placed in an Environment.
+pub(super) struct PlacedCrew<'a> {
+    pub convoy: &'a str,
+    pub vessel: &'a str,
+    pub session: &'a str,
+    pub crew: &'a str,
+}
+
+pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, placed: PlacedCrew<'_>) {
     let backend = daemon.resource_backend();
     let convoys = backend.using::<Convoy>("flotilla");
     let convoy = convoys
-        .create(&InputMeta::builder().name("own".into()).build(), &ConvoySpec::builder().workflow_ref("single-agent".into()).build())
+        .create(
+            &InputMeta::builder().name(placed.convoy.into()).build(),
+            &ConvoySpec::builder().workflow_ref("single-agent".into()).build(),
+        )
         .await
         .expect("convoy");
     convoys
         .update_status(
-            "own",
+            placed.convoy,
             &convoy.metadata.resource_version,
             &flotilla_resources::ConvoyStatus {
                 phase: flotilla_resources::ConvoyPhase::Active,
@@ -5760,9 +5785,9 @@ pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir,
     backend
         .using::<Vessel>("flotilla")
         .create(
-            &InputMeta::builder().name("placed-vessel".into()).build(),
+            &InputMeta::builder().name(placed.vessel.into()).build(),
             &flotilla_resources::VesselSpec {
-                convoy_ref: "own".into(),
+                convoy_ref: placed.convoy.into(),
                 vessel_name: "work".into(),
                 placement_policy_ref: "policy".into(),
                 adopted_checkout_refs: Default::default(),
@@ -5773,7 +5798,7 @@ pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir,
     let sessions = backend.using::<TerminalSession>("flotilla");
     let created = sessions
         .create(
-            &InputMeta::builder().name("placed-session".into()).build(),
+            &InputMeta::builder().name(placed.session.into()).build(),
             &TerminalSessionSpec {
                 env_ref: environment.into(),
                 role: "coder".into(),
@@ -5785,8 +5810,8 @@ pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir,
                     brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
                     context: Box::new(TerminalCrewContext {
                         namespace: "flotilla".into(),
-                        convoy: "own".into(),
-                        vessel_ref: "placed-vessel".into(),
+                        convoy: placed.convoy.into(),
+                        vessel_ref: placed.vessel.into(),
                     }),
                     message: None,
                 },
@@ -5796,19 +5821,20 @@ pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir,
         .expect("placed session");
     sessions
         .update_status(
-            "placed-session",
+            placed.session,
             &created.metadata.resource_version,
             &TerminalSessionStatus {
                 crew: Some(
-                    CrewSessionStatus::builder().id("placed-crew".into()).adapter("codex".into()).stance("trusted-implicit".into()).build(),
+                    CrewSessionStatus::builder().id(placed.crew.into()).adapter("codex".into()).stance("trusted-implicit".into()).build(),
                 ),
                 ..Default::default()
             },
         )
         .await
         .expect("crew identity");
-    (_tmp, daemon)
 }
+
+mod agentless_forward;
 
 // #3270: the transport's environment constrains every request, independently of
 // command context. Exercise the real store and dispatcher over in-memory framing.

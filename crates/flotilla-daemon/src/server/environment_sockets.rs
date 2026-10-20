@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use tokio::{net::UnixListener, task::JoinHandle};
 use tracing::info;
 
-pub(super) fn directory_name(id: &EnvironmentId) -> String {
+pub(crate) fn directory_name(id: &EnvironmentId) -> String {
     let digest = Sha256::digest(id.as_str().as_bytes());
     digest[..16].iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -188,13 +188,23 @@ impl EnvironmentSocketRegistry {
     }
 }
 
+/// How crews reach an environment socket, which decides what the kernel peer proves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketReach {
+    /// Bind-mounted into a container: the kernel peer is the crew's own process.
+    Mounted,
+    /// Carried by an ssh reverse forward (agentless hosts): the kernel peer is
+    /// the controller's own ssh client, so its environment is no crew evidence.
+    Forwarded,
+}
+
 /// Host-owned provisioning seam. The server supplies the accept loop; the
 /// controller owns admission and retirement, without knowing the transport.
 #[derive(Clone)]
 pub struct EnvironmentSocketService {
     registry: std::sync::Arc<tokio::sync::Mutex<EnvironmentSocketRegistry>>,
     directory: DaemonHostPath,
-    accept: std::sync::Arc<dyn Fn(UnixListener, EnvironmentId) -> JoinHandle<()> + Send + Sync>,
+    accept: std::sync::Arc<dyn Fn(UnixListener, EnvironmentId, SocketReach) -> JoinHandle<()> + Send + Sync>,
 }
 
 impl std::fmt::Debug for EnvironmentSocketService {
@@ -207,14 +217,24 @@ impl EnvironmentSocketService {
     pub(crate) fn new(
         registry: std::sync::Arc<tokio::sync::Mutex<EnvironmentSocketRegistry>>,
         directory: DaemonHostPath,
-        accept: impl Fn(UnixListener, EnvironmentId) -> JoinHandle<()> + Send + Sync + 'static,
+        accept: impl Fn(UnixListener, EnvironmentId, SocketReach) -> JoinHandle<()> + Send + Sync + 'static,
     ) -> Self {
         Self { registry, directory, accept: std::sync::Arc::new(accept) }
     }
 
     pub(crate) async fn prepare(&self, id: EnvironmentId) -> Result<DaemonHostPath, String> {
+        self.prepare_reached(id, SocketReach::Mounted).await
+    }
+
+    /// The socket an agentless host's ssh reverse forward carries.
+    pub(crate) async fn prepare_forwarded(&self, id: EnvironmentId) -> Result<DaemonHostPath, String> {
+        self.prepare_reached(id, SocketReach::Forwarded).await
+    }
+
+    async fn prepare_reached(&self, id: EnvironmentId, reach: SocketReach) -> Result<DaemonHostPath, String> {
         tokio::fs::create_dir_all(self.directory.as_path()).await.map_err(|error| error.to_string())?;
-        self.registry.lock().await.add(id, &self.directory, &*self.accept).await
+        let accept = &self.accept;
+        self.registry.lock().await.add(id, &self.directory, |listener, id| accept(listener, id, reach)).await
     }
 
     pub(crate) async fn remove(&self, id: &EnvironmentId) -> Result<(), String> {
@@ -222,27 +242,30 @@ impl EnvironmentSocketService {
     }
 }
 
+/// Production aliases survive daemon shutdown. Tests own unique state roots
+/// and retire their aliases even when an assertion unwinds.
+#[cfg(test)]
+pub(crate) struct SocketAliasGuard(pub(crate) std::path::PathBuf);
+
+#[cfg(test)]
+impl SocketAliasGuard {
+    pub(crate) fn new(state_dir: &DaemonHostPath) -> Self {
+        std::fs::create_dir_all(state_dir.as_path()).expect("test state directory");
+        let target = std::fs::canonicalize(state_dir.as_path()).expect("canonical test state directory");
+        Self(alias_path(&target, effective_uid()))
+    }
+}
+
+#[cfg(test)]
+impl Drop for SocketAliasGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Production aliases survive daemon shutdown. Tests own unique state roots
-    // and retire their aliases even when an assertion unwinds.
-    struct SocketAliasGuard(std::path::PathBuf);
-
-    impl SocketAliasGuard {
-        fn new(state_dir: &DaemonHostPath) -> Self {
-            std::fs::create_dir_all(state_dir.as_path()).expect("test state directory");
-            let target = std::fs::canonicalize(state_dir.as_path()).expect("canonical test state directory");
-            Self(alias_path(&target, effective_uid()))
-        }
-    }
-
-    impl Drop for SocketAliasGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
 
     // #3285: the length guard counts bytes, accepting the last safe pathname
     // and refusing the next byte with the actual path and limit in the error.

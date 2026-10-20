@@ -29,6 +29,7 @@ mod tests {
             session_id: uuid::Uuid::nil(),
             connection_role: None,
             surface: None,
+            crew_claims: Default::default(),
         };
         let mut buf = Vec::new();
         write_message_line(&mut buf, &msg).await.expect("write should succeed");

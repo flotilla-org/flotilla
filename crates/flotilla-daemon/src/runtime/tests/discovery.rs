@@ -172,7 +172,7 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
     std::fs::create_dir_all(&claude_dir).expect("create remote Claude dir");
     std::fs::write(claude_dir.join(".credentials.json"), r#"{"claudeAiOauth":{"expiresAt":1756000000000}}"#)
         .expect("write remote credential metadata");
-    apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None).await.expect("publish SSH observation");
+    apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("publish SSH observation");
     let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id).await.expect("SSH Host");
     let status = host.status.expect("SSH status");
     assert!(status.ready);
@@ -186,18 +186,18 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         .update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &changed)
         .await
         .expect("edit SSH policy while the daemon runs");
-    apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None).await.expect("refresh SSH observation");
+    apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("refresh SSH observation");
     let kind =
         daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE).get("host-direct-ssh-test-host").await.expect("refreshed SSH kind");
     assert_eq!(kind.spec.pool, "alternate-pool");
     let mut unreachable = profile.clone();
     unreachable.runner = Arc::new(DiscoveryMockRunner::builder().on_run("rustc", &["--version"], Ok("rustc 9".into())).build());
-    apply_agentless_ssh_observation(&daemon, NAMESPACE, &unreachable, None).await.expect("publish unreachable SSH observation");
+    apply_agentless_ssh_observation(&daemon, NAMESPACE, &unreachable, None, None).await.expect("publish unreachable SSH observation");
     let unreachable_status =
         daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id).await.expect("SSH Host").status.expect("unreachable SSH status");
     assert!(!unreachable_status.ready);
     assert!(unreachable_status.fulfilment_facts.is_empty(), "unreachable SSH host must not retain or probe facts");
-    apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None).await.expect("restore SSH observation");
+    apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("restore SSH observation");
     let state = Arc::new(
         ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -269,3 +269,54 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
 }
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
+
+// #3618: a host whose platform has no flotilla CLI in the controller's
+// generation is refused at placement with the reason; a host on the
+// controller's own platform is served by the controller's CLI.
+#[tokio::test]
+async fn agentless_host_without_a_platform_cli_is_refused_at_placement() {
+    use super::agentless_reach::{AgentlessReach, CliSource, ForwardTiming, HostPlatform};
+    use crate::server::environment_sockets::{EnvironmentSocketRegistry, EnvironmentSocketService};
+    let controller = HostPlatform::controller();
+    let controller_uname = format!(
+        "{} {}\n",
+        if controller.os == "macos" { "Darwin" } else { "Linux" },
+        if controller.os == "macos" && controller.arch == "aarch64" { "arm64" } else { controller.arch.as_str() }
+    );
+    let state = TempDir::new().expect("state");
+    let sockets = EnvironmentSocketService::new(
+        Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
+        DaemonHostPath::new(state.path().join("env")),
+        |listener, _, _| {
+            tokio::spawn(async move {
+                let _listener = listener;
+                std::future::pending::<()>().await
+            })
+        },
+    );
+    let reach = AgentlessReach::new(
+        Arc::new(ProcessCommandRunner),
+        sockets,
+        CliSource::new(Ok(state.path().join("bin/flotilla")), "gen-1"),
+        ForwardTiming::default(),
+    );
+    let profile = |uname: &str| AgentlessSshProfile {
+        provisioning: manual_profile("b1", false),
+        environment_id: EnvironmentId::new("host-direct-b1"),
+        destination: "crew@b1".into(),
+        env_bag: EnvironmentBag::new(),
+        runner: Arc::new(DiscoveryMockRunner::builder().on_run("uname", &["-s", "-m"], Ok(uname.into())).build()),
+        fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
+    };
+    let now = chrono::Utc::now();
+
+    let (conditions, cli_available) = super::discovery::agentless_reach_conditions(&reach, &profile("Linux riscv64\n")).await;
+    assert!(!cli_available);
+    let status = flotilla_resources::HostStatus { ready: cli_available, heartbeat_at: Some(now), conditions, ..Default::default() };
+    let refusal = flotilla_admission::support::unready_placement_refusal("host-direct-b1", "b1", Some(&status), now).expect("refused");
+    assert!(refusal.contains("NoPlatformBuild") && refusal.contains("linux-riscv64"), "{refusal}");
+
+    let (conditions, cli_available) = super::discovery::agentless_reach_conditions(&reach, &profile(&controller_uname)).await;
+    assert!(cli_available, "{conditions:?}");
+    assert!(conditions.is_empty(), "no forward has been dialled, so none is reported down");
+}

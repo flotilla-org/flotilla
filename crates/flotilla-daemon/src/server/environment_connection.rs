@@ -150,6 +150,7 @@ pub(super) async fn serve(
         protocol_version,
         display_name,
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
+        crew_claims,
         ..
     }))) = first
     else {
@@ -168,6 +169,7 @@ pub(super) async fn serve(
             session_id: daemon.session_id(),
             connection_role: Some(flotilla_protocol::ConnectionRole::Client),
             surface: None,
+            crew_claims: Default::default(),
         })
         .await
         .is_err()
@@ -189,7 +191,8 @@ pub(super) async fn serve(
         // Re-resolve for every request: a retired session cannot retain authority.
         let identity = async {
             let crews = environment_crews(&daemon, &environment).await?;
-            let crew = super::caller::check_claims(crews, claims.as_ref().unwrap_or(&HashMap::new()))?;
+            let claims = super::caller::combine_claims(claims.clone().unwrap_or_default(), &crew_claims)?;
+            let crew = super::caller::check_claims(crews, &claims)?;
             let scope = super::environment_supervision::authorize(&daemon, &mut request, &crew).await?;
             Ok::<_, String>((crew, scope))
         }

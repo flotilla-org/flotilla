@@ -552,6 +552,18 @@ pub enum ResponseResult {
     Err { message: String },
 }
 
+/// Crew identity variables a client may claim in-band ([`Message::Hello`]).
+pub const CREW_CLAIM_VARIABLES: [&str; 6] =
+    ["FLOTILLA_NAMESPACE", "FLOTILLA_CONVOY", "FLOTILLA_VESSEL", "FLOTILLA_CREW_ROLE", "FLOTILLA_CREW_ID", "FLOTILLA_TERMINAL_SESSION"];
+
+/// The crew claims present in an environment, keeping only nonempty identity variables.
+pub fn crew_claims_from(lookup: impl Fn(&str) -> Option<String>) -> std::collections::BTreeMap<String, String> {
+    CREW_CLAIM_VARIABLES
+        .into_iter()
+        .filter_map(|key| lookup(key).filter(|value| !value.is_empty()).map(|value| (key.to_string(), value)))
+        .collect()
+}
+
 /// Top-level message envelope for the JSON protocol.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,6 +586,12 @@ pub enum Message {
         connection_role: Option<ConnectionRole>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         surface: Option<SurfaceDeclaration>,
+        /// A crew client's own `FLOTILLA_*` identity variables, carried in-band
+        /// because a forwarded environment socket's kernel peer is the
+        /// controller's ssh client, not the crew. They only narrow among crews
+        /// already placed in the socket's Environment; other sockets ignore them.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        crew_claims: std::collections::BTreeMap<String, String>,
     },
     #[serde(rename = "peer")]
     Peer(Box<PeerWireMessage>),
