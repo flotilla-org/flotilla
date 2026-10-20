@@ -486,6 +486,28 @@ async fn token_file_is_private_and_replaced_at_each_start() {
     assert_eq!(second.send("GET", "/v1/hello", &[("Host", &second.host()), ("Authorization", &second.bearer())]).await.0, 200);
 }
 
+// The token directory is narrowed to owner-only when it already exists, and a symlink in its
+// place is refused rather than followed: the listener does not start.
+#[tokio::test]
+async fn token_directory_is_narrowed_and_never_followed() {
+    let state = tempfile::tempdir().expect("state dir");
+    let directory = state.path().join(TOKEN_DIRECTORY);
+    std::fs::create_dir(&directory).expect("existing directory");
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).expect("widen");
+    let tcp = Listening::start("127.0.0.1:0", state.path()).await;
+    assert_eq!(std::fs::metadata(&directory).expect("dir").permissions().mode() & 0o777, 0o700);
+    drop(tcp);
+
+    let elsewhere = tempfile::tempdir().expect("elsewhere");
+    std::fs::set_permissions(elsewhere.path(), std::fs::Permissions::from_mode(0o755)).expect("widen");
+    let linked = tempfile::tempdir().expect("state dir");
+    std::os::unix::fs::symlink(elsewhere.path(), linked.path().join(TOKEN_DIRECTORY)).expect("symlink");
+    let listen = ListenAddress::resolve_with("127.0.0.1:0", |_, _| async { Ok(Vec::new()) }).await.expect("listen address");
+    let refused = TcpListener::bind(&listen, linked.path(), Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock)))).await;
+    assert!(refused.is_err_and(|error| error.contains("symlinks are refused")));
+    assert_eq!(std::fs::metadata(elsewhere.path()).expect("target").permissions().mode() & 0o777, 0o755, "the target was not touched");
+}
+
 // TCP requests need the file token. Missing, wrong, repeated or non-Bearer credentials
 // are 401 and never fall back to a cookie; a bearer request needs no Origin. Only the
 // login exchange is reachable without credentials.

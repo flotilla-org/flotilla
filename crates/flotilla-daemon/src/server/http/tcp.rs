@@ -117,7 +117,8 @@ impl TcpListener {
             .map_err(|error| format!("bind HTTP listener {}: {error}", listen.bind_address()))?;
         let bound = server.local_addr().map_err(|error| format!("read HTTP listener address: {error}"))?;
         let token = std::fs::read(&token_path).map_err(|error| format!("read HTTP token {}: {error}", token_path.display()))?;
-        let token: [u8; 32] = Sha256::digest(&token).into();
+        // rigging writes the bare 64-hex token; trailing whitespace is never part of it.
+        let token: [u8; 32] = Sha256::digest(token.trim_ascii_end()).into();
         let policy = TcpPolicy::new(listen.allowed_hosts(bound.port()), move |request| authenticate(request, &token, &logins));
         Ok(Self { server, policy, origin: listen.origin(bound.port()) })
     }
@@ -161,11 +162,15 @@ fn authenticate(request: &Request, token: &[u8; 32], logins: &LoginStore) -> Opt
     None
 }
 
-/// Create `directory` owner-only, or narrow an existing one to owner-only.
+/// Create `directory` owner-only, or narrow an existing one to owner-only. A symlink or
+/// any other non-directory there is refused rather than followed.
 fn private_directory(directory: &Path) -> io::Result<()> {
     match std::fs::DirBuilder::new().mode(0o700).create(directory) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if !std::fs::symlink_metadata(directory)?.file_type().is_dir() {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "not a directory (symlinks are refused)"));
+            }
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
         }
         Err(error) => Err(error),
