@@ -1625,3 +1625,51 @@ mod description_tests {
             .any(|table| table.field == "links" && table.parent.is_some_and(|parent| awareness.tables[parent].field == "entries")));
     }
 }
+
+#[cfg(test)]
+mod serde_category_tests {
+    use super::*;
+    use crate::{Priority, Relationship, SubjectKind};
+    use flotilla_schema::Describe;
+
+    fn serialized_code<T: Serialize>(value: &T, tag: Option<&str>) -> String {
+        let value = serde_json::to_value(value).unwrap();
+        let code = tag.map_or(&value, |tag| &value[tag]);
+        code.as_str().unwrap().to_owned()
+    }
+
+    // An exhaustive match makes adding a variant require another real serialization example.
+    macro_rules! categories {
+        ($ty:ident, $tag:expr, $( $variant:ident => $value:expr ),+ $(,)?) => {{
+            let _exhaustive = |value: $ty| match value { $( $ty::$variant { .. } => (), )+ };
+            let expected = vec![$((serialized_code(&$value, $tag), stringify!($variant).to_owned())),+];
+            let set = <$ty as Describe>::table_set();
+            assert_eq!(set.tables[0].columns[0].categories, expected, stringify!($ty));
+        }};
+    }
+
+    // Review #3592: every current query-row enum's categories agree with Serde's real output.
+    // Enumerate the finite variant set, including both tagged data enums; no mirrored rename rules.
+    #[test]
+    fn every_query_row_enum_matches_its_serde_output() {
+        categories!(AwarenessGrouping, None, Project => AwarenessGrouping::Project, Convoy => AwarenessGrouping::Convoy);
+        categories!(AwarenessKind, None, Fleet => AwarenessKind::Fleet, Project => AwarenessKind::Project, Convoy => AwarenessKind::Convoy, Issue => AwarenessKind::Issue, Vessel => AwarenessKind::Vessel, Independent => AwarenessKind::Independent, Checkout => AwarenessKind::Checkout);
+        categories!(AwarenessFamily, None, Convoys => AwarenessFamily::Convoys, Issues => AwarenessFamily::Issues, Checkouts => AwarenessFamily::Checkouts, Independents => AwarenessFamily::Independents);
+        categories!(AwarenessState, None, Unknown => AwarenessState::Unknown, Idle => AwarenessState::Idle, Pending => AwarenessState::Pending, Waiting => AwarenessState::Waiting, Active => AwarenessState::Active, Done => AwarenessState::Done, Failed => AwarenessState::Failed, Cancelled => AwarenessState::Cancelled);
+        categories!(Salience, None, None => Salience::None, Info => Salience::Info, Attention => Salience::Attention, Urgent => Salience::Urgent);
+        categories!(AwarenessPhase, Some("kind"), Convoy => AwarenessPhase::Convoy(ConvoyPhase::Pending), Work => AwarenessPhase::Work(WorkPhase::Pending), Session => AwarenessPhase::Session(SessionPhase::Starting), Issue => AwarenessPhase::Issue(IssueState::Open));
+        categories!(SessionPhase, None, Starting => SessionPhase::Starting, Running => SessionPhase::Running, Stopped => SessionPhase::Stopped, Failed => SessionPhase::Failed);
+        categories!(StandingRoleHold, None, BackingUnverified => StandingRoleHold::BackingUnverified, RestartLimit => StandingRoleHold::RestartLimit);
+        categories!(ConvoyPhase, None, Pending => ConvoyPhase::Pending, Active => ConvoyPhase::Active, Interrupted => ConvoyPhase::Interrupted, Landing => ConvoyPhase::Landing, Landed => ConvoyPhase::Landed, Failed => ConvoyPhase::Failed, Abandoned => ConvoyPhase::Abandoned);
+        categories!(WorkPhase, None, Pending => WorkPhase::Pending, Ready => WorkPhase::Ready, Launching => WorkPhase::Launching, Running => WorkPhase::Running, Stalled => WorkPhase::Stalled, Interrupted => WorkPhase::Interrupted, Complete => WorkPhase::Complete, Failed => WorkPhase::Failed, Cancelled => WorkPhase::Cancelled, Abandoned => WorkPhase::Abandoned);
+        categories!(SurfaceState, Some("state"), Working => SurfaceState::Working, Available => SurfaceState::Available, StalledHandled => SurfaceState::StalledHandled { rung: HandledRung::Nudge }, NeedsYou => SurfaceState::NeedsYou);
+        categories!(HandledRung, None, Nudge => HandledRung::Nudge, Supervisor => HandledRung::Supervisor, Bosun => HandledRung::Bosun, Governor => HandledRung::Governor);
+        categories!(ReadinessState, None, Ready => ReadinessState::Ready, Unknown => ReadinessState::Unknown, Provisioning => ReadinessState::Provisioning, Blocked => ReadinessState::Blocked, Failed => ReadinessState::Failed);
+        categories!(LifecycleAuthority, None, Observed => LifecycleAuthority::Observed, Adopted => LifecycleAuthority::Adopted, Managed => LifecycleAuthority::Managed);
+        categories!(ChangeRequestStatus, None, Open => ChangeRequestStatus::Open, Draft => ChangeRequestStatus::Draft, Merged => ChangeRequestStatus::Merged, Closed => ChangeRequestStatus::Closed);
+        categories!(IssueState, None, Open => IssueState::Open, Closed => IssueState::Closed);
+        categories!(Priority, None, Urgent => Priority::Urgent, High => Priority::High, Medium => Priority::Medium, Low => Priority::Low);
+        categories!(SubjectKind, None, ChangeRequest => SubjectKind::ChangeRequest, Issue => SubjectKind::Issue);
+        categories!(Relationship, None, WorksOn => Relationship::WorksOn, Produces => Relationship::Produces, Adopts => Relationship::Adopts, Supersedes => Relationship::Supersedes, References => Relationship::References);
+    }
+}

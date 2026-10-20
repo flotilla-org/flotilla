@@ -6,6 +6,7 @@ mod description;
 mod edges;
 mod event;
 mod inline;
+mod serde_description;
 mod tables;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;

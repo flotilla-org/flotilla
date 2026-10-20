@@ -24,7 +24,10 @@
 //! and `#[shape(code = "value")]` describe query rows through the same [`Layout`], without a
 //! storage codec or write handles. `Stored` also accepts these shape attributes; existing
 //! `#[store(...)]` annotations remain supported. Storage policy (`records`, `history`, `frozen`)
-//! belongs only to `Stored`. SQL rendering and its extension traits live in `flotilla-schema-sqlite`.
+//! belongs only to `Stored`. Descriptions keep Rust field names, including when Serde applies
+//! `rename_all_fields`, variant-level `rename_all` or field `rename`. Enum category values follow
+//! Serde's serialization-side variant renaming; deserialization aliases do not change categories.
+//! SQL rendering and its extension traits live in `flotilla-schema-sqlite`.
 //!
 //! Each [`ColumnDef`] carries enum categories, a reference target and open semantic properties.
 //! Structural `roles` are arrays of strings (`key`, `ref`, `state`, `since`, `sequence`, `time`,
@@ -78,8 +81,8 @@ pub use code::{code_value, decode_code};
 pub use code::{Code, CodeError, ADDRESS_DOMAIN, HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN};
 pub use codec::{DecodeError, Decoder, EncodeError, Encoder};
 pub use descriptor::{
-    ColumnDef, ColumnType, Condition, DescriptorError, Expansion, FieldColumns, Guard, Index, IndexProblem, Table, TableRole, TableSet,
-    When, RECORD_VERSION, RESERVED_CHILD_COLUMNS, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES, VIEW_SUFFIX,
+    ColumnDef, ColumnType, Condition, DescriptorError, Expansion, FieldColumns, Guard, Index, IndexProblem, SchemaMode, Table, TableRole,
+    TableSet, When, RECORD_VERSION, RESERVED_CHILD_COLUMNS, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES, VIEW_SUFFIX,
 };
 pub use edge::{
     AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeHeader, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf,

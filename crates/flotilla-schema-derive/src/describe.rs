@@ -1,4 +1,5 @@
 //! Describe-only expansion: shape attributes and Layout, with no stored trait implementations.
+use crate::serde_names::{serialization_name, snake_case, RenameRule};
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{ext::IdentExt, Data, DeriveInput, Fields, LitStr};
@@ -48,61 +49,26 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
             if data.variants.is_empty() {
                 return Err(syn::Error::new_spanned(input, "an enum needs at least one variant"));
             }
+            let rename_all = RenameRule::parse(serialization_name(&input.attrs, "rename_all")?)?;
             let mut categories = Vec::new();
             let mut seen = std::collections::BTreeSet::new();
             let mut datums: Vec<(String, syn::Field, String)> = Vec::new();
             let mut carried = Vec::new();
             for variant in &data.variants {
                 let label = variant.ident.unraw().to_string();
-                // Serde's snake_case enum values are the named queries' existing values.
-                let mut rename_all = None;
-                for attr in input.attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
-                    attr.parse_nested_meta(|meta| {
-                        if meta.path.is_ident("rename_all") {
-                            rename_all = Some(meta.value()?.parse::<LitStr>()?);
-                        } else if meta.input.peek(syn::Token![=]) {
-                            let _: syn::Expr = meta.value()?.parse()?;
-                        }
-                        Ok(())
-                    })?;
-                }
-                let mut value = match rename_all.as_ref().map(LitStr::value).as_deref() {
-                    None | Some("PascalCase") => label.clone(),
-                    Some("snake_case") => snake_case(&label),
-                    Some("kebab-case") => snake_case(&label).replace('_', "-"),
-                    Some("SCREAMING_SNAKE_CASE") => snake_case(&label).to_uppercase(),
-                    Some("SCREAMING-KEBAB-CASE") => snake_case(&label).to_uppercase().replace('_', "-"),
-                    Some("lowercase") => label.to_lowercase(),
-                    Some("UPPERCASE") => label.to_uppercase(),
-                    Some("camelCase") => {
-                        let mut value = label.clone();
-                        value[..1].make_ascii_lowercase();
-                        value
-                    }
-                    Some(_) => return Err(syn::Error::new_spanned(rename_all.unwrap(), "unsupported enum renaming")),
-                };
+                let mut value =
+                    serialization_name(&variant.attrs, "rename")?.map(|name| name.value()).unwrap_or_else(|| rename_all.apply(&label));
                 for attr in &variant.attrs {
                     if attr.path().is_ident("store") {
                         return Err(syn::Error::new_spanned(attr, "Describe accepts shape attributes only"));
                     }
-                    if attr.path().is_ident("serde") {
-                        attr.parse_nested_meta(|meta| {
-                            if meta.path.is_ident("rename") {
-                                value = meta.value()?.parse::<LitStr>()?.value();
-                            } else if meta.input.peek(syn::Token![=]) {
-                                let _: syn::Expr = meta.value()?.parse()?;
-                            }
-                            Ok(())
-                        })?;
-                    }
                     if attr.path().is_ident("shape") {
-                        attr.parse_nested_meta(|meta| {
-                            if !meta.path.is_ident("code") {
-                                return Err(meta.error("expected code"));
-                            }
-                            value = meta.value()?.parse::<LitStr>()?.value();
-                            Ok(())
-                        })?;
+                        for shape in crate::attrs::validate_shape_attr(attr)? {
+                            let crate::attrs::ShapeAttr::Code(code) = shape else {
+                                return Err(syn::Error::new_spanned(attr, "expected code"));
+                            };
+                            value = code.value();
+                        }
                     }
                 }
                 if !seen.insert(value.clone()) {
@@ -191,20 +157,6 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
             }
         }
     })
-}
-
-fn snake_case(name: &str) -> String {
-    name.chars()
-        .enumerate()
-        .flat_map(|(i, c)| {
-            let mut out = String::new();
-            if i > 0 && c.is_uppercase() {
-                out.push('_');
-            }
-            out.extend(c.to_lowercase());
-            out.chars().collect::<Vec<_>>()
-        })
-        .collect()
 }
 
 #[cfg(test)]

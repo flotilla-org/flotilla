@@ -14,7 +14,7 @@
 
 use crate::{
     code::Code,
-    descriptor::{ColumnDef, ColumnType, Expansion, FieldColumns, Guard, Index, Table, TableRole, TableSet, When},
+    descriptor::{ColumnDef, ColumnType, Expansion, FieldColumns, Guard, Index, SchemaMode, Table, TableRole, TableSet, When},
     value::KindCode,
 };
 
@@ -96,6 +96,7 @@ impl Layout {
         let root = Table { generated: vec![id, version], ..root };
         Layout {
             set: TableSet {
+                mode: SchemaMode::Stored,
                 kind: kind.to_owned(),
                 code,
                 tables: vec![root],
@@ -110,6 +111,7 @@ impl Layout {
     /// Starts a table description without any columns or identity supplied by a store.
     pub fn description(name: &str) -> Layout {
         let mut layout = Self::root(name, KindCode::new("query"));
+        layout.set.mode = SchemaMode::DescribeOnly;
         layout.set.tables[0].generated.clear();
         layout
     }
@@ -244,7 +246,7 @@ impl Layout {
         }
         // A query can contain an optional struct with only optional fields. Description
         // has no codec needing to distinguish absent from present-but-empty in that case.
-        if scope.required.is_empty() && self.set.tables[0].generated.is_empty() {
+        if scope.required.is_empty() && self.set.mode == SchemaMode::DescribeOnly {
             return;
         }
         let first = scope.required.first().cloned().unwrap_or_else(|| {
@@ -294,7 +296,7 @@ impl Layout {
             key,
             own_key: 0,
             columns: Vec::new(),
-            generated: if self.set.tables[0].generated.is_empty() { Vec::new() } else { vec![owner] },
+            generated: if self.set.mode == SchemaMode::DescribeOnly { Vec::new() } else { vec![owner] },
             guards: Vec::new(),
             enums: Vec::new(),
             fields: Vec::new(),

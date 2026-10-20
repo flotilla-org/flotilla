@@ -87,7 +87,44 @@ impl FieldAttr {
 }
 
 fn store_attrs(attrs: &[Attribute]) -> impl Iterator<Item = &Attribute> {
-    attrs.iter().filter(|attr| attr.path().is_ident("store") || attr.path().is_ident("shape"))
+    attrs.iter().filter(|attr| attr.path().is_ident("store"))
+}
+
+fn shape_attrs(attrs: &[Attribute]) -> impl Iterator<Item = &Attribute> {
+    attrs.iter().filter(|attr| attr.path().is_ident("shape"))
+}
+
+pub(crate) enum ShapeAttr {
+    Child,
+    Flatten,
+    Intern(LitStr),
+    Code(LitStr),
+}
+
+/// Parse the shape namespace once. Storage policy never reaches the storage parser through it.
+pub(crate) fn validate_shape_attr(attr: &Attribute) -> syn::Result<Vec<ShapeAttr>> {
+    let mut parsed = Vec::new();
+    attr.parse_nested_meta(|meta| {
+        let value = if meta.path.is_ident("code") {
+            ShapeAttr::Code(meta.value()?.parse()?)
+        } else if meta.path.is_ident("intern") {
+            ShapeAttr::Intern(meta.value()?.parse()?)
+        } else if meta.path.is_ident("child") || meta.path.is_ident("flatten") {
+            if !meta.input.is_empty() && !meta.input.peek(syn::Token![,]) {
+                return Err(meta.error("child and flatten take no arguments"));
+            }
+            if meta.path.is_ident("child") {
+                ShapeAttr::Child
+            } else {
+                ShapeAttr::Flatten
+            }
+        } else {
+            return Err(meta.error("shape attributes are child, intern, flatten and code; storage attributes belong in #[store(...)]"));
+        };
+        parsed.push(value);
+        Ok(())
+    })?;
+    Ok(parsed)
 }
 
 fn path_name(path: &syn::Path) -> String {
@@ -97,20 +134,6 @@ fn path_name(path: &syn::Path) -> String {
 pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
     let mut parsed = TypeAttrs { kind: None, code: None, indexes: Vec::new(), labels: None, state: None, edges: None };
     for attr in store_attrs(attrs) {
-        if attr.path().is_ident("shape") {
-            attr.parse_nested_meta(|meta| {
-                let name = path_name(&meta.path);
-                if !["child", "intern", "flatten", "code"].contains(&name.as_str()) {
-                    return Err(
-                        meta.error("shape attributes are child, intern, flatten and code; storage attributes belong in #[store(...)]")
-                    );
-                }
-                if meta.input.peek(syn::Token![=]) {
-                    let _: LitStr = meta.value()?.parse()?;
-                }
-                Ok(())
-            })?;
-        }
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
             match name.as_str() {
@@ -158,26 +181,23 @@ pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
             Ok(())
         })?;
     }
+    for attr in shape_attrs(attrs) {
+        for shape in validate_shape_attr(attr)? {
+            let ShapeAttr::Code(value) = shape else {
+                return Err(refuse(attr, "only code is a type shape attribute"));
+            };
+            let value = (code(&value)?, value.span());
+            if parsed.code.replace(value).is_some() {
+                return Err(syn::Error::new_spanned(attr, "`code` is given twice"));
+            }
+        }
+    }
     Ok(parsed)
 }
 
 pub(crate) fn field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
     let mut found = FieldAttrs { shape: None, alias: None, domain: None };
     for attr in store_attrs(attrs) {
-        if attr.path().is_ident("shape") {
-            attr.parse_nested_meta(|meta| {
-                let name = path_name(&meta.path);
-                if !["child", "intern", "flatten", "code"].contains(&name.as_str()) {
-                    return Err(
-                        meta.error("shape attributes are child, intern, flatten and code; storage attributes belong in #[store(...)]")
-                    );
-                }
-                if meta.input.peek(syn::Token![=]) {
-                    let _: LitStr = meta.value()?.parse()?;
-                }
-                Ok(())
-            })?;
-        }
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
             if name == "alias" {
@@ -217,26 +237,32 @@ pub(crate) fn field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
             Ok(())
         })?;
     }
+    for attr in shape_attrs(attrs) {
+        for shape in validate_shape_attr(attr)? {
+            let parsed = match shape {
+                ShapeAttr::Child => FieldAttr::Child,
+                ShapeAttr::Flatten => FieldAttr::Flatten,
+                ShapeAttr::Intern(domain) => {
+                    code(&domain)?;
+                    found.domain = Some(domain);
+                    FieldAttr::Intern
+                }
+                ShapeAttr::Code(_) => return Err(refuse(attr, "code belongs on enum variants and kinds, not fields")),
+            };
+            if let Some(previous) = found.shape.replace(parsed) {
+                return Err(refuse(
+                    attr,
+                    format_args!("a field takes one shape or storage attribute, found `{}` and `{}`", previous.name(), parsed.name()),
+                ));
+            }
+        }
+    }
     Ok(found)
 }
 
 pub(crate) fn variant_code(attrs: &[Attribute]) -> syn::Result<Option<(String, Span)>> {
     let mut code = None;
     for attr in store_attrs(attrs) {
-        if attr.path().is_ident("shape") {
-            attr.parse_nested_meta(|meta| {
-                let name = path_name(&meta.path);
-                if !["child", "intern", "flatten", "code"].contains(&name.as_str()) {
-                    return Err(
-                        meta.error("shape attributes are child, intern, flatten and code; storage attributes belong in #[store(...)]")
-                    );
-                }
-                if meta.input.peek(syn::Token![=]) {
-                    let _: LitStr = meta.value()?.parse()?;
-                }
-                Ok(())
-            })?;
-        }
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
             if name != "code" {
@@ -248,6 +274,16 @@ pub(crate) fn variant_code(attrs: &[Attribute]) -> syn::Result<Option<(String, S
             }
             Ok(())
         })?;
+    }
+    for attr in shape_attrs(attrs) {
+        for shape in validate_shape_attr(attr)? {
+            let ShapeAttr::Code(value) = shape else {
+                return Err(refuse(attr, "only code is a variant shape attribute"));
+            };
+            if code.replace((self::code(&value)?, value.span())).is_some() {
+                return Err(syn::Error::new_spanned(attr, "`code` is given twice"));
+            }
+        }
     }
     Ok(code)
 }
@@ -279,5 +315,49 @@ fn code(value: &LitStr) -> syn::Result<String> {
             value,
             format!("a code is short text written by hand: one to {CODE_MAX} bytes, a lowercase ASCII letter then lowercase letters, digits or `_`, such as \"dr\""),
         ))
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use quote::quote;
+    use syn::DeriveInput;
+
+    // Review #3592: separate namespaces cannot bypass storage-policy refusals or make mixed
+    // duplicate attributes depend on source ordering. Enumerate all storage-only field policies.
+    #[test]
+    fn shape_namespaces_are_validated_independently() {
+        for storage in ["records", "history", "frozen", "cbor", "state"] {
+            let name = syn::Ident::new(storage, proc_macro2::Span::call_site());
+            let input: DeriveInput = syn::parse2(quote!(
+                struct Row {
+                    #[shape(#name)]
+                    value: String,
+                }
+            ))
+            .unwrap();
+            assert!(crate::expand(&input).is_err());
+        }
+        let mut messages = Vec::new();
+        for input in [
+            quote!(
+                #[shape(code = "a")]
+                #[store(code = "b")]
+                struct Row {
+                    value: String,
+                }
+            ),
+            quote!(
+                #[store(code = "b")]
+                #[shape(code = "a")]
+                struct Row {
+                    value: String,
+                }
+            ),
+        ] {
+            let input: DeriveInput = syn::parse2(input).unwrap();
+            messages.push(crate::expand(&input).unwrap_err().to_string());
+        }
+        assert_eq!(messages, vec!["`code` is given twice"; 2]);
     }
 }

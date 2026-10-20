@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+from pathlib import Path
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -879,6 +880,18 @@ class BuildGraphContract(unittest.TestCase):
 
 
 class LayerContract(unittest.TestCase):
+    def test_protocol_descriptors_real_cargo_graph(self):
+        # ADR 0067: exercise the current production graph, not only a synthetic parser input.
+        root = Path(__file__).resolve().parents[2]
+        result = subprocess.run(["cargo", "tree", "--manifest-path", str(root / "Cargo.toml"),
+                                 "--locked", "-p", "flotilla-protocol", "--edges", "normal,build",
+                                 "--prefix", "none", "--format", "{p}|{f}"],
+                                check=True, capture_output=True, text=True)
+        tree = tree_features(result.stdout)
+        for expected in ("flotilla-schema", "flotilla-schema-derive", "flotilla-build-features-types"):
+            self.assertTrue(any(package.split()[0] == expected for package in tree), expected)
+        self.assertEqual(c_free_violations("flotilla-protocol", tree), [])
+
     def test_protocol_descriptors_keep_the_graph_storage_free(self):
         # ADR 0067: enumerate the allowed descriptor stack and both SQLite C entry points.
         descriptor_tree = "flotilla-protocol v0.1|\nflotilla-schema v0.1|\nflotilla-schema-derive v0.1|\nflotilla-build-features-types v0.1|"

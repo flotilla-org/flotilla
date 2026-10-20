@@ -38,6 +38,8 @@ pub const RESERVED_RECORD_COLUMNS: &[&str] = &["owner", RECORD_VERSION];
 /// encoder and decoder address tables by that index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSet {
+    /// Whether storage invariants apply; independent of generated-column metadata.
+    pub mode: SchemaMode,
     pub kind: String,
     pub code: KindCode,
     pub tables: Vec<Table>,
@@ -48,6 +50,13 @@ pub struct TableSet {
     /// The Rust names of the variants carrying [`TableSet::edges`], in the same order: the
     /// `codes` table's names for the kind's log entries, which only the readable views read.
     pub edge_names: Vec<String>,
+}
+
+/// The purpose of a table description. This is never inferred from its columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaMode {
+    Stored,
+    DescribeOnly,
 }
 
 /// How a table's rows may change through the owner's write.
@@ -329,7 +338,7 @@ impl TableSet {
     /// nullable column the predicate does not require, or whose predicate cannot hold as written.
     pub fn validate(&self) -> Result<(), DescriptorError> {
         let kind = || self.kind.clone();
-        let stored = self.tables.first().is_some_and(|table| !table.generated.is_empty());
+        let stored = self.mode == SchemaMode::Stored;
         let mut names = BTreeSet::new();
         for name in self.object_names() {
             if stored && SHARED_NAMES.contains(&name.as_str()) {

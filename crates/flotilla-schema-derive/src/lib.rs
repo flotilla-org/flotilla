@@ -18,6 +18,7 @@ mod describe;
 mod enums;
 mod fields;
 mod index;
+mod serde_names;
 mod shape;
 mod structs;
 

@@ -2,9 +2,20 @@
 use crate::{ColumnType, Columns, Layout, TableRole, TableSet};
 
 /// A value's flattened columns and child tables, independent of encoding or persistence.
+/// Collection fields select their shape explicitly:
+/// ```compile_fail
+/// #[derive(flotilla_schema::Describe)]
+/// struct MissingCollectionShape { values: Vec<String> }
+/// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` has no table description",
+    note = "derive Describe for row parts; annotate Vec, map and set fields with #[shape(child)]; unsupported wrappers need an explicit Describe implementation"
+)]
 pub trait Describe {
     fn describe(layout: &mut Layout, name: &str, required: bool);
 
+    /// Fallback for manual implementations of non-generic types. Generic manual implementations
+    /// should override this method with a stable source name; the derive uses its declaration name.
     fn table_set() -> TableSet {
         let name = std::any::type_name::<Self>().rsplit("::").next().unwrap_or("Query");
         let mut layout = Layout::description(name);
@@ -41,6 +52,10 @@ impl<K: crate::Kind> Describe for crate::Ref<K> {
 }
 
 /// Collection shape shared by describe-only rows; lists get positional keys exactly as stored lists do.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot describe a child table",
+    note = "#[shape(child)] accepts Vec, BTreeMap, HashMap, BTreeSet and HashSet whose elements implement Describe"
+)]
 pub trait DescribeChild {
     fn describe_child(layout: &mut Layout, name: &str);
 }
@@ -89,6 +104,8 @@ impl Describe for serde_json::Value {
 }
 
 // Nested collections retain a child table at every level rather than becoming object columns.
+// A BTreeMap used as an unnamed collection element uses the explicit fallback table name `items`;
+// named map fields keep their field name. Other collections require #[shape(child)] on a field.
 impl<K: Describe, V: Describe> Describe for std::collections::BTreeMap<K, V> {
     fn describe(layout: &mut Layout, name: &str, _required: bool) {
         <Self as DescribeChild>::describe_child(layout, if name.is_empty() { "items" } else { name });

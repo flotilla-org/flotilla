@@ -70,3 +70,79 @@ fn a_non_derived_source_can_add_semantic_properties() {
     assert_eq!(set.tables[0].columns[0].properties["operators"], serde_json::json!(["eq", "lt"]));
     assert!(set.tables[0].generated.is_empty());
 }
+
+#[derive(Describe)]
+#[allow(dead_code)] // Description-only fixtures deliberately have no value codec.
+struct AllOptional {
+    count: Option<u32>,
+    label: Option<String>,
+}
+
+#[derive(Describe)]
+#[allow(dead_code)]
+struct OptionalQuery {
+    part: Option<AllOptional>,
+}
+
+// Review #3592: describe-only optional parts may be present-but-empty; there is no codec
+// needing a presence discriminator, and all their flattened columns remain nullable.
+#[test]
+fn description_all_optional_parts_need_no_presence_guard() {
+    let set = OptionalQuery::table_set();
+    assert_eq!(set.mode, flotilla_schema::SchemaMode::DescribeOnly);
+    assert!(set.tables[0].guards.is_empty());
+    assert_eq!(
+        set.tables[0].columns.iter().map(|column| (column.name.as_str(), column.nullable)).collect::<Vec<_>>(),
+        [("part_count", true), ("part_label", true)]
+    );
+}
+
+// Review #3592: changing incidental generated-column metadata cannot select description mode
+// or bypass storage-only reserved-column invariants.
+#[test]
+fn storage_mode_does_not_depend_on_generated_columns() {
+    let mut layout = Layout::root("Stored", KindCode::new("st"));
+    layout.column("id", ColumnType::Text, true);
+    let mut set = layout.finish();
+    set.tables[0].generated.clear();
+    assert!(matches!(set.validate(), Err(flotilla_schema::DescriptorError::ReservedColumn { column, .. }) if column == "id"));
+}
+
+#[derive(Stored)]
+#[store(kind = "ShapeKind")]
+#[shape(code = "sk")]
+struct ShapeKind {
+    value: String,
+}
+
+// Review #3592: kind identity is a storage declaration, but its stable code may use the shape
+// namespace. Both namespaces are parsed separately into the one stored descriptor.
+#[test]
+fn stored_types_accept_the_shape_code_namespace() {
+    use flotilla_schema::Kind;
+    assert_eq!(ShapeKind::table_set().code, KindCode::new("sk"));
+}
+
+#[derive(Describe)]
+#[allow(dead_code)]
+struct MapRows {
+    #[shape(child)]
+    ordered: std::collections::BTreeMap<usize, bool>,
+    #[shape(child)]
+    hashed: std::collections::HashMap<usize, bool>,
+    #[shape(child)]
+    nested: std::collections::BTreeMap<String, std::collections::BTreeMap<usize, bool>>,
+}
+
+// Review #3592: supported scalars compose in child maps; unnamed nested map values get the
+// documented `items` table name, consistently carrying their parent's key.
+#[test]
+fn scalar_map_keys_and_values_compose_in_child_tables() {
+    let set = MapRows::table_set();
+    for table in &set.tables[1..3] {
+        assert_eq!(table.key[0].ty, ColumnType::Integer);
+        assert_eq!(table.columns[0].ty, ColumnType::Bool);
+    }
+    let nested = set.tables.iter().find(|table| table.name == "map_rows_nested_items").unwrap();
+    assert_eq!(nested.key.iter().map(|column| column.name.as_str()).collect::<Vec<_>>(), ["nested_key", "key"]);
+}
