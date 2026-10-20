@@ -1,9 +1,12 @@
 //! Per-kind statements, rendered once from the descriptor when the store opens. Every statement
 //! addresses rows by primary key: the root by `id`, child rows by `owner` plus their key.
 
+use crate::IndexPredicateSql;
+
 use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
-use flotilla_schema::{quote_ident, Code, ColumnDef, ColumnType, FieldColumns, Index, Table, TableRole, TableSet};
+use crate::quote_ident;
+use flotilla_schema::{Code, ColumnDef, ColumnType, FieldColumns, Index, Table, TableRole, TableSet};
 
 pub(crate) struct TableSql {
     pub name: String,
@@ -154,7 +157,7 @@ impl KindSql {
                  WHERE i.\"home\" = ?1 AND i.\"kind\" = ?2 AND i.\"id\" > ?3 ORDER BY i.\"id\" LIMIT ?4"
             ),
             edges: set.edges.clone(),
-            edge_state: set.edge_state().map(|(field, codes)| (field.name.clone(), codes.to_vec())),
+            edge_state: set.edge_state().map(|(field, codes)| (field.name.clone(), codes)),
         }
     }
 
@@ -265,6 +268,7 @@ impl IndexSql {
 fn lowest(ty: &ColumnType) -> &'static str {
     match ty {
         ColumnType::Text | ColumnType::Code(_) => "''",
+        ColumnType::Number => "-1e999",
         ColumnType::Blob | ColumnType::Frozen | ColumnType::Cbor => "x''",
         ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp | ColumnType::Interned(_) | ColumnType::Ref => {
             "-9223372036854775808"
@@ -462,7 +466,8 @@ fn prefixed_placeholders(from: usize, count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_schema::{render_ddl, Code, ColumnType, KindCode, Layout, TableRole, CODES_DDL};
+    use crate::{render_ddl, CODES_DDL};
+    use flotilla_schema::{Code, ColumnType, KindCode, Layout, TableRole};
     use rusqlite::Connection;
 
     use super::KindSql;
@@ -530,13 +535,13 @@ mod tests {
         let mut layout = Layout::root("Convoy", KindCode::new("k2"));
         layout.field("label", false, |layout| layout.column("label", ColumnType::Text, true));
         layout.field("state", true, |layout| {
-            layout.column("state", ColumnType::Code(vec![Code::new("c1"), Code::new("c2")]), true);
+            layout.column("state", ColumnType::Code(vec!["c1".to_owned(), "c2".to_owned()]), true);
             layout.column("state_since", ColumnType::Timestamp, true);
         });
         layout.table("deliverables", TableRole::Records, |layout| {
             layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
             layout.column("version", ColumnType::Integer, true);
-            layout.field("state", true, |layout| layout.column("state", ColumnType::Code(vec![Code::new("c1"), Code::new("c2")]), true));
+            layout.field("state", true, |layout| layout.column("state", ColumnType::Code(vec!["c1".to_owned(), "c2".to_owned()]), true));
             layout.table("evidence", TableRole::Records, |layout| {
                 layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
                 layout.column("version", ColumnType::Integer, true);

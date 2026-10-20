@@ -18,7 +18,7 @@ pub struct DispatchQueueResponse {
     pub entries: Vec<DispatchQueueRow>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct DispatchQueueRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<crate::DispatchScore>,

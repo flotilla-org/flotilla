@@ -71,7 +71,7 @@ fn aliases_name_fields_columns_and_tables_by_their_earlier_names() {
 
     assert_eq!(set.edges, PhaseEdge::CODES);
     let (state, labels) = set.edge_state().expect("one root state");
-    assert_eq!((state.name.as_str(), labels), ("phase", &[Code::new("cl"), Code::new("op")][..]));
+    assert_eq!((state.name.as_str(), labels.as_slice()), ("phase", &[Code::new("cl"), Code::new("op")][..]));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]

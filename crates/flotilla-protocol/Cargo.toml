@@ -12,6 +12,7 @@ sha2 = { workspace = true }
 default = []
 
 [dependencies]
+flotilla-schema = { path = "../flotilla-schema" }
 base64 = "0.22"
 bon = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
@@ -35,6 +36,7 @@ tempfile = { workspace = true }
 workspace = true
 
 # Keep native library features stable across build and test commands.
+# ADR 0067: base/types also anchor the storage-free schema descriptor dependency.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }
 flotilla-build-features-async = { path = "../flotilla-build-features-async" }

@@ -11,10 +11,11 @@ use std::{
     fmt,
 };
 
+use crate::DdlMode;
 use flotilla_schema::{
-    Cause, Change, Code, ColumnDef, ColumnType, DdlMode, DecodeError, Decoder, Edge, EdgeParts, EdgeRow, Effect, Encoder, Event, Hash,
-    Identity, IndexQuery, Kind, KindCode, KindRegistry, Named, Origin, Row, RowEdit, RowPath, Rows, TableRole, Timestamp, Value,
-    HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
+    Cause, Change, Code, ColumnDef, ColumnType, DecodeError, Decoder, Edge, EdgeParts, EdgeRow, Effect, Encoder, Event, Hash, Identity,
+    IndexQuery, Kind, KindCode, KindRegistry, Named, Origin, Row, RowEdit, RowPath, Rows, TableRole, Timestamp, Value, HOME_DOMAIN,
+    RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
 

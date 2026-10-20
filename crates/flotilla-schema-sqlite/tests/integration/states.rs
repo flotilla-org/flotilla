@@ -4,9 +4,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_schema::{
-    quote_ident, Cause, Change, Code, Edge, EdgeEvent, Event, Kind, Labelled, Position, Row, State, TableRole, Timestamp, Value,
-};
+use flotilla_schema::{Cause, Change, Code, Edge, EdgeEvent, Event, Kind, Labelled, Position, Row, State, TableRole, Timestamp, Value};
+use flotilla_schema_sqlite::quote_ident;
 use flotilla_schema_sqlite::{Applied, ResourceId, Snapshot, Stamp, Store, StoreError};
 use hegel::{generators as gs, TestCase};
 use rusqlite::{Connection, ErrorCode};

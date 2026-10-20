@@ -14,9 +14,11 @@
 //! `Ref<K>` names a kind without containing it, so references are not recursion.
 
 mod attrs;
+mod describe;
 mod enums;
 mod fields;
 mod index;
+mod serde_names;
 mod shape;
 mod structs;
 
@@ -25,7 +27,7 @@ use syn::{Data, DeriveInput, Fields, GenericParam};
 
 use crate::attrs::refuse;
 
-#[proc_macro_derive(Stored, attributes(store))]
+#[proc_macro_derive(Stored, attributes(store, shape))]
 pub fn derive_stored(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
     expand(&input).unwrap_or_else(syn::Error::into_compile_error).into()
@@ -49,6 +51,12 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             Fields::Unit => Err(structs::refuse_empty(input)),
         },
     }
+}
+
+#[proc_macro_derive(Describe, attributes(shape))]
+pub fn derive_describe(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as DeriveInput);
+    describe::expand(&input).unwrap_or_else(syn::Error::into_compile_error).into()
 }
 
 #[cfg(test)]

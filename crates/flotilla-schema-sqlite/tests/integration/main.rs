@@ -3,6 +3,10 @@
 mod bench;
 mod checks;
 mod ddl;
+mod derive_codec;
+mod derive_indexes;
+mod derive_layout;
+mod derive_states;
 mod domains;
 mod edges;
 mod fixtures;

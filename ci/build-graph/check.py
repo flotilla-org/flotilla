@@ -9,6 +9,8 @@ import sys
 
 
 # ADR 0060 step 2: these isolated production graphs must remain C-free.
+# ADR 0067: protocol may reach schema descriptors and their base/types anchors,
+# but must still reject SQLite or any other native storage dependency.
 C_FREE_BASE = frozenset({
     "flotilla-address", "flotilla-protocol", "flotilla-transport", "flotilla-paths",
     "flotilla-daemon-api", "flotilla-relay-protocol",

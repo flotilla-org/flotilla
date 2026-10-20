@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{quote_ident, Edge, Hash, Kind, Records, State, Table, Timestamp};
+use flotilla_schema::{Edge, Hash, Kind, Records, State, Table, Timestamp};
+use flotilla_schema_sqlite::quote_ident;
 use flotilla_schema_sqlite::{Loaded, Stamp, Store, StoreError};
 use flotilla_state_machines::{
     machines::{

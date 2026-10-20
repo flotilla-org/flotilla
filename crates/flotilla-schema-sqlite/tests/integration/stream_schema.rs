@@ -1,7 +1,8 @@
 use std::{env, fs, path::Path};
 
-use flotilla_schema::{quote_ident, DdlMode, KindRegistry};
+use flotilla_schema::KindRegistry;
 use flotilla_schema_sqlite::schema_ddl;
+use flotilla_schema_sqlite::{quote_ident, DdlMode};
 use rusqlite::Connection;
 
 use crate::fixtures::registry;

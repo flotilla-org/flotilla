@@ -1,7 +1,8 @@
 //! The database refuses rows that break a tag's or an optional value's column rule, whoever writes
 //! them.
 
-use flotilla_schema::{code_literal, quote_ident, ColumnDef, ColumnType, Guard, Table, TableRole, When, RECORD_VERSION};
+use flotilla_schema::{ColumnDef, ColumnType, Guard, Table, TableRole, When, RECORD_VERSION};
+use flotilla_schema_sqlite::quote_ident;
 use flotilla_schema_sqlite::Write;
 use hegel::TestCase;
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, ErrorCode};
@@ -19,6 +20,7 @@ fn valid_value(conn: &Connection, column: &ColumnDef) -> SqlValue {
         ColumnType::Integer | ColumnType::Bool | ColumnType::Timestamp => SqlValue::Integer(1),
         ColumnType::Code(codes) => SqlValue::Text(codes[0].to_string()),
         ColumnType::Text => SqlValue::Text("x".into()),
+        ColumnType::Number => SqlValue::Real(1.0),
         ColumnType::Blob | ColumnType::Cbor => SqlValue::Blob(vec![0]),
         ColumnType::Frozen => any("SELECT hash FROM objects LIMIT 1"),
         ColumnType::Interned(_) => any("SELECT min(id) FROM strings"),
@@ -28,7 +30,7 @@ fn valid_value(conn: &Connection, column: &ColumnDef) -> SqlValue {
 
 fn condition(guard: &Guard) -> String {
     match &guard.when {
-        When::Is(code) => format!("{} = {}", quote_ident(&guard.column), code_literal(*code)),
+        When::Is(code) => format!("{} = '{}'", quote_ident(&guard.column), code.replace('\'', "''")),
         When::Present => format!("{} IS NOT NULL", quote_ident(&guard.column)),
     }
 }

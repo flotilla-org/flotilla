@@ -441,6 +441,7 @@ mod tests {
             let mut kinds = KindRegistry::new();
             kinds
                 .register_table_set(flotilla_schema::TableSet {
+                    mode: flotilla_schema::SchemaMode::Stored,
                     kind: "TestRecord".into(),
                     code: KindCode::new("ms"),
                     indexes: vec![],
@@ -456,7 +457,7 @@ mod tests {
                         columns: vec![],
                         guards: vec![],
                         enums: vec![],
-                        codes: vec![],
+                        generated: vec![],
                         fields: vec![],
                         field_aliases: vec![],
                         aliases: vec![],

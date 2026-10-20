@@ -1,6 +1,7 @@
 use std::{env, fs, path::Path};
 
-use flotilla_schema::{render_view, DdlMode, Kind, Timestamp};
+use flotilla_schema::{render_view, Kind, Timestamp};
+use flotilla_schema_sqlite::DdlMode;
 use flotilla_schema_sqlite::{schema_ddl, Store};
 use flotilla_state_machines::{
     machines::message::{Deliver, MemoryMessageWorld, MessageSpec, MessageWorld},
@@ -222,4 +223,57 @@ fn reopening_an_unchanged_schema_changes_nothing() {
         .query_row("SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'message_view'", [], |row| row.get(0))
         .expect("count");
     assert_eq!(views, 1, "a missing view is recreated");
+}
+
+// ADR 0067: the existing Message kind describes enum values, typed references and generated
+// structural roles. This constant descriptor is glue; one exact example covers its mapping.
+#[test]
+fn message_descriptor_carries_meaning_without_changing_storage() {
+    let set = Resource::<Message>::table_set();
+    let root = &set.tables[0];
+    let column = |name: &str| root.columns.iter().find(|column| column.name == name).expect("column");
+    assert_eq!(
+        column("state").categories,
+        [("aw", "Awaiting"), ("dr", "Dropped"), ("pe", "Pending"), ("se", "Settled")].map(|(code, name)| (code.into(), name.into()))
+    );
+    assert_eq!(column("in_reply_to").reference.as_deref(), Some("message"));
+    assert_eq!(column("in_reply_to").properties["roles"], serde_json::json!(["ref"]));
+    assert_eq!(column("state").properties["roles"], serde_json::json!(["state"]));
+    assert_eq!(column("state_since").properties["roles"], serde_json::json!(["time", "since"]));
+    assert!(column("admitted_seq").properties.is_empty(), "roles never come from names");
+    assert_eq!(root.generated[0].properties["roles"], serde_json::json!(["key", "ref"]));
+    assert_eq!(root.generated[1].properties["roles"], serde_json::json!(["sequence"]));
+    let child = &set.tables[1];
+    assert_eq!(child.generated[0].reference.as_deref(), Some("message"));
+    assert_eq!(child.key[0].properties["roles"], serde_json::json!(["key"]));
+    let log = set.log_table();
+    let column = |name: &str| log.columns.iter().find(|column| column.name == name).expect("log column");
+    assert_eq!(column("from").properties["roles"], serde_json::json!(["transition-from"]));
+    assert_eq!(column("to").properties["roles"], serde_json::json!(["transition-to"]));
+    assert_eq!(column("from").categories, root.columns.iter().find(|column| column.name == "state").unwrap().categories);
+    assert_eq!(column("at").properties["roles"], serde_json::json!(["time"]));
+    assert_eq!(column("cause").categories[0], ("create".into(), "Create".into()));
+    assert_eq!(log.key[1].properties["roles"], serde_json::json!(["key", "sequence"]));
+}
+
+// ADR 0067: richer inherited-key metadata must not alter the pre-existing SQLite DDL.
+// This example covers an enum map key inherited by a nested list, absent from the corpus fixtures.
+#[test]
+fn inherited_enum_key_metadata_preserves_sqlite_views() {
+    use flotilla_schema::{Code, ColumnType, KindCode, Layout, TableRole};
+    let mut layout = Layout::root("Tree", KindCode::new("tr"));
+    layout.table("parents", TableRole::Child, |layout| {
+        layout.key(|layout| layout.code("key", &[Code::new("a")], &["Active"], true));
+        layout.table("children", TableRole::Child, |layout| {
+            layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
+            layout.column("value", ColumnType::Text, true);
+        });
+    });
+    let set = layout.finish();
+    assert_eq!(set.tables[2].key[0].categories, [("a".into(), "Active".into())]);
+    let ddl = flotilla_schema_sqlite::render_ddl(&set);
+    assert!(ddl.contains("('tr', 'parents.key', 'a', 'Active')"));
+    assert!(!ddl.contains("parents_children.parents_key"));
+    let views = flotilla_schema_sqlite::render_views(&set);
+    assert!(views[2].1.contains("\"tree_parents_children\".\"parents_key\",\n"));
 }

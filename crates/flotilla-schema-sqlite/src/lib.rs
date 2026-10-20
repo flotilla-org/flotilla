@@ -33,6 +33,12 @@
 //! rendered DDL; opening the previous generation's schema belongs to the post-cut-over form of
 //! ADR 0047.
 
+mod ddl;
+pub use ddl::{
+    code_field, code_literal, quote_ident, render_ddl, render_ddl_with, render_views, ConditionSql, DdlMode, GuardSql, IndexPredicateSql,
+    CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD, VIEW_SUFFIX,
+};
+
 mod audit;
 mod cache;
 mod effect;

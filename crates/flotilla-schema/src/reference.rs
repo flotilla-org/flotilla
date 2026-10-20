@@ -86,6 +86,7 @@ impl<K: Kind> Columns for Ref<K> {
 
     fn layout(layout: &mut Layout, name: &str, required: bool) {
         layout.column(name, ColumnType::Ref, required);
+        layout.reference(&crate::snake_case(K::KIND));
     }
 
     fn encode(&self, e: &mut Encoder) -> Result<(), EncodeError> {

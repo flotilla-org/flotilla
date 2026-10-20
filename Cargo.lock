@@ -2823,6 +2823,7 @@ dependencies = [
  "flotilla-build-features-os",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-schema",
  "gethostname",
  "indexmap",
  "percent-encoding",
@@ -3129,6 +3130,7 @@ dependencies = [
  "hegeltest",
  "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
 ]

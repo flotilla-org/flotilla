@@ -30,6 +30,7 @@ pub struct RepositoryUpstream {
 /// remain owned by `flotilla-resources`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+#[derive(flotilla_schema::Describe)]
 pub struct RepositoryKey(pub String);
 
 impl std::fmt::Display for RepositoryKey {

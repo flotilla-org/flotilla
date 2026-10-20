@@ -71,7 +71,7 @@ pub enum QueryId {
 /// The Project scope owned by a curated query family. Repository membership
 /// expansion is an Aggregator implementation detail and never crosses the
 /// client protocol.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct QueryScope {
     pub namespace: String,
     pub name: String,
@@ -426,6 +426,22 @@ pub enum Rows {
 }
 
 impl Rows {
+    /// The description of this named query, independent of its current rows or scope.
+    /// This exhaustive match makes a new query require a self-describing row type.
+    pub fn table_set(&self) -> flotilla_schema::TableSet {
+        use flotilla_schema::Describe;
+        match self {
+            Self::Convoys { .. } => ConvoyRow::table_set(),
+            Self::Independents { .. } => IndependentRow::table_set(),
+            Self::Issues { .. } => IssueRow::table_set(),
+            Self::Checkouts { .. } => CheckoutRow::table_set(),
+            Self::Awareness { .. } => AwarenessNode::table_set(),
+            Self::StandingRoles { .. } => StandingRoleRow::table_set(),
+            Self::DispatchReady { .. } => crate::DispatchQueueRow::table_set(),
+            Self::ProjectRepositories { .. } => ProjectRepositoriesRow::table_set(),
+        }
+    }
+
     pub fn query(&self) -> QueryId {
         match self {
             Self::Convoys { scope, .. } => QueryId::Convoys { scope: scope.clone() },
@@ -512,13 +528,14 @@ impl Rows {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum AwarenessGrouping {
     #[default]
     Project,
     Convoy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct AwarenessLimit {
     pub groups: usize,
     pub entries: usize,
@@ -536,6 +553,7 @@ impl AwarenessLimit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum AwarenessKind {
     Fleet,
     Project,
@@ -549,6 +567,7 @@ pub enum AwarenessKind {
 /// Named-query family represented by one panel of a project awareness view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum AwarenessFamily {
     Convoys,
     Issues,
@@ -558,6 +577,7 @@ pub enum AwarenessFamily {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum AwarenessState {
     #[default]
     Unknown,
@@ -576,6 +596,7 @@ pub enum AwarenessState {
 /// demand, regard, or attention facts themselves.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum Salience {
     #[default]
     None,
@@ -585,7 +606,7 @@ pub enum Salience {
 }
 
 /// Centrally aggregated salience and freshness for one awareness family.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct AwarenessFamilySummary {
     pub family: AwarenessFamily,
     #[builder(default)]
@@ -596,6 +617,7 @@ pub struct AwarenessFamilySummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum AwarenessPhase {
     Convoy(ConvoyPhase),
     Work(WorkPhase),
@@ -603,7 +625,7 @@ pub enum AwarenessPhase {
     Issue(IssueState),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct AwarenessCounts {
     #[builder(default)]
     pub total: usize,
@@ -636,7 +658,7 @@ pub struct AwarenessCounts {
     pub independents: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct AwarenessLink {
     pub rel: String,
     pub target: String,
@@ -644,7 +666,7 @@ pub struct AwarenessLink {
 
 pub const AWARENESS_REL_FOR_CONVOY: &str = "for-convoy";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct AwarenessEntry {
     pub id: String,
     pub kind: AwarenessKind,
@@ -658,19 +680,23 @@ pub struct AwarenessEntry {
     pub as_of: Timestamp,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub refs: Vec<ResourceRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub issue_refs: Vec<IssueRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub links: Vec<AwarenessLink>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub annotations: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct AwarenessNode {
     pub id: String,
     pub kind: AwarenessKind,
@@ -687,21 +713,27 @@ pub struct AwarenessNode {
     pub counts: AwarenessCounts,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub refs: Vec<ResourceRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub issue_refs: Vec<IssueRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub links: Vec<AwarenessLink>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub annotations: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub entries: Vec<AwarenessEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub family_summaries: Vec<AwarenessFamilySummary>,
 }
 
@@ -722,7 +754,7 @@ fn is_zero(value: &usize) -> bool {
 }
 
 /// One row in an `issues{scope}` result set.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct IssueRow {
     pub reference: IssueRef,
     pub issue: Issue,
@@ -731,6 +763,7 @@ pub struct IssueRow {
 /// One concrete checkout observation in a scoped result set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
+#[derive(flotilla_schema::Describe)]
 pub struct CheckoutRow {
     pub resource: ResourceRef,
     /// Canonical Repository identity used for joins.
@@ -760,6 +793,7 @@ pub struct CheckoutRow {
 /// Lifecycle phase of an independent terminal session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum SessionPhase {
     #[default]
     Starting,
@@ -788,6 +822,7 @@ impl fmt::Display for SessionPhase {
 /// One row of the [`QueryId::Independents`] result set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
+#[derive(flotilla_schema::Describe)]
 pub struct IndependentRow {
     /// Row identity and merge key across hosts.
     pub resource: ResourceRef,
@@ -814,7 +849,7 @@ pub struct IndependentRow {
     pub phase: SessionPhase,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct CleatEndpoint {
     pub runtime_root: String,
     pub daemon: String,
@@ -823,16 +858,17 @@ pub struct CleatEndpoint {
 
 /// One authoritative Project definition. Presence of this row makes an empty
 /// `repositories` list known-empty; absence means the definition is unavailable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct ProjectRepositoriesRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ResourceRef>,
     pub resource: ResourceRef,
     pub display_name: String,
+    #[shape(child)]
     pub repositories: Vec<ProjectRepositoryMembership>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct ProjectRepositoryMembership {
     pub key: RepositoryKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -846,6 +882,7 @@ pub struct ProjectRepositoryMembership {
 /// [`ConvoyRow::ensured_from`] naming `resource.name`, never by display names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
+#[derive(flotilla_schema::Describe)]
 pub struct StandingRoleRow {
     /// The `ConvoyEnsure`; row identity and merge key across hosts.
     pub resource: ResourceRef,
@@ -873,6 +910,7 @@ pub struct StandingRoleRow {
 /// Why automatic admission of a standing role is suspended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum StandingRoleHold {
     BackingUnverified,
     RestartLimit,
@@ -890,6 +928,7 @@ impl StandingRoleHold {
 /// Convoy lifecycle phase as reported on query rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum ConvoyPhase {
     #[default]
     Pending,
@@ -928,6 +967,7 @@ impl fmt::Display for ConvoyPhase {
 /// Work lifecycle phase for one vessel within a convoy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum WorkPhase {
     #[default]
     Pending,
@@ -968,6 +1008,7 @@ impl fmt::Display for WorkPhase {
 /// One row of the [`QueryId::Convoys`] result set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum SurfaceState {
     #[default]
     Working,
@@ -1014,6 +1055,7 @@ impl SurfaceState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum HandledRung {
     Nudge,
     Supervisor,
@@ -1034,10 +1076,12 @@ impl HandledRung {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
+#[derive(flotilla_schema::Describe)]
 pub struct ConvoyRow {
     /// Counts by vessel/role, then promise state.
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[shape(child)]
     pub promise_counts: BTreeMap<String, BTreeMap<String, usize>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing_reason: Option<String>,
@@ -1045,6 +1089,7 @@ pub struct ConvoyRow {
     /// workflow snapshot or concrete Vessel exists.
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[shape(child)]
     pub admission_blockers: Vec<ReadinessBlocker>,
     /// Row identity and merge key across hosts.
     pub resource: ResourceRef,
@@ -1088,26 +1133,29 @@ pub struct ConvoyRow {
     /// Issues represented by this convoy, captured at admission time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub issues: Vec<ConvoyIssueRow>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub subjects: Vec<ConvoySubjectRow>,
     /// Vessels from the convoy's workflow snapshot.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub vessels: Vec<VesselRow>,
     #[builder(default)]
     pub surface_state: SurfaceState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct ConvoyIssueRow {
     pub reference: IssueRef,
     pub title: String,
     pub state: IssueState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct ConvoySubjectRow {
     pub subject: crate::Subject,
     pub relationship: crate::Relationship,
@@ -1120,7 +1168,7 @@ pub struct ConvoySubjectRow {
 }
 
 /// The external change request currently associated with a convoy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct ConvoyChangeRequest {
     pub id: String,
     pub status: ChangeRequestStatus,
@@ -1130,6 +1178,7 @@ pub struct ConvoyChangeRequest {
 /// Readiness is independent of workflow lifecycle and attachment capability.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum ReadinessState {
     Ready,
     #[default]
@@ -1153,16 +1202,17 @@ impl ReadinessState {
 
 /// Current evidence explaining an unavailable vessel. Resource identities and
 /// phases are retained so surfaces need not parse controller message prose.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct ReadinessBlocker {
     pub resource: ResourceRef,
     pub phase: String,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct Readiness {
     pub state: ReadinessState,
+    #[shape(child)]
     pub blockers: Vec<ReadinessBlocker>,
 }
 
@@ -1223,6 +1273,7 @@ impl ConvoyRow {
 /// One vessel within a [`ConvoyRow`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
+#[derive(flotilla_schema::Describe)]
 pub struct VesselRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_ref: Option<String>,
@@ -1243,6 +1294,7 @@ pub struct VesselRow {
     pub placement_decision: Option<crate::PlacementDecision>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub crew: Vec<CrewMemberSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_at: Option<Timestamp>,
@@ -1267,6 +1319,7 @@ pub struct VesselRow {
     /// Names of sibling vessels this vessel depends on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
+    #[shape(child)]
     pub depends_on: Vec<String>,
     /// Host whose daemon can act on this vessel.
     pub host: HostName,
@@ -1286,7 +1339,7 @@ pub struct VesselRow {
 }
 
 /// Crew membership summary on a vessel row.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct CrewMemberSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
@@ -1509,5 +1562,114 @@ mod tests {
         let json = serde_json::to_string(&set).expect("serialize truncated projection");
         assert!(json.contains(r#""state":{"truncated":true}"#));
         assert_eq!(serde_json::from_str::<ResultSet>(&json).expect("deserialize truncated projection").state, state);
+    }
+}
+
+#[cfg(test)]
+mod description_tests {
+    use super::*;
+    use flotilla_schema::{ColumnType, Describe, TableRole};
+
+    // ADR 0067: named-query rows use the derive's flattening and typed child tables without
+    // implementing any stored codec. These fixed descriptions need one exact mapping example.
+    #[test]
+    fn issue_and_project_rows_describe_enums_and_nested_lists() {
+        let issue = IssueRow::table_set();
+        assert_eq!(issue.tables[0].name, "issue_row");
+        assert!(issue.tables[0].generated.is_empty());
+        let state = issue.tables[0].columns.iter().find(|column| column.name == "issue_state").unwrap();
+        assert_eq!(state.ty, ColumnType::Code(vec!["open".into(), "closed".into()]));
+        assert_eq!(state.categories, [("open".into(), "Open".into()), ("closed".into(), "Closed".into())]);
+        let labels = issue.tables.iter().find(|table| table.name == "issue_row_issue_labels").unwrap();
+        assert_eq!((labels.role, labels.parent), (TableRole::Child, Some(0)));
+        assert_eq!(labels.key[0].name, "pos");
+        assert_eq!(labels.key[0].properties["roles"], serde_json::json!(["key"]));
+        assert_eq!((labels.columns[0].name.as_str(), &labels.columns[0].ty), ("value", &ColumnType::Text));
+        let projects = ProjectRepositoriesRow::table_set();
+        let repositories = &projects.tables[1];
+        assert_eq!(repositories.name, "project_repositories_row_repositories");
+        assert_eq!(
+            repositories.columns.iter().map(|column| (column.name.as_str(), column.nullable)).collect::<Vec<_>>(),
+            [("key", false), ("slug", true), ("subpath", true)]
+        );
+    }
+
+    // Every named-query root, including the Awareness nested lists, must produce a descriptor.
+    // This exhausts the finite set of current query rows and includes optional all-null parts.
+    #[test]
+    fn all_named_queries_describe_their_existing_rows() {
+        let sets = [
+            IssueRow::table_set(),
+            CheckoutRow::table_set(),
+            IndependentRow::table_set(),
+            ProjectRepositoriesRow::table_set(),
+            StandingRoleRow::table_set(),
+            AwarenessNode::table_set(),
+            ConvoyRow::table_set(),
+            crate::DispatchQueueRow::table_set(),
+        ];
+        for set in sets {
+            set.validate().unwrap_or_else(|error| panic!("{}: {error}", set.kind));
+            assert!(!set.tables[0].columns.is_empty(), "{}", set.kind);
+            assert!(set.tables.iter().all(|table| table.generated.is_empty()));
+        }
+        let dispatch = crate::DispatchQueueRow::table_set();
+        let weight = dispatch.tables[0].columns.iter().find(|column| column.name == "score_attributes_weight").unwrap();
+        assert_eq!(weight.ty, ColumnType::Number);
+        assert!(weight.nullable);
+        assert_eq!(Rows::DispatchReady { scope: None, rows: vec![] }.table_set(), dispatch);
+        let awareness = AwarenessNode::table_set();
+        assert!(awareness
+            .tables
+            .iter()
+            .any(|table| table.field == "links" && table.parent.is_some_and(|parent| awareness.tables[parent].field == "entries")));
+    }
+}
+
+#[cfg(test)]
+mod serde_category_tests {
+    use super::*;
+    use crate::{Priority, Relationship, SubjectKind};
+    use flotilla_schema::Describe;
+
+    fn serialized_code<T: Serialize>(value: &T, tag: Option<&str>) -> String {
+        let value = serde_json::to_value(value).unwrap();
+        let code = tag.map_or(&value, |tag| &value[tag]);
+        code.as_str().unwrap().to_owned()
+    }
+
+    // An exhaustive match makes adding a variant require another real serialization example.
+    macro_rules! categories {
+        ($ty:ident, $tag:expr, $( $variant:ident => $value:expr ),+ $(,)?) => {{
+            let _exhaustive = |value: $ty| match value { $( $ty::$variant { .. } => (), )+ };
+            let expected = vec![$((serialized_code(&$value, $tag), stringify!($variant).to_owned())),+];
+            let set = <$ty as Describe>::table_set();
+            assert_eq!(set.tables[0].columns[0].categories, expected, stringify!($ty));
+        }};
+    }
+
+    // Review #3592: every current query-row enum's categories agree with Serde's real output.
+    // Enumerate the finite variant set, including both tagged data enums; no mirrored rename rules.
+    #[test]
+    fn every_query_row_enum_matches_its_serde_output() {
+        categories!(AwarenessGrouping, None, Project => AwarenessGrouping::Project, Convoy => AwarenessGrouping::Convoy);
+        categories!(AwarenessKind, None, Fleet => AwarenessKind::Fleet, Project => AwarenessKind::Project, Convoy => AwarenessKind::Convoy, Issue => AwarenessKind::Issue, Vessel => AwarenessKind::Vessel, Independent => AwarenessKind::Independent, Checkout => AwarenessKind::Checkout);
+        categories!(AwarenessFamily, None, Convoys => AwarenessFamily::Convoys, Issues => AwarenessFamily::Issues, Checkouts => AwarenessFamily::Checkouts, Independents => AwarenessFamily::Independents);
+        categories!(AwarenessState, None, Unknown => AwarenessState::Unknown, Idle => AwarenessState::Idle, Pending => AwarenessState::Pending, Waiting => AwarenessState::Waiting, Active => AwarenessState::Active, Done => AwarenessState::Done, Failed => AwarenessState::Failed, Cancelled => AwarenessState::Cancelled);
+        categories!(Salience, None, None => Salience::None, Info => Salience::Info, Attention => Salience::Attention, Urgent => Salience::Urgent);
+        categories!(AwarenessPhase, Some("kind"), Convoy => AwarenessPhase::Convoy(ConvoyPhase::Pending), Work => AwarenessPhase::Work(WorkPhase::Pending), Session => AwarenessPhase::Session(SessionPhase::Starting), Issue => AwarenessPhase::Issue(IssueState::Open));
+        categories!(SessionPhase, None, Starting => SessionPhase::Starting, Running => SessionPhase::Running, Stopped => SessionPhase::Stopped, Failed => SessionPhase::Failed);
+        categories!(StandingRoleHold, None, BackingUnverified => StandingRoleHold::BackingUnverified, RestartLimit => StandingRoleHold::RestartLimit);
+        categories!(ConvoyPhase, None, Pending => ConvoyPhase::Pending, Active => ConvoyPhase::Active, Interrupted => ConvoyPhase::Interrupted, Landing => ConvoyPhase::Landing, Landed => ConvoyPhase::Landed, Failed => ConvoyPhase::Failed, Abandoned => ConvoyPhase::Abandoned);
+        categories!(WorkPhase, None, Pending => WorkPhase::Pending, Ready => WorkPhase::Ready, Launching => WorkPhase::Launching, Running => WorkPhase::Running, Stalled => WorkPhase::Stalled, Interrupted => WorkPhase::Interrupted, Complete => WorkPhase::Complete, Failed => WorkPhase::Failed, Cancelled => WorkPhase::Cancelled, Abandoned => WorkPhase::Abandoned);
+        categories!(SurfaceState, Some("state"), Working => SurfaceState::Working, Available => SurfaceState::Available, StalledHandled => SurfaceState::StalledHandled { rung: HandledRung::Nudge }, NeedsYou => SurfaceState::NeedsYou);
+        categories!(HandledRung, None, Nudge => HandledRung::Nudge, Supervisor => HandledRung::Supervisor, Bosun => HandledRung::Bosun, Governor => HandledRung::Governor);
+        categories!(ReadinessState, None, Ready => ReadinessState::Ready, Unknown => ReadinessState::Unknown, Provisioning => ReadinessState::Provisioning, Blocked => ReadinessState::Blocked, Failed => ReadinessState::Failed);
+        categories!(LifecycleAuthority, None, Observed => LifecycleAuthority::Observed, Adopted => LifecycleAuthority::Adopted, Managed => LifecycleAuthority::Managed);
+        categories!(ChangeRequestStatus, None, Open => ChangeRequestStatus::Open, Draft => ChangeRequestStatus::Draft, Merged => ChangeRequestStatus::Merged, Closed => ChangeRequestStatus::Closed);
+        categories!(IssueState, None, Open => IssueState::Open, Closed => IssueState::Closed);
+        categories!(Priority, None, Urgent => Priority::Urgent, High => Priority::High, Medium => Priority::Medium, Low => Priority::Low);
+        categories!(SubjectKind, None, ChangeRequest => SubjectKind::ChangeRequest, Issue => SubjectKind::Issue);
+        categories!(Relationship, None, WorksOn => Relationship::WorksOn, Produces => Relationship::Produces, Adopts => Relationship::Adopts, Supersedes => Relationship::Supersedes, References => Relationship::References);
     }
 }

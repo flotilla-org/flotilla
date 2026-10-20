@@ -6,7 +6,7 @@
 //! every id and rows compare equal across databases. Serde reaches storage only through `frozen` and `cbor` fields.
 //!
 //! ```
-//! use flotilla_schema::{render_ddl, Decoder, Encoder, Kind, Stored};
+//! use flotilla_schema::{Decoder, Encoder, Stored};
 //!
 //! #[derive(Debug, PartialEq, Stored)]
 //! #[store(kind = "Note", code = "k9")]
@@ -15,12 +15,24 @@
 //!     pinned: Option<bool>,
 //! }
 //!
-//! let ddl = render_ddl(&Note::table_set());
-//! assert!(ddl.starts_with("CREATE TABLE \"note\" ("));
 //! let note = Note { body: "hi".into(), pinned: None };
 //! assert_eq!(Decoder::decode::<Note>(Encoder::encode(&note)?)?, note);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! `#[derive(Describe)]` and `#[shape(child)]`, `#[shape(flatten)]`, `#[shape(intern = "nm")]`
+//! and `#[shape(code = "value")]` describe query rows through the same [`Layout`], without a
+//! storage codec or write handles. `Stored` also accepts these shape attributes; existing
+//! `#[store(...)]` annotations remain supported. Storage policy (`records`, `history`, `frozen`)
+//! belongs only to `Stored`. Descriptions keep Rust field names, including when Serde applies
+//! `rename_all_fields`, variant-level `rename_all` or field `rename`. Enum category values follow
+//! Serde's serialization-side variant renaming; deserialization aliases do not change categories.
+//! SQL rendering and its extension traits live in `flotilla-schema-sqlite`.
+//!
+//! Each [`ColumnDef`] carries enum categories, a reference target and open semantic properties.
+//! Structural `roles` are arrays of strings (`key`, `ref`, `state`, `since`, `sequence`, `time`,
+//! `transition-from`, `transition-to`). [`Layout::description`] starts a builder for other sources;
+//! [`TableSet::log_table`] describes the shared event log for one kind, including its labels.
 //!
 //! A field type outside the list is refused at its `Column` bound, whose diagnostic names the
 //! list. Here a struct is used without `flatten`:
@@ -45,8 +57,9 @@ extern crate self as flotilla_schema;
 pub mod adapt;
 mod code;
 mod codec;
-mod ddl;
+mod describe;
 mod descriptor;
+pub use describe::{Describe, DescribeChild};
 mod edge;
 mod event;
 mod frozen;
@@ -67,12 +80,9 @@ mod view;
 pub use code::{code_value, decode_code};
 pub use code::{Code, CodeError, ADDRESS_DOMAIN, HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN};
 pub use codec::{DecodeError, Decoder, EncodeError, Encoder};
-pub use ddl::{
-    code_field, quote_ident, render_ddl, render_ddl_with, render_views, DdlMode, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD, VIEW_SUFFIX,
-};
 pub use descriptor::{
-    code_literal, CodeNames, ColumnDef, ColumnType, Condition, DescriptorError, Expansion, FieldColumns, Guard, Index, IndexProblem, Table,
-    TableRole, TableSet, When, RECORD_VERSION, RESERVED_CHILD_COLUMNS, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES,
+    ColumnDef, ColumnType, Condition, DescriptorError, Expansion, FieldColumns, Guard, Index, IndexProblem, SchemaMode, Table, TableRole,
+    TableSet, When, RECORD_VERSION, RESERVED_CHILD_COLUMNS, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS, SHARED_NAMES, VIEW_SUFFIX,
 };
 pub use edge::{
     AppendTo, ColumnOf, Edge, EdgeAppend, EdgeError, EdgeHeader, EdgeParts, EdgeRow, EdgeSet, FieldOf, HistoryOf, LabelCheck, RecordsOf,
@@ -80,7 +90,7 @@ pub use edge::{
 };
 pub use event::{Cause, Change, Effect, Event, EventError, Named, Origin, Step, LOG_LIMITS};
 pub use flotilla_address::Address;
-pub use flotilla_schema_derive::Stored;
+pub use flotilla_schema_derive::{Describe, Stored};
 pub use frozen::{Freezable, Frozen};
 pub use history::{EdgeEvent, Labelled};
 pub use inline::{Cbor, INLINE_LIMITS};

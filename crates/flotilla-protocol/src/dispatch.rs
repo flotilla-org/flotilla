@@ -7,6 +7,7 @@ use crate::{DispatchQueueRow, IssueRef};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(flotilla_schema::Describe)]
 pub enum Priority {
     Urgent,
     High,
@@ -18,6 +19,7 @@ pub enum Priority {
 /// Finite nonnegative mission weight with a total order and canonical zero.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "f64", into = "f64")]
+#[derive(flotilla_schema::Describe)]
 pub struct MissionWeight(f64);
 impl TryFrom<f64> for MissionWeight {
     type Error = String;
@@ -53,6 +55,7 @@ impl Default for MissionWeight {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "MissionAttributesRecord")]
+#[derive(flotilla_schema::Describe)]
 pub struct MissionAttributes {
     pub priority: Priority,
     pub weight: MissionWeight,
@@ -107,12 +110,13 @@ impl From<MissionFieldsRecord> for MissionFields {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct DispatchScore {
     pub mission: String,
     pub mission_issue: Option<IssueRef>,
     pub attributes: MissionAttributes,
     pub membership: String,
+    #[shape(child)]
     pub attribute_sources: std::collections::BTreeMap<String, String>,
     pub unblock_count: usize,
     pub conflict_penalty: u64,

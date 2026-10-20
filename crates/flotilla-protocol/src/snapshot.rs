@@ -8,6 +8,7 @@ use crate::host::RepoIdentity;
 /// Populated from a `flotilla.work/repo` label on the convoy resource when present.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+#[derive(flotilla_schema::Describe)]
 pub struct RepoKey(pub String);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

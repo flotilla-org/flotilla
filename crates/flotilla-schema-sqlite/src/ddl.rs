@@ -12,7 +12,8 @@
 
 use std::fmt::Write as _;
 
-use crate::descriptor::{code_literal, ColumnDef, ColumnType, Table, TableRole, TableSet};
+use flotilla_schema::Code;
+use flotilla_schema::{ColumnDef, ColumnType, Condition, Guard, Index, Table, TableRole, TableSet, When};
 
 /// The shared table naming every code: one row per (kind, field, code), `name` the Rust name of
 /// the variant carrying it. `kind` is the kind code and `field` the code column: its name on the
@@ -31,7 +32,7 @@ pub const LOG_EDGE_FIELD: &str = "log:edge";
 pub const LOG_LABEL_FIELD: &str = "log:label";
 
 /// The suffix of a table's readable view: `<table>_view`.
-pub const VIEW_SUFFIX: &str = "_view";
+pub use flotilla_schema::VIEW_SUFFIX;
 
 /// Whether statements may meet objects that already exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,10 +106,20 @@ fn render_codes(out: &mut String, set: &TableSet, mode: DdlMode) {
     let mut rows: Vec<(String, String, String)> = set
         .tables
         .iter()
-        .flat_map(|table| table.codes.iter().map(move |codes| (table, codes)))
+        .flat_map(|table| {
+            // Inherited keys retain their meaning in the descriptor. Existing SQLite views
+            // name only a table's own enums, preserving the established DDL exactly.
+            table
+                .key
+                .iter()
+                .skip(table.parent_key().len())
+                .chain(&table.columns)
+                .filter(|column| !column.categories.is_empty())
+                .map(move |column| (table, column))
+        })
         .flat_map(|(table, codes)| {
-            let field = text_literal(&code_field(set, table, &codes.column));
-            codes.names.iter().map(move |(code, name)| (field.clone(), code_literal(*code), text_literal(name)))
+            let field = text_literal(&code_field(set, table, &codes.name));
+            codes.categories.iter().map(move |(code, name)| (field.clone(), text_literal(code), text_literal(name)))
         })
         .collect();
     let edge = text_literal(LOG_EDGE_FIELD);
@@ -117,11 +128,14 @@ fn render_codes(out: &mut String, set: &TableSet, mode: DdlMode) {
         let root = &set.tables[0];
         let labels = set.edge_state().and_then(|(field, _)| {
             let column = &root.columns[field.columns.start].name;
-            root.codes.iter().find(|codes| &codes.column == column)
+            root.columns.iter().find(|codes| &codes.name == column)
         });
         let label = text_literal(LOG_LABEL_FIELD);
         rows.extend(
-            labels.into_iter().flat_map(|codes| &codes.names).map(|(code, name)| (label.clone(), code_literal(*code), text_literal(name))),
+            labels
+                .into_iter()
+                .flat_map(|codes| &codes.categories)
+                .map(|(code, name)| (label.clone(), text_literal(code), text_literal(name))),
         );
     }
     if !rows.is_empty() {
@@ -158,10 +172,10 @@ fn readable(set: &TableSet, table: &Table) -> (String, String) {
         None => ["id", "version"].iter().map(|column| format!("{source}.{}", quote_ident(column))).collect(),
         Some(_) => vec![format!("{source}.{}", quote_ident("owner"))],
     };
-    for column in table.key.iter().chain(&table.columns) {
+    for (position, column) in table.key.iter().chain(&table.columns).enumerate() {
         let value = format!("{source}.{}", quote_ident(&column.name));
         let alias = quote_ident(&column.name);
-        let named = table.codes.iter().any(|codes| codes.column == column.name);
+        let named = position >= table.parent_key().len() && !column.categories.is_empty();
         lines.push(match column.ty {
             ColumnType::Code(_) if named => format!(
                 "(SELECT \"name\" FROM \"codes\" WHERE \"kind\" = {} AND \"field\" = {} AND \"code\" = {value}) AS {alias}",
@@ -217,6 +231,7 @@ fn column(column: &ColumnDef) -> String {
     let name = quote_ident(&column.name);
     let sql_type = match column.ty {
         ColumnType::Text | ColumnType::Code(_) => "TEXT",
+        ColumnType::Number => "REAL",
         ColumnType::Blob | ColumnType::Frozen | ColumnType::Cbor => "BLOB",
         _ => "INTEGER",
     };
@@ -232,23 +247,98 @@ fn column(column: &ColumnDef) -> String {
             let _ = write!(out, " CHECK ({name} IN (0, 1))");
         }
         ColumnType::Code(codes) => {
-            let codes: Vec<String> = codes.iter().copied().map(code_literal).collect();
+            let codes: Vec<String> = codes.iter().map(|code| text_literal(code)).collect();
             let _ = write!(out, " CHECK ({name} IN ({}))", codes.join(", "));
         }
-        ColumnType::Integer | ColumnType::Text | ColumnType::Blob | ColumnType::Cbor | ColumnType::Timestamp => {}
+        ColumnType::Integer | ColumnType::Number | ColumnType::Text | ColumnType::Blob | ColumnType::Cbor | ColumnType::Timestamp => {}
     }
     out
+}
+
+/// SQLite rendering of a structured row guard.
+pub trait GuardSql {
+    fn check(&self) -> String;
+    fn check_with(&self, separator: &str) -> String;
+}
+impl GuardSql for Guard {
+    /// `CASE WHEN <cond> THEN <required> IS NOT NULL AND <absent> IS NULL [ELSE <otherwise> IS
+    /// NULL] END`. A CASE without a match is null, which a CHECK accepts.
+    fn check(&self) -> String {
+        self.check_with(" ")
+    }
+
+    /// The CHECK with `separator` before `THEN`, `ELSE` and each term, for readable DDL.
+    fn check_with(&self, separator: &str) -> String {
+        let and = format!("{separator}AND ");
+        let required = self.required.iter().map(|name| format!("{} IS NOT NULL", quote_ident(name)));
+        let absent = self.absent.iter().map(|name| format!("{} IS NULL", quote_ident(name)));
+        let then = conjunction(required.chain(absent), &and);
+        let column = quote_ident(&self.column);
+        let condition = match &self.when {
+            When::Is(code) => format!("{column} = {}", text_literal(code)),
+            When::Present => format!("{column} IS NOT NULL"),
+        };
+        let mut out = format!("CASE WHEN {condition}{separator}THEN {then}");
+        if !self.otherwise.is_empty() {
+            let otherwise = conjunction(self.otherwise.iter().map(|name| format!("{} IS NULL", quote_ident(name))), &and);
+            out.push_str(&format!("{separator}ELSE {otherwise}"));
+        }
+        out.push_str(&format!("{separator}END"));
+        out
+    }
+}
+
+/// SQLite rendering of an index predicate term.
+pub trait ConditionSql {
+    fn sql(&self) -> String;
+}
+impl ConditionSql for Condition {
+    fn sql(&self) -> String {
+        match self {
+            Condition::In { column, codes } => {
+                let codes: Vec<String> = codes.iter().copied().map(code_literal).collect();
+                format!("{} IN ({})", quote_ident(column), codes.join(", "))
+            }
+            Condition::NotNull { column } => format!("{} IS NOT NULL", quote_ident(column)),
+        }
+    }
+}
+/// SQLite rendering of an index predicate.
+pub trait IndexPredicateSql {
+    fn predicate_sql(&self) -> Option<String>;
+}
+impl IndexPredicateSql for Index {
+    /// The predicate's terms joined by `AND`; `None` for a full index.
+    fn predicate_sql(&self) -> Option<String> {
+        if self.predicate.is_empty() {
+            None
+        } else {
+            Some(self.predicate.iter().map(Condition::sql).collect::<Vec<_>>().join(" AND "))
+        }
+    }
+}
+/// A code as an SQL string literal. Codes hold only letters, digits and `_`, so need no escaping.
+pub fn code_literal(code: Code) -> String {
+    format!("'{code}'")
+}
+
+fn conjunction(terms: impl Iterator<Item = String>, and: &str) -> String {
+    let terms: Vec<String> = terms.collect();
+    if terms.is_empty() {
+        "1".to_owned()
+    } else {
+        terms.join(and)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{render_ddl, render_ddl_with, DdlMode};
-    use crate::{
-        code::Code,
-        descriptor::{ColumnType, Condition, DescriptorError, Index, IndexProblem, TableRole, RECORD_VERSION},
-        layout::Layout,
-        value::KindCode,
-    };
+    use flotilla_schema::{Code, ColumnType, Condition, DescriptorError, Index, IndexProblem, KindCode, Layout, TableRole, RECORD_VERSION};
+
+    fn text_codes(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).into()).collect()
+    }
 
     fn codes(codes: &[&str]) -> Vec<Code> {
         codes.iter().map(|code| Code::new(code)).collect()
@@ -380,7 +470,7 @@ FROM "convoy_deliverables_evidence";
     #[test]
     fn guard_checks_render_as_table_constraints() {
         let mut layout = Layout::root("Edge", KindCode::new("k1"));
-        layout.column("event", ColumnType::Code(codes(&["dr", "go"])), true);
+        layout.column("event", ColumnType::Code(text_codes(&["dr", "go"])), true);
         let datums = [layout.scope(|layout| layout.column("event_cause", ColumnType::Text, true))];
         layout.tag_guard("event", Code::new("dr"), &datums, &[(0, true)]);
         layout.tag_guard("event", Code::new("go"), &datums, &[]);
@@ -476,7 +566,7 @@ FROM "convoy_deliverables_evidence";
     fn validate_refuses_malformed_indexes() {
         let problem = |index: Index| {
             let mut layout = Layout::root("Note", KindCode::new("k1"));
-            layout.column("phase", ColumnType::Code(codes(&["dr", "op"])), true);
+            layout.column("phase", ColumnType::Code(text_codes(&["dr", "op"])), true);
             layout.column("due", ColumnType::Timestamp, false);
             layout.column("seq", ColumnType::Integer, true);
             layout.column("owner", ColumnType::Ref, true);

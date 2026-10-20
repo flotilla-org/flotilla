@@ -53,7 +53,9 @@ impl<E: StateData> Columns for State<E> {
     fn layout(layout: &mut Layout, name: &str, required: bool) {
         layout.field(name, true, |layout| {
             layout.code(name, E::CODES, E::NAMES, required);
+            layout.role("state");
             Timestamp::layout(layout, &Layout::join(name, "since"), required);
+            layout.role("since");
         });
         E::layout_data(layout, name);
     }

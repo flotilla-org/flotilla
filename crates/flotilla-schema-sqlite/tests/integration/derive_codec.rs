@@ -1,6 +1,8 @@
 //! Derived layouts and logical rows for newtypes, code enums, data enums, `intern`, `flatten`,
 //! `state` and references, without a backend.
 
+use flotilla_schema_sqlite::GuardSql;
+
 use flotilla_schema::{
     Code, CodeEnum, ColumnType, DecodeError, Decoder, Element, Encoder, Guard, Identity, Kind, KindCode, Layout, Ref, Rows, State, Stored,
     Timestamp, Value,
@@ -150,7 +152,7 @@ fn derived_columns_follow_the_naming_rules() {
     set.validate().expect("valid");
     let root = &set.tables[0];
     let shape: Vec<(&str, &ColumnType, bool)> = root.columns.iter().map(|c| (c.name.as_str(), &c.ty, c.nullable)).collect();
-    let codes = |codes: &[&str]| ColumnType::Code(codes.iter().map(|code| Code::new(code)).collect());
+    let codes = |codes: &[&str]| ColumnType::Code(codes.iter().map(|code| (*code).to_owned()).collect());
     let code = codes(&["c2", "c7"]);
     assert_eq!(
         shape,
