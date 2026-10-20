@@ -5,7 +5,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from check import (CAPABILITY_CRATES, C_FREE_BASE, DISCOVERY_FORBIDDEN, RESOURCE_EXEMPTIONS, SCHEMA_CRATES, STATE_MACHINES, c_free_violations,
+from check import (AGENT_CONNECTOR, AGENT_CONNECTOR_FORBIDDEN, CAPABILITY_CRATES, C_FREE_BASE, DISCOVERY_FORBIDDEN, RESOURCE_EXEMPTIONS, SCHEMA_CRATES, STATE_MACHINES, c_free_violations,
                    vessel_graph_violations, feature_differences, is_testkit, layer, main, tree_features, violations)
 
 
@@ -507,6 +507,44 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-terminal", normal=("flotilla-protocol", "flotilla-provider-runtime")),
             package("flotilla-core", normal=("flotilla-terminal",)),
             package("flotilla-protocol"), package("flotilla-provider-runtime"),
+        )), [])
+
+    def test_terminal_refuses_resource_records(self):
+        # #2951 ruling 6: flotilla-terminal declares no flotilla-resources edge, normal or build.
+        for kind in ("normal", "build"):
+            with self.subTest(kind=kind):
+                self.assertEqual(violations(graph(
+                    package("flotilla-terminal", **{kind: ("flotilla-resources",)}), package("flotilla-resources"),
+                )), ["flotilla-terminal: must not depend directly on flotilla-resources"])
+        # The rule is about direct edges: discovery-api still reaches resources through flotilla-config.
+        self.assertEqual(violations(graph(
+            package("flotilla-terminal", normal=("flotilla-discovery-api",)),
+            package("flotilla-discovery-api", normal=("flotilla-resources",)), package("flotilla-resources"),
+        )), [])
+        # A dev-only edge is not a production dependency.
+        self.assertEqual(violations(graph(
+            package("flotilla-terminal", dev=("flotilla-resources",)), package("flotilla-resources"),
+        )), [])
+
+    def test_agent_connector_is_base_and_refuses_resources_and_stores(self):
+        # #3545: the contract crate is C-free base and reaches no resource or store crate.
+        self.assertEqual(AGENT_CONNECTOR, "flotilla-agent-connector")
+        self.assertEqual(layer(AGENT_CONNECTOR), "base")
+        # Finite generator: every forbidden crate named by the contract, direct and transitive, normal and build edges.
+        for target in ("flotilla-resources", "flotilla-store", "flotilla-store-memory", "flotilla-store-sqlite",
+                       "flotilla-store-http", "flotilla-engine-store", "flotilla-schema-sqlite"):
+            self.assertIn(target, AGENT_CONNECTOR_FORBIDDEN)
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertEqual(violations(graph(
+                            package(AGENT_CONNECTOR, **{kind: (middle,)}),
+                            package("adapter", normal=(target,)), package(target),
+                        )), [f"{AGENT_CONNECTOR}: must not depend on {target}, directly or transitively"])
+        # Consumers above the store may depend on the contract.
+        self.assertEqual(violations(graph(
+            package("flotilla-messaging", normal=(AGENT_CONNECTOR, "flotilla-store")),
+            package(AGENT_CONNECTOR), package("flotilla-store", normal=("flotilla-resources",)), package("flotilla-resources"),
         )), [])
 
     def test_cloud_agent_is_native_and_independent(self):

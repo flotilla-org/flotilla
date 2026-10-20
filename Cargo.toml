@@ -7,6 +7,7 @@ members = [
     "crates/flotilla-admission",
     "crates/flotilla-crew",
     "crates/flotilla-agent",
+    "crates/flotilla-agent-connector",
     "crates/flotilla-projections",
     "crates/flotilla-provisioning",
     "crates/flotilla-build-features",
