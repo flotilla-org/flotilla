@@ -499,9 +499,18 @@ async fn only_a_fixed_listen_port_serves_hooks() {
     assert_eq!(hooks.claude_code_launch(NAMESPACE, CODER), None, "port 0 keeps command hooks");
     drop(listener);
 
-    let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|probe| probe.local_addr()).expect("free port").port();
-    let fixed = ListenAddress::resolve_with(&format!("127.0.0.1:{port}"), |_, _| async { Ok(Vec::new()) }).await.expect("listen address");
-    let listener = TcpListener::bind(&fixed, state.path(), logins).await.expect("bind fixed port");
+    // A probed free port can be taken before the listener binds it; probe again if so.
+    let mut attempts = 0;
+    let (port, listener) = loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|probe| probe.local_addr()).expect("free port").port();
+        let fixed =
+            ListenAddress::resolve_with(&format!("127.0.0.1:{port}"), |_, _| async { Ok(Vec::new()) }).await.expect("listen address");
+        match TcpListener::bind(&fixed, state.path(), Arc::clone(&logins)).await {
+            Ok(listener) => break (port, listener),
+            Err(_) if attempts < 5 => attempts += 1,
+            Err(error) => panic!("bind fixed port: {error}"),
+        }
+    };
     let hooks = HookEndpoint::default();
     hooks.publish(&listener);
     let launch = hooks.claude_code_launch(NAMESPACE, CODER).expect("a fixed port serves hooks");
