@@ -485,6 +485,29 @@ fn no_listener_means_no_hook_endpoint() {
     assert_eq!(HookEndpoint::default().claude_code_launch(NAMESPACE, CODER), None);
 }
 
+// The hook URL is fixed into each crew's settings at launch, so only a listener with a
+// fixed port serves hooks: a port-0 listener binds elsewhere at the next start, and its
+// launches keep command hooks rather than post to a dead port.
+#[tokio::test]
+async fn only_a_fixed_listen_port_serves_hooks() {
+    let state = tempfile::tempdir().expect("state directory");
+    let logins = Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock)));
+    let ephemeral = ListenAddress::resolve_with("127.0.0.1:0", |_, _| async { Ok(Vec::new()) }).await.expect("listen address");
+    let listener = TcpListener::bind(&ephemeral, state.path(), Arc::clone(&logins)).await.expect("bind port 0");
+    let hooks = HookEndpoint::default();
+    hooks.publish(&listener);
+    assert_eq!(hooks.claude_code_launch(NAMESPACE, CODER), None, "port 0 keeps command hooks");
+    drop(listener);
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|probe| probe.local_addr()).expect("free port").port();
+    let fixed = ListenAddress::resolve_with(&format!("127.0.0.1:{port}"), |_, _| async { Ok(Vec::new()) }).await.expect("listen address");
+    let listener = TcpListener::bind(&fixed, state.path(), logins).await.expect("bind fixed port");
+    let hooks = HookEndpoint::default();
+    hooks.publish(&listener);
+    let launch = hooks.claude_code_launch(NAMESPACE, CODER).expect("a fixed port serves hooks");
+    assert_eq!(launch.base_url, format!("http://127.0.0.1:{port}/v1/hooks/claude-code"));
+}
+
 // Concurrent creators of the hook key all end up holding the one key that landed on disk,
 // so none of them mints tokens the next start refuses.
 #[test]
