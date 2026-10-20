@@ -188,14 +188,16 @@ pub trait Resource: Send + Sync + 'static {
     /// keep one event so lagging watchers relist instead of replaying history.
     const EVENT_HISTORY: crate::EventHistory = Self::REPLICATION_CLASS.event_history();
 
-    /// Opt into observation selection across local and replicated copies.
-    /// `None` keeps local-first reads. For observed subjects, a missing status
-    /// ranks below every status; observation time and authority break ties.
-    fn replica_read_rank(_object: &ResourceObject<Self>) -> Option<(Option<DateTime<Utc>>, &str)>
+    /// Select every visible copy using `replica_read_rank` instead of local-first reads.
+    const RANKED_REPLICA_READS: bool = false;
+
+    /// Rank observed subjects: missing status sorts last, then observation time
+    /// and authority. Shared selection adds local preference on an exact tie.
+    fn replica_read_rank(_object: &ResourceObject<Self>) -> (Option<DateTime<Utc>>, &str)
     where
         Self: Sized,
     {
-        None
+        (None, "")
     }
 
     /// Opt in to sibling validation at the authoritative write boundary.

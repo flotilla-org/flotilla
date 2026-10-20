@@ -846,6 +846,43 @@ fn empty_queued_batches_preserve_attention_cleanup(tc: hegel::TestCase) {
     });
 }
 
+async fn publish_remote_observation<T: flotilla_resources::Resource>(
+    home: &ResourceBackend,
+    observer: &ResourceBackend,
+    name: &str,
+    spec: &T::Spec,
+    status: &T::Status,
+) -> flotilla_resources::ResourceObject<T> {
+    let records = observer.using::<T>("flotilla");
+    let remote = records.create(&InputMeta::builder().name(name.into()).build(), spec).await.unwrap();
+    let observed = records.update_status(name, &remote.metadata.resource_version, status).await.unwrap();
+    home.replica_writer::<T>(NodeId::new("observer"), "flotilla").replace(&records.list().await.unwrap(), Utc::now()).await.unwrap();
+    observed
+}
+
+// For equal observation times, the larger authority wins over local provenance.
+// When authority also ties, local wins, independently of copy iteration order.
+fn assert_observation_authority_ties<T: flotilla_resources::Resource + Clone>(
+    observed: flotilla_resources::ResourceObject<T>,
+    set_authority: impl Fn(&mut T::Spec, &str),
+) {
+    let mut local = observed.clone();
+    let mut replica = observed;
+    set_authority(&mut local.spec, "authority-a");
+    set_authority(&mut replica.spec, "authority-z");
+    for local_first in [true, false] {
+        let copies = if local_first { [(&local, true), (&replica, false)] } else { [(&replica, false), (&local, true)] };
+        let selected = flotilla_resources::pick_replica_read(copies, |(object, local)| (*object, *local)).unwrap();
+        assert!(!selected.1, "larger authority wins even over an equally fresh local copy");
+    }
+    set_authority(&mut local.spec, "authority-z");
+    for local_first in [true, false] {
+        let copies = if local_first { [(&local, true), (&replica, false)] } else { [(&replica, false), (&local, true)] };
+        let selected = flotilla_resources::pick_replica_read(copies, |(object, local)| (*object, *local)).unwrap();
+        assert!(selected.1, "local wins only after observation time and authority tie");
+    }
+}
+
 // A demanded placeholder on the convoy home must never hide observations from
 // another host: triggering and delivery must agree, including a stalled merge.
 #[hegel::test]
@@ -938,7 +975,6 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
                 )
                 .await
                 .unwrap();
-            let meta = InputMeta::builder().name(name.clone()).build();
             let kind = if is_issue {
                 let key = flotilla_observation::issue_observer::IssueKey::new(
                     "flotilla",
@@ -949,28 +985,23 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
                 observed_at = if newer_placeholder { base + chrono::Duration::seconds(1) } else { Utc::now() };
                 let local = home.using::<Issue>("flotilla").get(&name).await.unwrap();
                 assert!(local.status.is_none(), "demand creates an empty local placeholder");
-                let records = observer.using::<Issue>("flotilla");
                 let mut spec = local.spec;
                 spec.observing_authority = "observer".into();
-                let remote = records.create(&meta, &spec).await.unwrap();
-                records
-                    .update_status(
-                        &name,
-                        &remote.metadata.resource_version,
-                        &flotilla_resources::IssueStatus {
-                            title: Default::default(),
-                            assignees: Default::default(),
-                            state: Observation::known(flotilla_resources::ObservedIssueState::Closed, observed_at),
-                            labels: Observation::known(vec![], observed_at),
-                            updated_at: Observation::known(observed_at, observed_at),
-                        },
-                    )
-                    .await
-                    .unwrap();
-                home.replica_writer::<Issue>(NodeId::new("observer"), "flotilla")
-                    .replace(&records.list().await.unwrap(), Utc::now())
-                    .await
-                    .unwrap();
+                let observed = publish_remote_observation::<Issue>(
+                    &home,
+                    &observer,
+                    &name,
+                    &spec,
+                    &flotilla_resources::IssueStatus {
+                        title: Default::default(),
+                        assignees: Default::default(),
+                        state: Observation::known(flotilla_resources::ObservedIssueState::Closed, observed_at),
+                        labels: Observation::known(vec![], observed_at),
+                        updated_at: Observation::known(observed_at, observed_at),
+                    },
+                )
+                .await;
+                assert_observation_authority_ties(observed, |spec, authority| spec.observing_authority = authority.into());
                 ObjectKind::Issue
             } else {
                 let key = ChangeRequestKey::new(
@@ -982,40 +1013,32 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
                 observed_at = if newer_placeholder { base + chrono::Duration::seconds(1) } else { Utc::now() };
                 let local = home.using::<ChangeRequest>("flotilla").get(&name).await.unwrap();
                 assert!(local.status.is_none(), "demand creates an empty local placeholder");
-                let records = observer.using::<ChangeRequest>("flotilla");
                 let mut spec = local.spec;
                 spec.observing_authority = "observer".into();
-                let remote = records.create(&meta, &spec).await.unwrap();
-                records
-                    .update_status(
-                        &name,
-                        &remote.metadata.resource_version,
-                        &flotilla_resources::ChangeRequestStatus {
-                            title: Default::default(),
-                            author: Default::default(),
-                            review_decision: Default::default(),
-                            review_requested_from_owner: Default::default(),
-                            state: Observation::known(
-                                if merged { ObservedChangeRequestState::Merged } else { ObservedChangeRequestState::Open },
-                                observed_at,
-                            ),
-                            head_sha: Observation::known("head".into(), observed_at),
-                            checks: Observation::known(
-                                if failed_checks { ObservedChecks::Fail } else { ObservedChecks::Pass },
-                                observed_at,
-                            ),
-                            review: flotilla_resources::ChangeRequestReviewObservation {
-                                actionable_at_head: Observation::known(true, observed_at),
-                            },
-                            mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
+                let observed = publish_remote_observation::<ChangeRequest>(
+                    &home,
+                    &observer,
+                    &name,
+                    &spec,
+                    &flotilla_resources::ChangeRequestStatus {
+                        title: Default::default(),
+                        author: Default::default(),
+                        review_decision: Default::default(),
+                        review_requested_from_owner: Default::default(),
+                        state: Observation::known(
+                            if merged { ObservedChangeRequestState::Merged } else { ObservedChangeRequestState::Open },
+                            observed_at,
+                        ),
+                        head_sha: Observation::known("head".into(), observed_at),
+                        checks: Observation::known(if failed_checks { ObservedChecks::Fail } else { ObservedChecks::Pass }, observed_at),
+                        review: flotilla_resources::ChangeRequestReviewObservation {
+                            actionable_at_head: Observation::known(true, observed_at),
                         },
-                    )
-                    .await
-                    .unwrap();
-                home.replica_writer::<ChangeRequest>(NodeId::new("observer"), "flotilla")
-                    .replace(&records.list().await.unwrap(), Utc::now())
-                    .await
-                    .unwrap();
+                        mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
+                    },
+                )
+                .await;
+                assert_observation_authority_ties(observed, |spec, authority| spec.observing_authority = authority.into());
                 ObjectKind::ChangeRequest
             };
             let row = LeafSubscriptionRow {

@@ -17,8 +17,10 @@ impl Resource for Issue {
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "issues", kind: "Issue" };
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Observations;
 
-    fn replica_read_rank(object: &crate::ResourceObject<Self>) -> Option<(Option<DateTime<Utc>>, &str)> {
-        Some((object.status.as_ref().map(|status| status.state.observed_at), object.spec.observing_authority.as_str()))
+    const RANKED_REPLICA_READS: bool = true;
+
+    fn replica_read_rank(object: &crate::ResourceObject<Self>) -> (Option<DateTime<Utc>>, &str) {
+        (object.status.as_ref().map(|status| status.state.observed_at), object.spec.observing_authority.as_str())
     }
 
     fn validate_spec_update(current: &Self::Spec, requested: &Self::Spec) -> Result<(), ResourceError> {
