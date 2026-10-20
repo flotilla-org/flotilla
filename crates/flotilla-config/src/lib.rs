@@ -323,6 +323,9 @@ pub struct DaemonConfig {
     /// without `[dummy_fleet]` until the cut-over checklist is done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primitives: Option<PrimitivesConfig>,
+    /// The optional loopback HTTP listener (ADR 0065); absent means none.
+    #[serde(default)]
+    pub http: HttpListenerConfig,
 }
 
 /// The `[primitives]` section. It moves only Message for now, so it has no keys.
@@ -338,6 +341,14 @@ impl DaemonConfig {
             (primitives, _) => Ok(primitives.as_ref()),
         }
     }
+}
+
+/// `[http]` in `daemon.toml`. `flotillad --http-listen` overrides `listen`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct HttpListenerConfig {
+    /// `host:port`; the host must be loopback or resolve only to loopback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
 }
 
 pub const DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(2).expect("default removal limit is positive");
@@ -361,6 +372,7 @@ impl Default for DaemonConfig {
             checkout_removal_concurrency: default_checkout_removal_concurrency(),
             dummy_fleet: None,
             primitives: None,
+            http: HttpListenerConfig::default(),
         }
     }
 }

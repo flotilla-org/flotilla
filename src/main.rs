@@ -19,7 +19,7 @@ use cli::{
     dispatch, query_installer_health, run_artifact_command, run_attach, run_complete, run_completions, run_control_command, run_daemon,
     run_daemon_bridge, run_daemon_dev_mode, run_daemon_stop, run_ensure_command, run_fleet_health, run_fleet_list, run_hook,
     run_hooks_command, run_image_command, run_logs, run_manifest_command, run_pm_command, run_resource_command, run_status,
-    run_topology_command, run_tui, run_wait, run_watch,
+    run_topology_command, run_tui, run_wait, run_watch, run_web_command,
 };
 
 fn binary_version() -> &'static str {
@@ -80,7 +80,9 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         Some(SubCommand::Daemon(DaemonArgs { command: Some(DaemonSubCommand::DevMode { command }), .. })) => {
             run_daemon_dev_mode(&cli, command).await
         }
-        Some(SubCommand::Daemon(DaemonArgs { command: None, timeout })) => run_daemon(&cli, timeout).await,
+        Some(SubCommand::Daemon(DaemonArgs { command: None, timeout, http_listen })) => {
+            run_daemon(&cli, timeout, http_listen.as_deref()).await
+        }
         Some(SubCommand::Status) => run_status(&cli, format).await,
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
         Some(SubCommand::Wait(WaitArgs { leaves, namespace, fresher_than, timeout })) => {
@@ -133,6 +135,7 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         Some(SubCommand::Hooks { command }) => run_hooks_command(&command).await,
         Some(SubCommand::Pm { command }) => run_pm_command(&cli, command).await,
         Some(SubCommand::Ensure { command }) => run_ensure_command(&cli, command, format).await,
+        Some(SubCommand::Web { command }) => run_web_command(&cli, command).await,
         Some(SubCommand::Resource { command }) => run_resource_command(&cli, command, format).await,
         Some(SubCommand::Manifest { command }) => run_manifest_command(&cli, command, format).await,
         Some(SubCommand::Artifact { command }) => run_artifact_command(&cli, command, format).await,

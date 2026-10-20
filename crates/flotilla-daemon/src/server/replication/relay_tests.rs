@@ -19,7 +19,7 @@ use tokio::{io::AsyncReadExt, net::UnixListener, task::JoinSet};
 use flotilla_replication::{replicate_kind_direct, replicate_relay_direct, ReplicationStore};
 
 use super::replication_host;
-use crate::server::resource_http::{serve_resource_http, serve_resource_http_with_daemon};
+use crate::server::http::serve_test_connection;
 
 async fn await_template(daemon: &InProcessDaemon, name: &str, expected: &WorkflowTemplateSpec) {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -138,7 +138,7 @@ async fn governor_relay_contract(storage: TestBackend) {
                 requests.spawn(async move {
                     if let Ok(first) = stream.read_u8().await {
                         // Client cancellation can close a watch mid-write.
-                        let _ = serve_resource_http(stream, first, backend).await;
+                        let _ = serve_test_connection(stream, first, backend, None).await;
                     }
                 });
             }
@@ -281,7 +281,7 @@ async fn observed_checkout_http_relay_keeps_ephemeral_origin_and_deletes() {
                 let daemon = Arc::clone(&server_daemon);
                 requests.spawn(async move {
                     if let Ok(first) = stream.read_u8().await {
-                        let _ = serve_resource_http_with_daemon(stream, first, daemon.resource_backend(), Some(daemon)).await;
+                        let _ = serve_test_connection(stream, first, daemon.resource_backend(), Some(daemon)).await;
                     }
                 });
             }
@@ -370,10 +370,11 @@ async fn http_digest_drill_down_reads_only_the_requested_partition() {
     let path = sockets.socket_path("digest.sock");
     let listener = UnixListener::bind(&path).expect("bind resource API");
     let server = tokio::spawn(async move {
-        for _ in 0..3 {
+        // The router keeps connections alive, so serve each one until the test ends.
+        loop {
             let (mut stream, _) = listener.accept().await.expect("accept digest request");
             let first = stream.read_u8().await.expect("request byte");
-            serve_resource_http(stream, first, backend.clone()).await.expect("serve digest");
+            tokio::spawn(serve_test_connection(stream, first, backend.clone(), None));
         }
     });
     let remote = ResourceBackend::new(HttpBackend::from_unix_socket(&path).expect("HTTP client")).using::<WorkflowTemplate>("flotilla");
@@ -386,5 +387,5 @@ async fn http_digest_drill_down_reads_only_the_requested_partition() {
     let listed = snapshot.snapshot::<WorkflowTemplate>(&children, bucket).expect("validated bucket");
     assert_eq!(listed.items.len(), 1);
     assert_eq!(listed.items[0].metadata.name, "retained");
-    server.await.expect("server");
+    server.abort();
 }

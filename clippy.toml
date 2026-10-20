@@ -85,6 +85,7 @@ absolute-paths-allowed-crates = [
     "rigging_process",
     "rigging_http_client",
     "rigging_replay_testkit",
+    "rigging_http_serve",
     "flotilla_store_testkit",
     "flotilla_test_support",
     "flotilla_transport",

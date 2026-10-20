@@ -38,6 +38,7 @@ flotilla-build-features-logging = { path = "../flotilla-build-features-logging" 
 tracing.workspace = true
 rusqlite = { version = "0.37", features = ["bundled", "functions"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
 serde_yml = "0.0.12"
 rigging-tls = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }

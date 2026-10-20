@@ -37,6 +37,10 @@ mod unix {
         /// Idle timeout in seconds (0 = no timeout)
         #[arg(long, default_value = "300")]
         timeout: u64,
+
+        /// Loopback HTTP listen address (host:port), overriding daemon.toml's `[http] listen`
+        #[arg(long)]
+        http_listen: Option<String>,
     }
 
     fn binary_version() -> &'static str {
@@ -83,7 +87,7 @@ mod unix {
         let state_dir = cli.state_dir();
         let socket_path = cli.socket_path();
         ensure_daemon_socket_belongs_to_config(&socket_path, &config_dir)?;
-        flotilla_daemon::cli::run(&socket_path, &config_dir, &state_dir, cli.timeout).await
+        flotilla_daemon::cli::run(&socket_path, &config_dir, &state_dir, cli.timeout, cli.http_listen.as_deref()).await
     }
 
     #[cfg(all(test, target_os = "linux"))]

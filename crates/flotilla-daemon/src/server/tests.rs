@@ -54,6 +54,7 @@ use super::cleanup_reverse_peer_resource_sockets;
 use super::client_connection::QuerySubscriptions;
 use super::handle_client;
 use super::handle_client_session;
+use super::http::serve_test_connection;
 use super::peer_connection::PEER_IDLE_TIMEOUT;
 use super::peer_runtime::forward_with_keepalive_for_test;
 use super::peer_runtime::retry_with_backoff_for_test;
@@ -69,7 +70,6 @@ use super::remote_commands::PendingRemoteCommandMap;
 use super::remote_commands::RemoteCommandRouter;
 use super::replication::replication_host;
 use super::request_dispatch::RequestDispatcher;
-use super::resource_http::serve_resource_http;
 use super::shared::sync_peer_query_state;
 use super::shared::write_message;
 use super::AcceptErrorBackoff;
@@ -255,13 +255,11 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind resource HTTP socket");
     let server_backend = source.clone();
     let server = tokio::spawn(async move {
-        for _ in 0..4 {
+        // The router keeps connections alive, so serve each one until the test ends.
+        loop {
             let (mut stream, _) = listener.accept().await.expect("accept resource HTTP request");
             let first_byte = tokio::io::AsyncReadExt::read_u8(&mut stream).await.expect("read HTTP preface");
-            let backend = server_backend.clone();
-            tokio::spawn(async move {
-                serve_resource_http(stream, first_byte, backend).await.expect("serve resource HTTP request");
-            });
+            tokio::spawn(serve_test_connection(stream, first_byte, server_backend.clone(), None));
         }
     });
 
@@ -302,7 +300,7 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
         WatchEvent::Added(object) if object.metadata.name == "after-watch"
     ));
 
-    server.await.expect("resource HTTP server task");
+    server.abort();
     std::fs::remove_file(&socket_path).expect("remove resource HTTP socket");
 }
 
@@ -377,13 +375,11 @@ async fn http_replication_resnapshots_after_quarantined_history() {
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind origin resource HTTP socket");
     let server_backend = origin.clone();
     let server = tokio::spawn(async move {
-        for _ in 0..3 {
+        // The router keeps connections alive, so serve each one until the test ends.
+        loop {
             let (mut stream, _) = listener.accept().await.expect("accept resource HTTP request");
             let first_byte = tokio::io::AsyncReadExt::read_u8(&mut stream).await.expect("read HTTP preface");
-            let backend = server_backend.clone();
-            tokio::spawn(async move {
-                serve_resource_http(stream, first_byte, backend).await.expect("serve resource HTTP request");
-            });
+            tokio::spawn(serve_test_connection(stream, first_byte, server_backend.clone(), None));
         }
     });
 
@@ -790,6 +786,72 @@ async fn spawn_test_client_handler(
         .await;
     });
     (tmp, client_stream, handle, client_count, shutdown_request_rx)
+}
+
+// The main socket's front door: one real Unix socket carries an HTTP connection to the
+// router and a framed client connection at once, each judged by its first byte.
+#[tokio::test]
+async fn main_socket_serves_http_and_framed_connections_side_by_side() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let sockets = TestSocketDir::new();
+    let socket_path = sockets.socket_path("main.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind main socket");
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let accept_daemon = Arc::clone(&daemon);
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let daemon = Arc::clone(&accept_daemon);
+            let peer_manager = Arc::clone(&peer_manager);
+            let shutdown_rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
+                let (shutdown_request_tx, _shutdown_request_rx) = mpsc::unbounded_channel();
+                let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
+                let remote_command_router = empty_remote_command_router(&daemon, &peer_manager);
+                handle_client(
+                    stream,
+                    daemon,
+                    shutdown_request_tx,
+                    shutdown_rx,
+                    peer_data_tx,
+                    peer_manager,
+                    remote_command_router,
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(Notify::new()),
+                    peer_connected_tx,
+                    flotilla_agent::shared_in_memory_agent_state_store(),
+                    None,
+                )
+                .await;
+            });
+        }
+    });
+
+    // A framed client completes its Hello and stays connected.
+    let framed = flotilla_transport::message::unix_message_session(tokio::net::UnixStream::connect(&socket_path).await.expect("framed"));
+    complete_client_hello(&framed).await;
+
+    // Meanwhile an HTTP client on the same socket reaches the router as the socket's caller.
+    let mut http = tokio::net::UnixStream::connect(&socket_path).await.expect("http");
+    tokio::io::AsyncWriteExt::write_all(&mut http, b"GET /v1/hello HTTP/1.1\r\nHost: flotilla\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("request");
+    let mut response = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut http, &mut response).await.expect("response");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body: serde_json::Value = serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1).expect("hello JSON");
+    assert_eq!(body["protocol_fingerprint"], flotilla_protocol::PROTOCOL_FINGERPRINT);
+    let remote = ResourceBackend::new(HttpBackend::from_unix_socket(&socket_path).expect("resource client"));
+    remote.using::<Convoy>("flotilla").list().await.expect("the resource API is served on the same socket");
+
+    // The framed connection is still live after the HTTP traffic.
+    framed.write(Message::Request { id: 7, request: Request::ListRepos }).await.expect("write request");
+    assert!(matches!(ok_response(read_session_message(&framed).await, 7), Response::ListRepos(_)));
+
+    let _ = shutdown_tx.send(true);
+    server.abort();
 }
 
 async fn empty_daemon_named(host_name: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {

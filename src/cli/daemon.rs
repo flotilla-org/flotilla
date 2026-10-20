@@ -57,7 +57,7 @@ pub(crate) async fn run_daemon_bridge(cli: &Cli) -> Result<()> {
     }
 }
 
-pub(crate) async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
+pub(crate) async fn run_daemon(cli: &Cli, timeout_secs: u64, http_listen: Option<&str>) -> Result<()> {
     cli.require_local_daemon("daemon")?;
     let daemon_binary = resolve_flotillad_binary()?;
     let CliPaths { config_dir, state_dir, socket_path } = cli.daemon_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
@@ -68,6 +68,9 @@ pub(crate) async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
     command.arg("--config-dir").arg(config_dir);
     command.arg("--state-dir").arg(state_dir);
     command.arg("--socket").arg(socket_path);
+    if let Some(address) = http_listen {
+        command.arg("--http-listen").arg(address);
+    }
     let status = command.status().await?;
     if status.success() {
         Ok(())

@@ -1,5 +1,5 @@
 //! HTTP adapter for the listener-independent ADR 0064 stream. Paths and framed CBOR bodies
-//! are independent of Unix sockets, SSH forwarding, and the future axum listener.
+//! are independent of Unix sockets and SSH forwarding; the router serves them.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -9,28 +9,68 @@ use flotilla_schema_sqlite::{
     StoreError,
 };
 use futures::StreamExt;
-use tokio::{
-    io::{AsyncWrite, AsyncWriteExt},
-    sync::mpsc,
-};
+use tokio::{io::AsyncWriteExt, sync::mpsc};
 
 const CADENCE: Duration = Duration::from_secs(5);
 const IO_DEADLINE: Duration = Duration::from_secs(15);
+/// How long the router's change-stream body waits on a consumer that stopped reading.
+pub(super) const CONSUMER_DEADLINE: Duration = IO_DEADLINE;
 const QUEUED_FRAMES: usize = 2;
 
 fn transport(error: impl std::fmt::Display) -> StoreError {
     StoreError::Stream(error.to_string())
 }
 
-/// Listener seam: write only requires AsyncWrite; the service supplies no listener or clock.
-pub(super) async fn serve<W: AsyncWrite + Unpin>(
-    writer: &mut W,
+pub(super) const CONTENT_TYPE: &str = "application/vnd.flotilla.log+cbor";
+
+/// Router seam: the frames as a response body. A consumer that stops reading for
+/// `deadline` ([`CONSUMER_DEADLINE`] in production) fails the stream: the producer gives up, releases the store, and the body
+/// ends with an error, so the client sees a failed stream rather than a clean end.
+pub(super) fn body(
     service: Arc<Service>,
     after: Option<u64>,
     clock: Arc<dyn flotilla_resources::Clock>,
     once: bool,
+    deadline: Duration,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+    let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(QUEUED_FRAMES);
+    let failure = Arc::new(std::sync::Mutex::new(None::<String>));
+    let failed = Arc::clone(&failure);
+    tokio::spawn(async move {
+        if let Err(error) = frames(service, after, clock, once, &tx, deadline).await {
+            // Never wait on a stalled consumer: the channel may be full. Record the failure
+            // for the body to report once it drains, then drop the sender.
+            *failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+        }
+    });
+    futures::stream::unfold((rx, failure), |(mut rx, failure)| async move {
+        match rx.recv().await {
+            Some(item) => Some((item, (rx, failure))),
+            None => {
+                let error = failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
+                Some((Err(std::io::Error::other(error)), (rx, failure)))
+            }
+        }
+    })
+}
+
+/// Queue one frame for the body, failing when the consumer stops reading for `deadline`.
+async fn emit(tx: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>, frame: Vec<u8>, deadline: Duration) -> Result<(), String> {
+    tokio::time::timeout(deadline, tx.send(Ok(frame.into())))
+        .await
+        .map_err(|_| "stream consumer stalled".to_owned())?
+        .map_err(|_| "stream consumer closed".to_owned())
+}
+
+/// Snapshot, then keepalives every [`CADENCE`]; with `once`, returns after the first round.
+async fn frames(
+    service: Arc<Service>,
+    after: Option<u64>,
+    clock: Arc<dyn flotilla_resources::Clock>,
+    once: bool,
+    body: &mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    deadline: Duration,
 ) -> Result<(), String> {
-    writer.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.flotilla.log+cbor\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.map_err(|e| e.to_string())?;
     let mut cursor = after;
     loop {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(QUEUED_FRAMES);
@@ -38,57 +78,24 @@ pub(super) async fn serve<W: AsyncWrite + Unpin>(
         let at = Timestamp::from_datetime(&clock.now());
         let task =
             tokio::task::spawn_blocking(move || source.serve(cursor, at, |frame| tx.blocking_send(frame.to_vec()).map_err(transport)));
-        // A writer error drops rx. The blocking worker may finish its current read/encode,
+        // An emit error drops rx. The blocking worker may finish its current read/encode,
         // then exits when blocking_send observes the closed, two-frame bounded channel.
         while let Some(frame) = rx.recv().await {
-            let chunk = async {
-                writer.write_all(format!("{:x}\r\n", frame.len()).as_bytes()).await?;
-                writer.write_all(&frame).await?;
-                writer.write_all(b"\r\n").await?;
-                writer.flush().await
-            };
-            tokio::time::timeout(IO_DEADLINE, chunk)
-                .await
-                .map_err(|_| "stream consumer stalled".to_owned())?
-                .map_err(|error| error.to_string())?;
+            emit(body, frame, deadline).await?;
         }
         cursor = Some(task.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?);
         if once {
-            writer.write_all(b"0\r\n\r\n").await.map_err(|error| error.to_string())?;
             return Ok(());
         }
         tokio::time::sleep(CADENCE).await;
     }
 }
 
-pub(super) async fn record<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    service: Arc<Service>,
-    kind: &str,
-    name: &str,
-    now: Timestamp,
-) -> Result<(), String> {
+/// One encoded point read, as the record route's body.
+pub(super) async fn query_record(service: Arc<Service>, kind: &str, name: &str, now: Timestamp) -> Result<Vec<u8>, String> {
     let kind = KindCode(Code::parse(kind).map_err(|e| e.to_string())?);
     let name = name.to_owned();
-    let bytes = tokio::task::spawn_blocking(move || service.query(kind, &name, now))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-    tokio::time::timeout(IO_DEADLINE, async {
-        writer
-            .write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.flotilla.log+cbor\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    bytes.len()
-                )
-                .as_bytes(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        writer.write_all(&bytes).await.map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|_| "record consumer stalled".to_owned())?
+    tokio::task::spawn_blocking(move || service.query(kind, &name, now)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
 }
 
 /// Surface point read: one local lookup, then one query through the home's forwarded HTTP
@@ -406,40 +413,17 @@ mod tests {
         assert_eq!(service.watermark("other").expect("other mark").applied_through, Timestamp(3));
     }
 
-    // The listener adapter emits standard HTTP chunking around the unchanged stream body.
-    // Duplex I/O proves it has no dependency on a Unix or TCP listener.
+    // The router's body carries the snapshot and keepalive frames, one per chunk, and a
+    // `once` stream ends cleanly after its first round.
     #[tokio::test]
-    async fn listener_seam_sends_snapshot_and_keepalive() {
+    async fn router_seam_sends_snapshot_and_keepalive_and_ends_once() {
         let store_dir = tempfile::tempdir().expect("dir");
         let service = Arc::new(Service::open(&store_dir.path().join("store.sqlite"), "home", KindRegistry::new()).expect("store"));
-        let (mut writer, mut reader) = tokio::io::duplex(4096);
-        let task = tokio::spawn(async move { serve(&mut writer, service, None, Arc::new(flotilla_resources::SystemClock), false).await });
-        let mut header = Vec::new();
-        while !header.ends_with(b"\r\n\r\n") {
-            let mut byte = [0];
-            reader.read_exact(&mut byte).await.expect("header");
-            header.push(byte[0]);
-        }
-        assert!(String::from_utf8(header).expect("header").contains("Transfer-Encoding: chunked"));
-        let mut kinds = Vec::new();
-        for _ in 0..3 {
-            let mut length = Vec::new();
-            while !length.ends_with(b"\r\n") {
-                let mut byte = [0];
-                reader.read_exact(&mut byte).await.expect("length");
-                length.push(byte[0]);
-            }
-            let len = usize::from_str_radix(std::str::from_utf8(&length[..length.len() - 2]).expect("length"), 16).expect("hex");
-            let mut body = vec![0; len];
-            reader.read_exact(&mut body).await.expect("body");
-            let mut end = [0; 2];
-            reader.read_exact(&mut end).await.expect("chunk end");
-            assert_eq!(&end, b"\r\n");
-            kinds.push(Frame::decode(&body).expect("frame"));
-        }
-        assert!(matches!(kinds.as_slice(), [Frame::Begin { .. }, Frame::End { .. }, Frame::Keepalive { .. }]));
-        task.abort();
+        let chunks: Vec<_> = body(service, None, Arc::new(flotilla_resources::SystemClock), true, CONSUMER_DEADLINE).collect().await;
+        let frames = chunks.into_iter().map(|chunk| Frame::decode(&chunk.expect("chunk")).expect("frame")).collect::<Vec<_>>();
+        assert!(matches!(frames.as_slice(), [Frame::Begin { .. }, Frame::End { .. }, Frame::Keepalive { .. }]), "{frames:?}");
     }
+
     // A routed miss is exactly one encoded point query to the home. Even an absent result
     // retains remote provenance and the age of the home time that served it.
     #[tokio::test]

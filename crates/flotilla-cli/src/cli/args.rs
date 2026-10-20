@@ -112,6 +112,11 @@ pub enum SubCommand {
         #[command(subcommand)]
         command: EnsureSubCommand,
     },
+    /// Browser access to the daemon's loopback HTTP listener
+    Web {
+        #[command(subcommand)]
+        command: WebSubCommand,
+    },
     /// Inspect raw daemon resources
     Resource {
         #[command(subcommand)]
@@ -150,6 +155,9 @@ pub struct DaemonArgs {
     /// Idle timeout in seconds (0 = no timeout)
     #[arg(long, default_value = "300")]
     pub timeout: u64,
+    /// Loopback HTTP listen address (host:port), overriding daemon.toml's `[http] listen`
+    #[arg(long)]
+    pub http_listen: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -523,6 +531,15 @@ pub enum EnsureSubCommand {
         #[arg(long)]
         host: Option<String>,
     },
+}
+
+#[derive(clap::Subcommand)]
+pub enum WebSubCommand {
+    /// Print a one-time browser login URL for the daemon's HTTP listener
+    ///
+    /// The code is minted over this host's daemon socket, works once and expires within
+    /// minutes. The daemon needs an HTTP listener (`[http] listen` or `--http-listen`).
+    Login,
 }
 
 #[derive(clap::Subcommand)]
@@ -1408,12 +1425,25 @@ mod tests {
     }
 
     #[test]
+    fn web_login_is_a_nested_web_command() {
+        let cli = Cli::try_parse_from(["flotilla", "web", "login"]).expect("web login should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Web { command: WebSubCommand::Login })));
+    }
+
+    #[test]
     fn daemon_stop_is_a_nested_daemon_command() {
         let cli = Cli::try_parse_from(["flotilla", "daemon", "stop"]).expect("daemon stop should parse");
         assert!(matches!(cli.command, Some(SubCommand::Daemon(DaemonArgs { command: Some(DaemonSubCommand::Stop), .. }))));
 
         let foreground = Cli::try_parse_from(["flotilla", "daemon", "--timeout", "0"]).expect("foreground daemon should still parse");
-        assert!(matches!(foreground.command, Some(SubCommand::Daemon(DaemonArgs { command: None, timeout: 0 }))));
+        assert!(matches!(foreground.command, Some(SubCommand::Daemon(DaemonArgs { command: None, timeout: 0, http_listen: None }))));
+
+        let listening =
+            Cli::try_parse_from(["flotilla", "daemon", "--http-listen", "127.0.0.1:7878"]).expect("daemon --http-listen should parse");
+        assert!(matches!(
+            listening.command,
+            Some(SubCommand::Daemon(DaemonArgs { command: None, http_listen: Some(ref address), .. })) if address == "127.0.0.1:7878"
+        ));
 
         let dev_mode = Cli::try_parse_from(["flotilla", "daemon", "dev-mode", "enable"]).expect("daemon dev-mode enable should parse");
         assert!(matches!(
