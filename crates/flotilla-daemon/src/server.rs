@@ -39,7 +39,7 @@ use tokio::{
     sync::{mpsc, watch, Mutex, Notify},
     task::JoinSet,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use self::{
     client_connection::ClientConnection,
@@ -780,6 +780,11 @@ async fn read_preface(stream: &mut tokio::net::UnixStream) -> Option<u8> {
             None
         }
         Ok(Ok(_)) => Some(first_byte[0]),
+        // A peer that connects and closes without a byte (a liveness probe) is not a fault.
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            debug!("connection closed before sending a preface");
+            None
+        }
         Ok(Err(error)) => {
             warn!(%error, "failed to read connection preface");
             None

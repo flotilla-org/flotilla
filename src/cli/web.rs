@@ -32,12 +32,18 @@ async fn mint_login_url(socket: &Path) -> Result<String> {
         .await
         .map_err(|error| eyre!("could not reach the daemon at {}: {error}", socket.display()))?;
     let status = response.status();
-    let body: serde_json::Value = response.json().await.map_err(|error| eyre!("daemon answered {status} without JSON: {error}"))?;
+    let text = response.text().await.map_err(|error| eyre!("read daemon response ({status}): {error}"))?;
+    let body = serde_json::from_str::<serde_json::Value>(&text).ok();
     if !status.is_success() {
-        let message = body["message"].as_str().unwrap_or("no reason given");
+        // Prefer the router's JSON message; otherwise show whatever the daemon sent.
+        let message = body.as_ref().and_then(|body| body["message"].as_str()).unwrap_or(text.trim());
+        let message = if message.is_empty() { "no reason given" } else { message };
         return Err(eyre!("daemon refused a login code ({status}): {message}"));
     }
-    body["url"].as_str().map(str::to_owned).ok_or_else(|| eyre!("daemon login code response has no url"))
+    body.as_ref()
+        .and_then(|body| body["url"].as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| eyre!("daemon login code response has no url: {}", text.trim()))
 }
 
 #[cfg(all(test, unix))]
@@ -68,5 +74,14 @@ mod tests {
         let socket = stand_in(&dir, (StatusCode::CONFLICT, serde_json::json!({"message": "no HTTP listener is configured"}))).await;
         let error = mint_login_url(&socket).await.expect_err("no listener").to_string();
         assert!(error.contains("409") && error.contains("no HTTP listener is configured"), "{error}");
+
+        // A refusal without a JSON body still reaches the user, with its status.
+        let dir = TestSocketDir::new();
+        let socket = dir.socket_path("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind stand-in");
+        let router = Router::new().route(LOGIN_CODES_PATH, post(|| async { (StatusCode::FORBIDDEN, "not on this socket") }));
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let error = mint_login_url(&socket).await.expect_err("plain refusal").to_string();
+        assert!(error.contains("403") && error.contains("not on this socket"), "{error}");
     }
 }
