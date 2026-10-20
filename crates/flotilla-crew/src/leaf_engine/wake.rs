@@ -484,63 +484,68 @@ impl ReconcilerWake {
                         });
                     }
                 }
-                for (vessel, crew) in &status.crew_work {
-                    for (role, work) in crew {
-                        let owes_promise = !flotilla_resources::promises::owned(status, vessel, role).is_empty();
-                        let owes_claim = owes_promise
-                            || status.workflow_snapshot.as_ref().is_some_and(|snapshot| {
-                                snapshot.vessels.iter().any(|requirement| {
-                                    requirement.name == *vessel
-                                        && requirement.crew.iter().any(|member| {
-                                            member.role == *role
-                                                && (!member.promises.is_empty() || !member.completion_conditions.is_empty())
-                                        })
-                                })
+                // Without an exit declaration this convoy is standing: its
+                // roles never owe settlement claims, even after assignment.
+                // A missing workflow snapshot likewise declares no exit.
+                if status.workflow_snapshot.as_ref().and_then(|snapshot| snapshot.exit.as_ref()).is_some() {
+                    for (vessel, crew) in &status.crew_work {
+                        for (role, work) in crew {
+                            let owes_promise = !flotilla_resources::promises::pending(status, vessel, role).is_empty();
+                            let owes_claim = owes_promise
+                                || status.workflow_snapshot.as_ref().is_some_and(|snapshot| {
+                                    snapshot.vessels.iter().any(|requirement| {
+                                        requirement.name == *vessel
+                                            && requirement.crew.iter().any(|member| {
+                                                member.role == *role
+                                                    && (!member.promises.is_empty() || !member.completion_conditions.is_empty())
+                                            })
+                                    })
+                                });
+                            // A launch is availability, not an assignment. A delivered task
+                            // owes a report even without a workflow claim; a declared stall
+                            // remains an obligation until resolved. An initial brief alone
+                            // does not assign a report, including for non-standing roles.
+                            if !owes_claim
+                                && !(work.phase == CrewWorkPhase::Working && work.task_assigned)
+                                && work.phase != CrewWorkPhase::Stalled
+                            {
+                                continue;
+                            }
+                            if status.stalled.as_ref().is_some_and(|stalled| {
+                                stalled.supervisor.is_some()
+                                    && stalled.leaves.iter().any(|leaf| {
+                                        leaf.address == LeafAddress::Work { convoy: convoy.metadata.name.clone(), work: vessel.clone() }
+                                            && leaf.field_path == format!(".crew.{role}.phase")
+                                    })
+                            }) {
+                                continue;
+                            }
+                            if !status
+                                .work
+                                .get(vessel)
+                                .is_some_and(|work| matches!(work.phase, WorkPhase::Launching | WorkPhase::Running | WorkPhase::Stalled))
+                                || matches!(work.phase, CrewWorkPhase::Done | CrewWorkPhase::Failed | CrewWorkPhase::HandedBack)
+                            {
+                                continue;
+                            }
+                            let leaf = Leaf {
+                                address: LeafAddress::Work { convoy: convoy.metadata.name.clone(), work: vessel.clone() },
+                                field_path: format!(".crew.{role}.phase"),
+                                operator: LeafOperator::Equal,
+                                literal: "Done".into(),
+                            };
+                            actor_obligation(&leaf)?;
+                            desired.push(LeafSubscriptionRow {
+                                id: uuid::Uuid::nil(),
+                                namespace: namespace.to_string(),
+                                leaves: vec![leaf],
+                                watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
+                                maker: LeafMaker::Actor { vessel: vessel.clone(), role: role.clone() },
+                                freshness_demand: None,
+                                created_at: Utc::now(),
+                                episode_key: EpisodeKeyFields::default(),
                             });
-                        // A launch is availability, not an assignment. A delivered task
-                        // owes a report even without a workflow claim; a declared stall
-                        // remains an obligation until resolved. An initial brief alone
-                        // does not assign a report, including for non-standing roles.
-                        if !owes_claim
-                            && !(work.phase == CrewWorkPhase::Working && work.task_assigned)
-                            && work.phase != CrewWorkPhase::Stalled
-                        {
-                            continue;
                         }
-                        if status.stalled.as_ref().is_some_and(|stalled| {
-                            stalled.supervisor.is_some()
-                                && stalled.leaves.iter().any(|leaf| {
-                                    leaf.address == LeafAddress::Work { convoy: convoy.metadata.name.clone(), work: vessel.clone() }
-                                        && leaf.field_path == format!(".crew.{role}.phase")
-                                })
-                        }) {
-                            continue;
-                        }
-                        if !status
-                            .work
-                            .get(vessel)
-                            .is_some_and(|work| matches!(work.phase, WorkPhase::Launching | WorkPhase::Running | WorkPhase::Stalled))
-                            || matches!(work.phase, CrewWorkPhase::Done | CrewWorkPhase::Failed | CrewWorkPhase::HandedBack)
-                        {
-                            continue;
-                        }
-                        let leaf = Leaf {
-                            address: LeafAddress::Work { convoy: convoy.metadata.name.clone(), work: vessel.clone() },
-                            field_path: format!(".crew.{role}.phase"),
-                            operator: LeafOperator::Equal,
-                            literal: "Done".into(),
-                        };
-                        actor_obligation(&leaf)?;
-                        desired.push(LeafSubscriptionRow {
-                            id: uuid::Uuid::nil(),
-                            namespace: namespace.to_string(),
-                            leaves: vec![leaf],
-                            watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
-                            maker: LeafMaker::Actor { vessel: vessel.clone(), role: role.clone() },
-                            freshness_demand: None,
-                            created_at: Utc::now(),
-                            episode_key: EpisodeKeyFields::default(),
-                        });
                     }
                 }
                 for delivery in instantiate_turn_delivery(convoy, &observed_change_requests, &forges)? {

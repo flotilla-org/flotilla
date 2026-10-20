@@ -462,7 +462,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
                         vessel: "work".to_string(),
                         role: "bosun".to_string(),
                     }]),
-                    exit: None,
+                    exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
                     turn_delivery: indexmap::IndexMap::from([(
                         "conflicting".to_string(),
                         flotilla_resources::TurnDeliveryRule::builder()

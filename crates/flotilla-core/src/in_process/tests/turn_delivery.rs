@@ -294,6 +294,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         let convoy = convoys.get("resume-staging").await.expect("convoy");
         let mut status = convoy.status.expect("status");
         status.phase = flotilla_resources::ConvoyPhase::Active;
+        status.workflow_snapshot.as_mut().expect("workflow").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
         status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Running;
         status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
         status.workflow_snapshot.as_mut().expect("workflow").stall_nudges.insert(

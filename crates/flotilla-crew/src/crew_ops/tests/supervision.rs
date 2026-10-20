@@ -1010,6 +1010,8 @@ async fn seed_escalation_stall(backend: &ResourceBackend, cursor: bool, operator
     let mut status = convoy.status.expect("status");
     status.phase = ConvoyPhase::Active;
     status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Running;
+    // This scenario escalates an ordinary convoy settlement obligation.
+    status.workflow_snapshot.as_mut().expect("workflow").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
     status.workflow_snapshot.as_mut().expect("workflow").vessels[0].crew[0].completion_conditions =
         vec![flotilla_resources::CrewCompletionExpectation::artifact_exists(
             "coder",

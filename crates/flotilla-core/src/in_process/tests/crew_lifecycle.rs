@@ -107,6 +107,7 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
                 phase: flotilla_resources::ConvoyPhase::Active,
                 workflow_snapshot: Some({
                     let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
+                    snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
                     snapshot.stall_nudges.insert(
                         "work/coder".into(),
                         flotilla_resources::StallNudgePolicy { max_per_episode: 2, max_refusals: None, idle_grace_seconds: Some(3) },
