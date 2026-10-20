@@ -1,5 +1,6 @@
 use super::*;
 use flotilla_resources::queued_turn_evidence;
+use flotilla_resources::{Observation, ObservedChangeRequestState, ObservedMergeability};
 use flotilla_store_memory::InMemoryBackend;
 
 // #2684: queue acceptance remains queued for every attention state. Only an
@@ -843,5 +844,309 @@ fn empty_queued_batches_preserve_attention_cleanup(tc: hegel::TestCase) {
         let expected = if attention_kind == 1 { None } else { attention };
         assert_eq!(after.status.as_ref().unwrap().attention, expected);
         assert_eq!(after.metadata.resource_version == before.metadata.resource_version, attention_kind != 1);
+    });
+}
+
+async fn demand_placeholder_spec<T: flotilla_resources::Resource>(
+    home: &ResourceBackend,
+    name: &str,
+    demand: impl std::future::Future<Output = Result<(), String>>,
+) -> T::Spec {
+    demand.await.unwrap();
+    let local = home.using::<T>("flotilla").get(name).await.unwrap();
+    // Demand must create a placeholder without inventing observed evidence.
+    assert!(local.status.is_none(), "demand creates an empty local placeholder");
+    local.spec
+}
+
+async fn publish_remote_observation<T: flotilla_resources::Resource>(
+    home: &ResourceBackend,
+    observer: &ResourceBackend,
+    name: &str,
+    spec: &T::Spec,
+    status: &T::Status,
+) -> flotilla_resources::ResourceObject<T> {
+    let records = observer.using::<T>("flotilla");
+    let remote = records.create(&InputMeta::builder().name(name.into()).build(), spec).await.unwrap();
+    let observed = records.update_status(name, &remote.metadata.resource_version, status).await.unwrap();
+    home.replica_writer::<T>(NodeId::new("observer"), "flotilla").replace(&records.list().await.unwrap(), Utc::now()).await.unwrap();
+    observed
+}
+
+// For equal observation times, the larger authority wins over local provenance.
+// When authority also ties, local wins, independently of copy iteration order.
+fn assert_observation_authority_ties<T: flotilla_resources::Resource + Clone>(
+    observed: flotilla_resources::ResourceObject<T>,
+    set_authority: impl Fn(&mut T::Spec, &str),
+) {
+    let mut local = observed.clone();
+    let mut replica = observed;
+    set_authority(&mut local.spec, "authority-a");
+    set_authority(&mut replica.spec, "authority-z");
+    for local_first in [true, false] {
+        let copies = if local_first { [(&local, true), (&replica, false)] } else { [(&replica, false), (&local, true)] };
+        let selected = flotilla_resources::pick_replica_read(copies, |(object, local)| (*object, *local)).unwrap();
+        assert!(!selected.1, "larger authority wins even over an equally fresh local copy");
+    }
+    set_authority(&mut local.spec, "authority-z");
+    for local_first in [true, false] {
+        let copies = if local_first { [(&local, true), (&replica, false)] } else { [(&replica, false), (&local, true)] };
+        let selected = flotilla_resources::pick_replica_read(copies, |(object, local)| (*object, *local)).unwrap();
+        assert!(selected.1, "local wins only after observation time and authority tie");
+    }
+}
+
+struct ReplicaTurnSetup<'a> {
+    home: &'a ResourceBackend,
+    observer: &'a ResourceBackend,
+    name: &'a str,
+    id: uuid::Uuid,
+    observed_at: Option<DateTime<Utc>>,
+}
+
+impl ReplicaTurnSetup<'_> {
+    async fn observe_issue(&self, issues: &IssueRefresher) -> DateTime<Utc> {
+        let home = self.home;
+        let observer = self.observer;
+        let name = self.name;
+        let id = self.id;
+        let key = flotilla_observation::issue_observer::IssueKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_issue_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap(),
+        )
+        .unwrap();
+        let mut spec = demand_placeholder_spec::<Issue>(home, name, issues.demand(id, key, None)).await;
+        let observed_at = self.observed_at.unwrap_or_else(Utc::now);
+        spec.observing_authority = "observer".into();
+        let observed = publish_remote_observation::<Issue>(
+            home,
+            observer,
+            name,
+            &spec,
+            &flotilla_resources::IssueStatus {
+                title: Default::default(),
+                assignees: Default::default(),
+                state: Observation::known(flotilla_resources::ObservedIssueState::Closed, observed_at),
+                labels: Observation::known(vec![], observed_at),
+                updated_at: Observation::known(observed_at, observed_at),
+            },
+        )
+        .await;
+        assert_observation_authority_ties(observed, |spec, authority| spec.observing_authority = authority.into());
+        observed_at
+    }
+
+    async fn observe_change_request(&self, refresher: &ChangeRequestRefresher, merged: bool, failed_checks: bool) -> DateTime<Utc> {
+        let home = self.home;
+        let observer = self.observer;
+        let name = self.name;
+        let id = self.id;
+
+        let key = ChangeRequestKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap(),
+        )
+        .unwrap();
+        let mut spec = demand_placeholder_spec::<ChangeRequest>(home, name, refresher.demand(id, key, None)).await;
+        let observed_at = self.observed_at.unwrap_or_else(Utc::now);
+        spec.observing_authority = "observer".into();
+        let observed = publish_remote_observation::<ChangeRequest>(
+            home,
+            observer,
+            name,
+            &spec,
+            &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: Observation::known(
+                    if merged { ObservedChangeRequestState::Merged } else { ObservedChangeRequestState::Open },
+                    observed_at,
+                ),
+                head_sha: Observation::known("head".into(), observed_at),
+                checks: Observation::known(if failed_checks { ObservedChecks::Fail } else { ObservedChecks::Pass }, observed_at),
+                review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Observation::known(true, observed_at) },
+                mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
+            },
+        )
+        .await;
+        assert_observation_authority_ties(observed, |spec, authority| spec.observing_authority = authority.into());
+        observed_at
+    }
+}
+
+struct ReplicaTurnSource {
+    name: &'static str,
+    field_path: &'static str,
+    literal: &'static str,
+}
+
+impl ReplicaTurnSource {
+    const fn new(name: &'static str, field_path: &'static str, literal: &'static str) -> Self {
+        Self { name, field_path, literal }
+    }
+
+    fn is_issue(&self) -> bool {
+        self.name == "issue"
+    }
+
+    fn leaf(&self) -> Leaf {
+        let address = if self.is_issue() {
+            LeafAddress::Issue { service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 3556 }
+        } else {
+            LeafAddress::ChangeRequest { service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 3556 }
+        };
+        Leaf {
+            address,
+            field_path: self.field_path.into(),
+            operator: if self.name == "checks-settled" { LeafOperator::NotEqual } else { LeafOperator::Equal },
+            literal: self.literal.into(),
+        }
+    }
+
+    fn rule(&self, leaf: &Leaf) -> TurnDeliveryRule {
+        let comparison = if leaf.operator == LeafOperator::NotEqual { "!=" } else { "==" };
+        TurnDeliveryRule::builder()
+            .on(flotilla_resources::parse_leaf_template(&format!(
+                "${}{} {comparison} {}",
+                if self.is_issue() { "issue" } else { "cr" },
+                self.field_path,
+                self.literal
+            ))
+            .unwrap())
+            .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
+            .brief("Handle observed change".into())
+            .hold(HoldAct::State)
+            .build()
+    }
+
+    // A delivered message must identify the observed subject revision.
+    fn assert_message_subject(&self, subject: flotilla_resources::MessageReference, observed_at: DateTime<Utc>) {
+        if self.is_issue() {
+            assert!(matches!(subject, flotilla_resources::MessageReference::Issue { number: 3556, revision, .. }
+                if revision == observed_at.to_rfc3339()));
+        } else {
+            assert!(matches!(subject, flotilla_resources::MessageReference::ChangeRequest { number: 3556, revision, .. }
+                if revision == "head"));
+        }
+    }
+}
+
+// A demanded placeholder on the convoy home must never hide observations from
+// another host: triggering and delivery must agree, including a stalled merge.
+#[hegel::test]
+fn replica_status_turn_delivery(tc: hegel::TestCase) {
+    use super::super::routing::{ObjectAddress, ObjectKind};
+    // Cross both timestamp orders; a newly created empty copy is not evidence.
+    let newer_placeholder = tc.draw(hegel::generators::booleans());
+    // Both terminal check outcomes satisfy the stock checks-settled rule.
+    let failed_checks = tc.draw(hegel::generators::booleans());
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        for case in [
+            ReplicaTurnSource::new("merged", ".state", "merged"),
+            ReplicaTurnSource::new("checks-settled", ".checks", "pending"),
+            ReplicaTurnSource::new("review", ".review.actionable-at-head", "true"),
+            ReplicaTurnSource::new("issue", ".state", "closed"),
+        ] {
+            let source = case.name;
+            let home = ResourceBackend::new(InMemoryBackend::default());
+            let observer = ResourceBackend::new(InMemoryBackend::default());
+            let (tx, _) = broadcast::channel(4);
+            // External forge boundary: provider reads are unavailable; demand and replication are real.
+            let refresher = ChangeRequestRefresher::new(
+                "fleet".into(),
+                home.clone(),
+                "home".into(),
+                Arc::new(UnavailableChangeRequests),
+                Default::default(),
+            );
+            let issues = IssueRefresher::new(home.clone(), "home".into(), Arc::new(UnavailableIssues), Default::default());
+            let table = LeafSubscriptionTable::new(home.clone(), broadcast_test_sink(tx), refresher.clone());
+            let actuator = Arc::new(RecordingTurnDelivery::default());
+            table.set_turn_delivery_actuator(actuator.clone()).await;
+            let base = Utc::now() - chrono::Duration::seconds(10);
+            let id = uuid::Uuid::new_v4();
+            let is_issue = case.is_issue();
+            let leaf = case.leaf();
+            let name = flotilla_resources::address::leaf_record_name(&leaf.address, &[]).unwrap();
+            let rule = case.rule(&leaf);
+            let convoys = home.using::<Convoy>("flotilla");
+            let convoy = convoys
+                .create(
+                    &InputMeta::builder().name("remote-turn".into()).build(),
+                    &ConvoySpec::builder().workflow_ref("workflow".into()).build(),
+                )
+                .await
+                .unwrap();
+            let merged = source == "merged";
+            convoys
+                .update_status(
+                    "remote-turn",
+                    &convoy.metadata.resource_version,
+                    &ConvoyStatus {
+                        phase: if merged { ConvoyPhase::Active } else { ConvoyPhase::Landing },
+                        crew_work: BTreeMap::from([(
+                            "work".into(),
+                            BTreeMap::from([(
+                                "coder".into(),
+                                CrewWorkState::builder()
+                                    .phase(if merged { CrewWorkPhase::Stalled } else { CrewWorkPhase::Done })
+                                    .maybe_finished_at((!merged).then_some(base))
+                                    .build(),
+                            )]),
+                        )]),
+                        started_at: Some(base),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let setup = ReplicaTurnSetup {
+                home: &home,
+                observer: &observer,
+                name: &name,
+                id,
+                observed_at: newer_placeholder.then_some(base + chrono::Duration::seconds(1)),
+            };
+            let (kind, observed_at) = if is_issue {
+                (ObjectKind::Issue, setup.observe_issue(&issues).await)
+            } else {
+                (ObjectKind::ChangeRequest, setup.observe_change_request(&refresher, merged, failed_checks).await)
+            };
+            let row = LeafSubscriptionRow {
+                id,
+                namespace: "flotilla".into(),
+                leaves: vec![leaf.clone()],
+                watcher: LeafWatcher::TurnDelivery { convoy: "remote-turn".into(), source: source.into(), rule: Box::new(rule.clone()) },
+                maker: LeafMaker::Observed { refresher: "test".into(), external_party: "forge".into() },
+                freshness_demand: Some(base),
+                created_at: base,
+                episode_key: Default::default(),
+            };
+            table.inner.rows.lock().await.insert(id, row.clone());
+            let subjects = table
+                .load_subjects("flotilla", &std::collections::HashSet::from([ObjectAddress { kind, name: name.clone() }]))
+                .await
+                .unwrap();
+            let firing = super::super::subscriptions::evaluate_row(
+                &row,
+                &subjects.borrowed(),
+                &HashMap::from([(leaf.address.clone(), name)]),
+                super::super::sources::LeafObservationStaleness { change_request: Duration::from_secs(60), issue: Duration::from_secs(60) },
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("replica triggers {source} rule"));
+            table.fire(id, firing.clone()).await;
+            assert_eq!(actuator.requests.lock().unwrap().len(), 1, "{source} must deliver from replica status");
+            let subject = actuator.requests.lock().unwrap()[0].message_subject.clone().unwrap();
+            case.assert_message_subject(subject, observed_at);
+            table.fire(id, firing).await;
+            assert_eq!(actuator.requests.lock().unwrap().len(), 1, "duplicate {source} is idempotent");
+            let status = convoys.get("remote-turn").await.unwrap().status.unwrap();
+            assert!(status.turn_deliveries[source].failure.is_none());
+            refresher.release(id).await;
+            issues.release(id).await;
+        }
     });
 }

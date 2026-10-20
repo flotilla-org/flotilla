@@ -68,16 +68,16 @@ impl CheckoutControllerRuntime {
         let qualified = canonical.split_once("://").map(|(_, qualified)| qualified).unwrap_or(&canonical);
         let Some((service, scope)) = qualified.split_once('/') else { return Ok(None) };
         let Ok(number) = id.parse::<u64>() else { return Ok(None) };
-        Ok(change_requests
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .items
-            .into_iter()
-            .find(|record| {
+        let copies = change_requests.list().await.map_err(|error| error.to_string())?;
+        // A demanded local placeholder may precede the observing host's copy.
+        // Match the subject first, then use the shared whole-observation selection.
+        Ok(flotilla_resources::pick_replica_read(
+            copies.items.into_iter().filter(|record| {
                 record.object.spec.service == service && record.object.spec.scope == scope && record.object.spec.number == number
-            })
-            .and_then(|record| record.object.status))
+            }),
+            |record| (&record.object, matches!(record.provenance, flotilla_resources::ResourceProvenance::Local)),
+        )
+        .and_then(|record| record.object.status))
     }
 }
 

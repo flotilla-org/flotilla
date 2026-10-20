@@ -130,6 +130,18 @@ impl<T: Resource> ReplicaReadResolver<T> {
     }
 
     pub async fn get(&self, name: &str) -> Result<ReadResourceObject<T>, ResourceError> {
+        if !T::RANKED_REPLICA_READS {
+            return self.get_local_first(name).await;
+        }
+        // Demanded placeholders must not hide observed replicas. Read each copy
+        // once and share selection with leaf evaluation and observer ownership.
+        flotilla_resources::pick_replica_read(self.get_all(name).await?.items, |item| {
+            (&item.object, matches!(item.provenance, ResourceProvenance::Local))
+        })
+        .ok_or_else(|| ResourceError::not_found(name))
+    }
+
+    async fn get_local_first(&self, name: &str) -> Result<ReadResourceObject<T>, ResourceError> {
         if T::REPLICATION_CLASS == crate::ReplicationClass::None {
             return self
                 .backend
@@ -165,7 +177,7 @@ impl<T: Resource> ReplicaReadResolver<T> {
     pub async fn get_all(&self, name: &str) -> Result<ReadResourceList<T>, ResourceError> {
         // These classes have at most one visible copy for a name.
         if T::REPLICATION_CLASS == crate::ReplicationClass::None || T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
-            return match self.get(name).await {
+            return match self.get_local_first(name).await {
                 Ok(item) => Ok(ReadResourceList { items: vec![item] }),
                 Err(ResourceError::NotFound { .. }) => Ok(ReadResourceList { items: Vec::new() }),
                 Err(error) => Err(error),

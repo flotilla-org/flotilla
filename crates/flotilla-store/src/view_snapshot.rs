@@ -320,6 +320,15 @@ impl Store for ViewSnapshot {
     ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
         Ok(ReadResourceList { items: self.items(kind, namespace)? })
     }
+    async fn get_all_including_replicas_raw(
+        &self,
+        kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+    ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
+        let query = crate::StoreQuery::names([name.to_owned()], true);
+        Ok(ReadResourceList { items: self.query_raw(kind, namespace, &query).await?.items })
+    }
     async fn get_including_replicas_raw(
         &self,
         kind: ResourceKind,
@@ -327,5 +336,65 @@ impl Store for ViewSnapshot {
         name: &str,
     ) -> Result<ReadResourceObject<SerializedResource>, ResourceError> {
         self.named(kind, namespace, name, false)?.ok_or_else(|| ResourceError::not_found(name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Request snapshots must expose every visible copy for a named subject,
+    // allowing ranked reads to choose evidence over a placeholder just as live stores do.
+    #[hegel::test]
+    fn snapshot_ranked_reads_preserve_all_copies(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let unrelated = tc.draw(gs::integers::<usize>().min_value(0).max_value(32));
+        let reverse = tc.draw(gs::booleans());
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let local = ResourceObject::<Issue>::from_k8s_object(
+                serde_json::from_value(serde_json::json!({
+                    "apiVersion": "flotilla.work/v1", "kind": "Issue",
+                    "metadata": {"namespace": "test", "name": "subject", "resourceVersion": "1",
+                        "creationTimestamp": "2026-01-01T00:00:00Z"},
+                    "spec": {"service": "github.com", "scope": "test/repo", "number": 1, "observing_authority": "observer"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut remote = local.clone();
+            let now = chrono::Utc::now();
+            remote.status = Some(IssueStatus {
+                title: Default::default(),
+                assignees: Default::default(),
+                state: Observation::known(ObservedIssueState::Closed, now),
+                labels: Observation::known(vec![], now),
+                updated_at: Observation::known(now, now),
+            });
+            let mut items = vec![
+                ReadResourceObject { object: local.clone(), provenance: ResourceProvenance::Local },
+                ReadResourceObject {
+                    object: remote,
+                    provenance: ResourceProvenance::Replica { origin_root: NodeId::new("observer"), last_synced_at: now },
+                },
+            ];
+            for index in 0..unrelated {
+                let mut object = local.clone();
+                object.metadata.name = format!("unrelated-{index}");
+                items.push(ReadResourceObject { object, provenance: ResourceProvenance::Local });
+            }
+            if reverse {
+                items.reverse();
+            }
+            let mut snapshot = ViewSnapshot::new(Some(NodeId::new("home")));
+            snapshot.insert("test", ReadResourceList { items }).unwrap();
+            let backend = crate::ResourceBackend::new(snapshot);
+            let reads = backend.including_replicas::<Issue>("test");
+            let copies = reads.get_all("subject").await.unwrap();
+            assert_eq!(copies.items.len(), 2);
+            assert!(copies.items.iter().all(|copy| copy.object.metadata.name == "subject"));
+            assert_eq!(reads.get("subject").await.unwrap().object.status.unwrap().state.value, Some(ObservedIssueState::Closed));
+            assert!(reads.get_all("missing").await.unwrap().items.is_empty());
+            assert!(matches!(reads.get("missing").await, Err(ResourceError::NotFound { .. })));
+        });
     }
 }

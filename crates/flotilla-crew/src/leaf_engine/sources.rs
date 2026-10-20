@@ -26,18 +26,16 @@ pub(super) fn change_request_sources(list: flotilla_resources::ReadResourceList<
 /// Select borrowed observations for a pass without cloning their status bodies.
 pub(super) fn freshest_change_request_refs(items: &[ReadResourceObject<ChangeRequest>]) -> HashMap<&str, &ResourceObject<ChangeRequest>> {
     let mut selected: HashMap<&str, &ReadResourceObject<ChangeRequest>> = HashMap::new();
-    fn rank(item: &ReadResourceObject<ChangeRequest>) -> (chrono::DateTime<chrono::Utc>, &str, bool) {
-        (
-            item.object.status.as_ref().map_or(item.object.metadata.creation_timestamp, |status| status.state.observed_at),
-            item.object.spec.observing_authority.as_str(),
-            matches!(item.provenance, ResourceProvenance::Local),
-        )
-    }
     // Watch inventories are sorted by name and origin. On exact replica ties,
-    // select the last origin, matching BTreeMap::iter().max_by_key below.
+    // select the last origin, matching the shared selector over BTreeMap below.
     for item in items {
         let current = selected.entry(item.object.metadata.name.as_str()).or_insert(item);
-        if rank(item) >= rank(current) {
+        if flotilla_resources::compare_replica_reads(
+            (&item.object, matches!(item.provenance, ResourceProvenance::Local)),
+            (&current.object, matches!(current.provenance, ResourceProvenance::Local)),
+        )
+        .is_ge()
+        {
             *current = item;
         }
     }
@@ -49,16 +47,8 @@ pub(super) fn update_freshest_change_request(
     sources: &ChangeRequestSources,
     selected: &mut HashMap<String, ResourceObject<ChangeRequest>>,
 ) {
-    let freshest = sources.get(name).and_then(|copies| {
-        copies.iter().max_by_key(|(source, object)| {
-            (
-                object.status.as_ref().map_or(object.metadata.creation_timestamp, |status| status.state.observed_at),
-                object.spec.observing_authority.as_str(),
-                // Local wins an otherwise exact tie, matching the initial list order.
-                source.is_none(),
-            )
-        })
-    });
+    let freshest =
+        sources.get(name).and_then(|copies| flotilla_resources::pick_replica_read(copies, |(source, object)| (*object, source.is_none())));
     if let Some((_, object)) = freshest {
         selected.insert(name.to_string(), object.clone());
     } else {
@@ -85,15 +75,8 @@ pub(super) fn issue_sources(list: flotilla_resources::ReadResourceList<Issue>) -
 }
 
 pub(super) fn update_freshest_issue(name: &str, sources: &IssueSources, selected: &mut HashMap<String, ResourceObject<Issue>>) {
-    let freshest = sources.get(name).and_then(|copies| {
-        copies.iter().max_by_key(|(source, object)| {
-            (
-                object.status.as_ref().map_or(object.metadata.creation_timestamp, |status| status.state.observed_at),
-                object.spec.observing_authority.as_str(),
-                source.is_none(),
-            )
-        })
-    });
+    let freshest =
+        sources.get(name).and_then(|copies| flotilla_resources::pick_replica_read(copies, |(source, object)| (*object, source.is_none())));
     if let Some((_, object)) = freshest {
         selected.insert(name.to_string(), object.clone());
     } else {

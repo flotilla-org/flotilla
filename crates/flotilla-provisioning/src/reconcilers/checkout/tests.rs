@@ -1281,3 +1281,105 @@ async fn local_clone_teardown_preserves_dirty_work_and_removes_clean_clone() {
     assert!(source.path().join(".git").is_dir(), "managed clone remains");
     assert_eq!(runtime.remove_checkout(&removal).await.expect("idempotent teardown"), CheckoutRemovalOutcome::Removed);
 }
+
+// Checkout integration must use the freshest observed PR copy even when the
+// convoy home has an empty placeholder or an older local observation.
+#[hegel::test]
+fn checkout_observation_prefers_replica_status(tc: hegel::TestCase) {
+    use flotilla_resources::{
+        ChangeRequestReviewObservation, ChangeRequestSpec, ConvoyRepositorySpec, InputMeta, Observation, ObservedChangeRequestState,
+        ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, RepositoryKey,
+    };
+    // Subprocess boundary: this store-only read must issue no commands or probes.
+    struct NoCommands;
+    #[async_trait]
+    impl CommandRunner for NoCommands {
+        async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            panic!("observation selection must not run a subprocess")
+        }
+        async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+            panic!("observation selection must not run a subprocess")
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            panic!("observation selection must not probe a subprocess")
+        }
+    }
+    let local_has_status = tc.draw(hegel::generators::booleans());
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let home = ResourceBackend::new(InMemoryBackend::default());
+        let observer = ResourceBackend::new(InMemoryBackend::default());
+        let repo = RepositoryKey("repo".into());
+        let convoy = home
+            .using::<Convoy>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name("convoy".into()).build(),
+                &ConvoySpec::builder()
+                    .workflow_ref("workflow".into())
+                    .repositories(vec![ConvoyRepositorySpec::builder()
+                        .url("https://github.com/flotilla-org/flotilla".into())
+                        .repo_ref(repo.clone())
+                        .source_ref("feature".into())
+                        .target_ref("main".into())
+                        .workspace_slug("flotilla".into())
+                        .subpaths(vec![])
+                        .build()])
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let checkout = home
+            .using::<Checkout>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name("checkout".into()).build(),
+                &flotilla_resources::CheckoutSpec::Observed(ObservedCheckoutSpec {
+                    r#ref: "feature".into(),
+                    path: "/unused".into(),
+                    repo_ref: repo,
+                    host_ref: "home".into(),
+                    is_main: false,
+                }),
+            )
+            .await
+            .unwrap();
+        let name = flotilla_resources::address::record_name(
+            &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap(),
+        )
+        .unwrap();
+        let spec = ChangeRequestSpec::builder()
+            .service("github.com".into())
+            .scope("flotilla-org/flotilla".into())
+            .number(3556)
+            .observing_authority("observer".into())
+            .build();
+        let remote_records = observer.using::<ChangeRequest>(NAMESPACE);
+        let remote = remote_records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.unwrap();
+        let observed_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let remote_status = ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
+            state: Observation::known(ObservedChangeRequestState::Merged, observed_at),
+            head_sha: Observation::known("head".into(), observed_at),
+            checks: Observation::known(ObservedChecks::Pass, observed_at),
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, observed_at) },
+            mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
+        };
+        remote_records.update_status(&name, &remote.metadata.resource_version, &remote_status).await.unwrap();
+        let local_records = home.using::<ChangeRequest>(NAMESPACE);
+        let local = local_records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.unwrap();
+        if local_has_status {
+            let mut stale = remote_status;
+            stale.state = Observation::known(ObservedChangeRequestState::Open, observed_at - chrono::Duration::seconds(1));
+            local_records.update_status(&name, &local.metadata.resource_version, &stale).await.unwrap();
+        }
+        home.replica_writer::<ChangeRequest>(flotilla_protocol::NodeId::new("observer"), NAMESPACE)
+            .replace(&remote_records.list().await.unwrap(), chrono::Utc::now())
+            .await
+            .unwrap();
+        let runtime =
+            CheckoutControllerRuntime::new(Arc::new(NoCommands), None, Some(home.including_replicas::<ChangeRequest>(NAMESPACE)), vec![]);
+        let observed = runtime.observed_change_request(&convoy, &checkout, "3556").await.unwrap();
+        assert_eq!(observed.and_then(|status| status.state.value), Some(ObservedChangeRequestState::Merged));
+    });
+}

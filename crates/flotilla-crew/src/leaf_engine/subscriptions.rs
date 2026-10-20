@@ -313,7 +313,7 @@ pub(super) struct OwnedLeafSubjects {
 }
 
 impl OwnedLeafSubjects {
-    fn borrowed(&self) -> LeafSubjects<'_> {
+    pub(super) fn borrowed(&self) -> LeafSubjects<'_> {
         LeafSubjects {
             convoys: &self.convoys,
             vessels: &self.vessels,

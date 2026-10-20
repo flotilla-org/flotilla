@@ -22,6 +22,12 @@ impl Resource for ChangeRequest {
     const QUERYABLE_NUMERIC_FIELDS: &'static [&'static str] = &["spec.number"];
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Observations;
 
+    const RANKED_REPLICA_READS: bool = true;
+
+    fn replica_read_rank(object: &crate::ResourceObject<Self>) -> (Option<DateTime<Utc>>, &str) {
+        (object.status.as_ref().map(|status| status.state.observed_at), object.spec.observing_authority.as_str())
+    }
+
     fn validate_spec_update(current: &Self::Spec, requested: &Self::Spec) -> Result<(), ResourceError> {
         if current.service == requested.service && current.scope == requested.scope && current.number == requested.number {
             Ok(())
