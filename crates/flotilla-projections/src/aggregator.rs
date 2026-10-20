@@ -1,4 +1,6 @@
 //! Resource-store Aggregator maintaining named-query result sets.
+//! Convoy events update source keys; secondary joins use maintained key indexes.
+//! See [workload and assumptions](../../../docs/implementation-choices/convoy-event-cost.md).
 
 use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_observation::convoy_branch_refresh::ConvoyBranchRefresh;
@@ -50,6 +52,8 @@ use tracing::debug;
 
 use crate::issue_materializer::{IssueMaterializationResolver, IssueMaterializer, IssuePollingHealth};
 
+mod convoy_inputs;
+use convoy_inputs::ConvoyInputs;
 mod readiness;
 use readiness::{apply_readiness_event, readiness_resources};
 
@@ -178,12 +182,20 @@ enum ConvoyProjectionDelivery {
 
 #[derive(bon::Builder)]
 pub struct Aggregator {
+    #[cfg(test)]
+    #[builder(skip)]
+    copied_convoys: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    #[builder(skip)]
+    summarized_convoys: std::sync::atomic::AtomicUsize,
     state: AggregatorProjectionState,
     local_host: HostName,
     #[builder(skip)]
-    convoys_by_source: HashMap<LocalSource, HashMap<ConvoyKey, ReadResourceObject<Convoy>>>,
+    convoys_by_source: HashMap<LocalSource, HashMap<ConvoyKey, Arc<ReadResourceObject<Convoy>>>>,
     #[builder(skip)]
     demands: HashMap<ResourceRef, ResourceObject<Demand>>,
+    #[builder(skip)]
+    convoy_keys_by_name: HashMap<(String, String), HashSet<ConvoyKey>>,
     #[builder(skip)]
     sessions_by_source: HashMap<LocalSource, HashMap<SessionKey, ReadResourceObject<TerminalSession>>>,
     terminal_sessions: HashMap<SessionKey, ReadResourceObject<TerminalSession>>,
@@ -212,6 +224,14 @@ pub struct Aggregator {
     bootstrapping: bool,
     #[builder(skip)]
     projection_delivery: ConvoyProjectionDelivery,
+    #[builder(skip)]
+    projection_full: bool,
+    #[builder(skip)]
+    convoy_inputs: ConvoyInputs,
+    #[builder(skip)]
+    projection_keys: HashSet<ConvoyKey>,
+    #[builder(skip)]
+    known_origins: HashSet<flotilla_protocol::NodeId>,
     emitted_queries: HashSet<QueryId>,
     #[builder(skip)]
     attach_resolver: Option<Arc<dyn AttachCapabilityResolver>>,
@@ -295,10 +315,15 @@ impl Aggregator {
         event_rx: broadcast::Receiver<DaemonEvent>,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            copied_convoys: Default::default(),
+            #[cfg(test)]
+            summarized_convoys: Default::default(),
             state,
             local_host,
             convoys_by_source: HashMap::new(),
             demands: HashMap::new(),
+            convoy_keys_by_name: HashMap::new(),
             sessions_by_source: HashMap::new(),
             terminal_sessions: HashMap::new(),
             attachable_sessions: HashSet::new(),
@@ -317,6 +342,10 @@ impl Aggregator {
             checkout_replicas: HashMap::new(),
             bootstrapping: false,
             projection_delivery: ConvoyProjectionDelivery::Immediate,
+            projection_full: false,
+            convoy_inputs: ConvoyInputs::default(),
+            projection_keys: HashSet::new(),
+            known_origins: HashSet::new(),
             emitted_queries: HashSet::new(),
             attach_resolver: None,
             attach_refresh_tasks: tokio::task::JoinSet::new(),
@@ -977,8 +1006,12 @@ impl Aggregator {
 
     async fn replace_convoy_read_source(&mut self, source: LocalSource, convoys: Vec<ReadResourceObject<Convoy>>) {
         let previous = self.effective_convoys();
-        let replacement = convoys.into_iter().map(|convoy| (convoy_key(&convoy), convoy)).collect();
+        let replacement = convoys.into_iter().map(|convoy| (convoy_key(&convoy), Arc::new(convoy))).collect();
         self.convoys_by_source.insert(source, replacement);
+        self.convoy_keys_by_name.clear();
+        for key in self.convoys_by_source.values().flat_map(|sources| sources.keys()) {
+            self.convoy_keys_by_name.entry((key.0.clone(), key.1.clone())).or_default().insert(key.clone());
+        }
         self.refresh_origin_hosts().await;
         let current = self.effective_convoys();
         let references = previous.keys().chain(current.keys()).cloned().collect::<HashSet<_>>();
@@ -1069,32 +1102,85 @@ impl Aggregator {
             ReadWatchEvent::Added(convoy) | ReadWatchEvent::Modified(convoy) | ReadWatchEvent::Deleted(convoy) => convoy_key(convoy),
             ReadWatchEvent::DeletedByName { tombstone, provenance } => tombstone_key(tombstone, provenance),
         };
-        let previous = self.effective_convoys();
+        // Resolve a newly seen origin once. Unknown hosts remain buffered until
+        // host discovery changes; ordinary replica events do no inventory walk.
+        let new_origin = key.2.as_ref().is_some_and(|origin| !self.known_origins.contains(origin));
+        let previous_all = new_origin.then(|| self.effective_convoys());
+        let previous = self.effective_convoy_key(&key).filter(|item| item.object.metadata.deletion_timestamp.is_none()).cloned();
+        let previous_ref = self.convoy_key_ref(&key);
         match event {
             ReadWatchEvent::Added(convoy) | ReadWatchEvent::Modified(convoy) => {
-                self.convoys_by_source.entry(source).or_default().insert(key, convoy);
+                self.convoys_by_source.entry(source).or_default().insert(key.clone(), Arc::new(convoy));
             }
             ReadWatchEvent::Deleted(_) | ReadWatchEvent::DeletedByName { .. } => {
                 self.convoys_by_source.entry(source).or_default().remove(&key);
             }
         }
-        self.refresh_origin_hosts().await;
-        // Refreshing one origin can make other buffered convoy refs
-        // projectable too, so transition detection must compare the whole
-        // effective view rather than only the event's key.
-        let current = self.effective_convoys();
-        let references = previous.keys().chain(current.keys()).cloned().collect::<HashSet<_>>();
-        for reference in references {
-            self.handle_convoy_transition(&reference, previous.get(&reference), current.get(&reference));
+        let identity = (key.0.clone(), key.1.clone());
+        if self.effective_convoy_key(&key).is_some() {
+            self.convoy_keys_by_name.entry(identity).or_default().insert(key.clone());
+        } else if let Some(keys) = self.convoy_keys_by_name.get_mut(&identity) {
+            keys.remove(&key);
+            if keys.is_empty() {
+                self.convoy_keys_by_name.remove(&identity);
+            }
         }
-        self.convoy_change_requests.retain(|reference, _| current.contains_key(reference));
-        self.change_request_refresh_generations.retain(|reference, _| current.contains_key(reference));
-        self.change_request_refresh_started.retain(|reference, _| current.contains_key(reference));
-        self.change_request_refresh_failures.retain(|reference, _| current.contains_key(reference));
-        self.rebuild_local_projection().await;
-        if let Err(error) = self.rebuild_checkout_rows().await {
-            debug!(%error, "could not refresh checkout orphan attention after convoy event");
+        if new_origin {
+            let old_hosts = self.origin_hosts.clone();
+            self.refresh_origin_hosts().await;
+            if self.origin_hosts != old_hosts {
+                let previous = previous_all.expect("new origin saved the prior view");
+                let current = self.effective_convoys();
+                for reference in previous.keys().chain(current.keys()).collect::<HashSet<_>>() {
+                    self.handle_convoy_transition(reference, previous.get(reference), current.get(reference));
+                }
+                self.rebuild_local_projection().await;
+                if let Err(error) = self.rebuild_checkout_rows().await {
+                    debug!(%error, "could not refresh checkout orphan attention after origin change");
+                }
+                return;
+            }
         }
+        let current = self.effective_convoy_key(&key).filter(|item| item.object.metadata.deletion_timestamp.is_none()).cloned();
+        if let Some(reference) = self.convoy_key_ref(&key).or(previous_ref) {
+            self.handle_convoy_transition(
+                &reference,
+                previous.as_ref().map(|item| &item.object),
+                current.as_ref().map(|item| &item.object),
+            );
+            if current.is_none() {
+                self.invalidate_change_request(&reference);
+                self.change_request_refresh_started.remove(&reference);
+                self.change_request_refresh_generations.remove(&reference);
+            }
+        }
+        self.projection_keys.insert(key);
+        self.schedule_local_projection().await;
+        // Orphan status changes only when parent membership changes, not on
+        // progress/status churn. Checkouts contain compact references only.
+        if previous.is_some() != current.is_some() {
+            if let Err(error) = self.rebuild_checkout_rows().await {
+                debug!(%error, "could not refresh checkout orphan attention after convoy event");
+            }
+        }
+    }
+
+    fn has_convoy(&self, namespace: &str, name: &str) -> bool {
+        self.convoy_keys_by_name
+            .get(&(namespace.to_string(), name.to_string()))
+            .is_some_and(|keys| keys.iter().any(|key| self.convoy_key_ref(key).is_some()))
+    }
+
+    fn effective_convoy_key(&self, key: &ConvoyKey) -> Option<&Arc<ReadResourceObject<Convoy>>> {
+        LOCAL_SOURCE_PRECEDENCE.iter().rev().find_map(|source| self.convoys_by_source.get(source)?.get(key))
+    }
+
+    fn convoy_key_ref(&self, key: &ConvoyKey) -> Option<ResourceRef> {
+        let host = match &key.2 {
+            Some(origin) => self.origin_hosts.get(origin)?.clone(),
+            None => self.local_host.clone(),
+        };
+        Some(ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, &key.0, &key.1).on_host(host))
     }
 
     fn handle_convoy_transition(
@@ -1379,15 +1465,23 @@ impl Aggregator {
     }
 
     fn effective_convoy_reads_including_deleted(&self) -> HashMap<ResourceRef, ReadResourceObject<Convoy>> {
+        #[cfg(test)]
+        self.copied_convoys
+            .fetch_add(self.convoys_by_source.values().map(HashMap::len).sum::<usize>(), std::sync::atomic::Ordering::Relaxed);
         let mut effective_by_origin = HashMap::new();
         for source in LOCAL_SOURCE_PRECEDENCE {
             let Some(convoys) = self.convoys_by_source.get(&source) else { continue };
-            effective_by_origin.extend(convoys.iter().map(|(key, convoy)| (key.clone(), convoy.clone())));
+            effective_by_origin.extend(convoys.iter().map(|(key, convoy)| (key.clone(), convoy.as_ref().clone())));
         }
         effective_by_origin.into_values().filter_map(|convoy| self.read_convoy_ref(&convoy).map(|reference| (reference, convoy))).collect()
     }
 
     async fn rebuild_local_projection(&mut self) {
+        self.projection_full = true;
+        self.schedule_local_projection().await;
+    }
+
+    async fn schedule_local_projection(&mut self) {
         if let ConvoyProjectionDelivery::Coalesced { deadline } = &mut self.projection_delivery {
             // Keep the first deadline: a continuous stream cannot postpone delivery.
             deadline.get_or_insert_with(|| Instant::now() + CONVOY_PROJECTION_COALESCE_INTERVAL);
@@ -1397,13 +1491,18 @@ impl Aggregator {
     }
 
     async fn flush_local_projection(&mut self) {
-        self.refresh_origin_hosts().await;
+        let full = std::mem::take(&mut self.projection_full);
+        if full {
+            self.refresh_origin_hosts().await;
+            self.rebuild_convoy_inputs();
+        }
+        let keys = std::mem::take(&mut self.projection_keys);
         // A deletion timestamp begins finalizer-driven reaping; it does not
         // mean the Convoy or its child resources have left the store yet.
         // Keep the parent row projected until the watch emits Deleted so
         // vessels, checkouts, and sessions never appear parentless during
         // teardown.
-        let effective_convoys = self.effective_convoy_reads_including_deleted();
+        let effective_convoys = if full { self.effective_convoy_reads_including_deleted() } else { HashMap::new() };
         let salience_changed = self.rebuild_salience_projection().await;
         let mut local_replacement = HashMap::new();
         let mut replica_replacements: HashMap<HostName, HashMap<ResourceRef, ConvoyRow>> = HashMap::new();
@@ -1420,31 +1519,68 @@ impl Aggregator {
             }
         }
 
+        let updates = if full {
+            Vec::new()
+        } else {
+            keys.iter()
+                .filter_map(|key| {
+                    let reference = self.convoy_key_ref(key)?;
+                    let row = self.effective_convoy_key(key).map(|item| self.summarize(&reference, &item.object));
+                    Some((reference, key.2.is_some(), row))
+                })
+                .collect::<Vec<_>>()
+        };
         let (changed, removed, result_set) = {
             let mut view = self.state.write().await;
-            let changed = local_replacement
-                .iter()
-                .filter(|(reference, row)| view.local_rows.get(*reference) != Some(*row))
-                .map(|(_, row)| row.clone())
-                .chain(replica_replacements.iter().flat_map(|(host, rows)| {
-                    let prior = view.replica_rows.get(host);
-                    rows.iter()
-                        .filter(move |(reference, row)| prior.and_then(|prior| prior.get(*reference)) != Some(*row))
-                        .map(|(_, row)| row.clone())
-                }))
-                .collect::<Vec<_>>();
-            let removed = view
-                .local_rows
-                .keys()
-                .filter(|reference| !local_replacement.contains_key(*reference))
-                .cloned()
-                .chain(view.replica_rows.iter().flat_map(|(host, rows)| {
-                    let replacement = replica_replacements.get(host);
-                    rows.keys()
-                        .filter(move |reference| replacement.is_none_or(|replacement| !replacement.contains_key(*reference)))
-                        .cloned()
-                }))
-                .collect::<Vec<_>>();
+            let mut incremental_changed = Vec::new();
+            let mut incremental_removed = Vec::new();
+            if !full {
+                for (reference, replica, row) in updates {
+                    let rows = if replica {
+                        view.replica_rows.entry(reference.host.clone().expect("replica host")).or_default()
+                    } else {
+                        &mut view.local_rows
+                    };
+                    match row {
+                        Some(row) if rows.get(&reference) != Some(&row) => {
+                            rows.insert(reference, row.clone());
+                            incremental_changed.push(row);
+                        }
+                        None if rows.remove(&reference).is_some() => incremental_removed.push(reference),
+                        _ => {}
+                    }
+                }
+            }
+            let changed = if !full {
+                incremental_changed
+            } else {
+                local_replacement
+                    .iter()
+                    .filter(|(reference, row)| view.local_rows.get(*reference) != Some(*row))
+                    .map(|(_, row)| row.clone())
+                    .chain(replica_replacements.iter().flat_map(|(host, rows)| {
+                        let prior = view.replica_rows.get(host);
+                        rows.iter()
+                            .filter(move |(reference, row)| prior.and_then(|prior| prior.get(*reference)) != Some(*row))
+                            .map(|(_, row)| row.clone())
+                    }))
+                    .collect::<Vec<_>>()
+            };
+            let removed = if !full {
+                incremental_removed
+            } else {
+                view.local_rows
+                    .keys()
+                    .filter(|reference| !local_replacement.contains_key(*reference))
+                    .cloned()
+                    .chain(view.replica_rows.iter().flat_map(|(host, rows)| {
+                        let replacement = replica_replacements.get(host);
+                        rows.keys()
+                            .filter(move |reference| replacement.is_none_or(|replacement| !replacement.contains_key(*reference)))
+                            .cloned()
+                    }))
+                    .collect::<Vec<_>>()
+            };
             if changed.is_empty() && removed.is_empty() {
                 drop(view);
                 if salience_changed && !self.bootstrapping {
@@ -1452,10 +1588,12 @@ impl Aggregator {
                 }
                 return;
             }
-            view.local_rows = local_replacement;
-            view.replica_rows = replica_replacements;
+            if full {
+                view.local_rows = local_replacement;
+                view.replica_rows = replica_replacements;
+            }
             view.seq = view.seq.saturating_add(1);
-            (changed, removed, view.result_set())
+            (changed, removed, (!self.emitted_queries.contains(&QueryId::Convoys { scope: None })).then(|| view.result_set()))
         };
 
         if self.bootstrapping {
@@ -1465,7 +1603,7 @@ impl Aggregator {
             self.emit_delta(changed, removed).await;
         } else {
             self.emitted_queries.insert(QueryId::Convoys { scope: None });
-            self.event_sink.emit(DaemonEvent::ResultSet(Box::new(result_set)));
+            self.event_sink.emit(DaemonEvent::ResultSet(Box::new(result_set.expect("initial projection snapshot"))));
         }
         self.emit_scoped_convoy_result_sets().await;
         let represented = self.state.represented_issue_refs().await;
@@ -1742,11 +1880,6 @@ impl Aggregator {
     }
 
     async fn rebuild_checkout_rows(&self) -> Result<(), ResourceError> {
-        let convoys = self
-            .effective_convoy_reads_including_deleted()
-            .into_values()
-            .map(|convoy| (convoy.object.metadata.namespace, convoy.object.metadata.name))
-            .collect::<HashSet<_>>();
         let mut replicas = HashMap::<HostName, Vec<CheckoutRow>>::new();
         let mut local = Vec::new();
         let sources = self.observed_checkouts.values().map(|checkout| (checkout, self.local_host.clone())).chain(
@@ -1756,10 +1889,8 @@ impl Aggregator {
             let CheckoutSpec::Observed(spec) = &checkout.spec else { continue };
             let authority = checkout.metadata.lifecycle_authority()?.unwrap_or(LifecycleAuthority::Observed);
             let for_convoy = checkout.metadata.labels.get(CONVOY_LABEL).cloned();
-            let attention_reason = for_convoy
-                .as_ref()
-                .filter(|convoy| !convoys.contains(&(checkout.metadata.namespace.clone(), (*convoy).clone())))
-                .map(|convoy| {
+            let attention_reason =
+                for_convoy.as_ref().filter(|convoy| !self.has_convoy(&checkout.metadata.namespace, convoy)).map(|convoy| {
                     format!(
                         "checkout {} at {} references missing convoy {}/{}",
                         checkout.metadata.name, spec.path, checkout.metadata.namespace, convoy
@@ -1975,11 +2106,6 @@ impl Aggregator {
             (&left.object.metadata.namespace, &left.object.metadata.name)
                 .cmp(&(&right.object.metadata.namespace, &right.object.metadata.name))
         });
-        let effective_convoys = self
-            .effective_convoy_reads_including_deleted()
-            .into_iter()
-            .map(|(reference, convoy)| (reference, convoy.object))
-            .collect::<HashMap<_, _>>();
         let attention = sessions
             .into_iter()
             .flat_map(|session| {
@@ -1992,12 +2118,15 @@ impl Aggregator {
                 if status.phase != TerminalSessionPhase::Running || observation.is_stale_at(now) {
                     return Vec::new();
                 }
-                effective_convoys
-                    .iter()
-                    .filter(|(reference, _)| reference.namespace == session.metadata.namespace && &reference.name == convoy)
-                    .filter_map(|(reference, convoy)| {
-                        let work = convoy.status.as_ref().and_then(|status| status.work.get(vessel));
-                        (self.vessel_host(reference, work) == session_host).then(|| AttentionFact {
+                self.convoy_keys_by_name
+                    .get(&(session.metadata.namespace.clone(), convoy.clone()))
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|key| {
+                        let item = self.effective_convoy_key(key)?;
+                        let reference = self.convoy_key_ref(key)?;
+                        let work = item.object.status.as_ref().and_then(|status| status.work.get(vessel));
+                        (self.vessel_host(&reference, work) == session_host).then(|| AttentionFact {
                             target: reference.subresource(format!("vessels/{vessel}")),
                             state: observation.state,
                             as_of: observation.as_of,
@@ -2099,6 +2228,7 @@ impl Aggregator {
                 ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
             })
             .collect::<HashSet<_>>();
+        self.known_origins = origins.clone();
         self.origin_hosts = match &self.attach_resolver {
             Some(resolver) => resolver.origin_host_names(&origins).await,
             None => HashMap::new(),
@@ -2187,8 +2317,7 @@ impl Aggregator {
     }
 
     fn vessel_materialize(&self, namespace: &str, convoy: &str, vessel: &str, vessel_host: &HostName) -> Option<String> {
-        self.terminal_sessions
-            .values()
+        self.convoy_sessions(namespace, convoy)
             .filter(|session| {
                 session.object.metadata.namespace == namespace
                     && session.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|value| value == convoy)
@@ -2209,8 +2338,7 @@ impl Aggregator {
         vessel_host: &HostName,
     ) -> Option<flotilla_protocol::result_set::CleatEndpoint> {
         let name = self.vessel_materialize(namespace, convoy, vessel, vessel_host)?;
-        self.terminal_sessions
-            .values()
+        self.convoy_sessions(namespace, convoy)
             .find(|session| {
                 session.object.metadata.namespace == namespace
                     && session.object.metadata.name == name
@@ -2224,6 +2352,8 @@ impl Aggregator {
     }
 
     fn summarize(&self, resource: &ResourceRef, convoy: &ResourceObject<Convoy>) -> ConvoyRow {
+        #[cfg(test)]
+        self.summarized_convoys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let name = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
         let status = convoy.status.as_ref();
         let subject_conflicts = subject_relationship_conflicts(convoy);
@@ -2267,8 +2397,7 @@ impl Aggregator {
             }
         }
         let attention_demand = self
-            .demands
-            .values()
+            .convoy_demands(&resource.namespace, &resource.name)
             .filter(|demand| {
                 let state = demand.status.as_ref().map_or(DemandState::Raised, |status| status.state);
                 let target = &demand.spec.originating_work_ref;
@@ -2466,7 +2595,7 @@ impl Aggregator {
                     CrewSource::Tool { command } => command.clone(),
                     CrewSource::Agent { selector, prompt, .. } => prompt.clone().unwrap_or_else(|| selector.capability.clone()),
                 };
-                let session = self.terminal_sessions.values().find(|session| {
+                let session = self.convoy_sessions(&convoy_ref.namespace, &convoy_ref.name).find(|session| {
                     session.object.metadata.namespace == convoy_ref.namespace
                         && session.object.metadata.labels.get(CONVOY_LABEL) == Some(&convoy_ref.name)
                         && session.object.metadata.labels.get(VESSEL_LABEL) == Some(&definition.name)
@@ -2487,7 +2616,7 @@ impl Aggregator {
             .collect();
         let now = chrono::Utc::now();
         let matching_sessions = || {
-            self.terminal_sessions.values().filter(|session| {
+            self.convoy_sessions(&convoy_ref.namespace, &convoy_ref.name).filter(|session| {
                 session.object.metadata.namespace == convoy_ref.namespace
                     && session.object.metadata.labels.get(CONVOY_LABEL) == Some(&convoy_ref.name)
                     && session.object.metadata.labels.get(VESSEL_LABEL) == Some(&definition.name)
@@ -2512,8 +2641,7 @@ impl Aggregator {
             .min_by_key(|pending| pending.attempted_at)
             .cloned();
         let credential_attention = self
-            .demands
-            .values()
+            .convoy_demands(&convoy_ref.namespace, &convoy_ref.name)
             .filter(|demand| {
                 demand.spec.originating_work_ref.namespace == convoy_ref.namespace
                     && demand.spec.originating_work_ref.name == convoy_ref.name
@@ -4278,6 +4406,64 @@ mod tests {
             .observed_checkout_replicas(&observed_checkout_replicas)
             .build();
         aggregator.run_with_sources(sources).await
+    }
+
+    // One 30 KB replica event must copy a bounded number of bodies even with
+    // hundreds of unrelated replicas. The real event and projection path runs.
+    #[tokio::test]
+    async fn replica_convoy_event_work_measurement() {
+        let state = AggregatorProjectionState::new();
+        let (tx, _) = broadcast::channel(1024);
+        struct Hosts;
+        #[async_trait]
+        impl AttachCapabilityResolver for Hosts {
+            async fn resolvable_attach_targets(&self, targets: &[(String, HostName)]) -> Result<Vec<bool>, String> {
+                Ok(vec![false; targets.len()])
+            }
+            async fn origin_host_names(
+                &self,
+                origins: &HashSet<flotilla_protocol::NodeId>,
+            ) -> HashMap<flotilla_protocol::NodeId, HostName> {
+                origins.iter().map(|origin| (origin.clone(), HostName::new("remote"))).collect()
+            }
+        }
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver_arc(Arc::new(Hosts));
+        let mut records = Vec::new();
+        for index in 0..320 {
+            let mut object = convoy_object(&format!("remote-{index}")).await;
+            object.spec.instruction = Some("x".repeat(30_000));
+            object.status.get_or_insert_with(Default::default).message = Some("progress-00".into());
+            records.push(ReadResourceObject {
+                object,
+                provenance: ResourceProvenance::Replica {
+                    origin_root: flotilla_protocol::NodeId::new("remote"),
+                    last_synced_at: chrono::Utc::now(),
+                },
+            });
+        }
+        aggregator.replace_convoy_read_source(LocalSource::Durable, records.clone()).await;
+        // Keep a mapped origin without a host registry collaborator.
+        aggregator.origin_hosts.insert(flotilla_protocol::NodeId::new("remote"), HostName::new("remote"));
+        let before = aggregator.copied_convoys.load(std::sync::atomic::Ordering::Relaxed);
+        let summarized = aggregator.summarized_convoys.load(std::sync::atomic::Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        for index in 0..20 {
+            let mut event = records[0].clone();
+            event.object.status.as_mut().unwrap().message = Some(format!("progress-{index:02}"));
+            aggregator.apply_replica_convoy_event(ReadWatchEvent::Modified(event)).await;
+        }
+        let result = state.result_set().await;
+        let rows = result.rows.as_convoys().unwrap();
+        assert_eq!(rows.len(), 320);
+        assert!(rows.iter().find(|row| row.resource.name == "remote-0").unwrap().message.as_ref().unwrap().ends_with("19"));
+        let copied = aggregator.copied_convoys.load(std::sync::atomic::Ordering::Relaxed) - before;
+        eprintln!("replica aggregator: bodies/event={}, elapsed/event={:?}", copied / 20, started.elapsed() / 20);
+        assert_eq!(copied, 0, "ordinary events share previous/current bodies");
+        assert_eq!(
+            aggregator.summarized_convoys.load(std::sync::atomic::Ordering::Relaxed) - summarized,
+            20,
+            "summarize only the event key"
+        );
     }
 
     async fn convoy_object(name: &str) -> ResourceObject<Convoy> {

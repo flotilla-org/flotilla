@@ -1,4 +1,6 @@
 //! Indexed list/watch state shared by continuous store consumers.
+//! Authoritative handles and bounded key deltas avoid replica-wide materialization;
+//! see [Convoy workload](../../../docs/implementation-choices/convoy-event-cost.md).
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -47,8 +49,7 @@ impl<T: Resource> ViewSource<T> for StoreViewSource<T> {
         let replicas = if T::REPLICATION_CLASS == ReplicationClass::None {
             futures::stream::pending().boxed()
         } else if self.backend.serves_read_views() {
-            store
-                .watch_replica_sources_typed::<T>(&self.namespace)
+            crate::retry_store_read(|| store.watch_replica_sources_typed::<T>(&self.namespace))
                 .await?
                 .filter_map(|event| async move {
                     match event {
@@ -63,18 +64,35 @@ impl<T: Resource> ViewSource<T> for StoreViewSource<T> {
                 })
                 .boxed()
         } else {
-            store.watch_replicas_typed::<T>(&self.namespace).await?
+            crate::retry_store_read(|| store.watch_replicas_typed::<T>(&self.namespace)).await?
         };
         let query = StoreQuery { include_replicas: true, suppress_self_origin: false, ..StoreQuery::default() };
-        let listed = store.query_decoded(ResourceKind::of::<T>(), &self.namespace, &query).await?;
+        let listed = crate::retry_store_read(|| store.query_decoded(ResourceKind::of::<T>(), &self.namespace, &query)).await?;
         let position = listed.position.clone();
         let start = match position.generation {
             Some(generation) => WatchStart::FromVersionInGeneration { generation, resource_version: position.resource_version },
             None => WatchStart::FromVersion(position.resource_version),
         };
-        let local = store.watch_typed::<T>(&self.namespace, start).await?.map(|event| event.map(ReadWatchEvent::local));
+        let local = crate::retry_store_read(|| store.watch_typed::<T>(&self.namespace, start.clone()))
+            .await?
+            .map(|event| event.map(ReadWatchEvent::local));
         let items = ReadResourceList { items: listed.into_typed()? };
         Ok((items, futures::stream::select(local, replicas).boxed()))
+    }
+}
+
+fn event_is_local<T: Resource>(event: &ReadWatchEvent<T>) -> bool {
+    match event {
+        ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item) => {
+            matches!(item.provenance, ResourceProvenance::Local)
+        }
+        ReadWatchEvent::DeletedByName { provenance, .. } => matches!(provenance, ResourceProvenance::Local),
+    }
+}
+fn event_name<T: Resource>(event: &ReadWatchEvent<T>) -> String {
+    match event {
+        ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item) => item.object.metadata.name.clone(),
+        ReadWatchEvent::DeletedByName { tombstone, .. } => tombstone.name.clone(),
     }
 }
 
@@ -91,6 +109,8 @@ pub struct ViewState<T: Resource> {
     local_root: Option<NodeId>,
     snapshot: Option<Arc<crate::view_snapshot::SnapshotPartition>>,
     shared_list: std::sync::OnceLock<Arc<ReadResourceList<T>>>,
+    local_objects: ViewObjects<T>,
+    shared_local: std::sync::OnceLock<Arc<Vec<Arc<ReadResourceObject<T>>>>>,
 }
 impl<T: Resource> ViewState<T> {
     pub fn new(local_root: Option<NodeId>) -> Self {
@@ -102,6 +122,8 @@ impl<T: Resource> ViewState<T> {
             local_root,
             snapshot: None,
             shared_list: std::sync::OnceLock::new(),
+            local_objects: BTreeMap::new(),
+            shared_local: std::sync::OnceLock::new(),
         }
     }
     fn key(namespace: &str, name: &str, provenance: &ResourceProvenance) -> String {
@@ -196,6 +218,7 @@ impl<T: Resource> ViewState<T> {
             snapshot.index = self.index.clone();
         }
         self.objects.remove(&key);
+        self.local_objects.remove(&key);
         let identity = (namespace.to_owned(), name.to_owned());
         if let Some(keys) = self.sources.get_mut(&identity) {
             keys.remove(&key);
@@ -206,6 +229,15 @@ impl<T: Resource> ViewState<T> {
     }
     fn apply_source(&mut self, event: ReadWatchEvent<T>) -> Result<(), ResourceError> {
         self.shared_list.take();
+        let local = match &event {
+            ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item) => {
+                matches!(item.provenance, ResourceProvenance::Local)
+            }
+            ReadWatchEvent::DeletedByName { provenance, .. } => matches!(provenance, ResourceProvenance::Local),
+        };
+        if local {
+            self.shared_local.take();
+        }
         // Release the view's own index handle before mutating it. Only an
         // outstanding immutable snapshot should trigger copy-on-write.
         let snapshots_source_rows = self.snapshots_source_rows();
@@ -234,7 +266,11 @@ impl<T: Resource> ViewState<T> {
                         .or_default()
                         .insert(key.clone());
                 }
-                self.objects.insert(key, Arc::new(item));
+                let item = Arc::new(item);
+                if matches!(item.provenance, ResourceProvenance::Local) {
+                    self.local_objects.insert(key.clone(), item.clone());
+                }
+                self.objects.insert(key, item);
             }
             ReadWatchEvent::Deleted(item) => {
                 self.remove_source(&item.object.metadata.namespace, &item.object.metadata.name, &item.provenance);
@@ -432,10 +468,21 @@ pub struct WatchView<T: Resource> {
     changes: watch::Receiver<u64>,
     task: Arc<ViewTask>,
     flush: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
+    materialized: Arc<std::sync::atomic::AtomicU64>,
+    keys: tokio::sync::broadcast::Sender<Option<String>>,
+    local_keys: tokio::sync::broadcast::Sender<Option<String>>,
 }
 impl<T: Resource> Clone for WatchView<T> {
     fn clone(&self) -> Self {
-        Self { state: self.state.clone(), changes: self.changes.clone(), task: self.task.clone(), flush: self.flush.clone() }
+        Self {
+            state: self.state.clone(),
+            changes: self.changes.clone(),
+            task: self.task.clone(),
+            flush: self.flush.clone(),
+            materialized: self.materialized.clone(),
+            keys: self.keys.clone(),
+            local_keys: self.local_keys.clone(),
+        }
     }
 }
 struct ViewTask(tokio::task::JoinHandle<()>);
@@ -445,6 +492,17 @@ impl Drop for ViewTask {
     }
 }
 impl<T: Resource> WatchView<T> {
+    /// Number of owned bodies produced by this view's list APIs.
+    pub fn materialized_objects(&self) -> u64 {
+        self.materialized.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Local bodies are shared separately. Replica events neither invalidate
+    /// this generation nor visit its objects; filtering never walks replicas.
+    pub async fn shared_local_objects(&self) -> Result<Arc<Vec<Arc<ReadResourceObject<T>>>>, ResourceError> {
+        self.flush().await?;
+        let state = self.state.read().await;
+        Ok(state.shared_local.get_or_init(|| Arc::new(state.local_objects.values().cloned().collect())).clone())
+    }
     pub async fn start(backend: ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
         let root = backend.local_root()?;
         Self::start_at_root(backend, namespace, root).await
@@ -465,18 +523,30 @@ impl<T: Resource> WatchView<T> {
         let (tx, changes) = watch::channel(0_u64);
         let worker_state = state.clone();
         let (flush, mut flush_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<()>>(16);
+        let (keys, _) = tokio::sync::broadcast::channel(1024);
+        let worker_keys = keys.clone();
+        let (local_keys, _) = tokio::sync::broadcast::channel(1024);
+        let worker_local_keys = local_keys.clone();
         let task = tokio::spawn(async move {
             let mut warnings = RecoveryWarnings::default();
             loop {
                 tokio::select! {
                     event = events.next() => {
-                        handle_view_event(event, source.as_ref(), &worker_state, &mut events, &mut warnings).await;
+                        let local = event.as_ref().and_then(|event| event.as_ref().ok()).is_some_and(event_is_local);
+                        let key = event.as_ref().and_then(|event| event.as_ref().ok()).map(event_name);
+                        let recovered = handle_view_event(event, source.as_ref(), &worker_state, &mut events, &mut warnings).await;
+                        if recovered || local { let _ = worker_local_keys.send(if recovered { None } else { key.clone() }); }
+                        let _ = worker_keys.send(if recovered { None } else { key });
                     }
                     request = flush_rx.recv() => {
                         let Some(request) = request else { break };
                         let mut changed = false;
                         while let Some(event) = events.next().now_or_never() {
+                            let local = event.as_ref().and_then(|event| event.as_ref().ok()).is_some_and(event_is_local);
+                            let key = event.as_ref().and_then(|event| event.as_ref().ok()).map(event_name);
                             let recovered = handle_view_event(event, source.as_ref(), &worker_state, &mut events, &mut warnings).await;
+                            if recovered || local { let _ = worker_local_keys.send(if recovered { None } else { key.clone() }); }
+                            let _ = worker_keys.send(if recovered { None } else { key });
                             changed = true;
                             // A fresh snapshot is a coherent read boundary. Do
                             // not chase immediately ended replacement streams.
@@ -491,7 +561,7 @@ impl<T: Resource> WatchView<T> {
                 tx.send_modify(|revision| *revision = revision.wrapping_add(1));
             }
         });
-        Ok(Self { state, changes, task: Arc::new(ViewTask(task)), flush })
+        Ok(Self { state, changes, task: Arc::new(ViewTask(task)), flush, materialized: Arc::default(), keys, local_keys })
     }
     /// Drain queued events before reading, stopping at a fresh resync snapshot.
     /// This avoids scheduler-dependent
@@ -504,6 +574,18 @@ impl<T: Resource> WatchView<T> {
     }
     /// Kind-wide invalidations, including changes irrelevant to a selector.
     /// Subscribers re-query; revisions are not a resource event or wire cursor.
+    /// Bounded key deltas. None means a replacement snapshot; lagging readers
+    /// must reselect their inventory. Bodies remain in the indexed view.
+    pub fn subscribe_local_keys(&self) -> tokio::sync::broadcast::Receiver<Option<String>> {
+        self.local_keys.subscribe()
+    }
+    pub fn subscribe_keys(&self) -> tokio::sync::broadcast::Receiver<Option<String>> {
+        self.keys.subscribe()
+    }
+    pub async fn shared_named(&self, name: &str) -> Result<Vec<Arc<ReadResourceObject<T>>>, ResourceError> {
+        self.flush().await?;
+        self.state.read().await.select(&StoreQuery::names([name.to_string()], true))
+    }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changes.clone()
     }
@@ -515,6 +597,7 @@ impl<T: Resource> WatchView<T> {
             return Err(ResourceError::other("watch view stopped"));
         }
         let selected = self.state.read().await.select(query)?;
+        self.materialized.fetch_add(selected.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(materialize(selected))
     }
     /// Immutable inventory shared by all readers of this view generation.
@@ -526,7 +609,9 @@ impl<T: Resource> WatchView<T> {
         if let Some(listed) = state.shared_list.get() {
             return Ok(listed.clone());
         }
-        let listed = Arc::new(materialize(state.select(&query)?));
+        let selected = state.select(&query)?;
+        self.materialized.fetch_add(selected.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let listed = Arc::new(materialize(selected));
         Ok(state.shared_list.get_or_init(|| listed).clone())
     }
     /// Add this generation's maintained objects and equality index. The
@@ -541,7 +626,9 @@ impl<T: Resource> WatchView<T> {
         snapshot.insert_partition::<T>(namespace, state.snapshot_partition()?);
         if state.shared_list.get().is_none() {
             let query = StoreQuery { include_replicas: true, ..StoreQuery::default() };
-            let listed = Arc::new(materialize(state.select(&query)?));
+            let selected = state.select(&query)?;
+            self.materialized.fetch_add(selected.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let listed = Arc::new(materialize(selected));
             state.shared_list.get_or_init(|| listed);
         }
         Ok(state.shared_list.get().expect("initialized inventory").clone())
@@ -567,17 +654,17 @@ pub trait LocalViewSource<T: Resource>: Send + Sync {
 #[async_trait]
 impl<T: Resource> LocalViewSource<T> for crate::TypedResolver<T> {
     async fn list(&self) -> Result<ResourceList<T>, ResourceError> {
-        self.list().await
+        crate::retry_store_read(|| self.list()).await
     }
     async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
-        self.watch(start).await
+        crate::retry_store_read(|| self.watch(start.clone())).await
     }
 }
 #[async_trait]
 impl<T: Resource> ViewSource<T> for crate::ReplicaReadResolver<T> {
     async fn list_and_watch(&self) -> Result<(ReadResourceList<T>, Events<T>), ResourceError> {
-        let watch = self.watch().await?;
-        let listed = self.list().await?;
+        let watch = crate::retry_store_read(|| self.watch()).await?;
+        let listed = crate::retry_store_read(|| self.list()).await?;
         Ok((listed, watch))
     }
 }
@@ -588,8 +675,8 @@ pub async fn recover_local_view<T: Resource>(source: &dyn LocalViewSource<T>) ->
     let mut warnings = RecoveryWarnings::default();
     loop {
         let result = async {
-            let listed = source.list().await?;
-            let events = source.watch(WatchStart::resuming_from(&listed)).await?;
+            let listed = crate::retry_store_read(|| source.list()).await?;
+            let events = crate::retry_store_read(|| source.watch(WatchStart::resuming_from(&listed))).await?;
             Ok((listed, events))
         }
         .await;

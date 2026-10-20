@@ -10,7 +10,7 @@ use flotilla_protocol::{
 };
 use flotilla_resources::canonical_placement_host_ref_from_sources;
 use flotilla_resources::{
-    crew_attention, Checkout as ResourceCheckout, Convoy as ResourceConvoy, Environment as ResourceEnvironment, Host as ResourceHost,
+    crew_attention, Checkout as ResourceCheckout, Environment as ResourceEnvironment, Host as ResourceHost,
     HostStatus as ResourceHostStatus, ReadResourceObject, ResourceProvenance, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
@@ -160,24 +160,16 @@ impl FleetService {
             .into_iter()
             .map(|environment| (environment.metadata.name.clone(), environment))
             .collect();
-        let convoy_items = backend
-            .including_replicas::<ResourceConvoy>(namespace)
-            .list()
-            .await
-            .map_err(|err| err.to_string())?
-            .items
-            .into_iter()
-            .map(|item| item.object)
-            .collect::<Vec<_>>();
-        let convoy_addresses = convoy_items
+        // The Aggregator maintains this catalog from watch events. Health polls
+        // consume projected rows, never stored Convoy bodies or frozen workflows.
+        let convoy_addresses = result_sets
             .iter()
+            .filter_map(|set| set.rows.as_convoys())
+            .flatten()
             .map(|convoy| {
-                let address = convoy
-                    .spec
-                    .project_ref
-                    .as_ref()
-                    .map_or_else(|| convoy.spec.role.clone(), |project| format!("{} @ {project}", convoy.spec.role));
-                (convoy.metadata.name.clone(), address)
+                let role = convoy.address_role.as_deref().unwrap_or(&convoy.name);
+                let address = convoy.project_ref.as_ref().map_or_else(|| role.to_string(), |project| format!("{role} @ {project}"));
+                (convoy.resource.name.clone(), address)
             })
             .collect::<HashMap<_, _>>();
         let mut authority_by_convoy = HashMap::new();

@@ -94,6 +94,12 @@ impl ResourceError {
         Self::other(message)
     }
 
+    /// Store adapters preserve this refusal across the HTTP error boundary.
+    /// It describes read pressure, not an invalid cursor or failed stream.
+    pub fn is_store_busy(&self) -> bool {
+        matches!(self, Self::Other { message } if message.contains("resource store busy: read deadline exceeded"))
+    }
+
     /// Reconcilers requeue both optimistic concurrency conflicts and ownership
     /// enforcement failures from a fresh read.
     pub fn is_stale_view(&self) -> bool {

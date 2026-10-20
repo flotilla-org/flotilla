@@ -131,6 +131,7 @@ pub struct SqliteBackend {
     discovery_readers: Arc<Mutex<Vec<usize>>>,
     writer_depth: Arc<AtomicUsize>,
     read_depth: Arc<AtomicUsize>,
+    read_warnings: Arc<Mutex<ReadWarnings>>,
     // Mutations notify, and watches read the stream's current version and
     // register, on the writer thread. A watch therefore receives live exactly
     // the events committed after the version it registered at; its replay up
@@ -293,6 +294,43 @@ impl StoredEventKind {
             "MODIFIED" => Ok(Self::Modified),
             "DELETED" => Ok(Self::Deleted),
             other => Err(ResourceError::decode(format!("unknown stored event type '{other}'"))),
+        }
+    }
+}
+
+// Per-backend aggregate: pressure cannot turn every refused/slow read into a
+// file write. Counts include suppressed warnings and reset only on publication.
+#[derive(Debug, Default)]
+struct ReadWarnings {
+    last: Option<Instant>,
+    slow: u64,
+    abandoned: u64,
+    deadlines: u64,
+}
+impl ReadWarnings {
+    fn record(&mut self, slow: u64, abandoned: u64, deadlines: u64, now: Instant) -> bool {
+        self.slow += slow;
+        self.abandoned += abandoned;
+        self.deadlines += deadlines;
+        if self.last.is_some_and(|last| now.duration_since(last) < Duration::from_secs(30)) {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+    fn warn(shared: &Mutex<Self>, slow: u64, abandoned: u64, deadlines: u64, operation: &'static str) {
+        let Ok(mut state) = shared.lock() else { return };
+        if state.record(slow, abandoned, deadlines, Instant::now()) {
+            tracing::warn!(
+                operation,
+                slow_reads = state.slow,
+                abandoned_reads = state.abandoned,
+                read_deadlines = state.deadlines,
+                "sqlite read pressure summary (at most every 30s)"
+            );
+            state.slow = 0;
+            state.abandoned = 0;
+            state.deadlines = 0;
         }
     }
 }
@@ -475,6 +513,7 @@ impl SqliteBackend {
             discovery_readers: Arc::new(Mutex::new(vec![0])),
             writer_depth: Arc::default(),
             read_depth: Arc::default(),
+            read_warnings: Arc::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             replica_watchers: Arc::new(Mutex::new(HashMap::new())),
             pending_cleanups: Arc::new(Mutex::new(HashSet::new())),
@@ -507,6 +546,7 @@ impl SqliteBackend {
             discovery_readers: Arc::new(Mutex::new(vec![0])),
             writer_depth: Arc::default(),
             read_depth: Arc::default(),
+            read_warnings: Arc::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             replica_watchers: Arc::new(Mutex::new(HashMap::new())),
             pending_cleanups: Arc::new(Mutex::new(HashSet::new())),
@@ -1371,6 +1411,7 @@ impl SqliteBackend {
             let connection = self.read_connections.get(index).unwrap_or(&self.connection);
             let meter = Arc::clone(self.reader_meters.get(index).unwrap_or(&self.writer_meter));
             let load_metrics = Arc::clone(&self.load_metrics);
+            let read_warnings = self.read_warnings.clone();
             connection
                 .call(move |connection| {
                     let _lease = lease;
@@ -1382,13 +1423,7 @@ impl SqliteBackend {
                     if !alive.load(Ordering::Acquire) || queue_wait >= READ_DEADLINE {
                         load_metrics.reads_shed.increment();
                         if queue_wait >= SLOW_STORE_OPERATION {
-                            tracing::warn!(
-                                operation = operation_name,
-                                queue_wait_ms = queue_wait.as_millis(),
-                                execution_ms = 0,
-                                queue_depth,
-                                "skipped abandoned sqlite read"
-                            );
+                            ReadWarnings::warn(&read_warnings, 0, 1, 0, operation_name);
                         }
                         return Err(ResourceError::other("resource store busy: read deadline exceeded"));
                     }
@@ -1400,13 +1435,7 @@ impl SqliteBackend {
                     let result = operation(connection);
                     load_metrics.read_execution.record(execution.elapsed());
                     if started.elapsed() >= SLOW_STORE_OPERATION {
-                        tracing::warn!(
-                            operation = operation_name,
-                            queue_wait_ms = queue_wait.as_millis(),
-                            execution_ms = execution.elapsed().as_millis(),
-                            queue_depth,
-                            "slow sqlite store read"
-                        );
+                        ReadWarnings::warn(&read_warnings, 1, 0, 0, operation_name);
                     }
                     result
                 })
@@ -1426,16 +1455,7 @@ impl SqliteBackend {
         match result {
             Ok(result) => result,
             Err(_) => {
-                let execution = execution_started.lock().ok().and_then(|timing| *timing);
-                let queue_wait = execution.map_or_else(|| started.elapsed(), |execution| execution.duration_since(started));
-                let execution_time = execution.map_or(Duration::ZERO, |execution| execution.elapsed());
-                tracing::warn!(
-                    operation = operation_name,
-                    queue_wait_ms = queue_wait.as_millis(),
-                    execution_ms = execution_time.as_millis(),
-                    queue_depth = self.read_depth.load(Ordering::Relaxed),
-                    "sqlite read deadline exceeded"
-                );
+                ReadWarnings::warn(&self.read_warnings, 0, 0, 1, operation_name);
                 Err(ResourceError::other("resource store busy: read deadline exceeded"))
             }
         }
@@ -4248,6 +4268,19 @@ mod latency_tests {
 
 #[cfg(test)]
 mod tests {
+    // Suppressed pressure warnings are counted, with one publication per 30 s.
+    #[test]
+    fn pressure_warnings_aggregate_instead_of_writing_per_read() {
+        let mut warnings = super::ReadWarnings::default();
+        let now = std::time::Instant::now();
+        assert!(warnings.record(1, 0, 0, now));
+        for _ in 0..1000 {
+            assert!(!warnings.record(1, 1, 1, now + std::time::Duration::from_secs(29)));
+        }
+        assert_eq!((warnings.slow, warnings.abandoned, warnings.deadlines), (1001, 1000, 1000));
+        assert!(warnings.record(0, 0, 0, now + std::time::Duration::from_secs(30)));
+    }
+
     use flotilla_resources::Resource;
     use tempfile::tempdir;
 

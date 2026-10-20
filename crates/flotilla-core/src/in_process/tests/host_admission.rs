@@ -637,3 +637,49 @@ async fn admitting_host_floor_gates_only_work_that_lands_on_it() {
     assert!(refused.contains("below the 20.0 GiB floor"), "{refused}");
     daemon.admission.check_admitting_host_floor([]).await.expect_err("work without a placement decision defaults to the admitter");
 }
+
+// Health uses the event-maintained Aggregator projection, never Convoy bodies.
+// Background watchers are excluded: this counts this request's reads only.
+#[tokio::test]
+async fn fleet_health_does_not_materialize_convoy_inventory() {
+    use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt, ReadOperation};
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"health-cost\"\n").unwrap();
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    let remote = ResourceBackend::new(InMemoryBackend::default());
+    for index in 0..320 {
+        let records = remote.using::<ResourceConvoy>("flotilla");
+        let name = format!("remote-{index}");
+        let object = records.create(&test_meta(&name), &ConvoySpec::builder().workflow_ref("scratch".into()).build()).await.unwrap();
+        records
+            .update_status(
+                &name,
+                &object.metadata.resource_version,
+                &ConvoyStatus { message: Some("x".repeat(30_000)), ..Default::default() },
+            )
+            .await
+            .unwrap();
+    }
+    backend
+        .replica_writer::<ResourceConvoy>(flotilla_protocol::NodeId::new("remote"), "flotilla")
+        .replace(&remote.using::<ResourceConvoy>("flotilla").list().await.unwrap(), Utc::now())
+        .await
+        .unwrap();
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local-host"),
+        backend.clone(),
+        Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    for _ in 0..2 {
+        let (response, reads) = measure_reads(daemon.fleet_health_internal()).await;
+        response.unwrap();
+        let reads = reads.of(&backend);
+        for operation in [ReadOperation::Get, ReadOperation::List, ReadOperation::Query] {
+            assert_eq!(reads.calls("Convoy", operation), 0, "health must not read Convoys: {reads}");
+        }
+    }
+}

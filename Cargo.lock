@@ -3288,6 +3288,7 @@ dependencies = [
  "flotilla-build-features-types",
  "flotilla-protocol",
  "flotilla-relay-protocol",
+ "flotilla-replication",
  "flotilla-resources",
  "flotilla-store",
  "flotilla-store-testkit",
