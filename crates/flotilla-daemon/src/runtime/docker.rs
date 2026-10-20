@@ -87,7 +87,7 @@ impl DockerControllerRuntime {
             if host == local {
                 Arc::clone(&self.state.local_registry)
             } else {
-                let ssh = self.state.agentless_ssh.get(host.as_str()).ok_or("host-direct provider host is not registered")?;
+                let ssh = self.state.agentless_ssh_for_host(host.as_str()).ok_or("host-direct provider host is not registered")?;
                 self.state
                     .daemon
                     .environment_registry_for_environment(&ssh.environment_id)

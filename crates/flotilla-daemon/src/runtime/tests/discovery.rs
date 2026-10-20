@@ -139,7 +139,15 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         ProviderDescriptor::named(ProviderCategory::TerminalPool, "cleat"),
         Arc::clone(&pool) as Arc<dyn TerminalPool>,
     );
-    daemon.set_direct_environment_registry(&environment_id, Arc::new(registry)).expect("register SSH terminal pool");
+    registry.environment_providers.insert(
+        "host-direct",
+        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "host-direct"),
+        Arc::new(flotilla_environment::environment::host_direct::HostDirectEnvironmentProvider::new(
+            Arc::clone(&runner),
+            std::collections::HashMap::new(),
+        )) as Arc<dyn EnvironmentProvider>,
+    );
+    daemon.set_direct_environment_registry(&environment_id, Arc::new(registry)).expect("register SSH providers");
     let profile = AgentlessSshProfile {
         provisioning: LocalProvisioningProfile {
             repo_default_dir: temp.path().join("ssh-repos").display().to_string(),
@@ -201,6 +209,15 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         )
         .with_agentless_ssh(vec![profile]),
     );
+    // The SSH host's host-direct Environment resolves to the provider in the
+    // SSH environment's registry, not the owner's.
+    let environment =
+        daemon.resource_backend().using::<Environment>(NAMESPACE).get(environment_id.as_str()).await.expect("SSH host-direct Environment");
+    let environments = DockerControllerRuntime { state: Arc::clone(&state) };
+    environments
+        .provision_environment(environment_id.as_str(), &environment.spec)
+        .await
+        .expect("host-direct Environment provisions on the SSH host");
     let clone_runtime = RoutingCloneRuntime { state: Arc::clone(&state) };
     let clone_path = temp.path().join("ssh-repos/base");
     clone_runtime
@@ -225,7 +242,7 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         .await
         .expect("worktree over SSH runner");
     assert!(worktree_path.join(".git").exists());
-    let terminal = TerminalControllerRuntime { state };
+    let terminal = TerminalControllerRuntime { state: Arc::clone(&state) };
     terminal
         .ensure_session(
             "ssh-crew",
@@ -240,12 +257,15 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         )
         .await
         .expect("crew terminal pool provisioned through the SSH environment");
-    let ensured = pool.ensured.lock().await;
-    assert_eq!(ensured.len(), 1);
-    assert_eq!(ensured[0].cwd.as_path(), worktree_path.as_path());
-    let commands = commands.lock().expect("command log");
-    assert!(commands.iter().any(|command| command == "git"));
-    assert!(commands.iter().any(|command| command == "mv"));
+    {
+        let ensured = pool.ensured.lock().await;
+        assert_eq!(ensured.len(), 1);
+        assert_eq!(ensured[0].cwd.as_path(), worktree_path.as_path());
+        let commands = commands.lock().expect("command log");
+        assert!(commands.iter().any(|command| command == "git"));
+        assert!(commands.iter().any(|command| command == "mv"));
+    }
+    environments.cleanup(environment_id.as_str()).await.expect("host-direct Environment is released on the SSH host");
 }
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
