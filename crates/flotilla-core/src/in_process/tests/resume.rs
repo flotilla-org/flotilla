@@ -161,6 +161,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         convoys.update(&input_meta_from_resource(&source), &source.metadata.resource_version, &spec).await.expect("project source");
     let mut status = source.status.expect("source status");
     status.phase = flotilla_resources::ConvoyPhase::Active;
+    status.workflow_snapshot.as_mut().expect("workflow").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
     status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Running;
     status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
     convoys.update_status("resume-staging", &source.metadata.resource_version, &status).await.expect("activate source");
