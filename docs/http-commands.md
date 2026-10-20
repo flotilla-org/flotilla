@@ -7,7 +7,10 @@ existing allowlist and project supervision restrictions. Bearer tokens and brows
 sessions authenticate the same single daemon operator as the main Unix socket;
 they can administer repositories and shut down the daemon. All non-crew callers
 share that operator's command records, including read and cancel access across
-transports and browser sessions. Crew callers can access only their own records.
+transports and browser sessions. Crew callers can read only their own records;
+they cannot cancel commands. Transport-bound callers receive scoped completion
+outcomes and no step events, matching the framed connection. Main-socket callers
+without kernel peer credentials and hook-token callers are refused.
 The TCP listener's Host/Origin policy still applies before routing; artifact path
 operations remain restricted to Unix sockets.
 
@@ -25,7 +28,6 @@ operations remain restricted to Unix sockets.
 | POST | `/v1/artifacts` | `{kind, subject, summary, media_type, source_path}` | 201, artifact address/digest/URL | 64 KiB |
 | GET | `/v1/artifacts` | query: `convoy`, `kind`, `subject` (optional) | 200, `{items}` | 0 |
 | GET | `/v1/artifacts/content` | query: `reference`, `destination_path` | 200, size/URL | 0 |
-| POST | `/v1/events/replay` | `{last_seen}` | 200, replay events | 64 KiB |
 | POST | `/v1/shutdown` | none | 200 | 0 |
 
 POST commands take the command directly, without the framed Execute envelope.
@@ -65,7 +67,7 @@ underlying daemon execution for event correlation (null for a synchronous query)
 Queries also return 202, with their result already retained in the record.
 `wait` is between 0 and 300 seconds and returns the current record. Concurrent waiters are supported. Cancelling a
 finished command returns 409. Records survive HTTP disconnection but not daemon
-restart. At most 1,024 records are retained, evicting the oldest eligible record
+restart. At most 1,024 records are retained. Successful command dispatch evicts the oldest eligible record
 as needed. Completed records become eligible in completion order, including a
 recovered unknown record: its finish event assigns a fresh completion sequence. An unknown
 record with a closed collector is immediately
@@ -73,7 +75,8 @@ evictable. An unknown record whose collector can still recover becomes eligible
 for capacity eviction 300 seconds after its first lost observation; repeated lag
 does not extend that window. Eviction stops the event collector and releases its
 record slot, but never cancels the underlying execution or invents its outcome.
-If active or pending commands occupy all capacity, submissions receive 409.
+Failed dispatch preserves existing outcomes. Admissions are serialized independently
+of record reads and cancellation. If active commands occupy all capacity, submissions receive 409.
 Lost observations report `state: "unknown"` and an `observation_error`, without
 fabricating an execution outcome. A lagged receiver continues consuming; a later
 finish event recovers the real outcome. A closed receiver leaves the outcome
@@ -86,5 +89,5 @@ Cancellation of an existing record whose execution just finished returns 409,
 even if the HTTP collector has not observed that completion yet.
 
 Connection-owned operations (query subscriptions/recovery, fetch-more, focus,
-and wait subscriptions) remain on the surface WebSocket as specified by ADR 0065.
+replay recovery and wait subscriptions) remain on the surface WebSocket as specified by ADR 0065.
 Agent hooks have their own HTTP workstream (#3247); no hook route is added here.

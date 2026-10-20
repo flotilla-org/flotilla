@@ -6,10 +6,10 @@
 //! with `tower::ServiceExt::oneshot`.
 
 mod auth;
+mod commands;
 #[cfg(test)]
 mod hook_tests;
 mod hooks;
-mod commands;
 mod login;
 mod resource_api;
 mod tcp;
@@ -132,7 +132,6 @@ impl HttpRouter {
             .route("/v1/artifacts", axum::routing::any(commands::handle))
             .route("/v1/artifacts/content", axum::routing::any(commands::handle))
             .route("/v1/shutdown", axum::routing::any(commands::handle))
-            .route("/v1/events/replay", axum::routing::any(commands::handle))
             .fallback(resource_api)
             .with_state(RouterState(Arc::new(self)))
             .layer(middleware::from_fn(caller_from_listener))

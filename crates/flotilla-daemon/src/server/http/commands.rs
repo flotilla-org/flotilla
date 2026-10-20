@@ -44,11 +44,20 @@ const MAX_STEPS: usize = 256;
 const MAX_PROGRESS_BYTES: usize = 256 * 1024;
 const UNKNOWN_RETENTION: Duration = Duration::from_secs(300);
 
+// Test double only for the kernel/procfs evidence boundary; resolution remains real.
+#[cfg(test)]
+struct PeerEvidence {
+    caller: CommandCaller,
+    claims: std::collections::HashMap<String, String>,
+    mounts: Option<caller::PeerMounts>,
+}
+
 pub(super) struct Commands {
     router: RemoteCommandRouter,
     shutdown: mpsc::UnboundedSender<()>,
     socket_path: PathBuf,
     records: Mutex<BTreeMap<Uuid, Record>>,
+    admission: Mutex<()>,
     capacity: Arc<Semaphore>,
     eviction_sequence: Arc<AtomicU64>,
 }
@@ -99,6 +108,8 @@ struct CommandState {
     unknown_since: Option<Instant>,
     #[serde(skip)]
     collector_closed: bool,
+    #[serde(skip)]
+    completion_scope: CompletionScope,
 }
 
 impl Commands {
@@ -108,9 +119,15 @@ impl Commands {
             shutdown,
             socket_path,
             records: Mutex::new(BTreeMap::new()),
+            admission: Mutex::new(()),
             capacity: Arc::new(Semaphore::new(RECORD_LIMIT)),
             eviction_sequence: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    async fn has_capacity(&self) -> bool {
+        self.capacity.available_permits() > 0
+            || self.records.lock().await.values().any(|r| r.state.borrow().evictable_order(Instant::now()).is_some())
     }
 
     async fn reserve(&self) -> Result<OwnedSemaphorePermit, &'static str> {
@@ -231,7 +248,6 @@ fn route(method: &Method, path: &str) -> Option<(&'static str, usize)> {
         ("GET", "/v1/artifacts") => Some(("artifact_list", 0)),
         ("GET", "/v1/artifacts/content") => Some(("artifact_get", 0)),
         ("POST", "/v1/shutdown") => Some(("shutdown", 0)),
-        ("POST", "/v1/events/replay") => Some(("replay_since", SMALL_LIMIT)),
         _ => None,
     }
 }
@@ -278,13 +294,16 @@ pub(super) async fn handle(
             None => return encoding.error(StatusCode::METHOD_NOT_ALLOWED, "method is not available on this route"),
         }
     };
-    if request
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .is_some_and(|v| v.to_str().ok().and_then(|v| v.parse::<u64>().ok()).is_none_or(|size| size > limit as u64))
-    {
-        return encoding.error(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds route limit");
+    if let Some(length) = request.headers().get(header::CONTENT_LENGTH) {
+        let Some(size) = length.to_str().ok().and_then(|v| v.parse::<u64>().ok()) else {
+            return encoding.error(StatusCode::BAD_REQUEST, "invalid Content-Length");
+        };
+        if size > limit as u64 {
+            return encoding.error(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds route limit");
+        }
     }
+    #[cfg(test)]
+    let injected_evidence = request.extensions().get::<Arc<PeerEvidence>>().cloned();
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -311,6 +330,17 @@ pub(super) async fn handle(
             let peer = *peer;
             let socket_path = commands.socket_path.clone();
             let evidence = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(evidence) = injected_evidence {
+                    return Ok((
+                        evidence.caller.clone(),
+                        evidence.claims.clone(),
+                        evidence
+                            .mounts
+                            .as_ref()
+                            .map(|m| caller::PeerMounts { mountinfo: m.mountinfo.clone(), legacy_main_directory: m.legacy_main_directory }),
+                    ));
+                }
                 let claims = caller::claims_from_peer(Some(peer));
                 let caller = caller::caller_from_peer(Some(peer), &namespace)?;
                 let mounts = caller
@@ -351,8 +381,18 @@ pub(super) async fn handle(
             transport_bound = true;
             CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&crew.namespace), process: None, crew: Some(crew) }
         }
-        _ => CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&namespace), process: None, crew: None },
+        CallerAuth::Bearer | CallerAuth::Session(_) => {
+            CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&namespace), process: None, crew: None }
+        }
+        CallerAuth::Socket(None) => {
+            return encoding.error(StatusCode::FORBIDDEN, "CallerIdentityUnavailable: socket peer credentials unavailable")
+        }
+        CallerAuth::Hook(_) => return encoding.error(StatusCode::FORBIDDEN, "a hook token reaches only the hook routes"),
+        CallerAuth::Anonymous => return encoding.error(StatusCode::UNAUTHORIZED, "authentication required"),
     };
+    if transport_bound && method == Method::DELETE && command_resource.is_some() {
+        return encoding.error(StatusCode::FORBIDDEN, "EnvironmentCommandDenied: cancellation is outside supervisor authority");
+    }
     if let Some(id) = command_resource {
         let id = match Uuid::parse_str(id) {
             Ok(id) => id,
@@ -414,7 +454,7 @@ pub(super) async fn handle(
         Err(e) => return encoding.error(StatusCode::BAD_REQUEST, e.to_string()),
     };
     if matches!(rpc, RpcRequest::ArtifactPut { .. } | RpcRequest::ArtifactGet { .. })
-        && matches!(authenticated, CallerAuth::Bearer | CallerAuth::Session(_))
+        && !matches!(authenticated, CallerAuth::Socket(_) | CallerAuth::Environment { .. })
     {
         return encoding.error(StatusCode::FORBIDDEN, "artifact path operations require a Unix socket");
     }
@@ -429,13 +469,14 @@ pub(super) async fn handle(
     } else {
         None
     };
-    // Pending dispatches also consume capacity. Never hold the record lock across
-    // dispatch: unrelated reads, cancellations and artifact requests must stay live.
-    let permit = if kind == "execute" {
-        match commands.reserve().await {
-            Ok(permit) => Some(permit),
-            Err(error) => return encoding.error(StatusCode::CONFLICT, error),
+    // Serialize admissions, not record reads: retain the eviction candidate until
+    // dispatch succeeds so a caller error cannot destroy an earlier outcome.
+    let _admission = if kind == "execute" {
+        let guard = commands.admission.lock().await;
+        if !commands.has_capacity().await {
+            return encoding.error(StatusCode::CONFLICT, "HTTP command record capacity is occupied by active or pending commands");
         }
+        Some(guard)
     } else {
         None
     };
@@ -450,8 +491,8 @@ pub(super) async fn handle(
     );
     let dispatcher = if transport_bound { dispatcher } else { dispatcher.with_authenticated_user() };
     let mut response = dispatcher.dispatch(0, rpc).await;
-    if let Some(project) = scope {
-        environment_supervision::scope_response(&mut response, &caller.crew.as_ref().expect("authorized crew").namespace, &project);
+    if let Some(project) = scope.as_ref() {
+        environment_supervision::scope_response(&mut response, &caller.crew.as_ref().expect("authorized crew").namespace, project);
     }
     let response = match response {
         Message::Response { response, .. } => match *response {
@@ -467,14 +508,19 @@ pub(super) async fn handle(
             RpcResponse::QueryResult { value, .. } => (None, Some(value)),
             _ => return encoding.error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected execute response"),
         };
-        let initial = CommandState::new(id, outcome, &commands.eviction_sequence);
+        let permit = commands.reserve().await.expect("serialized admission retains an eligible slot");
+        let completion_scope = CompletionScope {
+            transport_bound,
+            project: scope.map(|project| (caller.crew.as_ref().expect("authorized crew").namespace.clone(), project)),
+        };
+        let mut initial = CommandState::new(id, outcome, &commands.eviction_sequence);
+        initial.completion_scope = completion_scope;
+        let completion_scope = initial.completion_scope.clone();
         let (sender, receiver) = watch::channel(initial);
-        let collector =
-            command_id.map(|command_id| tokio::spawn(collect_progress(events, command_id, sender, commands.eviction_sequence.clone())));
-        commands.records.lock().await.insert(
-            id,
-            Record { _permit: permit.expect("execute reserves capacity"), command_id, owner: caller, state: receiver, collector },
-        );
+        let collector = command_id.map(|command_id| {
+            tokio::spawn(collect_progress(events, command_id, sender, commands.eviction_sequence.clone(), completion_scope))
+        });
+        commands.records.lock().await.insert(id, Record { _permit: permit, command_id, owner: caller, state: receiver, collector });
         let url = format!("/v1/commands/{id}");
         let mut response = encoding.render(StatusCode::ACCEPTED, json!({"id": id, "command_id": command_id, "url": url}));
         response.headers_mut().insert(header::LOCATION, url.parse().expect("UUID URL"));
@@ -504,6 +550,7 @@ impl CommandState {
             progress_bytes: 0,
             unknown_since: None,
             collector_closed: outcome_is_terminal,
+            completion_scope: CompletionScope::default(),
         }
     }
 
@@ -543,14 +590,21 @@ impl CommandState {
     }
 }
 
+#[derive(Clone, Default)]
+struct CompletionScope {
+    transport_bound: bool,
+    project: Option<(String, String)>,
+}
+
 async fn collect_progress(
     mut events: broadcast::Receiver<DaemonEvent>,
     command_id: u64,
     sender: watch::Sender<CommandState>,
     order: Arc<AtomicU64>,
+    scope: CompletionScope,
 ) {
     loop {
-        let event = match events.recv().await {
+        let mut event = match events.recv().await {
             Ok(event) => event,
             Err(error) => {
                 sender.send_modify(|s| {
@@ -566,6 +620,9 @@ async fn collect_progress(
                 }
             }
         };
+        if let Some((namespace, project)) = &scope.project {
+            environment_supervision::scope_completion(&mut event, namespace, project);
+        }
         match event {
             DaemonEvent::CommandFinished { command_id: finished, result, .. } if finished == command_id => {
                 sender.send_modify(|s| {
@@ -578,7 +635,7 @@ async fn collect_progress(
                 });
                 break;
             }
-            event @ DaemonEvent::CommandStepUpdate { command_id: updated, .. } if updated == command_id => {
+            event @ DaemonEvent::CommandStepUpdate { command_id: updated, .. } if updated == command_id && !scope.transport_bound => {
                 sender.send_modify(|s| s.push_step(event))
             }
             _ => {}
@@ -633,7 +690,7 @@ mod tests {
     use super::*;
     use crate::blob_store::{BlobStore, TieredBlobStore};
     use crate::server::http::{HttpRouter, ListenerOrigin, LoginStore};
-    use crate::server::tests::placed_crew_daemon;
+    use crate::server::tests::{caller_mountinfo, placed_crew_daemon, supervisor_daemon};
 
     struct Harness {
         _temp: tempfile::TempDir,
@@ -682,6 +739,18 @@ mod tests {
             cbor: bool,
             caller: CallerAuth,
         ) -> (StatusCode, Value, axum::http::HeaderMap) {
+            self.call_with_evidence(method, path, body, cbor, caller, None).await
+        }
+
+        async fn call_with_evidence(
+            &self,
+            method: &str,
+            path: &str,
+            body: Option<Value>,
+            cbor: bool,
+            caller: CallerAuth,
+            evidence: Option<Arc<PeerEvidence>>,
+        ) -> (StatusCode, Value, axum::http::HeaderMap) {
             let media = if cbor { "application/cbor" } else { "application/json" };
             let bytes = body
                 .map(|v| if cbor { flotilla_cbor::to_vec(&v, &Default::default()).unwrap() } else { serde_json::to_vec(&v).unwrap() })
@@ -694,6 +763,9 @@ mod tests {
                 .body(Body::from(bytes))
                 .unwrap();
             request.extensions_mut().insert(caller);
+            if let Some(evidence) = evidence {
+                request.extensions_mut().insert(evidence);
+            }
             let response = self.router.clone().oneshot(request).await.unwrap();
             let (parts, body) = response.into_parts();
             let bytes = to_bytes(body, 16 * COMMAND_LIMIT).await.unwrap();
@@ -704,6 +776,257 @@ mod tests {
             };
             assert_eq!(parts.headers[header::CONTENT_TYPE], media);
             (parts.status, value, parts.headers)
+        }
+    }
+
+    fn socket_caller() -> CallerAuth {
+        CallerAuth::Socket(Some(caller::PeerCredential::from_kernel(1000, Some(42))))
+    }
+
+    fn host_evidence() -> Arc<PeerEvidence> {
+        Arc::new(PeerEvidence {
+            caller: CommandCaller {
+                principal_ref: PrincipalRef::implicit_for_namespace("flotilla"),
+                process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).build()),
+                crew: None,
+            },
+            claims: Default::default(),
+            mounts: None,
+        })
+    }
+
+    // A hook credential never inherits operator authority on any command route.
+    #[tokio::test]
+    async fn hook_tokens_are_refused() {
+        let h = Harness::new().await;
+        for cbor in [false, true] {
+            for (method, path, body) in [
+                ("POST", "/v1/shutdown", None),
+                ("POST", "/v1/repos", Some(json!({"path":"/tmp/repo"}))),
+                ("POST", "/v1/commands", Some(watch_command())),
+                ("GET", "/v1/commands/00000000-0000-0000-0000-000000000001", None),
+            ] {
+                let caller = CallerAuth::Hook(flotilla_protocol::AgentHookTerminalRef {
+                    namespace: "flotilla".into(),
+                    session_name: "crew-session".into(),
+                });
+                let reply = h.call(method, path, body, cbor, caller).await;
+                assert_eq!(reply.0, StatusCode::FORBIDDEN);
+                assert_eq!(reply.1["message"], "a hook token reaches only the hook routes");
+            }
+        }
+    }
+
+    // Missing kernel identity is refused, and removed replay recovery has no HTTP route.
+    #[tokio::test]
+    async fn missing_peer_and_replay_are_refused() {
+        let h = Harness::new().await;
+        for cbor in [false, true] {
+            let reply = h.call("POST", "/v1/shutdown", None, cbor, CallerAuth::Socket(None)).await;
+            assert_eq!(reply.0, StatusCode::FORBIDDEN);
+            assert_eq!(reply.1["message"], "CallerIdentityUnavailable: socket peer credentials unavailable");
+            let reply = h
+                .router
+                .clone()
+                .oneshot(HttpRequest::post("/v1/events/replay").extension(CallerAuth::Bearer).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), StatusCode::METHOD_NOT_ALLOWED);
+        }
+    }
+
+    // Malformed length is a caller error, checked before the body is polled.
+    #[tokio::test]
+    async fn malformed_content_length_is_bad_request() {
+        let h = Harness::new().await;
+        for length in ["invalid", "-1", "18446744073709551616"] {
+            let body =
+                Body::from_stream(futures::stream::poll_fn(|_| -> std::task::Poll<Option<Result<axum::body::Bytes, std::io::Error>>> {
+                    panic!("body polled")
+                }));
+            let reply = h
+                .router
+                .clone()
+                .oneshot(
+                    HttpRequest::post("/v1/commands")
+                        .header(header::CONTENT_LENGTH, length)
+                        .extension(CallerAuth::Bearer)
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // Failed dispatch at full capacity must preserve every existing completed outcome.
+    #[tokio::test]
+    async fn failed_dispatch_preserves_completed_records() {
+        let h = Harness::new().await;
+        let mut ids = Vec::new();
+        for _ in 0..RECORD_LIMIT {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let (_, state) = watch::channel(CommandState::new(id, Some(CommandValue::Cancelled), &h.commands.eviction_sequence));
+            let permit = h.commands.reserve().await.unwrap();
+            h.commands.records.lock().await.insert(
+                id,
+                Record {
+                    _permit: permit,
+                    command_id: None,
+                    owner: CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace("flotilla"), process: None, crew: None },
+                    state,
+                    collector: None,
+                },
+            );
+        }
+        let bad =
+            serde_json::to_value(Command::builder().action(CommandAction::QueryCrewList { context: Default::default() }).build()).unwrap();
+        let reply = h.call("POST", "/v1/commands", Some(bad), false, CallerAuth::Bearer).await;
+        assert!(reply.0.is_client_error() || reply.0.is_server_error(), "{}", reply.1);
+        for id in ids {
+            assert!(h.commands.records.lock().await.contains_key(&id));
+        }
+    }
+
+    // The Unix branch resolves injected kernel/procfs evidence through live placement.
+    // A container reaching the main socket retains crew authority, never operator authority.
+    #[tokio::test]
+    async fn unix_peer_evidence_keeps_container_crew_bound() {
+        use flotilla_resources::{Environment, EnvironmentStatus, InputMeta};
+        for cbor in [false, true] {
+            let (temp, daemon) = placed_crew_daemon("unix-crew").await;
+            let environments = daemon.resource_backend().using::<Environment>("flotilla");
+            let env = environments
+                .create(
+                    &InputMeta::builder().name("unix-crew".into()).build(),
+                    &serde_json::from_value(json!({"docker":{"host_ref":"host","image":"image"}})).unwrap(),
+                )
+                .await
+                .unwrap();
+            environments
+                .update_status(
+                    "unix-crew",
+                    &env.metadata.resource_version,
+                    &EnvironmentStatus {
+                        runtime_observation: Some(flotilla_protocol::EnvironmentRuntimeObservation {
+                            container_id: Some("kernel-container".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let h = Harness::from_daemon(temp, daemon);
+            let mut evidence = host_evidence();
+            Arc::get_mut(&mut evidence).unwrap().caller.process.as_mut().unwrap().container = Some("kernel-container".into());
+            Arc::get_mut(&mut evidence).unwrap().mounts = Some(caller_mountinfo(&flotilla_protocol::EnvironmentId::new("unix-crew"), true));
+            let denied = h.call_with_evidence("POST", "/v1/shutdown", None, cbor, socket_caller(), Some(evidence.clone())).await;
+            assert_eq!(denied.0, StatusCode::FORBIDDEN);
+            let action = CommandAction::CrewPromise {
+                context: Default::default(),
+                operation: flotilla_protocol::commands::CrewPromiseOperation::Promise { id: "http-promise".into(), kind: "pr".into() },
+            };
+            let accepted = h
+                .call_with_evidence(
+                    "POST",
+                    "/v1/commands",
+                    Some(serde_json::to_value(Command::builder().action(action).build()).unwrap()),
+                    cbor,
+                    socket_caller(),
+                    Some(evidence.clone()),
+                )
+                .await;
+            assert_eq!(accepted.0, StatusCode::ACCEPTED, "{}", accepted.1);
+            let url = accepted.1["url"].as_str().unwrap();
+            let done = h.call_with_evidence("GET", &format!("{url}?wait=2"), None, cbor, socket_caller(), Some(evidence.clone())).await;
+            assert_eq!(done.1["state"], "finished");
+            assert_eq!(done.1["steps"], json!([]));
+            assert_eq!(h.call_with_evidence("DELETE", url, None, cbor, socket_caller(), Some(evidence)).await.0, StatusCode::FORBIDDEN);
+            let host = h.call_with_evidence("GET", "/v1/status", None, cbor, socket_caller(), Some(host_evidence())).await;
+            assert_eq!(host.0, StatusCode::OK);
+        }
+    }
+
+    // Async supervisor dispatch retains the bound project on its record. The same
+    // collector scope filters foreign completion rows and suppresses step events.
+    #[tokio::test]
+    async fn async_crew_completion_is_scoped() {
+        for cbor in [false, true] {
+            let (temp, daemon) = supervisor_daemon().await;
+            let h = Harness::from_daemon(temp, daemon);
+            let caller =
+                CallerAuth::Environment { environment: flotilla_protocol::EnvironmentId::new("supervisor-environment"), peer: None };
+            let command = Command::builder()
+                .action(CommandAction::ConvoyAbandon { namespace: None, name: "target".into(), reason: "scope test".into() })
+                .build();
+            let accepted = h.call("POST", "/v1/commands", Some(serde_json::to_value(command).unwrap()), cbor, caller.clone()).await;
+            assert_eq!(accepted.0, StatusCode::ACCEPTED, "{}", accepted.1);
+            assert!(accepted.1["command_id"].is_number());
+            let id = Uuid::parse_str(accepted.1["id"].as_str().unwrap()).unwrap();
+            let scope = h.commands.records.lock().await[&id].state.borrow().completion_scope.clone();
+            assert!(scope.transport_bound);
+            assert_eq!(scope.project, Some(("flotilla".into(), "project-a".into())));
+            let url = accepted.1["url"].as_str().unwrap();
+            assert_eq!(h.call("DELETE", url, None, cbor, caller.clone()).await.0, StatusCode::FORBIDDEN);
+            let done = h.call("GET", &format!("{url}?wait=2"), None, cbor, caller.clone()).await;
+            assert_eq!(done.1["state"], "finished");
+            assert_eq!(done.1["steps"], json!([]));
+
+            // Event bus boundary: deterministic foreign data and a step on the
+            // dispatched command's retained scope, consumed by the real collector.
+            let order = Arc::new(AtomicU64::new(0));
+            let (events, input) = broadcast::channel(4);
+            let (sender, state) = watch::channel(CommandState::new(id, None, &order));
+            {
+                let mut records = h.commands.records.lock().await;
+                let record = records.get_mut(&id).unwrap();
+                if let Some(collector) = record.collector.take() {
+                    collector.abort();
+                }
+                record.state = state.clone();
+            }
+            let task = tokio::spawn(collect_progress(input, 77, sender, order, scope));
+            events.send(step("private progress".into())).unwrap();
+            let rows = ["project-a", "project-b"]
+                .into_iter()
+                .map(|project| {
+                    flotilla_protocol::CrewStallRow::builder()
+                        .namespace("flotilla".into())
+                        .project(project.into())
+                        .convoy("convoy".into())
+                        .convoy_display_name("convoy".into())
+                        .vessel("work".into())
+                        .role("coder".into())
+                        .evidence("stalled".into())
+                        .cause_group("same".into())
+                        .shared_cause_count(2)
+                        .artifacts(Vec::new())
+                        .build()
+                })
+                .collect();
+            let mut event = finished();
+            if let DaemonEvent::CommandFinished { result, .. } = &mut event {
+                *result = CommandValue::CrewStalls(Box::new(flotilla_protocol::CrewStallsResponse { rows, ..Default::default() }));
+            }
+            events.send(event).unwrap();
+            task.await.unwrap();
+            assert!(state.borrow().steps.is_empty());
+            {
+                let state = state.borrow();
+                let Some(CommandValue::CrewStalls(stalls)) = &state.outcome else { panic!("scoped stalls") };
+                assert_eq!(stalls.rows.len(), 1);
+                assert_eq!(stalls.rows[0].project.as_deref(), Some("project-a"));
+                assert_eq!(stalls.rows[0].shared_cause_count, 1);
+            }
+            let reply = h.call("GET", url, None, cbor, caller).await;
+            assert_eq!(reply.0, StatusCode::OK);
+            assert_eq!(reply.1["steps"], json!([]));
+            let wire = reply.1["outcome"].to_string();
+            assert!(wire.contains("project-a"));
+            assert!(!wire.contains("project-b"));
         }
     }
 
@@ -743,32 +1066,31 @@ mod tests {
                 ),
                 StatusCode::FORBIDDEN,
             ),
-            ("GET", "/v1/artifacts/content?reference=artifact/missing&destination_path=/tmp/output.md", None, StatusCode::NOT_FOUND),
-            ("POST", "/v1/events/replay", Some(json!({"last_seen":[]})), StatusCode::OK),
+            ("GET", "/v1/artifacts/content?reference=artifact/missing&destination_path=/tmp/output.md", None, StatusCode::FORBIDDEN),
         ] {
             let h = Harness::new().await;
-            let json_reply = h.call(method, path, body.clone(), false, CallerAuth::Socket(None)).await;
+            let json_reply = h.call(method, path, body.clone(), false, CallerAuth::Bearer).await;
             // Only mutations need a fresh daemon; read-only replies share the same
             // incarnation so random node IDs do not obscure encoding equivalence.
             let cbor_reply = if path.starts_with("/v1/repos") && method != "GET" {
-                Harness::new().await.call(method, path, body, true, CallerAuth::Socket(None)).await
+                Harness::new().await.call(method, path, body, true, CallerAuth::Bearer).await
             } else {
-                h.call(method, path, body, true, CallerAuth::Socket(None)).await
+                h.call(method, path, body, true, CallerAuth::Bearer).await
             };
             assert_eq!(json_reply.0, status, "{method} {path}: {}", json_reply.1);
             assert_eq!((json_reply.0, json_reply.1.clone()), (cbor_reply.0, cbor_reply.1), "{method} {path}");
             if path == "/v1/artifacts" && method == "POST" {
-                assert_eq!(json_reply.1["message"], "artifact put requires a calling crew session");
+                assert_eq!(json_reply.1["message"], "artifact path operations require a Unix socket");
             }
         }
     }
 
     // Shutdown delegates exactly once per HTTP request, independently in each encoding.
     #[tokio::test]
-    async fn unix_shutdown_signals_once_per_request() {
+    async fn shutdown_signals_once_per_request() {
         for cbor in [false, true] {
             let mut h = Harness::new().await;
-            assert_eq!(h.call("POST", "/v1/shutdown", None, cbor, CallerAuth::Socket(None)).await.0, StatusCode::OK);
+            assert_eq!(h.call("POST", "/v1/shutdown", None, cbor, CallerAuth::Bearer).await.0, StatusCode::OK);
             assert_eq!(h.shutdown.try_recv(), Ok(()));
             assert!(h.shutdown.try_recv().is_err());
         }
@@ -780,28 +1102,28 @@ mod tests {
     async fn command_wait_progress_and_cancel_in_both_encodings() {
         for cbor in [false, true] {
             let h = Harness::new().await;
-            let (status, accepted, headers) = h.call("POST", "/v1/commands", Some(watch_command()), cbor, CallerAuth::Socket(None)).await;
+            let (status, accepted, headers) = h.call("POST", "/v1/commands", Some(watch_command()), cbor, CallerAuth::Bearer).await;
             assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
             let url = accepted["url"].as_str().unwrap();
             assert_eq!(headers[header::LOCATION], url);
             assert_eq!(accepted["id"], url.strip_prefix("/v1/commands/").unwrap());
-            let (status, running, _) = h.call("GET", &format!("{url}?wait=0.01"), None, cbor, CallerAuth::Socket(None)).await;
+            let (status, running, _) = h.call("GET", &format!("{url}?wait=0.01"), None, cbor, CallerAuth::Bearer).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(running["state"], "running");
             assert!(running["outcome"].is_null());
             assert!(!running["steps"].as_array().unwrap().is_empty());
             let wait_path = format!("{url}?wait=2");
             let (first, second, cancel) = tokio::join!(
-                h.call("GET", &wait_path, None, cbor, CallerAuth::Socket(None)),
-                h.call("GET", &wait_path, None, cbor, CallerAuth::Socket(None)),
-                h.call("DELETE", url, None, cbor, CallerAuth::Socket(None)),
+                h.call("GET", &wait_path, None, cbor, CallerAuth::Bearer),
+                h.call("GET", &wait_path, None, cbor, CallerAuth::Bearer),
+                h.call("DELETE", url, None, cbor, CallerAuth::Bearer),
             );
             assert_eq!(cancel.0, StatusCode::ACCEPTED);
             assert_eq!(first.1, second.1);
             assert_eq!(first.1["state"], "finished");
             assert_eq!(first.1["outcome"], serde_json::to_value(CommandValue::Cancelled).unwrap());
-            assert_eq!(h.call("DELETE", url, None, cbor, CallerAuth::Socket(None)).await.0, StatusCode::CONFLICT);
-            assert_eq!(h.call("GET", &format!("{url}?wait=-1"), None, cbor, CallerAuth::Socket(None)).await.0, StatusCode::BAD_REQUEST);
+            assert_eq!(h.call("DELETE", url, None, cbor, CallerAuth::Bearer).await.0, StatusCode::CONFLICT);
+            assert_eq!(h.call("GET", &format!("{url}?wait=-1"), None, cbor, CallerAuth::Bearer).await.0, StatusCode::BAD_REQUEST);
         }
     }
 
@@ -813,10 +1135,10 @@ mod tests {
             let h = Harness::new().await;
             for action in [CommandAction::Refresh { repo: None }, CommandAction::QueryHostList {}] {
                 let command = serde_json::to_value(Command::builder().action(action).build()).unwrap();
-                let reply = h.call("POST", "/v1/commands", Some(command), cbor, CallerAuth::Socket(None)).await;
+                let reply = h.call("POST", "/v1/commands", Some(command), cbor, CallerAuth::Bearer).await;
                 assert_eq!(reply.0, StatusCode::ACCEPTED, "{}", reply.1);
                 let url = reply.1["url"].as_str().unwrap();
-                let finished = h.call("GET", &format!("{url}?wait=2"), None, cbor, CallerAuth::Socket(None)).await;
+                let finished = h.call("GET", &format!("{url}?wait=2"), None, cbor, CallerAuth::Bearer).await;
                 assert_eq!(finished.0, StatusCode::OK);
                 assert_eq!(finished.1["state"], "finished");
                 let outcome: CommandValue = serde_json::from_value(finished.1["outcome"].clone()).unwrap();
@@ -832,20 +1154,20 @@ mod tests {
         let h = Harness::new().await;
         for input_cbor in [false, true] {
             for output_cbor in [false, true] {
-                let body = json!({"last_seen":[]});
+                let body = watch_command();
                 let bytes = if input_cbor {
                     flotilla_cbor::to_vec(&body, &Default::default()).unwrap()
                 } else {
                     serde_json::to_vec(&body).unwrap()
                 };
-                let mut request = HttpRequest::post("/v1/events/replay")
+                let mut request = HttpRequest::post("/v1/commands")
                     .header(header::CONTENT_TYPE, if input_cbor { "application/cbor" } else { "application/json" })
                     .header(header::ACCEPT, if output_cbor { "application/cbor" } else { "application/json" })
                     .body(Body::from(bytes))
                     .unwrap();
                 request.extensions_mut().insert(CallerAuth::Bearer);
                 let reply = h.router.clone().oneshot(request).await.unwrap();
-                assert_eq!(reply.status(), StatusCode::OK);
+                assert_eq!(reply.status(), StatusCode::ACCEPTED);
                 assert_eq!(reply.headers()[header::CONTENT_TYPE], if output_cbor { "application/cbor" } else { "application/json" });
             }
         }
@@ -901,10 +1223,17 @@ mod tests {
     // the negotiated CBOR response keeps the same numeric value without precision loss.
     #[tokio::test]
     async fn integer_request_and_response_contract() {
-        let h = Harness::new().await;
+        let command = Command::builder()
+            .action(CommandAction::QueryDaemonLogs {
+                query: flotilla_protocol::commands::DaemonLogQuery { since_seconds: Some(u64::MAX), level: None, target: None },
+            })
+            .build();
+        // Request decoders accept the same plain integer model, without response wrappers.
+        let json = serde_json::to_vec(&command).unwrap();
+        let cbor = flotilla_cbor::to_vec(&serde_json::to_value(&command).unwrap(), &Default::default()).unwrap();
+        assert_eq!(serde_json::from_slice::<Command>(&json).unwrap(), command);
+        assert_eq!(flotilla_cbor::from_slice::<Command>(&cbor, &Default::default()).unwrap(), command);
         for cbor in [false, true] {
-            let body = json!({"last_seen":[{"stream":{"kind":"host","environment_id":"absent"},"seq":u64::MAX}]});
-            assert_eq!(h.call("POST", "/v1/events/replay", Some(body), cbor, CallerAuth::Bearer).await.0, StatusCode::OK);
             let response = if cbor { Encoding::Cbor } else { Encoding::Json }.render(StatusCode::OK, json!([u64::MAX, i64::MIN]));
             let body = to_bytes(response.into_body(), COMMAND_LIMIT).await.unwrap();
             let value: Value =
@@ -962,7 +1291,9 @@ mod tests {
                 .append_pair("reference", digest.as_str())
                 .append_pair("destination_path", destination.to_str().unwrap())
                 .finish();
-            let reply = h.call("GET", &format!("/v1/artifacts/content?{query}"), None, cbor, CallerAuth::Socket(None)).await;
+            let reply = h
+                .call_with_evidence("GET", &format!("/v1/artifacts/content?{query}"), None, cbor, socket_caller(), Some(host_evidence()))
+                .await;
             assert_eq!(reply.0, StatusCode::OK, "{}", reply.1);
             assert_eq!(reply.1["size"], 17);
             assert_eq!(tokio::fs::read(destination).await.unwrap(), b"artifact contents");
@@ -1015,10 +1346,10 @@ mod tests {
                 Ok::<_, std::io::Error>(bytes::Bytes::new())
             }));
             let mut request = HttpRequest::builder().method(method).uri(path).header(header::CONTENT_LENGTH, limit + 1).body(body).unwrap();
-            request.extensions_mut().insert(CallerAuth::Socket(None));
+            request.extensions_mut().insert(CallerAuth::Bearer);
             assert_eq!(h.router.clone().oneshot(request).await.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
             let mut request = HttpRequest::builder().method(method).uri(path).body(Body::from(vec![b' '; limit + 1])).unwrap();
-            request.extensions_mut().insert(CallerAuth::Socket(None));
+            request.extensions_mut().insert(CallerAuth::Bearer);
             assert_eq!(h.router.clone().oneshot(request).await.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
 
             // Limits are inclusive, including the empty-body route's zero boundary.
@@ -1039,7 +1370,7 @@ mod tests {
             boundary.resize(limit, b' ');
             let mut request =
                 HttpRequest::builder().method(method).uri(path).header(header::CONTENT_LENGTH, limit).body(Body::from(boundary)).unwrap();
-            request.extensions_mut().insert(CallerAuth::Socket(None));
+            request.extensions_mut().insert(CallerAuth::Bearer);
             assert_eq!(h.router.clone().oneshot(request).await.unwrap().status(), expected);
         }
     }
@@ -1097,7 +1428,10 @@ mod tests {
             let accepted = h.call("POST", "/v1/commands", Some(watch_command()), cbor, CallerAuth::Bearer).await;
             let url = accepted.1["url"].as_str().unwrap();
             assert_eq!(h.call("GET", url, None, cbor, CallerAuth::Session(session)).await.0, StatusCode::OK);
-            assert_eq!(h.call("DELETE", url, None, cbor, CallerAuth::Socket(None)).await.0, StatusCode::ACCEPTED);
+            assert_eq!(
+                h.call_with_evidence("DELETE", url, None, cbor, socket_caller(), Some(host_evidence())).await.0,
+                StatusCode::ACCEPTED
+            );
             let final_state = h.call("GET", &format!("{url}?wait=1"), None, cbor, CallerAuth::Session(session)).await;
             assert_eq!(final_state.1["state"], "finished");
         }
@@ -1143,7 +1477,7 @@ mod tests {
         events.send(step("first".into())).unwrap();
         events.send(step("second".into())).unwrap();
         let (sender, mut state) = watch::channel(CommandState::new(Uuid::new_v4(), None, &order));
-        let task = tokio::spawn(collect_progress(receiver, 77, sender, order.clone()));
+        let task = tokio::spawn(collect_progress(receiver, 77, sender, order.clone(), CompletionScope::default()));
         tokio::time::timeout(Duration::from_secs(1), state.wait_for(|s| s.state == "unknown")).await.unwrap().unwrap();
         assert!(state.borrow().outcome.is_none());
         assert!(state.borrow().progress_truncated);
@@ -1158,7 +1492,7 @@ mod tests {
         let (events, receiver) = broadcast::channel(1);
         let (sender, state) = watch::channel(CommandState::new(Uuid::new_v4(), None, &order));
         drop(events);
-        collect_progress(receiver, 77, sender, order).await;
+        collect_progress(receiver, 77, sender, order, CompletionScope::default()).await;
         assert_eq!(state.borrow().state, "unknown");
         assert!(state.borrow().outcome.is_none());
         assert!(state.borrow().collector_closed);
@@ -1218,7 +1552,7 @@ mod tests {
         let (sender, state) = watch::channel(CommandState::new(id, None, &h.commands.eviction_sequence));
         let permit = h.commands.reserve().await.unwrap();
         h.commands.records.lock().await.insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state, collector: None });
-        let task = tokio::spawn(collect_progress(receiver, 77, sender, h.commands.eviction_sequence.clone()));
+        let task = tokio::spawn(collect_progress(receiver, 77, sender, h.commands.eviction_sequence.clone(), CompletionScope::default()));
         let url = format!("/v1/commands/{id}");
         let running = h.call("GET", &format!("{url}?wait=0.001"), None, false, CallerAuth::Bearer).await;
         assert_eq!(running.1["state"], "running");
@@ -1252,16 +1586,16 @@ mod tests {
             }
         }
         for (media, bytes) in [
-            (None, serde_json::to_vec(&json!({"last_seen":[]})).unwrap()),
-            (Some("Application/CBOR"), flotilla_cbor::to_vec(&json!({"last_seen":[]}), &Default::default()).unwrap()),
+            (None, serde_json::to_vec(&watch_command()).unwrap()),
+            (Some("Application/CBOR"), flotilla_cbor::to_vec(&watch_command(), &Default::default()).unwrap()),
         ] {
-            let mut builder = HttpRequest::post("/v1/events/replay");
+            let mut builder = HttpRequest::post("/v1/commands");
             if let Some(media) = media {
                 builder = builder.header(header::CONTENT_TYPE, media);
             }
             let mut request = builder.body(Body::from(bytes)).unwrap();
             request.extensions_mut().insert(CallerAuth::Bearer);
-            assert_eq!(h.router.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+            assert_eq!(h.router.clone().oneshot(request).await.unwrap().status(), StatusCode::ACCEPTED);
         }
     }
 
@@ -1285,8 +1619,13 @@ mod tests {
             if n == 0 {
                 first_state = Some(receiver.clone());
             }
-            let collector =
-                Some(tokio::spawn(collect_progress(events.subscribe(), n as u64, sender, h.commands.eviction_sequence.clone())));
+            let collector = Some(tokio::spawn(collect_progress(
+                events.subscribe(),
+                n as u64,
+                sender,
+                h.commands.eviction_sequence.clone(),
+                CompletionScope::default(),
+            )));
             h.commands
                 .records
                 .lock()
@@ -1318,7 +1657,8 @@ mod tests {
             let (sender, receiver) = watch::channel(state);
             let observer = sender.clone();
             let (events, input) = broadcast::channel(4);
-            let collector = Some(tokio::spawn(collect_progress(input, 77, sender, h.commands.eviction_sequence.clone())));
+            let collector =
+                Some(tokio::spawn(collect_progress(input, 77, sender, h.commands.eviction_sequence.clone(), CompletionScope::default())));
             let permit = h.commands.reserve().await.unwrap();
             h.commands
                 .records
@@ -1359,7 +1699,7 @@ mod tests {
         let (sender, receiver) = watch::channel(CommandState::new(id, None, &h.commands.eviction_sequence));
         let (events, input) = broadcast::channel(1);
         drop(events);
-        collect_progress(input, 77, sender, h.commands.eviction_sequence.clone()).await;
+        collect_progress(input, 77, sender, h.commands.eviction_sequence.clone(), CompletionScope::default()).await;
         assert!(receiver.borrow().evictable_order(Instant::now()).is_some());
         let permit = h.commands.reserve().await.unwrap();
         h.commands
@@ -1395,7 +1735,7 @@ mod tests {
         let operations: Vec<usize> = (0..count).map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(3))).collect();
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let h = Harness::new().await;
-            let accepted = h.call("POST", "/v1/commands", Some(watch_command()), cbor, CallerAuth::Socket(None)).await;
+            let accepted = h.call("POST", "/v1/commands", Some(watch_command()), cbor, CallerAuth::Bearer).await;
             assert_eq!(accepted.0, StatusCode::ACCEPTED);
             let url = accepted.1["url"].as_str().unwrap();
             let mut finished = false;
@@ -1408,28 +1748,28 @@ mod tests {
                                 &format!("{url}?wait={}", if operation == 0 { "0" } else { "0.001" }),
                                 None,
                                 cbor,
-                                CallerAuth::Socket(None),
+                                CallerAuth::Bearer,
                             )
                             .await;
                         assert_eq!(reply.0, StatusCode::OK);
                         assert_eq!(reply.1["outcome"].is_null(), !finished);
                     }
                     2 => {
-                        let reply = h.call("DELETE", url, None, cbor, CallerAuth::Socket(None)).await;
+                        let reply = h.call("DELETE", url, None, cbor, CallerAuth::Bearer).await;
                         assert_eq!(reply.0, if finished { StatusCode::CONFLICT } else { StatusCode::ACCEPTED });
-                        let reply = h.call("GET", &format!("{url}?wait=1"), None, cbor, CallerAuth::Socket(None)).await;
+                        let reply = h.call("GET", &format!("{url}?wait=1"), None, cbor, CallerAuth::Bearer).await;
                         assert_eq!(reply.1["outcome"], serde_json::to_value(CommandValue::Cancelled).unwrap());
                         finished = true;
                     }
                     _ => {
-                        let reply = h.call("GET", &format!("{url}?wait=NaN"), None, cbor, CallerAuth::Socket(None)).await;
+                        let reply = h.call("GET", &format!("{url}?wait=NaN"), None, cbor, CallerAuth::Bearer).await;
                         assert_eq!(reply.0, StatusCode::BAD_REQUEST);
                     }
                 }
             }
             if !finished {
-                h.call("DELETE", url, None, cbor, CallerAuth::Socket(None)).await;
-                let reply = h.call("GET", &format!("{url}?wait=1"), None, cbor, CallerAuth::Socket(None)).await;
+                h.call("DELETE", url, None, cbor, CallerAuth::Bearer).await;
+                let reply = h.call("GET", &format!("{url}?wait=1"), None, cbor, CallerAuth::Bearer).await;
                 assert!(!reply.1["outcome"].is_null());
             }
         });

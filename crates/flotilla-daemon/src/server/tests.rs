@@ -6007,10 +6007,7 @@ async fn environment_client_lease_releases_idle_accounting() {
     assert_eq!(count.load(Ordering::SeqCst), 0);
 }
 
-// Supervision is conferred by a current role holder's subscription, not by a
-// caller's role spelling. Every extra command stays within that bound Project.
-#[tokio::test]
-async fn environment_supervisor_authority_is_project_bound_and_revocable() {
+pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Project, ProjectSpec};
     let (_tmp, daemon) = empty_daemon().await;
     let backend = daemon.resource_backend();
@@ -6114,6 +6111,17 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
         )
         .await
         .unwrap();
+    (_tmp, daemon)
+}
+
+// Supervision is conferred by a current role holder's subscription, not by a
+// caller's role spelling. Every extra command stays within that bound Project.
+#[tokio::test]
+async fn environment_supervisor_authority_is_project_bound_and_revocable() {
+    use flotilla_resources::ConvoyEnsure;
+    let (_tmp, daemon) = supervisor_daemon().await;
+    let backend = daemon.resource_backend();
+    let ensures = backend.using::<ConvoyEnsure>("flotilla");
     let crew =
         super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("supervisor-environment")).await.unwrap().remove(0);
     let mut ordinary = crew.clone();
@@ -6258,7 +6266,7 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     assert!(super::environment_supervision::authorize(&daemon, &mut read, &crew).await.is_err(), "retired role binding loses authority");
 }
 
-fn caller_mountinfo(environment: &EnvironmentId, bound: bool) -> super::caller::PeerMounts {
+pub(super) fn caller_mountinfo(environment: &EnvironmentId, bound: bool) -> super::caller::PeerMounts {
     // Kernel mount-table boundary: bind roots distinguish the old run directory
     // from the dedicated per-environment socket directory without Docker.
     let source = if bound {
