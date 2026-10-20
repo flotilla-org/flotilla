@@ -1,5 +1,6 @@
 use super::*;
 use flotilla_resources::queued_turn_evidence;
+use flotilla_resources::{Observation, ObservedChangeRequestState, ObservedMergeability};
 use flotilla_store_memory::InMemoryBackend;
 
 // #2684: queue acceptance remains queued for every attention state. Only an
@@ -895,12 +896,91 @@ fn assert_observation_authority_ties<T: flotilla_resources::Resource + Clone>(
     }
 }
 
+struct ReplicaTurnSetup<'a> {
+    home: &'a ResourceBackend,
+    observer: &'a ResourceBackend,
+    name: &'a str,
+    id: uuid::Uuid,
+    observed_at: Option<DateTime<Utc>>,
+}
+
+impl ReplicaTurnSetup<'_> {
+    async fn observe_issue(&self, issues: &IssueRefresher) -> DateTime<Utc> {
+        let home = self.home;
+        let observer = self.observer;
+        let name = self.name;
+        let id = self.id;
+        let key = flotilla_observation::issue_observer::IssueKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_issue_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap(),
+        )
+        .unwrap();
+        let mut spec = demand_placeholder_spec::<Issue>(home, name, issues.demand(id, key, None)).await;
+        let observed_at = self.observed_at.unwrap_or_else(Utc::now);
+        spec.observing_authority = "observer".into();
+        let observed = publish_remote_observation::<Issue>(
+            home,
+            observer,
+            name,
+            &spec,
+            &flotilla_resources::IssueStatus {
+                title: Default::default(),
+                assignees: Default::default(),
+                state: Observation::known(flotilla_resources::ObservedIssueState::Closed, observed_at),
+                labels: Observation::known(vec![], observed_at),
+                updated_at: Observation::known(observed_at, observed_at),
+            },
+        )
+        .await;
+        assert_observation_authority_ties(observed, |spec, authority| spec.observing_authority = authority.into());
+        observed_at
+    }
+
+    async fn observe_change_request(&self, refresher: &ChangeRequestRefresher, merged: bool, failed_checks: bool) -> DateTime<Utc> {
+        let home = self.home;
+        let observer = self.observer;
+        let name = self.name;
+        let id = self.id;
+
+        let key = ChangeRequestKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap(),
+        )
+        .unwrap();
+        let mut spec = demand_placeholder_spec::<ChangeRequest>(home, name, refresher.demand(id, key, None)).await;
+        let observed_at = self.observed_at.unwrap_or_else(Utc::now);
+        spec.observing_authority = "observer".into();
+        let observed = publish_remote_observation::<ChangeRequest>(
+            home,
+            observer,
+            name,
+            &spec,
+            &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: Observation::known(
+                    if merged { ObservedChangeRequestState::Merged } else { ObservedChangeRequestState::Open },
+                    observed_at,
+                ),
+                head_sha: Observation::known("head".into(), observed_at),
+                checks: Observation::known(if failed_checks { ObservedChecks::Fail } else { ObservedChecks::Pass }, observed_at),
+                review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Observation::known(true, observed_at) },
+                mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
+            },
+        )
+        .await;
+        assert_observation_authority_ties(observed, |spec, authority| spec.observing_authority = authority.into());
+        observed_at
+    }
+}
+
 // A demanded placeholder on the convoy home must never hide observations from
 // another host: triggering and delivery must agree, including a stalled merge.
 #[hegel::test]
 fn replica_status_turn_delivery(tc: hegel::TestCase) {
     use super::super::routing::{ObjectAddress, ObjectKind};
-    use flotilla_resources::{Observation, ObservedChangeRequestState, ObservedMergeability};
     // Cross both timestamp orders; a newly created empty copy is not evidence.
     let newer_placeholder = tc.draw(hegel::generators::booleans());
     // Both terminal check outcomes satisfy the stock checks-settled rule.
@@ -928,7 +1008,6 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
             let actuator = Arc::new(RecordingTurnDelivery::default());
             table.set_turn_delivery_actuator(actuator.clone()).await;
             let base = Utc::now() - chrono::Duration::seconds(10);
-            let observed_at;
             let id = uuid::Uuid::new_v4();
             let is_issue = source == "issue";
             let address = if is_issue {
@@ -987,65 +1066,17 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
                 )
                 .await
                 .unwrap();
-            let kind = if is_issue {
-                let key = flotilla_observation::issue_observer::IssueKey::new(
-                    "flotilla",
-                    flotilla_resources::address::stored_issue_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap(),
-                )
-                .unwrap();
-                let mut spec = demand_placeholder_spec::<Issue>(&home, &name, issues.demand(id, key, None)).await;
-                observed_at = if newer_placeholder { base + chrono::Duration::seconds(1) } else { Utc::now() };
-                spec.observing_authority = "observer".into();
-                let observed = publish_remote_observation::<Issue>(
-                    &home,
-                    &observer,
-                    &name,
-                    &spec,
-                    &flotilla_resources::IssueStatus {
-                        title: Default::default(),
-                        assignees: Default::default(),
-                        state: Observation::known(flotilla_resources::ObservedIssueState::Closed, observed_at),
-                        labels: Observation::known(vec![], observed_at),
-                        updated_at: Observation::known(observed_at, observed_at),
-                    },
-                )
-                .await;
-                assert_observation_authority_ties(observed, |spec, authority| spec.observing_authority = authority.into());
-                ObjectKind::Issue
+            let setup = ReplicaTurnSetup {
+                home: &home,
+                observer: &observer,
+                name: &name,
+                id,
+                observed_at: newer_placeholder.then_some(base + chrono::Duration::seconds(1)),
+            };
+            let (kind, observed_at) = if is_issue {
+                (ObjectKind::Issue, setup.observe_issue(&issues).await)
             } else {
-                let key = ChangeRequestKey::new(
-                    "flotilla",
-                    flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap(),
-                )
-                .unwrap();
-                let mut spec = demand_placeholder_spec::<ChangeRequest>(&home, &name, refresher.demand(id, key, None)).await;
-                observed_at = if newer_placeholder { base + chrono::Duration::seconds(1) } else { Utc::now() };
-                spec.observing_authority = "observer".into();
-                let observed = publish_remote_observation::<ChangeRequest>(
-                    &home,
-                    &observer,
-                    &name,
-                    &spec,
-                    &flotilla_resources::ChangeRequestStatus {
-                        title: Default::default(),
-                        author: Default::default(),
-                        review_decision: Default::default(),
-                        review_requested_from_owner: Default::default(),
-                        state: Observation::known(
-                            if merged { ObservedChangeRequestState::Merged } else { ObservedChangeRequestState::Open },
-                            observed_at,
-                        ),
-                        head_sha: Observation::known("head".into(), observed_at),
-                        checks: Observation::known(if failed_checks { ObservedChecks::Fail } else { ObservedChecks::Pass }, observed_at),
-                        review: flotilla_resources::ChangeRequestReviewObservation {
-                            actionable_at_head: Observation::known(true, observed_at),
-                        },
-                        mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
-                    },
-                )
-                .await;
-                assert_observation_authority_ties(observed, |spec, authority| spec.observing_authority = authority.into());
-                ObjectKind::ChangeRequest
+                (ObjectKind::ChangeRequest, setup.observe_change_request(&refresher, merged, failed_checks).await)
             };
             let row = LeafSubscriptionRow {
                 id,

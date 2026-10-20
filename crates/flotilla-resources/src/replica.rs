@@ -89,3 +89,31 @@ pub struct ReplicaCursor {
     pub resource_version: String,
     pub generation: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The selector's documented full-tie contract keeps the last supplied
+    // payload, and an empty inventory has no winner.
+    #[hegel::test]
+    fn pick_replica_read_full_tie_keeps_last(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Vary empty/single/multiple candidates and both provenance choices.
+        // All candidates have identical timestamp, authority, and locality rank.
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
+        let local = tc.draw(gs::booleans());
+        let object = ResourceObject::<crate::Issue>::from_k8s_object(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "flotilla.work/v1", "kind": "Issue",
+                "metadata": {"namespace": "test", "name": "issue", "resourceVersion": "1",
+                    "creationTimestamp": "2026-01-01T00:00:00Z"},
+                "spec": {"service": "github.com", "scope": "test/repo", "number": 1, "observing_authority": "observer"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let selected = pick_replica_read((0..count).map(|index| (&object, local, index)), |(object, local, _)| (*object, *local));
+        assert_eq!(selected.map(|(_, _, index)| index), count.checked_sub(1));
+    }
+}
