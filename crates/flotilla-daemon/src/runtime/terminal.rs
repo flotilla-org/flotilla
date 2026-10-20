@@ -12,6 +12,7 @@ use chrono::Utc;
 use flotilla_agent::adapter::AgentAdapter;
 use flotilla_agent::adapter::AgentLaunchRequest;
 use flotilla_agent::adapter::CapabilityTable;
+use flotilla_agent::{CLAUDE_CODE_HOOK_TOKEN_ENV, CLAUDE_CODE_HOOK_URL_ENV};
 use flotilla_capability_contract::SessionCapabilitySource;
 use flotilla_credentials::crew_git_identity_environment;
 use flotilla_crew::reconcilers::terminal_session::{
@@ -473,6 +474,20 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     }
                     materialized_brief.content.push_str("\n\n");
                     materialized_brief.content.push_str(&card);
+                }
+                // Host-direct Claude Code delivers hooks over HTTP while flotillad listens on
+                // loopback TCP (#3247); vessel sessions keep command hooks until their
+                // loopback forwarder (#3485). The token binds the hooks to this terminal.
+                if spec.env_ref == self.state.host_direct_environment_name && requirement.adapter == "claude-code" {
+                    if let Some(hooks) =
+                        self.state.hook_endpoint.as_ref().and_then(|endpoint| endpoint.claude_code_launch(&context.namespace, name))
+                    {
+                        credential_env.retain(|(key, _)| key != CLAUDE_CODE_HOOK_URL_ENV && key != CLAUDE_CODE_HOOK_TOKEN_ENV);
+                        credential_env.extend([
+                            (CLAUDE_CODE_HOOK_URL_ENV.to_string(), hooks.base_url),
+                            (CLAUDE_CODE_HOOK_TOKEN_ENV.to_string(), hooks.token),
+                        ]);
+                    }
                 }
                 adapter.prepare_with_vcs(&cwd, &materialized_brief, &credential_env, vcs.as_ref()).await?;
                 for copy_root in &brief.copies {

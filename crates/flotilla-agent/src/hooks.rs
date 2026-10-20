@@ -233,8 +233,59 @@ struct ClaudeCodeHookSubscription {
 pub const CLAUDE_CODE_HOOK_COMMAND_PREFIX: &str = "flotilla hook claude-code";
 pub const CODEX_NOTIFY_COMMAND: &[&str] = &["flotilla", "hook", "codex", "notify"];
 
+/// The environment variable carrying a session's hook credential to Claude Code's HTTP
+/// hooks. Claude Code interpolates only the variables a hook lists in `allowedEnvVars`,
+/// and refuses to interpolate variables it treats as its own credentials, so the name is
+/// Flotilla's own.
+pub const CLAUDE_CODE_HOOK_TOKEN_ENV: &str = "FLOTILLA_HOOK_TOKEN";
+/// The environment variable naming the base URL of flotillad's Claude Code hook routes on
+/// its loopback listener; each event posts to `<base>/<event>`.
+pub const CLAUDE_CODE_HOOK_URL_ENV: &str = "FLOTILLA_HOOK_URL";
+
+/// Claude Code hook events that accept only `command` and `mcp_tool` hooks.
+const CLAUDE_CODE_COMMAND_ONLY_HOOKS: &[&str] = &["SessionStart", "Setup"];
+
+/// How a Claude Code session delivers Flotilla's hook events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaudeCodeHookTransport<'a> {
+    /// One `flotilla hook claude-code <event>` process per event.
+    Command,
+    /// HTTP POSTs to flotillad's hook routes under this base URL, authenticated by
+    /// [`CLAUDE_CODE_HOOK_TOKEN_ENV`]. Events that do not support HTTP hooks stay commands.
+    Http { base_url: &'a str },
+}
+
+impl<'a> ClaudeCodeHookTransport<'a> {
+    /// HTTP when a launch environment carries both the hook URL and the hook token;
+    /// otherwise commands.
+    pub fn from_environment(environment: &'a [(String, String)]) -> Self {
+        let value = |name: &str| environment.iter().find(|(key, value)| key == name && !value.is_empty()).map(|(_, value)| value.as_str());
+        match (value(CLAUDE_CODE_HOOK_URL_ENV), value(CLAUDE_CODE_HOOK_TOKEN_ENV)) {
+            (Some(base_url), Some(_)) => Self::Http { base_url },
+            _ => Self::Command,
+        }
+    }
+
+    fn handler(self, subscription: &ClaudeCodeHookSubscription) -> serde_json::Value {
+        match self {
+            Self::Http { base_url } if !CLAUDE_CODE_COMMAND_ONLY_HOOKS.contains(&subscription.hook) => serde_json::json!({
+                "type": "http",
+                "url": format!("{}/{}", base_url.trim_end_matches('/'), subscription.event),
+                "headers": { "Authorization": format!("Bearer ${CLAUDE_CODE_HOOK_TOKEN_ENV}") },
+                "allowedEnvVars": [CLAUDE_CODE_HOOK_TOKEN_ENV],
+            }),
+            _ => serde_json::json!({ "type": "command", "command": format!("{CLAUDE_CODE_HOOK_COMMAND_PREFIX} {}", subscription.event) }),
+        }
+    }
+}
+
 /// The `hooks` object Flotilla installs into Claude Code settings.
 pub fn claude_code_hook_entries() -> serde_json::Value {
+    claude_code_hook_entries_over(ClaudeCodeHookTransport::Command)
+}
+
+/// The `hooks` object for a transport.
+pub fn claude_code_hook_entries_over(transport: ClaudeCodeHookTransport<'_>) -> serde_json::Value {
     let mut entries = serde_json::Map::new();
     for subscription in CLAUDE_CODE_HOOK_SUBSCRIPTIONS {
         entries
@@ -242,10 +293,7 @@ pub fn claude_code_hook_entries() -> serde_json::Value {
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut()
             .expect("hook entries are arrays")
-            .push(serde_json::json!({
-                "matcher": subscription.matcher,
-                "hooks": [{ "type": "command", "command": format!("{CLAUDE_CODE_HOOK_COMMAND_PREFIX} {}", subscription.event) }],
-            }));
+            .push(serde_json::json!({ "matcher": subscription.matcher, "hooks": [transport.handler(subscription)] }));
     }
     serde_json::Value::Object(entries)
 }
@@ -256,7 +304,12 @@ pub fn claude_code_hook_entries() -> serde_json::Value {
 /// layers on top of the user's own settings for one invocation instead of
 /// mutating them.
 pub fn claude_code_hook_settings() -> serde_json::Value {
-    serde_json::json!({ "hooks": claude_code_hook_entries() })
+    claude_code_hook_settings_over(ClaudeCodeHookTransport::Command)
+}
+
+/// [`claude_code_hook_settings`] for a transport.
+pub fn claude_code_hook_settings_over(transport: ClaudeCodeHookTransport<'_>) -> serde_json::Value {
+    serde_json::json!({ "hooks": claude_code_hook_entries_over(transport) })
 }
 
 /// Look up the parser for a given harness name.
@@ -565,6 +618,55 @@ mod tests {
         // attention rather than a healthy-looking phase.
         assert_eq!(hooks["Notification"][0]["matcher"], "permission_prompt");
         assert_eq!(hooks["Notification"][1]["matcher"], "elicitation_dialog");
+    }
+
+    // Every event that supports HTTP hooks posts to its route with the hook token;
+    // SessionStart (and Setup, should Flotilla ever subscribe it) accepts only command
+    // and mcp_tool hooks, so it stays a command (code.claude.com/docs/en/hooks, "HTTP hook fields").
+    #[test]
+    fn http_hook_settings_post_each_event_with_the_flotilla_token() {
+        let settings =
+            claude_code_hook_settings_over(ClaudeCodeHookTransport::Http { base_url: "http://127.0.0.1:7878/v1/hooks/claude-code/" });
+        let hooks = settings["hooks"].as_object().expect("hooks object");
+        assert_eq!(hooks.len(), 7);
+        for subscription in CLAUDE_CODE_HOOK_SUBSCRIPTIONS {
+            let entry = hooks[subscription.hook]
+                .as_array()
+                .expect("hook entries")
+                .iter()
+                .find(|entry| entry["matcher"] == subscription.matcher)
+                .expect("subscription entry");
+            let handler = &entry["hooks"][0];
+            if subscription.hook == "SessionStart" {
+                assert_eq!(handler["type"], "command");
+                assert_eq!(handler["command"], "flotilla hook claude-code session-start");
+                continue;
+            }
+            assert_eq!(
+                handler,
+                &serde_json::json!({
+                    "type": "http",
+                    "url": format!("http://127.0.0.1:7878/v1/hooks/claude-code/{}", subscription.event),
+                    "headers": { "Authorization": "Bearer $FLOTILLA_HOOK_TOKEN" },
+                    "allowedEnvVars": ["FLOTILLA_HOOK_TOKEN"],
+                })
+            );
+        }
+    }
+
+    // A launch environment selects HTTP only with both the URL and the token.
+    #[test]
+    fn hook_transport_needs_both_the_url_and_the_token() {
+        let pair = |name: &str, value: &str| (name.to_owned(), value.to_owned());
+        let url = pair(CLAUDE_CODE_HOOK_URL_ENV, "http://127.0.0.1:1/v1/hooks/claude-code");
+        let token = pair(CLAUDE_CODE_HOOK_TOKEN_ENV, "secret");
+        assert_eq!(
+            ClaudeCodeHookTransport::from_environment(&[url.clone(), token.clone()]),
+            ClaudeCodeHookTransport::Http { base_url: "http://127.0.0.1:1/v1/hooks/claude-code" }
+        );
+        for environment in [vec![url.clone()], vec![token.clone()], vec![url, pair(CLAUDE_CODE_HOOK_TOKEN_ENV, "")], Vec::new()] {
+            assert_eq!(ClaudeCodeHookTransport::from_environment(&environment), ClaudeCodeHookTransport::Command, "{environment:?}");
+        }
     }
 
     // Real command input shapes from openai/codex rust-v0.160.0 schema.rs:

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use color_eyre::Result;
 use flotilla_agent as agents;
-use flotilla_protocol::{AgentHookEvent, AttachableId};
+use flotilla_protocol::AgentHookEvent;
 
 use flotilla_cli::cli::args::{Cli, CompletionShell, HooksSubCommand};
 
@@ -30,14 +30,9 @@ pub(crate) async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argumen
         .zip(std::env::var("FLOTILLA_TERMINAL_SESSION").ok().filter(|value| !value.is_empty()))
         .map(|(namespace, session_name)| flotilla_protocol::AgentHookTerminalRef { namespace, session_name });
     let explicit_id = std::env::var("FLOTILLA_ATTACHABLE_ID").ok();
-    let attachable_id = if harness_enum == flotilla_protocol::AgentHarness::Codex {
-        flotilla_agent::attachable::codex_hook_id(explicit_id.as_deref(), terminal.as_ref())
-    } else {
-        match explicit_id {
-            Some(id) if !id.is_empty() => AttachableId::new(id),
-            _ => agents::allocate_attachable_id(),
-        }
-    };
+    // A managed terminal names the agent, so a Claude Code session's command hooks
+    // (SessionStart) and HTTP hooks update one attachable.
+    let attachable_id = flotilla_agent::attachable::terminal_hook_id(explicit_id.as_deref(), terminal.as_ref());
 
     // 5. Build the event.
     let event = AgentHookEvent::builder()

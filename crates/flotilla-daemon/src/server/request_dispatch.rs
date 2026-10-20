@@ -32,8 +32,12 @@ fn absolute_crew_path(path: &Path, cwd: &str) -> std::path::PathBuf {
     }
 }
 
-enum HookIdentityPolicy {
+/// How a hook event's attachable identity is chosen.
+#[derive(Clone, Copy)]
+pub(super) enum HookIdentityPolicy {
+    /// A native session ID already on record keeps its attachable.
     NativeSession,
+    /// A transport that binds the caller to a terminal derives the attachable from it.
     PlacedTerminal,
 }
 
@@ -468,7 +472,7 @@ impl<'a> RequestDispatcher<'a> {
         let Request::AgentHook { event } = request else {
             return Message::error_response(id, "AgentHook request selected the wrong handler");
         };
-        match self.handle_agent_hook(event).await {
+        match handle_agent_hook(&self.daemon.resource_backend(), self.agent_state_store, self.hook_identity_policy, event).await {
             Ok(()) => Message::ok_response(id, Response::AgentHook),
             Err(e) => {
                 warn!(err = %e, "failed to process agent hook event");
@@ -500,131 +504,138 @@ impl<'a> RequestDispatcher<'a> {
             request @ Request::AgentHook { .. } => Box::pin(self.dispatch_request_agent_hook(id, request)).await,
         }
     }
+}
 
-    async fn handle_agent_hook(&self, mut event: AgentHookEvent) -> Result<(), String> {
-        use flotilla_protocol::AgentEventType;
+/// Record one agent hook event: the agent state store entry and, for a managed terminal,
+/// its attention. The framed `AgentHook` request and the router's hook routes share it.
+pub(super) async fn handle_agent_hook(
+    backend: &flotilla_store::ResourceBackend,
+    agent_state_store: &SharedAgentStateStore,
+    hook_identity_policy: HookIdentityPolicy,
+    mut event: AgentHookEvent,
+) -> Result<(), String> {
+    use flotilla_protocol::AgentEventType;
 
-        // Older notify clients allocate a candidate UUID on every invocation.
-        // The managed TerminalSession, rather than that candidate or a legacy
-        // native-session index entry, owns Codex hook attribution.
-        let managed_codex = event.harness == flotilla_protocol::AgentHarness::Codex && event.terminal.is_some();
-        if managed_codex {
-            event.attachable_id = flotilla_agent::attachable::codex_hook_id(None, event.terminal.as_ref());
-        }
+    // Older notify clients allocate a candidate UUID on every invocation.
+    // The managed TerminalSession, rather than that candidate or a legacy
+    // native-session index entry, owns Codex hook attribution.
+    let managed_codex = event.harness == flotilla_protocol::AgentHarness::Codex && event.terminal.is_some();
+    if managed_codex {
+        event.attachable_id = flotilla_agent::attachable::terminal_hook_id(None, event.terminal.as_ref());
+    }
 
-        tracing::info!(
-            harness = ?event.harness,
-            event_type = ?event.event_type,
-            attachable_id = %event.attachable_id,
-            session_id = ?event.session_id,
-            "received agent hook event"
-        );
+    tracing::info!(
+        harness = ?event.harness,
+        event_type = ?event.event_type,
+        attachable_id = %event.attachable_id,
+        session_id = ?event.session_id,
+        "received agent hook event"
+    );
 
-        {
-            let mut store = self.agent_state_store.lock().map_err(|_| "agent state store lock poisoned".to_string())?;
+    {
+        let mut store = agent_state_store.lock().map_err(|_| "agent state store lock poisoned".to_string())?;
 
-            let attachable_id = if matches!(self.hook_identity_policy, HookIdentityPolicy::PlacedTerminal) && event.terminal.is_some() {
-                // A transport-bound crew hook cannot alias another agent through
-                // a caller-supplied native session ID or attachable ID.
-                flotilla_agent::attachable::codex_hook_id(None, event.terminal.as_ref())
-            } else if let Some(ref sid) = event.session_id {
-                if managed_codex {
-                    // Fold a pre-fix unmanaged candidate into the managed shim.
-                    // Unknown notifications are NoChange and must leave the registry intact.
-                    if event.event_type != AgentEventType::NoChange {
-                        if let Some(existing) = store.lookup_by_session_id(sid).cloned().filter(|id| id != &event.attachable_id) {
-                            store.remove(&existing);
-                        }
+        let attachable_id = if matches!(hook_identity_policy, HookIdentityPolicy::PlacedTerminal) && event.terminal.is_some() {
+            // A transport-bound crew hook cannot alias another agent through
+            // a caller-supplied native session ID or attachable ID.
+            flotilla_agent::attachable::terminal_hook_id(None, event.terminal.as_ref())
+        } else if let Some(ref sid) = event.session_id {
+            if managed_codex {
+                // Fold a pre-fix unmanaged candidate into the managed shim.
+                // Unknown notifications are NoChange and must leave the registry intact.
+                if event.event_type != AgentEventType::NoChange {
+                    if let Some(existing) = store.lookup_by_session_id(sid).cloned().filter(|id| id != &event.attachable_id) {
+                        store.remove(&existing);
                     }
-                    event.attachable_id.clone()
-                } else if let Some(existing) = store.lookup_by_session_id(sid) {
-                    existing.clone()
-                } else {
-                    event.attachable_id.clone()
                 }
+                event.attachable_id.clone()
+            } else if let Some(existing) = store.lookup_by_session_id(sid) {
+                existing.clone()
             } else {
                 event.attachable_id.clone()
-            };
+            }
+        } else {
+            event.attachable_id.clone()
+        };
 
-            let changed = if event.event_type == AgentEventType::Ended {
-                store.remove(&attachable_id);
+        let changed = if event.event_type == AgentEventType::Ended {
+            store.remove(&attachable_id);
+            true
+        } else if let Some(status) = event.event_type.to_status() {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            let existing = store.get(&attachable_id);
+            // TODO(#393): persist event.cwd for CliAgentProvider correlation
+            let entry = AgentEntry {
+                harness: event.harness.clone(),
+                status,
+                model: event.model.clone().or_else(|| existing.and_then(|e| e.model.clone())),
+                transcript_path: event
+                    .transcript_path
+                    .clone()
+                    .or_else(|| existing.filter(|e| e.session_id == event.session_id).and_then(|e| e.transcript_path.clone())),
+                session_title: existing.and_then(|e| e.session_title.clone()),
+                session_id: event.session_id.clone(),
+                last_event_epoch_secs: now,
+            };
+            store.upsert(attachable_id, entry);
+            true
+        } else if let Some(existing) = store.get(&attachable_id).cloned() {
+            if let Some(path) = event.transcript_path.clone() {
+                store.upsert(attachable_id, AgentEntry { transcript_path: Some(path), ..existing });
                 true
-            } else if let Some(status) = event.event_type.to_status() {
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                let existing = store.get(&attachable_id);
-                // TODO(#393): persist event.cwd for CliAgentProvider correlation
-                let entry = AgentEntry {
-                    harness: event.harness.clone(),
-                    status,
-                    model: event.model.clone().or_else(|| existing.and_then(|e| e.model.clone())),
-                    transcript_path: event
-                        .transcript_path
-                        .clone()
-                        .or_else(|| existing.filter(|e| e.session_id == event.session_id).and_then(|e| e.transcript_path.clone())),
-                    session_title: existing.and_then(|e| e.session_title.clone()),
-                    session_id: event.session_id.clone(),
-                    last_event_epoch_secs: now,
-                };
-                store.upsert(attachable_id, entry);
-                true
-            } else if let Some(existing) = store.get(&attachable_id).cloned() {
-                if let Some(path) = event.transcript_path.clone() {
-                    store.upsert(attachable_id, AgentEntry { transcript_path: Some(path), ..existing });
-                    true
-                } else {
-                    false
-                }
             } else {
                 false
-            };
-
-            if changed {
-                store.save()?;
-            } else {
-                // Keep the legacy observer path a no-op when it has no control-plane identity.
             }
-        }
+        } else {
+            false
+        };
 
-        let Some(terminal) = event.terminal.as_ref() else { return Ok(()) };
-        let state = match event.event_type {
-            AgentEventType::Active | AgentEventType::ToolActive => flotilla_resources::TerminalAttentionState::Working,
-            AgentEventType::Idle | AgentEventType::Started => flotilla_resources::TerminalAttentionState::Idle,
-            AgentEventType::WaitingForPermission => flotilla_resources::TerminalAttentionState::NeedsInput,
-            AgentEventType::Ended | AgentEventType::NoChange => return Ok(()),
-        };
-        if !event.native_codex_hook {
-            return crate::agent_attention::observe_hook_attention(
-                &self.daemon.resource_backend(),
-                &terminal.namespace,
-                &terminal.session_name,
-                state,
-                event.event_type == AgentEventType::ToolActive,
-            )
-            .await;
+        if changed {
+            store.save()?;
+        } else {
+            // Keep the legacy observer path a no-op when it has no control-plane identity.
         }
-        let sessions = self.daemon.resource_backend().using::<flotilla_resources::TerminalSession>(&terminal.namespace);
-        sessions.get(&terminal.session_name).await.map_err(|error| error.to_string())?;
-        let attention = flotilla_resources::TerminalAttention {
-            state,
-            as_of: chrono::Utc::now(),
-            source: flotilla_resources::TerminalAttentionSource::Hook,
-        };
-        flotilla_store::apply_status_patch(
-            &sessions,
-            &terminal.session_name,
-            &if event.harness == flotilla_protocol::AgentHarness::Codex {
-                flotilla_resources::TerminalSessionStatusPatch::ObserveNativeCodexHook {
-                    attention,
-                    tool_activity: event.event_type == AgentEventType::ToolActive,
-                }
-            } else if event.event_type == AgentEventType::ToolActive {
-                flotilla_resources::TerminalSessionStatusPatch::ObserveToolActivity { attention }
-            } else {
-                flotilla_resources::TerminalSessionStatusPatch::ObserveAttention { attention }
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        Ok(())
     }
+
+    let Some(terminal) = event.terminal.as_ref() else { return Ok(()) };
+    let state = match event.event_type {
+        AgentEventType::Active | AgentEventType::ToolActive => flotilla_resources::TerminalAttentionState::Working,
+        AgentEventType::Idle | AgentEventType::Started => flotilla_resources::TerminalAttentionState::Idle,
+        AgentEventType::WaitingForPermission => flotilla_resources::TerminalAttentionState::NeedsInput,
+        AgentEventType::Ended | AgentEventType::NoChange => return Ok(()),
+    };
+    if !event.native_codex_hook {
+        return crate::agent_attention::observe_hook_attention(
+            backend,
+            &terminal.namespace,
+            &terminal.session_name,
+            state,
+            event.event_type == AgentEventType::ToolActive,
+        )
+        .await;
+    }
+    let sessions = backend.using::<flotilla_resources::TerminalSession>(&terminal.namespace);
+    sessions.get(&terminal.session_name).await.map_err(|error| error.to_string())?;
+    let attention = flotilla_resources::TerminalAttention {
+        state,
+        as_of: chrono::Utc::now(),
+        source: flotilla_resources::TerminalAttentionSource::Hook,
+    };
+    flotilla_store::apply_status_patch(
+        &sessions,
+        &terminal.session_name,
+        &if event.harness == flotilla_protocol::AgentHarness::Codex {
+            flotilla_resources::TerminalSessionStatusPatch::ObserveNativeCodexHook {
+                attention,
+                tool_activity: event.event_type == AgentEventType::ToolActive,
+            }
+        } else if event.event_type == AgentEventType::ToolActive {
+            flotilla_resources::TerminalSessionStatusPatch::ObserveToolActivity { attention }
+        } else {
+            flotilla_resources::TerminalSessionStatusPatch::ObserveAttention { attention }
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }

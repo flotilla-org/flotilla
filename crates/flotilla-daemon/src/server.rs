@@ -13,6 +13,8 @@ mod replication;
 mod request_dispatch;
 mod shared;
 
+pub use http::{HookEndpoint, HookLaunch};
+
 use std::{
     collections::HashMap,
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -349,6 +351,7 @@ pub struct DaemonServer {
     http_router: axum::Router,
     logins: Arc<http::LoginStore>,
     tcp_origin: http::ListenerOrigin,
+    hook_endpoint: http::HookEndpoint,
     http_listen: Option<http::ListenAddress>,
     /// Where the TCP listener's token file lives.
     state_dir: PathBuf,
@@ -506,6 +509,7 @@ impl DaemonServer {
             http_router,
             logins,
             tcp_origin,
+            hook_endpoint: http::HookEndpoint::default(),
             http_listen: None,
             state_dir,
         })
@@ -528,6 +532,12 @@ impl DaemonServer {
 
     /// Signals only after binding, publishing discovery, and preparing acceptance.
     /// A closed channel with no readiness means the server failed to start.
+    /// The hook endpoint host-direct crew launches deliver Claude Code hooks to, once the
+    /// loopback TCP listener binds.
+    pub fn hook_endpoint(&self) -> http::HookEndpoint {
+        self.hook_endpoint.clone()
+    }
+
     pub fn startup_ready(&self) -> watch::Receiver<bool> {
         self.startup_ready.subscribe()
     }
@@ -565,6 +575,7 @@ impl DaemonServer {
             Some(listen) => {
                 let listener = http::TcpListener::bind(listen, &self.state_dir, Arc::clone(&self.logins)).await?;
                 self.tcp_origin.set(listener.origin().to_owned());
+                self.hook_endpoint.set(listener.origin(), listener.hook_key().clone());
                 Some(listener)
             }
             None => None,

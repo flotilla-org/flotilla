@@ -115,7 +115,10 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
             "host-direct-host-test".to_string(),
         )
         .with_credential_store(credential_store)
-        .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([] as [(&str, &str); 0]))))),
+        .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([] as [(&str, &str); 0])))))
+        // #3247: flotillad listens for hooks, but a vessel session keeps command hooks
+        // until its loopback forwarder (#3485).
+        .with_hook_endpoint(Some(crate::server::HookEndpoint::listening_at("http://127.0.0.1:7878"))),
     );
     let spec = flotilla_resources::TerminalSessionSpec {
         env_ref: env_id.to_string(),
@@ -183,6 +186,10 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
     // #2706: session declarations survive, and granted credentials override conflicts.
     assert!(launch.env_vars.iter().any(|(name, value)| name == "DECLARED_VALUE" && value == "hello declared crew"));
     assert!(!launch.env_vars.iter().any(|(_, value)| value == "superseded-spec-token"));
+    assert!(
+        !launch.env_vars.iter().any(|(name, _)| name == flotilla_agent::CLAUDE_CODE_HOOK_TOKEN_ENV),
+        "a vessel session gets no hook token, so its overlay keeps command hooks"
+    );
     assert!(
         launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == "oauth-secret-material"),
         "the contained Claude process must receive its OAuth token"

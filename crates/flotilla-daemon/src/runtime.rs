@@ -95,6 +95,9 @@ pub struct RuntimeOptions {
     /// In-process runtimes omit the gate and restore in the background immediately.
     pub startup_ready: Option<watch::Receiver<bool>>,
     pub environment_sockets: Option<EnvironmentSocketService>,
+    /// flotillad's hook endpoint: host-direct Claude Code crews deliver their hooks over
+    /// HTTP while it has one, and keep command hooks otherwise.
+    pub hook_endpoint: Option<crate::server::HookEndpoint>,
 }
 
 impl Default for RuntimeOptions {
@@ -107,6 +110,7 @@ impl Default for RuntimeOptions {
             start_controllers: true,
             startup_ready: None,
             environment_sockets: None,
+            hook_endpoint: None,
             // Codex only proactively refreshes within 5 minutes of expiry; a
             // central login's access token lives far longer than that, so a
             // conservative fixed cadence comfortably inside that window
@@ -455,6 +459,7 @@ impl DaemonRuntime {
                     profile.host_direct_environment_name(),
                 )
                 .with_environment_sockets(options.environment_sockets.clone())
+                .with_hook_endpoint(options.hook_endpoint.clone())
                 .with_checkout_removal_concurrency(daemon_config.checkout_removal_concurrency)
                 .with_namespace(options.namespace.clone())
                 .with_agentless_ssh(ssh_profiles.clone())
