@@ -190,6 +190,7 @@ struct TableSample {
     #[store(intern = "tt")]
     text: String,
     number: i64,
+    bytes: Vec<u8>,
     #[store(child)]
     tags: Vec<String>,
 }
@@ -208,7 +209,7 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
             for (name, text, number) in [("one", "match", 1), ("two", "other", 2)] {
                 write.insert(
                     name,
-                    &TableSample { text: text.into(), number, tags: vec!["tag".into()] },
+                    &TableSample { text: text.into(), number, bytes: vec![0, 255, 1], tags: vec!["tag".into()] },
                     &flotilla_schema::Origin::new("test", flotilla_schema::Timestamp(1)),
                 )?;
             }
@@ -219,6 +220,21 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
         .with_store(|store| {
             let bounded = store.table_read("home", "table_sample.log", &[], 1)?;
             assert_eq!(bounded.rows.len(), 1, "SQL must apply the log limit before materializing rows");
+            for (field, value) in [
+                ("sequence", flotilla_schema::Value::Text("abc".into())),
+                ("cause", flotilla_schema::Value::Int(3)),
+                ("at", flotilla_schema::Value::Text("not-a-time".into())),
+                ("sequence", flotilla_schema::Value::Null),
+            ] {
+                let filters = [flotilla_schema_sqlite::TableFilter::Compare { field: field.into(), operator: "==".into(), value }];
+                assert!(store.table_read("home", "table_sample.log", &filters, 1).is_err(), "{field}");
+            }
+            let null_edge = [flotilla_schema_sqlite::TableFilter::Compare {
+                field: "edge".into(),
+                operator: "==".into(),
+                value: flotilla_schema::Value::Null,
+            }];
+            assert_eq!(store.table_read("home", "table_sample.log", &null_edge, 1)?.rows.len(), 1);
             assert!(store.table_read("home", "table_sample.log", &[], 0).is_err());
             assert!(store.table_read("home", "table_sample.log", &[], 10_002).is_err());
             Ok(())
@@ -234,7 +250,7 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
     let path = "/tables/table_sample/rows?where=.text%20%3D%3D%20match&count=exact";
     let json = messages(&router, path, false).await;
     assert_eq!(json, messages(&router, path, true).await);
-    assert!(json.iter().any(|message|matches!(message,Message::Rows{rows,..} if rows.len()==1&&rows[0]["text"]=="match"&&rows[0]["resource.name"]=="one"&&rows[0]["number"]==1)));
+    assert!(json.iter().any(|message|matches!(message,Message::Rows{rows,..} if rows.len()==1&&rows[0]["text"]=="match"&&rows[0]["resource.name"]=="one"&&rows[0]["number"]==1&&rows[0]["bytes"]=="AP8B")));
     for cbor in [false, true] {
         let child = messages(&router, "/tables/table_sample_tags/rows", cbor).await;
         assert!(child.iter().any(|message| matches!(message,Message::Rows{rows,..} if rows.len()==2&&rows[0]["value"]=="tag")));
@@ -246,6 +262,7 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
         for (path, code) in [
             ("/tables/table_sample/rows?where=.metadata.labels.group%20%3D%3D%20match", "unsupported_filter"),
             ("/tables/table_sample_tags/rows?where=.metadata.labels.group%20%3D%3D%20match", "unsupported_filter"),
+            ("/tables/table_sample/rows?sort=bytes", "unsupported_sort"),
             ("/tables/table_sample.log/rows?watch", "unsupported_watch"),
             ("/tables/table_sample.log/rows?count=exact", "unsupported_log_paging"),
             ("/tables/table_sample.log/rows?cursor=anything", "unsupported_log_paging"),

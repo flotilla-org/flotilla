@@ -83,3 +83,10 @@ without offering a continuation cursor. Cursor, offset, alternate sort and count
 requests return `unsupported_log_paging`; full keyset paging is deferred. This bounds
 returned history rows while the mutex is held; it does not promise index-bounded
 query execution for arbitrary filters.
+
+Primitive filters run in SQL, but predicates on resolved interned/reference
+aliases are not promised to use column indexes. Resource-tier read-observer checks
+prove use of the resource-store query API separately. Blob cells render as base64
+strings in both carriers. CBOR and frozen object cells decode to their native JSON
+values before either carrier encodes them. These blob/object columns cannot be
+sorted or filtered.

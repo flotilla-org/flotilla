@@ -21,6 +21,22 @@ pub enum TableFilter {
     None,
 }
 
+fn validate_filter_value(column: &ColumnDef, value: &Value) -> Result<(), StoreError> {
+    let valid = match (&column.ty, value) {
+        (_, Value::Null) => column.nullable,
+        (ColumnType::Integer | ColumnType::Timestamp, Value::Int(_)) => true,
+        (ColumnType::Bool, Value::Int(value)) => matches!(value, 0 | 1),
+        (ColumnType::Text | ColumnType::Interned(_) | ColumnType::Ref, Value::Text(_) | Value::Str(_)) => true,
+        (ColumnType::Code(codes), Value::Text(value) | Value::Str(value)) => codes.contains(value),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(StoreError::Stream("filter type mismatch".into()))
+    }
+}
+
 pub(crate) fn read(
     conn: &Connection,
     kinds: &KindRegistry,
@@ -28,11 +44,10 @@ pub(crate) fn read(
     name: &str,
     filters: &[TableFilter],
 ) -> Result<TableRead, StoreError> {
-    let set = kinds
+    let source = kinds
         .iter()
-        .find(|set| set.tables.iter().any(|table| table.name == name))
+        .find_map(|set| set.tables.iter().find(|table| table.name == name))
         .ok_or_else(|| StoreError::Stream("unknown table".into()))?;
-    let source = set.tables.iter().find(|table| table.name == name).expect("table found");
     let mut table = source.clone();
     let mut key = vec![ColumnDef::new("resource.home", ColumnType::Text, false), ColumnDef::new("resource.name", ColumnType::Text, false)];
     for column in &mut key {
@@ -77,17 +92,7 @@ pub(crate) fn read(
         {
             return Err(StoreError::Stream("unsupported filter".into()));
         }
-        let valid = match (&column.ty, value) {
-            (_, Value::Null) => column.nullable,
-            (ColumnType::Integer | ColumnType::Timestamp, Value::Int(_)) => true,
-            (ColumnType::Bool, Value::Int(value)) => matches!(value, 0 | 1),
-            (ColumnType::Text | ColumnType::Interned(_) | ColumnType::Ref, Value::Text(_) | Value::Str(_)) => true,
-            (ColumnType::Code(codes), Value::Text(value)) => codes.iter().any(|code| code.as_str() == value),
-            _ => false,
-        };
-        if !valid {
-            return Err(StoreError::Stream("filter type mismatch".into()));
-        }
+        validate_filter_value(column, value)?;
         let value = match value {
             Value::Null => SqlValue::Null,
             Value::Int(value) => SqlValue::Integer(*value),
@@ -139,7 +144,11 @@ pub(crate) fn read(
 }
 
 pub(crate) fn observed(conn: &Connection, kind: &str, home: &str, name: Option<&str>) -> Result<Vec<(String, String, u64)>, StoreError> {
-    let mut statement=conn.prepare("SELECT v.\"from\",v.\"to\",count(*) FROM log_view v WHERE v.kind=? AND v.home=? AND v.cause='edge' AND (? IS NULL OR v.name=?) GROUP BY v.\"from\",v.\"to\"")?;
+    let mut statement = conn.prepare(
+        "SELECT v.\"from\",v.\"to\",count(*) FROM log_view v \
+         WHERE v.kind=? AND v.home=? AND v.cause='edge' AND (? IS NULL OR v.name=?) \
+         GROUP BY v.\"from\",v.\"to\"",
+    )?;
     let edges = statement
         .query_map(rusqlite::params![kind, home, name, name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?;
@@ -167,15 +176,30 @@ pub(crate) fn read_log(
             clauses.push("0".into());
             continue;
         };
-        if !descriptor.key.iter().chain(&descriptor.columns).any(|column| column.name == *field)
-            || !["==", "!=", "<", "<=", ">", ">="].contains(&operator.as_str())
-        {
+        let column = descriptor
+            .key
+            .iter()
+            .chain(&descriptor.columns)
+            .find(|column| column.name == *field)
+            .ok_or_else(|| StoreError::Stream("unknown log filter field".into()))?;
+        if !["==", "!=", "<", "<=", ">", ">="].contains(&operator.as_str()) {
             return Err(StoreError::Stream("unsupported log filter".into()));
         }
+        validate_filter_value(column, value)?;
         let field = if *field == "sequence" { "home_seq" } else { field };
+        let operator = if matches!(value, Value::Null) {
+            match operator.as_str() {
+                "==" => "IS",
+                "!=" => "IS NOT",
+                _ => return Err(StoreError::Stream("unsupported null comparison".into())),
+            }
+        } else {
+            operator.as_str()
+        };
         clauses.push(format!("{} {} ?", quote_ident(field), operator));
         values.push(match value {
-            Value::Text(value) => SqlValue::Text(value.clone()),
+            Value::Null => SqlValue::Null,
+            Value::Text(value) | Value::Str(value) => SqlValue::Text(value.clone()),
             Value::Int(value) => SqlValue::Integer(*value),
             _ => return Err(StoreError::Stream("log filter type mismatch".into())),
         });
