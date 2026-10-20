@@ -28,7 +28,7 @@ use flotilla_resources::{
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_SESSION_TAG,
 };
 use flotilla_store::ResourceBackend;
-use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize};
+use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize, TerminalSubmission};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -193,14 +193,27 @@ pub(super) async fn deliver_and_confirm(
     // PTY input sent during agent startup can be consumed before the TUI has
     // enabled its composer input modes. A newly launched agent reports active,
     // so wait for its first idle observation before sending delivery bytes.
-    match wait_for_delivery_ready(pool, adapter, session_id, readiness).await {
-        Ok(true) => {}
-        result => {
-            warn!(%session_id, ?result, "agent session readiness failed before any message input was sent");
-            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+    let deadline =
+        tokio::time::Instant::now() + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
+    loop {
+        match tokio::time::timeout_at(deadline, wait_for_delivery_ready(pool, adapter, session_id, readiness)).await {
+            Ok(Ok(true)) => {}
+            Err(_) => return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)),
+            result => {
+                warn!(%session_id, ?result, "agent session readiness failed before any message input was sent");
+                return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+            }
         }
+        // timeout_at can poll an immediately-ready observation at the deadline.
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
+        }
+        let outcome = submit_and_confirm(pool, adapter, session_id, message, clear_before_delivery).await?;
+        if outcome != TerminalDeliveryOutcome::Pending {
+            return Ok(outcome);
+        }
+        tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
     }
-    submit_and_confirm(pool, adapter, session_id, message, clear_before_delivery).await
 }
 
 /// Readiness and freshness are both pre-write steps under one hold deadline.
@@ -214,31 +227,38 @@ pub(super) async fn deliver_guarded_and_confirm(
 ) -> Result<TerminalDeliveryOutcome, String> {
     let deadline =
         tokio::time::Instant::now() + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
-    let ready =
-        tokio::time::timeout_at(deadline, wait_for_delivery_ready(pool, adapter, session, TerminalDeliveryReadiness::TurnBoundary)).await;
-    if ready.is_err() {
-        // Stop waiting; the durable intent remains for the operator gate.
-        return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
-    }
-    if !matches!(ready, Ok(Ok(true))) {
-        return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
-    }
-    match tokio::time::timeout_at(deadline, inbox.validate_delivery_members(members, Utc::now())).await {
-        Ok(Ok(true)) => {}
-        Err(_) => return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)),
-        Ok(Err(error)) => {
-            warn!(%session, %error, "message freshness is unavailable before input; holding the unsent batch");
+    loop {
+        let ready =
+            tokio::time::timeout_at(deadline, wait_for_delivery_ready(pool, adapter, session, TerminalDeliveryReadiness::TurnBoundary))
+                .await;
+        if ready.is_err() {
+            // Stop waiting; the durable intent remains for the operator gate.
+            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
+        }
+        if !matches!(ready, Ok(Ok(true))) {
             return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
         }
-        Ok(Ok(false)) => return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)),
+        match tokio::time::timeout_at(deadline, inbox.validate_delivery_members(members, Utc::now())).await {
+            Ok(Ok(true)) => {}
+            Err(_) => return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)),
+            Ok(Err(error)) => {
+                warn!(%session, %error, "message freshness is unavailable before input; holding the unsent batch");
+                return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+            }
+            Ok(Ok(false)) => return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)),
+        }
+        // timeout_at polls an immediately-ready future before its timer; enforce
+        // the bound even if readiness and validation complete at the deadline.
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
+        }
+        // No second readiness wait may separate validation from terminal input.
+        let outcome = submit_and_confirm(pool, adapter, session, text, false).await?;
+        if outcome != TerminalDeliveryOutcome::Pending {
+            return Ok(outcome);
+        }
+        tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
     }
-    // timeout_at polls an immediately-ready future before its timer; enforce
-    // the bound even if readiness and validation complete at the deadline.
-    if tokio::time::Instant::now() >= deadline {
-        return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
-    }
-    // No second readiness wait may separate validation from terminal input.
-    submit_and_confirm(pool, adapter, session, text, false).await
 }
 
 pub(super) async fn submit_and_confirm(
@@ -248,13 +268,23 @@ pub(super) async fn submit_and_confirm(
     message: &str,
     clear_before_delivery: bool,
 ) -> Result<TerminalDeliveryOutcome, String> {
-    let submission =
-        if clear_before_delivery { pool.retry_delivery(session_id, message).await } else { pool.deliver(session_id, message).await };
-    // A transport error may occur after a partial write, or after acceptance
-    // with the reply lost. It does not prove that retyping is safe.
-    if let Err(error) = submission {
-        warn!(%session_id, %error, "message write has an ambiguous outcome; holding without resending");
-        return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
+    let submission = if clear_before_delivery {
+        pool.retry_delivery(session_id, message).await.map(|()| TerminalSubmission::Submitted)
+    } else {
+        pool.guarded_deliver(session_id, message).await
+    };
+    match submission {
+        Ok(TerminalSubmission::Submitted) => {}
+        Ok(TerminalSubmission::Refused(reason)) => {
+            debug!(%session_id, %reason, "cleat refused atomic submission; keeping delivery queued");
+            // Keep the in-flight batch at the FIFO head. A refusal consumes
+            // neither a receipt nor the bounded transport-failure budget.
+            return Ok(TerminalDeliveryOutcome::Pending);
+        }
+        Err(error) => {
+            warn!(%session_id, %error, "message write has an ambiguous outcome; holding without resending");
+            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
+        }
     }
     match session_busy_after_delivery_grace(pool, adapter, session_id).await {
         Ok(true) => Ok(TerminalDeliveryOutcome::Confirmed),

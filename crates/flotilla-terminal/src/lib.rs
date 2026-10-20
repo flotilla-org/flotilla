@@ -54,6 +54,13 @@ pub enum ScreenActivity {
     Stable,
 }
 
+/// A refused submission is known to have written no message input and may be retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalSubmission {
+    Submitted,
+    Refused(String),
+}
+
 /// Pure CLI adapter for terminal session management.
 /// Session names are opaque provider strings; durable TerminalSessions own identity.
 #[async_trait]
@@ -167,8 +174,18 @@ pub trait TerminalPool: Send + Sync {
         Err("terminal pool does not support delivery".to_string())
     }
 
+    /// Submit with any pool-owned atomic input guards. Transport errors remain
+    /// ambiguous; only an explicit refusal establishes that no text was written.
+    async fn guarded_deliver(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
+        self.deliver(session_name, text).await?;
+        Ok(TerminalSubmission::Submitted)
+    }
+
     /// Retry a delivery whose text is still present in a TUI composer. Pools
     /// with keyboard-level control should clear that text before resubmitting.
+    /// This legacy API reports failures after clearing as transport errors,
+    /// including a refused submission. Callers must hold those outcomes rather
+    /// than assume the preceding clear can safely be repeated.
     async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
         self.deliver(session_name, text).await
     }

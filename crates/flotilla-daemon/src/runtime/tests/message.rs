@@ -1049,14 +1049,17 @@ async fn terminal_delivery_lookup_deduplicates_same_message_and_replaces_a_diffe
     assert_eq!(completed.task.await.expect("delivery task").expect("delivery result"), TerminalDeliveryOutcome::Confirmed);
 }
 
-// Three receiver-homed intents reach the real adapter/pool boundary as one
-// ordered frame. An ambiguous write keeps observations fresh, resolves on
-// later Working evidence, and releases its slot without typing again.
-#[tokio::test(start_paused = true)]
-async fn message_batch_uses_one_pool_input_and_releases_a_late_receipt() {
-    for operator_closes in [false, true] {
-        run_message_batch_pool_case(operator_closes).await;
-    }
+// Three receiver-homed intents remain queued through controller refusals, then
+// reach the real adapter/pool boundary once, in FIFO order. An ambiguous write
+// resolves on later Working evidence (or operator closure) without duplication.
+#[hegel::test]
+fn message_batch_uses_one_pool_input_and_releases_a_late_receipt(tc: hegel::TestCase) {
+    // Generate repeated controller-input interleavings, including a single
+    // refusal and five refusals, and both receipt/closure settlement paths.
+    let refusals = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(5));
+    let operator_closes = tc.draw(hegel::generators::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused scenario runtime");
+    runtime.block_on(run_message_batch_pool_case(operator_closes, refusals));
 }
 
 // Legacy queue work cannot drain or replace a Message batch's task,
@@ -1260,4 +1263,49 @@ async fn message_resync_coalesces_active_messages() {
         assert!(!task.is_finished(), "inbox loop must remain live");
         task.abort();
     }
+}
+
+// The issue's queued-refusal retry also applies to legacy delivery: transient
+// controller activity retries once per boundary and permanent refusal ends at
+// the existing hold deadline, without typing input or leaking its reservation.
+#[hegel::test]
+fn legacy_controller_refusals_retry_within_a_bounded_hold(tc: hegel::TestCase) {
+    // Cover startup and turn-boundary readiness, zero through four transient
+    // refusals, and a controller that refuses for the entire hold interval.
+    let startup = tc.draw(hegel::generators::booleans());
+    let refusals = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4));
+    let permanent = tc.draw(hegel::generators::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused refusal runtime");
+    runtime.block_on(async {
+        let activities = if permanent {
+            vec![ScreenActivity::Stable]
+        } else {
+            let mut activities = vec![ScreenActivity::Stable; refusals + 1];
+            activities.push(ScreenActivity::Active);
+            activities
+        };
+        let pool = DeliveryProbePool::new(activities);
+        pool.controller_refusals.store(if permanent { usize::MAX } else { refusals }, Ordering::SeqCst);
+        let bound = flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
+        let started = tokio::time::Instant::now();
+        let readiness = if startup { TerminalDeliveryReadiness::Startup } else { TerminalDeliveryReadiness::TurnBoundary };
+        let result = tokio::time::timeout(
+            bound + Duration::from_secs(1),
+            deliver_and_confirm(&pool, None, "agent", "queued turn", readiness, false),
+        )
+        .await
+        .expect("legacy delivery must finish within the hold")
+        .expect("delivery outcome");
+        assert!(started.elapsed() <= bound);
+        if permanent {
+            assert_eq!(result, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
+            assert!(pool.inputs.lock().expect("input log").is_empty());
+            assert!(pool.submission_attempts.load(Ordering::SeqCst) > 0);
+        } else {
+            assert_eq!(result, TerminalDeliveryOutcome::Confirmed);
+            assert_eq!(*pool.inputs.lock().expect("input log"), vec!["queued turn"]);
+            assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), refusals + 1);
+        }
+        assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
+    });
 }

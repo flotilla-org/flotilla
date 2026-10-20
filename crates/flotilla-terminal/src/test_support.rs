@@ -1,12 +1,12 @@
-//! Config values are unused by terminal factories; this view keeps their tests independent of core.
+//! In-memory provider configuration keeps terminal factory tests independent of core.
 use async_trait::async_trait;
 use flotilla_discovery_api::provider_config::{ProviderConfig, ProviderConfigView, ResolvedCheckoutConfig};
 use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 
-pub struct TestConfig(DaemonHostPath);
+pub struct TestConfig(DaemonHostPath, pub ProviderConfig);
 impl TestConfig {
     pub fn with_base(path: impl AsRef<std::path::Path>) -> Self {
-        Self(DaemonHostPath::new(path.as_ref()))
+        Self(DaemonHostPath::new(path.as_ref()), ProviderConfig::default())
     }
 }
 #[async_trait]
@@ -21,6 +21,6 @@ impl ProviderConfigView for TestConfig {
         panic!("terminal factories do not read checkout config")
     }
     async fn load_config_for_probe(&self) -> Result<ProviderConfig, String> {
-        panic!("terminal factories do not read provider config")
+        Ok(self.1.clone())
     }
 }
