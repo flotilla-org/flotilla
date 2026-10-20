@@ -18,6 +18,10 @@ FLOTILLA_LOAD_DEADLINE_SECS=1800 FLOTILLA_LOAD_MAX_RESIDENT_GIB=6 FLOTILLA_LOAD_
   cargo test --release -p flotilla-daemon --locked --test dummy_fleet_load load_baseline -- --ignored --nocapture
 ```
 
+To run a plan on a hosted box without a Rust toolchain (build on feta, copy, run detached), see
+[#3317's load page](3317-message-engine-load.md#running-a-load-plan-on-a-hosted-box). `FLOTILLA_LOAD_PRIMITIVES=true` runs
+a plan with Message on the engine.
+
 | Run | Daemons | Running | Ramp/s | Merge after | Window | Ramp limit |
 |---|---:|---:|---:|---:|---:|---:|
 | `d1-n100` | 1 | 100 | 10 | 120 s | 300 s | 600 s |
