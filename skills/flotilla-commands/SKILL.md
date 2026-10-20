@@ -50,7 +50,8 @@ promise; discovered produced PRs participate too. A closed, unmerged PR rejects
 its submission, retains the verdict in history, and reopens the promise. Submit
 the next attempt against the same promise.
 
-When several PR promises are open, branch discovery creates a separate
+The deliverer’s default PR promise attaches to named PR submissions too.
+When several named PR promises are open, branch discovery creates a separate
 crew-sourced promise instead of guessing which declaration it fulfills. Use
 explicit `--promise` submissions to bind that PR to the intended declarations;
 all promises for the merged PR become kept.

@@ -2417,6 +2417,8 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = None;
                     state.completion_turn = None;
                     state.completion_refusal = None;
+                } else {
+                    return;
                 }
                 clear_nudge_budget(status, vessel, role);
                 clear_stall_for_crew(status, vessel, role);

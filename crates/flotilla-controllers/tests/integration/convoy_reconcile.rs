@@ -3632,7 +3632,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
         workflow.vessels[0].crew.retain(|crew| crew.role == "coder");
         workflow.vessels[0].crew[0].completion_conditions.clear();
         workflow.vessels[0].crew[0].promises.clear();
-        workflow.vessels[0].crew[0].deliverer = false;
+        workflow.vessels[0].crew[0].deliverer = true;
         let mut status = ConvoyStatus {
             phase: if pending {
                 ConvoyPhase::Pending
@@ -3679,6 +3679,9 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
             )]),
             ..Default::default()
         };
+        for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], &status) {
+            flotilla_resources::promises::apply(&mut status, &vessel, &role, &operation);
+        }
         for number in 1..=3 {
             flotilla_resources::promises::apply(
                 &mut status,
@@ -3745,7 +3748,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
             }
             let current = convoys.get("three-pr").await.unwrap();
             let promises = &current.status.as_ref().unwrap().promises["work"]["coder"];
-            assert_eq!(promises.iter().filter(|p| p.state == PromiseState::Kept).count(), number as usize);
+            assert_eq!(promises.iter().filter(|p| p.state == PromiseState::Kept).count(), number as usize + 1);
             for _ in 0..duplicates {
                 let current = convoys.get("three-pr").await.unwrap();
                 let prepared = reconciler.prepare(&current).await.unwrap();
@@ -3770,7 +3773,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
                     timestamp(55),
                 );
                 assert_eq!(evidence.satisfied, number == 3);
-                assert_eq!(evidence.promises.len(), 3);
+                assert_eq!(evidence.promises.len(), 4);
             }
         }
         for _ in 0..3 {
@@ -3784,7 +3787,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
         let status = landed.status.as_ref().unwrap();
         assert_eq!(status.phase, ConvoyPhase::Landed);
         let receipt = status.landing_settlement.as_ref().unwrap();
-        assert_eq!(receipt.promises.len(), 3);
+        assert_eq!(receipt.promises.len(), 4);
         assert_eq!(receipt.subjects.len(), 3);
         assert!(receipt.promises.iter().all(|p| p.state == PromiseState::Kept));
         assert_eq!(serde_json::from_value::<ConvoyStatus>(serde_json::to_value(status).unwrap()).unwrap(), *status);

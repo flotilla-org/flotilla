@@ -227,6 +227,18 @@ pub fn pending(status: &ConvoyStatus, vessel: &str, role: &str) -> Vec<String> {
     owned(status, vessel, role).iter().filter(|p| !p.state.terminal()).map(|p| p.id.clone()).collect()
 }
 
+/// The deliverer minimum follows PR evidence even when a named obligation owns it.
+fn is_default_pr(promise: &Promise) -> bool {
+    promise.id == "template/pr" && promise.kind == PromiseKind::Pr && promise.source == PromiseSource::Template
+}
+
+/// The generic admission slot does not make a single named submission ambiguous.
+pub fn submission_candidates(promises: &[Promise], kind: PromiseKind) -> Vec<&Promise> {
+    let open = promises.iter().filter(|p| p.kind == kind && p.state == PromiseState::Open).collect::<Vec<_>>();
+    let named = kind == PromiseKind::Pr && open.iter().any(|p| !is_default_pr(p));
+    open.into_iter().filter(|p| !named || !is_default_pr(p)).collect()
+}
+
 pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &PromiseOperation) {
     if status.phase.is_terminal() {
         return;
@@ -248,27 +260,30 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
             }
             let promise = promises.iter_mut().find(|p| p.id == *id).expect("inserted promise");
             if let PromiseOperation::Submit { submission, .. } = operation {
-                if promise.kind == *kind && matches!(promise.state, PromiseState::Submitted | PromiseState::Kept) {
-                    if let Some(prior) = promise.submissions.last_mut().filter(|prior| prior.same_subject(submission, &[])) {
-                        prior.metadata.extend(submission.metadata.clone());
+                let reused = if promise.kind == *kind && matches!(promise.state, PromiseState::Submitted | PromiseState::Kept) {
+                    let Some(prior) = promise.submissions.last_mut().filter(|prior| prior.same_subject(submission, &[])) else {
+                        return;
+                    };
+                    prior.metadata.extend(submission.metadata.clone());
+                    true
+                } else {
+                    false
+                };
+                if !reused {
+                    // Optimistic patches may have outlived command validation.
+                    if promise.kind != *kind || promise.state.terminal() {
+                        return;
                     }
-                    return;
+                    if promise.submissions.iter().any(|prior| {
+                        prior.reference == submission.reference
+                            && prior.submitted_at == submission.submitted_at
+                            && prior.metadata == submission.metadata
+                    }) {
+                        return;
+                    }
+                    promise.submissions.push(submission.clone());
+                    promise.state = PromiseState::Submitted;
                 }
-                // Optimistic patches may have outlived command validation.
-                // The command checks effect_present on the persisted result;
-                // mismatched kinds and terminal states must remain untouched.
-                if promise.kind != *kind || promise.state.terminal() {
-                    return;
-                }
-                if promise.submissions.iter().any(|prior| {
-                    prior.reference == submission.reference
-                        && prior.submitted_at == submission.submitted_at
-                        && prior.metadata == submission.metadata
-                }) {
-                    return;
-                }
-                promise.submissions.push(submission.clone());
-                promise.state = PromiseState::Submitted;
             }
         }
         PromiseOperation::Retract { id, reason } => {
@@ -300,6 +315,18 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
         }
     }
     if let PromiseOperation::Submit { kind: PromiseKind::Pr, submission, .. } = operation {
+        // A named PR also fulfils the deliverer's admission minimum. Binding
+        // the same evidence atomically leaves every named obligation intact.
+        if let Some(id) =
+            owned(status, vessel, role).iter().find(|p| is_default_pr(p) && p.state == PromiseState::Open).map(|p| p.id.clone())
+        {
+            apply(
+                status,
+                vessel,
+                role,
+                &PromiseOperation::Submit { id, kind: PromiseKind::Pr, source: PromiseSource::Template, submission: submission.clone() },
+            );
+        }
         // Status patches apply without a Forge list: a forge-id or public
         // GitHub spelling resolves, and an existing subject in another
         // spelling of the same request is not discovered twice.
@@ -622,8 +649,7 @@ pub fn discovered_submission(
         return None;
     }
     let reference = crate::address::submission_subject_text(&address).ok()?;
-    let open =
-        owned(status, vessel, role).iter().filter(|p| p.kind == PromiseKind::Pr && p.state == PromiseState::Open).collect::<Vec<_>>();
+    let open = submission_candidates(owned(status, vessel, role), PromiseKind::Pr);
     let id = match open.as_slice() {
         [p] => p.id.clone(),
         _ => reference.clone(),
@@ -921,63 +947,81 @@ mod tests {
     fn deliverer_admission_requires_a_submitted_pr_even_with_a_kept_ledger(tc: hegel::TestCase) {
         use crate::{ConvoyPhase, CrewWorkPhase, CrewWorkState, WorkflowSnapshot};
         let explicit = tc.draw(hegel::generators::booleans());
-        let mut workflow = crate::single_agent_workflow_spec();
-        if explicit {
-            workflow.vessels[0].crew[0].promises.push(crate::TemplatePromise { owner: "coder".into(), kind: PromiseKind::Pr });
+        for named in [false, true] {
+            let mut workflow = crate::single_agent_workflow_spec();
+            if explicit {
+                workflow.vessels[0].crew[0].promises.push(crate::TemplatePromise { owner: "coder".into(), kind: PromiseKind::Pr });
+            }
+            let mut status = ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: workflow.exit,
+                    turn_delivery: workflow.turn_delivery,
+                    vessels: workflow.vessels,
+                }),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            };
+            for (vessel, role, operation) in admitted_declarations(&[], &status) {
+                apply(&mut status, &vessel, &role, &operation);
+            }
+            assert_eq!(owned(&status, "work", "coder").iter().filter(|p| p.kind == PromiseKind::Pr).count(), 1);
+            assert!(admitted_declarations(&[], &status).is_empty());
+            status
+                .promises
+                .get_mut("work")
+                .unwrap()
+                .get_mut("coder")
+                .unwrap()
+                .iter_mut()
+                .find(|p| p.kind == PromiseKind::DecisionLedger)
+                .unwrap()
+                .state = PromiseState::Kept;
+            if named {
+                apply(
+                    &mut status,
+                    "work",
+                    "coder",
+                    &PromiseOperation::Declare { id: "implementation".into(), kind: PromiseKind::Pr, source: PromiseSource::Dispatch },
+                );
+            }
+            let now = DateTime::from_timestamp(1, 0).unwrap();
+            assert!(next_completion(&status, now).is_none());
+            let operation = discovered_submission(&status, "work", "coder", &pr_subject(1), &[], now).unwrap();
+            apply(&mut status, "work", "coder", &operation);
+            assert_eq!(owned(&status, "work", "coder").len(), if named { 3 } else { 2 });
+            let pr = owned(&status, "work", "coder").iter().find(|p| p.kind == PromiseKind::Pr).unwrap();
+            assert_eq!(pr.id, "template/pr");
+            assert_eq!(pr.source, PromiseSource::Template);
+            assert_eq!(pr.state, PromiseState::Submitted);
+            assert_eq!(pr.submissions.len(), 1);
+            assert!(next_completion(&status, now).is_none());
+            let evidence = owned(&status, "work", "coder")
+                .iter()
+                .filter(|p| p.kind == PromiseKind::Pr)
+                .map(|p| (p.id.clone(), p.submissions[0].clone()))
+                .collect::<Vec<_>>();
+            for (id, attempt) in evidence {
+                apply(
+                    &mut status,
+                    "work",
+                    "coder",
+                    &PromiseOperation::Verdict {
+                        id,
+                        reference: attempt.reference,
+                        submitted_at: attempt.submitted_at,
+                        verdict: SubmissionVerdict { accepted: true, who: "forge".into(), at: now, why: "merged".into() },
+                    },
+                );
+            }
+            assert!(next_completion(&status, now).is_some());
         }
-        let mut status = ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: workflow.exit,
-                turn_delivery: workflow.turn_delivery,
-                vessels: workflow.vessels,
-            }),
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            ..Default::default()
-        };
-        for (vessel, role, operation) in admitted_declarations(&[], &status) {
-            apply(&mut status, &vessel, &role, &operation);
-        }
-        assert_eq!(owned(&status, "work", "coder").iter().filter(|p| p.kind == PromiseKind::Pr).count(), 1);
-        assert!(admitted_declarations(&[], &status).is_empty());
-        status
-            .promises
-            .get_mut("work")
-            .unwrap()
-            .get_mut("coder")
-            .unwrap()
-            .iter_mut()
-            .find(|p| p.kind == PromiseKind::DecisionLedger)
-            .unwrap()
-            .state = PromiseState::Kept;
-        let now = DateTime::from_timestamp(1, 0).unwrap();
-        assert!(next_completion(&status, now).is_none());
-        let operation = discovered_submission(&status, "work", "coder", &pr_subject(1), &[], now).unwrap();
-        apply(&mut status, "work", "coder", &operation);
-        assert_eq!(owned(&status, "work", "coder").len(), 2);
-        let pr = owned(&status, "work", "coder").iter().find(|p| p.kind == PromiseKind::Pr).unwrap();
-        assert_eq!(pr.id, "template/pr");
-        assert_eq!(pr.source, PromiseSource::Template);
-        assert!(next_completion(&status, now).is_none());
-        let attempt = pr.submissions[0].clone();
-        apply(
-            &mut status,
-            "work",
-            "coder",
-            &PromiseOperation::Verdict {
-                id: "template/pr".into(),
-                reference: attempt.reference,
-                submitted_at: attempt.submitted_at,
-                verdict: SubmissionVerdict { accepted: true, who: "forge".into(), at: now, why: "merged".into() },
-            },
-        );
-        assert!(next_completion(&status, now).is_some());
     }
 
     // #3586: submission history, including a rejected attempt, requires a

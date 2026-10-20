@@ -1030,7 +1030,7 @@ impl CrewService {
                         }) {
                             existing.id.clone()
                         } else {
-                            let matching = promises.iter().filter(|p| p.kind == kind && p.state == PromiseState::Open).collect::<Vec<_>>();
+                            let matching = flotilla_resources::promises::submission_candidates(promises, kind);
                             match matching.as_slice() {
                                 [p] => p.id.clone(),
                                 [] => reference.clone(),
