@@ -43,7 +43,10 @@ pub fn match_provider<'a>(
     };
     // Class fixes input shape (ADR 0058); capabilities still determine behavior.
     // The legacy per-vessel input carrier also serves Dummy and future kinds.
-    let incompatible_class = |class| (class == EnvironmentClass::HostDirect) != spec.host_direct.is_some();
+    // Express this input-shape constraint as data; no class dispatch chooses
+    // provider operations. The matcher only tests membership in that constraint.
+    let host_adoption_classes = [EnvironmentClass::HostDirect];
+    let incompatible_class = |class| host_adoption_classes.contains(&class) != spec.host_direct.is_some();
     let strategy = if spec.host_direct.is_some() { "host-direct" } else { "per-vessel" };
     if let Some(class) = requirements.class.filter(|class| incompatible_class(*class)) {
         return Err(format!("{host}: provider class {class:?} is incompatible with {strategy} execution strategy"));
