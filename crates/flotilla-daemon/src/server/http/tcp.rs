@@ -110,6 +110,8 @@ pub(in crate::server) struct TcpListener {
     policy: TcpPolicy<CallerAuth>,
     origin: String,
     hook_key: HookKey,
+    /// Whether the configured port is fixed (non-zero), so the origin survives a restart.
+    fixed_port: bool,
 }
 
 impl TcpListener {
@@ -127,12 +129,18 @@ impl TcpListener {
         let hook_key = HookKey::load_or_create(&directory)?;
         let hooks = hook_key.clone();
         let policy = TcpPolicy::new(listen.allowed_hosts(bound.port()), move |request| authenticate(request, &token, &hooks, &logins));
-        Ok(Self { server, policy, origin: listen.origin(bound.port()), hook_key })
+        Ok(Self { server, policy, origin: listen.origin(bound.port()), hook_key, fixed_port: listen.bind_address().port() != 0 })
     }
 
     /// The key this listener verifies hook tokens with.
     pub(in crate::server) fn hook_key(&self) -> &HookKey {
         &self.hook_key
+    }
+
+    /// Whether the listen address was configured with a fixed port, rather than port 0,
+    /// which binds a different port at each start.
+    pub(in crate::server) fn has_fixed_port(&self) -> bool {
+        self.fixed_port
     }
 
     pub(in crate::server) fn local_addr(&self) -> io::Result<SocketAddr> {

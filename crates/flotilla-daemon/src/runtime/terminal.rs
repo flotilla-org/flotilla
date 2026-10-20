@@ -31,7 +31,7 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize, TerminalSubmission};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::credentials::{agent_material_environment, RuntimeSessionCapabilities};
 use super::state::ControllerRuntimeState;
@@ -482,6 +482,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     if let Some(hooks) =
                         self.state.hook_endpoint.as_ref().and_then(|endpoint| endpoint.claude_code_launch(&context.namespace, name))
                     {
+                        info!(session = %name, url = %hooks.base_url, "Claude Code hooks post over HTTP");
                         credential_env.retain(|(key, _)| key != CLAUDE_CODE_HOOK_URL_ENV && key != CLAUDE_CODE_HOOK_TOKEN_ENV);
                         credential_env.extend([
                             (CLAUDE_CODE_HOOK_URL_ENV.to_string(), hooks.base_url),
