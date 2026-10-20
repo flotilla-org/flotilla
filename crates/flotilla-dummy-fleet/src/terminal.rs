@@ -269,11 +269,10 @@ mod tests {
     const SESSION: &str = "terminal-convoy-a-implement-crew";
 
     // Stands in for the daemon's command boundary: records each crew command,
-    // refuses the first completions, and reports handoffs to the test's peer.
+    // delays promise settlement, and reports handoffs to the test's peer.
     struct RecordingPort {
         /// Every submitted change-request reference starts with this.
         reference_prefix: String,
-        refusals: std::sync::Mutex<usize>,
         handoff_refusals: std::sync::Mutex<usize>,
         commands: mpsc::UnboundedSender<String>,
         attention: std::sync::Mutex<Vec<(String, bool)>>,
@@ -285,6 +284,9 @@ mod tests {
             let (entry, value) = match action {
                 CommandAction::CrewPromise { operation: CrewPromiseOperation::Promise { .. }, .. } => {
                     ("promise".to_string(), CommandValue::Ok)
+                }
+                CommandAction::CrewPromise { operation: CrewPromiseOperation::Submit { kind, .. }, .. } if kind == "decision-ledger" => {
+                    ("submit-ledger".to_string(), CommandValue::Ok)
                 }
                 CommandAction::CrewPromise { operation: CrewPromiseOperation::Submit { reference, .. }, .. } => {
                     assert!(reference.starts_with(&self.reference_prefix), "{reference}");
@@ -304,14 +306,9 @@ mod tests {
                     let proposal = if proposed_disposition == Some(StallProposedDisposition::Fail) { "fail" } else { "resume" };
                     (format!("stall:{proposal}"), CommandValue::Ok)
                 }
-                CommandAction::CrewComplete { .. } => {
-                    let mut refusals = self.refusals.lock().expect("refusals");
-                    if *refusals > 0 {
-                        *refusals -= 1;
-                        ("complete".to_string(), CommandValue::Error { message: "crew promises are not kept or retracted: pr".into() })
-                    } else {
-                        ("complete".to_string(), CommandValue::Ok)
-                    }
+                CommandAction::ResourceApply { document, .. } => {
+                    assert_eq!(document["kind"], "Artifact");
+                    ("ledger".to_string(), CommandValue::Ok)
                 }
                 other => panic!("dummy crews send only crew commands, not {other:?}"),
             };
@@ -359,15 +356,15 @@ mod tests {
         .collect()
     }
 
-    fn expected_commands(script: &CrewScript, refusals: usize, handoff_refusals: usize, failed: bool, stalled: bool) -> Vec<String> {
+    fn expected_commands(script: &CrewScript, handoff_refusals: usize, failed: bool, stalled: bool) -> Vec<String> {
         if failed {
             return vec!["stall:fail".into()];
         }
         let mut commands = if stalled { vec!["stall:resume".to_string()] } else { Vec::new() };
-        let handoffs_start = commands.len() + if matches!(script, CrewScript::Coder { .. }) { 2 } else { 0 };
+        let handoffs_start = commands.len() + if matches!(script, CrewScript::Coder { .. }) { 1 } else { 0 };
         match script {
             CrewScript::Coder { reviewer, .. } => {
-                commands.extend(["promise".to_string(), "submit".to_string()]);
+                commands.push("submit".to_string());
                 commands.extend(reviewer.iter().map(|reviewer| format!("handoff:{reviewer}!")));
             }
             CrewScript::Responder { reply_to } => commands.extend((0..RESPONDER_TURNS).map(|_| format!("handoff:{reply_to}"))),
@@ -383,7 +380,7 @@ mod tests {
             });
             commands.splice(handoffs_start..handoffs_start, refused);
         }
-        commands.extend(std::iter::repeat_n("complete".to_string(), refusals + 1));
+        commands.extend(["submit-ledger".to_string(), "ledger".to_string()]);
         commands
     }
 
@@ -392,10 +389,10 @@ mod tests {
     // Behaviour (#3206): a dummy crew acts only through crew commands, in its
     // script's order. It stalls proposing failure at its failure rate; at its
     // stall rate it stalls proposing resumption and continues after the next
-    // turn; it retries completion until its daemon accepts it; it shows as
+    // turn; it publishes a ledger and waits for promise settlement; it shows as
     // working from a turn's delivery until it has acted, and idle afterwards.
     // The generator spans every script, peers present and absent, zero to two
-    // completion refusals, and each failure/stall/clean outcome.
+    // handoff refusals, and each failure/stall/clean outcome.
     // Paused time keeps a case to milliseconds, so the property affords more
     // cases than the default profile to reach the rarer script/refusal pairs.
     #[test]
@@ -410,7 +407,6 @@ mod tests {
             2 => CrewScript::Responder { reply_to: "coder".into() },
             _ => CrewScript::Governor { aide: "aide".into(), turns: tc.draw(gs::integers::<u32>().min_value(1).max_value(4)) },
         };
-        let refusals = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
         // Zero to four refusals: below, at and beyond the three attempts before a stall.
         let handoff_refusals = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
         let failed = tc.draw(gs::booleans());
@@ -427,7 +423,6 @@ mod tests {
             let (commands, mut recorded) = mpsc::unbounded_channel();
             let port = Arc::new(RecordingPort {
                 reference_prefix: "https://forge.dummy.invalid/dummy/fleet/pulls/".into(),
-                refusals: std::sync::Mutex::new(refusals),
                 handoff_refusals: std::sync::Mutex::new(handoff_refusals),
                 commands,
                 attention: Default::default(),
@@ -448,7 +443,7 @@ mod tests {
             .expect("launch");
             assert_eq!(screen().await, Some(TerminalAttentionState::Working), "the launch prompt is the first turn");
 
-            let expected = expected_commands(&script, refusals, handoff_refusals, failed, stalled);
+            let expected = expected_commands(&script, handoff_refusals, failed, stalled);
             let mut seen = Vec::new();
             let mut delivered = 0u64;
             let responder = matches!(script, CrewScript::Responder { .. });
@@ -536,7 +531,6 @@ mod tests {
         let (commands, mut recorded) = mpsc::unbounded_channel();
         let port = Arc::new(RecordingPort {
             reference_prefix: "https://fake-forge.test:3443/github/flotilla-org/flotilla/pulls/".into(),
-            refusals: std::sync::Mutex::new(0),
             handoff_refusals: std::sync::Mutex::new(0),
             commands,
             attention: Default::default(),
@@ -556,7 +550,6 @@ mod tests {
         async fn next(recorded: &mut mpsc::UnboundedReceiver<String>) -> String {
             tokio::time::timeout(Duration::from_secs(600), recorded.recv()).await.expect("crew acts").expect("port open")
         }
-        assert_eq!(next(&mut recorded).await, "promise");
         assert_eq!(next(&mut recorded).await, "stall:resume", "a refused open stalls after its retries");
         assert_eq!(fake.refusals().1, 3, "each attempt reached the forge and was refused");
         let repo = RepoRef::new("github", "flotilla-org", "flotilla");
@@ -565,7 +558,8 @@ mod tests {
         std::fs::write(token.path(), "right\n").expect("fix token");
         pool.deliver(SESSION, "[from the operator (supervisor)]\n\nToken fixed.").await.expect("deliver");
         assert_eq!(next(&mut recorded).await, "submit");
-        assert_eq!(next(&mut recorded).await, "complete");
+        assert_eq!(next(&mut recorded).await, "submit-ledger");
+        assert_eq!(next(&mut recorded).await, "ledger");
         let pull = fake.pull(&repo, 1).expect("the crew's pull request");
         assert_eq!((pull.title.as_str(), pull.user.as_str()), ("Dummy work for convoy-a", "rehearsal-crew"));
         assert_eq!(pull.pull.expect("pull facts").head_branch, "dummy/convoy-a/implement");

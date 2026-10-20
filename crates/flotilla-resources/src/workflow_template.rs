@@ -92,10 +92,10 @@ pub struct StallNudgePolicy {
     /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_grace_seconds: Option<u32>,
-    /// Repeated claims with the same unmet expectation escalate at this count.
+    /// Legacy refusal policy, decoded for one generation; no longer enforced.
     /// The default for previous-generation snapshots is two. The default shim
     /// can be removed one fleet roll after this field lands.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub max_refusals: Option<u32>,
 }
 
@@ -845,7 +845,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
             TurnDeliveryRule::builder()
                 .on(parse_leaf_template("$cr.state == merged").expect("valid stock merged leaf"))
                 .to(target())
-                .brief("The PR merged. Inspect your open promises, continue any remaining work, and submit your decision ledger. Run `flotilla crew complete` once every promise is kept or retracted.".to_string())
+                .brief("The PR merged. Inspect your open promises, continue any remaining work, and submit your decision ledger. Your part ends when every promise is kept or retracted.".to_string())
                 .hold(HoldAct::State)
                 .build(),
         ),
@@ -855,7 +855,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
                 .on(parse_leaf_template("$cr.review.actionable-at-head == true").expect("valid stock review leaf"))
                 .to(target())
                 .brief(
-                    "Address the actionable review at the bound head, push the durable fix, and file a fresh settlement claim."
+                    "Address the actionable review at the bound head, push the durable fix, and continue shepherding your submitted PR."
                         .to_string(),
                 )
                 .hold(HoldAct::State)
@@ -867,7 +867,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
                 .on(parse_leaf_template("$cr.mergeable == conflicting").expect("valid stock mergeability leaf"))
                 .to(target())
                 .brief(
-                    "Rebase onto the current base branch and resolve conflicts additively, keeping both sides' intent. Regenerate generated files rather than hand-merging them. Re-run the repository's pinned CI gates, push the same branch, process any review, and file a fresh settlement claim; the previous claim is superseded."
+                    "Rebase onto the current base branch and resolve conflicts additively, keeping both sides' intent. Regenerate generated files rather than hand-merging them. Re-run the repository's pinned CI gates, push the same branch, process any review, and continue shepherding your submitted PR."
                         .to_string(),
                 )
                 .hold(HoldAct::State)
@@ -1803,7 +1803,12 @@ mod promise_template_tests {
         assert!(frozen.vessels[0].crew[0].deliverer);
         let mut status = ConvoyStatus { workflow_snapshot: Some(frozen), ..Default::default() };
         let operations = promises::template_declarations(&status);
-        let expected: Vec<_> = declarations.iter().filter(|promise| !exclusions.contains(promise)).map(|promise| promise.kind).collect();
+        let expected: Vec<_> = [PromiseKind::Pr, PromiseKind::DecisionLedger]
+            .into_iter()
+            .filter(|kind| {
+                (*kind == PromiseKind::Pr || declarations.iter().any(|p| p.kind == *kind)) && !exclusions.iter().any(|p| p.kind == *kind)
+            })
+            .collect();
         let actual: Vec<_> = operations
             .iter()
             .map(|(_, _, operation)| match operation {

@@ -97,8 +97,7 @@ use flotilla_resources::{
 };
 #[cfg(test)]
 use flotilla_resources::{
-    CheckoutIntegrationStatus, ConditionValue, CrewCompletionRefusalCause, IntegrationCondition, TerminalSessionIdentity,
-    CREDENTIAL_SCOPES_ANNOTATION,
+    CheckoutIntegrationStatus, ConditionValue, IntegrationCondition, TerminalSessionIdentity, CREDENTIAL_SCOPES_ANNOTATION,
 };
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::{

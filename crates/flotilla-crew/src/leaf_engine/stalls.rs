@@ -8,10 +8,10 @@ use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     actor_obligation,
     address::{leaf_address, record_name},
-    select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewCompletionRefusal, CrewCompletionRefusalCause,
-    LeafMaker, NudgeObligation, ResourceObject, StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition,
-    SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, LeafMaker, NudgeObligation, ResourceObject,
+    StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition, SupervisionTarget, TerminalAttention,
+    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::sources::freshest_change_request_refs;
@@ -147,7 +147,6 @@ pub(super) fn stall_supervision_log_brief(convoy: &ResourceObject<Convoy>, condi
     stall_supervision_brief(convoy, condition).replace('\n', " ")
 }
 
-pub(super) const DEFAULT_REFUSAL_LIMIT: u32 = 2;
 pub(super) const DEFAULT_IDLE_GRACE_SECONDS: u32 = 180;
 
 pub(super) fn nudge_policy<'a>(status: &'a ConvoyStatus, vessel: &str, role: &str) -> Option<&'a flotilla_resources::StallNudgePolicy> {
@@ -204,30 +203,6 @@ pub(super) fn is_active_change_request_probe(
                         && work.phase == flotilla_resources::CrewWorkPhase::Stalled)
                     || matches!(work.phase, flotilla_resources::CrewWorkPhase::Working | flotilla_resources::CrewWorkPhase::Interrupted))
         })
-}
-
-pub(super) fn refusal_nudge_brief(refusal: &CrewCompletionRefusal) -> String {
-    let conflict = refusal.causes.iter().find_map(|cause| match cause {
-        CrewCompletionRefusalCause::ConflictingChangeRequest { number, .. } => Some(*number),
-        _ => None,
-    });
-    let missing = refusal.causes.iter().find_map(|cause| match cause {
-        CrewCompletionRefusalCause::MissingChangeRequestObservation { number, .. } => Some(*number),
-        _ => None,
-    });
-    // Prefer actionable conflicts over missing observations when several causes coexist.
-    let remedy = if let Some(number) = conflict {
-        format!("PR #{number} is conflicting: rebase onto the current base branch, rerun the gates, push, then `flotilla crew complete`.")
-    } else if let Some(number) = missing {
-        format!("PR #{number} has no observation yet: check the PR URL and forge access, then run `flotilla crew complete` again.")
-    } else {
-        "Resolve the unmet expectation, then run `flotilla crew complete` again.".to_string()
-    };
-    format!("Your settlement claim was refused: {}. {remedy}", refusal.expectation)
-}
-
-pub(super) fn refusal_limit(status: &ConvoyStatus, vessel: &str, role: &str) -> u32 {
-    nudge_policy(status, vessel, role).and_then(|policy| policy.max_refusals).unwrap_or(DEFAULT_REFUSAL_LIMIT).max(1)
 }
 
 impl ReconcilerWake {
@@ -1008,9 +983,6 @@ impl ReconcilerWake {
                 }
                 let mut awaiting_resumed_turn = false;
                 if let (Some(LeafMaker::Actor { vessel, role }), Some(row)) = (&condition.maker, unable.as_ref().map(|(row, _, _)| *row)) {
-                    let refusal =
-                        status.crew_work.get(vessel).and_then(|crew| crew.get(role)).and_then(|work| work.completion_refusal.as_ref());
-                    let refusal_escalated = refusal.is_some_and(|refusal| refusal.consecutive_count >= refusal_limit(status, vessel, role));
                     let session = selected_sessions.values().find(|session| {
                         session.metadata.labels.get(VESSEL_LABEL) == Some(vessel) && session.metadata.labels.get(ROLE_LABEL) == Some(role)
                     });
@@ -1043,14 +1015,7 @@ impl ReconcilerWake {
                             !operator_brief_delivered || idle_at.is_none_or(|idle_at| idle_at <= resumed_at)
                         });
                     awaiting_resumed_turn = resume_grace;
-                    if refusal_escalated {
-                        condition.rung = StallRung::Operator;
-                        condition.evidence = format!(
-                            "settlement claim refused {} times: {}",
-                            refusal.map_or(0, |refusal| refusal.consecutive_count),
-                            refusal.map_or("", |refusal| refusal.expectation.as_str())
-                        );
-                    } else if idle_at.is_some() && declared.is_none() && !resume_grace {
+                    if idle_at.is_some() && declared.is_none() && !resume_grace {
                         let limit = nudge_policy(status, vessel, role).map_or(2, |policy| policy.max_per_episode) as usize;
                         let grace_seconds = idle_grace_seconds(status, vessel, role);
                         // Initial grace is 1x; intervals after delivered nudges are 1x, 2x, 4x, ...
@@ -1075,8 +1040,6 @@ impl ReconcilerWake {
                                     .is_some_and(|crew| crew.phase == flotilla_resources::CrewWorkPhase::Stalled);
                                 let obligation = if declared_stall {
                                     "Your stall is recorded. What changed since your report? If the blocker persists, update the stall with new evidence; if it has cleared, ask your supervisor to resume you.".into()
-                                } else if let Some(refusal) = refusal {
-                                    refusal_nudge_brief(refusal)
                                 } else {
                                     actor_obligation(leaf)?
                                 };
@@ -1138,9 +1101,6 @@ impl ReconcilerWake {
                 let needs_supervisor = matches!(condition.maker, Some(LeafMaker::Supervisor { .. }))
                     || condition.source == StallEvidenceSource::Crew
                     || condition.source == StallEvidenceSource::Session
-                    || matches!(&condition.maker, Some(LeafMaker::Actor { vessel, role }) if status.crew_work.get(vessel)
-                        .and_then(|crew| crew.get(role)).and_then(|work| work.completion_refusal.as_ref())
-                        .is_some_and(|refusal| refusal.consecutive_count >= refusal_limit(status, vessel, role)))
                     || condition.evidence == "NeedsInput"
                     || (condition.rung == StallRung::Operator && !condition.nudge_history.is_empty())
                     || (condition.rung == StallRung::Operator

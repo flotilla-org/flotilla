@@ -2065,7 +2065,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { request_id, .. }) => *request_id,
         other => panic!("expected fresh crew completion, got {other:?}"),
     };
-    router.complete_remote_command(request_id, node("feta"), CommandValue::Ok).await;
+    router.complete_remote_command(request_id, node("feta"), CommandValue::CrewCompletionAdvisory { pending: vec![] }).await;
     assert!(
         sessions
             .get("terminal-stranded-work-coder")
@@ -6338,13 +6338,18 @@ async fn caller_can_stall_and_complete(daemon: &InProcessDaemon, caller: flotill
         let mut events = daemon.subscribe();
         let id = daemon.execute_for_caller(Command::builder().action(action).build(), Some(caller.clone())).await.unwrap();
         let event = super::environment_connection::command_completion(&mut events, id).await.unwrap();
-        assert!(matches!(event, DaemonEvent::CommandFinished { result: flotilla_protocol::CommandValue::Ok, .. }), "{event:?}");
+        assert!(
+            matches!(&event, DaemonEvent::CommandFinished { result, .. }
+            if if stalling { matches!(result, CommandValue::Ok) } else { matches!(result, CommandValue::CrewCompletionAdvisory { .. }) }),
+            "{event:?}"
+        );
         let status = convoys.get("own").await.unwrap().status.unwrap();
         let work = &status.crew_work["work"]["coder"];
         if stalling {
             assert_eq!(work.phase, flotilla_resources::CrewWorkPhase::Stalled);
         } else {
-            assert_eq!(work.phase, flotilla_resources::CrewWorkPhase::Done);
+            assert_eq!(work.phase, flotilla_resources::CrewWorkPhase::Stalled);
+            assert!(work.completion_refusal.is_none());
         }
     }
 }

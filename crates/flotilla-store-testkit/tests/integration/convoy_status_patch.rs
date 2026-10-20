@@ -1340,31 +1340,6 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
 }
 
 #[test]
-fn refused_claims_count_only_identical_expectations_and_decode_old_work() {
-    let old_work: CrewWorkState = serde_json::from_str(r#"{"phase":"Working"}"#).expect("previous-generation crew work");
-    assert!(old_work.completion_refusal.is_none());
-    let old_policy: flotilla_resources::StallNudgePolicy =
-        serde_json::from_str(r#"{"max_per_episode":2}"#).expect("previous-generation stall nudge policy");
-    assert_eq!(old_policy.max_refusals, None);
-    let mut status = ConvoyStatus::default();
-    status.crew_work.insert("work".into(), BTreeMap::from([("coder".into(), old_work)]));
-    let refuse = |expectation: &str| ConvoyStatusPatch::RefuseCrewCompletion {
-        vessel: "work".into(),
-        role: "coder".into(),
-        expectation: expectation.into(),
-        causes: Vec::new(),
-        message: Some("https://github.com/flotilla-org/flotilla/pull/2200".into()),
-    };
-    refuse("PR is conflicting").apply(&mut status);
-    refuse("PR is conflicting").apply(&mut status);
-    assert_eq!(status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal").consecutive_count, 2);
-    refuse("PR observation missing").apply(&mut status);
-    let refusal = status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal");
-    assert_eq!(refusal.consecutive_count, 1);
-    assert_eq!(refusal.expectation, "PR observation missing");
-}
-
-#[test]
 fn nudge_budget_survives_stall_clear_and_resets_only_for_progress_by_that_actor() {
     use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
     use flotilla_resources::{LeafMaker, NudgeObligation, StallNudge, StallReason};
@@ -1392,16 +1367,6 @@ fn nudge_budget_survives_stall_clear_and_resets_only_for_progress_by_that_actor(
     let stored = serde_json::to_string(&status).expect("persist budget");
     status = serde_json::from_str(&stored).expect("restore budget");
     assert_eq!(status.nudge_obligations[0].history.len(), 1, "attention-driven stall clearing preserves accounting");
-    ConvoyStatusPatch::RefuseCrewCompletion {
-        vessel: "work".into(),
-        role: "coder".into(),
-        expectation: "checks pass".into(),
-        causes: Vec::new(),
-        message: None,
-    }
-    .apply(&mut status);
-    assert!(status.nudge_obligations[0].history.is_empty(), "a claim is real progress even when refused");
-    assert_eq!(status.nudge_obligations[1].history.len(), 1, "another actor's obligation is independent");
     ConvoyStatusPatch::MarkCrewStalled {
         convoy: "convoy".into(),
         vessel: "work".into(),
@@ -1418,9 +1383,9 @@ fn nudge_budget_survives_stall_clear_and_resets_only_for_progress_by_that_actor(
 }
 
 // ADR 0047: a previous-generation Convoy with a durable refusal still decodes;
-// rewriting it always emits the new causes field, without parsing its explanation.
+// rewriting it omits the retired refusal, without parsing its explanation.
 #[test]
-fn previous_generation_convoy_refusal_decodes_and_writes_new_shape() {
+fn previous_generation_convoy_refusal_decodes_but_is_never_written() {
     let old = serde_json::json!({
         "phase": "Active",
         "crew_work": {"work": {"coder": {
@@ -1437,47 +1402,7 @@ fn previous_generation_convoy_refusal_decodes_and_writes_new_shape() {
     assert!(refusal.causes.is_empty());
     assert_eq!(refusal.expectation, "could not observe PR 42");
     let rewritten = serde_json::to_value(&status).expect("write current status");
-    assert_eq!(rewritten["crew_work"]["work"]["coder"]["completion_refusal"]["causes"], serde_json::json!([]));
-}
-
-// #2211: persisted causes retain the complete CR identity through a status patch
-// and a stored-data round trip, including combined or repeated remedies.
-#[hegel::test]
-fn refusal_causes_survive_status_patch_and_storage(tc: hegel::TestCase) {
-    use flotilla_resources::CrewCompletionRefusalCause;
-    use hegel::generators as gs;
-
-    // Explicitly span absent causes, both variants, duplicates and u64 boundaries.
-    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
-    let number = tc.draw(gs::integers::<u64>());
-    let causes = (0..count)
-        .map(|_| {
-            if tc.draw(gs::booleans()) {
-                CrewCompletionRefusalCause::ConflictingChangeRequest { service: "github.com".into(), scope: "owner/repo".into(), number }
-            } else {
-                CrewCompletionRefusalCause::MissingChangeRequestObservation {
-                    service: "forge.example".into(),
-                    scope: "other/repo".into(),
-                    number,
-                }
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut status = ConvoyStatus::default();
-    status
-        .crew_work
-        .insert("work".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]));
-    ConvoyStatusPatch::RefuseCrewCompletion {
-        vessel: "work".into(),
-        role: "coder".into(),
-        expectation: "wording is presentation only".into(),
-        causes: causes.clone(),
-        message: None,
-    }
-    .apply(&mut status);
-    let stored = serde_json::to_string(&status).expect("serialize status");
-    let restored: ConvoyStatus = serde_json::from_str(&stored).expect("deserialize status");
-    assert_eq!(restored.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal").causes, causes);
+    assert!(rewritten["crew_work"]["work"]["coder"].get("completion_refusal").is_none());
 }
 
 // A failed or suppressed producer restores only its own speculative activation;

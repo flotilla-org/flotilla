@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
 use chrono::Utc;
-use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext};
+use flotilla_protocol::{CommandValue, CrewCommandContext};
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, Vessel, VesselSpec,
 };
@@ -85,10 +84,10 @@ fn convoy_branch_refresh_reuses_repository_results(tc: hegel::TestCase) {
     });
 }
 
-// #2677: PR-less claim exits accept the claiming crew's artifact, without any comment pointer,
-// and settle. A missing artifact (including one belonging to another crew) still refuses the claim.
+// #3586: a PR-less role settles its ledger promise from its own artifact without
+// a completion claim. Another crew's artifact never keeps that promise.
 #[tokio::test]
-async fn prless_decision_ledger_claim_accepts_and_settles() {
+async fn prless_decision_ledger_promise_settles_without_a_claim() {
     let (daemon, backend, _temp, watch) = stall_test_daemon().await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let created = convoys
@@ -110,7 +109,9 @@ async fn prless_decision_ledger_claim_accepts_and_settles() {
         )
         .await
         .expect("convoy");
-    let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
+    let mut crew = claim_crew("coder");
+    crew.promises = vec![flotilla_resources::TemplatePromise::decision_ledger("coder")];
+    let mut snapshot = stall_workflow_snapshot(vec![crew]);
     snapshot.exit = Some(flotilla_resources::ExitDeclaration::Claim(flotilla_resources::ClaimExit));
     convoys
         .update_status(
@@ -148,27 +149,37 @@ async fn prless_decision_ledger_claim_accepts_and_settles() {
         role: Some("coder".into()),
         ..Default::default()
     };
-    // Review #2681: a legacy Done status alone must not bypass the artifact expectation.
-    let current = convoys.get("ledger-claim").await.expect("convoy");
-    let mut status = current.status.expect("status");
-    status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("claim").phase = CrewWorkPhase::Done;
-    convoys.update_status("ledger-claim", &current.metadata.resource_version, &status).await.expect("legacy Done claim");
-    daemon
-        .crew_complete_with_disposition_internal(&context, None, None, None)
-        .await
-        .expect_err("Done without admission evidence must not bypass validation");
-    for producer in ["reviewer", "coder"] {
-        daemon
-            .crew_complete_with_disposition_internal(&context, None, None, None)
-            .await
-            .expect_err("claim without this crew's artifact must be refused");
-        let name = flotilla_resources::address::record_name(
-            &flotilla_resources::address::artifact_address("ledger-claim", producer, "decision-ledger", "ledger-claim")
-                .expect("artifact address"),
+    // #3586: the ledger promise is observed and kept by reconciliation; the
+    // advisory command never writes a completion claim or its ledger digest.
+    let current = convoys.get("ledger-claim").await.unwrap();
+    for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], current.status.as_ref().unwrap()) {
+        flotilla_store::apply_status_patch(
+            &convoys,
+            "ledger-claim",
+            &flotilla_resources::ConvoyStatusPatch::Promise { vessel, role, operation },
         )
-        .expect("record name");
-        backend
-            .using::<flotilla_resources::Artifact>("flotilla")
+        .await
+        .unwrap();
+    }
+    let advisory = daemon.crew_complete_with_disposition_internal(&context, None, None, None).await.unwrap();
+    assert!(matches!(advisory, CommandValue::CrewCompletionAdvisory { .. }));
+    let mut status = convoys.get("ledger-claim").await.unwrap().status.unwrap();
+    let artifacts = backend.using::<flotilla_resources::Artifact>("flotilla");
+    let mut observed = BTreeMap::new();
+    for producer in ["reviewer", "coder"] {
+        assert!(flotilla_resources::promises::next_observation(
+            &status,
+            "ledger-claim",
+            &BTreeMap::new(),
+            &observed,
+            &[],
+            Utc::now(),
+            std::time::Duration::from_secs(30)
+        )
+        .is_none());
+        let name =
+            flotilla_resources::address::artifact_slot_record_name("ledger-claim", producer, "decision-ledger", "ledger-claim").unwrap();
+        let artifact = artifacts
             .create(
                 &test_meta(&name),
                 &flotilla_resources::ArtifactSpec::builder()
@@ -183,54 +194,26 @@ async fn prless_decision_ledger_claim_accepts_and_settles() {
                     .build(),
             )
             .await
-            .expect("artifact");
+            .unwrap();
+        observed.insert(name, artifact);
     }
-    assert_eq!(
-        daemon.crew_complete_with_disposition_internal(&context, None, None, None).await.expect("artifact-backed claim"),
-        CommandValue::Ok
-    );
-    let explanation = daemon
-        .execute_query(
-            Command::builder()
-                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: "ledger-claim".into() })
-                .build(),
-            uuid::Uuid::new_v4(),
-        )
-        .await
-        .expect("explain accepted claim");
-    let CommandValue::ConvoyExplanation(explanation) = explanation else { panic!("expected convoy explanation") };
-    let admitted = convoys.get("ledger-claim").await.expect("admitted convoy");
-    assert_eq!(admitted.status.as_ref().expect("status").crew_work["work"]["coder"].decision_ledger_digest.as_deref(), Some("ledger"));
-    assert!(!explanation.decision_ledgers[0].missing);
-    assert!(!explanation.decision_ledgers[0].projection_missing);
-    assert!(explanation.settlement.satisfied, "artifact-backed issue convoy must explain as settled");
-
-    // An accepted claim remains admitted on retry after evidence retention removes its artifact.
-    let ledgers = backend.using::<flotilla_resources::Artifact>("flotilla");
-    let name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::artifact_address("ledger-claim", "coder", "decision-ledger", "ledger-claim")
-            .expect("artifact address"),
-    )
-    .expect("record name");
-    ledgers.delete(&name).await.expect("artifact retention");
-    assert_eq!(
-        daemon.crew_complete_with_disposition_internal(&context, None, None, None).await.expect("duplicate claim"),
-        CommandValue::Ok
-    );
-    let convoy = convoys.get("ledger-claim").await.expect("convoy");
-    let claim = &convoy.status.as_ref().expect("status").crew_work["work"]["coder"];
-    assert_eq!(claim.phase, CrewWorkPhase::Done);
-    assert!(claim.decision_ledger_ref.is_none());
-    let settlement = flotilla_resources::evaluate_landing_settlement(
-        &convoy,
+    use flotilla_resources::StatusPatch;
+    while let Some(patch) = flotilla_resources::promises::next_observation(
+        &status,
+        "ledger-claim",
         &BTreeMap::new(),
-        &BTreeMap::new(),
-        &BTreeMap::new(),
+        &observed,
         &[],
-        std::time::Duration::from_secs(30),
-        std::time::Duration::from_secs(30),
         Utc::now(),
-    );
-    assert!(settlement.satisfied, "claim exit must settle without a PR comment");
+        std::time::Duration::from_secs(30),
+    ) {
+        patch.apply(&mut status);
+    }
+    assert!(flotilla_resources::promises::pending(&status, "work", "coder").is_empty());
+    flotilla_resources::promises::next_completion(&status, Utc::now()).unwrap().apply(&mut status);
+    let done = &status.crew_work["work"]["coder"];
+    assert_eq!(done.phase, CrewWorkPhase::Done);
+    assert_eq!(done.completion_authority, flotilla_resources::WorkCompletionAuthority::Promises);
+    assert!(done.decision_ledger_digest.is_none());
     watch.abort();
 }

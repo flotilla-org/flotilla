@@ -113,11 +113,11 @@ fn issue_list_shows_open_issue_details() {
 }
 
 #[test]
-fn crew_follow_up_result_tells_the_crew_to_complete_again() {
+fn crew_follow_up_result_describes_promise_settlement() {
     let output = format_command_result(&CommandValue::CrewFollowUpDelivered);
-    assert!(output.contains("Completion received"));
+    assert!(output.contains("A follow-up brief was delivered"));
     assert!(output.contains("follow-up brief was delivered"));
-    assert!(output.contains("run `flotilla crew complete` again"));
+    assert!(output.contains("your part ends when your promises are kept"));
 }
 
 #[test]
@@ -665,15 +665,22 @@ fn convoy_explanation_subject_observations_snapshot() {
 // retry the original claim only when GitHub's advertised cooldown has elapsed.
 #[tokio::test(start_paused = true)]
 async fn crew_completion_wait_retries_same_claim_after_deadline() {
-    completion_wait_case(false).await;
+    completion_wait_case(false, false).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn cancelling_completion_wait_stops_future_claims() {
-    completion_wait_case(true).await;
+    completion_wait_case(true, false).await;
 }
 
-async fn completion_wait_case(cancel: bool) {
+// #3586: pending PR promises are advisory, exit successfully and never retry.
+// Glue: exercise the CLI's existing command-result boundary with one event.
+#[tokio::test]
+async fn crew_completion_advisory_succeeds_without_retry() {
+    completion_wait_case(false, true).await;
+}
+
+async fn completion_wait_case(cancel: bool, advisory: bool) {
     use std::sync::{Arc, Mutex};
 
     use flotilla_protocol::{Command, CommandAction, CrewCommandContext};
@@ -710,6 +717,14 @@ async fn completion_wait_case(cancel: bool) {
         repo: None,
         result,
     };
+    if advisory {
+        let result = CommandValue::CrewCompletionAdvisory { pending: vec!["template/pr: waiting on PR merge".into()] };
+        tx.send(event(result.clone())).expect("advisory event");
+        assert_eq!(run.await.expect("successful CLI result"), result);
+        assert_eq!(calls.lock().expect("calls").len(), 1);
+        assert!(format_command_result(&result).contains("template/pr: waiting on PR merge"));
+        return;
+    }
     tx.send(event(CommandValue::CrewCompletionWaiting {
         reason: "GitHub secondary limit".into(),
         retry_at: chrono::Utc::now() + chrono::Duration::seconds(60),

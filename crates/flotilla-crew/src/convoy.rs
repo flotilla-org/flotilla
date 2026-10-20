@@ -336,6 +336,7 @@ impl Reconciler for ConvoyReconciler {
                 self.clock.now(),
                 self.change_request_stale_after,
             )
+            .or_else(|| flotilla_resources::promises::next_completion(status, self.clock.now()))
         });
         let settlement = if is_landing {
             Some(evaluate_landing_settlement_with_disposition(

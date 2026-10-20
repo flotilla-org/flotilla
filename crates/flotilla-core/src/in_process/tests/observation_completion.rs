@@ -1,4 +1,3 @@
-use flotilla_resources::checkout_integration::change_request_subjects_from_claim;
 use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -14,21 +13,19 @@ use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::{CrewCommandContext, HostName};
 use flotilla_resources::{
-    BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
-    ConvoyStatusPatch, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, Repository, RepositorySpec, Selector,
-    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
-    TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    BoundChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase,
+    CrewWorkState, InputMeta, Repository, RepositorySpec, Selector, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselRequirement,
+    VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply, RestAdmissionSelection};
 use super::support::{test_meta, BatchedObservationRunner};
-use crate::in_process::CrewCompletionRefusalCause;
 use crate::in_process::InProcessDaemon;
 
 use crate::testkits::discovery::fake_discovery_with_runner;
-use flotilla_store_testkit::cr_name;
 
 // #2585: the real convoy resolver shares proven branch absence across callers
 // while preserving ordered repository selection and refreshing after five minutes.
@@ -321,26 +318,24 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
 }
 
 #[tokio::test]
-async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates() {
+async fn completion_discovers_pr_without_refusal_or_escalation() {
     completion_claim_observation_case(false, false, false).await;
 }
 
-// #2499: a timed observation limit waits without increasing refusal strikes,
-// then admits the same claim after fresh readiness is actually observed.
+// #3586: advisory completion succeeds without forge observation during a limit.
 #[tokio::test(start_paused = true)]
-async fn rate_limited_completion_waits_then_requires_fresh_ready_observation() {
+async fn rate_limited_completion_is_advisory() {
     completion_claim_observation_case(true, false, false).await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn rate_limited_completion_defers_but_preserves_non_forge_gate() {
+async fn completion_with_missing_non_forge_evidence_is_advisory() {
     completion_claim_observation_case(true, true, false).await;
 }
 
-// #2510: a limited PR never masks another PR's hard error, even on a cached
-// completion read; a refusal records a strike and recovery needs fresh evidence.
+// #3586: mixed observation failures cannot turn advisory completion into a refusal.
 #[tokio::test(start_paused = true)]
-async fn mixed_observation_completion_refuses_and_recovers() {
+async fn completion_with_mixed_observation_errors_is_advisory() {
     completion_claim_observation_case(false, false, true).await;
 }
 
@@ -578,183 +573,42 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
             Some("https://github.com/flotilla-org/flotilla/pull/2200#issuecomment-1".to_string()),
         )
     };
-    if mixed {
-        let subjects = change_request_subjects_from_claim(
-            "https://github.com/flotilla-org/flotilla/pull/2201",
-            &convoys.get("refused-claim").await.expect("convoy").spec.repositories,
-            &[],
+    // #3586: even conflicts, rate limits and missing non-forge evidence do not
+    // make the advisory command refuse, observe the forge, or escalate.
+    runner.rate_limit_all.store(rate_limited, Ordering::SeqCst);
+    runner.mixed_history_errors.store(mixed, Ordering::SeqCst);
+    let calls = runner.calls.lock().unwrap().len();
+    for _ in 0..3 {
+        let advisory = claim().await.expect("advisory succeeds");
+        assert!(
+            matches!(advisory, flotilla_protocol::CommandValue::CrewCompletionAdvisory { ref pending }
+            if pending.iter().any(|p| p.contains("waiting on PR merge"))),
+            "{advisory:?}"
         );
-        assert_eq!(subjects.len(), 1);
-        flotilla_store::apply_status_patch(
-            &convoys,
-            "refused-claim",
-            &ConvoyStatusPatch::DiscoverSubjects {
-                subjects: vec![(subjects[0].clone(), flotilla_protocol::Relationship::Produces)],
-                source: flotilla_resources::SubjectDiscoverySource::Claim,
-                at: Utc::now(),
-            },
+    }
+    assert_eq!(runner.calls.lock().unwrap().len(), calls, "advisory does not poll the forge");
+    let status = convoys.get("refused-claim").await.unwrap().status.unwrap();
+    assert!(status.subjects.iter().any(|entry| entry.subject.id == "2200"));
+    assert!(status.crew_work["work"]["coder"].completion_refusal.is_none());
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    assert!(status.stalled.is_none());
+    assert!(turns.0.lock().unwrap().is_empty());
+    // The discovered, submitted PR is no longer unilaterally retractable.
+    let promise = flotilla_resources::promises::owned(&status, "work", "coder")
+        .iter()
+        .find(|p| p.kind == flotilla_resources::promises::PromiseKind::Pr)
+        .unwrap();
+    daemon
+        .crew
+        .promise(
+            &context,
+            flotilla_protocol::commands::CrewPromiseOperation::Retract { id: promise.id.clone(), reason: "skip merge".into() },
         )
         .await
-        .expect("second PR discovery");
-        runner.mixed_history_errors.store(true, std::sync::atomic::Ordering::SeqCst);
-        let first = claim().await.expect_err("mixed observations must refuse");
-        assert!(first.contains("history access denied"), "{first}");
-        let calls = runner.calls.lock().expect("calls").len();
-        assert_eq!(calls, 3, "one shared batch and two history outcomes");
-        // #2211: a hard observation failure retains its subject even if other PRs have evidence.
-        let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
-        assert!(status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal").causes.contains(
-            &CrewCompletionRefusalCause::MissingChangeRequestObservation {
-                service: "github.com".into(),
-                scope: "flotilla-org/flotilla".into(),
-                number: 2200,
-            }
-        ));
-
-        let second = claim().await.expect_err("cached hard error must still refuse");
-        assert!(second.contains("history access denied"), "{second}");
-        assert_eq!(runner.calls.lock().expect("calls").len(), calls, "cooldown prevents forge calls");
-        let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
-        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
-        assert_eq!(status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal strike").consecutive_count, 2);
-        runner.merged.store(true, std::sync::atomic::Ordering::SeqCst);
-        runner.mixed_history_errors.store(false, std::sync::atomic::Ordering::SeqCst);
-        runner.conflicting.store(false, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::advance(Duration::from_secs(60)).await;
-        assert_eq!(claim().await.expect("recovered claim"), flotilla_protocol::CommandValue::Ok);
-        assert_eq!(
-            convoys.get("refused-claim").await.expect("convoy").status.expect("status").crew_work["work"]["coder"].phase,
-            CrewWorkPhase::Done
-        );
-        for number in [2200, 2201] {
-            let subject = ChangeRequestKey::new(
-                "flotilla",
-                flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", number, &[])
-                    .expect("address"),
-            )
-            .expect("key");
-            assert!(
-                daemon.crew.subscription_diagnostics().change_request_observation_error(&subject).await.is_none(),
-                "recovery clears subject errors"
-            );
-        }
-        return;
-    }
-    if rate_limited {
-        runner.rate_limit_all.store(true, std::sync::atomic::Ordering::SeqCst);
-        let wait = claim().await.expect("observation wait");
-        let flotilla_protocol::CommandValue::CrewCompletionWaiting { reason, retry_at } = wait else { panic!("expected timed wait") };
-        assert!(reason.contains("kind=secondary") && reason.contains("retry_source=retry-after"), "{reason}");
-        assert!(retry_at < Utc::now() + chrono::Duration::minutes(2), "ignore unrelated primary window");
-        let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
-        assert!(status.crew_work["work"]["coder"].completion_refusal.is_none());
-        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
-        let calls = runner.calls.lock().expect("calls").len();
-        assert!(matches!(claim().await.expect("cached wait"), flotilla_protocol::CommandValue::CrewCompletionWaiting { .. }));
-        assert_eq!(runner.calls.lock().expect("calls").len(), calls, "fresh completion must respect cooldown");
-        runner.rate_limit_all.store(false, std::sync::atomic::Ordering::SeqCst);
-        // Advance only the monotonic cache TTL. The old response's UTC deadline
-        // remains future; expiry admits a new forge read, now healthy, before
-        // completion is judged. The explicit two-clock test pins the conversion.
-        tokio::time::advance(Duration::from_secs(60)).await;
-        assert!(claim().await.expect_err("fresh conflict still refuses").contains(".ready"));
-        runner.conflicting.store(false, std::sync::atomic::Ordering::SeqCst);
-        if missing_artifact {
-            assert!(claim().await.expect_err("non-forge gate still refuses").contains("review-bundle"));
-            let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
-            assert_ne!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
-            assert!(status.crew_work["work"]["coder"].completion_refusal.is_some());
-            return;
-        }
-        // ADR 0061: readiness alone cannot keep a PR promise. A fresh merge
-        // observation is required before its separate completion claim succeeds.
-        assert!(claim().await.expect_err("open ready PR still owes its promise").contains("2200"));
-        runner.merged.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(claim().await.expect("fresh merged claim"), flotilla_protocol::CommandValue::Ok);
-        let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
-        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
-        return;
-    }
-    let first = claim().await.expect_err("conflicting PR must refuse claim");
-    assert!(first.contains("cr/github.com/flotilla-org/flotilla/2200") && first.contains(".ready"), "{first}");
-    let refused_status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
-    assert!(
-        refused_status.subjects.iter().any(|entry| entry.subject.id == "2200"),
-        "the rejected completion still discovered a PR in the convoy's repository"
-    );
-    // #2211: claim admission persists the cause and exact PR identity before nudging.
-    assert_eq!(
-        refused_status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal").causes,
-        vec![CrewCompletionRefusalCause::ConflictingChangeRequest {
-            service: "github.com".into(),
-            scope: "flotilla-org/flotilla".into(),
-            number: 2200,
-        }]
-    );
-    assert_ne!(refused_status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
-    let observed = backend
-        .using::<ResourceChangeRequest>("flotilla")
-        .get(&cr_name("github.com", "flotilla-org/flotilla", 2200))
-        .await
-        .expect("claim-time observation");
-    assert_eq!(observed.status.expect("status").mergeable.value, Some(flotilla_resources::ObservedMergeability::Conflicting));
-
-    let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
-    let task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if turns.0.lock().expect("turns").iter().any(|request| {
-                request.source == "stall-nudge-1" && request.brief.contains("PR #2200 is conflicting") && request.brief.contains(".ready")
-            }) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("refusal nudge");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if turns
-                .0
-                .lock()
-                .expect("turns")
-                .iter()
-                .any(|request| request.source == "conflicting" && request.brief.contains("PR #2200 is conflicting"))
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("active conflict delivery");
-    let second = claim().await.expect_err("same conflicting PR must refuse again");
-    assert_eq!(second, first);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
-            if status.stalled.as_ref().is_some_and(|stall| {
-                stall.rung == flotilla_resources::StallRung::Bosun && stall.evidence.contains("settlement claim refused 2 times")
-            }) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("supervision escalation");
-    assert_eq!(turns.0.lock().expect("turns").iter().filter(|request| request.source.starts_with("stall-nudge")).count(), 1);
-    task.abort();
-    let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
-    let restarted = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        turns.0.lock().expect("turns").iter().filter(|request| request.source == "conflicting").count(),
-        1,
-        "a persisted turn episode prevents duplicate Active conflict delivery after restart"
-    );
-    restarted.abort();
+        .expect("propose retraction");
+    let after = convoys.get("refused-claim").await.unwrap().status.unwrap();
+    assert_eq!(flotilla_resources::promises::owned(&after, "work", "coder").iter().find(|p| p.id == promise.id), Some(promise));
+    assert!(after.stalled.as_ref().unwrap().evidence.contains("retraction-proposed"));
 }
 
 use crate::testkits::in_process_ext::InProcessDiscoveryExt;

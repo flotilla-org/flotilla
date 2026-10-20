@@ -201,8 +201,42 @@ pub fn owned<'a>(status: &'a ConvoyStatus, vessel: &str, role: &str) -> &'a [Pro
     status.promises.get(vessel).and_then(|crew| crew.get(role)).map(Vec::as_slice).unwrap_or_default()
 }
 
+/// Only a nonempty set of settled promises ends a nonterminal crew's part.
+pub fn next_completion(status: &ConvoyStatus, now: DateTime<Utc>) -> Option<super::ConvoyStatusPatch> {
+    if status.phase.is_terminal() {
+        return None;
+    }
+    let landing_ready = super::ready_for_landing(status);
+    status.crew_work.iter().find_map(|(vessel, crew)| {
+        crew.iter().find_map(|(role, work)| {
+            let promises = owned(status, vessel, role);
+            let due = !work.phase.is_terminal()
+                || (landing_ready
+                    && work.phase == super::CrewWorkPhase::Done
+                    && work.completion_authority == super::WorkCompletionAuthority::Promises);
+            (due && !promises.is_empty() && promises.iter().all(|p| p.state.terminal())).then(|| super::ConvoyStatusPatch::DeriveCrewDone {
+                vessel: vessel.clone(),
+                role: role.clone(),
+                at: now,
+            })
+        })
+    })
+}
+
 pub fn pending(status: &ConvoyStatus, vessel: &str, role: &str) -> Vec<String> {
     owned(status, vessel, role).iter().filter(|p| !p.state.terminal()).map(|p| p.id.clone()).collect()
+}
+
+/// The deliverer minimum follows PR evidence even when a named obligation owns it.
+fn is_default_pr(promise: &Promise) -> bool {
+    promise.id == "template/pr" && promise.kind == PromiseKind::Pr && promise.source == PromiseSource::Template
+}
+
+/// The generic admission slot does not make a single named submission ambiguous.
+pub fn submission_candidates(promises: &[Promise], kind: PromiseKind) -> Vec<&Promise> {
+    let open = promises.iter().filter(|p| p.kind == kind && p.state == PromiseState::Open).collect::<Vec<_>>();
+    let named = kind == PromiseKind::Pr && open.iter().any(|p| !is_default_pr(p));
+    open.into_iter().filter(|p| !named || !is_default_pr(p)).collect()
 }
 
 pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &PromiseOperation) {
@@ -226,34 +260,40 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
             }
             let promise = promises.iter_mut().find(|p| p.id == *id).expect("inserted promise");
             if let PromiseOperation::Submit { submission, .. } = operation {
-                if promise.kind == *kind && matches!(promise.state, PromiseState::Submitted | PromiseState::Kept) {
-                    if let Some(prior) = promise.submissions.last_mut().filter(|prior| prior.same_subject(submission, &[])) {
-                        prior.metadata.extend(submission.metadata.clone());
+                let reused = if promise.kind == *kind && matches!(promise.state, PromiseState::Submitted | PromiseState::Kept) {
+                    let Some(prior) = promise.submissions.last_mut().filter(|prior| prior.same_subject(submission, &[])) else {
+                        return;
+                    };
+                    prior.metadata.extend(submission.metadata.clone());
+                    true
+                } else {
+                    false
+                };
+                if !reused {
+                    // Optimistic patches may have outlived command validation.
+                    if promise.kind != *kind || promise.state.terminal() {
+                        return;
                     }
-                    return;
+                    if promise.submissions.iter().any(|prior| {
+                        prior.reference == submission.reference
+                            && prior.submitted_at == submission.submitted_at
+                            && prior.metadata == submission.metadata
+                    }) {
+                        return;
+                    }
+                    promise.submissions.push(submission.clone());
+                    promise.state = PromiseState::Submitted;
                 }
-                // Optimistic patches may have outlived command validation.
-                // The command checks effect_present on the persisted result;
-                // mismatched kinds and terminal states must remain untouched.
-                if promise.kind != *kind || promise.state.terminal() {
-                    return;
-                }
-                if promise.submissions.iter().any(|prior| {
-                    prior.reference == submission.reference
-                        && prior.submitted_at == submission.submitted_at
-                        && prior.metadata == submission.metadata
-                }) {
-                    return;
-                }
-                promise.submissions.push(submission.clone());
-                promise.state = PromiseState::Submitted;
             }
         }
         PromiseOperation::Retract { id, reason } => {
             let Some(promises) = status.promises.get_mut(vessel).and_then(|crew| crew.get_mut(role)) else {
                 return;
             };
-            if let Some(promise) = promises.iter_mut().find(|p| p.id == *id && !p.state.terminal() && p.source == PromiseSource::Crew) {
+            if let Some(promise) = promises
+                .iter_mut()
+                .find(|p| p.id == *id && !p.state.terminal() && p.source == PromiseSource::Crew && p.submissions.is_empty())
+            {
                 promise.state = PromiseState::Retracted;
                 promise.retraction_reason = Some(reason.clone());
             }
@@ -275,6 +315,18 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
         }
     }
     if let PromiseOperation::Submit { kind: PromiseKind::Pr, submission, .. } = operation {
+        // A named PR also fulfils the deliverer's admission minimum. Binding
+        // the same evidence atomically leaves every named obligation intact.
+        if let Some(id) =
+            owned(status, vessel, role).iter().find(|p| is_default_pr(p) && p.state == PromiseState::Open).map(|p| p.id.clone())
+        {
+            apply(
+                status,
+                vessel,
+                role,
+                &PromiseOperation::Submit { id, kind: PromiseKind::Pr, source: PromiseSource::Template, submission: submission.clone() },
+            );
+        }
         // Status patches apply without a Forge list: a forge-id or public
         // GitHub spelling resolves, and an existing subject in another
         // spelling of the same request is not discovered twice.
@@ -366,18 +418,26 @@ pub fn template_declarations(status: &ConvoyStatus) -> Vec<(String, String, Prom
         .flat_map(|snapshot| &snapshot.vessels)
         .flat_map(|vessel| {
             vessel.crew.iter().filter(|crew| seeds_open_promises(status, &vessel.name, &crew.role)).flat_map(move |crew| {
-                crew.promises.iter().filter_map(move |promise| {
-                    if crew.promise_exclusions.contains(&promise.kind) {
-                        return None;
-                    }
-                    let kind = promise.kind;
-                    let name = kind.as_str();
-                    let id = format!("template/{name}");
-                    if owned(status, &vessel.name, &crew.role).iter().any(|p| p.id == id) {
-                        return None;
-                    }
-                    Some((vessel.name.clone(), crew.role.clone(), PromiseOperation::Declare { id, kind, source: PromiseSource::Template }))
-                })
+                [PromiseKind::Pr, PromiseKind::DecisionLedger]
+                    .into_iter()
+                    .filter(move |kind| {
+                        crew.promises.iter().any(|promise| promise.kind == *kind) || (crew.deliverer && *kind == PromiseKind::Pr)
+                    })
+                    .filter_map(move |kind| {
+                        if crew.promise_exclusions.contains(&kind) {
+                            return None;
+                        }
+                        let name = kind.as_str();
+                        let id = format!("template/{name}");
+                        if owned(status, &vessel.name, &crew.role).iter().any(|p| p.id == id) {
+                            return None;
+                        }
+                        Some((
+                            vessel.name.clone(),
+                            crew.role.clone(),
+                            PromiseOperation::Declare { id, kind, source: PromiseSource::Template },
+                        ))
+                    })
             })
         })
         .collect()
@@ -589,8 +649,7 @@ pub fn discovered_submission(
         return None;
     }
     let reference = crate::address::submission_subject_text(&address).ok()?;
-    let open =
-        owned(status, vessel, role).iter().filter(|p| p.kind == PromiseKind::Pr && p.state == PromiseState::Open).collect::<Vec<_>>();
+    let open = submission_candidates(owned(status, vessel, role), PromiseKind::Pr);
     let id = match open.as_slice() {
         [p] => p.id.clone(),
         _ => reference.clone(),
@@ -794,6 +853,206 @@ fn discovery_owner(status: &ConvoyStatus) -> Option<(&str, &str)> {
 mod tests {
     use super::*;
     use crate::StatusPatch;
+    // #3586: a nonempty, wholly settled promise set ends a nonterminal role,
+    // without a crew claim. Cover every promise state, role phase, empty sets,
+    // multiple promises and duplicate reconciliation.
+    #[hegel::test]
+    fn done_is_derived_only_from_nonempty_settled_promises(tc: hegel::TestCase) {
+        use crate::{ConvoyPhase, CrewWorkPhase, CrewWorkState, WorkCompletionAuthority, WorkPhase, WorkState};
+        let phases = [
+            CrewWorkPhase::Pending,
+            CrewWorkPhase::Working,
+            CrewWorkPhase::Interrupted,
+            CrewWorkPhase::Stalled,
+            CrewWorkPhase::Done,
+            CrewWorkPhase::HandedBack,
+            CrewWorkPhase::Failed,
+        ];
+        let variants = [PromiseState::Open, PromiseState::Submitted, PromiseState::Kept, PromiseState::Retracted];
+        // Draw mixed promise sets, then cross every crew phase, empty/nonempty
+        // sets, and raw/settled states. Positive paths run even in the 12-case
+        // development profile rather than relying on a rare combination.
+        let generated = (0..tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(4)))
+            .map(|_| variants[tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3))])
+            .collect::<Vec<_>>();
+        for phase in phases {
+            for count in [0, generated.len()] {
+                for all_settled in [false, true] {
+                    let mut status = ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() };
+                    status.work.insert("work".into(), WorkState::builder().phase(WorkPhase::Running).build());
+                    status
+                        .crew_work
+                        .insert("work".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(phase).build())]));
+                    for (i, state) in generated.iter().copied().take(count).enumerate() {
+                        apply(
+                            &mut status,
+                            "work",
+                            "coder",
+                            &PromiseOperation::Declare { id: i.to_string(), kind: PromiseKind::Pr, source: PromiseSource::Crew },
+                        );
+                        let state = if all_settled {
+                            match state {
+                                PromiseState::Open | PromiseState::Kept => PromiseState::Kept,
+                                PromiseState::Submitted | PromiseState::Retracted => PromiseState::Retracted,
+                            }
+                        } else {
+                            state
+                        };
+                        status.promises.get_mut("work").unwrap().get_mut("coder").unwrap()[i].state = state;
+                    }
+                    let expected = !phase.is_terminal() && count > 0 && owned(&status, "work", "coder").iter().all(|p| p.state.terminal());
+                    let now = DateTime::from_timestamp(1, 0).unwrap();
+                    let patch = next_completion(&status, now);
+                    assert_eq!(patch.is_some(), expected);
+                    // The patch must also reject stale, no-longer-settled promises.
+                    if let Some(patch) = patch {
+                        let mut concurrent = status.clone();
+                        concurrent.promises.get_mut("work").unwrap().get_mut("coder").unwrap()[0].state = PromiseState::Open;
+                        patch.apply(&mut concurrent);
+                        assert_eq!(concurrent.crew_work["work"]["coder"].phase, phase);
+                        patch.apply(&mut status);
+                        let done = &status.crew_work["work"]["coder"];
+                        assert_eq!(done.phase, CrewWorkPhase::Done);
+                        assert_eq!(done.completion_authority, WorkCompletionAuthority::Promises);
+                        assert!(done.finished_at.is_none() && done.message.is_none());
+                        assert_eq!(status.phase, ConvoyPhase::Landing);
+                        assert!(status.landing_entry.as_ref().unwrap().claims.is_empty(), "derived Done is not a claim");
+                        let settled = status.clone();
+                        patch.apply(&mut status);
+                        assert_eq!(status, settled);
+                        assert!(next_completion(&status, now).is_none());
+                        // An explicit work override keeps its own authority even when a
+                        // member previously ended through promises; it is a real claim.
+                        let mut overridden = status.clone();
+                        overridden.phase = ConvoyPhase::Active;
+                        super::super::ConvoyStatusPatch::ForceWorkCompleted {
+                            work: "work".into(),
+                            finished_at: now,
+                            message: Some("operator override".into()),
+                        }
+                        .apply(&mut overridden);
+                        let claims = &overridden.landing_entry.as_ref().unwrap().claims;
+                        assert_eq!(claims.len(), 1);
+                        assert_eq!(claims[0].message.as_deref(), Some("operator override"));
+                    }
+                }
+            }
+        }
+    }
+
+    // #3586: admission gives deliverers a template PR promise. A kept ledger
+    // cannot finish the role until a PR is submitted and merged. Explicit and
+    // implicit PR declarations converge on the same slot, including retries.
+    #[hegel::test]
+    fn deliverer_admission_requires_a_submitted_pr_even_with_a_kept_ledger(tc: hegel::TestCase) {
+        use crate::{ConvoyPhase, CrewWorkPhase, CrewWorkState, WorkflowSnapshot};
+        let explicit = tc.draw(hegel::generators::booleans());
+        for named in [false, true] {
+            let mut workflow = crate::single_agent_workflow_spec();
+            if explicit {
+                workflow.vessels[0].crew[0].promises.push(crate::TemplatePromise { owner: "coder".into(), kind: PromiseKind::Pr });
+            }
+            let mut status = ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: workflow.exit,
+                    turn_delivery: workflow.turn_delivery,
+                    vessels: workflow.vessels,
+                }),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            };
+            for (vessel, role, operation) in admitted_declarations(&[], &status) {
+                apply(&mut status, &vessel, &role, &operation);
+            }
+            assert_eq!(owned(&status, "work", "coder").iter().filter(|p| p.kind == PromiseKind::Pr).count(), 1);
+            assert!(admitted_declarations(&[], &status).is_empty());
+            status
+                .promises
+                .get_mut("work")
+                .unwrap()
+                .get_mut("coder")
+                .unwrap()
+                .iter_mut()
+                .find(|p| p.kind == PromiseKind::DecisionLedger)
+                .unwrap()
+                .state = PromiseState::Kept;
+            if named {
+                apply(
+                    &mut status,
+                    "work",
+                    "coder",
+                    &PromiseOperation::Declare { id: "implementation".into(), kind: PromiseKind::Pr, source: PromiseSource::Dispatch },
+                );
+            }
+            let now = DateTime::from_timestamp(1, 0).unwrap();
+            assert!(next_completion(&status, now).is_none());
+            let operation = discovered_submission(&status, "work", "coder", &pr_subject(1), &[], now).unwrap();
+            apply(&mut status, "work", "coder", &operation);
+            assert_eq!(owned(&status, "work", "coder").len(), if named { 3 } else { 2 });
+            let pr = owned(&status, "work", "coder").iter().find(|p| p.kind == PromiseKind::Pr).unwrap();
+            assert_eq!(pr.id, "template/pr");
+            assert_eq!(pr.source, PromiseSource::Template);
+            assert_eq!(pr.state, PromiseState::Submitted);
+            assert_eq!(pr.submissions.len(), 1);
+            assert!(next_completion(&status, now).is_none());
+            let evidence = owned(&status, "work", "coder")
+                .iter()
+                .filter(|p| p.kind == PromiseKind::Pr)
+                .map(|p| (p.id.clone(), p.submissions[0].clone()))
+                .collect::<Vec<_>>();
+            for (id, attempt) in evidence {
+                apply(
+                    &mut status,
+                    "work",
+                    "coder",
+                    &PromiseOperation::Verdict {
+                        id,
+                        reference: attempt.reference,
+                        submitted_at: attempt.submitted_at,
+                        verdict: SubmissionVerdict { accepted: true, who: "forge".into(), at: now, why: "merged".into() },
+                    },
+                );
+            }
+            assert!(next_completion(&status, now).is_some());
+        }
+    }
+
+    // #3586: submission history, including a rejected attempt, requires a
+    // supplier's retraction decision; an unsent crew declaration is retractable.
+    #[hegel::test]
+    fn submitted_promises_cannot_be_unilaterally_retracted(tc: hegel::TestCase) {
+        let submitted = tc.draw(hegel::generators::booleans());
+        let rejected = tc.draw(hegel::generators::booleans());
+        let mut status = ConvoyStatus::default();
+        apply(
+            &mut status,
+            "work",
+            "coder",
+            &PromiseOperation::Declare { id: "pr".into(), kind: PromiseKind::Pr, source: PromiseSource::Crew },
+        );
+        if submitted {
+            apply(&mut status, "work", "coder", &submit("pr", 1));
+            if rejected {
+                apply(&mut status, "work", "coder", &verdict("pr", 1, false));
+            }
+        }
+        let before = owned(&status, "work", "coder")[0].clone();
+        apply(&mut status, "work", "coder", &PromiseOperation::Retract { id: "pr".into(), reason: "no longer needed".into() });
+        let after = &owned(&status, "work", "coder")[0];
+        if submitted {
+            assert_eq!(after, &before);
+        } else {
+            assert_eq!(after.state, PromiseState::Retracted);
+        }
+    }
+
     fn pr_subject(number: u64) -> flotilla_protocol::Subject {
         let address = crate::address::stored_change_request_address("github.com", "org/repo", number, &[]).expect("address");
         crate::address::subject_for(&address).expect("subject")
@@ -982,7 +1241,6 @@ mod tests {
             [tc.draw(hegel::generators::integers::<usize>().max_value(2))];
         let mut status = ConvoyStatus::default();
         apply(&mut status, "work", "coder", &PromiseOperation::Declare { id: "feature".into(), kind: PromiseKind::Pr, source });
-        apply(&mut status, "work", "coder", &submit("feature", 1));
         apply(&mut status, "work", "coder", &PromiseOperation::Retract { id: "feature".into(), reason: "scope reduced".into() });
         let promise = &owned(&status, "work", "coder")[0];
         assert_eq!(promise.state == PromiseState::Retracted, source == PromiseSource::Crew);
@@ -1124,7 +1382,12 @@ mod tests {
             assert_eq!(status.crew_work["work"]["coder"].phase, super::super::CrewWorkPhase::Done);
         }
         let mut retracted = ConvoyStatus::default();
-        apply(&mut retracted, "work", "coder", &submission);
+        apply(
+            &mut retracted,
+            "work",
+            "coder",
+            &PromiseOperation::Declare { id: "feature".into(), kind: PromiseKind::Pr, source: PromiseSource::Crew },
+        );
         apply(&mut retracted, "work", "coder", &PromiseOperation::Retract { id: "feature".into(), reason: "reduced".into() });
         apply(&mut retracted, "work", "coder", &submission);
         assert!(!effect_present(&retracted, "work", "coder", &submission));
@@ -1392,6 +1655,7 @@ mod tests {
         assert_eq!(
             summary(&status, "coder"),
             vec![
+                ("template/pr".into(), PromiseSource::Template, PromiseKind::Pr, PromiseState::Open),
                 ("template/decision-ledger".into(), PromiseSource::Template, PromiseKind::DecisionLedger, PromiseState::Open),
                 ("api-split".into(), PromiseSource::Dispatch, PromiseKind::Pr, PromiseState::Open),
             ]

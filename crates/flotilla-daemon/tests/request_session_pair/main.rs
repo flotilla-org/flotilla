@@ -2373,6 +2373,7 @@ async fn artifact_environment_reference_contract() {
                             .name("work".into())
                             .crew(vec![CrewSpec::builder()
                                 .role("coder".into())
+                                .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("coder")])
                                 .source(CrewSource::Tool { command: "test".into() })
                                 .completion_conditions(vec![CrewCompletionExpectation::artifact_exists(
                                     "coder",
@@ -2392,6 +2393,16 @@ async fn artifact_environment_reference_contract() {
             )
             .await
             .expect("active crew work");
+        let admitted = convoys.get(convoy).await.unwrap();
+        for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&[], admitted.status.as_ref().unwrap()) {
+            flotilla_store::apply_status_patch(
+                &convoys,
+                convoy,
+                &flotilla_resources::ConvoyStatusPatch::Promise { vessel, role, operation },
+            )
+            .await
+            .unwrap();
+        }
         leader
             .resource_backend()
             .using::<Vessel>(namespace)
@@ -2539,8 +2550,8 @@ async fn artifact_environment_reference_contract() {
         let id = topology.client.execute(completion()).await.expect("dispatch completion");
         let result = await_command_result(&mut events, id).await;
         assert!(
-            matches!(&result, CommandValue::Error { message } if message.contains("decision-ledger")),
-            "completion requires the ledger artifact: {result:?}"
+            matches!(&result, CommandValue::CrewCompletionAdvisory { pending } if pending.iter().any(|p| p.contains("decision-ledger"))),
+            "advisory reports the pending ledger artifact: {result:?}"
         );
         let ledger = b"## Decision ledger\n\n1. **Brief silence:** Test setup.\n- **Choice:** Exercise every environment.\n- **Alternative:** Only local.\n- **If asking were free:** Which environment?\n";
         let source = workspace.path().join("ledger.md");
@@ -2612,11 +2623,28 @@ async fn artifact_environment_reference_contract() {
         // Observe only the completion below; earlier artifact requests can fill the broadcast buffer.
         let mut events = leader.subscribe();
         let id = topology.client.execute(completion()).await.expect("dispatch completion with ledger");
-        assert!(matches!(await_command_result(&mut events, id).await, CommandValue::Ok), "ledger admits completion");
-        assert_eq!(
-            convoys.get(convoy).await.expect("completed convoy").status.expect("status").crew_work["work"]["coder"].phase,
-            CrewWorkPhase::Done
-        );
+        assert!(matches!(await_command_result(&mut events, id).await, CommandValue::CrewCompletionAdvisory { .. }));
+        // Automatic reconciliation is deliberately gated in this transport
+        // contract. Drive the real convoy reconciler after transferring evidence.
+        use flotilla_store::controller::Reconciler;
+        let backend = leader.resource_backend();
+        let reconciler =
+            flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>(namespace))
+                .with_artifacts(backend.including_replicas::<Artifact>(namespace));
+        for _ in 0..16 {
+            let current = convoys.get(convoy).await.unwrap();
+            let prepared = reconciler.prepare(&current).await.unwrap();
+            let Some(patch) = reconciler.reconcile(&current, &prepared, Utc::now()).patch else {
+                break;
+            };
+            flotilla_store::apply_status_patch(&convoys, convoy, &patch).await.unwrap();
+        }
+        let status = convoys.get(convoy).await.unwrap().status.unwrap();
+        assert!(status.promises["work"]["coder"].iter().any(|p| p.kind == flotilla_resources::promises::PromiseKind::DecisionLedger
+            && p.state == flotilla_resources::promises::PromiseState::Kept));
+        // This transport fixture admits only a ledger promise; PR promise
+        // gating is covered by the controller and dummy-fleet scenarios.
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
         runtime.shutdown();
     }
 }

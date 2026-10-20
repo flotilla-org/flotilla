@@ -111,8 +111,8 @@ routing remains part of the federation work tracked in #1188.
    See [configuration](../configuration.md#dispatch-time-agent-selection).
 4. Crews are briefed automatically (assignment, delivery contract, crew
    verbs). Delivery is part of the assignment: implement, push, PR,
-   shepherd until checks pass, then `flotilla crew complete` — crews do not
-   merge.
+   shepherd until checks pass, submit the PR and decision ledger. A crew’s
+   part ends when its promises are kept or retracted; merge settles its PR promise.
 
 ## Monitoring and intervening
 

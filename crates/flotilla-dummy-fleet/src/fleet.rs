@@ -12,7 +12,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_config::dummy_fleet::DummyFleetConfig;
 use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_protocol::{commands::CommandValue, query::CrewCommandContext, Command, CommandAction, DaemonEvent};
+use flotilla_protocol::{commands::CommandValue, Command, CommandAction, DaemonEvent};
 use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
 use tokio::sync::{broadcast::error::RecvError, oneshot};
 
@@ -23,12 +23,6 @@ use crate::{catalog::CrewMix, forge::DummyForge, shared_forge::SharedForge, term
 #[async_trait]
 pub trait CrewCommandPort: Send + Sync {
     async fn execute(&self, action: CommandAction) -> Result<CommandValue, String>;
-
-    /// Observe settlement before attempting completion, as a real crew checks
-    /// its submitted promises. Boundary doubles without a store are ready.
-    async fn completion_ready(&self, _context: &CrewCommandContext) -> Result<bool, String> {
-        Ok(true)
-    }
 
     /// Report the crew working or idle in its terminal session, as a real
     /// harness's hooks do. Ports without a hook path ignore it; the session's
@@ -122,10 +116,6 @@ impl DummyFleet {
             Ok(CommandValue::Error { message }) => Err(message),
             result => result,
         }
-    }
-
-    pub(crate) async fn completion_ready(&self, context: &CrewCommandContext) -> Result<bool, String> {
-        self.port.get().ok_or("dummy fleet is not attached to a daemon")?.completion_ready(context).await
     }
 
     pub(crate) async fn report_attention(&self, namespace: &str, session: &str, working: bool) {

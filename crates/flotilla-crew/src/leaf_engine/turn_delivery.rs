@@ -209,7 +209,7 @@ impl LeafSubscriptionTable {
                         .filter(|promise| !promise.state.terminal())
                         .collect();
                     if !pending.is_empty() {
-                        brief.push_str("\nResolve these non-terminal promises before `flotilla crew complete`:\n\n");
+                        brief.push_str("\nSubmit the remaining deliverables; your part ends when these promises are kept:\n\n");
                         for promise in pending {
                             brief.push_str(&format!("- `{}` ({})\n", promise.id, promise.kind.as_str()));
                         }

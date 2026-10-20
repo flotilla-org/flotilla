@@ -43,12 +43,10 @@ pub const SCRIPT_LINE_PREFIX: &str = "dummy-script:";
 /// Marks the final task of an exchange; its responder completes after replying.
 pub const LAST_TURN_MARKER: &str = "[dummy:last]";
 const DEFAULT_REPOSITORY: &str = "dummy/fleet";
-const PROMISE_ID: &str = "pr";
 const PROMISE_KIND: &str = "pr";
 /// Attempts at a refused command before the crew stalls with the error.
 const COMMAND_ATTEMPTS: usize = 3;
 /// Longest wait between completion attempts while a promise is unsettled.
-const MAX_COMPLETION_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CrewScript {
@@ -165,6 +163,7 @@ pub(crate) struct Crew {
     turns: mpsc::UnboundedReceiver<String>,
     /// Peer tasks that arrived while the crew waited for guidance.
     held: VecDeque<String>,
+    script_finished: bool,
 }
 
 enum Ending {
@@ -179,7 +178,7 @@ impl Crew {
         identity: CrewIdentity,
         turns: mpsc::UnboundedReceiver<String>,
     ) -> Self {
-        Self { fleet, session, identity, turns, held: VecDeque::new() }
+        Self { fleet, session, identity, turns, held: VecDeque::new(), script_finished: false }
     }
 
     pub(crate) async fn run(mut self, script: CrewScript) {
@@ -194,10 +193,8 @@ impl Crew {
                 CrewScript::Governor { aide, turns } => self.govern(&aide, turns).await,
             },
         };
-        match ending {
-            Some(Ending::Completed) => self.fleet.count(Counter::CrewsCompleted),
-            Some(Ending::Failed) => self.fleet.count(Counter::CrewsFailed),
-            None => {}
+        if matches!(ending, Some(Ending::Failed)) {
+            self.fleet.count(Counter::CrewsFailed);
         }
         // Completion leaves the conversation alive. A handoff can reopen Done
         // work, so consume the delivered turn and report again after acting on it.
@@ -205,7 +202,7 @@ impl Crew {
         if matches!(ending, Some(Ending::Completed)) {
             while self.next_turn().await.is_some() {
                 // Report this follow-up without repeating the original completion message or URL.
-                if self.complete(None).await.is_none() {
+                if self.settle_promises().await.is_none() {
                     break;
                 }
             }
@@ -245,9 +242,6 @@ impl Crew {
     }
 
     async fn code(&mut self, reviewer: Option<String>, repository: &str) -> Option<Ending> {
-        let promise = CrewPromiseOperation::Promise { id: PROMISE_ID.into(), kind: PROMISE_KIND.into() };
-        // A crew resumed after a restart may have promised already.
-        let _ = self.fleet.execute(CommandAction::CrewPromise { context: self.identity.context(), operation: promise }).await;
         let branch = format!("dummy/{}/{}", self.identity.convoy, self.identity.vessel);
         let title = format!("Dummy work for {}", self.identity.convoy);
         let url = match self.fleet.shared_forge.clone() {
@@ -255,18 +249,14 @@ impl Crew {
             None => self.fleet.forge.open(repository, &branch, &title).1,
         };
         self.fleet.count(Counter::ChangeRequestsOpened);
-        let submit = CrewPromiseOperation::Submit {
-            promise: Some(PROMISE_ID.into()),
-            kind: PROMISE_KIND.into(),
-            reference: url.clone(),
-            metadata: BTreeMap::new(),
-        };
+        let submit =
+            CrewPromiseOperation::Submit { promise: None, kind: PROMISE_KIND.into(), reference: url.clone(), metadata: BTreeMap::new() };
         self.persist(CommandAction::CrewPromise { context: self.identity.context(), operation: submit }).await?;
         if let Some(reviewer) = reviewer {
             self.hand_off(&reviewer, &format!("Please review {url} {LAST_TURN_MARKER}")).await?;
             self.next_turn().await?;
         }
-        self.complete(Some(url)).await
+        self.settle_promises().await
     }
 
     async fn respond(&mut self, reply_to: &str) -> Option<Ending> {
@@ -274,7 +264,7 @@ impl Crew {
             let turn = self.next_turn().await?;
             self.hand_off(reply_to, "Done.").await?;
             if turn.contains(LAST_TURN_MARKER) {
-                return self.complete(None).await;
+                return self.settle_promises().await;
             }
         }
     }
@@ -285,7 +275,7 @@ impl Crew {
             self.hand_off(aide, &format!("Task {task} of {turns}. {last}")).await?;
             self.next_turn().await?;
         }
-        self.complete(None).await
+        self.settle_promises().await
     }
 
     async fn hand_off(&mut self, target: &str, message: &str) -> Option<CommandValue> {
@@ -376,52 +366,49 @@ impl Crew {
         }
     }
 
-    /// Complete, waiting out refusals while a promise is still unsettled.
-    async fn complete(&mut self, message: Option<String>) -> Option<Ending> {
-        let mut backoff = Duration::from_secs(1);
-        loop {
-            // Do not repeatedly claim completion while a submitted promise is
-            // still open. Refusals are command errors, not a polling interface.
-            // Promises that never settle surface through harness inactivity/stall
-            // checks; waiting here deliberately does not create a command error.
-            match self.fleet.completion_ready(&self.identity.context()).await {
-                Ok(false) => {
-                    self.idle_for(backoff).await;
-                    backoff = (backoff * 2).min(MAX_COMPLETION_BACKOFF);
-                    continue;
-                }
-                Ok(true) => {}
-                Err(error) => {
-                    tracing::warn!(crew = %self.identity.subject(), %error, "dummy crew settlement observation failed");
-                    self.idle_for(backoff).await;
-                    backoff = (backoff * 2).min(MAX_COMPLETION_BACKOFF);
-                    continue;
-                }
-            }
-            let action = CommandAction::CrewComplete {
+    /// Publish the script's final evidence; the daemon settles the promises.
+    async fn settle_promises(&mut self) -> Option<Ending> {
+        // The dummy artifact stands in for a crew publishing its finished ledger.
+        // Use the same resource command boundary as artifact put, so the real
+        // promise observer (rather than a completion command) settles the role.
+        let name = flotilla_resources::address::artifact_slot_record_name(
+            &self.identity.convoy,
+            &self.identity.role,
+            "decision-ledger",
+            &self.identity.convoy,
+        )
+        .ok()?;
+        // Open obligations can move to a peer during handoffs. Submit this
+        // script's own final ledger explicitly, even if its template moved.
+        if !self.script_finished {
+            self.persist(CommandAction::CrewPromise {
                 context: self.identity.context(),
-                message: message.clone(),
-                disposition: None,
-                decision_ledger_ref: None,
-                force: false,
-            };
-            match self.fleet.execute(action).await {
-                Ok(CommandValue::CrewCompletionWaiting { retry_at, .. }) => {
-                    let wait = (retry_at - chrono::Utc::now()).to_std().unwrap_or_default();
-                    self.idle_for(wait.clamp(Duration::from_millis(100), MAX_COMPLETION_BACKOFF)).await;
-                }
-                // A supervisor's follow-up arrives as a turn; answer it, then retry.
-                Ok(CommandValue::CrewFollowUpDelivered) => {
-                    self.next_turn().await?;
-                }
-                Ok(_) => return Some(Ending::Completed),
-                Err(error) => {
-                    tracing::debug!(crew = %self.identity.subject(), %error, "dummy crew completion refused; retrying");
-                    self.idle_for(backoff).await;
-                    backoff = (backoff * 2).min(MAX_COMPLETION_BACKOFF);
-                }
-            }
+                operation: CrewPromiseOperation::Submit {
+                    promise: Some("script-ledger".into()),
+                    kind: "decision-ledger".into(),
+                    reference: name.clone(),
+                    metadata: BTreeMap::new(),
+                },
+            })
+            .await?;
+            // Count finished scripts before publishing evidence triggers teardown.
+            self.fleet.count(Counter::CrewsCompleted);
+            self.script_finished = true;
         }
+        self.persist(CommandAction::ResourceApply {
+            namespace: self.identity.namespace.clone(),
+            document: serde_json::json!({
+                "apiVersion": "flotilla.work/v1", "kind": "Artifact", "metadata": {"name": name},
+                "spec": {
+                    "convoy": self.identity.convoy, "producer": self.identity.role,
+                    "kind": "decision-ledger", "subject": self.identity.convoy,
+                    "digest": "dummy-script-finished", "size": 0, "media_type": "text/markdown",
+                    "expires_at": chrono::Utc::now() + chrono::Duration::days(1),
+                }
+            }),
+        })
+        .await?;
+        Some(Ending::Completed)
     }
 
     async fn attempt(&self, action: CommandAction) -> Option<CommandValue> {

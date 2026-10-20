@@ -15,7 +15,6 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_protocol::{
     CheckoutArchiveOutcome, CheckoutArchiveStatus, CommandValue, CrewCommandContext, CrewListMember, CrewListResponse, CrewProject,
     CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
@@ -24,18 +23,18 @@ use flotilla_resources::checkout_integration::{change_request_subjects_from_clai
 use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::{
     address::{
-        artifact_slot_record_name, leaf_address, leaf_record_name, record_name, remote_change_request_address, repository_address,
-        subject_address, submission_subject_text, AddressKind,
+        leaf_address, leaf_record_name, record_name, remote_change_request_address, repository_address, subject_address,
+        submission_subject_text, AddressKind,
     },
-    evaluate_crew_completion, expected_change_request_leaves, external_patches as convoy_external_patches,
-    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus, Clock, ConditionValue,
-    Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewCompletionClaim, CrewCompletionPending, CrewCompletionRefusalCause,
-    CrewMessageSender, CrewSource, CrewWorkPhase, Demand as ResourceDemand, Forge, HoldAct, InputMeta, IntegrationCondition,
-    LifecycleAuthority, ObservedChangeRequestState, Project, Repository, RepositoryKey, Resource, ResourceError, ResourceObject,
-    ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
-    TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WorkCompletionAuthority, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION,
-    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    expected_change_request_leaves, external_patches as convoy_external_patches, ChangeRequest as ResourceChangeRequest,
+    Checkout as ResourceCheckout, CheckoutIntegrationStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyPhase,
+    ConvoyStatusPatch, CrewCompletionPending, CrewMessageSender, CrewSource, CrewWorkPhase, Demand as ResourceDemand, Forge, HoldAct,
+    InputMeta, IntegrationCondition, LifecycleAuthority, ObservedChangeRequestState, Project, Repository, RepositoryKey, Resource,
+    ResourceError, ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
+    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung, Vessel, WorkCompletionAuthority, CONVOY_LABEL,
+    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_REF_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{CrewMessageDelivery, TerminalCrewMessage};
@@ -57,8 +56,6 @@ use crate::leaf_engine::{
     LeafSubscriptionTable, ResourceIntentPublisher, TurnDeliveryActuator,
 };
 use flotilla_resources::crew_attention;
-
-use flotilla_resources::explain_unmet_expectation;
 
 use flotilla_config::ConfigStore;
 
@@ -249,22 +246,6 @@ async fn crew_brief_repo_roots(
     roots
 }
 
-// Keep local completion evidence authoritative regardless of query row ordering.
-fn select_crew_artifacts(
-    sources: Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Artifact>>,
-) -> BTreeMap<String, ResourceObject<flotilla_resources::Artifact>> {
-    let mut selected = BTreeMap::new();
-    for source in sources {
-        let name = source.object.metadata.name.clone();
-        if matches!(source.provenance, flotilla_resources::ResourceProvenance::Local) {
-            selected.insert(name, source.object);
-        } else {
-            selected.entry(name).or_insert(source.object);
-        }
-    }
-    selected
-}
-
 // Legacy queues and pending follow-ups on terminal convoys are ignored (#3430),
 // including when a name is selected. No name means all live convoys in the namespace.
 fn convoy_names_query(name: Option<&str>, include_replicas: bool) -> StoreQuery {
@@ -346,9 +327,9 @@ fn safe_header_value(value: &str) -> String {
 fn crew_message_header(sender: &CrewMessageSender) -> String {
     match sender {
         CrewMessageSender::Unknown => "unknown sender · message".to_string(),
-        CrewMessageSender::FlotillaNudge => "flotilla · nudge · reply by running `crew complete` or `crew stall`".to_string(),
+        CrewMessageSender::FlotillaNudge => "flotilla · nudge · submit your deliverables or report a stall".to_string(),
         CrewMessageSender::FlotillaTurn { source } => {
-            format!("flotilla · turn: {} · reply by running `crew complete`", safe_header_value(source))
+            format!("flotilla · turn: {} · submit your deliverables; your part ends when your promises are kept", safe_header_value(source))
         }
         CrewMessageSender::FlotillaEscalation { from } => {
             format!("flotilla · escalated from {} · supervise the stalled crew", safe_header_value(from))
@@ -358,14 +339,20 @@ fn crew_message_header(sender: &CrewMessageSender) -> String {
             |principal| format!("operator {} · via convoy resume", safe_header_value(&principal.name)),
         ),
         CrewMessageSender::OperatorFollowUp { principal } => format!(
-            "operator {} · follow-up brief · reply by running `crew complete`",
+            "operator {} · follow-up brief · submit your deliverables; your part ends when your promises are kept",
             principal.as_ref().map_or_else(|| "(unattributed)".to_string(), |principal| safe_header_value(&principal.name))
         ),
         CrewMessageSender::Governor { name } => {
-            format!("governor {} · guidance for your stalled work · reply by running `crew complete`", safe_header_value(name))
+            format!(
+                "governor {} · guidance for your stalled work · submit your deliverables; your part ends when your promises are kept",
+                safe_header_value(name)
+            )
         }
         CrewMessageSender::Bosun { name } => {
-            format!("bosun {} · guidance for your stalled work · reply by running `crew complete`", safe_header_value(name))
+            format!(
+                "bosun {} · guidance for your stalled work · submit your deliverables; your part ends when your promises are kept",
+                safe_header_value(name)
+            )
         }
         CrewMessageSender::Handoff { from } => format!("handoff from {}", safe_header_value(from)),
     }
@@ -1043,7 +1030,7 @@ impl CrewService {
                         }) {
                             existing.id.clone()
                         } else {
-                            let matching = promises.iter().filter(|p| p.kind == kind && p.state == PromiseState::Open).collect::<Vec<_>>();
+                            let matching = flotilla_resources::promises::submission_candidates(promises, kind);
                             match matching.as_slice() {
                                 [p] => p.id.clone(),
                                 [] => reference.clone(),
@@ -1070,7 +1057,7 @@ impl CrewService {
                 if promise.state.terminal() {
                     return Err(format!("promise `{id}` is already terminal"));
                 }
-                if promise.source != PromiseSource::Crew {
+                if promise.source != PromiseSource::Crew || !promise.submissions.is_empty() {
                     apply_resource_status_patch(
                         &convoys,
                         name,
@@ -1150,9 +1137,8 @@ impl CrewService {
             .flat_map(|text| change_request_subjects_from_claim(text, &convoy.spec.repositories, &forges))
             .collect::<BTreeSet<_>>();
         ensure_crew_work_is_defined(&convoy, &context)?;
-        // Discovery is evidence, independent of whether this completion claim
-        // passes validation. Record it first so a newly named PR can satisfy
-        // readiness; the parser admits only this convoy's repositories.
+        // Discover submission evidence without making a completion claim.
+        // The parser admits only this convoy's repositories.
         if !claim_subjects.is_empty() {
             convoy = apply_resource_status_patch(
                 &convoys,
@@ -1165,13 +1151,6 @@ impl CrewService {
             )
             .await
             .map_err(|error| error.to_string())?;
-        }
-        if let Some(status) = &convoy.status {
-            for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&convoy.spec.promises, status) {
-                convoy = apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::Promise { vessel, role, operation })
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
         }
         for subject in &claim_subjects {
             if let Some(operation) = convoy.status.as_ref().and_then(|status| {
@@ -1193,307 +1172,49 @@ impl CrewService {
                 .map_err(|e| e.to_string())?;
             }
         }
-        let ledger_name = artifact_slot_record_name(convoy_name, &context.caller_role, "decision-ledger", convoy_name)?;
-        let artifact_sources = self
-            .resource_backend
-            .query_declared::<flotilla_resources::Artifact>(
-                namespace,
-                &StoreQuery {
-                    fields: BTreeMap::from([("spec.convoy".into(), convoy_name.into())]),
-                    include_replicas: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            .items;
-        let promise_artifacts = select_crew_artifacts(artifact_sources);
-        let ledger_artifact = promise_artifacts.get(&ledger_name);
-        let decision_ledger_digest = ledger_artifact.as_ref().map(|artifact| artifact.spec.digest.clone());
-        let projected_ledger_ref = ledger_artifact
-            .as_ref()
-            .and_then(|artifact| artifact.spec.summary.get("comment_url"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let decision_ledger_ref = projected_ledger_ref.or(decision_ledger_ref);
-        // This records the principal declared by the connected surface. Stronger
-        // authentication and operator/agent separation belongs to the caller-
-        // identity contract; until then the durable attribution is the audit
-        // boundary rather than an authorization boundary.
-        let forced_by = if force { Some(principal.ok_or_else(|| "`--force` requires an operator principal".to_string())?) } else { None };
-        let existing_claim_is_admitted = convoy
-            .status
-            .as_ref()
-            .and_then(|status| status.crew_work.get(&context.vessel))
-            .and_then(|crew| crew.get(&context.caller_role))
-            .is_some_and(|claim| {
-                // Admission survives artifact retention, but a legacy Done status without
-                // artifact evidence, a projection pointer, or an operator override must revalidate.
-                claim.phase == CrewWorkPhase::Done
-                    && (claim.decision_ledger_digest.is_some()
-                        || claim.decision_ledger_ref.is_some()
-                        || claim.completion_override.is_some())
-            });
-        if decision_ledger_ref.is_none()
-            && forced_by.is_none()
-            && existing_claim_is_admitted
-            && convoy
+        if !force {
+            let pending = convoy
                 .status
                 .as_ref()
-                .is_none_or(|status| flotilla_resources::promises::pending(status, &context.vessel, &context.caller_role).is_empty())
-        {
-            return Ok(flotilla_protocol::CommandValue::Ok);
-        }
-        let mut observed_change_requests = None;
-        if forced_by.is_none() && !existing_claim_is_admitted {
-            let requires_change_request = convoy
-                .status
-                .as_ref()
-                .and_then(|status| status.workflow_snapshot.as_ref())
-                .and_then(|snapshot| snapshot.vessels.iter().find(|vessel| vessel.name == context.vessel))
-                .and_then(|vessel| vessel.crew.iter().find(|crew| crew.role == context.caller_role))
-                .is_some_and(|crew| {
-                    crew.deliverer
-                        || crew.completion_conditions.iter().any(|condition| {
-                            matches!(
-                                condition,
-                                flotilla_resources::CrewCompletionExpectation::Condition(
-                                    flotilla_resources::CompletionCondition::ChangeRequest { .. }
-                                )
-                            )
+                .map(|status| {
+                    flotilla_resources::promises::owned(status, &context.vessel, &context.caller_role)
+                        .iter()
+                        .filter(|promise| !promise.state.terminal())
+                        .map(|promise| {
+                            let waits_on = match (promise.kind, promise.state) {
+                                (_, flotilla_resources::promises::PromiseState::Open) => "submission",
+                                (flotilla_resources::promises::PromiseKind::Pr, _) => "PR merge",
+                                (flotilla_resources::promises::PromiseKind::DecisionLedger, _) => "decision-ledger artifact",
+                            };
+                            format!("{}: waiting on {waits_on}", promise.id)
                         })
-                });
-            let mut observation_errors = Vec::new();
-            let mut refusal_causes = Vec::new();
-            let mut observation_waits = Vec::new();
-            if requires_change_request {
-                // One subject per change request, whatever its leaves' spellings.
-                let mut subjects = BTreeMap::new();
-                for leaf in expected_change_request_leaves(&convoy, &forges)? {
-                    let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else { continue };
-                    let cause = || CrewCompletionRefusalCause::MissingChangeRequestObservation {
-                        service: service.clone(),
-                        scope: scope.clone(),
-                        number: *number,
-                    };
-                    match leaf_address(&leaf.address, &forges).and_then(|address| ChangeRequestKey::new(namespace, address)) {
-                        Ok(subject) => {
-                            subjects.entry(subject).or_insert_with(cause);
-                        }
-                        Err(error) => {
-                            observation_errors.push(format!("could not observe PR {number}: {error}"));
-                            refusal_causes.push(cause());
-                        }
-                    }
-                }
-                for (subject, cause) in subjects {
-                    if let Err(error) = self.leaf_subscriptions.refresh_change_request_once(&subject).await {
-                        if let Some(retry_at) = error.retry_at().filter(|retry_at| *retry_at > Utc::now()) {
-                            observation_waits.push((retry_at, format!("PR {} observation: {error}", subject.number())));
-                        } else {
-                            observation_errors.push(format!("could not observe PR {}: {error}", subject.number()));
-                            refusal_causes.push(cause);
-                        }
-                    }
-                }
-            }
-            let change_request_sources = self
-                .resource_backend
-                .query_declared::<ResourceChangeRequest>(namespace, &crew_change_request_query(&convoy, &forges)?)
-                .await
-                .map_err(|error| error.to_string())?;
-            let change_requests =
-                flotilla_resources::select_change_requests(change_request_sources.items.iter().map(|source| &source.object));
-            let change_requests =
-                change_requests.into_values().filter_map(|record| spec_record_name(record, &forges)).collect::<BTreeMap<_, _>>();
-            observed_change_requests = Some(change_requests.clone());
-            let unmet = evaluate_crew_completion(
-                &convoy,
-                CrewCompletionClaim { vessel: &context.vessel, role: &context.caller_role },
-                &change_requests,
-                &promise_artifacts,
-                &forges,
-                self.leaf_subscriptions.change_request_stale_after(),
-                self.clock.now(),
-            )?;
-            // Missing fresh forge evidence is a timed wait, not a crew refusal.
-            // Keep all declared completion gates: neither stale readiness nor a
-            // rate-limit response is permission to mark the crew Done.
-            // Defer even independent unmet gates until observation recovers:
-            // waiting does not accept the claim, and every gate is re-evaluated
-            // on retry before either Done or a substantive refusal is recorded.
-            if observation_errors.is_empty() && !observation_waits.is_empty() {
-                let retry_at = observation_waits.iter().map(|(at, _)| *at).max().expect("nonempty waits");
-                let reason = observation_waits.into_iter().map(|(_, reason)| reason).collect::<Vec<_>>().join("; ");
-                return Ok(flotilla_protocol::CommandValue::CrewCompletionWaiting { reason, retry_at });
-            }
-            if !unmet.is_empty() || !observation_errors.is_empty() {
-                for expectation in &unmet {
-                    if let UnmetSettlementExpectation::CompletionConditionUnsatisfied { causes, .. } = expectation {
-                        for cause in causes {
-                            if !refusal_causes.contains(cause) {
-                                refusal_causes.push(cause.clone());
-                            }
-                        }
-                    }
-                }
-                let mut reasons = unmet
-                    .into_iter()
-                    .map(explain_unmet_expectation)
-                    .map(|expectation| format!("{}: {}", expectation.subject, expectation.detail))
-                    .collect::<Vec<_>>();
-                reasons.extend(observation_errors);
-                if let Some(status) = &convoy.status {
-                    reasons.extend(
-                        flotilla_resources::promises::pending(status, &context.vessel, &context.caller_role)
-                            .into_iter()
-                            .map(|id| format!("promise `{id}` is not kept or retracted")),
-                    );
-                }
-                let expectation = reasons.join("; ");
-                apply_resource_status_patch(
-                    &convoys,
-                    convoy_name,
-                    &ConvoyStatusPatch::RefuseCrewCompletion {
-                        vessel: context.vessel.clone(),
-                        role: context.caller_role.clone(),
-                        expectation: expectation.clone(),
-                        causes: refusal_causes,
-                        message: message.clone(),
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-                return Err(format!("crew completion expectations unmet: {expectation}"));
-            }
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            return Ok(CommandValue::CrewCompletionAdvisory { pending });
         }
-        let promise_change_requests = match observed_change_requests {
-            Some(records) => records,
-            None => {
-                let records = self
-                    .resource_backend
-                    .query_declared::<ResourceChangeRequest>(namespace, &crew_change_request_query(&convoy, &forges)?)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                flotilla_resources::select_change_requests(records.items.iter().map(|source| &source.object))
-                    .into_values()
-                    .filter_map(|record| spec_record_name(record, &forges))
-                    .collect()
-            }
-        };
-        loop {
-            let next = convoy.status.as_ref().and_then(|status| {
-                flotilla_resources::promises::next_observation(
-                    status,
-                    convoy_name,
-                    &promise_change_requests,
-                    &promise_artifacts,
-                    &forges,
-                    self.clock.now(),
-                    self.leaf_subscriptions.change_request_stale_after(),
-                )
-            });
-            let Some(patch) = next else {
-                break;
-            };
-            convoy = apply_resource_status_patch(&convoys, convoy_name, &patch).await.map_err(|e| e.to_string())?;
-        }
-        if let Some(status) = &convoy.status {
-            let pending = flotilla_resources::promises::pending(status, &context.vessel, &context.caller_role);
-            if !pending.is_empty() {
-                let expectation = format!("crew promises are not kept or retracted: {}", pending.join(", "));
-                apply_resource_status_patch(
-                    &convoys,
-                    convoy_name,
-                    &ConvoyStatusPatch::RefuseCrewCompletion {
-                        vessel: context.vessel.clone(),
-                        role: context.caller_role.clone(),
-                        expectation: expectation.clone(),
-                        causes: Vec::new(),
-                        message: message.clone(),
-                    },
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                return Err(expectation);
-            }
-        }
-        if let Some(reference) = convoy
-            .status
-            .as_ref()
-            .and_then(|status| status.crew_work.get(&context.vessel))
-            .and_then(|crew| crew.get(&context.caller_role))
-            .and_then(|state| state.pending_follow_up.as_ref())
-        {
-            let follow_up = self
-                .message_record(namespace, &reference.name)
-                .await
-                .map_err(|error| format!("follow-up Message awaits replication: {error}"))?;
-            if follow_up.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal()) {
-                let claim = flotilla_resources::SupersededCrewClaim {
-                    claimed_at: self.clock.now(),
-                    message,
-                    disposition,
-                    completion_override: forced_by
-                        .as_ref()
-                        .filter(|_| decision_ledger_ref.is_none() && decision_ledger_digest.is_none())
-                        .map(|principal| flotilla_resources::CrewCompletionOverride {
-                            principal: principal.clone(),
-                            forced_at: self.clock.now(),
-                        }),
-                    decision_ledger_ref,
-                    decision_ledger_digest,
-                    completed_while_crew_active,
-                };
-                apply_resource_status_patch(
-                    &convoys,
-                    convoy_name,
-                    &ConvoyStatusPatch::BeginMessageFollowUp {
-                        vessel: context.vessel,
-                        role: context.caller_role,
-                        message: reference.clone(),
-                        content: follow_up.object.spec.body,
-                        claim,
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-                if let Some(session) = routing.session_name.as_deref() {
-                    self.clear_crew_completion_pending(namespace, session).await?;
-                }
-                return Ok(flotilla_protocol::CommandValue::CrewFollowUpDelivered);
-            }
-        }
-        let updated = apply_resource_status_patch(
+        let principal = principal.ok_or_else(|| "`--force` requires an operator principal".to_string())?;
+        apply_resource_status_patch(
             &convoys,
             convoy_name,
             &convoy_external_patches::mark_crew_completed_with_context(
                 context.vessel.clone(),
                 context.caller_role.clone(),
-                chrono::Utc::now(),
+                self.clock.now(),
                 message,
                 disposition,
                 decision_ledger_ref,
-                decision_ledger_digest,
+                None,
                 completed_while_crew_active,
-                forced_by,
+                Some(principal),
             ),
         )
         .await
-        .map_err(|err| err.to_string())?;
-        if updated
-            .status
-            .as_ref()
-            .and_then(|status| status.crew_work.get(&context.vessel))
-            .and_then(|crew| crew.get(&context.caller_role))
-            .is_none_or(|work| work.phase != CrewWorkPhase::Done)
-        {
-            return Err("crew completion changed concurrently; inspect pending promises and retry".into());
-        }
+        .map_err(|error| error.to_string())?;
         if let Some(session_name) = routing.session_name {
             self.clear_crew_completion_pending(namespace, &session_name).await?;
         }
-        Ok(flotilla_protocol::CommandValue::Ok)
+        Ok(CommandValue::Ok)
     }
 
     pub async fn fail(
@@ -3709,16 +3430,6 @@ fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, int
     } else {
         Some(format!("{} [{}]: {}", checkout.metadata.name, checkout_path(checkout).unwrap_or("<unknown path>"), problems.join("; ")))
     }
-}
-
-/// A change-request record keyed by the record name its spec addresses,
-/// resolving a host-spelled service through `forges`.
-fn spec_record_name(
-    record: ResourceObject<ResourceChangeRequest>,
-    forges: &[flotilla_resources::ForgeSpec],
-) -> Option<(String, ResourceObject<ResourceChangeRequest>)> {
-    let name = record.spec.address(forges).ok().and_then(|address| record_name(&address))?;
-    Some((name, record))
 }
 
 fn associated_change_request_name_without_checkout_status(

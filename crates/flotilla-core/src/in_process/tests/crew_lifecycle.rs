@@ -664,7 +664,7 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
 // ADR 0061: crew retraction is immediate only for crew-sourced promises;
 // template/dispatch retractions stall with the promise and reason preserved.
 #[tokio::test]
-async fn promise_retractions_and_named_completion_refusal() {
+async fn promise_retractions_and_named_completion_advisory() {
     use flotilla_protocol::commands::CrewPromiseOperation;
     use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState};
     let (daemon, backend, _temp, watch) = stall_test_daemon().await;
@@ -711,9 +711,10 @@ async fn promise_retractions_and_named_completion_refusal() {
         role: Some("coder".into()),
         ..Default::default()
     };
-    let error = daemon.crew_complete_as_principal_internal(&context, None, None, None, false, None).await.unwrap_err();
+    let advisory = daemon.crew_complete_as_principal_internal(&context, None, None, None, false, None).await.unwrap();
+    let flotilla_protocol::CommandValue::CrewCompletionAdvisory { pending } = advisory else { panic!("advisory") };
     for id in ["template", "dispatch", "own"] {
-        assert!(error.contains(id), "{error}");
+        assert!(pending.iter().any(|p| p.contains(id)), "{pending:?}");
     }
     daemon.crew.promise(&context, CrewPromiseOperation::Retract { id: "own".into(), reason: "scope reduced".into() }).await.unwrap();
     for id in ["template", "dispatch"] {
