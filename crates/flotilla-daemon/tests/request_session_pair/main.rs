@@ -28,6 +28,7 @@ use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_caller;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_caller_and_blob_store;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_surface;
+use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_with_replication_kinds;
 use flotilla_daemon_testkit::server::InMemoryRequestMesh;
 use flotilla_daemon_testkit::server::InMemoryRequestTopology;
 use flotilla_discovery_api::EnvironmentBag;
@@ -3591,18 +3592,42 @@ fn generated_start_placement_with_lagging_replicas(tc: hegel::TestCase) {
 
 #[tokio::test]
 async fn placement_host_convoy_start_enforces_capacity_before_persistence() {
+    placement_host_capacity_scenario(false).await;
+}
+
+#[tokio::test]
+async fn placement_host_capacity_without_project_replication() {
+    placement_host_capacity_scenario(true).await;
+}
+
+// Behaviour (#3599): the placement host admits the start and refuses its own
+// insufficient capacity before persisting a Convoy, even with no definition replication.
+async fn placement_host_capacity_scenario(hold_definitions: bool) {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named_with_floor("follower", Some(1_000_000)).await;
     seed_host_capacity(&follower, 0, 1_000_000 * 1024 * 1024 * 1024).await;
     follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
-    let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
+    // Admission runs on the placement host. Hold definition replication so an
+    // origin-only Project deterministically reproduces #3599 instead of racing.
+    let topology = if hold_definitions {
+        spawn_in_memory_request_topology_with_replication_kinds(
+            leader,
+            follower,
+            &[Host::API_PATHS.kind, PlacementPolicy::API_PATHS.kind, FulfilmentKind::API_PATHS.kind],
+        )
+        .await
+        .expect("spawn topology holding Project and WorkflowTemplate replication")
+    } else {
+        spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology")
+    };
     let namespace = "flotilla";
     let remote_host_id = topology.follower.local_host_id().expect("follower host identity").to_string();
     let placement_policy = format!("host-direct-{remote_host_id}");
 
     seed_target_placement_policy(&topology, namespace, &placement_policy).await;
     await_host_capacity(&topology.leader, &remote_host_id).await;
-    seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
+    // The follower performs admission; seed its prerequisites synchronously.
+    seed_trusted_remote_convoy_project(&topology.follower, namespace).await;
 
     let mut events = topology.leader.subscribe();
     let command_id = topology
@@ -3635,6 +3660,18 @@ async fn placement_host_convoy_start_enforces_capacity_before_persistence() {
     assert!(message.contains("reap settled convoys"), "{message}");
     assert!(message.contains("scripts/prune-target.sh"), "{message}");
     assert!(message.contains("pick another host"), "{message}");
+    if hold_definitions {
+        // The refusal must not depend on either declaration reaching the origin.
+        assert!(matches!(
+            topology.leader.resource_backend().definitions::<flotilla_resources::Project>(namespace).get("flotilla").await,
+            Err(ResourceError::NotFound { .. })
+        ));
+        assert!(matches!(
+            topology.leader.resource_backend().definitions::<WorkflowTemplate>(namespace).get("remote-workflow").await,
+            Err(ResourceError::NotFound { .. })
+        ));
+    }
+
     assert!(
         matches!(
             topology.leader.resource_backend().using::<Convoy>(namespace).get("remote-disk-hungry").await,

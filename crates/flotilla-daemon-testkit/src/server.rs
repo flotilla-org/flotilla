@@ -310,7 +310,17 @@ pub async fn spawn_in_memory_request_topology_stateful(
     leader: Arc<InProcessDaemon>,
     follower: Arc<InProcessDaemon>,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None, None).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None, None, None).await
+}
+
+/// Stateful pair with replication limited to the kinds authored by a scenario.
+/// Use an explicit set to hold unrelated declarations off the placement host.
+pub async fn spawn_in_memory_request_topology_with_replication_kinds(
+    leader: Arc<InProcessDaemon>,
+    follower: Arc<InProcessDaemon>,
+    replication_kinds: &'static [&'static str],
+) -> Result<InMemoryRequestTopology, String> {
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None, None, Some(replication_kinds)).await
 }
 
 /// Stateful in-memory topology whose client declares an explicit attention
@@ -320,7 +330,7 @@ pub async fn spawn_in_memory_request_topology_stateful_with_surface(
     follower: Arc<InProcessDaemon>,
     surface: SurfaceDeclaration,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), None, None).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), None, None, None).await
 }
 
 pub async fn spawn_in_memory_request_topology_stateful_with_caller(
@@ -329,7 +339,7 @@ pub async fn spawn_in_memory_request_topology_stateful_with_caller(
     surface: SurfaceDeclaration,
     caller: CommandCaller,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), None).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), None, None).await
 }
 
 pub async fn spawn_in_memory_request_topology_stateful_with_caller_and_blob_store(
@@ -339,7 +349,7 @@ pub async fn spawn_in_memory_request_topology_stateful_with_caller_and_blob_stor
     caller: CommandCaller,
     blob_store: Arc<TieredBlobStore>,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), Some(blob_store)).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), Some(blob_store), None).await
 }
 
 async fn spawn_in_memory_request_topology_stateful_with_options(
@@ -348,6 +358,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
     surface: Option<SurfaceDeclaration>,
     caller: Option<CommandCaller>,
     blob_store: Option<Arc<TieredBlobStore>>,
+    replication_kinds: Option<&'static [&'static str]>,
 ) -> Result<InMemoryRequestTopology, String> {
     let leader_host = leader.host_name().clone();
     let follower_host = follower.host_name().clone();
@@ -390,7 +401,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
             leader_remote_router.clone(),
             None,
         )
-        .with_replication_kinds(None)
+        .with_replication_kinds(replication_kinds)
         .spawn();
     let (follower_runtime_handle, _follower_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
         PeerRuntime::new(
@@ -401,7 +412,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
             follower_remote_router,
             None,
         )
-        .with_replication_kinds(None)
+        .with_replication_kinds(replication_kinds)
         .spawn();
 
     // Spawn the server-side client session handler BEFORE the client handshake,
