@@ -12,6 +12,8 @@ Amended by ADR 0046: workflows no longer declare stance, so the §2 clause about
 
 Amended by [ADR 0053](0053-crew-images-compose-from-declared-layers-and-freeze-in-stages.md): contained images compose from declared capability layers; credential grants still select on the work, while image availability and build delivery follow fulfilment.
 
+Amended in place by the credential proxy section below (rulings on #3262 and #3261, 2026-10-15; engine and control direction on #3312, 2026-10-20): a crew never holds a credential, and a per-host proxy attaches it.
+
 ## Context
 
 ADR 0022 made grants **stance-first**, and by "stance" it meant *repository trust*: fork-stance crews get model-API credentials only, and trusted-repo crews add the crew forge identity. Its migration clause also let trusted crews inherit **ambient** human identity. Two things have happened since:
@@ -139,3 +141,61 @@ and gives Docker a private throwaway config; no ambient login or global config
 is used. Work-selected grants remain the only route by which a crew may receive
 registry credentials. This adds host actions alongside work selection; it does
 not make vessel isolation a selector.
+
+## Amendment: the proxy holds credentials, the crew holds placeholders (#3262, #3261, #3312)
+
+Ruled on [where credentials live so a crew never holds one](https://github.com/flotilla-org/flotilla/issues/3262) and [flotilla's approval policy and low-risk merges](https://github.com/flotilla-org/flotilla/issues/3261), 2026-10-15. The engine and control direction were set on [#3312](https://github.com/flotilla-org/flotilla/issues/3312), 2026-10-20. This changes §2 and §5 for every credential the proxy can attach: the grant still selects on the work and still resolves the scope, but the material goes to the proxy, never to the crew.
+
+### P1. No crew holds a credential
+
+The vessel holds placeholders. A per-host credential proxy removes the placeholder and attaches the real credential on the way out.
+- **Forge:** `gh` and git get a fixed placeholder (`GH_TOKEN` plus a git credential helper). The real token is minted by `flotilla-credentials`, scoped to the convoy.
+- **Private registries:** the proxy attaches the token; the vessel sees a placeholder.
+- **Cloud:** short-lived workload identity where the provider supports it. Flotilla mints an OIDC token and the proxy exchanges it for a role scoped to the convoy. A static key held by the proxy is the fallback.
+- **Image pulls** at vessel start use the host's environment-provider credentials and never enter the vessel.
+
+The only security material left in the vessel is the proxy's public CA trust (`SSL_CERT_FILE`, `GIT_SSL_CAINFO`, `NODE_EXTRA_CA_CERTS`, `CODEX_CA_CERTIFICATE`). Workflows don't change.
+
+### P2. Model logins go through the proxy too, with one bounded exception
+
+- **API-key mode:** the key is held by the proxy. A charter can require this mode.
+- **Subscription logins** (Claude, ChatGPT): flotilla supports holding the subscription token in either the proxy or the harness.
+- **The in-vessel exception:** a subscription login held by the harness is the single named credential allowed in a vessel. Three limits apply:
+  - egress may reach only the provider's own hosts;
+  - each crew gets its own revocable slot, never the owner's personal login;
+  - a charter can refuse the exception by requiring API-key mode.
+
+Whether the subscription token moves to the proxy by default is revisited as the provider terms settle. The owner reads them as aimed at reselling proxies run for other people, not at a user's own machines and proxies.
+
+### P3. Reach is frozen; permission is asked live
+
+- **Reach** (repositories and services) is frozen at admission and delivered when the vessel starts. Adding reach means readmitting the convoy.
+- **Conditional actions** are asked of the daemon live, under the approval tiers ruled on #3261 (their ADR lands with the first implementation ticket). These are the "owner by default, delegable per project" tier: merging PRs, and closing or relabelling tickets in another project.
+- **When the daemon can't be reached,** conditional actions are refused, and plain in-reach actions keep working.
+- **Writes are normal traffic.** Pushes, PRs, comments and labels within reach pass with the real credential attached. A GraphQL mutation is refused only when the proxy can't attribute it to an action the crew may take. The proxy reads the request body to make that attribution.
+- Forge rulesets and required checks remain the floor. The proxy refuses earlier, and can enforce rules the forge can't express.
+
+### P4. Identity comes from host-side setup
+
+There is one shared proxy per host, with one listener per vessel. The listener a request arrives on is the vessel's identity. Identity never comes from a secret in the vessel, so a placeholder presented on another vessel's listener is refused.
+
+There are two modes, and each environment provider declares which it can set up:
+- **Explicit:** `HTTPS_PROXY` points at a loopback port on the in-vessel flotilla agent ([ADR 0069](0069-an-agent-inside-every-vessel.md)), which forwards over the vessel's own socket.
+- **Transparent:** the host redirects the vessel's traffic to its listener. This is also what makes default-deny egress real.
+
+Transparent mode is used where it is available, and a charter can require it. Telling individual crews apart within one vessel waits. Host-direct placement should shrink to a minimum. Cloud sandboxes need their own network setup: either a proxy near them, or the same rules applied in a proxy they already have.
+
+### P5. The proxy is flotilla's own process, controlled declaratively
+
+- **Engine:** a flotilla-owned Rust proxy, built on `hyper` and `rustls`, or on hudsucker or a fork of it ([the transparent-mode spike](https://github.com/flotilla-org/flotilla/issues/3275)). Policy, GraphQL attribution and the token swap run in the proxy's own code.
+- **Rejected:** Envoy ([experiment](https://github.com/flotilla-org/flotilla/issues/3593)). Its policy hooks are a gRPC callout per request (ext_authz, ext_proc), or code in its Lua or WebAssembly plugins. That means a second protocol stack, an extra hop on every forge request, and policy outside flotilla's code.
+- **Process:** a separate process, so one proxy can be shared per host. Whether something supervises it is a deployment choice.
+- **Control:** flotilla sends the proxy everything it needs as one JSON or CBOR document, over HTTP on a Unix-socket control endpoint, when a vessel starts and whenever its configuration changes. A document replaces the previous one whole. The only per-request call out of the proxy is the live conditional check in P3.
+- **Open:**
+  - whether a control document is per vessel or per agent;
+  - how credentials reach the proxy and are refreshed there. §5's delivery-lifetime rules (refresh without gaps, surfacing persistent failure, never degrading to anonymous) apply to the proxy as the holder.
+
+### Consequences
+
+- §2's "staged into its credential directory" applies only to the in-vessel subscription exception, and to credentials the proxy can't yet attach while the proxy is being built.
+- The recording of approved and delegated actions, and where that record lives, belong to the approval-policy ADR and to "the audit trail and its tamper evidence" (#3265), not to this one.
