@@ -191,6 +191,7 @@ pub trait Resource: Send + Sync + 'static {
     /// Select every visible copy using `replica_read_rank` instead of local-first reads.
     const RANKED_REPLICA_READS: bool = false;
 
+    /// Higher ranks are better; tuples are compared lexicographically.
     /// Rank observed subjects: missing status sorts last, then observation time
     /// and authority. Shared selection adds local preference on an exact tie.
     /// Status-less copies tie on time; their creation timestamps intentionally do not participate.

@@ -976,6 +976,63 @@ impl ReplicaTurnSetup<'_> {
     }
 }
 
+struct ReplicaTurnSource {
+    name: &'static str,
+    field_path: &'static str,
+    literal: &'static str,
+}
+
+impl ReplicaTurnSource {
+    const fn new(name: &'static str, field_path: &'static str, literal: &'static str) -> Self {
+        Self { name, field_path, literal }
+    }
+
+    fn is_issue(&self) -> bool {
+        self.name == "issue"
+    }
+
+    fn leaf(&self) -> Leaf {
+        let address = if self.is_issue() {
+            LeafAddress::Issue { service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 3556 }
+        } else {
+            LeafAddress::ChangeRequest { service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 3556 }
+        };
+        Leaf {
+            address,
+            field_path: self.field_path.into(),
+            operator: if self.name == "checks-settled" { LeafOperator::NotEqual } else { LeafOperator::Equal },
+            literal: self.literal.into(),
+        }
+    }
+
+    fn rule(&self, leaf: &Leaf) -> TurnDeliveryRule {
+        let comparison = if leaf.operator == LeafOperator::NotEqual { "!=" } else { "==" };
+        TurnDeliveryRule::builder()
+            .on(flotilla_resources::parse_leaf_template(&format!(
+                "${}{} {comparison} {}",
+                if self.is_issue() { "issue" } else { "cr" },
+                self.field_path,
+                self.literal
+            ))
+            .unwrap())
+            .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
+            .brief("Handle observed change".into())
+            .hold(HoldAct::State)
+            .build()
+    }
+
+    // A delivered message must identify the observed subject revision.
+    fn assert_message_subject(&self, subject: flotilla_resources::MessageReference, observed_at: DateTime<Utc>) {
+        if self.is_issue() {
+            assert!(matches!(subject, flotilla_resources::MessageReference::Issue { number: 3556, revision, .. }
+                if revision == observed_at.to_rfc3339()));
+        } else {
+            assert!(matches!(subject, flotilla_resources::MessageReference::ChangeRequest { number: 3556, revision, .. }
+                if revision == "head"));
+        }
+    }
+}
+
 // A demanded placeholder on the convoy home must never hide observations from
 // another host: triggering and delivery must agree, including a stalled merge.
 #[hegel::test]
@@ -986,12 +1043,13 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
     // Both terminal check outcomes satisfy the stock checks-settled rule.
     let failed_checks = tc.draw(hegel::generators::booleans());
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        for (source, path, literal) in [
-            ("merged", ".state", "merged"),
-            ("checks-settled", ".checks", "pending"),
-            ("review", ".review.actionable-at-head", "true"),
-            ("issue", ".state", "closed"),
+        for case in [
+            ReplicaTurnSource::new("merged", ".state", "merged"),
+            ReplicaTurnSource::new("checks-settled", ".checks", "pending"),
+            ReplicaTurnSource::new("review", ".review.actionable-at-head", "true"),
+            ReplicaTurnSource::new("issue", ".state", "closed"),
         ] {
+            let source = case.name;
             let home = ResourceBackend::new(InMemoryBackend::default());
             let observer = ResourceBackend::new(InMemoryBackend::default());
             let (tx, _) = broadcast::channel(4);
@@ -1009,32 +1067,10 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
             table.set_turn_delivery_actuator(actuator.clone()).await;
             let base = Utc::now() - chrono::Duration::seconds(10);
             let id = uuid::Uuid::new_v4();
-            let is_issue = source == "issue";
-            let address = if is_issue {
-                LeafAddress::Issue { service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 3556 }
-            } else {
-                LeafAddress::ChangeRequest { service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 3556 }
-            };
-            let checks_settled = source == "checks-settled";
-            let leaf = Leaf {
-                address,
-                field_path: path.into(),
-                operator: if checks_settled { LeafOperator::NotEqual } else { LeafOperator::Equal },
-                literal: literal.into(),
-            };
-            let comparison = if checks_settled { "!=" } else { "==" };
+            let is_issue = case.is_issue();
+            let leaf = case.leaf();
             let name = flotilla_resources::address::leaf_record_name(&leaf.address, &[]).unwrap();
-            let rule = TurnDeliveryRule::builder()
-                .on(flotilla_resources::parse_leaf_template(&format!(
-                    "${}{} {comparison} {literal}",
-                    if is_issue { "issue" } else { "cr" },
-                    path
-                ))
-                .unwrap())
-                .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
-                .brief("Handle observed change".into())
-                .hold(HoldAct::State)
-                .build();
+            let rule = case.rule(&leaf);
             let convoys = home.using::<Convoy>("flotilla");
             let convoy = convoys
                 .create(
@@ -1104,13 +1140,7 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
             table.fire(id, firing.clone()).await;
             assert_eq!(actuator.requests.lock().unwrap().len(), 1, "{source} must deliver from replica status");
             let subject = actuator.requests.lock().unwrap()[0].message_subject.clone().unwrap();
-            if is_issue {
-                assert!(matches!(subject, flotilla_resources::MessageReference::Issue { number: 3556, revision, .. }
-                    if revision == observed_at.to_rfc3339()));
-            } else {
-                assert!(matches!(subject, flotilla_resources::MessageReference::ChangeRequest { number: 3556, revision, .. }
-                    if revision == "head"));
-            }
+            case.assert_message_subject(subject, observed_at);
             table.fire(id, firing).await;
             assert_eq!(actuator.requests.lock().unwrap().len(), 1, "duplicate {source} is idempotent");
             let status = convoys.get("remote-turn").await.unwrap().status.unwrap();

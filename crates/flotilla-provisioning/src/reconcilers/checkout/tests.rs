@@ -1290,6 +1290,20 @@ fn checkout_observation_prefers_replica_status(tc: hegel::TestCase) {
         ChangeRequestReviewObservation, ChangeRequestSpec, ConvoyRepositorySpec, InputMeta, Observation, ObservedChangeRequestState,
         ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, RepositoryKey,
     };
+    // Subprocess boundary: this store-only read must issue no commands or probes.
+    struct NoCommands;
+    #[async_trait]
+    impl CommandRunner for NoCommands {
+        async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            panic!("observation selection must not run a subprocess")
+        }
+        async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+            panic!("observation selection must not run a subprocess")
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            panic!("observation selection must not probe a subprocess")
+        }
+    }
     let local_has_status = tc.draw(hegel::generators::booleans());
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let home = ResourceBackend::new(InMemoryBackend::default());
@@ -1363,12 +1377,8 @@ fn checkout_observation_prefers_replica_status(tc: hegel::TestCase) {
             .replace(&remote_records.list().await.unwrap(), chrono::Utc::now())
             .await
             .unwrap();
-        let runtime = CheckoutControllerRuntime::new(
-            Arc::new(ProcessCommandRunner),
-            None,
-            Some(home.including_replicas::<ChangeRequest>(NAMESPACE)),
-            vec![],
-        );
+        let runtime =
+            CheckoutControllerRuntime::new(Arc::new(NoCommands), None, Some(home.including_replicas::<ChangeRequest>(NAMESPACE)), vec![]);
         let observed = runtime.observed_change_request(&convoy, &checkout, "3556").await.unwrap();
         assert_eq!(observed.and_then(|status| status.state.value), Some(ObservedChangeRequestState::Merged));
     });
