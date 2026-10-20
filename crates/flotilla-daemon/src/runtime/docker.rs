@@ -656,6 +656,10 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let provider = self.provider_for_environment(name, kind).await?;
         let prepared = provider.prepare(spec, &Default::default()).await?;
         provider.provision(EnvironmentId::new(name), &prepared, Default::default()).await?;
+        // A re-provisioned agentless Environment may reach the daemon again (#3618).
+        if let Some(reach) = &self.state.agentless_reach {
+            reach.admit(&EnvironmentId::new(name)).await;
+        }
         Ok(EnvironmentProvisioning::HostDirect)
     }
 

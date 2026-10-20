@@ -473,6 +473,11 @@ async fn retired_environment_is_not_resurrected() {
     assert!(harness.reach.prepare_session(&harness.target).await.is_err());
     assert_eq!(harness.ssh.spawns().len(), 1, "no second forward");
     assert_eq!(harness.reach.health(&harness.target.environment).await, None);
+
+    // Provisioning the Environment again is a new incarnation.
+    harness.reach.admit(&harness.target.environment).await;
+    harness.reach.prepare_session(&harness.target).await.expect("re-provisioned");
+    assert_eq!(harness.ssh.spawns().len(), 2);
 }
 
 // Review #3621: concurrent launches install the CLI once, publishing only a

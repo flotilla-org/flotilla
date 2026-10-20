@@ -265,7 +265,9 @@ pub(crate) struct AgentlessReach {
     timing: ForwardTiming,
     forwards: Mutex<HashMap<EnvironmentId, Forward>>,
     /// Tombstones for torn-down Environments: a late observation of one of
-    /// their sessions must not resurrect the forward or its socket.
+    /// their sessions must not resurrect the forward or its socket. Provisioning
+    /// the Environment again admits it ([`AgentlessReach::admit`]); the set is
+    /// bounded by the configured agentless hosts, whose IDs are per host.
     retired: Mutex<HashSet<EnvironmentId>>,
     /// Serialises CLI installation, so concurrent launches never race one path.
     installing: Mutex<()>,
@@ -369,6 +371,12 @@ impl AgentlessReach {
 
     pub(crate) async fn health(&self, environment: &EnvironmentId) -> Option<ForwardHealth> {
         self.forwards.lock().await.get(environment).map(|forward| forward.health.borrow().clone())
+    }
+
+    /// Environment (re-)provisioning: a torn-down Environment of the same name
+    /// is a new incarnation, so its forward may start again.
+    pub(crate) async fn admit(&self, environment: &EnvironmentId) {
+        self.retired.lock().await.remove(environment);
     }
 
     /// Environment teardown: stop the forward, which removes its remote
