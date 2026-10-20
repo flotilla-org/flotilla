@@ -1,0 +1,2 @@
+{"websocket": {"greeting": "Request served by 4d896d95b55478", "reply": "envoy-3593-test-payload", "seconds": 0.1499724870081991}}
+{"ssh_connect": "HTTP/1.1 200 OK\r\ndate: Tue, 20 Oct 2026 16:55:02 GMT\r\nserver: envoy\r\n\r\n", "banner": "SSH-2.0-54ec6dd1\r\n", "seconds": 0.16167149000102654}

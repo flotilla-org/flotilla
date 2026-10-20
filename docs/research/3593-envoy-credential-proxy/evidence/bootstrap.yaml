@@ -1,0 +1,21 @@
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 19000
+bootstrap_extensions:
+- name: envoy.bootstrap.internal_listener
+  typed_config:
+    '@type': type.googleapis.com/envoy.extensions.bootstrap.internal_listener.v3.InternalListener
+dynamic_resources:
+  cds_config:
+    path_config_source:
+      path: /tmp/envoy-spike/cds.yaml
+    resource_api_version: V3
+  lds_config:
+    path_config_source:
+      path: /tmp/envoy-spike/lds.yaml
+    resource_api_version: V3
+node:
+  cluster: spike
+  id: spike

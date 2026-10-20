@@ -1,0 +1,37 @@
+{"hook": "auth", "vessel": "b", "allowed": false}
+{"hook": "proc", "body": "{\"query\":\"mutation { nope }\"}"}
+{"hook": "auth", "vessel": "b", "allowed": false}
+{"hook": "proc", "body": "{\"query\":\"query { viewer { login } }\"}"}
+{"hook": "proc", "body": "{\"query\":\"mutation { nope }\"}"}
+{"hook": "auth", "vessel": "a", "allowed": false}
+{"upstream": "/repo.git/info/refs?service=git-receive-pack", "authorization": "Bearer real-test-token-a", "bytes": 0, "seconds": 9.29760280996561e-05}
+{"upstream": "/repo.git/git-receive-pack", "authorization": "Bearer real-test-token-a", "bytes": 416, "seconds": 0.0002626069472171366}
+{"hook": "auth", "vessel": "a", "allowed": false}
+{"upstream": "/repo.git/info/refs?service=git-upload-pack", "authorization": "Bearer real-test-token-a", "bytes": 0, "seconds": 8.533202344551682e-05}
+{"upstream": "/repo.git/git-upload-pack", "authorization": "Bearer real-test-token-a", "bytes": 177, "seconds": 7.064396049827337e-05}
+{"hook": "auth", "vessel": "a", "allowed": false}
+{"upstream": "/repo.git/info/refs?service=git-receive-pack", "authorization": "Bearer real-test-token-a", "bytes": 0, "seconds": 5.87120302952826e-05}
+{"upstream": "/repo.git/git-receive-pack", "authorization": "Bearer real-test-token-a", "bytes": 452, "seconds": 8.231599349528551e-05}
+{"hook": "auth", "vessel": "a", "allowed": false}
+{"upstream": "/repo.git/info/refs?service=git-upload-pack", "authorization": "Bearer real-test-token-a", "bytes": 0, "seconds": 7.512199226766825e-05}
+{"upstream": "/repo.git/git-upload-pack", "authorization": "Bearer real-test-token-a", "bytes": 239, "seconds": 0.00010273396037518978}
+{"hook": "auth", "vessel": "a", "allowed": false}
+{"upstream": "/repo.git/info/refs?service=git-receive-pack", "authorization": "Bearer real-test-token-a", "bytes": 0, "seconds": 7.958000060170889e-05}
+{"upstream": "/repo.git/git-receive-pack", "authorization": "Bearer real-test-token-a", "bytes": 4, "seconds": 9.349698666483164e-05}
+{"upstream": "/repo.git/git-receive-pack", "authorization": "Bearer real-test-token-a", "bytes": 524448422, "seconds": 1.1583262820495293}
+{"hook": "auth", "vessel": "b", "allowed": false}
+{"hook": "proc", "body": "{\"query\":\"query { viewer { login } }\"}"}
+{"hook": "proc", "body": "{\"query\":\"mutation { nope }\"}"}
+{"hook": "auth", "vessel": "b", "allowed": false}
+{"hook": "proc", "body": "{\"query\":\"query { viewer { login } }\"}"}
+{"hook": "proc", "body": "{\"query\":\"mutation { nope }\"}"}
+{"hook": "auth", "vessel": "b", "allowed": false}
+{"hook": "proc", "body": "{\"query\":\"query { viewer { login } }\"}"}
+{"hook": "proc", "body": "{\"query\":\"mutation { nope }\"}"}
+{"hook": "auth", "vessel": "a", "allowed": false}
+{"upstream": "/repo.git/info/refs?service=git-receive-pack", "authorization": "Bearer real-test-token-a", "bytes": 0, "seconds": 6.725703133270144e-05}
+{"upstream": "/repo.git/git-receive-pack", "authorization": "Bearer real-test-token-a", "bytes": 4, "seconds": 8.842704119160771e-05}
+{"upstream": "/repo.git/git-receive-pack", "authorization": "Bearer real-test-token-a", "bytes": 524448742, "seconds": 1.113748628005851}
+{"hook": "auth", "vessel": "b", "allowed": false}
+{"hook": "proc", "body": "{\"query\":\"mutation { nope }\"}"}
+{"upstream": "/upstream-still-alive", "authorization": null, "bytes": 0, "seconds": 5.3522002417594194e-05}

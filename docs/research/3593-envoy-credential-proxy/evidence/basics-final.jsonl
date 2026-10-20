@@ -1,0 +1,5 @@
+{"vessel": "a", "path": "/", "result": [200, "{\"authorization\": \"Bearer real-test-token-a\", \"bytes\": 0}"]}
+{"vessel": "b", "path": "/", "result": [403, ""]}
+{"vessel": "a", "path": "/graphql", "result": [200, "{\"authorization\": \"Bearer real-test-token-a\", \"bytes\": 38}"]}
+{"vessel": "a", "path": "/graphql", "result": [403, "mutation denied"]}
+{"unlisted": "HTTP/1.1 403 Forbidden\r\ndate: Tue, 20 Oct 2026 16:59:02 GMT\r\nserver: envoy\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"}

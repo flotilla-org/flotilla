@@ -1,0 +1,23 @@
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: is subject to change. To configure the initial branch name to use in all
+hint: of your new repositories, which will suppress this warning, call:
+hint: 
+hint: 	git config --global init.defaultBranch <name>
+hint: 
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint: 
+hint: 	git branch -m <name>
+Initialized empty Git repository in /tmp/envoy-spike/source/.git/
+[master (root-commit) 14e1fee] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 hello
+To https://git.test/repo.git
+ * [new branch]      HEAD -> master
+Cloning into '/tmp/envoy-spike/clone'...
+[master 8e84348] second
+ 1 file changed, 1 insertion(+)
+To https://git.test/repo.git
+   14e1fee..8e84348  HEAD -> master
+From https://git.test/repo
+   14e1fee..8e84348  master     -> origin/master

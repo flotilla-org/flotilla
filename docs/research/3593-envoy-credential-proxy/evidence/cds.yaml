@@ -1,0 +1,150 @@
+resources:
+- '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+  connect_timeout: 2s
+  load_assignment:
+    cluster_name: upstream
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address:
+              address: 127.0.0.1
+              port_value: 18443
+  name: upstream
+  transport_socket:
+    name: envoy.transport_sockets.tls
+    typed_config:
+      '@type': type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+  type: STATIC
+- '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+  connect_timeout: 2s
+  load_assignment:
+    cluster_name: auth
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address:
+              address: 127.0.0.1
+              port_value: 19001
+  name: auth
+  type: STATIC
+  typed_extension_protocol_options: &id001
+    envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+      '@type': type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+      explicit_http_config:
+        http2_protocol_options: {}
+- '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+  connect_timeout: 2s
+  load_assignment:
+    cluster_name: proc
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address:
+              address: 127.0.0.1
+              port_value: 19002
+  name: proc
+  type: STATIC
+  typed_extension_protocol_options: *id001
+- '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+  connect_timeout: 2s
+  load_assignment:
+    cluster_name: github.com
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address:
+              address: 20.26.156.215
+              port_value: 22
+  name: github.com
+  type: STATIC
+- '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+  connect_timeout: 2s
+  load_assignment:
+    cluster_name: echo.websocket.org
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address:
+              address: 66.241.124.119
+              port_value: 443
+  name: echo.websocket.org
+  type: STATIC
+- '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+  connect_timeout: 2s
+  load_assignment:
+    cluster_name: chatgpt.com
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address:
+              address: 172.64.155.209
+              port_value: 443
+  name: chatgpt.com
+  type: STATIC
+- '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+  connect_timeout: 2s
+  load_assignment:
+    cluster_name: tls_a
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            envoy_internal_address:
+              server_listener_name: tls_a
+  name: tls_a
+  transport_socket:
+    name: envoy.transport_sockets.internal_upstream
+    typed_config:
+      '@type': type.googleapis.com/envoy.extensions.transport_sockets.internal_upstream.v3.InternalUpstreamTransport
+      transport_socket:
+        name: envoy.transport_sockets.raw_buffer
+        typed_config:
+          '@type': type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
+  type: STATIC
+- '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+  connect_timeout: 2s
+  load_assignment:
+    cluster_name: tls_b
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            envoy_internal_address:
+              server_listener_name: tls_b
+  name: tls_b
+  transport_socket:
+    name: envoy.transport_sockets.internal_upstream
+    typed_config:
+      '@type': type.googleapis.com/envoy.extensions.transport_sockets.internal_upstream.v3.InternalUpstreamTransport
+      transport_socket:
+        name: envoy.transport_sockets.raw_buffer
+        typed_config:
+          '@type': type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
+  type: STATIC
+- '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+  connect_timeout: 2s
+  load_assignment:
+    cluster_name: tls_c
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            envoy_internal_address:
+              server_listener_name: tls_c
+  name: tls_c
+  transport_socket:
+    name: envoy.transport_sockets.internal_upstream
+    typed_config:
+      '@type': type.googleapis.com/envoy.extensions.transport_sockets.internal_upstream.v3.InternalUpstreamTransport
+      transport_socket:
+        name: envoy.transport_sockets.raw_buffer
+        typed_config:
+          '@type': type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
+  type: STATIC
+version_info: '1792515573315053676'

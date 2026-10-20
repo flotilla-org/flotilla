@@ -1,0 +1,8 @@
+{"path": "/cross-vessel-proof", "status": 403}
+{"path": "/graphql?case=mutation", "status": 403}
+200
+{"path": "/fail-closed-proof", "status": 403}
+{"direct_upstream_status": 200}
+{"upstream_path": "/cross-vessel-proof", "count": 0}
+{"upstream_path": "/graphql?case=mutation", "count": 0}
+{"upstream_path": "/fail-closed-proof", "count": 0}
