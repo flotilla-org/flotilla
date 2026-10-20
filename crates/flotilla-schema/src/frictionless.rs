@@ -16,7 +16,7 @@ impl TableBuilder {
             columns: vec![],
             guards: vec![],
             enums: vec![],
-            codes: vec![],
+            generated: vec![],
             fields: vec![],
             field_aliases: vec![],
             aliases: vec![],
@@ -24,11 +24,11 @@ impl TableBuilder {
         })
     }
     pub fn column(mut self, name: &str, ty: ColumnType, nullable: bool) -> Self {
-        self.0.columns.push(ColumnDef { name: name.into(), ty, nullable });
+        self.0.columns.push(ColumnDef::new(name, ty, nullable));
         self
     }
     pub fn key(mut self, name: &str, ty: ColumnType) -> Self {
-        self.0.key.push(ColumnDef { name: name.into(), ty, nullable: false });
+        self.0.key.push(ColumnDef::new(name, ty, false));
         self.0.own_key += 1;
         self
     }
@@ -51,6 +51,7 @@ impl Table {
             .map(|column| {
                 let ty = match column.ty {
                     ColumnType::Integer => "integer",
+                    ColumnType::Number => "number",
                     ColumnType::Bool => "boolean",
                     ColumnType::Timestamp => "datetime",
                     ColumnType::Frozen | ColumnType::Cbor => "object",
@@ -61,20 +62,26 @@ impl Table {
                     field["format"] = json!("binary");
                 }
                 if let ColumnType::Code(codes) = &column.ty {
-                    let names = self.codes.iter().find(|entry| entry.column == column.name);
                     field["categories"] = json!(codes
                         .iter()
                         .map(|code| {
-                            let label = names
-                                .and_then(|entry| entry.names.iter().find(|(value, _)| value == code))
-                                .map(|(_, name)| name.clone())
-                                .unwrap_or_else(|| code.to_string());
-                            json!({"value":code.to_string(),"label":label})
+                            let label =
+                                column.categories.iter().find(|(value, _)| value == code).map(|(_, name)| name.as_str()).unwrap_or(code);
+                            json!({"value":code,"label":label})
                         })
                         .collect::<Vec<_>>());
                 }
+                field.as_object_mut().expect("field object").extend(column.properties.clone());
+                if let Some(reference) = &column.reference {
+                    field["reference"] = json!({"resource": reference});
+                }
                 if self.key.iter().any(|key| key.name == column.name) {
-                    field["roles"] = json!(["key"]);
+                    let roles = field.as_object_mut().expect("field object").entry("roles").or_insert_with(|| json!([]));
+                    if let Some(roles) = roles.as_array_mut() {
+                        if !roles.iter().any(|role| role == "key") {
+                            roles.push(json!("key"));
+                        }
+                    }
                 }
                 if let Some(properties) = self.properties.get(&column.name) {
                     field.as_object_mut().expect("field object").extend(properties.clone());
@@ -104,7 +111,7 @@ impl crate::TableSet {
         schema
     }
     /// The kind's projection of the per-home event log; its key stays natural and portable.
-    pub fn log_table(&self) -> Table {
+    pub fn log_projection(&self) -> Table {
         TableBuilder::new(format!("{}.log", self.tables[0].name))
             .key("home", ColumnType::Text)
             .key("sequence", ColumnType::Integer)
@@ -125,6 +132,20 @@ impl crate::TableSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rendering_preserves_enriched_column_metadata() {
+        let mut table = TableBuilder::new("sample").key("state", ColumnType::Code(vec!["r".into()])).build();
+        table.key[0].categories.push(("r".into(), "Running".into()));
+        table.key[0].reference = Some("Agent".into());
+        table.key[0].add_role("sequence");
+        table.key[0].properties.insert("title".into(), json!("State"));
+        let schema = table.frictionless();
+        let field = &schema["fields"][0];
+        assert_eq!(field["categories"], json!([{"value":"r", "label":"Running"}]));
+        assert_eq!(field["reference"]["resource"], "Agent");
+        assert_eq!(field["roles"], json!(["sequence", "key"]));
+        assert_eq!(field["title"], "State");
+    }
     // ADR 0067: field types come from the descriptor, independent of source. Generate
     // every native type and both nullabilities; semantic extensions survive rendering.
     #[hegel::test]
@@ -132,6 +153,7 @@ mod tests {
         use hegel::generators as gs;
         let cases = [
             (ColumnType::Integer, "integer"),
+            (ColumnType::Number, "number"),
             (ColumnType::Bool, "boolean"),
             (ColumnType::Text, "string"),
             (ColumnType::Timestamp, "datetime"),
@@ -140,7 +162,7 @@ mod tests {
             (ColumnType::Cbor, "object"),
             (ColumnType::Interned(crate::HOME_DOMAIN), "string"),
             (ColumnType::Ref, "string"),
-            (ColumnType::Code(vec![crate::Code::new("a")]), "string"),
+            (ColumnType::Code(vec!["a".into()]), "string"),
         ];
         let index = tc.draw(gs::integers::<usize>().min_value(0).max_value(cases.len() - 1));
         let nullable = tc.draw(gs::booleans());

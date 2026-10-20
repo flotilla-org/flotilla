@@ -36,7 +36,7 @@ pub(super) async fn list(service: &Arc<Service>) -> Result<Vec<Value>, String> {
             .iter()
             .map(|set| {
                 let names: Vec<_> =
-                    set.tables.iter().map(|table| table.name.clone()).chain(std::iter::once(set.log_table().name)).collect();
+                    set.tables.iter().map(|table| table.name.clone()).chain(std::iter::once(set.log_projection().name)).collect();
                 json!({"kind":set.kind,"root":set.tables[0].name,"tables":names})
             })
             .collect())
@@ -178,7 +178,7 @@ pub(super) async fn respond(name: &str, rows: bool, params: &[(String, String)],
         Ok(store
             .kinds()
             .iter()
-            .find(|set| set.tables.iter().any(|table| table.name == table_name) || set.log_table().name == table_name)
+            .find(|set| set.tables.iter().any(|table| table.name == table_name) || set.log_projection().name == table_name)
             .cloned())
     })
     .await;
@@ -187,7 +187,7 @@ pub(super) async fn respond(name: &str, rows: bool, params: &[(String, String)],
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "unknown table"),
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "table_source", err),
     };
-    let log = set.log_table();
+    let log = set.log_projection();
     set.tables.push(log);
     let get = |name: &str| params.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
     let format = match super::table_api::negotiate(get("format"), accept, rows) {
@@ -226,8 +226,8 @@ pub(super) async fn respond(name: &str, rows: bool, params: &[(String, String)],
         vec![]
     } else {
         vec![
-            flotilla_schema::ColumnDef { name: "resource.home".into(), ty: ColumnType::Text, nullable: false },
-            flotilla_schema::ColumnDef { name: "resource.name".into(), ty: ColumnType::Text, nullable: false },
+            flotilla_schema::ColumnDef::new("resource.home", ColumnType::Text, false),
+            flotilla_schema::ColumnDef::new("resource.name", ColumnType::Text, false),
         ]
     };
     keys.extend(table.key);

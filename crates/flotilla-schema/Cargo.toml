@@ -12,7 +12,6 @@ flotilla-cbor = { path = "../flotilla-cbor" }
 flotilla-schema-derive = { path = "../flotilla-schema-derive" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { workspace = true }
-serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = "2"
 

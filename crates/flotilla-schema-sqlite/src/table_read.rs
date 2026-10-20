@@ -1,7 +1,7 @@
 //! Natural-value reads for self-describing tables. The SQL boundary validates every
 //! identifier and comparison before preparing a statement, and applies all predicates.
-use crate::StoreError;
-use flotilla_schema::{quote_ident, ColumnDef, ColumnType, KindRegistry, Table, Value};
+use crate::{quote_ident, StoreError};
+use flotilla_schema::{ColumnDef, ColumnType, KindRegistry, Table, Value};
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
 use std::collections::BTreeMap;
 
@@ -34,10 +34,7 @@ pub(crate) fn read(
         .ok_or_else(|| StoreError::Stream("unknown table".into()))?;
     let source = set.tables.iter().find(|table| table.name == name).expect("table found");
     let mut table = source.clone();
-    let mut key = vec![
-        ColumnDef { name: "resource.home".into(), ty: ColumnType::Text, nullable: false },
-        ColumnDef { name: "resource.name".into(), ty: ColumnType::Text, nullable: false },
-    ];
+    let mut key = vec![ColumnDef::new("resource.home", ColumnType::Text, false), ColumnDef::new("resource.name", ColumnType::Text, false)];
     key.extend(table.key.clone());
     table.key = key;
     table.own_key += 2;
@@ -155,7 +152,7 @@ pub(crate) fn read_log(
 ) -> Result<TableRead, StoreError> {
     let root = name.strip_suffix(".log").ok_or_else(|| StoreError::Stream("unknown log table".into()))?;
     let set = kinds.iter().find(|set| set.tables[0].name == root).ok_or_else(|| StoreError::Stream("unknown log kind".into()))?;
-    let descriptor = set.log_table();
+    let descriptor = set.log_projection();
     let mut clauses = vec!["kind=?".to_owned(), "home=?".to_owned()];
     let mut values = vec![SqlValue::Text(set.code.to_string()), SqlValue::Text(home.into())];
     for filter in filters {
