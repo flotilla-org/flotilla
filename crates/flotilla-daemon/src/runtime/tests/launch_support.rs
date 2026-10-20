@@ -169,7 +169,7 @@ pub(super) async fn assert_contained_claude_invocation_home(private_home: bool, 
     if matches!(observation, LaunchObservationRecord::Present) {
         backend.using::<TerminalSession>(NAMESPACE).create(&terminal_meta, &spec).await.expect("terminal context");
     }
-    let tags = [flotilla_resources::TerminalSessionTag::new(CREDENTIAL_REF_SESSION_TAG, "claude-max")];
+    let tags = [flotilla_terminal::TerminalSessionTag::new(CREDENTIAL_REF_SESSION_TAG, "claude-max")];
 
     let launched = TerminalControllerRuntime { state }
         .ensure_session("terminal-demo-work-coder", &spec, &tags)

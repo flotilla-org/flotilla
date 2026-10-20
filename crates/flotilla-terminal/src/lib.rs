@@ -4,9 +4,21 @@ pub mod passthrough;
 
 use async_trait::async_trait;
 use flotilla_protocol::{arg::Arg, commands::AttachMode, result_set::CleatEndpoint, TerminalStatus};
-pub use flotilla_resources::TerminalSessionTag;
 
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+
+/// A key/value tag cleat records on a session, for example its convoy and vessel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSessionTag {
+    pub key: String,
+    pub value: String,
+}
+
+impl TerminalSessionTag {
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self { key: key.into(), value: value.into() }
+    }
+}
 
 /// Environment variables to inject into the terminal session.
 pub type TerminalEnvVars = Vec<(String, String)>;

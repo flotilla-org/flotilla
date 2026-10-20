@@ -197,7 +197,7 @@ impl TerminalRuntime for FakeTerminalRuntime {
         &self,
         name: &str,
         _spec: &flotilla_resources::TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         Ok(TerminalRuntimeState {
             configured_limits: Some(ConfiguredResourceLimits {

@@ -100,7 +100,7 @@ impl TerminalRuntime for DeadThenRestoredRuntime {
         &self,
         _name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         Ok(TerminalRuntimeState::builder()
             .session_id("new-generation".to_string())
@@ -233,7 +233,7 @@ impl TerminalRuntime for BrieflyMissingRuntime {
         &self,
         _name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("a revived session must not be launched again")
     }
@@ -366,7 +366,7 @@ impl TerminalRuntime for FailingTerminalRuntime {
         &self,
         _name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         Err("boom".to_string())
     }
@@ -415,7 +415,7 @@ impl TerminalRuntime for GoneEnvironmentTerminalRuntime {
         &self,
         _name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("deleted environments cannot launch sessions")
     }
@@ -711,7 +711,7 @@ impl TerminalRuntime for UnavailableRunningRuntime {
         &self,
         _name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("a running session must be probed, not ensured")
     }
@@ -1021,7 +1021,7 @@ impl TerminalRuntime for GhostRecoveryRuntime {
         &self,
         name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         self.ensure_calls.fetch_add(1, Ordering::SeqCst);
         Ok(TerminalRuntimeState {
@@ -1203,7 +1203,7 @@ impl TerminalRuntime for RecordingTerminalRuntime {
         &self,
         _name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("terminal finalization must not ensure a new session")
     }
@@ -1270,9 +1270,9 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
     assert_eq!(
         runtime.tags.lock().expect("tags mutex").as_slice(),
         &[
-            flotilla_resources::TerminalSessionTag::new("convoy", "demo"),
-            flotilla_resources::TerminalSessionTag::new("vessel", "demo-work"),
-            flotilla_resources::TerminalSessionTag::new(
+            flotilla_terminal::TerminalSessionTag::new("convoy", "demo"),
+            flotilla_terminal::TerminalSessionTag::new("vessel", "demo-work"),
+            flotilla_terminal::TerminalSessionTag::new(
                 CREDENTIAL_SCOPES_SESSION_TAG,
                 r#"{"github-app":["github.com-flotilla-org-flotilla"]}"#,
             ),
@@ -1296,7 +1296,7 @@ impl TerminalRuntime for BriefGateRuntime {
         &self,
         name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         self.launches.fetch_add(1, Ordering::SeqCst);
         Ok(TerminalRuntimeState {
@@ -1370,7 +1370,7 @@ async fn digest_backed_session_waits_for_blob_then_launches() {
 
 #[derive(Default)]
 struct TagRecordingRuntime {
-    tags: Mutex<Vec<flotilla_resources::TerminalSessionTag>>,
+    tags: Mutex<Vec<flotilla_terminal::TerminalSessionTag>>,
 }
 
 #[async_trait]
@@ -1379,7 +1379,7 @@ impl TerminalRuntime for TagRecordingRuntime {
         &self,
         name: &str,
         _spec: &TerminalSessionSpec,
-        tags: &[flotilla_resources::TerminalSessionTag],
+        tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         *self.tags.lock().expect("tags mutex") = tags.to_vec();
         Ok(TerminalRuntimeState {
@@ -1537,7 +1537,7 @@ impl TerminalRuntime for MissingTerminalRuntime {
         &self,
         _name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("running sessions should be observed, not ensured")
     }
@@ -2231,7 +2231,7 @@ impl TerminalRuntime for CleanupRecordingTerminalRuntime {
         &self,
         _name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("finalizer should not ensure sessions")
     }
@@ -2255,7 +2255,7 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
         &self,
         _name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("running sessions should not be ensured")
     }
@@ -2376,7 +2376,7 @@ impl TerminalRuntime for HooklessTerminalRuntime {
         &self,
         _name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("running sessions should not be ensured")
     }
@@ -2394,7 +2394,7 @@ impl TerminalRuntime for AuthFailedTerminalRuntime {
         &self,
         _name: &str,
         _spec: &TerminalSessionSpec,
-        _tags: &[flotilla_resources::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("running sessions should not be ensured")
     }
@@ -2585,7 +2585,7 @@ impl TerminalRuntime for ExitedAgentRuntime {
         &self,
         _: &str,
         _: &TerminalSessionSpec,
-        _: &[flotilla_resources::TerminalSessionTag],
+        _: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         panic!("running shell must not provision a replacement before exit is observed")
     }
@@ -2751,7 +2751,7 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
         &self,
         name: &str,
         spec: &TerminalSessionSpec,
-        _: &[flotilla_resources::TerminalSessionTag],
+        _: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         if self.fail_launch.load(Ordering::SeqCst) {
             return Err("launch failed".into());
