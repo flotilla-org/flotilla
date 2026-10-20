@@ -172,18 +172,33 @@ Whether the subscription token moves to the proxy by default is revisited as the
 - **Reach** (repositories and services) is frozen at admission and delivered when the vessel starts. Adding reach means readmitting the convoy.
 - **Conditional actions** are asked of the daemon live, under the approval tiers ruled on #3261 (their ADR lands with the first implementation ticket). These are the "owner by default, delegable per project" tier: merging PRs, and closing or relabelling tickets in another project.
 - **When the daemon can't be reached,** conditional actions are refused, and plain in-reach actions keep working.
-- **Writes are normal traffic.** Pushes, PRs, comments and labels within reach pass with the real credential attached. A GraphQL mutation is refused only when the proxy can't attribute it to an action the crew may take. The proxy reads the request body to make that attribution.
+- **Writes are normal traffic.** Pushes, PRs, comments and labels within reach pass with the real credential attached.
+- **Readmission** versions a live convoy's snapshot in place; running vessels and the proxy pick up the new version without teardown or restart ([#3277](https://github.com/flotilla-org/flotilla/issues/3277)).
 - Forge rulesets and required checks remain the floor. The proxy refuses earlier, and can enforce rules the forge can't express.
 
-### P4. Identity comes from host-side setup
+### P4. Identity comes from host-side setup; the host proxy is explicit-only
 
-There is one shared proxy per host, with one listener per vessel. The listener a request arrives on is the vessel's identity. Identity never comes from a secret in the vessel, so a placeholder presented on another vessel's listener is refused.
+There is one shared proxy per host, with one listener per vessel. The listener a request arrives on is the vessel's identity. Identity never comes from a secret in the vessel, so a placeholder presented on another vessel's listener is refused. This is the same identity model as the vessel's daemon socket: both rest on the per-vessel endpoint the host sets up. Telling individual crews apart within one vessel waits.
 
-There are two modes, and each environment provider declares which it can set up:
-- **Explicit:** `HTTPS_PROXY` points at a loopback port on the in-vessel flotilla agent ([ADR 0069](0069-an-agent-inside-every-vessel.md)), which forwards over the vessel's own socket.
-- **Transparent:** the host redirects the vessel's traffic to its listener. This is also what makes default-deny egress real.
+The vessel end follows [ADR 0069](0069-an-agent-inside-every-vessel.md), which refines #3262's two modes:
+- The in-vessel agent carries all outbound traffic. Software that honours `HTTPS_PROXY` uses it directly. Everything else is redirected inside the guest to the agent, which recovers the hostname and issues an ordinary `CONNECT hostname:port`.
+- The host proxy therefore only ever sees CONNECT on the vessel's listener: it runs explicit mode only. #3262's "transparent mode" lives inside the guest, not on the host.
+- The guest trusts the proxy's CA through one combined trust bundle, exposed through the variables in P1.
 
-Transparent mode is used where it is available, and a charter can require it. Telling individual crews apart within one vessel waits. Host-direct placement should shrink to a minimum. Cloud sandboxes need their own network setup: either a proxy near them, or the same rules applied in a proxy they already have.
+Host-direct placement should shrink to a minimum. Cloud sandboxes use the controlling host's proxy by default (ADR 0069). A nearer proxy, or the same rules in the provider's own proxy, can be configured later.
+
+### P4a. Egress levels and two layers of enforcement ([#3263](https://github.com/flotilla-org/flotilla/issues/3263))
+
+- **Default reach** is read-only public web: port 443, GET and HEAD only, no request bodies, no credential attached, and every request logged with its convoy.
+- **Writes** go only to the named services in the convoy's reach (forge, model provider, registries), each with its swapped credential.
+- **Always denied:**
+  - private ranges (LAN, docker0, the host);
+  - the metadata endpoint;
+  - bare-IP connections;
+  - other ports;
+  - DNS other than flotilla's resolver.
+- **Two layers:** the network layer, which the vessel can't change, and the HTTP layer, which is the proxy. The in-vessel agent forwards and never enforces. A provider that can't enforce declares itself advisory, and placement refuses a charter that requires enforced egress.
+- **Refusals** name the destination and the command to ask with. The request becomes a proposal record, approval extends reach by readmission, and everything is audited. An approval request is a Message addressed to a role, and each request kind declares the lowest tier that may decide it. There is no self-approval ([#3277](https://github.com/flotilla-org/flotilla/issues/3277)).
 
 ### P5. The proxy is flotilla's own process, controlled declaratively
 
@@ -193,7 +208,9 @@ Transparent mode is used where it is available, and a charter can require it. Te
 - **Control:** flotilla sends the proxy everything it needs as one JSON or CBOR document, over HTTP on a Unix-socket control endpoint, when a vessel starts and whenever its configuration changes. A document replaces the previous one whole. The only per-request call out of the proxy is the live conditional check in P3.
 - **Open:**
   - whether a control document is per vessel or per agent;
-  - how credentials reach the proxy and are refreshed there. §5's delivery-lifetime rules (refresh without gaps, surfacing persistent failure, never degrading to anonymous) apply to the proxy as the holder.
+  - how credentials reach the proxy and are refreshed there. §5's delivery-lifetime rules (refresh without gaps, surfacing persistent failure, never degrading to anonymous) apply to the proxy as the holder;
+  - **which hosts' TLS the proxy intercepts.** ADR 0069 intercepts only hosts where the proxy swaps credentials. But P4a's read-only default (GET and HEAD only, no bodies) can only be enforced on traffic the proxy can read, so as written it can't hold for other hosts;
+  - **how forge writes are attributed.** Refusing a GraphQL mutation that the proxy can't attribute to an action the crew may take comes from #3312's outline and the #3125 research, not from a ruling.
 
 ### Consequences
 
