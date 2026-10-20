@@ -34,6 +34,7 @@ uuid = { version = "1", features = ["v4"] }
 serde_path_to_error = "0.1.20"
 
 [dev-dependencies]
+flotilla-replication = { path = "../flotilla-replication" }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 hegeltest = "=0.48.1"

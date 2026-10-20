@@ -4036,7 +4036,7 @@ impl InProcessDaemon {
     pub async fn fleet_health_internal(&self) -> Result<FleetHealthResponse, String> {
         let now = Utc::now();
         let namespace = self.provisioning_namespace().await;
-        let (reads, _, _) = self.read_projections().fleet_inventory(&namespace, None, None, None).await?;
+        let reads = self.resource_backend.clone();
         self.refresh_resource_host_summaries_with_backend(&reads).await?;
         let host_list = self.host_registry.list_hosts(&self.local_host_counts().await).await;
         let mut response = self

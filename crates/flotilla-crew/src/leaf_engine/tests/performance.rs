@@ -211,3 +211,79 @@ async fn stale_episode_reads_one_schedule_and_does_not_rewrite_lag() {
     wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(25)).await.unwrap();
     assert_eq!(wake.subscriptions.inner.change_requests.grace_schedule_reads(), 2);
 }
+
+// A remote event must not materialize the replica inventory in the leaf engine.
+// 320 bodies carry a 30 KB workflow/brief-sized payload; setup is outside timing.
+#[tokio::test]
+async fn replica_event_work_measurement() {
+    use flotilla_store_testkit::ReadCountsBackendExt;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let remote = ResourceBackend::new(InMemoryBackend::default());
+    for index in 0..320 {
+        create_convoy(
+            &remote,
+            &format!("replica-{index}"),
+            ConvoyStatus { phase: ConvoyPhase::Active, message: None, ..Default::default() },
+        )
+        .await;
+        let records = remote.using::<Convoy>("flotilla");
+        let object = records.get(&format!("replica-{index}")).await.unwrap();
+        let mut spec = object.spec;
+        spec.instruction = Some("x".repeat(30_000));
+        records.update(&InputMeta::builder().name(object.metadata.name).build(), &object.metadata.resource_version, &spec).await.unwrap();
+    }
+    let records = remote.using::<Convoy>("flotilla");
+    let writer = backend.replica_writer::<Convoy>(flotilla_protocol::NodeId::new("remote"), "flotilla");
+    writer.replace(&records.list().await.unwrap(), Utc::now()).await.unwrap();
+    let counted = backend.with_read_counts();
+    let wake = supervision_wake(&counted);
+    wake.local_convoys("flotilla").await.unwrap();
+    let cell = wake.views("flotilla").await.unwrap();
+    let view = &cell.get().unwrap().convoys;
+    let before = view.materialized_objects();
+    let reads = counted.read_snapshot();
+    let started = std::time::Instant::now();
+    for index in 0..20 {
+        let mut changed = records.get("replica-0").await.unwrap();
+        changed.status.as_mut().unwrap().message = Some(format!("event-{index}"));
+        changed.metadata.resource_version = format!("{}", 1000 + index);
+        writer.apply(flotilla_resources::WatchEvent::Modified(changed), Utc::now()).await.unwrap();
+        assert!(wake.local_convoys("flotilla").await.unwrap().is_empty());
+    }
+    let copied = view.materialized_objects() - before;
+    eprintln!("replica leaf: bodies/event={}, elapsed/event={:?}", copied / 20, started.elapsed() / 20);
+    counted.read_snapshot().since(&reads).assert_zero("replica leaf event");
+    assert_eq!(copied, 0, "replicas must never materialize owned inventory bodies");
+}
+
+// A keyed change derives only that Convoy's standing rows. An empty selection
+// does nothing, and a deleted key prunes without re-evaluating other parents.
+#[tokio::test]
+async fn row_sync_evaluates_only_selected_convoys() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let wake = supervision_wake(&backend);
+    for index in 0..32 {
+        create_convoy(&backend, &format!("local-{index}"), ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    }
+    let mut objects = backend
+        .using::<Convoy>("flotilla")
+        .list()
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|item| (item.metadata.name.clone(), item))
+        .collect::<HashMap<_, _>>();
+    wake.sync_rows("flotilla", &objects).await.unwrap();
+    let cell = wake.views("flotilla").await.unwrap();
+    let calls = || cell.get().unwrap().row_evaluations.load(Ordering::Relaxed);
+    let before = calls();
+    let selected = HashSet::from(["local-0".to_string()]);
+    wake.sync_rows_selected("flotilla", &objects, Some(&selected)).await.unwrap();
+    assert_eq!(calls(), before + 1);
+    wake.sync_rows_selected("flotilla", &objects, Some(&HashSet::new())).await.unwrap();
+    assert_eq!(calls(), before + 1);
+    objects.remove("local-0");
+    wake.sync_rows_selected("flotilla", &objects, Some(&selected)).await.unwrap();
+    assert_eq!(calls(), before + 1);
+}

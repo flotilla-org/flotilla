@@ -1314,6 +1314,8 @@ async fn patch_status_typed<T: Resource>(
     Err(ResourceError::conflict(name, "status patch retry budget exhausted"))
 }
 
+// Raw watch setup preserves the backend read deadline. Continuous consumers own
+// retry and cancellation; interactive callers must receive a bounded refusal.
 async fn watch_typed<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
@@ -1358,6 +1360,8 @@ async fn watch_typed_including_replicas<T: Resource>(
     namespace: &str,
 ) -> Result<DynamicResourceWatch, ResourceError> {
     let resolver = backend.including_replicas::<T>(namespace);
+    // Subscribe before listing to cover the handoff. WatchChannel is bounded
+    // (256 events); overflow reports WatchExpired rather than growing a queue.
     let stream = resolver.watch().await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
     let initial = resolver
         .list()

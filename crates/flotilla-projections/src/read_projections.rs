@@ -983,7 +983,6 @@ impl ReadProjections<'_> {
             .map_err(|error| error.to_string())?;
         let mut snapshot = project_ops::RequestSnapshot::new(&reads, namespace)?;
         snapshot.copy::<ResourceTerminalSession>(&reads).await?;
-        snapshot.copy::<ResourceConvoy>(&reads).await?;
         snapshot.copy::<flotilla_resources::Environment>(&reads).await?;
         snapshot.copy::<ResourceHost>(&reads).await?;
         snapshot.copy::<ResourceCheckout>(&reads).await?;

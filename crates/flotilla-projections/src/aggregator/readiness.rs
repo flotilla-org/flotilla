@@ -43,7 +43,7 @@ impl Aggregator {
             },
             blockers: Vec::new(),
         };
-        let vessel = self.readiness_vessels.values().find(|source| {
+        let vessel = self.convoy_vessels(&convoy.namespace, &convoy.name).find(|source| {
             source.object.metadata.namespace == convoy.namespace
                 && source.object.spec.convoy_ref == convoy.name
                 && source.object.spec.vessel_name == definition.name
@@ -93,8 +93,7 @@ impl Aggregator {
             // vessel records their refs. Host-scoped membership avoids joining
             // a same-named replica or another convoy's checkout.
             checkout_refs.extend(
-                self.readiness_checkouts
-                    .values()
+                self.convoy_checkouts(&convoy.namespace, &convoy.name)
                     .filter(|source| {
                         source.object.metadata.namespace == convoy.namespace
                             && source.object.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.name)
@@ -103,7 +102,7 @@ impl Aggregator {
                     .map(|source| source.object.metadata.name.clone()),
             );
             for name in &checkout_refs {
-                let source = self.readiness_checkouts.values().find(|source| {
+                let source = self.named_checkouts(&convoy.namespace, name).find(|source| {
                     source.object.metadata.namespace == convoy.namespace
                         && source.object.metadata.name == *name
                         && self.read_host(&source.provenance).as_ref() == Some(host)
@@ -124,7 +123,7 @@ impl Aggregator {
                     continue;
                 }
                 if let CheckoutSpec::Worktree(spec) = &source.object.spec {
-                    if let Some(clone) = self.readiness_clones.values().find(|clone| {
+                    if let Some(clone) = self.named_clones(&convoy.namespace, &spec.clone_ref).find(|clone| {
                         clone.object.metadata.namespace == convoy.namespace
                             && clone.object.metadata.name == spec.clone_ref
                             && self.read_host(&clone.provenance).as_ref() == Some(host)

@@ -19,7 +19,7 @@ use flotilla_resources::{
 };
 use flotilla_store::{
     controller::{SecondaryWatch, WorkQueueSender},
-    ResourceBackend, WatchView,
+    ResourceBackend, StoreQuery, WatchView,
 };
 use tokio::sync::{broadcast, OnceCell};
 
@@ -45,14 +45,12 @@ impl ConvoyRead for ResourceObject<Convoy> {
         self
     }
 }
-pub(super) struct SharedConvoy {
-    inventory: Arc<flotilla_resources::ReadResourceList<Convoy>>,
-    index: usize,
-}
+#[derive(Clone)]
+pub(super) struct SharedConvoy(Arc<flotilla_resources::ReadResourceObject<Convoy>>);
 impl std::ops::Deref for SharedConvoy {
     type Target = ResourceObject<Convoy>;
     fn deref(&self) -> &Self::Target {
-        &self.inventory.items[self.index].object
+        &self.0.object
     }
 }
 impl ConvoyRead for SharedConvoy {
@@ -60,10 +58,9 @@ impl ConvoyRead for SharedConvoy {
         self
     }
 }
-
 type SharedConvoyInventory = HashMap<String, SharedConvoy>;
 struct CachedLocalConvoys {
-    generation: Arc<flotilla_resources::ReadResourceList<Convoy>>,
+    generation: Arc<Vec<Arc<flotilla_resources::ReadResourceObject<Convoy>>>>,
     objects: Arc<SharedConvoyInventory>,
 }
 
@@ -120,6 +117,32 @@ impl FinalSettlementInputs {
     }
 }
 
+#[derive(Default)]
+struct RowDependencies {
+    by_convoy: HashMap<String, HashSet<String>>,
+    by_record: HashMap<String, HashSet<String>>,
+}
+impl RowDependencies {
+    fn replace(&mut self, convoy: &str, records: HashSet<String>) {
+        if let Some(previous) = self.by_convoy.remove(convoy) {
+            for record in previous {
+                if let Some(names) = self.by_record.get_mut(&record) {
+                    names.remove(convoy);
+                    if names.is_empty() {
+                        self.by_record.remove(&record);
+                    }
+                }
+            }
+        }
+        if !records.is_empty() {
+            for record in &records {
+                self.by_record.entry(record.clone()).or_default().insert(convoy.to_string());
+            }
+            self.by_convoy.insert(convoy.to_string(), records);
+        }
+    }
+}
+
 pub(super) struct LeafViews {
     pub(super) defaults: WatchView<flotilla_resources::CrewDefaults>,
     pub(super) fleet: WatchView<flotilla_resources::FleetDesignation>,
@@ -133,9 +156,13 @@ pub(super) struct LeafViews {
     pub(super) messages: WatchView<flotilla_resources::Message>,
     pub(super) forges: WatchView<Forge>,
     local_convoys: tokio::sync::Mutex<Option<CachedLocalConvoys>>,
+    row_dependencies: tokio::sync::Mutex<RowDependencies>,
+    standing_rows: tokio::sync::Mutex<HashMap<String, HashSet<uuid::Uuid>>>,
     final_settlements: std::sync::Mutex<HashMap<String, FinalSettlementInputs>>,
     #[cfg(test)]
     pub(super) settlement_evaluations: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(super) row_evaluations: std::sync::atomic::AtomicUsize,
 }
 impl LeafViews {
     async fn start(backend: &ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
@@ -152,28 +179,25 @@ impl LeafViews {
             messages: WatchView::start(backend.clone(), namespace).await?,
             forges: WatchView::start(backend.clone(), namespace).await?,
             local_convoys: Default::default(),
+            row_dependencies: Default::default(),
+            standing_rows: Default::default(),
             final_settlements: Default::default(),
             #[cfg(test)]
             settlement_evaluations: Default::default(),
+            #[cfg(test)]
+            row_evaluations: Default::default(),
         })
     }
     async fn local_convoys(&self) -> Result<Arc<HashMap<String, SharedConvoy>>, String> {
-        let listed = self.convoys.shared_list().await.map_err(|error| error.to_string())?;
+        let listed = self.convoys.shared_local_objects().await.map_err(|error| error.to_string())?;
         let mut cached = self.local_convoys.lock().await;
         if let Some(previous) = cached.as_ref() {
             if Arc::ptr_eq(&previous.generation, &listed) {
                 return Ok(previous.objects.clone());
             }
         }
-        let objects: Arc<HashMap<String, SharedConvoy>> = Arc::new(
-            listed
-                .items
-                .iter()
-                .enumerate()
-                .filter(|(_, item)| matches!(item.provenance, flotilla_resources::ResourceProvenance::Local))
-                .map(|(index, item)| (item.object.metadata.name.clone(), SharedConvoy { inventory: listed.clone(), index }))
-                .collect(),
-        );
+        let objects: Arc<SharedConvoyInventory> =
+            Arc::new(listed.iter().map(|item| (item.object.metadata.name.clone(), SharedConvoy(item.clone()))).collect());
         *cached = Some(CachedLocalConvoys { generation: listed, objects: objects.clone() });
         Ok(objects)
     }
@@ -300,12 +324,12 @@ impl ReconcilerWake {
         self.subscriptions.inner.controller_queues.lock().await.insert(namespace.clone(), sender.clone());
         let cell = self.views(&namespace).await?;
         let views = cell.get().expect("initialized views");
-        let mut convoy_watch = views.convoys.subscribe();
-        let mut checkout_watch = views.checkouts.subscribe();
-        let mut change_request_watch = views.change_requests.subscribe();
-        let mut vessel_watch = views.vessels.subscribe();
+        let mut convoy_watch = views.convoys.subscribe_local_keys();
+        let mut checkout_watch = views.checkouts.subscribe_keys();
+        let mut change_request_watch = views.change_requests.subscribe_keys();
+        let mut vessel_watch = views.vessels.subscribe_keys();
         let mut forge_watch = views.forges.subscribe();
-        let mut convoy_objects = views.local_convoys().await?;
+        let mut convoy_objects = views.local_convoys().await?.as_ref().clone();
         let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
         self.sync_rows(&namespace, &convoy_objects).await?;
         let mut judge_tick = tokio::time::interval(Duration::from_secs(1));
@@ -315,22 +339,33 @@ impl ReconcilerWake {
                 _ = judge_tick.tick() => {
                     self.judge_stalls(&namespace, &convoy_objects).await?;
                 }
-                event = convoy_watch.changed() => {
-                    event.map_err(|_| "convoy view stopped".to_string())?;
-                    convoy_objects = views.local_convoys().await?;
-                    self.sync_rows(&namespace, &convoy_objects).await?;
+                event = convoy_watch.recv() => {
+                    let selected = match event {
+                        Ok(Some(name)) => {
+                            if let Some(item) = views.convoys.shared_named(&name).await.map_err(|e| e.to_string())?.into_iter().find(|item| matches!(item.provenance, flotilla_resources::ResourceProvenance::Local)) {
+                                convoy_objects.insert(name.clone(), SharedConvoy(item));
+                            } else { convoy_objects.remove(&name); }
+                            Some(HashSet::from([name]))
+                        }
+                        Ok(None) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            convoy_objects = views.local_convoys().await?.as_ref().clone();
+                            None
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return Err("convoy view stopped".into()),
+                    };
+                    self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
                 }
-                event = checkout_watch.changed() => {
-                    event.map_err(|_| "checkout view stopped".to_string())?;
-                    self.sync_rows(&namespace, &convoy_objects).await?;
+                event = checkout_watch.recv() => {
+                    let selected = affected_rows(views, &views.checkouts, event).await?;
+                    self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
                 }
-                event = change_request_watch.changed() => {
-                    event.map_err(|_| "change request view stopped".to_string())?;
-                    self.sync_rows(&namespace, &convoy_objects).await?;
+                event = change_request_watch.recv() => {
+                    let selected = affected_rows(views, &views.change_requests, event).await?;
+                    self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
                 }
-                event = vessel_watch.changed() => {
-                    event.map_err(|_| "vessel view stopped".to_string())?;
-                    self.sync_rows(&namespace, &convoy_objects).await?;
+                event = vessel_watch.recv() => {
+                    let selected = affected_rows(views, &views.vessels, event).await?;
+                    self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
                 }
                 event = forge_watch.changed() => {
                     event.map_err(|_| "forge view stopped".to_string())?;
@@ -352,27 +387,109 @@ impl ReconcilerWake {
     }
 
     pub(super) async fn sync_rows(&self, namespace: &str, convoys: &HashMap<String, impl ConvoyRead>) -> Result<(), String> {
+        self.sync_rows_selected(namespace, convoys, None).await
+    }
+
+    pub(super) async fn sync_rows_selected(
+        &self,
+        namespace: &str,
+        convoys: &HashMap<String, impl ConvoyRead>,
+        selected: Option<&HashSet<String>>,
+    ) -> Result<(), String> {
+        if selected.is_some_and(HashSet::is_empty) {
+            return Ok(());
+        }
         let cell = self.views(namespace).await?;
         let views = cell.get().expect("initialized views");
         let forges =
             views.forges.definitions().await.map_err(|error| error.to_string())?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
-        let checkout_sources = views.checkouts.list().await.map_err(|error| error.to_string())?.items;
-        let change_request_list = views.change_requests.list().await.map_err(|error| error.to_string())?;
+        let children_query = selected.map(|names| StoreQuery {
+            any_of: Some(
+                names
+                    .iter()
+                    .map(|name| StoreQuery::labels(&BTreeMap::from([(flotilla_resources::CONVOY_LABEL.into(), name.clone())]), true, true))
+                    .collect(),
+            ),
+            include_replicas: true,
+            ..Default::default()
+        });
+        let checkout_sources = match &children_query {
+            Some(query) => views.checkouts.query(query).await,
+            None => views.checkouts.list().await,
+        }
+        .map_err(|error| error.to_string())?
+        .items;
+        let vessel_sources = match &children_query {
+            Some(query) => views.vessels.query(query).await,
+            None => views.vessels.list().await,
+        }
+        .map_err(|error| error.to_string())?
+        .items;
+        let change_request_list = if let Some(names) = selected {
+            let mut references = HashSet::new();
+            for convoy in names.iter().filter_map(|name| convoys.get(name)).map(ConvoyRead::convoy) {
+                let mut leaves = flotilla_resources::expected_change_request_leaves(convoy, &forges).unwrap_or_default();
+                if let Ok(InstantiatedExit::Table(entries)) = instantiate_exit(convoy, &forges) {
+                    leaves.extend(entries.into_iter().flat_map(|entry| entry.leaves));
+                }
+                for leaf in leaves {
+                    if let Ok(name) = flotilla_resources::address::leaf_record_name(&leaf.address, &forges) {
+                        references.insert(name);
+                    }
+                }
+            }
+            views.change_requests.query(&StoreQuery::names(references, true)).await
+        } else {
+            views.change_requests.list().await
+        }
+        .map_err(|error| error.to_string())?;
         let observed_change_requests =
             freshest_change_requests(&change_request_sources(change_request_list)).into_iter().collect::<BTreeMap<_, _>>();
-        let vessel_sources = views.vessels.list().await.map_err(|error| error.to_string())?.items;
-        // Pruning bounds memory. Revision keys also invalidate proofs when a
-        // convoy leaves and re-enters Landing between these snapshots.
-        views.final_settlements.lock().expect("settlement cache lock poisoned").retain(|name, _| {
-            convoys
-                .get(name)
-                .is_some_and(|convoy| convoy.convoy().status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing))
-        });
+        // Revision-keyed final proofs are pruned only for affected parents.
+        {
+            let mut finals = views.final_settlements.lock().expect("settlement cache lock poisoned");
+            let landing = |name: &String| {
+                convoys
+                    .get(name)
+                    .is_some_and(|convoy| convoy.convoy().status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing))
+            };
+            if let Some(names) = selected {
+                for name in names {
+                    if !landing(name) {
+                        finals.remove(name);
+                    }
+                }
+            } else {
+                finals.retain(|name, _| landing(name));
+            }
+        }
         let mut desired = Vec::<LeafSubscriptionRow>::new();
-        for convoy in convoys.values().map(ConvoyRead::convoy).filter(|convoy| {
+        let mut dependencies = HashMap::<String, HashSet<String>>::new();
+        let selected_convoys = match selected {
+            Some(names) => names.iter().filter_map(|name| convoys.get(name)).collect::<Vec<_>>(),
+            None => convoys.values().collect(),
+        };
+        for convoy in selected_convoys.into_iter().map(ConvoyRead::convoy).filter(|convoy| {
             convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing))
         }) {
+            #[cfg(test)]
+            views.row_evaluations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let inputs = dependencies.entry(convoy.metadata.name.clone()).or_default();
             let status = convoy.status.as_ref().expect("holding convoy has status");
+            for leaf in flotilla_resources::expected_change_request_leaves(convoy, &forges).unwrap_or_default() {
+                if let Ok(name) = flotilla_resources::address::leaf_record_name(&leaf.address, &forges) {
+                    inputs.insert(name);
+                }
+            }
+            if let Ok(InstantiatedExit::Table(entries)) = instantiate_exit(convoy, &forges) {
+                for leaf in entries.iter().flat_map(|entry| &entry.leaves) {
+                    if let Ok(address) = leaf_address(&leaf.address, &forges) {
+                        if let Some(name) = record_name(&address) {
+                            inputs.insert(name);
+                        }
+                    }
+                }
+            }
             let mut controller_rows = HashSet::<(String, String)>::new();
             let conflicts = subject_relationship_conflicts(convoy);
             if !conflicts.is_empty() {
@@ -408,6 +525,7 @@ impl ReconcilerWake {
                 });
             }
             let checkouts = select_convoy_children(convoy, &checkout_sources);
+            inputs.extend(checkouts.keys().cloned());
             for checkout in checkouts.values() {
                 let CheckoutSpec::Worktree(spec) = &checkout.spec else { continue };
                 let Some(retry) = checkout.status.as_ref().and_then(|status| status.clone_retry.clone()) else { continue };
@@ -436,6 +554,7 @@ impl ReconcilerWake {
                 });
             }
             let convoy_vessels = select_convoy_children(convoy, &vessel_sources);
+            inputs.extend(convoy_vessels.keys().cloned());
             for vessel in convoy_vessels.values() {
                 let Some(vessel_status) = vessel.status.as_ref() else { continue };
                 let Some(environment_ref) = vessel_status.environment_ref.as_ref() else { continue };
@@ -769,18 +888,54 @@ impl ReconcilerWake {
             }
         }
 
-        let existing = self
-            .subscriptions
-            .inner
-            .rows
-            .lock()
-            .await
-            .values()
-            .filter(|row| {
-                row.namespace == namespace && matches!(row.watcher, LeafWatcher::ReconcilerWake { .. } | LeafWatcher::TurnDelivery { .. })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        for row in &desired {
+            let convoy = match &row.watcher {
+                LeafWatcher::ReconcilerWake { convoy } | LeafWatcher::TurnDelivery { convoy, .. } => convoy,
+                _ => continue,
+            };
+            for leaf in &row.leaves {
+                if let Ok(address) = leaf_address(&leaf.address, &forges) {
+                    if let Some(name) = record_name(&address) {
+                        dependencies.entry(convoy.clone()).or_default().insert(name);
+                    }
+                }
+            }
+        }
+        {
+            let mut index = views.row_dependencies.lock().await;
+            let names = match selected {
+                Some(names) => names.clone(),
+                None => index.by_convoy.keys().chain(convoys.keys()).cloned().collect(),
+            };
+            for name in names {
+                index.replace(&name, dependencies.remove(&name).unwrap_or_default());
+            }
+        }
+        let existing = if let Some(names) = selected {
+            let index = views.standing_rows.lock().await;
+            let rows = self.subscriptions.inner.rows.lock().await;
+            names.iter().flat_map(|name| index.get(name).into_iter().flatten()).filter_map(|id| rows.get(id)).cloned().collect::<Vec<_>>()
+        } else {
+            self.subscriptions
+                .inner
+                .rows
+                .lock()
+                .await
+                .values()
+                .filter(|row| row.namespace == namespace && watcher_convoy(&row.watcher).is_some())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        {
+            let mut index = views.standing_rows.lock().await;
+            if let Some(names) = selected {
+                for name in names {
+                    index.remove(name);
+                }
+            } else {
+                index.clear();
+            }
+        }
         for row in &existing {
             if desired.iter().any(|candidate| same_standing_row(candidate, row)) {
                 continue;
@@ -797,6 +952,9 @@ impl ReconcilerWake {
 
         'desired_rows: for mut row in desired {
             if let Some(existing) = existing.iter().find(|existing| same_standing_row(&row, existing)) {
+                if let Some(convoy) = watcher_convoy(&existing.watcher) {
+                    views.standing_rows.lock().await.entry(convoy.to_string()).or_default().insert(existing.id);
+                }
                 if existing.maker != row.maker {
                     let mut rows = self.subscriptions.inner.rows.lock().await;
                     if let Some(stored) = rows.get_mut(&existing.id) {
@@ -808,6 +966,9 @@ impl ReconcilerWake {
             let id = uuid::Uuid::new_v4();
             row.id = id;
             self.subscriptions.inner.rows.lock().await.insert(id, row.clone());
+            if let Some(convoy) = watcher_convoy(&row.watcher) {
+                views.standing_rows.lock().await.entry(convoy.to_string()).or_default().insert(id);
+            }
             if let Err(error) = self.subscriptions.arm_dependencies(&row).await {
                 self.subscriptions.finish(id).await;
                 tracing::warn!(watcher = ?row.watcher, %error, "arm standing leaf subscription failed");
@@ -825,6 +986,35 @@ impl ReconcilerWake {
         Ok(())
     }
 }
+fn watcher_convoy(watcher: &LeafWatcher) -> Option<&str> {
+    match watcher {
+        LeafWatcher::ReconcilerWake { convoy } | LeafWatcher::TurnDelivery { convoy, .. } => Some(convoy),
+        LeafWatcher::WaitCaller { .. } => None,
+    }
+}
+
+// Reverse dependencies cover disappeared children too. A newly created child
+// supplies its parent label before it has ever participated in row evaluation.
+async fn affected_rows<T: flotilla_resources::Resource>(
+    views: &LeafViews,
+    view: &WatchView<T>,
+    event: Result<Option<String>, broadcast::error::RecvError>,
+) -> Result<Option<HashSet<String>>, String> {
+    match event {
+        Ok(Some(name)) => {
+            let mut names = views.row_dependencies.lock().await.by_record.get(&name).cloned().unwrap_or_default();
+            for item in view.shared_named(&name).await.map_err(|error| error.to_string())? {
+                if let Some(parent) = item.object.metadata.labels.get(flotilla_resources::CONVOY_LABEL) {
+                    names.insert(parent.clone());
+                }
+            }
+            Ok(Some(names))
+        }
+        Ok(None) | Err(broadcast::error::RecvError::Lagged(_)) => Ok(None),
+        Err(broadcast::error::RecvError::Closed) => Err("leaf input view stopped".into()),
+    }
+}
+
 pub(super) fn same_standing_row(left: &LeafSubscriptionRow, right: &LeafSubscriptionRow) -> bool {
     let same_freshness = left.freshness_demand == right.freshness_demand
         || (matches!(left.watcher, LeafWatcher::ReconcilerWake { .. })
@@ -846,5 +1036,32 @@ pub(super) fn same_standing_maker(left: &LeafMaker, right: &LeafMaker) -> bool {
             LeafMaker::Controller { resource_kind: right_kind, name: right_name, ceiling: right_ceiling, .. },
         ) => left_kind == right_kind && left_name == right_name && left_ceiling == right_ceiling,
         _ => left == right,
+    }
+}
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::*;
+    // Replacement removes old reverse edges, keeps other parents, and deletes
+    // empty buckets. Generated operation sequences cover duplicate and delete.
+    #[hegel::test]
+    fn reverse_dependencies_follow_replacements(tc: hegel::TestCase) {
+        let mut index = RowDependencies::default();
+        let mut expected = HashMap::<String, HashSet<String>>::new();
+        let count = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(32));
+        for _ in 0..count {
+            let parent = format!("c{}", tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4)));
+            let size = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(6));
+            let records = (0..size).map(|i| format!("record-{i}")).collect::<HashSet<_>>();
+            index.replace(&parent, records.clone());
+            expected.insert(parent, records);
+            let mut reverse = HashMap::<String, HashSet<String>>::new();
+            for (parent, records) in &expected {
+                for record in records {
+                    reverse.entry(record.clone()).or_default().insert(parent.clone());
+                }
+            }
+            assert_eq!(index.by_record, reverse);
+        }
     }
 }
