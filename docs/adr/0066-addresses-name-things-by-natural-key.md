@@ -155,12 +155,12 @@ For those kinds a shim never actually becomes removable, and the roll-time live 
 
 ### 9. Places and providers (owner grill, 2026-10-20)
 
-An Environment names its provider by a qualified address ([ADR 0058, environment providers](0058-environment-providers-own-lifecycle-and-runtime-capabilities.md), 2026-10-20 section). That needs three kinds the enum does not have yet.
+An Environment names its provider by a qualified address ([ADR 0058, environment providers](0058-environment-providers-own-lifecycle-and-runtime-capabilities.md), 2026-10-20 section). That needs two kinds the enum does not have yet, `host:` and `provider:`, and a new position for `account:`, which today is valid only under `usage:`.
 
 - **`host:<host>`** is a root kind naming a Host by its record name. It is a place: somewhere providers are found, with a replicated record saying which daemon controls it. The record name may be an opaque host ID, so surfaces resolve it to the Host's display name when they show an address; examples here use display names.
 - **`account:<account>`** becomes a root kind, naming a provider account as a place by its fleet-unique identity label (for example `namespace-lab`). Its capacity pool and its usage are facts about the same account, so the account is the key for both.
   - This supersedes §8's `usage:<provider>/account:<account>` form. Usage is part of the account; if it needs an address of its own, it is a sub-resource under the account rather than a root.
-  - Wait conditions on usage already use the §8 form (`LeafAddress::Usage`). They keep it until usage observation is remodelled under the account, and the move then follows §6's re-encode step.
+  - Wait conditions on usage already use the §8 form (`LeafAddress::Usage`). They keep it until usage observation is remodelled under the account, and the move then follows §6's re-encode step. Until then `account:` is valid in both positions, as a root and under `usage:`; the shape check (`Kind::may_follow` in `crates/flotilla-address/src/kind.rs`) accepts both, and drops the child position when the §8 form retires.
 - **`provider:<instance>`** sits under a place and names a configured provider instance there: `host:b1/provider:host-direct`, `account:namespace-lab/provider:namespace`. Under drydock the instance is the drydock provider's name.
 
 Adding these is a deliberate parser change, as §4 requires.
