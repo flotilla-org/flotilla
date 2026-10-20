@@ -10,6 +10,10 @@ use std::{
 };
 
 use chrono::Utc;
+use flotilla_agent_connector::{
+    AgentTransport, Delivery, DeliveryTarget, SubmissionRef, TransportId, TransportObservation, TransportOutcome, TransportRouter,
+    KEYSTROKE,
+};
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_crew::leaf_engine::CrewTurnIntent;
@@ -18,15 +22,13 @@ use flotilla_daemon::runtime::spawn_pending_supervisor_turn_task;
 use flotilla_daemon::runtime::spawn_pending_supervisor_turn_task_with_watches;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
 use flotilla_discovery_testkit::fake_discovery;
-use flotilla_messaging::{MessageBatch, MessageObservation, MessageTransport, MessageTransportOutcome};
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
     Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, ExitDeclaration, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, Message, MessageExpectation, MessagePhase,
-    MessageSubmission, PlacementPolicy, PlacementPolicySpec, Resource, ResourceObject, Selector, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowSnapshot,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    PlacementPolicy, PlacementPolicySpec, Resource, Selector, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowSnapshot, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 use flotilla_store::{controller::Reconciler, ResourceBackend};
 use futures::StreamExt;
@@ -60,15 +62,18 @@ async fn remote_turn_delivery_recovers_after_either_watch_closes() {
 // mutation dispatch remain real. Pool framing is covered by runtime scenarios.
 struct AcceptedMessageTransport(AtomicUsize);
 #[async_trait::async_trait]
-impl MessageTransport for AcceptedMessageTransport {
-    async fn observe(&self, _: &ResourceObject<TerminalSession>, _: Option<&MessageSubmission>) -> Result<MessageObservation, String> {
-        Ok(MessageObservation { ready: true, ..Default::default() })
+impl AgentTransport for AcceptedMessageTransport {
+    fn id(&self) -> TransportId {
+        KEYSTROKE.into()
     }
-    async fn submit(&self, _: &MessageBatch) -> MessageTransportOutcome {
+    async fn observe(&self, _: &DeliveryTarget, _: Option<&SubmissionRef>) -> Result<TransportObservation, String> {
+        Ok(TransportObservation { ready: true, ..Default::default() })
+    }
+    async fn submit(&self, _: &Delivery) -> TransportOutcome {
         self.0.fetch_add(1, Ordering::SeqCst);
-        MessageTransportOutcome::Accepted { evidence: "receiver transport receipt".into() }
+        TransportOutcome::Accepted { evidence: "receiver transport receipt".into() }
     }
-    async fn poll(&self, _: &MessageBatch) -> MessageTransportOutcome {
+    async fn poll(&self, _: &Delivery) -> TransportOutcome {
         panic!("a confirmed submission must not be polled")
     }
 }
@@ -333,8 +338,9 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         sessions.get(&session_meta.name).await.expect("terminal after admission").spec.source,
         TerminalSessionSource::Agent { message: None, .. }
     ));
-    let transport = AcceptedMessageTransport(AtomicUsize::new(0));
-    placement_daemon.message_inbox("flotilla").await.reconcile_delivery(&transport, Utc::now()).await.expect("receiver delivery");
+    let transport = Arc::new(AcceptedMessageTransport(AtomicUsize::new(0)));
+    let router = TransportRouter::new().with_transport(transport.clone());
+    placement_daemon.message_inbox("flotilla").await.reconcile_delivery(&router, Utc::now()).await.expect("receiver delivery");
     let delivered = placement.using::<Message>("flotilla").get(&nudge.metadata.name).await.expect("durable nudge receipt");
     assert_eq!(delivered.status.as_ref().expect("delivery status").phase, MessagePhase::Delivered);
     assert_eq!(

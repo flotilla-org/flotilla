@@ -210,6 +210,8 @@ pub fn old_view(
             session,
             delivered_at: since,
             evidence: format!("Receive on AgentSession {}", consumer.id),
+            // The engine path types through cleat outside the transport router (#3545).
+            transport: None,
         }
     });
     let reason = match state {

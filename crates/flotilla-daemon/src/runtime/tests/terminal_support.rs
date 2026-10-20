@@ -326,7 +326,7 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool, refusals:
         "intent is homed only at the receiver"
     );
     assert_eq!(backend.using::<Message>(NAMESPACE).list().await.expect("cross-host Message fixture operation succeeds").items.len(), 3);
-    inbox.reconcile_delivery(&runtime, now).await.expect("cross-host Message fixture operation succeeds");
+    inbox.reconcile_delivery(&keystroke_router(&runtime.state), now).await.expect("cross-host Message fixture operation succeeds");
     tokio::task::yield_now().await;
     for attempt in 1..=refusals {
         tokio::time::timeout(Duration::from_secs(2), pool.submission_attempted.notified()).await.expect("guard retry reached PTY boundary");
@@ -336,13 +336,16 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool, refusals:
             !runtime.state.terminal_deliveries.lock().expect("delivery reservation").is_empty(),
             "the batch keeps its de-duplication reservation"
         );
-        inbox.reconcile_delivery(&runtime, now).await.expect("pending batch reconciliation");
+        inbox.reconcile_delivery(&keystroke_router(&runtime.state), now).await.expect("pending batch reconciliation");
         assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), attempt, "reconciliation must not start another submission");
         tokio::time::advance(Duration::from_millis(200)).await;
         tokio::task::yield_now().await;
     }
     tokio::time::sleep(Duration::from_secs(6)).await;
-    inbox.reconcile_delivery(&runtime, now + chrono::Duration::seconds(1)).await.expect("cross-host Message fixture operation succeeds");
+    inbox
+        .reconcile_delivery(&keystroke_router(&runtime.state), now + chrono::Duration::seconds(1))
+        .await
+        .expect("cross-host Message fixture operation succeeds");
     assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), refusals + 1);
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
     assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
@@ -391,7 +394,10 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool, refusals:
             .await
             .expect("route operator closure to batch home");
         assert!(matches!(wait_for_command_result(&mut events, id).await, CommandValue::Ok));
-        inbox.reconcile_delivery(&runtime, now + chrono::Duration::seconds(2)).await.expect("reap explicitly closed transport");
+        inbox
+            .reconcile_delivery(&keystroke_router(&runtime.state), now + chrono::Duration::seconds(2))
+            .await
+            .expect("reap explicitly closed transport");
         for message in backend.using::<Message>(NAMESPACE).list().await.expect("closed batch audit").items {
             let status = message.status.expect("status");
             assert_eq!(status.phase, MessagePhase::DeadLettered);
@@ -404,8 +410,14 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool, refusals:
     }
     pool.observations.store(1000, Ordering::SeqCst);
     refresh_attention(&runtime, &backend).await;
-    inbox.reconcile_delivery(&runtime, now + chrono::Duration::seconds(2)).await.expect("cross-host Message fixture operation succeeds");
-    inbox.reconcile_delivery(&runtime, now + chrono::Duration::seconds(4)).await.expect("cross-host Message fixture operation succeeds");
+    inbox
+        .reconcile_delivery(&keystroke_router(&runtime.state), now + chrono::Duration::seconds(2))
+        .await
+        .expect("cross-host Message fixture operation succeeds");
+    inbox
+        .reconcile_delivery(&keystroke_router(&runtime.state), now + chrono::Duration::seconds(4))
+        .await
+        .expect("cross-host Message fixture operation succeeds");
     for message in backend.using::<Message>(NAMESPACE).list().await.expect("cross-host Message fixture operation succeeds").items {
         let status = message.status.expect("cross-host Message fixture operation succeeds");
         // A receipt fulfills a Message with no reply expectation; the
