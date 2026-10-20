@@ -62,6 +62,13 @@ pub enum ResourceError {
 }
 
 impl ResourceError {
+    /// Stable read-pressure refusal, preserved by existing string error transports.
+    pub const STORE_BUSY_READ_DEADLINE_MESSAGE: &'static str = "resource store busy: read deadline exceeded";
+
+    pub fn store_busy_read_deadline() -> Self {
+        Self::other(Self::STORE_BUSY_READ_DEADLINE_MESSAGE)
+    }
+
     // Keep wire-message classification beside its formatter until command errors
     // carry typed categories. Changing this prefix updates both sides together.
     const INVALID_MESSAGE_PREFIX: &'static str = "invalid resource: ";
@@ -97,7 +104,7 @@ impl ResourceError {
     /// Store adapters preserve this refusal across the HTTP error boundary.
     /// It describes read pressure, not an invalid cursor or failed stream.
     pub fn is_store_busy(&self) -> bool {
-        matches!(self, Self::Other { message } if message.contains("resource store busy: read deadline exceeded"))
+        matches!(self, Self::Other { message } if message.contains(Self::STORE_BUSY_READ_DEADLINE_MESSAGE))
     }
 
     /// Reconcilers requeue both optimistic concurrency conflicts and ownership
@@ -146,3 +153,18 @@ impl fmt::Display for ResourceError {
 }
 
 impl Error for ResourceError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Only read-pressure refusal retries. The interactive request deadline is
+    // a different budget, and transport context preserves the read category.
+    #[test]
+    fn busy_read_classification_preserves_transport_context() {
+        let error = ResourceError::store_busy_read_deadline();
+        assert!(error.is_store_busy());
+        assert!(ResourceError::other(format!("remote error: {error}")).is_store_busy());
+        assert!(!ResourceError::other("resource store busy: interactive request deadline exceeded").is_store_busy());
+        assert!(!ResourceError::other("disk error").is_store_busy());
+    }
+}

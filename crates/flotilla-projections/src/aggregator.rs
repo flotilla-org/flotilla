@@ -4466,6 +4466,87 @@ mod tests {
         );
     }
 
+    // Unknown roots stay buffered without repeated discovery. When discovering
+    // a new root also resolves an older one, the fallback must project both;
+    // subsequent progress events must return to one-key work.
+    #[tokio::test]
+    async fn origin_discovery_reprojects_buffered_keys_then_returns_to_keyed_updates() {
+        #[derive(Default)]
+        struct Hosts {
+            mapping: Mutex<HashMap<flotilla_protocol::NodeId, HostName>>,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl AttachCapabilityResolver for Hosts {
+            async fn resolvable_attach_targets(&self, targets: &[(String, HostName)]) -> Result<Vec<bool>, String> {
+                Ok(vec![false; targets.len()])
+            }
+            async fn origin_host_names(
+                &self,
+                origins: &HashSet<flotilla_protocol::NodeId>,
+            ) -> HashMap<flotilla_protocol::NodeId, HostName> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.mapping
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|(root, _)| origins.contains(*root))
+                    .map(|(root, host)| (root.clone(), host.clone()))
+                    .collect()
+            }
+        }
+        let state = AggregatorProjectionState::new();
+        let (tx, _) = broadcast::channel(32);
+        let hosts = Arc::new(Hosts::default());
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver_arc(hosts.clone());
+        let first = ReadResourceObject {
+            object: convoy_object("buffered").await,
+            provenance: ResourceProvenance::Replica {
+                origin_root: flotilla_protocol::NodeId::new("first-root"),
+                last_synced_at: Utc::now(),
+            },
+        };
+        aggregator.replace_convoy_read_source(LocalSource::Durable, vec![first.clone()]).await;
+        assert!(state.result_set().await.rows.as_convoys().unwrap().is_empty());
+        let calls = hosts.calls.load(Ordering::Relaxed);
+        let copied = aggregator.copied_convoys.load(Ordering::Relaxed);
+        for _ in 0..3 {
+            aggregator.apply_replica_convoy_event(ReadWatchEvent::Modified(first.clone())).await;
+        }
+        assert_eq!(hosts.calls.load(Ordering::Relaxed), calls, "do not rediscover the same unresolved origin per event");
+        assert_eq!(aggregator.copied_convoys.load(Ordering::Relaxed), copied);
+        hosts.mapping.lock().await.extend([
+            (flotilla_protocol::NodeId::new("first-root"), HostName::new("first-host")),
+            (flotilla_protocol::NodeId::new("second-root"), HostName::new("second-host")),
+        ]);
+        aggregator
+            .apply_replica_convoy_event(ReadWatchEvent::Added(ReadResourceObject {
+                object: convoy_object("new-origin").await,
+                provenance: ResourceProvenance::Replica {
+                    origin_root: flotilla_protocol::NodeId::new("second-root"),
+                    last_synced_at: Utc::now(),
+                },
+            }))
+            .await;
+        let result = state.result_set().await;
+        let rows = result.rows.as_convoys().unwrap();
+        assert_eq!(rows.len(), 2, "discovery must also release previously buffered keys");
+        assert_eq!(rows.iter().find(|row| row.resource.name == "buffered").unwrap().resource.host, Some(HostName::new("first-host")));
+        let untouched = rows.iter().find(|row| row.resource.name == "new-origin").unwrap().clone();
+        assert!(aggregator.copied_convoys.load(Ordering::Relaxed) > copied, "the origin-change fallback ran");
+        let copied = aggregator.copied_convoys.load(Ordering::Relaxed);
+        let summarized = aggregator.summarized_convoys.load(Ordering::Relaxed);
+        let calls = hosts.calls.load(Ordering::Relaxed);
+        let mut changed = first;
+        changed.object.status.get_or_insert_with(Default::default).message = Some("changed".into());
+        aggregator.apply_replica_convoy_event(ReadWatchEvent::Modified(changed)).await;
+        assert_eq!(aggregator.copied_convoys.load(Ordering::Relaxed), copied);
+        assert_eq!(aggregator.summarized_convoys.load(Ordering::Relaxed), summarized + 1);
+        assert_eq!(hosts.calls.load(Ordering::Relaxed), calls);
+        let result = state.result_set().await;
+        assert_eq!(result.rows.as_convoys().unwrap().iter().find(|row| row.resource.name == "new-origin"), Some(&untouched));
+    }
+
     async fn convoy_object(name: &str) -> ResourceObject<Convoy> {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         backend

@@ -1425,7 +1425,7 @@ impl SqliteBackend {
                         if queue_wait >= SLOW_STORE_OPERATION {
                             ReadWarnings::warn(&read_warnings, 0, 1, 0, operation_name);
                         }
-                        return Err(ResourceError::other("resource store busy: read deadline exceeded"));
+                        return Err(ResourceError::store_busy_read_deadline());
                     }
                     meter.record_operation();
                     let execution = Instant::now();
@@ -1456,7 +1456,7 @@ impl SqliteBackend {
             Ok(result) => result,
             Err(_) => {
                 ReadWarnings::warn(&self.read_warnings, 0, 0, 1, operation_name);
-                Err(ResourceError::other("resource store busy: read deadline exceeded"))
+                Err(ResourceError::store_busy_read_deadline())
             }
         }
     }
@@ -3994,11 +3994,10 @@ mod latency_tests {
         let result = tokio::time::timeout(Duration::from_secs(3), hosts.get("feta")).await;
         release_tx.send(()).expect("release writer");
         writer.await.expect("writer task");
-        assert!(result
-            .expect("read must answer before client timeout")
-            .expect_err("store must report busy")
-            .to_string()
-            .contains("store busy"));
+        let error = result.expect("read must answer before client timeout").expect_err("store must report busy");
+        // Exercise the actual producer, not a separately spelled test error.
+        assert!(error.is_store_busy(), "SQLite's deadline must retain its retry category: {error}");
+        assert_eq!(error.to_string(), crate::ResourceError::STORE_BUSY_READ_DEADLINE_MESSAGE);
     }
 
     #[tokio::test]

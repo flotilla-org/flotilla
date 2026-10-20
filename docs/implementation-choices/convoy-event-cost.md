@@ -30,7 +30,7 @@ event itself, which necessarily carries the changed body.
 | Aggregator, ordinary Convoy event | Multiple N-body maps plus all-row summaries and salience | Two source-precedence lookups; retain previous/current Arc handles; update one source key; summarize only that Convoy with indexed child evidence | 0 |
 | Aggregator, delivery | Whole inventory rebuild per event (some delivery already coalesced) | First-deadline 25 ms coalescing, K row updates; one salience pass per flush | 0 |
 | Fleet health | Request snapshot copies Convoys, then fleet rows list them again | Use the Aggregator's event-maintained rows for addresses, placement and surface state; no Convoy store query or body materialization | 0 Convoy reads |
-| Busy read | Return deadline failure into controller/replicator restart path | Retry that idempotent read in the same consumer: 25 ms exponential backoff, capped at 1 s; cancellation drops the retry | One per attempt |
+| Busy read | Return deadline failure into controller/replicator restart path | Retry that idempotent read in the same consumer: 25 ms exponential backoff window, capped at 1 s, with per-consumer upper-half jitter; cancellation drops the retry | One per attempt |
 | Slow/deadline read log | A WARN/file write per occurrence | Shared per-backend counts, at most one summary per 30 s | n/a |
 
 A whole Convoy-map diff remains necessary at initial snapshot/recovery and when
@@ -79,7 +79,11 @@ representation meets the root's compact-form budget.
 Busy retry is attached to continuous consumers, not interactive read APIs or
 writes. Interactive reads still return a bounded busy refusal. Only the store's
 specific busy-read message is classified as pressure, including across the existing
-HTTP error boundary. Invalid cursors, ended streams, missing access and real
+HTTP error boundary. SQLite producers and classification share a single message
+constant/factory, tested using the real SQLite deadline error; the interactive
+request deadline is deliberately a different category. Independently seeded
+per-consumer jitter samples the upper half of each backoff window (initially
+12.5–25 ms, eventually 0.5–1 s), avoiding synchronized retries. Invalid cursors, ended streams, missing access and real
 storage/transport failures retain their existing error/recovery paths. Retry has
 one outstanding read per consumer and a capped rate during prolonged pressure.
 
